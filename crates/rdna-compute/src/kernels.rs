@@ -361,6 +361,10 @@ pub const GEMM_GATE_UP_HFQ6G256_WMMA_GFX12_SRC: &str = include_str!("../../../ke
 // from one source file. See kernel header for VGPR budget details.
 pub const GEMV_HFQ4G256_MULTIROW_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_multirow.gfx1100.hip");
 pub const GEMV_HFQ4G256_MULTIROW_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_multirow.hip");
+// FP16 packed inner loop variant (gfx1010 experiment, HIPFIRE_GEMV_FP16=1
+// opt-in). Caller pre-converts X to FP16 via convert_f32_to_f16; weights
+// stay HFQ4 unchanged. Inner loop uses __hfma2 / v_pk_fma_f16.
+pub const GEMV_HFQ4G256_MULTIROW_FP16_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_multirow_fp16.hip");
 pub const GEMV_HFQ4G256_RESIDUAL_MULTIROW_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_hfq4g256_residual_multirow.gfx1100.hip");
 
 // 4-way fused HFQ4-G256 projection for Qwen3.5 DeltaNet LA preamble:

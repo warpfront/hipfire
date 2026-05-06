@@ -57,6 +57,23 @@ fn gemv_dp4a_enabled(arch: &str) -> bool {
     override_.unwrap_or(arch == "gfx906")
 }
 
+/// FP16-packed multirow GEMV opt-in (gfx1010 experiment).
+///
+/// When set, the default-multirow path (gfx1010 / gfx1013 baseline) diverts to
+/// `gemv_hfq4g256_multirow_fp16_r{2,4,8}` which uses __hfma2 / v_pk_fma_f16
+/// in the inner loop instead of scalar v_fma_f32. Caller pre-converts X to
+/// FP16 via convert_f32_to_f16. Off by default — null-result expected on
+/// BW-bound decode but the VGPR-pressure side-effect is worth measuring.
+fn gemv_fp16_enabled() -> bool {
+    static CACHE: OnceLock<bool> = OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("HIPFIRE_GEMV_FP16").ok().is_some_and(|v| matches!(
+            v.as_str(),
+            "1" | "true" | "TRUE" | "on" | "ON"
+        ))
+    })
+}
+
 /// Weight-prefetch variant of the wave64 residual-GEMV.
 ///
 /// The prefetch kernel does software-pipelined across-quad weight loads —
@@ -2786,6 +2803,13 @@ impl Gpu {
         let rows = gemv_rows_override().unwrap_or_else(|| gemv_rows_default(self.arch.as_str()));
         let use_multirow = rows > 1;
 
+        // FP16-packed multirow opt-in (gfx1010 experiment): divert before any
+        // FP32-path setup. Only applies on the default-multirow archs (i.e.
+        // not RDNA3, which has its own gfx1100 multirow variant).
+        if use_multirow && !rdna3 && gemv_fp16_enabled() {
+            return self.gemv_hfq4g256_multirow_fp16(a_raw, x, y, m, k, rows);
+        }
+
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
         // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
         let use_wide = !use_multirow
@@ -2832,6 +2856,72 @@ impl Gpu {
         result
     }
 
+    /// FP16-packed multirow HFQ4-G256 GEMV (gfx1010 experiment).
+    ///
+    /// X is converted to FP16 once via `ensure_fp16_x`, then the multirow
+    /// kernel processes the inner loop with __hfma2 / v_pk_fma_f16. Cross-
+    /// group accumulation stays FP32. Same R-templating as the FP32 variant
+    /// (R ∈ {2, 4, 8}) so the x-hoist amortization across rows still applies.
+    ///
+    /// Opt-in via `HIPFIRE_GEMV_FP16=1`. Routed only on default-multirow archs
+    /// (non-RDNA3) — RDNA3 has its own gfx1100 multirow path.
+    pub fn gemv_hfq4g256_multirow_fp16(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        rows: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // X is FP32 [K]; convert once into the persistent FP16 scratch.
+        let x_f16_ptr = self.ensure_fp16_x(x, k)?;
+
+        let func_name = match rows {
+            2 => "gemv_hfq4g256_multirow_fp16_r2",
+            4 => "gemv_hfq4g256_multirow_fp16_r4",
+            8 => "gemv_hfq4g256_multirow_fp16_r8",
+            _ => unreachable!("gemv_fp16 multirow only valid for rows ∈ {{2,4,8}}"),
+        };
+        self.ensure_kernel(
+            "gemv_hfq4g256_multirow_fp16",
+            kernels::GEMV_HFQ4G256_MULTIROW_FP16_SRC,
+            func_name,
+        )?;
+
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x_f16_ptr;
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let blob_builder = || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(a_ptr); b.push_ptr(x_ptr); b.push_ptr(y_ptr);
+            b.push_i32(m_val); b.push_i32(k_val);
+            b
+        };
+
+        let grid = ((m as u32) + rows - 1) / rows;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + k * 2;  // + FP16 X
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_multirow_fp16", bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [grid, 1, 1], [32, 1, 1], 0, &mut params,
+            blob_builder,
+        );
+        if let Some(t) = timer { t.finish(&self.hip); }
+        result
+    }
+
     /// dp4a-port of fused_qkv_hfq4g256 for gfx906. Pre-quantizes x to
     /// Q8_1 via the shared MMQ scratch, then runs the dp4a-based GEMV.
     /// Math is identical modulo Q8_1 quant noise. Targets gfx906's
@@ -2844,6 +2934,7 @@ impl Gpu {
         q_m: usize, k_m: usize, v_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -3093,6 +3184,7 @@ impl Gpu {
         qkv_m: usize, z_m: usize, beta_m: usize, alpha_m: usize,
         k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;
 
         self.ensure_kernel(
@@ -5888,6 +5980,7 @@ impl Gpu {
         n_exp: usize,
         norm_topk: bool,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "moe_topk_renorm_k8",
             kernels::MOE_TOPK_RENORM_K8_SRC,
@@ -6114,6 +6207,7 @@ impl Gpu {
         norm_topk: bool,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         self.ensure_kernel(
             "moe_topk_renorm_k8_batched",
             kernels::MOE_TOPK_RENORM_K8_BATCHED_SRC,
@@ -6809,6 +6903,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // DIAGNOSTIC: HIPFIRE_MMQ_DIAG_PASSTHROUGH=1 forwards to the FP16
         // wave64 kernel instead of running the dp4a kernel.
         if std::env::var("HIPFIRE_MMQ_DIAG_PASSTHROUGH").ok().as_deref() == Some("1") {
@@ -6929,6 +7024,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         let mmq_x = if batch_size <= 8 { 8 }
             else if batch_size <= 16 { 16 }
             else if batch_size <= 24 { 24 }
@@ -7656,6 +7752,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Quantize x → Xq[K/128 * batch_size] block_q8_1_mmq via the
         // shared scratch. Stride layout: kblock-major (matches
         // quantize_q8_1_mmq_ds4 at gemm_hfq4g256_residual_mmq.hip:80).
@@ -10308,6 +10405,7 @@ impl Gpu {
         y_gate: &GpuTensor, y_up: &GpuTensor,
         gate_m: usize, up_m: usize, k: usize,
     ) -> HipResult<()> {
+        self.bind_thread()?;
         // Quantize x → Xq[K/128] block_q8_1_mmq via the existing shared
         // scratch path. Batch=1 for GEMV.
         let xq_ptr = self.ensure_q8_1_mmq_x(x, 1, k)?;

@@ -1,0 +1,107 @@
+# Per-(M,K)-shape hipGraph cache for decode-path GEMVs on RDNA1
+
+**Status:** design — 2026-05-07 (gfx1010 branch)
+**Motivation:** RX 5700 XT (gfx1010 dGPU, USB4 eGPU on hipx) per-shape graph replay measured **+22% to +32%** vs sequential launch on individual GEMV shapes. Monolithic forward-pass capture LOSES −12.9%. Per-shape caching is the right architecture; full-pass capture is wrong. Supersedes the BC-250 (Skillfish APU) NO-GO verdict — different memory subsystem (dedicated GDDR6 vs shared sysram) yields different burst-mode behavior.
+
+## 1. Shape inventory
+
+Per `crates/hipfire-arch-qwen35/src/qwen35.rs:76-104` and the PoC's shape list at `crates/hsa-bridge/examples/hip_graph_gemv_poc.rs:467-489`:
+
+**Qwen3.5 0.8B** (24 layers: ~18 LA + 6 FA, dim=1024, hidden=2816, n_heads=8, n_kv=2, head_dim=256):
+
+| Kernel | Per-call output sizes | K | Layers | Calls/token |
+|---|---|---|---|---|
+| `fused_qkv_hfq4g256` | (q=1024, k=256, v=256) | 1024 | 6 FA | 6 |
+| `fused_qkvza_hfq4g256` | (qkv=768, z=256, β=32, α=32) | 1024 | 18 LA | 18 |
+| `fused_gate_up_hfq4g256` | (gate=2816, up=2816) | 1024 | 24 | 24 |
+| `gemv_hfq4g256` (wo / wo-FA) | M=1024 | 256/1024 | 18+6 | 24 |
+| `gemv_hfq4g256` (w_down) | M=1024 | 2816 | 24 | 24 |
+| `gemv_hfq4g256` (lm_head) | M=vocab | 1024 | 1 | 1 |
+
+**Unique (kernel, M-tuple, K) keys: ~7. Total launches/token: ~97. Cache hit rate ≈ 99% after one-token warmup.**
+
+**Qwen3.5 9B** (dim=3584, hidden≈18944, ~36 layers, head_dim=128, n_heads=28, n_kv=4): same 6-kernel skeleton, ~6 distinct shapes, ~144 launches/token, ≈ 99% hit rate.
+
+The PoC's "+22-32% on individual shapes / −12.9% on monolithic" is explained by RDNA1 burst-mode pipelining: small per-shape graphs avoid burst serialization while still amortizing launch overhead.
+
+## 2. API surface
+
+```rust
+// New file: crates/rdna-compute/src/gemv_graph_cache.rs
+
+#[derive(Eq, PartialEq, Hash, Clone)]
+pub struct GemvShape {
+    pub kernel: &'static str,         // "gemv_hfq4g256_wide", "fused_qkv_hfq4g256", ...
+    pub m_tuple: SmallVec<[u32; 4]>,  // 1 entry plain, 3 fused_qkv, 4 fused_qkvza
+    pub k: u32,
+}
+
+pub struct GemvGraphEntry {
+    exec: hip_bridge::GraphExec,
+    graph: hip_bridge::Graph,                // retained so exec stays valid
+    kernarg: Box<[u8]>,                      // stable address; mutated in place per replay
+    kernarg_len: Box<usize>,                 // stable address (HIP records the &usize)
+    extra: Box<[*mut c_void; 5]>,            // stable address; HIP records the array ptr
+    ptr_offsets: SmallVec<[usize; 8]>,       // byte offsets of pointer fields in `kernarg`
+    scalar_offsets: SmallVec<[(usize, ScalarTy); 4]>,
+}
+
+pub struct GemvGraphCache {
+    entries: HashMap<GemvShape, GemvGraphEntry>,
+    captured_stream: Option<*mut c_void>,    // entries are stream-affined
+    min_amortize_replays: u32,
+    stats: GemvGraphStats,
+}
+```
+
+Cache key = `(kernel name, M-tuple, K)`. Block/grid is a pure function of these (see `dispatch.rs:2785-2830`). `batch_size` is intentionally not part of the key (decode is batch=1).
+
+## 3. Integration points
+
+New field on `Gpu`: `gemv_graph_cache: Option<GemvGraphCache>`, gated by `HIPFIRE_GEMV_GRAPH=1` at construction. Wrap inside `launch_maybe_blob` (`dispatch.rs:1052`):
+
+```rust
+fn launch_maybe_blob(...) {
+    if let Some(cache) = &mut self.gemv_graph_cache {
+        if let Some(shape) = cache.classify(func_name, grid, block) {
+            return cache.dispatch(&self.hip, &self.functions, &self.active_stream, shape, params);
+        }
+    }
+    // existing path unchanged
+}
+```
+
+`cache.dispatch` does:
+- Compute key → lookup → on **hit**: rewrite ptr/scalar slots in `kernarg` in place from `params`, then `hipGraphLaunch(exec, stream)`.
+- On **miss**: run sequential launch this call; on the next call to the same shape, begin_capture / launch / end_capture / instantiate / store.
+
+**Blast radius: one new field + one if-let in `launch_maybe_blob`. Zero changes to existing call sites.**
+
+## 4. Kernarg lifetime
+
+The PoC's discovery (`hip_graph_gemv_poc.rs:524-555`): all three of `kernarg buffer` / `kernarg_size` / `extra[5]` must outlive capture. Cache entry stores all as `Box`-allocated → addresses stable for the entry's lifetime.
+
+**Per-replay rewrite-in-place is correct.** HIP records the `extra` pointer and dereferences it at `hipGraphLaunch` time. Kernarg layout (offsets, sizes) is fixed per-shape, so we only mutate bytes at known offsets (3 device pointers + 2 i32 scalars for plain GEMV; 7+4 for fused_qkv). No graph rebuild needed when only pointer values change.
+
+Drop order: `exec` → `graph` → kernarg/extra Boxes. HIP holds no refs after `hipGraphExecDestroy`.
+
+## 5. Build sequence
+
+1. **PR1 — `GemvGraphCache` skeleton + classifier (no caching).** Add the type, `classify()`, offset table covering 6 kernels, `HIPFIRE_GEMV_GRAPH=1` env knob. `dispatch()` always falls through to legacy. Coherence-gate parity.
+2. **PR2 — Capture/replay for `gemv_hfq4g256` (plain) only.** First call sequential, second captures, third+ replays. Validate on `bench_qwen35_mq4` 0.8B decode on 5700 XT (expect PoC-level +22-32%). Add `tests/gemv_graph_cache_correctness.rs`: 100 random-pointer launches, bit-comparing graph vs sequential output.
+3. **PR3 — Extend to fused_qkv / fused_qkvza / fused_gate_up.** These own ~75 launches/step on 0.8B — the real win.
+4. **PR4 — Stream-affinity invalidation + multi-GPU LRU bound** (cap at 64 entries, LRU eviction; per-`Gpu` cache).
+
+Bench validation at each step in `crates/hipfire-runtime/examples/bench_qwen35_mq4.rs`. Coherence gate (`./scripts/coherence-gate.sh`) must pass on 0.8B and 9B.
+
+## 6. Risks / open questions
+
+- **Capture-cost amortization minimum.** PoC didn't measure capture cost in isolation; on RDNA1 a graph instantiate is ~1-3ms. At 4.6ms/step on 0.8B, single-token warmup is fine — but for prefill or short prompts we could regress turn-1 latency. **Action:** gate caching to AR-decode only initially.
+- **Stream affinity.** `gpu.active_stream` is set at AR loop entry (`dispatch.rs:2845-2846`). Spec-decode uses `draft_stream`/`verify_stream` (lines 357-358). Cache must key by stream pointer or invalidate on stream change. **Open:** one cache per stream, or invalidate-on-change?
+- **Multi-GPU.** Each `Gpu` owns its cache; tensor-parallel decode spans devices. As long as cache is `Gpu`-local and graphs are per-device, this is fine. Confirm `Gpu::clone_for_thread` doesn't share the field.
+- **Recompile invalidation.** Kernel-arg ABI guarantees layout stability across hipcc rebuilds, but on cache miss after kernel recompile (different `gemv_rows_default`, gfx12 iu4 path, etc.) offsets could change. **Mitigation:** key by `(kernel_name, function_handle_addr, m_tuple, k)` so recompile invalidates entries.
+- **HIPFIRE_GRAPH=1 interaction.** Existing `capture_mode` (monolithic forward-pass) LOSES on 5700 XT per PoC. Per-shape cache is orthogonal: when `capture_mode == true`, per-shape MUST fall through (don't nest captures). Add `if self.capture_mode { fallthrough; }` guard.
+
+## Recommendation
+
+Build PR1+PR2 first, validate the +22-32% on 5700 XT in `bench_qwen35_mq4` before extending to fused kernels. The blob-path infrastructure already pays for the kernarg-stability invariant, so the cache is a thin layer on top.
