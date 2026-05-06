@@ -198,10 +198,20 @@ impl KernelCompiler {
             }
         }
 
-        // Fall back to runtime compilation via hipcc
-        let src_path = self.cache_dir.join(format!("{name}.hip"));
-        let obj_path = self.cache_dir.join(format!("{name}.hsaco"));
-        let hash_path = self.cache_dir.join(format!("{name}.hash"));
+        // Fall back to runtime compilation via hipcc. Cache layout is
+        // arch-keyed so heterogeneous multi-GPU runs (e.g. gfx1151 iGPU +
+        // gfx1201 eGPU on hipx) don't collide on `{name}.hsaco`. Without
+        // the arch dir, dev 0's JIT output (gfx1151 binary) gets read by
+        // dev 1 (gfx1201) on its first call, which fails with hipModuleLoad
+        // = HipError(200) "device kernel image is invalid". Mirrors the
+        // pre-compiled hot-dir layout (`cache_dir/{arch}/`) at line 118.
+        let arch_cache = self.cache_dir.join(&self.arch);
+        std::fs::create_dir_all(&arch_cache).map_err(|e| {
+            hip_bridge::HipError::new(0, &format!("failed to create arch cache dir: {e}"))
+        })?;
+        let src_path = arch_cache.join(format!("{name}.hip"));
+        let obj_path = arch_cache.join(format!("{name}.hsaco"));
+        let hash_path = arch_cache.join(format!("{name}.hash"));
 
         let cache_valid = obj_path.exists() && hash_path.exists()
             && std::fs::read_to_string(&hash_path).unwrap_or_default() == src_hash;
