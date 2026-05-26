@@ -3066,8 +3066,8 @@ fn run_gguf_pipeline(input: &Path, output: &Path, format: GgufFormat, no_kmap: b
     let needs_signs_g128 = matches!(format, GgufFormat::Mq4g128);
     let signs1 = if needs_signs_g256 { gen_fwht_signs(42, 256) } else { Vec::new() };
     let signs2 = if needs_signs_g256 { gen_fwht_signs(1042, 256) } else { Vec::new() };
-    let signs1_g128 = if needs_signs_g128 { gen_fwht_signs(42, 128) } else { Vec::new() };
-    let signs2_g128 = if needs_signs_g128 { gen_fwht_signs(1042, 128) } else { Vec::new() };
+    let signs1_g128 = if needs_signs_g128 { gen_fwht_signs(43, 128) } else { Vec::new() };
+    let signs2_g128 = if needs_signs_g128 { gen_fwht_signs(1043, 128) } else { Vec::new() };
 
     // K-map setup for GGUF path
     let is_moe = arch_id == 6;
@@ -3796,8 +3796,8 @@ fn main() {
             // more VRAM per expert. MQ4 is the default for VRAM efficiency.
             let signs1 = gen_fwht_signs(42, 256);
             let signs2 = gen_fwht_signs(1042, 256);
-            let signs1_g128 = gen_fwht_signs(42, 128);
-            let signs2_g128 = gen_fwht_signs(1042, 128);
+            let signs1_g128 = gen_fwht_signs(43, 128);
+            let signs2_g128 = gen_fwht_signs(1043, 128);
             let inner_k = inner_shape[1] as usize;
             let supports_g256 = inner_k % 256 == 0;
             // K-map: check the parent tensor name directly. The parent
@@ -3960,8 +3960,8 @@ fn main() {
                 // K-map says promote to 6-bit
                 let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
                 if use_mq4g128 {
-                    let signs1 = gen_fwht_signs(42, 128);
-                    let signs2 = gen_fwht_signs(1042, 128);
+                    let signs1 = gen_fwht_signs(43, 128);
+                    let signs2 = gen_fwht_signs(1043, 128);
                     let q = quantize_mq4g128(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G128, 128u32, "MQ4G128")
                 } else if (use_mq4g256 || use_mq4_mq6exp || use_mq3g256 || use_mq2g256
@@ -4082,8 +4082,8 @@ fn main() {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
             } else if use_mq4g128 {
-                let signs1 = gen_fwht_signs(42, 128);
-                let signs2 = gen_fwht_signs(1042, 128);
+                let signs1 = gen_fwht_signs(43, 128);
+                let signs2 = gen_fwht_signs(1043, 128);
                 let q = quantize_mq4g128(&f32_data, &signs1, &signs2);
                 (q, QuantType::MQ4G128, 128u32, "MQ4G128")
             } else if (use_mq4g256 || use_mq4_mq6exp) && is_embed {
@@ -4562,8 +4562,8 @@ mod tests {
 
     #[test]
     fn quantize_mq4g128_uses_128_weight_blocks() {
-        let signs1 = gen_fwht_signs(42, 128);
-        let signs2 = gen_fwht_signs(1042, 128);
+        let signs1 = gen_fwht_signs(43, 128);
+        let signs2 = gen_fwht_signs(1043, 128);
         let data: Vec<f32> = (0..129).map(|i| i as f32 * 0.01 - 0.5).collect();
         let packed = quantize_mq4g128(&data, &signs1, &signs2);
         assert_eq!(packed.len(), 2 * 72);

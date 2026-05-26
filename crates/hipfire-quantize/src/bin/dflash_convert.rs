@@ -666,8 +666,11 @@ fn main() {
     let needs_fwht_g256 = use_mq4 || use_mq3;
     let signs1: Vec<f32> = if needs_fwht_g256 { gen_fwht_signs(42, 256) } else { Vec::new() };
     let signs2: Vec<f32> = if needs_fwht_g256 { gen_fwht_signs(1042, 256) } else { Vec::new() };
-    let signs1_g128: Vec<f32> = if use_mq4g128 { gen_fwht_signs(42, 128) } else { Vec::new() };
-    let signs2_g128: Vec<f32> = if use_mq4g128 { gen_fwht_signs(1042, 128) } else { Vec::new() };
+    // g128 FWHT seeds MUST match the runtime's ensure_mq_signs_128 (43/1043),
+    // NOT the g256 seeds (42/1042). Mismatch => x rotated with different signs
+    // than the weights => garbage output. See gemv_mq4g128 dispatch path.
+    let signs1_g128: Vec<f32> = if use_mq4g128 { gen_fwht_signs(43, 128) } else { Vec::new() };
+    let signs2_g128: Vec<f32> = if use_mq4g128 { gen_fwht_signs(1043, 128) } else { Vec::new() };
     let metadata = serde_json::json!({
         "architecture": "dflash",
         "config": config,
