@@ -4008,8 +4008,14 @@ fn main() {
             let this_q4k = use_q4k_all || use_q4k_q8embed || use_mixed;
 
             // Embeddings stored as Q8 in HFQ4 mode — Q4 is too lossy for
-            // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
-            let is_embed = name.contains("embed_tokens");
+            // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007).
+            // Also covers lm_head/output: the runtime lm_head loader accepts
+            // F16/F32/Q8/MQ4G256 but NOT MQ4G128 (qt=30) — keep it Q8 in the
+            // Base path to match the kmap path (Rule 2). Without this, --format
+            // mq4g128 panics: "unsupported quant_type 30 for lm_head".
+            let is_embed = name.contains("embed_tokens")
+                || name.contains("lm_head")
+                || name.ends_with("output.weight");
 
             if use_hfq_mixed {
                 // hfq-mixed: Q8 for attention, HFQ4 for FFN (fits 9B in 8GB VRAM)
