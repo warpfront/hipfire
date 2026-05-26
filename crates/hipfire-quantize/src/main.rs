@@ -4082,10 +4082,26 @@ fn main() {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
             } else if use_mq4g128 {
-                let signs1 = gen_fwht_signs(43, 128);
-                let signs2 = gen_fwht_signs(1043, 128);
-                let q = quantize_mq4g128(&f32_data, &signs1, &signs2);
-                (q, QuantType::MQ4G128, 128u32, "MQ4G128")
+                // HIPFIRE_MQ4G128_ATTN_ONLY=1 => naive mixed-block quant: only
+                // attention projections (self_attn / linear_attn) go g128; MLP
+                // and other 256-aligned weights stay g256. embed/lm_head are
+                // already forced Q8 above. No tuning — pure per-tensor format
+                // selection, mirroring the conv1d special-case. Lets us A/B the
+                // mix vs uniform g256 without paying all-g128's decode tax.
+                let attn_only = std::env::var("HIPFIRE_MQ4G128_ATTN_ONLY").is_ok();
+                let is_attn = name.contains("self_attn") || name.contains("linear_attn");
+                let k_dim = if meta.shape.len() == 2 { meta.shape[1] } else { n_elements };
+                if attn_only && !is_attn && k_dim % 256 == 0 {
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ4G256, 256u32, "MQ4G256")
+                } else {
+                    let signs1 = gen_fwht_signs(43, 128);
+                    let signs2 = gen_fwht_signs(1043, 128);
+                    let q = quantize_mq4g128(&f32_data, &signs1, &signs2);
+                    (q, QuantType::MQ4G128, 128u32, "MQ4G128")
+                }
             } else if (use_mq4g256 || use_mq4_mq6exp) && is_embed {
                 let q = quantize_q8f16(&f32_data);
                 (q, QuantType::Q8F16, 32u32, "Q8_F16")
