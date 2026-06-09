@@ -635,12 +635,26 @@ pub fn run_moe_decode_bias_aware(
     ))?;
     hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top))?;
 
-    // 4. Indexed MQ2-Lloyd down: atomic-accumulate Σ_k w_k·(W_down[e_k]·rot)
-    //    into ffn_out. route_scale is already baked into topk_weights.
-    hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
-        p.expert_down_ptrs, p.topk_indices, p.topk_weights, p.rot_batch,
-        p.ffn_out, p.hidden, p.mi, p.k_top,
-    ))?;
+    // 4. Indexed MQ2-Lloyd down. Deterministic (default): expanded per-expert
+    //    write + fixed-order non-atomic combine into ffn_out — bit-reproducible
+    //    for greedy/spec-decode. MOE_DETERMINISTIC=0 uses the faster
+    //    atomicAdd-fused path (nondeterministic; bench only).
+    let deterministic =
+        std::env::var("HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC").as_deref() != Ok("0");
+    if deterministic {
+        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_expanded_k4(
+            p.expert_down_ptrs, p.topk_indices, p.rot_batch, p.down_expanded,
+            p.hidden, p.mi, p.k_top, 1,
+        ))?;
+        hip!(gpu.moe_down_combine_k8_batched(
+            p.down_expanded, p.topk_weights, p.ffn_out, p.hidden, p.k_top, 1,
+        ))?;
+    } else {
+        hip!(gpu.deepseek4_gemv_mq2g256_lloyd_moe_down_residual_scaled_indexed(
+            p.expert_down_ptrs, p.topk_indices, p.topk_weights, p.rot_batch,
+            p.ffn_out, p.hidden, p.mi, p.k_top,
+        ))?;
+    }
 
     Ok(())
 }

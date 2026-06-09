@@ -230,6 +230,7 @@ fn gemv_auto_batched_wmma(
                 .map(|s| s != "0")
                 .unwrap_or(true);
             if wmma_on && gpu.arch_caps.is_rdna4() {
+                // RDNA4 (gfx12): upstream-tuned gating (unchanged).
                 if let Some(scratch) = x_f16_scratch {
                     let n = (batch_size * k) as i64;
                     gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
@@ -243,6 +244,27 @@ fn gemv_auto_batched_wmma(
                         && k % 32 == 0
                         && batch_size % 64 == 0;
                     if use_4w {
+                        return gpu
+                            .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
+                            .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
+                    }
+                    return gpu
+                        .gemm_q8_0_wmma(weight, scratch, y, m, k, batch_size)
+                        .map_err(|e| format!("gemm_q8_0_wmma: {e:?}"));
+                }
+            } else if wmma_on && gpu.arch_caps.has_wmma() && m % 64 == 0 && k % 32 == 0 {
+                // gfx11 / RDNA3.5 (gfx1151) Q8_0 WMMA prefill. The activation
+                // is pre-converted to F16 in `scratch`; the kernels honor the
+                // F16 dtype (no re-convert). 4-warp 64×64-tile kernel for
+                // batch%64==0 (~12% over single-warp 16×16; weight-bandwidth-
+                // bound); HIPFIRE_DEEPSEEK4_Q8_4W=0 forces single-warp.
+                if let Some(scratch) = x_f16_scratch {
+                    let n = (batch_size * k) as i64;
+                    gpu.deepseek4_convert_f32_to_f16(x_plain_batch, scratch, n)
+                        .map_err(|e| format!("convert_f32_to_f16 (Q8 WMMA): {e:?}"))?;
+                    let opt_out_4w =
+                        std::env::var("HIPFIRE_DEEPSEEK4_Q8_4W").as_deref() == Ok("0");
+                    if !opt_out_4w && batch_size >= 64 && batch_size % 64 == 0 {
                         return gpu
                             .gemm_q8_0_wmma_4w(weight, scratch, y, m, k, batch_size)
                             .map_err(|e| format!("gemm_q8_0_wmma_4w: {e:?}"));
@@ -467,7 +489,10 @@ fn compressor_forward_impl(
             }
             if l_state.indexer_score_state.is_none() {
                 l_state.indexer_score_state = Some(
-                    gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    // -inf init: unfilled pool slots (e.g. block 0's missing
+                    // overlap prev-window) must get zero softmax weight, per the
+                    // reference `score_state = torch.full(-inf)`.
+                    gpu.full_f32(&[state_rows, proj_dim], f32::NEG_INFINITY)
                         .map_err(|e| format!("alloc idx score_state l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -486,7 +511,9 @@ fn compressor_forward_impl(
             }
             if l_state.main_score_state.is_none() {
                 l_state.main_score_state = Some(
-                    gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    // -inf init (reference `score_state = torch.full(-inf)`):
+                    // unfilled overlap slots get zero softmax weight.
+                    gpu.full_f32(&[state_rows, proj_dim], f32::NEG_INFINITY)
                         .map_err(|e| format!("alloc main score_state l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -899,7 +926,10 @@ fn compressor_forward_batched(
             }
             if l_state.indexer_score_state.is_none() {
                 l_state.indexer_score_state = Some(
-                    gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    // -inf init: unfilled pool slots (e.g. block 0's missing
+                    // overlap prev-window) must get zero softmax weight, per the
+                    // reference `score_state = torch.full(-inf)`.
+                    gpu.full_f32(&[state_rows, proj_dim], f32::NEG_INFINITY)
                         .map_err(|e| format!("alloc idx score_state l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -918,7 +948,9 @@ fn compressor_forward_batched(
             }
             if l_state.main_score_state.is_none() {
                 l_state.main_score_state = Some(
-                    gpu.zeros(&[state_rows, proj_dim], DType::F32)
+                    // -inf init (reference `score_state = torch.full(-inf)`):
+                    // unfilled overlap slots get zero softmax weight.
+                    gpu.full_f32(&[state_rows, proj_dim], f32::NEG_INFINITY)
                         .map_err(|e| format!("alloc main score_state l{layer_idx}: {e:?}"))?,
                 );
             }
@@ -3256,6 +3288,15 @@ fn ffn_routed(
                     .map_err(|e| format!("alloc moe_rot_batch: {e:?}"))?,
             );
         }
+        // [k_top × hidden] per-expert down outputs for the deterministic
+        // (atomic-free) combine in run_moe_decode_bias_aware (default on;
+        // HIPFIRE_DEEPSEEK4_MOE_DETERMINISTIC=0 uses the atomic path).
+        if state.moe_down_expert_outputs.is_none() {
+            state.moe_down_expert_outputs = Some(
+                gpu.alloc_tensor(&[k_top, cfg.hidden_size], DType::F32)
+                    .map_err(|e| format!("alloc moe_down_expert_outputs: {e:?}"))?,
+            );
+        }
         let topk_idx_dev = state.moe_topk_indices.as_ref().unwrap();
         let topk_w_dev = state.moe_topk_weights.as_ref().unwrap();
         // GPU top-K: bias-aware select + normalize + route_scale in one
@@ -3270,6 +3311,7 @@ fn ffn_routed(
         let gate_batch = state.moe_gate_batch.as_ref().unwrap();
         let up_batch = state.moe_up_batch.as_ref().unwrap();
         let rot_batch = state.moe_rot_batch.as_ref().unwrap();
+        let down_expanded = state.moe_down_expert_outputs.as_ref().unwrap();
 
         // Bias-aware top-k select + the routed MQ2-Lloyd experts now run through
         // the centralized MoE family (Ship 4.3): bias-aware top-k -> indexed
@@ -3304,6 +3346,7 @@ fn ffn_routed(
             gate_batch,
             up_batch,
             rot_batch,
+            down_expanded,
         };
         hipfire_runtime::llama::moe_family()
             .run_bias_aware(gpu, &moe_params)
@@ -4868,10 +4911,18 @@ pub(crate) fn precompute_positions_batched(
             let base = stripe + layer_idx * POS_SLOTS_PER_LAYER;
             host[base] = pos as i32;
             if ratio > 0 {
+                // Default MUST be "start" — `(pos/ratio)*ratio` — to match the
+                // decode path (`fill_pos_array_host`) and the reference ds4
+                // (comp_pos = start of the just-closed window). This previously
+                // defaulted to "mid" (+ ratio/2) while decode defaults to
+                // "start", so the compressed KV was BUILT here with a different
+                // compressor-RoPE phase than it is READ with at decode → far-
+                // context (compressed) recall lost the tail of the prompt.
+                // Keep the named modes identical to `fill_pos_array_host`.
                 let main_rope_pos: i32 = match comp_rope_mode {
                     Some("end") => pos as i32,
-                    Some("start") => ((pos / ratio) * ratio) as i32,
-                    _ => (((pos / ratio) * ratio) + ratio / 2) as i32,
+                    Some("mid") => (((pos / ratio) * ratio) + ratio / 2) as i32,
+                    _ => ((pos / ratio) * ratio) as i32,
                 };
                 let indexer_rope_pos = ((pos / ratio) * ratio) as i32;
                 host[base + 1] = main_rope_pos;
@@ -6656,42 +6707,109 @@ fn attention_block_batched_mixed(
             .main_kv_cache
             .as_ref()
             .ok_or_else(|| "main_kv_cache missing".to_string())?;
-        gpu.deepseek4_attn_swa_topk_direct_batched_f32(
-            &pbs.q_batch,
-            &pbs.swa_staged_batch,
-            &pbs.swa_staged_batch, // K=V tied
-            main_kv_cache,
-            &pbs.idx_topk_indices_batch,
-            attn_sink,
-            &pbs.n_valid_swa_arr,
-            &pbs.n_active_topk_arr,
-            &pbs.attn_out_raw_batch,
-            n_heads as i32,
-            head_dim as i32,
-            win as i32,
-            topk_max as i32,
-            topk_direct_n_compressed as i32,
-            batch_size as i32,
-        )
-        .map_err(|e| format!("deepseek4_attn_swa_topk_direct_batched l{layer_idx}: {e:?}"))?;
+        // Head-batched f16-WMMA DSA attention (~4.4× the f32 kernel at prefill
+        // batch); falls back to f32 if disabled, shapes don't tile, or the
+        // score LDS would exceed 64 KB. max_n_total bounds the LDS (n_valid ≤ win).
+        let use_dsa_wmma = std::env::var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref() != Ok("0")
+            && gpu.arch_caps.has_wmma()
+            && n_heads % 16 == 0
+            && head_dim % 16 == 0;
+        let max_n_total = win as i32 + n_active_host.iter().copied().max().unwrap_or(0);
+        let mut done = false;
+        if use_dsa_wmma {
+            if gpu
+                .deepseek4_attn_swa_topk_direct_wmma(
+                    &pbs.q_batch,
+                    &pbs.swa_staged_batch, // K=V tied
+                    main_kv_cache,
+                    &pbs.idx_topk_indices_batch,
+                    attn_sink,
+                    &pbs.n_valid_swa_arr,
+                    &pbs.n_active_topk_arr,
+                    &pbs.attn_out_raw_batch,
+                    n_heads as i32,
+                    head_dim as i32,
+                    win as i32,
+                    topk_max as i32,
+                    topk_direct_n_compressed as i32,
+                    batch_size as i32,
+                    max_n_total,
+                )
+                .is_ok()
+            {
+                done = true;
+            }
+        }
+        if !done {
+            gpu.deepseek4_attn_swa_topk_direct_batched_f32(
+                &pbs.q_batch,
+                &pbs.swa_staged_batch,
+                &pbs.swa_staged_batch, // K=V tied
+                main_kv_cache,
+                &pbs.idx_topk_indices_batch,
+                attn_sink,
+                &pbs.n_valid_swa_arr,
+                &pbs.n_active_topk_arr,
+                &pbs.attn_out_raw_batch,
+                n_heads as i32,
+                head_dim as i32,
+                win as i32,
+                topk_max as i32,
+                topk_direct_n_compressed as i32,
+                batch_size as i32,
+            )
+            .map_err(|e| format!("deepseek4_attn_swa_topk_direct_batched l{layer_idx}: {e:?}"))?;
+        }
     } else {
-        gpu.deepseek4_attn_swa_topk_batched_f32(
-            &pbs.q_batch,
-            &pbs.swa_staged_batch,
-            &pbs.swa_staged_batch, // K=V tied
-            &pbs.topk_staged_batch,
-            &pbs.topk_staged_batch,
-            attn_sink,
-            &pbs.n_valid_swa_arr,
-            &pbs.n_active_topk_arr,
-            &pbs.attn_out_raw_batch,
-            n_heads as i32,
-            head_dim as i32,
-            win as i32,
-            topk_max as i32,
-            batch_size as i32,
-        )
-        .map_err(|e| format!("deepseek4_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
+        // Head-batched f16-WMMA gathered DSA attention; f32 fallback on
+        // disable / non-tiling shapes / LDS > 64 KB.
+        let use_dsa_wmma = std::env::var("HIPFIRE_DEEPSEEK4_DSA_WMMA").as_deref() != Ok("0")
+            && gpu.arch_caps.has_wmma()
+            && n_heads % 16 == 0
+            && head_dim % 16 == 0;
+        let max_n_total = win as i32 + n_active_host.iter().copied().max().unwrap_or(0);
+        let mut done = false;
+        if use_dsa_wmma {
+            if gpu
+                .deepseek4_attn_swa_topk_batched_wmma(
+                    &pbs.q_batch,
+                    &pbs.swa_staged_batch,  // K=V tied
+                    &pbs.topk_staged_batch, // K=V tied
+                    attn_sink,
+                    &pbs.n_valid_swa_arr,
+                    &pbs.n_active_topk_arr,
+                    &pbs.attn_out_raw_batch,
+                    n_heads as i32,
+                    head_dim as i32,
+                    win as i32,
+                    topk_max as i32,
+                    batch_size as i32,
+                    max_n_total,
+                )
+                .is_ok()
+            {
+                done = true;
+            }
+        }
+        if !done {
+            gpu.deepseek4_attn_swa_topk_batched_f32(
+                &pbs.q_batch,
+                &pbs.swa_staged_batch,
+                &pbs.swa_staged_batch, // K=V tied
+                &pbs.topk_staged_batch,
+                &pbs.topk_staged_batch,
+                attn_sink,
+                &pbs.n_valid_swa_arr,
+                &pbs.n_active_topk_arr,
+                &pbs.attn_out_raw_batch,
+                n_heads as i32,
+                head_dim as i32,
+                win as i32,
+                topk_max as i32,
+                batch_size as i32,
+            )
+            .map_err(|e| format!("deepseek4_attn_swa_topk_batched l{layer_idx}: {e:?}"))?;
+        }
     }
 
     // 5. Inverse RoPE.

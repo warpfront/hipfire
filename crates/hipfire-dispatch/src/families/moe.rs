@@ -227,6 +227,8 @@ pub struct MoeBiasAwareParams<'a> {
     pub gate_batch: &'a GpuTensor,
     pub up_batch: &'a GpuTensor,
     pub rot_batch: &'a GpuTensor,
+    /// `[k_top × hidden]` per-expert down outputs for the deterministic combine.
+    pub down_expanded: &'a GpuTensor,
 }
 
 // ── DeepSeek-V4 batched/prefill MoE parameters ─────────

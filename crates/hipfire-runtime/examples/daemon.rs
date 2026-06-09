@@ -10256,6 +10256,23 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                         }
                     }
 
+                    // If the replayed turn body opened a `<think>` block but
+                    // the model premature-stopped without closing it (EOS inside
+                    // the think, no tool call), close it here with a `</think>`.
+                    // Otherwise the dangling `<think>…<EOS>` drifts the next turn
+                    // (more premature stops, a leaked `</think>`). This is a
+                    // deterministic surround token — a pure function of
+                    // msg.content, NOT part of the cached turn body or the
+                    // asst_turn_fingerprint (which strips think anyway) — so it
+                    // is emitted identically on hit and miss paths and the
+                    // prefix-cache LCP + asst_turn_cache stay effective.
+                    if msg.tool_calls.is_empty()
+                        && msg.content.starts_with("<think>")
+                        && !msg.content.contains("</think>")
+                    {
+                        prompt_ids.extend(tokenizer.encode("</think>"));
+                    }
+
                     // Close the assistant turn with the EOS marker so
                     // the next turn starts cleanly.
                     prompt_ids.push(m.deepseek4_eos_tok);
@@ -10416,9 +10433,39 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         }
     };
 
+    // DSA compressor-ring safety on a PARTIAL prefix-cache hit.
+    //
+    // The DSA decode caches (SWA ring, compressor/indexer ring state, full +
+    // compressed KV) are *position-indexed* and were left by the prior turn at
+    // ITS end position. A FULL hit (`lcp == prior length`) resumes exactly where
+    // the prior turn left those rings, so the incremental prefill is correct —
+    // this is the normal "growing conversation" path and stays fast.
+    //
+    // A PARTIAL hit (`0 < lcp < prior length`) resumes the suffix prefill from
+    // `start_pos = lcp`, but the compressor ring still holds the prior turn's
+    // *end* window, not `lcp`'s. The first compressed block committed after the
+    // resume point then pools a STALE overlap window — and with ratio-4 overlap
+    // that window reaches back over the just-cached tail, corrupting far-context
+    // recall (the cwd/tool-path "lossiness" symptom). The ring can't be cheaply
+    // repopulated (a position's hidden state depends on its SWA window, which
+    // chains all the way back to token 0), so the correct, robust fix is to fall
+    // back to a cold rebuild for partial hits only. Full hits are unaffected.
+    let lcp = if lcp > 0 && lcp < m.conversation_tokens.len() {
+        0
+    } else {
+        lcp
+    };
+
     if lcp == 0 {
         // Cache miss — start a fresh conversation in V4F's state.
         state.reset();
+        // reset() only rewinds n_tokens; the position-indexed decode caches
+        // (SWA ring, compressed/full KV, indexer scratch) still hold the prior
+        // turn's residue, which bleeds into this fresh conversation's forward
+        // and makes greedy output drift turn-to-turn (the "recall/tool-calls
+        // unreliable" symptom). Zero them so a fresh conversation reproduces a
+        // freshly-launched daemon's clean, deterministic state.
+        state.zero_decode_caches(gpu);
         m.conversation_tokens.clear();
         // Tear down the captured V4F decode hipGraph alongside the
         // state, same rationale as the daemon's `"reset"` handler:
@@ -10618,6 +10665,29 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         let mut spec_last_token = deepseek4::spec_decode::logits_argmax(&last_logits) as u32;
         let mut spec_last_position = pos_after_prefill;
         let mut last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
+        // Emit the FIRST generated token (the prefill argmax). The loop below
+        // consumes `spec_last_token` as the decode-FROM token and only emits
+        // the drafted continuation (`r.accepted_tokens`), so without this the
+        // first token is dropped from every spec-decode response — a regression
+        // vs the non-spec path (e.g. "Here's…" → "'s…"). Mirrors the in-loop
+        // emission; EOS-first yields an empty turn (loop then no-ops).
+        if spec_last_token != eos_tok && generated_count < max_tokens {
+            let frag = tokenizer.decode(&[spec_last_token]);
+            for ev in parser.feed(&frag) {
+                absorb_event(&ev);
+                emit_stream_event(stdout, id, ev);
+            }
+            emit_committed_event(
+                stdout,
+                id,
+                spec_last_token,
+                generated_count,
+                decode_t0.elapsed().as_millis() as u64,
+            );
+            let _ = stdout.flush();
+            m.conversation_tokens.push(spec_last_token);
+            generated_count += 1;
+        }
         'outer: while generated_count < max_tokens {
             let lh: Option<&rdna_compute::GpuTensor> = unsafe {
                 last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref())
@@ -10666,21 +10736,15 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                     break 'outer;
                 }
                 let frag = tokenizer.decode(&[t]);
-                if grammar_active {
-                    for ev in parser.feed(&frag) {
-                        absorb_event(&ev);
-                        emit_stream_event(stdout, id, ev);
-                    }
-                } else {
-                    // Build through serde_json so `id` (user-supplied) and
-                    // `frag` (model-generated UTF-8 with possible `"`/`\`)
-                    // can't corrupt the JSONL line.
-                    let envelope = serde_json::json!({
-                        "type": "token",
-                        "id": id,
-                        "text": frag,
-                    });
-                    let _ = writeln!(stdout, "{}", envelope);
+                // Always route through the DSML StreamParser (new_in_think in
+                // thinking modes) so `<think>…</think>` is split into reasoning
+                // vs content server-side and emitted as structured events. The
+                // old non-grammar branch emitted raw tokens, leaving the CLI to
+                // client-side-parse a stream that (for V4 thinking mode) starts
+                // INSIDE the think block with no `<think>` opener in the output.
+                for ev in parser.feed(&frag) {
+                    absorb_event(&ev);
+                    emit_stream_event(stdout, id, ev);
                 }
                 emit_committed_event(
                     stdout,
@@ -10699,15 +10763,16 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
             }
             last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
         }
-        if grammar_active {
-            for ev in parser.finish() {
-                absorb_event(&ev);
-                emit_stream_event(stdout, id, ev);
-            }
-            let _ = stdout.flush();
-            drop(absorb_event);
-            tool_calls_parsed_count = emit_tool_calls_buf.len();
+        // Flush buffered partial markers / unclosed think — always, not only
+        // when tools are present. A thinking turn that fills max_tokens without
+        // closing </think> must still surface its buffered reasoning.
+        for ev in parser.finish() {
+            absorb_event(&ev);
+            emit_stream_event(stdout, id, ev);
         }
+        let _ = stdout.flush();
+        drop(absorb_event);
+        tool_calls_parsed_count = emit_tool_calls_buf.len();
     } else {
         // Plain decode loop. Sampler honours `temp` + `top_p` from the
         // request; HF default is temp=1.0, top_p=1.0 (multinomial across
