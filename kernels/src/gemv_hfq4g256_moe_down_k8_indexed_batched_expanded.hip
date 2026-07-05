@@ -94,6 +94,38 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
              + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x7; \
     } while (0)
 
+    #define DOG_X8_STAGED(sc, zp, pk, b, a) do { \
+        const float x0 = x[(b) + 0]; \
+        const float x1 = x[(b) + 1]; \
+        const float x2 = x[(b) + 2]; \
+        const float x3 = x[(b) + 3]; \
+        const float x4 = x[(b) + 4]; \
+        const float x5 = x[(b) + 5]; \
+        const float x6 = x[(b) + 6]; \
+        const float x7 = x[(b) + 7]; \
+        (a) += ((sc) * (float)(((pk)) & 0xFu)         + (zp)) * x0 \
+             + ((sc) * (float)((((pk)) >> 4) & 0xFu)  + (zp)) * x1 \
+             + ((sc) * (float)((((pk)) >> 8) & 0xFu)  + (zp)) * x2 \
+             + ((sc) * (float)((((pk)) >> 12) & 0xFu) + (zp)) * x3 \
+             + ((sc) * (float)((((pk)) >> 16) & 0xFu) + (zp)) * x4 \
+             + ((sc) * (float)((((pk)) >> 20) & 0xFu) + (zp)) * x5 \
+             + ((sc) * (float)((((pk)) >> 24) & 0xFu) + (zp)) * x6 \
+             + ((sc) * (float)((((pk)) >> 28) & 0xFu) + (zp)) * x7; \
+    } while (0)
+
+    #define DOG_X8_TAIL2(row_ptr, g0, g1, base0, base1, a0, a1) do { \
+        const char* gp_tail0 = (row_ptr) + (g0) * 136; \
+        const char* gp_tail1 = (row_ptr) + (g1) * 136; \
+        const float sc_tail0 = __builtin_bit_cast(float, *(const unsigned int*)(gp_tail0)); \
+        const float zp_tail0 = __builtin_bit_cast(float, *(const unsigned int*)(gp_tail0 + 4)); \
+        const unsigned int pk_tail0 = *(const unsigned int*)(gp_tail0 + 8 + boff); \
+        const float sc_tail1 = __builtin_bit_cast(float, *(const unsigned int*)(gp_tail1)); \
+        const float zp_tail1 = __builtin_bit_cast(float, *(const unsigned int*)(gp_tail1 + 4)); \
+        const unsigned int pk_tail1 = *(const unsigned int*)(gp_tail1 + 8 + boff); \
+        DOG_X8_STAGED(sc_tail0, zp_tail0, pk_tail0, base0, a0); \
+        DOG_X8_STAGED(sc_tail1, zp_tail1, pk_tail1, base1, a1); \
+    } while (0)
+
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const int base0 = g * 256 + tid * 8;
@@ -132,7 +164,16 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         }
     }
 
-    if (tail >= 1) {
+    if (tail >= 2) {
+        const int g0 = quads << 2;
+        const int g1 = g0 + 1;
+        const int base0 = g0 * 256 + tid * 8;
+        const int base1 = g1 * 256 + tid * 8;
+        DOG_X8_TAIL2(row_ptr0, g0, g1, base0, base1, acc0, acc1);
+        if (have_row1) DOG_X8_TAIL2(row_ptr1, g0, g1, base0, base1, bcc0, bcc1);
+        if (have_row2) DOG_X8_TAIL2(row_ptr2, g0, g1, base0, base1, ccc0, ccc1);
+        if (have_row3) DOG_X8_TAIL2(row_ptr3, g0, g1, base0, base1, dcc0, dcc1);
+    } else if (tail >= 1) {
         const int g = quads << 2;
         int base = g * 256 + tid * 8;
         LOAD_X8(base);
@@ -140,15 +181,6 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         if (have_row1) DOG_X8(row_ptr1 + g * 136, bcc0);
         if (have_row2) DOG_X8(row_ptr2 + g * 136, ccc0);
         if (have_row3) DOG_X8(row_ptr3 + g * 136, dcc0);
-    }
-    if (tail >= 2) {
-        const int g = (quads << 2) + 1;
-        int base = g * 256 + tid * 8;
-        LOAD_X8(base);
-        DOG_X8(row_ptr0 + g * 136, acc1);
-        if (have_row1) DOG_X8(row_ptr1 + g * 136, bcc1);
-        if (have_row2) DOG_X8(row_ptr2 + g * 136, ccc1);
-        if (have_row3) DOG_X8(row_ptr3 + g * 136, dcc1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
@@ -159,6 +191,8 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         if (have_row2) DOG_X8(row_ptr2 + g * 136, ccc2);
         if (have_row3) DOG_X8(row_ptr3 + g * 136, dcc2);
     }
+    #undef DOG_X8_TAIL2
+    #undef DOG_X8_STAGED
     #undef DOG_X8
     #undef LOAD_X8
 
