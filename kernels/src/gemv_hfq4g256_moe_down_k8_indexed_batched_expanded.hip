@@ -204,14 +204,26 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
     float bcc = (bcc0 + bcc1) + (bcc2 + bcc3);
     float ccc = (ccc0 + ccc1) + (ccc2 + ccc3);
     float dcc = (dcc0 + dcc1) + (dcc2 + dcc3);
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        acc += __shfl_down(acc, offset);
-        bcc += __shfl_down(bcc, offset);
-    }
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        ccc += __shfl_down(ccc, offset);
-        dcc += __shfl_down(dcc, offset);
-    }
+    acc += __shfl_down(acc, 16);
+    bcc += __shfl_down(bcc, 16);
+    acc += __shfl_down(acc, 8);
+    bcc += __shfl_down(bcc, 8);
+    acc += __shfl_down(acc, 4);
+    bcc += __shfl_down(bcc, 4);
+    acc += __shfl_down(acc, 2);
+    bcc += __shfl_down(bcc, 2);
+    acc += __shfl_down(acc, 1);
+    bcc += __shfl_down(bcc, 1);
+    ccc += __shfl_down(ccc, 16);
+    dcc += __shfl_down(dcc, 16);
+    ccc += __shfl_down(ccc, 8);
+    dcc += __shfl_down(dcc, 8);
+    ccc += __shfl_down(ccc, 4);
+    dcc += __shfl_down(dcc, 4);
+    ccc += __shfl_down(ccc, 2);
+    dcc += __shfl_down(dcc, 2);
+    ccc += __shfl_down(ccc, 1);
+    dcc += __shfl_down(dcc, 1);
 
     if (tid == 0) {
         // Direct store to per-(token, krank) row — no atomic contention.
