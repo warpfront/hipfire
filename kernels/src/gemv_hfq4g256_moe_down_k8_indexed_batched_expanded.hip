@@ -204,14 +204,14 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
     float bcc = (bcc0 + bcc1) + (bcc2 + bcc3);
     float ccc = (ccc0 + ccc1) + (ccc2 + ccc3);
     float dcc = (dcc0 + dcc1) + (dcc2 + dcc3);
-    for (int offset = 16; offset > 0; offset >>= 1)
+    for (int offset = 16; offset > 0; offset >>= 1) {
         acc += __shfl_down(acc, offset);
-    for (int offset = 16; offset > 0; offset >>= 1)
         bcc += __shfl_down(bcc, offset);
-    for (int offset = 16; offset > 0; offset >>= 1)
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
         ccc += __shfl_down(ccc, offset);
-    for (int offset = 16; offset > 0; offset >>= 1)
         dcc += __shfl_down(dcc, offset);
+    }
 
     if (tid == 0) {
         // Direct store to per-(token, krank) row — no atomic contention.

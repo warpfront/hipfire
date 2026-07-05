@@ -55,49 +55,20 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         const float x4 = x[(b) + 4]; \
         const float x5 = x[(b) + 5]; \
         const float x6 = x[(b) + 6]; \
-        const float x7 = x[(b) + 7]; \
-        const float xs = ((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7))
+        const float x7 = x[(b) + 7]
 
     #define DOG_X8(gp, a) do { \
         float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
         float zp = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
         unsigned int pk = *(const unsigned int*)((gp) + 8 + boff); \
-        const float dot = (float)((pk) & 0xFu) * x0 \
-             + (float)(((pk) >> 4) & 0xFu) * x1 \
-             + (float)(((pk) >> 8) & 0xFu) * x2 \
-             + (float)(((pk) >> 12) & 0xFu) * x3 \
-             + (float)(((pk) >> 16) & 0xFu) * x4 \
-             + (float)(((pk) >> 20) & 0xFu) * x5 \
-             + (float)(((pk) >> 24) & 0xFu) * x6 \
-             + (float)(((pk) >> 28) & 0xFu) * x7; \
-        (a) += sc * dot + zp * xs; \
-    } while (0)
-
-    #define DOG_PAIR_X8(gp_g, gp_u, ga, ua) do { \
-        const float gsc = __builtin_bit_cast(float, *(const unsigned int*)(gp_g)); \
-        const float gzp = __builtin_bit_cast(float, *(const unsigned int*)((gp_g) + 4)); \
-        const unsigned int gpk = *(const unsigned int*)((gp_g) + 8 + boff); \
-        const float usc = __builtin_bit_cast(float, *(const unsigned int*)(gp_u)); \
-        const float uzp = __builtin_bit_cast(float, *(const unsigned int*)((gp_u) + 4)); \
-        const unsigned int upk = *(const unsigned int*)((gp_u) + 8 + boff); \
-        float gdot = (float)(gpk & 0xFu) * x0; \
-        float udot = (float)(upk & 0xFu) * x0; \
-        gdot += (float)((gpk >> 4) & 0xFu) * x1; \
-        udot += (float)((upk >> 4) & 0xFu) * x1; \
-        gdot += (float)((gpk >> 8) & 0xFu) * x2; \
-        udot += (float)((upk >> 8) & 0xFu) * x2; \
-        gdot += (float)((gpk >> 12) & 0xFu) * x3; \
-        udot += (float)((upk >> 12) & 0xFu) * x3; \
-        gdot += (float)((gpk >> 16) & 0xFu) * x4; \
-        udot += (float)((upk >> 16) & 0xFu) * x4; \
-        gdot += (float)((gpk >> 20) & 0xFu) * x5; \
-        udot += (float)((upk >> 20) & 0xFu) * x5; \
-        gdot += (float)((gpk >> 24) & 0xFu) * x6; \
-        udot += (float)((upk >> 24) & 0xFu) * x6; \
-        gdot += (float)((gpk >> 28) & 0xFu) * x7; \
-        udot += (float)((upk >> 28) & 0xFu) * x7; \
-        (ga) += gsc * gdot + gzp * xs; \
-        (ua) += usc * udot + uzp * xs; \
+        (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x3 \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x4 \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x5 \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x6 \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x7; \
     } while (0)
 
     for (int q = 0; q < quads; q++) {
@@ -106,19 +77,23 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
 
         {
             LOAD_X8(base0);
-            DOG_PAIR_X8(gate_ptr + g * 136, up_ptr + g * 136, gacc0, uacc0);
+            DOG_X8(gate_ptr + g * 136, gacc0);
+            DOG_X8(up_ptr + g * 136, uacc0);
         }
         {
             LOAD_X8(base0 + 256);
-            DOG_PAIR_X8(gate_ptr + (g + 1) * 136, up_ptr + (g + 1) * 136, gacc1, uacc1);
+            DOG_X8(gate_ptr + (g + 1) * 136, gacc1);
+            DOG_X8(up_ptr + (g + 1) * 136, uacc1);
         }
         {
             LOAD_X8(base0 + 512);
-            DOG_PAIR_X8(gate_ptr + (g + 2) * 136, up_ptr + (g + 2) * 136, gacc2, uacc2);
+            DOG_X8(gate_ptr + (g + 2) * 136, gacc2);
+            DOG_X8(up_ptr + (g + 2) * 136, uacc2);
         }
         {
             LOAD_X8(base0 + 768);
-            DOG_PAIR_X8(gate_ptr + (g + 3) * 136, up_ptr + (g + 3) * 136, gacc3, uacc3);
+            DOG_X8(gate_ptr + (g + 3) * 136, gacc3);
+            DOG_X8(up_ptr + (g + 3) * 136, uacc3);
         }
     }
 
@@ -126,30 +101,32 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         const int g = quads << 2;
         int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_PAIR_X8(gate_ptr + g * 136, up_ptr + g * 136, gacc0, uacc0);
+        DOG_X8(gate_ptr + g * 136, gacc0);
+        DOG_X8(up_ptr + g * 136, uacc0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
         int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_PAIR_X8(gate_ptr + g * 136, up_ptr + g * 136, gacc1, uacc1);
+        DOG_X8(gate_ptr + g * 136, gacc1);
+        DOG_X8(up_ptr + g * 136, uacc1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
         int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_PAIR_X8(gate_ptr + g * 136, up_ptr + g * 136, gacc2, uacc2);
+        DOG_X8(gate_ptr + g * 136, gacc2);
+        DOG_X8(up_ptr + g * 136, uacc2);
     }
-    #undef DOG_PAIR_X8
     #undef DOG_X8
     #undef LOAD_X8
 
     float gacc = (gacc0 + gacc1) + (gacc2 + gacc3);
     float uacc = (uacc0 + uacc1) + (uacc2 + uacc3);
-    for (int offset = 16; offset > 0; offset >>= 1) {
+    for (int offset = 16; offset > 0; offset >>= 1)
         gacc += __shfl_down(gacc, offset);
+    for (int offset = 16; offset > 0; offset >>= 1)
         uacc += __shfl_down(uacc, offset);
-    }
 
     if (tid == 0) {
         y_gate[krank * mi + row] = gacc;
