@@ -55,20 +55,22 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         const float x4 = x[(b) + 4]; \
         const float x5 = x[(b) + 5]; \
         const float x6 = x[(b) + 6]; \
-        const float x7 = x[(b) + 7]
+        const float x7 = x[(b) + 7]; \
+        const float xs = ((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7))
 
     #define DOG_X8(gp, a) do { \
         float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
         float zp = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
         unsigned int pk = *(const unsigned int*)((gp) + 8 + boff); \
-        (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
-             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
-             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
-             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x3 \
-             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x4 \
-             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x5 \
-             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x6 \
-             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x7; \
+        const float dot = (float)((pk) & 0xFu) * x0 \
+             + (float)(((pk) >> 4) & 0xFu) * x1 \
+             + (float)(((pk) >> 8) & 0xFu) * x2 \
+             + (float)(((pk) >> 12) & 0xFu) * x3 \
+             + (float)(((pk) >> 16) & 0xFu) * x4 \
+             + (float)(((pk) >> 20) & 0xFu) * x5 \
+             + (float)(((pk) >> 24) & 0xFu) * x6 \
+             + (float)(((pk) >> 28) & 0xFu) * x7; \
+        (a) += sc * dot + zp * xs; \
     } while (0)
 
     for (int q = 0; q < quads; q++) {
@@ -123,10 +125,10 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
 
     float gacc = (gacc0 + gacc1) + (gacc2 + gacc3);
     float uacc = (uacc0 + uacc1) + (uacc2 + uacc3);
-    for (int offset = 16; offset > 0; offset >>= 1)
+    for (int offset = 16; offset > 0; offset >>= 1) {
         gacc += __shfl_down(gacc, offset);
-    for (int offset = 16; offset > 0; offset >>= 1)
         uacc += __shfl_down(uacc, offset);
+    }
 
     if (tid == 0) {
         y_gate[krank * mi + row] = gacc;
