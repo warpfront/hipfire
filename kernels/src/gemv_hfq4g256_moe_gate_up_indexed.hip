@@ -73,29 +73,52 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         (a) += sc * dot + zp * xs; \
     } while (0)
 
+    #define DOG_PAIR_X8(gp_g, gp_u, ga, ua) do { \
+        const float gsc = __builtin_bit_cast(float, *(const unsigned int*)(gp_g)); \
+        const float gzp = __builtin_bit_cast(float, *(const unsigned int*)((gp_g) + 4)); \
+        const unsigned int gpk = *(const unsigned int*)((gp_g) + 8 + boff); \
+        const float usc = __builtin_bit_cast(float, *(const unsigned int*)(gp_u)); \
+        const float uzp = __builtin_bit_cast(float, *(const unsigned int*)((gp_u) + 4)); \
+        const unsigned int upk = *(const unsigned int*)((gp_u) + 8 + boff); \
+        const float gdot = (float)(gpk & 0xFu) * x0 \
+             + (float)((gpk >> 4) & 0xFu) * x1 \
+             + (float)((gpk >> 8) & 0xFu) * x2 \
+             + (float)((gpk >> 12) & 0xFu) * x3 \
+             + (float)((gpk >> 16) & 0xFu) * x4 \
+             + (float)((gpk >> 20) & 0xFu) * x5 \
+             + (float)((gpk >> 24) & 0xFu) * x6 \
+             + (float)((gpk >> 28) & 0xFu) * x7; \
+        const float udot = (float)(upk & 0xFu) * x0 \
+             + (float)((upk >> 4) & 0xFu) * x1 \
+             + (float)((upk >> 8) & 0xFu) * x2 \
+             + (float)((upk >> 12) & 0xFu) * x3 \
+             + (float)((upk >> 16) & 0xFu) * x4 \
+             + (float)((upk >> 20) & 0xFu) * x5 \
+             + (float)((upk >> 24) & 0xFu) * x6 \
+             + (float)((upk >> 28) & 0xFu) * x7; \
+        (ga) += gsc * gdot + gzp * xs; \
+        (ua) += usc * udot + uzp * xs; \
+    } while (0)
+
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const int base0 = g * 256 + tid * 8;
 
         {
             LOAD_X8(base0);
-            DOG_X8(gate_ptr + g * 136, gacc0);
-            DOG_X8(up_ptr + g * 136, uacc0);
+            DOG_PAIR_X8(gate_ptr + g * 136, up_ptr + g * 136, gacc0, uacc0);
         }
         {
             LOAD_X8(base0 + 256);
-            DOG_X8(gate_ptr + (g + 1) * 136, gacc1);
-            DOG_X8(up_ptr + (g + 1) * 136, uacc1);
+            DOG_PAIR_X8(gate_ptr + (g + 1) * 136, up_ptr + (g + 1) * 136, gacc1, uacc1);
         }
         {
             LOAD_X8(base0 + 512);
-            DOG_X8(gate_ptr + (g + 2) * 136, gacc2);
-            DOG_X8(up_ptr + (g + 2) * 136, uacc2);
+            DOG_PAIR_X8(gate_ptr + (g + 2) * 136, up_ptr + (g + 2) * 136, gacc2, uacc2);
         }
         {
             LOAD_X8(base0 + 768);
-            DOG_X8(gate_ptr + (g + 3) * 136, gacc3);
-            DOG_X8(up_ptr + (g + 3) * 136, uacc3);
+            DOG_PAIR_X8(gate_ptr + (g + 3) * 136, up_ptr + (g + 3) * 136, gacc3, uacc3);
         }
     }
 
@@ -103,23 +126,21 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         const int g = quads << 2;
         int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_X8(gate_ptr + g * 136, gacc0);
-        DOG_X8(up_ptr + g * 136, uacc0);
+        DOG_PAIR_X8(gate_ptr + g * 136, up_ptr + g * 136, gacc0, uacc0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
         int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_X8(gate_ptr + g * 136, gacc1);
-        DOG_X8(up_ptr + g * 136, uacc1);
+        DOG_PAIR_X8(gate_ptr + g * 136, up_ptr + g * 136, gacc1, uacc1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
         int base = g * 256 + tid * 8;
         LOAD_X8(base);
-        DOG_X8(gate_ptr + g * 136, gacc2);
-        DOG_X8(up_ptr + g * 136, uacc2);
+        DOG_PAIR_X8(gate_ptr + g * 136, up_ptr + g * 136, gacc2, uacc2);
     }
+    #undef DOG_PAIR_X8
     #undef DOG_X8
     #undef LOAD_X8
 

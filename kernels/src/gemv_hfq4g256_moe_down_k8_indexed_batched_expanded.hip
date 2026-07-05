@@ -78,22 +78,20 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         const float x4 = x[(b) + 4]; \
         const float x5 = x[(b) + 5]; \
         const float x6 = x[(b) + 6]; \
-        const float x7 = x[(b) + 7]; \
-        const float xs = ((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7))
+        const float x7 = x[(b) + 7]
 
     #define DOG_X8(gp, a) do { \
         float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
         float zp = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
         unsigned int pk = *(const unsigned int*)((gp) + 8 + boff); \
-        const float dot = (float)((pk) & 0xFu) * x0 \
-             + (float)(((pk) >> 4) & 0xFu) * x1 \
-             + (float)(((pk) >> 8) & 0xFu) * x2 \
-             + (float)(((pk) >> 12) & 0xFu) * x3 \
-             + (float)(((pk) >> 16) & 0xFu) * x4 \
-             + (float)(((pk) >> 20) & 0xFu) * x5 \
-             + (float)(((pk) >> 24) & 0xFu) * x6 \
-             + (float)(((pk) >> 28) & 0xFu) * x7; \
-        (a) += sc * dot + zp * xs; \
+        (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x3 \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x4 \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x5 \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x6 \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x7; \
     } while (0)
 
     #define DOG_X8_STAGED(sc, zp, pk, b, a) do { \
@@ -105,16 +103,14 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         const float x5 = x[(b) + 5]; \
         const float x6 = x[(b) + 6]; \
         const float x7 = x[(b) + 7]; \
-        const float xs = ((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7)); \
-        const float dot = (float)(((pk)) & 0xFu) * x0 \
-             + (float)((((pk)) >> 4) & 0xFu) * x1 \
-             + (float)((((pk)) >> 8) & 0xFu) * x2 \
-             + (float)((((pk)) >> 12) & 0xFu) * x3 \
-             + (float)((((pk)) >> 16) & 0xFu) * x4 \
-             + (float)((((pk)) >> 20) & 0xFu) * x5 \
-             + (float)((((pk)) >> 24) & 0xFu) * x6 \
-             + (float)((((pk)) >> 28) & 0xFu) * x7; \
-        (a) += (sc) * dot + (zp) * xs; \
+        (a) += ((sc) * (float)(((pk)) & 0xFu)         + (zp)) * x0 \
+             + ((sc) * (float)((((pk)) >> 4) & 0xFu)  + (zp)) * x1 \
+             + ((sc) * (float)((((pk)) >> 8) & 0xFu)  + (zp)) * x2 \
+             + ((sc) * (float)((((pk)) >> 12) & 0xFu) + (zp)) * x3 \
+             + ((sc) * (float)((((pk)) >> 16) & 0xFu) + (zp)) * x4 \
+             + ((sc) * (float)((((pk)) >> 20) & 0xFu) + (zp)) * x5 \
+             + ((sc) * (float)((((pk)) >> 24) & 0xFu) + (zp)) * x6 \
+             + ((sc) * (float)((((pk)) >> 28) & 0xFu) + (zp)) * x7; \
     } while (0)
 
     #define DOG_X8_TAIL2(row_ptr, g0, g1, base0, base1, a0, a1) do { \
