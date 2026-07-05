@@ -80,22 +80,22 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         const float usc = __builtin_bit_cast(float, *(const unsigned int*)(gp_u)); \
         const float uzp = __builtin_bit_cast(float, *(const unsigned int*)((gp_u) + 4)); \
         const unsigned int upk = *(const unsigned int*)((gp_u) + 8 + boff); \
-        const float gdot = (float)(gpk & 0xFu) * x0 \
-             + (float)((gpk >> 4) & 0xFu) * x1 \
-             + (float)((gpk >> 8) & 0xFu) * x2 \
-             + (float)((gpk >> 12) & 0xFu) * x3 \
-             + (float)((gpk >> 16) & 0xFu) * x4 \
-             + (float)((gpk >> 20) & 0xFu) * x5 \
-             + (float)((gpk >> 24) & 0xFu) * x6 \
-             + (float)((gpk >> 28) & 0xFu) * x7; \
-        const float udot = (float)(upk & 0xFu) * x0 \
-             + (float)((upk >> 4) & 0xFu) * x1 \
-             + (float)((upk >> 8) & 0xFu) * x2 \
-             + (float)((upk >> 12) & 0xFu) * x3 \
-             + (float)((upk >> 16) & 0xFu) * x4 \
-             + (float)((upk >> 20) & 0xFu) * x5 \
-             + (float)((upk >> 24) & 0xFu) * x6 \
-             + (float)((upk >> 28) & 0xFu) * x7; \
+        float gdot = (float)(gpk & 0xFu) * x0; \
+        float udot = (float)(upk & 0xFu) * x0; \
+        gdot += (float)((gpk >> 4) & 0xFu) * x1; \
+        udot += (float)((upk >> 4) & 0xFu) * x1; \
+        gdot += (float)((gpk >> 8) & 0xFu) * x2; \
+        udot += (float)((upk >> 8) & 0xFu) * x2; \
+        gdot += (float)((gpk >> 12) & 0xFu) * x3; \
+        udot += (float)((upk >> 12) & 0xFu) * x3; \
+        gdot += (float)((gpk >> 16) & 0xFu) * x4; \
+        udot += (float)((upk >> 16) & 0xFu) * x4; \
+        gdot += (float)((gpk >> 20) & 0xFu) * x5; \
+        udot += (float)((upk >> 20) & 0xFu) * x5; \
+        gdot += (float)((gpk >> 24) & 0xFu) * x6; \
+        udot += (float)((upk >> 24) & 0xFu) * x6; \
+        gdot += (float)((gpk >> 28) & 0xFu) * x7; \
+        udot += (float)((upk >> 28) & 0xFu) * x7; \
         (ga) += gsc * gdot + gzp * xs; \
         (ua) += usc * udot + uzp * xs; \
     } while (0)
