@@ -73,7 +73,8 @@ extern "C" __global__ void fused_qkvza_hfq4g256(
 
     const int tid = threadIdx.x;
     const int groups_per_row = K / 256;
-    const char* row_ptr = A + (long long)row * groups_per_row * 136;
+    const long long row_stride = (long long)groups_per_row * 136;
+    const char* row_ptr = A + (long long)row * row_stride;
     const int boff = tid * 4;
 
     // Four accumulators for the 4x group unroll. Tail groups go back into
