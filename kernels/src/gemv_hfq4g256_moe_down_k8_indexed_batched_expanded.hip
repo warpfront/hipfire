@@ -78,22 +78,20 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         const float x4 = x[(b) + 4]; \
         const float x5 = x[(b) + 5]; \
         const float x6 = x[(b) + 6]; \
-        const float x7 = x[(b) + 7]; \
-        const float xs = ((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7))
+        const float x7 = x[(b) + 7]
 
     #define DOG_X8(gp, a) do { \
         float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
         float zp = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
         unsigned int pk = *(const unsigned int*)((gp) + 8 + boff); \
-        const float dot = (float)((pk) & 0xFu) * x0 \
-             + (float)(((pk) >> 4) & 0xFu) * x1 \
-             + (float)(((pk) >> 8) & 0xFu) * x2 \
-             + (float)(((pk) >> 12) & 0xFu) * x3 \
-             + (float)(((pk) >> 16) & 0xFu) * x4 \
-             + (float)(((pk) >> 20) & 0xFu) * x5 \
-             + (float)(((pk) >> 24) & 0xFu) * x6 \
-             + (float)(((pk) >> 28) & 0xFu) * x7; \
-        (a) += sc * dot + zp * xs; \
+        (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x3 \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x4 \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x5 \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x6 \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x7; \
     } while (0)
 
     #define DOG_X8_STAGED(sc, zp, pk, b, a) do { \
@@ -105,16 +103,14 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         const float x5 = x[(b) + 5]; \
         const float x6 = x[(b) + 6]; \
         const float x7 = x[(b) + 7]; \
-        const float xs = ((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7)); \
-        const float dot = (float)(((pk)) & 0xFu) * x0 \
-             + (float)((((pk)) >> 4) & 0xFu) * x1 \
-             + (float)((((pk)) >> 8) & 0xFu) * x2 \
-             + (float)((((pk)) >> 12) & 0xFu) * x3 \
-             + (float)((((pk)) >> 16) & 0xFu) * x4 \
-             + (float)((((pk)) >> 20) & 0xFu) * x5 \
-             + (float)((((pk)) >> 24) & 0xFu) * x6 \
-             + (float)((((pk)) >> 28) & 0xFu) * x7; \
-        (a) += (sc) * dot + (zp) * xs; \
+        (a) += ((sc) * (float)(((pk)) & 0xFu)         + (zp)) * x0 \
+             + ((sc) * (float)((((pk)) >> 4) & 0xFu)  + (zp)) * x1 \
+             + ((sc) * (float)((((pk)) >> 8) & 0xFu)  + (zp)) * x2 \
+             + ((sc) * (float)((((pk)) >> 12) & 0xFu) + (zp)) * x3 \
+             + ((sc) * (float)((((pk)) >> 16) & 0xFu) + (zp)) * x4 \
+             + ((sc) * (float)((((pk)) >> 20) & 0xFu) + (zp)) * x5 \
+             + ((sc) * (float)((((pk)) >> 24) & 0xFu) + (zp)) * x6 \
+             + ((sc) * (float)((((pk)) >> 28) & 0xFu) + (zp)) * x7; \
     } while (0)
 
     #define DOG_X8_TAIL2(row_ptr, g0, g1, base0, base1, a0, a1) do { \
@@ -204,26 +200,14 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
     float bcc = (bcc0 + bcc1) + (bcc2 + bcc3);
     float ccc = (ccc0 + ccc1) + (ccc2 + ccc3);
     float dcc = (dcc0 + dcc1) + (dcc2 + dcc3);
-    acc += __shfl_down(acc, 16);
-    bcc += __shfl_down(bcc, 16);
-    acc += __shfl_down(acc, 8);
-    bcc += __shfl_down(bcc, 8);
-    acc += __shfl_down(acc, 4);
-    bcc += __shfl_down(bcc, 4);
-    acc += __shfl_down(acc, 2);
-    bcc += __shfl_down(bcc, 2);
-    acc += __shfl_down(acc, 1);
-    bcc += __shfl_down(bcc, 1);
-    ccc += __shfl_down(ccc, 16);
-    dcc += __shfl_down(dcc, 16);
-    ccc += __shfl_down(ccc, 8);
-    dcc += __shfl_down(dcc, 8);
-    ccc += __shfl_down(ccc, 4);
-    dcc += __shfl_down(dcc, 4);
-    ccc += __shfl_down(ccc, 2);
-    dcc += __shfl_down(dcc, 2);
-    ccc += __shfl_down(ccc, 1);
-    dcc += __shfl_down(dcc, 1);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        bcc += __shfl_down(bcc, offset);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        ccc += __shfl_down(ccc, offset);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        dcc += __shfl_down(dcc, offset);
 
     if (tid == 0) {
         // Direct store to per-(token, krank) row — no atomic contention.
