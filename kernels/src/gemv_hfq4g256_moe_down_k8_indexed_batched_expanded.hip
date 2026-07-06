@@ -57,10 +57,11 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         rot_batch + ((long long)bid * K_TOP + krank) * K;
 
     const int groups_per_row = K / 256;
-    const char* row_ptr0 = A + (long long)row0 * groups_per_row * 136;
-    const char* row_ptr1 = A + (long long)row1 * groups_per_row * 136;
-    const char* row_ptr2 = A + (long long)row2 * groups_per_row * 136;
-    const char* row_ptr3 = A + (long long)row3 * groups_per_row * 136;
+    const long long row_stride = (long long)groups_per_row * 136;
+    const char* row_ptr0 = A + (long long)row0 * row_stride;
+    const char* row_ptr1 = row_ptr0 + row_stride;
+    const char* row_ptr2 = row_ptr1 + row_stride;
+    const char* row_ptr3 = row_ptr2 + row_stride;
     const int boff = tid * 4;
 
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
