@@ -100,6 +100,7 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         (ua) += usc * udot + uzp * xs; \
     } while (0)
 
+    #pragma clang loop unroll(disable)
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const int base0 = g * 256 + tid * 8;
