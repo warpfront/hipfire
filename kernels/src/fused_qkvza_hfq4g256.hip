@@ -164,8 +164,11 @@ extern "C" __global__ void fused_qkvza_hfq4g256(
     #undef TAIL_DOG
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
-    for (int offset = 16; offset > 0; offset >>= 1)
-        acc += __shfl_down(acc, offset);
+    acc += __shfl_down(acc, 16);
+    acc += __shfl_down(acc, 8);
+    acc += __shfl_down(acc, 4);
+    acc += __shfl_down(acc, 2);
+    acc += __shfl_down(acc, 1);
 
     if (tid == 0) y[row] = acc;
 }
