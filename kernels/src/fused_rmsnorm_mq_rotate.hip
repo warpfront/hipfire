@@ -44,8 +44,7 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
     float eps
 ) {
     extern __shared__ float smem[];
-    float* x_shared = smem;            // [K]
-    float* reduce   = smem + K;        // [256]
+    float* reduce = smem;              // [256]
 
     const int tid = threadIdx.x;
     const int block_size = blockDim.x; // 256
@@ -61,11 +60,11 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
     const float* x_b     = x     + batch_off;
           float* x_rot_b = x_rot + batch_off;
 
-    // Phase 1a: gather → cache to LDS and accumulate sum-of-squares.
+    // Phase 1a: accumulate sum-of-squares. The baseline caches x in LDS;
+    // this variant reloads x during rotation to avoid the large x_shared slab.
     float local_sum = 0.0f;
     for (int i = tid; i < K; i += block_size) {
         float v = x_b[i];
-        x_shared[i] = v;
         local_sum += v * v;
     }
     reduce[tid] = local_sum;
@@ -77,12 +76,6 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
         __syncthreads();
     }
     const float rms = rsqrtf(reduce[0] / (float)K + eps);
-
-    // Phase 1c: normalize in place. x_shared now holds rmsnormalized values.
-    for (int i = tid; i < K; i += block_size) {
-        x_shared[i] = x_shared[i] * weight[i] * rms;
-    }
-    __syncthreads();
 
     // Phase 2: FWHT per group, 256 elements at a time. Each wave owns
     // `groups_per_warp` groups and processes them serially. Register usage per
@@ -98,14 +91,14 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
         const int d0 = lane_id * 8;
         const int base = group * 256 + d0;
 
-        float v0 = x_shared[base]     * signs1[d0];
-        float v1 = x_shared[base + 1] * signs1[d0 + 1];
-        float v2 = x_shared[base + 2] * signs1[d0 + 2];
-        float v3 = x_shared[base + 3] * signs1[d0 + 3];
-        float v4 = x_shared[base + 4] * signs1[d0 + 4];
-        float v5 = x_shared[base + 5] * signs1[d0 + 5];
-        float v6 = x_shared[base + 6] * signs1[d0 + 6];
-        float v7 = x_shared[base + 7] * signs1[d0 + 7];
+        float v0 = (x_b[base]     * weight[base]     * rms) * signs1[d0];
+        float v1 = (x_b[base + 1] * weight[base + 1] * rms) * signs1[d0 + 1];
+        float v2 = (x_b[base + 2] * weight[base + 2] * rms) * signs1[d0 + 2];
+        float v3 = (x_b[base + 3] * weight[base + 3] * rms) * signs1[d0 + 3];
+        float v4 = (x_b[base + 4] * weight[base + 4] * rms) * signs1[d0 + 4];
+        float v5 = (x_b[base + 5] * weight[base + 5] * rms) * signs1[d0 + 5];
+        float v6 = (x_b[base + 6] * weight[base + 6] * rms) * signs1[d0 + 6];
+        float v7 = (x_b[base + 7] * weight[base + 7] * rms) * signs1[d0 + 7];
 
         // Local butterfly: strides 1, 2, 4 (within each thread's 8 registers).
         float t;
