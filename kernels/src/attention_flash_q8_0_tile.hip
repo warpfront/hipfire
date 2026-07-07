@@ -81,7 +81,6 @@ __global__ void attention_flash_q8_0_tile(
         q_lds[d_base + 2] = q_head[d_base + 2];
         q_lds[d_base + 3] = q_head[d_base + 3];
     }
-    __syncthreads();
 
     // ═══ Phase A: compute tile_len dot products (wave-cooperative) ═══
     // Each thread handles 4 of 128 elements per half, accumulates across
@@ -90,29 +89,37 @@ __global__ void attention_flash_q8_0_tile(
     // half*4 + bi_k.
     const int k_off = (tid % 8) * 4;
 
-    for (int t_local = 0; t_local < tile_len; t_local++) {
-        int t = tile_start + t_local;
-        if (t < win_lo) {                  // outside sliding window → mask, skip dot
-            if (tid == 0) scores[t_local] = -INFINITY;
-            continue;                      // t is wave-uniform, all lanes skip together
-        }
-        float partial = 0.0f;
-        for (int half = 0; half < n_halves; half++) {
-            const int k_bi = half * 4 + tid / 8;
-            const int k_blk_off = (kv_head_block_start + k_bi) * 34;
-            const unsigned char* kb = k_cache + (size_t)t * row_stride + k_blk_off;
-            float ks = (float)*((const _Float16*)kb);
-            const float* qb_thread = q_lds + k_bi * 32 + k_off;
-            partial += qb_thread[0] * (ks * (float)((signed char)kb[2 + k_off + 0]))
-                     + qb_thread[1] * (ks * (float)((signed char)kb[2 + k_off + 1]))
-                     + qb_thread[2] * (ks * (float)((signed char)kb[2 + k_off + 2]))
-                     + qb_thread[3] * (ks * (float)((signed char)kb[2 + k_off + 3]));
-        }
-        for (int off = 16; off > 0; off >>= 1)
-            partial += __shfl_xor(partial, off);
-        if (tid == 0)
-            scores[t_local] = partial * scale_attn;
+    #define SCORE_ONE(tl) do { \
+        int t = tile_start + (tl); \
+        if (t < win_lo) { \
+            if (tid == 0) scores[(tl)] = -INFINITY; \
+        } else { \
+            float partial = 0.0f; \
+            for (int half = 0; half < n_halves; half++) { \
+                const int k_bi = half * 4 + tid / 8; \
+                const int k_blk_off = (kv_head_block_start + k_bi) * 34; \
+                const unsigned char* kb = k_cache + (size_t)t * row_stride + k_blk_off; \
+                float ks = (float)*((const _Float16*)kb); \
+                const float* qb_thread = q_lds + k_bi * 32 + k_off; \
+                partial += qb_thread[0] * (ks * (float)((signed char)kb[2 + k_off + 0])) \
+                         + qb_thread[1] * (ks * (float)((signed char)kb[2 + k_off + 1])) \
+                         + qb_thread[2] * (ks * (float)((signed char)kb[2 + k_off + 2])) \
+                         + qb_thread[3] * (ks * (float)((signed char)kb[2 + k_off + 3])); \
+            } \
+            for (int off = 16; off > 0; off >>= 1) \
+                partial += __shfl_xor(partial, off); \
+            if (tid == 0) \
+                scores[(tl)] = partial * scale_attn; \
+        } \
+    } while (0)
+    int score_i = 0;
+    for (; score_i + 1 < tile_len; score_i += 2) {
+        SCORE_ONE(score_i + 0);
+        SCORE_ONE(score_i + 1);
     }
+    for (; score_i < tile_len; score_i++)
+        SCORE_ONE(score_i);
+    #undef SCORE_ONE
     __syncthreads();
 
     // ═══ Phase B: find tile max ═══
@@ -163,16 +170,30 @@ __global__ void attention_flash_q8_0_tile(
         const int bj_base = d_base % 32;
         const int v_blk_off = (kv_head_block_start + bi) * 34;
         float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
-        for (int t_local = 0; t_local < tile_len; t_local++) {
-            float w = scores[t_local];
-            int t = tile_start + t_local;
-            const unsigned char* vb = v_cache + (size_t)t * row_stride + v_blk_off;
-            float vs = (float)*((const _Float16*)vb);
-            out0 += w * (vs * (float)((signed char)vb[2 + bj_base + 0]));
-            out1 += w * (vs * (float)((signed char)vb[2 + bj_base + 1]));
-            out2 += w * (vs * (float)((signed char)vb[2 + bj_base + 2]));
-            out3 += w * (vs * (float)((signed char)vb[2 + bj_base + 3]));
+        int t_local = 0;
+        #define ACCUM_V(tl) do { \
+            float w = scores[(tl)]; \
+            int t = tile_start + (tl); \
+            const unsigned char* vb = v_cache + (size_t)t * row_stride + v_blk_off; \
+            float vs = (float)*((const _Float16*)vb); \
+            out0 += w * (vs * (float)((signed char)vb[2 + bj_base + 0])); \
+            out1 += w * (vs * (float)((signed char)vb[2 + bj_base + 1])); \
+            out2 += w * (vs * (float)((signed char)vb[2 + bj_base + 2])); \
+            out3 += w * (vs * (float)((signed char)vb[2 + bj_base + 3])); \
+        } while (0)
+        for (; t_local + 7 < tile_len; t_local += 8) {
+            ACCUM_V(t_local + 0);
+            ACCUM_V(t_local + 1);
+            ACCUM_V(t_local + 2);
+            ACCUM_V(t_local + 3);
+            ACCUM_V(t_local + 4);
+            ACCUM_V(t_local + 5);
+            ACCUM_V(t_local + 6);
+            ACCUM_V(t_local + 7);
         }
+        for (; t_local < tile_len; t_local++)
+            ACCUM_V(t_local);
+        #undef ACCUM_V
         p[2 + d_base + 0] = out0;
         p[2 + d_base + 1] = out1;
         p[2 + d_base + 2] = out2;
