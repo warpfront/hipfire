@@ -60,18 +60,14 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         const char* gp2 = gp1 + 136;
         const char* gp3 = gp2 + 136;
 
-        uint2 sz0 = *(const uint2*)(gp0);
-        uint2 sz1 = *(const uint2*)(gp1);
-        uint2 sz2 = *(const uint2*)(gp2);
-        uint2 sz3 = *(const uint2*)(gp3);
-        float sc0 = __builtin_bit_cast(float, sz0.x);
-        float zp0 = __builtin_bit_cast(float, sz0.y);
-        float sc1 = __builtin_bit_cast(float, sz1.x);
-        float zp1 = __builtin_bit_cast(float, sz1.y);
-        float sc2 = __builtin_bit_cast(float, sz2.x);
-        float zp2 = __builtin_bit_cast(float, sz2.y);
-        float sc3 = __builtin_bit_cast(float, sz3.x);
-        float zp3 = __builtin_bit_cast(float, sz3.y);
+        float sc0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0));
+        float zp0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0 + 4));
+        float sc1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1));
+        float zp1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1 + 4));
+        float sc2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2));
+        float zp2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2 + 4));
+        float sc3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3));
+        float zp3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3 + 4));
 
         unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
         unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
@@ -110,9 +106,8 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
     if (tail >= 1) {
         const int g = quads << 2;
         const char* gp = row_ptr + g * 136;
-        uint2 sz = *(const uint2*)(gp);
-        float sc = __builtin_bit_cast(float, sz.x);
-        float zp = __builtin_bit_cast(float, sz.y);
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
         unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc0);
@@ -120,9 +115,8 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
         const char* gp = row_ptr + g * 136;
-        uint2 sz = *(const uint2*)(gp);
-        float sc = __builtin_bit_cast(float, sz.x);
-        float zp = __builtin_bit_cast(float, sz.y);
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
         unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc1);
@@ -130,9 +124,8 @@ extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
         const char* gp = row_ptr + g * 136;
-        uint2 sz = *(const uint2*)(gp);
-        float sc = __builtin_bit_cast(float, sz.x);
-        float zp = __builtin_bit_cast(float, sz.y);
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
         unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc2);

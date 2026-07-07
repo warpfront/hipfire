@@ -44,10 +44,9 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
-    const char* gp0_iter = row_ptr;
-    int base_iter = tid * 8;
-    for (int q = 0; q < quads; q++, gp0_iter += 544, base_iter += 1024) {
-        const char* gp0 = gp0_iter;
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        const char* gp0 = row_ptr + g * 136;
         const char* gp1 = gp0 + 136;
         const char* gp2 = gp1 + 136;
         const char* gp3 = gp2 + 136;
@@ -66,6 +65,8 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
         unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
 
+        int base = g * 256 + tid * 8;
+
         #define DOG(pk, sc, zp, b, a) \
             (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
                  + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
@@ -76,10 +77,10 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
                  + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
                  + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
 
-        DOG(pk0, sc0, zp0, base_iter, acc0);
-        DOG(pk1, sc1, zp1, base_iter + 256, acc1);
-        DOG(pk2, sc2, zp2, base_iter + 512, acc2);
-        DOG(pk3, sc3, zp3, base_iter + 768, acc3);
+        DOG(pk0, sc0, zp0, base, acc0);
+        DOG(pk1, sc1, zp1, base + 256, acc1);
+        DOG(pk2, sc2, zp2, base + 512, acc2);
+        DOG(pk3, sc3, zp3, base + 768, acc3);
         #undef DOG
     }
 
