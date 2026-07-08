@@ -1,11 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire - see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
-
-// gfx1151 experiment: combine the no-xshared rotation path with a warp-first
-// sum-of-squares reduction to reduce block-wide barrier count.
 
 __launch_bounds__(256, 1)
 extern "C" __global__ void fused_rmsnorm_mq_rotate(
@@ -18,7 +14,7 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
     float eps
 ) {
     extern __shared__ float smem[];
-    float* reduce = smem;              // [8] warp sums are enough here.
+    float* reduce = smem;
 
     const int tid = threadIdx.x;
     const int block_size = blockDim.x;
@@ -32,16 +28,21 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
 
     float local_sum = 0.0f;
     int i = tid;
-    for (; i + block_size < K; i += block_size * 2) {
+    for (; i + block_size * 3 < K; i += block_size * 4) {
         float v0 = x_b[i];
         float v1 = x_b[i + block_size];
+        float v2 = x_b[i + block_size * 2];
+        float v3 = x_b[i + block_size * 3];
         local_sum += v0 * v0;
         local_sum += v1 * v1;
+        local_sum += v2 * v2;
+        local_sum += v3 * v3;
     }
-    if (i < K) {
+    for (; i < K; i += block_size) {
         float v = x_b[i];
         local_sum += v * v;
     }
+
     for (int off = 16; off > 0; off >>= 1)
         local_sum += __shfl_down(local_sum, off);
     if (lane_id == 0) reduce[warp_id] = local_sum;
