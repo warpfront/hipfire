@@ -39,7 +39,7 @@
 // Bit-exact with four sequential gemv_hfq4g256 calls — the inner loop
 // is a verbatim copy.
 
-__launch_bounds__(32, 16)
+__launch_bounds__(32, 20)
 extern "C" __global__ void fused_qkvza_hfq4g256(
     const char*  __restrict__ A_qkv,
     const char*  __restrict__ A_z,
