@@ -19,6 +19,14 @@
 //!   HIPFIRE_DEEPSEEK4_CHAT_RAW=1     disable chat template (base-completion mode)
 //!   HIPFIRE_DEEPSEEK4_TEMP=F         sampling temperature (default 0.7; 0 = greedy argmax)
 //!   HIPFIRE_DEEPSEEK4_TOP_K=N        top-K filter before softmax (default 40; 0 = full vocab)
+//!   HIPFIRE_DEEPSEEK4_BENCH_PROMPT_TOKENS=N
+//!                                      truncate the tokenized prompt to exactly N tokens
+//!   HIPFIRE_DEEPSEEK4_BENCH_TILE_PROMPT=1
+//!                                      if shorter than N, tile context before one complete tail copy
+//!   HIPFIRE_DEEPSEEK4_BENCH_STDIN_ALL=1
+//!                                      consume stdin as one document instead of blank-line-delimited turns
+//!   HIPFIRE_DEEPSEEK4_BENCH_EXPERTS_PER_TOK=N
+//!                                      benchmark-only routed-expert override (must not exceed checkpoint default)
 //!   HIPFIRE_DEEPSEEK4_SEED=N         PRNG seed (default: time-based)
 //!   HIPFIRE_DEEPSEEK4_SPEC_DECODE=1  opt-in MTP speculative decode (default off — plain
 //!                              decode is faster on current DeepSeek V4 MQ2-Lloyd accept rates;
@@ -37,7 +45,7 @@ use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::tokenizer::Tokenizer;
 use rdna_compute::Gpu;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 /// Read one prompt "turn" from stdin: accumulate lines into a buffer
 /// until a blank line or EOF terminates the chunk. Empty chunks are
@@ -157,6 +165,30 @@ fn main() -> Result<(), String> {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(200);
+    let bench_prompt_tokens = std::env::var("HIPFIRE_DEEPSEEK4_BENCH_PROMPT_TOKENS")
+        .ok()
+        .map(|value| {
+            value
+                .parse::<usize>()
+                .map_err(|error| format!("invalid benchmark prompt-token limit '{value}': {error}"))
+        })
+        .transpose()?;
+    let bench_experts_per_tok = std::env::var("HIPFIRE_DEEPSEEK4_BENCH_EXPERTS_PER_TOK")
+        .ok()
+        .map(|value| {
+            value.parse::<usize>().map_err(|error| {
+                format!("invalid benchmark experts-per-token override '{value}': {error}")
+            })
+        })
+        .transpose()?;
+    let bench_tile_prompt = std::env::var("HIPFIRE_DEEPSEEK4_BENCH_TILE_PROMPT")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let bench_stdin_all = std::env::var("HIPFIRE_DEEPSEEK4_BENCH_STDIN_ALL")
+        .ok()
+        .as_deref()
+        == Some("1");
     let raw_mode = std::env::var("HIPFIRE_DEEPSEEK4_CHAT_RAW").ok().as_deref() == Some("1");
     let temp: f32 = std::env::var("HIPFIRE_DEEPSEEK4_TEMP")
         .ok()
@@ -192,6 +224,19 @@ fn main() -> Result<(), String> {
     eprintln!("Loading DeepSeek V4 from {path}...");
     let mut hfq = HfqFile::open(std::path::Path::new(&path)).map_err(|e| format!("open: {e:?}"))?;
     let mut cfg = DeepseekV4::config_from_hfq(&hfq)?;
+    if let Some(experts_per_tok) = bench_experts_per_tok {
+        if experts_per_tok == 0 || experts_per_tok > cfg.num_experts_per_tok {
+            return Err(format!(
+                "benchmark experts-per-token override must be in 1..={}, got {experts_per_tok}",
+                cfg.num_experts_per_tok
+            ));
+        }
+        eprintln!(
+            "[benchmark override: num_experts_per_tok {} -> {}]",
+            cfg.num_experts_per_tok, experts_per_tok
+        );
+        cfg.num_experts_per_tok = experts_per_tok;
+    }
     // The checkpoint metadata may advertise DSpark availability, but this
     // executable's explicit AR mode must not upload the three-stage sidecar.
     // Besides wasting VRAM, doing so makes every fresh-process AR comparison
@@ -231,8 +276,12 @@ fn main() -> Result<(), String> {
 
     eprintln!("DeepSeek V4 ready. Type a prompt and press enter (or pipe text). EOF to quit. /reset to clear context.");
     eprintln!(
-        "Config: layers={} hidden={} vocab={} window={}",
-        cfg.num_hidden_layers, cfg.hidden_size, cfg.vocab_size, cfg.sliding_window
+        "Config: layers={} hidden={} vocab={} window={} experts_per_tok={}",
+        cfg.num_hidden_layers,
+        cfg.hidden_size,
+        cfg.vocab_size,
+        cfg.sliding_window,
+        cfg.num_experts_per_tok
     );
     eprintln!(
         "Generation: max_tokens={} attention={} mode={} temp={} top_k={} seed={}",
@@ -258,9 +307,23 @@ fn main() -> Result<(), String> {
     let mut stdout = io::stdout();
     let mut pos: u32 = 0;
     let mut first_turn = true;
+    let mut whole_stdin = if bench_stdin_all {
+        let mut text = String::new();
+        stdin_lock
+            .read_to_string(&mut text)
+            .map_err(|error| format!("stdin: {error:?}"))?;
+        Some(text.trim_end().to_owned())
+    } else {
+        None
+    };
 
     loop {
-        let prompt = match read_prompt_chunk(&mut stdin_lock)? {
+        let next_prompt = if bench_stdin_all {
+            whole_stdin.take()
+        } else {
+            read_prompt_chunk(&mut stdin_lock)?
+        };
+        let prompt = match next_prompt {
             Some(p) => p,
             None => break,
         };
@@ -292,6 +355,28 @@ fn main() -> Result<(), String> {
             prompt_tokens.extend(tokenizer.encode(&prompt));
             if let Some(a) = asst_tok {
                 prompt_tokens.push(a);
+            }
+        }
+        if let Some(limit) = bench_prompt_tokens {
+            if prompt_tokens.len() < limit && !bench_tile_prompt {
+                return Err(format!(
+                    "benchmark fixture tokenized to {} tokens, fewer than requested {limit}; \
+                     set HIPFIRE_DEEPSEEK4_BENCH_TILE_PROMPT=1 for an explicit tiled fixture",
+                    prompt_tokens.len(),
+                ));
+            }
+            if prompt_tokens.len() < limit {
+                let complete_tail = prompt_tokens.clone();
+                let context_len = limit - complete_tail.len();
+                let mut exact = Vec::with_capacity(limit);
+                while exact.len() < context_len {
+                    let take = (context_len - exact.len()).min(complete_tail.len());
+                    exact.extend_from_slice(&complete_tail[..take]);
+                }
+                exact.extend_from_slice(&complete_tail);
+                prompt_tokens = exact;
+            } else {
+                prompt_tokens.truncate(limit);
             }
         }
         let prompt_token_count = prompt_tokens.len();

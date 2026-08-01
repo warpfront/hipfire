@@ -215,6 +215,7 @@ pub enum KernelKey {
     GemvMfp4G32P,
     GemvMfp4G32E8,
     GemvMfp4G32E8Soa,
+    GemvMfp3G32E8,
     GemvMfp4G32Fused,
     GemvHfp4G32,
     GemvParoQ4G128,
@@ -236,6 +237,7 @@ pub enum KernelKey {
     GemvMfp4G32PPrerotated,
     GemvMfp4G32E8Prerotated,
     GemvMfp4G32E8SoaPrerotated,
+    GemvMfp3G32E8Prerotated,
     // GEMV residual
     GemvHfq4G256Residual,
     GemvHfq3G256Residual,
@@ -603,6 +605,7 @@ impl KernelKey {
             (MFP4G32P, Plain) => Ok(Self::GemvMfp4G32P),
             (MFP4G32E8, Plain) => Ok(Self::GemvMfp4G32E8),
             (MFP4G32E8SOA, Plain) => Ok(Self::GemvMfp4G32E8Soa),
+            (MFP3G32E8, Plain) => Ok(Self::GemvMfp3G32E8),
             (HFP4G32, Plain) => Ok(Self::GemvHfp4G32),
             (ParoQ4G128, Plain) => Ok(Self::GemvParoQ4G128),
             (Q4F16G64, Plain) => Ok(Self::GemvQ4F16G64),
@@ -634,6 +637,7 @@ impl KernelKey {
             MFP4G32P => Ok(Self::GemvMfp4G32PPrerotated),
             MFP4G32E8 => Ok(Self::GemvMfp4G32E8Prerotated),
             MFP4G32E8SOA => Ok(Self::GemvMfp4G32E8SoaPrerotated),
+            MFP3G32E8 => Ok(Self::GemvMfp3G32E8Prerotated),
             // Q8/Paro have no separate "prerotated" kernel: Q8 is not FWHT-rotated
             // (prerotated input == raw input → gemv_q8_0), and Paro's Givens-rotated
             // input feeds the same gemv_hfq4g128 kernel as its Plain path. launch()

@@ -1312,7 +1312,6 @@ pub fn run_moe_decode_bias_aware(
             quant: "",
         });
     }
-
     // 1. Bias-aware top-K: select on (scores + bias), weight on the unbiased
     //    scores, normalize, then fold in route_scale — all in one launch.
     hip!(gpu.deepseek4_moe_topk_bias_aware_f32(
@@ -1347,7 +1346,7 @@ pub fn run_moe_decode_bias_aware(
         p.k_top,
         p.swiglu_limit,
     ))?;
-    hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top))?;
+    hip!(gpu.rotate_x_mq_batched(p.gate_batch, p.rot_batch, p.mi, p.k_top,))?;
 
     // 4. Indexed MQ2-Lloyd down. Deterministic (default): expanded per-expert
     //    write + fixed-order non-atomic combine into ffn_out — bit-reproducible
@@ -1397,6 +1396,9 @@ pub fn run_moe_decode_bias_aware(
 /// `Lloyd4w` on gfx11+, `Base` otherwise). Selected once per gate_up/down call.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum GroupedLloydVariant {
+    /// Native CDNA3 wave64 MFMA path. Selected only for gfx942 so the
+    /// wave32 RDNA WMMA variants below retain their existing routes.
+    MfmaGfx942,
     /// i8 WMMA MMQ path (gfx1151): decodes the 2-bit Lloyd index via an int8
     /// codebook LUT and runs i8 WMMA at ~2x the FP16 rate. Top priority when
     /// enabled — ~1.7x the FP16 grouped GEMM on the DeepSeek-V4 prefill shape.
@@ -1414,6 +1416,7 @@ enum GroupedLloydVariant {
 /// n32 > cnd > 8w > nosync > mmqload > 4w > base). `n32`/`cnd`/`eightw` apply
 /// only on the 4w path; `use_nosync` ⊂ `use_mmqload` ⊂ `use_lloyd_4w`.
 fn select_grouped_lloyd_variant(
+    mfma_gfx942: bool,
     use_lloyd_4w: bool,
     i8: bool,
     n32: bool,
@@ -1422,7 +1425,9 @@ fn select_grouped_lloyd_variant(
     use_mmqload: bool,
     use_nosync: bool,
 ) -> GroupedLloydVariant {
-    if i8 {
+    if mfma_gfx942 {
+        GroupedLloydVariant::MfmaGfx942
+    } else if i8 {
         GroupedLloydVariant::I8
     } else if use_lloyd_4w && n32 {
         GroupedLloydVariant::N32
@@ -1476,6 +1481,18 @@ fn dispatch_grouped_lloyd(
 ) -> Result<(), DispatchError> {
     use GroupedLloydVariant as V;
     let r = match variant {
+        V::MfmaGfx942 => gpu.gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942(
+            ptrs,
+            tile_ids,
+            slot_index,
+            x,
+            y,
+            m,
+            k,
+            x_row_div,
+            m_total_max,
+            rows,
+        ),
         V::I8 if use_gfx1151_i8_moe_perm() => gpu.gemm_mq2g256_lloyd_moe_grouped_mmq_perm_gfx1151(
             ptrs,
             tile_ids,
@@ -1710,6 +1727,7 @@ pub fn run_moe_prefill_bias_aware(
         // i8 path requires (2*im)%16==0 && hidden%256==0 (looser than 4w's %64).
         let use_i8_gu = i8_moe && (2 * im) % 16 == 0 && hidden % 256 == 0;
         let v_gu = select_grouped_lloyd_variant(
+            gpu.arch == "gfx942",
             use_lloyd_4w_gu,
             use_i8_gu,
             n32,
@@ -1777,6 +1795,7 @@ pub fn run_moe_prefill_bias_aware(
         let use_nosync_dn = use_mmqload_dn && nosync_env;
         let use_i8_dn = i8_moe && hidden % 16 == 0 && im % 256 == 0;
         let v_dn = select_grouped_lloyd_variant(
+            gpu.arch == "gfx942",
             use_lloyd_4w_dn,
             use_i8_dn,
             n32,

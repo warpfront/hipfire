@@ -183,6 +183,15 @@ impl HfqFile {
         self.overlay.is_some()
     }
 
+    /// Tensor index of the attached REAP overlay, if any. This is intentionally
+    /// read-only: architecture validators use it to prove that a surgery plan
+    /// did not smuggle unrelated tensor replacements into a frozen recipe.
+    pub fn overlay_tensors(&self) -> Option<&[HfqTensorInfo]> {
+        self.overlay
+            .as_deref()
+            .map(|overlay| overlay.tensors.as_slice())
+    }
+
     /// Open an HFQM container that lives inside a larger file, starting at
     /// `base_offset`. Used by the bundled `.mq4-mtp` loader to parse the
     /// MTP section embedded after the trunk's tensor data.

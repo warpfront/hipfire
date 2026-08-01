@@ -175,11 +175,17 @@ fn main() -> Result<(), String> {
 
     let dspark_enabled = weights.dspark.is_some()
         && std::env::var("HIPFIRE_DEEPSEEK4_DSPARK").ok().as_deref() != Some("0");
-    let block = if let Some(d) = weights.dspark.as_ref() {
+    let sidecar_block = if let Some(d) = weights.dspark.as_ref() {
         d.cfg.block_size
     } else {
         5
     };
+    let block = std::env::var("HIPFIRE_DEEPSEEK4_SPEC_K")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|&k| k > 0)
+        .unwrap_or(sidecar_block)
+        .min(sidecar_block);
     eprintln!(
         "Drafter: {} (block={}) dspark_present={}",
         if dspark_enabled { "DSpark" } else { "MTP" },

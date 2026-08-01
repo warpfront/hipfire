@@ -219,7 +219,7 @@
       "quant_recipe": "deepseek4-mq2r-e8-p3-v1",
       "sha256": "392325b5a8cd284c8f305f23f74f178007a14b88173babeb3f4784ec4fc0e511",
       "size_bytes": 82191362222,
-      "desc": "DeepSeek V4 Flash MQ2R (arch_id=9): immutable P3 tensor recipe with 554 MFP4-E8 dense tensors and MQ2-Lloyd routed experts. gfx1151 route v2 is the default measured route but is versioned independently; other architectures use portable fallback dispatch. Target-aligned MTP and DSpark sidecars are not yet registered."
+      "desc": "DeepSeek V4 Flash MQ2R (arch_id=9): immutable P3 tensor recipe with 554 MFP4-E8 dense tensors and MQ2-Lloyd routed experts. gfx1151 route v3 is the default measured route but is versioned independently; other architectures use portable fallback dispatch. Target-aligned MTP and DSpark sidecars are not yet registered."
     },
     "minimax-m2.7": {
       "repo": "hipfire-models/hipfire-MiniMax-M2.7",

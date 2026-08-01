@@ -7,11 +7,11 @@
 
 use crate::{
     gen_fwht_signs, load_ds4_head_importance, load_hessian_blocks, quantize_hfq4g256,
-    quantize_hfq6g256, quantize_mfp4g32_e8_2d, quantize_mfp4g32_e8_soa_2d,
-    quantize_mfp4g32_e8_soa_awls_2d, quantize_mfp4g32_e8_soa_gptq_2d,
-    quantize_mfp4g32_e8_soa_lsq_2d, quantize_mq2g256_lloyd, quantize_mq3g256_lloyd,
-    quantize_mq4g256, quantize_mq4g256_lloyd, quantize_mq6g256, quantize_q8f16, HfqTensor,
-    QuantType,
+    quantize_hfq6g256, quantize_mfp2g32_e8_gptq_2d, quantize_mfp3g32_e8_gptq_2d,
+    quantize_mfp4g32_e8_2d, quantize_mfp4g32_e8_soa_2d, quantize_mfp4g32_e8_soa_awls_2d,
+    quantize_mfp4g32_e8_soa_gptq_2d, quantize_mfp4g32_e8_soa_lsq_2d, quantize_mq2g256_lloyd,
+    quantize_mq3g256_lloyd, quantize_mq4g256, quantize_mq4g256_lloyd, quantize_mq6g256,
+    quantize_q8f16, HfqTensor, QuantType,
 };
 use hipfire_reap::plan::{QuantOverride, ReapPlan, Role};
 
@@ -145,6 +145,48 @@ pub fn quantize_to_format(
                 QuantType::MFP4G32E8SOA,
                 32,
                 quantize_mfp4g32_e8_soa_gptq_2d(f32_data, m, k, &s1, &s2, &h_blocks),
+            )
+        }
+        "mfp3e8-gptq" | "mfp3g32e8-gptq" => {
+            let &[m, k] = shape else {
+                return Err(format!("reap: MFP3-E8-GPTQ requires rank-2 tensor {name}"));
+            };
+            let hessian_dir = std::env::var("HIPFIRE_E8_HESSIAN_DIR")
+                .map_err(|_| "mfp3e8-gptq requires HIPFIRE_E8_HESSIAN_DIR".to_string())?;
+            let h_blocks = load_hessian_blocks(std::path::Path::new(&hessian_dir), name);
+            if h_blocks.len() != k / 256 {
+                return Err(format!(
+                    "reap: GPTQ Hessian for {name} has {} blocks, expected {}",
+                    h_blocks.len(),
+                    k / 256
+                ));
+            }
+            let (s1, s2) = signs();
+            (
+                QuantType::MFP3G32E8,
+                32,
+                quantize_mfp3g32_e8_gptq_2d(f32_data, m, k, &s1, &s2, &h_blocks),
+            )
+        }
+        "mfp2e8-gptq" | "mfp2g32e8-gptq" => {
+            let &[m, k] = shape else {
+                return Err(format!("reap: MFP2-E8-GPTQ requires rank-2 tensor {name}"));
+            };
+            let hessian_dir = std::env::var("HIPFIRE_E8_HESSIAN_DIR")
+                .map_err(|_| "mfp2e8-gptq requires HIPFIRE_E8_HESSIAN_DIR".to_string())?;
+            let h_blocks = load_hessian_blocks(std::path::Path::new(&hessian_dir), name);
+            if h_blocks.len() != k / 256 {
+                return Err(format!(
+                    "reap: GPTQ Hessian for {name} has {} blocks, expected {}",
+                    h_blocks.len(),
+                    k / 256
+                ));
+            }
+            let (s1, s2) = signs();
+            (
+                QuantType::MFP2G32E8,
+                32,
+                quantize_mfp2g32_e8_gptq_2d(f32_data, m, k, &s1, &s2, &h_blocks),
             )
         }
         other => {
@@ -456,6 +498,25 @@ mod tests {
             err.contains("unsupported overlay tier 'bogus'"),
             "got: {err}"
         );
+    }
+
+    #[test]
+    fn narrowed_e8_gptq_tiers_require_explicit_hessian_directory() {
+        if std::env::var_os("HIPFIRE_E8_HESSIAN_DIR").is_some() {
+            return;
+        }
+        for (tier, expected) in [
+            ("mfp3e8-gptq", "mfp3e8-gptq requires HIPFIRE_E8_HESSIAN_DIR"),
+            (
+                "mfp2g32e8-gptq",
+                "mfp2e8-gptq requires HIPFIRE_E8_HESSIAN_DIR",
+            ),
+        ] {
+            let error =
+                quantize_to_format("layers.3.attn.wq_b.weight", tier, &[0.0; 256], &[1, 256])
+                    .unwrap_err();
+            assert_eq!(error, expected);
+        }
     }
 }
 

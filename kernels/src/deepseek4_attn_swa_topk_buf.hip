@@ -421,6 +421,13 @@ void deepseek4_attn_swa_topk_scoregrid_f32_buf(
                 stride = topk_window;
                 col = p - n_valid_swa;
             }
+#if defined(HIPFIRE_GFX1151_ATTN_SCOREGRID_LARGE_SERIAL)
+            float sum = 0.0f;
+            for (int i = 0; i < head_dim; ++i) {
+                sum += q_lds[i] * k_col[i * stride + col];
+            }
+            scores_lds[p] = sum * inv_scale;
+#else
             float sum0 = 0.0f, sum1 = 0.0f, sum2 = 0.0f, sum3 = 0.0f;
             int i = 0;
             for (; i + 3 < head_dim; i += 4) {
@@ -433,6 +440,7 @@ void deepseek4_attn_swa_topk_scoregrid_f32_buf(
                 sum0 += q_lds[i] * k_col[i * stride + col];
             }
             scores_lds[p] = ((sum0 + sum1) + (sum2 + sum3)) * inv_scale;
+#endif
         }
         __syncthreads();
     }
@@ -444,18 +452,32 @@ void deepseek4_attn_swa_topk_scoregrid_f32_buf(
     if (t == 0) {
         local_max = fmaxf(local_max, attn_sink[h]);
     }
+#if defined(HIPFIRE_GFX1151_ATTN_SCOREGRID_XLANE)
+    for (int stride = 16; stride > 0; stride >>= 1) {
+        local_max = fmaxf(local_max, __int_as_float(
+            hipfire_xor_shuffle_b32_gfx1151(__float_as_int(local_max), stride)));
+    }
+#else
     for (int off = 16; off > 0; off >>= 1) {
         local_max = fmaxf(local_max, __shfl_down(local_max, off));
     }
+#endif
     if (lane_id == 0) {
         warp_scratch[warp_id] = local_max;
     }
     __syncthreads();
     if (warp_id == 0) {
         float value = lane_id < MAX_WARPS ? warp_scratch[lane_id] : -1e30f;
+#if defined(HIPFIRE_GFX1151_ATTN_SCOREGRID_XLANE)
+        for (int stride = 16; stride > 0; stride >>= 1) {
+            value = fmaxf(value, __int_as_float(
+                hipfire_xor_shuffle_b32_gfx1151(__float_as_int(value), stride)));
+        }
+#else
         for (int off = 16; off > 0; off >>= 1) {
             value = fmaxf(value, __shfl_down(value, off));
         }
+#endif
         if (lane_id == 0) {
             warp_scratch[0] = value;
         }
@@ -496,6 +518,19 @@ void deepseek4_attn_swa_topk_scoregrid_f32_buf(
 
     if (t >= head_dim) return;
     const int d = t;
+#if defined(HIPFIRE_GFX1151_ATTN_SCOREGRID_LARGE_SERIAL)
+    if (n_total > 64) {
+        float acc = 0.0f;
+        for (int p = 0; p < n_valid_swa; ++p) {
+            acc += scores_lds[p] * swa_v[d * swa_window + p];
+        }
+        for (int p = 0; p < n_active_topk; ++p) {
+            acc += scores_lds[n_valid_swa + p] * topk_v[d * topk_window + p];
+        }
+        attn_out[h * head_dim + d] = acc;
+        return;
+    }
+#endif
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     int p = 0;
     for (; p + 3 < n_valid_swa; p += 4) {

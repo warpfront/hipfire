@@ -1801,7 +1801,7 @@ pub fn quantize_mfp2g32_e8_2d(
 }
 
 /// CPU reference dequant for mfp3-E8. Returns row-major f32 in the ROTATED domain.
-/// Mirrors the kernel mfp3_decode_index decode exactly (3-bit nibbles, center 3,
+/// Mirrors the kernel mfp3_decode_index decode exactly (3-bit nibbles, center 4,
 /// coset bit 23, e7_high 2b at bit 21).
 #[allow(dead_code)]
 fn dequant_mfp3g32_e8(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
@@ -1822,7 +1822,7 @@ fn dequant_mfp3g32_e8(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
                 let idx: u32 = (packed[cw_off] as u32)
                     | ((packed[cw_off + 1] as u32) << 8)
                     | ((packed[cw_off + 2] as u32) << 16);
-                // mfp3_decode_index: 3-bit nibbles, center 3, coset bit 23, e7_high @21 (2b)
+                // mfp3_decode_index: 3-bit nibbles, center 4, coset bit 23, e7_high @21 (2b)
                 let coset = (idx >> 23) & 1;
                 let mut e = [0u32; 8];
                 let mut sl: u32 = 0;
@@ -1834,7 +1834,7 @@ fn dequant_mfp3g32_e8(packed: &[u8], m: usize, k: usize) -> Vec<f32> {
                 let p7 = e7_high << 1;
                 e[7] = p7 | ((sl + p7) & 1);
                 for i in 0..8usize {
-                    let c = (e[i] as i32 - 3) as f32;
+                    let c = (e[i] as i32 - 4) as f32;
                     let coord = if coset == 1 { c + 0.5 } else { c };
                     out[r * k + b * 32 + g * 8 + i] = scale * coord;
                 }
@@ -4561,7 +4561,7 @@ pub(crate) enum QuantType {
     // (8 weights/codeword, QUANT_STEP=0.88). 4.25 bpw, FWHT rotation.
     MFP4G32E8SOA = 35, // mfp4-E8 SoA: same E8 data as qt=34 but in structure-of-arrays layout.
     // [16B hdr] + [n_blocks B E4M3 scales, pad 16B] + [n_blocks*16B codewords].
-    MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
+    MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 4), 13 B/blk, 3.25 bpw.
     // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
     MFP2G32E8 = 37, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1), 9 B/blk, 2.25 bpw.
                     // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).

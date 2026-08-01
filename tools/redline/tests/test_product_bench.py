@@ -775,6 +775,19 @@ class Pm4PreflightTests(unittest.TestCase):
         self.assertGreater(result["route_proof"]["retained_rows"], 0)
         fake.close.assert_called_once_with()
 
+    def test_deepseek4_preflight_allows_two_setup_positions(self):
+        row = RouteProofTests.route_row(iterations=4, delta=2, retained=True)
+        fake = unittest.mock.Mock()
+        fake.request.side_effect = [{"type": "loaded", "arch": "deepseek4"}, row]
+        with tempfile.TemporaryDirectory() as work_dir:
+            with patch("tools.redline.product_bench.Daemon", return_value=fake):
+                result = run_pm4_preflight(self.args(work_dir))
+
+        smoke = fake.request.call_args_list[1].args[0]
+        self.assertEqual(smoke["iterations"], 4)
+        self.assertTrue(result["route_proof"]["valid"], result["route_proof"])
+        fake.close.assert_called_once_with()
+
     def test_preflight_fast_fails_with_fallback_reason(self):
         row = RouteProofTests.route_row(iterations=2, delta=0, retained=False)
         row["redline_route"]["state"] = "fallback"

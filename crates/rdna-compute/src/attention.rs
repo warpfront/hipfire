@@ -8384,6 +8384,7 @@ impl Gpu {
             },
         )
     }
+
     pub fn compressor_ring_write_batched_f32(
         &mut self,
         kv_batch: &GpuTensor,
@@ -10147,6 +10148,7 @@ impl Gpu {
             blob_builder,
         )
     }
+
     pub fn state_ring_write_f32_buf(
         &mut self,
         src: &GpuTensor,
@@ -10189,6 +10191,7 @@ impl Gpu {
             blob_builder,
         )
     }
+
     pub fn swa_ring_write_batched_f32(
         &mut self,
         kv_batch: &GpuTensor, // [B, head_dim]
@@ -10282,6 +10285,7 @@ impl Gpu {
             blob_builder,
         )
     }
+
     pub fn swa_visibility_stage_batched(
         &mut self,
         ring: &GpuTensor,     // [head_dim, swa_window] pre-chunk

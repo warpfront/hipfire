@@ -508,6 +508,7 @@ fn for_gemv_plain_maps_all_scalar_dtypes() {
         (DType::MQ4G256, KernelKey::GemvMq4G256),
         (DType::MQ3G256, KernelKey::GemvMq3G256),
         (DType::MFP4G32, KernelKey::GemvMfp4G32),
+        (DType::MFP3G32E8, KernelKey::GemvMfp3G32E8),
     ];
     for (dtype, expected) in cases {
         assert_eq!(
@@ -528,6 +529,7 @@ fn for_gemv_prerotated_maps_mq_family() {
         (DType::MQ6G256, KernelKey::GemvMq6G256Prerotated),
         (DType::MQ8G256, KernelKey::GemvMq8G256Prerotated),
         (DType::MFP4G32, KernelKey::GemvMfp4G32Prerotated),
+        (DType::MFP3G32E8, KernelKey::GemvMfp3G32E8Prerotated),
     ];
     for (dtype, expected) in cases {
         assert_eq!(

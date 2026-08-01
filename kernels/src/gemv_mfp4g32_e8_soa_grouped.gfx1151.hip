@@ -39,7 +39,11 @@ __device__ __forceinline__ void e8_decode_index(
 }
 
 __launch_bounds__(32, 7)
-extern "C" __global__ void gemv_mfp4g32_e8_soa_grouped_gfx1151(
+#ifndef GEMV_MFP4G32_E8_SOA_GROUPED_KERNEL
+#define GEMV_MFP4G32_E8_SOA_GROUPED_KERNEL gemv_mfp4g32_e8_soa_grouped_gfx1151
+#endif
+
+extern "C" __global__ void GEMV_MFP4G32_E8_SOA_GROUPED_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,
     float* __restrict__ y,
@@ -59,11 +63,24 @@ extern "C" __global__ void gemv_mfp4g32_e8_soa_grouped_gfx1151(
         16LL + scale_padded + (long long)n_blocks * 16;
     const long long global_row = (long long)group * M + row;
     const char* hdr = A + global_row * row_total;
+    // Byte offsets from A for the buffer-SRD path. The main E8 decode GEMV
+    // fetches weights through a buffer resource descriptor with an explicit
+    // cache policy (the accepted B2 lever); this kernel shipped with plain
+    // global loads and never received it. Offsets stay in u32: the largest is
+    // G*M*row_total, ~18 MB for the recorded wo_a shape.
+    const unsigned int hdr_off = (unsigned int)(global_row * row_total);
     const float* x_group = x + (long long)group * K;
-    const float row_scale =
-        (float)__builtin_bit_cast(_Float16, *(const unsigned short*)hdr);
+#if defined(E8_GROUPED_BUFFER_LOADS)
+    const auto weight_rsrc = HIPFIRE_WEIGHT_RSRC(A);
+    #define GRP_U32(ptr, off) HIPFIRE_WEIGHT_LOAD_U32(weight_rsrc, (unsigned int)(off))
+#else
+    #define GRP_U32(ptr, off) (*(const unsigned int*)(ptr))
+#endif
+    const float row_scale = (float)__builtin_bit_cast(
+        _Float16, (unsigned short)(GRP_U32(hdr, hdr_off) & 0xffffu));
     const char* scale_base = hdr + 16;
     const char* code_base = hdr + 16 + scale_padded;
+    const unsigned int code_off = hdr_off + 16u + (unsigned int)scale_padded;
     const int block_in_group = tid >> 2;
     const int code_slot = tid & 3;
 
@@ -77,19 +94,19 @@ extern "C" __global__ void gemv_mfp4g32_e8_soa_grouped_gfx1151(
         const float scale0 =
             row_scale
             * cvt_e4m3_scale_to_f32(
-                *(const unsigned char*)(scale_base + block0))
+                (unsigned char)GRP_U32(scale_base + block0, hdr_off + 16u + (unsigned int)block0))
             * 0.88f;
         const float scale1 =
             row_scale
             * cvt_e4m3_scale_to_f32(
-                *(const unsigned char*)(scale_base + block1))
+                (unsigned char)GRP_U32(scale_base + block1, hdr_off + 16u + (unsigned int)block1))
             * 0.88f;
         const unsigned int code0 =
-            *(const unsigned int*)(
-                code_base + (long long)block0 * 16 + code_slot * 4);
+            GRP_U32(code_base + (long long)block0 * 16 + code_slot * 4,
+                    code_off + (unsigned int)block0 * 16u + (unsigned int)code_slot * 4u);
         const unsigned int code1 =
-            *(const unsigned int*)(
-                code_base + (long long)block1 * 16 + code_slot * 4);
+            GRP_U32(code_base + (long long)block1 * 16 + code_slot * 4,
+                    code_off + (unsigned int)block1 * 16u + (unsigned int)code_slot * 4u);
         const int base0 = group0 * 256 + tid * 8;
         const int base1 = base0 + 256;
 
@@ -123,11 +140,11 @@ extern "C" __global__ void gemv_mfp4g32_e8_soa_grouped_gfx1151(
         const float scale =
             row_scale
             * cvt_e4m3_scale_to_f32(
-                *(const unsigned char*)(scale_base + block))
+                (unsigned char)GRP_U32(scale_base + block, hdr_off + 16u + (unsigned int)block))
             * 0.88f;
         const unsigned int code =
-            *(const unsigned int*)(
-                code_base + (long long)block * 16 + code_slot * 4);
+            GRP_U32(code_base + (long long)block * 16 + code_slot * 4,
+                    code_off + (unsigned int)block * 16u + (unsigned int)code_slot * 4u);
         const int base = group0 * 256 + tid * 8;
         float points[8];
         e8_decode_index(code, points);
@@ -141,7 +158,6 @@ extern "C" __global__ void gemv_mfp4g32_e8_soa_grouped_gfx1151(
             + scale * points[6] * x_group[base + 6]
             + scale * points[7] * x_group[base + 7];
     }
-
     float acc = acc0 + acc1;
     for (int offset = 16; offset > 0; offset >>= 1) {
         acc += __shfl_down(acc, offset);

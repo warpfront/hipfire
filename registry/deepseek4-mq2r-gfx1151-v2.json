@@ -1,6 +1,6 @@
 {
   "schema": "hipfire.deepseek4_mq2r_product.v1",
-  "status": "frozen_tensor_recipe_route_v2_robustness_validated_competitive_fixture_pending",
+  "status": "frozen_tensor_recipe_route_v2_validated_t1_met_at_matched_top4_shipping_top6_profile_pending",
   "recipe": "deepseek4-mq2r-e8-p3-v1",
   "tensor_identity": {
     "meaning": "MQ2R names the exact P3 tensor map and standalone artifact; kernel, tape, PM4, and cache policy belong to separately versioned routes",
@@ -171,6 +171,80 @@
     "parallel_over_serial_bootstrap_95": [21.443182, 21.886364],
     "redline_admitted": false,
     "note": "This freezes route v2 tape and resource identity after the 8K robustness fix. The 2048/510 competitive fixture remains pending; this is not automatic Redline admission or full certification."
+      },
+      "competitive_measurement_top6": {
+        "date_utc": "2026-07-25",
+        "fixture": "exactly 2048 prompt tokens derived from coherent Halyard prose; 510 generated tokens; batch 1; temperature 0",
+        "prompt_source": "benchmarks/prompts/adaptive_kv_long_prefill.txt tiled to 2048 tokens with one complete tail copy and consumed as one stdin document",
+        "prompt_source_md5": "7ef3f606d2826a08e161bbeb4848b11e",
+        "binary_md5": "70044549a25a33d777ab86baf6557067",
+        "binary_sha256": "41c6e3cc1ae88d0ffa9410faad4d9de0d855c20925f2be80e762711ac114dc2c",
+        "kernel_cache_bundle_sha256": "3c50a8328cb6a03fd43818a8987fe77f1de906401753edb40d35bfaf275164f9",
+        "num_experts_per_tok": 6,
+        "fresh_process_samples_per_arm": 3,
+        "order": "ABBAAB",
+        "arms": {
+          "standalone_local_nvme_tok_s": [25.01, 24.89, 24.90],
+          "nas_overlay_tok_s": [25.00, 24.97, 25.04]
+        },
+        "medians": {
+          "standalone_local_nvme_tok_s": 24.90,
+          "nas_overlay_tok_s": 25.00,
+          "standalone_minus_overlay_percent": -0.4
+        },
+        "standalone_minus_overlay_bootstrap_95_percent": [-0.599042, 0.160192],
+        "decoded_output_md5": "65e473d239598dd9c90257996c426c9e",
+        "decoded_output_bit_exact_between_arms": true,
+        "decoded_output_human_coherent": true,
+        "route": {
+          "launch_count": 2320,
+          "unique_kernel_count": 32,
+          "sequence_hash_u64": "6907000390144547465",
+          "command_dwords_observed": [57794, 57795],
+          "packet_count": 1
+        },
+        "targets": {
+          "t1_25_31_tok_s_met": false,
+          "t2_32_tok_s_met": false,
+          "t3_50_tok_s_met": false
+        },
+        "note": "Shipping top-k 6 is 1.62% below T1. The earlier 24.94 legacy-prefix result is coherence-rejected because its output was a single-token attractor; its 5.9% bimodality does not reproduce on coherent prose. Static PM4 register compression makes encoded dword count vary by one while the logical launch tape remains identical."
+      },
+      "competitive_measurement_top4": {
+        "date_utc": "2026-07-25",
+        "fixture": "same coherent 2048/510 Halyard prose fixture as top-k 6",
+        "prompt_source_md5": "7ef3f606d2826a08e161bbeb4848b11e",
+        "binary_md5": "70044549a25a33d777ab86baf6557067",
+        "num_experts_per_tok": 4,
+        "quality_config": "benchmark-only matched configuration; shipping default remains 6",
+        "fresh_process_samples_per_arm": 3,
+        "order": "ABBAAB",
+        "arms": {
+          "standalone_local_nvme_tok_s": [26.94, 26.84, 26.86],
+          "nas_overlay_tok_s": [26.75, 26.96, 26.92]
+        },
+        "medians": {
+          "standalone_local_nvme_tok_s": 26.86,
+          "nas_overlay_tok_s": 26.92,
+          "standalone_minus_overlay_percent": -0.222883
+        },
+        "standalone_minus_overlay_bootstrap_95_percent": [-0.445104, 0.71028],
+        "decoded_output_md5": "a4b2767bf3ff788f5525da5b9d668d25",
+        "decoded_output_bit_exact_between_arms": true,
+        "decoded_output_human_coherent": true,
+        "route": {
+          "launch_count": 2320,
+          "unique_kernel_count": 32,
+          "sequence_hash_u64": "2541189520118612547",
+          "command_dwords_observed": [57794, 57795],
+          "packet_count": 1
+        },
+        "targets": {
+          "lucebox_top4_ar_tok_s": 25.31,
+          "standalone_minus_lucebox_percent": 6.124062,
+          "t1_25_31_tok_s_met": true
+        },
+        "note": "T1 is met at the competitor-matched top-k 4 configuration. This is not the shipping default and must never be blended with the top-k 6 result."
       }
     }
   },

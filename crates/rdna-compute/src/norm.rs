@@ -4153,6 +4153,15 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.arch == "gfx942"
+            && hipfire_config::developer_var("HIPFIRE_GFX942_ROTATE_UNFUSED")
+                .ok()
+                .as_deref()
+                == Some("1")
+        {
+            self.rmsnorm_f32(x, weight, x_plain, eps)?;
+            return self.rotate_x_mq(x_plain, x_rot, k);
+        }
         self.ensure_mq_signs()?;
         let nox = self.arch == "gfx1151"
             && (self.deepseek4_mq2r_route_v1
@@ -4230,6 +4239,15 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.arch == "gfx942"
+            && hipfire_config::developer_var("HIPFIRE_GFX942_ROTATE_UNFUSED")
+                .ok()
+                .as_deref()
+                == Some("1")
+        {
+            self.rmsnorm_f32(x, weight, x_plain, eps)?;
+            return self.rotate_x_mq_batched(x_plain, x_rot, k, batch_size);
+        }
         self.ensure_mq_signs()?;
         self.ensure_kernel(
             "fused_rmsnorm_mq_rotate_plain",
@@ -4376,6 +4394,15 @@ impl Gpu {
         swiglu_limit: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        if self.arch == "gfx942"
+            && hipfire_config::developer_var("HIPFIRE_GFX942_ROTATE_UNFUSED")
+                .ok()
+                .as_deref()
+                == Some("1")
+        {
+            self.deepseek4_silu_mul_clamp_f32(gate, up, x_rot, swiglu_limit)?;
+            return self.rotate_x_mq(x_rot, x_rot, k);
+        }
         self.ensure_mq_signs()?;
         self.ensure_kernel(
             "deepseek4_fused_silu_mul_clamp_mq_rotate",

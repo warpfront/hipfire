@@ -205,7 +205,11 @@ impl DeepseekV4Config {
             || wrapper
                 .get("hipfire_quant_recipe")
                 .and_then(|value| value.as_str())
-                .is_some_and(|recipe| recipe == "deepseek4-mq2r-e8-p3-v1");
+                .is_some_and(|recipe| recipe == "deepseek4-mq2r-e8-p3-v1")
+            || wrapper
+                .get("hipfire_derived_quant_recipe")
+                .and_then(|value| value.as_str())
+                .is_some_and(|recipe| recipe == "deepseek4-mq2r-mfp3-p1-gptq-v1");
         let mut config = DeepseekV4Config {
             vocab_size: raw.vocab_size,
             hidden_size: raw.hidden_size,
@@ -1217,7 +1221,6 @@ pub struct DeepseekV4State {
     /// LM head output logits `[vocab_size = 129280]` F32. Output of
     /// `head_weight @ final_norm`.
     pub logits: Option<rdna_compute::GpuTensor>,
-
     /// FWHT-rotated `final_norm` for the MQ4 head GEMV. Shape `[hidden]`.
     pub final_norm_rot: Option<rdna_compute::GpuTensor>,
 

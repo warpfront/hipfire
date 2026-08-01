@@ -10,7 +10,11 @@ fn pack_q8_0(w: &[f32], m: usize, k: usize) -> Vec<u8> {
         for bi in 0..blocks {
             let base = row * k + bi * 32;
             let slice = &w[base..base + 32];
-            let amax = slice.iter().map(|v| v.abs()).fold(0.0f32, f32::max).max(1e-8);
+            let amax = slice
+                .iter()
+                .map(|v| v.abs())
+                .fold(0.0f32, f32::max)
+                .max(1e-8);
             let d = amax / 127.0;
             let off = (row * blocks + bi) * 34;
             // pack fp16 scale via software
@@ -46,7 +50,10 @@ fn pack_q8_0(w: &[f32], m: usize, k: usize) -> Vec<u8> {
 }
 fn main() {
     let mut gpu = Gpu::init().expect("gpu");
-    assert_eq!(gpu.arch, "gfx1030", "this channel test is exact-gfx1030 only");
+    assert_eq!(
+        gpu.arch, "gfx1030",
+        "this channel test is exact-gfx1030 only"
+    );
     println!("arch={}", gpu.arch);
     // Shapes typical of LA qkv / router on A3B
     let cases = [
@@ -116,7 +123,8 @@ fn main() {
                 off += take;
             }
         }
-        gpu.gemm_q8_0_mmq_gfx1030(&w_gpu, &x_gpu, &y_mmq, m, k, n).unwrap();
+        gpu.gemm_q8_0_mmq_gfx1030(&w_gpu, &x_gpu, &y_mmq, m, k, n)
+            .unwrap();
         gpu.hip.device_synchronize().unwrap();
         let leg = gpu.download_f32(&y_leg).unwrap();
         let mmq = gpu.download_f32(&y_mmq).unwrap();
@@ -131,18 +139,18 @@ fn main() {
         }
         let rms = (sum_sq / leg.len() as f32).sqrt();
         let rel = rms / (sum_ref_sq / leg.len() as f32).sqrt().max(1e-8);
-        println!(
-            "m={m:<5} k={k:<5} n={n:<4}  max_abs={max_abs:.6} rms={rms:.6} rel={rel:.6}"
-        );
+        println!("m={m:<5} k={k:<5} n={n:<4}  max_abs={max_abs:.6} rms={rms:.6} rel={rel:.6}");
         // timing
         for _ in 0..3 {
-            gpu.gemm_q8_0_mmq_gfx1030(&w_gpu, &x_gpu, &y_mmq, m, k, n).unwrap();
+            gpu.gemm_q8_0_mmq_gfx1030(&w_gpu, &x_gpu, &y_mmq, m, k, n)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let t0 = Instant::now();
         let trials = 20;
         for _ in 0..trials {
-            gpu.gemm_q8_0_mmq_gfx1030(&w_gpu, &x_gpu, &y_mmq, m, k, n).unwrap();
+            gpu.gemm_q8_0_mmq_gfx1030(&w_gpu, &x_gpu, &y_mmq, m, k, n)
+                .unwrap();
         }
         gpu.hip.device_synchronize().unwrap();
         let us = t0.elapsed().as_secs_f64() / trials as f64 * 1e6;
@@ -171,7 +179,10 @@ fn main() {
         }
         gpu.hip.device_synchronize().unwrap();
         let us_leg = t1.elapsed().as_secs_f64() / trials as f64 * 1e6;
-        println!("  time mmq={us:.1}us  legacy={us_leg:.1}us  speedup={:.1}x", us_leg / us);
+        println!(
+            "  time mmq={us:.1}us  legacy={us_leg:.1}us  speedup={:.1}x",
+            us_leg / us
+        );
         std::mem::forget(w_gpu);
         std::mem::forget(x_gpu);
         std::mem::forget(y_leg);

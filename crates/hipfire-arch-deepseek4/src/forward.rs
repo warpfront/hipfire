@@ -283,6 +283,19 @@ mod config_cache {
                         != Some("0")
                 }))
     }
+    /// `HIPFIRE_GFX942_E8_WO_GROUPED=1` — collapse DeepSeek4's eight O-LoRA
+    /// E8-SoA GEMVs into one gfx942 wave64 launch. Default-off until the
+    /// full-model AR A/B clears.
+    pub(super) fn e8_wo_grouped_gfx942_on(arch: &str) -> bool {
+        static V: OnceLock<bool> = OnceLock::new();
+        arch == "gfx942"
+            && *V.get_or_init(|| {
+                hipfire_config::developer_var("HIPFIRE_GFX942_E8_WO_GROUPED")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+            })
+    }
     /// `HIPFIRE_DEEPSEEK4_E8_U4` — use the four-group-unrolled E8-SoA
     /// decode schedule for DeepSeek V4 dense projections on gfx1151. This is
     /// deliberately architecture-owned: the same schedule regresses smaller
@@ -1268,7 +1281,6 @@ fn compressor_forward_impl(
     // ---- Decode / graph-captured path (state-buffer-driven slots) ----
     let (ring_slot_buf, commit_slot_buf) =
         attn_buf_view.expect("attn_buf_view populated when !pre_batched.is_some()");
-
     // Ring write — unconditional within graph, no-op on -1 sentinel.
     gpu.state_ring_write_f32_buf(kv_buf, kv_state, &ring_slot_buf, proj_dim as i32)
         .map_err(|e| format!("comp ring write kv l{layer_idx}: {e:?}"))?;
@@ -5524,7 +5536,21 @@ fn attn_stub(
             .map_err(|e| format!("rotate attn_out batched l{layer_idx}: {e:?}"))?;
     }
 
-    if wo_a.dtype == DType::MFP4G32E8SOA && config_cache::e8_wo_grouped_on(&gpu.arch, cfg.mq2r) {
+    if wo_a.dtype == DType::MFP4G32E8SOA
+        && config_cache::e8_wo_grouped_gfx942_on(&gpu.arch)
+    {
+        gpu.gemv_mfp4g32_e8_soa_grouped_gfx942(
+            wo_a,
+            attn_out_raw_rot,
+            wo_a_out,
+            n_groups,
+            o_lora_rank,
+            per_group_in,
+        )
+        .map_err(|e| format!("grouped gfx942 E8 wo_a l{layer_idx}: {e:?}"))?;
+    } else if wo_a.dtype == DType::MFP4G32E8SOA
+        && config_cache::e8_wo_grouped_on(&gpu.arch, cfg.mq2r)
+    {
         gpu.gemv_mfp4g32_e8_soa_grouped_gfx1151(
             wo_a,
             attn_out_raw_rot,

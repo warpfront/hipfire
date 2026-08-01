@@ -1246,6 +1246,86 @@ fn pm4_single_ib_reorder_from_config(device_name: &str) -> Option<usize> {
         .flatten()
 }
 
+fn report_gfx1151_same_symbol_bundle_census(
+    device_name: &str,
+    recorded: &[RecordedHipLaunch],
+    order: &[usize],
+    reorder_window: Option<usize>,
+) {
+    let enabled = hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GFX1151_BUNDLE_CENSUS")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "on"));
+    if !enabled
+        || !device_name.eq_ignore_ascii_case("gfx1151")
+        || recorded.len() != 2320
+        || replay_sequence_hash(recorded) != 0x3cf7_fbbf_fe4c_159a
+        || reorder_window != Some(64)
+    {
+        return;
+    }
+    let detail_symbol =
+        hipfire_config::process_value("HIPFIRE_REPLAY_PM4_GFX1151_BUNDLE_CENSUS_DETAIL");
+
+    let mut by_symbol = BTreeMap::<String, (usize, usize, usize, usize)>::new();
+    let mut run = Vec::<usize>::new();
+    let flush = |run: &mut Vec<usize>,
+                 by_symbol: &mut BTreeMap<String, (usize, usize, usize, usize)>| {
+        if run.len() < 2 {
+            run.clear();
+            return;
+        }
+        let symbol = &recorded[run[0]].kernel;
+        if detail_symbol.as_deref() == Some(symbol.as_str()) {
+            eprintln!(
+                "[redline] gfx1151 bundle census detail: symbol={symbol} recorded_indices={run:?}"
+            );
+        }
+        let entry = by_symbol.entry(symbol.clone()).or_default();
+        entry.0 += 1;
+        entry.1 += run.len();
+        entry.2 += run.len() - 1;
+        entry.3 = entry.3.max(run.len());
+        run.clear();
+    };
+
+    for index in order.iter().copied() {
+        let launch = &recorded[index];
+        let compatible = run.first().is_some_and(|first| {
+            let first = &recorded[*first];
+            first.kernel == launch.kernel
+                && first.grid == launch.grid
+                && first.block == launch.block
+                && first.shared_mem == launch.shared_mem
+                && run
+                    .iter()
+                    .all(|prior| launches_are_independent(&recorded[*prior], launch))
+        });
+        if !compatible {
+            flush(&mut run, &mut by_symbol);
+        }
+        run.push(index);
+    }
+    flush(&mut run, &mut by_symbol);
+
+    let mut total_groups = 0usize;
+    let mut total_launches = 0usize;
+    let mut total_saved = 0usize;
+    for (symbol, (groups, launches, saved, max_width)) in &by_symbol {
+        total_groups += groups;
+        total_launches += launches;
+        total_saved += saved;
+        eprintln!(
+            "[redline] gfx1151 bundle census: symbol={symbol} groups={groups} \
+             launches={launches} removable_dispatches={saved} max_width={max_width}"
+        );
+    }
+    eprintln!(
+        "[redline] gfx1151 bundle census total: groups={total_groups} \
+         launches={total_launches} removable_dispatches={total_saved} \
+         dispatch_floor_us={:.3}",
+        total_saved as f64 * 1.77,
+    );
+}
+
 /// Permute the recorded launch order so mutually independent launches become
 /// adjacent, widening the antichains `pm4_phase_plan` can form.
 ///
@@ -3330,6 +3410,12 @@ impl ReplayController {
                     order
                 }
             };
+            report_gfx1151_same_symbol_bundle_census(
+                device.name(),
+                recorded,
+                &order,
+                reorder_window,
+            );
             let mut commands = Pm4Commands::new(
                 pm4_architecture,
                 self.pm4_register_policy,
@@ -4251,6 +4337,18 @@ mod tests {
         let certifications = BTreeMap::from([(artifact.clone(), certification)]);
         launch.artifact = Some(artifact);
         assert!(radiowave_vmem_only_consumer(&certifications, &launch));
+        assert!(pm4_vmem_acquire_enabled(
+            Pm4Architecture::Gfx11,
+            true,
+            &certifications,
+            &launch,
+        ));
+        assert!(!pm4_vmem_acquire_enabled(
+            Pm4Architecture::Gfx12,
+            true,
+            &certifications,
+            &launch,
+        ));
         launch.kernel = "unknown_kernel".to_owned();
         assert!(!radiowave_vmem_only_consumer(&certifications, &launch));
     }
@@ -4276,21 +4374,6 @@ mod tests {
             pointer_effects("hc_input_map_4stream").map(|effects| effects[1].mode),
             Some(RecordedAccessMode::Read)
         );
-    }
-
-    #[test]
-    fn gfx12_never_reports_gfx11_vmem_acquire() {
-        let kernel = "fused_rmsnorm_mq_rotate";
-        assert!(pm4_vmem_acquire_enabled(
-            Pm4Architecture::Gfx11,
-            true,
-            kernel
-        ));
-        assert!(!pm4_vmem_acquire_enabled(
-            Pm4Architecture::Gfx12,
-            true,
-            kernel
-        ));
     }
 
     #[test]

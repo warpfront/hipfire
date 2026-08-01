@@ -368,6 +368,10 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DEBUG_BATCH` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_DEEPSEEK4_AR` | crates/hipfire-arch-deepseek4/examples/dspark_bench.rs |
 | `HIPFIRE_DEEPSEEK4_ATTN` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs, crates/hipfire-arch-deepseek4/src/forward.rs |
+| `HIPFIRE_DEEPSEEK4_BENCH_EXPERTS_PER_TOK` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs |
+| `HIPFIRE_DEEPSEEK4_BENCH_PROMPT_TOKENS` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs |
+| `HIPFIRE_DEEPSEEK4_BENCH_STDIN_ALL` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs |
+| `HIPFIRE_DEEPSEEK4_BENCH_TILE_PROMPT` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs |
 | `HIPFIRE_DEEPSEEK4_ATTN_DEBUG_BISECT` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_ATTN_PER_POS` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_ATTN_TOPK_DIRECT` | crates/hipfire-arch-deepseek4/src/forward.rs |
@@ -392,6 +396,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_DEEPSEEK4_GEN_TOKENS` | crates/hipfire-arch-deepseek4/examples/deepseek4_chat.rs |
 | `HIPFIRE_DEEPSEEK4_GRAPH` | crates/hipfire-arch-deepseek4/src/deepseek4.rs, crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_HFQ4_WMMA` | crates/hipfire-arch-deepseek4/src/forward.rs |
+| `HIPFIRE_DEEPSEEK4_INDEXER_TOPK_PARALLEL` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_DEEPSEEK4_INDEXER_TOPK_SERIAL` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_DEEPSEEK4_INDEXER_WMMA` | crates/hipfire-arch-deepseek4/src/forward.rs |
 | `HIPFIRE_DEEPSEEK4_LOAD_DSPARK` | crates/hipfire-runtime/src/loader_api.rs |
@@ -627,6 +632,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GFX12_WEIGHT_CPOL_AUX` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX12_WEIGHT_LOAD_POLICY` | crates/rdna-compute/src/feature_flags.rs |
+| `HIPFIRE_GFX1151_E8_BUFFER` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX942_GEMV_V2` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX942_GEMV_V3` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX942_LDS_GEMV` | crates/rdna-compute/src/feature_flags.rs |

@@ -1521,6 +1521,14 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_GFX12_WEIGHT_LOAD_POLICY",
         "Select the gfx12 compiler weight-load policy."
     ),
+    process_auto_bool_field!(
+        "kernel.gfx1151_e8_buffer",
+        "gfx1151_e8_buffer",
+        Kernel,
+        false,
+        "HIPFIRE_GFX1151_E8_BUFFER",
+        "Override the accepted gfx1151 MQ2R temporal raw-buffer E8 U4 route."
+    ),
     diagnostic_field!(
         "diagnostic.kernel.gfx942_mfma_prefill",
         "gfx942_mfma_prefill",

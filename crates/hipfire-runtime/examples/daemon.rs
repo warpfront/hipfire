@@ -1256,6 +1256,8 @@ fn redline_bench_decode_deepseek4(
                 "packets": identity.packet_count,
                 "queue_id": identity.queue_id,
                 "command_dwords": identity.command_dwords,
+                "queues": identity.queue_count,
+                "phases": identity.phase_count,
             })
         });
         let sequence = gpu.replay.capture_summary();
@@ -18302,6 +18304,17 @@ fn generate_deepseek4(
         let _ = stdout.flush();
         return;
     }
+
+    // DS4 returns into this arch-owned producer before the shared Qwen path
+    // emits its stream prologue. The beta client fails closed unless the first
+    // lifecycle event is the correlated gen_start for this attempt.
+    let started_in_think = matches!(think_mode, ThinkMode::High | ThinkMode::Max);
+    emit_gen_start(
+        stdout,
+        id,
+        started_in_think,
+        ds4_gen_start_contract_version(),
+    );
 
     if std::env::var("HIPFIRE_DEEPSEEK4_DUMP_PROMPT")
         .ok()

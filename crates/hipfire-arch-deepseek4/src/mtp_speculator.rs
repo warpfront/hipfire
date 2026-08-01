@@ -173,56 +173,89 @@ impl MtpDrafter for Deepseek4MtpDrafter {
             None => None,
         };
 
-        let bundle = Self::bundle(target)?;
-        let Deepseek4Bundle {
-            config,
-            weights,
-            state,
-            ..
-        } = bundle;
+        // Snapshot the target's recurrent compressor rings before either the
+        // MTP draft loop or the batched trunk verify mutates model state. The
+        // MTP layer itself is SWA-only, but the trunk verify carries recurrent
+        // compressed-KV rings and must be rewound after a partial accept.
+        let mut scratch = target.new_spec_scratch(gpu, k + 1)?;
 
-        // SAFETY: `last_hidden_ref` is a raw pointer to `state.mtp_last_hidden`'s
-        // allocation, which lives in stable VRAM for the duration of the call.
-        // We need to read `state.mtp_last_hidden` (as `&`) while `state` is
-        // simultaneously borrowed `&mut` by `speculative_decode_step_with_pbs`.
-        // The step function only WRITES to `state.mtp_last_hidden` (refreshing
-        // it from the verify pass), never frees or reallocates the backing
-        // buffer — so the pointer remains valid across the call. This mirrors
-        // the raw-pointer pattern in daemon.rs generate_deepseek4 (line 9683/9708).
-        let last_hidden_ref: Option<*const rdna_compute::GpuTensor> =
-            state.mtp_last_hidden.as_ref().map(|t| t as *const _);
-
-        let lh: Option<&rdna_compute::GpuTensor> =
-            unsafe { last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref()) };
-
-        let r = match grammar {
-            Some(g) => speculative_decode_step_with_pbs_grammar(
+        let step_result = {
+            let bundle = match Self::bundle(target) {
+                Ok(bundle) => bundle,
+                Err(e) => {
+                    scratch.free(gpu);
+                    return Err(e);
+                }
+            };
+            let Deepseek4Bundle {
                 config,
                 weights,
                 state,
-                gpu,
-                pbs,
-                seed,
-                position as u32,
-                lh,
-                k,
-                &mut g.matcher,
-                &g.decoded_vocab[..],
-                &mut g.grammar_mask,
-            ),
-            None => speculative_decode_step_with_pbs(
-                config,
-                weights,
-                state,
-                gpu,
-                pbs,
-                seed,
-                position as u32,
-                lh,
-                k,
-            ),
-        }
-        .map_err(|e| format!("mtp step: {e}"))?;
+                ..
+            } = bundle;
+
+            // SAFETY: `last_hidden_ref` is a raw pointer to
+            // `state.mtp_last_hidden`'s allocation, which lives in stable VRAM
+            // for the duration of the call. The step refreshes the contents but
+            // does not replace the backing allocation.
+            let last_hidden_ref: Option<*const rdna_compute::GpuTensor> =
+                state.mtp_last_hidden.as_ref().map(|t| t as *const _);
+            let lh: Option<&rdna_compute::GpuTensor> = unsafe {
+                last_hidden_ref.and_then(|p| (p as *const rdna_compute::GpuTensor).as_ref())
+            };
+
+            match grammar {
+                Some(g) => speculative_decode_step_with_pbs_grammar(
+                    config,
+                    weights,
+                    state,
+                    gpu,
+                    pbs,
+                    seed,
+                    position as u32,
+                    lh,
+                    k,
+                    &mut g.matcher,
+                    &g.decoded_vocab[..],
+                    &mut g.grammar_mask,
+                ),
+                None => speculative_decode_step_with_pbs(
+                    config,
+                    weights,
+                    state,
+                    gpu,
+                    pbs,
+                    seed,
+                    position as u32,
+                    lh,
+                    k,
+                ),
+            }
+        };
+        let r = match step_result {
+            Ok(r) => r,
+            Err(e) => {
+                scratch.free(gpu);
+                return Err(format!("mtp step: {e}"));
+            }
+        };
+
+        // `commit_prefix` needs the full verify-window length to distinguish a
+        // partial accept, but replay consumes only `[seed, accepted drafts...]`.
+        // The rejected tail values are therefore sentinels; they are never read.
+        let mut verify_inputs = Vec::with_capacity(k + 1);
+        verify_inputs.push(seed);
+        verify_inputs.extend(r.accepted_tokens.iter().take(r.n_accepted).copied());
+        verify_inputs.resize(k + 1, u32::MAX);
+        let commit_result = target.commit_prefix(
+            gpu,
+            &verify_inputs,
+            r.n_accepted,
+            position,
+            scratch.as_mut(),
+        );
+        scratch.free(gpu);
+        commit_result.map_err(|e| format!("mtp commit: {e}"))?;
 
         debug_assert!(
             r.accepted_tokens.len() <= k + 1,

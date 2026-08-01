@@ -273,7 +273,7 @@ fn main() {
         }
         let input_norm = hipfire_runtime::tokenizer::maybe_normalize_prompt(input);
         let input: &str = &input_norm;
-    if hipfire_runtime::config::get().prompt_token_heat {
+        if hipfire_runtime::config::get().prompt_token_heat {
             tokenizer.dump_prompt_heat(input);
         }
 

@@ -6,6 +6,9 @@
 //! Supports pre-compiled .hsaco blobs for deployment without ROCm SDK.
 
 use hip_bridge::HipResult;
+use radiowave::{
+    CodeObjectCertification, Compiler as RadiowaveCompiler, ExistingCodeObjectRequest, Wavefront,
+};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
@@ -542,6 +545,43 @@ impl KernelCompiler {
         )
     }
 
+    /// Bind an exact gfx1151 code object to Radiowave's fail-closed cache
+    /// classification. Missing inspection tooling is non-fatal: replay will
+    /// reject a missing or stale manifest and retain the conservative acquire.
+    fn ensure_radiowave_certification(&self, name: &str, source: &str, object: &Path) {
+        if self.arch != "gfx1151" {
+            return;
+        }
+        let manifest = object.with_extension("radiowave.json");
+        if let (Ok(code), Ok(encoded)) = (std::fs::read(object), std::fs::read_to_string(&manifest))
+        {
+            if CodeObjectCertification::from_json(&code, &encoded).is_ok() {
+                return;
+            }
+        }
+
+        let source_path = self.cache_dir.join(format!("{name}.hip"));
+        if let Err(error) = std::fs::write(&source_path, source) {
+            eprintln!(
+                "  {name}: Radiowave certification skipped: cannot write {}: {error}",
+                source_path.display()
+            );
+            return;
+        }
+        let request = ExistingCodeObjectRequest::new(&source_path, object, &self.arch)
+            .wavefront(Wavefront::Wave32)
+            .command(vec![
+                "hipfire::KernelCompiler".to_owned(),
+                name.to_owned(),
+                self.arch.clone(),
+                self.extra_flags.clone(),
+            ])
+            .manifest(&manifest);
+        if let Err(error) = RadiowaveCompiler.certify_existing(&request) {
+            eprintln!("  {name}: Radiowave certification unavailable: {error}");
+        }
+    }
+
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
     /// Tries pre-compiled blob first (with hash validation), falls back to hipcc.
     pub fn compile(&mut self, name: &str, source: &str) -> HipResult<&Path> {
@@ -569,6 +609,7 @@ impl KernelCompiler {
                 if let Some(cold) = self.writeback_dir().map(Path::to_path_buf) {
                     writeback_cold(name, &precompiled, &src_hash, &cold, false);
                 }
+                self.ensure_radiowave_certification(name, source, &precompiled);
                 self.compiled.insert(name.to_string(), precompiled);
                 return Ok(&self.compiled[name]);
             }
@@ -580,6 +621,7 @@ impl KernelCompiler {
                     eprintln!(
                         "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
                     );
+                    self.ensure_radiowave_certification(name, source, &precompiled);
                     self.compiled.insert(name.to_string(), precompiled);
                     return Ok(&self.compiled[name]);
                 }
@@ -595,6 +637,7 @@ impl KernelCompiler {
             if let Some(dir) = self.writeback_dir() {
                 writeback_cold(name, &obj_path, &src_hash, dir, false);
             }
+            self.ensure_radiowave_certification(name, source, &obj_path);
             self.compiled.insert(name.to_string(), obj_path);
             return Ok(&self.compiled[name]);
         }
@@ -608,6 +651,7 @@ impl KernelCompiler {
                 eprintln!(
                     "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
                 );
+                self.ensure_radiowave_certification(name, source, &obj_path);
                 self.compiled.insert(name.to_string(), obj_path);
                 return Ok(&self.compiled[name]);
             }
@@ -636,6 +680,7 @@ impl KernelCompiler {
             writeback_cold(name, &obj_path, &src_hash, dir, false);
         }
 
+        self.ensure_radiowave_certification(name, source, &obj_path);
         self.compiled.insert(name.to_string(), obj_path);
         Ok(&self.compiled[name])
     }
@@ -677,6 +722,7 @@ impl KernelCompiler {
             writeback_cold(name, &obj_path, &src_hash, &dir, true);
         }
 
+        self.ensure_radiowave_certification(name, source, &obj_path);
         self.compiled.insert(name.to_string(), obj_path.clone());
         Ok(obj_path)
     }
@@ -1001,6 +1047,7 @@ impl KernelCompiler {
                     if let Some(cold) = self.writeback_dir().map(Path::to_path_buf) {
                         writeback_cold(name, &precompiled, &src_hash, &cold, false);
                     }
+                    self.ensure_radiowave_certification(name, source, &precompiled);
                     self.compiled.insert(name.to_string(), precompiled);
                     continue;
                 }
@@ -1013,6 +1060,7 @@ impl KernelCompiler {
                     eprintln!(
                         "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
                     );
+                    self.ensure_radiowave_certification(name, source, &precompiled);
                     self.compiled.insert(name.to_string(), precompiled);
                     continue;
                 }
@@ -1026,6 +1074,7 @@ impl KernelCompiler {
                 if let Some(dir) = self.writeback_dir() {
                     writeback_cold(name, &obj_path, &src_hash, dir, false);
                 }
+                self.ensure_radiowave_certification(name, source, &obj_path);
                 self.compiled.insert(name.to_string(), obj_path);
                 continue;
             }
@@ -1038,6 +1087,7 @@ impl KernelCompiler {
                     eprintln!(
                         "           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes."
                     );
+                    self.ensure_radiowave_certification(name, source, &obj_path);
                     self.compiled.insert(name.to_string(), obj_path);
                     continue;
                 }
@@ -1100,7 +1150,7 @@ impl KernelCompiler {
                     let marker = if result.is_ok() { "✓" } else { "✗" };
                     eprintln!("  [{i:>3}/{n}] {marker} {name}");
                     let obj_path = cache_dir.join(format!("{name}.hsaco"));
-                    (name, obj_path, result)
+                    (name, source, obj_path, result)
                 });
                 handle
             })
@@ -1108,9 +1158,10 @@ impl KernelCompiler {
 
         let mut errors = Vec::new();
         for handle in results {
-            let (name, obj_path, result) = handle.join().unwrap();
+            let (name, source, obj_path, result) = handle.join().unwrap();
             match result {
                 Ok(()) => {
+                    self.ensure_radiowave_certification(&name, &source, &obj_path);
                     self.compiled.insert(name, obj_path);
                 }
                 Err(e) => errors.push(e),

@@ -12,6 +12,7 @@
 //! Usage:
 //!   deepseek4_perplexity <model.hfq> <corpus.txt> \
 //!       [--ctx 2048] [--warmup 8] [--offset 0] [--dump-logits <path>] \
+//!       [--dump-head-imatrix <path>] [--dump-head-acts <path>] \
 //!       [--dump-dense-acts <directory>]
 //!
 //! Set `HIPFIRE_DEEPSEEK4_REAP_KEEPMAP=<dir>` to evaluate the REAP-pruned
@@ -45,6 +46,8 @@ fn main() {
     let mut warmup: usize = 8;
     let mut offset: usize = 0;
     let mut dump_logits: Option<String> = None;
+    let mut dump_head_imatrix: Option<String> = None;
+    let mut dump_head_acts: Option<String> = None;
     let mut dump_dense_acts: Option<String> = None;
     while let Some(flag) = args.next() {
         let val = args.next().expect("flag missing value");
@@ -53,6 +56,8 @@ fn main() {
             "--warmup" => warmup = val.parse().unwrap(),
             "--offset" => offset = val.parse().unwrap(),
             "--dump-logits" => dump_logits = Some(val),
+            "--dump-head-imatrix" => dump_head_imatrix = Some(val),
+            "--dump-head-acts" => dump_head_acts = Some(val),
             "--dump-dense-acts" => dump_dense_acts = Some(val),
             _ => panic!("unknown flag: {flag}"),
         }
@@ -69,6 +74,11 @@ fn main() {
         }
         eprintln!("Dumping DeepSeek P1 dense activations to {path}");
     }
+    // This is a teacher-forced target evaluator. Loading either speculative
+    // sidecar wastes unified memory and contaminates the AR quality fixture.
+    unsafe {
+        std::env::set_var("HIPFIRE_DEEPSEEK4_LOAD_MTP", "0");
+    }
 
     let want_bytes = (offset + ctx_len) * 8;
     let raw = std::fs::read(&corpus_path).expect("read corpus");
@@ -81,11 +91,19 @@ fn main() {
     );
 
     let mut hfq = HfqFile::open(Path::new(&model_path)).expect("open model");
-    let cfg = DeepseekV4::config_from_hfq(&hfq).expect("config");
+    let overlay_active = hfq.has_overlay();
+    if std::env::var("HIPFIRE_REQUIRE_REAP_OVERLAY").as_deref() == Ok("1") && !overlay_active {
+        panic!(
+            "HIPFIRE_REQUIRE_REAP_OVERLAY=1 but no overlay attached; \
+             refusing to score the unchanged base"
+        );
+    }
+    let mut cfg = DeepseekV4::config_from_hfq(&hfq).expect("config");
+    cfg.load_dspark = false;
     let tokenizer =
         Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer from HFQ metadata");
     eprintln!(
-        "Model arch_id={} n_layers={} n_routed_experts={} (keep-map {})",
+        "Model arch_id={} n_layers={} n_routed_experts={} (keep-map {}, overlay {})",
         DeepseekV4::arch_id(),
         cfg.num_hidden_layers,
         cfg.n_routed_experts,
@@ -94,6 +112,7 @@ fn main() {
         } else {
             "off"
         },
+        if overlay_active { "ACTIVE" } else { "off" },
     );
 
     eprintln!("Tokenizing...");
@@ -141,11 +160,54 @@ fn main() {
     let mut total_nll: f64 = 0.0;
     let mut scored: usize = 0;
     let mut vocab_seen: u32 = 0;
+    let mut head_sumsq = dump_head_imatrix
+        .as_ref()
+        .map(|_| vec![0.0f64; cfg.hidden_size]);
+    let mut head_acts = dump_head_acts.as_ref().map(|path| {
+        let mut writer = std::io::BufWriter::new(
+            std::fs::File::create(path).expect("create head activation dump"),
+        );
+        writer
+            .write_all(&((window.len() - 1) as u32).to_le_bytes())
+            .unwrap();
+        writer
+            .write_all(&(cfg.hidden_size as u32).to_le_bytes())
+            .unwrap();
+        eprintln!("Dumping pre-rotation head activations to {path}");
+        writer
+    });
+    let mut head_rows = 0u32;
     let t0 = Instant::now();
 
     for (pos, &tok) in window.iter().enumerate().take(window.len() - 1) {
         let logits = decode_step(&cfg, &weights, &mut state, &mut gpu, tok, pos as u32)
             .expect("decode_step");
+        if let Some(writer) = head_acts.as_mut() {
+            // GPTQ rotates the captured Hessian itself, so persist the raw
+            // pre-FWHT activation consumed by the logical output matrix.
+            let final_norm = state.final_norm.as_ref().expect("final_norm");
+            let activation = gpu
+                .download_f32(final_norm)
+                .expect("download pre-rotation head activation");
+            writer.write_all(bytemuck_cast(&activation)).unwrap();
+        }
+        if let Some(sumsq) = head_sumsq.as_mut() {
+            // E8 head weights live in the FWHT-rotated domain. The baseline
+            // Q8 head does not otherwise populate final_norm_rot, so rotate
+            // explicitly after the logits have been produced and accumulate
+            // the calibration importance in the exact domain consumed by E8.
+            let final_norm = state.final_norm.as_ref().expect("final_norm");
+            let final_norm_rot = state.final_norm_rot.as_ref().expect("final_norm_rot");
+            gpu.rotate_x_mq(final_norm, final_norm_rot, cfg.hidden_size)
+                .expect("rotate head calibration activation");
+            let activation = gpu
+                .download_f32(final_norm_rot)
+                .expect("download head calibration activation");
+            for (acc, value) in sumsq.iter_mut().zip(activation) {
+                *acc += (value as f64) * (value as f64);
+            }
+            head_rows += 1;
+        }
         if pos < warmup {
             continue;
         }
@@ -193,6 +255,21 @@ fn main() {
             }
         }
     }
+    if let (Some(path), Some(sumsq)) = (dump_head_imatrix.as_ref(), head_sumsq.as_ref()) {
+        write_head_imatrix(Path::new(path), sumsq, head_rows).expect("write head imatrix");
+        eprintln!(
+            "Wrote rotated head imatrix: {path} (hidden={} rows={head_rows})",
+            sumsq.len()
+        );
+    }
+    if let (Some(path), Some(mut writer)) = (dump_head_acts.as_ref(), head_acts) {
+        writer.flush().expect("flush head activation dump");
+        eprintln!(
+            "Wrote pre-rotation head activations: {path} (hidden={} rows={})",
+            cfg.hidden_size,
+            window.len() - 1
+        );
+    }
     hipfire_arch_deepseek4::forward::finish_dense_activation_dump()
         .expect("finalize DeepSeek P1 dense activation dump");
 
@@ -208,7 +285,14 @@ fn main() {
     println!("Corpus:   {corpus_path}");
     println!(
         "Variant:  {}",
-        if cfg.reap_keep.is_some() {
+        if cfg.mq2r {
+            format!("MQ2R target-only ({} experts/layer)", cfg.n_routed_experts)
+        } else if overlay_active {
+            format!(
+                "E8 surgery overlay ({} experts/layer)",
+                cfg.n_routed_experts
+            )
+        } else if cfg.reap_keep.is_some() {
             format!("REAP keep-map ({} experts/layer)", cfg.n_routed_experts)
         } else {
             format!("full ({} experts/layer)", cfg.n_routed_experts)
@@ -226,6 +310,18 @@ fn main() {
         elapsed,
         scored as f64 / elapsed.max(1e-9)
     );
+}
+
+/// DS4HIM01 | hidden:u32 | rows:u32 | sum_x2:[f64; hidden].
+fn write_head_imatrix(path: &Path, sumsq: &[f64], rows: u32) -> std::io::Result<()> {
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+    writer.write_all(b"DS4HIM01")?;
+    writer.write_all(&(sumsq.len() as u32).to_le_bytes())?;
+    writer.write_all(&rows.to_le_bytes())?;
+    for value in sumsq {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    writer.flush()
 }
 
 fn neg_log_softmax_at(logits: &[f32], target: usize) -> f32 {

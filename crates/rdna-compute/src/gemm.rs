@@ -12125,7 +12125,20 @@ impl Gpu {
         m_total: usize,
         x_src_rows: usize,
     ) -> HipResult<()> {
-        if self.arch_caps.is_gfx1151() && m % 16 == 0 && k % 256 == 0 {
+        if self.arch_caps.is_gfx942() && m % 16 == 0 && k % 256 == 0 {
+            self.gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942(
+                expert_weight_ptrs,
+                expert_tile_ids,
+                sorted_slot_index,
+                x_src,
+                y_grouped,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                x_src_rows,
+            )
+        } else if self.arch_caps.is_gfx1151() && m % 16 == 0 && k % 256 == 0 {
             self.gemm_mq2g256_lloyd_moe_grouped_mmq_gfx1151(
                 expert_weight_ptrs,
                 expert_tile_ids,
@@ -12152,6 +12165,93 @@ impl Gpu {
                 x_src_rows,
             )
         }
+    }
+
+    /// gfx942/CDNA3 grouped MQ2-Lloyd MoE prefill using native wave64 MFMA.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx942() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942 requires gfx942; current arch = {}",
+                    self.arch
+                ),
+            ));
+        }
+        debug_assert_eq!(m % 16, 0);
+        debug_assert_eq!(k % 256, 0);
+        let kernel_name = "gemm_mq2g256_lloyd_moe_grouped_mfma_gfx942";
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_MQ2G256_LLOYD_MOE_GROUPED_MFMA_GFX942_SRC,
+            kernel_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x_src, x_src_rows * k)?;
+
+        let ep = expert_weight_ptrs.buf.as_ptr();
+        let tp = expert_tile_ids.buf.as_ptr();
+        let sp = sorted_slot_index.buf.as_ptr();
+        let xp = x_f16_ptr;
+        let yp = y_grouped.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let xrd_val = x_row_div as i32;
+        let mt_val = m_total as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ep as *const _ as *mut c_void,
+            &tp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &xrd_val as *const _ as *mut c_void,
+            &mt_val as *const _ as *mut c_void,
+        ];
+
+        let row_tiles = ((m + 15) / 16) as u32;
+        let slot_tiles = ((m_total + 15) / 16) as u32;
+        let mq2_weight_bytes = m * (k / 256) * 72;
+        let bytes = m_total * k * 2 + m_total * m * 4 + mq2_weight_bytes;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles, slot_tiles, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ep);
+                b.push_ptr(tp);
+                b.push_ptr(sp);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(xrd_val);
+                b.push_i32(mt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Arch-resolved MQ3-Lloyd grouped MoE GEMM (dispatcher entry). Picks the i8
@@ -13752,7 +13852,7 @@ impl Gpu {
         {
             let mfma_v = self.flags.gfx942_mfma_prefill.clone();
             let want = mfma_v.as_deref();
-            if (want == Some("1") || want == Some("2") || want == Some("3") || want == Some("4"))
+            if matches!(want, Some("1" | "2" | "3" | "4"))
                 && self.arch_caps.is_cdna3()
                 && batch_size >= 16
                 && m % 16 == 0

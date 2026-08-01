@@ -12,7 +12,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
 const MAX_N: usize = 2048;
-const K: usize = 512;
+const MAX_K: usize = 512;
 
 fn upload_i32(gpu: &mut Gpu, values: &[i32]) -> GpuTensor {
     let tensor = gpu
@@ -37,28 +37,30 @@ fn download_i32(gpu: &Gpu, tensor: &GpuTensor, len: usize) -> Vec<i32> {
     values
 }
 
-fn expected_top_k(scores: &[f32], n: usize) -> Vec<i32> {
-    if n <= K {
-        return (0..K)
+fn expected_top_k(scores: &[f32], n: usize, k: usize) -> Vec<i32> {
+    if n <= k {
+        return (0..MAX_K)
             .map(|index| if index < n { index as i32 } else { -1 })
             .collect();
     }
 
     let mut indices: Vec<usize> = (0..n).collect();
     indices.sort_unstable_by(|&a, &b| scores[b].total_cmp(&scores[a]).then_with(|| a.cmp(&b)));
-    indices
+    let mut selected: Vec<i32> = indices
         .into_iter()
-        .take(K)
+        .take(k)
         .map(|index| index as i32)
-        .collect()
+        .collect();
+    selected.resize(MAX_K, -1);
+    selected
 }
 
-fn run_case(gpu: &mut Gpu, n: usize, iters: usize) {
+fn run_case(gpu: &mut Gpu, n: usize, k: usize, iters: usize) {
     assert!(n <= MAX_N);
     // 109 is coprime with 2048, so the long-context case is a permutation
     // of 0..2047. The n=513 case deliberately repeats scores to exercise
     // the lower-index stable tiebreak used by the serial reference.
-    let scores: Vec<f32> = if n == K + 1 {
+    let scores: Vec<f32> = if n == MAX_K + 1 {
         (0..MAX_N).map(|index| (index % 64) as f32).collect()
     } else {
         (0..MAX_N)
@@ -67,10 +69,10 @@ fn run_case(gpu: &mut Gpu, n: usize, iters: usize) {
     };
     let scores_gpu = gpu.upload_f32(&scores, &[MAX_N]).expect("upload scores");
     let indices_gpu = gpu
-        .alloc_tensor(&[K * 4], DType::Raw)
+        .alloc_tensor(&[MAX_K * 4], DType::Raw)
         .expect("alloc top-k output");
     let n_gpu = upload_i32(gpu, &[n as i32]);
-    let k_gpu = upload_i32(gpu, &[K as i32]);
+    let k_gpu = upload_i32(gpu, &[k as i32]);
 
     gpu.indexer_top_k_buf(
         &scores_gpu,
@@ -79,14 +81,14 @@ fn run_case(gpu: &mut Gpu, n: usize, iters: usize) {
         &k_gpu,
         1,
         MAX_N as i32,
-        K as i32,
+        MAX_K as i32,
     )
     .expect("warm indexer_top_k_buf");
     gpu.hip.device_synchronize().expect("warm synchronize");
 
-    let actual = download_i32(gpu, &indices_gpu, K);
-    let expected = expected_top_k(&scores, n);
-    assert_eq!(actual, expected, "top-k mismatch at n={n}");
+    let actual = download_i32(gpu, &indices_gpu, MAX_K);
+    let expected = expected_top_k(&scores, n, k);
+    assert_eq!(actual, expected, "top-k mismatch at n={n} k={k}");
 
     let started = Instant::now();
     for _ in 0..iters {
@@ -97,13 +99,13 @@ fn run_case(gpu: &mut Gpu, n: usize, iters: usize) {
             &k_gpu,
             1,
             MAX_N as i32,
-            K as i32,
+            MAX_K as i32,
         )
         .expect("timed indexer_top_k_buf");
     }
     gpu.hip.device_synchronize().expect("timed synchronize");
     let us = started.elapsed().as_secs_f64() * 1e6 / iters as f64;
-    println!("PASS n={n} k={K} exact=true {us:.3} us/call");
+    println!("PASS n={n} k={k} exact=true {us:.3} us/call");
 }
 
 fn main() {
@@ -117,7 +119,10 @@ fn main() {
     gpu.deepseek4_mq2r_route_v1 = true;
     eprintln!("GPU: {} MQ2R route active, iters={iters}", gpu.arch);
 
-    run_case(&mut gpu, K, iters);
-    run_case(&mut gpu, K + 1, iters);
-    run_case(&mut gpu, MAX_N, iters);
+    run_case(&mut gpu, MAX_K, MAX_K, iters);
+    run_case(&mut gpu, MAX_K + 1, MAX_K, iters);
+    run_case(&mut gpu, 640, MAX_K, iters);
+    run_case(&mut gpu, 1024, MAX_K, iters);
+    run_case(&mut gpu, MAX_N, MAX_K, iters);
+    run_case(&mut gpu, MAX_N, 1, iters);
 }

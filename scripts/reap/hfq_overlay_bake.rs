@@ -3,10 +3,12 @@
 //
 // Bake one HFQ overlay into a standalone HFQ without re-quantizing anything.
 // Every replacement tensor is copied byte-for-byte from the overlay; every
-// other tensor and the metadata JSON are copied byte-for-byte from the base.
+// other tensor is copied byte-for-byte from the base. Metadata is copied
+// byte-for-byte unless --derived-quant-recipe adds the standalone SKU identity.
 //
 // Usage:
-//   hfq_overlay_bake <output.hfq> <base.hfq> <overlay.hfq> [expected-overrides]
+//   hfq_overlay_bake <output.hfq> <base.hfq> <overlay.hfq>
+//     [expected-overrides] [--derived-quant-recipe <recipe>]
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::convert::TryInto;
@@ -46,25 +48,36 @@ struct OutputTensor {
 
 fn main() -> io::Result<()> {
     let args: Vec<String> = env::args().collect();
-    if !(args.len() == 4 || args.len() == 5) {
-        eprintln!(
-            "usage: {} <output.hfq> <base.hfq> <overlay.hfq> [expected-overrides]",
-            args[0]
-        );
-        std::process::exit(2);
+    if args.len() < 4 {
+        usage(&args[0]);
     }
 
     let output = Path::new(&args[1]);
     let base = parse_hfq(Path::new(&args[2]))?;
     let overlay = parse_hfq(Path::new(&args[3]))?;
-    let expected_overrides = args
-        .get(4)
-        .map(|value| {
-            value
-                .parse::<usize>()
-                .map_err(|_| invalid(format!("invalid expected-overrides '{value}'")))
-        })
-        .transpose()?;
+    let mut expected_overrides = None;
+    let mut derived_quant_recipe = None;
+    let mut arg_index = 4;
+    while arg_index < args.len() {
+        if args[arg_index] == "--derived-quant-recipe" {
+            let recipe = args
+                .get(arg_index + 1)
+                .ok_or_else(|| invalid("--derived-quant-recipe requires a recipe value"))?;
+            if derived_quant_recipe.replace(recipe.clone()).is_some() {
+                return Err(invalid(
+                    "--derived-quant-recipe was provided more than once",
+                ));
+            }
+            arg_index += 2;
+        } else if expected_overrides.is_none() {
+            expected_overrides = Some(args[arg_index].parse::<usize>().map_err(|_| {
+                invalid(format!("invalid expected-overrides '{}'", args[arg_index]))
+            })?);
+            arg_index += 1;
+        } else {
+            usage(&args[0]);
+        }
+    }
 
     if output == base.path || output == overlay.path {
         return Err(invalid("output must differ from base and overlay"));
@@ -125,9 +138,13 @@ fn main() -> io::Result<()> {
         }
     }
 
+    let metadata = match derived_quant_recipe {
+        Some(recipe) => add_derived_quant_recipe(&base.metadata, &recipe)?,
+        None => base.metadata.clone(),
+    };
     let index = encode_index(&tensors)?;
     let metadata_offset = 32_u64;
-    let unaligned_data_offset = metadata_offset + base.metadata.len() as u64 + index.len() as u64;
+    let unaligned_data_offset = metadata_offset + metadata.len() as u64 + index.len() as u64;
     let data_offset = (unaligned_data_offset + 4095) & !4095;
 
     let mut output_file = OpenOptions::new()
@@ -140,7 +157,7 @@ fn main() -> io::Result<()> {
     output_file.write_all(&(tensors.len() as u32).to_le_bytes())?;
     output_file.write_all(&metadata_offset.to_le_bytes())?;
     output_file.write_all(&data_offset.to_le_bytes())?;
-    output_file.write_all(&base.metadata)?;
+    output_file.write_all(&metadata)?;
     output_file.write_all(&index)?;
     let padding = (data_offset - unaligned_data_offset) as usize;
     output_file.write_all(&vec![0_u8; padding])?;
@@ -179,6 +196,44 @@ fn main() -> io::Result<()> {
         replacement_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
     );
     Ok(())
+}
+
+fn usage(program: &str) -> ! {
+    eprintln!(
+        "usage: {program} <output.hfq> <base.hfq> <overlay.hfq> \
+         [expected-overrides] [--derived-quant-recipe <recipe>]"
+    );
+    std::process::exit(2);
+}
+
+fn add_derived_quant_recipe(metadata: &[u8], recipe: &str) -> io::Result<Vec<u8>> {
+    const FIELD: &str = "hipfire_derived_quant_recipe";
+    if recipe.is_empty()
+        || !recipe
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err(invalid(format!("unsafe derived quant recipe {recipe:?}")));
+    }
+    if metadata.last() != Some(&b'}') {
+        return Err(invalid("base metadata is not a canonical JSON object"));
+    }
+    let existing_key = format!("\"{FIELD}\"");
+    if metadata
+        .windows(existing_key.len())
+        .any(|window| window == existing_key.as_bytes())
+    {
+        return Err(invalid(format!("base metadata already carries {FIELD:?}")));
+    }
+
+    let mut stamped = Vec::with_capacity(metadata.len() + FIELD.len() + recipe.len() + 6);
+    stamped.extend_from_slice(&metadata[..metadata.len() - 1]);
+    stamped.extend_from_slice(b",\"");
+    stamped.extend_from_slice(FIELD.as_bytes());
+    stamped.extend_from_slice(b"\":\"");
+    stamped.extend_from_slice(recipe.as_bytes());
+    stamped.extend_from_slice(b"\"}");
+    Ok(stamped)
 }
 
 fn encode_index(tensors: &[OutputTensor]) -> io::Result<Vec<u8>> {

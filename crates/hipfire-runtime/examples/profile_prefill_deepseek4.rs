@@ -9,7 +9,74 @@
 //! Usage:
 //!   profile_prefill_deepseek4 <model.mq2lloyd> [--prefill N] [--warmup N]
 //!                              [--pp-batch N] [--mtp-fill]
-//!                              [--gen N] [--no-profile]
+//!                              [--gen N] [--no-profile|--profile-decode]
+
+#[cfg(feature = "deltanet")]
+fn print_kernel_profile(
+    label: &str,
+    wall_ms: f64,
+    entries: Vec<rdna_compute::profile::ProfileEntry>,
+) {
+    use std::collections::BTreeMap;
+
+    #[derive(Default)]
+    struct Agg {
+        calls: usize,
+        total_us: f64,
+        total_bytes: usize,
+    }
+
+    let mut by_kernel: BTreeMap<(&'static str, &'static str), Agg> = BTreeMap::new();
+    let mut total_us = 0.0f64;
+    let mut total_bytes = 0usize;
+    for entry in entries {
+        let aggregate = by_kernel
+            .entry((entry.category, entry.kernel))
+            .or_default();
+        aggregate.calls += 1;
+        aggregate.total_us += entry.time_us;
+        aggregate.total_bytes += entry.bytes;
+        total_us += entry.time_us;
+        total_bytes += entry.bytes;
+    }
+    let mut sorted: Vec<_> = by_kernel.into_iter().collect();
+    sorted.sort_by(|a, b| b.1.total_us.partial_cmp(&a.1.total_us).unwrap());
+
+    println!("\n=== {label}: wall={wall_ms:.2}ms tracked={total_us:.1}us ===");
+    println!(
+        "{:<4} {:<10} {:<48} {:>8} {:>12} {:>10} {:>12} {:>9} {:>5}",
+        "rnk", "category", "kernel", "calls", "total_us", "avg_us", "total_MiB", "GiB/s", "%"
+    );
+    println!("{:-<128}", "");
+    for (rank, ((category, name), aggregate)) in sorted.iter().enumerate().take(60) {
+        let avg_us = aggregate.total_us / aggregate.calls as f64;
+        let mib = aggregate.total_bytes as f64 / (1024.0 * 1024.0);
+        let gbps = if aggregate.total_us > 0.0 {
+            (aggregate.total_bytes as f64 / (1024.0_f64.powi(3)))
+                / (aggregate.total_us / 1_000_000.0)
+        } else {
+            0.0
+        };
+        let pct = aggregate.total_us / total_us * 100.0;
+        println!(
+            "{:<4} {:<10} {:<48} {:>8} {:>12.1} {:>10.2} {:>12.1} {:>9.1} {:>5.1}",
+            rank + 1,
+            category,
+            name,
+            aggregate.calls,
+            aggregate.total_us,
+            avg_us,
+            mib,
+            gbps,
+            pct
+        );
+    }
+    println!("{:-<128}", "");
+    println!(
+        "TOTAL tracked_us={total_us:.1} tracked_MiB={:.1} wall_ms={wall_ms:.2}",
+        total_bytes as f64 / (1024.0 * 1024.0)
+    );
+}
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -22,7 +89,6 @@ fn main() {
     use hipfire_runtime::arch::Architecture;
     use hipfire_runtime::hfq::HfqFile;
     use rdna_compute::profile;
-    use std::collections::BTreeMap;
     use std::path::Path;
     use std::time::Instant;
 
@@ -39,6 +105,7 @@ fn main() {
     let mut mtp_fill = false;
     let mut gen_steps: usize = 0;
     let mut no_profile = false;
+    let mut profile_decode = false;
     let mut i = 2;
     while i < args.len() {
         match args[i].as_str() {
@@ -66,6 +133,10 @@ fn main() {
                 no_profile = true;
                 i += 1;
             }
+            "--profile-decode" => {
+                profile_decode = true;
+                i += 1;
+            }
             other => {
                 eprintln!("unknown arg: {other}");
                 std::process::exit(1);
@@ -76,7 +147,7 @@ fn main() {
     eprintln!("=== profile_prefill_deepseek4 ===");
     eprintln!("Model: {model_path}");
     eprintln!(
-        "Prefill: {prefill_len}  Warmup: {warmup_iters}  PP-batch: {pp_batch}  MTP-fill: {mtp_fill}  Gen: {gen_steps}  No-profile: {no_profile}"
+        "Prefill: {prefill_len}  Warmup: {warmup_iters}  PP-batch: {pp_batch}  MTP-fill: {mtp_fill}  Gen: {gen_steps}  No-profile: {no_profile}  Profile-decode: {profile_decode}"
     );
 
     let mut hfq = HfqFile::open(Path::new(model_path)).expect("open model");
@@ -147,6 +218,38 @@ fn main() {
         );
     }
 
+    if profile_decode {
+        assert!(gen_steps > 0, "--profile-decode requires --gen N with N > 0");
+        let (_, logits) = run_prefill(&mut state, &mut gpu);
+        let mut next_tok = hipfire_arch_deepseek4::spec_decode::logits_argmax(&logits) as u32;
+        let pos_after_prefill = state.n_tokens as u32;
+        let _ = gpu.hip.device_synchronize();
+        profile::start();
+        let start = Instant::now();
+        for step in 0..gen_steps {
+            let next_logits = hipfire_arch_deepseek4::forward::decode_step_with_graph(
+                &config,
+                &weights,
+                &mut state,
+                &mut gpu,
+                next_tok,
+                pos_after_prefill + step as u32,
+            )
+            .expect("profiled decode failed");
+            next_tok =
+                hipfire_arch_deepseek4::spec_decode::logits_argmax(&next_logits) as u32;
+        }
+        let _ = gpu.hip.device_synchronize();
+        let wall_ms = start.elapsed().as_secs_f64() * 1000.0;
+        let entries = profile::stop().unwrap_or_default();
+        print_kernel_profile(
+            &format!("profiled decode ({gen_steps} steps)"),
+            wall_ms,
+            entries,
+        );
+        return;
+    }
+
     if no_profile {
         let (prefill_ms, logits) = run_prefill(&mut state, &mut gpu);
         {
@@ -206,6 +309,7 @@ fn main() {
         prefill_len as f64 * 1000.0 / profile_wall_ms.max(1.0),
     );
 
+    use std::collections::BTreeMap;
     #[derive(Default)]
     struct Agg {
         calls: usize,

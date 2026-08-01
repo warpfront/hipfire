@@ -53,6 +53,7 @@ const MODEL_SUFFIXES: &[&str] = &[
     ".hfq",
     ".mq2",
     ".mq2lloyd",
+    ".mq2r",
     ".mq3",
     ".mq3p",
     ".mq4",
@@ -6852,7 +6853,9 @@ fn ensure_update_not_interrupted() -> Result<()> {
 
 fn update_command(paths: &Paths, args: UpdateArgs) -> Result<()> {
     if !cfg!(target_os = "linux") {
-        bail!("hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS");
+        bail!(
+            "hipfire update is Linux-only; re-run the platform installer with a revision selector on this OS"
+        );
     }
     // Install before any fetch/mutation so SIGINT cannot race past the guard.
     install_update_interrupt_handler();
@@ -8314,6 +8317,7 @@ mod tests {
     fn model_suffix_filter_covers_current_formats() {
         assert!(is_model_file("qwen3.6-35b-a3b.mq4r"));
         assert!(is_model_file("deepseek.mq2lloyd"));
+        assert!(is_model_file("deepseek-v4-flash.mq2r"));
         assert!(is_model_file("draft.hfq"));
         assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));

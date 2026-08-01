@@ -415,6 +415,44 @@ fn gemv_auto_batched_wmma(
     x_f16_scratch: Option<&GpuTensor>,
 ) -> Result<(), String> {
     match weight.dtype {
+        // DeepSeek MQ2R keeps the output head in MFP4-E8-SoA. Do not let it
+        // fall through to the generic HFQ4 arm below: the two formats have
+        // different row layouts, and interpreting E8 bytes as HFQ4 makes every
+        // DSpark proposal wrong even though trunk verification stays coherent.
+        //
+        // Mirror the architecture-owned DeepSeek prefill dispatch. MQ2R pins
+        // B4; diagnostic non-MQ2R artifacts retain the same opt-out controls.
+        DType::MFP4G32E8SOA if gpu.arch == "gfx1151" => {
+            let b4 = gpu.deepseek4_mq2r_route_v1
+                || hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_PREFILL_B4")
+                    .ok()
+                    .as_deref()
+                    != Some("0");
+            let b2 = gpu.deepseek4_mq2r_route_v1
+                || hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_E8_PREFILL_B2")
+                    .ok()
+                    .as_deref()
+                    != Some("0");
+            if b4 {
+                gpu.gemm_mfp4g32_e8_soa_wmma_b4(weight, x_rotated_batch, y, m, k, batch_size)
+                    .map_err(|e| format!("gemm MFP4-E8-SoA WMMA B4: {e:?}"))
+            } else if b2 {
+                gpu.gemm_mfp4g32_e8_soa_wmma_b2(weight, x_rotated_batch, y, m, k, batch_size)
+                    .map_err(|e| format!("gemm MFP4-E8-SoA WMMA B2: {e:?}"))
+            } else {
+                gpu.gemm_mfp4g32_e8_soa_wmma(weight, x_rotated_batch, y, m, k, batch_size)
+                    .map_err(|e| format!("gemm MFP4-E8-SoA WMMA B1: {e:?}"))
+            }
+        }
+        DType::MFP4G32E8 | DType::MFP4G32E8SOA => {
+            for batch in 0..batch_size {
+                let x_rot = x_rotated_batch.sub_offset(batch * k, k);
+                let x_plain = x_plain_batch.sub_offset(batch * k, k);
+                let y_row = y.sub_offset(batch * m, m);
+                gemv_auto(gpu, weight, &x_rot, &x_plain, &y_row, m, k)?;
+            }
+            Ok(())
+        }
         DType::F32 => gpu
             .gemm_f32_register_tiled(weight, x_plain_batch, y, m, k, batch_size)
             .map_err(|e| format!("gemm_f32_register_tiled: {e:?}")),

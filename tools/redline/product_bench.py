@@ -688,13 +688,15 @@ def run_pm4_preflight(args):
                 },
             }
         )
+        # DeepSeek4 materializes its retained route one decode later than
+        # Qwen, so it needs four positions to prove two distinct replays.
+        # Keep the established three-position Qwen preflight unchanged.
+        preflight_iterations = 4 if loaded.get("arch") == "deepseek4" else 3
         row = daemon.request(
             {
                 "type": "bench_decode",
                 "context_tokens": args.context,
-                # The first decode prepares the tape; two more prove replay at
-                # distinct positions without entering benchmark warmup.
-                "iterations": 3,
+                "iterations": preflight_iterations,
                 "redline_product_route": True,
             }
         )
