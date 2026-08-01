@@ -1,0 +1,5 @@
+{
+  "pdg": true,
+  "maxFileSize": "1024",
+  "defaultBranch": "beta"
+}

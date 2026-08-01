@@ -1,0 +1,131 @@
+{
+  "schema": "hipfire.deepseek4_mq2r_route.v1",
+  "status": "validated_default_route_t1_met_top6_t2_pending",
+  "recipe": "deepseek4-mq2r-e8-p3-v1",
+  "tensor_identity": {
+    "meaning": "MQ2R identity is the frozen 554-tensor P3 map plus the standalone artifact SHA; this route changes kernels only",
+    "artifact_sha256": "392325b5a8cd284c8f305f23f74f178007a14b88173babeb3f4784ec4fc0e511",
+    "e8_tensor_count": 554,
+    "tensor_map_mutated": false,
+    "overlay_variants_allowed": false
+  },
+  "route": {
+    "version": "gfx1151_v3",
+    "architecture": "gfx1151",
+    "selected_by_default": true,
+    "transport": "retained_pm4",
+    "queues": 1,
+    "changes_from_v2": [
+      "temporal raw-buffer cpol0 loads for MFP4-E8 U4 decode",
+      "exact-code-object Radiowave cache contracts consumed fail-closed",
+      "32x32 padded-LDS transpose for ratio-4 top-k KV gather"
+    ],
+    "explicitly_rejected": [
+      "two-queue E8 sibling overlap",
+      "score-grid XOR exchange as a product route",
+      "large-context serial attention accumulation"
+    ],
+    "accepted_tape": {
+      "launch_count": 2320,
+      "unique_kernel_count": 32,
+      "sequence_hash_u64": "4393256763546932634",
+      "command_dwords_observed": [57746, 57747],
+      "packet_count": 1,
+      "covered_boundaries": 2319,
+      "total_boundaries": 2319,
+      "symbols": [
+        "compressor_add_ape_f32_buf",
+        "compressor_overlap_concat_f32",
+        "compressor_softmax_pool_f32_buf",
+        "deepseek4_attn_swa_buf",
+        "deepseek4_attn_swa_topk_scoregrid_f32_buf",
+        "deepseek4_fused_silu_mul_clamp_mq_rotate",
+        "deepseek4_moe_topk_bias_aware_f32",
+        "deepseek4_silu_mul_clamp_f32",
+        "deepseek4_topk_kv_gather_identity_f32_buf",
+        "deepseek4_topk_kv_gather_tiled_f32_buf",
+        "fused_rmsnorm_mq_rotate_plain_nox",
+        "gemv_mfp4g32_e8_soa_grouped_gfx1151",
+        "gemv_mfp4g32_e8_soa_u4_buffer_cpol0_gfx1151",
+        "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8all_indexed",
+        "gemv_mq2g256_lloyd_moe_gate_up_k8_indexed",
+        "hash_router_normalize_f32_buf",
+        "hc_compute_control_vec4_finalize",
+        "hc_head_compute_pre",
+        "hc_input_map_4stream",
+        "hc_mix_4stream",
+        "indexer_relu_score_f32_buf",
+        "indexer_top_k_buf_parallel",
+        "mq_rotate_x",
+        "rmsnorm_f32",
+        "rmsnorm_f32_at_slot_buf",
+        "rope_tail_interleaved_f32",
+        "rope_tail_yarn_interleaved_at_slot_buf_f32",
+        "rope_tail_yarn_interleaved_wide_f32",
+        "sqrt_softplus_f32",
+        "state_overlap_shift_f32_buf",
+        "state_ring_write_f32_buf",
+        "swa_ring_write_f32_buf"
+      ]
+    }
+  },
+  "competitive_measurement_top6": {
+    "date_utc": "2026-07-25",
+    "fixture": {
+      "prompt_file": "benchmarks/prompts/adaptive_kv_long_prefill.txt",
+      "prompt_md5": "7ef3f606d2826a08e161bbeb4848b11e",
+      "prompt_tokens": 2048,
+      "generated_tokens": 510,
+      "kv_depth_range": [2048, 2558],
+      "batch": 1,
+      "temperature": 0,
+      "num_experts_per_tok": 6
+    },
+    "method": {
+      "fresh_process_samples_per_arm": 3,
+      "order": "ABBAAB",
+      "baseline": "route v3 stack with incumbent top-k KV gather",
+      "candidate": "route v3 stack with tiled top-k KV gather"
+    },
+    "results": {
+      "baseline_tok_s": [25.57, 25.60, 25.53],
+      "candidate_tok_s": [26.38, 26.45, 26.43],
+      "baseline_median_tok_s": 25.57,
+      "candidate_median_tok_s": 26.43,
+      "candidate_over_baseline_percent": 3.363316,
+      "exact_bootstrap_95_percent": [3.046875, 3.603604],
+      "decoded_output_md5": "65e473d239598dd9c90257996c426c9e",
+      "decoded_output_bit_exact": true
+    },
+    "targets": {
+      "t1_25_31_tok_s_met": true,
+      "t2_30_tok_s_met": false,
+      "t3_50_tok_s_met": false
+    }
+  },
+  "kernel_contracts": {
+    "e8_temporal_buffer": {
+      "radiowave_recipe": "hipfire.cache.mfp4_e8_u4_temporal_buffer",
+      "whole_model_delta_percent": 2.937766
+    },
+    "topk_gather_tiled": {
+      "source": "kernels/src/deepseek4_topk_kv_gather_tiled.gfx1151.hip",
+      "source_sha256": "30d685efc762be42c8ebc2d48351a108e0529b96e31a15358b7ee7aab41b61d5",
+      "code_object_sha256": "a92ac0fc8d7b8c7a6b18c4df82bee0307a9322cfedd680bd08ab306284926a01",
+      "wavefront": 32,
+      "workgroup_size": 256,
+      "static_lds_bytes": 4352,
+      "vgpr_count": 13,
+      "sgpr_count": 18,
+      "private_segment_bytes": 0,
+      "scratch_spills": 0,
+      "radiowave_recipe": "hipfire.memory.topk_gather_lds_transpose",
+      "radiowave_upstream_commit": "f4a0994e2315645b74eef8dec9305c58d252e699"
+    }
+  },
+  "sidecar_policy": {
+    "mtp": "blocked_until_G5",
+    "dspark": "blocked_until_G6_after_G4_and_G5",
+    "sidecars_part_of_this_ar_route": false
+  }
+}
