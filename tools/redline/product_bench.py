@@ -1146,6 +1146,7 @@ def run_coherence_smoke(args, backend):
 
     unique_daemon = _unique_coherence_daemon(daemon_src, smoke_dir, backend)
     configured_backend = backend_config_value(backend)
+    coherence_sampling = getattr(args, "coherence_sampling", COHERENCE_SAMPLING)
     # Ephemeral loopback port so concurrent CLI/serve gates never collide.
     port = _allocate_loopback_port()
     argv = [
@@ -1164,7 +1165,7 @@ def run_coherence_smoke(args, backend):
         "--max-seq",
         str(args.max_seq),
         "--sampling",
-        COHERENCE_SAMPLING,
+        coherence_sampling,
         "--mode",
         COHERENCE_MODE,
         "--seed",
@@ -1215,7 +1216,7 @@ def run_coherence_smoke(args, backend):
         "thinking_cap_tokens": COHERENCE_THINKING_CAP_TOKENS,
         "max_tokens": COHERENCE_MAX_TOKENS,
         "seed": COHERENCE_SEED,
-        "sampling": COHERENCE_SAMPLING,
+        "sampling": coherence_sampling,
         "mode": COHERENCE_MODE,
         "mtp": COHERENCE_MTP,
         "kv_mode": args.kv_mode,
@@ -1862,6 +1863,14 @@ def main(argv=None):
             "the whole run on models whose capability cannot satisfy it (e.g. the "
             "qwen3.5:0.8b reference fixture). Reports produced this way are marked "
             "coherence_skipped and can never be `valid`, so they are diagnostics only."
+        ),
+    )
+    parser.add_argument(
+        "--coherence-sampling",
+        default=COHERENCE_SAMPLING,
+        help=(
+            "explicit serve_harness sampling policy for the coherence arms "
+            f"(default: {COHERENCE_SAMPLING})"
         ),
     )
     parser.add_argument(

@@ -906,6 +906,7 @@ class CoherenceSmokeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as work_dir:
             self._prepare_binaries(work_dir)
             args = self.args(work_dir, transport="pm4")
+            args.coherence_sampling = "greedy"
             with patch("tools.redline.product_bench.subprocess.run", side_effect=fake_run):
                 result = run_coherence_smoke(args, "auto")
 
@@ -923,7 +924,7 @@ class CoherenceSmokeTests(unittest.TestCase):
             self.assertEqual(argv[argv.index("--thinking") + 1], "low")
             self.assertEqual(argv[argv.index("--max-tokens") + 1], "1024")
             self.assertEqual(argv[argv.index("--seed") + 1], "1")
-            self.assertEqual(argv[argv.index("--sampling") + 1], "registry")
+            self.assertEqual(argv[argv.index("--sampling") + 1], "greedy")
             self.assertEqual(argv[argv.index("--mode") + 1], "battery")
             self.assertEqual(argv[argv.index("--mtp") + 1], "off")
             self.assertEqual(argv[argv.index("--kv") + 1], "q8")
@@ -941,6 +942,7 @@ class CoherenceSmokeTests(unittest.TestCase):
             self.assertEqual(result["port"], port)
             self.assertEqual(result["config"]["port"], port)
             self.assertEqual(result["config"]["smoke_dir"], str(smoke_dir))
+            self.assertEqual(result["config"]["sampling"], "greedy")
             env = captured["env"]
             self.assertEqual(
                 env["HIPFIRE_CLI_BIN"], str((Path(work_dir) / "hipfire").resolve())
