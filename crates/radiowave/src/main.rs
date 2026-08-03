@@ -3,8 +3,9 @@
 
 use radiowave::{
     ArchProfile, CampaignLedger, CampaignStarted, CandidateSubmission, CandidateVerdict,
-    CompileRequest, Compiler, Inspector, KernelReport, ResourceAssessment, ResourceContract,
-    SchedulerProfile, Wavefront, materialize_support_header, resolve_hipcc,
+    CompileRequest, Compiler, ExistingCodeObjectRequest, Inspector, KernelReport,
+    ResourceAssessment, ResourceContract, SchedulerProfile, Wavefront, materialize_support_header,
+    resolve_hipcc,
 };
 use std::env;
 use std::error::Error;
@@ -16,6 +17,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut args = env::args_os().skip(1);
     match args.next().as_deref().and_then(|value| value.to_str()) {
         Some("compile") => compile(args.collect()),
+        Some("certify") => certify(args.collect()),
         Some("inspect") => inspect(args.collect()),
         Some("oracle") => oracle(args.collect()),
         Some("recipes") => recipes(args.collect()),
@@ -32,6 +34,69 @@ fn main() -> Result<(), Box<dyn Error>> {
         }
         Some(command) => Err(format!("unknown command {command}").into()),
     }
+}
+
+fn certify(args: Vec<OsString>) -> Result<(), Box<dyn Error>> {
+    let mut source = None;
+    let mut output = None;
+    let mut arch = env::var("RADIOWAVE_ARCH").ok();
+    let mut wavefront = Wavefront::Wave32;
+    let mut hipcc = env::var_os("HIPCC")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from);
+    let mut manifest = None;
+    let mut command = Vec::new();
+    let mut iter = args.into_iter();
+    while let Some(arg) = iter.next() {
+        match arg.to_str() {
+            Some("--source") => source = Some(PathBuf::from(next(&mut iter, "--source")?)),
+            Some("--output") => output = Some(PathBuf::from(next(&mut iter, "--output")?)),
+            Some("--arch") => {
+                arch = Some(next(&mut iter, "--arch")?.to_string_lossy().into_owned())
+            }
+            Some("--wave32") => wavefront = Wavefront::Wave32,
+            Some("--wave64") => wavefront = Wavefront::Wave64,
+            Some("--hipcc") => hipcc = Some(PathBuf::from(next(&mut iter, "--hipcc")?)),
+            Some("--manifest") => manifest = Some(PathBuf::from(next(&mut iter, "--manifest")?)),
+            Some("--command-arg") => command.push(
+                next(&mut iter, "--command-arg")?
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            Some("--help" | "-h") => {
+                usage();
+                return Ok(());
+            }
+            _ => return Err(format!("unknown certify argument {}", arg.to_string_lossy()).into()),
+        }
+    }
+    let source = source.ok_or("certify requires --source")?;
+    let output = output.ok_or("certify requires --output")?;
+    let arch = arch.ok_or("certify requires --arch or RADIOWAVE_ARCH")?;
+    let mut request = ExistingCodeObjectRequest::new(source, output, arch)
+        .wavefront(wavefront)
+        .command(command);
+    if let Some(hipcc) = hipcc {
+        request = request.hipcc(hipcc);
+    }
+    if let Some(manifest) = manifest {
+        request = request.manifest(manifest);
+    }
+    let artifact = Compiler.certify_existing(&request)?;
+    println!(
+        "certified {} sha256={} kernels={} manifest={}",
+        artifact.output.display(),
+        artifact.output_sha256,
+        artifact
+            .inspection
+            .as_ref()
+            .map_or(0, |inspection| inspection.kernels.len()),
+        artifact
+            .manifest
+            .as_ref()
+            .map_or_else(|| "none".to_owned(), |path| path.display().to_string())
+    );
+    Ok(())
 }
 
 fn support_header_cache_directory() -> PathBuf {
@@ -798,6 +863,7 @@ where
 fn usage() {
     println!(
         "radiowave compile --source KERNEL.hip --output KERNEL.hsaco --arch TARGET [--wave32|--wave64] [--scheduler-profile default|max-ilp|iterative-ilp|memory-clause|pipeline-ilp] [--define NAME=VALUE] [--arg FLAG] [--manifest PATH] [--no-inspect] [--fast-math|--no-fast-math]\n\
+         radiowave certify --source KERNEL.hip --output KERNEL.hsaco --arch TARGET [--wave32|--wave64] [--hipcc PATH] [--manifest PATH] [--command-arg ARG]\n\
          radiowave inspect --input KERNEL.hsaco --arch TARGET\n\
          radiowave oracle hip --manifest MANIFEST.json --kernel NAME --workgroup X[,Y,Z] [--output REPORT.json]\n\
          radiowave oracle aco --input ACO.dump --input-artifact SHADER.spv --kernel NAME --arch TARGET --wavefront 32|64 [--workgroup X,Y,Z] [--compiler-version TEXT] [--output REPORT.json]\n\
