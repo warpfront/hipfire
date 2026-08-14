@@ -59,8 +59,8 @@ use hipfire_runtime::dspark_core::{
 };
 use hipfire_runtime::hfq::{load_layer, load_weight_tensor_pread, HfqFile};
 use hipfire_runtime::llama::{
-    weight_gemv, EmbeddingFormat, ForwardScratch, KvCache, LayerWeights, LlamaConfig, LlamaWeights,
-    ModelArch, PrefillBatchScratch, WeightTensor,
+    embedding_lookup_dispatch, weight_gemv, EmbeddingFormat, ForwardScratch, KvCache, LayerWeights,
+    LlamaConfig, LlamaWeights, ModelArch, PrefillBatchScratch, WeightTensor,
 };
 use hipfire_runtime::weight_backend::{
     dequant_f32, dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, read_first,
@@ -990,13 +990,19 @@ pub fn dspark_qwen3_block_forward(
 
     // ── 1. Embed block_ids → pbs.x_batch  ─────────────────────────────────────
     //
-    // Embed each token into pbs.x_batch row i.
-    // drafter.embd_format is F32 (qt=1 F16 was dequantized in the loader).
-    // sub_offset takes offset in ELEMENTS (not bytes); pbs.x_batch is F32.
+    // Embed each token into pbs.x_batch row i, dispatching the sidecar-owned
+    // or target-aliased table's actual storage format.
     for (i, &tok) in block_ids.iter().enumerate() {
         let x_row = scratch.pbs.x_batch.sub_offset(i * dim, dim);
-        gpu.embedding_lookup(&drafter.token_embd, &x_row, tok, dim)
-            .map_err(|e| format!("dspark_qwen3: embed[{i}]: {e:?}"))?;
+        embedding_lookup_dispatch(
+            gpu,
+            drafter.embd_format,
+            &drafter.token_embd,
+            &x_row,
+            tok,
+            dim,
+        )
+        .map_err(|e| format!("dspark_qwen3: embed[{i}]: {e:?}"))?;
     }
 
     // ── 2. Per-layer loop ×5 ───────────────────────────────────────────────────
