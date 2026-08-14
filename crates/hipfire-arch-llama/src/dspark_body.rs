@@ -1340,6 +1340,19 @@ pub fn dspark_qwen3_block_forward(
             )
             .map_err(|e| format!("dspark_qwen3 l{layer_idx}: o_proj (hfq4): {e:?}"))?;
         }
+        // modeling.py:196 `hidden_states = post_attention_layernorm(hidden_states)`.
+        // The MLP consumes this normalized post-attention residual, not the
+        // input-layer-normalized activation left in x_rot_batch.
+        gpu.rmsnorm_batched(
+            &scratch.pbs.x_batch,
+            &layer.ffn_norm,
+            &scratch.pbs.x_rot_batch,
+            block,
+            dim,
+            config.norm_eps,
+        )
+        .map_err(|e| format!("dspark_qwen3 l{layer_idx}: post-attention norm: {e:?}"))?;
+
         // ── 2k. MLP SwiGLU: gate/up → silu_mul → down + residual  ─────────────
         // modeling.py:197  `hidden_states = self.mlp(hidden_states)` (Qwen3MLP = SwiGLU)
         // modeling.py:198  `return residual + hidden_states`

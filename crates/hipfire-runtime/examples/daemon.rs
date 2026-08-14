@@ -19348,28 +19348,31 @@ fn generate_dflash(
         None
     };
 
-    // DFlash ctx-capacity downgrade. The draft's context-indexed structures
-    // (target_hidden, per-layer K/V caches, hidden ring) are sized at load to
-    // min(max_seq, HIPFIRE_DFLASH_CTX_CAP|8192) to bound draft-side VRAM on
-    // large-max_seq serve loads. A request that outgrows the cap cannot run
-    // spec — but DFlash is verify-gated, so AR produces the same tokens, just
-    // slower. Emit a correlated info event and hand the request back to the
-    // caller's AR fallthrough (handled=false: no gen_start/done yet). Mirrors
-    // the hard guard in generate_spec (belt-and-suspenders last line).
-    let spec_ctx_capacity = m
+    // Draft-context downgrade. Context-indexed hidden/KV structures are
+    // bounded independently of the target's maximum context; an over-cap
+    // request safely falls back to target AR.
+    let (spec_ctx_capacity, spec_name) = m
         .speculator
         .as_ref()
-        .map(|s| s.ctx_capacity())
-        .unwrap_or(usize::MAX);
+        .map(|spec| (spec.ctx_capacity(), spec.name()))
+        .unwrap_or((usize::MAX, "spec"));
     if prompt_tokens.len().saturating_add(max_tokens) > spec_ctx_capacity {
+        let cap_env = if spec_name == "dspark" {
+            "HIPFIRE_DSPARK_CTX_CAP"
+        } else {
+            "HIPFIRE_DFLASH_CTX_CAP"
+        };
         emit_qwen_ar_info(
             stdout,
             id,
             &format!(
-                "prompt={} + max_tokens={} exceeds DFlash draft ctx capacity {} — falling back to AR (identical output, slower; raise HIPFIRE_DFLASH_CTX_CAP to re-enable spec)",
+                "prompt={} + max_tokens={} exceeds {} draft ctx capacity {} — \
+                 falling back to AR (identical output, slower; raise {} to re-enable spec)",
                 prompt_tokens.len(),
                 max_tokens,
-                spec_ctx_capacity
+                spec_name,
+                spec_ctx_capacity,
+                cap_env
             ),
         );
         return false;

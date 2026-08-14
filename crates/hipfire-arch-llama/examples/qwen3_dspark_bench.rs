@@ -379,9 +379,9 @@ fn main() -> Result<(), String> {
         // stage_norm = drafter's final norm (output_norm in sidecar).
         let stage_norm = assets.weights.output_norm.shallow_clone();
 
-        // lm_head: upload_raw sets dtype=Raw; fix to F16 (carrier pattern).
+        // Preserve the sidecar/target head's actual dispatch dtype.
         let mut lm_head = assets.weights.output.buf.shallow_clone();
-        lm_head.dtype = DType::F16;
+        lm_head.dtype = assets.weights.output.gpu_dtype;
         lm_head.shape = vec![vocab];
 
         let conf_threshold = std::env::var("HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD")

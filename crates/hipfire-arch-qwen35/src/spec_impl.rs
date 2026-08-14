@@ -117,12 +117,17 @@ impl SpecTarget for ModelSlot {
         // `dspark_extract_layers`) ⇒ the ring captures the per-position residual
         // hidden at those layers during `verify_block_capture_gpu`.
         let num_extract = self.dspark_extract_layers.len();
+        let hidden_capacity = if num_extract > 0 {
+            hipfire_runtime::dspark_core::dspark_context_capacity(self.ctx_capacity())
+        } else {
+            self.ctx_capacity()
+        };
         let mut hidden_rb = HiddenStateRingBuffer::new(
             gpu,
             self.config.n_layers,
             num_extract,
             dim,
-            self.ctx_capacity(),
+            hidden_capacity,
             block_size,
         )
         .map_err(|e| format!("Qwen35SpecScratch HiddenStateRingBuffer: {e}"))?;

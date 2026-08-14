@@ -288,6 +288,30 @@ impl DsparkConfig {
     }
 }
 
+/// Default ceiling for DSpark's context-indexed target-hidden ring.
+///
+/// Qwen3.8 advertises 262K context, but five captured target layers at hidden
+/// size 5120 would require over 20 GiB if eagerly allocated to that horizon.
+/// Requests beyond this cap fall back to target AR through the existing
+/// speculator capacity guard, preserving output correctness.
+pub const DEFAULT_DSPARK_CTX_CAP: usize = 8192;
+
+fn apply_dspark_ctx_cap(requested: usize, configured: Option<usize>) -> usize {
+    match configured {
+        Some(0) => requested,
+        Some(cap) => requested.min(cap),
+        None => requested.min(DEFAULT_DSPARK_CTX_CAP),
+    }
+}
+
+/// Resolve the DSpark context cap. `HIPFIRE_DSPARK_CTX_CAP=0` opts out.
+pub fn dspark_context_capacity(requested: usize) -> usize {
+    let configured = hipfire_config::developer_var("HIPFIRE_DSPARK_CTX_CAP")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    apply_dspark_ctx_cap(requested, configured)
+}
+
 pub struct DsparkWeights {
     pub cfg: DsparkConfig,
     pub main_proj: Option<GpuTensor>, // [dim, target_layer_ids.len()*dim]
@@ -460,15 +484,13 @@ fn gemv_auto(
     k: usize,
 ) -> Result<(), String> {
     use hipfire_dispatch::context::DispatchCtx;
-    use hipfire_dispatch::families::gemv::WeightRef;
+    use hipfire_dispatch::families::gemv::{GemvParams, WeightRef};
+    use hipfire_dispatch::types::GemvVariant;
 
     let gemv = crate::llama::gemv_family();
     let ctx = DispatchCtx::new(gpu);
-    let x = if weight_needs_fwht(weight) {
-        x_rotated
-    } else {
-        x_plain
-    };
+    let needs_fwht = weight_needs_fwht(weight);
+    let x = if needs_fwht { x_rotated } else { x_plain };
     let wr = WeightRef {
         buf: weight,
         dtype: weight.dtype,
@@ -478,8 +500,24 @@ fn gemv_auto(
         rotation: None,
         awq_scale: None,
     };
-    gemv.run_auto(&ctx, gpu, &wr, x, y)
-        .map_err(|e| format!("gemv dispatch: {e}"))
+    gemv.run(
+        &ctx,
+        gpu,
+        &GemvParams {
+            w: &wr,
+            x,
+            y,
+            variant: if needs_fwht {
+                GemvVariant::Prerotated
+            } else {
+                GemvVariant::Plain
+            },
+            residual: None,
+            gate: None,
+            up: None,
+        },
+    )
+    .map_err(|e| format!("gemv dispatch: {e}"))
 }
 
 /// Batched GEMV/GEMM dispatched by weight dtype with optional WMMA path.
@@ -1826,7 +1864,7 @@ pub fn build_dspark_speculator(
 
 #[cfg(test)]
 mod tests {
-    use super::DsparkConfig;
+    use super::{apply_dspark_ctx_cap, DsparkConfig, DEFAULT_DSPARK_CTX_CAP};
 
     #[test]
     fn from_metadata_json_qwen38_yarn_enabled() {
@@ -1881,5 +1919,14 @@ mod tests {
         assert!(!c.confidence_uses_normed);
         assert_eq!(c.partial_rotary_factor, 1.0);
         assert_eq!(c.draft_vocab_size, 0);
+    }
+
+    #[test]
+    fn dspark_context_cap_bounds_eager_hidden_capture() {
+        assert_eq!(DEFAULT_DSPARK_CTX_CAP, 8192);
+        assert_eq!(apply_dspark_ctx_cap(262_144, None), 8192);
+        assert_eq!(apply_dspark_ctx_cap(4096, None), 4096);
+        assert_eq!(apply_dspark_ctx_cap(262_144, Some(16_384)), 16_384);
+        assert_eq!(apply_dspark_ctx_cap(262_144, Some(0)), 262_144);
     }
 }

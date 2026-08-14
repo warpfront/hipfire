@@ -760,6 +760,15 @@ impl Carrier for LlamaCarrier {
                     .and_then(|s| s.parse().ok())
                     .or(ctx.spec.dspark_conf_threshold)
                     .unwrap_or(0.1f32);
+            let dspark_ctx_capacity =
+                hipfire_runtime::dspark_core::dspark_context_capacity(ctx.max_seq);
+            if dspark_ctx_capacity < ctx.max_seq {
+                eprintln!(
+                    "  llama: DSpark ctx capped: {} -> {} rows \
+                     (HIPFIRE_DSPARK_CTX_CAP=0 for uncapped)",
+                    ctx.max_seq, dspark_ctx_capacity
+                );
+            }
 
             eprintln!(
                 "  llama DSpark speculator enabled (sidecar, block={}, conf_threshold={:.2})",
@@ -777,7 +786,7 @@ impl Carrier for LlamaCarrier {
                 stage_norm,
                 lm_head,
                 block,
-                ctx.max_seq,
+                dspark_ctx_capacity,
                 conf_threshold,
                 // temp>0 sampled verify ENABLED: with lazy prefix sampling (only ~τ
                 // lm_heads/window) qwen3 DSpark at temp>0 beats AR by ~+24% (29.6 vs

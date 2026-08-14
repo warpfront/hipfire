@@ -1196,6 +1196,17 @@ fn finish_qwen35_load(
                                     .and_then(|s| s.parse().ok())
                                     .or(ctx.spec.dspark_conf_threshold)
                                     .unwrap_or(0.1f32);
+                                    let dspark_ctx_capacity =
+                                        hipfire_runtime::dspark_core::dspark_context_capacity(
+                                            physical_cap,
+                                        );
+                                    if dspark_ctx_capacity < physical_cap {
+                                        eprintln!(
+                                            "  qwen35: DSpark ctx capped: {physical_cap} -> \
+                                             {dspark_ctx_capacity} rows \
+                                             (HIPFIRE_DSPARK_CTX_CAP=0 for uncapped)"
+                                        );
+                                    }
                                     eprintln!(
                                     "  qwen35 DSpark enabled (block={}, target_layers={:?}, draft_vocab={}, conf={:.2})",
                                     block,
@@ -1215,7 +1226,7 @@ fn finish_qwen35_load(
                                             stage_norm,
                                             lm_head,
                                             block,
-                                            physical_cap,
+                                            dspark_ctx_capacity,
                                             conf_threshold,
                                             true, // sampled verify (temp>0) supported
                                             0.5,
@@ -1340,6 +1351,7 @@ fn finish_qwen35_load(
     // GPU), released before `bundle` moves into `state`. `None` ⇒ AR-only model.
     // DSpark wins over DFlash/MTP/n-gram when its sidecar loaded.
     // When adaptive, upstream gates left dspark/dflash/mtp as None — no free needed.
+    let dspark_selected = dspark_speculator.is_some();
     let speculator = if adaptive_blocks_generic_spec {
         None
     } else {
@@ -1366,7 +1378,9 @@ fn finish_qwen35_load(
     //
     // max_seq mirrors the trunk's KV capacity (the MTP head's KV is a single
     // F32 layer, so even a 100K window is only a few hundred MB at dim=5120).
-    let qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = {
+    let qwen35_mtp_head: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = if dspark_selected {
+        None
+    } else {
         use hipfire_arch_qwen35::mtp_head;
         let trunk_path = Path::new(ctx.path);
         // 1. Bundled trailer inside the trunk file?
