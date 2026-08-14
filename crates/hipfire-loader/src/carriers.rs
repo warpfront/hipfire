@@ -675,8 +675,17 @@ impl Carrier for LlamaCarrier {
                 match hipfire_runtime::hfq::HfqFile::open(&p) {
                     Ok(mut sidecar) => {
                         sidecar.drop_mmap();
-                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(&sidecar, ctx.gpu)
-                        {
+                        let target_shared =
+                            hipfire_arch_llama::dspark_body::QwenDsparkTargetShared {
+                                token_embd: &bundle.weights.token_embd,
+                                embd_format: bundle.weights.embd_format,
+                                output: &bundle.weights.output,
+                            };
+                        match hipfire_arch_llama::dspark_body::load_qwen3_dspark(
+                            &sidecar,
+                            ctx.gpu,
+                            Some(target_shared),
+                        ) {
                             Ok(Some((dspark_weights, dspark_assets))) => {
                                 eprintln!(
                                     "  llama: DSpark sidecar loaded (block_size={}, target_layers={:?})",
@@ -736,12 +745,10 @@ impl Carrier for LlamaCarrier {
             // the speculator holds an alias that is freed before the weights on unload.
             let stage_norm = assets.weights.output_norm.shallow_clone();
 
-            // lm_head fix: assets.weights.output.buf.dtype == Raw (upload_raw always
-            // sets Raw), but the actual data layout is F16.  run_heads dispatches on
-            // GpuTensor.dtype, so we shallow_clone and fix the dtype + shape here.
-            // (The parity harness does the same at qwen3_dspark_parity.rs:215-217.)
+            // lm_head: preserve the actual `WeightTensor.gpu_dtype` (Q8 for MQ4R targets,
+            // F16 for legacy sidecars). Previously forced F16, which corrupted Q8 heads.
             let mut lm_head = assets.weights.output.buf.shallow_clone();
-            lm_head.dtype = rdna_compute::DType::F16;
+            lm_head.dtype = assets.weights.output.gpu_dtype;
             lm_head.shape = vec![vocab];
 
             // conf_threshold ladder: env > CLI arg > 0.1

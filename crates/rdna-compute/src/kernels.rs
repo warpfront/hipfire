@@ -2896,12 +2896,6 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PK_SRC: &str =
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PIPE_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_pipe.hip");
 
-
-
-
-
-
-
 pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_lmhead_wmma.gfx12.hip");
 // Q8_1 MMQ prefill variant — opt-in via HIPFIRE_MMQ=1, gated to RDNA3/3.5.
@@ -4823,6 +4817,13 @@ pub const ROPE_PARTIAL_INTERLEAVED_BATCHED_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/rope_partial_halfsplit_batched.hip");
+
+/// Batched YaRN half-split partial RoPE for Qwen DSpark. Host uploads the
+/// inverse-frequency table (`freqs[n_rot/2]`); kernel multiplies both cos/sin
+/// by `mscale` and rotates HF `rotate_half` pairs `(i, i + n_rot/2)`.
+#[cfg(feature = "deltanet")]
+pub const ROPE_YARN_HALFSPLIT_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rope_yarn_halfsplit_batched.hip");
 
 /// 3D mrope, half-split convention. Twin of ROPE_PARTIAL_HALFSPLIT_SRC,
 /// differing only in which position each frequency index reads: band mapping

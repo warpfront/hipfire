@@ -7369,6 +7369,277 @@ fn build_deepseek4_dspark_e8soa_sidecar(input: &Path, output: &Path) -> Result<(
     Ok(())
 }
 
+/// Parsed Qwen3/Qwen3.8 DSpark drafter `config.json` fields needed for HFQ
+/// sidecar metadata + tensor classification.
+#[derive(Debug, Clone)]
+struct Qwen3DsparkParsed {
+    block_size: usize,
+    target_layer_ids: Vec<u64>,
+    markov_rank: usize,
+    noise_token_id: u32,
+    draft_vocab_size: u64,
+    confidence_with_markov: bool,
+    enable_confidence: bool,
+    projector_type: String,
+    hidden_size: u64,
+    head_dim: u64,
+    num_hidden_layers: u64,
+    num_attention_heads: u64,
+    num_key_value_heads: u64,
+    intermediate_size: u64,
+    vocab_size: u64,
+    partial_rotary_factor: f64,
+    rope_theta: f64,
+    rope_type: Option<String>,
+    yarn_factor: Option<f64>,
+    yarn_original_max_position_embeddings: Option<u64>,
+    yarn_beta_fast: Option<f64>,
+    yarn_beta_slow: Option<f64>,
+}
+
+/// Parse DSpark draft config. Prefers nested `dflash_config` for
+/// `target_layer_ids` / `mask_token_id` / `projector_type` / markov+confidence
+/// flags, then legacy top-level keys. YaRN lives under `rope_parameters`
+/// (or `transformer_layer_config.rope_parameters` for older nests).
+fn parse_qwen3_dspark_config(config: &serde_json::Value) -> Qwen3DsparkParsed {
+    let tlc = config.get("transformer_layer_config");
+    let dflash = config.get("dflash_config");
+    let cfg_u64 = |k: &str, d: u64| -> u64 {
+        config
+            .get(k)
+            .or_else(|| tlc.and_then(|t| t.get(k)))
+            .and_then(|v| v.as_u64())
+            .unwrap_or(d)
+    };
+    let block_size = config
+        .get("block_size")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(7) as usize;
+    // Nested dflash_config first, then legacy top-level / aux_hidden aliases.
+    let target_layer_ids: Vec<u64> = dflash
+        .and_then(|d| d.get("target_layer_ids"))
+        .or_else(|| config.get("target_layer_ids"))
+        .or_else(|| config.get("aux_hidden_state_layer_ids"))
+        .and_then(|v| v.as_array())
+        .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
+        .unwrap_or_else(|| vec![1, 9, 17, 25, 33]);
+    let markov_rank = dflash
+        .and_then(|d| d.get("markov_rank"))
+        .or_else(|| config.get("markov_rank"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(256) as usize;
+    let noise_token_id = dflash
+        .and_then(|d| d.get("mask_token_id"))
+        .or_else(|| config.get("mask_token_id"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(151669) as u32;
+    let draft_vocab_size = cfg_u64("draft_vocab_size", 0);
+    let confidence_with_markov = dflash
+        .and_then(|d| d.get("confidence_head_with_markov"))
+        .or_else(|| config.get("confidence_head_with_markov"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    let enable_confidence = dflash
+        .and_then(|d| d.get("enable_confidence_head"))
+        .or_else(|| config.get("enable_confidence_head"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let projector_type = dflash
+        .and_then(|d| d.get("projector_type"))
+        .or_else(|| config.get("projector_type"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("dspark")
+        .to_string();
+    let hidden_size = cfg_u64("hidden_size", 2048);
+    let head_dim = cfg_u64("head_dim", 128);
+    let num_hidden_layers = cfg_u64("num_hidden_layers", 0);
+    let num_attention_heads = cfg_u64("num_attention_heads", 0);
+    let num_key_value_heads = cfg_u64("num_key_value_heads", 0);
+    let intermediate_size = cfg_u64("intermediate_size", 0);
+    let vocab_size = cfg_u64("vocab_size", 0);
+    // rope params nest under transformer_layer_config.rope_parameters in v0.6.0
+    // and top-level rope_parameters on RadixArk/Qwen3.8-27B-DSpark.
+    let rope = config
+        .get("rope_parameters")
+        .or_else(|| tlc.and_then(|t| t.get("rope_parameters")));
+    let partial_rotary_factor = rope
+        .and_then(|r| r.get("partial_rotary_factor"))
+        .or_else(|| config.get("partial_rotary_factor"))
+        .or_else(|| tlc.and_then(|t| t.get("partial_rotary_factor")))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1.0);
+    let rope_theta = rope
+        .and_then(|r| r.get("rope_theta"))
+        .or_else(|| config.get("rope_theta"))
+        .or_else(|| tlc.and_then(|t| t.get("rope_theta")))
+        .and_then(|v| v.as_f64())
+        .unwrap_or(1_000_000.0);
+    let rope_type = rope
+        .and_then(|r| r.get("rope_type").or_else(|| r.get("type")))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let yarn_factor = rope.and_then(|r| r.get("factor")).and_then(|v| v.as_f64());
+    let yarn_original_max_position_embeddings = rope
+        .and_then(|r| r.get("original_max_position_embeddings"))
+        .and_then(|v| v.as_u64());
+    let yarn_beta_fast = rope
+        .and_then(|r| r.get("beta_fast"))
+        .and_then(|v| v.as_f64());
+    let yarn_beta_slow = rope
+        .and_then(|r| r.get("beta_slow"))
+        .and_then(|v| v.as_f64());
+    Qwen3DsparkParsed {
+        block_size,
+        target_layer_ids,
+        markov_rank,
+        noise_token_id,
+        draft_vocab_size,
+        confidence_with_markov,
+        enable_confidence,
+        projector_type,
+        hidden_size,
+        head_dim,
+        num_hidden_layers,
+        num_attention_heads,
+        num_key_value_heads,
+        intermediate_size,
+        vocab_size,
+        partial_rotary_factor,
+        rope_theta,
+        rope_type,
+        yarn_factor,
+        yarn_original_max_position_embeddings,
+        yarn_beta_fast,
+        yarn_beta_slow,
+    }
+}
+
+/// Build the HFQ metadata envelope for a Qwen3 DSpark sidecar. Flat
+/// `dspark_*` keys only — matches `DsparkConfig::from_metadata_json` plus the
+/// YaRN keys agreed with the runtime yarn plan.
+fn qwen3_dspark_metadata_json(p: &Qwen3DsparkParsed) -> String {
+    let mut cfg = serde_json::Map::new();
+    cfg.insert("dspark_block_size".into(), serde_json::json!(p.block_size));
+    cfg.insert(
+        "dspark_target_layer_ids".into(),
+        serde_json::json!(p.target_layer_ids),
+    );
+    cfg.insert(
+        "dspark_num_targets".into(),
+        serde_json::json!(p.target_layer_ids.len()),
+    );
+    cfg.insert(
+        "dspark_markov_rank".into(),
+        serde_json::json!(p.markov_rank),
+    );
+    cfg.insert(
+        "dspark_noise_token_id".into(),
+        serde_json::json!(p.noise_token_id),
+    );
+    cfg.insert(
+        "dspark_enable_confidence".into(),
+        serde_json::json!(p.enable_confidence),
+    );
+    cfg.insert(
+        "dspark_confidence_with_markov".into(),
+        serde_json::json!(p.confidence_with_markov),
+    );
+    cfg.insert(
+        "dspark_projector_type".into(),
+        serde_json::json!(p.projector_type),
+    );
+    cfg.insert(
+        "dspark_draft_vocab_size".into(),
+        serde_json::json!(p.draft_vocab_size),
+    );
+    cfg.insert(
+        "dspark_hidden_size".into(),
+        serde_json::json!(p.hidden_size),
+    );
+    cfg.insert("dspark_head_dim".into(), serde_json::json!(p.head_dim));
+    cfg.insert(
+        "dspark_num_hidden_layers".into(),
+        serde_json::json!(p.num_hidden_layers),
+    );
+    cfg.insert(
+        "dspark_num_attention_heads".into(),
+        serde_json::json!(p.num_attention_heads),
+    );
+    cfg.insert(
+        "dspark_num_key_value_heads".into(),
+        serde_json::json!(p.num_key_value_heads),
+    );
+    cfg.insert(
+        "dspark_intermediate_size".into(),
+        serde_json::json!(p.intermediate_size),
+    );
+    cfg.insert("dspark_vocab_size".into(), serde_json::json!(p.vocab_size));
+    cfg.insert(
+        "dspark_partial_rotary_factor".into(),
+        serde_json::json!(p.partial_rotary_factor),
+    );
+    cfg.insert("dspark_rope_theta".into(), serde_json::json!(p.rope_theta));
+    if let Some(ref t) = p.rope_type {
+        cfg.insert("dspark_rope_type".into(), serde_json::json!(t));
+    }
+    if let Some(f) = p.yarn_factor {
+        cfg.insert("dspark_yarn_factor".into(), serde_json::json!(f));
+    }
+    if let Some(o) = p.yarn_original_max_position_embeddings {
+        cfg.insert(
+            "dspark_yarn_original_max_position_embeddings".into(),
+            serde_json::json!(o),
+        );
+    }
+    if let Some(b) = p.yarn_beta_fast {
+        cfg.insert("dspark_yarn_beta_fast".into(), serde_json::json!(b));
+    }
+    if let Some(b) = p.yarn_beta_slow {
+        cfg.insert("dspark_yarn_beta_slow".into(), serde_json::json!(b));
+    }
+    let metadata = serde_json::json!({
+        "architecture": "qwen3",
+        "config": cfg,
+    });
+    serde_json::to_string(&metadata).unwrap()
+}
+
+/// Source-name → sidecar-name mapping for Qwen3 DSpark tensors.
+fn qwen3_dspark_sidecar_name(name: &str) -> String {
+    if name == "fc.weight" {
+        "main_proj.weight".to_string()
+    } else if name == "hidden_norm.weight" {
+        "main_norm.weight".to_string()
+    } else {
+        name.to_string()
+    }
+}
+
+/// Body attention/MLP 2D matmul weights (Q8 path preserves these as Q8F16;
+/// MQ4 path encodes them as MQ4G256). Does **not** include `fc`/`main_proj`.
+fn is_qwen3_dspark_body_matmul(name: &str) -> bool {
+    let is_attn = name.contains("self_attn.")
+        && (name.ends_with("q_proj.weight")
+            || name.ends_with("k_proj.weight")
+            || name.ends_with("v_proj.weight")
+            || name.ends_with("o_proj.weight"));
+    let is_mlp = name.contains("mlp.")
+        && (name.ends_with("gate_proj.weight")
+            || name.ends_with("up_proj.weight")
+            || name.ends_with("down_proj.weight"));
+    is_attn || is_mlp
+}
+
+/// MQ4 body selection: body q/k/v/o + MLP gate/up/down + `fc.weight` /
+/// `main_proj.weight`. Explicitly excludes Markov / confidence / norms /
+/// embeds / lm_head.
+fn is_qwen3_dspark_mq4_weight(name: &str) -> bool {
+    if name == "fc.weight" || name == "main_proj.weight" {
+        return true;
+    }
+    is_qwen3_dspark_body_matmul(name)
+}
+
 fn main() {
     let args = QuantizeArgs::parse();
 
@@ -7425,36 +7696,44 @@ fn main() {
         return;
     }
 
-    // ── qwen3-dspark-q8: Qwen3DSparkModel drafter sidecar emission ──────────
+    // ── qwen3-dspark-{q8,mq4}: Qwen3DSparkModel / DSparkDraftModel sidecar ──
     // Produces a `<stem>-dspark.<ext>` HFQ carrying the 5-layer dense drafter
     // body + DSpark globals (main_proj, main_norm, markov_w1/w2, confidence_proj
-    // + confidence_bias) + lm_head, with DSpark metadata keys so the arch-side
-    // loader can detect and configure the speculator.
+    // + confidence_bias), with DSpark metadata keys so the arch-side loader can
+    // detect and configure the speculator. embed_tokens / lm_head are optional:
+    // published Qwen3.8-27B-DSpark omits them (shares the target's weights).
     //
-    // Quant recipe (small trained drafter — preserve precision):
-    //   2D matmul weights (attn q/k/v/o, mlp gate/up/down) → Q8F16
-    //   Everything else (norms, embed, main_proj/main_norm, markov, confidence,
-    //   lm_head, bias) → F16 (or F32 for scalar bias)
+    // Quant recipe:
+    //   q8:  body attn q/k/v/o + MLP gate/up/down → Q8F16; rest F16
+    //   mq4: body + fc/main_proj → MQ4G256 (FWHT seeds 42/1042);
+    //        norms / Markov w1/w2 / confidence → F16
     //
     // Tensor name mapping (source → sidecar):
     //   fc.weight           → main_proj.weight   (the `[hidden, 5*hidden]` concat)
     //   hidden_norm.weight  → main_norm.weight    (RMSNorm after fc)
     //   all others          → kept as-is
-    if format == "qwen3-dspark-q8" || format == "qwen35-dspark-q8" {
+    let qwen3_dspark_mq4 = matches!(
+        format,
+        "qwen3-dspark-mq4" | "qwen35-dspark-mq4" | "qwen38-dspark-mq4"
+    );
+    let qwen3_dspark_q8 = matches!(format, "qwen3-dspark-q8" | "qwen35-dspark-q8");
+    if qwen3_dspark_q8 || qwen3_dspark_mq4 {
+        let label = if qwen3_dspark_mq4 {
+            "qwen3-dspark-mq4"
+        } else {
+            "qwen3-dspark-q8"
+        };
         let input_dir = Path::new(input_dir);
         let output_path = Path::new(output_path);
 
         // Read config
         let config_path = input_dir.join("config.json");
         let config_str = std::fs::read_to_string(&config_path).unwrap_or_else(|e| {
-            eprintln!(
-                "qwen3-dspark-q8: cannot read {}: {e}",
-                config_path.display()
-            );
+            eprintln!("{label}: cannot read {}: {e}", config_path.display());
             std::process::exit(1);
         });
         let config: serde_json::Value = serde_json::from_str(&config_str).unwrap_or_else(|e| {
-            eprintln!("qwen3-dspark-q8: config.json parse error: {e}");
+            eprintln!("{label}: config.json parse error: {e}");
             std::process::exit(1);
         });
 
@@ -7472,106 +7751,31 @@ fn main() {
             .unwrap_or(false);
         if !is_dspark {
             eprintln!(
-                "dspark-q8: architectures is not a DSpark drafter \
+                "{label}: architectures is not a DSpark drafter \
                  (Qwen3DSparkModel / DSparkDraftModel / DSparkSpeculator); got {:?}",
                 archs
             );
             std::process::exit(1);
         }
 
-        // Read DSpark config fields. speculators v0.6.0 (DSparkDraftModel) nests
-        // the body dims under `transformer_layer_config` and names the target
-        // taps `aux_hidden_state_layer_ids`; the legacy Qwen3DSparkModel puts
-        // dims / `target_layer_ids` at the top level. Handle both.
-        let tlc = config.get("transformer_layer_config");
-        let cfg_u64 = |k: &str, d: u64| -> u64 {
-            config
-                .get(k)
-                .or_else(|| tlc.and_then(|t| t.get(k)))
-                .and_then(|v| v.as_u64())
-                .unwrap_or(d)
-        };
-        let block_size = config
-            .get("block_size")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(7) as usize;
-        let target_layer_ids: Vec<u64> = config
-            .get("target_layer_ids")
-            .or_else(|| config.get("aux_hidden_state_layer_ids"))
-            .and_then(|v| v.as_array())
-            .map(|a| a.iter().filter_map(|v| v.as_u64()).collect())
-            .unwrap_or_else(|| vec![1, 9, 17, 25, 33]);
-        let markov_rank = config
-            .get("markov_rank")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(256) as usize;
-        let noise_token_id = config
-            .get("mask_token_id")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(151669) as u32;
-        let draft_vocab_size = cfg_u64("draft_vocab_size", 0);
-        let confidence_with_markov = config
-            .get("confidence_head_with_markov")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let hidden_size = cfg_u64("hidden_size", 2048);
-        let head_dim = cfg_u64("head_dim", 128);
-        let num_hidden_layers = cfg_u64("num_hidden_layers", 0);
-        let num_attention_heads = cfg_u64("num_attention_heads", 0);
-        let num_key_value_heads = cfg_u64("num_key_value_heads", 0);
-        let intermediate_size = cfg_u64("intermediate_size", 0);
-        let vocab_size = cfg_u64("vocab_size", 0);
-        // rope params nest under transformer_layer_config.rope_parameters in v0.6.0.
-        let rope = tlc
-            .and_then(|t| t.get("rope_parameters"))
-            .or_else(|| config.get("rope_parameters"));
-        let partial_rotary_factor = rope
-            .and_then(|r| r.get("partial_rotary_factor"))
-            .or_else(|| config.get("partial_rotary_factor"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(1.0);
-        let rope_theta = rope
-            .and_then(|r| r.get("rope_theta"))
-            .and_then(|v| v.as_f64())
-            .unwrap_or(10000000.0);
-
+        let parsed = parse_qwen3_dspark_config(&config);
         eprintln!(
-            "qwen3-dspark-q8: block_size={block_size} target_layer_ids={target_layer_ids:?} \
-             markov_rank={markov_rank} noise_token_id={noise_token_id}"
+            "{label}: block_size={} target_layer_ids={:?} markov_rank={} \
+             noise_token_id={} projector_type={} yarn_factor={:?}",
+            parsed.block_size,
+            parsed.target_layer_ids,
+            parsed.markov_rank,
+            parsed.noise_token_id,
+            parsed.projector_type,
+            parsed.yarn_factor
         );
 
-        // Build metadata JSON — mirrors the keys DsparkConfig::from_metadata_json reads.
-        let metadata = serde_json::json!({
-            "architecture": "qwen3",
-            "config": {
-                "dspark_block_size": block_size,
-                "dspark_target_layer_ids": target_layer_ids,
-                "dspark_num_targets": target_layer_ids.len(),
-                "dspark_markov_rank": markov_rank,
-                "dspark_noise_token_id": noise_token_id,
-                "dspark_enable_confidence": true,
-                "dspark_confidence_with_markov": confidence_with_markov,
-                "dspark_draft_vocab_size": draft_vocab_size,
-                "dspark_hidden_size": hidden_size,
-                "dspark_head_dim": head_dim,
-                "dspark_num_hidden_layers": num_hidden_layers,
-                "dspark_num_attention_heads": num_attention_heads,
-                "dspark_num_key_value_heads": num_key_value_heads,
-                "dspark_intermediate_size": intermediate_size,
-                "dspark_vocab_size": vocab_size,
-                "dspark_partial_rotary_factor": partial_rotary_factor,
-                "dspark_rope_theta": rope_theta,
-            },
-        });
-        let metadata_json = serde_json::to_string(&metadata).unwrap();
+        let metadata_json = qwen3_dspark_metadata_json(&parsed);
 
         // Load safetensors
         let st_paths = find_safetensors(input_dir);
         if st_paths.is_empty() {
-            eprintln!(
-                "qwen3-dspark-q8: no safetensors found in {}",
-                input_dir.display()
-            );
+            eprintln!("{label}: no safetensors found in {}", input_dir.display());
             std::process::exit(1);
         }
         let st_files: Vec<SafetensorsFile> = st_paths
@@ -7589,27 +7793,16 @@ fn main() {
             }
         }
         all_tensors.sort_by_key(|(name, _)| name.to_string());
-        eprintln!("qwen3-dspark-q8: {} tensors found", all_tensors.len());
+        eprintln!("{label}: {} tensors found", all_tensors.len());
 
-        // Determine which 2D weights get Q8F16 (attn projections + MLP projections)
-        let is_dspark_matmul_weight = |name: &str| -> bool {
-            // Attn projections: q/k/v/o_proj
-            let is_attn = name.contains("self_attn.")
-                && (name.ends_with("q_proj.weight")
-                    || name.ends_with("k_proj.weight")
-                    || name.ends_with("v_proj.weight")
-                    || name.ends_with("o_proj.weight"));
-            // MLP projections: gate/up/down_proj
-            let is_mlp = name.contains("mlp.")
-                && (name.ends_with("gate_proj.weight")
-                    || name.ends_with("up_proj.weight")
-                    || name.ends_with("down_proj.weight"));
-            is_attn || is_mlp
-        };
+        // Canonical FWHT seeds (must match engine Gpu::ensure_mq_signs).
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
 
         let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
         let mut total_params = 0u64;
         let mut q8_params = 0u64;
+        let mut mq4_params = 0u64;
         let mut f16_params = 0u64;
 
         for (name, file_idx) in &all_tensors {
@@ -7617,15 +7810,7 @@ fn main() {
             let n_elements: usize = meta.shape.iter().product();
             total_params += n_elements as u64;
 
-            // Map source tensor name → sidecar name
-            let sidecar_name = if *name == "fc.weight" {
-                "main_proj.weight".to_string()
-            } else if *name == "hidden_norm.weight" {
-                "main_norm.weight".to_string()
-            } else {
-                name.to_string()
-            };
-
+            let sidecar_name = qwen3_dspark_sidecar_name(name);
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
 
             // Reduced-vocab maps: `d2t` (draft→target token id, I64) and `t2d`
@@ -7663,8 +7848,35 @@ fn main() {
                 continue;
             }
 
-            if is_dspark_matmul_weight(name) && n_elements >= 32 {
-                // 2D matmul weight → Q8F16 (body layers, trained precision preserved)
+            let use_mq4 = qwen3_dspark_mq4
+                && is_qwen3_dspark_mq4_weight(name)
+                && n_elements >= 256
+                && n_elements % 256 == 0;
+            let use_q8 = !qwen3_dspark_mq4 && is_qwen3_dspark_body_matmul(name) && n_elements >= 32;
+
+            if use_mq4 {
+                let f32_data = to_f32(raw_data, &meta.dtype);
+                let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
+                eprintln!(
+                    "  {:>8}: {} {:?} ({} elems, {:.1} KB → {:.1} KB)",
+                    "MQ4G256",
+                    sidecar_name,
+                    meta.shape,
+                    n_elements,
+                    raw_data.len() as f64 / 1024.0,
+                    q.len() as f64 / 1024.0
+                );
+                mq4_params += n_elements as u64;
+                hfq_tensors.push(HfqTensor {
+                    name: sidecar_name,
+                    quant_type: QuantType::MQ4G256,
+                    shape,
+                    group_size: 256,
+                    data: q,
+                    spilled_len: 0,
+                });
+            } else if use_q8 {
+                // 2D body matmul → Q8F16 (body layers, trained precision preserved)
                 let f32_data = to_f32(raw_data, &meta.dtype);
                 let q = quantize_q8f16(&f32_data);
                 eprintln!(
@@ -7686,7 +7898,9 @@ fn main() {
                     spilled_len: 0,
                 });
             } else {
-                // Everything else → F16 (norms, embeds, main_proj, markov, confidence, lm_head)
+                // Norms, Markov, confidence, main_proj (q8 path), optional
+                // embed/lm_head if present → F16. Absent embed/lm_head are
+                // simply not emitted (share target weights at runtime).
                 let f32_data = to_f32(raw_data, &meta.dtype);
                 let f16_bytes: Vec<u8> = f32_data
                     .iter()
@@ -7713,20 +7927,33 @@ fn main() {
             }
         }
 
-        eprintln!(
-            "\n=== qwen3-dspark-q8 Summary ===\n\
-             Total params:  {total_params}\n\
-             Q8F16 params:  {q8_params} ({:.1}%)\n\
-             F16 params:    {f16_params} ({:.1}%)\n\
-             Tensors:       {}",
-            100.0 * q8_params as f64 / total_params as f64,
-            100.0 * f16_params as f64 / total_params as f64,
-            hfq_tensors.len()
-        );
+        if qwen3_dspark_mq4 {
+            eprintln!(
+                "\n=== {label} Summary ===\n\
+                 Total params:  {total_params}\n\
+                 MQ4G256 params:{mq4_params} ({:.1}%)\n\
+                 F16 params:    {f16_params} ({:.1}%)\n\
+                 Tensors:       {}",
+                100.0 * mq4_params as f64 / total_params.max(1) as f64,
+                100.0 * f16_params as f64 / total_params.max(1) as f64,
+                hfq_tensors.len()
+            );
+        } else {
+            eprintln!(
+                "\n=== {label} Summary ===\n\
+                 Total params:  {total_params}\n\
+                 Q8F16 params:  {q8_params} ({:.1}%)\n\
+                 F16 params:    {f16_params} ({:.1}%)\n\
+                 Tensors:       {}",
+                100.0 * q8_params as f64 / total_params.max(1) as f64,
+                100.0 * f16_params as f64 / total_params.max(1) as f64,
+                hfq_tensors.len()
+            );
+        }
 
         eprintln!("\nWriting: {}", output_path.display());
         write_hfq(output_path, 1u32, &metadata_json, &hfq_tensors, None).unwrap_or_else(|e| {
-            eprintln!("qwen3-dspark-q8: write_hfq failed: {e}");
+            eprintln!("{label}: write_hfq failed: {e}");
             std::process::exit(2);
         });
 
@@ -8660,7 +8887,8 @@ fn main() {
     // (not RMSNorm-anchored) corrupts AWQ saliency for FFN; embed/lm_head are
     // tied + scaled by √3840 making AWQ scale saliency meaningless there.
     let is_gemma4_family = arch_id == 13 || arch_id == 22;
-    let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
+    let is_moe_like =
+        is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
     // Gemma4 (arch_id 13) defaults to kmap_mode=3 (typed-gemma4): promote down_proj,
     // v_proj, and edge-layer non-attn-qko tensors. Attn q/k/o are excluded even
     // in edge layers (dense attn promotion regresses PPL +3.1% on 27B).
@@ -8681,8 +8909,8 @@ fn main() {
     // is why `.mq2` reads 45% MORE bytes/token than `.mq4r` despite being 7 GB
     // smaller on disk, and why `.mq4r` — which needs this flag off — is not
     // byte-reproducible from HEAD without it.
-    let no_q8_router_flag = args.no_q8_router
-        || std::env::var("HIPFIRE_NO_Q8_ROUTER").ok().as_deref() == Some("1");
+    let no_q8_router_flag =
+        args.no_q8_router || std::env::var("HIPFIRE_NO_Q8_ROUTER").ok().as_deref() == Some("1");
     let q8_router = (is_moe_like || q8_router_flag) && !no_q8_router_flag;
     // Muse Glimmer (arch 14): untied lm_head defaults to Q8, like embed.
     //
@@ -10822,12 +11050,16 @@ fn main() {
                             // the flat form the Lloyd ones use — the SoA layout needs the
                             // row count to place the scale region.
                             QuantType::MQ2G256GL => (
-                                quantize_mq2g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2),
+                                quantize_mq2g256gl(
+                                    &f32_slice, inner_m, inner_k_e, &signs1, &signs2,
+                                ),
                                 QuantType::MQ2G256GL,
                                 256u32,
                             ),
                             QuantType::MQ3G256GL => (
-                                quantize_mq3g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2),
+                                quantize_mq3g256gl(
+                                    &f32_slice, inner_m, inner_k_e, &signs1, &signs2,
+                                ),
                                 QuantType::MQ3G256GL,
                                 256u32,
                             ),
@@ -10945,7 +11177,8 @@ fn main() {
                     } else if expert_mq3lloyd_native && routed_gl {
                         // GL swap: same 3-bit allocation, global codebook instead of
                         // a per-block fp16 one. 3.0625 vs 3.5 bpw.
-                        let q = quantize_mq3g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        let q =
+                            quantize_mq3g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                         (q, QuantType::MQ3G256GL, 256u32)
                     } else if expert_mq3lloyd_native {
                         let q = quantize_mq3g256_lloyd(&f32_slice, &signs1, &signs2);
@@ -10957,7 +11190,8 @@ fn main() {
                         // R[i][j]^2 = 1/256, so a rotated diagonal importance vector
                         // is constant), so plain Lloyd is the honest baseline and
                         // there is nothing to lose by taking it.
-                        let q = quantize_mq2g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        let q =
+                            quantize_mq2g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                         (q, QuantType::MQ2G256GL, 256u32)
                     } else if expert_mq2lloyd_native {
                         // Native MQ2-Lloyd: ship qt=19 bytes (72 B / 256 weights).
@@ -15332,10 +15566,21 @@ mod tests {
         // via q8_class_of:is_q8_tensor (56xx). should_quantize keeps it quantizable
         // (contains "weight", not norm/bias, not vision).
         let name = "lm_head.weight";
-        assert!(should_quantize(name), "lm_head must be quantizable (should_quantize:53xx)");
-        assert_eq!(q8_class_of(name), Some("lm_head"), "q8_class_of:55xx lm_head");
+        assert!(
+            should_quantize(name),
+            "lm_head must be quantizable (should_quantize:53xx)"
+        );
+        assert_eq!(
+            q8_class_of(name),
+            Some("lm_head"),
+            "q8_class_of:55xx lm_head"
+        );
         assert!(is_q8_tensor(name), "is_q8_tensor:59xx must be Q8");
-        assert_eq!(kmap_resolve(name, 52, false), QuantLevel::Q8, "kmap Rule2 Q8");
+        assert_eq!(
+            kmap_resolve(name, 52, false),
+            QuantLevel::Q8,
+            "kmap Rule2 Q8"
+        );
         assert_eq!(kmap_resolve_mode(name, 52, false, 0), QuantLevel::Q8);
         assert_eq!(kmap_resolve_mode(name, 52, false, 3), QuantLevel::Q8);
     }
@@ -15364,8 +15609,14 @@ mod tests {
         );
         let attn_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.q_proj.weight");
         let gate_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.gate_proj.weight");
-        assert!(!attn_q8, "attention must NOT be pulled into Q8 by the glimmer default");
-        assert!(!gate_q8, "the Glimmer attention gate is a projection and must follow --format");
+        assert!(
+            !attn_q8,
+            "attention must NOT be pulled into Q8 by the glimmer default"
+        );
+        assert!(
+            !gate_q8,
+            "the Glimmer attention gate is a projection and must follow --format"
+        );
 
         match prev {
             Some(v) => unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", v) },
@@ -15392,10 +15643,21 @@ mod tests {
         let mlp_gate = "model.language_model.layers.0.mlp.gate_proj.weight";
         // q8_class_of:55xx — self_attn substring => "attn"; mlp gate has no
         // self_attn/attn_q/class and is not a router, so None.
-        assert_eq!(q8_class_of(attn_gate), Some("attn"), "self_attn.gate_proj => attn (q8_class_of)");
-        assert_eq!(q8_class_of(mlp_gate), None, "mlp.gate_proj must not be attn/router");
+        assert_eq!(
+            q8_class_of(attn_gate),
+            Some("attn"),
+            "self_attn.gate_proj => attn (q8_class_of)"
+        );
+        assert_eq!(
+            q8_class_of(mlp_gate),
+            None,
+            "mlp.gate_proj must not be attn/router"
+        );
         assert!(is_q8_tensor(attn_gate), "attn gate must be fixed-tier Q8");
-        assert!(!is_q8_tensor(mlp_gate), "mlp gate is not fixed-tier (unless --q8-router on MoE)");
+        assert!(
+            !is_q8_tensor(mlp_gate),
+            "mlp gate is not fixed-tier (unless --q8-router on MoE)"
+        );
         // should_quantize:53xx — both are weights, not norms/bias/vision => true
         assert!(should_quantize(attn_gate));
         assert!(should_quantize(mlp_gate));
@@ -15406,7 +15668,10 @@ mod tests {
         // the gate's input channels and is divided at inference before the gate;
         // the gate's output then scales attn_out via sigmoid. Input-side AWQ is
         // mathematically valid regardless of where the gate's output is applied.
-        assert!(awq_eligible(attn_gate), "attn gate must be AWQ-eligible (input-side)");
+        assert!(
+            awq_eligible(attn_gate),
+            "attn gate must be AWQ-eligible (input-side)"
+        );
         assert!(awq_eligible(mlp_gate), "mlp gate must be AWQ-eligible");
         // kmap: dense edge-layer rule promotes FFN only, not attn — so even in
         // edge layer 0, the attn gate stays Base (not Promote6). This matches the
@@ -15416,7 +15681,10 @@ mod tests {
         // mis-fire even if is_moe were true: attn gate is not mlp.gate.weight.
         // For MoE edge-layer (0 is edge), full promotion returns Promote6 for every
         // tensor including attn — that is the expected MoE policy, not a router.
-        assert_eq!(kmap_resolve_mode("model.layers.0.self_attn.gate_proj.weight", 52, true, 0), QuantLevel::Promote6);
+        assert_eq!(
+            kmap_resolve_mode("model.layers.0.self_attn.gate_proj.weight", 52, true, 0),
+            QuantLevel::Promote6
+        );
     }
 
     #[test]
@@ -15433,12 +15701,23 @@ mod tests {
             "model.language_model.norm.weight",
         ];
         for name in norms {
-            assert!(!should_quantize(name), "norm {name} must not be quantizable");
-            assert_eq!(kmap_resolve(name, 52, false), QuantLevel::F16, "kmap F16 for {name}");
+            assert!(
+                !should_quantize(name),
+                "norm {name} must not be quantizable"
+            );
+            assert_eq!(
+                kmap_resolve(name, 52, false),
+                QuantLevel::F16,
+                "kmap F16 for {name}"
+            );
             assert_eq!(kmap_resolve_mode(name, 52, false, 1), QuantLevel::F16);
             assert_eq!(kmap_resolve_mode(name, 52, false, 2), QuantLevel::F16);
             assert_eq!(kmap_resolve_mode(name, 52, false, 3), QuantLevel::F16);
-            assert_eq!(kmap_resolve(name, 52, true), QuantLevel::F16, "even MoE must be F16");
+            assert_eq!(
+                kmap_resolve(name, 52, true),
+                QuantLevel::F16,
+                "even MoE must be F16"
+            );
             // q8_class_of is unrelated to norms — must be None / not Q8
             assert!(!is_q8_tensor(name));
         }
@@ -15459,18 +15738,35 @@ mod tests {
             "model.vision_projection.weight",
         ];
         for name in vision {
-            assert!(!should_quantize(name), "vision {name} must stay F16 (should_quantize)");
-            assert_eq!(kmap_resolve(name, 52, false), QuantLevel::F16, "kmap vision F16 for {name}");
+            assert!(
+                !should_quantize(name),
+                "vision {name} must stay F16 (should_quantize)"
+            );
+            assert_eq!(
+                kmap_resolve(name, 52, false),
+                QuantLevel::F16,
+                "kmap vision F16 for {name}"
+            );
             assert_eq!(kmap_resolve_mode(name, 52, false, 0), QuantLevel::F16);
             assert_eq!(kmap_resolve_mode(name, 52, true, 1), QuantLevel::F16);
             // parse_layer_idx must NOT extract vision_tower.layers.N as text layer
-            assert_eq!(parse_layer_idx(name), None, "vision {name} must not parse as layer idx");
+            assert_eq!(
+                parse_layer_idx(name),
+                None,
+                "vision {name} must not parse as layer idx"
+            );
             // The old unanchored find("layers.") would have returned Some(0/49)
             // and edge-layer Promote6 could have fired — locked to None now.
         }
         // Plain vision_tower. prefix (dots.ocr style) must still be F16
-        assert_eq!(kmap_resolve("vision_tower.layers.0.attn.q_proj.weight", 52, false), QuantLevel::F16);
-        assert_eq!(parse_layer_idx("vision_tower.layers.0.attn.q_proj.weight"), None);
+        assert_eq!(
+            kmap_resolve("vision_tower.layers.0.attn.q_proj.weight", 52, false),
+            QuantLevel::F16
+        );
+        assert_eq!(
+            parse_layer_idx("vision_tower.layers.0.attn.q_proj.weight"),
+            None
+        );
         // model.visual.* (Qwen3.5-VL) unchanged
         assert!(!should_quantize("model.visual.patch_embed.weight"));
         assert_eq!(parse_layer_idx("model.visual.layers.0.weight"), None);
@@ -15479,9 +15775,18 @@ mod tests {
     #[test]
     fn glimmer_text_layers_still_parse() {
         // Sanity: text layers must still parse correctly (no regression for non-vision).
-        assert_eq!(parse_layer_idx("model.language_model.layers.0.self_attn.q_proj.weight"), Some(0));
-        assert_eq!(parse_layer_idx("model.language_model.layers.51.mlp.down_proj.weight"), Some(51));
-        assert_eq!(parse_layer_idx("model.layers.3.self_attn.gate_proj.weight"), Some(3));
+        assert_eq!(
+            parse_layer_idx("model.language_model.layers.0.self_attn.q_proj.weight"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_layer_idx("model.language_model.layers.51.mlp.down_proj.weight"),
+            Some(51)
+        );
+        assert_eq!(
+            parse_layer_idx("model.layers.3.self_attn.gate_proj.weight"),
+            Some(3)
+        );
     }
 
     #[test]
@@ -15518,5 +15823,204 @@ mod tests {
                 / (m * k) as f64
         };
         assert!(weighted_mse(&q_repaired) <= weighted_mse(&q_regular));
+    }
+
+    /// Published RadixArk/Qwen3.8-27B-DSpark nests taps/mask under
+    /// `dflash_config` and YaRN under `rope_parameters`. Parsing must prefer
+    /// those nests and emit the flat dspark_* YaRN keys the runtime reads.
+    #[test]
+    fn qwen3_dspark_nested_dflash_and_yarn_metadata() {
+        let config: serde_json::Value = serde_json::json!({
+            "architectures": ["DSparkDraftModel"],
+            "block_size": 7,
+            "dflash_config": {
+                "mask_token_id": 248077,
+                "projector_type": "dspark",
+                "target_layer_ids": [4, 16, 28, 40, 52],
+                "markov_rank": 256,
+                "confidence_head_with_markov": true,
+                "enable_confidence_head": true
+            },
+            // Deliberately wrong top-level fallbacks — nested must win.
+            "target_layer_ids": [1, 2, 3],
+            "mask_token_id": 999,
+            "rope_parameters": {
+                "beta_fast": 32.0,
+                "beta_slow": 1.0,
+                "factor": 32.0,
+                "original_max_position_embeddings": 8192,
+                "rope_theta": 10000000,
+                "rope_type": "yarn"
+            },
+            "hidden_size": 5120,
+            "head_dim": 128,
+            "num_hidden_layers": 5,
+            "num_attention_heads": 40,
+            "num_key_value_heads": 8,
+            "intermediate_size": 10240,
+            "vocab_size": 248320
+        });
+        let p = parse_qwen3_dspark_config(&config);
+        assert_eq!(p.block_size, 7);
+        assert_eq!(p.target_layer_ids, vec![4, 16, 28, 40, 52]);
+        assert_eq!(p.noise_token_id, 248077);
+        assert_eq!(p.markov_rank, 256);
+        assert!(p.confidence_with_markov);
+        assert!(p.enable_confidence);
+        assert_eq!(p.projector_type, "dspark");
+        assert_eq!(p.rope_theta, 10_000_000.0);
+        assert_eq!(p.rope_type.as_deref(), Some("yarn"));
+        assert_eq!(p.yarn_factor, Some(32.0));
+        assert_eq!(p.yarn_original_max_position_embeddings, Some(8192));
+        assert_eq!(p.yarn_beta_fast, Some(32.0));
+        assert_eq!(p.yarn_beta_slow, Some(1.0));
+
+        let meta: serde_json::Value =
+            serde_json::from_str(&qwen3_dspark_metadata_json(&p)).unwrap();
+        let cfg = meta.get("config").unwrap();
+        assert_eq!(
+            cfg.get("dspark_target_layer_ids")
+                .unwrap()
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| v.as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![4, 16, 28, 40, 52]
+        );
+        assert_eq!(
+            cfg.get("dspark_noise_token_id").unwrap().as_u64(),
+            Some(248077)
+        );
+        assert_eq!(cfg.get("dspark_block_size").unwrap().as_u64(), Some(7));
+        assert_eq!(cfg.get("dspark_rope_type").unwrap().as_str(), Some("yarn"));
+        assert_eq!(
+            cfg.get("dspark_rope_theta").unwrap().as_f64(),
+            Some(10_000_000.0)
+        );
+        assert_eq!(cfg.get("dspark_yarn_factor").unwrap().as_f64(), Some(32.0));
+        assert_eq!(
+            cfg.get("dspark_yarn_original_max_position_embeddings")
+                .unwrap()
+                .as_u64(),
+            Some(8192)
+        );
+        assert_eq!(
+            cfg.get("dspark_yarn_beta_fast").unwrap().as_f64(),
+            Some(32.0)
+        );
+        assert_eq!(
+            cfg.get("dspark_yarn_beta_slow").unwrap().as_f64(),
+            Some(1.0)
+        );
+        assert_eq!(
+            cfg.get("dspark_projector_type").unwrap().as_str(),
+            Some("dspark")
+        );
+    }
+
+    /// Legacy plain sidecars without rope_parameters / dflash_config keep the
+    /// historic defaults (top-level taps, no yarn keys emitted).
+    #[test]
+    fn qwen3_dspark_legacy_top_level_defaults() {
+        let config: serde_json::Value = serde_json::json!({
+            "architectures": ["Qwen3DSparkModel"],
+            "block_size": 7,
+            "target_layer_ids": [1, 9, 17, 25, 33],
+            "mask_token_id": 151669,
+            "markov_rank": 256,
+            "hidden_size": 4096,
+            "head_dim": 128
+        });
+        let p = parse_qwen3_dspark_config(&config);
+        assert_eq!(p.target_layer_ids, vec![1, 9, 17, 25, 33]);
+        assert_eq!(p.noise_token_id, 151669);
+        assert_eq!(p.rope_theta, 1_000_000.0);
+        assert!(p.rope_type.is_none());
+        assert!(p.yarn_factor.is_none());
+        let meta: serde_json::Value =
+            serde_json::from_str(&qwen3_dspark_metadata_json(&p)).unwrap();
+        let cfg = meta.get("config").unwrap();
+        assert!(cfg.get("dspark_rope_type").is_none());
+        assert!(cfg.get("dspark_yarn_factor").is_none());
+        assert_eq!(
+            cfg.get("dspark_rope_theta").unwrap().as_f64(),
+            Some(1_000_000.0)
+        );
+    }
+
+    #[test]
+    fn qwen35_dspark_transformer_layer_rope_values_are_preserved() {
+        let config: serde_json::Value = serde_json::json!({
+            "architectures": ["DSparkDraftModel"],
+            "block_size": 8,
+            "aux_hidden_state_layer_ids": [9, 19, 29],
+            "mask_token_id": 151669,
+            "markov_rank": 256,
+            "transformer_layer_config": {
+                "hidden_size": 2048,
+                "head_dim": 256,
+                "partial_rotary_factor": 0.25,
+                "rope_theta": 10000000
+            }
+        });
+        let p = parse_qwen3_dspark_config(&config);
+        assert_eq!(p.target_layer_ids, vec![9, 19, 29]);
+        assert_eq!(p.partial_rotary_factor, 0.25);
+        assert_eq!(p.rope_theta, 10_000_000.0);
+        assert!(p.rope_type.is_none());
+        assert!(p.yarn_factor.is_none());
+    }
+
+    #[test]
+    fn qwen3_dspark_mq4_tensor_classification() {
+        // Body + fc/main_proj selected for MQ4.
+        assert!(is_qwen3_dspark_mq4_weight(
+            "layers.0.self_attn.q_proj.weight"
+        ));
+        assert!(is_qwen3_dspark_mq4_weight(
+            "layers.4.self_attn.k_proj.weight"
+        ));
+        assert!(is_qwen3_dspark_mq4_weight(
+            "layers.2.self_attn.v_proj.weight"
+        ));
+        assert!(is_qwen3_dspark_mq4_weight(
+            "layers.1.self_attn.o_proj.weight"
+        ));
+        assert!(is_qwen3_dspark_mq4_weight("layers.0.mlp.gate_proj.weight"));
+        assert!(is_qwen3_dspark_mq4_weight("layers.0.mlp.up_proj.weight"));
+        assert!(is_qwen3_dspark_mq4_weight("layers.0.mlp.down_proj.weight"));
+        assert!(is_qwen3_dspark_mq4_weight("fc.weight"));
+        assert!(is_qwen3_dspark_mq4_weight("main_proj.weight"));
+
+        // Markov / confidence / norms / qk norms stay F16.
+        assert!(!is_qwen3_dspark_mq4_weight("markov_head.markov_w1.weight"));
+        assert!(!is_qwen3_dspark_mq4_weight("markov_head.markov_w2.weight"));
+        assert!(!is_qwen3_dspark_mq4_weight("confidence_head.proj.weight"));
+        assert!(!is_qwen3_dspark_mq4_weight("confidence_head.proj.bias"));
+        assert!(!is_qwen3_dspark_mq4_weight(
+            "layers.0.input_layernorm.weight"
+        ));
+        assert!(!is_qwen3_dspark_mq4_weight(
+            "layers.0.post_attention_layernorm.weight"
+        ));
+        assert!(!is_qwen3_dspark_mq4_weight(
+            "layers.0.self_attn.q_norm.weight"
+        ));
+        assert!(!is_qwen3_dspark_mq4_weight("hidden_norm.weight"));
+        assert!(!is_qwen3_dspark_mq4_weight("main_norm.weight"));
+        assert!(!is_qwen3_dspark_mq4_weight("norm.weight"));
+
+        // Q8 body path does not MQ4-select fc (mq4 helper does).
+        assert!(!is_qwen3_dspark_body_matmul("fc.weight"));
+        assert!(is_qwen3_dspark_body_matmul(
+            "layers.0.self_attn.q_proj.weight"
+        ));
+
+        assert_eq!(qwen3_dspark_sidecar_name("fc.weight"), "main_proj.weight");
+        assert_eq!(
+            qwen3_dspark_sidecar_name("hidden_norm.weight"),
+            "main_norm.weight"
+        );
     }
 }

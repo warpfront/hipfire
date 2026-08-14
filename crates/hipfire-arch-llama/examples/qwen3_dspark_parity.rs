@@ -113,8 +113,8 @@ fn main() -> Result<(), String> {
     eprintln!("GPU ready (arch={})", gpu.arch_caps.arch());
 
     // ── Load sidecar ──────────────────────────────────────────────────────────
-    let (dspark_weights, assets) =
-        load_qwen3_dspark(&hfq, &mut gpu)?.ok_or("load_qwen3_dspark: no dspark_* in metadata")?;
+    let (dspark_weights, assets) = load_qwen3_dspark(&hfq, &mut gpu, None)?
+        .ok_or("load_qwen3_dspark: no dspark_* in metadata")?;
 
     let cfg = &dspark_weights.cfg;
     let dim = assets.config.dim;
@@ -164,7 +164,7 @@ fn main() -> Result<(), String> {
     let check_a = parity_stats("(a) ctx1 main_x", &gpu_main_x1, &cpu_main_x1, 0.999, None);
 
     // Check (b): x_head_out from dspark_qwen3_block_forward (ctx_len=1)
-    let scratch1 = Qwen3DsparkScratch::new(&mut gpu, &assets.config, BLOCK, 1)
+    let scratch1 = Qwen3DsparkScratch::new(&mut gpu, &assets.config, BLOCK, 1, cfg)
         .map_err(|e| format!("Qwen3DsparkScratch ctx1: {e}"))?;
     let x_head_dev1 = gpu
         .alloc_tensor(&[BLOCK, dim], DType::F32)
@@ -281,7 +281,7 @@ fn main() -> Result<(), String> {
     );
 
     // Check (f): x_head_out from dspark_qwen3_block_forward (ctx_len=3)
-    let scratch3 = Qwen3DsparkScratch::new(&mut gpu, &assets.config, BLOCK, CTX_LEN3)
+    let scratch3 = Qwen3DsparkScratch::new(&mut gpu, &assets.config, BLOCK, CTX_LEN3, cfg)
         .map_err(|e| format!("Qwen3DsparkScratch ctx3: {e}"))?;
     let x_head_dev3 = gpu
         .alloc_tensor(&[BLOCK, dim], DType::F32)

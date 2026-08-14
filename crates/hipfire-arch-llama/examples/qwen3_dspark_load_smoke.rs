@@ -27,7 +27,7 @@ fn main() -> Result<(), String> {
     let mut gpu = Gpu::init().map_err(|e| format!("gpu init: {e:?}"))?;
     eprintln!("GPU initialised");
 
-    let (dspark, assets) = load_qwen3_dspark(&hfq, &mut gpu)?.ok_or_else(|| {
+    let (dspark, assets) = load_qwen3_dspark(&hfq, &mut gpu, None)?.ok_or_else(|| {
         "load_qwen3_dspark returned None — sidecar has no dspark_* metadata".to_string()
     })?;
 

@@ -203,7 +203,12 @@ fn main() -> Result<(), String> {
         let mut sidecar_hfq =
             HfqFile::open(Path::new(&sidecar_path)).map_err(|e| format!("sidecar open: {e:?}"))?;
         sidecar_hfq.drop_mmap();
-        match load_qwen3_dspark(&sidecar_hfq, ctx.gpu)? {
+        let target_shared = hipfire_arch_llama::dspark_body::QwenDsparkTargetShared {
+            token_embd: &bundle.weights.token_embd,
+            embd_format: bundle.weights.embd_format,
+            output: &bundle.weights.output,
+        };
+        match load_qwen3_dspark(&sidecar_hfq, ctx.gpu, Some(target_shared))? {
             Some((dspark_weights, dspark_assets)) => {
                 eprintln!(
                     "DSpark sidecar loaded: block_size={} target_layers={:?} markov_rank={} enable_confidence={}",

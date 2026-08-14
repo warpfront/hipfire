@@ -59,14 +59,25 @@ use hipfire_runtime::dspark_core::{
 };
 use hipfire_runtime::hfq::{load_layer, load_weight_tensor_pread, HfqFile};
 use hipfire_runtime::llama::{
-    weight_gemv, ForwardScratch, KvCache, LayerWeights, LlamaConfig, LlamaWeights, ModelArch,
-    PrefillBatchScratch, WeightTensor,
+    weight_gemv, EmbeddingFormat, ForwardScratch, KvCache, LayerWeights, LlamaConfig, LlamaWeights,
+    ModelArch, PrefillBatchScratch, WeightTensor,
 };
 use hipfire_runtime::weight_backend::{
     dequant_f32, dequant_norm, dequant_weight_raw, load_awq_scale_for, load_embedding, read_first,
     HfqBackend,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
+
+/// Optional target-shared embedding and LM-head for sidecars that omit them
+/// (e.g. Qwen3.8-27B-DSpark: 62 tensors, no `embed_tokens`/`lm_head`).
+/// When the sidecar lacks those tensors, the loader shallow-aliases the
+/// target's buffers, preserves `gpu_dtype`/`shape`, and tracks ownership so
+/// teardown never frees target-owned VRAM.
+pub struct QwenDsparkTargetShared<'a> {
+    pub token_embd: &'a GpuTensor,
+    pub embd_format: EmbeddingFormat,
+    pub output: &'a WeightTensor,
+}
 
 // ── name resolver ─────────────────────────────────────────────────────────────
 // The sidecar uses flat names (no `model.` prefix).  read_first's candidate fn
@@ -90,12 +101,84 @@ pub struct Qwen3DrafterAssets {
     pub config: LlamaConfig,
     /// Per-layer attention + FFN weights. Owned GPU tensors.
     pub weights: LlamaWeights,
+    /// True if `weights.token_embd` aliases target-owned VRAM (sidecar omitted it).
+    pub token_embd_is_alias: bool,
+    /// True if `weights.output` aliases target-owned VRAM (sidecar omitted it).
+    pub lm_head_is_alias: bool,
     /// Block-only KvCache: F32, 5 layers, cap = block_size.  Reset per window.
     pub kv: KvCache,
     /// Single-token decode scratch.
     pub scratch: ForwardScratch,
     /// Block-parallel prefill scratch (block_size tokens × dim).
     pub pbs: PrefillBatchScratch,
+}
+
+impl Qwen3DrafterAssets {
+    /// Free GPU allocations, skipping target-aliased buffers.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let LlamaWeights {
+            token_embd,
+            embd_format: _,
+            output_norm,
+            output,
+            layers,
+            lm_head_aliases_embd,
+        } = self.weights;
+        if !self.token_embd_is_alias {
+            let _ = gpu.free_tensor(token_embd);
+        }
+        let _ = gpu.free_tensor(output_norm);
+        {
+            let WeightTensor {
+                buf,
+                gpu_dtype: _,
+                m: _,
+                k: _,
+                row_stride: _,
+                paro,
+                awq_scale,
+            } = output;
+            let is_aliased = self.lm_head_is_alias || lm_head_aliases_embd;
+            if !is_aliased {
+                let _ = gpu.free_tensor(buf);
+                if let Some(awq) = awq_scale {
+                    let _ = gpu.free_tensor(awq);
+                }
+                if let Some(paro) = paro {
+                    if !paro.is_alias {
+                        let _ = gpu.free_tensor(paro.pairs);
+                        let _ = gpu.free_tensor(paro.theta);
+                        let _ = gpu.free_tensor(paro.channel_scales);
+                    }
+                }
+            } else {
+                // Every buffer is a non-owning shallow alias of the target.
+                // DeviceBuffer has no Drop-time free; the target owner releases
+                // these allocations exactly once during target teardown.
+                let _ = (buf, awq_scale, paro);
+            }
+        }
+        for l in layers {
+            let _ = gpu.free_tensor(l.attn_norm);
+            l.wq.free_all(gpu);
+            l.wk.free_all(gpu);
+            l.wv.free_all(gpu);
+            l.wo.free_all(gpu);
+            if let Some(t) = l.q_norm {
+                let _ = gpu.free_tensor(t);
+            }
+            if let Some(t) = l.k_norm {
+                let _ = gpu.free_tensor(t);
+            }
+            let _ = gpu.free_tensor(l.ffn_norm);
+            l.w_gate.free_all(gpu);
+            l.w_up.free_all(gpu);
+            l.w_down.free_all(gpu);
+        }
+        let _ = self.kv.free_gpu(gpu);
+        self.scratch.free_gpu(gpu);
+        self.pbs.free_gpu(gpu);
+    }
 }
 
 // ── Public loader ─────────────────────────────────────────────────────────────
@@ -106,12 +189,20 @@ pub struct Qwen3DrafterAssets {
 /// `drop_mmap()` before calling this function (pread is used throughout to
 /// avoid page-cache pressure on UMA).
 ///
+/// `target_shared` — when `Some`, the already-loaded target embedding and LM-head
+/// are used as a shallow-alias fallback for sidecars that omit those tensors
+/// (Qwen3.8-27B-DSpark ships 62 tensors, no `embed_tokens`/`lm_head`). The alias
+/// preserves the target's `gpu_dtype`/`shape` (Q8 for MQ4R) and is tracked so
+/// teardown never frees target-owned buffers. Old self-contained sidecars ignore
+/// this and load their own tensors.
+///
 /// Returns `None` when `dspark_block_size` is absent from the sidecar metadata
 /// (i.e. the file is not a DSpark sidecar).  Returns `Err` on tensor load
-/// failures.
+/// failures. Missing embed/lm_head without a target alias is a clear error.
 pub fn load_qwen3_dspark(
     source: &HfqFile,
     gpu: &mut Gpu,
+    target_shared: Option<QwenDsparkTargetShared<'_>>,
 ) -> Result<Option<(DsparkWeights, Qwen3DrafterAssets)>, String> {
     // 1. Parse DSpark config — includes dspark_enable_confidence (hard req #2)
     let dspark_cfg = match DsparkConfig::from_metadata_json(&source.metadata_json) {
@@ -123,7 +214,9 @@ pub fn load_qwen3_dspark(
     //    The sidecar metadata only carries dspark_* keys (no model_type /
     //    hidden_size etc.), so config_from_hfq would fail on a missing
     //    `model_type` field.  Derive the config from tensor shapes instead.
-    let mut cfg = config_from_sidecar_tensors(source)
+    //    For target-shared sidecars (no embed), vocab/dim fallback to target.
+    let target_vocab_dim = target_shared.as_ref().map(|t| (t.output.m, t.output.k));
+    let mut cfg = config_from_sidecar_tensors_with_target(source, target_vocab_dim)
         .map_err(|e| format!("qwen3_dspark: derive config: {e}"))?;
     // config_from_sidecar_tensors hardcodes rope θ=1e6 (qwen3-8B). Qwen3.5's
     // drafter uses 1e7 — take it from the sidecar metadata (defaults to 1e6 for
@@ -140,13 +233,22 @@ pub fn load_qwen3_dspark(
     }
 
     // 4. Embedding table (embed_tokens.weight, qt=1 F16 → F32 EmbeddingFormat::F32)
-    let (token_embd, embd_format) = {
-        let (ei, ed) = source
-            .tensor_data_pread("embed_tokens.weight")
-            .ok_or_else(|| "qwen3_dspark: embed_tokens.weight missing".to_string())?;
-        let qt = ei.quant_type;
-        load_embedding(gpu, qt, &ed, cfg.vocab_size, cfg.dim)
-            .map_err(|e| format!("qwen3_dspark: embed_tokens: {e:?}"))?
+    //    Fall back to target-shared shallow alias when sidecar omits it.
+    let (token_embd, embd_format, token_embd_is_alias) = match source
+        .tensor_data_pread("embed_tokens.weight")
+    {
+        Some((ei, ed)) => {
+            let qt = ei.quant_type;
+            let (t, f) = load_embedding(gpu, qt, &ed, cfg.vocab_size, cfg.dim)
+                .map_err(|e| format!("qwen3_dspark: embed_tokens: {e:?}"))?;
+            (t, f, false)
+        }
+        None => {
+            let t = target_shared.as_ref().ok_or_else(|| {
+                "qwen3_dspark: embed_tokens.weight missing and no target_shared provided (Qwen3.8 sidecar requires target embedding)".to_string()
+            })?;
+            (t.token_embd.shallow_clone(), t.embd_format, true)
+        }
     };
 
     // 5. Final norm (norm.weight → F32)
@@ -162,12 +264,54 @@ pub fn load_qwen3_dspark(
     // 6. lm_head.weight (qt=1 F16). Reduced-vocab drafters (EAGLE-3, e.g. qwen35
     //    ORNITH) emit a compressed draft vocab, so the lm_head has
     //    draft_vocab_size rows, not the full embed vocab. 0 ⇒ shared full vocab.
+    //    Fall back to target-shared shallow alias when sidecar omits it, preserving
+    //    the target's gpu_dtype/shape (Q8 for MQ4R) and tracking alias ownership.
     let draft_vocab = if dspark_cfg.draft_vocab_size > 0 {
         dspark_cfg.draft_vocab_size
     } else {
         cfg.vocab_size
     };
-    let lm_head = load_global_proj(source, gpu, "lm_head.weight", draft_vocab, cfg.dim)?;
+    let (lm_head, lm_head_is_alias) = if source.find_tensor_info("lm_head.weight").is_some() {
+        let wt = load_global_proj(source, gpu, "lm_head.weight", draft_vocab, cfg.dim)?;
+        (wt, false)
+    } else {
+        let target = target_shared.as_ref().ok_or_else(|| {
+            "qwen3_dspark: lm_head.weight missing and no target_shared provided \
+                 (Qwen3.8 sidecar requires target LM head)"
+                .to_string()
+        })?;
+        if draft_vocab != target.output.m {
+            return Err(format!(
+                "qwen3_dspark: lm_head alias mismatch: draft_vocab {draft_vocab} \
+                     != target lm_head m {}",
+                target.output.m
+            ));
+        }
+        let wt =
+            WeightTensor {
+                buf: target.output.buf.shallow_clone(),
+                gpu_dtype: target.output.gpu_dtype,
+                m: target.output.m,
+                k: target.output.k,
+                row_stride: target.output.row_stride,
+                paro: target.output.paro.as_ref().map(|paro| {
+                    hipfire_runtime::llama::ParoRotation {
+                        pairs: paro.pairs.shallow_clone(),
+                        theta: paro.theta.shallow_clone(),
+                        channel_scales: paro.channel_scales.shallow_clone(),
+                        krot: paro.krot,
+                        group_size: paro.group_size,
+                        is_alias: true,
+                    }
+                }),
+                awq_scale: target
+                    .output
+                    .awq_scale
+                    .as_ref()
+                    .map(GpuTensor::shallow_clone),
+            };
+        (wt, true)
+    };
 
     let weights = LlamaWeights {
         token_embd,
@@ -281,6 +425,8 @@ pub fn load_qwen3_dspark(
     let assets = Qwen3DrafterAssets {
         config: cfg,
         weights,
+        token_embd_is_alias,
+        lm_head_is_alias,
         kv,
         scratch,
         pbs,
@@ -331,8 +477,12 @@ fn load_global_tensor(source: &HfqFile, gpu: &mut Gpu, name: &str) -> Result<Gpu
     let mut t = gpu
         .upload_raw(&bytes, &shape)
         .map_err(|e| format!("qwen3_dspark: upload {name}: {e:?}"))?;
-    if qt == 1 {
-        t.dtype = DType::F16;
+    match qt {
+        1 => t.dtype = DType::F16,
+        3 => t.dtype = DType::Q8_0,
+        6 => t.dtype = DType::HFQ4G256,
+        13 => t.dtype = DType::MQ4G256,
+        _ => {}
     }
     Ok(t)
 }
@@ -362,25 +512,41 @@ fn load_global_proj(
 /// the config from tensor shapes instead.  The qwen3-8b drafter is always a
 /// dense-GQA transformer, so the derivation is exact.
 fn config_from_sidecar_tensors(source: &HfqFile) -> Result<LlamaConfig, String> {
-    // ── dim from embed_tokens.weight ─────────────────────────────────────────
-    let embed = source
-        .find_tensor_info("embed_tokens.weight")
-        .ok_or_else(|| "embed_tokens.weight missing".to_string())?;
-    if embed.shape.len() < 2 {
-        return Err(format!(
-            "embed_tokens.weight unexpected shape {:?}",
-            embed.shape
-        ));
-    }
-    let vocab_size = embed.shape[0] as usize;
-    let dim = embed.shape[1] as usize;
+    config_from_sidecar_tensors_with_target(source, None)
+}
+
+fn config_from_sidecar_tensors_with_target(
+    source: &HfqFile,
+    target_vocab_dim: Option<(usize, usize)>,
+) -> Result<LlamaConfig, String> {
+    // ── dim/vocab from embed_tokens.weight or target fallback ─────────────────
+    let (vocab_size, dim) = match source.find_tensor_info("embed_tokens.weight") {
+        Some(embed) => {
+            if embed.shape.len() < 2 {
+                return Err(format!(
+                    "embed_tokens.weight unexpected shape {:?}",
+                    embed.shape
+                ));
+            }
+            (embed.shape[0] as usize, embed.shape[1] as usize)
+        }
+        None => match target_vocab_dim {
+            Some(target) => target,
+            None => {
+                return Err(
+                    "embed_tokens.weight missing and no target_shared; cannot derive vocab/dim"
+                        .to_string(),
+                );
+            }
+        },
+    };
 
     // ── head_dim from q_norm.weight ───────────────────────────────────────────
     let q_norm = source
         .find_tensor_info("layers.0.self_attn.q_norm.weight")
         .ok_or_else(|| "layers.0.self_attn.q_norm.weight missing".to_string())?;
     let head_dim = q_norm.shape.first().copied().unwrap_or(128) as usize;
-    let has_qk_norm = true; // presence of q_norm.weight confirms it
+    let has_qk_norm = true;
 
     // ── n_heads from q_proj.weight [q_out_dim, dim] ──────────────────────────
     let wq = source
@@ -503,6 +669,47 @@ pub struct Qwen3DsparkScratch {
     /// (modeling.py:58 `self.is_causal = False`; `create_dspark_attention_mask`
     /// makes every block query see all block keys.)
     pub bias: GpuTensor,
+
+    /// Reusable MQ4 activation-rotation scratch for batched GEMMs.
+    /// Sized to `[block × hidden_dim]` F32, covering the largest activation
+    /// (`ffn_hidden_batch` for down_proj). Smaller activations (`fa_attn_out_batch`,
+    /// `x_rot_batch`) use a prefix via `sub_offset`.
+    pub mq_rot: GpuTensor,
+
+    /// Host-precomputed YaRN inverse-frequency table `[n_rot/2]` F32, uploaded
+    /// once when [`DsparkConfig::yarn_enabled`] is true.
+    pub yarn_freqs: Option<GpuTensor>,
+
+    /// YaRN attention scale applied to both cosine and sine.
+    pub yarn_mscale: f32,
+}
+
+/// Compute Hugging Face YaRN inverse frequencies using f64 intermediates.
+fn yarn_halfsplit_inv_freqs(
+    n_rot: usize,
+    base: f64,
+    factor: f64,
+    original_max_pos: usize,
+    beta_fast: f64,
+    beta_slow: f64,
+) -> (Vec<f32>, f32, f32, f32) {
+    let dim = n_rot as f64;
+    let correction = |rot: f64| {
+        dim * ((original_max_pos as f64) / (rot * 2.0 * std::f64::consts::PI)).ln()
+            / (2.0 * base.ln())
+    };
+    let low = correction(beta_fast).floor().max(0.0);
+    let high = correction(beta_slow).ceil().min((dim - 1.0).max(0.0));
+    let denom = (high - low).max(0.001);
+    let mut freqs = Vec::with_capacity(n_rot / 2);
+    for i in 0..n_rot / 2 {
+        let i = i as f64;
+        let plain = base.powf(-2.0 * i / dim);
+        let ramp = ((i - low) / denom).clamp(0.0, 1.0);
+        freqs.push((plain / factor * ramp + plain * (1.0 - ramp)) as f32);
+    }
+    let mscale = (1.0 + 0.1 * factor.ln()) as f32;
+    (freqs, mscale, low as f32, high as f32)
 }
 
 impl Qwen3DsparkScratch {
@@ -516,6 +723,7 @@ impl Qwen3DsparkScratch {
         config: &LlamaConfig,
         block_size: usize,
         max_ctx_len: usize,
+        dspark_cfg: &DsparkConfig,
     ) -> Result<Self, String> {
         let max_ctx_len = max_ctx_len.max(1);
         let kv_cap = max_ctx_len + block_size;
@@ -551,6 +759,42 @@ impl Qwen3DsparkScratch {
         let bias = gpu
             .zeros(&[block_size * block_size], DType::F32)
             .map_err(|e| format!("Qwen3DsparkScratch: bias: {e:?}"))?;
+        let mq_rot = gpu
+            .alloc_tensor(&[block_size * config.hidden_dim], DType::F32)
+            .map_err(|e| format!("Qwen3DsparkScratch: mq_rot: {e:?}"))?;
+
+        let (yarn_freqs, yarn_mscale) = if dspark_cfg.yarn_enabled() {
+            let n_rot = (config.head_dim as f32 * dspark_cfg.partial_rotary_factor) as usize;
+            let (freqs_host, mscale, _, _) = yarn_halfsplit_inv_freqs(
+                n_rot,
+                dspark_cfg.rope_theta as f64,
+                dspark_cfg.yarn_factor as f64,
+                dspark_cfg.yarn_original_max_position_embeddings,
+                dspark_cfg.yarn_beta_fast as f64,
+                dspark_cfg.yarn_beta_slow as f64,
+            );
+            match gpu.upload_f32(&freqs_host, &[freqs_host.len()]) {
+                Ok(freqs) => (Some(freqs), mscale),
+                Err(e) => {
+                    let _ = kv.free_gpu(gpu);
+                    pbs.free_gpu(gpu);
+                    for tensor in [
+                        all_k,
+                        all_v,
+                        positions_kv_all,
+                        positions_q_block,
+                        positions_compact,
+                        bias,
+                        mq_rot,
+                    ] {
+                        let _ = gpu.free_tensor(tensor);
+                    }
+                    return Err(format!("Qwen3DsparkScratch: yarn_freqs: {e:?}"));
+                }
+            }
+        } else {
+            (None, 1.0)
+        };
 
         Ok(Self {
             max_ctx_len,
@@ -562,6 +806,9 @@ impl Qwen3DsparkScratch {
             positions_q_block,
             positions_compact,
             bias,
+            mq_rot,
+            yarn_freqs,
+            yarn_mscale,
         })
     }
 
@@ -576,13 +823,15 @@ impl Qwen3DsparkScratch {
             self.positions_q_block,
             self.positions_compact,
             self.bias,
+            self.mq_rot,
         ] {
             let _ = gpu.free_tensor(t);
         }
+        if let Some(freqs) = self.yarn_freqs {
+            let _ = gpu.free_tensor(freqs);
+        }
     }
 }
-
-// ── dspark_qwen3_block_forward ─────────────────────────────────────────────────
 
 /// Qwen3-8B DSpark block-attention forward: 5-layer dense GQA over the
 /// bidirectional `[context(ctx_len) ++ block(N)]` KV set.
@@ -850,16 +1099,14 @@ pub fn dspark_qwen3_block_forward(
         //   q uses cos[..., -q_len:, :]  → block_positions (last block entries)
         //   k uses full cos              → [ctx_positions ++ block_positions]
 
-        // Qwen3.5 rotates only n_rot = head_dim·partial_rotary_factor dims
-        // (partial-interleaved/halfsplit, matching the qwen35 target forward);
-        // qwen3-8B rotates the full head_dim (factor 1.0 → rope_batched_f32,
-        // byte-identical). pos_offset=0: the drafter's block-only KV never compacts.
+        // Qwen3.5 rotates only n_rot = head_dim·partial_rotary_factor dims.
+        // Published Qwen3.8 DSpark uses static YaRN frequencies and attention
+        // scaling at every position. Legacy sidecars retain the old branches.
         let use_partial = partial_rotary_factor < 1.0;
         let n_rot = (config.head_dim as f32 * partial_rotary_factor) as usize;
 
-        // RoPE on Q (only): n_heads_k=0 skips K rotation.
-        if use_partial {
-            gpu.rope_partial_interleaved_f32_batched(
+        if let Some(yarn_freqs) = &scratch.yarn_freqs {
+            gpu.rope_yarn_halfsplit_batched_f32(
                 &scratch.pbs.fa_q_batch,
                 &scratch.all_k,
                 &scratch.positions_q_block,
@@ -867,27 +1114,12 @@ pub fn dspark_qwen3_block_forward(
                 0,
                 config.head_dim,
                 n_rot,
-                config.rope_freq_base,
-                block,
-                0,
-            )
-        } else {
-            gpu.rope_batched_f32(
-                &scratch.pbs.fa_q_batch,
-                &scratch.all_k, // dummy k (n_heads_k=0 → not modified)
-                &scratch.positions_q_block,
-                config.n_heads,
-                0, // n_heads_k=0 → skip K
-                config.head_dim,
-                config.rope_freq_base,
+                yarn_freqs,
+                scratch.yarn_mscale,
                 block,
             )
-        }
-        .map_err(|e| format!("dspark_qwen3 l{layer_idx}: rope Q: {e:?}"))?;
-
-        // RoPE on K (only): n_heads_q=0 skips Q rotation.
-        if use_partial {
-            gpu.rope_partial_interleaved_f32_batched(
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: yarn rope Q: {e:?}"))?;
+            gpu.rope_yarn_halfsplit_batched_f32(
                 &scratch.pbs.fa_q_batch,
                 &scratch.all_k,
                 &scratch.positions_kv_all,
@@ -895,23 +1127,66 @@ pub fn dspark_qwen3_block_forward(
                 config.n_kv_heads,
                 config.head_dim,
                 n_rot,
-                config.rope_freq_base,
+                yarn_freqs,
+                scratch.yarn_mscale,
                 kv_cap,
-                0,
             )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: yarn rope K: {e:?}"))?;
         } else {
-            gpu.rope_batched_f32(
-                &scratch.pbs.fa_q_batch, // dummy q (n_heads_q=0 → not modified)
-                &scratch.all_k,
-                &scratch.positions_kv_all,
-                0, // n_heads_q=0 → skip Q
-                config.n_kv_heads,
-                config.head_dim,
-                config.rope_freq_base,
-                kv_cap, // batch = ctx_len + block
-            )
+            if use_partial {
+                gpu.rope_partial_interleaved_f32_batched(
+                    &scratch.pbs.fa_q_batch,
+                    &scratch.all_k,
+                    &scratch.positions_q_block,
+                    config.n_heads,
+                    0,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_freq_base,
+                    block,
+                    0,
+                )
+            } else {
+                gpu.rope_batched_f32(
+                    &scratch.pbs.fa_q_batch,
+                    &scratch.all_k,
+                    &scratch.positions_q_block,
+                    config.n_heads,
+                    0,
+                    config.head_dim,
+                    config.rope_freq_base,
+                    block,
+                )
+            }
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: rope Q: {e:?}"))?;
+
+            if use_partial {
+                gpu.rope_partial_interleaved_f32_batched(
+                    &scratch.pbs.fa_q_batch,
+                    &scratch.all_k,
+                    &scratch.positions_kv_all,
+                    0,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    n_rot,
+                    config.rope_freq_base,
+                    kv_cap,
+                    0,
+                )
+            } else {
+                gpu.rope_batched_f32(
+                    &scratch.pbs.fa_q_batch,
+                    &scratch.all_k,
+                    &scratch.positions_kv_all,
+                    0,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    config.rope_freq_base,
+                    kv_cap,
+                )
+            }
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: rope K: {e:?}"))?;
         }
-        .map_err(|e| format!("dspark_qwen3 l{layer_idx}: rope K: {e:?}"))?;
 
         // ── 2g. Write K and V to Q8 KV cache at compact slots 0..kv_cap  ───────
         // Write context K/V (slots 0..ctx_len) first, then block K/V
@@ -1003,7 +1278,10 @@ pub fn dspark_qwen3_block_forward(
         // Dispatch mirrors llama.rs:forward_prefill_batch_inner (lines 2761–2826):
         // Q8_0 weights use gemm_q8_0_residual_wmma (WMMA arch) or
         // gemm_q8_0_batched_chunked+add_inplace_f32 (non-WMMA); HFQ4G256 otherwise.
+        // MQ4G256 (FWHT-rotated at quantize time) reuses the HFQ4 136 B/group kernel
+        // but requires a pre-GEMM FWHT activation rotation.
         let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+        let wo_is_mq4 = matches!(layer.wo.gpu_dtype, DType::MQ4G256);
         let q8_wmma_arch = gpu.arch_caps.has_wmma();
         if wo_is_q8 && q8_wmma_arch {
             let x_n = scratch.pbs.x_batch.sub_offset(0, block * layer.wo.m);
@@ -1030,6 +1308,21 @@ pub fn dspark_qwen3_block_forward(
             let x_n = scratch.pbs.x_batch.sub_offset(0, block * layer.wo.m);
             gpu.add_inplace_f32(&x_n, &tmp)
                 .map_err(|e| format!("dspark_qwen3 l{layer_idx}: o_proj residual add: {e:?}"))?;
+        } else if wo_is_mq4 {
+            gpu.ensure_mq_signs()
+                .map_err(|e| format!("dspark_qwen3 l{layer_idx}: ensure_mq_signs o_proj: {e:?}"))?;
+            let mq_in = scratch.mq_rot.sub_offset(0, block * layer.wo.k);
+            gpu.rotate_x_mq_batched(&scratch.pbs.fa_attn_out_batch, &mq_in, layer.wo.k, block)
+                .map_err(|e| format!("dspark_qwen3 l{layer_idx}: rotate o_proj: {e:?}"))?;
+            gpu.gemm_hfq4g256_residual(
+                &layer.wo.buf,
+                &mq_in,
+                &scratch.pbs.x_batch,
+                layer.wo.m,
+                layer.wo.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: o_proj (mq4): {e:?}"))?;
         } else {
             gpu.gemm_hfq4g256_residual(
                 &layer.wo.buf,
@@ -1041,25 +1334,15 @@ pub fn dspark_qwen3_block_forward(
             )
             .map_err(|e| format!("dspark_qwen3 l{layer_idx}: o_proj (hfq4): {e:?}"))?;
         }
-
-        // ── 2j. post_attention_layernorm(x_batch) → x_rot_batch  ──────────────
-        // modeling.py:196  `hidden_states = self.post_attention_layernorm(hidden_states)`
-        gpu.rmsnorm_batched(
-            &scratch.pbs.x_batch,
-            &layer.ffn_norm,
-            &scratch.pbs.x_rot_batch,
-            block,
-            dim,
-            config.norm_eps,
-        )
-        .map_err(|e| format!("dspark_qwen3 l{layer_idx}: ffn_norm: {e:?}"))?;
-
         // ── 2k. MLP SwiGLU: gate/up → silu_mul → down + residual  ─────────────
         // modeling.py:197  `hidden_states = self.mlp(hidden_states)` (Qwen3MLP = SwiGLU)
         // modeling.py:198  `return residual + hidden_states`
         // Dispatch mirrors llama.rs:forward_prefill_batch_inner (lines 2838–2939):
         // Q8_0 → gemm_gate_up_q8_0_wmma (WMMA) or two gemm_q8_0_batched_chunked calls.
+        // MQ4G256 gate/up also reuses the HFQ4 kernel after a shared rotation.
         let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
+        let ffn_is_mq4 = matches!(layer.w_gate.gpu_dtype, DType::MQ4G256)
+            && matches!(layer.w_up.gpu_dtype, DType::MQ4G256);
         if ffn_is_q8 && q8_wmma_arch {
             gpu.gemm_gate_up_q8_0_wmma(
                 &layer.w_gate.buf,
@@ -1092,6 +1375,25 @@ pub fn dspark_qwen3_block_forward(
                 block,
             )
             .map_err(|e| format!("dspark_qwen3 l{layer_idx}: up (q8 chunked): {e:?}"))?;
+        } else if ffn_is_mq4 {
+            gpu.ensure_mq_signs().map_err(|e| {
+                format!("dspark_qwen3 l{layer_idx}: ensure_mq_signs gate_up: {e:?}")
+            })?;
+            let mq_in = scratch.mq_rot.sub_offset(0, block * layer.w_gate.k);
+            gpu.rotate_x_mq_batched(&scratch.pbs.x_rot_batch, &mq_in, layer.w_gate.k, block)
+                .map_err(|e| format!("dspark_qwen3 l{layer_idx}: rotate gate_up: {e:?}"))?;
+            gpu.gemm_gate_up_hfq4g256(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &mq_in,
+                &scratch.pbs.gate_ffn_batch,
+                &scratch.pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: gate_up (mq4): {e:?}"))?;
         } else {
             gpu.gemm_gate_up_hfq4g256(
                 &layer.w_gate.buf,
@@ -1106,7 +1408,6 @@ pub fn dspark_qwen3_block_forward(
             )
             .map_err(|e| format!("dspark_qwen3 l{layer_idx}: gate_up (hfq4): {e:?}"))?;
         }
-
         gpu.silu_mul_f32(
             &scratch.pbs.gate_ffn_batch,
             &scratch.pbs.up_batch,
@@ -1116,7 +1417,9 @@ pub fn dspark_qwen3_block_forward(
 
         // Dispatch mirrors llama.rs:forward_prefill_batch_inner (lines 2947–3020):
         // Q8_0 → gemm_q8_0_residual_wmma (WMMA) or gemm_q8_0_batched_chunked+add_inplace.
+        // MQ4G256 also reuses the HFQ4 136 B/group kernel after a rotation.
         let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
+        let w_down_is_mq4 = matches!(layer.w_down.gpu_dtype, DType::MQ4G256);
         if w_down_is_q8 && q8_wmma_arch {
             let x_n = scratch.pbs.x_batch.sub_offset(0, block * layer.w_down.m);
             gpu.gemm_q8_0_residual_wmma(
@@ -1145,6 +1448,21 @@ pub fn dspark_qwen3_block_forward(
             let x_n = scratch.pbs.x_batch.sub_offset(0, block * layer.w_down.m);
             gpu.add_inplace_f32(&x_n, &tmp)
                 .map_err(|e| format!("dspark_qwen3 l{layer_idx}: w_down residual add: {e:?}"))?;
+        } else if w_down_is_mq4 {
+            gpu.ensure_mq_signs()
+                .map_err(|e| format!("dspark_qwen3 l{layer_idx}: ensure_mq_signs w_down: {e:?}"))?;
+            let mq_in = scratch.mq_rot.sub_offset(0, block * layer.w_down.k);
+            gpu.rotate_x_mq_batched(&scratch.pbs.ffn_hidden_batch, &mq_in, layer.w_down.k, block)
+                .map_err(|e| format!("dspark_qwen3 l{layer_idx}: rotate w_down: {e:?}"))?;
+            gpu.gemm_hfq4g256_residual(
+                &layer.w_down.buf,
+                &mq_in,
+                &scratch.pbs.x_batch,
+                layer.w_down.m,
+                layer.w_down.k,
+                block,
+            )
+            .map_err(|e| format!("dspark_qwen3 l{layer_idx}: w_down (mq4): {e:?}"))?;
         } else {
             gpu.gemm_hfq4g256_residual(
                 &layer.w_down.buf,
@@ -1258,17 +1576,7 @@ impl DsparkBody for Qwen3DsparkBody {
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {
         self.scratch.free_gpu(gpu);
-        let Qwen3DrafterAssets {
-            config: _,
-            weights,
-            kv,
-            scratch,
-            pbs,
-        } = self.assets;
-        weights.free_gpu(gpu);
-        let _ = kv.free_gpu(gpu);
-        scratch.free_gpu(gpu);
-        pbs.free_gpu(gpu);
+        self.assets.free_gpu(gpu);
     }
 }
 
@@ -1288,7 +1596,27 @@ pub fn build_qwen3_dspark_body(
     gpu: &mut Gpu,
 ) -> Result<Box<dyn DsparkBody>, String> {
     let max_ctx_len = cfg.block_size + 1;
-    let scratch = Qwen3DsparkScratch::new(gpu, &assets.config, cfg.block_size, max_ctx_len)
+    let scratch = Qwen3DsparkScratch::new(gpu, &assets.config, cfg.block_size, max_ctx_len, cfg)
         .map_err(|e| format!("build_qwen3_dspark_body: scratch: {e}"))?;
     Ok(Box::new(Qwen3DsparkBody { assets, scratch }))
+}
+
+#[cfg(test)]
+mod dspark_body_tests {
+    use super::yarn_halfsplit_inv_freqs;
+
+    #[test]
+    fn yarn_qwen38_published_table() {
+        let (freqs, mscale, low, high) =
+            yarn_halfsplit_inv_freqs(128, 10_000_000.0, 32.0, 8192, 32.0, 1.0);
+        assert_eq!(freqs.len(), 64);
+        assert_eq!(low, 14.0);
+        assert_eq!(high, 29.0);
+        assert!((mscale as f64 - 1.3465735902799727).abs() < 1e-7);
+        assert_eq!(freqs[0], 1.0);
+        assert!((freqs[14] as f64 - 0.029427271762092817).abs() < 1e-9);
+        assert!((freqs[15] as f64 - 0.021398340977978332).abs() < 1e-9);
+        assert!((freqs[29] as f64 - 0.00002103657445045307).abs() < 1e-12);
+        assert!((freqs[63] as f64 - 4.019990452928045e-9).abs() < 1e-15);
+    }
 }

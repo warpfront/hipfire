@@ -160,6 +160,19 @@ pub struct DsparkConfig {
     pub partial_rotary_factor: f32,
     /// RoPE theta (base) for the drafter body. qwen3-8B = 1e6, Qwen3.5 = 1e7.
     pub rope_theta: f32,
+    /// RoPE family name from sidecar metadata (`dspark_rope_type`).
+    /// `"default"` / plain when absent; `"yarn"` enables YaRN when the other
+    /// YaRN knobs are also set (see [`Self::yarn_enabled`]).
+    pub rope_type: String,
+    /// YaRN scale factor (`dspark_yarn_factor`). 1.0 ⇒ disabled / plain RoPE.
+    pub yarn_factor: f32,
+    /// Pre-extension max position embeddings for YaRN
+    /// (`dspark_yarn_original_max_position_embeddings`). 0 ⇒ disabled.
+    pub yarn_original_max_position_embeddings: usize,
+    /// YaRN beta_fast (`dspark_yarn_beta_fast`). Default 32.
+    pub yarn_beta_fast: f32,
+    /// YaRN beta_slow (`dspark_yarn_beta_slow`). Default 1.
+    pub yarn_beta_slow: f32,
 }
 
 impl DsparkConfig {
@@ -176,6 +189,10 @@ impl DsparkConfig {
     /// need the once-normed input, e.g. qwen3, must set this explicitly after
     /// parsing or emit it in the sidecar metadata).
     /// `norm_eps` (defaults to `1e-6` — compatible with both DeepSeek V4 and Qwen3).
+    /// `dspark_rope_type` (defaults to `"default"`), `dspark_yarn_factor` (1.0),
+    /// `dspark_yarn_original_max_position_embeddings` (0), `dspark_yarn_beta_fast`
+    /// (32), `dspark_yarn_beta_slow` (1) — legacy sidecars without these keys stay
+    /// plain RoPE with `yarn_enabled() == false`.
     pub fn from_metadata_json(metadata_json: &str) -> Option<Self> {
         let wrapper: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
         let cfg = wrapper.get("config")?;
@@ -218,6 +235,30 @@ impl DsparkConfig {
             .and_then(|v| v.as_f64())
             .map(|v| v as f32)
             .unwrap_or(1_000_000.0);
+        let rope_type = cfg
+            .get("dspark_rope_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default")
+            .to_string();
+        let yarn_factor = cfg
+            .get("dspark_yarn_factor")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(1.0);
+        let yarn_original_max_position_embeddings = cfg
+            .get("dspark_yarn_original_max_position_embeddings")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let yarn_beta_fast = cfg
+            .get("dspark_yarn_beta_fast")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(32.0);
+        let yarn_beta_slow = cfg
+            .get("dspark_yarn_beta_slow")
+            .and_then(|v| v.as_f64())
+            .map(|v| v as f32)
+            .unwrap_or(1.0);
         Some(Self {
             block_size,
             target_layer_ids,
@@ -229,7 +270,21 @@ impl DsparkConfig {
             draft_vocab_size,
             partial_rotary_factor,
             rope_theta,
+            rope_type,
+            yarn_factor,
+            yarn_original_max_position_embeddings,
+            yarn_beta_fast,
+            yarn_beta_slow,
         })
+    }
+
+    /// YaRN is active only when the sidecar explicitly opts in: rope type is
+    /// `"yarn"`, scale factor is strictly greater than 1, and the original max
+    /// position embeddings is positive. Host YaRN math lives in the arch body.
+    pub fn yarn_enabled(&self) -> bool {
+        self.rope_type == "yarn"
+            && self.yarn_factor > 1.0
+            && self.yarn_original_max_position_embeddings > 0
     }
 }
 
@@ -1767,4 +1822,64 @@ pub fn build_dspark_speculator(
         profiler: DsparkProfiler::new(),
         block_controller,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::DsparkConfig;
+
+    #[test]
+    fn from_metadata_json_qwen38_yarn_enabled() {
+        // Published Qwen3.8 DSpark sidecar YaRN values.
+        let meta = r#"{
+            "architecture": "qwen3",
+            "config": {
+                "dspark_block_size": 7,
+                "dspark_target_layer_ids": [4, 16, 28, 40, 52],
+                "dspark_markov_rank": 256,
+                "dspark_noise_token_id": 248077,
+                "dspark_rope_type": "yarn",
+                "dspark_rope_theta": 10000000.0,
+                "dspark_yarn_factor": 32.0,
+                "dspark_yarn_original_max_position_embeddings": 8192,
+                "dspark_yarn_beta_fast": 32.0,
+                "dspark_yarn_beta_slow": 1.0
+            }
+        }"#;
+        let c = DsparkConfig::from_metadata_json(meta).expect("qwen3.8 yarn sidecar");
+        assert_eq!(c.rope_type, "yarn");
+        assert_eq!(c.rope_theta, 10_000_000.0);
+        assert_eq!(c.yarn_factor, 32.0);
+        assert_eq!(c.yarn_original_max_position_embeddings, 8192);
+        assert_eq!(c.yarn_beta_fast, 32.0);
+        assert_eq!(c.yarn_beta_slow, 1.0);
+        assert!(c.yarn_enabled());
+    }
+
+    #[test]
+    fn from_metadata_json_legacy_plain_rope_defaults() {
+        // Legacy sidecars omit YaRN keys — stay plain RoPE, yarn disabled.
+        let meta = r#"{
+            "architecture": "qwen3",
+            "config": {
+                "dspark_block_size": 7,
+                "dspark_target_layer_ids": [1, 13, 25],
+                "dspark_markov_rank": 256,
+                "dspark_noise_token_id": 151643
+            }
+        }"#;
+        let c = DsparkConfig::from_metadata_json(meta).expect("legacy sidecar");
+        assert_eq!(c.rope_type, "default");
+        assert_eq!(c.rope_theta, 1_000_000.0);
+        assert_eq!(c.yarn_factor, 1.0);
+        assert_eq!(c.yarn_original_max_position_embeddings, 0);
+        assert_eq!(c.yarn_beta_fast, 32.0);
+        assert_eq!(c.yarn_beta_slow, 1.0);
+        assert!(!c.yarn_enabled());
+        // Existing defaults preserved.
+        assert!(c.enable_confidence);
+        assert!(!c.confidence_uses_normed);
+        assert_eq!(c.partial_rotary_factor, 1.0);
+        assert_eq!(c.draft_vocab_size, 0);
+    }
 }

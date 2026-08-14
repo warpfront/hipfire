@@ -1165,8 +1165,16 @@ fn finish_qwen35_load(
                     match hipfire_runtime::hfq::HfqFile::open(&p) {
                         Ok(mut sidecar) => {
                             sidecar.drop_mmap();
+                            let target_shared =
+                                hipfire_arch_llama::dspark_body::QwenDsparkTargetShared {
+                                    token_embd: &bundle.weights.token_embd,
+                                    embd_format: bundle.weights.embd_format,
+                                    output: &bundle.weights.output,
+                                };
                             match hipfire_arch_llama::dspark_body::load_qwen3_dspark(
-                                &sidecar, ctx.gpu,
+                                &sidecar,
+                                ctx.gpu,
+                                Some(target_shared),
                             ) {
                                 Ok(Some((dspark_weights, assets))) => {
                                     let block = dspark_weights.cfg.block_size;
@@ -1178,9 +1186,8 @@ fn finish_qwen35_load(
                                         assets.config.vocab_size
                                     };
                                     let stage_norm = assets.weights.output_norm.shallow_clone();
-                                    // upload_raw sets dtype=Raw; the data is F16.
                                     let mut lm_head = assets.weights.output.buf.shallow_clone();
-                                    lm_head.dtype = rdna_compute::DType::F16;
+                                    lm_head.dtype = assets.weights.output.gpu_dtype;
                                     lm_head.shape = vec![vocab];
                                     let conf_threshold = hipfire_config::developer_var(
                                         "HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD",

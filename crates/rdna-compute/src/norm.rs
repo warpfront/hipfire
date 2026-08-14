@@ -250,9 +250,8 @@ impl Gpu {
         let shared_mem = block_size * 4;
 
         let bytes = crate::profile::rmsnorm_bytes(batch * n as usize);
-        let timer = crate::profile::begin_timer(
-            &self.hip, "rmsnorm", "rmsnorm_residual_add_f32", bytes,
-        );
+        let timer =
+            crate::profile::begin_timer(&self.hip, "rmsnorm", "rmsnorm_residual_add_f32", bytes);
         let result = self.launch_maybe_blob(
             "rmsnorm_residual_add_f32",
             [batch as u32, 1, 1],
@@ -261,16 +260,22 @@ impl Gpu {
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(x_ptr); b.push_ptr(w_ptr); b.push_ptr(res_ptr);
-                b.push_ptr(out_ptr); b.push_i32(n_val); b.push_f32(eps_val);
+                b.push_ptr(x_ptr);
+                b.push_ptr(w_ptr);
+                b.push_ptr(res_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_val);
+                b.push_f32(eps_val);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
-        /// c = a + b (element-wise)
+    /// c = a + b (element-wise)
     pub fn add_f32(&mut self, a: &GpuTensor, b: &GpuTensor, c: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("add", kernels::ADD_SRC, "add_f32")?;
@@ -1206,6 +1211,91 @@ impl Gpu {
                 b.push_f32(fb);
                 b.push_i32(bs);
                 b.push_i32(po);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Batched YaRN half-split RoPE (HF `rotate_half`). Host supplies the
+    /// inverse-frequency table `freqs` with `n_rot/2` F32 entries and a
+    /// scalar `mscale` applied to both cos and sin. Q/K are
+    /// `[batch_size × n_heads × head_dim]` row-major; only the first
+    /// `n_rot` dims of each head rotate.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_yarn_halfsplit_batched_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        n_rot: usize,
+        freqs: &GpuTensor,
+        mscale: f32,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "rope_yarn_halfsplit_batched",
+            kernels::ROPE_YARN_HALFSPLIT_BATCHED_SRC,
+            "rope_yarn_halfsplit_batched_f32",
+        )?;
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut pp = positions.buf.as_ptr();
+        let mut fp = freqs.buf.as_ptr();
+        let mut nhq = n_heads_q as i32;
+        let mut nhk = n_heads_k as i32;
+        let mut hd = head_dim as i32;
+        let mut nr = n_rot as i32;
+        let mut ms = mscale;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut nhq as *mut _ as *mut c_void,
+            &mut nhk as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nr as *mut _ as *mut c_void,
+            &mut fp as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let n_pairs = (n_rot / 2) as u32;
+        let block = 32u32.min(n_pairs.max(1));
+        let grid_x = (n_pairs + block - 1) / block;
+        let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "rope",
+            "rope_yarn_halfsplit_batched_f32",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "rope_yarn_halfsplit_batched_f32",
+            [grid_x, batch_size as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(pp);
+                b.push_i32(nhq);
+                b.push_i32(nhk);
+                b.push_i32(hd);
+                b.push_i32(nr);
+                b.push_ptr(fp);
+                b.push_f32(ms);
+                b.push_i32(bs);
                 b
             },
         );
@@ -5354,7 +5444,11 @@ impl Gpu {
     /// 1D grid over n, block 256.
     pub fn logit_softcap_f32(&mut self, x: &GpuTensor, n: usize, cap: f32) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("logit_softcap_f32", kernels::LOGIT_SOFTCAP_SRC, "logit_softcap_f32")?;
+        self.ensure_kernel(
+            "logit_softcap_f32",
+            kernels::LOGIT_SOFTCAP_SRC,
+            "logit_softcap_f32",
+        )?;
         let xp = x.buf.as_ptr();
         let ni = n as i32;
         let cp = cap;
@@ -5365,16 +5459,25 @@ impl Gpu {
         ];
         let blocks = ((n + 255) / 256) as u32;
         let bytes = crate::profile::elementwise1_bytes(n);
-        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "logit_softcap_f32", bytes);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "logit_softcap_f32", bytes);
         let result = self.launch_maybe_blob(
-            "logit_softcap_f32", [blocks, 1, 1], [256, 1, 1], 0, &mut params,
+            "logit_softcap_f32",
+            [blocks, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(xp); b.push_i32(ni); b.push_f32(cp);
+                b.push_ptr(xp);
+                b.push_i32(ni);
+                b.push_f32(cp);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -5384,36 +5487,67 @@ impl Gpu {
     /// device buffer holding one i32 position (graph-capture-safe). Grid over
     /// n_rot_pairs, block 256.
     pub fn rope_partial_halved_f32(
-        &mut self, q: &GpuTensor, k: &GpuTensor, pos_buf: &DeviceBuffer,
-        n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot_pairs: usize, freq_base: f32,
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        n_rot_pairs: usize,
+        freq_base: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel("rope_partial_halved", kernels::ROPE_PARTIAL_HALVED_SRC, "rope_partial_halved_f32")?;
-        let qp = q.buf.as_ptr(); let kp = k.buf.as_ptr();
+        self.ensure_kernel(
+            "rope_partial_halved",
+            kernels::ROPE_PARTIAL_HALVED_SRC,
+            "rope_partial_halved_f32",
+        )?;
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
         let pp = pos_buf.as_ptr();
-        let nhq = n_heads_q as i32; let nhk = n_heads_k as i32;
-        let hd = head_dim as i32; let nrp = n_rot_pairs as i32; let fb = freq_base;
+        let nhq = n_heads_q as i32;
+        let nhk = n_heads_k as i32;
+        let hd = head_dim as i32;
+        let nrp = n_rot_pairs as i32;
+        let fb = freq_base;
         let block = 256u32;
         let grid = [((n_rot_pairs as u32) + block - 1) / block, 1, 1];
         let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
-        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_halved_f32", bytes);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "rope", "rope_partial_halved_f32", bytes);
         let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
-            &pp as *const _ as *mut c_void, &nhq as *const _ as *mut c_void,
-            &nhk as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
-            &nrp as *const _ as *mut c_void, &fb as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &nrp as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
         ];
         let result = self.launch_maybe_blob(
-            "rope_partial_halved_f32", grid, [block, 1, 1], 0, &mut params,
+            "rope_partial_halved_f32",
+            grid,
+            [block, 1, 1],
+            0,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(pp);
-                b.push_i32(nhq); b.push_i32(nhk); b.push_i32(hd); b.push_i32(nrp);
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(pp);
+                b.push_i32(nhq);
+                b.push_i32(nhk);
+                b.push_i32(hd);
+                b.push_i32(nrp);
                 b.push_f32(fb);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -5464,9 +5598,8 @@ impl Gpu {
         let block = 32u32;
         let grid = [n_heads as u32, 1, 1];
         let bytes = crate::profile::rope_bytes(n_heads, n_kv, head_dim);
-        let timer = crate::profile::begin_timer(
-            &self.hip, "rope", "fused_gemma4_qk_norm_rope_f32", bytes,
-        );
+        let timer =
+            crate::profile::begin_timer(&self.hip, "rope", "fused_gemma4_qk_norm_rope_f32", bytes);
         let mut params: Vec<*mut c_void> = vec![
             &qp as *const _ as *mut c_void,
             &kp as *const _ as *mut c_void,
@@ -5489,14 +5622,24 @@ impl Gpu {
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(qnw); b.push_ptr(knw);
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(qnw);
+                b.push_ptr(knw);
                 b.push_ptr(pp);
-                b.push_i32(nh); b.push_i32(nkv); b.push_i32(hd); b.push_i32(nrp);
-                b.push_f32(qs); b.push_f32(fb); b.push_f32(ep);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(nrp);
+                b.push_f32(qs);
+                b.push_f32(fb);
+                b.push_f32(ep);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
@@ -5505,9 +5648,16 @@ impl Gpu {
     /// array. Q/K are [batch × n_heads × head_dim] row-major. Grid over
     /// n_rot_pairs × batch, block 256.
     pub fn rope_partial_halved_f32_batched(
-        &mut self, q: &GpuTensor, k: &GpuTensor, positions: &GpuTensor,
-        n_heads_q: usize, n_heads_k: usize, head_dim: usize, n_rot_pairs: usize,
-        freq_base: f32, batch: usize,
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads_q: usize,
+        n_heads_k: usize,
+        head_dim: usize,
+        n_rot_pairs: usize,
+        freq_base: f32,
+        batch: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -5515,35 +5665,58 @@ impl Gpu {
             kernels::ROPE_PARTIAL_HALVED_BATCHED_SRC,
             "rope_partial_halved_f32_batched",
         )?;
-        let qp = q.buf.as_ptr(); let kp = k.buf.as_ptr();
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
         let pp = positions.buf.as_ptr();
-        let nhq = n_heads_q as i32; let nhk = n_heads_k as i32;
-        let hd = head_dim as i32; let nrp = n_rot_pairs as i32; let fb = freq_base;
+        let nhq = n_heads_q as i32;
+        let nhk = n_heads_k as i32;
+        let hd = head_dim as i32;
+        let nrp = n_rot_pairs as i32;
+        let fb = freq_base;
         let bz = batch as i32;
         let block = 256u32;
         let grid = [((n_rot_pairs as u32) + block - 1) / block, batch as u32, 1];
         let bytes = batch * crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim);
-        let timer = crate::profile::begin_timer(&self.hip, "rope", "rope_partial_halved_f32_batched", bytes);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "rope",
+            "rope_partial_halved_f32_batched",
+            bytes,
+        );
         let mut params: Vec<*mut c_void> = vec![
-            &qp as *const _ as *mut c_void, &kp as *const _ as *mut c_void,
-            &pp as *const _ as *mut c_void, &nhq as *const _ as *mut c_void,
-            &nhk as *const _ as *mut c_void, &hd as *const _ as *mut c_void,
-            &nrp as *const _ as *mut c_void, &fb as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &nhq as *const _ as *mut c_void,
+            &nhk as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &nrp as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
             &bz as *const _ as *mut c_void,
         ];
         let result = self.launch_maybe_blob(
-            "rope_partial_halved_f32_batched", grid, [block, 1, 1], 0, &mut params,
+            "rope_partial_halved_f32_batched",
+            grid,
+            [block, 1, 1],
+            0,
+            &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(qp); b.push_ptr(kp); b.push_ptr(pp);
-                b.push_i32(nhq); b.push_i32(nhk); b.push_i32(hd); b.push_i32(nrp);
-                b.push_f32(fb); b.push_i32(bz);
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(pp);
+                b.push_i32(nhq);
+                b.push_i32(nhk);
+                b.push_i32(hd);
+                b.push_i32(nrp);
+                b.push_f32(fb);
+                b.push_i32(bz);
                 b
             },
         );
-        if let Some(t) = timer { t.finish(&self.hip); }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
-
-
 }
