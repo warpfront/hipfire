@@ -300,6 +300,13 @@ fn main() {
     // Shape 2: groups_per_row=4 (exercises the accumulate-across-groups path).
     all_ok &= run(&mut gpu, 48, 512, 0xDEADBEEF);
 
+    // Shape 3: groups_per_row=3 — ODD, so the 2-group unrolled loop runs once
+    // and leaves one group to the tail. Even counts alone never exercise that
+    // handoff, which is where an off-by-one in the unroll would hide.
+    all_ok &= run(&mut gpu, 32, 384, 0x5EED0003);
+    // Shape 4: groups_per_row=5 — two unrolled iterations plus a tail group.
+    all_ok &= run(&mut gpu, 40, 640, 0x5EED0005);
+
     if !all_ok {
         eprintln!("\nFAIL: one or more shapes did not pass parity/neg-control.");
         std::process::exit(1);
