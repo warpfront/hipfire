@@ -269,6 +269,11 @@ pub enum KernelKey {
     GemvMq3G256LloydSwiGLUResidual,
     GemvMq4G256LloydSwiGLUResidual,
     // GEMM
+    /// Tiled prefill GEMM over PACKED TQ2-G128 blocks. Register-blocked
+    /// 64x64 output tile; beats the per-token GEMV loop from N~32 up.
+    GemmTQ2G128Prefill,
+    /// Binary sibling of `GemmTQ2G128Prefill`.
+    GemmBQ1G128Prefill,
     GemmHfq4G256,
     GemmHfq4G128,
     GemmQ8_0BatchedChunked,

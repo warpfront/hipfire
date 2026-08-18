@@ -85,6 +85,16 @@ fn main() {
                         .expect("native prefill");
                 }
             };
+            // Arm D: WMMA straight off the packed blocks (F16 activations).
+            let wmma = |gpu: &mut Gpu| {
+                if ternary {
+                    gpu.gemm_tq2g128_wmma(&d_a, &d_xf, &d_y, m, k, n)
+                        .expect("wmma");
+                } else {
+                    gpu.gemm_bq1g128_wmma(&d_a, &d_xf, &d_y, m, k, n)
+                        .expect("wmma");
+                }
+            };
             // Arm C: dequant -> F16 -> WMMA GEMM (measured, kept for contrast).
             let dequant_route = |gpu: &mut Gpu| {
                 if ternary {
@@ -117,6 +127,15 @@ fn main() {
             gpu.hip.device_synchronize().expect("sync");
             let d_ms = t1.elapsed().as_secs_f64() * 1000.0 / reps as f64;
 
+            wmma(&mut gpu);
+            gpu.hip.device_synchronize().expect("sync");
+            let tw = Instant::now();
+            for _ in 0..reps {
+                wmma(&mut gpu);
+            }
+            gpu.hip.device_synchronize().expect("sync");
+            let w_ms = tw.elapsed().as_secs_f64() * 1000.0 / reps as f64;
+
             let tn = Instant::now();
             for _ in 0..reps {
                 native(&mut gpu);
@@ -139,8 +158,9 @@ fn main() {
             let dq_ms = t2.elapsed().as_secs_f64() * 1000.0 / reps as f64;
 
             println!(
-                "M={m:<6} K={k:<5} N={n:<4} scalar {s_ms:8.3} ms | NATIVE {n_ms:8.3} ms ({:5.1}x) | dequant+f16 {d_ms:8.3} ms ({:.2}x, dq {dq_ms:.2})",
+                "M={m:<6} K={k:<5} N={n:<4} scalar {s_ms:8.3} | tiled {n_ms:7.3} ({:4.1}x) | WMMA {w_ms:7.3} ({:5.1}x) | dq+f16 {d_ms:7.3} ({:.2}x)",
                 s_ms / n_ms,
+                s_ms / w_ms,
                 s_ms / d_ms
             );
         }

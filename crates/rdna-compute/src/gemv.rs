@@ -5715,6 +5715,18 @@ impl Gpu {
         assert!(n_tokens >= 1, "{name}: n_tokens must be >= 1");
         // Same floor-vs-ceil block-count hazard as the scalar kernels.
         assert_eq!(k % 128, 0, "{name}: k must be a multiple of 128, got {k}");
+        // Internal arch dispatch, same idiom as gemm_hfq4g256 routing to
+        // dp4a/rocBLAS/WMMA: where wave32 WMMA exists the matrix-core kernel
+        // is 2-3x the register-blocked vector one (measured 6.6x vs scalar at
+        // M=17408 N=128, against the tiled kernel's 2.5x), so prefer it and
+        // keep the tiled kernel as the portable fallback.
+        if self.arch_caps.has_wmma_w32() {
+            return if name == "gemm_tq2g128_prefill" {
+                self.gemm_tq2g128_wmma(a_raw, x, y, m, k, n_tokens)
+            } else {
+                self.gemm_bq1g128_wmma(a_raw, x, y, m, k, n_tokens)
+            };
+        }
         self.bind_thread()?;
         self.ensure_kernel(name, src, name)?;
         let func = &self.functions[name];

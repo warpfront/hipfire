@@ -11717,6 +11717,21 @@ pub fn forward_prefill_batch_with_pbs_opts(
 // through the gemm_*_mq4g256_lloyd_wmma family on gfx11 (always-on)
 // and gfx12 (opt-in via HIPFIRE_LLOYD_GFX12=1). MQ2G256Lloyd remains
 // unwired — MQ2-Lloyd lands separately.
+/// Plain (unfused) batched-GEMM dispatcher key for a weight dtype.
+///
+/// Q8 keeps the chunked kernel it already used, so this is behaviour-preserving
+/// for every existing model; the low-bit formats route to their tiled prefill
+/// GEMMs. They share the Q8 call sites deliberately: none of the three has a
+/// fused qkvza/gate_up/qkv kernel, so all three want the same unfused strategy.
+fn plain_gemm_key_for(dt: DType) -> hipfire_dispatch::types::KernelKey {
+    use hipfire_dispatch::types::KernelKey as K;
+    match dt {
+        DType::TQ2G128 => K::GemmTQ2G128Prefill,
+        DType::BQ1G128 => K::GemmBQ1G128Prefill,
+        _ => K::GemmQ8_0BatchedChunked,
+    }
+}
+
 fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(
         dt,
@@ -11732,6 +11747,13 @@ fn is_batchable_la(dt: DType, arch: &str) -> bool {
         // models unaffected because no production checkpoint sets
         // wqkv.gpu_dtype = ParoQ4G128 outside the shisa-PARO codepath.
         | DType::ParoQ4G128 | DType::F32
+        // TQ2G128/BQ1G128 (PrismML Bonsai ternary/binary). Unrotated, so they
+        // take the plain-rmsnorm activation path and dispatch through
+        // plain_gemm_key_for to the tiled prefill GEMMs. Admitting them here is
+        // only safe because every is_q8 unfused branch was widened to accept
+        // them in the same change -- see the all-together rule in
+        // docs/plans/mq-lloyd-batched-prefill-followup.md.
+        | DType::TQ2G128 | DType::BQ1G128
     );
     if always_ok {
         return true;
@@ -14382,6 +14404,11 @@ fn forward_batch_chunk_impl(
                 let is_mq3_lloyd = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256Lloyd);
                 let is_fp4 = matches!(layer.wqkv.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
+                // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+                // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+                // to the HFQ4 arm, which would read these packed blocks at the wrong
+                // stride and produce fluent-but-wrong tokens.
+                let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
 
                 // Batched rmsnorm (+ FWHT for MQ) for the LA preamble.
                 // x_batch / x_rot_batch are [N × dim] contiguous. For HFQ
@@ -14461,14 +14488,14 @@ fn forward_batch_chunk_impl(
                         layer.wqkv.k,
                         n,
                     )?;
-                } else if is_q8 {
+                } else if is_q8 || is_lowbit {
                     // #397 Ship 5.2 slice1: four plain Q8 batched GEMMs
                     // (wqkv/wz/w_beta/w_alpha) → GemmFamily::run_key with the
                     // GemmQ8_0BatchedChunked dispatcher-entry key → identical
                     // gpu.gemm_q8_0_batched_chunked method, byte-for-byte.
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wqkv.gpu_dtype),
                         &layer.wqkv.buf,
                         layer.wqkv.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -14479,7 +14506,7 @@ fn forward_batch_chunk_impl(
                     )?;
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wz.gpu_dtype),
                         &layer.wz.buf,
                         layer.wz.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -14490,7 +14517,7 @@ fn forward_batch_chunk_impl(
                     )?;
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.w_beta.gpu_dtype),
                         &layer.w_beta.buf,
                         layer.w_beta.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -14501,7 +14528,7 @@ fn forward_batch_chunk_impl(
                     )?;
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.w_alpha.gpu_dtype),
                         &layer.w_alpha.buf,
                         layer.w_alpha.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -14954,6 +14981,11 @@ fn forward_batch_chunk_impl(
                 let wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
                 let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+                // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+                // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+                // to the HFQ4 arm, which would read these packed blocks at the wrong
+                // stride and produce fluent-but-wrong tokens.
+                let wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
                 let wo_input = if wo_is_mq {
                     // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
                     rotate_x_mq_batched_for(
@@ -14993,14 +15025,14 @@ fn forward_batch_chunk_impl(
                         layer.wo.k,
                         n,
                     )?;
-                } else if wo_is_q8 {
+                } else if wo_is_q8 || wo_is_lowbit {
                     // Tier 2 fallback (non-WMMA archs): GEMM into x_rot_batch as
                     // scratch (safe — next consumer is the FFN rmsnorm), then
                     // add into residual.
                     let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wo.gpu_dtype),
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
                         wo_input,
@@ -15090,6 +15122,12 @@ fn forward_batch_chunk_impl(
                 let ffn_is_mq3_lloyd = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256Lloyd);
                 let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
+                // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+                // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+                // to the HFQ4 arm, which would read these packed blocks at the wrong
+                // stride and produce fluent-but-wrong tokens.
+                let ffn_is_lowbit =
+                    matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
                 if ffn_is_mq {
                     // AWQ-aware: next linear is w_gate (gate/up share input → same AWQ scale).
                     fused_rmsnorm_rotate_mq_batched_for(
@@ -15152,10 +15190,10 @@ fn forward_batch_chunk_impl(
                         layer.w_gate.k,
                         n,
                     )?;
-                } else if ffn_is_q8 {
+                } else if ffn_is_q8 || ffn_is_lowbit {
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.w_gate.gpu_dtype),
                         &layer.w_gate.buf,
                         layer.w_gate.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -15166,7 +15204,7 @@ fn forward_batch_chunk_impl(
                     )?;
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.w_up.gpu_dtype),
                         &layer.w_up.buf,
                         layer.w_up.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -15254,6 +15292,12 @@ fn forward_batch_chunk_impl(
                 let w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
+                // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+                // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+                // to the HFQ4 arm, which would read these packed blocks at the wrong
+                // stride and produce fluent-but-wrong tokens.
+                let w_down_is_lowbit =
+                    matches!(layer.w_down.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
                 if w_down_is_mq {
                     // F2: AWQ-aware silu_mul+rotate for w_down input.
                     fused_silu_mul_rotate_mq_batched_for(
@@ -15295,11 +15339,11 @@ fn forward_batch_chunk_impl(
                         layer.w_down.k,
                         n,
                     )?;
-                } else if w_down_is_q8 {
+                } else if w_down_is_q8 || w_down_is_lowbit {
                     let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.w_down.gpu_dtype),
                         &layer.w_down.buf,
                         layer.w_down.gpu_dtype,
                         &pbs.ffn_hidden_batch,
@@ -15404,6 +15448,11 @@ fn forward_batch_chunk_impl(
                 let qkv_is_mq3_lloyd = matches!(layer.wq.gpu_dtype, DType::MQ3G256Lloyd);
                 let qkv_is_fp4 = matches!(layer.wq.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
+                // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+                // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+                // to the HFQ4 arm, which would read these packed blocks at the wrong
+                // stride and produce fluent-but-wrong tokens.
+                let qkv_is_lowbit = matches!(layer.wq.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
                 // Fused QKV kernels require all three weights to share a
                 // dtype — they treat wq/wk/wv as same-stride byte arrays.
                 // When kmap mode 2 promotes only `v_proj` (issue #249), the
@@ -15539,10 +15588,10 @@ fn forward_batch_chunk_impl(
                         layer.wq.k,
                         n,
                     )?;
-                } else if qkv_is_q8 && qkv_same_dtype {
+                } else if (qkv_is_q8 || qkv_is_lowbit) && qkv_same_dtype {
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wq.gpu_dtype),
                         &layer.wq.buf,
                         layer.wq.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -15553,7 +15602,7 @@ fn forward_batch_chunk_impl(
                     )?;
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wk.gpu_dtype),
                         &layer.wk.buf,
                         layer.wk.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -15564,7 +15613,7 @@ fn forward_batch_chunk_impl(
                     )?;
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wv.gpu_dtype),
                         &layer.wv.buf,
                         layer.wv.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -15797,6 +15846,11 @@ fn forward_batch_chunk_impl(
                 let fa_wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
                 let fa_wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+                // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+                // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+                // to the HFQ4 arm, which would read these packed blocks at the wrong
+                // stride and produce fluent-but-wrong tokens.
+                let fa_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
                 let fa_wo_input = if fa_wo_is_mq {
                     // F2: AWQ-aware rotate for FullAttention wo (o_proj) input.
                     rotate_x_mq_batched_for(
@@ -15836,11 +15890,11 @@ fn forward_batch_chunk_impl(
                         layer.wo.k,
                         n,
                     )?;
-                } else if fa_wo_is_q8 {
+                } else if fa_wo_is_q8 || fa_wo_is_lowbit {
                     let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wo.gpu_dtype),
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
                         fa_wo_input,
@@ -15932,6 +15986,12 @@ fn forward_batch_chunk_impl(
                 let fa_ffn_is_fp4 =
                     matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
+                // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+                // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+                // to the HFQ4 arm, which would read these packed blocks at the wrong
+                // stride and produce fluent-but-wrong tokens.
+                let fa_ffn_is_lowbit =
+                    matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
                 if fa_ffn_is_mq {
                     // AWQ-aware: next linear is w_gate (FA-FFN, gate/up share input).
                     fused_rmsnorm_rotate_mq_batched_for(
@@ -15990,10 +16050,10 @@ fn forward_batch_chunk_impl(
                         layer.w_gate.k,
                         n,
                     )?;
-                } else if fa_ffn_is_q8 {
+                } else if fa_ffn_is_q8 || fa_ffn_is_lowbit {
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.w_gate.gpu_dtype),
                         &layer.w_gate.buf,
                         layer.w_gate.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -16004,7 +16064,7 @@ fn forward_batch_chunk_impl(
                     )?;
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.w_up.gpu_dtype),
                         &layer.w_up.buf,
                         layer.w_up.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -16085,6 +16145,12 @@ fn forward_batch_chunk_impl(
                 let fa_w_down_is_fp4 =
                     matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
                 let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
+                // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+                // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+                // to the HFQ4 arm, which would read these packed blocks at the wrong
+                // stride and produce fluent-but-wrong tokens.
+                let fa_w_down_is_lowbit =
+                    matches!(layer.w_down.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
                 if fa_w_down_is_mq {
                     // F2: AWQ-aware silu_mul+rotate for FullAttention w_down input.
                     fused_silu_mul_rotate_mq_batched_for(
@@ -16124,11 +16190,11 @@ fn forward_batch_chunk_impl(
                         layer.w_down.k,
                         n,
                     )?;
-                } else if fa_w_down_is_q8 {
+                } else if fa_w_down_is_q8 || fa_w_down_is_lowbit {
                     let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.w_down.gpu_dtype),
                         &layer.w_down.buf,
                         layer.w_down.gpu_dtype,
                         &pbs.ffn_hidden_batch,
@@ -16280,6 +16346,11 @@ fn forward_batch_chunk_impl(
                 let is_mq = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
+                // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+                // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+                // to the HFQ4 arm, which would read these packed blocks at the wrong
+                // stride and produce fluent-but-wrong tokens.
+                let is_lowbit = matches!(layer.wqkv.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
                 // Phase 1.5: PARO mode for DeltaNetMoe — wqkv/wz are
                 // ParoQ4G128 (each with its own Givens rotation tables);
                 // w_alpha/w_beta are F32 (no rotation, no quantization).
@@ -16456,12 +16527,12 @@ fn forward_batch_chunk_impl(
                         layer.wqkv.k,
                         n,
                     )?;
-                } else if is_q8 {
+                } else if is_q8 || is_lowbit {
                     // #397 Ship 5.2 slice1: four plain Q8 batched GEMMs
                     // (wqkv/wz/w_beta/w_alpha), sibling DeltaNet QKVZA path.
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wqkv.gpu_dtype),
                         &layer.wqkv.buf,
                         layer.wqkv.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -16472,7 +16543,7 @@ fn forward_batch_chunk_impl(
                     )?;
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wz.gpu_dtype),
                         &layer.wz.buf,
                         layer.wz.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -16483,7 +16554,7 @@ fn forward_batch_chunk_impl(
                     )?;
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.w_beta.gpu_dtype),
                         &layer.w_beta.buf,
                         layer.w_beta.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -16494,7 +16565,7 @@ fn forward_batch_chunk_impl(
                     )?;
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.w_alpha.gpu_dtype),
                         &layer.w_alpha.buf,
                         layer.w_alpha.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -16864,6 +16935,11 @@ fn forward_batch_chunk_impl(
                 // stream when dispatched through the HFQ4 kernel against
                 // 200 B/group MQ6-layout bytes.
                 let dn_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+                // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+                // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+                // to the HFQ4 arm, which would read these packed blocks at the wrong
+                // stride and produce fluent-but-wrong tokens.
+                let dn_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
                 let dn_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let dn_wo_is_paro = matches!(layer.wo.gpu_dtype, DType::ParoQ4G128);
                 let dn_wo_input = if dn_wo_is_q8 {
@@ -16923,14 +16999,14 @@ fn forward_batch_chunk_impl(
                         layer.wo.k,
                         n,
                     )?;
-                } else if dn_wo_is_q8 {
+                } else if dn_wo_is_q8 || dn_wo_is_lowbit {
                     // Non-WMMA Q8: gemm into a scratch then add into x_batch.
                     // Reuse `dn_normed_rot_batch` (free since the MQ4 rotate
                     // path didn't run here) as the GEMM scratch.
                     let scratch = pbs.dn_normed_rot_batch.sub_offset(0, n * layer.wo.m);
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wo.gpu_dtype),
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
                         dn_wo_input,
@@ -17021,6 +17097,11 @@ fn forward_batch_chunk_impl(
                 let qkv_is_mq = matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::MQ6G256);
                 let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
+                // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+                // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+                // to the HFQ4 arm, which would read these packed blocks at the wrong
+                // stride and produce fluent-but-wrong tokens.
+                let qkv_is_lowbit = matches!(layer.wq.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
                 // Phase 1.6 (PARO FullAttnMoe): wq/wk/wv are ParoQ4G128
                 // (each with its own Givens rotation tables). The fused-QKV
                 // kernels can't handle this — they assume one shared
@@ -17184,10 +17265,10 @@ fn forward_batch_chunk_impl(
                         layer.wq.k,
                         n,
                     )?;
-                } else if qkv_is_q8 && qkv_same_dtype {
+                } else if (qkv_is_q8 || qkv_is_lowbit) && qkv_same_dtype {
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wq.gpu_dtype),
                         &layer.wq.buf,
                         layer.wq.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -17198,7 +17279,7 @@ fn forward_batch_chunk_impl(
                     )?;
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wk.gpu_dtype),
                         &layer.wk.buf,
                         layer.wk.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -17209,7 +17290,7 @@ fn forward_batch_chunk_impl(
                     )?;
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wv.gpu_dtype),
                         &layer.wv.buf,
                         layer.wv.gpu_dtype,
                         &pbs.x_rot_batch,
@@ -17415,6 +17496,11 @@ fn forward_batch_chunk_impl(
                 // — catastrophic stride mismatch produces a single-token
                 // attractor on AWQ A3B's 4/40 FA layers with MQ6 wo).
                 let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
+                // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
+                // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
+                // to the HFQ4 arm, which would read these packed blocks at the wrong
+                // stride and produce fluent-but-wrong tokens.
+                let fa_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
                 let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
                 // Phase 1.6 (PARO FullAttnMoe wo): own Givens rotation table,
                 // 72 B/group HFQ4G128 layout. Rotate fa_attn_out_batch by wo's
@@ -17475,14 +17561,14 @@ fn forward_batch_chunk_impl(
                         layer.wo.k,
                         n,
                     )?;
-                } else if fa_wo_is_q8 {
+                } else if fa_wo_is_q8 || fa_wo_is_lowbit {
                     // Non-WMMA Q8: GEMM into a scratch then add into x_batch.
                     // Reuse `fa_attn_out_rot_batch` (free since MQ4 rotate
                     // didn't run here) as scratch.
                     let scratch = pbs.fa_attn_out_rot_batch.sub_offset(0, n * layer.wo.m);
                     run_plain_gemm_key(
                         gpu,
-                        hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
+                        plain_gemm_key_for(layer.wo.gpu_dtype),
                         &layer.wo.buf,
                         layer.wo.gpu_dtype,
                         fa_wo_input,

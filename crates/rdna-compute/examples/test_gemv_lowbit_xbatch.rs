@@ -238,6 +238,116 @@ fn run_prefill(gpu: &mut Gpu, ternary: bool, m: usize, k: usize, n: usize, seed:
     true
 }
 
+/// WMMA prefill GEMM: same oracle, but activations are staged to F16 first,
+/// so the tolerance has to admit F16 rounding of x (~1e-3 relative) rather
+/// than the F32 paths' ~1e-6.
+fn run_wmma(gpu: &mut Gpu, ternary: bool, m: usize, k: usize, n: usize, seed: u64) -> bool {
+    let name = if ternary { "tq2g128" } else { "bq1g128" };
+    let mut rng = Rng(seed);
+    let (packed, w) = pack(m, k, ternary, &mut rng);
+    let xs: Vec<f32> = (0..n * k).map(|_| rng.signed()).collect();
+    // Round x through F16 so the oracle sees exactly what the kernel reads.
+    let xs_rt: Vec<f32> = xs.iter().map(|v| f16_to_f32(f32_to_f16_bits(*v))).collect();
+
+    let mut expect = vec![0f32; n * m];
+    for ni in 0..n {
+        for row in 0..m {
+            let mut acc = 0f32;
+            for j in 0..k {
+                acc += w[row * k + j] * xs_rt[ni * k + j];
+            }
+            expect[ni * m + row] = acc;
+        }
+    }
+
+    let d_a = gpu.upload_raw(&packed, &[packed.len()]).expect("upload A");
+    // The kernel takes F32 and converts to F16 fragments in-register, so feed
+    // it the F16-rounded values the oracle used -- that isolates the kernel's
+    // arithmetic from the rounding, which the oracle already accounts for.
+    let x_h = gpu.upload_f32(&xs_rt, &[n * k]).expect("upload x f32");
+    let d_y = gpu.zeros(&[n * m], DType::F32).expect("zeros y");
+    let res = if ternary {
+        gpu.gemm_tq2g128_wmma(&d_a, &x_h, &d_y, m, k, n)
+    } else {
+        gpu.gemm_bq1g128_wmma(&d_a, &x_h, &d_y, m, k, n)
+    };
+    res.expect("launch wmma");
+    let got = gpu.download_f32(&d_y).expect("download y");
+
+    let max_abs = expect.iter().fold(0f32, |a, v| a.max(v.abs()));
+    // A WMMA fragment accumulates 16 F16 products per step in F32; the A side
+    // is exact (ternary/binary * an F16 scale), so the error is dominated by
+    // F16 x rounding accumulated over K.
+    let tol = 5e-3 * (1.0 + max_abs);
+    let mut worst = 0f32;
+    for i in 0..n * m {
+        worst = worst.max((got[i] - expect[i]).abs());
+    }
+    if worst >= tol {
+        eprintln!("FAIL: {name} wmma M={m} K={k} N={n} max_err={worst:e} >= tol={tol:e}");
+        return false;
+    }
+    println!("PARITY OK {name} wmma    M={m:<4} K={k:<4} N={n:<4} max_err={worst:e} tol={tol:e}");
+    true
+}
+
+/// Fused 4-way qkvza GEMM must equal four separate plain GEMMs on the same
+/// activations. The plain path is itself oracle-verified above, so this is a
+/// genuine equivalence check on the fusion/routing, which is where a fused
+/// kernel actually goes wrong (rows routed to the wrong matrix or stride).
+fn run_fused_qkvza(gpu: &mut Gpu, m: [usize; 4], k: usize, n: usize, seed: u64) -> bool {
+    let mut rng = Rng(seed);
+    let mut packed = Vec::new();
+    let mut dev = Vec::new();
+    for mi in m.iter() {
+        let (p, _) = pack(*mi, k, true, &mut rng);
+        let d = gpu.upload_raw(&p, &[p.len()]).expect("upload A");
+        packed.push(p);
+        dev.push(d);
+    }
+    let xs: Vec<f32> = (0..n * k).map(|_| rng.signed()).collect();
+    let d_x = gpu.upload_f32(&xs, &[n * k]).expect("upload x");
+
+    // Reference: four independent plain GEMMs.
+    let mut refs = Vec::new();
+    for (i, mi) in m.iter().enumerate() {
+        let y = gpu.zeros(&[n * mi], DType::F32).expect("zeros");
+        gpu.gemm_tq2g128_prefill(&dev[i], &d_x, &y, *mi, k, n)
+            .expect("plain");
+        refs.push(gpu.download_f32(&y).expect("dl"));
+    }
+
+    // Fused: one launch.
+    let ys: Vec<_> = m
+        .iter()
+        .map(|mi| gpu.zeros(&[n * mi], DType::F32).expect("zeros"))
+        .collect();
+    gpu.gemm_qkvza_tq2g128(
+        &dev[0], &dev[1], &dev[2], &dev[3], &d_x, &ys[0], &ys[1], &ys[2], &ys[3], m[0], m[1], m[2],
+        m[3], k, n,
+    )
+    .expect("fused");
+
+    for (i, mi) in m.iter().enumerate() {
+        let got = gpu.download_f32(&ys[i]).expect("dl");
+        let r = &refs[i];
+        let max_abs = r.iter().fold(0f32, |a, v| a.max(v.abs()));
+        let tol = 1e-3 * (1.0 + max_abs);
+        let mut worst = 0f32;
+        for j in 0..n * mi {
+            worst = worst.max((got[j] - r[j]).abs());
+        }
+        if worst >= tol {
+            eprintln!(
+                "FAIL: fused qkvza matrix {i} (m={mi}) K={k} N={n} max_err={worst:e} >= tol={tol:e}"
+            );
+            return false;
+        }
+    }
+    println!("PARITY OK fused qkvza  m={m:?} K={k:<4} N={n:<4} (== 4 separate GEMMs)");
+    true
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     println!("arch: {}", gpu.arch);
@@ -261,6 +371,24 @@ fn main() {
                 ok &= run_prefill(&mut gpu, ternary, m, k, n, seed | 1);
             }
         }
+    }
+
+    // WMMA prefill. N straddles the 16-wide batch tile; M=24 straddles the
+    // 16-wide row tile, so the edge-clamp paths are covered.
+    for &ternary in &[true, false] {
+        for &(m, k) in &[(32usize, 512usize), (24, 384)] {
+            for &n in &[1usize, 15, 16, 17, 70] {
+                seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ok &= run_wmma(&mut gpu, ternary, m, k, n, seed | 1);
+            }
+        }
+    }
+
+    // Fused qkvza. Uneven m values on purpose: beta/alpha are tiny in the
+    // real LA layer, and the routing arithmetic is where fusion breaks.
+    for &n in &[1usize, 8, 33, 70] {
+        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+        ok &= run_fused_qkvza(&mut gpu, [64, 32, 8, 8], 512, n, seed | 1);
     }
 
     if !ok {

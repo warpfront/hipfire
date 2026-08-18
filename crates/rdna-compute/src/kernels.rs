@@ -4017,6 +4017,21 @@ pub const GEMV_BQ1G128_XBATCH_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_bq1g128.hip")
 );
 
+/// Batched 4-way FUSED TQ2-G128 GEMM for the DeltaNet LA preamble: one
+/// launch covering qkv+z+beta+alpha, mirroring GEMM_QKVZA_HFQ4G256_SRC.
+/// The unfused path issues four launches; closing that gap is what remains
+/// between low-bit prefill and the same-size mq4 model.
+pub const GEMM_QKVZA_TQ2G128_SRC: &str =
+    include_str!("../../../kernels/src/gemm_qkvza_tq2g128.hip");
+
+/// WMMA prefill GEMM over PACKED TQ2-G128 blocks + F16 activations.
+/// Dequantises each 16-element A fragment straight into registers and feeds
+/// the matrix cores, mirroring GEMM_HFQ4G256_WMMA_SRC. gfx1100+ only.
+pub const GEMM_TQ2G128_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_tq2g128_wmma.hip");
+
+/// Binary sibling of [`GEMM_TQ2G128_WMMA_SRC`].
+pub const GEMM_BQ1G128_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_bq1g128_wmma.hip");
+
 /// Tiled prefill GEMM over PACKED TQ2-G128 blocks — no dequant, no F16 copy.
 /// Decodes each code byte once and reuses it across a tile of TILE_N tokens.
 pub const GEMM_TQ2G128_PREFILL_SRC: &str =
