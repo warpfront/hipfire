@@ -1032,9 +1032,13 @@ mod integ {
         // Capture everything we need while the guard is held; remove the env var
         // immediately after `open` (before any assert can unwind) so a failure
         // can't leak the var to a concurrent `open`.
-        std::env::set_var("HIPFIRE_REAP_PLAN", plan_dir.path());
-        let f = HfqFile::open(&base_path).unwrap();
-        std::env::remove_var("HIPFIRE_REAP_PLAN");
+        // Inject the plan rather than set_var + open: process config is a
+        // start-time OnceLock snapshot, so a set_var here is invisible unless
+        // this test happens to be the first in the process to read config.
+        // That made this an order-dependent failure (reproducible on master
+        // with `cargo test -p hipfire-quantize --bin hipfire-quantize
+        // reap_overlay`).
+        let f = HfqFile::open_with_reap_plan(&base_path, Some(plan_dir.path())).unwrap();
 
         // Overlay auto-attached (arch_id 9 matches; expert name is a base subset).
         assert!(

@@ -98,6 +98,31 @@ struct QuantizeArgs {
     #[arg(long)]
     force_arch_id: bool,
 
+    /// Reuse the source checkpoint's AWQ sidecars as an imatrix for the
+    /// low-bit packers' column weighting. Value is the alpha the source was
+    /// AWQ-built with (see `awq_col_weights`); defaults to the CLI's own
+    /// --awq default. Off entirely when the flag is absent.
+    #[arg(long, value_name = "ALPHA", num_args = 0..=1, default_missing_value = "0.55")]
+    awq_imatrix: Option<f32>,
+
+    /// Requantize an ordinary checkpoint down to ternary/binary anyway.
+    /// See `lowbit_ptq_gate` — this is a measured collapse regime.
+    #[arg(long, env = "HIPFIRE_ALLOW_LOWBIT_PTQ")]
+    allow_lowbit_ptq: bool,
+
+    /// Upstream URL recorded in the output's `hipfire_provenance`.
+    #[arg(long, value_name = "URL")]
+    source_url: Option<String>,
+
+    /// SPDX license recorded in the output's `hipfire_provenance`.
+    #[arg(long, value_name = "SPDX")]
+    license: Option<String>,
+
+    /// Write a ternary model even if the pack-health check says it is
+    /// degenerate (see `check_ternary_pack_health`). Research escape hatch.
+    #[arg(long, env = "HIPFIRE_ALLOW_DEGENERATE_TERNARY")]
+    allow_degenerate_ternary: bool,
+
     /// Emit only tensors selected by a REAP plan.
     #[arg(long, value_name = "PLAN_DIR", conflicts_with = "reap_bake")]
     reap_overlay: Option<String>,
@@ -850,6 +875,68 @@ fn cpu_fwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
     }
 }
 
+/// Exact inverse of `cpu_fwht_256`. The forward transform is
+/// `F = D(scale·s2) · H · D(s1)` where `H` is the unnormalized 256-point
+/// Walsh-Hadamard butterfly (self-transpose, `H·H = 256·I`) and `scale = 1/16`.
+/// Hence `F⁻¹ = D(s1) · (1/256)·H · D(s2/scale)`: undo the trailing signs2/scale,
+/// re-run the (self-inverse-up-to-1/256) butterfly, then apply 1/256 and signs1.
+/// Used to recover un-rotated F32 from MQ4/MFP-rotated groups on the CPU.
+fn cpu_ifwht_256(x: &mut [f32], signs1: &[f32], signs2: &[f32]) {
+    assert!(x.len() == 256);
+    let scale = 0.0625; // 1/16, matches cpu_fwht_256
+                        // Undo the trailing `x[i] *= scale * signs2[i]`.
+    for i in 0..256 {
+        x[i] *= signs2[i] / scale;
+    }
+    // H is symmetric and self-inverse up to the 1/256 factor → identical butterfly.
+    let mut stride = 1;
+    while stride < 256 {
+        let mut i = 0;
+        while i < 256 {
+            for j in 0..stride {
+                let a = x[i + j];
+                let b = x[i + j + stride];
+                x[i + j] = a + b;
+                x[i + j + stride] = a - b;
+            }
+            i += stride * 2;
+        }
+        stride <<= 1;
+    }
+    // Undo the leading `x[i] *= signs1[i]` and apply H's 1/256 normalization.
+    let inv_n = 1.0 / 256.0;
+    for i in 0..256 {
+        x[i] *= inv_n * signs1[i];
+    }
+}
+
+#[cfg(test)]
+mod ifwht_tests {
+    use super::*;
+
+    /// `cpu_ifwht_256(cpu_fwht_256(v)) == v` elementwise within 1e-4 for a
+    /// deterministic random-ish 256-vector, using the fixed MQ4 sign pair.
+    #[test]
+    fn ifwht_inverts_fwht() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let orig: Vec<f32> = (0..256)
+            .map(|i| ((i * 7 + 3) % 257) as f32 - 128.0)
+            .collect();
+        let mut v = orig.clone();
+        cpu_fwht_256(&mut v, &signs1, &signs2);
+        cpu_ifwht_256(&mut v, &signs1, &signs2);
+        for i in 0..256 {
+            assert!(
+                (v[i] - orig[i]).abs() < 1e-4,
+                "idx {i}: got {}, want {}",
+                v[i],
+                orig[i]
+            );
+        }
+    }
+}
+
 /// Generate FWHT sign table (matches engine's gen_fwht_signs).
 pub(crate) fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
     let mut state = seed;
@@ -906,6 +993,93 @@ pub(crate) fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32])
     }
 
     output
+}
+
+/// Inverse of `quantize_mq4g256`: unpack each 256-weight block's 4-bit + affine
+/// codebook into the FWHT-*rotated* group, then apply `cpu_ifwht_256` with the
+/// fixed MQ4 sign pair (`gen_fwht_signs(42,256)` / `gen_fwht_signs(1042,256)`)
+/// to recover the original un-rotated F32 weights. Block layout mirrors the
+/// packer exactly: `[f32 scale][f32 min][128B nibbles]` = 136 bytes / 256
+/// weights, low nibble = even index, high nibble = odd. Returns exactly
+/// `n_elems` values (the final block's padding is truncated).
+pub(crate) fn dequant_mq4g256_to_f32(data: &[u8], n_elems: usize) -> Vec<f32> {
+    let group_size = 256;
+    let block_bytes = 136;
+    let n_blocks = (n_elems + group_size - 1) / group_size;
+    // Fixed MQ4 sign pair — same seeds the packer/runtime use.
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+
+    let mut out = vec![0.0f32; n_blocks * group_size];
+    for b in 0..n_blocks {
+        let in_off = b * block_bytes;
+        let scale = f32::from_le_bytes(data[in_off..in_off + 4].try_into().unwrap());
+        let min_val = f32::from_le_bytes(data[in_off + 4..in_off + 8].try_into().unwrap());
+
+        // Unpack 4-bit codes → rotated group (inverse of the packer's nibble write).
+        let mut group = [0.0f32; 256];
+        for i in 0..128 {
+            let byte = data[in_off + 8 + i];
+            let lo = (byte & 0x0F) as f32;
+            let hi = (byte >> 4) as f32;
+            group[2 * i] = min_val + lo * scale;
+            group[2 * i + 1] = min_val + hi * scale;
+        }
+        // Undo the FWHT rotation baked in at quant time.
+        cpu_ifwht_256(&mut group, &signs1, &signs2);
+        out[b * group_size..(b + 1) * group_size].copy_from_slice(&group);
+    }
+
+    out.truncate(n_elems);
+    out
+}
+
+#[cfg(test)]
+mod dequant_mq4g256_tests {
+    use super::*;
+
+    /// rotate→pack→unpack→unrotate round trip: a known F32 group survives
+    /// `quantize_mq4g256` → `dequant_mq4g256_to_f32` within MQ4 codebook
+    /// tolerance. The forward transform is orthonormal, so per-element error is
+    /// rigorously bounded by `8·scale` (16-level uniform quant of the rotated
+    /// group, `scale = rotated_range/15`), and the relative L2 error is small.
+    #[test]
+    fn mq4g256_round_trip_recovers_group() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let orig: Vec<f32> = (0..256)
+            .map(|i| (((i * 13 + 5) % 251) as f32 - 125.0) * 0.01)
+            .collect();
+
+        let packed = quantize_mq4g256(&orig, &signs1, &signs2);
+        assert_eq!(packed.len(), 136, "one 256-group = 136 bytes");
+
+        let recon = dequant_mq4g256_to_f32(&packed, 256);
+        assert_eq!(recon.len(), 256);
+
+        // Per-element bound from the block's own scale (orthonormal FWHT).
+        let scale = f32::from_le_bytes(packed[0..4].try_into().unwrap());
+        let tol = 8.0 * scale + 1e-4;
+
+        let mut num = 0.0f64;
+        let mut den = 0.0f64;
+        for i in 0..256 {
+            let e = (recon[i] - orig[i]).abs();
+            assert!(
+                e < tol,
+                "idx {i}: got {}, want {} (err {e}, tol {tol})",
+                recon[i],
+                orig[i]
+            );
+            num += (e as f64) * (e as f64);
+            den += (orig[i] as f64) * (orig[i] as f64);
+        }
+        let rel_l2 = (num / den).sqrt();
+        assert!(
+            rel_l2 < 0.2,
+            "relative L2 error {rel_l2} too high for 4-bit"
+        );
+    }
 }
 
 /// MagnumQuant MQ6-G256: FWHT-rotated 6-bit quantization.
@@ -2654,6 +2828,34 @@ mod awq_tests {
                 y_ref[i],
                 rel
             );
+        }
+    }
+
+    /// `awq_col_weights` inverts `compute_awq_scales`: an AWQ-pre-scaled
+    /// checkpoint carries its own imatrix, recoverable up to a per-tensor
+    /// constant (which the GPTQ packers' argmin is invariant to).
+    #[test]
+    fn awq_col_weights_recovers_imatrix_up_to_constant() {
+        for &alpha in &[0.3f32, 0.55, 0.8, 1.0] {
+            // Wide but non-pathological dynamic range (no clamp rail hits).
+            let in_sum2: Vec<f32> = (1..=64).map(|j| (j as f32).powf(1.7) * 3.0).collect();
+            let s = compute_awq_scales(&in_sum2, alpha);
+            let cw = awq_col_weights(&s, alpha);
+
+            // cw ∝ in_sum2 — check the ratio is constant across channels.
+            let ratios: Vec<f64> = cw
+                .iter()
+                .zip(&in_sum2)
+                .map(|(&c, &v)| c as f64 / v as f64)
+                .collect();
+            let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
+            for (i, r) in ratios.iter().enumerate() {
+                let rel = (r - mean).abs() / mean;
+                assert!(
+                    rel < 1e-3,
+                    "alpha={alpha}: channel {i} ratio {r} deviates {rel:.2e} from mean {mean}"
+                );
+            }
         }
     }
 
@@ -4606,6 +4808,440 @@ fn quantize_hfq2g128(f32_data: &[f32]) -> Vec<u8> {
     output
 }
 
+/// Quantize F32 weights to TQ2G128: PrismML `Q2_0`-compatible scale-only
+/// ternary quant. Block: `[FP16 d][32B packed 2-bit codes]` = 34 bytes per
+/// 128 weights (2.125 bpw). Scale is `d = max(|w|)` over the group (NOT
+/// mean — that's Q1_0's rule). Per element: `code = clamp(round(w * id) + 1,
+/// 0, 3)` where `id = d > 0 ? 1/d : 0`; codes pack LSB-first, 4 per byte
+/// (`byte[j/4] |= code << ((j%4)*2)`). Reconstruction: `w = (code-1) * d`.
+/// Mirrors PrismML's `quantize_row_q2_0_ref` byte-for-byte — this is both
+/// the re-quant fallback for non-Q2_0 tensors under `--format ternary` and
+/// the oracle the passthrough path is checked against.
+/// See findings/prismml-q2_0-layout.md for the frozen wire format.
+/// NOT used to encode shipped weights: `d = max|w|` is PrismML's DECODE
+/// convention, not a usable encoder for un-transformed weights (it zeroes
+/// ~85% of a Gaussian block). The requant pipeline routes through the
+/// scale-swept `quantize_tq2g128_gptq` instead; this stays as the byte-exact
+/// format reference (and is reproduced exactly by that packer at factor=1.0).
+#[cfg_attr(not(test), allow(dead_code))]
+fn quantize_tq2g128(f32_data: &[f32]) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 34;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+
+        let mut amax = 0.0f32;
+        for &w in group {
+            amax = amax.max(w.abs());
+        }
+        let d = amax;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+
+        let actual_len = end - start;
+        for i in 0..32 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                let idx = 4 * i + j;
+                let w = if idx < actual_len { group[idx] } else { 0.0 };
+                let mut q = (w * id).round() as i32 + 1;
+                // Clamp to the TERNARY set {0,1,2} == {-d, 0, +d}. NOT 3: both
+                // decoders compute `(code-1)*d`, so code 3 decodes to +2d and
+                // makes this an asymmetric 4-level quantizer (negatives
+                // saturating at -d while positives reach +2d). Only reachable
+                // once d < max|w|, i.e. under the scale sweep.
+                if q < 0 {
+                    q = 0;
+                }
+                if q > 2 {
+                    q = 2;
+                }
+                byte_val |= (q as u8) << (j * 2);
+            }
+            output[out_off + 2 + i] = byte_val;
+        }
+    }
+
+    output
+}
+
+#[cfg(test)]
+mod tq2g128_tests {
+    use super::*;
+
+    /// Byte-exactness of `quantize_tq2g128` against a hand-derived expected
+    /// block. Group of 128: idx0=-2.0, idx1=0.0, idx2=2.0, idx3..127=0.0.
+    /// d = max(|w|) = 2.0, id = 0.5.
+    ///
+    /// Per-element codes (q = clamp(round(w*id)+1, 0, 3)):
+    ///   idx0: round(-2.0*0.5)+1 = round(-1.0)+1 = 0
+    ///   idx1: round( 0.0*0.5)+1 = round( 0.0)+1 = 1
+    ///   idx2: round( 2.0*0.5)+1 = round( 1.0)+1 = 2
+    ///   idx3..127 (all 0.0): round(0.0)+1 = 1
+    ///
+    /// NOTE: the zero-valued tail encodes to code 1 (not code 0) because
+    /// id=0.5 != 0 here (d != 0) — only an all-zero *group* (d==0, id==0)
+    /// would encode zeros as code 0. This matters for the packed bytes:
+    /// byte0 packs elements 0..3 LSB-first (`code << ((j%4)*2)`):
+    ///   byte0 = code0 | code1<<2 | code2<<4 | code3<<6
+    ///         =    0  |   1<<2   |   2<<4   |   1<<6
+    ///         = 0b01_10_01_00 = 0x64
+    /// bytes[1..32] cover elements 4..127, all code=1:
+    ///   byte = 1 | 1<<2 | 1<<4 | 1<<6 = 0b01_01_01_01 = 0x55
+    ///
+    /// FP16(2.0) = 0x4000 (sign=0, exp=16, frac=0), little-endian [0x00,0x40] —
+    /// cross-checked against the existing `dequant_q2_0` CPU-oracle test in
+    /// gguf_input.rs, which uses the identical byte pair for scale 2.0.
+    #[test]
+    fn quantize_tq2g128_byte_exact() {
+        let mut group = vec![0.0f32; 128];
+        group[0] = -2.0;
+        group[1] = 0.0;
+        group[2] = 2.0;
+        // group[3..128] stay 0.0
+
+        let out = quantize_tq2g128(&group);
+        assert_eq!(out.len(), 34, "one 128-group -> one 34-byte block");
+
+        // FP16 scale d=2.0, little-endian.
+        assert_eq!(&out[0..2], &[0x00, 0x40]);
+
+        // qs[0] (elements 0..3): codes 0,1,2,1 -> 0x64.
+        assert_eq!(out[2], 0x64);
+
+        // qs[1..32] (elements 4..127): all code=1 -> 0x55, repeated 31 times.
+        assert_eq!(&out[3..34], &[0x55u8; 31][..]);
+    }
+
+    /// Round-trip losslessness for an already-ternary input: values drawn
+    /// from {-d, 0, +d} with d a power of two (4.0) so the FP16 scale is
+    /// exact and every code round-trips without rounding error. Decodes via
+    /// the crate's public `tensor_to_f32` dispatcher (which routes
+    /// `GgmlType::Q2_0` to the private `dequant_q2_0` CPU oracle added in
+    /// Task 5) — this exercises the *real* decode path rather than a
+    /// second hand-rolled decoder, so it also proves TQ2G128's block
+    /// layout is byte-compatible with GGUF `Q2_0` end-to-end.
+    #[test]
+    fn quantize_tq2g128_round_trips_ternary_input() {
+        let d = 4.0f32;
+        let f32_data: Vec<f32> = (0..128)
+            .map(|i| match i % 3 {
+                0 => -d,
+                1 => 0.0,
+                _ => d,
+            })
+            .collect();
+
+        let packed = quantize_tq2g128(&f32_data);
+        assert_eq!(packed.len(), 34);
+
+        let info = gguf_input::TensorInfo {
+            name: "round_trip".to_string(),
+            shape: vec![128],
+            dtype: gguf_input::GgmlType::Q2_0,
+            offset: 0,
+        };
+        let decoded = gguf_input::tensor_to_f32(&info, &packed);
+
+        assert_eq!(decoded, f32_data);
+    }
+
+    /// Multi-block input (2 groups of 128) — checks block offsets/lengths
+    /// are computed correctly, not just the single-block case above.
+    #[test]
+    fn quantize_tq2g128_multi_block_length() {
+        let f32_data = vec![1.0f32; 256];
+        let out = quantize_tq2g128(&f32_data);
+        assert_eq!(out.len(), 2 * 34);
+    }
+}
+
+/// imatrix-weighted ternary GPTQ packer. Same 34 B / 128-elem block layout as
+/// `quantize_tq2g128`, but per block it (a) sweeps a small set of candidate
+/// scales `d` around `max|w|` and keeps the one minimizing the
+/// `col_weights`-weighted squared *decoded* reconstruction error (instead of
+/// unconditionally `d = max|w|`), then (b) applies the same damped 1-D residual
+/// feed-forward as `quantize_mq2g256_lloyd_gptq` (`HIPFIRE_GPTQ_DAMPING`,
+/// default 0.0 → residual pass is a no-op and codes match the swept-scale
+/// plain packer) before packing bytes identically to `quantize_tq2g128`.
+/// `col_weights.len()` must be a multiple of 128; the per-input-column slice
+/// for block `b` starts at `col_off = (b % (col_weights.len()/128)) * 128`.
+fn quantize_tq2g128_gptq(f32_data: &[f32], col_weights: &[f32], damping: f32) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 34;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let blocks_per_row = (col_weights.len() / GROUP).max(1);
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+        let actual = end - start;
+
+        let col_off = (b % blocks_per_row) * GROUP;
+        let block_w = &col_weights[col_off..col_off + GROUP];
+
+        let mut amax = 0.0f32;
+        for &w in group {
+            amax = amax.max(w.abs());
+        }
+
+        // Sweep candidate scales, pick the least imatrix-weighted *decoded*
+        // error. factor=1.0 reproduces `quantize_tq2g128` exactly (same codes,
+        // same f16 header, same decode), so the winner is always ≤ plain.
+        //
+        // The sweep MUST reach well below 0.6·amax. Levels are {-d, 0, +d} with
+        // nearest-neighbour coding, so a weight survives only when |w| ≥ d/2;
+        // at d = amax over a 128-sample Gaussian block (amax ≈ 2.9σ) that
+        // threshold is ~1.45σ and ~85% of the block is zeroed. The MSE-optimal
+        // 3-level scale for a Gaussian is d ≈ 1.22σ ≈ 0.42·amax (~54% non-zero;
+        // PrismML's own Bonsai ternary runs ~69% non-zero). A sweep floored at
+        // 0.6 bottoms out at ~38% non-zero and never reaches the optimum.
+        let mut best_d = amax;
+        let mut best_err = f64::INFINITY;
+        for &factor in &[
+            0.20f32, 0.25, 0.30, 0.35, 0.40, 0.45, 0.50, 0.55, 0.60, 0.70, 0.80, 0.90, 1.0,
+        ] {
+            let d = amax * factor;
+            let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+            let dd = f16_to_f32(f32_to_f16(d)) as f64; // decode uses the f16 scale
+            let mut err = 0.0f64;
+            for i in 0..GROUP {
+                let w = if i < actual { group[i] } else { 0.0 };
+                let mut q = (w * id).round() as i32 + 1;
+                // Clamp to the TERNARY set {0,1,2} == {-d, 0, +d}. NOT 3: both
+                // decoders compute `(code-1)*d`, so code 3 decodes to +2d and
+                // makes this an asymmetric 4-level quantizer (negatives
+                // saturating at -d while positives reach +2d). Only reachable
+                // once d < max|w|, i.e. under the scale sweep.
+                if q < 0 {
+                    q = 0;
+                }
+                if q > 2 {
+                    q = 2;
+                }
+                let recon = (q - 1) as f64 * dd;
+                let diff = w as f64 - recon;
+                err += block_w[i] as f64 * diff * diff;
+            }
+            if err < best_err {
+                best_err = err;
+                best_d = d;
+            }
+        }
+
+        let d = best_d;
+        let id = if d > 0.0 { 1.0 / d } else { 0.0 };
+        let dd = f16_to_f32(f32_to_f16(d));
+
+        // Damped residual feed-forward across columns → codes.
+        let mut codes = [0u8; GROUP];
+        let mut residual = 0.0f32;
+        for i in 0..GROUP {
+            let w = if i < actual { group[i] } else { 0.0 };
+            let target = w + residual;
+            let mut q = (target * id).round() as i32 + 1;
+            // Ternary set {0,1,2}; see the note above — 3 would decode to +2d.
+            if q < 0 {
+                q = 0;
+            }
+            if q > 2 {
+                q = 2;
+            }
+            let recon = (q - 1) as f32 * dd;
+            residual = (target - recon) * damping;
+            codes[i] = q as u8;
+        }
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        for i in 0..32 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                byte_val |= (codes[4 * i + j] & 0x3) << (j * 2);
+            }
+            output[out_off + 2 + i] = byte_val;
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod tq2g128_gptq_tests {
+    use super::*;
+
+    fn weighted_mse(orig: &[f32], packed: &[u8], w: &[f32]) -> f64 {
+        let info = gguf_input::TensorInfo {
+            name: "wmse".to_string(),
+            shape: vec![orig.len()],
+            dtype: gguf_input::GgmlType::Q2_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, packed);
+        orig.iter()
+            .zip(&deq)
+            .zip(w)
+            .map(|((o, q), wi)| (*wi as f64) * ((o - q) as f64).powi(2))
+            .sum()
+    }
+
+    #[test]
+    fn gptq_ternary_not_worse_than_plain() {
+        // skewed importance: first 32 columns matter 10×.
+        let g: Vec<f32> = (0..128).map(|i| ((i as f32) - 64.0) * 0.03).collect();
+        let mut w = vec![1.0f32; 128];
+        for k in 0..32 {
+            w[k] = 10.0;
+        }
+        let plain = quantize_tq2g128(&g);
+        let gptq = quantize_tq2g128_gptq(&g, &w, 0.0);
+        assert!(
+            weighted_mse(&g, &gptq, &w) <= weighted_mse(&g, &plain, &w) + 1e-9,
+            "imatrix-weighted GPTQ error must be ≤ plain packer error"
+        );
+    }
+
+    /// Deterministic standard-normal block (Box–Muller over an LCG) — real
+    /// weights are Gaussian-ish, and the scale sweep must work on THOSE, not
+    /// just on the uniform ramp above (a ramp's `max|w|` is ~1 sigma-equivalent
+    /// so it hides a mis-ranged sweep entirely).
+    fn gaussian_block(n: usize, seed: u32) -> Vec<f32> {
+        let mut state = seed;
+        let mut next = || {
+            state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+            ((state >> 8) as f32 + 0.5) / ((1u32 << 24) as f32)
+        };
+        (0..n)
+            .map(|_| {
+                let u1: f32 = next();
+                let u2: f32 = next();
+                (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos()
+            })
+            .collect()
+    }
+
+    /// `tq2_pack_stats` is the shipping guard's eye: it must count the two
+    /// things that silently broke real requants — how much of the model got
+    /// zeroed, and whether any out-of-set code was emitted.
+    #[test]
+    fn tq2_pack_stats_counts_zeros_and_out_of_set_codes() {
+        // One block, 128 codes. Byte 0 = codes [0,1,2,3] (LSB-first, 2 b each)
+        // = 0b11_10_01_00 = 0xE4. Remaining 31 bytes = 0x55 = codes [1,1,1,1],
+        // i.e. all zero-level.
+        let mut blk = vec![0u8; 34];
+        blk[0..2].copy_from_slice(&f32_to_f16(0.5).to_le_bytes());
+        blk[2] = 0xE4;
+        for b in blk.iter_mut().skip(3) {
+            *b = 0x55;
+        }
+
+        let st = tq2_pack_stats(&blk);
+        assert_eq!(st.n_codes, 128);
+        // Non-zero = code != 1 → the 0, 2 and 3 in byte 0.
+        assert_eq!(st.nonzero, 3);
+        assert_eq!(st.out_of_set, 1, "exactly one code 3");
+    }
+
+    /// Raw 2-bit codes out of a TQ2G128 buffer (34 B/block: [f16 d][32 B qs]).
+    fn tq2_codes(packed: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        for blk in packed.chunks_exact(34) {
+            for &byte in &blk[2..] {
+                for j in 0..4 {
+                    out.push((byte >> (j * 2)) & 0x3);
+                }
+            }
+        }
+        out
+    }
+
+    /// The ternary level set is {-d, 0, +d} == codes {0, 1, 2}. Code 3 decodes
+    /// to `(3-1)*d = +2d` in BOTH decoders (gguf_input::dequant_q2_0 and
+    /// kernels/src/gemv_tq2g128.hip), so emitting it silently turns the
+    /// quantizer into an ASYMMETRIC 4-level one: negatives saturate at -d while
+    /// positives reach +2d. PrismML's own Bonsai ternary never emits code 3
+    /// (measured 0.0000 across 4 tensors).
+    ///
+    /// The `q > 3 => 3` clamp was unreachable while d = max|w| (|w/d| <= 1, so
+    /// round() is at most 1). Widening the scale sweep to 0.20*amax makes
+    /// |w/d| >> 1 reachable — which is how this surfaced: 5.9% of codes on a
+    /// real 27B requant.
+    #[test]
+    fn ternary_packers_never_emit_the_out_of_set_code() {
+        let g = gaussian_block(128, 4242);
+        let w = vec![1.0f32; 128];
+        for (label, packed) in [
+            ("plain", quantize_tq2g128(&g)),
+            ("gptq", quantize_tq2g128_gptq(&g, &w, 0.0)),
+        ] {
+            let codes = tq2_codes(&packed);
+            let bad = codes.iter().filter(|&&c| c == 3).count();
+            assert_eq!(
+                bad,
+                0,
+                "{label}: emitted out-of-set code 3 ({bad} of {} codes) — decodes to +2d",
+                codes.len()
+            );
+        }
+    }
+
+    /// Saturation must be symmetric: with a scale below max|w|, mirrored
+    /// out-of-range weights must land on mirrored levels.
+    #[test]
+    fn ternary_saturation_is_symmetric() {
+        let mut g = gaussian_block(128, 99);
+        g[0] = 6.0; // far above any swept d
+        g[1] = -6.0;
+        let w = vec![1.0f32; 128];
+        let codes = tq2_codes(&quantize_tq2g128_gptq(&g, &w, 0.0));
+        assert_eq!(codes[0], 2, "large positive must saturate to +d (code 2)");
+        assert_eq!(codes[1], 0, "large negative must saturate to -d (code 0)");
+    }
+
+    /// The ternary level set is `{-d, 0, +d}` with nearest-neighbour coding, so
+    /// a weight survives only when `|w| >= d/2`. With `d = max|w|` over a
+    /// 128-sample Gaussian block (`amax ~ 2.9 sigma`) the threshold lands at
+    /// ~1.45 sigma and ~85% of weights are zeroed — which is exactly what the
+    /// plain packer shipped for qwen3.6-27b (16.3% non-zero measured, vs 69.4%
+    /// for PrismML's own Bonsai ternary).
+    ///
+    /// The MSE-optimal 3-level scale for a Gaussian is `d ~ 1.22 sigma`
+    /// (thresholds at +/-0.61 sigma, ~54% non-zero) = ~0.42 * amax. The sweep
+    /// must therefore reach well below 0.6 * amax.
+    #[test]
+    fn gptq_ternary_scale_sweep_reaches_mse_optimum_on_gaussian() {
+        let g = gaussian_block(128, 12345);
+        let w = vec![1.0f32; 128];
+
+        let plain = quantize_tq2g128(&g);
+        let gptq = quantize_tq2g128_gptq(&g, &w, 0.0);
+
+        let nz = tq2_pack_stats(&gptq).nonzero_fraction();
+        assert!(
+            (0.45..=0.80).contains(&nz),
+            "swept-scale ternary should keep roughly half the weights alive on \
+             Gaussian input (MSE-optimal ~0.54); got non-zero fraction {nz:.3}"
+        );
+
+        let (e_gptq, e_plain) = (weighted_mse(&g, &gptq, &w), weighted_mse(&g, &plain, &w));
+        assert!(
+            e_gptq <= 0.6 * e_plain,
+            "swept scale must substantially beat d=max|w| on Gaussian input; \
+             got gptq={e_gptq:.5} vs plain={e_plain:.5}"
+        );
+    }
+}
+
 /// Quantize F32 weights to HFQ6-G256: 6-bit with 256-weight groups.
 /// Block: [f32 scale][f32 zero][192B packed 6-bit] = 200 bytes per 256 weights (0.78125 B/w).
 pub(crate) fn quantize_hfq6g256(f32_data: &[f32]) -> Vec<u8> {
@@ -4856,7 +5492,12 @@ pub(crate) enum QuantType {
     MFP3G32E8 = 36, // mfp3-E8: MFP4G32E8 frame, 3-bit lattice (center 3), 13 B/blk, 3.25 bpw.
     // Drop-in cold tier for MQ3G256Lloyd (tag 3 → tag 5).
     MFP2G32E8 = 37, // mfp2-E8: MFP4G32E8 frame, 2-bit lattice (center 1), 9 B/blk, 2.25 bpw.
-                    // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
+    // Drop-in cold tier for MQ2G256Lloyd (tag 1 → tag 6).
+    TQ2G128 = 40, // TQ2G128: PrismML Q2_0-compatible scale-only ternary, g128, 34 B/blk
+    // (2.125 bpw). [FP16 d][32B 2-bit codes], code=(w/d)+1 clamped 0..3,
+    // dequant w=(code-1)*d. Byte-identical to GGUF ggml_type Q2_0=42.
+    // See findings/prismml-q2_0-layout.md.
+    BQ1G128 = 41, // BQ1G128: PrismML Q1_0-compatible scale-only binary, g128, 18 B/blk
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -4903,6 +5544,12 @@ fn default_promote_target(base: GgufFormat) -> GgufFormat {
         GgufFormat::Mfp4E8Soa => GgufFormat::Mfp4E8Soa,
         GgufFormat::Mfp3E8 => GgufFormat::Mfp3E8,
         GgufFormat::Mfp2E8 => GgufFormat::Mfp2E8,
+        // Ternary has no promote sibling (PrismML Q2_0 has no 6-bit variant);
+        // no-op, matching the FP4-family pattern above.
+        GgufFormat::Ternary => GgufFormat::Ternary,
+        // Binary has no promote sibling either (PrismML Q1_0 has no
+        // higher-bit variant); no-op, matching Ternary above.
+        GgufFormat::Binary => GgufFormat::Binary,
     }
 }
 
@@ -5764,6 +6411,1542 @@ fn is_gguf_input(p: &Path) -> bool {
     p.is_file() && p.extension().and_then(|e| e.to_str()) == Some("gguf")
 }
 
+/// True when `--input` is itself an `.hfq` container (magic `HFQM`), regardless
+/// of extension (the FP source is `qwen3.6-27b.mq4`, an `.hfq`). Routed to
+/// `run_hfq_requant_pipeline` instead of the safetensors/GGUF paths.
+fn is_hfq_input(p: &Path) -> bool {
+    if !p.is_file() {
+        return false;
+    }
+    use std::io::Read;
+    let mut f = match File::open(p) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut magic = [0u8; 4];
+    f.read_exact(&mut magic).is_ok() && &magic == HFQ_MAGIC
+}
+
+/// Map a raw `.hfq` per-tensor quant-type byte back to `QuantType` for verbatim
+/// passthrough of tensors we don't requantize (norms, embeddings, routers, …).
+/// Covers every `QuantType` discriminant so any source `.hfq` round-trips; an
+/// unknown byte is a corrupt/newer file and panics loudly.
+fn quant_type_from_u8(qt: u8) -> QuantType {
+    match qt {
+        0 => QuantType::Q4F16G64,
+        1 => QuantType::F16,
+        2 => QuantType::F32,
+        3 => QuantType::Q8F16,
+        4 => QuantType::Q4K,
+        5 => QuantType::Q8HFQ,
+        6 => QuantType::HFQ4G256,
+        7 => QuantType::HFQ4G128,
+        8 => QuantType::HFQ6G256,
+        9 => QuantType::HFQ2G256,
+        10 => QuantType::HFQ2G128,
+        11 => QuantType::HFQ3G256,
+        12 => QuantType::HFQ3G128,
+        13 => QuantType::MQ4G256,
+        14 => QuantType::MQ8G256,
+        15 => QuantType::MQ6G256,
+        16 => QuantType::BF16,
+        17 => QuantType::MQ3G256,
+        18 => QuantType::MQ2G256,
+        19 => QuantType::MQ2G256Lloyd,
+        20 => QuantType::MQ3G256Lloyd,
+        21 => QuantType::HFP4G32,
+        22 => QuantType::TidI32,
+        24 => QuantType::MFP4G32,
+        28 => QuantType::PARO4G128,
+        29 => QuantType::PARO4G128T,
+        30 => QuantType::MQ4G256Lloyd,
+        31 => QuantType::MQ5G256,
+        32 => QuantType::MFP4G32Lloyd,
+        33 => QuantType::MFP4G32P,
+        34 => QuantType::MFP4G32E8,
+        35 => QuantType::MFP4G32E8SOA,
+        36 => QuantType::MFP3G32E8,
+        37 => QuantType::MFP2G32E8,
+        40 => QuantType::TQ2G128,
+        41 => QuantType::BQ1G128,
+        other => panic!("unknown .hfq quant-type byte {other} — corrupt or newer file"),
+    }
+}
+
+/// Quantize F32 → BQ1G128 (PrismML `Q1_0`-compatible sign-only binary), the
+/// requant path for `--format binary` when the source is F32 rather than
+/// already-Q1_0 bytes (the GGUF pipeline's binary arm is byte-verbatim
+/// passthrough and cannot consume F32). Inverse of `dequant_q1_0`: block is
+/// `[FP16 d][16B sign bits]` = 18 bytes / 128 weights, `d = mean(|w|)` over the
+/// group; bit `j` (LSB-first in byte `j>>3`) is 1 for `w>=0` (+d), 0 for `w<0`.
+/// NOT used to encode shipped weights: `d = max|w|` is PrismML's DECODE
+/// convention, not a usable encoder for un-transformed weights (it zeroes
+/// ~85% of a Gaussian block). The requant pipeline routes through the
+/// scale-swept `quantize_bq1g128_gptq` instead; this stays as the byte-exact
+/// format reference (and is reproduced exactly by that packer at factor=1.0).
+#[cfg_attr(not(test), allow(dead_code))]
+fn quantize_bq1g128(f32_data: &[f32]) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 18;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+        let actual = end - start;
+
+        let mut sum = 0.0f32;
+        for &w in group {
+            sum += w.abs();
+        }
+        let d = if actual > 0 { sum / actual as f32 } else { 0.0 };
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+        for j in 0..GROUP {
+            let w = if j < actual { group[j] } else { 0.0 };
+            if w >= 0.0 {
+                output[out_off + 2 + (j >> 3)] |= 1u8 << (j & 7);
+            }
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod bq1g128_tests {
+    use super::*;
+
+    #[test]
+    fn quantize_bq1g128_byte_exact() {
+        // group of 128: [0]=+2, [1]=-2, rest 0 (0 → sign bit set → +d)
+        let mut g = vec![0.0f32; 128];
+        g[0] = 2.0;
+        g[1] = -2.0;
+        // d = mean|w| = (2+2)/128 = 0.03125
+        let out = quantize_bq1g128(&g);
+        assert_eq!(out.len(), 18);
+        assert_eq!(&out[0..2], &f32_to_f16(0.03125).to_le_bytes());
+        // byte 2 = elements 0..7: bit0 (e0,+)=1, bit1 (e1,-)=0,
+        // bits2..7 (0.0≥0)=1 → 0b1111_1101 = 0xFD
+        assert_eq!(out[2], 0xFD);
+        // bytes 3..18 = elements 8..127 all 0.0 ≥ 0 → all bits set → 0xFF
+        assert_eq!(&out[3..18], &[0xFFu8; 15]);
+    }
+
+    #[test]
+    fn quantize_bq1g128_round_trips() {
+        let g: Vec<f32> = (0..256).map(|i| ((i as f32) - 128.0) * 0.01).collect();
+        let packed = quantize_bq1g128(&g);
+        let info = gguf_input::TensorInfo {
+            name: "rt".to_string(),
+            shape: vec![256],
+            dtype: gguf_input::GgmlType::Q1_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, &packed);
+        // every element recovers sign; magnitude == block mean|w|
+        for i in 0..256 {
+            assert_eq!(deq[i] >= 0.0, g[i] >= 0.0);
+        }
+    }
+}
+
+/// imatrix-weighted 1-bit GPTQ packer. Same 18 B / 128-elem block layout as
+/// `quantize_bq1g128`. Signs follow the residual-compensated value (which
+/// equals `w` when `HIPFIRE_GPTQ_DAMPING`=0.0, the default → signs fixed by
+/// `w >= 0`); the lever is the importance-weighted optimal magnitude
+/// `d = (Σ w_i|x_i|) / (Σ w_i)` — the exact minimizer of
+/// `Σ_i w_i (x_i - sign_i·d)²` over the block — with a fallback to the plain
+/// unweighted mean-abs when `Σ w_i == 0`. A damped 1-D residual feed-forward
+/// (mirror of `quantize_mq2g256_lloyd_gptq`) is threaded across columns.
+/// `col_weights.len()` must be a multiple of 128;
+/// `col_off = (b % (col_weights.len()/128)) * 128`.
+fn quantize_bq1g128_gptq(f32_data: &[f32], col_weights: &[f32], damping: f32) -> Vec<u8> {
+    const GROUP: usize = 128;
+    const BLOCK_BYTES: usize = 18;
+    let n = f32_data.len();
+    let n_blocks = (n + GROUP - 1) / GROUP;
+    let blocks_per_row = (col_weights.len() / GROUP).max(1);
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    for b in 0..n_blocks {
+        let start = b * GROUP;
+        let end = (start + GROUP).min(n);
+        let group = &f32_data[start..end];
+        let actual = end - start;
+
+        let col_off = (b % blocks_per_row) * GROUP;
+        let block_w = &col_weights[col_off..col_off + GROUP];
+
+        // Importance-weighted optimal magnitude d = Σ w|x| / Σ w.
+        let mut wsum = 0.0f64;
+        let mut wabs = 0.0f64;
+        for i in 0..actual {
+            let wi = block_w[i] as f64;
+            wsum += wi;
+            wabs += wi * (group[i].abs() as f64);
+        }
+        let d = if wsum > 0.0 {
+            (wabs / wsum) as f32
+        } else {
+            // fallback: plain unweighted mean-abs (matches quantize_bq1g128)
+            let mut s = 0.0f32;
+            for &w in group {
+                s += w.abs();
+            }
+            if actual > 0 {
+                s / actual as f32
+            } else {
+                0.0
+            }
+        };
+        let dd = f16_to_f32(f32_to_f16(d));
+
+        let out_off = b * BLOCK_BYTES;
+        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
+
+        let mut residual = 0.0f32;
+        for j in 0..GROUP {
+            let w = if j < actual { group[j] } else { 0.0 };
+            let target = w + residual;
+            let bit = target >= 0.0;
+            let recon = if bit { dd } else { -dd };
+            residual = (target - recon) * damping;
+            if bit {
+                output[out_off + 2 + (j >> 3)] |= 1u8 << (j & 7);
+            }
+        }
+    }
+    output
+}
+
+#[cfg(test)]
+mod bq1g128_gptq_tests {
+    use super::*;
+
+    fn wmse_bq1(orig: &[f32], packed: &[u8], w: &[f32]) -> f64 {
+        let info = gguf_input::TensorInfo {
+            name: "wmse".to_string(),
+            shape: vec![orig.len()],
+            dtype: gguf_input::GgmlType::Q1_0,
+            offset: 0,
+        };
+        let deq = gguf_input::tensor_to_f32(&info, packed);
+        orig.iter()
+            .zip(&deq)
+            .zip(w)
+            .map(|((o, q), wi)| (*wi as f64) * ((o - q) as f64).powi(2))
+            .sum()
+    }
+
+    #[test]
+    fn gptq_binary_not_worse_than_plain() {
+        let g: Vec<f32> = (0..128).map(|i| ((i as f32) - 64.0) * 0.05).collect();
+        let mut w = vec![1.0f32; 128];
+        for k in 96..128 {
+            w[k] = 8.0;
+        } // tail columns important
+        let plain = quantize_bq1g128(&g);
+        let gptq = quantize_bq1g128_gptq(&g, &w, 0.0);
+        assert!(wmse_bq1(&g, &gptq, &w) <= wmse_bq1(&g, &plain, &w) + 1e-9);
+    }
+}
+
+/// `--input <file>.hfq` requant pipeline. Reads an already-coherent `.hfq` (the
+/// mq4 FP source, whose 2D weights are FWHT-rotated MQ4G256), recovers true
+/// un-rotated F32 per tensor (`dequant_mq4g256_to_f32`), re-packs each 2D weight
+/// to the requested `--format` (ternary/binary/mq*), and writes a new `.hfq`
+/// that reuses the source metadata JSON verbatim so config / layer-count /
+/// tokenizer are byte-identical and the existing runtime loads it unchanged.
+///
+/// Non-2D-MQ4 tensors (Q8F16 embeddings, F16 norms, routers, tid tables, …) are
+/// already unrotated and in their runtime-expected precision, so they pass
+/// through byte-verbatim — mirroring how the GGUF ternary/binary pipeline keeps
+/// embeddings at Q8F16 and norms at F16 regardless of `--format`.
+/// Attribution the operator supplies for a redistributable artifact.
+///
+/// Apache-2.0 §4 requires a derivative to carry the license notice AND to state
+/// that files were changed. `modifications` is filled in by the pipeline from
+/// the transforms it actually applied, so the artifact self-describes rather
+/// than relying on someone remembering to write it down.
+#[derive(Default, Clone)]
+struct Attribution {
+    source_url: Option<String>,
+    license: Option<String>,
+    modifications: Vec<String>,
+}
+
+/// Parse `--source-url` / `--license` for redistributable artifacts.
+fn attribution_from_args(args: &QuantizeArgs) -> Attribution {
+    Attribution {
+        source_url: args.source_url.clone(),
+        license: args.license.clone(),
+        modifications: Vec::new(),
+    }
+}
+
+/// Provenance fields common to every `.hfq` this tool writes.
+///
+/// Shared by the `.hfq` requant path and the GGUF path so a published artifact
+/// is traceable no matter which produced it — a `.hfq` is a frozen snapshot of
+/// the convert path, and when convert changes the artifact silently goes stale.
+fn base_provenance(source: &str, format_label: &str, attr: &Attribution) -> serde_json::Value {
+    let built_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let mut m = serde_json::Map::new();
+    m.insert("source".into(), source.into());
+    m.insert("format".into(), format_label.into());
+    m.insert("built_unix".into(), built_unix.into());
+    m.insert("tool".into(), "hipfire-quantize".into());
+    m.insert("tool_version".into(), env!("CARGO_PKG_VERSION").into());
+    m.insert(
+        "git_commit".into(),
+        option_env!("HIPFIRE_GIT_COMMIT")
+            .unwrap_or("unknown")
+            .into(),
+    );
+    if let Some(u) = &attr.source_url {
+        m.insert("source_url".into(), u.clone().into());
+    }
+    if let Some(l) = &attr.license {
+        m.insert("license".into(), l.clone().into());
+    }
+    if !attr.modifications.is_empty() {
+        m.insert("modifications".into(), attr.modifications.clone().into());
+    }
+    serde_json::Value::Object(m)
+}
+
+/// Policy gate for requantizing an existing checkpoint DOWN to ternary/binary.
+///
+/// Returns `Err(message)` when the target is a low-bit PTQ target and the
+/// caller has not opted in. Pure, so it is testable; `main` owns the exit.
+///
+/// The problem is the CODEBOOK, not the bit budget. Measured on
+/// qwen3.6-27b (SP-E 2026-08-17, 8 chunks, KLD vs the mq4 teacher):
+///
+///   | target                              | bpw   | KLD   | PPL    |
+///   |-------------------------------------|-------|-------|--------|
+///   | ternary, uniform 3-level, unrotated  | 2.125 | 5.10  | 1436   |  token soup
+///   | ternary + AWQ imatrix                | 2.125 | 2.24  |   86.6 |  immediate EOS
+///   | MQ2 uniform 4-level, rotated         | 2.25  | 3.92  |  472   |
+///   | MQ2-LLOYD (non-uniform, rotated)     | 2.25  | 0.61  |   17.0 |  usable
+///   | PrismML Bonsai ternary (transformed) | 2.125 | 0.54  |   16.7 |
+///
+/// So ~2 bpw is NOT inherently hopeless: a non-uniform per-block codebook plus
+/// the FWHT rotation lands within noise of PrismML's proprietary transform.
+/// What collapses is the uniform, unrotated level set that the Q2_0/Q1_0 wire
+/// format fixes — `{-d, 0, +d}` leaves the encoder only `d` to choose, and no
+/// amount of scale search or importance weighting recovers it.
+///
+/// Hence: ternary/binary are supported as byte-verbatim passthrough of an
+/// already-transformed source (the GGUF arm), and `--format mq2lloyd` is the
+/// answer for ~2 bpw from an ordinary checkpoint. Research on low-bit PTQ is
+/// still legitimate, hence the opt-in.
+fn lowbit_ptq_gate(format: GgufFormat, allowed: bool) -> Result<(), String> {
+    if allowed || !matches!(format, GgufFormat::Ternary | GgufFormat::Binary) {
+        return Ok(());
+    }
+    let bpw = if matches!(format, GgufFormat::Binary) {
+        "1.14"
+    } else {
+        "2.125"
+    };
+    Err(format!(
+        "error: --input <.hfq> --format {} re-quantizes an ordinary checkpoint into a \
+         UNIFORM {bpw}-bpw level set, which is a measured collapse — not a supported \
+         build.\n\
+         \n\
+         Measured on qwen3.6-27b (KLD vs the mq4 teacher, 8 chunks):\n\
+         \x20 ternary uniform            2.125 bpw  KLD 5.10  PPL 1436   (token soup)\n\
+         \x20 ternary + AWQ imatrix      2.125 bpw  KLD 2.24  PPL   86.6 (immediate EOS)\n\
+         \x20 mq2lloyd (non-uniform)     2.25  bpw  KLD 0.61  PPL   17.0 (usable)\n\
+         \x20 PrismML Bonsai ternary     2.125 bpw  KLD 0.54  PPL   16.7\n\
+         \n\
+         The bit budget is NOT the problem — the fixed uniform level set is. Q2_0/Q1_0 \
+         leave the encoder only the block scale to choose, and no scale search or \
+         importance weighting recovers it.\n\
+         \n\
+         For ~2 bpw from an ordinary checkpoint use --format mq2lloyd instead. \
+         Ternary/binary ship coherently as byte-verbatim passthrough of an \
+         already-transformed source (PrismML Bonsai Q2_0/Q1_0) — convert that GGUF \
+         directly.\n\
+         \n\
+         To do it anyway for research, pass --allow-lowbit-ptq or set \
+         HIPFIRE_ALLOW_LOWBIT_PTQ=1.",
+        format.label(),
+    ))
+}
+
+/// Stamp build provenance into an .hfq's metadata JSON.
+///
+/// Inserted as a `hipfire_provenance` object immediately after the opening
+/// brace, so every source key survives byte-for-byte (the runtime parses this
+/// as a `serde_json::Value` and reads named keys, so an extra top-level key is
+/// inert — see `qwen35::config_from_metadata_json`).
+///
+/// This exists because of a concrete failure: the 2026-07-16 SP-E canary
+/// scored a Bonsai ternary .hfq built BEFORE that day's norm-bias fix and
+/// reported KLD 6.15 for a model that actually measures 0.61. Nothing in the
+/// artifact or the result table could reveal the staleness. Now it can.
+fn stamp_provenance(metadata_json: &str, prov: &serde_json::Value) -> String {
+    let body = serde_json::to_string(prov).unwrap_or_else(|_| "{}".to_string());
+    let trimmed = metadata_json.trim_start();
+    match trimmed.strip_prefix('{') {
+        // `{}` (or `{ }`) — no trailing comma, there is nothing after us.
+        Some(rest) if rest.trim_start().starts_with('}') => {
+            format!("{{\"hipfire_provenance\":{body}{rest}")
+        }
+        Some(rest) => format!("{{\"hipfire_provenance\":{body},{rest}"),
+        // Not an object; leave it alone rather than corrupt it.
+        None => metadata_json.to_string(),
+    }
+}
+
+/// Code-level statistics of a packed TQ2G128 buffer.
+#[derive(Default, Debug, Clone, Copy)]
+struct Tq2PackStats {
+    /// Codes decoding to a non-zero level (i.e. code != 1).
+    nonzero: u64,
+    /// Codes equal to 3 — outside the ternary set, decoding to +2d.
+    out_of_set: u64,
+    n_codes: u64,
+}
+
+impl Tq2PackStats {
+    fn add(&mut self, o: Tq2PackStats) {
+        self.nonzero += o.nonzero;
+        self.out_of_set += o.out_of_set;
+        self.n_codes += o.n_codes;
+    }
+    fn nonzero_fraction(&self) -> f64 {
+        if self.n_codes == 0 {
+            return 0.0;
+        }
+        self.nonzero as f64 / self.n_codes as f64
+    }
+}
+
+/// Count zero / non-zero / out-of-set codes in a TQ2G128 buffer
+/// (34 B per 128-weight block: `[f16 d][32 B codes]`, 4 codes per byte).
+fn tq2_pack_stats(data: &[u8]) -> Tq2PackStats {
+    let mut st = Tq2PackStats::default();
+    for blk in data.chunks_exact(34) {
+        for &byte in &blk[2..] {
+            for j in 0..4 {
+                let code = (byte >> (j * 2)) & 0x3;
+                st.n_codes += 1;
+                if code != 1 {
+                    st.nonzero += 1;
+                }
+                if code == 3 {
+                    st.out_of_set += 1;
+                }
+            }
+        }
+    }
+    st
+}
+
+/// Refuse to write a ternary model that the code histogram says is broken.
+///
+/// This is the cheap observable that would have caught both shipped defects
+/// immediately, without a GPU or an eval:
+///
+///   * `d = max|w|` as an ENCODER zeroed 83.7% of a real 27B requant (16.3%
+///     non-zero). Healthy is ~54% (Gaussian MSE optimum) to ~69% (PrismML's
+///     own Bonsai ternary). A model below `MIN_NONZERO` is not "lossy", it is
+///     mostly deleted.
+///   * code 3 decodes to `+2d` in both decoders, turning the quantizer into an
+///     asymmetric 4-level one. PrismML never emits it; neither should we.
+///
+/// `--allow-degenerate-ternary` (env HIPFIRE_ALLOW_DEGENERATE_TERNARY) downgrades
+/// this to a warning. Read at the CLI boundary, never inside the pipeline:
+/// a getenv racing another test's setenv in a threaded test binary is unsound.
+fn check_ternary_pack_health(st: Tq2PackStats, allow_degenerate: bool) {
+    const MIN_NONZERO: f64 = 0.25;
+    if st.n_codes == 0 {
+        return;
+    }
+    let nz = st.nonzero_fraction();
+    eprintln!(
+        "ternary pack health: {:.1}% non-zero codes ({} of {}), {} out-of-set",
+        nz * 100.0,
+        st.nonzero,
+        st.n_codes,
+        st.out_of_set
+    );
+    let degenerate = nz < MIN_NONZERO;
+    if !degenerate && st.out_of_set == 0 {
+        return;
+    }
+    let mut why = Vec::new();
+    if degenerate {
+        why.push(format!(
+            "only {:.1}% of codes are non-zero (expected >={:.0}%; healthy 54-69%) \
+             — {:.1}% of the model is zeroed",
+            nz * 100.0,
+            MIN_NONZERO * 100.0,
+            (1.0 - nz) * 100.0
+        ));
+    }
+    if st.out_of_set > 0 {
+        why.push(format!(
+            "{} codes are 3, which decodes to +2d (outside the ternary set)",
+            st.out_of_set
+        ));
+    }
+    let msg = why.join("; ");
+    if allow_degenerate {
+        eprintln!(
+            "WARNING: degenerate ternary pack ({msg}) — allowed by --allow-degenerate-ternary"
+        );
+        return;
+    }
+    eprintln!("error: refusing to write a degenerate ternary model: {msg}.");
+    eprintln!(
+        "       Set HIPFIRE_ALLOW_DEGENERATE_TERNARY=1 to write it anyway (it will \
+         not serve coherently)."
+    );
+    std::process::exit(3);
+}
+
+/// Per-input-column importance weights for a requantized tensor.
+///
+/// Returns the `--imatrix` row for `name` when one was supplied and its length
+/// is a usable multiple of the 128 group, else all-ones (a pure unweighted-MSE
+/// scale search). The GPTQ packers slice this as
+/// `col_weights[(b % blocks_per_row) * 128 ..][..128]`, so the length must be a
+/// multiple of 128 — an all-ones length-128 vector makes every block reuse the
+/// same (uniform) weights, which is exactly the no-imatrix behaviour.
+fn requant_col_weights(name: &str, k: usize) -> Vec<f32> {
+    if k % 128 == 0 {
+        if let Some(im) = IMATRIX.get() {
+            if let Some(v) = safetensors_to_ggml_name(name).and_then(|g| im.get(&g)) {
+                if v.len() == k {
+                    return v.clone();
+                }
+                eprintln!(
+                    "hfq requant: imatrix row for '{name}' has length {} but K={k}; \
+                     falling back to uniform weights",
+                    v.len()
+                );
+            }
+        }
+    }
+    vec![1.0f32; 128]
+}
+
+fn run_hfq_requant_pipeline(
+    input_hfq: &Path,
+    output: &Path,
+    format: GgufFormat,
+    awq_imatrix_alpha: Option<f32>,
+    damping: f32,
+    attribution: Attribution,
+    allow_degenerate: bool,
+) {
+    // ── Read the source .hfq (mirrors bin/draft_to_mq4.rs::read_hfq — no
+    //    cross-bin dependency; the parsing logic is copied here). ──
+    use memmap2::Mmap;
+    let file = File::open(input_hfq).expect("open input .hfq");
+    let mmap = unsafe { Mmap::map(&file).expect("mmap input .hfq") };
+    // Length-check before indexing the 32-byte header: a truncated file (an
+    // interrupted download is the common case now that these ship) would
+    // otherwise die on a slice-index panic that says nothing useful.
+    if mmap.len() < 32 {
+        eprintln!(
+            "error: {} is {} bytes — too short to be an .hfq (needs a 32-byte header). \
+             Truncated or interrupted download?",
+            input_hfq.display(),
+            mmap.len()
+        );
+        std::process::exit(1);
+    }
+    assert_eq!(&mmap[0..4], HFQ_MAGIC, "input is not an .hfq (bad magic)");
+    let _version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+    let arch_id = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
+    let n_tensors = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
+    let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
+    let data_offset = u64::from_le_bytes(mmap[24..32].try_into().unwrap()) as usize;
+
+    // Brace-scan the metadata JSON object (string-aware, escape-aware).
+    let meta_bytes = &mmap[metadata_offset..data_offset];
+    let mut brace = 0i32;
+    let mut in_str = false;
+    let mut escape = false;
+    let mut json_end = 0usize;
+    for (i, &b) in meta_bytes.iter().enumerate() {
+        if escape {
+            escape = false;
+            continue;
+        }
+        if b == b'\\' && in_str {
+            escape = true;
+            continue;
+        }
+        if b == b'"' {
+            in_str = !in_str;
+            continue;
+        }
+        if !in_str {
+            if b == b'{' {
+                brace += 1;
+            }
+            if b == b'}' {
+                brace -= 1;
+                if brace == 0 {
+                    json_end = i + 1;
+                    break;
+                }
+            }
+        }
+    }
+    let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
+
+    // Tensor index follows the metadata JSON.
+    let mut pos = metadata_offset + json_end;
+    let idx_n = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()) as usize;
+    assert_eq!(idx_n, n_tensors, "index count != header n_tensors");
+    pos += 4;
+
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+
+    // Parse the whole tensor index up front: folding the AWQ scale needs a
+    // weight's sidecar, which may sit anywhere in the index.
+    struct IndexEntry {
+        name: String,
+        qt: u8,
+        shape: Vec<u32>,
+        group_size: u32,
+        off: usize,
+        size: usize,
+    }
+    let mut entries: Vec<IndexEntry> = Vec::with_capacity(n_tensors);
+    {
+        let mut cumulative = data_offset;
+        for _ in 0..n_tensors {
+            let name_len = u16::from_le_bytes(mmap[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            let name = String::from_utf8_lossy(&mmap[pos..pos + name_len]).to_string();
+            pos += name_len;
+            let qt = mmap[pos];
+            pos += 1;
+            let n_dims = mmap[pos] as usize;
+            pos += 1;
+            let mut shape = Vec::with_capacity(n_dims);
+            for _ in 0..n_dims {
+                shape.push(u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap()));
+                pos += 4;
+            }
+            let group_size = u32::from_le_bytes(mmap[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            entries.push(IndexEntry {
+                name,
+                qt,
+                shape,
+                group_size,
+                off: cumulative,
+                size: data_size,
+            });
+            cumulative += data_size;
+        }
+    }
+
+    // AWQ bakes `·s` into the stored weights and relies on the fused
+    // rmsnorm-rotate pre-pass upstream of the linear to apply the matching
+    // `x/s` (`(W·s)·(x/s) = W·x`; see `WeightTensor::awq_scale`). That pre-pass
+    // is keyed on `dtype_rotation_plan`, which is `RotationPlan::None` for
+    // TQ2G128 / BQ1G128 — so for a ternary/binary target the `x/s` half can
+    // NEVER run. Packing `W·s` would ship a model whose every AWQ-scaled
+    // projection is wrong by a per-channel factor (up to ~5× on qwen3.6-27b).
+    // Fold `s` out here instead, and drop the sidecar so a future AWQ-aware
+    // ternary kernel can't double-correct.
+    //
+    // Enumerated per requant-capable target rather than written as a negation,
+    // so that adding a new one is a decision instead of a default. Defaulting
+    // "unknown target" to AWQ-aware is precisely the bug above: it silently
+    // ships `W·s` weights whose `x/s` never runs.
+    let awq_aware_target = match format {
+        // FWHT-rotated targets: the GEMV rotate pre-pass carries the AWQ hook,
+        // so the scale stays baked into the weights and the sidecar rides along.
+        GgufFormat::Mq2
+        | GgufFormat::Mq3
+        | GgufFormat::Mq4
+        | GgufFormat::Mq6
+        | GgufFormat::Mq2Lloyd
+        | GgufFormat::Mq3Lloyd
+        | GgufFormat::Mq4Lloyd => true,
+        // No rotation plan => no AWQ hook anywhere in the forward => fold here.
+        GgufFormat::Ternary | GgufFormat::Binary => false,
+        // Everything else falls through the per-tensor match below without
+        // being requantized (weights are copied verbatim), so the source's AWQ
+        // arrangement is still internally consistent — leave it alone.
+        _ => true,
+    };
+    let awq_scales: std::collections::HashMap<String, Vec<f32>> = if awq_aware_target {
+        std::collections::HashMap::new()
+    } else {
+        entries
+            .iter()
+            .filter_map(|e| {
+                let stem = e.name.strip_suffix(".awq_scale.weight")?;
+                if e.qt != QuantType::F16 as u8 {
+                    eprintln!(
+                        "hfq requant: AWQ sidecar {} has quant_type={} (expected {}=F16); \
+                         NOT folding — output would be silently wrong",
+                        e.name,
+                        e.qt,
+                        QuantType::F16 as u8
+                    );
+                    return None;
+                }
+                let v: Vec<f32> = mmap[e.off..e.off + e.size]
+                    .chunks_exact(2)
+                    .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                    .collect();
+                Some((format!("{stem}.weight"), v))
+            })
+            .collect()
+    };
+
+    let mut out_tensors: Vec<HfqTensor> = Vec::with_capacity(n_tensors);
+    let mut requant = 0usize;
+    let mut passthrough = 0usize;
+    let mut awq_folded = 0usize;
+    let mut awq_dropped = 0usize;
+    let mut awq_imatrix_used = 0usize;
+    let mut ternary_stats = Tq2PackStats::default();
+
+    // The α a checkpoint was AWQ-built with is not recorded anywhere in the
+    // .hfq (pre-provenance builds carry no build knobs at all), so
+    // `--awq-imatrix` has to assume one. Say so out loud: a wrong α re-sharpens
+    // the importance weighting, though it preserves channel ORDERING for any
+    // α > 0, so the failure mode is "less effective", not "wrong".
+    if let Some(alpha) = awq_imatrix_alpha {
+        // `awq_scales` is only collected for unrotated targets, so on a rotated
+        // one the flag would silently do nothing. Say that rather than letting
+        // a run look imatrix-weighted when it isn't.
+        if awq_aware_target {
+            eprintln!(
+                "hfq requant: --awq-imatrix has NO EFFECT for --format {} — it feeds the \
+                 low-bit packers' column weighting, and this target keeps the AWQ scale \
+                 baked into the weights instead.",
+                format.label()
+            );
+        } else if !metadata_json.contains("\"awq_alpha\"") {
+            eprintln!(
+                "hfq requant: --awq-imatrix using ASSUMED alpha={alpha} — the source \
+                 records no AWQ alpha. If it was built with a different --awq alpha, \
+                 the column weighting is mis-sharpened (channel ordering is unaffected)."
+            );
+        }
+    }
+
+    use rayon::prelude::*;
+
+    // Per-tensor work is independent (the mmap is read-only and every output is
+    // a fresh buffer), so this is a pure scheduling change. Sequential, the
+    // 13-candidate scale sweep over 27B params pegs ONE core for ~40 min while
+    // the rest of the tool already runs on a rayon pool.
+    //
+    // `collect()` on a rayon indexed parallel iterator preserves source order,
+    // which the .hfq index requires — it is positional, so any reordering
+    // silently repoints every tensor (pinned by
+    // `requant_preserves_tensor_order_across_many_tensors`). Counters are folded
+    // afterwards rather than shared, so the totals are scheduling-independent
+    // too.
+    struct TensorOutcome {
+        tensor: Option<HfqTensor>,
+        requant: usize,
+        passthrough: usize,
+        awq_folded: usize,
+        awq_dropped: usize,
+        awq_imatrix_used: usize,
+        stats: Tq2PackStats,
+    }
+
+    let outcomes: Vec<TensorOutcome> = entries
+        .par_iter()
+        .map(|entry| {
+            let mut oc = TensorOutcome {
+                tensor: None,
+                requant: 0,
+                passthrough: 0,
+                awq_folded: 0,
+                awq_dropped: 0,
+                awq_imatrix_used: 0,
+                stats: Tq2PackStats::default(),
+            };
+            let IndexEntry {
+                name,
+                qt,
+                shape,
+                group_size,
+                off,
+                size,
+            } = entry;
+            let (qt, group_size) = (*qt, *group_size);
+            let (name, shape) = (name.clone(), shape.clone());
+            let data = &mmap[*off..*off + *size];
+
+            let n_elems: usize = shape.iter().map(|&d| d as usize).product();
+
+            // A folded scale must not also ride along as a sidecar.
+            if !awq_aware_target && name.ends_with(".awq_scale.weight") {
+                oc.awq_dropped += 1;
+                return oc;
+            }
+
+            if qt == QuantType::MQ4G256 as u8 && shape.len() == 2 {
+                // Recover un-rotated F32, then re-pack to the requested format using
+                // the SAME per-format packers the GGUF Ternary/Binary/MQ arms use.
+                let mut f32_data = dequant_mq4g256_to_f32(data, n_elems);
+                if let Some(scale) = awq_scales.get(&name) {
+                    let k = shape[1] as usize;
+                    assert_eq!(
+                        scale.len(),
+                        k,
+                        "AWQ sidecar for '{name}' has length {} but K={k}",
+                        scale.len()
+                    );
+                    for (i, v) in f32_data.iter_mut().enumerate() {
+                        *v /= scale[i % k];
+                    }
+                    oc.awq_folded += 1;
+                }
+                let f32_data = f32_data;
+                // Column importance for the low-bit packers. `--awq-imatrix` reuses
+                // the checkpoint's own AWQ sidecar as the imatrix (see
+                // `awq_col_weights`); otherwise uniform (or an explicit --imatrix).
+                let k = shape[1] as usize;
+                let col_weights = match (awq_imatrix_alpha, awq_scales.get(&name)) {
+                    (Some(alpha), Some(s)) if k % 128 == 0 && s.len() == k => {
+                        oc.awq_imatrix_used += 1;
+                        awq_col_weights(s, alpha)
+                    }
+                    _ => requant_col_weights(&name, k),
+                };
+                let (packed, out_qt, out_group) = match format {
+                    GgufFormat::Ternary => {
+                        let p = quantize_tq2g128_gptq(&f32_data, &col_weights, damping);
+                        oc.stats.add(tq2_pack_stats(&p));
+                        (p, QuantType::TQ2G128, 128u32)
+                    }
+                    GgufFormat::Binary => (
+                        quantize_bq1g128_gptq(&f32_data, &col_weights, damping),
+                        QuantType::BQ1G128,
+                        128u32,
+                    ),
+                    GgufFormat::Mq4 => (
+                        quantize_mq4g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ4G256,
+                        256u32,
+                    ),
+                    GgufFormat::Mq6 => (
+                        quantize_mq6g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ6G256,
+                        256u32,
+                    ),
+                    GgufFormat::Mq3 => (
+                        quantize_mq3g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ3G256,
+                        256u32,
+                    ),
+                    GgufFormat::Mq2 => (
+                        quantize_mq2g256(&f32_data, &signs1, &signs2),
+                        QuantType::MQ2G256,
+                        256u32,
+                    ),
+                    // Lloyd-Max (non-uniform per-block codebook) targets. The
+                    // uniform sub-4-bit codebooks are a known-collapse regime on
+                    // this family — `--format mq2` is reserved in-tree with the
+                    // verdict "collapse on every model" — so at 2-3 bits these
+                    // are the targets worth reaching for.
+                    GgufFormat::Mq2Lloyd => (
+                        quantize_mq2g256_lloyd(&f32_data, &signs1, &signs2),
+                        QuantType::MQ2G256Lloyd,
+                        256u32,
+                    ),
+                    GgufFormat::Mq3Lloyd => (
+                        quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2),
+                        QuantType::MQ3G256Lloyd,
+                        256u32,
+                    ),
+                    GgufFormat::Mq4Lloyd => (
+                        quantize_mq4g256_lloyd(&f32_data, &signs1, &signs2),
+                        QuantType::MQ4G256Lloyd,
+                        256u32,
+                    ),
+                    other => {
+                        eprintln!(
+                            "hfq requant: --format {} unsupported for mq4 2D weights; \
+                         keeping tensor '{name}' as MQ4G256",
+                            other.label()
+                        );
+                        (data.to_vec(), QuantType::MQ4G256, group_size)
+                    }
+                };
+                oc.requant += 1;
+                oc.tensor = Some(HfqTensor {
+                    name,
+                    quant_type: out_qt,
+                    shape,
+                    group_size: out_group,
+                    data: packed,
+                    spilled_len: 0,
+                });
+            } else {
+                // Norms / embeddings / routers / tid tables — already unrotated and
+                // in runtime-expected precision; copy verbatim.
+                oc.passthrough += 1;
+                oc.tensor = Some(HfqTensor {
+                    name,
+                    quant_type: quant_type_from_u8(qt),
+                    shape,
+                    group_size,
+                    data: data.to_vec(),
+                    spilled_len: 0,
+                });
+            }
+            oc
+        })
+        .collect();
+
+    for oc in outcomes {
+        requant += oc.requant;
+        passthrough += oc.passthrough;
+        awq_folded += oc.awq_folded;
+        awq_dropped += oc.awq_dropped;
+        awq_imatrix_used += oc.awq_imatrix_used;
+        ternary_stats.add(oc.stats);
+        if let Some(t) = oc.tensor {
+            out_tensors.push(t);
+        }
+    }
+
+    eprintln!(
+        "hfq requant {} → {}: {} tensors ({} requantized, {} passthrough, \
+         {} AWQ-folded, {} AWQ sidecars dropped, {} AWQ-imatrix)",
+        input_hfq.display(),
+        format.label(),
+        out_tensors.len(),
+        requant,
+        passthrough,
+        awq_folded,
+        awq_dropped,
+        awq_imatrix_used
+    );
+
+    check_ternary_pack_health(ternary_stats, allow_degenerate);
+
+    // Record what this artifact was built from, so a stale model can never
+    // again be mistaken for a current one (see `stamp_provenance`).
+    let mut provenance =
+        base_provenance(&input_hfq.to_string_lossy(), format.label(), &attribution);
+    if let Some(o) = provenance.as_object_mut() {
+        o.insert("awq_imatrix_alpha".into(), awq_imatrix_alpha.into());
+        o.insert("awq_folded".into(), awq_folded.into());
+        o.insert(
+            "ternary_nonzero_fraction".into(),
+            ternary_stats.nonzero_fraction().into(),
+        );
+    }
+    let metadata_json = stamp_provenance(&metadata_json, &provenance);
+
+    write_hfq(output, arch_id, &metadata_json, &out_tensors, None).expect("write output .hfq");
+    eprintln!("wrote {}", output.display());
+}
+
+#[cfg(test)]
+mod hfq_requant_pipeline_tests {
+    use super::*;
+
+    /// Minimal `.hfq` reader for the test: (arch, meta, Vec<(name, qt, shape,
+    /// group_size, data)>). Mirrors the pipeline's own parse.
+    fn read_hfq_back(path: &Path) -> (u32, String, Vec<(String, u8, Vec<u32>, u32, Vec<u8>)>) {
+        let bytes = std::fs::read(path).unwrap();
+        assert_eq!(&bytes[0..4], HFQ_MAGIC);
+        let arch = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        let n_tensors = u32::from_le_bytes(bytes[12..16].try_into().unwrap()) as usize;
+        let metadata_offset = u64::from_le_bytes(bytes[16..24].try_into().unwrap()) as usize;
+        let data_offset = u64::from_le_bytes(bytes[24..32].try_into().unwrap()) as usize;
+
+        let meta_bytes = &bytes[metadata_offset..data_offset];
+        let mut brace = 0i32;
+        let mut json_end = 0usize;
+        for (i, &b) in meta_bytes.iter().enumerate() {
+            if b == b'{' {
+                brace += 1;
+            }
+            if b == b'}' {
+                brace -= 1;
+                if brace == 0 {
+                    json_end = i + 1;
+                    break;
+                }
+            }
+        }
+        let meta = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
+
+        let mut pos = metadata_offset + json_end + 4; // skip idx count
+        let mut cumulative = data_offset;
+        let mut out = Vec::new();
+        for _ in 0..n_tensors {
+            let name_len = u16::from_le_bytes(bytes[pos..pos + 2].try_into().unwrap()) as usize;
+            pos += 2;
+            let name = String::from_utf8_lossy(&bytes[pos..pos + name_len]).to_string();
+            pos += name_len;
+            let qt = bytes[pos];
+            pos += 1;
+            let n_dims = bytes[pos] as usize;
+            pos += 1;
+            let mut shape = Vec::new();
+            for _ in 0..n_dims {
+                shape.push(u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap()));
+                pos += 4;
+            }
+            let gs = u32::from_le_bytes(bytes[pos..pos + 4].try_into().unwrap());
+            pos += 4;
+            let dsz = u64::from_le_bytes(bytes[pos..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            let data = bytes[cumulative..cumulative + dsz].to_vec();
+            cumulative += dsz;
+            out.push((name, qt, shape, gs, data));
+        }
+        (arch, meta, out)
+    }
+
+    /// End-to-end: build a tiny `.hfq` (one 2D MQ4G256 weight + one F16 norm),
+    /// requant to ternary, and confirm the output reuses the metadata verbatim,
+    /// converts the MQ4 weight to TQ2G128 (correct byte length), and passes the
+    /// F16 norm through byte-verbatim.
+    #[test]
+    fn requant_mq4_hfq_to_ternary_end_to_end() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+
+        // 2D weight [m=2, k=256] → 512 elems, 2 groups of 256.
+        let weight_f32: Vec<f32> = (0..512)
+            .map(|i| (((i * 17 + 9) % 241) as f32 - 120.0) * 0.02)
+            .collect();
+        let mq4_data = quantize_mq4g256(&weight_f32, &signs1, &signs2);
+        assert_eq!(mq4_data.len(), 2 * 136);
+
+        // 1D norm [4] as F16.
+        let norm_vals = [0.5f32, -1.0, 2.0, -0.25];
+        let mut norm_data = Vec::new();
+        for &v in &norm_vals {
+            norm_data.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+        }
+
+        let in_tensors = vec![
+            HfqTensor {
+                name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+                quant_type: QuantType::MQ4G256,
+                shape: vec![2, 256],
+                group_size: 256,
+                data: mq4_data,
+                spilled_len: 0,
+            },
+            HfqTensor {
+                name: "model.layers.0.input_layernorm.weight".to_string(),
+                quant_type: QuantType::F16,
+                shape: vec![4],
+                group_size: 1,
+                data: norm_data.clone(),
+                spilled_len: 0,
+            },
+        ];
+
+        let meta = r#"{"architecture":"qwen3.6","num_hidden_layers":1}"#;
+        let dir = std::env::temp_dir();
+        let inp = dir.join(format!("hfq_requant_in_{}.hfq", std::process::id()));
+        let outp = dir.join(format!("hfq_requant_out_{}.hfq", std::process::id()));
+
+        write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
+        run_hfq_requant_pipeline(
+            &inp,
+            &outp,
+            GgufFormat::Ternary,
+            None,
+            0.0,
+            Attribution::default(),
+            false,
+        );
+
+        let (arch, out_meta, tensors) = read_hfq_back(&outp);
+        assert_eq!(arch, 7, "arch preserved");
+        // Source metadata carried through unchanged apart from the appended
+        // provenance stamp (see requant_stamps_provenance_into_metadata).
+        let src_meta: serde_json::Value = serde_json::from_str(meta).unwrap();
+        let out_val: serde_json::Value = serde_json::from_str(&out_meta).unwrap();
+        for (k, v) in src_meta.as_object().unwrap() {
+            assert_eq!(
+                out_val.get(k),
+                Some(v),
+                "source metadata key '{k}' preserved"
+            );
+        }
+        assert_eq!(tensors.len(), 2);
+
+        // Weight → TQ2G128 (40), group 128, 512 elems / 128 = 4 blocks * 34 B.
+        assert_eq!(tensors[0].1, QuantType::TQ2G128 as u8, "MQ4 → TQ2G128");
+        assert_eq!(tensors[0].3, 128, "ternary group size");
+        assert_eq!(tensors[0].4.len(), 4 * 34, "TQ2G128 byte length");
+        assert_eq!(tensors[0].2, vec![2, 256], "shape preserved");
+
+        // Norm → F16 passthrough, byte-verbatim.
+        assert_eq!(tensors[1].1, QuantType::F16 as u8, "norm stays F16");
+        assert_eq!(tensors[1].4, norm_data, "norm bytes verbatim");
+
+        let _ = std::fs::remove_file(&inp);
+        let _ = std::fs::remove_file(&outp);
+    }
+
+    /// Every requant output must record WHAT it was built from and WHEN.
+    ///
+    /// Motivation is not hygiene, it is a real month-long wrong conclusion: the
+    /// 2026-07-16 SP-E canary scored a `ternary-bonsai-27b.hfq` that had been
+    /// built BEFORE the norm-bias fix landed the same day, and reported the
+    /// model at KLD 6.15 when it actually measures 0.61. Nothing in the file or
+    /// the result table could have revealed that. A build timestamp would have.
+    #[test]
+    fn requant_stamps_provenance_into_metadata() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let weight_f32: Vec<f32> = (0..512).map(|i| ((i % 61) as f32 - 30.0) * 0.01).collect();
+
+        let in_tensors = vec![HfqTensor {
+            name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+            quant_type: QuantType::MQ4G256,
+            shape: vec![2, 256],
+            group_size: 256,
+            data: quantize_mq4g256(&weight_f32, &signs1, &signs2),
+            spilled_len: 0,
+        }];
+
+        let meta = r#"{"architecture":"qwen3.6","num_hidden_layers":1}"#;
+        let dir = std::env::temp_dir();
+        let inp = dir.join(format!("hfq_prov_in_{}.hfq", std::process::id()));
+        let outp = dir.join(format!("hfq_prov_out_{}.hfq", std::process::id()));
+
+        write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
+        run_hfq_requant_pipeline(
+            &inp,
+            &outp,
+            GgufFormat::Ternary,
+            Some(0.55),
+            0.0,
+            Attribution::default(),
+            false,
+        );
+        let (_a, out_meta, _t) = read_hfq_back(&outp);
+
+        let v: serde_json::Value =
+            serde_json::from_str(&out_meta).expect("output metadata is JSON");
+        let p = v
+            .get("hipfire_provenance")
+            .expect("hipfire_provenance stamped");
+        assert_eq!(p.get("format").and_then(|x| x.as_str()), Some("TQ2G128"));
+        assert_eq!(
+            p.get("source").and_then(|x| x.as_str()),
+            Some(inp.to_string_lossy().as_ref())
+        );
+        // f32 -> JSON widens (0.55f32 == 0.550000011920929f64), so compare loosely.
+        let alpha = p
+            .get("awq_imatrix_alpha")
+            .and_then(|x| x.as_f64())
+            .expect("awq_imatrix_alpha recorded");
+        assert!((alpha - 0.55).abs() < 1e-6, "alpha recorded as {alpha}");
+        assert!(
+            p.get("built_unix").and_then(|x| x.as_u64()).unwrap_or(0) > 1_700_000_000,
+            "built_unix must be a real epoch timestamp"
+        );
+        assert!(p.get("tool_version").and_then(|x| x.as_str()).is_some());
+        assert!(p.get("git_commit").is_some());
+
+        // Source keys survive.
+        assert_eq!(
+            v.get("architecture").and_then(|x| x.as_str()),
+            Some("qwen3.6")
+        );
+
+        let _ = std::fs::remove_file(&inp);
+        let _ = std::fs::remove_file(&outp);
+    }
+
+    /// Ternary/binary requant of an ordinary checkpoint is gated (measured
+    /// collapse); the GGUF passthrough path and all other targets are not.
+    #[test]
+    fn lowbit_ptq_gate_blocks_only_ternary_binary_and_only_without_opt_in() {
+        for fmt in [GgufFormat::Ternary, GgufFormat::Binary] {
+            let err = lowbit_ptq_gate(fmt, false).expect_err("must be gated by default");
+            assert!(err.contains("collapse"), "explains what goes wrong: {err}");
+            // Must point at the target that DOES work at ~2 bpw rather than
+            // just refusing — mq2lloyd measured KLD 0.61 vs this path's 2.24.
+            assert!(
+                err.contains("mq2lloyd"),
+                "names the working alternative: {err}"
+            );
+            assert!(
+                err.contains("--allow-lowbit-ptq"),
+                "names the opt-in: {err}"
+            );
+            assert!(
+                lowbit_ptq_gate(fmt, true).is_ok(),
+                "opt-in must let research through"
+            );
+        }
+        // Everything else is unaffected — including the 4-bit default.
+        for fmt in [
+            GgufFormat::Mq4,
+            GgufFormat::Mq6,
+            GgufFormat::Mq3,
+            GgufFormat::Mq2Lloyd,
+        ] {
+            assert!(
+                lowbit_ptq_gate(fmt, false).is_ok(),
+                "{fmt:?} must not be gated here"
+            );
+        }
+    }
+
+    /// The Lloyd-Max targets must actually requantize, not silently fall
+    /// through to "keep MQ4G256".
+    ///
+    /// They matter because the uniform low-bit codebooks are a known-collapse
+    /// regime on this model family — `--format mq2` is reserved in-tree with
+    /// the verdict "collapse on every model ... multilingual mojibake", which
+    /// our uniform ternary reproduced at 27B. Non-uniform (Lloyd) codebooks are
+    /// the in-tree remedy, so the requant path has to be able to emit them.
+    #[test]
+    fn requant_routes_lloyd_targets_instead_of_keeping_mq4() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let w: Vec<f32> = (0..512).map(|i| ((i % 71) as f32 - 35.0) * 0.02).collect();
+        let mq4 = quantize_mq4g256(&w, &signs1, &signs2);
+
+        for (fmt, want) in [
+            (GgufFormat::Mq2Lloyd, QuantType::MQ2G256Lloyd),
+            (GgufFormat::Mq3Lloyd, QuantType::MQ3G256Lloyd),
+            (GgufFormat::Mq4Lloyd, QuantType::MQ4G256Lloyd),
+        ] {
+            let in_tensors = vec![HfqTensor {
+                name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+                quant_type: QuantType::MQ4G256,
+                shape: vec![2, 256],
+                group_size: 256,
+                data: mq4.clone(),
+                spilled_len: 0,
+            }];
+            let meta = r#"{"architecture":"qwen3.6","num_hidden_layers":1}"#;
+            let dir = std::env::temp_dir();
+            let inp = dir.join(format!(
+                "hfq_lloyd_in_{}_{:?}.hfq",
+                std::process::id(),
+                want
+            ));
+            let outp = dir.join(format!(
+                "hfq_lloyd_out_{}_{:?}.hfq",
+                std::process::id(),
+                want
+            ));
+
+            write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
+            run_hfq_requant_pipeline(&inp, &outp, fmt, None, 0.0, Attribution::default(), false);
+            let (_a, _m, tensors) = read_hfq_back(&outp);
+
+            assert_eq!(tensors[0].1, want as u8, "{want:?} emitted");
+            assert_eq!(tensors[0].3, 256, "{want:?} group size");
+            assert_ne!(
+                tensors[0].4, mq4,
+                "{want:?} must be requantized, not the source MQ4 bytes"
+            );
+
+            let _ = std::fs::remove_file(&inp);
+            let _ = std::fs::remove_file(&outp);
+        }
+    }
+
+    /// Tensor order and contents must not depend on how the requant loop is
+    /// scheduled — the .hfq index is positional, so a reordering silently
+    /// repoints every tensor in the file.
+    #[test]
+    fn requant_preserves_tensor_order_across_many_tensors() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+        let wof = |layer: usize| -> Vec<f32> {
+            (0..256)
+                .map(|i| (((i * 31 + layer * 7) % 97) as f32 - 48.0) * 0.01)
+                .collect()
+        };
+        let scale_at = |i: usize| f16_to_f32(f32_to_f16(1.0 + (i % 5) as f32 * 0.1));
+
+        // Interleave requantized 2D weights, dropped AWQ sidecars and
+        // passed-through norms so an ordering bug cannot hide.
+        let mut in_tensors = Vec::new();
+        let mut expect_names = Vec::new();
+        for layer in 0..12 {
+            let wname = format!("model.layers.{layer}.mlp.gate_proj.weight");
+            in_tensors.push(HfqTensor {
+                name: wname.clone(),
+                quant_type: QuantType::MQ4G256,
+                shape: vec![1, 256],
+                group_size: 256,
+                data: quantize_mq4g256(&wof(layer), &signs1, &signs2),
+                spilled_len: 0,
+            });
+            expect_names.push(wname);
+
+            in_tensors.push(HfqTensor {
+                name: format!("model.layers.{layer}.mlp.gate_proj.awq_scale.weight"),
+                quant_type: QuantType::F16,
+                shape: vec![256],
+                group_size: 1,
+                data: (0..256)
+                    .flat_map(|i| f32_to_f16(1.0 + (i % 5) as f32 * 0.1).to_le_bytes())
+                    .collect(),
+                spilled_len: 0,
+            });
+
+            let nname = format!("model.layers.{layer}.input_layernorm.weight");
+            in_tensors.push(HfqTensor {
+                name: nname.clone(),
+                quant_type: QuantType::F16,
+                shape: vec![4],
+                group_size: 1,
+                data: (0..4)
+                    .flat_map(|i| f32_to_f16(0.5 + i as f32).to_le_bytes())
+                    .collect(),
+                spilled_len: 0,
+            });
+            expect_names.push(nname);
+        }
+
+        let meta = r#"{"architecture":"qwen3.6","num_hidden_layers":12}"#;
+        let dir = std::env::temp_dir();
+        let inp = dir.join(format!("hfq_order_in_{}.hfq", std::process::id()));
+        let outp = dir.join(format!("hfq_order_out_{}.hfq", std::process::id()));
+
+        write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
+        run_hfq_requant_pipeline(
+            &inp,
+            &outp,
+            GgufFormat::Ternary,
+            None,
+            0.0,
+            Attribution::default(),
+            false,
+        );
+        let (_a, _m, tensors) = read_hfq_back(&outp);
+
+        let got: Vec<String> = tensors.iter().map(|t| t.0.clone()).collect();
+        assert_eq!(
+            got, expect_names,
+            "tensor order preserved, sidecars dropped"
+        );
+
+        // Each requantized tensor must hold ITS OWN weights, not a neighbour's.
+        for (layer, t) in tensors
+            .iter()
+            .filter(|t| t.1 == QuantType::TQ2G128 as u8)
+            .enumerate()
+        {
+            let mq4 = quantize_mq4g256(&wof(layer), &signs1, &signs2);
+            let mut rec = dequant_mq4g256_to_f32(&mq4, 256);
+            for (i, v) in rec.iter_mut().enumerate() {
+                *v /= scale_at(i);
+            }
+            assert_eq!(
+                t.4,
+                quantize_tq2g128_gptq(&rec, &vec![1.0f32; 128], 0.0),
+                "layer {layer} content"
+            );
+        }
+
+        let _ = std::fs::remove_file(&inp);
+        let _ = std::fs::remove_file(&outp);
+    }
+
+    /// Ternary/binary requant must go through the scale-swept (GPTQ) packers,
+    /// not the plain `d = max|w|` reference packers.
+    ///
+    /// The plain packers mirror PrismML's decode convention and exist to pin
+    /// the on-disk format; they are NOT a usable encoder for un-transformed
+    /// weights (they zero ~85% of a Gaussian block). With no imatrix the
+    /// col_weights are all-ones, so this is a pure unweighted-MSE scale search.
+    #[test]
+    fn requant_routes_ternary_through_scale_swept_packer() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+
+        // Gaussian-ish weights — the ramp used elsewhere hides the scale bug.
+        let mut state = 987u32;
+        let weight_f32: Vec<f32> = (0..512)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let u1 = ((state >> 8) as f32 + 0.5) / ((1u32 << 24) as f32);
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                let u2 = ((state >> 8) as f32 + 0.5) / ((1u32 << 24) as f32);
+                (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos() * 0.02
+            })
+            .collect();
+        let mq4_data = quantize_mq4g256(&weight_f32, &signs1, &signs2);
+
+        let in_tensors = vec![HfqTensor {
+            name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+            quant_type: QuantType::MQ4G256,
+            shape: vec![2, 256],
+            group_size: 256,
+            data: mq4_data.clone(),
+            spilled_len: 0,
+        }];
+
+        let meta = r#"{"architecture":"qwen3.6","num_hidden_layers":1}"#;
+        let dir = std::env::temp_dir();
+        let inp = dir.join(format!("hfq_sweep_in_{}.hfq", std::process::id()));
+        let outp = dir.join(format!("hfq_sweep_out_{}.hfq", std::process::id()));
+
+        write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
+        run_hfq_requant_pipeline(
+            &inp,
+            &outp,
+            GgufFormat::Ternary,
+            None,
+            0.0,
+            Attribution::default(),
+            false,
+        );
+        let (_a, _m, tensors) = read_hfq_back(&outp);
+
+        let recovered = dequant_mq4g256_to_f32(&mq4_data, 512);
+        let ones = vec![1.0f32; 128];
+        assert_eq!(
+            tensors[0].4,
+            quantize_tq2g128_gptq(&recovered, &ones, 0.0),
+            "requant must use the scale-swept ternary packer"
+        );
+        assert_ne!(
+            tensors[0].4,
+            quantize_tq2g128(&recovered),
+            "plain d=max|w| packer must NOT be what ships"
+        );
+
+        let _ = std::fs::remove_file(&inp);
+        let _ = std::fs::remove_file(&outp);
+    }
+
+    /// AWQ-scaled sources must have the per-input-channel scale divided OUT of
+    /// the recovered F32 before packing to a non-AWQ-aware target (ternary /
+    /// binary).
+    ///
+    /// The AWQ identity is `(W·s)·(x/s) = W·x`: the `·s` is baked into the
+    /// stored weights at quantize time and the `x/s` is applied by the
+    /// fused-rmsnorm-rotate pre-pass upstream of the linear. That pre-pass only
+    /// exists for rotated dtypes (`dtype_rotation_plan` → MQ/Paro families);
+    /// TQ2G128 / BQ1G128 are `RotationPlan::None`, so the `x/s` half NEVER
+    /// runs. Packing `W·s` into ternary therefore ships a model whose every
+    /// AWQ-scaled projection is wrong by a per-channel factor of up to ~5×.
+    ///
+    /// So: fold `s` out of the weights, and drop the now-meaningless sidecar.
+    #[test]
+    fn requant_mq4_hfq_to_ternary_divides_out_awq_scale() {
+        let signs1 = gen_fwht_signs(42, 256);
+        let signs2 = gen_fwht_signs(1042, 256);
+
+        // Stored (AWQ-pre-scaled) weight [m=2, k=256].
+        let stored_f32: Vec<f32> = (0..512)
+            .map(|i| (((i * 17 + 9) % 241) as f32 - 120.0) * 0.02)
+            .collect();
+        let mq4_data = quantize_mq4g256(&stored_f32, &signs1, &signs2);
+
+        // Non-unit per-input-channel AWQ scales, length K=256.
+        let scales: Vec<f32> = (0..256).map(|i| 0.9 + ((i % 7) as f32) * 0.35).collect();
+        let mut scale_data = Vec::new();
+        for &v in &scales {
+            scale_data.extend_from_slice(&f32_to_f16(v).to_le_bytes());
+        }
+        // What the loader will see after the F16 round-trip.
+        let scales_f16: Vec<f32> = scales.iter().map(|&v| f16_to_f32(f32_to_f16(v))).collect();
+
+        let in_tensors = vec![
+            HfqTensor {
+                name: "model.layers.0.mlp.gate_proj.weight".to_string(),
+                quant_type: QuantType::MQ4G256,
+                shape: vec![2, 256],
+                group_size: 256,
+                data: mq4_data.clone(),
+                spilled_len: 0,
+            },
+            HfqTensor {
+                name: "model.layers.0.mlp.gate_proj.awq_scale.weight".to_string(),
+                quant_type: QuantType::F16,
+                shape: vec![256],
+                group_size: 1,
+                data: scale_data,
+                spilled_len: 0,
+            },
+        ];
+
+        let meta = r#"{"architecture":"qwen3.6","num_hidden_layers":1}"#;
+        let dir = std::env::temp_dir();
+        let inp = dir.join(format!("hfq_awq_in_{}.hfq", std::process::id()));
+        let outp = dir.join(format!("hfq_awq_out_{}.hfq", std::process::id()));
+
+        write_hfq(&inp, 7, meta, &in_tensors, None).unwrap();
+        run_hfq_requant_pipeline(
+            &inp,
+            &outp,
+            GgufFormat::Ternary,
+            None,
+            0.0,
+            Attribution::default(),
+            false,
+        );
+        let (_arch, _meta, tensors) = read_hfq_back(&outp);
+
+        // Expected: ternary of the UNSCALED weights. Derived from the mq4
+        // dequant (not from `stored_f32`) so this asserts ONLY the AWQ
+        // division, not mq4 round-trip fidelity.
+        let recovered = dequant_mq4g256_to_f32(&mq4_data, 512);
+        let unscaled: Vec<f32> = recovered
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| v / scales_f16[i % 256])
+            .collect();
+        let expected = quantize_tq2g128_gptq(&unscaled, &vec![1.0f32; 128], 0.0);
+
+        let w = tensors
+            .iter()
+            .find(|t| t.0 == "model.layers.0.mlp.gate_proj.weight")
+            .expect("weight present in output");
+        assert_eq!(w.1, QuantType::TQ2G128 as u8, "MQ4 → TQ2G128");
+        assert_eq!(
+            w.4, expected,
+            "ternary codes must encode W (AWQ scale divided out), not W·s"
+        );
+
+        // The sidecar is meaningless once folded in — and actively dangerous if
+        // a future ternary kernel learns to honor it (double correction).
+        assert!(
+            !tensors.iter().any(|t| t.0.ends_with(".awq_scale.weight")),
+            "AWQ sidecar must be dropped from a non-AWQ-aware output"
+        );
+
+        let _ = std::fs::remove_file(&inp);
+        let _ = std::fs::remove_file(&outp);
+    }
+}
+
 /// Translate llama.cpp GGUF tensor names to the HuggingFace safetensors
 /// names that `hipfire_runtime::hfq::load_weights_hfq` expects. The mapping is
 /// the canonical llama.cpp ↔ HF convention.
@@ -5781,15 +7964,39 @@ fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
     }
     // Per-layer: blk.{N}.<slot>.weight  →  model.layers.{N}.<slot>.weight
     if let Some(rest) = gguf_name.strip_prefix("blk.") {
-        // rest = "{N}.<slot>.weight"
+        // rest = "{N}.<slot>.weight"  (or, for a couple of qwen3.5/DeltaNet
+        // SSM tensors, "{N}.<slot>" / "{N}.<slot>.bias" — no ".weight" at
+        // all; handled below BEFORE the ".weight"-suffix strip, since that
+        // strip would otherwise reject them via `?` and silently drop them
+        // from the conversion).
         let dot = rest.find('.')?;
         let layer_idx = &rest[..dot];
-        let slot_full = &rest[dot + 1..]; // "<slot>.weight"
-                                          // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
+        let slot_full = &rest[dot + 1..]; // "<slot>.weight" | "<slot>" | "<slot>.bias"
+
+        // qwen3.5 DeltaNet (linear-attention) SSM tensors with no/unusual
+        // suffix. `ssm_a` carries the raw `A_log` decay parameter as a bare
+        // 1D tensor (no ".weight"); `ssm_dt.bias` is the dt-projection bias
+        // (".bias", not ".weight"). Both map to hipfire's `linear_attn.*`
+        // raw-f32 slots, which are looked up WITHOUT a ".weight" suffix
+        // (see `hfq_plain_name` / `layer_driver.rs`'s `raw_f32("linear_attn.A_log", ...)`
+        // / `raw_f32("linear_attn.dt_bias", ...)`).
+        if slot_full == "ssm_a" {
+            return Some(format!("model.layers.{layer_idx}.linear_attn.A_log"));
+        }
+        if slot_full == "ssm_dt.bias" {
+            return Some(format!("model.layers.{layer_idx}.linear_attn.dt_bias"));
+        }
+
+        // Drop the trailing ".weight" so we can rewrite slots like "attn_q"→"self_attn.q_proj".
         let slot = slot_full.strip_suffix(".weight")?;
         let translated = match slot {
             "attn_norm" => "input_layernorm".to_string(),
             "ffn_norm" => "post_attention_layernorm".to_string(),
+            // qwen3.5 hybrid arch: FullAttention layers name their
+            // post-attention norm "post_attention_norm" (NOT "ffn_norm" —
+            // QWEN35's GGUF tensor list omits FFN_NORM entirely), but it
+            // maps to the same hipfire slot as "ffn_norm" does elsewhere.
+            "post_attention_norm" => "post_attention_layernorm".to_string(),
             "attn_q" => "self_attn.q_proj".to_string(),
             "attn_k" => "self_attn.k_proj".to_string(),
             "attn_v" => "self_attn.v_proj".to_string(),
@@ -5799,6 +8006,18 @@ fn gguf_to_safetensors_name(gguf_name: &str) -> Option<String> {
             "ffn_gate" => "mlp.gate_proj".to_string(),
             "ffn_up" => "mlp.up_proj".to_string(),
             "ffn_down" => "mlp.down_proj".to_string(),
+            // qwen3.5 hybrid arch: LinearAttention (DeltaNet) layer tensors.
+            // These slot names (attn_qkv/attn_gate/ssm_*) are qwen3.5/
+            // qwen3next-specific and don't collide with any other arch's
+            // naming, so it's safe to extend this arch-agnostic function
+            // in place.
+            "attn_qkv" => "linear_attn.in_proj_qkv".to_string(),
+            "attn_gate" => "linear_attn.in_proj_z".to_string(),
+            "ssm_alpha" => "linear_attn.in_proj_a".to_string(),
+            "ssm_beta" => "linear_attn.in_proj_b".to_string(),
+            "ssm_out" => "linear_attn.out_proj".to_string(),
+            "ssm_conv1d" => "linear_attn.conv1d".to_string(),
+            "ssm_norm" => "linear_attn.norm".to_string(),
             other => return Some(format!("model.layers.{layer_idx}.{other}.weight")),
         };
         return Some(format!("model.layers.{layer_idx}.{translated}.weight"));
@@ -6100,6 +8319,33 @@ fn minimax_layer_awq_scales(
     ))
 }
 
+/// Inverse of [`compute_awq_scales`]: recover per-input-channel imatrix
+/// importance (`Σ act²`) from an AWQ sidecar, up to a per-tensor constant.
+///
+/// `compute_awq_scales` emits `s[k] = exp((α/2)·ln(in_sum2[k]) − mean_log)`,
+/// i.e. `s[k] = C · in_sum2[k]^(α/2)` with `C` constant per tensor. So
+/// `in_sum2[k] ∝ s[k]^(2/α)`. The GPTQ packers use `col_weights` only inside a
+/// per-block `argmin_d Σ w_i·Δ_i²`, which is invariant to a positive global
+/// scale — so the unknown `C` (and the mean-normalization below) drops out.
+///
+/// This lets an AWQ-pre-scaled checkpoint act as its own imatrix: the
+/// calibration data is already baked into the sidecars, correctly aligned per
+/// input channel, with no llama.cpp dependency and no name-mapping risk.
+///
+/// `alpha` must match the α the checkpoint was built with (CLI default 0.55).
+/// A wrong α only changes how sharply importance is weighted — the channel
+/// ORDERING is preserved for any α > 0.
+fn awq_col_weights(scales: &[f32], alpha: f32) -> Vec<f32> {
+    debug_assert!(alpha > 0.0, "alpha must be positive");
+    let inv = 2.0 / (alpha as f64);
+    let raw: Vec<f64> = scales
+        .iter()
+        .map(|&s| (s as f64).max(1e-12).powf(inv))
+        .collect();
+    let mean = (raw.iter().sum::<f64>() / raw.len().max(1) as f64).max(1e-300);
+    raw.iter().map(|v| (v / mean) as f32).collect()
+}
+
 fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
     let k = in_sum2.len();
     debug_assert!(k > 0, "empty imatrix vector");
@@ -6386,7 +8632,719 @@ fn config_json_from_gguf(gguf: &gguf_input::GgufFile, arch_str: &str) -> serde_j
     }
     cfg.insert("bos_token_id".to_string(), serde_json::Value::from(bos));
     cfg.insert("eos_token_id".to_string(), serde_json::Value::from(eos));
+
+    // qwen3.5 hybrid-attention (DeltaNet linear-attention + FullAttention)
+    // config. Gated on arch_str since these GGUF keys/JSON fields are
+    // qwen3.5/qwen3.5moe-specific (see onboarding-map-research.md §B).
+    if is_qwen35_arch(arch_str) {
+        let conv_kernel = read_u(&format!("{prefix}.ssm.conv_kernel"));
+        let state_size = read_u(&format!("{prefix}.ssm.state_size"));
+        let group_count = read_u(&format!("{prefix}.ssm.group_count"));
+        let time_step_rank = read_u(&format!("{prefix}.ssm.time_step_rank"));
+        let inner_size = read_u(&format!("{prefix}.ssm.inner_size"));
+        let full_attention_interval =
+            read_u(&format!("{prefix}.full_attention_interval")).unwrap_or(4);
+        let rope_dim_count = read_u(&format!("{prefix}.rope.dimension_count"));
+
+        if let Some(v) = group_count {
+            cfg.insert(
+                "linear_num_key_heads".to_string(),
+                serde_json::Value::from(v),
+            );
+        }
+        if let Some(v) = time_step_rank {
+            cfg.insert(
+                "linear_num_value_heads".to_string(),
+                serde_json::Value::from(v),
+            );
+        }
+        if let Some(v) = state_size {
+            cfg.insert(
+                "linear_key_head_dim".to_string(),
+                serde_json::Value::from(v),
+            );
+        }
+        // `linear_value_head_dim` has no direct GGUF key; derive it from
+        // ssm.inner_size / ssm.time_step_rank — the only GGUF-recoverable
+        // source (the C++ loader just reuses state_size for both key AND
+        // value head-dim, which happens to agree for this checkpoint, but
+        // this derivation is the more defensive/general choice — see
+        // onboarding-map-research.md D3b).
+        if let (Some(inner), Some(rank)) = (inner_size, time_step_rank) {
+            if rank > 0 {
+                cfg.insert(
+                    "linear_value_head_dim".to_string(),
+                    serde_json::Value::from(inner / rank),
+                );
+            }
+        }
+        if let Some(v) = conv_kernel {
+            cfg.insert(
+                "linear_conv_kernel_dim".to_string(),
+                serde_json::Value::from(v),
+            );
+        }
+        // partial_rotary_factor = rope.dimension_count / head_dim (fraction
+        // of head_dim actually rotated by RoPE).
+        if let (Some(rope_dim), Some(hd)) = (rope_dim_count, head_dim) {
+            if hd > 0 {
+                cfg.insert(
+                    "partial_rotary_factor".to_string(),
+                    serde_json::Value::from(rope_dim as f64 / hd as f64),
+                );
+            }
+        }
+        // layer_types: derive the hybrid-attention layer pattern from
+        // `full_attention_interval` — layer i is FullAttention iff
+        // (i+1) % interval == 0, everything else is LinearAttention
+        // (confirmed against qwen35.cpp's `is_recr_impl` formula). This is
+        // the root-cause fix: without this key, `from_config_value`'s
+        // fallback stamps every layer FullAttention, and layer 0 (actually
+        // LinearAttention) then looks for a nonexistent `self_attn.q_proj`.
+        if let Some(n) = n_layers {
+            let interval = full_attention_interval.max(1);
+            let layer_types: Vec<serde_json::Value> = qwen35_layer_types(n, interval)
+                .into_iter()
+                .map(serde_json::Value::from)
+                .collect();
+            cfg.insert(
+                "layer_types".to_string(),
+                serde_json::Value::Array(layer_types),
+            );
+        }
+        // `rope_theta` must be nested under `rope_parameters` for qwen35 —
+        // `RawQwen35Config` only reads `rope_parameters.rope_theta`, never a
+        // flat top-level `rope_theta` (the flat insert above is a harmless
+        // no-op for this arch; left in place since other archs DO read it
+        // flat — see onboarding-map-research.md D4).
+        let mut rope_params = serde_json::Map::new();
+        if let Some(v) = rope_theta {
+            rope_params.insert("rope_theta".to_string(), serde_json::Value::from(v));
+        }
+        rope_params.insert(
+            "mrope_interleaved".to_string(),
+            serde_json::Value::from(true),
+        );
+        let mrope_section: Vec<serde_json::Value> = gguf
+            .metadata
+            .get(&format!("{prefix}.rope.dimension_sections"))
+            .and_then(|v| match v {
+                gguf_input::MetaValue::Array(arr) => Some(arr),
+                _ => None,
+            })
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(meta_value_as_u64)
+                    .take(3)
+                    .map(serde_json::Value::from)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v: &Vec<serde_json::Value>| !v.is_empty())
+            .unwrap_or_else(|| {
+                vec![
+                    serde_json::Value::from(11u64),
+                    serde_json::Value::from(11u64),
+                    serde_json::Value::from(10u64),
+                ]
+            });
+        rope_params.insert(
+            "mrope_section".to_string(),
+            serde_json::Value::Array(mrope_section),
+        );
+        cfg.insert(
+            "rope_parameters".to_string(),
+            serde_json::Value::Object(rope_params),
+        );
+    }
+
     serde_json::Value::Object(cfg)
+}
+
+/// Coerce any GGUF integer-typed `MetaValue` to `u64`. Used for reading
+/// small integer arrays (e.g. `qwen35.rope.dimension_sections`) that don't
+/// fit the scalar `read_u` closure in `config_json_from_gguf`.
+fn meta_value_as_u64(v: &gguf_input::MetaValue) -> Option<u64> {
+    match v {
+        gguf_input::MetaValue::U8(x) => Some(*x as u64),
+        gguf_input::MetaValue::I8(x) => Some(*x as u64),
+        gguf_input::MetaValue::U16(x) => Some(*x as u64),
+        gguf_input::MetaValue::I16(x) => Some(*x as u64),
+        gguf_input::MetaValue::U32(x) => Some(*x as u64),
+        gguf_input::MetaValue::I32(x) => Some(*x as u64),
+        gguf_input::MetaValue::U64(x) => Some(*x),
+        gguf_input::MetaValue::I64(x) => Some(*x as u64),
+        _ => None,
+    }
+}
+
+/// Pure derivation of the qwen3.5 hybrid-attention `layer_types` array:
+/// layer `i` (0-indexed) is `"full_attention"` iff `(i+1) % interval == 0`,
+/// otherwise `"linear_attention"`. Matches qwen35.cpp's `is_recr_impl`
+/// formula exactly (confirmed in onboarding-map-research.md §B). Pure and
+/// GPU-free so it's unit-testable without a GGUF file.
+fn qwen35_layer_types(n_layers: u64, interval: u64) -> Vec<&'static str> {
+    let interval = interval.max(1);
+    (0..n_layers)
+        .map(|i| {
+            if (i + 1) % interval == 0 {
+                "full_attention"
+            } else {
+                "linear_attention"
+            }
+        })
+        .collect()
+}
+
+/// Invert PrismML's grouped→tiled V-head reorder (D1) and apply the A_log
+/// -exp inverse (D2) for a qwen35 GGUF tensor. Returns Some(transformed_bytes)
+/// when this tensor needs a value transform, else None (caller keeps raw).
+///
+/// Direction is verified against hipfire kernels and MUST NOT be flipped:
+/// GGUF stores V-heads TILED; hipfire repeat-INTERLEAVES K→V
+/// (qwen35.rs:8662-8683) so it expects GROUPED order → invert tiled→grouped.
+/// hipfire's fused_sigmoid_alpha_gate applies -exp(A_log) itself, so
+/// A_log must hold the raw log parameter: A_log_raw = ln(-gguf_ssm_a).
+/// True for any spelling of the Qwen3.5/3.6 hybrid-attention arch that requires
+/// the PrismML onboarding transforms (V-head un-tiling, A_log `ln(-x)`, norm
+/// de-bias). The GGUF/config auto-detectors and reap_overlay each accept a
+/// disjoint set of spellings for the SAME arch (arch_id 5 dense / 6 MoE); the
+/// transform gates must recognize the full union or a `qwen3_5` GGUF would
+/// auto-detect as Qwen3.5 yet silently skip every transform → corrupt `.hfq`.
+/// Plain `qwen3`/`qwen2` (arch_id 1) are deliberately excluded — they are NOT
+/// hybrid-attn and must not get these transforms.
+fn is_qwen35_arch(arch: &str) -> bool {
+    matches!(
+        arch,
+        "qwen35"
+            | "qwen35moe"
+            | "qwen3_5"
+            | "qwen3_5_text"
+            | "qwen3_5_moe"
+            | "qwen3_5_moe_text"
+            | "qwen3.5"
+            | "qwen3moe"
+    )
+}
+
+fn qwen35_value_transform(
+    gguf_name: &str,
+    raw: &[u8],
+    shape: &[usize],
+    nk: usize, // linear_num_key_heads   (16)
+    nv: usize, // linear_num_value_heads (48)
+    hv: usize, // linear_value_head_dim  (128)
+    dtype: gguf_input::GgmlType,
+) -> Option<Vec<u8>> {
+    // rel = name with the "blk.N." prefix removed
+    let rel = gguf_name
+        .strip_prefix("blk.")
+        .and_then(|rest| rest.split_once('.'))
+        .map(|(_n, r)| r)?;
+
+    let reorder = nk != nv;
+    debug_assert!(
+        nv % nk == 0,
+        "qwen35 reorder expects nv({nv}) divisible by nk({nk})"
+    );
+    let r = nv / nk; // v-heads per k-head (3)
+    let inv = |g: usize| -> usize { (g % r) * nk + (g / r) }; // tiled→grouped
+    let blk: usize = match dtype {
+        gguf_input::GgmlType::Q2_0 => 34, // ternary
+        gguf_input::GgmlType::Q1_0 => 18, // binary
+        _ => 0, // non-low-bit dtypes are rejected by the guard below before blk is used
+    };
+
+    // ---- A_log: value transform (+ permute if GQA) ----
+    if rel == "ssm_a" {
+        let mut vals: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        for v in vals.iter_mut() {
+            *v = (-*v).ln(); // A = -exp(raw) < 0  ⇒  -A > 0  ⇒  ln(-A) = raw
+        }
+        let out: Vec<f32> = if reorder {
+            (0..nv).map(|g| vals[inv(g)]).collect()
+        } else {
+            vals
+        };
+        return Some(out.iter().flat_map(|v| v.to_le_bytes()).collect());
+    }
+
+    if !reorder {
+        return None;
+    }
+
+    // ---- pure permutations (no value change) ----
+    if rel == "ssm_dt.bias" {
+        let vals: Vec<f32> = raw
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        let out: Vec<f32> = (0..nv).map(|g| vals[inv(g)]).collect();
+        return Some(out.iter().flat_map(|v| v.to_le_bytes()).collect());
+    }
+
+    let ne0 = shape[0];
+
+    // permute `nv` contiguous head-blocks of `chunk` bytes at `base`;
+    // bytes outside [base, base+nv*chunk) are copied verbatim.
+    let permute = |base: usize, chunk: usize| -> Vec<u8> {
+        let mut out = raw.to_vec();
+        for g in 0..nv {
+            let dst = base + g * chunk;
+            let src = base + inv(g) * chunk;
+            out[dst..dst + chunk].copy_from_slice(&raw[src..src + chunk]);
+        }
+        out
+    };
+
+    // conv1d is stored F32 (channels are 4-byte floats), so its permute is
+    // dtype-independent — handle it before the Q2_0-only block-permute gate.
+    if rel == "ssm_conv1d.weight" {
+        // F32 (4,10240): V channels [nk*hv*2 ..), each channel = ne0 f32
+        let chan = ne0 * 4; // 16 bytes
+        let base = (nk * hv * 2) * chan; // 4096 * 16
+        return Some(permute(base, hv * chan));
+    }
+
+    // The remaining reorder arms slice `raw` as fixed-size quant blocks whose
+    // byte layout is only valid for Q2_0 (34 bytes/128-element block, ternary)
+    // and Q1_0 (18 bytes/128-element block, binary) — see `blk` above.
+    // Fed any other dtype (Q8_0/Q4_K/F16/…) the offsets stay in bounds but
+    // scramble the bytes silently, so decline the transform and let the raw
+    // bytes pass through unchanged.
+    match dtype {
+        gguf_input::GgmlType::Q2_0 | gguf_input::GgmlType::Q1_0 => {}
+        _ => return None,
+    }
+    debug_assert!(
+        ne0 % 128 == 0,
+        "qwen35 reorder expects 128-aligned ne0, got {ne0}"
+    );
+
+    match rel {
+        // Q2_0 (ne0,ne1)=(5120,10240): V rows [nk*hv*2 ..), row=(ne0/128)*34
+        "attn_qkv.weight" => {
+            let row = (ne0 / 128) * blk;
+            let base = (nk * hv * 2) * row; // 4096 * row
+            Some(permute(base, hv * row)) // head = hv ne1-rows
+        }
+        // Q2_0 (5120,6144): all rows are V
+        "attn_gate.weight" => {
+            let row = (ne0 / 128) * blk;
+            Some(permute(0, hv * row))
+        }
+        // Q2_0 (5120,48): head_dim = 1 → one ne1-row per head
+        "ssm_alpha.weight" | "ssm_beta.weight" => {
+            let row = (ne0 / 128) * blk;
+            Some(permute(0, row))
+        }
+        // Q2_0 (6144,5120): reorder ne0 columns → per-row 48-block permute
+        "ssm_out.weight" => {
+            let ne1 = shape[1];
+            let row_bytes = (ne0 / 128) * blk; // 48*34 = 1632 (Q2_0) / 48*18 (Q1_0)
+            let mut out = raw.to_vec();
+            for rrow in 0..ne1 {
+                let rb = rrow * row_bytes;
+                for g in 0..nv {
+                    let dst = rb + g * blk;
+                    let src = rb + inv(g) * blk;
+                    out[dst..dst + blk].copy_from_slice(&raw[src..src + blk]);
+                }
+            }
+            Some(out)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod qwen35_onboarding_tests {
+    use super::*;
+
+    // ── gguf_to_safetensors_name: qwen3.5 linear-attn/SSM slot names ───────
+
+    #[test]
+    fn linear_attn_fused_qkv_and_gate() {
+        assert_eq!(
+            gguf_to_safetensors_name("blk.5.attn_qkv.weight").as_deref(),
+            Some("model.layers.5.linear_attn.in_proj_qkv.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.5.attn_gate.weight").as_deref(),
+            Some("model.layers.5.linear_attn.in_proj_z.weight")
+        );
+    }
+
+    #[test]
+    fn linear_attn_ssm_alpha_beta_out_conv_norm() {
+        assert_eq!(
+            gguf_to_safetensors_name("blk.0.ssm_alpha.weight").as_deref(),
+            Some("model.layers.0.linear_attn.in_proj_a.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.0.ssm_beta.weight").as_deref(),
+            Some("model.layers.0.linear_attn.in_proj_b.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.0.ssm_out.weight").as_deref(),
+            Some("model.layers.0.linear_attn.out_proj.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.0.ssm_conv1d.weight").as_deref(),
+            Some("model.layers.0.linear_attn.conv1d.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.0.ssm_norm.weight").as_deref(),
+            Some("model.layers.0.linear_attn.norm.weight")
+        );
+    }
+
+    /// `ssm_a` (no `.weight` suffix at all) and `ssm_dt.bias` (`.bias`, not
+    /// `.weight`) previously fell through the `?` on
+    /// `slot_full.strip_suffix(".weight")` and were silently DROPPED from
+    /// the conversion (D3/D3b in onboarding-map-research.md). They must now
+    /// map to hipfire's raw-f32 `linear_attn.A_log` / `linear_attn.dt_bias`
+    /// slots, WITHOUT a `.weight` suffix (matches `hfq_plain_name`, which
+    /// hipfire's `raw_f32` loader queries with).
+    #[test]
+    fn linear_attn_ssm_a_and_dt_bias_no_longer_dropped() {
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.ssm_a").as_deref(),
+            Some("model.layers.3.linear_attn.A_log")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.ssm_dt.bias").as_deref(),
+            Some("model.layers.3.linear_attn.dt_bias")
+        );
+    }
+
+    /// FullAttention layers name their post-attention norm
+    /// `post_attention_norm` (not `ffn_norm`) — must map to the same
+    /// `post_attention_layernorm` slot the `ffn_norm` arm already produces.
+    #[test]
+    fn full_attn_post_attention_norm() {
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.post_attention_norm.weight").as_deref(),
+            Some("model.layers.3.post_attention_layernorm.weight")
+        );
+    }
+
+    /// Existing FullAttention / global-tensor mappings must stay unchanged
+    /// (no regression from the new arms).
+    #[test]
+    fn existing_mappings_unchanged() {
+        assert_eq!(
+            gguf_to_safetensors_name("token_embd.weight").as_deref(),
+            Some("model.embed_tokens.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.attn_q.weight").as_deref(),
+            Some("model.layers.3.self_attn.q_proj.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.attn_norm.weight").as_deref(),
+            Some("model.layers.3.input_layernorm.weight")
+        );
+        assert_eq!(
+            gguf_to_safetensors_name("blk.3.ffn_gate.weight").as_deref(),
+            Some("model.layers.3.mlp.gate_proj.weight")
+        );
+    }
+
+    // ── qwen35_layer_types: hybrid full/linear attention derivation ────────
+
+    #[test]
+    fn layer_types_interval_4_matches_bonsai_27b() {
+        // Bonsai-27B: full_attention_interval=4, 64 layers. Layer i is
+        // FullAttention iff (i+1) % 4 == 0: indices 3, 7, 11, ... are full;
+        // everything else (incl. 0, 1, 2) is linear.
+        let types = qwen35_layer_types(64, 4);
+        assert_eq!(types.len(), 64);
+        assert_eq!(types[0], "linear_attention");
+        assert_eq!(types[1], "linear_attention");
+        assert_eq!(types[2], "linear_attention");
+        assert_eq!(types[3], "full_attention");
+        assert_eq!(types[7], "full_attention");
+        assert_eq!(types[11], "full_attention");
+        assert_eq!(types[63], "full_attention");
+        // Spot-check a non-boundary linear layer past the first full layer.
+        assert_eq!(types[4], "linear_attention");
+        assert_eq!(types[6], "linear_attention");
+    }
+
+    #[test]
+    fn layer_types_interval_zero_does_not_divide_by_zero() {
+        // Defensive: an interval of 0 (malformed metadata) must not panic;
+        // `.max(1)` clamps it so every layer ends up FullAttention.
+        let types = qwen35_layer_types(4, 0);
+        assert_eq!(types, vec!["full_attention"; 4]);
+    }
+
+    // ── qwen35_value_transform: A_log (-exp inverse) + V-head un-tiling ────
+
+    #[test]
+    fn qwen35_inv_perm_inverts_tiling() {
+        let (nk, nv, r) = (16usize, 48usize, 3usize);
+        let a: Vec<usize> = (0..nv).collect(); // grouped source
+        let mut tiled = vec![0usize; nv]; // PrismML forward grouped→tiled
+        for kh in 0..nk {
+            for vpk in 0..r {
+                tiled[vpk * nk + kh] = a[kh * r + vpk];
+            }
+        }
+        let inv = |g: usize| (g % r) * nk + (g / r);
+        let rec: Vec<usize> = (0..nv).map(|g| tiled[inv(g)]).collect();
+        assert_eq!(rec, a, "inv must undo PrismML's grouped→tiled reorder");
+        let mut sorted = (0..nv).map(inv).collect::<Vec<_>>();
+        sorted.sort();
+        assert_eq!(
+            sorted,
+            (0..nv).collect::<Vec<_>>(),
+            "inv must be a bijection"
+        );
+    }
+
+    #[test]
+    fn qwen35_alog_roundtrip() {
+        for &x in &[-8.0f32, -3.5, -1.0, 0.0, 0.7] {
+            let gguf = -(x.exp()); // PrismML stored A = -exp(x)
+            let recovered = (-gguf).ln(); // our transform
+            assert!((recovered - x).abs() < 1e-5);
+        }
+        // and check the helper emits it for ssm_a
+        let raw: Vec<u8> = [-(0.5f32.exp()), -(2.0f32.exp())]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        // nk==nv → no reorder, only ln
+        let out = qwen35_value_transform(
+            "blk.0.ssm_a",
+            &raw,
+            &[2],
+            2,
+            2,
+            128,
+            gguf_input::GgmlType::Q2_0,
+        )
+        .unwrap();
+        let got: Vec<f32> = out
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect();
+        assert!((got[0] - 0.5).abs() < 1e-5 && (got[1] - 2.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn qwen35_ssm_alpha_full_permute() {
+        let (nk, nv) = (2usize, 6usize);
+        let ne0 = 128usize; // 1 block → row = 34 bytes
+        let row = 34usize;
+        let mut raw = vec![0u8; nv * row];
+        for g in 0..nv {
+            for b in 0..row {
+                raw[g * row + b] = (g as u8) + 1;
+            }
+        }
+        let out = qwen35_value_transform(
+            "blk.0.ssm_alpha.weight",
+            &raw,
+            &[ne0, nv],
+            nk,
+            nv,
+            128,
+            gguf_input::GgmlType::Q2_0,
+        )
+        .unwrap();
+        let r = nv / nk;
+        let inv = |g: usize| (g % r) * nk + (g / r);
+        for g in 0..nv {
+            assert_eq!(
+                out[g * row],
+                (inv(g) as u8) + 1,
+                "grouped head {g} must come from tiled head {}",
+                inv(g)
+            );
+        }
+    }
+
+    #[test]
+    fn qwen35_qkv_v_permuted_qk_untouched() {
+        let (nk, nv, hv) = (2usize, 6usize, 4usize);
+        let ne0 = 128usize;
+        let row = 34usize;
+        let v_start = nk * hv * 2; // 16 rows
+        let ne1 = v_start + nv * hv; // 40 rows
+        let mut raw = vec![0u8; ne1 * row];
+        for rr in 0..ne1 {
+            for b in 0..row {
+                raw[rr * row + b] = rr as u8;
+            }
+        }
+        let out = qwen35_value_transform(
+            "blk.5.attn_qkv.weight",
+            &raw,
+            &[ne0, ne1],
+            nk,
+            nv,
+            hv,
+            gguf_input::GgmlType::Q2_0,
+        )
+        .unwrap();
+        // Q/K region untouched
+        for rr in 0..v_start {
+            assert_eq!(out[rr * row], rr as u8, "Q/K row {rr} must be untouched");
+        }
+        // V head-blocks permuted by inv (each head = hv rows)
+        let r = nv / nk;
+        let inv = |g: usize| (g % r) * nk + (g / r);
+        for g in 0..nv {
+            for e in 0..hv {
+                let dst_row = v_start + g * hv + e;
+                let src_row = v_start + inv(g) * hv + e;
+                assert_eq!(out[dst_row * row], src_row as u8, "V head {g} elem {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn qwen35_reorder_q1_0_uses_18b_blocks() {
+        // Same layout/assertions as qwen35_qkv_v_permuted_qk_untouched, but
+        // for the 1-bit Q1_0 format's 18-byte blocks instead of Q2_0's 34.
+        let (nk, nv, hv) = (2usize, 6usize, 4usize);
+        let ne0 = 128usize;
+        let row = 18usize;
+        let v_start = nk * hv * 2; // 16 rows
+        let ne1 = v_start + nv * hv; // 40 rows
+        let mut raw = vec![0u8; ne1 * row];
+        for rr in 0..ne1 {
+            for b in 0..row {
+                raw[rr * row + b] = rr as u8;
+            }
+        }
+        let out = qwen35_value_transform(
+            "blk.5.attn_qkv.weight",
+            &raw,
+            &[ne0, ne1],
+            nk,
+            nv,
+            hv,
+            gguf_input::GgmlType::Q1_0,
+        )
+        .expect("Q1_0 attn_qkv should be reordered");
+        // Q/K region untouched
+        for rr in 0..v_start {
+            assert_eq!(out[rr * row], rr as u8, "Q/K row {rr} must be untouched");
+        }
+        // V head-blocks permuted by inv (each head = hv rows), 18-byte stride
+        let r = nv / nk;
+        let inv = |g: usize| (g % r) * nk + (g / r);
+        for g in 0..nv {
+            for e in 0..hv {
+                let dst_row = v_start + g * hv + e;
+                let src_row = v_start + inv(g) * hv + e;
+                assert_eq!(out[dst_row * row], src_row as u8, "V head {g} elem {e}");
+            }
+        }
+    }
+
+    #[test]
+    fn qwen35_ssm_out_column_block_permute() {
+        let (nk, nv) = (2usize, 6usize);
+        let ne0 = nv * 128;
+        let ne1 = 3usize;
+        let blk = 34usize;
+        let row_bytes = (ne0 / 128) * blk; // 6*34
+        let mut raw = vec![0u8; ne1 * row_bytes];
+        for rr in 0..ne1 {
+            for blk_i in 0..nv {
+                raw[rr * row_bytes + blk_i * blk] = (rr * nv + blk_i) as u8;
+            }
+        }
+        let out = qwen35_value_transform(
+            "blk.0.ssm_out.weight",
+            &raw,
+            &[ne0, ne1],
+            nk,
+            nv,
+            128,
+            gguf_input::GgmlType::Q2_0,
+        )
+        .unwrap();
+        let r = nv / nk;
+        let inv = |g: usize| (g % r) * nk + (g / r);
+        for rr in 0..ne1 {
+            for g in 0..nv {
+                assert_eq!(out[rr * row_bytes + g * blk], (rr * nv + inv(g)) as u8);
+            }
+        }
+    }
+
+    // Fix 2: the block-permute arms slice raw bytes as 34-byte Q2_0 blocks.
+    // For any non-Q2_0 dtype they would scramble data silently, so the transform
+    // must decline (return None) and let the raw bytes pass through unchanged.
+    #[test]
+    fn qwen35_block_permute_only_for_q2_0() {
+        let (nk, nv) = (2usize, 6usize);
+        let ne0 = 128usize; // 1 block → row = 34 bytes for Q2_0
+        let row = 34usize;
+        let mut raw = vec![0u8; nv * row];
+        for g in 0..nv {
+            for b in 0..row {
+                raw[g * row + b] = (g as u8) + 1;
+            }
+        }
+        // Q2_0 still permutes (behaviour preserved).
+        let q2 = qwen35_value_transform(
+            "blk.0.ssm_alpha.weight",
+            &raw,
+            &[ne0, nv],
+            nk,
+            nv,
+            128,
+            gguf_input::GgmlType::Q2_0,
+        )
+        .expect("Q2_0 must still permute");
+        let r = nv / nk;
+        let inv = |g: usize| (g % r) * nk + (g / r);
+        for g in 0..nv {
+            assert_eq!(q2[g * row], (inv(g) as u8) + 1, "Q2_0 head {g} permuted");
+        }
+        // A non-Q2_0 dtype must NOT be byte-permuted: decline the transform.
+        let f16 = qwen35_value_transform(
+            "blk.0.ssm_alpha.weight",
+            &raw,
+            &[ne0, nv],
+            nk,
+            nv,
+            128,
+            gguf_input::GgmlType::F16,
+        );
+        assert!(
+            f16.is_none(),
+            "non-Q2_0 block-permute must be declined (raw bytes pass through), got {f16:?}"
+        );
+    }
+
+    // Fix 1: the transform gate must recognize every spelling of the qwen3.5/3.6
+    // hybrid-attn arch that the auto-detectors / reap_overlay accept, but not
+    // plain non-hybrid qwen3.
+    #[test]
+    fn qwen35_arch_spelling_union() {
+        assert!(is_qwen35_arch("qwen3_5"));
+        assert!(is_qwen35_arch("qwen35"));
+        assert!(is_qwen35_arch("qwen35moe"));
+        assert!(is_qwen35_arch("qwen3_5_text"));
+        assert!(is_qwen35_arch("qwen3_5_moe"));
+        assert!(is_qwen35_arch("qwen3_5_moe_text"));
+        assert!(is_qwen35_arch("qwen3.5"));
+        assert!(is_qwen35_arch("qwen3moe"));
+        // plain non-hybrid qwen3 must NOT be treated as qwen3.5
+        assert!(!is_qwen35_arch("qwen3"));
+        assert!(!is_qwen35_arch("qwen2"));
+        assert!(!is_qwen35_arch("llama"));
+    }
 }
 
 /// Translate the GGUF metadata HashMap into a JSON object that ends up in
@@ -6461,6 +9419,22 @@ enum GgufFormat {
     Mfp4E8Soa, // mfp4-E8 SoA — same E8 data in structure-of-arrays layout for coalesced GEMV
     Mfp3E8, // mfp3-E8 — mfp4-E8 frame with 3-bit lattice (13 B/blk, 3.25 bpw; drop-in for MQ3-Lloyd cold)
     Mfp2E8, // mfp2-E8 — mfp4-E8 frame with 2-bit lattice (9 B/blk, 2.25 bpw; drop-in for MQ2-Lloyd cold)
+    /// Ternary — PrismML Bonsai family. Source GGUF is already mixed-precision
+    /// (Q2_0 ternary matmuls + Q8_0/F16 embeddings + F32/F16 norms); the
+    /// per-tensor precision PrismML chose is authoritative, so 2D matmul
+    /// tensors already in Q2_0 pass through byte-verbatim to TQ2G128
+    /// (see the dedicated arm in `run_gguf_pipeline`) rather than going
+    /// through the kmap/Q8 rules. `quantize_tq2g128` is only the re-quant
+    /// fallback for the rare non-Q2_0 matmul tensor under this format.
+    Ternary,
+    /// Binary — PrismML Bonsai family, 1-bit variant. Source GGUF is already
+    /// mixed-precision (Q1_0 binary matmuls + Q8_0/F16 embeddings + F32/F16
+    /// norms); the per-tensor precision PrismML chose is authoritative, so 2D
+    /// matmul tensors already in Q1_0 pass through byte-verbatim to BQ1G128
+    /// (see the dedicated arm in `run_gguf_pipeline`) rather than going
+    /// through the kmap/Q8 rules. There is no re-quant fallback for this
+    /// format — binary weights always take the byte-verbatim passthrough.
+    Binary,
 }
 
 impl GgufFormat {
@@ -6484,6 +9458,8 @@ impl GgufFormat {
             "mfp4e8soa" | "mfp4-e8-soa" | "mfp4e8-soa" => Some(Self::Mfp4E8Soa),
             "mfp3e8" | "mfp3-e8" => Some(Self::Mfp3E8),
             "mfp2e8" | "mfp2-e8" => Some(Self::Mfp2E8),
+            "ternary" | "tq2" | "tq2g128" => Some(Self::Ternary),
+            "binary" | "bq1" | "bq1g128" => Some(Self::Binary),
             _ => None,
         }
     }
@@ -6508,8 +9484,16 @@ impl GgufFormat {
             Self::Mfp4E8Soa => "MFP4G32E8SOA",
             Self::Mfp3E8 => "MFP3G32E8",
             Self::Mfp2E8 => "MFP2G32E8",
+            Self::Ternary => "TQ2G128",
+            Self::Binary => "BQ1G128",
         }
     }
+}
+
+/// Q1_0 on-disk layout == hipfire BQ1G128 layout: copy verbatim.
+fn convert_binary_tensor(src: &[u8], dtype: gguf_input::GgmlType) -> (Vec<u8>, QuantType, u32) {
+    debug_assert_eq!(dtype, gguf_input::GgmlType::Q1_0);
+    (src.to_vec(), QuantType::BQ1G128, 128)
 }
 
 /// Convert a GGUF file to a hipfire `.hfq`. Per-format quantization target
@@ -6526,6 +9510,7 @@ fn run_gguf_pipeline(
     kmap_mode: u8,
     arch_id_override: Option<u32>,
     force_arch_id: bool,
+    attribution: Attribution,
 ) -> std::io::Result<()> {
     eprintln!("=== GGUF → {} conversion ===", format.label());
     eprintln!("Input:  {}", input.display());
@@ -6565,9 +9550,12 @@ fn run_gguf_pipeline(
                      Re-run with an explicit --arch-id 5 (dense) or 6 (MoE)."
                 );
                 std::process::exit(1);
+            } else {
+                eprintln!(
+                    "warning: unknown GGUF architecture '{other}', tagging as llama-compatible"
+                );
+                0
             }
-            eprintln!("warning: unknown GGUF architecture '{other}', tagging as llama-compatible");
-            0
         }
     };
     // --arch-id <u32> overrides the auto-detected id. Use when the
@@ -6691,8 +9679,36 @@ fn run_gguf_pipeline(
     let mut total_bytes_in: u64 = 0;
     let mut total_bytes_out: u64 = 0;
 
+    // qwen35 linear-attn head geometry, for the V-head un-tiling + A_log transform.
+    let (qw_nk, qw_nv, qw_hv): (Option<usize>, Option<usize>, Option<usize>) =
+        if is_qwen35_arch(&arch_str) {
+            let g = |k: &str| gguf.metadata.get(k).and_then(meta_value_as_u64);
+            let nk = g(&format!("{arch_str}.ssm.group_count")); // 16
+            let nv = g(&format!("{arch_str}.ssm.time_step_rank")); // 48
+            let inner = g(&format!("{arch_str}.ssm.inner_size")); // 6144
+            match (nk, nv, inner) {
+                (Some(k), Some(v), Some(i)) if v > 0 => {
+                    (Some(k as usize), Some(v as usize), Some((i / v) as usize))
+                }
+                _ => (None, None, None),
+            }
+        } else {
+            (None, None, None)
+        };
+    let mut qw_xform_count = 0usize;
+
     for info in &gguf.tensors {
         let raw = gguf.tensor_data(info);
+        let qw_transformed: Option<Vec<u8>> = match (qw_nk, qw_nv, qw_hv) {
+            (Some(nk), Some(nv), Some(hv)) => {
+                qwen35_value_transform(&info.name, raw, &info.shape, nk, nv, hv, info.dtype)
+            }
+            _ => None,
+        };
+        if qw_transformed.is_some() {
+            qw_xform_count += 1;
+        }
+        let raw: &[u8] = qw_transformed.as_deref().unwrap_or(raw);
         let n_elements = info.numel();
         total_params += n_elements as u64;
         total_bytes_in += raw.len() as u64;
@@ -6712,14 +9728,79 @@ fn run_gguf_pipeline(
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
-        let (data, quant_type, group_size, label) = if is_norm || !is_2d {
-            // Norms and 1D tensors always F16 (primary gate)
-            let f32_data = gguf_input::tensor_to_f32(info, raw);
+        // Depthwise conv1d kernels (Qwen3.5 GDN) are tiny and precision-critical;
+        // the reference keeps them full-precision. Never route them through the
+        // terminal HFQ4G128 4-bit fallback (k_dim=conv_kernel is never 256-aligned).
+        let is_conv1d = info.name.ends_with("conv1d.weight");
+        // PrismML's GGUF converter (conversion/qwen.py) bakes `+1` into every
+        // RMSNorm weight EXCEPT linear_attn.norm (ssm_norm). hipfire's qwen35
+        // runtime ALSO adds QWEN35_NORM_BIAS=1.0 to exactly that same set
+        // (input_layernorm / post_attention_layernorm / q_norm / k_norm /
+        // output_norm — but NOT ssm_norm, which loads raw). Passing the GGUF
+        // value straight through would double-add → norm weights ~2× → the
+        // whole forward pass runs ~2× hot (verified layer-0 vs llama.cpp).
+        // Undo PrismML's +1 here so the runtime's +1 restores the true weight.
+        let is_qwen35 = is_qwen35_arch(&arch_str);
+        let undo_norm_bias = is_qwen35
+            && info.name.ends_with("norm.weight")
+            && !info.name.ends_with("ssm_norm.weight");
+        let (data, quant_type, group_size, label) = if is_norm || !is_2d || is_conv1d {
+            // Norms, 1D tensors, and conv1d always F16 (primary gate)
+            let mut f32_data = gguf_input::tensor_to_f32(info, raw);
+            if undo_norm_bias {
+                for v in f32_data.iter_mut() {
+                    *v -= 1.0;
+                }
+            }
             let f16_bytes: Vec<u8> = f32_data
                 .iter()
                 .flat_map(|&v| f32_to_f16(v).to_le_bytes())
                 .collect();
             (f16_bytes, QuantType::F16, 0u32, "F16")
+        } else if matches!(format, GgufFormat::Ternary) && info.dtype == gguf_input::GgmlType::Q2_0
+        {
+            // TQ2G128 byte-verbatim passthrough wins over the kmap/Q8 rules
+            // when the source is already Q2_0 — PrismML's per-tensor format
+            // choice (incl. embedding/lm_head) is authoritative. Preserves
+            // the ternary calibration that QAT'd into the model. Layout is
+            // identical between the GGUF Q2_0 block and hipfire TQ2G128
+            // (findings/prismml-q2_0-layout.md) so no re-pack is needed.
+            let nblocks = (n_elements + 127) / 128;
+            let expected = nblocks * 34;
+            assert_eq!(
+                raw.len(),
+                expected,
+                "Q2_0 size mismatch for {}: got {} bytes, expected {}",
+                info.name,
+                raw.len(),
+                expected
+            );
+            quant_params += n_elements as u64;
+            (
+                raw.to_vec(),
+                QuantType::TQ2G128,
+                128u32,
+                "TQ2G128 (passthrough)",
+            )
+        } else if matches!(format, GgufFormat::Binary) && info.dtype == gguf_input::GgmlType::Q1_0 {
+            // BQ1G128 byte-verbatim passthrough — mirrors the TQ2G128/Q2_0 arm
+            // above. PrismML's per-tensor format choice (incl. embedding/lm_head)
+            // is authoritative for the Bonsai binary variant. Layout is
+            // identical between the GGUF Q1_0 block and hipfire BQ1G128.
+            let nblocks = (n_elements + 127) / 128;
+            let expected = nblocks * 18;
+            assert_eq!(
+                raw.len(),
+                expected,
+                "Q1_0 size mismatch for {}: got {} bytes, expected {}",
+                info.name,
+                raw.len(),
+                expected
+            );
+            quant_params += n_elements as u64;
+            let (bytes, quant_type, group_size) =
+                convert_binary_tensor(raw, gguf_input::GgmlType::Q1_0);
+            (bytes, quant_type, group_size, "BQ1G128 (passthrough)")
         } else if kmap_level == QuantLevel::Q8 || is_embed {
             // K-map Q8 or embedding
             let f32_data = gguf_input::tensor_to_f32(info, raw);
@@ -6834,6 +9915,16 @@ fn run_gguf_pipeline(
                     let q = quantize_hfq4g256(&f32_data);
                     (q, QuantType::HFQ4G256, 256u32, "HFQ4G256")
                 }
+                GgufFormat::Ternary => {
+                    // No Promote6 sibling for ternary (see default_promote_target);
+                    // this arm only exists for match-exhaustiveness — Bonsai has
+                    // no kmap-promoted tensors (kmap is dense-gated off by default).
+                    let q = quantize_tq2g128(&f32_data);
+                    (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant, promote6)")
+                }
+                GgufFormat::Binary => unreachable!(
+                    "binary format uses byte-verbatim Q1_0 passthrough; no requant path"
+                ),
             }
         } else if let (QuantLevel::Override(override_fmt), true) = (kmap_level, k_dim % 256 == 0) {
             // K-map says override (lm_head when --lm-head-format set).
@@ -6922,6 +10013,15 @@ fn run_gguf_pipeline(
                     let q = quantize_mfp2g32_e8_2d(&f32_data, m, k_dim, &signs1, &signs2);
                     (q, QuantType::MFP2G32E8, 32u32, "MFP2G32E8")
                 }
+                GgufFormat::Ternary => {
+                    // K-map override target (lm_head) not expected under
+                    // --format ternary; arm only for match-exhaustiveness.
+                    let q = quantize_tq2g128(&f32_data);
+                    (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant, override)")
+                }
+                GgufFormat::Binary => unreachable!(
+                    "binary format uses byte-verbatim Q1_0 passthrough; no requant path"
+                ),
             }
         } else if k_dim % 256 == 0 {
             // 256-aligned 2D weight — quantize per the chosen format (Base level).
@@ -6936,6 +10036,16 @@ fn run_gguf_pipeline(
                     let q = quantize_hfq6g256(&f32_data);
                     (q, QuantType::HFQ6G256, 256u32, "HFQ6G256")
                 }
+                GgufFormat::Ternary => {
+                    // Safety net for non-Q2_0 matmul tensors under --format
+                    // ternary (real Bonsai matmuls are all Q2_0 and are
+                    // caught by the passthrough arm earlier in this chain).
+                    let q = quantize_tq2g128(&f32_data);
+                    (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant)")
+                }
+                GgufFormat::Binary => unreachable!(
+                    "binary format uses byte-verbatim Q1_0 passthrough; no requant path"
+                ),
                 GgufFormat::Mq4 => {
                     let q = quantize_mq4g256(&f32_data, &signs1, &signs2);
                     (q, QuantType::MQ4G256, 256u32, "MQ4G256")
@@ -7049,6 +10159,12 @@ fn run_gguf_pipeline(
         });
     }
 
+    if qw_xform_count > 0 {
+        eprintln!(
+            "qwen35 value-transform: applied to {qw_xform_count} tensors (A_log + V-head un-tiling)"
+        );
+    }
+
     eprintln!("\n=== GGUF → MQ4 Summary ===");
     eprintln!("  Tensors:        {}", hfq_tensors.len());
     eprintln!("  Total params:   {total_params}");
@@ -7062,6 +10178,27 @@ fn run_gguf_pipeline(
         total_bytes_out as f64 / 1e6,
         100.0 * total_bytes_out as f64 / total_bytes_in as f64,
     );
+
+    // Stamp provenance + attribution. The GGUF path previously wrote NO
+    // provenance at all, so every Bonsai artifact we produced was unlabelled —
+    // exactly the condition that let a stale ternary .hfq stand as a published
+    // number for a month. `modifications` records the qwen35 onboarding
+    // transforms actually applied, which is what Apache-2.0 §4(b) asks for.
+    let mut attribution = attribution;
+    if is_qwen35_arch(&arch_str) {
+        attribution.modifications.extend([
+            "converted GGUF -> hipfire .hfq container".to_string(),
+            "quantized weight VALUES unchanged (low-bit blocks copied verbatim)".to_string(),
+            "linear-attn value heads permuted tiled->grouped for hipfire's runtime".to_string(),
+            "ssm_a stored as A_log = ln(-A), inverting the upstream converter".to_string(),
+            "RMSNorm weights (except ssm_norm): upstream's baked +1 removed, \
+             re-added at load by QWEN35_NORM_BIAS"
+                .to_string(),
+            "conv1d kept full precision (F16)".to_string(),
+        ]);
+    }
+    let provenance = base_provenance(&input.to_string_lossy(), format.label(), &attribution);
+    let metadata_json = stamp_provenance(&metadata_json, &provenance);
 
     write_hfq(output, arch_id, &metadata_json, &hfq_tensors, None)?;
     eprintln!("\nWrote: {}", output.display());
@@ -8497,6 +11634,57 @@ fn main() {
     // Llama-style model produces correct output (the FWHT cancels in
     // `gemv_mq4g256_with_rotate`) but adds runtime rotation overhead
     // with no quality benefit.
+    // HFQ-input requant branch: if --input is itself an `.hfq` (the mq4 FP
+    // source), recover un-rotated F32 per tensor (inverse-FWHT for MQ4G256) and
+    // re-pack to --format, writing a new `.hfq` that reuses the source metadata
+    // verbatim so it loads on the existing runtime. Checked BEFORE the GGUF
+    // branch (mq4 files carry the `HFQM` magic, not a `.gguf` extension).
+    {
+        let raw_input = Path::new(input_dir);
+        if is_hfq_input(raw_input) {
+            let hfq_format = GgufFormat::from_flag(format).unwrap_or_else(|| {
+                eprintln!(
+                    "hfq input: --format '{format}' not recognized. Supported requant \
+                     targets: ternary, binary, mq2, mq3, mq4, mq6."
+                );
+                std::process::exit(1);
+            });
+            // Refuse to requantize an ordinary checkpoint down to 2/1 bpw
+            // unless explicitly opted in — see `lowbit_ptq_gate`.
+            let allow_lowbit = args.allow_lowbit_ptq;
+            if let Err(msg) = lowbit_ptq_gate(hfq_format, allow_lowbit) {
+                eprintln!("{msg}");
+                std::process::exit(1);
+            }
+
+            // --awq-imatrix [alpha=0.55]: treat the source checkpoint's AWQ
+            // sidecars as its imatrix for the low-bit packers' column
+            // weighting. alpha MUST match the α the source was built with
+            // (hipfire-quantize --awq default). Off by default so the plain
+            // requant stays an unweighted-MSE baseline.
+            let awq_imatrix_alpha = args.awq_imatrix.filter(|a| *a > 0.0);
+            // Read the damping knob ONCE, here at the CLI boundary. The packers
+            // take it as an argument so a pipeline run is deterministic and
+            // self-consistent: 25 rayon workers re-reading a process-global
+            // mid-run could otherwise emit a model with mixed damping, and a
+            // concurrently-mutating test made the packers' output unreproducible.
+            let damping: f32 = std::env::var("HIPFIRE_GPTQ_DAMPING")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0.0);
+            run_hfq_requant_pipeline(
+                raw_input,
+                Path::new(output_path),
+                hfq_format,
+                awq_imatrix_alpha,
+                damping,
+                attribution_from_args(&args),
+                args.allow_degenerate_ternary,
+            );
+            return;
+        }
+    }
+
     {
         let raw_input = Path::new(input_dir);
         if is_gguf_input(raw_input) {
@@ -8518,6 +11706,7 @@ fn main() {
                 kmap_mode,
                 args.arch_id,
                 args.force_arch_id,
+                attribution_from_args(&args),
             ) {
                 eprintln!("GGUF pipeline failed: {e}");
                 std::process::exit(2);
@@ -8660,7 +11849,8 @@ fn main() {
     // (not RMSNorm-anchored) corrupts AWQ saliency for FFN; embed/lm_head are
     // tied + scaled by √3840 making AWQ scale saliency meaningless there.
     let is_gemma4_family = arch_id == 13 || arch_id == 22;
-    let is_moe_like = is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
+    let is_moe_like =
+        is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
     // Gemma4 (arch_id 13) defaults to kmap_mode=3 (typed-gemma4): promote down_proj,
     // v_proj, and edge-layer non-attn-qko tensors. Attn q/k/o are excluded even
     // in edge layers (dense attn promotion regresses PPL +3.1% on 27B).
@@ -8681,8 +11871,8 @@ fn main() {
     // is why `.mq2` reads 45% MORE bytes/token than `.mq4r` despite being 7 GB
     // smaller on disk, and why `.mq4r` — which needs this flag off — is not
     // byte-reproducible from HEAD without it.
-    let no_q8_router_flag = args.no_q8_router
-        || std::env::var("HIPFIRE_NO_Q8_ROUTER").ok().as_deref() == Some("1");
+    let no_q8_router_flag =
+        args.no_q8_router || std::env::var("HIPFIRE_NO_Q8_ROUTER").ok().as_deref() == Some("1");
     let q8_router = (is_moe_like || q8_router_flag) && !no_q8_router_flag;
     // Muse Glimmer (arch 14): untied lm_head defaults to Q8, like embed.
     //
@@ -10822,12 +14012,16 @@ fn main() {
                             // the flat form the Lloyd ones use — the SoA layout needs the
                             // row count to place the scale region.
                             QuantType::MQ2G256GL => (
-                                quantize_mq2g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2),
+                                quantize_mq2g256gl(
+                                    &f32_slice, inner_m, inner_k_e, &signs1, &signs2,
+                                ),
                                 QuantType::MQ2G256GL,
                                 256u32,
                             ),
                             QuantType::MQ3G256GL => (
-                                quantize_mq3g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2),
+                                quantize_mq3g256gl(
+                                    &f32_slice, inner_m, inner_k_e, &signs1, &signs2,
+                                ),
                                 QuantType::MQ3G256GL,
                                 256u32,
                             ),
@@ -10945,7 +14139,8 @@ fn main() {
                     } else if expert_mq3lloyd_native && routed_gl {
                         // GL swap: same 3-bit allocation, global codebook instead of
                         // a per-block fp16 one. 3.0625 vs 3.5 bpw.
-                        let q = quantize_mq3g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        let q =
+                            quantize_mq3g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                         (q, QuantType::MQ3G256GL, 256u32)
                     } else if expert_mq3lloyd_native {
                         let q = quantize_mq3g256_lloyd(&f32_slice, &signs1, &signs2);
@@ -10957,7 +14152,8 @@ fn main() {
                         // R[i][j]^2 = 1/256, so a rotated diagonal importance vector
                         // is constant), so plain Lloyd is the honest baseline and
                         // there is nothing to lose by taking it.
-                        let q = quantize_mq2g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                        let q =
+                            quantize_mq2g256gl(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                         (q, QuantType::MQ2G256GL, 256u32)
                     } else if expert_mq2lloyd_native {
                         // Native MQ2-Lloyd: ship qt=19 bytes (72 B / 256 weights).
@@ -11639,6 +14835,18 @@ fn main() {
                                 let q = quantize_hfp4g32_2d(&f32_data, m, k_dim);
                                 (q, QuantType::HFP4G32, 32u32, "HFP4G32")
                             }
+                            GgufFormat::Ternary => {
+                                // safetensors pipeline has no Bonsai/GGUF Q2_0
+                                // passthrough source; arm only for
+                                // match-exhaustiveness (not a real dispatch
+                                // target — lm_head override under ternary is
+                                // unused on this branch).
+                                let q = quantize_tq2g128(&f32_data);
+                                (q, QuantType::TQ2G128, 128u32, "TQ2G128 (requant)")
+                            }
+                            GgufFormat::Binary => unreachable!(
+                                "binary format uses byte-verbatim Q1_0 passthrough; no requant path"
+                            ),
                         }
                     } else {
                         // Non-256-aligned override target: Q8 fallback.
@@ -15332,10 +18540,21 @@ mod tests {
         // via q8_class_of:is_q8_tensor (56xx). should_quantize keeps it quantizable
         // (contains "weight", not norm/bias, not vision).
         let name = "lm_head.weight";
-        assert!(should_quantize(name), "lm_head must be quantizable (should_quantize:53xx)");
-        assert_eq!(q8_class_of(name), Some("lm_head"), "q8_class_of:55xx lm_head");
+        assert!(
+            should_quantize(name),
+            "lm_head must be quantizable (should_quantize:53xx)"
+        );
+        assert_eq!(
+            q8_class_of(name),
+            Some("lm_head"),
+            "q8_class_of:55xx lm_head"
+        );
         assert!(is_q8_tensor(name), "is_q8_tensor:59xx must be Q8");
-        assert_eq!(kmap_resolve(name, 52, false), QuantLevel::Q8, "kmap Rule2 Q8");
+        assert_eq!(
+            kmap_resolve(name, 52, false),
+            QuantLevel::Q8,
+            "kmap Rule2 Q8"
+        );
         assert_eq!(kmap_resolve_mode(name, 52, false, 0), QuantLevel::Q8);
         assert_eq!(kmap_resolve_mode(name, 52, false, 3), QuantLevel::Q8);
     }
@@ -15364,8 +18583,14 @@ mod tests {
         );
         let attn_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.q_proj.weight");
         let gate_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.gate_proj.weight");
-        assert!(!attn_q8, "attention must NOT be pulled into Q8 by the glimmer default");
-        assert!(!gate_q8, "the Glimmer attention gate is a projection and must follow --format");
+        assert!(
+            !attn_q8,
+            "attention must NOT be pulled into Q8 by the glimmer default"
+        );
+        assert!(
+            !gate_q8,
+            "the Glimmer attention gate is a projection and must follow --format"
+        );
 
         match prev {
             Some(v) => unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", v) },
@@ -15392,10 +18617,21 @@ mod tests {
         let mlp_gate = "model.language_model.layers.0.mlp.gate_proj.weight";
         // q8_class_of:55xx — self_attn substring => "attn"; mlp gate has no
         // self_attn/attn_q/class and is not a router, so None.
-        assert_eq!(q8_class_of(attn_gate), Some("attn"), "self_attn.gate_proj => attn (q8_class_of)");
-        assert_eq!(q8_class_of(mlp_gate), None, "mlp.gate_proj must not be attn/router");
+        assert_eq!(
+            q8_class_of(attn_gate),
+            Some("attn"),
+            "self_attn.gate_proj => attn (q8_class_of)"
+        );
+        assert_eq!(
+            q8_class_of(mlp_gate),
+            None,
+            "mlp.gate_proj must not be attn/router"
+        );
         assert!(is_q8_tensor(attn_gate), "attn gate must be fixed-tier Q8");
-        assert!(!is_q8_tensor(mlp_gate), "mlp gate is not fixed-tier (unless --q8-router on MoE)");
+        assert!(
+            !is_q8_tensor(mlp_gate),
+            "mlp gate is not fixed-tier (unless --q8-router on MoE)"
+        );
         // should_quantize:53xx — both are weights, not norms/bias/vision => true
         assert!(should_quantize(attn_gate));
         assert!(should_quantize(mlp_gate));
@@ -15406,7 +18642,10 @@ mod tests {
         // the gate's input channels and is divided at inference before the gate;
         // the gate's output then scales attn_out via sigmoid. Input-side AWQ is
         // mathematically valid regardless of where the gate's output is applied.
-        assert!(awq_eligible(attn_gate), "attn gate must be AWQ-eligible (input-side)");
+        assert!(
+            awq_eligible(attn_gate),
+            "attn gate must be AWQ-eligible (input-side)"
+        );
         assert!(awq_eligible(mlp_gate), "mlp gate must be AWQ-eligible");
         // kmap: dense edge-layer rule promotes FFN only, not attn — so even in
         // edge layer 0, the attn gate stays Base (not Promote6). This matches the
@@ -15416,7 +18655,10 @@ mod tests {
         // mis-fire even if is_moe were true: attn gate is not mlp.gate.weight.
         // For MoE edge-layer (0 is edge), full promotion returns Promote6 for every
         // tensor including attn — that is the expected MoE policy, not a router.
-        assert_eq!(kmap_resolve_mode("model.layers.0.self_attn.gate_proj.weight", 52, true, 0), QuantLevel::Promote6);
+        assert_eq!(
+            kmap_resolve_mode("model.layers.0.self_attn.gate_proj.weight", 52, true, 0),
+            QuantLevel::Promote6
+        );
     }
 
     #[test]
@@ -15433,12 +18675,23 @@ mod tests {
             "model.language_model.norm.weight",
         ];
         for name in norms {
-            assert!(!should_quantize(name), "norm {name} must not be quantizable");
-            assert_eq!(kmap_resolve(name, 52, false), QuantLevel::F16, "kmap F16 for {name}");
+            assert!(
+                !should_quantize(name),
+                "norm {name} must not be quantizable"
+            );
+            assert_eq!(
+                kmap_resolve(name, 52, false),
+                QuantLevel::F16,
+                "kmap F16 for {name}"
+            );
             assert_eq!(kmap_resolve_mode(name, 52, false, 1), QuantLevel::F16);
             assert_eq!(kmap_resolve_mode(name, 52, false, 2), QuantLevel::F16);
             assert_eq!(kmap_resolve_mode(name, 52, false, 3), QuantLevel::F16);
-            assert_eq!(kmap_resolve(name, 52, true), QuantLevel::F16, "even MoE must be F16");
+            assert_eq!(
+                kmap_resolve(name, 52, true),
+                QuantLevel::F16,
+                "even MoE must be F16"
+            );
             // q8_class_of is unrelated to norms — must be None / not Q8
             assert!(!is_q8_tensor(name));
         }
@@ -15459,18 +18712,35 @@ mod tests {
             "model.vision_projection.weight",
         ];
         for name in vision {
-            assert!(!should_quantize(name), "vision {name} must stay F16 (should_quantize)");
-            assert_eq!(kmap_resolve(name, 52, false), QuantLevel::F16, "kmap vision F16 for {name}");
+            assert!(
+                !should_quantize(name),
+                "vision {name} must stay F16 (should_quantize)"
+            );
+            assert_eq!(
+                kmap_resolve(name, 52, false),
+                QuantLevel::F16,
+                "kmap vision F16 for {name}"
+            );
             assert_eq!(kmap_resolve_mode(name, 52, false, 0), QuantLevel::F16);
             assert_eq!(kmap_resolve_mode(name, 52, true, 1), QuantLevel::F16);
             // parse_layer_idx must NOT extract vision_tower.layers.N as text layer
-            assert_eq!(parse_layer_idx(name), None, "vision {name} must not parse as layer idx");
+            assert_eq!(
+                parse_layer_idx(name),
+                None,
+                "vision {name} must not parse as layer idx"
+            );
             // The old unanchored find("layers.") would have returned Some(0/49)
             // and edge-layer Promote6 could have fired — locked to None now.
         }
         // Plain vision_tower. prefix (dots.ocr style) must still be F16
-        assert_eq!(kmap_resolve("vision_tower.layers.0.attn.q_proj.weight", 52, false), QuantLevel::F16);
-        assert_eq!(parse_layer_idx("vision_tower.layers.0.attn.q_proj.weight"), None);
+        assert_eq!(
+            kmap_resolve("vision_tower.layers.0.attn.q_proj.weight", 52, false),
+            QuantLevel::F16
+        );
+        assert_eq!(
+            parse_layer_idx("vision_tower.layers.0.attn.q_proj.weight"),
+            None
+        );
         // model.visual.* (Qwen3.5-VL) unchanged
         assert!(!should_quantize("model.visual.patch_embed.weight"));
         assert_eq!(parse_layer_idx("model.visual.layers.0.weight"), None);
@@ -15479,9 +18749,18 @@ mod tests {
     #[test]
     fn glimmer_text_layers_still_parse() {
         // Sanity: text layers must still parse correctly (no regression for non-vision).
-        assert_eq!(parse_layer_idx("model.language_model.layers.0.self_attn.q_proj.weight"), Some(0));
-        assert_eq!(parse_layer_idx("model.language_model.layers.51.mlp.down_proj.weight"), Some(51));
-        assert_eq!(parse_layer_idx("model.layers.3.self_attn.gate_proj.weight"), Some(3));
+        assert_eq!(
+            parse_layer_idx("model.language_model.layers.0.self_attn.q_proj.weight"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_layer_idx("model.language_model.layers.51.mlp.down_proj.weight"),
+            Some(51)
+        );
+        assert_eq!(
+            parse_layer_idx("model.layers.3.self_attn.gate_proj.weight"),
+            Some(3)
+        );
     }
 
     #[test]
@@ -15518,5 +18797,18 @@ mod tests {
                 / (m * k) as f64
         };
         assert!(weighted_mse(&q_repaired) <= weighted_mse(&q_regular));
+    }
+
+    #[test]
+    fn q1_0_converts_byte_verbatim_to_bq1g128() {
+        // 18-byte Q1_0 block: FP16 d then 16 arbitrary qs bytes.
+        let mut block = vec![0x00u8, 0x3C]; // f16 1.0
+        block.extend((0..16u8).map(|i| i.wrapping_mul(17)));
+        assert_eq!(block.len(), 18);
+        let (out, qt, group) = convert_binary_tensor(&block, gguf_input::GgmlType::Q1_0);
+        assert_eq!(out, block); // byte-verbatim
+        assert_eq!(qt, QuantType::BQ1G128);
+        assert_eq!(group, 128);
+        assert_eq!(QuantType::BQ1G128 as u32, 41);
     }
 }

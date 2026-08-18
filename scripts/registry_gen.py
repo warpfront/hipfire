@@ -194,6 +194,10 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 23 if "dflash" in file else 14
     if "dflash" in file:
         return 20
+    # Prism ML Bonsai = behaviour-preserving transform of Qwen3.6-27B,
+    # architecture unchanged (dense qwen35).
+    if family == "bonsai":
+        return 5
     if family in ("qwen3.5", "qwen3.6", "qwen3.8", "qwopus3.6", "carnice", "qwopus"):
         return 6 if "a3b" in tag else 5
     if family == "nex-n2":

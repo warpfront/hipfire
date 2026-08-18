@@ -436,7 +436,10 @@ impl MropeCtx {
             "MropeCtx::pos3 called below base ({pos} < {})",
             self.base
         );
-        match pos.checked_sub(self.base).and_then(|i| self.positions.get(i)) {
+        match pos
+            .checked_sub(self.base)
+            .and_then(|i| self.positions.get(i))
+        {
             Some(p) => *p,
             None => [pos as i32 + self.rope_delta; 3],
         }
@@ -854,6 +857,8 @@ fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         37 => Ok(DType::MFP2G32E8),
         38 => Ok(DType::MQ2G256GL),
         39 => Ok(DType::MQ3G256GL),
+        40 => Ok(DType::TQ2G128),
+        41 => Ok(DType::BQ1G128),
         6 => Ok(DType::HFQ4G256),
         3 => Ok(DType::Q8_0),
         1 => Ok(DType::F16),
@@ -2816,6 +2821,30 @@ fn load_weight_tensor_raw(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256GL,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        40 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::TQ2G128,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        41 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BQ1G128,
                 m,
                 k,
                 row_stride: 0,
@@ -18054,7 +18083,9 @@ pub fn forward_scratch_mrope(
     mrope: Option<&MropeCtx>,
 ) -> HipResult<()> {
     let Some(mc) = mrope else {
-        return forward_scratch(gpu, weights, config, token, pos, kv_cache, dn_state, scratch);
+        return forward_scratch(
+            gpu, weights, config, token, pos, kv_cache, dn_state, scratch,
+        );
     };
     mark_mrope_forward_ineligible(gpu);
     // Embedding lookup into scratch.x + the 1D pos scalar (still consumed by

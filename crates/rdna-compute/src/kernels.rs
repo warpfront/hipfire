@@ -2925,12 +2925,6 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PK_SRC: &str =
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX1100_MUSE_RM_PIPE_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_pipe.hip");
 
-
-
-
-
-
-
 pub const GEMM_HFQ4G256_LMHEAD_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_lmhead_wmma.gfx12.hip");
 // Q8_1 MMQ prefill variant — opt-in via HIPFIRE_MMQ=1, gated to RDNA3/3.5.
@@ -3975,6 +3969,34 @@ pub fn gemv_hfq3g256_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'stat
 /// [f32 scale (4B)][f32 zero (4B)][2-bit × 128 (32B)] = 40 bytes per 128 weights (0.3125 B/w).
 /// 32 threads × 4 elements = 128 per group. Each thread reads 1 byte.
 pub const GEMV_HFQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_hfq2g128.hip");
+
+/// TQ2-G128: PrismML Q2_0-layout ternary dequant-to-f16 correctness oracle.
+/// [FP16 d (2B)][2-bit × 128 (32B)] = 34 bytes per 128-weight group.
+/// 32 threads × 4 elements = 128 per group. Each thread reads 1 byte.
+/// code -> (code - 1) * d, i.e. {0,1,2,3} -> {-d, 0, +d, +2d}.
+pub const DEQUANT_TQ2G128_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequant_tq2g128_to_f16.hip");
+
+/// BQ1-G128: PrismML Q1_0-layout binary dequant-to-f16 correctness oracle.
+/// [FP16 d (2B)][1-bit × 128 (16B)] = 18 bytes per 128-weight group.
+/// 32 threads × 4 elements = 128 per group. Each thread reads 4 bits (half a byte).
+/// bit -> {0,1} -> {-d, +d}.
+pub const DEQUANT_BQ1G128_TO_F16_SRC: &str =
+    include_str!("../../../kernels/src/dequant_bq1g128_to_f16.hip");
+
+/// TQ2-G128 GEMV: correctness-first FP decode GEMV for PrismML Q2_0 ternary.
+/// Mirrors GEMV_HFQ2G128_SRC's layout/reduction, swapping the affine
+/// [f32 scale][f32 zero][32B codes] (40B) block for the ternary
+/// [FP16 d (2B)][32B codes] (34B) block and the `scale*code+zero` map for
+/// `(code - 1) * d`.
+pub const GEMV_TQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_tq2g128.hip");
+
+/// BQ1-G128 GEMV: correctness-first FP decode GEMV for PrismML Q1_0 binary.
+/// Mirrors GEMV_TQ2G128_SRC's layout/reduction, swapping the ternary
+/// [FP16 d (2B)][32B codes] (34B) block for the binary
+/// [FP16 d (2B)][16B codes] (18B) block and the `(code - 1) * d` map for
+/// the 1-bit sign decode `bit ? +d : -d`.
+pub const GEMV_BQ1G128_SRC: &str = include_str!("../../../kernels/src/gemv_bq1g128.hip");
 
 /// HFQ4-G256 wide GEMV: 2 rows per block (64 threads = 2 warps).
 /// Each warp processes one row independently. Halves grid size.
