@@ -45,13 +45,15 @@ extern "C" __global__ void gemv_bq1g128(
                          + BQ1_SGN(nb, 2, xv.z) + BQ1_SGN(nb, 3, xv.w) );    \
         } while (0)
 
-    float acc0 = 0.0f, acc1 = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     int g = 0;
     const int xbase = tid * 4;
-    for (; g + 2 <= groups_per_row; g += 2) {
+    for (; g + 4 <= groups_per_row; g += 4) {
         const char* gp0 = row_ptr + g * 18;
-        BQ1_BLOCK_DOT(gp0,      g * 128 + xbase,       acc0);
-        BQ1_BLOCK_DOT(gp0 + 18, (g + 1) * 128 + xbase, acc1);
+        BQ1_BLOCK_DOT(gp0,          g * 128 + xbase,       acc0);
+        BQ1_BLOCK_DOT(gp0 + 18,     (g + 1) * 128 + xbase, acc1);
+        BQ1_BLOCK_DOT(gp0 + 36,     (g + 2) * 128 + xbase, acc2);
+        BQ1_BLOCK_DOT(gp0 + 54,     (g + 3) * 128 + xbase, acc3);
     }
     for (; g < groups_per_row; g++) {
         BQ1_BLOCK_DOT(row_ptr + g * 18, g * 128 + xbase, acc0);
@@ -59,7 +61,7 @@ extern "C" __global__ void gemv_bq1g128(
     #undef BQ1_BLOCK_DOT
     #undef BQ1_SGN
 
-    float acc = acc0 + acc1;
+    float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
     if (tid == 0) y[row] = acc;

@@ -38,20 +38,22 @@ extern "C" __global__ void gemv_tq2g128(
                          + (float)((int)((b >> 6) & 0x3) - 1) * xv.w );     \
         } while (0)
 
-    float acc0 = 0.0f, acc1 = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     int g = 0;
     const int xbase = tid * 4;
-    for (; g + 2 <= groups_per_row; g += 2) {
+    for (; g + 4 <= groups_per_row; g += 4) {
         const char* gp0 = row_ptr + g * 34;
-        TQ2_BLOCK_DOT(gp0,      g * 128 + xbase,       acc0);
-        TQ2_BLOCK_DOT(gp0 + 34, (g + 1) * 128 + xbase, acc1);
+        TQ2_BLOCK_DOT(gp0,          g * 128 + xbase,       acc0);
+        TQ2_BLOCK_DOT(gp0 + 34,     (g + 1) * 128 + xbase, acc1);
+        TQ2_BLOCK_DOT(gp0 + 68,     (g + 2) * 128 + xbase, acc2);
+        TQ2_BLOCK_DOT(gp0 + 102,     (g + 3) * 128 + xbase, acc3);
     }
     for (; g < groups_per_row; g++) {
         TQ2_BLOCK_DOT(row_ptr + g * 34, g * 128 + xbase, acc0);
     }
     #undef TQ2_BLOCK_DOT
 
-    float acc = acc0 + acc1;
+    float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)
         acc += __shfl_down(acc, offset);
     if (tid == 0) y[row] = acc;
