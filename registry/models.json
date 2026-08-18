@@ -1141,18 +1141,18 @@
       "min_vram_gb": 26,
       "desc": "DFlash draft for muse-glimmer (muse_glimmer_assistant, arch 23) — 5-layer block-diffusion head that reuses the target's embed and lm_head. Pairs with either SKU. Attach with HIPFIRE_DFLASH_DRAFT; there is no filename auto-pairing."
     },
-    "bonsai:27b-1bit": {
+    "bonsai:27b-bq1": {
       "repo": "hipfire-models/bonsai-27b",
-      "file": "binary-bonsai-27b.hfq",
+      "file": "bonsai-27b.bq1",
       "size_gb": 3.8,
       "min_vram_gb": 5,
       "default_kv_mode": "q8",
       "desc": "Bonsai-27B 1-bit (Prism ML, BQ1G128 1.14 bpw). Smallest usable 27B: 3.8 GB, KLD 0.629 vs the mq4 teacher, ~28.2 tok/s decode and ~258 tok/s prefill on gfx1151 (medians of 3, after warmup). Apache-2.0; see the repo NOTICE for attribution and the list of conversion changes.",
       "quant_recipe": "prismml-bonsai-q1_0-passthrough"
     },
-    "bonsai:27b-ternary": {
+    "bonsai:27b-tq2": {
       "repo": "hipfire-models/bonsai-27b",
-      "file": "ternary-bonsai-27b.hfq",
+      "file": "bonsai-27b.tq2",
       "size_gb": 7.16,
       "min_vram_gb": 8,
       "default_kv_mode": "q8",
@@ -1161,7 +1161,7 @@
     }
   },
   "aliases": {
-    "bonsai": "bonsai:27b-ternary",
+    "bonsai": "bonsai:27b-tq2",
     "qwen3.5": "qwen3.5:4b",
     "qwen3.5:latest": "qwen3.5:9b",
     "qwen3.5:small": "qwen3.5:0.8b",

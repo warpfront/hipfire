@@ -67,6 +67,11 @@ KNOWN_QUANTS = {
     "mq5",
     "mq6",
     "mfp4",
+    # PrismML Bonsai low-bit: TQ2G128 ternary / BQ1G128 binary. Added with the
+    # filename rename in the same commit -- quant_for() reads the extension and
+    # an unknown one aborts the whole run.
+    "tq2",
+    "bq1",
     "hf4",
     "hf6",
     "q8",
