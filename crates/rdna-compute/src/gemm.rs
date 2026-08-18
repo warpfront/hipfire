@@ -24108,6 +24108,12 @@ impl Gpu {
             )
         }
     }
+    /// Waves per block in the low-bit WMMA prefill GEMMs. Each wave owns a
+    /// 16-row tile and they share one LDS-staged activation tile, so x is read
+    /// from global once per (16 * this) rows. Must match
+    /// HIPFIRE_LOWBIT_WMMA_WAVES in the kernel sources.
+    pub const LOWBIT_WMMA_WAVES: usize = 16;
+
     /// WMMA prefill GEMM for TQ2-G128 packed weights + F32 activations.
     /// `x_f32` is [batch x k] F32 (converted to F16 fragments in-register,
     /// so this drops into the existing F32 prefill pipeline unchanged);
@@ -24190,8 +24196,14 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [m.div_ceil(16) as u32, batch_size.div_ceil(64) as u32, 1],
-                [32, 1, 1],
+                // 16 rows per wave x LOWBIT_WMMA_WAVES waves per block; the
+                // block shares one LDS-staged x tile.
+                [
+                    m.div_ceil(16 * Self::LOWBIT_WMMA_WAVES) as u32,
+                    batch_size.div_ceil(64) as u32,
+                    1,
+                ],
+                [32 * Self::LOWBIT_WMMA_WAVES as u32, 1, 1],
                 0,
                 self.stream_ref(),
                 &mut params,
