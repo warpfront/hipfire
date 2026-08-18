@@ -58,3 +58,113 @@ extern "C" __global__ void gemv_tq2g128(
         acc += __shfl_down(acc, offset);
     if (tid == 0) y[row] = acc;
 }
+
+// ── x-batched TQ2-G128 ────────────────────────────────────────────────────
+//
+// y[b][row] = A[row] . x[b] for b in 0..B, reading each weight row ONCE
+// instead of once per b. That reuse is the whole point: the scalar kernel is
+// x-load and ALU bound, but a prefill chunk re-reads the same weights for
+// every token, so amortising the weight pass over B is what turns prefill
+// from decode-speed into a real GEMM.
+//
+// Compiled only into its own module (guarded below) so the scalar kernel's
+// VGPR/occupancy fingerprint is untouched.
+#if defined(HIPFIRE_TQ2G128_XBATCH)
+
+#ifndef HIPFIRE_TQ2G128_XBATCH_MAX
+#define HIPFIRE_TQ2G128_XBATCH_MAX 4
+#endif
+
+// Occupancy 8, not the scalar kernel's 20: B accumulator sets multiply the
+// live float state, and a spilled accumulator would change the FMA order.
+__launch_bounds__(32, 8)
+extern "C" __global__ void HIPFIRE_TQ2G128_XBATCH_KERNEL(
+    const char* __restrict__ A,
+    const float* __restrict__ x,   // [B x K]
+    float* __restrict__ y,         // [B x M]
+    int M, int K, int B
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+    const int groups_per_row = K / 128;
+    const char* row_ptr = A + (long long)row * groups_per_row * 34;
+    const int xbase = tid * 4;
+
+    float acc0[HIPFIRE_TQ2G128_XBATCH_MAX];
+    float acc1[HIPFIRE_TQ2G128_XBATCH_MAX];
+    float acc2[HIPFIRE_TQ2G128_XBATCH_MAX];
+    float acc3[HIPFIRE_TQ2G128_XBATCH_MAX];
+    #pragma unroll
+    for (int b = 0; b < HIPFIRE_TQ2G128_XBATCH_MAX; b++) {
+        acc0[b] = 0.0f; acc1[b] = 0.0f; acc2[b] = 0.0f; acc3[b] = 0.0f;
+    }
+
+    const int quads = groups_per_row >> 2;
+    const int tail = groups_per_row & 3;
+
+    #define TQ2_XDOG(code, d, xoff, a)                                      \
+        do {                                                                \
+            const float4 xv = *(const float4*)(xb + (xoff));                \
+            (a) += (d) * ( (float)((int)( (code)       & 0x3) - 1) * xv.x   \
+                         + (float)((int)(((code) >> 2) & 0x3) - 1) * xv.y   \
+                         + (float)((int)(((code) >> 4) & 0x3) - 1) * xv.z   \
+                         + (float)((int)(((code) >> 6) & 0x3) - 1) * xv.w );\
+        } while (0)
+
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        const char* gp0 = row_ptr + g * 34;
+        const char* gp1 = gp0 + 34;
+        const char* gp2 = gp1 + 34;
+        const char* gp3 = gp2 + 34;
+        const float d0 = (float)(*(const _Float16*)gp0);
+        const float d1 = (float)(*(const _Float16*)gp1);
+        const float d2 = (float)(*(const _Float16*)gp2);
+        const float d3 = (float)(*(const _Float16*)gp3);
+        const unsigned int c0 = *((const unsigned char*)(gp0 + 2 + tid));
+        const unsigned int c1 = *((const unsigned char*)(gp1 + 2 + tid));
+        const unsigned int c2 = *((const unsigned char*)(gp2 + 2 + tid));
+        const unsigned int c3 = *((const unsigned char*)(gp3 + 2 + tid));
+        const int base = g * 128 + xbase;
+        #pragma unroll
+        for (int b = 0; b < HIPFIRE_TQ2G128_XBATCH_MAX; b++) {
+            if (b >= B) break;
+            const float* xb = x + (long long)b * K;
+            TQ2_XDOG(c0, d0, base,       acc0[b]);
+            TQ2_XDOG(c1, d1, base + 128, acc1[b]);
+            TQ2_XDOG(c2, d2, base + 256, acc2[b]);
+            TQ2_XDOG(c3, d3, base + 384, acc3[b]);
+        }
+    }
+
+    // Tail groups accumulate into acc[g % 4], matching the 4-way interleave
+    // the combine below assumes.
+    for (int t = 0; t < tail; t++) {
+        const int g = (quads << 2) + t;
+        const char* gp = row_ptr + g * 34;
+        const float d = (float)(*(const _Float16*)gp);
+        const unsigned int c = *((const unsigned char*)(gp + 2 + tid));
+        const int base = g * 128 + xbase;
+        #pragma unroll
+        for (int b = 0; b < HIPFIRE_TQ2G128_XBATCH_MAX; b++) {
+            if (b >= B) break;
+            const float* xb = x + (long long)b * K;
+            if (t == 0)      { TQ2_XDOG(c, d, base, acc0[b]); }
+            else if (t == 1) { TQ2_XDOG(c, d, base, acc1[b]); }
+            else             { TQ2_XDOG(c, d, base, acc2[b]); }
+        }
+    }
+    #undef TQ2_XDOG
+
+    #pragma unroll
+    for (int b = 0; b < HIPFIRE_TQ2G128_XBATCH_MAX; b++) {
+        if (b >= B) break;
+        float acc = (acc0[b] + acc1[b]) + (acc2[b] + acc3[b]);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            acc += __shfl_down(acc, offset);
+        if (tid == 0) y[(long long)b * M + row] = acc;
+    }
+}
+
+#endif  // HIPFIRE_TQ2G128_XBATCH

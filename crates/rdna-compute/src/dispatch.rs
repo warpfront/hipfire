@@ -1096,6 +1096,89 @@ impl Gpu {
         }
     }
 
+    /// Dequantize a TQ2-G128 (ternary) weight [M × K] into an FP16 buffer
+    /// [M × K] row-major. The FP16 buffer must be pre-allocated to M*K*2 bytes.
+    ///
+    /// This is the prefill route for the low-bit formats: they have no tiled
+    /// GEMM of their own, so a chunk of N tokens would otherwise re-read every
+    /// weight row N times through the scalar GEMV. Dequantising once into a
+    /// scratch and handing the chunk to the F16 GEMM amortises that read.
+    pub fn dequantize_tq2g128_to_f16(
+        &mut self,
+        w_packed: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — thin delegator; dequantize_lowbit_to_f16 binds.
+        self.dequantize_lowbit_to_f16(
+            "dequant_tq2g128_to_f16",
+            kernels::DEQUANT_TQ2G128_TO_F16_SRC,
+            w_packed,
+            w_fp16,
+            m,
+            k,
+        )
+    }
+
+    /// Binary sibling of [`Self::dequantize_tq2g128_to_f16`].
+    pub fn dequantize_bq1g128_to_f16(
+        &mut self,
+        w_packed: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        // bind_thread: skip — thin delegator; dequantize_lowbit_to_f16 binds.
+        self.dequantize_lowbit_to_f16(
+            "dequant_bq1g128_to_f16",
+            kernels::DEQUANT_BQ1G128_TO_F16_SRC,
+            w_packed,
+            w_fp16,
+            m,
+            k,
+        )
+    }
+
+    /// Shared body for the two low-bit dequants. Both kernels take the same
+    /// (A, W_f16, M, K) kernargs and the same [M, groups] × [32] geometry, so
+    /// one body keeps them from drifting.
+    fn dequantize_lowbit_to_f16(
+        &mut self,
+        name: &'static str,
+        src: &'static str,
+        w_packed: &DeviceBuffer,
+        w_fp16: &DeviceBuffer,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(k % 128, 0, "{name}: K must be a multiple of 128 (got {k})");
+        self.ensure_kernel(name, src, name)?;
+        let func = &self.functions[name];
+        let mut w_in = w_packed.as_ptr();
+        let mut w_out = w_fp16.as_ptr();
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut w_in as *mut _ as *mut c_void,
+            &mut w_out as *mut _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+        ];
+        let groups = (k / 128) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [m as u32, groups, 1],
+                [32, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Dequantize an HFQ4-G256 weight [M × K] into an FP16 buffer [M × K]
     /// row-major. The FP16 buffer must be pre-allocated to M*K*2 bytes.
     ///

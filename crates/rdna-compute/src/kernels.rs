@@ -3998,6 +3998,34 @@ pub const GEMV_TQ2G128_SRC: &str = include_str!("../../../kernels/src/gemv_tq2g1
 /// the 1-bit sign decode `bit ? +d : -d`.
 pub const GEMV_BQ1G128_SRC: &str = include_str!("../../../kernels/src/gemv_bq1g128.hip");
 
+/// x-batched TQ2-G128 GEMV: `y[b] = A . x[b]` for b in 0..B, reading each
+/// weight row ONCE instead of once per b. This is the prefill / multi-stream
+/// path: without it these formats fall back to per-token GEMV, so prefill
+/// runs at decode speed and the batched backend rejects the model outright.
+pub const GEMV_TQ2G128_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_TQ2G128_XBATCH 1\n",
+    "#define HIPFIRE_TQ2G128_XBATCH_MAX 4\n",
+    "#define HIPFIRE_TQ2G128_XBATCH_KERNEL gemv_tq2g128_xbatch\n",
+    include_str!("../../../kernels/src/gemv_tq2g128.hip")
+);
+
+/// Binary sibling of [`GEMV_TQ2G128_XBATCH_SRC`].
+pub const GEMV_BQ1G128_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_BQ1G128_XBATCH 1\n",
+    "#define HIPFIRE_BQ1G128_XBATCH_MAX 4\n",
+    "#define HIPFIRE_BQ1G128_XBATCH_KERNEL gemv_bq1g128_xbatch\n",
+    include_str!("../../../kernels/src/gemv_bq1g128.hip")
+);
+
+/// Tiled prefill GEMM over PACKED TQ2-G128 blocks — no dequant, no F16 copy.
+/// Decodes each code byte once and reuses it across a tile of TILE_N tokens.
+pub const GEMM_TQ2G128_PREFILL_SRC: &str =
+    include_str!("../../../kernels/src/gemm_tq2g128_prefill.hip");
+
+/// Binary sibling of [`GEMM_TQ2G128_PREFILL_SRC`].
+pub const GEMM_BQ1G128_PREFILL_SRC: &str =
+    include_str!("../../../kernels/src/gemm_bq1g128_prefill.hip");
+
 /// HFQ4-G256 wide GEMV: 2 rows per block (64 threads = 2 warps).
 /// Each warp processes one row independently. Halves grid size.
 pub const GEMV_HFQ4G256_WIDE_SRC: &str =
