@@ -307,6 +307,33 @@ fn main() {
     // Shape 4: groups_per_row=5 — two unrolled iterations plus a tail group.
     all_ok &= run(&mut gpu, 40, 640, 0x5EED0005);
 
+    // GUARD: the dispatch wrapper must refuse a K that is not a multiple of
+    // 128. The packer emits ceil(K/128) blocks, the kernel derives row_bytes
+    // from floor(K/128), so a non-multiple would misalign every row past the
+    // first -- silent corruption. The parity shapes above all go straight to
+    // launch_kernel_blob, so they never exercise the wrapper's assert.
+    {
+        let k_bad = 5000usize; // 39.06 groups -- deliberately not a multiple
+        let m_bad = 8usize;
+        let blocks = k_bad.div_ceil(128);
+        let packed = vec![0u8; m_bad * blocks * 34];
+        let xs = vec![0.0f32; k_bad];
+        let d_a = gpu
+            .upload_raw(&packed, &[packed.len()])
+            .expect("upload_raw");
+        let d_x = gpu.upload_f32(&xs, &[k_bad]).expect("upload_f32");
+        let d_y = gpu.zeros(&[m_bad], DType::F32).expect("zeros");
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _ = gpu.gemv_tq2g128(&d_a, &d_x, &d_y, m_bad, k_bad);
+        }));
+        if caught.is_err() {
+            println!("GUARD OK K={k_bad} rejected (not a multiple of 128)");
+        } else {
+            eprintln!("FAIL: GUARD K={k_bad} was ACCEPTED; row stride would misalign");
+            all_ok = false;
+        }
+    }
+
     if !all_ok {
         eprintln!("\nFAIL: one or more shapes did not pass parity/neg-control.");
         std::process::exit(1);

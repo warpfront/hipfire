@@ -5649,6 +5649,15 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // The packer emits ceil(K/128) blocks with a partial tail; the kernel
+        // derives row_bytes from floor(K/128). A non-multiple K would leave
+        // row_bytes one block short, so every row past the first reads at the
+        // wrong offset -- silent corruption, not merely a wrong last element.
+        assert_eq!(
+            k % 128,
+            0,
+            "TQ2G128 GEMV requires K multiple of 128, got {k}"
+        );
         self.bind_thread()?;
         self.ensure_kernel("gemv_tq2g128", kernels::GEMV_TQ2G128_SRC, "gemv_tq2g128")?;
         let func = &self.functions["gemv_tq2g128"];
@@ -5685,6 +5694,13 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
+        // See gemv_tq2g128: floor-vs-ceil block count would silently misalign
+        // every row past the first, so refuse a non-multiple K outright.
+        assert_eq!(
+            k % 128,
+            0,
+            "BQ1G128 GEMV requires K multiple of 128, got {k}"
+        );
         self.bind_thread()?;
         self.ensure_kernel("gemv_bq1g128", kernels::GEMV_BQ1G128_SRC, "gemv_bq1g128")?;
         let func = &self.functions["gemv_bq1g128"];
