@@ -4787,7 +4787,13 @@ fn handle_moe_expert_3d(
                 let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
                 (q, QuantType::MQ4G256, 256u32)
             } else {
-                let q = quantize_hfq4g128(&f32_slice);
+                // Keep every HFQ4-G128 group within one matrix row. Gemma4's
+                // routed-expert down_proj has K=704: flat packing joins the
+                // last 64 values of one row to the first 64 of the next while
+                // GPU kernels address rows independently, corrupting every
+                // row after the first. The 2-D packer emits a padded tail
+                // group and the kernels predicate those padding lanes.
+                let q = quantize_hfq4g128_2d(&f32_slice, inner_m, inner_k_e);
                 (q, QuantType::HFQ4G128, 128u32)
             };
             let weight = HfqTensor {
