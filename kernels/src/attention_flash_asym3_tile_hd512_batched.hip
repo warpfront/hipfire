@@ -56,11 +56,14 @@ __global__ void attention_flash_asym3_tile_hd512_batched(
     int batch_offset,
     int block_start,                           // ignored when tree_bias == nullptr
     int block_cols,                            // ignored when tree_bias == nullptr
-    int window_size,                           // 0 = full causal (Gemma 4 full layers)
-    // Ring-buffer cache_capacity. 0 = no wrap (Gemma 4 full layers don't ring).
-    // Matches the matching kv_cache_write_asym_k_givens3_hd512_batched's cap.
-    int cache_capacity
+    int v_mode,                               // ABI parity; hd512 asym3 uses Q8 V
+    int window_size,                          // 0 = full causal (Gemma 4 full layers)
+    const void* slot_descs,                   // ABI parity; unused on this route
+    const int* row_slot                       // ABI parity; unused on this route
 ) {
+    (void)v_mode;
+    (void)slot_descs;
+    (void)row_slot;
     if (head_dim != 512) return;
 
     const int h = blockIdx.x;
@@ -140,8 +143,7 @@ __global__ void attention_flash_asym3_tile_hd512_batched(
         const bool out_of_window = sliding && (t < t_lo);
         float partial = 0.0f;
         if (!out_of_window) {
-            const int k_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
-            const unsigned char* kb = k_cache + (size_t)k_slot * k_bytes_per_pos + k_head_off;
+            const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
             float cnorm = *(const float*)kb;
             // Chunk 0
             const unsigned char* base0 = kb + 4 + tid * 3;
@@ -208,8 +210,7 @@ __global__ void attention_flash_asym3_tile_hd512_batched(
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
-        const int v_slot = (cache_capacity > 0) ? (t % cache_capacity) : t;
-        const unsigned char* vb = v_cache + (size_t)v_slot * v_row_stride;
+        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             const int d_lo = d0_lo + i;

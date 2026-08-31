@@ -957,6 +957,11 @@ fn load_gemma4_weight(
                 paro: None,
             });
         }
+        // Q8F16/Q8_0 projections are emitted when a matrix is not eligible
+        // for the requested grouped format.  The lowered forward path already
+        // dispatches DType::Q8_0; keep its loader aligned with the eager and
+        // drafter loaders instead of rejecting a valid quantizer fallback.
+        3 => DType::Q8_0,
         4 => DType::Q4K,
         6 => DType::HFQ4G256,
         7 => DType::HFQ4G128,
@@ -3026,7 +3031,6 @@ fn sliding_layer_decode_impl(
 
     // KV cache write + flash attention via dispatch framework (Step::Attend).
     // flash_mode=2 (forced) because sliding layers always need flash for window masking.
-    let sliding_cap = kv_cache.physical_cap as u32;
     {
         let tier_inputs = KvTierInputs {
             quant_asym4: kv_cache.quant_asym4,
@@ -3046,7 +3050,7 @@ fn sliding_layer_decode_impl(
             batch_size: 1,
             is_tree: false,
             is_boundary: false,
-            q8_windowed: false,
+            q8_windowed: true,
             window: config.sliding_window as i32,
         };
         let plan = KvTierPlan::derive(tier_inputs)
@@ -3065,7 +3069,7 @@ fn sliding_layer_decode_impl(
             n_heads,
             n_kv_heads: n_kv,
             head_dim,
-            physical_cap: kv_cache.max_seq,
+            physical_cap: kv_cache.physical_cap,
             batch_size: 1,
             max_ctx_len: 0,
             flash_partials: Some(&scratch.flash_partials),
@@ -4252,7 +4256,7 @@ fn forward_prefill_batch_v2(
                         batch_size: 1,
                         is_tree: false,
                         is_boundary: false,
-                        q8_windowed: false,
+                        q8_windowed: true,
                         window: sliding_cap as i32,
                     };
                     let plan = KvTierPlan::derive(tier_inputs)
@@ -4271,7 +4275,7 @@ fn forward_prefill_batch_v2(
                         n_heads,
                         n_kv_heads: n_kv,
                         head_dim,
-                        physical_cap: kv_sliding.max_seq,
+                        physical_cap: kv_sliding.physical_cap,
                         batch_size: 1,
                         max_ctx_len: 0,
                         flash_partials: Some(&scratch.flash_partials),
@@ -4584,7 +4588,7 @@ fn forward_prefill_batch_v2(
                     batch_size: n_batch,
                     is_tree: false,
                     is_boundary: false,
-                    q8_windowed: false,
+                    q8_windowed: true,
                     window: 0,
                 };
                 let plan = KvTierPlan::derive(tier_inputs)
@@ -5550,7 +5554,6 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                 // KV write + flash attention via dispatch.
                 let kv = &mut *self.kv_sliding;
                 let kv_layer_idx = self.sliding_kv_idx;
-                let sliding_cap = kv.physical_cap as u32;
                 let ctx = DispatchCtx::new(gpu);
                 let tier_inputs = KvTierInputs {
                     quant_asym4: kv.quant_asym4,
@@ -5570,7 +5573,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     batch_size: 1,
                     is_tree: false,
                     is_boundary: false,
-                    q8_windowed: false,
+                    q8_windowed: true,
                     window: config.sliding_window as i32,
                 };
                 let plan = KvTierPlan::derive(tier_inputs)
@@ -5589,7 +5592,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     n_heads,
                     n_kv_heads: n_kv,
                     head_dim,
-                    physical_cap: kv.max_seq,
+                    physical_cap: kv.physical_cap,
                     batch_size: 1,
                     max_ctx_len: 0,
                     flash_partials: Some(&s.flash_partials),

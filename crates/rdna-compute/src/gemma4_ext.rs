@@ -6,15 +6,16 @@
 //! Ported from `feat/gemma4-128k-ring-buffer`. Includes hd512 attention,
 //! proportional partial RoPE, logit softcap, and MoE stubs (Phase 4).
 
-use crate::{GpuTensor, Gpu};
 use crate::kernels;
-use hip_bridge::{DeviceBuffer, HipError, HipResult};
+use crate::{Gpu, GpuTensor};
+use hip_bridge::{DeviceBuffer, HipResult};
 
 // rope_partial_halved_f32 / logit_softcap_f32 live in norm.rs (master copies
 // with profiling timers) — the ported duplicates were removed in the union merge.
 
 // ─── hd512 attention + KV write (full-attention layers) ─────────────────
 
+#[rustfmt::skip]
 impl Gpu {
     /// Single-token hd512 flash attention for asym3 KV cache (Gemma4 full-attn layers).
     pub fn attention_flash_asym3_hd512(
@@ -96,8 +97,8 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [n_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    0,
+                    [256, 1, 1],
+                    (max_tiles * std::mem::size_of::<f32>()) as u32,
                     self.stream_ref(),
                     &mut params,
                 )?;
@@ -231,8 +232,8 @@ impl Gpu {
                 self.hip.launch_kernel(
                     func,
                     [n_heads as u32, 1, 1],
-                    [32, 1, 1],
-                    0,
+                    [256, 1, 1],
+                    (max_tiles * std::mem::size_of::<f32>()) as u32,
                     self.stream_ref(),
                     &mut params,
                 )?;
@@ -285,6 +286,9 @@ impl Gpu {
 
 // ─── MoE GPU method stubs (Phase 4) ────────────────────────────────────
 
+// These pre-modular stubs duplicate production implementations in gemm.rs.
+#[cfg(any())]
+#[rustfmt::skip]
 impl Gpu {
     /// Indexed MoE gate_up GEMV for MQ4G256 expert weights.
     /// MQ4G256 has the same 136-byte/group layout as HFQ4G256, so this
@@ -497,6 +501,9 @@ impl Gpu {
 
 // ─── Sliding-window attention wrappers (route hd512 → hd512 kernels) ───
 
+// These wrappers target retired *_cap APIs; routing now lives in dispatch.
+#[cfg(any())]
+#[rustfmt::skip]
 impl Gpu {
     pub fn attention_flash_asym3_window(
         &mut self,

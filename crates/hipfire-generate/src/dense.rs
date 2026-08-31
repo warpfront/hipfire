@@ -2002,6 +2002,284 @@ mod gemma4_prefill_batch_tests {
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn generate_gemma4_lowered(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    max_think_tokens: usize,
+    enable_thinking: bool,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    logprobs_top_k: Option<usize>,
+    request_seed: u32,
+) {
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded");
+        return;
+    }
+    emit_gen_start(
+        stdout,
+        id,
+        false,
+        gen_start_contract_version_for_arch(m.arch_id),
+    );
+
+    let Some(bundle_ref) = m.gemma4_lowered_mut() else {
+        emit_error_with_id(stdout, id, "gemma4 lowered bundle missing");
+        return;
+    };
+    let bos_tok = bundle_ref.config.bos_token;
+    let cfg_eos_tok = bundle_ref.config.eos_token;
+    let bundle = bundle_ref as *mut hipfire_loader::Gemma4LoweredBundle;
+
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let try_jinja = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0")
+            && m.chat_template.is_some();
+        let mut ids = if try_jinja {
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template: m.chat_template.as_ref().unwrap(),
+                system: system_prompt,
+                user: prompt,
+                enable_thinking,
+                bos_token: Some("<bos>"),
+                reasoning_strength: None,
+                reasoning_effort: None,
+            };
+            let rendered = if tools.is_some() || messages_history.is_some() {
+                let synthesized;
+                let history = match messages_history {
+                    Some(history) => history,
+                    None => {
+                        let mut messages = Vec::new();
+                        if let Some(system) = system_prompt {
+                            messages.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::System,
+                                content: system.to_owned(),
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_plan: String::new(),
+                            });
+                        }
+                        messages.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::User,
+                            content: prompt.to_owned(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                        synthesized = messages;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(history, tools, None)
+            } else {
+                frame.render()
+            };
+            match rendered {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(error) => {
+                    eprintln!("[daemon] jinja render failed in Gemma4 lowered path ({error}); using raw prompt");
+                    tokenizer.encode(prompt)
+                }
+            }
+        } else {
+            tokenizer.encode(prompt)
+        };
+        if ids.first() != Some(&bos_tok) {
+            ids.insert(0, bos_tok);
+        }
+        ids
+    };
+
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        return;
+    }
+    if prompt_ids.len() + max_tokens > m.max_seq {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "gemma4 lowered request needs {} KV positions but max_seq is {}",
+                prompt_ids.len() + max_tokens,
+                m.max_seq
+            ),
+        );
+        return;
+    }
+
+    // The lowered route does not yet publish a prompt-cache contract. Rebuild
+    // the full Jinja frame from position zero so stale KV can never leak across
+    // requests; absolute-position writes overwrite every row that is observed.
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    let t0 = Instant::now();
+    for (pos, &token) in prompt_ids.iter().enumerate() {
+        let result = unsafe {
+            gemma4::lowered::forward_scratch(
+                gpu,
+                &(*bundle).weights,
+                &(*bundle).config,
+                token,
+                pos,
+                &mut (*bundle).kv_sliding,
+                &mut (*bundle).kv_full,
+                &(*bundle).scratch,
+            )
+        };
+        if let Err(error) = result {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!("gemma4 lowered prefill failed: {error:?}"),
+            );
+            return;
+        }
+    }
+    m.conversation_tokens.extend_from_slice(&prompt_ids);
+    m.seq_pos = prompt_ids.len();
+    let prefill_ms = t0.elapsed().as_millis();
+
+    let stop_set = unsafe { [cfg_eos_tok, (*bundle).eos_tok, 106] };
+    let sampler_cfg = hipfire_runtime::sampler::SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        blocked_tokens: Vec::new(),
+        top_k,
+        min_p,
+    };
+    let mut rng_state = request_seed;
+    let mut router = GemmaThoughtRouter::new(enable_thinking, max_think_tokens);
+    let mut generated = 0usize;
+    let mut ttft_ms = None;
+    let decode_t0 = Instant::now();
+
+    while generated < max_tokens {
+        let next = unsafe {
+            hipfire_runtime::sampler::sample(
+                gpu,
+                &(*bundle).scratch.logits,
+                &(*bundle).scratch.sample_buf,
+                &(*bundle).scratch.repeat_buf,
+                (*bundle).config.vocab_size,
+                &m.conversation_tokens,
+                &sampler_cfg,
+                &mut rng_state,
+            )
+        };
+        if stop_set.contains(&next) {
+            break;
+        }
+        if ttft_ms.is_none() {
+            ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let frag = m.tokenizer.as_ref().unwrap().decode(&[next]);
+        let host_logits = if logprobs_top_k.is_some() {
+            unsafe { gpu.download_f32(&(*bundle).scratch.logits).ok() }
+        } else {
+            None
+        };
+        for event in router.push(&frag).0 {
+            match event {
+                GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                GemmaEmit::Token(text) => {
+                    let mut envelope = serde_json::json!({
+                        "type": "token", "id": id, "text": text,
+                        "attempt_id": active_attempt_id(),
+                    });
+                    if let Some(logits) = host_logits.as_ref() {
+                        if let Some((logprob, top)) = crate::common::token_logprob_fields(
+                            logits,
+                            next,
+                            logprobs_top_k,
+                            m.tokenizer.as_ref().unwrap(),
+                        ) {
+                            envelope["logprob"] = serde_json::json!(logprob);
+                            envelope["top_logprobs"] = top;
+                        }
+                    }
+                    let _ = writeln!(stdout, "{envelope}");
+                    let _ = stdout.flush();
+                }
+            }
+        }
+        m.conversation_tokens.push(next);
+        generated += 1;
+        let pos = m.seq_pos;
+        let result = unsafe {
+            gemma4::lowered::forward_scratch(
+                gpu,
+                &(*bundle).weights,
+                &(*bundle).config,
+                next,
+                pos,
+                &mut (*bundle).kv_sliding,
+                &mut (*bundle).kv_full,
+                &(*bundle).scratch,
+            )
+        };
+        if let Err(error) = result {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!("gemma4 lowered decode failed: {error:?}"),
+            );
+            return;
+        }
+        m.seq_pos += 1;
+    }
+    for event in router.flush() {
+        match event {
+            GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+            GemmaEmit::Token(text) => emit_visible_token(stdout, id, &text),
+        }
+    }
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let decode_tok_s = generated as f64 * 1000.0 / decode_ms as f64;
+    let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"attempt_id":{}}}"#,
+        id,
+        generated,
+        decode_tok_s,
+        prompt_ids.len(),
+        prefill_ms,
+        prefill_tok_s,
+        decode_tok_s,
+        ttft_ms.unwrap_or(total_ms as f64),
+        total_ms,
+        active_attempt_id(),
+    );
+    let _ = stdout.flush();
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn generate_gemma4(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
