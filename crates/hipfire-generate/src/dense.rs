@@ -3174,38 +3174,38 @@ impl GemmaThoughtRouter {
         loop {
             match self.state {
                 GemmaChannel::AwaitingThought => {
-                    if let Some(pos) = self.pending.find("<|channel>thought") {
-                        let mut header_end = pos + "<|channel>thought".len();
+                    const CHANNEL_OPEN: &str = "<|channel>";
+                    const THOUGHT_OPEN: &str = "<|channel>thought";
+
+                    // A thought channel is optional and may be split across
+                    // decoded fragments. Hold only while the bytes seen so far
+                    // can still become the canonical opening header.
+                    if THOUGHT_OPEN.starts_with(&self.pending) {
+                        break;
+                    }
+                    if self.pending.starts_with(THOUGHT_OPEN) {
+                        let mut header_end = THOUGHT_OPEN.len();
                         if self.pending[header_end..].starts_with('\n') {
                             header_end += 1;
-                        }
-                        if pos > 0 {
-                            let pre = self.pending[..pos].to_string();
-                            self.pending.drain(..pos);
-                            header_end -= pos;
-                            if !pre.is_empty() && !gemma_is_marker_prefix(&pre) {
-                                out.push(GemmaEmit::Token(pre));
-                            }
-                            continue;
                         }
                         self.pending.drain(..header_end);
                         self.state = GemmaChannel::Reasoning;
                         continue;
-                    } else {
-                        let hold = gemma_longest_marker_suffix(&self.pending);
-                        if hold == 0 || hold >= self.pending.len() {
-                            break;
-                        }
-                        let emit_len = self.pending.len() - hold;
-                        if emit_len > 0 {
-                            let text = self.pending[..emit_len].to_string();
-                            self.pending.drain(..emit_len);
-                            if !text.is_empty() && !gemma_is_marker_prefix(&text) {
-                                out.push(GemmaEmit::Token(text));
-                            }
-                        }
-                        break;
                     }
+
+                    // The response schema makes the thought header optional.
+                    // Once the buffered bytes cannot form that header, route
+                    // them as answer content. Some Gemma4 checkpoints emit an
+                    // orphan `<|channel>` before an otherwise valid answer;
+                    // consume that control token without dropping its payload.
+                    if self.pending.starts_with(CHANNEL_OPEN) {
+                        self.pending.drain(..CHANNEL_OPEN.len());
+                        if self.pending.starts_with('\n') {
+                            self.pending.drain(..1);
+                        }
+                    }
+                    self.state = GemmaChannel::Answer;
+                    continue;
                 }
                 GemmaChannel::Reasoning => {
                     if let Some(pos) = self.pending.find("<channel|>") {
@@ -3294,7 +3294,7 @@ impl GemmaThoughtRouter {
         if self.pending.is_empty() {
             return Vec::new();
         }
-        if self.state == GemmaChannel::AwaitingThought {
+        if self.state == GemmaChannel::AwaitingThought && gemma_is_marker_prefix(&self.pending) {
             self.pending.clear();
             return Vec::new();
         }
@@ -3318,7 +3318,87 @@ pub fn gemma_is_marker_prefix(s: &str) -> bool {
         "<|turn>",
         "<turn|>",
     ];
-    MARKERS.iter().any(|m| m.starts_with(s) || s.starts_with(m))
+    MARKERS.iter().any(|m| m.starts_with(s))
+}
+
+#[cfg(test)]
+mod gemma_thought_router_tests {
+    use super::{gemma_is_marker_prefix, GemmaChannel, GemmaEmit, GemmaThoughtRouter};
+
+    fn route(enable_thinking: bool, chunks: &[&str]) -> (String, String, GemmaChannel) {
+        let mut router = GemmaThoughtRouter::new(enable_thinking, 0);
+        let mut visible = String::new();
+        let mut reasoning = String::new();
+        for chunk in chunks {
+            for event in router.push(chunk).0 {
+                match event {
+                    GemmaEmit::Reasoning(text) => reasoning.push_str(&text),
+                    GemmaEmit::Token(text) => visible.push_str(&text),
+                }
+            }
+        }
+        for event in router.flush() {
+            match event {
+                GemmaEmit::Reasoning(text) => reasoning.push_str(&text),
+                GemmaEmit::Token(text) => visible.push_str(&text),
+            }
+        }
+        (visible, reasoning, router.state)
+    }
+
+    #[test]
+    fn gemma_router_routes_canonical_thought_then_answer() {
+        let (visible, reasoning, state) = route(
+            true,
+            &["<|channel>", "thought", "\nplan<channel|>\nanswer<turn|>"],
+        );
+        assert_eq!(reasoning, "plan");
+        assert_eq!(visible, "answer");
+        assert_eq!(state, GemmaChannel::Answer);
+    }
+
+    #[test]
+    fn gemma_router_recovers_orphan_channel_before_answer() {
+        let (visible, reasoning, state) =
+            route(true, &["<|channel>", "\n", "```python\nprint('ok')\n```"]);
+        assert_eq!(visible, "```python\nprint('ok')\n```");
+        assert!(reasoning.is_empty());
+        assert_eq!(state, GemmaChannel::Answer);
+    }
+
+    #[test]
+    fn gemma_router_orphan_channel_is_chunk_boundary_invariant() {
+        let full = "<|channel>\nanswer";
+        let expected = route(true, &[full]);
+        for split in 1..full.len() {
+            if full.is_char_boundary(split) {
+                assert_eq!(route(true, &[&full[..split], &full[split..]]), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn gemma_router_thinking_request_can_emit_direct_answer() {
+        let (visible, reasoning, state) = route(true, &["direct answer"]);
+        assert_eq!(visible, "direct answer");
+        assert!(reasoning.is_empty());
+        assert_eq!(state, GemmaChannel::Answer);
+    }
+
+    #[test]
+    fn gemma_router_drops_only_an_unfinished_control_marker_at_eos() {
+        let (visible, reasoning, state) = route(true, &["<|chan"]);
+        assert!(visible.is_empty());
+        assert!(reasoning.is_empty());
+        assert_eq!(state, GemmaChannel::AwaitingThought);
+    }
+
+    #[test]
+    fn gemma_marker_prefix_does_not_classify_marker_plus_payload() {
+        assert!(gemma_is_marker_prefix("<|chan"));
+        assert!(gemma_is_marker_prefix("<|channel>"));
+        assert!(!gemma_is_marker_prefix("<|channel>\nanswer"));
+    }
 }
 
 pub fn gemma_longest_marker_suffix(s: &str) -> usize {
