@@ -3238,30 +3238,63 @@ impl GemmaThoughtRouter {
                     }
                 }
                 GemmaChannel::Answer => {
-                    if let Some(pos) = self.pending.find("<turn|>") {
-                        if pos > 0 {
-                            let text = self.pending[..pos].to_string();
-                            self.pending.drain(..pos);
-                            if !text.is_empty() {
-                                out.push(GemmaEmit::Token(text));
+                    // Answer must chunk-safely strip any Gemma channel
+                    // control markers, including canonical <|channel|>
+                    // forms, orphan <|channel> variants, and markers
+                    // arriving after a forced max-think transition.
+                    // Preserve payload before/after each marker and hold
+                    // a suffix that could still become a marker.
+                    const ANSWER_MARKERS: &[&str] = &[
+                        "<|channel>thought",
+                        "<|channel>",
+                        "<|channel|>",
+                        "<channel|>",
+                        "<|turn>",
+                        "<turn|>",
+                    ];
+                    loop {
+                        let hold = gemma_longest_marker_suffix(&self.pending);
+                        let search_len = self.pending.len().saturating_sub(hold);
+                        let searchable = &self.pending[..search_len];
+                        let mut best_pos: Option<usize> = None;
+                        let mut best_len = 0usize;
+                        for &m in ANSWER_MARKERS {
+                            if let Some(pos) = searchable.find(m) {
+                                if best_pos.is_none()
+                                    || pos < best_pos.unwrap()
+                                    || (pos == best_pos.unwrap() && m.len() > best_len)
+                                {
+                                    best_pos = Some(pos);
+                                    best_len = m.len();
+                                }
+                            }
+                        }
+                        if let Some(pos) = best_pos {
+                            if pos > 0 {
+                                let text = self.pending[..pos].to_string();
+                                self.pending.drain(..pos);
+                                if !text.is_empty() {
+                                    out.push(GemmaEmit::Token(text));
+                                }
+                                continue;
+                            }
+                            self.pending.drain(..best_len);
+                            if self.pending.starts_with('\n') {
+                                self.pending.drain(..1);
+                            }
+                            if self.pending.is_empty() {
+                                break;
                             }
                             continue;
                         }
-                        self.pending.drain(.."<turn|>".len());
-                        if !self.pending.is_empty() && !gemma_is_marker_prefix(&self.pending) {
-                            let tail = std::mem::take(&mut self.pending);
-                            out.push(GemmaEmit::Token(tail));
+                        if search_len > 0 {
+                            let text = self.pending[..search_len].to_string();
+                            self.pending.drain(..search_len);
+                            if !text.is_empty() {
+                                out.push(GemmaEmit::Token(text));
+                            }
                         }
                         break;
-                    }
-                    let hold = gemma_longest_marker_suffix(&self.pending);
-                    let emit_len = self.pending.len().saturating_sub(hold);
-                    if emit_len > 0 {
-                        let text = self.pending[..emit_len].to_string();
-                        self.pending.drain(..emit_len);
-                        if !text.is_empty() {
-                            out.push(GemmaEmit::Token(text));
-                        }
                     }
                     break;
                 }
@@ -3314,6 +3347,7 @@ pub fn gemma_is_marker_prefix(s: &str) -> bool {
     const MARKERS: &[&str] = &[
         "<|channel>thought",
         "<|channel>",
+        "<|channel|>",
         "<channel|>",
         "<|turn>",
         "<turn|>",
@@ -3399,12 +3433,226 @@ mod gemma_thought_router_tests {
         assert!(gemma_is_marker_prefix("<|channel>"));
         assert!(!gemma_is_marker_prefix("<|channel>\nanswer"));
     }
+
+    fn route_with_cap(
+        enable_thinking: bool,
+        max_think_tokens: usize,
+        chunks: &[&str],
+    ) -> (String, String, GemmaChannel) {
+        let mut router = GemmaThoughtRouter::new(enable_thinking, max_think_tokens);
+        let mut visible = String::new();
+        let mut reasoning = String::new();
+        for chunk in chunks {
+            for event in router.push(chunk).0 {
+                match event {
+                    GemmaEmit::Reasoning(text) => reasoning.push_str(&text),
+                    GemmaEmit::Token(text) => visible.push_str(&text),
+                }
+            }
+        }
+        for event in router.flush() {
+            match event {
+                GemmaEmit::Reasoning(text) => reasoning.push_str(&text),
+                GemmaEmit::Token(text) => visible.push_str(&text),
+            }
+        }
+        (visible, reasoning, router.state)
+    }
+
+    fn assert_no_markers(s: &str) {
+        for m in &[
+            "<|channel>thought",
+            "<|channel>",
+            "<|channel|>",
+            "<channel|>",
+            "<|turn>",
+            "<turn|>",
+        ] {
+            assert!(!s.contains(m), "visible leaked marker {:?} in {:?}", m, s);
+        }
+    }
+
+    #[test]
+    fn gemma_router_thinking_off_strips_all_channel_markers_every_split() {
+        // Thinking-off starts in Answer; every channel/turn marker must be
+        // stripped chunk-safely regardless of split.
+        let full = "pre<|channel>mid<channel|>post<|channel|>inner<|channel>thought\nX<channel|>tail<|turn>end<turn|>after";
+        let expected = route_with_cap(false, 0, &[full]);
+        assert_no_markers(&expected.0);
+        // Adjacent payload must survive: markers stripped, text joined.
+        assert_eq!(expected.0, "premidpostinnerXtailendafter");
+        for split in 1..full.len() {
+            if !full.is_char_boundary(split) {
+                continue;
+            }
+            let got = route_with_cap(false, 0, &[&full[..split], &full[split..]]);
+            assert_eq!(got, expected, "mismatch at split {}", split);
+            assert_no_markers(&got.0);
+        }
+        // Also verify orphan <|channel> with newline framing is stripped.
+        let full2 = "<|channel>\nanswer";
+        let exp2 = route_with_cap(false, 0, &[full2]);
+        assert_eq!(exp2.0, "answer");
+        for split in 1..full2.len() {
+            if !full2.is_char_boundary(split) {
+                continue;
+            }
+            assert_eq!(
+                route_with_cap(false, 0, &[&full2[..split], &full2[split..]]),
+                exp2
+            );
+        }
+        // Canonical <|channel|> in thinking-off must also be stripped.
+        let full3 = "A<|channel|>B";
+        let exp3 = route_with_cap(false, 0, &[full3]);
+        assert_eq!(exp3.0, "AB");
+        assert_no_markers(&exp3.0);
+        for split in 1..full3.len() {
+            if !full3.is_char_boundary(split) {
+                continue;
+            }
+            assert_eq!(
+                route_with_cap(false, 0, &[&full3[..split], &full3[split..]]),
+                exp3
+            );
+        }
+    }
+
+    #[test]
+    fn gemma_router_forced_close_strips_markers_after_transition_every_split() {
+        // Force max-think after one reasoning push, then ensure every
+        // subsequent channel/turn marker in Answer is stripped at every
+        // split, preserving adjacent payload.
+        let pre = "<|channel>thought\nAAA<channel|>";
+        let post = "BBB<|channel>CCC<channel|>DDD<|channel|>EEE<|turn>FFF<turn|>GGG";
+        let full = format!("{}{}", pre, post);
+        // full = "<|channel>thought\nAAA<channel|>BBB<|channel>CCC<channel|>DDD<|channel|>EEE<|turn>FFF<turn|>GGG"
+        // With max_think=1 the router forces to Answer after the first
+        // reasoning push; the trailing <channel|> that closes thought and
+        // all markers inside post must be stripped, not leaked.
+        let expected = route_with_cap(true, 1, &[&full]);
+        assert!(expected.1.contains("AAA") || expected.0.contains("AAA"));
+        assert_no_markers(&expected.0);
+        // Answer payload should be the post text with markers removed.
+        // Post without markers: "BBBCCCDDDEEEFFFGGG"
+        assert_eq!(expected.0, "BBBCCCDDDEEEFFFGGG");
+        // For split invariance after forced close, keep the reasoning header
+        // as one chunk and only split the post payload. Splitting the header
+        // itself changes per-push reasoning counting and is not required to
+        // be invariant for this test.
+        for split in 0..=post.len() {
+            if split != 0 && !post.is_char_boundary(split) {
+                continue;
+            }
+            let got = if split == 0 || split == post.len() {
+                route_with_cap(true, 1, &[&full])
+            } else {
+                let c1 = &post[..split];
+                let c2 = &post[split..];
+                route_with_cap(true, 1, &[pre, c1, c2])
+            };
+            assert_eq!(got.0, expected.0, "forced mismatch at post split {}", split);
+            assert_no_markers(&got.0);
+        }
+        // Also test forced transition where pending marker is split across
+        // the forced boundary: reasoning chunk ends with partial marker prefix.
+        let full2 = "<|channel>thought\nRR<channel|>XX<|channel>YY";
+        let exp2 = route_with_cap(true, 1, &[full2]);
+        assert_no_markers(&exp2.0);
+        // Split only the post part after the forced close to keep reasoning counting stable
+        let pre2 = "<|channel>thought\nRR<channel|>";
+        let post2 = "XX<|channel>YY";
+        let exp2_post = route_with_cap(true, 1, &[full2]);
+        for split in 0..=post2.len() {
+            if split != 0 && !post2.is_char_boundary(split) {
+                continue;
+            }
+            let got = if split == 0 || split == post2.len() {
+                route_with_cap(true, 1, &[full2])
+            } else {
+                route_with_cap(true, 1, &[pre2, &post2[..split], &post2[split..]])
+            };
+            assert_eq!(
+                got.0, exp2.0,
+                "forced split2 mismatch at post split {}",
+                split
+            );
+            assert_no_markers(&got.0);
+        }
+        // Verify that a marker arriving strictly after forced transition
+        // as a separate push is still stripped at every internal split.
+        for payload in &[
+            "hello<channel|>world",
+            "hello<|channel>world",
+            "hello<|channel|>world",
+            "hello<turn|>world",
+            "hello<|turn>world",
+        ] {
+            let expected_payload = (*payload)
+                .replace("<|channel>thought", "")
+                .replace("<|channel>", "")
+                .replace("<|channel|>", "")
+                .replace("<channel|>", "")
+                .replace("<|turn>", "")
+                .replace("<turn|>", "");
+            for split in 0..=payload.len() {
+                if split != 0 && !payload.is_char_boundary(split) {
+                    continue;
+                }
+                // Build payload split after forced transition.
+                let full = if split == 0 || split == payload.len() {
+                    format!("<|channel>thought\nZ<channel|>{}", payload)
+                } else {
+                    // Simulate payload split across two pushes after forced.
+                    // Create a single concatenated string and test split invariance
+                    // via the full-string split test already done; here just
+                    // verify the payload alone after forced.
+                    let c1 = &payload[..split];
+                    let c2 = &payload[split..];
+                    let mut rr = GemmaThoughtRouter::new(true, 1);
+                    let _ = rr.push("<|channel>thought\nZ");
+                    let mut vis = String::new();
+                    for ev in rr.push("<channel|>").0 {
+                        if let GemmaEmit::Token(t) = ev {
+                            vis.push_str(&t);
+                        }
+                    }
+                    for ev in rr.push(c1).0 {
+                        if let GemmaEmit::Token(t) = ev {
+                            vis.push_str(&t);
+                        }
+                    }
+                    for ev in rr.push(c2).0 {
+                        if let GemmaEmit::Token(t) = ev {
+                            vis.push_str(&t);
+                        }
+                    }
+                    for ev in rr.flush() {
+                        if let GemmaEmit::Token(t) = ev {
+                            vis.push_str(&t);
+                        }
+                    }
+                    assert_eq!(
+                        vis, expected_payload,
+                        "payload {:?} split {}",
+                        payload, split
+                    );
+                    assert_no_markers(&vis);
+                    continue;
+                };
+                let got = route_with_cap(true, 1, &[&full]);
+                assert!(got.0.contains(&expected_payload) || got.0 == expected_payload);
+                assert_no_markers(&got.0);
+            }
+        }
+    }
 }
 
 pub fn gemma_longest_marker_suffix(s: &str) -> usize {
     const MARKERS: &[&str] = &[
         "<|channel>thought",
         "<|channel>",
+        "<|channel|>",
         "<channel|>",
         "<|turn>",
         "<turn|>",

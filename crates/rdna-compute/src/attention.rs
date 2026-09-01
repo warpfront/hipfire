@@ -6133,6 +6133,23 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         if head_dim == 512 {
+            // Fail-closed: HD512's descriptor translation requires that the
+            // KvSlotDesc fields can actually represent the layout. The only
+            // field that can overflow is `cap: i32` (and `seq_len: i32`) —
+            // `k_base`/`v_base` are u64 and wide enough for any arena this
+            // GPU can allocate. If max_seq does not fit in i32, the device-side
+            // `KvSlotDesc.cap` would truncate and silently corrupt slab
+            // bounds; we must not silently fall back to the legacy path.
+            if slot_descs.is_some() && max_seq > i32::MAX as usize {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "hd512 batched: max_seq {max_seq} exceeds KvSlotDesc.cap i32 range; \
+                         cannot represent HD512 layout via descriptors — fail closed rather than \
+                         silently ignoring descriptors"
+                    ),
+                ));
+            }
             return self.launch_asym_flash_batched(
                 "attention_flash_asym3_tile_hd512_batched",
                 kernels::ATTENTION_FLASH_ASYM3_TILE_HD512_BATCHED_SRC,

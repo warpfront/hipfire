@@ -20,8 +20,10 @@
 // Grid: [n_heads, max_tiles, sub_batch_size]. Block: [32, 1, 1].
 // LDS: tile_size * 4 bytes.
 #include <hip/hip_runtime.h>
+#include <assert.h>
 #include "turbo_common.h"
 #include "givens_common.h"
+#include "kv_slot_desc.h"
 
 __device__ __forceinline__ void givens_rot_fwd_hd512_batched(
     float& a, float& b, float c, float s)
@@ -58,12 +60,10 @@ __global__ void attention_flash_asym3_tile_hd512_batched(
     int block_cols,                            // ignored when tree_bias == nullptr
     int v_mode,                               // ABI parity; hd512 asym3 uses Q8 V
     int window_size,                          // 0 = full causal (Gemma 4 full layers)
-    const void* slot_descs,                   // ABI parity; unused on this route
-    const int* row_slot                       // ABI parity; unused on this route
+    const KvSlotDesc* __restrict__ slot_descs, // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot           // [total_batch] or nullptr = legacy
 ) {
     (void)v_mode;
-    (void)slot_descs;
-    (void)row_slot;
     if (head_dim != 512) return;
 
     const int h = blockIdx.x;
@@ -74,13 +74,49 @@ __global__ void attention_flash_asym3_tile_hd512_batched(
 
     const int global_bid = batch_offset + local_bid;
     const bool tree_mode = (tree_bias != nullptr);
-    const int seq_len = tree_mode ? (block_start + block_cols) : (positions[global_bid] + 1);
+    // hipGraph-safe block_start: under captured tree-verify replay the
+    // `block_start` scalar kernarg is baked at capture time and goes stale as
+    // the committed prefix grows. positions[] is re-uploaded (uncaptured) every
+    // cycle and the linearized tree root sits at positions[0] == start_pos ==
+    // block_start, so derive it from the device buffer instead of the scalar.
+    // Eager (non-capture) value is identical, so this is a no-op off-graph.
+    const int eff_block_start = tree_mode ? positions[0] : block_start;
+    const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[global_bid] + 1);
+
+    // One code path for both modes: in legacy mode we synthesise a descriptor
+    // with zero bases, so the address arithmetic below is unchanged and the
+    // output is bitwise identical to the pre-SP1 kernel. row_slot is indexed
+    // by GLOBAL row (batch_offset + blockIdx.z, i.e. global_bid above) — using
+    // the local blockIdx.z alone would silently read the wrong slot once the
+    // partials buffer forces the launcher into sub-batching.
+    const int slot = (row_slot != nullptr) ? row_slot[global_bid] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(seq_len, max_seq);
+
+    // `positions[row] + 1` (== `seq_len` above) is the PER-ROW CAUSAL BOUND:
+    // how far this specific query row is allowed to attend. `desc.seq_len` is
+    // the SLOT's logical KV length — allocation/capacity metadata, not a
+    // per-row quantity. The two coincide only when a slot has exactly one
+    // query row (M=1 decode); a slot verifying M>1 draft tokens has rows at
+    // positions p, p+1, ..., p+M-1 that legitimately differ, and row 0 must
+    // NOT see row 2's key. `desc` supplies the K/V slab BASE ADDRESS (via
+    // kv_offset_for_k/v below) — it must never override the row's own
+    // causal bound. This also keeps tile-count agreement with
+    // attention_flash_asym_reduce_batched, which independently derives its
+    // n_tiles from positions[global_bid]+1 and has no way to learn a
+    // different eff_seq_len computed here; disagreement would make the
+    // reduce iterate tiles this kernel early-returned from without writing a
+    // partial, folding stale (possibly another slot's) memory into the
+    // output.
+    const int eff_seq_len = seq_len;
+
     const int tile_start = tile_id * tile_size;
-    if (tile_start >= seq_len) return;
-    const int tile_end = min(tile_start + tile_size, seq_len);
+    if (tile_start >= eff_seq_len) return;
+    const int tile_end = min(tile_start + tile_size, eff_seq_len);
     const int tile_len = tile_end - tile_start;
     const bool sliding = (window_size > 0) && !tree_mode;
-    const int t_lo = sliding ? max(0, seq_len - window_size) : 0;
+    const int t_lo = sliding ? max(0, eff_seq_len - window_size) : 0;
     if (sliding && tile_end <= t_lo) {
         float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
                             + tile_id * (2 + head_dim);
@@ -143,7 +179,7 @@ __global__ void attention_flash_asym3_tile_hd512_batched(
         const bool out_of_window = sliding && (t < t_lo);
         float partial = 0.0f;
         if (!out_of_window) {
-            const unsigned char* kb = k_cache + (size_t)t * k_bytes_per_pos + k_head_off;
+            const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, k_bytes_per_pos) + k_head_off;
             float cnorm = *(const float*)kb;
             // Chunk 0
             const unsigned char* base0 = kb + 4 + tid * 3;
@@ -176,8 +212,8 @@ __global__ void attention_flash_asym3_tile_hd512_batched(
             partial += __shfl_xor(partial, off);
         if (tid == 0) {
             float s = out_of_window ? -1e30f : (partial * scale_attn);
-            if (tree_mode && t >= block_start) {
-                s += tree_bias[global_bid * block_cols + (t - block_start)];
+            if (tree_mode && t >= eff_block_start) {
+                s += tree_bias[global_bid * block_cols + (t - eff_block_start)];
             }
             scores[t_local] = s;
         }
@@ -210,7 +246,7 @@ __global__ void attention_flash_asym3_tile_hd512_batched(
     for (int t_local = 0; t_local < tile_len; t_local++) {
         float w = scores[t_local];
         int t = tile_start + t_local;
-        const unsigned char* vb = v_cache + (size_t)t * v_row_stride;
+        const unsigned char* vb = v_cache + kv_offset_for_v(desc, t, v_row_stride);
         #pragma unroll
         for (int i = 0; i < 8; i++) {
             const int d_lo = d0_lo + i;

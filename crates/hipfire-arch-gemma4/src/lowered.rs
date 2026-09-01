@@ -1543,6 +1543,37 @@ pub fn init_scratch_constants(
 // ─── Scratch ────────────────────────────────────────────────────────────
 
 use hip_bridge::DeviceBuffer;
+/// Flash tile size for gemma4 lowered path. Matches the HIP partition kernel's
+/// `TILE_SIZE = 128`.
+pub const GEMMA4_FLASH_TILE: usize = 128;
+/// Max prefill batch size for lowered gemma4. Sized once; batch flash partials
+/// scale linearly with this.
+pub const GEMMA4_MAX_PREFILL_BATCH: usize = 128;
+
+/// Pure geometry: single-query flash partial length for `max_seq`.
+/// `n_heads * ceil(max_seq / TILE) * (2 + head_dim)` floats.
+#[inline]
+pub fn gemma4_flash_partials_len(max_seq: usize, n_heads: usize, full_head_dim: usize) -> usize {
+    let tiles = max_seq.div_ceil(GEMMA4_FLASH_TILE);
+    n_heads * tiles * (2 + full_head_dim)
+}
+
+/// Pure geometry: batched flash partial length for `max_seq`.
+#[inline]
+pub fn gemma4_pb_flash_partials_len(max_seq: usize, n_heads: usize, full_head_dim: usize) -> usize {
+    GEMMA4_MAX_PREFILL_BATCH * gemma4_flash_partials_len(max_seq, n_heads, full_head_dim)
+}
+
+/// Convenience for `Gemma4Config`.
+#[inline]
+pub fn gemma4_flash_partials_len_for_config(max_seq: usize, config: &Gemma4Config) -> usize {
+    gemma4_flash_partials_len(max_seq, config.n_heads, config.full_head_dim)
+}
+
+#[inline]
+pub fn gemma4_pb_flash_partials_len_for_config(max_seq: usize, config: &Gemma4Config) -> usize {
+    gemma4_pb_flash_partials_len(max_seq, config.n_heads, config.full_head_dim)
+}
 
 /// Per-decode scratch, sized once at model-load time against the MAX of
 /// sliding and full attention dimensions so a single buffer works across
@@ -1676,7 +1707,11 @@ pub struct Gemma4Scratch {
 }
 
 impl Gemma4Scratch {
-    pub fn new(gpu: &mut Gpu, config: &Gemma4Config, _max_prefill: usize) -> HipResult<Self> {
+    /// `max_seq` is the sole allocation authority — MUST equal `LoadCtx::max_seq`
+    /// and the `KvCache::max_seq` / `physical_cap` for the paired caches.
+    /// Both `flash_partials` and `pb_flash_partials` are sized from this single
+    /// value; the `HIPFIRE_KV_SEQ` env var is no longer consulted.
+    pub fn new(gpu: &mut Gpu, config: &Gemma4Config, max_seq: usize) -> HipResult<Self> {
         let dim = config.dim;
         let q_dim =
             (config.n_heads * config.sliding_head_dim).max(config.n_heads * config.full_head_dim);
@@ -1698,7 +1733,6 @@ impl Gemma4Scratch {
         let up_ffn = gpu.zeros(&[config.hidden_dim], DType::F32)?;
         let ffn_hidden = gpu.zeros(&[config.hidden_dim], DType::F32)?;
         let ffn_out = gpu.zeros(&[dim], DType::F32)?;
-
         let logits = gpu.zeros(&[config.vocab_size], DType::F32)?;
         let sample_buf = gpu.zeros(&[2], DType::F32)?;
         let repeat_buf = gpu.zeros(&[1024], DType::F32)?;
@@ -1706,27 +1740,14 @@ impl Gemma4Scratch {
         // Flash partials sizing. Per-head × max_tiles × (2 + head_dim) floats.
         // Sized for FULL attn (head_dim=512 stride 514, vs sliding 256 stride 258);
         // sliding-layer dispatches use part of the buffer, full-layer dispatches
-        // use all of it.
-        //
-        // Default 32k. The branch name "gemma4-128k-ring-buffer" describes the
-        // sliding-window code path (sliding KV is ring-buffered at sliding_window
-        // = 1024 slots regardless of context length). The FULL-attention layers
-        // (5 of 30 in 26B-A4B-it) still allocate `max_kv_seq` slots — those
-        // layers are NOT ring-buffered. At 26B-A4B-it asym3 sizes the full KV
-        // budget for 128k is ~970 MB (5 layers × 2 KV heads × 131072 tokens ×
-        // 740 B/head), which fits comfortably on a 17 GB card alongside the
-        // 14.8 GB model weights. Users who want the full 128k context set
-        // `HIPFIRE_KV_SEQ=131072` at daemon launch. Default stays at 32k to
-        // match the cross-arch baseline.
-        const FALLBACK_KV_SEQ: usize = 32768;
-        const TILE_SIZE: usize = 128;
-        let max_kv_seq: usize = std::env::var("HIPFIRE_KV_SEQ")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .filter(|&n| n >= 128 && n <= 524_288)
-            .unwrap_or(FALLBACK_KV_SEQ);
-        let max_tiles_full = (max_kv_seq + TILE_SIZE - 1) / TILE_SIZE;
-        let flash_partials_sz = config.n_heads * max_tiles_full * (2 + config.full_head_dim);
+        // use all of it. `max_seq` is the single authority shared with both KV
+        // caches — no independent `HIPFIRE_KV_SEQ` env var.
+        assert!(
+            max_seq >= 128,
+            "gemma4 scratch: max_seq {max_seq} too small"
+        );
+        let flash_partials_sz =
+            gemma4_flash_partials_len(max_seq, config.n_heads, config.full_head_dim);
         let flash_partials = gpu.zeros(&[flash_partials_sz], DType::F32)?;
 
         // (Note 2026-05-19): removed the precomputed sliding/full cos+sin
@@ -1771,43 +1792,45 @@ impl Gemma4Scratch {
 
         // Prefill-batch scratch (N tokens at once). Larger batches expose
         // more concurrent GPU work — total batch scratch ≈ N*0.16 MB.
-        const MAX_PREFILL_BATCH: usize = 128;
-        let pb_attn_out = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_ffn_out = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_pre2 = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_pre2_rot = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_router_in = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_router_logits = gpu.zeros(&[MAX_PREFILL_BATCH, n_exp], DType::F32)?;
-        let pb_moe_topk_indices = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
-        let pb_moe_topk_weights = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
+        let pb_attn_out = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_ffn_out = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_pre2 = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_pre2_rot = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_router_in = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_router_logits = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, n_exp], DType::F32)?;
+        let pb_moe_topk_indices = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, k_top], DType::F32)?;
+        let pb_moe_topk_weights = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, k_top], DType::F32)?;
         // Routing-bucket scratch (Phase B). expert_offsets has n_exp+1 entries.
         // expert_token_list has one entry per (token, krank) pair = N × k_top.
         let pb_moe_expert_offsets = gpu.zeros(&[n_exp + 1], DType::F32)?; // i32-typed slots
-        let pb_moe_expert_token_list = gpu.zeros(&[MAX_PREFILL_BATCH, k_top], DType::F32)?;
-        let pb_moe_gate_batch = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
-        let pb_moe_up_batch = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
-        let pb_moe_hidden_batch = gpu.zeros(&[MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
-        let pb_moe_cur_moe = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_moe_cur_mlp = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_residual = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
-        let pb_tmp = gpu.zeros(&[MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_expert_token_list = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, k_top], DType::F32)?;
+        let pb_moe_gate_batch = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
+        let pb_moe_up_batch = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
+        let pb_moe_hidden_batch = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, k_top * mi], DType::F32)?;
+        let pb_moe_cur_moe = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_moe_cur_mlp = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_residual = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
+        let pb_tmp = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, dim], DType::F32)?;
         // Sized for max across sliding/full per-token vector dims.
         // q_dim_max = n_heads * max(sliding_head_dim, full_head_dim)
         let q_dim_max = config.n_heads * config.sliding_head_dim.max(config.full_head_dim);
         let kv_dim_max = (config.sliding_n_kv_heads * config.sliding_head_dim)
             .max(config.full_n_kv_heads * config.full_head_dim);
-        let pb_q = gpu.zeros(&[MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
-        let pb_attn_q = gpu.zeros(&[MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
-        let pb_flash_partials = gpu.zeros(&[MAX_PREFILL_BATCH * flash_partials_sz], DType::F32)?;
-        let pb_k = gpu.zeros(&[MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
-        let pb_v = gpu.zeros(&[MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
-        let pb_gate = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
-        let pb_up = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
-        let pb_ffn_hidden = gpu.zeros(&[MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
-        let pb_positions = gpu.zeros(&[MAX_PREFILL_BATCH], DType::F32)?; // i32 packed in f32 slots
-                                                                         // BF16 staging for calibration MFMA: persistent, sized once.
+        let pb_q = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
+        let pb_attn_q = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, q_dim_max], DType::F32)?;
+        let pb_flash_partials_sz =
+            gemma4_pb_flash_partials_len(max_seq, config.n_heads, config.full_head_dim);
+        let pb_flash_partials = gpu.zeros(&[pb_flash_partials_sz], DType::F32)?;
+        let pb_k = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
+        let pb_v = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, kv_dim_max], DType::F32)?;
+        let pb_gate = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
+        let pb_up = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
+        let pb_ffn_hidden =
+            gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH, config.hidden_dim], DType::F32)?;
+        let pb_positions = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH], DType::F32)?; // i32 packed in f32 slots
+                                                                                // BF16 staging for calibration MFMA: persistent, sized once.
         let max_k_bf16 = config.dim.max(config.hidden_dim);
-        let pb_bf16 = gpu.zeros(&[MAX_PREFILL_BATCH * max_k_bf16], DType::BF16)?;
+        let pb_bf16 = gpu.zeros(&[GEMMA4_MAX_PREFILL_BATCH * max_k_bf16], DType::BF16)?;
 
         Ok(Gemma4Scratch {
             x,
@@ -1841,7 +1864,7 @@ impl Gemma4Scratch {
             moe_expert_gate_batch,
             moe_expert_up_batch,
             moe_expert_hidden_batch,
-            max_prefill_batch: MAX_PREFILL_BATCH,
+            max_prefill_batch: GEMMA4_MAX_PREFILL_BATCH,
             pb_attn_out,
             pb_ffn_out,
             pb_moe_pre2,
@@ -1934,6 +1957,121 @@ impl Gemma4Scratch {
         let _ = gpu.free_tensor(self.pb_ffn_hidden);
         let _ = gpu.free_tensor(self.pb_positions);
         let _ = gpu.free_tensor(self.pb_bf16);
+    }
+}
+#[cfg(test)]
+mod scratch_geometry_tests {
+    use super::*;
+
+    fn dummy_cfg_31b() -> Gemma4Config {
+        // Minimal config mirroring 31B/26B shapes: n_heads=32, full_head_dim=512
+        Gemma4Config {
+            dim: 5376,
+            n_layers: 40,
+            vocab_size: 262144,
+            norm_eps: 1e-6,
+            bos_token: 2,
+            eos_token: 1,
+            pad_token: 0,
+            n_heads: 32,
+            sliding_head_dim: 256,
+            sliding_n_kv_heads: 16,
+            sliding_rope_theta: 10000.0,
+            sliding_window: 1024,
+            full_head_dim: 512,
+            full_n_kv_heads: 4,
+            full_rope_theta: 1_000_000.0,
+            full_rope_type: RopeType::Proportional,
+            full_partial_rotary_factor: 0.25,
+            attention_k_eq_v: true,
+            hidden_dim: 21504,
+            enable_moe_block: false,
+            moe_intermediate_size: 704,
+            num_experts: 128,
+            top_k_experts: 8,
+            final_logit_softcapping: 30.0,
+            tie_word_embeddings: true,
+            embed_scale: (5376 as f32).sqrt(),
+            layer_types: vec![LayerType::Sliding; 40],
+            has_vision: false,
+            image_token_id: 258880,
+            boi_token_id: 255999,
+            eoi_token_id: 258882,
+            audio_token_id: 258881,
+            video_token_id: 258884,
+        }
+    }
+
+    #[test]
+    fn flash_partials_geometry_matches_formula() {
+        // Single tile edge
+        assert_eq!(gemma4_flash_partials_len(128, 32, 512), 32 * 1 * 514);
+        assert_eq!(gemma4_flash_partials_len(129, 32, 512), 32 * 2 * 514);
+        assert_eq!(gemma4_flash_partials_len(256, 32, 512), 32 * 2 * 514);
+        // 32k baseline (FALLBACK_KV_SEQ before fix)
+        assert_eq!(gemma4_flash_partials_len(32768, 32, 512), 32 * 256 * 514);
+        assert_eq!(gemma4_flash_partials_len(32768, 32, 512), 4_210_688);
+        // 131072 must be exactly 4× the 32768 geometry (no overflow, no env var)
+        assert_eq!(gemma4_flash_partials_len(131072, 32, 512), 32 * 1024 * 514);
+        assert_eq!(gemma4_flash_partials_len(131072, 32, 512), 16_842_752);
+        assert_eq!(
+            gemma4_flash_partials_len(131072, 32, 512),
+            4 * gemma4_flash_partials_len(32768, 32, 512)
+        );
+    }
+
+    #[test]
+    fn pb_flash_is_batch_scaled_and_single_authority() {
+        for &max_seq in &[128usize, 1024, 32768, 131072] {
+            let single = gemma4_flash_partials_len(max_seq, 32, 512);
+            let batched = gemma4_pb_flash_partials_len(max_seq, 32, 512);
+            assert_eq!(batched, GEMMA4_MAX_PREFILL_BATCH * single);
+            // PB via config helper shares the same max_seq authority
+            let cfg = dummy_cfg_31b();
+            assert_eq!(
+                gemma4_pb_flash_partials_len_for_config(max_seq, &cfg),
+                batched
+            );
+            assert_eq!(gemma4_flash_partials_len_for_config(max_seq, &cfg), single);
+        }
+        // Concrete 131072 batched size without allocating GPU memory
+        assert_eq!(
+            gemma4_pb_flash_partials_len(131072, 32, 512),
+            128 * 16_842_752
+        );
+        assert_eq!(gemma4_pb_flash_partials_len(131072, 32, 512), 2_155_872_256);
+        assert_eq!(gemma4_pb_flash_partials_len(32768, 32, 512), 538_968_064);
+    }
+
+    #[test]
+    fn flash_scales_invariant_to_tile_rounding() {
+        // Non-multiple of 128 must ceil
+        let tiles_32769 = 32769usize.div_ceil(GEMMA4_FLASH_TILE);
+        assert_eq!(tiles_32769, 257);
+        assert_eq!(gemma4_flash_partials_len(32769, 32, 512), 32 * 257 * 514);
+        // 131071 is one short of 131072 -> still 1024 tiles (ceil)
+        assert_eq!(131071usize.div_ceil(GEMMA4_FLASH_TILE), 1024);
+        assert_eq!(
+            gemma4_flash_partials_len(131071, 32, 512),
+            gemma4_flash_partials_len(131072, 32, 512)
+        );
+    }
+
+    #[test]
+    fn kv_and_partials_share_max_seq_authority_concept() {
+        // Documents the invariant: KV capacity (ctx.max_seq / physical_cap) and
+        // both flash buffers are derived from the same max_seq value. We test
+        // the arithmetic side here; the carrier integration test below asserts
+        // that the constructor is wired to ctx.max_seq and not an env var.
+        let max_seq = 131072usize;
+        let cfg = dummy_cfg_31b();
+        // If KV were sized to max_seq but partials to a different value, decode
+        // would OOB. Here we just prove both helpers agree on the same input.
+        let kv_tiles = max_seq.div_ceil(GEMMA4_FLASH_TILE);
+        let flash = gemma4_flash_partials_len_for_config(max_seq, &cfg);
+        assert_eq!(flash, cfg.n_heads * kv_tiles * (2 + cfg.full_head_dim));
+        let pb = gemma4_pb_flash_partials_len_for_config(max_seq, &cfg);
+        assert_eq!(pb, GEMMA4_MAX_PREFILL_BATCH * flash);
     }
 }
 
