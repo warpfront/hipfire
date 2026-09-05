@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+### Performance
+
+- Reduce per-fragment EOS holdback and token/reasoning JSONL allocation while preserving wire bytes and stop semantics.
+
 ## v0.3.0 — MQ V2 wire schema, Bonsai, Redline across RDNA
 
 ### Runtime token streaming

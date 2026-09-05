@@ -11,4 +11,5 @@ hipfire-loader = { path = "../hipfire-loader" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
+serde.workspace = true
 serde_json.workspace = true

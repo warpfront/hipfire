@@ -18,7 +18,9 @@ pub fn render_tail_opens_think(rendered: &str) -> bool {
 /// Reduce the authoritative rendered-prompt state to the signal consumed by
 /// speculative emitters. Jinja owns the generation suffix, so the request's
 /// `assistant_prefix` is not authoritative once rendering succeeds.
-pub fn spec_assistant_prefix(started_in_think: bool) -> hipfire_runtime::prompt_frame::AssistantPrefix {
+pub fn spec_assistant_prefix(
+    started_in_think: bool,
+) -> hipfire_runtime::prompt_frame::AssistantPrefix {
     if started_in_think {
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
     } else {
@@ -52,28 +54,61 @@ pub fn emit_gen_start(
 pub const QWEN_AR_SEMANTIC_CONTRACT_VERSION: u32 = 2;
 pub const QWEN_DFLASH_SEMANTIC_CONTRACT_VERSION: u32 = QWEN_AR_SEMANTIC_CONTRACT_VERSION;
 
+/// Borrowed per-token envelope shared by [`emit_visible_token`] and
+/// [`emit_reasoning_token`].
+///
+/// Serializes field-for-field identically to the previous `serde_json::json!`
+/// `Value`: `serde_json` builds with `preserve_order` workspace-wide (see
+/// `crates/hipfire-runtime/Cargo.toml`), so the old `Value` kept `json!`
+/// insertion order (`type`, `id`, `text`, `attempt_id`) — the same order as
+/// the hand-rolled oracle in `hipfire-generate/src/dense.rs`. Streaming via
+/// `to_writer` applies the same string escaping as `Value` display, with no
+/// per-token `Value` allocation or text clone.
+struct TokenEnvelope<'a> {
+    kind: &'a str,
+    id: &'a str,
+    text: &'a str,
+    attempt_id: u64,
+}
+
+impl serde::Serialize for TokenEnvelope<'_> {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        use serde::ser::SerializeStruct;
+        let mut envelope = serializer.serialize_struct("TokenEnvelope", 4)?;
+        envelope.serialize_field("type", self.kind)?;
+        envelope.serialize_field("id", self.id)?;
+        envelope.serialize_field("text", self.text)?;
+        envelope.serialize_field("attempt_id", &self.attempt_id)?;
+        envelope.end()
+    }
+}
+
+/// Shared token writer: stream the envelope, then the JSONL newline, then
+/// flush. Failure semantics mirror the previous `writeln!(stdout, "{envelope}")`
+/// + `flush` (all errors ignored): `writeln!` skips its trailing newline when
+/// the value write fails, so a failed serialize emits no extra newline, while
+/// flush is always attempted.
+fn write_token_envelope(stdout: &mut impl std::io::Write, kind: &str, id: &str, text: &str) {
+    let envelope = TokenEnvelope {
+        kind,
+        id,
+        text,
+        attempt_id: active_attempt_id(),
+    };
+    if serde_json::to_writer(&mut *stdout, &envelope).is_ok() {
+        let _ = stdout.write_all(b"\n");
+    }
+    let _ = stdout.flush();
+}
+
 /// Emit one classifier-authorized visible token event (no protocol markers).
 pub fn emit_visible_token(stdout: &mut impl std::io::Write, id: &str, text: &str) {
-    let envelope = serde_json::json!({
-        "type": "token",
-        "id": id,
-        "text": text,
-        "attempt_id": active_attempt_id(),
-    });
-    let _ = writeln!(stdout, "{}", envelope);
-    let _ = stdout.flush();
+    write_token_envelope(stdout, "token", id, text);
 }
 
 /// Emit one producer-classified reasoning fragment.
 pub fn emit_reasoning_token(stdout: &mut impl std::io::Write, id: &str, text: &str) {
-    let envelope = serde_json::json!({
-        "type": "reasoning",
-        "id": id,
-        "text": text,
-        "attempt_id": active_attempt_id(),
-    });
-    let _ = writeln!(stdout, "{}", envelope);
-    let _ = stdout.flush();
+    write_token_envelope(stdout, "reasoning", id, text);
 }
 
 /// Canonical `{name, arguments}` array for staged terminal / tool_calls events.
@@ -164,7 +199,11 @@ pub fn canonical_json(v: &serde_json::Value) -> String {
     out
 }
 
-pub fn emit_error_with_id(stdout: &mut impl std::io::Write, id: &str, message: impl std::fmt::Display) {
+pub fn emit_error_with_id(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    message: impl std::fmt::Display,
+) {
     emit_active_attempt_error(
         stdout,
         Some(id),
@@ -261,11 +300,138 @@ pub fn emit_qwen_ar_info(stdout: &mut impl std::io::Write, id: &str, message: &s
     let _ = stdout.flush();
 }
 
-pub fn emit_qwen_ar_cancelled(stdout: &mut impl std::io::Write, id: &str, completion_tokens: usize) {
+pub fn emit_qwen_ar_cancelled(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    completion_tokens: usize,
+) {
     let attempt_id = active_attempt_id();
     let aborted = hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id);
     let _ = writeln!(stdout, "{}", aborted);
     let done = hipfire_runtime::semantic::wire_aborted_done(id, completion_tokens, attempt_id);
     let _ = writeln!(stdout, "{}", done);
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod token_emit_tests {
+    use super::{emit_reasoning_token, emit_visible_token};
+    use crate::terminal::set_active_attempt_id;
+
+    #[test]
+    fn visible_token_exact_bytes_with_escapes_and_unicode() {
+        set_active_attempt_id(7);
+        let mut sink = Vec::new();
+        emit_visible_token(&mut sink, "r1", "a\"b\\c\ndé😀");
+        assert_eq!(
+            String::from_utf8(sink).unwrap(),
+            "{\"type\":\"token\",\"id\":\"r1\",\"text\":\"a\\\"b\\\\c\\ndé😀\",\"attempt_id\":7}\n"
+        );
+    }
+
+    #[test]
+    fn reasoning_token_exact_bytes() {
+        set_active_attempt_id(3);
+        let mut sink = Vec::new();
+        emit_reasoning_token(&mut sink, "req", "hello");
+        assert_eq!(
+            String::from_utf8(sink).unwrap(),
+            "{\"type\":\"reasoning\",\"id\":\"req\",\"text\":\"hello\",\"attempt_id\":3}\n"
+        );
+    }
+
+    #[test]
+    fn token_bytes_match_legacy_value_oracle() {
+        // Byte identity against the pre-change `json!` Value rendering
+        // (insertion order under workspace `preserve_order`).
+        let cases = [
+            ("", ""),
+            ("r1", "plain"),
+            ("a\"b", "q\"\\"),
+            ("uni", "é😀\t\r\n"),
+            ("x", "\"\\/\u{8}\u{c}"),
+        ];
+        for (attempt, (id, text)) in cases.iter().copied().enumerate() {
+            set_active_attempt_id(attempt as u64);
+            let mut sink = Vec::new();
+            emit_visible_token(&mut sink, id, text);
+            let oracle = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": text,
+                "attempt_id": attempt as u64,
+            });
+            assert_eq!(
+                String::from_utf8(sink).unwrap(),
+                format!("{oracle}\n"),
+                "case {id:?}"
+            );
+        }
+    }
+
+    /// Writer that accepts `budget` bytes then fails every further write;
+    /// records bytes and flush attempts.
+    struct FailAfter {
+        budget: usize,
+        written: Vec<u8>,
+        flush_calls: usize,
+    }
+
+    impl std::io::Write for FailAfter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            if self.budget == 0 {
+                return Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "boom"));
+            }
+            let n = buf.len().min(self.budget);
+            self.written.extend_from_slice(&buf[..n]);
+            self.budget -= n;
+            Ok(n)
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flush_calls += 1;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn failed_serialize_writes_no_newline_but_still_flushes() {
+        set_active_attempt_id(1);
+        let mut stdout = FailAfter {
+            budget: 10,
+            written: Vec::new(),
+            flush_calls: 0,
+        };
+        // Must not panic; errors are ignored like the old `writeln!` path.
+        emit_visible_token(&mut stdout, "req", "hello world, this is long");
+        // Only the 10 accepted prefix bytes: no extra newline after failure.
+        assert_eq!(stdout.written.len(), 10);
+        assert!(!stdout.written.ends_with(b"\n"));
+        assert_eq!(stdout.flush_calls, 1);
+    }
+
+    #[test]
+    fn flush_failure_is_ignored() {
+        struct FlushFails {
+            written: Vec<u8>,
+        }
+        impl std::io::Write for FlushFails {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.written.extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Err(std::io::Error::new(std::io::ErrorKind::BrokenPipe, "boom"))
+            }
+        }
+        set_active_attempt_id(9);
+        let mut stdout = FlushFails {
+            written: Vec::new(),
+        };
+        emit_reasoning_token(&mut stdout, "req", "hi");
+        assert_eq!(
+            String::from_utf8(stdout.written).unwrap(),
+            "{\"type\":\"reasoning\",\"id\":\"req\",\"text\":\"hi\",\"attempt_id\":9}\n"
+        );
+    }
 }

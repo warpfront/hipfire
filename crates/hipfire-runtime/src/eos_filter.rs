@@ -382,37 +382,41 @@ impl EosFilter {
         // as "committed" when more bytes may arrive — but visible path
         // also gates on utf8_safe_end. Still avoid stuffing incomplete
         // sequences that are only marker heads.
-        let mut watch: Vec<&[u8]> = Vec::new();
-        for p in &self.config.holdback_prefixes {
-            if !p.is_empty() {
-                watch.push(p.as_slice());
-            }
-        }
-        for s in &self.config.stop_at {
-            if !s.is_empty() {
-                watch.push(s.as_slice());
-            }
-        }
-        if self.config.strip_think {
-            watch.push(b"<think>");
-            watch.push(b"</think>");
-        }
-        if !watch.is_empty() {
-            let mut max_trim = 0usize;
-            for p in &watch {
-                let max_k = p.len().saturating_sub(1).min(end);
-                for k in (1..=max_k).rev() {
-                    if k <= max_trim {
-                        break;
-                    }
-                    if rest[end - k..end] == p[..k] {
-                        max_trim = k;
-                        break;
-                    }
+        // Ordered scan: holdback_prefixes → stop_at → optional think markers.
+        // Longest trailing proper-prefix match across the chain (same as the
+        // former transient watch list).
+        let holdback = self
+            .config
+            .holdback_prefixes
+            .iter()
+            .map(Vec::as_slice)
+            .filter(|p| !p.is_empty());
+        let stops = self
+            .config
+            .stop_at
+            .iter()
+            .map(Vec::as_slice)
+            .filter(|s| !s.is_empty());
+        let think = self
+            .config
+            .strip_think
+            .then_some([b"<think>".as_slice(), b"</think>".as_slice()])
+            .into_iter()
+            .flatten();
+        let mut max_trim = 0usize;
+        for p in holdback.chain(stops).chain(think) {
+            let max_k = p.len().saturating_sub(1).min(end);
+            for k in (1..=max_k).rev() {
+                if k <= max_trim {
+                    break;
+                }
+                if rest[end - k..end] == p[..k] {
+                    max_trim = k;
+                    break;
                 }
             }
-            end -= max_trim;
         }
+        end -= max_trim;
         // Also hold incomplete UTF-8 at the tail so it pairs with the
         // next token rather than landing as a replacement later.
         end = utf8_safe_end(&rest[..end]);

@@ -1410,6 +1410,7 @@ dependencies = [
  "hipfire-runtime",
  "rdna-compute",
  "saddle-core",
+ "serde",
  "serde_json",
 ]
 
