@@ -2054,7 +2054,10 @@ pub fn generate_gemma4(
     // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -2265,7 +2268,10 @@ pub fn generate_gemma4(
     // avoids that, which is how the numbers above were taken.
     let eagle_active = bundle.eagle.is_some()
         && temp <= 1e-6
-        && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() == Some("1");
+        && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
+            .ok()
+            .as_deref()
+            == Some("1");
     if eagle_active {
         let draft_len = bundle.eagle.as_ref().unwrap().draft_len;
         // Seed hidden = post-`model.norm` hidden of the last prompt position
@@ -4237,7 +4243,10 @@ pub fn generate_muse_glimmer(
     // ── Prompt build (same two-path branch as the gemma4 AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -4474,7 +4483,10 @@ pub fn generate_muse_glimmer(
             .ok()
             .as_deref()
             == Some("0");
-        let trace = hipfire_config::developer_var("HIPFIRE_GLIMMER_CACHE_TRACE").ok().as_deref() == Some("1");
+        let trace = hipfire_config::developer_var("HIPFIRE_GLIMMER_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1");
         if cache_disabled {
             // Opting out of the cache does NOT restore the CLI's per-request
             // reset — arch 14 is in the cache_capable allowlist either way, so
@@ -4641,7 +4653,10 @@ pub fn generate_muse_glimmer(
             &bundle.weights,
         );
     let fast_sample_on = hipfire_runtime::config::get().dflash_fast_sample;
-    let temp_spec_env_off = hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
+    let temp_spec_env_off = hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
+        .ok()
+        .as_deref()
+        == Some("0");
     let spec_mode = glimmer_spec_admission(
         bundle.drafter.is_some(),
         max_tokens,
@@ -4660,7 +4675,9 @@ pub fn generate_muse_glimmer(
     // Shared by native AR, profit probes, and post-retirement AR tail.
     let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
     let gpu_sample = !matches!(
-        hipfire_config::developer_var("HIPFIRE_GLIMMER_GPU_SAMPLE").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_GLIMMER_GPU_SAMPLE")
+            .ok()
+            .as_deref(),
         Some("0")
     );
     let mut gpu_rng: u32 = (rng.next_u64() as u32) | 1;
@@ -4680,7 +4697,9 @@ pub fn generate_muse_glimmer(
         .ok()
         .as_deref()
         == Some("0");
-    let profit_guard_diag_off = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref()
+    let profit_guard_diag_off = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG")
+        .ok()
+        .as_deref()
         == Some("1")
         || hipfire_config::developer_var("HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT")
             .ok()
@@ -4782,8 +4801,10 @@ pub fn generate_muse_glimmer(
         if !skip_spec_loop {
             loop {
                 let t_window = std::time::Instant::now();
-                let do_window_timing =
-                    hipfire_config::developer_var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
+                let do_window_timing = hipfire_config::developer_var("HIPFIRE_GLIMMER_TIMING")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
                 if generated_count >= max_tokens {
                     break;
                 }
@@ -5078,7 +5099,10 @@ pub fn generate_muse_glimmer(
                 let t_after_drafter = t_window.elapsed();
                 // Bring-up diagnostic: HIPFIRE_GLIMMER_SPEC_DIAG=1 — device mode
                 // does not require/download host hidden; print backend + logical length.
-                if hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref() == Some("1")
+                if hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
                     && windows < 2
                 {
                     let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
@@ -5961,7 +5985,10 @@ pub fn generate_lfm2moe(
         // Jinja default-ON (flipped 2026-06-09): render through the model's chat
         // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
         // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -6348,7 +6375,10 @@ pub fn generate_minimax(
         // jinja on for both (falls back to Plain only when the .hfq carries no
         // template).
         // Jinja default-ON (flipped 2026-06-09); opt out with HIPFIRE_JINJA_CHAT=0.
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -6512,7 +6542,11 @@ pub fn generate_minimax(
             // the degenerate pure-extension case (rewind is then a no-op).
             let cache_hit = lcp > 0 && lcp < prompt_ids.len();
             let partial = lcp < prior_len;
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
                 eprintln!(
                 "[minimax-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
                 prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
@@ -6771,7 +6805,10 @@ pub fn generate_cohere2moe(
         // (b) never matches across turns so the LCP prompt-cache is dead. Force
         // jinja on (falls back to Plain only when the .hfq carries no template).
         // Jinja default-ON; opt out with HIPFIRE_JINJA_CHAT=0.
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -6825,7 +6862,11 @@ pub fn generate_cohere2moe(
             match render_result {
                 Ok(rendered) => {
                     primed_think = rendered.trim_end().ends_with("<think>");
-                    if hipfire_config::developer_var("HIPFIRE_C2M_DUMP_PROMPT").ok().as_deref() == Some("1") {
+                    if hipfire_config::developer_var("HIPFIRE_C2M_DUMP_PROMPT")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
                         let ids = tokenizer.encode(&rendered);
                         eprintln!(
                             "[c2m prompt dump] rendered chars={} tokens={}\n>>> HEAD(400):\n{}\n>>> TAIL(800):\n{}\n<<< end",
@@ -6936,7 +6977,11 @@ pub fn generate_cohere2moe(
         // the degenerate pure-extension case (rewind is then a no-op).
         let cache_hit = lcp > 0 && lcp < prompt_ids.len();
         let partial = lcp < prior_len;
-        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             eprintln!(
                 "[cohere2moe-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
                 prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
@@ -8204,6 +8249,7 @@ pub fn generate_maple(
     // Qwen/LLaMA AR bodies use, minus the EosFilter that arch 15 has no
     // overrides for.
     let mut streamed_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut streamed_bytes: Vec<u8> = Vec::new();
     let mut bytes_emitted: usize = 0;
 
     loop {
@@ -8219,7 +8265,8 @@ pub fn generate_maple(
         // honoured by the router which injects a forced `</think>` when the
         // budget is exhausted.
         streamed_tokens.push(next_tok);
-        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        tokenizer.decode_bytes_into(std::slice::from_ref(&next_tok), &mut streamed_bytes);
+        let all_bytes = streamed_bytes.as_slice();
         let pending = &all_bytes[bytes_emitted.min(all_bytes.len())..];
         let valid_len = match std::str::from_utf8(pending) {
             Ok(_) => pending.len(),
@@ -8285,7 +8332,7 @@ pub fn generate_maple(
     // non-empty tail means the run ended (EOS or max_tokens) mid-code-point;
     // dropping it would silently truncate the reply's last character.
     if !streamed_tokens.is_empty() {
-        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let all_bytes = streamed_bytes.as_slice();
         if bytes_emitted < all_bytes.len() {
             let frag = String::from_utf8_lossy(&all_bytes[bytes_emitted..]).into_owned();
             bytes_emitted = all_bytes.len();

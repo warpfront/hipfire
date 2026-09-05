@@ -32,9 +32,12 @@ pub struct Qwen35Emit<'a> {
     /// Index into the freshly-decoded byte stream past which bytes have not yet
     /// been fed to the filter (the daemon's old `bytes_fed_to_filter`).
     bytes_fed_to_filter: usize,
-    /// Every committed token in order, for byte decoding + the cache-store the
-    /// daemon does after the loop (exposed via [`Self::streamed_tokens`]).
+    /// Every committed token in order, for the cache-store the daemon does
+    /// after the loop (exposed via [`Self::streamed_tokens`]).
     streamed_tokens: Vec<u32>,
+    /// Persistent raw decode of committed `streamed_tokens`; append-only on
+    /// `push_and_filter`.
+    streamed_bytes: Vec<u8>,
     /// Incremental tool-protocol authority. Fed only EosFilter-emitted UTF-8.
     router: ToolOutputRouter,
     /// Incremental reasoning/content authority, upstream of tool routing.
@@ -128,6 +131,7 @@ impl<'a> Qwen35Emit<'a> {
             filter: EosFilter::new(qwen_dflash_eos_filter_config()),
             bytes_fed_to_filter: 0,
             streamed_tokens: Vec::new(),
+            streamed_bytes: Vec::new(),
             router: if tool_protocol_enabled {
                 ToolOutputRouter::new()
             } else {
@@ -243,9 +247,10 @@ impl<'a> Qwen35Emit<'a> {
             id: token,
             idx: self.streamed_tokens.len() - 1,
         });
-        let all_bytes = self.tokenizer.decode_bytes(&self.streamed_tokens);
-        let new_bytes = &all_bytes[self.bytes_fed_to_filter..];
-        self.bytes_fed_to_filter = all_bytes.len();
+        self.tokenizer
+            .decode_bytes_into(std::slice::from_ref(&token), &mut self.streamed_bytes);
+        let new_bytes = &self.streamed_bytes[self.bytes_fed_to_filter..];
+        self.bytes_fed_to_filter = self.streamed_bytes.len();
         let action = self.filter.observe(new_bytes);
         self.apply_filter_action(action, &mut events);
         events
@@ -277,7 +282,7 @@ impl<'a> Qwen35Emit<'a> {
         if self.stop.is_empty() {
             return false;
         }
-        let decoded_suffix = self.tokenizer.decode(&self.streamed_tokens);
+        let decoded_suffix = String::from_utf8_lossy(&self.streamed_bytes);
         self.stop
             .iter()
             .any(|s| decoded_suffix.ends_with(s.as_str()))
@@ -383,8 +388,7 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
 
         // max_think_tokens enforcement. Mirrors 4632-4664.
         if self.max_think_tokens > 0 {
-            let raw_so_far = self.tokenizer.decode_bytes(&self.streamed_tokens);
-            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+            let raw_str = std::str::from_utf8(&self.streamed_bytes).unwrap_or("");
             let in_think = currently_in_think(raw_str, self.open_think_prefix);
             if in_think && !self.prev_in_think {
                 self.think_count = 0;

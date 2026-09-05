@@ -2,6 +2,14 @@
 
 ## v0.3.0 — MQ V2 wire schema, Bonsai, Redline across RDNA
 
+### Runtime token streaming
+
+Streaming emitters now append newly committed token bytes instead of repeatedly
+decoding the complete generated token history. UTF-8 holdback, forced tokens,
+hidden state-only trailers, and stop/think routing retain their existing
+semantics. `Tokenizer::decode_bytes_into` appends to a caller-owned buffer;
+the allocating `decode_bytes` API remains available for one-shot decoding.
+
 ### Quant wire schema (Bonsai + Magnum V2)
 
 This release locks the HFQM quant-type register through qt=50 and lands the

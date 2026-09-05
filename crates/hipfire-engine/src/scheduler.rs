@@ -75,6 +75,8 @@ pub struct QwenBatchLane {
     pub rng_state: u64,
     pub conversation_tokens: Vec<u32>,
     pub streamed_tokens: Vec<u32>,
+    /// Raw decoded bytes of the committed `streamed_tokens`, including UTF-8 holdback.
+    pub streamed_bytes: Vec<u8>,
     pub bytes_fed_to_filter: usize,
     pub created_at: Instant,
     /// Host Instant after successful lane prefill + first sample.
@@ -258,6 +260,7 @@ impl ContinuousBatchScheduler {
             rng_state: request_rng_u64(&key, req.client_seed),
             conversation_tokens: Vec::new(),
             streamed_tokens: Vec::new(),
+            streamed_bytes: Vec::new(),
             bytes_fed_to_filter: 0,
             created_at: Instant::now(),
             prefill_done_at: None,
@@ -855,6 +858,7 @@ pub fn lfm_populate_lane_after_sample(
         lane.rng_state = next_rng as u64;
         lane.conversation_tokens = Vec::new();
         lane.streamed_tokens = Vec::new();
+        lane.streamed_bytes.clear();
         lane.bytes_fed_to_filter = 0;
         lane.prefill_done_at = Some(Instant::now());
     }

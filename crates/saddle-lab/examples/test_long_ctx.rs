@@ -254,6 +254,7 @@ it?"
 
         let t_gen = Instant::now();
         let mut generated: Vec<u32> = Vec::new();
+        let mut streamed_bytes: Vec<u8> = Vec::new();
         let mut emitted_bytes = 0usize;
         let mut in_thinking = !no_think;
         let mut think_count = 0usize;
@@ -277,8 +278,8 @@ it?"
             }
 
             // Stream decoded text, only emitting complete UTF-8.
-            let all_bytes = tokenizer.decode_bytes(&generated);
-            let new_bytes = &all_bytes[emitted_bytes..];
+            tokenizer.decode_bytes_into(std::slice::from_ref(&next_token), &mut streamed_bytes);
+            let new_bytes = &streamed_bytes[emitted_bytes..];
             let vl = match std::str::from_utf8(new_bytes) {
                 Ok(_) => new_bytes.len(),
                 Err(e) => e.valid_up_to(),

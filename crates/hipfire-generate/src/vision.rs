@@ -974,6 +974,7 @@ pub fn generate_vl(
     let t_prefill = Instant::now();
     let mut generated = 0;
     let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut streamed_bytes: Vec<u8> = Vec::new();
     let mut emitted_bytes = 0usize;
     // Typed-emission state for the v2 stream contract (see
     // `vl_route_decode_text`): EosFilter owns UTF-8 boundaries + EOT marker
@@ -1083,9 +1084,9 @@ pub fn generate_vl(
             t0.elapsed().as_millis() as u64,
         );
 
-        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-        let new_bytes = &all_bytes[emitted_bytes..];
-        emitted_bytes = all_bytes.len();
+        tokenizer.decode_bytes_into(&[next_token], &mut streamed_bytes);
+        let new_bytes = &streamed_bytes[emitted_bytes..];
+        emitted_bytes = streamed_bytes.len();
         if vl_route_decode_text(stdout, id, &mut vl_filter, &mut vl_think, new_bytes) {
             break;
         }
@@ -1243,9 +1244,9 @@ pub fn generate_vl(
                             t0.elapsed().as_millis() as u64,
                         );
 
-                        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                        let new_bytes = &all_bytes[emitted_bytes..];
-                        emitted_bytes = all_bytes.len();
+                        tokenizer.decode_bytes_into(&[t], &mut streamed_bytes);
+                        let new_bytes = &streamed_bytes[emitted_bytes..];
+                        emitted_bytes = streamed_bytes.len();
                         // Same typed routing as the main decode site: the
                         // forced `</think>` closer is consumed by the router
                         // (channel flips to content), never emitted literally.
@@ -1722,6 +1723,7 @@ pub fn generate_vl_dots_ocr(
     };
     let t_gen = Instant::now();
     let mut streamed: Vec<u32> = Vec::new();
+    let mut streamed_bytes: Vec<u8> = Vec::new();
     let mut emitted_bytes = 0usize;
     let mut generated = 0usize;
     // No ngram loop-guard here: dots.ocr layout-JSON legitimately repeats
@@ -1743,8 +1745,8 @@ pub fn generate_vl_dots_ocr(
         streamed.push(next);
 
         // Incremental UTF-8 streaming — only emit complete code points.
-        let all_bytes = tokenizer.decode_bytes(&streamed);
-        let new_bytes = &all_bytes[emitted_bytes..];
+        tokenizer.decode_bytes_into(&[next], &mut streamed_bytes);
+        let new_bytes = &streamed_bytes[emitted_bytes..];
         let valid_len = match std::str::from_utf8(new_bytes) {
             Ok(_) => new_bytes.len(),
             Err(e) => e.valid_up_to(),
@@ -1901,6 +1903,7 @@ pub fn run_dots_ocr_ngram_loop(
 
     let t_gen = Instant::now();
     let mut streamed: Vec<u32> = Vec::new();
+    let mut streamed_bytes: Vec<u8> = Vec::new();
     let mut emitted_bytes = 0usize;
     let mut generated = 0usize;
     // n-gram context (committed generated tail; the drafter holds the prompt
@@ -1932,8 +1935,8 @@ pub fn run_dots_ocr_ngram_loop(
             emitted.push(tok);
             // Incremental UTF-8 streaming — only emit complete code points
             // (byte-identical to the AR path).
-            let all_bytes = tokenizer.decode_bytes(&streamed);
-            let new_bytes = &all_bytes[emitted_bytes..];
+            tokenizer.decode_bytes_into(&[tok], &mut streamed_bytes);
+            let new_bytes = &streamed_bytes[emitted_bytes..];
             let valid_len = match std::str::from_utf8(new_bytes) {
                 Ok(_) => new_bytes.len(),
                 Err(e) => e.valid_up_to(),
@@ -2146,6 +2149,7 @@ pub fn generate_dots_ocr_text(
     };
     let t_gen = Instant::now();
     let mut streamed: Vec<u32> = Vec::new();
+    let mut streamed_bytes: Vec<u8> = Vec::new();
     let mut emitted_bytes = 0usize;
     let mut generated = 0usize;
 
@@ -2158,8 +2162,8 @@ pub fn generate_dots_ocr_text(
         streamed.push(next);
 
         // Incremental UTF-8 streaming — only emit complete code points.
-        let all_bytes = tokenizer.decode_bytes(&streamed);
-        let new_bytes = &all_bytes[emitted_bytes..];
+        tokenizer.decode_bytes_into(&[next], &mut streamed_bytes);
+        let new_bytes = &streamed_bytes[emitted_bytes..];
         let valid_len = match std::str::from_utf8(new_bytes) {
             Ok(_) => new_bytes.len(),
             Err(e) => e.valid_up_to(),

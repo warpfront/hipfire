@@ -393,6 +393,7 @@ fn main() {
     let loop_guard = LoopGuard::from_config(hipfire_runtime::config::get());
     let mut bytes_fed_to_filter = 0usize;
     let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut streamed_bytes: Vec<u8> = Vec::new();
 
     for _ in 0..max_gen {
         generated.push(next_token);
@@ -402,9 +403,9 @@ fn main() {
             // the filter so partial UTF-8 codepoints / marker prefixes
             // are buffered until the next token disambiguates them.
             streamed_tokens.push(next_token);
-            let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-            let new_bytes = &all_bytes[bytes_fed_to_filter..];
-            bytes_fed_to_filter = all_bytes.len();
+            tokenizer.decode_bytes_into(std::slice::from_ref(&next_token), &mut streamed_bytes);
+            let new_bytes = &streamed_bytes[bytes_fed_to_filter..];
+            bytes_fed_to_filter = streamed_bytes.len();
             if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
                 if let Ok(text) = std::str::from_utf8(&text_bytes) {
                     print!("{text}");

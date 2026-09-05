@@ -317,7 +317,6 @@ fn sp_dummy_prefix_from_hf_json(tok: &serde_json::Value) -> bool {
         || pre_tokenizer.map(pretokenizer_prepends).unwrap_or(false)
 }
 
-
 impl Tokenizer {
     /// Load tokenizer from GGUF metadata.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
@@ -798,6 +797,18 @@ impl Tokenizer {
     /// complete UTF-8 sequences, buffering partial multi-byte chars.
     pub fn decode_bytes(&self, tokens: &[u32]) -> Vec<u8> {
         let mut bytes = Vec::new();
+        self.decode_bytes_into(tokens, &mut bytes);
+        bytes
+    }
+
+    /// Append decoded token bytes into `bytes` without clearing it.
+    ///
+    /// Like [`Self::decode_bytes`], this emits raw token bytes (GPT-2 BPE mapping or
+    /// SentencePiece `▁` / `<0xHH>` handling) and may leave `bytes` ending in a
+    /// partial UTF-8 sequence when multi-byte characters are split across
+    /// tokens. Callers that stream must buffer those trailing incomplete bytes;
+    /// this method never truncates or rewrites the existing prefix of `bytes`.
+    pub fn decode_bytes_into(&self, tokens: &[u32], bytes: &mut Vec<u8>) {
         for &id in tokens {
             if let Some(tok) = self.vocab.get(id as usize) {
                 if self.is_gpt2_bpe {
@@ -826,7 +837,6 @@ impl Tokenizer {
                 }
             }
         }
-        bytes
     }
 
     /// Encode text to token IDs.
@@ -2109,6 +2119,29 @@ mod sp_tests {
     }
 
     #[test]
+    fn sp_decode_bytes_into_appends_partial_cjk() {
+        // Append API must keep a nonempty destination prefix, expose raw partial
+        // UTF-8 after the first byte-fallback token, then complete "中" (E4 B8 AD)
+        // across subsequent calls. Literal expected bytes are the oracle.
+        let tok = synth_sp(&["<0xE4>", "<0xB8>", "<0xAD>"]);
+        let mut bytes = b"prefix".to_vec();
+
+        tok.decode_bytes_into(&[], &mut bytes);
+        assert_eq!(bytes, b"prefix");
+
+        tok.decode_bytes_into(&[0], &mut bytes);
+        assert_eq!(bytes, b"prefix\xe4");
+
+        tok.decode_bytes_into(&[1, 2], &mut bytes);
+        assert_eq!(bytes, b"prefix\xe4\xb8\xad");
+
+        // Unknown ids are skipped; empty + OOV stay one boundary check with
+        // the append/partial contract above.
+        tok.decode_bytes_into(&[99], &mut bytes);
+        assert_eq!(bytes, b"prefix\xe4\xb8\xad");
+    }
+
+    #[test]
     fn sp_decode_hex_escapes_bytes_ascii_and_literal() {
         // ASCII byte-fallback (<0x0A> = newline) and a non-matching literal
         // "<0xZZ>" must pass through untouched, encoded as UTF-8.
@@ -2454,7 +2487,6 @@ mod prompt_norm_tests {
     }
 }
 
-
 #[cfg(test)]
 mod sp_dummy_prefix_tests {
     //! Config-driven SP dummy-prefix coverage (gemma4 first-word bug,
@@ -2528,8 +2560,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_no_dummy_prefix_first_word_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(t.bos_id, 2, "generation_config bos override");
         let mut ids = vec![t.bos_id];
         ids.extend(t.encode("The capital of France is"));
@@ -2538,8 +2569,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_chat_tail_thought_channel_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(
             t.encode("<|channel>thought\n<channel|>The capital of France is"),
             vec![100, 45518, 107, 101, 818, 5279, 529, 7001, 563],
