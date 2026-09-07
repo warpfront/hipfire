@@ -1,0 +1,11 @@
+[package]
+name = "vcn-bisect"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+hip-bridge = { path = "../../../crates/hip-bridge" }
+va-bridge = { path = "../../../crates/va-bridge" }
+libloading = "0.9"

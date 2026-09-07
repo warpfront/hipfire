@@ -1,0 +1,13 @@
+[package]
+name = "va-bridge"
+version = "0.1.0"
+edition = "2021"
+description = "Direct VA-API (VCN JPEG) dispatch via dlopen — experiment/vcn-jpeg only, default-off"
+license = "Apache-2.0"
+
+[dependencies]
+libloading = { workspace = true }
+hipfire-config = { path = "../hipfire-config" }
+
+[features]
+default = []
