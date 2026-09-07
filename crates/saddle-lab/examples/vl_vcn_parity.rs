@@ -128,9 +128,9 @@ impl Md5 {
     }
     fn block(s: &mut [u32; 4], b: &[u8; 64]) {
         const S: [u32; 64] = [
-            7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14,
-            20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11,
-            16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+            7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20,
+            5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+            6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
         ];
         const K: [u32; 64] = [
             0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
@@ -219,9 +219,12 @@ impl RgbArgs {
             (&mut self.chw as *mut u64).cast(),
         ]
     }
-    /// Redline explicit-arg bytes, same field order.
+    /// Redline explicit-arg bytes, same field order, packed per the AMDGPU
+    /// kernarg ABI: each arg at its natural alignment. Verified against
+    /// `llvm-readelf -n` of the gfx1201 HSACO: surf@0, u32s@8..52, 4-byte
+    /// pad@52..56, chw@56 (64 bytes); hidden block counts follow at 64.
     fn bytes(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(60);
+        let mut b = Vec::with_capacity(64);
         b.extend_from_slice(&self.surf.to_le_bytes());
         for v in [
             self.y_pitch,
@@ -238,6 +241,7 @@ impl RgbArgs {
         ] {
             b.extend_from_slice(&v.to_le_bytes());
         }
+        b.extend_from_slice(&[0u8; 4]); // pad so chw lands at offset 56
         b.extend_from_slice(&self.chw.to_le_bytes());
         b
     }
@@ -267,12 +271,15 @@ impl PatchArgs {
             (&mut self.out as *mut u64).cast(),
         ]
     }
+    /// Same ABI rule: chw@0, u32s@8..28, 4-byte pad@28..32, out@32
+    /// (40 bytes); hidden block counts follow at 40.
     fn bytes(&self) -> Vec<u8> {
-        let mut b = Vec::with_capacity(36);
+        let mut b = Vec::with_capacity(40);
         b.extend_from_slice(&self.chw.to_le_bytes());
         for v in [self.h, self.w, self.p, self.t, self.s] {
             b.extend_from_slice(&v.to_le_bytes());
         }
+        b.extend_from_slice(&[0u8; 4]); // pad so out lands at offset 32
         b.extend_from_slice(&self.out.to_le_bytes());
         b
     }
@@ -291,7 +298,11 @@ struct PatchifyPlan {
 impl PatchifyPlan {
     fn compute(sw: usize, sh: usize, img_h: usize, img_w: usize, expect_elem: usize) -> Self {
         let (t_h, t_w) = smart_resize(sh, sw, FACTOR, MIN_PX, MAX_PX);
-        assert_eq!((t_h, t_w), (img_h, img_w), "smart_resize mismatch vs repo path");
+        assert_eq!(
+            (t_h, t_w),
+            (img_h, img_w),
+            "smart_resize mismatch vs repo path"
+        );
         let n_elem = (t_h / PATCH) * (t_w / PATCH) * TEMPORAL * 3 * PATCH * PATCH;
         assert_eq!(n_elem, expect_elem);
         Self {
@@ -375,7 +386,10 @@ fn native_plane_diff(
 ) -> (usize, u8) {
     let w = layout.width as usize;
     assert_eq!(w, oracle.width as usize, "layout width vs oracle width");
-    assert_eq!(layout.height, oracle.height, "layout height vs oracle height");
+    assert_eq!(
+        layout.height, oracle.height,
+        "layout height vs oracle height"
+    );
     let is_444 = matches!(layout.format, JpegNativeFormat::Yuv444p);
     let expect_planes = if is_444 { 3 } else { 2 };
     assert_eq!(
@@ -405,7 +419,8 @@ fn native_plane_diff(
         );
         let base = layout.plane_offsets[i] as usize;
         for r in 0..nr {
-            let row = &surf[base + r * layout.pitch as usize..base + r * layout.pitch as usize + rw];
+            let row =
+                &surf[base + r * layout.pitch as usize..base + r * layout.pitch as usize + rw];
             for (a, b) in row.iter().zip(want[r * rw..(r + 1) * rw].iter()) {
                 let d = a.abs_diff(*b);
                 if d > 0 {
@@ -455,23 +470,43 @@ struct RlRep<'a> {
 /// writes it, WAIT_REG_MEM polls it — a repeated value would pass on the
 /// previous rep's stale write).
 fn chained_rep(ctx: &mut RlRep<'_>, bytes: &[u8], fence_value: u32) {
-    let pending = ctx.decoder.submit(ctx.dev, ctx.queue, bytes).expect("jpeg submit");
+    let pending = ctx
+        .decoder
+        .submit(ctx.dev, ctx.queue, bytes)
+        .expect("jpeg submit");
     // The output BO persists while Idle on identical bytes/format; the
     // kernargs baked for the fixture stay valid only if this holds.
     assert_eq!(
-        pending.surface().gpu_addr, ctx.surf_va,
+        pending.surface().gpu_addr,
+        ctx.surf_va,
         "surface VA moved between Idle submits"
     );
     let k_rgb = Kernel::find(ctx.module, "vl_nv12_to_rgb_norm").expect("k_rgb");
     let k_patch = Kernel::find(ctx.module, "vl_extract_patches").expect("k_patch");
     let mut cb = CommandBuffer::new();
-    cb.dispatch(k_rgb, ctx.plan.grid_rgb, [16, 16, 1], ctx.bufs.ka_rgb.gpu_addr);
+    cb.dispatch(
+        k_rgb,
+        ctx.plan.grid_rgb,
+        [16, 16, 1],
+        ctx.bufs.ka_rgb.gpu_addr,
+    );
     cb.barrier(ctx.bufs.fence.gpu_addr, fence_value);
-    cb.dispatch(k_patch, ctx.plan.grid_patch, [256, 1, 1], ctx.bufs.ka_patch.gpu_addr);
+    cb.dispatch(
+        k_patch,
+        ctx.plan.grid_patch,
+        [256, 1, 1],
+        ctx.bufs.ka_patch.gpu_addr,
+    );
     // Per-rep IB upload (only the barrier value changes); the IB BO persists.
-    ctx.dev.upload(&ctx.bufs.ib, &cb.as_bytes()).expect("upload ib");
+    ctx.dev
+        .upload(&ctx.bufs.ib, &cb.as_bytes())
+        .expect("upload ib");
     let wait: &[SyncObj] = &[*pending.ready_syncobj()];
-    let sync = SubmitSync { wait, signal: None, ib_flags: AMDGPU_IB_FLAG_EMIT_MEM_SYNC };
+    let sync = SubmitSync {
+        wait,
+        signal: None,
+        ib_flags: AMDGPU_IB_FLAG_EMIT_MEM_SYNC,
+    };
     let bos: &[&GpuBuffer] = &[
         &ctx.bufs.ib,
         &ctx.bufs.ka_rgb,
@@ -484,9 +519,19 @@ fn chained_rep(ctx: &mut RlRep<'_>, bytes: &[u8], fence_value: u32) {
     ];
     let fence = ctx
         .queue
-        .submit_async(ctx.dev, Engine::COMPUTE, &ctx.bufs.ib, cb.len_dwords(), bos, &sync)
+        .submit_async(
+            ctx.dev,
+            Engine::COMPUTE,
+            &ctx.bufs.ib,
+            cb.len_dwords(),
+            bos,
+            &sync,
+        )
         .expect("compute submit_async");
-    let done = ctx.queue.wait_fence(ctx.dev, &fence, FENCE_TIMEOUT_NS).expect("wait_fence");
+    let done = ctx
+        .queue
+        .wait_fence(ctx.dev, &fence, FENCE_TIMEOUT_NS)
+        .expect("wait_fence");
     assert!(done, "chained rep fence timeout");
     pending
         .complete_after(ctx.dev, ctx.queue, &fence, FENCE_TIMEOUT_NS)
@@ -513,10 +558,7 @@ fn main() {
         .iter()
         .find_map(|a| a.strip_prefix("--warm=").and_then(|v| v.parse().ok()))
         .unwrap_or(10);
-    let only: Vec<&String> = args
-        .iter()
-        .filter(|a| !a.starts_with("--"))
-        .collect();
+    let only: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let fixtures = [
         "general_qa.jpg",
         "barney_cigar.jpg",
@@ -553,8 +595,14 @@ fn main() {
     assert!(st.success(), "hipcc failed");
     println!("[parity] hipcc {:.2}s", t_cc.elapsed().as_secs_f32());
     let hsaco_bytes = std::fs::read(&hsaco).unwrap();
-    println!("[parity] hsaco md5={} ({}B)", md5hex(&hsaco_bytes), hsaco_bytes.len());
-    let module = hip.module_load_data(&hsaco_bytes).expect("module_load_data");
+    println!(
+        "[parity] hsaco md5={} ({}B)",
+        md5hex(&hsaco_bytes),
+        hsaco_bytes.len()
+    );
+    let module = hip
+        .module_load_data(&hsaco_bytes)
+        .expect("module_load_data");
     let k_rgb = hip
         .module_get_function(&module, "vl_nv12_to_rgb_norm")
         .expect("vl_nv12_to_rgb_norm");
@@ -576,7 +624,12 @@ fn main() {
             Kernel::find(&module, "vl_extract_patches").is_some(),
             "redline module missing vl_extract_patches"
         );
-        Some(Redline { dev, queue, decoder, module })
+        Some(Redline {
+            dev,
+            queue,
+            decoder,
+            module,
+        })
     } else {
         None
     };
@@ -773,7 +826,10 @@ fn main() {
             match sess.decode_jpeg(&bytes) {
                 Ok(vf) if vf.fourcc == 0x3231_564E || vf.fourcc == 0x5034_3434 => Some(vf),
                 Ok(vf) => {
-                    println!("[parity] {name}: VCN decoded fourcc=0x{:08x} — no kernel arm, CPU path", vf.fourcc);
+                    println!(
+                        "[parity] {name}: VCN decoded fourcc=0x{:08x} — no kernel arm, CPU path",
+                        vf.fourcc
+                    );
                     planar_444 = true;
                     None
                 }
@@ -786,14 +842,16 @@ fn main() {
         let derived = if zc.is_some() {
             Err(va_bridge::VaError::Corrupt("zero-copy arm taken"))
         } else if planar_444 {
-            Err(va_bridge::VaError::Unsupported("444P needs planar kernel arm"))
+            Err(va_bridge::VaError::Unsupported(
+                "444P needs planar kernel arm",
+            ))
         } else {
             match sess.decode_jpeg_derived(&bytes) {
                 // Derived readback is NV12-only; a 444P frame decoded fine on VCN
                 // but this example cannot consume it yet.
-                Err(va_bridge::VaError::Corrupt("derived image is not 2-plane NV12")) => {
-                    Err(va_bridge::VaError::Unsupported("444P needs planar kernel arm"))
-                }
+                Err(va_bridge::VaError::Corrupt("derived image is not 2-plane NV12")) => Err(
+                    va_bridge::VaError::Unsupported("444P needs planar kernel arm"),
+                ),
                 r => r,
             }
         };
@@ -804,7 +862,13 @@ fn main() {
                 let (uv_pitch, u_off, v_off, step, shifts) = if planar {
                     assert!(vf.num_layers >= 3, "444P export must carry 3 layers");
                     assert_eq!(vf.layers[1].pitch[0], vf.layers[2].pitch[0]);
-                    surf_kernel_params(true, vf.y_pitch(), vf.layers[1].pitch[0], vf.layers[1].offset[0], vf.layers[2].offset[0])
+                    surf_kernel_params(
+                        true,
+                        vf.y_pitch(),
+                        vf.layers[1].pitch[0],
+                        vf.layers[1].offset[0],
+                        vf.layers[2].offset[0],
+                    )
                 } else {
                     surf_kernel_params(false, vf.y_pitch(), vf.uv_pitch(), vf.uv_offset(), 0)
                 };
@@ -822,54 +886,64 @@ fn main() {
                 (if planar { "vcn-zc-444" } else { "vcn-zc" }, v, k)
             }
             (None, derived) => match derived {
-            Err(va_bridge::VaError::Unsupported(reason)) => {
-                // Blocker-2 product behavior: non-4:2:0 falls back to turbo.
-                println!("[parity] {name}: VCN unsupported ({reason}) — turbo CPU fallback");
-                let t1 = Instant::now();
-                let rgb = image::DynamicImage::ImageRgb8(
-                    image::RgbImage::from_raw(tw as u32, th as u32, turbo.data.clone())
-                        .expect("turbo rgb"),
-                );
-                let rgb = rgb
-                    .resize_exact(
-                        img_w as u32,
-                        img_h as u32,
-                        image::imageops::FilterType::CatmullRom,
-                    )
-                    .to_rgb8();
-                let plane = img_h * img_w;
-                let mut chw = vec![0f32; 3 * plane];
-                for (i, px) in rgb.pixels().enumerate() {
-                    chw[i] = px[0] as f32 / 127.5 - 1.0;
-                    chw[plane + i] = px[1] as f32 / 127.5 - 1.0;
-                    chw[2 * plane + i] = px[2] as f32 / 127.5 - 1.0;
+                Err(va_bridge::VaError::Unsupported(reason)) => {
+                    // Blocker-2 product behavior: non-4:2:0 falls back to turbo.
+                    println!("[parity] {name}: VCN unsupported ({reason}) — turbo CPU fallback");
+                    let t1 = Instant::now();
+                    let rgb = image::DynamicImage::ImageRgb8(
+                        image::RgbImage::from_raw(tw as u32, th as u32, turbo.data.clone())
+                            .expect("turbo rgb"),
+                    );
+                    let rgb = rgb
+                        .resize_exact(
+                            img_w as u32,
+                            img_h as u32,
+                            image::imageops::FilterType::CatmullRom,
+                        )
+                        .to_rgb8();
+                    let plane = img_h * img_w;
+                    let mut chw = vec![0f32; 3 * plane];
+                    for (i, px) in rgb.pixels().enumerate() {
+                        chw[i] = px[0] as f32 / 127.5 - 1.0;
+                        chw[plane + i] = px[1] as f32 / 127.5 - 1.0;
+                        chw[2 * plane + i] = px[2] as f32 / 127.5 - 1.0;
+                    }
+                    let fb = extract_patches(&chw, 3, img_h, img_w, PATCH, TEMPORAL, SMS);
+                    ("cpu-fallback", fb, t1.elapsed().as_secs_f64() * 1e3)
                 }
-                let fb = extract_patches(&chw, 3, img_h, img_w, PATCH, TEMPORAL, SMS);
-                ("cpu-fallback", fb, t1.elapsed().as_secs_f64() * 1e3)
-            }
-            Err(e) => panic!("vcn decode of {name}: {e}"),
-            Ok(d) => {
-                println!(
-                    "[parity] derived: {}x{} fourcc=0x{:08x} y_pitch={} uv_pitch={}",
-                    d.width, d.height, d.fourcc, d.y_pitch, d.uv_pitch
-                );
-                let (sw, sh) = (d.width as usize, d.height as usize);
-                let cw = (sw + 1) / 2;
-                assert_eq!(d.y.len(), sw * sh);
-                assert_eq!(d.uv.len(), cw * ((sh + 1) / 2) * 2);
-                // Packed NV12 upload (packed pitches: y=w, uv=2*cw); upload is
-                // inside the kernel timing since a derived product path pays it.
-                let mut nv12 = Vec::with_capacity(d.y.len() + d.uv.len());
-                nv12.extend_from_slice(&d.y);
-                nv12.extend_from_slice(&d.uv);
-                let d_surf = hip.malloc(nv12.len()).expect("malloc surf");
-                let t_up = Instant::now();
-                hip.memcpy_htod(&d_surf, &nv12).expect("htod surf");
-                let up_ms = t_up.elapsed().as_secs_f64() * 1e3;
-                let (v, k) = run_kernels(d_surf.as_ptr() as u64, sw as u32, (2 * cw) as u32, (sw * sh) as u32, (sw * sh) as u32 + 1, 2, (1, 1), sw, sh);
-                hip.free(d_surf).unwrap();
-                ("vcn", v, k + up_ms)
-            }
+                Err(e) => panic!("vcn decode of {name}: {e}"),
+                Ok(d) => {
+                    println!(
+                        "[parity] derived: {}x{} fourcc=0x{:08x} y_pitch={} uv_pitch={}",
+                        d.width, d.height, d.fourcc, d.y_pitch, d.uv_pitch
+                    );
+                    let (sw, sh) = (d.width as usize, d.height as usize);
+                    let cw = (sw + 1) / 2;
+                    assert_eq!(d.y.len(), sw * sh);
+                    assert_eq!(d.uv.len(), cw * ((sh + 1) / 2) * 2);
+                    // Packed NV12 upload (packed pitches: y=w, uv=2*cw); upload is
+                    // inside the kernel timing since a derived product path pays it.
+                    let mut nv12 = Vec::with_capacity(d.y.len() + d.uv.len());
+                    nv12.extend_from_slice(&d.y);
+                    nv12.extend_from_slice(&d.uv);
+                    let d_surf = hip.malloc(nv12.len()).expect("malloc surf");
+                    let t_up = Instant::now();
+                    hip.memcpy_htod(&d_surf, &nv12).expect("htod surf");
+                    let up_ms = t_up.elapsed().as_secs_f64() * 1e3;
+                    let (v, k) = run_kernels(
+                        d_surf.as_ptr() as u64,
+                        sw as u32,
+                        (2 * cw) as u32,
+                        (sw * sh) as u32,
+                        (sw * sh) as u32 + 1,
+                        2,
+                        (1, 1),
+                        sw,
+                        sh,
+                    );
+                    hip.free(d_surf).unwrap();
+                    ("vcn", v, k + up_ms)
+                }
             },
         };
         let r = rel_l1(&cpu_patches, &got);
@@ -904,7 +978,10 @@ fn main() {
             // (a) Decode-only parity run: submit -> wait_decode -> ReadyJpeg
             // readback (valid rows vs oracle) -> Drop returns Idle.
             eprintln!("[trace] {name}: jpeg submit (VCN_JPEG ring, no host wait)");
-            let pending = ctx.decoder.submit(&ctx.dev, &ctx.queue, &bytes).expect("jpeg submit");
+            let pending = ctx
+                .decoder
+                .submit(&ctx.dev, &ctx.queue, &bytes)
+                .expect("jpeg submit");
             let layout = pending.layout();
             assert!(
                 matches!(
@@ -920,11 +997,15 @@ fn main() {
                 img_w,
                 cpu_patches.len(),
             );
-            let ready = pending.wait_decode(&ctx.dev, &ctx.queue, FENCE_TIMEOUT_NS).expect("wait_decode");
+            let ready = pending
+                .wait_decode(&ctx.dev, &ctx.queue, FENCE_TIMEOUT_NS)
+                .expect("wait_decode");
             let surf = ready.surface();
             let surf_va = surf.gpu_addr;
             let mut surf_bytes = vec![0u8; surf.size as usize];
-            ctx.dev.download(surf, &mut surf_bytes).expect("surface readback");
+            ctx.dev
+                .download(surf, &mut surf_bytes)
+                .expect("surface readback");
             let (plane_diff_n, plane_diff_max) = native_plane_diff(&surf_bytes, layout, &oracle);
             println!(
                 "[parity] {name}: native-plane diff_count={plane_diff_n} max_abs={plane_diff_max}"
@@ -936,22 +1017,38 @@ fn main() {
             // (b) Chained run: JPEG submit -> compute submit -> ONE terminal
             // wait. No fence query between the two submits. The surface VA is
             // stable: no realloc happens while Idle on identical bytes/format.
+            // Kernel surface bases are relative to the LUMA plane base, not
+            // the BO base: the decoder inserts canary guard regions before
+            // each plane (e.g. luma at +256). Chroma offsets go relative to
+            // luma so `surf + u_off` lands on the absolute chroma address.
+            debug_assert!(layout.plane_offsets[1] >= layout.plane_offsets[0]);
+            debug_assert!(layout.plane_offsets[2] >= layout.plane_offsets[0]);
+            let luma_base = surf_va + layout.plane_offsets[0] as u64;
             let (uv_pitch, u_off, v_off, step, shifts) = if is_444 {
                 surf_kernel_params(
                     true,
                     layout.pitch,
                     layout.pitch,
-                    layout.plane_offsets[1],
-                    layout.plane_offsets[2],
+                    layout.plane_offsets[1] - layout.plane_offsets[0],
+                    layout.plane_offsets[2] - layout.plane_offsets[0],
                 )
             } else {
-                surf_kernel_params(false, layout.pitch, layout.pitch, layout.plane_offsets[1], 0)
+                surf_kernel_params(
+                    false,
+                    layout.pitch,
+                    layout.pitch,
+                    layout.plane_offsets[1] - layout.plane_offsets[0],
+                    0,
+                )
             };
             let n_chw = 3 * img_h * img_w;
             let d_chw = ctx.dev.alloc_vram((n_chw * 4) as u64).expect("alloc chw");
-            let d_out = ctx.dev.alloc_vram((plan.n_elem * 4) as u64).expect("alloc out");
+            let d_out = ctx
+                .dev
+                .alloc_vram((plan.n_elem * 4) as u64)
+                .expect("alloc out");
             let rgb_args = RgbArgs {
-                surf: surf_va,
+                surf: luma_base,
                 y_pitch: layout.pitch,
                 uv_pitch,
                 u_off,
@@ -988,26 +1085,55 @@ fn main() {
                 plan.grid_patch,
                 [256, 1, 1],
             );
-            let ka_rgb_buf = ctx.dev.alloc_vram(ka_rgb.len() as u64).expect("alloc ka_rgb");
-            let ka_patch_buf = ctx.dev.alloc_vram(ka_patch.len() as u64).expect("alloc ka_patch");
+            let ka_rgb_buf = ctx
+                .dev
+                .alloc_vram(ka_rgb.len() as u64)
+                .expect("alloc ka_rgb");
+            let ka_patch_buf = ctx
+                .dev
+                .alloc_vram(ka_patch.len() as u64)
+                .expect("alloc ka_patch");
             ctx.dev.upload(&ka_rgb_buf, &ka_rgb).expect("upload ka_rgb");
-            ctx.dev.upload(&ka_patch_buf, &ka_patch).expect("upload ka_patch");
+            ctx.dev
+                .upload(&ka_patch_buf, &ka_patch)
+                .expect("upload ka_patch");
             let fence_buf = ctx.dev.alloc_vram(4096).expect("alloc fence");
-            ctx.dev.upload(&fence_buf, &vec![0u8; 4096]).expect("zero fence");
+            ctx.dev
+                .upload(&fence_buf, &vec![0u8; 4096])
+                .expect("zero fence");
             // ONE command buffer: rgb norm, intra-IB barrier, patch extract.
             let mut cb = CommandBuffer::new();
             cb.dispatch(k_rl_rgb, plan.grid_rgb, [16, 16, 1], ka_rgb_buf.gpu_addr);
             cb.barrier(fence_buf.gpu_addr, 1);
-            cb.dispatch(k_rl_patch, plan.grid_patch, [256, 1, 1], ka_patch_buf.gpu_addr);
-            let ib_buf = ctx.dev.alloc_vram(cb.as_bytes().len() as u64).expect("alloc ib");
+            cb.dispatch(
+                k_rl_patch,
+                plan.grid_patch,
+                [256, 1, 1],
+                ka_patch_buf.gpu_addr,
+            );
+            let ib_buf = ctx
+                .dev
+                .alloc_vram(cb.as_bytes().len() as u64)
+                .expect("alloc ib");
             ctx.dev.upload(&ib_buf, &cb.as_bytes()).expect("upload ib");
-            let bufs = RlBufs { d_chw, d_out, ka_rgb: ka_rgb_buf, ka_patch: ka_patch_buf, fence: fence_buf, ib: ib_buf };
+            let bufs = RlBufs {
+                d_chw,
+                d_out,
+                ka_rgb: ka_rgb_buf,
+                ka_patch: ka_patch_buf,
+                fence: fence_buf,
+                ib: ib_buf,
+            };
 
             eprintln!("[trace] {name}: jpeg submit (VCN_JPEG ring, no host wait)");
             let t_submit = Instant::now();
-            let pending = ctx.decoder.submit(&ctx.dev, &ctx.queue, &bytes).expect("jpeg submit");
+            let pending = ctx
+                .decoder
+                .submit(&ctx.dev, &ctx.queue, &bytes)
+                .expect("jpeg submit");
             assert_eq!(
-                pending.surface().gpu_addr, surf_va,
+                pending.surface().gpu_addr,
+                surf_va,
                 "surface VA moved between Idle submits"
             );
             let wait: &[SyncObj] = &[*pending.ready_syncobj()];
@@ -1016,7 +1142,9 @@ fn main() {
                 signal: None,
                 ib_flags: AMDGPU_IB_FLAG_EMIT_MEM_SYNC,
             };
-            eprintln!("[trace] {name}: compute submit_async SYNCOBJ_IN=ready_syncobj + EMIT_MEM_SYNC");
+            eprintln!(
+                "[trace] {name}: compute submit_async SYNCOBJ_IN=ready_syncobj + EMIT_MEM_SYNC"
+            );
             let bos: &[&GpuBuffer] = &[
                 &bufs.ib,
                 &bufs.ka_rgb,
@@ -1029,36 +1157,58 @@ fn main() {
             ];
             let fence = ctx
                 .queue
-                .submit_async(&ctx.dev, Engine::COMPUTE, &bufs.ib, cb.len_dwords(), bos, &sync)
+                .submit_async(
+                    &ctx.dev,
+                    Engine::COMPUTE,
+                    &bufs.ib,
+                    cb.len_dwords(),
+                    bos,
+                    &sync,
+                )
                 .expect("compute submit_async");
             let submit_ms = t_submit.elapsed().as_secs_f64() * 1e3;
             eprintln!("[trace] {name}: terminal wait_fence (sole wait before D2H)");
             let t_wait = Instant::now();
-            let done = ctx.queue.wait_fence(&ctx.dev, &fence, FENCE_TIMEOUT_NS).expect("wait_fence");
+            let done = ctx
+                .queue
+                .wait_fence(&ctx.dev, &fence, FENCE_TIMEOUT_NS)
+                .expect("wait_fence");
             assert!(done, "redline compute fence timeout on {name}");
             let wait_ms = t_wait.elapsed().as_secs_f64() * 1e3;
             let mut out_bytes = vec![0u8; plan.n_elem * 4];
-            ctx.dev.download(&bufs.d_out, &mut out_bytes).expect("d2h patches");
+            ctx.dev
+                .download(&bufs.d_out, &mut out_bytes)
+                .expect("d2h patches");
             // SAFETY: kernel wrote f32 elements; length checked by the plan.
-            let rl_patches: Vec<f32> =
-                unsafe { std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, plan.n_elem) }
-                    .to_vec();
+            let rl_patches: Vec<f32> = unsafe {
+                std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, plan.n_elem)
+            }
+            .to_vec();
             pending
                 .complete_after(&ctx.dev, &ctx.queue, &fence, FENCE_TIMEOUT_NS)
                 .expect("complete_after");
 
-            // Same-HSACO to_bits parity (inputs proven identical above).
+            // Same-HSACO to_bits parity (inputs proven byte-identical above).
             let mut bit_diff = 0usize;
             for (a, b) in rl_patches.iter().zip(got.iter()) {
                 if a.to_bits() != b.to_bits() {
                     bit_diff += 1;
                 }
             }
+            // to_bits equality is meaningful only when the VA side ran the
+            // same HSACO on VCN-decoded pixels. On the turbo CPU fallback
+            // (no VA kernel arm for the format) the inputs differ by decode
+            // path, so only the rel-L1 gate below applies.
+            let va_ran_kernels = path != "cpu-fallback";
             println!(
                 "[parity] {name}: redline-vs-VA to_bits differ={bit_diff}/{}",
                 rl_patches.len()
             );
-            assert_eq!(bit_diff, 0, "{name}: redline-vs-VA bit mismatch");
+            if va_ran_kernels {
+                assert_eq!(bit_diff, 0, "{name}: redline-vs-VA bit mismatch");
+            } else {
+                println!("[parity] {name}: VA took the CPU fallback; skipping to_bits gate");
+            }
 
             let r_rl = rel_l1(&cpu_patches, &rl_patches);
             worst_rl = worst_rl.max(r_rl);
@@ -1091,17 +1241,27 @@ fn main() {
             // Redline total-decode (submit + terminal wait_decode) and its
             // ring-only portion (wait_decode with everything resident).
             for _ in 0..warm {
-                let p = ctx.decoder.submit(&ctx.dev, &ctx.queue, &bytes).expect("warm jpeg");
-                let ready = p.wait_decode(&ctx.dev, &ctx.queue, FENCE_TIMEOUT_NS).expect("warm wait");
+                let p = ctx
+                    .decoder
+                    .submit(&ctx.dev, &ctx.queue, &bytes)
+                    .expect("warm jpeg");
+                let ready = p
+                    .wait_decode(&ctx.dev, &ctx.queue, FENCE_TIMEOUT_NS)
+                    .expect("warm wait");
                 drop(ready);
             }
             let (mut rl_total, mut rl_ring) = (Vec::with_capacity(reps), Vec::with_capacity(reps));
             for _ in 0..reps {
                 let t = Instant::now();
-                let p = ctx.decoder.submit(&ctx.dev, &ctx.queue, &bytes).expect("jpeg submit");
+                let p = ctx
+                    .decoder
+                    .submit(&ctx.dev, &ctx.queue, &bytes)
+                    .expect("jpeg submit");
                 let t_submit_side = t.elapsed().as_secs_f64() * 1e3;
                 let t2 = Instant::now();
-                let ready = p.wait_decode(&ctx.dev, &ctx.queue, FENCE_TIMEOUT_NS).expect("wait_decode");
+                let ready = p
+                    .wait_decode(&ctx.dev, &ctx.queue, FENCE_TIMEOUT_NS)
+                    .expect("wait_decode");
                 let t_ring = t2.elapsed().as_secs_f64() * 1e3;
                 drop(ready);
                 rl_total.push(t_submit_side + t_ring);
@@ -1131,6 +1291,26 @@ fn main() {
                 rl_chained.push(t.elapsed().as_secs_f64() * 1e3);
             }
             drop(rep_ctx);
+            // Repeated-frame stability: the last timed rep's output must be
+            // bit-identical to the correctness run (deterministic kernels +
+            // EMIT_MEM_SYNC visibility across 110 resubmits).
+            let mut rb = vec![0u8; plan.n_elem * 4];
+            ctx.dev.download(&bufs.d_out, &mut rb).expect("d2h repeat");
+            // SAFETY: kernel wrote f32 elements; length checked by the plan.
+            let repeat: Vec<f32> =
+                unsafe { std::slice::from_raw_parts(rb.as_ptr() as *const f32, plan.n_elem) }
+                    .to_vec();
+            let mut repeat_diff = 0usize;
+            for (a, b) in repeat.iter().zip(rl_patches.iter()) {
+                if a.to_bits() != b.to_bits() {
+                    repeat_diff += 1;
+                }
+            }
+            println!(
+                "[parity] {name}: repeated-frame to_bits differ={repeat_diff}/{}",
+                repeat.len()
+            );
+            assert_eq!(repeat_diff, 0, "{name}: repeated-frame instability");
             let (l_min, l_p50, l_p95) = stats(libva.clone());
             let (t_min, t_p50, t_p95) = stats(rl_total.clone());
             let (g_min, g_p50, g_p95) = stats(rl_ring.clone());
@@ -1152,7 +1332,14 @@ fn main() {
                 diff_max: plane_diff_max,
             });
 
-            let RlBufs { d_chw, d_out, ka_rgb, ka_patch, fence, ib } = bufs;
+            let RlBufs {
+                d_chw,
+                d_out,
+                ka_rgb,
+                ka_patch,
+                fence,
+                ib,
+            } = bufs;
             for b in [d_chw, d_out, ka_rgb, ka_patch, fence, ib] {
                 ctx.dev.free_buffer(b).expect("free rl buf");
             }
@@ -1199,10 +1386,18 @@ fn main() {
     }
     // ——— redline teardown: explicit-destroy ownership, exactly once ———
     if let Some(ctx) = rl {
-        let Redline { dev, queue, decoder, module } = ctx;
+        let Redline {
+            dev,
+            queue,
+            decoder,
+            module,
+        } = ctx;
         decoder.destroy(&dev);
         queue.destroy(&dev);
-        let LoadedModule { kernels: _, code_buf } = module;
+        let LoadedModule {
+            kernels: _,
+            code_buf,
+        } = module;
         dev.free_buffer(code_buf).expect("free code");
     }
 }
