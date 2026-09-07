@@ -377,10 +377,12 @@ impl VaSession {
     /// and the device mapping. All VA objects are destroyed before return;
     /// only the [`HipMapping`] (plus plain geometry) escapes.
     ///
-    /// NOTE (experiment/vcn-jpeg finding): on radeonsi/gfx1201 the exported
-    /// BO carries a `GFX12_64K_2D + DCC` modifier, so the mapping is NOT
-    /// linear-readable by a compute kernel. Use [`decode_jpeg_derived`]
-    /// for validated pixels.
+    /// The default surface allocation is tiled (+DCC on gfx12), which a
+    /// compute kernel cannot read linearly. With `HIPFIRE_VCN_LINEAR=1` the
+    /// surface is requested with `DRM_FORMAT_MOD_LINEAR` and the mapping is
+    /// directly kernel-readable; verified 0.000 LSB against
+    /// [`decode_jpeg_derived`] on gfx1010/1030/1100/1151/1201 (2026-09-07).
+    /// A product path should make linear the only allocation mode.
     pub fn decode_jpeg(&self, jpeg: &[u8]) -> Result<VcnFrame, VaError> {
         let lib = &self.lib;
         let fail = |op: &'static str, code: i32| VaError::Status {
