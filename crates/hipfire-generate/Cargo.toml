@@ -52,3 +52,7 @@ tracing = "0.1"
 
 [features]
 serve-fault-inject = ["hipfire-runtime/serve-fault-inject"]
+# VCN JPEG decode for VL images (`image.decode = vcn|auto`): pooled libva
+# decode straight to device patches, skipping CPU decode and upload.
+# Default off; the CPU path below is unchanged when disabled.
+vcn-jpeg = ["hipfire-arch-qwen35-vl/vcn-jpeg"]
