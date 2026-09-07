@@ -11,3 +11,9 @@ hipfire-config = { path = "../hipfire-config" }
 
 [features]
 default = []
+# Throwaway probes stay out of the default build (leanup ungated_examples).
+lab = []
+
+[[example]]
+name = "parse_fixtures"
+required-features = ["lab"]

@@ -20,7 +20,6 @@
  0 hipfire-config
  0 hipfire-detect
  0 radiowave
- 0 redline
  1 hip-bridge
  1 hipfire-client
  1 hipfire-registry
@@ -28,6 +27,7 @@
  1 redline-rocr
  1 va-bridge
  2 hipfire-tui
+ 2 redline
  2 redline-dispatch
  3 rdna-compute
  4 hipfire-dispatch

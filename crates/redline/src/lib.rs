@@ -37,13 +37,15 @@
 //! | hipDeviceSynchronize      | Sync::drain()                 | WAIT_CS (all)         |
 //! | hipMemGetInfo             | Device::vram_info()           | DRM_AMDGPU_INFO       |
 
-pub mod drm;
 pub mod device;
 pub mod dispatch;
+pub mod drm;
 pub mod hsaco;
 pub mod kfd;
 pub mod pm4;
 pub mod queue;
+#[cfg(feature = "vcn-jpeg")]
+pub mod vcn_jpeg;
 
 /// Redline error type.
 #[derive(Debug)]
