@@ -1,7 +1,8 @@
 use redline::device::Device;
 use redline::dispatch::{DispatchQueue, KernargBuilder, Kernel};
 fn main() {
-    let dev = Device::open(None).unwrap(); let dq = DispatchQueue::new(&dev).unwrap();
+    let node = std::env::args().nth(2);
+    let dev = Device::open(node.as_deref()).unwrap(); let dq = DispatchQueue::new(&dev).unwrap();
     eprintln!("family_id={} gfx_arch={:?} gran={}", dev.info.family_id, dev.info.gfx_arch, redline::dispatch::lds_granularity(&dev.info.gfx_arch));
     let m = dev.load_module_file(&std::env::args().nth(1).unwrap()).unwrap();
     for (name, n) in [("lds1024", 256usize), ("lds4096", 1024usize)] {
