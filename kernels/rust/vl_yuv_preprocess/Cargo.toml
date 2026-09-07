@@ -1,0 +1,8 @@
+[package]
+name = "vl_yuv_preprocess"
+version = "0.0.0"
+edition = "2021"
+
+
+[lib]
+crate-type = ["cdylib"]

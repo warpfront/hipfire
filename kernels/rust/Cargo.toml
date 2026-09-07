@@ -1,12 +1,6 @@
-[package]
-name = "vl_yuv_preprocess"
-version = "0.0.0"
-edition = "2021"
-
 [workspace]
-
-[lib]
-crate-type = ["cdylib"]
+members = ["vl_yuv_preprocess", "gemv_mq4g256v2"]
+resolver = "2"
 
 [profile.release]
 panic = "abort"
