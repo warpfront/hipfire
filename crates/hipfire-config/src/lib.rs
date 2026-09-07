@@ -483,6 +483,8 @@ const KV_MODES: &[&str] = &[
     "turbo4", "turbo3", "turbo2",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
+/// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
+const IMAGE_DECODE_MODES: &[&str] = &["cpu", "vcn", "auto"];
 // `off` disables thinking outright. It resolves to a cap of 1, the engine's
 // established "no thinking" sentinel (the daemon reads
 // `enable_thinking: max_think_tokens != 1`) and the same value the OpenAI
@@ -1115,6 +1117,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_VISION_MODE"),
         "Vision-tower sidecar policy."
+    ),
+    field!(
+        "image.decode",
+        "image_decode",
+        Vision,
+        ModelLoad,
+        DefaultValue::String("cpu"),
+        ValueRule::Enum(IMAGE_DECODE_MODES),
+        true,
+        false,
+        Some("HIPFIRE_IMAGE_DECODE"),
+        "VL image JPEG decode path: cpu (default), vcn, or auto (VCN when probed, else cpu)."
     ),
     field!(
         "speculation.dflash_ngram_block",
@@ -4841,12 +4855,12 @@ mod tests {
         assert!(field.parse_cli("7").is_err());
     }
     #[test]
-    fn vision_mode_defaults_off_with_auto_on_off_values() {
-        let field = field("vision.mode").expect("vision.mode schema field");
-        assert_eq!(field.legacy_key, "vision_mode");
-        assert_eq!(field.env_compat, Some("HIPFIRE_VISION_MODE"));
-        assert_eq!(field.default.to_value(), ConfigValue::String("off".into()));
-        for mode in ["off", "auto", "on"] {
+    fn image_decode_defaults_cpu_with_cpu_vcn_auto_values() {
+        let field = field("image.decode").expect("image.decode schema field");
+        assert_eq!(field.legacy_key, "image_decode");
+        assert_eq!(field.env_compat, Some("HIPFIRE_IMAGE_DECODE"));
+        assert_eq!(field.default.to_value(), ConfigValue::String("cpu".into()));
+        for mode in ["cpu", "vcn", "auto"] {
             assert_eq!(
                 field.parse_cli(mode).unwrap(),
                 ConfigValue::String(mode.into())
@@ -4854,6 +4868,7 @@ mod tests {
         }
         assert!(field.parse_cli("sometimes").is_err());
     }
+
 
     #[test]
     fn million_context_and_parent_output_limits_validate_without_coupling_effort() {

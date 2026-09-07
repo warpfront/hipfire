@@ -1320,6 +1320,7 @@ dependencies = [
  "image",
  "rdna-compute",
  "serde_json",
+ "va-bridge",
 ]
 
 [[package]]

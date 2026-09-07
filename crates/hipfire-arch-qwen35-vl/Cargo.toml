@@ -13,12 +13,17 @@ description = "Qwen3.5-VL (vision-language) architecture for hipfire"
 # (vision is a no-op stub when deltanet is off).
 default = ["deltanet"]
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+# VCN JPEG decode path (`image.decode = vcn|auto`): pooled libva decode +
+# `vl_yuv_preprocess` kernels straight to device patches. Default off; the
+# CPU decode path is unchanged when disabled.
+vcn-jpeg = ["dep:va-bridge"]
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+va-bridge = { path = "../va-bridge", optional = true }
 serde_json.workspace = true
 # image preprocessing (PNG/JPEG decode + resize) for the vision encoder
 # input pipeline lives in this crate (`crate::image`). Same default-feature
