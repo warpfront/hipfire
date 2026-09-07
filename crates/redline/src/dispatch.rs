@@ -29,7 +29,7 @@ pub struct Kernel {
     /// Total user SGPRs (private seg buf + dispatch ptr + kernarg ptr + ...)
     user_sgpr_count: u32,
     /// Index within user SGPRs where kernarg pointer goes (None if no kernarg)
-    kernarg_sgpr_idx: Option<u32>,
+    pub kernarg_sgpr_idx: Option<u32>,
 }
 
 /// A command buffer that accumulates PM4 dispatch packets.
@@ -136,6 +136,23 @@ impl Kernel {
 impl CommandBuffer {
     pub fn new() -> Self {
         Self { dwords: Vec::with_capacity(512) }
+    }
+
+    /// Append raw PM4 dwords. For experiments with packets this crate has
+    /// no typed helper for yet; the caller owns the encoding.
+    pub fn push_raw(&mut self, dwords: &[u32]) {
+        self.dwords.extend_from_slice(dwords);
+    }
+
+    /// Emit every SET_SH_REG a dispatch of `k` needs (PGM, RSRC1-3, NUM_THREAD,
+    /// USER_DATA...) without the DISPATCH packet itself, so a caller can
+    /// follow with DISPATCH_DIRECT / DISPATCH_INDIRECT / a COND_EXEC-guarded
+    /// block of its own. Same register stream as [`Self::dispatch_lds`].
+    pub fn set_kernel_state(&mut self, k: &Kernel, block: [u32; 3], kernarg_va: u64, lds_bytes: u32, granularity: u32) {
+        let n = self.dwords.len();
+        self.dispatch_with_lds(k, [1, 1, 1], block, kernarg_va, lds_bytes, granularity);
+        self.dwords.truncate(self.dwords.len() - 5); // drop the DISPATCH_DIRECT packet
+        debug_assert!(self.dwords.len() > n);
     }
 
     /// Append a single dispatch to this command buffer.

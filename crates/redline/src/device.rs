@@ -119,7 +119,15 @@ impl Device {
             148 => "gfx1103",             // GC 11.0.1 (Phoenix APU, RDNA3)
             149 | 151 => "gfx1036",       // GC 10.3.6 / 10.3.7 (RDNA2 APUs)
             150 | 154 => "gfx1150",       // GC 11.5.0 / 11.5.4 (Strix, Strix Halo — RDNA3.5)
-            152 => "gfx1200",             // GC 12.0.0 (RDNA4: gfx1200 / gfx1201)
+            152 => {
+                // GC 12.0.x (RDNA4). Navi 48 (R9700 / RX 9070) = 0x7550-0x755F
+                // is gfx1201; Navi 44 (RX 9060) = 0x7590-0x759F is gfx1200.
+                match gpu_info.asic_id & 0xFFF0 {
+                    0x7550 => "gfx1201",
+                    0x7590 => "gfx1200",
+                    _ => "gfx1201",
+                }
+            }
             _ => "unknown",
         };
 
