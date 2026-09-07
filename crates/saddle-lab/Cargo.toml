@@ -24,6 +24,8 @@ serve-fault-inject = []
 # VCN JPEG experiment (experiment/vcn-jpeg): default-off, pulls the VA-API
 # bridge + turbo oracle only when requested.
 vcn-jpeg = ["dep:va-bridge", "dep:libjpeg-turbo-rs", "dep:image"]
+# VCN video experiment (experiment/vcn-video): default-off, VA-API bridge only.
+vcn-video = ["dep:va-bridge"]
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
@@ -269,6 +271,10 @@ required-features = ["vcn-jpeg"]
 [[example]]
 name = "vl_vcn_444check"
 required-features = ["vcn-jpeg"]
+
+[[example]]
+name = "vl_vcn_video_parity"
+required-features = ["vcn-video"]
 
 [package.metadata.cargo-machete]
 # byteorder: deliberately kept (workspace from_le_bytes convention); never referenced by path in code.

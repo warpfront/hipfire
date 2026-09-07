@@ -79,31 +79,58 @@ macro_rules! sym {
 }
 
 fn main() {
-    let node = std::env::var("HIPFIRE_VCN_DRM_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
+    let node =
+        std::env::var("HIPFIRE_VCN_DRM_NODE").unwrap_or_else(|_| "/dev/dri/renderD128".into());
     let va: Library = unsafe { Library::new("libva.so.2").expect("libva.so.2") };
     let va_drm: Library = unsafe { Library::new("libva-drm.so.2").expect("libva-drm.so.2") };
     unsafe {
-        let get_dpy: extern "C" fn(i32) -> VaDisplay = sym!(va_drm, b"vaGetDisplayDRM", extern "C" fn(i32) -> VaDisplay);
-        let init: extern "C" fn(VaDisplay, *mut i32, *mut i32) -> i32 =
-            sym!(va, b"vaInitialize", extern "C" fn(VaDisplay, *mut i32, *mut i32) -> i32);
-        let vendor: extern "C" fn(VaDisplay) -> *const i8 =
-            sym!(va, b"vaQueryVendorString", extern "C" fn(VaDisplay) -> *const i8);
-        let maxp: extern "C" fn(VaDisplay) -> i32 = sym!(va, b"vaMaxNumProfiles", extern "C" fn(VaDisplay) -> i32);
-        let qprof: extern "C" fn(VaDisplay, *mut i32, *mut i32) -> i32 =
-            sym!(va, b"vaQueryConfigProfiles", extern "C" fn(VaDisplay, *mut i32, *mut i32) -> i32);
-        let qentry: extern "C" fn(VaDisplay, i32, *mut i32, *mut i32) -> i32 =
-            sym!(va, b"vaQueryConfigEntrypoints", extern "C" fn(VaDisplay, i32, *mut i32, *mut i32) -> i32);
-        let mkcfg: extern "C" fn(VaDisplay, i32, i32, *mut c_void, i32, *mut u32) -> i32 =
-            sym!(va, b"vaCreateConfig", extern "C" fn(VaDisplay, i32, i32, *mut c_void, i32, *mut u32) -> i32);
-        let errstr: extern "C" fn(i32) -> *const i8 = sym!(va, b"vaErrorStr", extern "C" fn(i32) -> *const i8);
+        let get_dpy: extern "C" fn(i32) -> VaDisplay =
+            sym!(va_drm, b"vaGetDisplayDRM", extern "C" fn(i32) -> VaDisplay);
+        let init: extern "C" fn(VaDisplay, *mut i32, *mut i32) -> i32 = sym!(
+            va,
+            b"vaInitialize",
+            extern "C" fn(VaDisplay, *mut i32, *mut i32) -> i32
+        );
+        let vendor: extern "C" fn(VaDisplay) -> *const i8 = sym!(
+            va,
+            b"vaQueryVendorString",
+            extern "C" fn(VaDisplay) -> *const i8
+        );
+        let maxp: extern "C" fn(VaDisplay) -> i32 =
+            sym!(va, b"vaMaxNumProfiles", extern "C" fn(VaDisplay) -> i32);
+        let qprof: extern "C" fn(VaDisplay, *mut i32, *mut i32) -> i32 = sym!(
+            va,
+            b"vaQueryConfigProfiles",
+            extern "C" fn(VaDisplay, *mut i32, *mut i32) -> i32
+        );
+        let qentry: extern "C" fn(VaDisplay, i32, *mut i32, *mut i32) -> i32 = sym!(
+            va,
+            b"vaQueryConfigEntrypoints",
+            extern "C" fn(VaDisplay, i32, *mut i32, *mut i32) -> i32
+        );
+        let mkcfg: extern "C" fn(VaDisplay, i32, i32, *mut c_void, i32, *mut u32) -> i32 = sym!(
+            va,
+            b"vaCreateConfig",
+            extern "C" fn(VaDisplay, i32, i32, *mut c_void, i32, *mut u32) -> i32
+        );
+        let errstr: extern "C" fn(i32) -> *const i8 =
+            sym!(va, b"vaErrorStr", extern "C" fn(i32) -> *const i8);
         let es = |c: i32| CStr::from_ptr(errstr(c)).to_string_lossy().into_owned();
 
-        let fd: std::os::fd::OwnedFd = std::fs::OpenOptions::new().read(true).write(true).open(&node).expect("open render node").into();
+        let fd: std::os::fd::OwnedFd = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&node)
+            .expect("open render node")
+            .into();
         let dpy = get_dpy(std::os::fd::AsRawFd::as_raw_fd(&fd));
         assert!(!dpy.is_null());
         let (mut mj, mut mn) = (0, 0);
         assert_eq!(init(dpy, &mut mj, &mut mn), 0);
-        println!("node={node} vendor={} va={mj}.{mn}", CStr::from_ptr(vendor(dpy)).to_string_lossy());
+        println!(
+            "node={node} vendor={} va={mj}.{mn}",
+            CStr::from_ptr(vendor(dpy)).to_string_lossy()
+        );
         let n = maxp(dpy).max(1).min(64) as usize;
         let mut profs = vec![0i32; n];
         let mut m = n as i32;
@@ -114,7 +141,11 @@ fn main() {
             let mut k = 16i32;
             let st = qentry(dpy, *p, es_.as_mut_ptr(), &mut k);
             let eps = if st == 0 {
-                es_[..k.max(0) as usize].iter().map(|e| format!("{e}={}", entrypoint_name(*e))).collect::<Vec<_>>().join(",")
+                es_[..k.max(0) as usize]
+                    .iter()
+                    .map(|e| format!("{e}={}", entrypoint_name(*e)))
+                    .collect::<Vec<_>>()
+                    .join(",")
             } else {
                 format!("query-failed: {}", es(st))
             };
@@ -122,11 +153,22 @@ fn main() {
         }
         for target in [7i32, 17, 32] {
             let mut cfg = 0u32;
-            let st = mkcfg(dpy, target, 1 /* VLD */, std::ptr::null_mut(), 0, &mut cfg);
+            let st = mkcfg(
+                dpy,
+                target,
+                1, /* VLD */
+                std::ptr::null_mut(),
+                0,
+                &mut cfg,
+            );
             println!(
                 "vaCreateConfig({target}={}/VLD): {}",
                 profile_name(target),
-                if st == 0 { format!("OK config={cfg}") } else { format!("FAIL {}", es(st)) }
+                if st == 0 {
+                    format!("OK config={cfg}")
+                } else {
+                    format!("FAIL {}", es(st))
+                }
             );
         }
     }

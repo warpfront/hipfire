@@ -16,14 +16,15 @@
 //! the `vl_yuv_preprocess` kernel consumes.
 
 mod ffi;
+mod h264;
 mod interop;
 mod jpeg;
-
 pub use ffi::{
     VaBufferId, VaConfigId, VaContextId, VaDisplay, VaDrmPrimeDescriptor, VaDrmPrimeLayer,
     VaDrmPrimeObject, VaError, VaJpegHuffmanBuffer, VaJpegIQMatrix, VaJpegPicParam,
     VaJpegSliceParam, VaLib, VaSurfaceId, VA_EXPORT_SURFACE_READ_ONLY,
-    VA_EXPORT_SURFACE_SEPARATE_LAYERS, VA_FOURCC_NV12, VA_MEM_TYPE_DRM_PRIME_2, VA_STATUS_SUCCESS,
+    VA_EXPORT_SURFACE_SEPARATE_LAYERS, VA_FOURCC_NV12, VA_MEM_TYPE_DRM_PRIME_2,
+    VA_PROFILE_AV1_PROFILE0, VA_PROFILE_H264_HIGH, VA_PROFILE_HEVC_MAIN, VA_STATUS_SUCCESS,
 };
 pub use interop::HipMapping;
 pub use jpeg::{parse_for_va, JpegVaParams};
@@ -93,8 +94,15 @@ struct Submitted<'a> {
 }
 
 impl VaSession {
-    /// Open the first working render node, initialise VA, create the JPEG
+    /// Open the first working render node, initialise VA, create a JPEG
+    /// baseline VLD config.
     pub fn open() -> Result<Self, VaError> {
+        Self::open_profile(VA_PROFILE_JPEG_BASELINE)
+    }
+
+    /// Open the first working render node with a VLD config for `profile`
+    /// (see `ffi::VA_PROFILE_*`; video lane uses H.264 High = 7).
+    pub(crate) fn open_profile(profile: i32) -> Result<Self, VaError> {
         let mut lib = Some(VaLib::load()?);
         let mut last_err = VaError::NoRenderNode;
         for node in render_nodes() {
@@ -102,7 +110,7 @@ impl VaSession {
                 Some(l) => l,
                 None => break,
             };
-            match Self::open_node(l, &node) {
+            match Self::open_node(l, &node, profile) {
                 Ok(s) => return Ok(s),
                 Err((l, e)) => {
                     lib = Some(l);
@@ -113,7 +121,7 @@ impl VaSession {
         Err(last_err)
     }
 
-    fn open_node(lib: VaLib, node: &str) -> Result<Self, (VaLib, VaError)> {
+    fn open_node(lib: VaLib, node: &str, profile: i32) -> Result<Self, (VaLib, VaError)> {
         // O_RDWR: radeonsi winsys creation (GEM backing) fails on O_RDONLY
         // with EACCES (`amdgpu_bo_cpu_map failed (-13)`), which surfaces as
         // vaInitialize succeeding but context creation segfaulting.
@@ -151,7 +159,7 @@ impl VaSession {
                 std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
             }
         };
-        // JPEG baseline advertised?
+        // Requested profile advertised?
         let max = unsafe { (lib.va_max_profiles)(dpy) }.max(0) as usize;
         let mut profiles = vec![0i32; max.min(64).max(1)];
         let mut n = profiles.len() as i32;
@@ -167,20 +175,20 @@ impl VaSession {
             };
             return Err((lib, e));
         }
-        if !profiles[..n.max(0) as usize].contains(&VA_PROFILE_JPEG_BASELINE) {
+        if !profiles[..n.max(0) as usize].contains(&profile) {
             unsafe {
                 (lib.va_terminate)(dpy);
             }
             return Err((
                 lib,
-                VaError::Unsupported("driver has no VAProfileJPEGBaseline"),
+                VaError::Unsupported("driver lacks the requested VA profile"),
             ));
         }
         let mut config = 0;
         let st = unsafe {
             (lib.va_create_config)(
                 dpy,
-                VA_PROFILE_JPEG_BASELINE,
+                profile,
                 VA_ENTRYPOINT_VLD,
                 std::ptr::null_mut(),
                 0,
@@ -192,7 +200,7 @@ impl VaSession {
                 (lib.va_terminate)(dpy);
             }
             let e = VaError::Status {
-                op: "vaCreateConfig(JPEG,VLD)",
+                op: "vaCreateConfig(VLD)",
                 code: st,
                 msg: lib.error_str(st),
             };
@@ -542,7 +550,11 @@ impl VaSession {
                 }
             }
         }
-        let _img_guard = ImgGuard { lib, dpy: self.dpy, id: img.image_id };
+        let _img_guard = ImgGuard {
+            lib,
+            dpy: self.dpy,
+            id: img.image_id,
+        };
         let mut ptr: *mut c_void = std::ptr::null_mut();
         // SAFETY: out-param is a valid pointer slot; unmapped below.
         st = unsafe { (lib.va_map_buffer)(self.dpy, img.buf, &mut ptr) };
@@ -572,8 +584,12 @@ impl VaSession {
         unsafe {
             let base = ptr as *const u8;
             for i in 0..np {
-                let (rw, nr, pitch, off) =
-                    (row_w(i), rows(i), img.pitches[i] as usize, img.offsets[i] as usize);
+                let (rw, nr, pitch, off) = (
+                    row_w(i),
+                    rows(i),
+                    img.pitches[i] as usize,
+                    img.offsets[i] as usize,
+                );
                 let mut out = vec![0u8; rw * nr];
                 for r in 0..nr {
                     let src = std::slice::from_raw_parts(base.add(off + r * pitch), rw);
@@ -583,7 +599,12 @@ impl VaSession {
             }
             (lib.va_unmap_buffer)(self.dpy, img.buf);
         }
-        Ok(DerivedPlanes { width, height, fourcc: img.format.fourcc, planes })
+        Ok(DerivedPlanes {
+            width,
+            height,
+            fourcc: img.format.fourcc,
+            planes,
+        })
     }
 
     pub fn decode_jpeg_derived(&self, jpeg: &[u8]) -> Result<DerivedFrame, VaError> {
@@ -709,7 +730,7 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
     fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
 }
-fn libc_close(fd: i32) {
+pub(crate) fn libc_close(fd: i32) {
     // SAFETY: close(2) on an owned fd; return value intentionally ignored.
     unsafe {
         close(fd);
