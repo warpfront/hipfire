@@ -2278,7 +2278,7 @@ impl Gpu {
         if self.arch_caps.is_gfx1100() && self.flags.rdna3_rmsnorm_wavegrid && k == 2048 {
             return self.fused_rmsnorm_rotate_mq_wavegrid_gfx1100(x, weight, x_rot, k, eps);
         }
-        if self.arch_caps.is_gfx1201()
+        if (self.arch_caps.is_gfx1201() || self.arch_caps.is_gfx1100())
             && hipfire_config::developer_var("HIPFIRE_RMSNORM_MQ_WG").as_deref() == Ok("1")
             && k % 256 == 0
         {
