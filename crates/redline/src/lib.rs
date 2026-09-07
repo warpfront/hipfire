@@ -44,6 +44,8 @@ pub mod hsaco;
 pub mod kfd;
 pub mod pm4;
 pub mod queue;
+#[cfg(feature = "vcn-jpeg")]
+pub mod vcn_jpeg;
 
 /// Redline error type.
 #[derive(Debug)]

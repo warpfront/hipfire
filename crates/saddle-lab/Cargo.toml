@@ -23,7 +23,7 @@ ep-fault-inject = []
 serve-fault-inject = []
 # VCN JPEG experiment (experiment/vcn-jpeg): default-off, pulls the VA-API
 # bridge + turbo oracle only when requested.
-vcn-jpeg = ["dep:va-bridge", "dep:libjpeg-turbo-rs", "dep:image"]
+vcn-jpeg = ["dep:va-bridge", "dep:libjpeg-turbo-rs", "dep:image", "dep:redline", "redline/vcn-jpeg"]
 
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
@@ -39,6 +39,7 @@ hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
 hipfire-detect = { path = "../hipfire-detect" }
 va-bridge = { path = "../va-bridge", optional = true }
+redline = { path = "../redline", optional = true }
 libjpeg-turbo-rs = { version = "0.8", optional = true }
 image = { workspace = true, optional = true }
 byteorder = "1"

@@ -8,10 +8,15 @@ description = "Direct-KMD GPU compute — bypass HIP, talk to amdgpu driver"
 [features]
 # Archived research probes; see the note by the [[example]] blocks.
 lab = []
+# VCN JPEG direct-ring experiment (experiment/vcn-ring): default-off.
+# Sibling slice JpegPacketAndState implements `src/vcn_jpeg.rs` against this
+# feature; it reuses `va_bridge::parse_for_va` for the JPEG stream.
+vcn-jpeg = ["dep:va-bridge"]
 
 [dependencies]
 libc = "0.2"
 libloading.workspace = true
+va-bridge = { path = "../va-bridge", optional = true }
 
 # ---------------------------------------------------------------------------
 # Archived research probes.
