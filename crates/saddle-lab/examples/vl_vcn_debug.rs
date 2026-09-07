@@ -134,9 +134,10 @@ fn sample_plane(img: &[u8], stride: usize, w: usize, h: usize, fx: f32, fy: f32)
 }
 
 fn main() {
-    let fixture = std::env::args().nth(1).unwrap_or("general_qa.jpg".to_string());
-    let img_dir =
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/vision/images");
+    let fixture = std::env::args()
+        .nth(1)
+        .unwrap_or("general_qa.jpg".to_string());
+    let img_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/vision/images");
     let path: PathBuf = if fixture.contains('/') {
         PathBuf::from(&fixture)
     } else {
@@ -156,7 +157,11 @@ fn main() {
         let rgb = &turbo.data;
         let resized = image::load_from_memory(&bytes)
             .expect("image decode")
-            .resize_exact(img_w as u32, img_h as u32, image::imageops::FilterType::CatmullRom)
+            .resize_exact(
+                img_w as u32,
+                img_h as u32,
+                image::imageops::FilterType::CatmullRom,
+            )
             .to_rgb8();
         let mut host = vec![0u8; 3 * img_w * img_h];
         for c in 0..3 {
@@ -189,8 +194,8 @@ fn main() {
     hip.set_device(0).expect("set_device(0)");
     let arch = hip.get_arch(0).unwrap_or_else(|_| "gfx1201".to_string());
     let stream = hip.stream_create().expect("stream_create");
-    let ksrc = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../kernels/src/vl_yuv_preprocess.hip");
+    let ksrc =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernels/src/vl_yuv_preprocess.hip");
     let tmp = std::env::temp_dir().join("vcn_debug");
     std::fs::create_dir_all(&tmp).unwrap();
     let hsaco = tmp.join("vl_yuv_preprocess.hsaco");
@@ -249,8 +254,7 @@ fn main() {
         hip.stream_synchronize(&stream).expect("sync");
         let mut raw = vec![0u8; n_elem * 4];
         hip.memcpy_dtoh(&mut raw, &d_out).expect("dtoh");
-        let gpu: &[f32] =
-            unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_elem) };
+        let gpu: &[f32] = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_elem) };
         let (mut maxd, mut first) = (0.0f32, usize::MAX);
         for (i, (a, b)) in cpu_patches.iter().zip(gpu.iter()).enumerate() {
             let d = (a - b).abs();
@@ -263,7 +267,11 @@ fn main() {
             "[stage] E patch-kernel vs cpu: rel-L1={:.3e} max_abs={:.3e} first_mismatch={} (n={})",
             rel_l1(&cpu_patches, gpu),
             maxd,
-            if maxd > 0.0 { first.to_string() } else { "-".to_string() },
+            if maxd > 0.0 {
+                first.to_string()
+            } else {
+                "-".to_string()
+            },
             n_elem
         );
         hip.free(d_chw).unwrap();
@@ -293,7 +301,10 @@ fn main() {
     let y8: Vec<u8> = turbo
         .data
         .chunks_exact(3)
-        .map(|p| (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32).clamp(0.0, 255.0) as u8)
+        .map(|p| {
+            (0.299 * p[0] as f32 + 0.587 * p[1] as f32 + 0.114 * p[2] as f32).clamp(0.0, 255.0)
+                as u8
+        })
         .collect();
     plane_stats("A turbo-luma", &y8);
     image::GrayImage::from_raw(sw as u32, sh as u32, y_plane.clone())
@@ -412,8 +423,15 @@ fn main() {
             (&mut chw_a as *mut u64).cast(),
         ];
         unsafe {
-            hip.launch_kernel(&k_rgb, [(W as u32 + 15) / 16, (H as u32 + 15) / 16, 1], [16, 16, 1], 0, Some(&stream), &mut args)
-                .expect("launch rgb");
+            hip.launch_kernel(
+                &k_rgb,
+                [(W as u32 + 15) / 16, (H as u32 + 15) / 16, 1],
+                [16, 16, 1],
+                0,
+                Some(&stream),
+                &mut args,
+            )
+            .expect("launch rgb");
         }
         hip.stream_synchronize(&stream).expect("sync");
         let mut raw = vec![0u8; 3 * W * H * 4];
@@ -425,7 +443,10 @@ fn main() {
         for r in 2..H - 2 {
             let y = 16.0 + 224.0 * r as f32 / (H - 1) as f32;
             let rr = (y + 1.402 * (150.0 - 128.0)).clamp(0.0, 255.0) / 127.5 - 1.0;
-            let gg = (y - 0.344136 * (100.0 - 128.0) - 0.714136 * (150.0 - 128.0)).clamp(0.0, 255.0) / 127.5 - 1.0;
+            let gg = (y - 0.344136 * (100.0 - 128.0) - 0.714136 * (150.0 - 128.0))
+                .clamp(0.0, 255.0)
+                / 127.5
+                - 1.0;
             let bb = (y + 1.772 * (100.0 - 128.0)).clamp(0.0, 255.0) / 127.5 - 1.0;
             for c in 2..W - 2 {
                 let i = r * W + c;
@@ -479,10 +500,12 @@ fn main() {
                 let (mut cb, mut cr) = (0.0f32, 0.0f32);
                 for (dy, dx) in [(0, 0), (0, 1), (1, 0), (1, 1)] {
                     let i = (2 * r + dy) * sw + (2 * c + dx);
-                    cb += -0.168736 * turbo.data[3 * i] as f32 - 0.331264 * turbo.data[3 * i + 1] as f32
+                    cb += -0.168736 * turbo.data[3 * i] as f32
+                        - 0.331264 * turbo.data[3 * i + 1] as f32
                         + 0.5 * turbo.data[3 * i + 2] as f32
                         + 128.0;
-                    cr += 0.5 * turbo.data[3 * i] as f32 - 0.418688 * turbo.data[3 * i + 1] as f32
+                    cr += 0.5 * turbo.data[3 * i] as f32
+                        - 0.418688 * turbo.data[3 * i + 1] as f32
                         - 0.081312 * turbo.data[3 * i + 2] as f32
                         + 128.0;
                 }
@@ -501,5 +524,3 @@ fn main() {
     drop(frame);
     println!("[debug] done");
 }
-
-

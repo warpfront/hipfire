@@ -372,8 +372,7 @@ pub struct VcnDecoded {
 }
 
 #[cfg(feature = "vcn-jpeg")]
-const VL_YUV_PREPROCESS_SRC: &str =
-    include_str!("../../../kernels/src/vl_yuv_preprocess.hip");
+const VL_YUV_PREPROCESS_SRC: &str = include_str!("../../../kernels/src/vl_yuv_preprocess.hip");
 #[cfg(feature = "vcn-jpeg")]
 const VL_RGB_KERNEL: &str = "vl_nv12_to_rgb_norm";
 #[cfg(feature = "vcn-jpeg")]
@@ -391,11 +390,7 @@ static VCN_UNAVAILABLE_LOGGED: std::sync::Once = std::sync::Once::new();
 /// the preprocess kernels have no arm for). A `None` here is never an
 /// error — the CPU path is always correct.
 #[cfg(feature = "vcn-jpeg")]
-pub fn vcn_decode(
-    data: &[u8],
-    patch_size: usize,
-    spatial_merge_size: usize,
-) -> Option<VcnDecoded> {
+pub fn vcn_decode(data: &[u8], patch_size: usize, spatial_merge_size: usize) -> Option<VcnDecoded> {
     let mode = resolve_image_decode();
     if mode == ImageDecode::Cpu {
         return None;
@@ -585,7 +580,14 @@ pub fn try_vcn_preprocess(
     let Some(dec) = vcn_decode(data, patch_size, spatial_merge_size) else {
         return Ok(None);
     };
-    vcn_to_patches(gpu, &dec, patch_size, temporal_patch_size, spatial_merge_size).map(Some)
+    vcn_to_patches(
+        gpu,
+        &dec,
+        patch_size,
+        temporal_patch_size,
+        spatial_merge_size,
+    )
+    .map(Some)
 }
 
 #[cfg(test)]

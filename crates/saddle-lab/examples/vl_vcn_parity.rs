@@ -159,10 +159,7 @@ fn main() {
         .next()
         .unwrap_or(1)
         .max(1);
-    let only: Vec<&String> = args
-        .iter()
-        .filter(|a| !a.starts_with("--"))
-        .collect();
+    let only: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let fixtures = [
         "general_qa.jpg",
         "barney_cigar.jpg",
@@ -295,9 +292,22 @@ fn main() {
         };
         // Shared kernel stage: NV12 at `surf_a` (device) -> CHW f32 -> patches.
         // Returns (patches, kernel ms incl. sync; excludes the parity D2H).
-        let run_kernels = |surf_a: u64, y_pitch: u32, uv_pitch: u32, u_offset: u32, v_offset: u32, chroma_step: u32, shifts: (u32, u32), sw: usize, sh: usize| -> (Vec<f32>, f64) {
+        let run_kernels = |surf_a: u64,
+                           y_pitch: u32,
+                           uv_pitch: u32,
+                           u_offset: u32,
+                           v_offset: u32,
+                           chroma_step: u32,
+                           shifts: (u32, u32),
+                           sw: usize,
+                           sh: usize|
+         -> (Vec<f32>, f64) {
             let (t_h, t_w) = smart_resize(sh, sw, FACTOR, MIN_PX, MAX_PX);
-            assert_eq!((t_h, t_w), (img_h, img_w), "smart_resize mismatch vs repo path");
+            assert_eq!(
+                (t_h, t_w),
+                (img_h, img_w),
+                "smart_resize mismatch vs repo path"
+            );
             let n_chw = 3 * t_h * t_w;
             let n_elem = (t_h / PATCH) * (t_w / PATCH) * TEMPORAL * 3 * PATCH * PATCH;
             assert_eq!(n_elem, cpu_patches.len());
@@ -328,8 +338,15 @@ fn main() {
             ];
             // SAFETY: module loaded, args are valid device pointers / values.
             unsafe {
-                hip.launch_kernel(&k_rgb, [(t_w as u32 + 15) / 16, (t_h as u32 + 15) / 16, 1], [16, 16, 1], 0, Some(&stream), &mut p1)
-                    .expect("launch rgb");
+                hip.launch_kernel(
+                    &k_rgb,
+                    [(t_w as u32 + 15) / 16, (t_h as u32 + 15) / 16, 1],
+                    [16, 16, 1],
+                    0,
+                    Some(&stream),
+                    &mut p1,
+                )
+                .expect("launch rgb");
             }
             let mut chw_b = chw_a;
             let (mut h_v, mut w_v) = (t_h as u32, t_w as u32);
@@ -346,15 +363,23 @@ fn main() {
             ];
             // SAFETY: same.
             unsafe {
-                hip.launch_kernel(&k_patch, [(n_elem as u32 + 255) / 256, 1, 1], [256, 1, 1], 0, Some(&stream), &mut p2)
-                    .expect("launch patches");
+                hip.launch_kernel(
+                    &k_patch,
+                    [(n_elem as u32 + 255) / 256, 1, 1],
+                    [256, 1, 1],
+                    0,
+                    Some(&stream),
+                    &mut p2,
+                )
+                .expect("launch patches");
             }
             hip.stream_synchronize(&stream).expect("sync");
             let kern_ms = t1.elapsed().as_secs_f64() * 1e3;
             let mut raw = vec![0u8; n_elem * 4];
             hip.memcpy_dtoh(&mut raw, &d_out).expect("dtoh");
             // SAFETY: kernel wrote f32 elements; length checked above.
-            let v: Vec<f32> = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_elem) }.to_vec();
+            let v: Vec<f32> =
+                unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_elem) }.to_vec();
             hip.free(d_chw).unwrap();
             hip.free(d_out).unwrap();
             (v, kern_ms)
@@ -396,14 +421,23 @@ fn main() {
                 let (u_off, v_off, step, shifts) = if planar {
                     assert!(vf.num_layers >= 3, "444P export must carry 3 layers");
                     assert_eq!(vf.layers[1].pitch[0], vf.layers[2].pitch[0]);
-                    (vf.layers[1].offset[0], vf.layers[2].offset[0], 1u32, (0u32, 0u32))
+                    (
+                        vf.layers[1].offset[0],
+                        vf.layers[2].offset[0],
+                        1u32,
+                        (0u32, 0u32),
+                    )
                 } else {
                     (vf.uv_offset(), vf.uv_offset() + 1, 2u32, (1u32, 1u32))
                 };
                 let (v, k) = run_kernels(
                     vf.device_ptr() as u64,
                     vf.y_pitch(),
-                    if planar { vf.layers[1].pitch[0] } else { vf.uv_pitch() },
+                    if planar {
+                        vf.layers[1].pitch[0]
+                    } else {
+                        vf.uv_pitch()
+                    },
                     u_off,
                     v_off,
                     step,
@@ -414,7 +448,10 @@ fn main() {
                 (if planar { "vcn-zc-444" } else { "vcn-zc" }, v, k)
             }
             Ok(va_bridge::DecodeOutcome::Decoded(vf)) => {
-                println!("[parity] {name}: VCN decoded fourcc=0x{:08x} — no kernel arm, CPU path", vf.fourcc);
+                println!(
+                    "[parity] {name}: VCN decoded fourcc=0x{:08x} — no kernel arm, CPU path",
+                    vf.fourcc
+                );
                 let t1 = Instant::now();
                 let rgb = image::DynamicImage::ImageRgb8(
                     image::RgbImage::from_raw(tw as u32, th as u32, turbo.data.clone())

@@ -1015,8 +1015,9 @@ pub fn vision_forward_patches(
     let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
     let t0 = std::time::Instant::now();
     // Diagnostic stage dumps (env-gated; see `vl_dump_slice`).
-    let dump_dir: Option<std::path::PathBuf> =
-        hipfire_config::developer_var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
+    let dump_dir: Option<std::path::PathBuf> = hipfire_config::developer_var("HIPFIRE_VL_DUMP_DIR")
+        .ok()
+        .map(Into::into);
     let dd = dump_dir.as_deref();
     if dd.is_some() {
         eprintln!(

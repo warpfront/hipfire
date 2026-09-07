@@ -114,7 +114,6 @@ const _: () = assert!(std::mem::size_of::<VaGenericValue>() == 16);
 const _: () = assert!(std::mem::size_of::<VaSurfaceAttrib>() == 24);
 const _: () = assert!(std::mem::size_of::<VaDrmFormatModifierList>() == 16);
 
-
 #[repr(C)]
 #[derive(Clone, Copy)]
 pub struct VaJpegIQMatrix {

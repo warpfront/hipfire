@@ -96,7 +96,10 @@ fn hip_pci_bus_id(device: i32) -> Option<String> {
                 continue;
             }
             let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-            buf[..len].iter().map(|&b| b as u8 as char).collect::<String>()
+            buf[..len]
+                .iter()
+                .map(|&b| b as u8 as char)
+                .collect::<String>()
         };
         return Some(bus);
     }
@@ -348,7 +351,6 @@ impl VaSession {
             .decode_jpeg(jpeg)
     }
 
-
     /// Allocate a pooled surface + decode context for `key`. Linear
     /// modifiers are the ONLY allocation mode: the exported dma-buf must be
     /// kernel-readable.
@@ -503,8 +505,7 @@ impl VaSession {
                 }
                 _ => std::mem::size_of::<crate::ffi::VaJpegSliceParam>() as u32,
             };
-            let st =
-                unsafe { (lib.va_create_buffer)(dpy, ctx, *ty, size, 1, *data, &mut bufs[i]) };
+            let st = unsafe { (lib.va_create_buffer)(dpy, ctx, *ty, size, 1, *data, &mut bufs[i]) };
             if st != VA_STATUS_SUCCESS {
                 for b in bufs[..i].iter() {
                     // SAFETY: created above.
@@ -745,7 +746,11 @@ impl VaSession {
                 }
             }
         }
-        let _img_guard = ImgGuard { lib, dpy: self.dpy, id: img.image_id };
+        let _img_guard = ImgGuard {
+            lib,
+            dpy: self.dpy,
+            id: img.image_id,
+        };
         let mut ptr: *mut c_void = std::ptr::null_mut();
         // SAFETY: out-param is a valid pointer slot; unmapped below.
         st = unsafe { (lib.va_map_buffer)(self.dpy, img.buf, &mut ptr) };
@@ -775,8 +780,12 @@ impl VaSession {
         unsafe {
             let base = ptr as *const u8;
             for i in 0..np {
-                let (rw, nr, pitch, off) =
-                    (row_w(i), rows(i), img.pitches[i] as usize, img.offsets[i] as usize);
+                let (rw, nr, pitch, off) = (
+                    row_w(i),
+                    rows(i),
+                    img.pitches[i] as usize,
+                    img.offsets[i] as usize,
+                );
                 let mut out = vec![0u8; rw * nr];
                 for r in 0..nr {
                     let src = std::slice::from_raw_parts(base.add(off + r * pitch), rw);
@@ -786,9 +795,13 @@ impl VaSession {
             }
             (lib.va_unmap_buffer)(self.dpy, img.buf);
         }
-        Ok(DerivedPlanes { width, height, fourcc: img.format.fourcc, planes })
+        Ok(DerivedPlanes {
+            width,
+            height,
+            fourcc: img.format.fourcc,
+            planes,
+        })
     }
-
 }
 
 // `libc` is not a workspace dep; close(2)/lseek(2) via direct externs.

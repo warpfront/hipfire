@@ -12,9 +12,16 @@ fn main() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/vision/images");
     let mut sess = va_bridge::VaSession::open().expect("va open");
     println!("[444check] {} (node {})", sess.vendor(), sess.node());
-    for name in ["barney_cigar.jpg", "scene_1.jpg", "doge.jpeg", "scene_2.jpg", "general_qa.jpg"] {
+    for name in [
+        "barney_cigar.jpg",
+        "scene_1.jpg",
+        "doge.jpeg",
+        "scene_2.jpg",
+        "general_qa.jpg",
+    ] {
         let bytes = std::fs::read(dir.join(name)).unwrap();
-        let turbo = libjpeg_turbo_rs::decompress_to(&bytes, libjpeg_turbo_rs::PixelFormat::Rgb).unwrap();
+        let turbo =
+            libjpeg_turbo_rs::decompress_to(&bytes, libjpeg_turbo_rs::PixelFormat::Rgb).unwrap();
         let (w, h) = (turbo.width as usize, turbo.height as usize);
         let f = match sess.decode_jpeg_planes(&bytes) {
             Ok(f) => f,
@@ -50,7 +57,11 @@ fn main() {
         let mut drgb = 0f64;
         let mut maxrgb = 0u8;
         for i in 0..w * h {
-            let (r, g, b) = (turbo.data[i * 3] as f32, turbo.data[i * 3 + 1] as f32, turbo.data[i * 3 + 2] as f32);
+            let (r, g, b) = (
+                turbo.data[i * 3] as f32,
+                turbo.data[i * 3 + 1] as f32,
+                turbo.data[i * 3 + 2] as f32,
+            );
             let yt = 0.299 * r + 0.587 * g + 0.114 * b;
             dy += (yt - f.planes[0][i] as f32).abs() as f64;
             for c in 0..3 {
@@ -70,7 +81,8 @@ fn main() {
                         let mut d = 0f64;
                         for y in 0..h {
                             for x in 0..w {
-                                d += (buf[y * pitch + x] as i32 - f.planes[0][y * w + x] as i32).abs() as f64;
+                                d += (buf[y * pitch + x] as i32 - f.planes[0][y * w + x] as i32)
+                                    .abs() as f64;
                             }
                         }
                         println!(

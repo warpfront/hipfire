@@ -4855,6 +4855,20 @@ mod tests {
         assert!(field.parse_cli("7").is_err());
     }
     #[test]
+    fn vision_mode_defaults_off_with_auto_on_off_values() {
+        let field = field("vision.mode").expect("vision.mode schema field");
+        assert_eq!(field.legacy_key, "vision_mode");
+        assert_eq!(field.env_compat, Some("HIPFIRE_VISION_MODE"));
+        assert_eq!(field.default.to_value(), ConfigValue::String("off".into()));
+        for mode in ["off", "auto", "on"] {
+            assert_eq!(
+                field.parse_cli(mode).unwrap(),
+                ConfigValue::String(mode.into())
+            );
+        }
+        assert!(field.parse_cli("sometimes").is_err());
+    }
+    #[test]
     fn image_decode_defaults_cpu_with_cpu_vcn_auto_values() {
         let field = field("image.decode").expect("image.decode schema field");
         assert_eq!(field.legacy_key, "image_decode");
@@ -4868,7 +4882,6 @@ mod tests {
         }
         assert!(field.parse_cli("sometimes").is_err());
     }
-
 
     #[test]
     fn million_context_and_parent_output_limits_validate_without_coupling_effort() {

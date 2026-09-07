@@ -133,6 +133,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 |---|---|---|
 | `HIPFIRE_VISION_SIDECAR` | explicit vision-tower path (overrides the registry sidecar); empty opts out | Read via `developer_var` (env beats `developer.vision_sidecar`); wired into the daemon load as `params["vision"]`. Skipped while `vision_mode=off`. |
 | `HIPFIRE_VISION_MODE` | tower sidecar gate: `off` (default) / `auto` / `on` | Env-compat for config `vision.mode`; projected into load params as `vision_mode` and enforced daemon-side. |
+| `HIPFIRE_IMAGE_DECODE` | VL image JPEG decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed, else cpu) | Env-compat for config `image.decode`; read via process snapshot in `hipfire-arch-qwen35-vl`. `vcn`/`auto` need the `vcn-jpeg` cargo feature. |
 
 ### Graph / MMQ / prefill
 
@@ -703,6 +704,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_HOST_TIMING` | crates/hipfire-runtime/examples/dflash_spec_demo.rs, scripts/ddtree_verify_profile.sh |
 | `HIPFIRE_IDLE_TIMEOUT` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_IMAGE` | scripts/container-gate.sh |
+| `HIPFIRE_IMAGE_DECODE` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_IMG_COND_CACHE` | crates/hipfire-arch-diffusion/src/pipeline.rs |
 | `HIPFIRE_IMG_PROFILE` | crates/hipfire-arch-diffusion/src/pipeline.rs |
 | `HIPFIRE_JINJA_CHAT` | crates/hipfire-daemon/src/main.rs, crates/hipfire-runtime/src/prompt_frame.rs |

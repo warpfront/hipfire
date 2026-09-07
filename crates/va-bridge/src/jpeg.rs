@@ -18,8 +18,8 @@
 
 use crate::ffi::{
     VaError, VaJpegComponent, VaJpegHuffmanBuffer, VaJpegIQMatrix, VaJpegPicParam,
-    VaJpegSliceComponent, VaJpegSliceParam, VA_SLICE_DATA_FLAG_ALL, VA_RT_FORMAT_YUV400, VA_RT_FORMAT_YUV420,
-    VA_RT_FORMAT_YUV422, VA_RT_FORMAT_YUV444,
+    VaJpegSliceComponent, VaJpegSliceParam, VA_RT_FORMAT_YUV400, VA_RT_FORMAT_YUV420,
+    VA_RT_FORMAT_YUV422, VA_RT_FORMAT_YUV444, VA_SLICE_DATA_FLAG_ALL,
 };
 
 /// Everything `VaSession::decode_jpeg` needs to fill the five VA buffers,
