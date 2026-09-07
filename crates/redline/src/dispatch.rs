@@ -37,27 +37,25 @@ pub struct CommandBuffer {
     pub(crate) dwords: Vec<u32>,
 }
 
-/// LDS allocation granularity for COMPUTE_PGM_RSRC2.LDS_SIZE (bits [20:14]).
-/// Measured 2026-09-07 with hipcc lds1024/lds4096 kernels and a rustc LDS
-/// kernel: the unit is 256 bytes on gfx1010, gfx1030, gfx1100, gfx1150 and
-/// gfx1201 alike (encoding 1024 B as 2 blocks leaves the upper half of LDS
-/// unallocated and stores silently vanish; 4 blocks is exact). The 512-byte
-/// rule this crate used to carry was never right on any RDNA part we can
-/// run. gfx9 is untested here; the documented gfx9 unit is also 128 dwords
-/// (512 B), so it keeps that value until measured.
-pub fn lds_granularity(gfx_arch: &str) -> u32 {
-    let n: u32 = gfx_arch.trim_start_matches("gfx").parse().unwrap_or(0);
-    if n >= 1000 { 256 } else { 512 }
+/// LDS allocation unit for COMPUTE_PGM_RSRC2.GRANULATED_LDS_SIZE. 128 dwords
+/// (512 B) on GFX7 through GFX12 — LLVM `AMDGPUBaseInfo::getLdsDwGranularity`
+/// and AMDGPUUsage.rst (compute_pgm_rsrc2 table); 64 dwords only on GFX6,
+/// which redline does not drive. Verified 2026-09-07 on gfx1010/1030/1100/
+/// 1150/1201 with hipcc and rustc LDS kernels (1024/4096 B exact, and 768 B
+/// exact — which a 256-byte unit at the wrong bit would not be).
+pub fn lds_granularity(_gfx_arch: &str) -> u32 {
+    512
 }
 
-/// COMPUTE_PGM_RSRC2 with LDS_SIZE derived from the kernel's static LDS plus
-/// `dynamic_lds` bytes. Descriptors from hipcc already carry a correct field;
-/// descriptors from other toolchains (e.g. rustc's amdgcn target) leave it 0
-/// while still declaring `group_segment_fixed_size`, so always derive it.
+/// COMPUTE_PGM_RSRC2 with GRANULATED_LDS_SIZE derived from the kernel
+/// descriptor's `group_segment_fixed_size` plus any dynamic LDS. hipcc
+/// leaves the field zero in the descriptor ("must be 0"; CP fills it from
+/// the AQL packet), so a bare-PM4 dispatcher has to program it itself.
+/// The field is bits [23:15] (9 bits); bit 14 is ENABLE_EXCEPTION_MEMORY.
 fn rsrc2_with_lds(k: &Kernel, dynamic_lds: u32, granularity: u32) -> u32 {
     let total = k.group_segment_size + dynamic_lds;
     let blocks = (total + granularity - 1) / granularity;
-    (k.pgm_rsrc2 & !(0x7F << 14)) | ((blocks & 0x7F) << 14)
+    (k.pgm_rsrc2 & !(0x1FF << 15)) | ((blocks & 0x1FF) << 15)
 }
 
 // PM4 helpers

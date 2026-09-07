@@ -1,0 +1,15 @@
+[package]
+name = "vl_yuv_preprocess"
+version = "0.0.0"
+edition = "2021"
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[profile.release]
+panic = "abort"
+opt-level = 3
+lto = "fat"
+codegen-units = 1

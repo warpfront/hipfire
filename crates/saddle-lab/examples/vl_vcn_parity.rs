@@ -568,6 +568,30 @@ fn main() {
         .find_map(|a| a.strip_prefix("--warm=").and_then(|v| v.parse().ok()))
         .unwrap_or(10);
     let only: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let elf_path: Option<String> = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--elf="))
+        .map(|s| s.to_string());
+    let hipcc_extra: Vec<String> = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--hipcc-flags="))
+        .map(|s| {
+            s.split_whitespace()
+                .map(|f| f.to_string())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let kern_iters: usize = args
+        .iter()
+        .find_map(|a| {
+            a.strip_prefix("--kern-iters=")
+                .and_then(|v| v.parse().ok())
+        })
+        .unwrap_or(0);
+    let drm_node: Option<String> = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--drm-node="))
+        .map(|s| s.to_string());
     let fixtures = [
         "general_qa.jpg",
         "barney_cigar.jpg",
@@ -586,24 +610,42 @@ fn main() {
 
     let ksrc =
         PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernels/src/vl_yuv_preprocess.hip");
-    let tmp = std::env::temp_dir().join("vcn_parity");
-    std::fs::create_dir_all(&tmp).unwrap();
-    let hsaco = tmp.join("vl_yuv_preprocess.hsaco");
-    println!("[parity] hipcc {} ...", ksrc.display());
-    let t_cc = Instant::now();
-    let st = Command::new("hipcc")
-        .args([
-            "--genco",
-            "-o",
-            hsaco.to_str().unwrap(),
-            &format!("--offload-arch={arch}"),
-            ksrc.to_str().unwrap(),
-        ])
-        .status()
-        .expect("hipcc spawn");
-    assert!(st.success(), "hipcc failed");
-    println!("[parity] hipcc {:.2}s", t_cc.elapsed().as_secs_f32());
-    let hsaco_bytes = std::fs::read(&hsaco).unwrap();
+    // `--elf=PATH`: skip hipcc entirely, load HSACO bytes from PATH.
+    // `--hipcc-flags="..."`: extra whitespace-separated hipcc flags.
+    let hsaco_bytes: Vec<u8> = if let Some(elf) = elf_path.as_deref() {
+        let b = std::fs::read(elf)
+            .unwrap_or_else(|e| panic!("--elf {elf}: failed to read HSACO bytes: {e}"));
+        println!("[parity] kernel source: elf {elf}");
+        b
+    } else {
+        let tmp = std::env::temp_dir().join("vcn_parity");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let hsaco = tmp.join("vl_yuv_preprocess.hsaco");
+        println!("[parity] hipcc {} ...", ksrc.display());
+        let t_cc = Instant::now();
+        let st = Command::new("hipcc")
+            .args([
+                "--genco",
+                "-o",
+                hsaco.to_str().unwrap(),
+                &format!("--offload-arch={arch}"),
+                ksrc.to_str().unwrap(),
+            ])
+            .args(&hipcc_extra)
+            .status()
+            .expect("hipcc spawn");
+        assert!(st.success(), "hipcc failed");
+        println!("[parity] hipcc {:.2}s", t_cc.elapsed().as_secs_f32());
+        println!(
+            "[parity] kernel source: hipcc {}",
+            if hipcc_extra.is_empty() {
+                "default".to_string()
+            } else {
+                hipcc_extra.join(" ")
+            }
+        );
+        std::fs::read(&hsaco).unwrap()
+    };
     println!(
         "[parity] hsaco md5={} ({}B)",
         md5hex(&hsaco_bytes),
@@ -621,7 +663,7 @@ fn main() {
 
     // ——— redline direct-ring context (redline backend only) ———
     let mut rl: Option<Redline> = if backend == "redline" && !cpu_only {
-        let dev = Device::open(None).expect("redline Device::open");
+        let dev = Device::open(drm_node.as_deref()).expect("redline Device::open");
         let queue = ComputeQueue::new(&dev).expect("ComputeQueue::new");
         let decoder = VcnJpegDecoder::new(&dev).expect("VcnJpegDecoder::new");
         let module = dev.load_module(&hsaco_bytes).expect("redline load_module");
@@ -658,8 +700,17 @@ fn main() {
         panic!("--backend=redline needs the VA oracle for plane diffs and to_bits parity");
     }
     println!(
-        "{:>16} {:>9} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10} {:>12}",
-        "fixture", "dims", "cpu_ms", "vcn_dec", "vcn_kern", "vcn_tot", "speedup", "rel-L1", "path"
+        "{:>16} {:>9} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10} {:>12}{}",
+        "fixture",
+        "dims",
+        "cpu_ms",
+        "vcn_dec",
+        "vcn_kern",
+        "vcn_tot",
+        "speedup",
+        "rel-L1",
+        "path",
+        if kern_iters > 0 { "    us/iter" } else { "" }
     );
     let mut worst_va = 0.0f64;
     let mut worst_rl = 0.0f64;
@@ -757,7 +808,7 @@ fn main() {
                            shifts: (u32, u32),
                            sw: usize,
                            sh: usize|
-         -> (Vec<f32>, f64) {
+         -> (Vec<f32>, f64, Option<f64>) {
             let plan = PatchifyPlan::compute(sw, sh, img_h, img_w, cpu_patches.len());
             let n_chw = 3 * img_h * img_w;
             let d_chw = hip.malloc(n_chw * 4).expect("malloc chw");
@@ -815,6 +866,53 @@ fn main() {
             }
             hip.stream_synchronize(&stream).expect("sync");
             let kern_ms = t1.elapsed().as_secs_f64() * 1e3;
+            // `--kern-iters=N`: re-launch the same rgb+patch pair N times
+            // back-to-back into the same buffers; GPU-side time per iter.
+            let kern_per_iter_us: Option<f64> = if kern_iters > 0 {
+                let start = hip.event_create().expect("event_create");
+                let stop = hip.event_create().expect("event_create");
+                hip.event_record(&start, Some(&stream))
+                    .expect("event_record");
+                for _ in 0..kern_iters {
+                    let mut p1 = rgb.ptrs();
+                    // SAFETY: same as above; buffers still live.
+                    unsafe {
+                        hip.launch_kernel(
+                            &k_rgb,
+                            [plan.grid_rgb[0], plan.grid_rgb[1], plan.grid_rgb[2]],
+                            [16, 16, 1],
+                            0,
+                            Some(&stream),
+                            &mut p1,
+                        )
+                        .expect("launch rgb (iters)");
+                    }
+                    let mut p2 = patch.ptrs();
+                    // SAFETY: same.
+                    unsafe {
+                        hip.launch_kernel(
+                            &k_patch,
+                            [plan.grid_patch[0], 1, 1],
+                            [256, 1, 1],
+                            0,
+                            Some(&stream),
+                            &mut p2,
+                        )
+                        .expect("launch patches (iters)");
+                    }
+                }
+                hip.event_record(&stop, Some(&stream))
+                    .expect("event_record");
+                hip.event_synchronize(&stop).expect("event_sync");
+                let ms = hip
+                    .event_elapsed_ms(&start, &stop)
+                    .expect("event_elapsed_ms");
+                hip.event_destroy(start).unwrap();
+                hip.event_destroy(stop).unwrap();
+                Some(ms as f64 * 1e3 / kern_iters as f64)
+            } else {
+                None
+            };
             let mut raw = vec![0u8; plan.n_elem * 4];
             hip.memcpy_dtoh(&mut raw, &d_out).expect("dtoh");
             // SAFETY: kernel wrote f32 elements; length checked above.
@@ -823,7 +921,7 @@ fn main() {
                     .to_vec();
             hip.free(d_chw).unwrap();
             hip.free(d_out).unwrap();
-            (v, kern_ms)
+            (v, kern_ms, kern_per_iter_us)
         };
 
         // Pooled zero-copy arm (linear-only surfaces): kernels read the
@@ -854,7 +952,8 @@ fn main() {
             );
         }
         let outcome = outcome.expect("at least one decode attempt");
-        let (path, got, kern_ms): (&str, Vec<f32>, f64) = match outcome {
+        let (path, got, kern_ms, kern_per_iter): (&str, Vec<f32>, f64, Option<f64>) =
+            match outcome {
             Ok(va_bridge::DecodeOutcome::Decoded(vf))
                 if vf.fourcc == 0x3231_564E || vf.fourcc == 0x5034_3434 =>
             {
@@ -872,7 +971,7 @@ fn main() {
                 } else {
                     surf_kernel_params(false, vf.y_pitch(), vf.uv_pitch(), vf.uv_offset(), 0)
                 };
-                let (v, k) = run_kernels(
+                let (v, k, ki) = run_kernels(
                     vf.device_ptr() as u64,
                     vf.y_pitch(),
                     uv_pitch,
@@ -883,7 +982,7 @@ fn main() {
                     vf.width as usize,
                     vf.height as usize,
                 );
-                (if planar { "vcn-zc-444" } else { "vcn-zc" }, v, k)
+                (if planar { "vcn-zc-444" } else { "vcn-zc" }, v, k, ki)
             }
             Ok(va_bridge::DecodeOutcome::Decoded(vf)) => {
                 println!(
@@ -910,7 +1009,7 @@ fn main() {
                     chw[2 * plane + i] = px[2] as f32 / 127.5 - 1.0;
                 }
                 let fb = extract_patches(&chw, 3, img_h, img_w, PATCH, TEMPORAL, SMS);
-                ("cpu-fallback", fb, t1.elapsed().as_secs_f64() * 1e3)
+                ("cpu-fallback", fb, t1.elapsed().as_secs_f64() * 1e3, None)
             }
             Ok(va_bridge::DecodeOutcome::Unsupported(reason)) => {
                 // Product behavior: VCN-unsupported streams fall back to turbo.
@@ -935,15 +1034,43 @@ fn main() {
                     chw[2 * plane + i] = px[2] as f32 / 127.5 - 1.0;
                 }
                 let fb = extract_patches(&chw, 3, img_h, img_w, PATCH, TEMPORAL, SMS);
-                ("cpu-fallback", fb, t1.elapsed().as_secs_f64() * 1e3)
+                ("cpu-fallback", fb, t1.elapsed().as_secs_f64() * 1e3, None)
             }
             Err(e) => panic!("vcn decode of {name}: {e}"),
         };
         let r = rel_l1(&cpu_patches, &got);
         worst_va = worst_va.max(r);
+        // Bit-exactness aid: md5 over the raw LE f32 bytes of the VCN-path
+        // output and (once per fixture) the CPU reference vector.
+        let got_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(got.as_ptr() as *const u8, got.len() * 4)
+        };
+        println!("[parity] {name}: out_md5={}", md5hex(got_bytes));
+        let ref_bytes: &[u8] = unsafe {
+            std::slice::from_raw_parts(cpu_patches.as_ptr() as *const u8, cpu_patches.len() * 4)
+        };
+        println!("[parity] {name}: ref_md5={}", md5hex(ref_bytes));
+        if kern_iters > 0 {
+            match kern_per_iter {
+                Some(us) => println!(
+                    "[parity] {name}: kern_iters={kern_iters} per_iter_us={us:.1} (gpu)"
+                ),
+                None => println!(
+                    "[parity] {name}: kern_iters={kern_iters} skipped ({path}, no kernels)"
+                ),
+            }
+        }
         let tot = dec_ms + kern_ms;
+        let va_iter_cell: String = if kern_iters > 0 {
+            match kern_per_iter {
+                Some(us) => format!(" {us:>10.1}"),
+                None => format!(" {:>10}", "-"),
+            }
+        } else {
+            String::new()
+        };
         println!(
-            "{:>16} {:>9} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>8.2}x {:>10.3e} {:>12}",
+            "{:>16} {:>9} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>8.2}x {:>10.3e} {:>12}{}",
             name,
             format!("{img_w}x{img_h}"),
             cpu_ms,
@@ -952,7 +1079,8 @@ fn main() {
             tot,
             cpu_ms / tot.max(1e-9),
             r,
-            path
+            path,
+            va_iter_cell
         );
 
         // ——— redline direct-ring lane (oracle planes + VA kernel output above
@@ -1177,6 +1305,45 @@ fn main() {
                 std::slice::from_raw_parts(out_bytes.as_ptr() as *const f32, plan.n_elem)
             }
             .to_vec();
+            // `--kern-iters=N`: re-submit the same rgb+patch IB N times
+            // back-to-back into the same buffers; wall-clock per iter with
+            // one terminal wait (no GPU-event API on this lane).
+            let rl_per_iter_us: Option<f64> = if kern_iters > 0 {
+                let t_iter = Instant::now();
+                let mut last_fence = None;
+                for _ in 0..kern_iters {
+                    last_fence = Some(
+                        ctx.queue
+                            .submit_async(
+                                &ctx.dev,
+                                Engine::COMPUTE,
+                                &bufs.ib,
+                                cb.len_dwords(),
+                                bos,
+                                &sync,
+                            )
+                            .expect("compute submit_async (iters)"),
+                    );
+                }
+                let done = ctx
+                    .queue
+                    .wait_fence(
+                        &ctx.dev,
+                        last_fence.as_ref().expect("iters fence"),
+                        FENCE_TIMEOUT_NS,
+                    )
+                    .expect("wait_fence (iters)");
+                assert!(done, "redline kern-iters fence timeout on {name}");
+                Some(t_iter.elapsed().as_secs_f64() * 1e6 / kern_iters as f64)
+            } else {
+                None
+            };
+            if kern_iters > 0 {
+                println!(
+                    "[parity] {name}: kern_iters={kern_iters} per_iter_us={:.1} (wall)",
+                    rl_per_iter_us.unwrap_or(f64::NAN)
+                );
+            }
             pending
                 .complete_after(&ctx.dev, &ctx.queue, &fence, FENCE_TIMEOUT_NS)
                 .expect("complete_after");
@@ -1206,8 +1373,16 @@ fn main() {
             let r_rl = rel_l1(&cpu_patches, &rl_patches);
             worst_rl = worst_rl.max(r_rl);
             let chained_ms = submit_ms + wait_ms;
+            let rl_iter_cell: String = if kern_iters > 0 {
+                match rl_per_iter_us {
+                    Some(us) => format!(" {us:>10.1}"),
+                    None => format!(" {:>10}", "-"),
+                }
+            } else {
+                String::new()
+            };
             println!(
-                "{:>16} {:>9} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>8.2}x {:>10.3e} {:>12}",
+                "{:>16} {:>9} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>8.2}x {:>10.3e} {:>12}{}",
                 name,
                 format!("{img_w}x{img_h}"),
                 cpu_ms,
@@ -1216,7 +1391,8 @@ fn main() {
                 chained_ms,
                 cpu_ms / chained_ms.max(1e-9),
                 r_rl,
-                "redline"
+                "redline",
+                rl_iter_cell
             );
 
             // ——— warmed timing loops (persistent decoder/BOs; reallocation
