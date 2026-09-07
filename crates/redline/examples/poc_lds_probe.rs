@@ -9,7 +9,7 @@ fn main() {
         let k = Kernel::find(&m, name).unwrap();
         let o = dev.alloc_vram((n * 4) as u64).unwrap(); dev.upload(&o, &vec![0u8; n * 4]).unwrap();
         let mut ka = KernargBuilder::new(8); ka.write_ptr(0, o.gpu_addr);
-        dq.dispatch(&dev, k, [1, 1, 1], [n.min(256) as u32, 1, 1], ka.as_bytes(), &[&m.code_buf, &o]).unwrap();
+        dq.dispatch(&dev, k, [1, 1, 1], [if n > 1024 { 256 } else { n as u32 }, 1, 1], ka.as_bytes(), &[&m.code_buf, &o]).unwrap();
         let mut raw = vec![0u8; n * 4]; dev.download(&o, &mut raw).unwrap();
         let out: &[f32] = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, n) };
         let bad = (0..n).filter(|&t| out[t] != (n - 1 - t) as f32).count();
