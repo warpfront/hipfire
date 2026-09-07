@@ -18,7 +18,8 @@
 
 use crate::ffi::{
     VaError, VaJpegComponent, VaJpegHuffmanBuffer, VaJpegIQMatrix, VaJpegPicParam,
-    VaJpegSliceComponent, VaJpegSliceParam, VA_SLICE_DATA_FLAG_ALL,
+    VaJpegSliceComponent, VaJpegSliceParam, VA_SLICE_DATA_FLAG_ALL, VA_RT_FORMAT_YUV400, VA_RT_FORMAT_YUV420,
+    VA_RT_FORMAT_YUV422, VA_RT_FORMAT_YUV444,
 };
 
 /// Everything `VaSession::decode_jpeg` needs to fill the five VA buffers,
@@ -35,6 +36,9 @@ pub struct JpegVaParams<'a> {
     /// Max sampling factors (for MCU count + subsampling classification).
     pub max_h: u8,
     pub max_v: u8,
+    /// VA render-target format the surface must be created with so the
+    /// driver's chroma-format check accepts the stream (see SOF0 arm).
+    pub rt_format: u32,
 }
 
 struct Cursor<'a> {
@@ -113,6 +117,7 @@ pub fn parse_for_va(data: &[u8]) -> Result<JpegVaParams<'_>, VaError> {
     let mut saw_sof = false;
     let mut max_h = 1u8;
     let mut max_v = 1u8;
+    let mut rt_format = VA_RT_FORMAT_YUV420;
 
     loop {
         // Markers: skip fill 0xFF bytes, then marker byte.
@@ -171,28 +176,31 @@ pub fn parse_for_va(data: &[u8]) -> Result<JpegVaParams<'_>, VaError> {
                 pic.picture_width = w;
                 pic.picture_height = h;
                 pic.num_components = nf;
-                // VCN output gate: radeonsi's JPEG backend only accepts 4:2:0
-                // (and single-component gray) into the YUV420 surface — its
-                // `radeon_dec_jpeg_end_frame` format check rejects 4:4:4 AND
-                // 4:2:2 at submit (measured 2026-09-07: barney_cigar 4:4:4
-                // and synthetic 4:2:2 both fail). Reject BEFORE any VA
-                // surface exists so the caller falls back to turbo CPU.
+                // The VA surface must carry the stream's chroma format:
+                // radeonsi's `radeon_dec_jpeg_end_frame` compares the two and
+                // refuses a mismatch ("VCN - Decode format check failed").
+                // The earlier "4:2:0 only" reading was this check firing on a
+                // hard-coded YUV420 surface; rocJPEG decodes 4:4:4 on the same
+                // driver by allocating a 444 surface. Classify here, allocate
+                // accordingly in `submit`.
                 let hv = |i: usize| {
                     (
                         pic.components[i].h_sampling_factor,
                         pic.components[i].v_sampling_factor,
                     )
                 };
-                let accepted = match nf {
-                    1 => hv(0) == (1, 1),
-                    3 => hv(0) == (2, 2) && hv(1) == (1, 1) && hv(2) == (1, 1),
-                    _ => false,
+                let chroma_ok = nf == 1 || (hv(1) == (1, 1) && hv(2) == (1, 1));
+                rt_format = match (nf, if nf == 3 { hv(0) } else { (1, 1) }) {
+                    (1, _) => VA_RT_FORMAT_YUV400,
+                    (3, (2, 2)) if chroma_ok => VA_RT_FORMAT_YUV420,
+                    (3, (2, 1)) if chroma_ok => VA_RT_FORMAT_YUV422,
+                    (3, (1, 1)) if chroma_ok => VA_RT_FORMAT_YUV444,
+                    _ => {
+                        return Err(VaError::Unsupported(
+                            "sampling factors are not 4:2:0, 4:2:2, 4:4:4 or gray",
+                        ))
+                    }
                 };
-                if !accepted {
-                    return Err(VaError::Unsupported(
-                        "sampling factors are not 4:2:0 or gray",
-                    ));
-                }
                 saw_sof = true;
                 c.pos = end; // skip any trailing bytes defensively
             }
@@ -320,6 +328,7 @@ pub fn parse_for_va(data: &[u8]) -> Result<JpegVaParams<'_>, VaError> {
                     entropy,
                     max_h,
                     max_v,
+                    rt_format,
                 });
             }
             0xCC => return Err(VaError::Unsupported("arithmetic coding (DAC)")),

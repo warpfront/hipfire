@@ -266,6 +266,10 @@ required-features = ["vcn-jpeg"]
 name = "vl_vcn_debug"
 required-features = ["vcn-jpeg"]
 
+[[example]]
+name = "vl_vcn_444check"
+required-features = ["vcn-jpeg"]
+
 [package.metadata.cargo-machete]
 # byteorder: deliberately kept (workspace from_le_bytes convention); never referenced by path in code.
 # hipfire-dispatch: no direct code reference, but [features].deltanet forwards hipfire-dispatch/deltanet.

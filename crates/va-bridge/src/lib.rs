@@ -223,18 +223,42 @@ impl VaSession {
             msg: lib.error_str(code),
         };
 
-        // Surfaces sized to the frame.
+        // Surfaces sized to the frame. Investigation knob: HIPFIRE_VCN_LINEAR=1
+        // asks the driver for a DRM_FORMAT_MOD_LINEAR surface via
+        // VASurfaceAttribDRMFormatModifiers so the exported dma-buf can be
+        // read linearly by a compute kernel (zero-copy question).
+        let want_linear = std::env::var_os("HIPFIRE_VCN_LINEAR").is_some();
+        let mut mods = [ffi::DRM_FORMAT_MOD_LINEAR];
+        let mut mod_list = ffi::VaDrmFormatModifierList {
+            num_modifiers: 1,
+            modifiers: mods.as_mut_ptr(),
+        };
+        let mut attribs = [ffi::VaSurfaceAttrib {
+            ty: ffi::VA_SURFACE_ATTRIB_DRM_FORMAT_MODIFIERS,
+            flags: ffi::VA_SURFACE_ATTRIB_SETTABLE,
+            value: ffi::VaGenericValue {
+                ty: ffi::VA_GENERIC_VALUE_TYPE_POINTER,
+                value: ffi::VaGenericValueUnion {
+                    p: (&mut mod_list as *mut ffi::VaDrmFormatModifierList).cast(),
+                },
+            },
+        }];
+        let (attr_ptr, attr_n): (*mut c_void, u32) = if want_linear {
+            (attribs.as_mut_ptr().cast(), 1)
+        } else {
+            (std::ptr::null_mut(), 0)
+        };
         let mut surf = 0;
         let mut st = unsafe {
             (lib.va_create_surfaces)(
                 self.dpy,
-                VA_RT_FORMAT_YUV420,
+                p.rt_format,
                 p.width as u32,
                 p.height as u32,
                 &mut surf,
                 1,
-                std::ptr::null_mut(),
-                0,
+                attr_ptr,
+                attr_n,
             )
         };
         if st != VA_STATUS_SUCCESS {
@@ -453,6 +477,113 @@ impl VaSession {
     /// linear CPU mapping). Returns packed NV12 planes. This is the
     /// validation path for VCN decode correctness; it costs a GPU→CPU copy
     /// but no JPEG entropy work on the CPU.
+    /// Format-generic derived readback: every plane the driver reports,
+    /// packed row-by-row (pitch stripped). Plane geometry follows the
+    /// fourcc: NV12 = [Y w*h, CbCr cw*ch*2]; 444P = [Y, Cb, Cr] each w*h;
+    /// anything else is returned as-is with its pitch-stripped rows sized
+    /// from the image height and pitch, and the caller must know the layout.
+    pub fn decode_jpeg_planes(&self, jpeg: &[u8]) -> Result<DerivedPlanes, VaError> {
+        let lib = &self.lib;
+        let fail = |op: &'static str, code: i32| VaError::Status {
+            op,
+            code,
+            msg: lib.error_str(code),
+        };
+        let Submitted {
+            width,
+            height,
+            surf,
+            _surf_guard,
+            _ctx_guard,
+            ..
+        } = self.submit(jpeg)?;
+        let mut img = ffi::VaImage {
+            image_id: 0,
+            format: ffi::VaImageFormat {
+                fourcc: 0,
+                byte_order: 0,
+                bits_per_pixel: 0,
+                depth: 0,
+                red_mask: 0,
+                green_mask: 0,
+                blue_mask: 0,
+                alpha_mask: 0,
+                va_reserved: [0; 4],
+            },
+            buf: 0,
+            width: 0,
+            height: 0,
+            data_size: 0,
+            num_planes: 0,
+            pitches: [0; 3],
+            offsets: [0; 3],
+            num_palette_entries: 0,
+            entry_bytes: 0,
+            component_order: [0; 4],
+            va_reserved: [0; 4],
+        };
+        // SAFETY: out-param is a valid VaImage slot.
+        let mut st = unsafe { (lib.va_derive_image)(self.dpy, surf, &mut img) };
+        if st != VA_STATUS_SUCCESS {
+            return Err(fail("vaDeriveImage", st));
+        }
+        struct ImgGuard<'a> {
+            lib: &'a VaLib,
+            dpy: VaDisplay,
+            id: u32,
+        }
+        impl Drop for ImgGuard<'_> {
+            fn drop(&mut self) {
+                // SAFETY: image was derived; destroy exactly once.
+                unsafe {
+                    (self.lib.va_destroy_image)(self.dpy, self.id);
+                }
+            }
+        }
+        let _img_guard = ImgGuard { lib, dpy: self.dpy, id: img.image_id };
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: out-param is a valid pointer slot; unmapped below.
+        st = unsafe { (lib.va_map_buffer)(self.dpy, img.buf, &mut ptr) };
+        if st != VA_STATUS_SUCCESS || ptr.is_null() {
+            return Err(fail("vaMapBuffer", st));
+        }
+        let (w, h) = (width as usize, height as usize);
+        let np = img.num_planes.min(3) as usize;
+        // Row width per plane by fourcc; fall back to pitch for unknown layouts.
+        let row_w = |i: usize| -> usize {
+            match (img.format.fourcc, i) {
+                (VA_FOURCC_NV12, 0) => w,
+                (VA_FOURCC_NV12, _) => ((w + 1) / 2) * 2,
+                (0x5034_3434, _) => w, // 444P
+                _ => img.pitches[i] as usize,
+            }
+        };
+        let rows = |i: usize| -> usize {
+            match (img.format.fourcc, i) {
+                (VA_FOURCC_NV12, 0) => h,
+                (VA_FOURCC_NV12, _) => (h + 1) / 2,
+                _ => h,
+            }
+        };
+        let mut planes = Vec::with_capacity(np);
+        // SAFETY: mapped bytes; every row read stays inside [offset, offset + pitch*rows).
+        unsafe {
+            let base = ptr as *const u8;
+            for i in 0..np {
+                let (rw, nr, pitch, off) =
+                    (row_w(i), rows(i), img.pitches[i] as usize, img.offsets[i] as usize);
+                let mut out = vec![0u8; rw * nr];
+                for r in 0..nr {
+                    let src = std::slice::from_raw_parts(base.add(off + r * pitch), rw);
+                    out[r * rw..(r + 1) * rw].copy_from_slice(src);
+                }
+                planes.push(out);
+            }
+            (lib.va_unmap_buffer)(self.dpy, img.buf);
+        }
+        Ok(DerivedPlanes { width, height, fourcc: img.format.fourcc, planes })
+    }
+
     pub fn decode_jpeg_derived(&self, jpeg: &[u8]) -> Result<DerivedFrame, VaError> {
         let lib = &self.lib;
         let fail = |op: &'static str, code: i32| VaError::Status {
@@ -519,6 +650,14 @@ impl VaSession {
             id: img.image_id,
         };
         if img.format.fourcc != VA_FOURCC_NV12 || img.num_planes != 2 {
+            eprintln!(
+                "[va-bridge] derived image fourcc=0x{:08x} ({}) planes={} pitches={:?} offsets={:?}",
+                img.format.fourcc,
+                String::from_utf8_lossy(&img.format.fourcc.to_le_bytes()),
+                img.num_planes,
+                &img.pitches[..img.num_planes.min(4) as usize],
+                &img.offsets[..img.num_planes.min(4) as usize]
+            );
             return Err(VaError::Corrupt("derived image is not 2-plane NV12"));
         }
         if img.width as u32 != width || img.height as u32 != height {
@@ -635,6 +774,14 @@ impl VcnFrame {
 /// planes with driver-resolved (linear) layout. Validation path for decode
 /// correctness when the dma-buf export is tiled/DCC (see
 /// [`VaSession::decode_jpeg_derived`]).
+/// Format-generic derived readback (see `decode_jpeg_planes`).
+pub struct DerivedPlanes {
+    pub width: u32,
+    pub height: u32,
+    pub fourcc: u32,
+    pub planes: Vec<Vec<u8>>,
+}
+
 pub struct DerivedFrame {
     pub width: u32,
     pub height: u32,

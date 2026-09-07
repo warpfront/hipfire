@@ -282,10 +282,117 @@ fn main() {
             println!("[parity] {name}: VA unavailable, skipping VCN path");
             continue;
         };
+        // Shared kernel stage: NV12 at `surf_a` (device) -> CHW f32 -> patches.
+        // Returns (patches, kernel ms incl. sync; excludes the parity D2H).
+        let run_kernels = |surf_a: u64, y_pitch: u32, uv_pitch: u32, uv_offset: u32, sw: usize, sh: usize| -> (Vec<f32>, f64) {
+            let (t_h, t_w) = smart_resize(sh, sw, FACTOR, MIN_PX, MAX_PX);
+            assert_eq!((t_h, t_w), (img_h, img_w), "smart_resize mismatch vs repo path");
+            let n_chw = 3 * t_h * t_w;
+            let n_elem = (t_h / PATCH) * (t_w / PATCH) * TEMPORAL * 3 * PATCH * PATCH;
+            assert_eq!(n_elem, cpu_patches.len());
+            let d_chw = hip.malloc(n_chw * 4).expect("malloc chw");
+            let d_out = hip.malloc(n_elem * 4).expect("malloc patches");
+            let mut surf_a = surf_a;
+            let mut chw_a = d_chw.as_ptr() as u64;
+            let (mut y_pitch, mut uv_pitch, mut uv_offset) = (y_pitch, uv_pitch, uv_offset);
+            let (mut src_w, mut src_h) = (sw as u32, sh as u32);
+            let (mut sh_v, mut sv_v) = (1u32, 1u32);
+            let (mut dst_w, mut dst_h) = (t_w as u32, t_h as u32);
+            let t1 = Instant::now();
+            let mut p1: Vec<*mut c_void> = vec![
+                (&mut surf_a as *mut u64).cast(),
+                (&mut y_pitch as *mut u32).cast(),
+                (&mut uv_pitch as *mut u32).cast(),
+                (&mut uv_offset as *mut u32).cast(),
+                (&mut src_w as *mut u32).cast(),
+                (&mut src_h as *mut u32).cast(),
+                (&mut sh_v as *mut u32).cast(),
+                (&mut sv_v as *mut u32).cast(),
+                (&mut dst_w as *mut u32).cast(),
+                (&mut dst_h as *mut u32).cast(),
+                (&mut chw_a as *mut u64).cast(),
+            ];
+            // SAFETY: module loaded, args are valid device pointers / values.
+            unsafe {
+                hip.launch_kernel(&k_rgb, [(t_w as u32 + 15) / 16, (t_h as u32 + 15) / 16, 1], [16, 16, 1], 0, Some(&stream), &mut p1)
+                    .expect("launch rgb");
+            }
+            let mut chw_b = chw_a;
+            let (mut h_v, mut w_v) = (t_h as u32, t_w as u32);
+            let (mut p_v, mut t_v, mut s_v) = (PATCH as u32, TEMPORAL as u32, SMS as u32);
+            let mut out_b = d_out.as_ptr() as u64;
+            let mut p2: Vec<*mut c_void> = vec![
+                (&mut chw_b as *mut u64).cast(),
+                (&mut h_v as *mut u32).cast(),
+                (&mut w_v as *mut u32).cast(),
+                (&mut p_v as *mut u32).cast(),
+                (&mut t_v as *mut u32).cast(),
+                (&mut s_v as *mut u32).cast(),
+                (&mut out_b as *mut u64).cast(),
+            ];
+            // SAFETY: same.
+            unsafe {
+                hip.launch_kernel(&k_patch, [(n_elem as u32 + 255) / 256, 1, 1], [256, 1, 1], 0, Some(&stream), &mut p2)
+                    .expect("launch patches");
+            }
+            hip.stream_synchronize(&stream).expect("sync");
+            let kern_ms = t1.elapsed().as_secs_f64() * 1e3;
+            let mut raw = vec![0u8; n_elem * 4];
+            hip.memcpy_dtoh(&mut raw, &d_out).expect("dtoh");
+            // SAFETY: kernel wrote f32 elements; length checked above.
+            let v: Vec<f32> = unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_elem) }.to_vec();
+            hip.free(d_chw).unwrap();
+            hip.free(d_out).unwrap();
+            (v, kern_ms)
+        };
+
+        // Zero-copy arm (HIPFIRE_VCN_ZEROCOPY=1, needs HIPFIRE_VCN_LINEAR=1 so the
+        // exported dma-buf is linear): kernels read the imported surface directly.
+        let zerocopy = std::env::var_os("HIPFIRE_VCN_ZEROCOPY").is_some();
         let t0 = Instant::now();
-        let derived = sess.decode_jpeg_derived(&bytes);
+        let mut planar_444 = false;
+        let zc = if zerocopy {
+            match sess.decode_jpeg(&bytes) {
+                Ok(vf) if vf.fourcc == 0x3231_564E => Some(vf),
+                Ok(vf) => {
+                    println!("[parity] {name}: VCN decoded fourcc=0x{:08x} (444P) — kernel has no planar arm yet, CPU path", vf.fourcc);
+                    planar_444 = true;
+                    None
+                }
+                Err(va_bridge::VaError::Unsupported(_)) => None,
+                Err(e) => panic!("vcn zero-copy decode of {name}: {e}"),
+            }
+        } else {
+            None
+        };
+        let derived = if zc.is_some() {
+            Err(va_bridge::VaError::Corrupt("zero-copy arm taken"))
+        } else if planar_444 {
+            Err(va_bridge::VaError::Unsupported("444P needs planar kernel arm"))
+        } else {
+            match sess.decode_jpeg_derived(&bytes) {
+                // Derived readback is NV12-only; a 444P frame decoded fine on VCN
+                // but this example cannot consume it yet.
+                Err(va_bridge::VaError::Corrupt("derived image is not 2-plane NV12")) => {
+                    Err(va_bridge::VaError::Unsupported("444P needs planar kernel arm"))
+                }
+                r => r,
+            }
+        };
         let dec_ms = t0.elapsed().as_secs_f64() * 1e3;
-        let (path, got, kern_ms): (&str, Vec<f32>, f64) = match derived {
+        let (path, got, kern_ms): (&str, Vec<f32>, f64) = match (zc, derived) {
+            (Some(vf), _) => {
+                let (v, k) = run_kernels(
+                    vf.device_ptr() as u64,
+                    vf.y_pitch(),
+                    vf.uv_pitch(),
+                    vf.uv_offset(),
+                    vf.width as usize,
+                    vf.height as usize,
+                );
+                ("vcn-zc", v, k)
+            }
+            (None, derived) => match derived {
             Err(va_bridge::VaError::Unsupported(reason)) => {
                 // Blocker-2 product behavior: non-4:2:0 falls back to turbo.
                 println!("[parity] {name}: VCN unsupported ({reason}) — turbo CPU fallback");
@@ -317,109 +424,24 @@ fn main() {
                     "[parity] derived: {}x{} fourcc=0x{:08x} y_pitch={} uv_pitch={}",
                     d.width, d.height, d.fourcc, d.y_pitch, d.uv_pitch
                 );
-                // Target dims: same smart_resize the repo path used.
-                let (t_h, t_w) =
-                    smart_resize(d.height as usize, d.width as usize, FACTOR, MIN_PX, MAX_PX);
-                assert_eq!(
-                    (t_h, t_w),
-                    (img_h, img_w),
-                    "smart_resize mismatch vs repo path (HIPFIRE_VL_MAX_PIXELS?)"
-                );
                 let (sw, sh) = (d.width as usize, d.height as usize);
-                assert_eq!(d.y.len(), sw * sh);
                 let cw = (sw + 1) / 2;
+                assert_eq!(d.y.len(), sw * sh);
                 assert_eq!(d.uv.len(), cw * ((sh + 1) / 2) * 2);
-                // Packed NV12 upload (packed pitches: y=w, uv=2*cw).
+                // Packed NV12 upload (packed pitches: y=w, uv=2*cw); upload is
+                // inside the kernel timing since a derived product path pays it.
                 let mut nv12 = Vec::with_capacity(d.y.len() + d.uv.len());
                 nv12.extend_from_slice(&d.y);
                 nv12.extend_from_slice(&d.uv);
-                let n_chw = 3 * t_h * t_w;
-                let n_elem = (t_h / PATCH) * (t_w / PATCH) * TEMPORAL * 3 * PATCH * PATCH;
-                assert_eq!(n_elem, cpu_patches.len());
-                // Allocations outside the timed window (a product path pools them).
                 let d_surf = hip.malloc(nv12.len()).expect("malloc surf");
-                let d_chw = hip.malloc(n_chw * 4).expect("malloc chw");
-                let d_out = hip.malloc(n_elem * 4).expect("malloc patches");
-                let mut surf_a = d_surf.as_ptr() as u64;
-                let mut chw_a = d_chw.as_ptr() as u64;
-                let mut y_pitch = sw as u32;
-                let mut uv_pitch = (2 * cw) as u32;
-                let mut uv_offset = (sw * sh) as u32;
-                let mut src_w = sw as u32;
-                let mut src_h = sh as u32;
-                // Derived NV12 is always 4:2:0-layout chroma.
-                let mut sh_v = 1u32;
-                let mut sv_v = 1u32;
-                let t1 = Instant::now();
+                let t_up = Instant::now();
                 hip.memcpy_htod(&d_surf, &nv12).expect("htod surf");
-                let mut dst_w = t_w as u32;
-                let mut dst_h = t_h as u32;
-                let mut p1: Vec<*mut c_void> = vec![
-                    (&mut surf_a as *mut u64).cast(),
-                    (&mut y_pitch as *mut u32).cast(),
-                    (&mut uv_pitch as *mut u32).cast(),
-                    (&mut uv_offset as *mut u32).cast(),
-                    (&mut src_w as *mut u32).cast(),
-                    (&mut src_h as *mut u32).cast(),
-                    (&mut sh_v as *mut u32).cast(),
-                    (&mut sv_v as *mut u32).cast(),
-                    (&mut dst_w as *mut u32).cast(),
-                    (&mut dst_h as *mut u32).cast(),
-                    (&mut chw_a as *mut u64).cast(),
-                ];
-                // SAFETY: module loaded, args are valid device pointers / values.
-                unsafe {
-                    hip.launch_kernel(
-                        &k_rgb,
-                        [(t_w as u32 + 15) / 16, (t_h as u32 + 15) / 16, 1],
-                        [16, 16, 1],
-                        0,
-                        Some(&stream),
-                        &mut p1,
-                    )
-                    .expect("launch rgb");
-                }
-                let mut chw_b = chw_a;
-                let mut h_v = t_h as u32;
-                let mut w_v = t_w as u32;
-                let mut p_v = PATCH as u32;
-                let mut t_v = TEMPORAL as u32;
-                let mut s_v = SMS as u32;
-                let mut out_b = d_out.as_ptr() as u64;
-                let mut p2: Vec<*mut c_void> = vec![
-                    (&mut chw_b as *mut u64).cast(),
-                    (&mut h_v as *mut u32).cast(),
-                    (&mut w_v as *mut u32).cast(),
-                    (&mut p_v as *mut u32).cast(),
-                    (&mut t_v as *mut u32).cast(),
-                    (&mut s_v as *mut u32).cast(),
-                    (&mut out_b as *mut u64).cast(),
-                ];
-                // SAFETY: same.
-                unsafe {
-                    hip.launch_kernel(
-                        &k_patch,
-                        [(n_elem as u32 + 255) / 256, 1, 1],
-                        [256, 1, 1],
-                        0,
-                        Some(&stream),
-                        &mut p2,
-                    )
-                    .expect("launch patches");
-                }
-                hip.stream_synchronize(&stream).expect("sync");
-                let kern_ms = t1.elapsed().as_secs_f64() * 1e3;
-                let mut raw = vec![0u8; n_elem * 4];
-                hip.memcpy_dtoh(&mut raw, &d_out).expect("dtoh");
-                // SAFETY: kernel wrote f32 elements; length checked above.
-                let v: Vec<f32> =
-                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_elem) }
-                        .to_vec();
+                let up_ms = t_up.elapsed().as_secs_f64() * 1e3;
+                let (v, k) = run_kernels(d_surf.as_ptr() as u64, sw as u32, (2 * cw) as u32, (sw * sh) as u32, sw, sh);
                 hip.free(d_surf).unwrap();
-                hip.free(d_chw).unwrap();
-                hip.free(d_out).unwrap();
-                ("vcn", v, kern_ms)
+                ("vcn", v, k + up_ms)
             }
+            },
         };
         let r = rel_l1(&cpu_patches, &got);
         worst = worst.max(r);

@@ -28,6 +28,9 @@ pub type VaBufferId = u32;
 pub const VA_PROFILE_JPEG_BASELINE: i32 = 12;
 pub const VA_ENTRYPOINT_VLD: i32 = 1;
 pub const VA_RT_FORMAT_YUV420: u32 = 0x0000_0001;
+pub const VA_RT_FORMAT_YUV422: u32 = 0x0000_0002;
+pub const VA_RT_FORMAT_YUV444: u32 = 0x0000_0004;
+pub const VA_RT_FORMAT_YUV400: u32 = 0x0000_0010;
 pub const VA_STATUS_SUCCESS: i32 = 0;
 
 // ── Buffer types (va/va.h `VABufferType`) ───────────────────────────────
@@ -73,6 +76,44 @@ pub struct VaJpegComponent {
 }
 // 4 + 255*4 + 2 + 2(pad) + 4 + 8 + 20 = 1060 (C ground truth, gcc LP64)
 const _: () = assert!(std::mem::size_of::<VaJpegPicParam>() == 1060);
+
+// --- Surface attributes (libva 2.23 va.h) ------------------------------------
+// VASurfaceAttribType: DRMFormatModifiers = 9. VA_SURFACE_ATTRIB_SETTABLE = 2.
+// VAGenericValueTypePointer = 3.
+pub const VA_SURFACE_ATTRIB_DRM_FORMAT_MODIFIERS: i32 = 9;
+pub const VA_SURFACE_ATTRIB_SETTABLE: u32 = 0x2;
+pub const VA_GENERIC_VALUE_TYPE_POINTER: i32 = 3;
+pub const DRM_FORMAT_MOD_LINEAR: u64 = 0;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub union VaGenericValueUnion {
+    pub i: i32,
+    pub f: f32,
+    pub p: *mut c_void,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VaGenericValue {
+    pub ty: i32,
+    pub value: VaGenericValueUnion,
+}
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VaSurfaceAttrib {
+    pub ty: i32,
+    pub flags: u32,
+    pub value: VaGenericValue,
+}
+#[repr(C)]
+pub struct VaDrmFormatModifierList {
+    pub num_modifiers: u32,
+    pub modifiers: *mut u64,
+}
+const _: () = assert!(std::mem::size_of::<VaGenericValue>() == 16);
+const _: () = assert!(std::mem::size_of::<VaSurfaceAttrib>() == 24);
+const _: () = assert!(std::mem::size_of::<VaDrmFormatModifierList>() == 16);
+
 
 #[repr(C)]
 #[derive(Clone, Copy)]
