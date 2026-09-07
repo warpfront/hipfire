@@ -37,16 +37,17 @@ pub struct CommandBuffer {
     pub(crate) dwords: Vec<u32>,
 }
 
-/// LDS allocation granularity for COMPUTE_PGM_RSRC2.LDS_SIZE (bits [20:14]):
-/// gfx6-gfx10 count 512-byte blocks; gfx11+ (incl. gfx12) count 256-byte
-/// blocks. Measured on gfx1201 2026-09-07: encoding 1024 B as 2 (512-byte
-/// rule) or 8 (128-byte rule) both allocate 512 B and the upper half of every
-/// LDS store silently vanishes; 4 blocks of 256 B is exact. hipcc leaves this
-/// field 0 in the descriptor (ROCr derives it from group_segment_fixed_size),
-/// so it must always be derived here.
+/// LDS allocation granularity for COMPUTE_PGM_RSRC2.LDS_SIZE (bits [20:14]).
+/// Measured 2026-09-07 with hipcc lds1024/lds4096 kernels and a rustc LDS
+/// kernel: the unit is 256 bytes on gfx1010, gfx1030, gfx1100, gfx1150 and
+/// gfx1201 alike (encoding 1024 B as 2 blocks leaves the upper half of LDS
+/// unallocated and stores silently vanish; 4 blocks is exact). The 512-byte
+/// rule this crate used to carry was never right on any RDNA part we can
+/// run. gfx9 is untested here; the documented gfx9 unit is also 128 dwords
+/// (512 B), so it keeps that value until measured.
 pub fn lds_granularity(gfx_arch: &str) -> u32 {
     let n: u32 = gfx_arch.trim_start_matches("gfx").parse().unwrap_or(0);
-    if n >= 1100 { 256 } else { 512 }
+    if n >= 1000 { 256 } else { 512 }
 }
 
 /// COMPUTE_PGM_RSRC2 with LDS_SIZE derived from the kernel's static LDS plus
