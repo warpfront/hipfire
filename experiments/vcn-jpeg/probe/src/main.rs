@@ -12,7 +12,10 @@ fn blank() {
         .expect("render node");
     let dpy = unsafe { (lib.va_get_display_drm)(f.as_raw_fd()) };
     let (mut major, mut minor) = (0, 0);
-    assert_eq!(unsafe { (lib.va_initialize)(dpy, &mut major, &mut minor) }, OK);
+    assert_eq!(
+        unsafe { (lib.va_initialize)(dpy, &mut major, &mut minor) },
+        OK
+    );
     let mut cfg = 0;
     assert_eq!(
         unsafe { (lib.va_create_config)(dpy, 12, 1, std::ptr::null_mut(), 0, &mut cfg) },
@@ -55,8 +58,7 @@ fn blank() {
         "[bisect] export objects={} size={}",
         desc.num_objects, desc.objects[0].size
     );
-    match va_bridge::HipMapping::import_dma_buf(desc.objects[0].fd, desc.objects[0].size as usize)
-    {
+    match va_bridge::HipMapping::import_dma_buf(desc.objects[0].fd, desc.objects[0].size as usize) {
         Ok(m) => println!("[bisect] IMPORT OK ptr={:?}", m.ptr()),
         Err(e) => println!("[bisect] IMPORT FAIL: {e}"),
     }
@@ -93,7 +95,10 @@ fn blank_export_only() -> (i32, usize) {
         .expect("render node");
     let dpy = unsafe { (lib.va_get_display_drm)(f.as_raw_fd()) };
     let (mut major, mut minor) = (0, 0);
-    assert_eq!(unsafe { (lib.va_initialize)(dpy, &mut major, &mut minor) }, OK);
+    assert_eq!(
+        unsafe { (lib.va_initialize)(dpy, &mut major, &mut minor) },
+        OK
+    );
     let mut cfg = 0;
     assert_eq!(
         unsafe { (lib.va_create_config)(dpy, 12, 1, std::ptr::null_mut(), 0, &mut cfg) },
@@ -137,13 +142,14 @@ fn blank_export_only() -> (i32, usize) {
 }
 
 fn main() {
-    let mode = std::env::args().nth(1).unwrap_or_else(|| "full".to_string());
+    let mode = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "full".to_string());
     match mode.as_str() {
         // Raw dlopen HIP (T0-C replica) instead of HipRuntime.
         "rawhip" => {
-            let lib =
-                unsafe { libloading::Library::new("/opt/rocm/core/lib/libamdhip64.so.7") }
-                    .expect("dlopen hip");
+            let lib = unsafe { libloading::Library::new("/opt/rocm/core/lib/libamdhip64.so.7") }
+                .expect("dlopen hip");
             unsafe {
                 let set_d: libloading::Symbol<unsafe extern "C" fn(i32) -> i32> =
                     lib.get(b"hipSetDevice").expect("setDevice");
@@ -157,9 +163,8 @@ fn main() {
             // T0 order: VA export with NO HIP initialised, then setDevice, then import.
             let (fd, size) = blank_export_only();
             println!("[bisect] exported fd={fd} size={size}, now bringing HIP up");
-            let lib =
-                unsafe { libloading::Library::new("/opt/rocm/core/lib/libamdhip64.so.7") }
-                    .expect("dlopen hip");
+            let lib = unsafe { libloading::Library::new("/opt/rocm/core/lib/libamdhip64.so.7") }
+                .expect("dlopen hip");
             unsafe {
                 let set_d: libloading::Symbol<unsafe extern "C" fn(i32) -> i32> =
                     lib.get(b"hipSetDevice").expect("setDevice");

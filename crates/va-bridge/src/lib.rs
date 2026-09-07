@@ -21,10 +21,9 @@ mod jpeg;
 
 pub use ffi::{
     VaBufferId, VaConfigId, VaContextId, VaDisplay, VaDrmPrimeDescriptor, VaDrmPrimeLayer,
-    VaDrmPrimeObject, VaJpegHuffmanBuffer, VaJpegIQMatrix, VaJpegPicParam, VaJpegSliceParam,
-    VaLib, VaSurfaceId, VaError, VA_EXPORT_SURFACE_READ_ONLY,
-    VA_EXPORT_SURFACE_SEPARATE_LAYERS, VA_FOURCC_NV12, VA_MEM_TYPE_DRM_PRIME_2,
-    VA_STATUS_SUCCESS,
+    VaDrmPrimeObject, VaError, VaJpegHuffmanBuffer, VaJpegIQMatrix, VaJpegPicParam,
+    VaJpegSliceParam, VaLib, VaSurfaceId, VA_EXPORT_SURFACE_READ_ONLY,
+    VA_EXPORT_SURFACE_SEPARATE_LAYERS, VA_FOURCC_NV12, VA_MEM_TYPE_DRM_PRIME_2, VA_STATUS_SUCCESS,
 };
 pub use interop::HipMapping;
 pub use jpeg::{parse_for_va, JpegVaParams};
@@ -39,9 +38,7 @@ fn render_nodes() -> Vec<String> {
     if let Ok(one) = hipfire_config::developer_var("HIPFIRE_VCN_DRM_NODE") {
         return vec![one];
     }
-    (128..132)
-        .map(|i| format!("/dev/dri/renderD{i}"))
-        .collect()
+    (128..132).map(|i| format!("/dev/dri/renderD{i}")).collect()
 }
 
 /// An initialised VA display with a JPEG-baseline VLD config.
@@ -56,6 +53,43 @@ pub struct VaSession {
     _drm_fd: OwnedFd,
     vendor: String,
     config: VaConfigId,
+}
+struct SurfGuard<'a> {
+    lib: &'a VaLib,
+    dpy: VaDisplay,
+    surf: VaSurfaceId,
+}
+impl Drop for SurfGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: surface was created; destroy exactly once.
+        unsafe {
+            (self.lib.va_destroy_surfaces)(self.dpy, &mut self.surf, 1);
+        }
+    }
+}
+struct CtxGuard<'a> {
+    lib: &'a VaLib,
+    dpy: VaDisplay,
+    ctx: VaContextId,
+}
+impl Drop for CtxGuard<'_> {
+    fn drop(&mut self) {
+        // SAFETY: context was created; destroy exactly once.
+        unsafe {
+            (self.lib.va_destroy_context)(self.dpy, self.ctx);
+        }
+    }
+}
+/// A decoded-then-synced VA surface with its context alive: either consumer
+/// (dma-buf export or derived-image readback) runs before the guards drop.
+struct Submitted<'a> {
+    width: u32,
+    height: u32,
+    max_h: u8,
+    max_v: u8,
+    surf: VaSurfaceId,
+    _surf_guard: SurfGuard<'a>,
+    _ctx_guard: CtxGuard<'a>,
 }
 
 impl VaSession {
@@ -83,7 +117,11 @@ impl VaSession {
         // O_RDWR: radeonsi winsys creation (GEM backing) fails on O_RDONLY
         // with EACCES (`amdgpu_bo_cpu_map failed (-13)`), which surfaces as
         // vaInitialize succeeding but context creation segfaulting.
-        let fd = match std::fs::OpenOptions::new().read(true).write(true).open(node) {
+        let fd = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(node)
+        {
             Ok(f) => f,
             Err(_) => return Err((lib, VaError::NoRenderNode)),
         };
@@ -133,7 +171,10 @@ impl VaSession {
             unsafe {
                 (lib.va_terminate)(dpy);
             }
-            return Err((lib, VaError::Unsupported("driver has no VAProfileJPEGBaseline")));
+            return Err((
+                lib,
+                VaError::Unsupported("driver has no VAProfileJPEGBaseline"),
+            ));
         }
         let mut config = 0;
         let st = unsafe {
@@ -170,12 +211,10 @@ impl VaSession {
         &self.vendor
     }
 
-    /// Decode one baseline JPEG to an exported dma-buf + HIP mapping.
-    ///
-    /// Returns the frame geometry, the NV12 layer layout (pitches/offsets),
-    /// and the device mapping. All VA objects are destroyed before return;
-    /// only the [`HipMapping`] (plus plain geometry) escapes.
-    pub fn decode_jpeg(&self, jpeg: &[u8]) -> Result<VcnFrame, VaError> {
+    /// Parse → surface/context → five VA buffers → begin/render/end → sync.
+    /// Returns the synced surface with its guards alive for either consumer
+    /// (dma-buf export or derived-image readback).
+    fn submit(&self, jpeg: &[u8]) -> Result<Submitted<'_>, VaError> {
         let p = parse_for_va(jpeg)?;
         let lib = &self.lib;
         let fail = |op: &'static str, code: i32| VaError::Status {
@@ -201,19 +240,6 @@ impl VaSession {
         if st != VA_STATUS_SUCCESS {
             return Err(fail("vaCreateSurfaces", st));
         }
-        struct SurfGuard<'a> {
-            lib: &'a VaLib,
-            dpy: VaDisplay,
-            surf: VaSurfaceId,
-        }
-        impl Drop for SurfGuard<'_> {
-            fn drop(&mut self) {
-                // SAFETY: surface was created; destroy exactly once.
-                unsafe {
-                    (self.lib.va_destroy_surfaces)(self.dpy, &mut self.surf, 1);
-                }
-            }
-        }
         let _surf_guard = SurfGuard {
             lib,
             dpy: self.dpy,
@@ -236,19 +262,6 @@ impl VaSession {
         if st != VA_STATUS_SUCCESS {
             return Err(fail("vaCreateContext", st));
         }
-        struct CtxGuard<'a> {
-            lib: &'a VaLib,
-            dpy: VaDisplay,
-            ctx: VaContextId,
-        }
-        impl Drop for CtxGuard<'_> {
-            fn drop(&mut self) {
-                // SAFETY: context was created; destroy exactly once.
-                unsafe {
-                    (self.lib.va_destroy_context)(self.dpy, self.ctx);
-                }
-            }
-        }
         let _ctx_guard = CtxGuard {
             lib,
             dpy: self.dpy,
@@ -266,7 +279,10 @@ impl VaSession {
                 ffi::VA_PIC_PARAM_TYPE,
                 (&mut pic as *mut ffi::VaJpegPicParam).cast(),
             ),
-            (ffi::VA_IQ_MATRIX_TYPE, (&mut iq as *mut ffi::VaJpegIQMatrix).cast()),
+            (
+                ffi::VA_IQ_MATRIX_TYPE,
+                (&mut iq as *mut ffi::VaJpegIQMatrix).cast(),
+            ),
             (
                 ffi::VA_HUFFMAN_TABLE_TYPE,
                 (&mut huff as *mut ffi::VaJpegHuffmanBuffer).cast(),
@@ -275,28 +291,20 @@ impl VaSession {
                 ffi::VA_SLICE_PARAM_TYPE,
                 (&mut slice as *mut ffi::VaJpegSliceParam).cast(),
             ),
-            (
-                ffi::VA_SLICE_DATA_TYPE,
-                p.entropy.as_ptr() as *mut c_void,
-            ),
+            (ffi::VA_SLICE_DATA_TYPE, p.entropy.as_ptr() as *mut c_void),
         ];
         for (i, (ty, data)) in specs.iter().enumerate() {
             let size = match *ty {
                 ffi::VA_SLICE_DATA_TYPE => p.entropy.len() as u32,
-                ffi::VA_PIC_PARAM_TYPE => {
-                    std::mem::size_of::<crate::ffi::VaJpegPicParam>() as u32
-                }
-                ffi::VA_IQ_MATRIX_TYPE => {
-                    std::mem::size_of::<crate::ffi::VaJpegIQMatrix>() as u32
-                }
+                ffi::VA_PIC_PARAM_TYPE => std::mem::size_of::<crate::ffi::VaJpegPicParam>() as u32,
+                ffi::VA_IQ_MATRIX_TYPE => std::mem::size_of::<crate::ffi::VaJpegIQMatrix>() as u32,
                 ffi::VA_HUFFMAN_TABLE_TYPE => {
                     std::mem::size_of::<crate::ffi::VaJpegHuffmanBuffer>() as u32
                 }
                 _ => std::mem::size_of::<crate::ffi::VaJpegSliceParam>() as u32,
             };
-            st = unsafe {
-                (lib.va_create_buffer)(self.dpy, ctx, *ty, size, 1, *data, &mut bufs[i])
-            };
+            st =
+                unsafe { (lib.va_create_buffer)(self.dpy, ctx, *ty, size, 1, *data, &mut bufs[i]) };
             if st != VA_STATUS_SUCCESS {
                 for b in bufs[..i].iter() {
                     // SAFETY: created above.
@@ -328,6 +336,45 @@ impl VaSession {
         if st != VA_STATUS_SUCCESS {
             return Err(fail("vaSyncSurface", st));
         }
+        Ok(Submitted {
+            width: p.width as u32,
+            height: p.height as u32,
+            max_h: p.max_h,
+            max_v: p.max_v,
+            surf,
+            _surf_guard,
+            _ctx_guard,
+        })
+    }
+
+    /// Decode one baseline JPEG to an exported dma-buf + HIP mapping.
+    ///
+    /// Returns the frame geometry, the NV12 layer layout (pitches/offsets),
+    /// and the device mapping. All VA objects are destroyed before return;
+    /// only the [`HipMapping`] (plus plain geometry) escapes.
+    ///
+    /// NOTE (experiment/vcn-jpeg finding): on radeonsi/gfx1201 the exported
+    /// BO carries a `GFX12_64K_2D + DCC` modifier, so the mapping is NOT
+    /// linear-readable by a compute kernel. Use [`decode_jpeg_derived`]
+    /// for validated pixels.
+    pub fn decode_jpeg(&self, jpeg: &[u8]) -> Result<VcnFrame, VaError> {
+        let lib = &self.lib;
+        let fail = |op: &'static str, code: i32| VaError::Status {
+            op,
+            code,
+            msg: lib.error_str(code),
+        };
+        let Submitted {
+            width,
+            height,
+            max_h,
+            max_v,
+            surf,
+            _surf_guard,
+            _ctx_guard,
+        } = self.submit(jpeg)?;
+        // `_surf_guard`/`_ctx_guard` stay alive until return.
+        let mut st = 0;
 
         // Export + import. The export fds are closed after import (HIP holds
         // its own reference); the surface/context die with the guards.
@@ -390,14 +437,128 @@ impl VaSession {
         }
         let mapping = mapping?;
         Ok(VcnFrame {
-            width: p.width as u32,
-            height: p.height as u32,
-            max_h: p.max_h,
-            max_v: p.max_v,
+            width,
+            height,
+            max_h,
+            max_v,
             fourcc: desc.fourcc,
             layers: desc.layers,
             num_layers: desc.num_layers,
             mapping,
+        })
+    }
+
+    /// Decode one baseline JPEG and read the pixels back through
+    /// `vaDeriveImage`/`vaMapBuffer` (the driver resolves tiling/DCC into a
+    /// linear CPU mapping). Returns packed NV12 planes. This is the
+    /// validation path for VCN decode correctness; it costs a GPU→CPU copy
+    /// but no JPEG entropy work on the CPU.
+    pub fn decode_jpeg_derived(&self, jpeg: &[u8]) -> Result<DerivedFrame, VaError> {
+        let lib = &self.lib;
+        let fail = |op: &'static str, code: i32| VaError::Status {
+            op,
+            code,
+            msg: lib.error_str(code),
+        };
+        let Submitted {
+            width,
+            height,
+            max_h: _,
+            max_v: _,
+            surf,
+            _surf_guard,
+            _ctx_guard,
+        } = self.submit(jpeg)?;
+        // `_surf_guard`/`_ctx_guard` stay alive until return.
+        let mut img = ffi::VaImage {
+            image_id: 0,
+            format: ffi::VaImageFormat {
+                fourcc: 0,
+                byte_order: 0,
+                bits_per_pixel: 0,
+                depth: 0,
+                red_mask: 0,
+                green_mask: 0,
+                blue_mask: 0,
+                alpha_mask: 0,
+                va_reserved: [0; 4],
+            },
+            buf: 0,
+            width: 0,
+            height: 0,
+            data_size: 0,
+            num_planes: 0,
+            pitches: [0; 3],
+            offsets: [0; 3],
+            num_palette_entries: 0,
+            entry_bytes: 0,
+            component_order: [0; 4],
+            va_reserved: [0; 4],
+        };
+        // SAFETY: out-param is a valid VaImage slot.
+        let mut st = unsafe { (lib.va_derive_image)(self.dpy, surf, &mut img) };
+        if st != VA_STATUS_SUCCESS {
+            return Err(fail("vaDeriveImage", st));
+        }
+        struct ImgGuard<'a> {
+            lib: &'a VaLib,
+            dpy: VaDisplay,
+            id: u32,
+        }
+        impl Drop for ImgGuard<'_> {
+            fn drop(&mut self) {
+                // SAFETY: image was derived; destroy exactly once.
+                unsafe {
+                    (self.lib.va_destroy_image)(self.dpy, self.id);
+                }
+            }
+        }
+        let _img_guard = ImgGuard {
+            lib,
+            dpy: self.dpy,
+            id: img.image_id,
+        };
+        if img.format.fourcc != VA_FOURCC_NV12 || img.num_planes != 2 {
+            return Err(VaError::Corrupt("derived image is not 2-plane NV12"));
+        }
+        if img.width as u32 != width || img.height as u32 != height {
+            return Err(VaError::Corrupt("derived image geometry mismatch"));
+        }
+        let mut ptr: *mut c_void = std::ptr::null_mut();
+        // SAFETY: out-param is a valid pointer slot; unmapped below.
+        st = unsafe { (lib.va_map_buffer)(self.dpy, img.buf, &mut ptr) };
+        if st != VA_STATUS_SUCCESS || ptr.is_null() {
+            return Err(fail("vaMapBuffer", st));
+        }
+        // SAFETY: mapped NV12 bytes; rows copied before unmap. Chroma dims
+        // are ceil(w/2) x ceil(h/2) so odd-size frames (e.g. 537x529) pack
+        // exactly.
+        let (y, uv) = unsafe {
+            let base = ptr as *const u8;
+            let (w, h) = (width as usize, height as usize);
+            let (yp, up) = (img.pitches[0] as usize, img.pitches[1] as usize);
+            let (yo, uo) = (img.offsets[0] as usize, img.offsets[1] as usize);
+            let mut y = vec![0u8; w * h];
+            for r in 0..h {
+                let src = std::slice::from_raw_parts(base.add(yo + r * yp), w);
+                y[r * w..(r + 1) * w].copy_from_slice(src);
+            }
+            let (cw, chh) = ((w + 1) / 2, (h + 1) / 2);
+            let mut uv = vec![0u8; cw * chh * 2];
+            for r in 0..chh {
+                let src = std::slice::from_raw_parts(base.add(uo + r * up), cw * 2);
+                uv[r * cw * 2..(r + 1) * cw * 2].copy_from_slice(src);
+            }
+            (y, uv)
+        };
+        Ok(DerivedFrame {
+            width,
+            height,
+            fourcc: img.format.fourcc,
+            y_pitch: img.pitches[0],
+            uv_pitch: img.pitches[1],
+            y,
+            uv,
         })
     }
 }
@@ -468,4 +629,20 @@ impl VcnFrame {
             self.y_pitch()
         }
     }
+}
+
+/// A VCN-decoded frame read back through `vaDeriveImage`: packed NV12
+/// planes with driver-resolved (linear) layout. Validation path for decode
+/// correctness when the dma-buf export is tiled/DCC (see
+/// [`VaSession::decode_jpeg_derived`]).
+pub struct DerivedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub fourcc: u32,
+    pub y_pitch: u32,
+    pub uv_pitch: u32,
+    /// Packed luma, `width * height` bytes.
+    pub y: Vec<u8>,
+    /// Packed interleaved chroma, `(width/2) * (height/2) * 2` bytes.
+    pub uv: Vec<u8>,
 }

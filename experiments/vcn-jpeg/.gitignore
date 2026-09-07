@@ -1,0 +1,7 @@
+# experiment/vcn-jpeg lab scratch: never commit built probes or cargo targets.
+/t0_probe
+/t0_d2d
+/t0_vcn_timing
+/target/
+probe/target/
+*.hsaco

@@ -5,8 +5,7 @@
 use std::path::PathBuf;
 
 fn main() {
-    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../benchmarks/vision/images");
+    let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/vision/images");
     for name in [
         "general_qa.jpg",
         "barney_cigar.jpg",

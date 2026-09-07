@@ -165,10 +165,46 @@ pub struct VaDrmPrimeLayer {
 }
 // 16 + 64 + 4 + 224 = 308, +4 tail pad to align 8 = 312 (C ground truth, gcc LP64)
 const _: () = assert!(std::mem::size_of::<VaDrmPrimeDescriptor>() == 312);
+// ── Derived images (va/va.h `VAImage`; tiling/DCC-resolving CPU readback) ──
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VaImageFormat {
+    pub fourcc: u32,
+    pub byte_order: u32,
+    pub bits_per_pixel: u32,
+    pub depth: u32,
+    pub red_mask: u32,
+    pub green_mask: u32,
+    pub blue_mask: u32,
+    pub alpha_mask: u32,
+    pub va_reserved: [u32; 4], // VA_PADDING_LOW
+}
+// 8*4 + 16 = 48
+const _: () = assert!(std::mem::size_of::<VaImageFormat>() == 48);
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VaImage {
+    pub image_id: u32,
+    pub format: VaImageFormat,
+    pub buf: u32,
+    pub width: u16,
+    pub height: u16,
+    pub data_size: u32,
+    pub num_planes: u32,
+    pub pitches: [u32; 3],
+    pub offsets: [u32; 3],
+    pub num_palette_entries: i32,
+    pub entry_bytes: i32,
+    pub component_order: [i8; 4],
+    pub va_reserved: [u32; 4], // VA_PADDING_LOW
+}
+// 4+48+4+2+2+4+4+12+12+4+4+4+16 = 120 (C ground truth, gcc LP64)
+const _: () = assert!(std::mem::size_of::<VaImage>() == 120);
 
 // ── Loaded library ──────────────────────────────────────────────────────
 macro_rules! fn_ty {
-    ($name:ident($($arg:ty),*) -> $ret:ty) => {
+    ($name:ident($($arg:ty),* $(,)?) -> $ret:ty) => {
         unsafe extern "C" fn($($arg),*) -> $ret
     };
 }
@@ -180,8 +216,7 @@ pub struct VaLib {
     _va: Library,
     _va_drm: Library,
     pub va_get_display_drm: fn_ty!(va_get_display_drm(i32) -> VaDisplay),
-    pub va_initialize:
-        fn_ty!(va_initialize(VaDisplay, *mut i32, *mut i32) -> i32),
+    pub va_initialize: fn_ty!(va_initialize(VaDisplay, *mut i32, *mut i32) -> i32),
     pub va_terminate: fn_ty!(va_terminate(VaDisplay) -> i32),
     pub va_error_str: fn_ty!(va_error_str(i32) -> *const i8),
     pub va_query_vendor: fn_ty!(va_query_vendor(VaDisplay) -> *const i8),
@@ -190,17 +225,43 @@ pub struct VaLib {
     pub va_create_config:
         fn_ty!(va_create_config(VaDisplay, i32, i32, *mut c_void, i32, *mut VaConfigId) -> i32),
     pub va_destroy_config: fn_ty!(va_destroy_config(VaDisplay, VaConfigId) -> i32),
-    pub va_create_surfaces: fn_ty!(va_create_surfaces(
-        VaDisplay, u32, u32, u32, *mut VaSurfaceId, u32, *mut c_void, u32
-    ) -> i32),
+    pub va_create_surfaces: fn_ty!(
+        va_create_surfaces(
+            VaDisplay,
+            u32,
+            u32,
+            u32,
+            *mut VaSurfaceId,
+            u32,
+            *mut c_void,
+            u32,
+        ) -> i32
+    ),
     pub va_destroy_surfaces: fn_ty!(va_destroy_surfaces(VaDisplay, *mut VaSurfaceId, i32) -> i32),
-    pub va_create_context: fn_ty!(va_create_context(
-        VaDisplay, VaConfigId, i32, i32, i32, *mut VaSurfaceId, i32, *mut VaContextId
-    ) -> i32),
+    pub va_create_context: fn_ty!(
+        va_create_context(
+            VaDisplay,
+            VaConfigId,
+            i32,
+            i32,
+            i32,
+            *mut VaSurfaceId,
+            i32,
+            *mut VaContextId,
+        ) -> i32
+    ),
     pub va_destroy_context: fn_ty!(va_destroy_context(VaDisplay, VaContextId) -> i32),
-    pub va_create_buffer: fn_ty!(va_create_buffer(
-        VaDisplay, VaContextId, i32, u32, u32, *mut c_void, *mut VaBufferId
-    ) -> i32),
+    pub va_create_buffer: fn_ty!(
+        va_create_buffer(
+            VaDisplay,
+            VaContextId,
+            i32,
+            u32,
+            u32,
+            *mut c_void,
+            *mut VaBufferId,
+        ) -> i32
+    ),
     pub va_destroy_buffer: fn_ty!(va_destroy_buffer(VaDisplay, VaBufferId) -> i32),
     pub va_begin_picture: fn_ty!(va_begin_picture(VaDisplay, VaContextId, VaSurfaceId) -> i32),
     pub va_render_picture:
@@ -209,6 +270,10 @@ pub struct VaLib {
     pub va_sync_surface: fn_ty!(va_sync_surface(VaDisplay, VaSurfaceId) -> i32),
     pub va_export_surface_handle:
         fn_ty!(va_export_surface_handle(VaDisplay, VaSurfaceId, u32, u32, *mut c_void) -> i32),
+    pub va_derive_image: fn_ty!(va_derive_image(VaDisplay, VaSurfaceId, *mut VaImage) -> i32),
+    pub va_map_buffer: fn_ty!(va_map_buffer(VaDisplay, VaBufferId, *mut *mut c_void) -> i32),
+    pub va_unmap_buffer: fn_ty!(va_unmap_buffer(VaDisplay, VaBufferId) -> i32),
+    pub va_destroy_image: fn_ty!(va_destroy_image(VaDisplay, u32) -> i32),
 }
 
 impl VaLib {
@@ -263,6 +328,10 @@ impl VaLib {
                 va_end_picture: resolve!(&va, b"vaEndPicture", _),
                 va_sync_surface: resolve!(&va, b"vaSyncSurface", _),
                 va_export_surface_handle: resolve!(&va, b"vaExportSurfaceHandle", _),
+                va_derive_image: resolve!(&va, b"vaDeriveImage", _),
+                va_map_buffer: resolve!(&va, b"vaMapBuffer", _),
+                va_unmap_buffer: resolve!(&va, b"vaUnmapBuffer", _),
+                va_destroy_image: resolve!(&va, b"vaDestroyImage", _),
                 _va: va,
                 _va_drm: va_drm,
             })
@@ -289,10 +358,19 @@ unsafe impl Sync for VaLib {}
 /// Recoverable VA-API failure. Callers fall back to the CPU oracle.
 #[derive(Debug)]
 pub enum VaError {
-    Dlopen { lib: String, msg: String },
-    MissingSymbol { symbol: String },
+    Dlopen {
+        lib: String,
+        msg: String,
+    },
+    MissingSymbol {
+        symbol: String,
+    },
     NoRenderNode,
-    Status { op: &'static str, code: i32, msg: String },
+    Status {
+        op: &'static str,
+        code: i32,
+        msg: String,
+    },
     Unsupported(&'static str),
     Corrupt(&'static str),
 }

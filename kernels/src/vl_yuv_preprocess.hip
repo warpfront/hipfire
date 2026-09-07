@@ -24,7 +24,9 @@
 
 #include <hip/hip_runtime.h>
 
-// Keys cubic with a = 0.5 (CatmullRom: Mitchell B=0, C=0.5).
+// Keys cubic with a = 0.5 (Catmull-Rom: Mitchell B=0, C=0.5). Term-identical
+// to image-0.25.10 `bc_cubic_spline(x, 0.0, 0.5)` (verified term by term;
+// stage-D host-port residual 0.35 LSB mean).
 __device__ __forceinline__ float vl_cubic(float x) {
     x = fabsf(x);
     const float x2 = x * x;
@@ -115,8 +117,11 @@ extern "C" __global__ void vl_nv12_to_rgb_norm(
     const unsigned char* uv_base = surf_base + uv_offset;
     const int cw = (int)(src_w >> chroma_shift_x);
     const int ch = (int)(src_h >> chroma_shift_y);
-    const float cx = (sx + 0.5f * (float)(1u << chroma_shift_x) - 0.5f) / (float)(1u << chroma_shift_x);
-    const float cy = (sy + 0.5f * (float)(1u << chroma_shift_y) - 0.5f) / (float)(1u << chroma_shift_y);
+    // Centered chroma siting (JFIF: chroma[i] is the 2x2-block average,
+    // nominally at luma S*i + (S-1)/2), matching libjpeg's fancy-upsample
+    // phase. (Was off by half a chroma tap: +0.25 instead of -0.25.)
+    const float cx = (sx - 0.5f * (float)((1u << chroma_shift_x) - 1u)) / (float)(1u << chroma_shift_x);
+    const float cy = (sy - 0.5f * (float)((1u << chroma_shift_y) - 1u)) / (float)(1u << chroma_shift_y);
     float cb, cr;
     vl_sample_chroma(uv_base, (int)uv_pitch, cw, ch, cx, cy, &cb, &cr);
 

@@ -80,9 +80,9 @@ impl Md5 {
     }
     fn finish(mut self) -> [u8; 16] {
         const S: [u32; 64] = [
-            7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14,
-            20, 5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11,
-            16, 23, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
+            7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 7, 12, 17, 22, 5, 9, 14, 20, 5, 9, 14, 20,
+            5, 9, 14, 20, 5, 9, 14, 20, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23, 4, 11, 16, 23,
+            6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21, 6, 10, 15, 21,
         ];
         const K: [u32; 64] = [
             0xd76aa478, 0xe8c7b756, 0x242070db, 0xc1bdceee, 0xf57c0faf, 0x4787c62a, 0xa8304613,
@@ -149,6 +149,9 @@ fn hex(b: &[u8]) -> String {
 }
 
 fn main() {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cpu_only = args.iter().any(|a| a == "--cpu-only");
+    let only: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
     let fixtures = [
         "general_qa.jpg",
         "barney_cigar.jpg",
@@ -156,8 +159,7 @@ fn main() {
         "scene_2.jpg",
         "doge.jpeg",
     ];
-    let img_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../benchmarks/vision/images");
+    let img_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/vision/images");
 
     // ——— HIP + kernels ———
     let hip = hip_bridge::HipRuntime::load().expect("HipRuntime::load");
@@ -166,8 +168,8 @@ fn main() {
     println!("[parity] hip arch={arch}");
     let stream = hip.stream_create().expect("stream_create");
 
-    let ksrc = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../kernels/src/vl_yuv_preprocess.hip");
+    let ksrc =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernels/src/vl_yuv_preprocess.hip");
     let tmp = std::env::temp_dir().join("vcn_parity");
     std::fs::create_dir_all(&tmp).unwrap();
     let hsaco = tmp.join("vl_yuv_preprocess.hsaco");
@@ -205,15 +207,21 @@ fn main() {
             None
         }
     };
-
     println!(
-        "{:>16} {:>9} {:>10} {:>10} {:>10} {:>8} {:>10} {:>10}",
-        "fixture", "dims", "cpu_ms", "vcn_dec", "vcn_kern", "vcn_tot", "speedup", "rel-L1"
+        "{:>16} {:>9} {:>10} {:>10} {:>10} {:>10} {:>8} {:>10} {:>12}",
+        "fixture", "dims", "cpu_ms", "vcn_dec", "vcn_kern", "vcn_tot", "speedup", "rel-L1", "path"
     );
     let mut worst = 0.0f64;
     for name in fixtures {
+        if !only.is_empty() && !only.iter().any(|o| o.as_str() == name) {
+            continue;
+        }
         let bytes = std::fs::read(img_dir.join(name)).expect("fixture read");
-        println!("[parity] --- {name} md5={} ({}B)", md5hex(&bytes), bytes.len());
+        println!(
+            "[parity] --- {name} md5={} ({}B)",
+            md5hex(&bytes),
+            bytes.len()
+        );
 
         // Oracle A (acceptance): the repo CPU path.
         let t0 = Instant::now();
@@ -232,7 +240,10 @@ fn main() {
             .expect("image decode")
             .to_rgb8();
         let (tw, th) = (turbo.width, turbo.height);
-        assert_eq!((tw, th), (via_image.width() as usize, via_image.height() as usize));
+        assert_eq!(
+            (tw, th),
+            (via_image.width() as usize, via_image.height() as usize)
+        );
         let raw = via_image.as_raw();
         let mut diff_n = 0usize;
         let mut diff_max = 0u8;
@@ -247,151 +258,174 @@ fn main() {
             "[parity] decode-xcheck turbo({tw}x{th}) vs image-crate: differ={diff_n}/{} max_abs={diff_max}",
             raw.len()
         );
-
-        // VCN path.
+        // VCN path (driver-resolved pixels) with turbo CPU fallback, or a
+        // --cpu-only timing row for the kill-gate A/B.
+        if cpu_only {
+            println!(
+                "{:>16} {:>9} {:>10.2} {:>10} {:>10} {:>10} {:>8} {:>10} {:>12}",
+                name,
+                format!("{img_w}x{img_h}"),
+                cpu_ms,
+                "-",
+                "-",
+                "-",
+                "-",
+                "-",
+                "cpu-only"
+            );
+            println!(
+                "[parity] {name}: cpu-only cpu_pre={cpu_pre_ms:.2}ms cpu_patch={cpu_patch_ms:.2}ms"
+            );
+            continue;
+        }
         let Some(sess) = session.as_ref() else {
             println!("[parity] {name}: VA unavailable, skipping VCN path");
             continue;
         };
         let t0 = Instant::now();
-        let frame = sess.decode_jpeg(&bytes).expect("vcn decode");
+        let derived = sess.decode_jpeg_derived(&bytes);
         let dec_ms = t0.elapsed().as_secs_f64() * 1e3;
-        println!(
-            "[parity] export: {}x{} fourcc=0x{:08x} layers={} y_pitch={} uv_off={} uv_pitch={} maxH={} maxV={}",
-            frame.width,
-            frame.height,
-            frame.fourcc,
-            frame.num_layers,
-            frame.y_pitch(),
-            frame.uv_offset(),
-            frame.uv_pitch(),
-            frame.max_h,
-            frame.max_v
-        );
-        for i in 0..frame.num_layers.min(4) as usize {
-            let l = &frame.layers[i];
-            println!(
-                "[parity]   layer{i}: fmt=0x{:08x} planes={} pitch={:?} off={:?}",
-                l.drm_format, l.num_planes, &l.pitch[..l.num_planes as usize],
-                &l.offset[..l.num_planes as usize]
-            );
-        }
-        if frame.fourcc != va_bridge::VA_FOURCC_NV12 || frame.num_layers != 2 {
-            println!("[parity] {name}: non-NV12-2-layer export — kernel TBD, skipping");
-            continue;
-        }
-        // Target dims: same smart_resize the repo path used; self-check equality.
-        let (t_h, t_w) = smart_resize(
-            frame.height as usize,
-            frame.width as usize,
-            FACTOR,
-            MIN_PX,
-            MAX_PX,
-        );
-        assert_eq!(
-            (t_h, t_w),
-            (img_h, img_w),
-            "smart_resize mismatch vs repo path (HIPFIRE_VL_MAX_PIXELS?)"
-        );
-        let (sh, sv) = match (frame.max_h, frame.max_v) {
-            (2, 2) => (1u32, 1u32),
-            (1, 1) => (0u32, 0u32),
-            _ => {
-                println!("[parity] {name}: odd sampling, skipping");
-                continue;
+        let (path, got, kern_ms): (&str, Vec<f32>, f64) = match derived {
+            Err(va_bridge::VaError::Unsupported(reason)) => {
+                // Blocker-2 product behavior: non-4:2:0 falls back to turbo.
+                println!("[parity] {name}: VCN unsupported ({reason}) — turbo CPU fallback");
+                let t1 = Instant::now();
+                let rgb = image::DynamicImage::ImageRgb8(
+                    image::RgbImage::from_raw(tw as u32, th as u32, turbo.data.clone())
+                        .expect("turbo rgb"),
+                );
+                let rgb = rgb
+                    .resize_exact(
+                        img_w as u32,
+                        img_h as u32,
+                        image::imageops::FilterType::CatmullRom,
+                    )
+                    .to_rgb8();
+                let plane = img_h * img_w;
+                let mut chw = vec![0f32; 3 * plane];
+                for (i, px) in rgb.pixels().enumerate() {
+                    chw[i] = px[0] as f32 / 127.5 - 1.0;
+                    chw[plane + i] = px[1] as f32 / 127.5 - 1.0;
+                    chw[2 * plane + i] = px[2] as f32 / 127.5 - 1.0;
+                }
+                let fb = extract_patches(&chw, 3, img_h, img_w, PATCH, TEMPORAL, SMS);
+                ("cpu-fallback", fb, t1.elapsed().as_secs_f64() * 1e3)
+            }
+            Err(e) => panic!("vcn decode of {name}: {e}"),
+            Ok(d) => {
+                println!(
+                    "[parity] derived: {}x{} fourcc=0x{:08x} y_pitch={} uv_pitch={}",
+                    d.width, d.height, d.fourcc, d.y_pitch, d.uv_pitch
+                );
+                // Target dims: same smart_resize the repo path used.
+                let (t_h, t_w) =
+                    smart_resize(d.height as usize, d.width as usize, FACTOR, MIN_PX, MAX_PX);
+                assert_eq!(
+                    (t_h, t_w),
+                    (img_h, img_w),
+                    "smart_resize mismatch vs repo path (HIPFIRE_VL_MAX_PIXELS?)"
+                );
+                let (sw, sh) = (d.width as usize, d.height as usize);
+                assert_eq!(d.y.len(), sw * sh);
+                let cw = (sw + 1) / 2;
+                assert_eq!(d.uv.len(), cw * ((sh + 1) / 2) * 2);
+                // Packed NV12 upload (packed pitches: y=w, uv=2*cw).
+                let mut nv12 = Vec::with_capacity(d.y.len() + d.uv.len());
+                nv12.extend_from_slice(&d.y);
+                nv12.extend_from_slice(&d.uv);
+                let n_chw = 3 * t_h * t_w;
+                let n_elem = (t_h / PATCH) * (t_w / PATCH) * TEMPORAL * 3 * PATCH * PATCH;
+                assert_eq!(n_elem, cpu_patches.len());
+                // Allocations outside the timed window (a product path pools them).
+                let d_surf = hip.malloc(nv12.len()).expect("malloc surf");
+                let d_chw = hip.malloc(n_chw * 4).expect("malloc chw");
+                let d_out = hip.malloc(n_elem * 4).expect("malloc patches");
+                let mut surf_a = d_surf.as_ptr() as u64;
+                let mut chw_a = d_chw.as_ptr() as u64;
+                let mut y_pitch = sw as u32;
+                let mut uv_pitch = (2 * cw) as u32;
+                let mut uv_offset = (sw * sh) as u32;
+                let mut src_w = sw as u32;
+                let mut src_h = sh as u32;
+                // Derived NV12 is always 4:2:0-layout chroma.
+                let mut sh_v = 1u32;
+                let mut sv_v = 1u32;
+                let t1 = Instant::now();
+                hip.memcpy_htod(&d_surf, &nv12).expect("htod surf");
+                let mut dst_w = t_w as u32;
+                let mut dst_h = t_h as u32;
+                let mut p1: Vec<*mut c_void> = vec![
+                    (&mut surf_a as *mut u64).cast(),
+                    (&mut y_pitch as *mut u32).cast(),
+                    (&mut uv_pitch as *mut u32).cast(),
+                    (&mut uv_offset as *mut u32).cast(),
+                    (&mut src_w as *mut u32).cast(),
+                    (&mut src_h as *mut u32).cast(),
+                    (&mut sh_v as *mut u32).cast(),
+                    (&mut sv_v as *mut u32).cast(),
+                    (&mut dst_w as *mut u32).cast(),
+                    (&mut dst_h as *mut u32).cast(),
+                    (&mut chw_a as *mut u64).cast(),
+                ];
+                // SAFETY: module loaded, args are valid device pointers / values.
+                unsafe {
+                    hip.launch_kernel(
+                        &k_rgb,
+                        [(t_w as u32 + 15) / 16, (t_h as u32 + 15) / 16, 1],
+                        [16, 16, 1],
+                        0,
+                        Some(&stream),
+                        &mut p1,
+                    )
+                    .expect("launch rgb");
+                }
+                let mut chw_b = chw_a;
+                let mut h_v = t_h as u32;
+                let mut w_v = t_w as u32;
+                let mut p_v = PATCH as u32;
+                let mut t_v = TEMPORAL as u32;
+                let mut s_v = SMS as u32;
+                let mut out_b = d_out.as_ptr() as u64;
+                let mut p2: Vec<*mut c_void> = vec![
+                    (&mut chw_b as *mut u64).cast(),
+                    (&mut h_v as *mut u32).cast(),
+                    (&mut w_v as *mut u32).cast(),
+                    (&mut p_v as *mut u32).cast(),
+                    (&mut t_v as *mut u32).cast(),
+                    (&mut s_v as *mut u32).cast(),
+                    (&mut out_b as *mut u64).cast(),
+                ];
+                // SAFETY: same.
+                unsafe {
+                    hip.launch_kernel(
+                        &k_patch,
+                        [(n_elem as u32 + 255) / 256, 1, 1],
+                        [256, 1, 1],
+                        0,
+                        Some(&stream),
+                        &mut p2,
+                    )
+                    .expect("launch patches");
+                }
+                hip.stream_synchronize(&stream).expect("sync");
+                let kern_ms = t1.elapsed().as_secs_f64() * 1e3;
+                let mut raw = vec![0u8; n_elem * 4];
+                hip.memcpy_dtoh(&mut raw, &d_out).expect("dtoh");
+                // SAFETY: kernel wrote f32 elements; length checked above.
+                let v: Vec<f32> =
+                    unsafe { std::slice::from_raw_parts(raw.as_ptr() as *const f32, n_elem) }
+                        .to_vec();
+                hip.free(d_surf).unwrap();
+                hip.free(d_chw).unwrap();
+                hip.free(d_out).unwrap();
+                ("vcn", v, kern_ms)
             }
         };
-        let n_chw = 3 * t_h * t_w;
-        let d_chw = hip.malloc(n_chw * 4).expect("malloc chw");
-        let gh = t_h / PATCH;
-        let gw = t_w / PATCH;
-        let n_elem = gh * gw * TEMPORAL * 3 * PATCH * PATCH;
-        assert_eq!(n_elem, cpu_patches.len());
-        let d_out = hip.malloc(n_elem * 4).expect("malloc patches");
-
-        let surf_u64 = frame.device_ptr() as u64;
-        let chw_u64 = d_chw.as_ptr() as u64;
-        let out_u64 = d_out.as_ptr() as u64;
-        let mut y_pitch = frame.y_pitch();
-        let mut uv_pitch = frame.uv_pitch();
-        let mut uv_offset = frame.uv_offset();
-        let mut src_w = frame.width;
-        let mut src_h = frame.height;
-        let mut sh_v = sh;
-        let mut sv_v = sv;
-        let mut dst_w = t_w as u32;
-        let mut dst_h = t_h as u32;
-        let mut surf_a = surf_u64;
-        let mut chw_a = chw_u64;
-        let t0 = Instant::now();
-        let mut p1: Vec<*mut c_void> = vec![
-            (&mut surf_a as *mut u64).cast(),
-            (&mut y_pitch as *mut u32).cast(),
-            (&mut uv_pitch as *mut u32).cast(),
-            (&mut uv_offset as *mut u32).cast(),
-            (&mut src_w as *mut u32).cast(),
-            (&mut src_h as *mut u32).cast(),
-            (&mut sh_v as *mut u32).cast(),
-            (&mut sv_v as *mut u32).cast(),
-            (&mut dst_w as *mut u32).cast(),
-            (&mut dst_h as *mut u32).cast(),
-            (&mut chw_a as *mut u64).cast(),
-        ];
-        // SAFETY: module loaded, args are valid device pointers / values.
-        unsafe {
-            hip.launch_kernel(
-                &k_rgb,
-                [(t_w as u32 + 15) / 16, (t_h as u32 + 15) / 16, 1],
-                [16, 16, 1],
-                0,
-                Some(&stream),
-                &mut p1,
-            )
-            .expect("launch rgb");
-        }
-        let mut chw_b = chw_u64;
-        let mut h_v = t_h as u32;
-        let mut w_v = t_w as u32;
-        let mut p_v = PATCH as u32;
-        let mut t_v = TEMPORAL as u32;
-        let mut s_v = SMS as u32;
-        let mut out_b = out_u64;
-        let mut p2: Vec<*mut c_void> = vec![
-            (&mut chw_b as *mut u64).cast(),
-            (&mut h_v as *mut u32).cast(),
-            (&mut w_v as *mut u32).cast(),
-            (&mut p_v as *mut u32).cast(),
-            (&mut t_v as *mut u32).cast(),
-            (&mut s_v as *mut u32).cast(),
-            (&mut out_b as *mut u64).cast(),
-        ];
-        // SAFETY: same.
-        unsafe {
-            hip.launch_kernel(
-                &k_patch,
-                [(n_elem as u32 + 255) / 256, 1, 1],
-                [256, 1, 1],
-                0,
-                Some(&stream),
-                &mut p2,
-            )
-            .expect("launch patches");
-        }
-        hip.stream_synchronize(&stream).expect("sync");
-        let kern_ms = t0.elapsed().as_secs_f64() * 1e3;
-
-        let mut vcn_patches = vec![0u8; n_elem * 4];
-        hip.memcpy_dtoh(&mut vcn_patches, &d_out).expect("dtoh");
-        // SAFETY: kernel wrote f32 elements; length checked above.
-        let vcn_patches: &[f32] = unsafe {
-            std::slice::from_raw_parts(vcn_patches.as_ptr() as *const f32, n_elem)
-        };
-        // Eyeball guard: error type distribution (catches single-token-attractor analogues).
-        let r = rel_l1(&cpu_patches, vcn_patches);
+        let r = rel_l1(&cpu_patches, &got);
         worst = worst.max(r);
         let tot = dec_ms + kern_ms;
         println!(
-            "{:>16} {:>9} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>8.2}x {:>10.3e}",
+            "{:>16} {:>9} {:>10.2} {:>10.2} {:>10.2} {:>10.2} {:>8.2}x {:>10.3e} {:>12}",
             name,
             format!("{img_w}x{img_h}"),
             cpu_ms,
@@ -399,12 +433,9 @@ fn main() {
             kern_ms,
             tot,
             cpu_ms / tot.max(1e-9),
-            r
+            r,
+            path
         );
-        // Keep the mapping alive until the kernels + D2H complete.
-        drop(frame);
-        hip.free(d_chw).unwrap();
-        hip.free(d_out).unwrap();
     }
     println!("[parity] worst rel-L1 = {worst:.3e} (equivalence bound 1e-2)");
 }

@@ -262,6 +262,9 @@ required-features = []
 [[example]]
 name = "vl_vcn_parity"
 required-features = ["vcn-jpeg"]
+[[example]]
+name = "vl_vcn_debug"
+required-features = ["vcn-jpeg"]
 
 [package.metadata.cargo-machete]
 # byteorder: deliberately kept (workspace from_le_bytes convention); never referenced by path in code.

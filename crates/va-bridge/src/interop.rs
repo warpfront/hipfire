@@ -70,9 +70,8 @@ impl HipMapping {
         // two (ROCm 7.15 under /opt/rocm + 7.1 under /usr/lib); importing
         // through a different instance than the one holding the device
         // context fails with hipErrorInvalidValue.
-        let candidates = hipfire_config::rocm::library_candidates(
-            hipfire_config::rocm::HIP_RUNTIME_LIBRARIES,
-        );
+        let candidates =
+            hipfire_config::rocm::library_candidates(hipfire_config::rocm::HIP_RUNTIME_LIBRARIES);
         // SAFETY: system HIP runtime; no Rust invariants involved.
         let mut lib = None;
         let mut last_err = String::new();
@@ -93,17 +92,27 @@ impl HipMapping {
         // SAFETY: signatures match hip_runtime_api.h; the library is the same
         // instance HipRuntime uses (candidate policy above).
         unsafe {
-            let fn_import: Symbol<unsafe extern "C" fn(*mut HipExternalMemory, *const HipExtMemHandleDesc) -> u32> =
-                lib.get(b"hipImportExternalMemory").map_err(|_| VaError::MissingSymbol {
+            let fn_import: Symbol<
+                unsafe extern "C" fn(*mut HipExternalMemory, *const HipExtMemHandleDesc) -> u32,
+            > = lib
+                .get(b"hipImportExternalMemory")
+                .map_err(|_| VaError::MissingSymbol {
                     symbol: "hipImportExternalMemory".to_string(),
                 })?;
             let fn_map: Symbol<
-                unsafe extern "C" fn(*mut *mut c_void, HipExternalMemory, *const HipExtMemBufferDesc) -> u32,
-            > = lib.get(b"hipExternalMemoryGetMappedBuffer").map_err(|_| VaError::MissingSymbol {
-                symbol: "hipExternalMemoryGetMappedBuffer".to_string(),
+                unsafe extern "C" fn(
+                    *mut *mut c_void,
+                    HipExternalMemory,
+                    *const HipExtMemBufferDesc,
+                ) -> u32,
+            > = lib.get(b"hipExternalMemoryGetMappedBuffer").map_err(|_| {
+                VaError::MissingSymbol {
+                    symbol: "hipExternalMemoryGetMappedBuffer".to_string(),
+                }
             })?;
-            let fn_destroy: Symbol<unsafe extern "C" fn(HipExternalMemory) -> u32> =
-                lib.get(b"hipDestroyExternalMemory").map_err(|_| VaError::MissingSymbol {
+            let fn_destroy: Symbol<unsafe extern "C" fn(HipExternalMemory) -> u32> = lib
+                .get(b"hipDestroyExternalMemory")
+                .map_err(|_| VaError::MissingSymbol {
                     symbol: "hipDestroyExternalMemory".to_string(),
                 })?;
             // Copy the fn pointer out so no borrow of `lib` survives the move below.
@@ -124,7 +133,11 @@ impl HipMapping {
                         std::mem::size_of::<HipExtMemHandleDesc>(),
                     )
                 };
-                eprintln!("[va-bridge] import desc ({}B): {}", raw.len(), hex_bytes(raw));
+                eprintln!(
+                    "[va-bridge] import desc ({}B): {}",
+                    raw.len(),
+                    hex_bytes(raw)
+                );
             }
             let mut handle: HipExternalMemory = std::ptr::null_mut();
             let code = fn_import(&mut handle, &desc);
@@ -166,6 +179,37 @@ impl HipMapping {
     }
     pub fn size(&self) -> usize {
         self.size
+    }
+    /// Copy `len` bytes at `offset` from the device mapping to host.
+    /// Experiment `experiment/vcn-jpeg` staging helper (parity bisection).
+    pub fn copy_to_host(&self, offset: usize, len: usize) -> Result<Vec<u8>, VaError> {
+        if offset.saturating_add(len) > self.size {
+            return Err(VaError::Corrupt("copy_to_host out of range"));
+        }
+        // SAFETY: signature matches hip_runtime_api.h; the library is the
+        // same instance the mapping was created from.
+        unsafe {
+            let fn_memcpy: Symbol<
+                unsafe extern "C" fn(*mut c_void, *const c_void, usize, u32) -> u32,
+            > = self
+                ._lib
+                .get(b"hipMemcpy")
+                .map_err(|_| VaError::MissingSymbol {
+                    symbol: "hipMemcpy".to_string(),
+                })?;
+            let mut host = vec![0u8; len];
+            let src = (self.ptr as *const u8).add(offset) as *const c_void;
+            // hipMemcpyDeviceToHost = 2.
+            let code = fn_memcpy(host.as_mut_ptr() as *mut c_void, src, len, 2);
+            if code != 0 {
+                return Err(VaError::Status {
+                    op: "hipMemcpy(D2H)",
+                    code: code as i32,
+                    msg: format!("code {code}"),
+                });
+            }
+            Ok(host)
+        }
     }
 }
 

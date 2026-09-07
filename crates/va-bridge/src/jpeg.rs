@@ -17,8 +17,8 @@
 //! caller falls back to the turbo CPU path.
 
 use crate::ffi::{
-    VaJpegComponent, VaJpegHuffmanBuffer, VaJpegIQMatrix, VaJpegPicParam, VaJpegSliceComponent,
-    VaJpegSliceParam, VaError, VA_SLICE_DATA_FLAG_ALL,
+    VaError, VaJpegComponent, VaJpegHuffmanBuffer, VaJpegIQMatrix, VaJpegPicParam,
+    VaJpegSliceComponent, VaJpegSliceParam, VA_SLICE_DATA_FLAG_ALL,
 };
 
 /// Everything `VaSession::decode_jpeg` needs to fill the five VA buffers,
@@ -127,9 +127,9 @@ pub fn parse_for_va(data: &[u8]) -> Result<JpegVaParams<'_>, VaError> {
             }
         }
         match m {
-            0xD8 => continue,                 // SOI (nested)
+            0xD8 => continue, // SOI (nested)
             0xD9 => return Err(VaError::Corrupt("EOI before SOS")),
-            0x01 | 0xD0..=0xD7 => continue,  // TEM / RSTn (standalone)
+            0x01 | 0xD0..=0xD7 => continue, // TEM / RSTn (standalone)
             0xC0 => {
                 // SOF0 baseline
                 let seg = c.seg_len()?;
@@ -171,6 +171,28 @@ pub fn parse_for_va(data: &[u8]) -> Result<JpegVaParams<'_>, VaError> {
                 pic.picture_width = w;
                 pic.picture_height = h;
                 pic.num_components = nf;
+                // VCN output gate: radeonsi's JPEG backend only accepts 4:2:0
+                // (and single-component gray) into the YUV420 surface — its
+                // `radeon_dec_jpeg_end_frame` format check rejects 4:4:4 AND
+                // 4:2:2 at submit (measured 2026-09-07: barney_cigar 4:4:4
+                // and synthetic 4:2:2 both fail). Reject BEFORE any VA
+                // surface exists so the caller falls back to turbo CPU.
+                let hv = |i: usize| {
+                    (
+                        pic.components[i].h_sampling_factor,
+                        pic.components[i].v_sampling_factor,
+                    )
+                };
+                let accepted = match nf {
+                    1 => hv(0) == (1, 1),
+                    3 => hv(0) == (2, 2) && hv(1) == (1, 1) && hv(2) == (1, 1),
+                    _ => false,
+                };
+                if !accepted {
+                    return Err(VaError::Unsupported(
+                        "sampling factors are not 4:2:0 or gray",
+                    ));
+                }
                 saw_sof = true;
                 c.pos = end; // skip any trailing bytes defensively
             }
@@ -202,15 +224,13 @@ pub fn parse_for_va(data: &[u8]) -> Result<JpegVaParams<'_>, VaError> {
                             return Err(VaError::Corrupt("DC table too long"));
                         }
                         huff.huffman_table[th].num_dc_codes = bits;
-                        huff.huffman_table[th].dc_values[..total]
-                            .copy_from_slice(vals);
+                        huff.huffman_table[th].dc_values[..total].copy_from_slice(vals);
                     } else {
                         if total > 162 {
                             return Err(VaError::Corrupt("AC table too long"));
                         }
                         huff.huffman_table[th].num_ac_codes = bits;
-                        huff.huffman_table[th].ac_values[..total]
-                            .copy_from_slice(vals);
+                        huff.huffman_table[th].ac_values[..total].copy_from_slice(vals);
                     }
                     huff.load_huffman_table[th] = 1;
                 }
@@ -286,10 +306,8 @@ pub fn parse_for_va(data: &[u8]) -> Result<JpegVaParams<'_>, VaError> {
                 let entropy_end = scan_entropy_end(data, entropy_start)?;
                 let entropy = &data[entropy_start..entropy_end];
                 // MCU count from frame sampling.
-                let mcu_w =
-                    (pic.picture_width as u32 + 8 * max_h as u32 - 1) / (8 * max_h as u32);
-                let mcu_h =
-                    (pic.picture_height as u32 + 8 * max_v as u32 - 1) / (8 * max_v as u32);
+                let mcu_w = (pic.picture_width as u32 + 8 * max_h as u32 - 1) / (8 * max_h as u32);
+                let mcu_h = (pic.picture_height as u32 + 8 * max_v as u32 - 1) / (8 * max_v as u32);
                 slice.num_mcus = mcu_w * mcu_h;
                 slice.slice_data_size = entropy.len() as u32;
                 return Ok(JpegVaParams {
@@ -358,7 +376,9 @@ mod tests {
         v.extend([0xFF, 0xDB, 0x00, 0x43, 0x00]);
         v.extend([8u8; 64]);
         // SOF0: P=8, 16x16, Nf=1, C1 H1V1 Tq0
-        v.extend([0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x10, 0x01, 0x01, 0x11, 0x00]);
+        v.extend([
+            0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x10, 0x00, 0x10, 0x01, 0x01, 0x11, 0x00,
+        ]);
         // DHT DC table 0: 1 code of length 2 (category 0 => EOB-ish DC diff 0)
         v.extend([0xFF, 0xC4, 0x00, 0x14, 0x00]);
         v.extend([0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]);
@@ -393,9 +413,19 @@ mod tests {
         let pos = jpeg.iter().position(|w| *w == 0xC0).unwrap();
         jpeg[pos] = 0xC2;
         // fix: the 0xC0 byte sits right after an 0xFF
-        assert!(matches!(
-            parse_for_va(&jpeg),
-            Err(VaError::Unsupported(_))
-        ));
+        assert!(matches!(parse_for_va(&jpeg), Err(VaError::Unsupported(_))));
+    }
+
+    #[test]
+    fn rejects_444_sampling_at_sof() {
+        // SOI + SOF0 with three 1x1 components (4:4:4); the VCN-output
+        // gate fires at SOF0, before any VA object exists.
+        let mut v = vec![0xFF, 0xD8];
+        v.extend([
+            0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, //
+            0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
+        ]);
+        v.extend([0xFF, 0xD9]);
+        assert!(matches!(parse_for_va(&v), Err(VaError::Unsupported(_))));
     }
 }
