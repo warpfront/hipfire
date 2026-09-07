@@ -73,7 +73,7 @@ fn rel_l1(a: &[f32], b: &[f32]) -> f64 {
 
 fn md5hex(data: &[u8]) -> String {
     // Minimal MD5 (RFC 1321) so prompts stay byte-pinned without a new dep.
-    Md5::digest(data).iter().map(|x| format!("{x:02x}")).collect()
+    hex(&Md5::digest(data))
 }
 
 // ——— tiny MD5 + hex (no new deps) ———
