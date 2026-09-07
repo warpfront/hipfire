@@ -271,8 +271,11 @@ fn main() {
     }
 
     // ——— VCN decode + D2H of raw planes ———
-    let sess = va_bridge::VaSession::open().expect("VA open");
-    let frame = sess.decode_jpeg(&bytes).expect("vcn decode");
+    let mut sess = va_bridge::VaSession::open().expect("VA open");
+    let frame = match sess.decode_jpeg(&bytes).expect("vcn decode") {
+        va_bridge::DecodeOutcome::Decoded(f) => f,
+        va_bridge::DecodeOutcome::Unsupported(reason) => panic!("fixture unsupported: {reason}"),
+    };
     assert_eq!(frame.fourcc, va_bridge::VA_FOURCC_NV12);
     let (sw, sh) = (frame.width as usize, frame.height as usize);
     let (yp, uvo, uvp) = (
@@ -281,7 +284,7 @@ fn main() {
         frame.uv_pitch() as usize,
     );
     println!("[debug] surface {sw}x{sh} y_pitch={yp} uv_off={uvo} uv_pitch={uvp}");
-    let y_raw = frame.mapping.copy_to_host(0, yp * sh).expect("y dtoh");
+    let y_raw = frame.copy_to_host(0, yp * sh).expect("y dtoh");
     let y_plane: Vec<u8> = (0..sh)
         .flat_map(|r| y_raw[r * yp..r * yp + sw].iter().copied())
         .collect();
@@ -320,10 +323,7 @@ fn main() {
     // ——— Stage B: UV vs turbo box-decimated chroma, both orders ———
     {
         let (cw, chh) = (sw / 2, sh / 2);
-        let uv_raw = frame
-            .mapping
-            .copy_to_host(uvo, uvp * chh)
-            .expect("uv dtoh");
+        let uv_raw = frame.copy_to_host(uvo, uvp * chh).expect("uv dtoh");
         let (mut b0, mut b1) = (vec![0u8; cw * chh], vec![0u8; cw * chh]);
         for r in 0..chh {
             for c in 0..cw {
@@ -445,29 +445,31 @@ fn main() {
         hip.free(d_surf).unwrap();
         hip.free(d_chw).unwrap();
     }
-    // ——— Stage G: driver-resolved readback (derive path) vs turbo ———
+    // ——— Stage G: planes-oracle readback vs turbo ———
     {
         let now = std::time::Instant::now();
-        let d = sess.decode_jpeg_derived(&bytes).expect("derived decode");
+        let d = sess.decode_jpeg_planes(&bytes).expect("planes decode");
+        assert_eq!(d.planes.len(), 2, "stage G expects NV12");
+        let (dy, duv) = (&d.planes[0], &d.planes[1]);
         let ms = now.elapsed().as_secs_f64() * 1e3;
         println!(
-            "[debug] derived {}x{} fourcc=0x{:08x} y_pitch={} uv_pitch={} in {:.2}ms",
-            d.width, d.height, d.fourcc, d.y_pitch, d.uv_pitch, ms
+            "[debug] planes {}x{} fourcc=0x{:08x} in {:.2}ms",
+            d.width, d.height, d.fourcc, ms
         );
-        plane_stats("G derived-y", &d.y);
+        plane_stats("G derived-y", dy);
         let mut y_ref = vec![0f32; sw * sh];
         for i in 0..sw * sh {
             y_ref[i] = 0.299 * turbo.data[3 * i] as f32
                 + 0.587 * turbo.data[3 * i + 1] as f32
                 + 0.114 * turbo.data[3 * i + 2] as f32;
         }
-        byte_stats("G derived-y-vs-turbo-luma", &d.y, &y_ref);
+        byte_stats("G derived-y-vs-turbo-luma", dy, &y_ref);
         let (cw, chh) = (sw / 2, sh / 2);
         let (mut b0, mut b1) = (vec![0u8; cw * chh], vec![0u8; cw * chh]);
         for r in 0..chh {
             for c in 0..cw {
-                b0[r * cw + c] = d.uv[r * cw * 2 + c * 2];
-                b1[r * cw + c] = d.uv[r * cw * 2 + c * 2 + 1];
+                b0[r * cw + c] = duv[r * cw * 2 + c * 2];
+                b1[r * cw + c] = duv[r * cw * 2 + c * 2 + 1];
             }
         }
         let mut cb_ref = vec![0f32; cw * chh];
@@ -490,7 +492,7 @@ fn main() {
         }
         byte_stats("G b0-vs-Cb", &b0, &cb_ref);
         byte_stats("G b1-vs-Cr", &b1, &cr_ref);
-        image::GrayImage::from_raw(d.width, d.height, d.y.clone())
+        image::GrayImage::from_raw(d.width, d.height, dy.clone())
             .expect("gray derived")
             .save("/tmp/vcn_derived_y.png")
             .expect("save derived");

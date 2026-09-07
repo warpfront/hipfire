@@ -4,21 +4,26 @@
 
 //! `va-bridge`: drive the VCN JPEG engine through libva directly.
 //!
-//! Experiment `experiment/vcn-jpeg` only. Nothing here runs unless a caller
-//! opts in (`vl_vcn_parity` lab example); absence of libva at runtime is a
-//! recoverable [`VaError`], and the caller falls back to the
-//! `libjpeg-turbo-rs` CPU oracle (byte-identical to PIL per
-//! `docs/VALIDATION.md`).
+//! Product decode path for VL images (`image.decode = vcn|auto`). Pipeline
+//! per frame: [`VaSession::decode_jpeg`] (parse → pooled VA surface/context
+//! → five VA buffers → `vaBegin/Render/EndPicture` → `vaSyncSurface` →
+//! `vaExportSurfaceHandle`, exported + imported once per key) then the
+//! `vl_yuv_preprocess` kernel consumes the pooled device pointer.
 //!
-//! Pipeline per frame: [`VaSession::decode_jpeg`] (parse → VA buffers →
-//! `vaBegin/Render/EndPicture` → `vaSyncSurface` → `vaExportSurfaceHandle`)
-//! then [`HipMapping::import_dma_buf`] for the zero-copy HIP device pointer
-//! the `vl_yuv_preprocess` kernel consumes.
+//! Allocation is always `DRM_FORMAT_MOD_LINEAR`, so the exported dma-buf is
+//! kernel-readable (0.000 LSB vs derived readback on
+//! gfx1010/1030/1100/1151/1201, 2026-09-07). There is no tiled/derived
+//! fallback: the derived-pixel path was deleted with the investigation (see
+//! `experiment/vcn-jpeg`); [`VaSession::decode_jpeg_planes`] remains as the
+//! `vaDeriveImage` oracle for `vl_vcn_444check`.
+//!
+//! [`DecodeOutcome`]: `Decoded` carries the pooled frame, `Unsupported`
+//! (progressive/arithmetic/12-bit/CMYK) means "take the CPU path" with NO
+//! session teardown; `Err` is real failures only.
 
 mod ffi;
 mod interop;
 mod jpeg;
-
 pub use ffi::{
     VaBufferId, VaConfigId, VaContextId, VaDisplay, VaDrmPrimeDescriptor, VaDrmPrimeLayer,
     VaDrmPrimeObject, VaError, VaJpegHuffmanBuffer, VaJpegIQMatrix, VaJpegPicParam,
@@ -28,76 +33,165 @@ pub use ffi::{
 pub use interop::HipMapping;
 pub use jpeg::{parse_for_va, JpegVaParams};
 
-use ffi::{VA_ENTRYPOINT_VLD, VA_PROFILE_JPEG_BASELINE, VA_RT_FORMAT_YUV420};
-use std::ffi::c_void;
+use ffi::{VA_ENTRYPOINT_VLD, VA_PROFILE_JPEG_BASELINE};
+use std::collections::HashMap;
+use std::ffi::{c_char, c_int, c_void};
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::sync::{Mutex, OnceLock};
 
-/// DRM render nodes to try, in order. `HIPFIRE_VCN_DRM_NODE` (via
-/// `developer_var`) overrides with a single path.
-fn render_nodes() -> Vec<String> {
+/// DRM render-node candidates, in order: `HIPFIRE_VCN_DRM_NODE` (via
+/// `developer_var`) wins; otherwise the node whose PCI slot matches HIP
+/// device 0; otherwise every `renderD*` node, sorted (the planes oracle
+/// needs no HIP runtime, so a missing HIP library still gets a scan).
+fn candidate_nodes() -> Vec<String> {
     if let Ok(one) = hipfire_config::developer_var("HIPFIRE_VCN_DRM_NODE") {
         return vec![one];
     }
-    (128..132).map(|i| format!("/dev/dri/renderD{i}")).collect()
+    if let Some(pci) = hip_pci_bus_id(0) {
+        if let Some(node) = render_node_for_pci(&pci) {
+            return vec![node];
+        }
+    }
+    sysfs_render_nodes()
+}
+
+/// Every DRM render node, sorted by name; the hardcoded 128..132 fallback
+/// only fires when sysfs is unreadable.
+fn sysfs_render_nodes() -> Vec<String> {
+    let mut out = Vec::new();
+    if let Ok(rd) = std::fs::read_dir("/sys/class/drm") {
+        for e in rd.flatten() {
+            let name = e.file_name();
+            let Some(s) = name.to_str() else { continue };
+            if s.starts_with("renderD") {
+                out.push(format!("/dev/dri/{s}"));
+            }
+        }
+    }
+    out.sort();
+    if out.is_empty() {
+        (128..132).map(|i| format!("/dev/dri/renderD{i}")).collect()
+    } else {
+        out
+    }
+}
+
+/// PCI bus id (`0000:03:00.0` form) of a HIP device, dlopen'd from the same
+/// `libamdhip64` instance `hip-bridge` uses. `va-bridge` must not depend on
+/// `hip-bridge` (same layer), so the one symbol is resolved locally.
+fn hip_pci_bus_id(device: i32) -> Option<String> {
+    let candidates =
+        hipfire_config::rocm::library_candidates(hipfire_config::rocm::HIP_RUNTIME_LIBRARIES);
+    for c in &candidates {
+        // SAFETY: system HIP runtime; no Rust invariants involved.
+        let lib = unsafe { libloading::Library::new(c) }.ok()?;
+        // SAFETY: signature matches hip_runtime_api.h
+        // (`hipError_t hipDeviceGetPCIBusId(char*, int, int)`).
+        let bus = unsafe {
+            let f: libloading::Symbol<unsafe extern "C" fn(*mut c_char, c_int, c_int) -> u32> =
+                lib.get(b"hipDeviceGetPCIBusId").ok()?;
+            let mut buf = [0 as c_char; 64];
+            let code = f(buf.as_mut_ptr(), buf.len() as c_int, device as c_int);
+            if code != 0 {
+                continue;
+            }
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            buf[..len].iter().map(|&b| b as u8 as char).collect::<String>()
+        };
+        return Some(bus);
+    }
+    None
+}
+
+/// `/dev/dri/<node>` whose `device/uevent` `PCI_SLOT_NAME` matches `pci`
+/// (case-insensitive; both are `domain:bus:device.function`).
+fn render_node_for_pci(pci: &str) -> Option<String> {
+    let want = pci.trim().to_ascii_lowercase();
+    let rd = std::fs::read_dir("/sys/class/drm").ok()?;
+    let mut names: Vec<String> = Vec::new();
+    for e in rd.flatten() {
+        let name = e.file_name();
+        let Some(s) = name.to_str() else { continue };
+        if s.starts_with("renderD") {
+            names.push(s.to_string());
+        }
+    }
+    names.sort();
+    for n in names {
+        let uevent = std::fs::read_to_string(format!("/sys/class/drm/{n}/device/uevent")).ok()?;
+        for line in uevent.lines() {
+            if let Some(slot) = line.strip_prefix("PCI_SLOT_NAME=") {
+                if slot.trim().to_ascii_lowercase() == want {
+                    return Some(format!("/dev/dri/{n}"));
+                }
+            }
+        }
+    }
+    None
 }
 
 /// An initialised VA display with a JPEG-baseline VLD config.
 ///
-/// Surfaces and decode contexts are created per frame (fixtures differ in
-/// size) and destroyed after the dma-buf is imported into HIP; the
-/// [`HipMapping`] holds its own dma-buf reference, so the device pointer
-/// outlives the VA objects.
+/// Surfaces, decode contexts, and HIP imports are pooled by
+/// (`rt_format`, width, height): the first decode of a key allocates
+/// (always `DRM_FORMAT_MOD_LINEAR`), exports + imports once, and every later
+/// decode of that key costs only parse + submit + sync. The pooled device
+/// pointer is stable per key; its *contents* reflect the most recent decode
+/// of that key — consume (launch + sync kernels) before the next decode.
 pub struct VaSession {
     lib: VaLib,
     dpy: VaDisplay,
     _drm_fd: OwnedFd,
     vendor: String,
     config: VaConfigId,
-}
-struct SurfGuard<'a> {
-    lib: &'a VaLib,
-    dpy: VaDisplay,
-    surf: VaSurfaceId,
-}
-impl Drop for SurfGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: surface was created; destroy exactly once.
-        unsafe {
-            (self.lib.va_destroy_surfaces)(self.dpy, &mut self.surf, 1);
-        }
-    }
-}
-struct CtxGuard<'a> {
-    lib: &'a VaLib,
-    dpy: VaDisplay,
-    ctx: VaContextId,
-}
-impl Drop for CtxGuard<'_> {
-    fn drop(&mut self) {
-        // SAFETY: context was created; destroy exactly once.
-        unsafe {
-            (self.lib.va_destroy_context)(self.dpy, self.ctx);
-        }
-    }
-}
-/// A decoded-then-synced VA surface with its context alive: either consumer
-/// (dma-buf export or derived-image readback) runs before the guards drop.
-struct Submitted<'a> {
-    width: u32,
-    height: u32,
-    max_h: u8,
-    max_v: u8,
-    surf: VaSurfaceId,
-    _surf_guard: SurfGuard<'a>,
-    _ctx_guard: CtxGuard<'a>,
+    node: String,
+    pool: HashMap<PoolKey, PooledEntry>,
 }
 
+/// Pool key: the VA render-target format (from the SOF0 sampling factors)
+/// plus frame geometry.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+struct PoolKey {
+    rt_format: u32,
+    width: u32,
+    height: u32,
+}
+
+/// The dma-buf export + HIP import cached per pool key. The import binds the
+/// surface's backing pages, not their contents, so it survives re-decode.
+struct CachedExport {
+    max_h: u8,
+    max_v: u8,
+    fourcc: u32,
+    layers: [VaDrmPrimeLayer; 4],
+    num_layers: u32,
+    mapping: HipMapping,
+}
+
+/// One pooled VA surface + decode context. Destroyed with the session.
+struct PooledEntry {
+    surf: VaSurfaceId,
+    ctx: VaContextId,
+    export: Option<CachedExport>,
+}
+
+/// Cached [`VaSession::probe`] failure: the first failed probe disables later
+/// ones for the process (VA init failure is environmental, not transient).
+static PROBE_FAILED: OnceLock<()> = OnceLock::new();
+
+// The VA display handle is a raw pointer, so `VaSession` is `!Send` by
+// default. Sharing is explicitly single-threaded behind the caller's
+// `&mut` (or the `shared_decode_jpeg` mutex); cross-thread transfer of the
+// session itself is the caller's responsibility, as with `HipMapping`.
+unsafe impl Send for VaSession {}
+
 impl VaSession {
-    /// Open the first working render node, initialise VA, create the JPEG
+    /// Open the first working render-node candidate, initialise VA, create
+    /// the JPEG-baseline VLD config. See [`candidate_nodes`] for selection.
     pub fn open() -> Result<Self, VaError> {
         let mut lib = Some(VaLib::load()?);
         let mut last_err = VaError::NoRenderNode;
-        for node in render_nodes() {
+        for node in candidate_nodes() {
             let l = match lib.take() {
                 Some(l) => l,
                 None => break,
@@ -204,6 +298,8 @@ impl VaSession {
             _drm_fd: owned,
             vendor,
             config,
+            node: node.to_string(),
+            pool: HashMap::new(),
         })
     }
 
@@ -211,23 +307,62 @@ impl VaSession {
         &self.vendor
     }
 
-    /// Parse → surface/context → five VA buffers → begin/render/end → sync.
-    /// Returns the synced surface with its guards alive for either consumer
-    /// (dma-buf export or derived-image readback).
-    fn submit(&self, jpeg: &[u8]) -> Result<Submitted<'_>, VaError> {
-        let p = parse_for_va(jpeg)?;
-        let lib = &self.lib;
+    /// The DRM render node this session decodes on (PCI-matched to HIP
+    /// device 0 unless `HIPFIRE_VCN_DRM_NODE` overrode selection).
+    pub fn node(&self) -> &str {
+        &self.node
+    }
+
+    /// Open a session when VCN JPEG is available, else `None`. A failure is
+    /// cached in a [`OnceLock`] so repeated probes never spam dlopen/VA
+    /// init; a success always opens fresh (the caller holds the session and
+    /// its pool — see [`VaSession::shared_decode_jpeg`] for the process-wide
+    /// pooled session the product path uses).
+    pub fn probe() -> Option<VaSession> {
+        if PROBE_FAILED.get().is_some() {
+            return None;
+        }
+        match Self::open() {
+            Ok(s) => Some(s),
+            Err(_) => {
+                let _ = PROBE_FAILED.set(());
+                None
+            }
+        }
+    }
+
+    /// Process-wide pooled session for the product decode path. Opens on
+    /// first use; `Err(NoRenderNode | Dlopen | MissingSymbol)` means "no
+    /// VCN — take the CPU path", any other `Err` is a real failure.
+    /// `Ok(Unsupported)` is a per-stream CPU fallback with no teardown.
+    pub fn shared_decode_jpeg(jpeg: &[u8]) -> Result<DecodeOutcome, VaError> {
+        static SHARED: std::sync::LazyLock<Mutex<Option<VaSession>>> =
+            std::sync::LazyLock::new(|| Mutex::new(None));
+        let mut guard = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        if guard.is_none() {
+            *guard = Some(VaSession::open()?);
+        }
+        guard
+            .as_mut()
+            .expect("pooled VCN session just opened")
+            .decode_jpeg(jpeg)
+    }
+
+
+    /// Allocate a pooled surface + decode context for `key`. Linear
+    /// modifiers are the ONLY allocation mode: the exported dma-buf must be
+    /// kernel-readable.
+    fn alloc_pooled(
+        lib: &VaLib,
+        dpy: VaDisplay,
+        config: VaConfigId,
+        key: PoolKey,
+    ) -> Result<(VaSurfaceId, VaContextId), VaError> {
         let fail = |op: &'static str, code: i32| VaError::Status {
             op,
             code,
             msg: lib.error_str(code),
         };
-
-        // Surfaces sized to the frame. Investigation knob: HIPFIRE_VCN_LINEAR=1
-        // asks the driver for a DRM_FORMAT_MOD_LINEAR surface via
-        // VASurfaceAttribDRMFormatModifiers so the exported dma-buf can be
-        // read linearly by a compute kernel (zero-copy question).
-        let want_linear = std::env::var_os("HIPFIRE_VCN_LINEAR").is_some();
         let mut mods = [ffi::DRM_FORMAT_MOD_LINEAR];
         let mut mod_list = ffi::VaDrmFormatModifierList {
             num_modifiers: 1,
@@ -243,40 +378,29 @@ impl VaSession {
                 },
             },
         }];
-        let (attr_ptr, attr_n): (*mut c_void, u32) = if want_linear {
-            (attribs.as_mut_ptr().cast(), 1)
-        } else {
-            (std::ptr::null_mut(), 0)
-        };
         let mut surf = 0;
         let mut st = unsafe {
             (lib.va_create_surfaces)(
-                self.dpy,
-                p.rt_format,
-                p.width as u32,
-                p.height as u32,
+                dpy,
+                key.rt_format,
+                key.width,
+                key.height,
                 &mut surf,
                 1,
-                attr_ptr,
-                attr_n,
+                attribs.as_mut_ptr().cast(),
+                1,
             )
         };
         if st != VA_STATUS_SUCCESS {
             return Err(fail("vaCreateSurfaces", st));
         }
-        let _surf_guard = SurfGuard {
-            lib,
-            dpy: self.dpy,
-            surf,
-        };
-
         let mut ctx = 0;
         st = unsafe {
             (lib.va_create_context)(
-                self.dpy,
-                self.config,
-                p.width as i32,
-                p.height as i32,
+                dpy,
+                config,
+                key.width as i32,
+                key.height as i32,
                 0,
                 &mut surf,
                 1,
@@ -284,14 +408,66 @@ impl VaSession {
             )
         };
         if st != VA_STATUS_SUCCESS {
+            // SAFETY: surface was just created; destroy exactly once.
+            unsafe {
+                (lib.va_destroy_surfaces)(dpy, &mut surf, 1);
+            }
             return Err(fail("vaCreateContext", st));
         }
-        let _ctx_guard = CtxGuard {
-            lib,
-            dpy: self.dpy,
-            ctx,
-        };
+        Ok((surf, ctx))
+    }
 
+    /// Fill the five VA buffers from parsed params, begin/render/end, sync.
+    /// Buffers are destroyed before return regardless of submit outcome.
+    fn render(
+        lib: &VaLib,
+        dpy: VaDisplay,
+        surf: VaSurfaceId,
+        ctx: VaContextId,
+        p: &JpegVaParams<'_>,
+    ) -> Result<(), VaError> {
+        let fail = |op: &'static str, code: i32| VaError::Status {
+            op,
+            code,
+            msg: lib.error_str(code),
+        };
+        let mut bufs = Self::create_buffers(lib, dpy, ctx, p)?;
+        let mut st = unsafe { (lib.va_begin_picture)(dpy, ctx, surf) };
+        if st == VA_STATUS_SUCCESS {
+            st = unsafe { (lib.va_render_picture)(dpy, ctx, bufs.as_mut_ptr(), 5) };
+        }
+        if st == VA_STATUS_SUCCESS {
+            st = unsafe { (lib.va_end_picture)(dpy, ctx) };
+        }
+        for b in bufs {
+            // SAFETY: created above; destroy regardless of submit outcome.
+            unsafe {
+                (lib.va_destroy_buffer)(dpy, b);
+            }
+        }
+        if st != VA_STATUS_SUCCESS {
+            return Err(fail("submit(begin/render/end)Picture", st));
+        }
+        st = unsafe { (lib.va_sync_surface)(dpy, surf) };
+        if st != VA_STATUS_SUCCESS {
+            return Err(fail("vaSyncSurface", st));
+        }
+        Ok(())
+    }
+
+    /// Create the five VA buffers from parsed params (data copied by
+    /// `vaCreateBuffer`). On failure, destroys what was created.
+    fn create_buffers(
+        lib: &VaLib,
+        dpy: VaDisplay,
+        ctx: VaContextId,
+        p: &JpegVaParams<'_>,
+    ) -> Result<[u32; 5], VaError> {
+        let fail = |op: &'static str, code: i32| VaError::Status {
+            op,
+            code,
+            msg: lib.error_str(code),
+        };
         // Fill the five buffers (data copied by vaCreateBuffer).
         let mut pic = p.pic;
         let mut iq = p.iq;
@@ -327,83 +503,34 @@ impl VaSession {
                 }
                 _ => std::mem::size_of::<crate::ffi::VaJpegSliceParam>() as u32,
             };
-            st =
-                unsafe { (lib.va_create_buffer)(self.dpy, ctx, *ty, size, 1, *data, &mut bufs[i]) };
+            let st =
+                unsafe { (lib.va_create_buffer)(dpy, ctx, *ty, size, 1, *data, &mut bufs[i]) };
             if st != VA_STATUS_SUCCESS {
                 for b in bufs[..i].iter() {
                     // SAFETY: created above.
                     unsafe {
-                        (lib.va_destroy_buffer)(self.dpy, *b);
+                        (lib.va_destroy_buffer)(dpy, *b);
                     }
                 }
                 return Err(fail("vaCreateBuffer", st));
             }
         }
-
-        st = unsafe { (lib.va_begin_picture)(self.dpy, ctx, surf) };
-        if st == VA_STATUS_SUCCESS {
-            st = unsafe { (lib.va_render_picture)(self.dpy, ctx, bufs.as_mut_ptr(), 5) };
-        }
-        if st == VA_STATUS_SUCCESS {
-            st = unsafe { (lib.va_end_picture)(self.dpy, ctx) };
-        }
-        for b in bufs {
-            // SAFETY: created above; destroy regardless of submit outcome.
-            unsafe {
-                (lib.va_destroy_buffer)(self.dpy, b);
-            }
-        }
-        if st != VA_STATUS_SUCCESS {
-            return Err(fail("submit(begin/render/end)Picture", st));
-        }
-        st = unsafe { (lib.va_sync_surface)(self.dpy, surf) };
-        if st != VA_STATUS_SUCCESS {
-            return Err(fail("vaSyncSurface", st));
-        }
-        Ok(Submitted {
-            width: p.width as u32,
-            height: p.height as u32,
-            max_h: p.max_h,
-            max_v: p.max_v,
-            surf,
-            _surf_guard,
-            _ctx_guard,
-        })
+        Ok(bufs)
     }
 
-    /// Decode one baseline JPEG to an exported dma-buf + HIP mapping.
-    ///
-    /// Returns the frame geometry, the NV12 layer layout (pitches/offsets),
-    /// and the device mapping. All VA objects are destroyed before return;
-    /// only the [`HipMapping`] (plus plain geometry) escapes.
-    ///
-    /// The default surface allocation is tiled (+DCC on gfx12), which a
-    /// compute kernel cannot read linearly. With `HIPFIRE_VCN_LINEAR=1` the
-    /// surface is requested with `DRM_FORMAT_MOD_LINEAR` and the mapping is
-    /// directly kernel-readable; verified 0.000 LSB against
-    /// [`decode_jpeg_derived`] on gfx1010/1030/1100/1151/1201 (2026-09-07).
-    /// A product path should make linear the only allocation mode.
-    pub fn decode_jpeg(&self, jpeg: &[u8]) -> Result<VcnFrame, VaError> {
-        let lib = &self.lib;
+    /// Export `surf` + import into HIP, once per pool key. The export fds
+    /// are closed after import (HIP holds its own reference).
+    fn export_once(
+        lib: &VaLib,
+        dpy: VaDisplay,
+        surf: VaSurfaceId,
+        p: &JpegVaParams<'_>,
+    ) -> Result<CachedExport, VaError> {
         let fail = |op: &'static str, code: i32| VaError::Status {
             op,
             code,
             msg: lib.error_str(code),
         };
-        let Submitted {
-            width,
-            height,
-            max_h,
-            max_v,
-            surf,
-            _surf_guard,
-            _ctx_guard,
-        } = self.submit(jpeg)?;
-        // `_surf_guard`/`_ctx_guard` stay alive until return.
-        let mut st = 0;
-
-        // Export + import. The export fds are closed after import (HIP holds
-        // its own reference); the surface/context die with the guards.
         let mut desc = ffi::VaDrmPrimeDescriptor {
             fourcc: 0,
             width: 0,
@@ -413,9 +540,9 @@ impl VaSession {
             num_layers: 0,
             layers: [ffi::VaDrmPrimeLayer::default(); 4],
         };
-        st = unsafe {
+        let st = unsafe {
             (lib.va_export_surface_handle)(
-                self.dpy,
+                dpy,
                 surf,
                 VA_MEM_TYPE_DRM_PRIME_2,
                 VA_EXPORT_SURFACE_READ_ONLY,
@@ -425,7 +552,7 @@ impl VaSession {
         if st != VA_STATUS_SUCCESS {
             return Err(fail("vaExportSurfaceHandle", st));
         }
-        if std::env::var_os("HIPFIRE_VCN_DEBUG").is_some() {
+        if hipfire_config::developer_var("HIPFIRE_VCN_DEBUG").is_ok() {
             eprintln!(
                 "[va-bridge] export fourcc=0x{:08x} {}x{} objects={} layers={}",
                 desc.fourcc, desc.width, desc.height, desc.num_objects, desc.num_layers
@@ -462,11 +589,9 @@ impl VaSession {
             libc_close(desc.objects[i].fd);
         }
         let mapping = mapping?;
-        Ok(VcnFrame {
-            width,
-            height,
-            max_h,
-            max_v,
+        Ok(CachedExport {
+            max_h: p.max_h,
+            max_v: p.max_v,
             fourcc: desc.fourcc,
             layers: desc.layers,
             num_layers: desc.num_layers,
@@ -474,31 +599,109 @@ impl VaSession {
         })
     }
 
+    /// Decode one JPEG to the pooled device frame.
+    ///
+    /// `Ok(Decoded)` carries geometry, the layer layout, and the pooled
+    /// device pointer (stable per key — see the struct docs). The surface is
+    /// linear-only, so the pointer is directly kernel-readable.
+    ///
+    /// `Ok(Unsupported)` (progressive/arithmetic/12-bit/CMYK) is a per-stream
+    /// CPU fallback: the pool entry and session are untouched, NO teardown.
+    /// `Err` is real failures only (driver errors, corrupt streams, export).
+    pub fn decode_jpeg(&mut self, jpeg: &[u8]) -> Result<DecodeOutcome, VaError> {
+        let p = match parse_for_va(jpeg) {
+            Ok(p) => p,
+            Err(VaError::Unsupported(reason)) => return Ok(DecodeOutcome::Unsupported(reason)),
+            Err(e) => return Err(e),
+        };
+        let key = PoolKey {
+            rt_format: p.rt_format,
+            width: p.width as u32,
+            height: p.height as u32,
+        };
+        if !self.pool.contains_key(&key) {
+            let (surf, ctx) = Self::alloc_pooled(&self.lib, self.dpy, self.config, key)?;
+            self.pool.insert(
+                key,
+                PooledEntry {
+                    surf,
+                    ctx,
+                    export: None,
+                },
+            );
+        }
+        let (surf, ctx) = {
+            let e = self.pool.get(&key).expect("pool entry just inserted");
+            (e.surf, e.ctx)
+        };
+        Self::render(&self.lib, self.dpy, surf, ctx, &p)?;
+        let needs_export = self
+            .pool
+            .get(&key)
+            .expect("pool entry just rendered")
+            .export
+            .is_none();
+        if needs_export {
+            let cached = Self::export_once(&self.lib, self.dpy, surf, &p)?;
+            self.pool
+                .get_mut(&key)
+                .expect("pool entry just rendered")
+                .export = Some(cached);
+        }
+        let e = self.pool.get(&key).expect("pool entry just exported");
+        let c = e.export.as_ref().expect("export just cached");
+        Ok(DecodeOutcome::Decoded(VcnFrame {
+            width: key.width,
+            height: key.height,
+            max_h: c.max_h,
+            max_v: c.max_v,
+            fourcc: c.fourcc,
+            layers: c.layers,
+            num_layers: c.num_layers,
+            ptr: c.mapping.ptr(),
+        }))
+    }
+
     /// Decode one baseline JPEG and read the pixels back through
-    /// `vaDeriveImage`/`vaMapBuffer` (the driver resolves tiling/DCC into a
-    /// linear CPU mapping). Returns packed NV12 planes. This is the
-    /// validation path for VCN decode correctness; it costs a GPU→CPU copy
-    /// but no JPEG entropy work on the CPU.
-    /// Format-generic derived readback: every plane the driver reports,
-    /// packed row-by-row (pitch stripped). Plane geometry follows the
-    /// fourcc: NV12 = [Y w*h, CbCr cw*ch*2]; 444P = [Y, Cb, Cr] each w*h;
-    /// anything else is returned as-is with its pitch-stripped rows sized
-    /// from the image height and pitch, and the caller must know the layout.
-    pub fn decode_jpeg_planes(&self, jpeg: &[u8]) -> Result<DerivedPlanes, VaError> {
+    /// `vaDeriveImage`/`vaMapBuffer` (the driver resolves the linear surface
+    /// into a CPU mapping). The `vl_vcn_444check` oracle for VCN decode
+    /// correctness; it costs a GPU→CPU copy but no JPEG entropy work on CPU.
+    /// Format-generic readback: every plane the driver reports, packed
+    /// row-by-row (pitch stripped). Plane geometry follows the fourcc:
+    /// NV12 = [Y w*h, CbCr cw*ch*2]; 444P = [Y, Cb, Cr] each w*h; anything
+    /// else is returned as-is with its pitch-stripped rows sized from the
+    /// image height and pitch, and the caller must know the layout.
+    pub fn decode_jpeg_planes(&mut self, jpeg: &[u8]) -> Result<DerivedPlanes, VaError> {
         let lib = &self.lib;
         let fail = |op: &'static str, code: i32| VaError::Status {
             op,
             code,
             msg: lib.error_str(code),
         };
-        let Submitted {
-            width,
-            height,
-            surf,
-            _surf_guard,
-            _ctx_guard,
-            ..
-        } = self.submit(jpeg)?;
+        let p = parse_for_va(jpeg)?;
+        let key = PoolKey {
+            rt_format: p.rt_format,
+            width: p.width as u32,
+            height: p.height as u32,
+        };
+        if !self.pool.contains_key(&key) {
+            let (surf, ctx) = Self::alloc_pooled(&self.lib, self.dpy, self.config, key)?;
+            self.pool.insert(
+                key,
+                PooledEntry {
+                    surf,
+                    ctx,
+                    export: None,
+                },
+            );
+        }
+        let (width, height, surf) = {
+            let e = self.pool.get(&key).expect("pool entry just inserted");
+            (key.width, key.height, e.surf)
+        };
+        let ctx = self.pool.get(&key).expect("pool entry just inserted").ctx;
+        Self::render(&self.lib, self.dpy, surf, ctx, &p)?;
+        // Pooled surface/context stay alive in the session (no guards).
         let mut img = ffi::VaImage {
             image_id: 0,
             format: ffi::VaImageFormat {
@@ -586,122 +789,6 @@ impl VaSession {
         Ok(DerivedPlanes { width, height, fourcc: img.format.fourcc, planes })
     }
 
-    pub fn decode_jpeg_derived(&self, jpeg: &[u8]) -> Result<DerivedFrame, VaError> {
-        let lib = &self.lib;
-        let fail = |op: &'static str, code: i32| VaError::Status {
-            op,
-            code,
-            msg: lib.error_str(code),
-        };
-        let Submitted {
-            width,
-            height,
-            max_h: _,
-            max_v: _,
-            surf,
-            _surf_guard,
-            _ctx_guard,
-        } = self.submit(jpeg)?;
-        // `_surf_guard`/`_ctx_guard` stay alive until return.
-        let mut img = ffi::VaImage {
-            image_id: 0,
-            format: ffi::VaImageFormat {
-                fourcc: 0,
-                byte_order: 0,
-                bits_per_pixel: 0,
-                depth: 0,
-                red_mask: 0,
-                green_mask: 0,
-                blue_mask: 0,
-                alpha_mask: 0,
-                va_reserved: [0; 4],
-            },
-            buf: 0,
-            width: 0,
-            height: 0,
-            data_size: 0,
-            num_planes: 0,
-            pitches: [0; 3],
-            offsets: [0; 3],
-            num_palette_entries: 0,
-            entry_bytes: 0,
-            component_order: [0; 4],
-            va_reserved: [0; 4],
-        };
-        // SAFETY: out-param is a valid VaImage slot.
-        let mut st = unsafe { (lib.va_derive_image)(self.dpy, surf, &mut img) };
-        if st != VA_STATUS_SUCCESS {
-            return Err(fail("vaDeriveImage", st));
-        }
-        struct ImgGuard<'a> {
-            lib: &'a VaLib,
-            dpy: VaDisplay,
-            id: u32,
-        }
-        impl Drop for ImgGuard<'_> {
-            fn drop(&mut self) {
-                // SAFETY: image was derived; destroy exactly once.
-                unsafe {
-                    (self.lib.va_destroy_image)(self.dpy, self.id);
-                }
-            }
-        }
-        let _img_guard = ImgGuard {
-            lib,
-            dpy: self.dpy,
-            id: img.image_id,
-        };
-        if img.format.fourcc != VA_FOURCC_NV12 || img.num_planes != 2 {
-            eprintln!(
-                "[va-bridge] derived image fourcc=0x{:08x} ({}) planes={} pitches={:?} offsets={:?}",
-                img.format.fourcc,
-                String::from_utf8_lossy(&img.format.fourcc.to_le_bytes()),
-                img.num_planes,
-                &img.pitches[..img.num_planes.min(4) as usize],
-                &img.offsets[..img.num_planes.min(4) as usize]
-            );
-            return Err(VaError::Corrupt("derived image is not 2-plane NV12"));
-        }
-        if img.width as u32 != width || img.height as u32 != height {
-            return Err(VaError::Corrupt("derived image geometry mismatch"));
-        }
-        let mut ptr: *mut c_void = std::ptr::null_mut();
-        // SAFETY: out-param is a valid pointer slot; unmapped below.
-        st = unsafe { (lib.va_map_buffer)(self.dpy, img.buf, &mut ptr) };
-        if st != VA_STATUS_SUCCESS || ptr.is_null() {
-            return Err(fail("vaMapBuffer", st));
-        }
-        // SAFETY: mapped NV12 bytes; rows copied before unmap. Chroma dims
-        // are ceil(w/2) x ceil(h/2) so odd-size frames (e.g. 537x529) pack
-        // exactly.
-        let (y, uv) = unsafe {
-            let base = ptr as *const u8;
-            let (w, h) = (width as usize, height as usize);
-            let (yp, up) = (img.pitches[0] as usize, img.pitches[1] as usize);
-            let (yo, uo) = (img.offsets[0] as usize, img.offsets[1] as usize);
-            let mut y = vec![0u8; w * h];
-            for r in 0..h {
-                let src = std::slice::from_raw_parts(base.add(yo + r * yp), w);
-                y[r * w..(r + 1) * w].copy_from_slice(src);
-            }
-            let (cw, chh) = ((w + 1) / 2, (h + 1) / 2);
-            let mut uv = vec![0u8; cw * chh * 2];
-            for r in 0..chh {
-                let src = std::slice::from_raw_parts(base.add(uo + r * up), cw * 2);
-                uv[r * cw * 2..(r + 1) * cw * 2].copy_from_slice(src);
-            }
-            (y, uv)
-        };
-        Ok(DerivedFrame {
-            width,
-            height,
-            fourcc: img.format.fourcc,
-            y_pitch: img.pitches[0],
-            uv_pitch: img.pitches[1],
-            y,
-            uv,
-        })
-    }
 }
 
 // `libc` is not a workspace dep; close(2)/lseek(2) via direct externs.
@@ -724,15 +811,37 @@ fn libc_lseek_end(fd: i32) -> i64 {
 
 impl Drop for VaSession {
     fn drop(&mut self) {
-        // SAFETY: config/display were created; destroy exactly once.
+        // SAFETY: every pooled surface/context was created; destroy exactly
+        // once each, then the config and display.
         unsafe {
+            for entry in self.pool.values() {
+                (self.lib.va_destroy_context)(self.dpy, entry.ctx);
+                let mut surf = entry.surf;
+                (self.lib.va_destroy_surfaces)(self.dpy, &mut surf, 1);
+            }
+            // The pooled HIP imports die with their `HipMapping` drops here.
             (self.lib.va_destroy_config)(self.dpy, self.config);
             (self.lib.va_terminate)(self.dpy);
         }
     }
 }
 
-/// A VCN-decoded frame: geometry + NV12 dma-buf mapped into HIP.
+/// Product decode contract. `Decoded` carries the pooled frame;
+/// `Unsupported` (progressive/arithmetic/12-bit/CMYK — anything
+/// [`parse_for_va`] rejects) means "take the CPU path" with NO session
+/// teardown. `Err` is real failures only.
+#[derive(Clone, Copy)]
+pub enum DecodeOutcome {
+    Decoded(VcnFrame),
+    Unsupported(&'static str),
+}
+
+/// A VCN-decoded frame: geometry + layer layout + the pooled device pointer.
+///
+/// The pointer is stable per (`rt_format`, width, height) pool key, but its
+/// *contents* reflect the most recent decode of that key — launch + sync
+/// consumer kernels before the next decode. Valid until the session drops.
+#[derive(Clone, Copy)]
 pub struct VcnFrame {
     pub width: u32,
     pub height: u32,
@@ -742,13 +851,16 @@ pub struct VcnFrame {
     pub fourcc: u32,
     pub layers: [ffi::VaDrmPrimeLayer; 4],
     pub num_layers: u32,
-    pub mapping: HipMapping,
+    ptr: *mut c_void,
 }
+
+// A device address; validity is tied to the owning session (see above).
+unsafe impl Send for VcnFrame {}
 
 impl VcnFrame {
     /// Device pointer to the start of the exported (single-object) surface.
     pub fn device_ptr(&self) -> *mut c_void {
-        self.mapping.ptr()
+        self.ptr
     }
     /// Y-plane pitch in bytes (layer 0, plane 0).
     pub fn y_pitch(&self) -> u32 {
@@ -770,28 +882,53 @@ impl VcnFrame {
             self.y_pitch()
         }
     }
+    /// Diagnostics-only D2H copy of `len` bytes at `offset` (the debug and
+    /// 444check examples). Opens the HIP runtime directly; never used on a
+    /// hot path.
+    pub fn copy_to_host(&self, offset: usize, len: usize) -> Result<Vec<u8>, VaError> {
+        let candidates =
+            hipfire_config::rocm::library_candidates(hipfire_config::rocm::HIP_RUNTIME_LIBRARIES);
+        // SAFETY: system HIP runtime; signature matches hip_runtime_api.h.
+        unsafe {
+            for c in &candidates {
+                let Ok(lib) = libloading::Library::new(c) else {
+                    continue;
+                };
+                let Ok(f_memcpy): Result<
+                    libloading::Symbol<
+                        unsafe extern "C" fn(*mut c_void, *const c_void, usize, u32) -> u32,
+                    >,
+                    _,
+                > = lib.get(b"hipMemcpy") else {
+                    continue;
+                };
+                let mut host = vec![0u8; len];
+                let src = (self.ptr as *const u8).add(offset) as *const c_void;
+                // hipMemcpyDeviceToHost = 2.
+                let code = f_memcpy(host.as_mut_ptr() as *mut c_void, src, len, 2);
+                if code != 0 {
+                    return Err(VaError::Status {
+                        op: "hipMemcpy(D2H)",
+                        code: code as i32,
+                        msg: format!("code {code}"),
+                    });
+                }
+                return Ok(host);
+            }
+        }
+        Err(VaError::Dlopen {
+            lib: candidates.join(","),
+            msg: "no HIP runtime for VcnFrame::copy_to_host".to_string(),
+        })
+    }
 }
 
-/// A VCN-decoded frame read back through `vaDeriveImage`: packed NV12
-/// planes with driver-resolved (linear) layout. Validation path for decode
-/// correctness when the dma-buf export is tiled/DCC (see
-/// [`VaSession::decode_jpeg_derived`]).
-/// Format-generic derived readback (see `decode_jpeg_planes`).
+/// A VCN-decoded frame read back through `vaDeriveImage`: packed planes with
+/// driver-resolved (linear) layout. The `vl_vcn_444check` oracle for VCN
+/// decode correctness (see [`VaSession::decode_jpeg_planes`]).
 pub struct DerivedPlanes {
     pub width: u32,
     pub height: u32,
     pub fourcc: u32,
     pub planes: Vec<Vec<u8>>,
-}
-
-pub struct DerivedFrame {
-    pub width: u32,
-    pub height: u32,
-    pub fourcc: u32,
-    pub y_pitch: u32,
-    pub uv_pitch: u32,
-    /// Packed luma, `width * height` bytes.
-    pub y: Vec<u8>,
-    /// Packed interleaved chroma, `(width/2) * (height/2) * 2` bytes.
-    pub uv: Vec<u8>,
 }

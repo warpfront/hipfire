@@ -16,10 +16,12 @@
 //! there `flock -w 60 /tmp/hipfire-gpu.lock <cmd>` holds the same mutex.)
 //!
 //! Per fixture (benchmarks/vision/images): repo CPU path
-//! (`load_and_preprocess_from_bytes` + `extract_patches`, timed) vs VCN path
-//! (va-bridge decode → dma-buf import → `vl_yuv_preprocess` kernels → D2H,
-//! timed), plus a `libjpeg-turbo-rs`-vs-`image` decode diagnostic. Prints
-//! rel-L1 of `pixel_values` and a timing table.
+//! (`load_and_preprocess_from_bytes` + `extract_patches`, timed) vs pooled
+//! VCN path (va-bridge decode → pooled dma-buf import → `vl_yuv_preprocess`
+//! kernels → D2H, timed), plus a `libjpeg-turbo-rs`-vs-`image` decode
+//! diagnostic. Prints rel-L1 of `pixel_values` and a timing table.
+//! Surfaces are linear-only and pooled in the session, so a repeated size
+//! costs only decode+sync; VCN-unsupported streams take the turbo fallback.
 //!
 //! Acceptance (per experiment contract): per-fixture rel-L1 within ~1e-2
 //! (the zune-equivalence argument: zune floor ≈ 4.6e-3 on doge,
@@ -147,11 +149,20 @@ impl Md5 {
 fn hex(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
-
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let cpu_only = args.iter().any(|a| a == "--cpu-only");
-    let only: Vec<&String> = args.iter().filter(|a| !a.starts_with("--")).collect();
+    let repeat: usize = args
+        .iter()
+        .filter_map(|a| a.strip_prefix("--repeat="))
+        .filter_map(|v| v.parse().ok())
+        .next()
+        .unwrap_or(1)
+        .max(1);
+    let only: Vec<&String> = args
+        .iter()
+        .filter(|a| !a.starts_with("--"))
+        .collect();
     let fixtures = [
         "general_qa.jpg",
         "barney_cigar.jpg",
@@ -197,9 +208,9 @@ fn main() {
         .expect("vl_extract_patches");
 
     // ——— VA session (None ⇒ CPU-fallback mode: oracles only) ———
-    let session = match va_bridge::VaSession::open() {
+    let mut session = match va_bridge::VaSession::open() {
         Ok(s) => {
-            println!("[parity] VA vendor: {}", s.vendor());
+            println!("[parity] VA vendor: {} (node {})", s.vendor(), s.node());
             Some(s)
         }
         Err(e) => {
@@ -278,7 +289,7 @@ fn main() {
             );
             continue;
         }
-        let Some(sess) = session.as_ref() else {
+        let Some(sess) = session.as_mut() else {
             println!("[parity] {name}: VA unavailable, skipping VCN path");
             continue;
         };
@@ -349,42 +360,38 @@ fn main() {
             (v, kern_ms)
         };
 
-        // Zero-copy arm (HIPFIRE_VCN_ZEROCOPY=1, needs HIPFIRE_VCN_LINEAR=1 so the
-        // exported dma-buf is linear): kernels read the imported surface directly.
-        let zerocopy = std::env::var_os("HIPFIRE_VCN_ZEROCOPY").is_some();
-        let t0 = Instant::now();
-        let mut planar_444 = false;
-        let zc = if zerocopy {
-            match sess.decode_jpeg(&bytes) {
-                Ok(vf) if vf.fourcc == 0x3231_564E || vf.fourcc == 0x5034_3434 => Some(vf),
-                Ok(vf) => {
-                    println!("[parity] {name}: VCN decoded fourcc=0x{:08x} — no kernel arm, CPU path", vf.fourcc);
-                    planar_444 = true;
-                    None
-                }
-                Err(va_bridge::VaError::Unsupported(_)) => None,
-                Err(e) => panic!("vcn zero-copy decode of {name}: {e}"),
+        // Pooled zero-copy arm (linear-only surfaces): kernels read the
+        // imported surface directly. The first decode of a size also pays
+        // surface/context/export/import; repeats cost only parse+submit+sync.
+        // `--repeat=N` times each decode to expose first vs steady-state.
+        let mut dec_iters = Vec::with_capacity(repeat);
+        let mut outcome = None;
+        for _ in 0..repeat {
+            let t0 = Instant::now();
+            let o = sess.decode_jpeg(&bytes);
+            dec_iters.push(t0.elapsed().as_secs_f64() * 1e3);
+            if o.is_err() {
+                outcome = Some(o);
+                break;
             }
-        } else {
-            None
-        };
-        let derived = if zc.is_some() {
-            Err(va_bridge::VaError::Corrupt("zero-copy arm taken"))
-        } else if planar_444 {
-            Err(va_bridge::VaError::Unsupported("444P needs planar kernel arm"))
-        } else {
-            match sess.decode_jpeg_derived(&bytes) {
-                // Derived readback is NV12-only; a 444P frame decoded fine on VCN
-                // but this example cannot consume it yet.
-                Err(va_bridge::VaError::Corrupt("derived image is not 2-plane NV12")) => {
-                    Err(va_bridge::VaError::Unsupported("444P needs planar kernel arm"))
-                }
-                r => r,
-            }
-        };
-        let dec_ms = t0.elapsed().as_secs_f64() * 1e3;
-        let (path, got, kern_ms): (&str, Vec<f32>, f64) = match (zc, derived) {
-            (Some(vf), _) => {
+            outcome = Some(o);
+        }
+        let dec_ms = *dec_iters.last().unwrap_or(&f64::NAN);
+        if repeat > 1 {
+            println!(
+                "[parity] {name}: dec iters (ms) = [{}]",
+                dec_iters
+                    .iter()
+                    .map(|v| format!("{v:.2}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        let outcome = outcome.expect("at least one decode attempt");
+        let (path, got, kern_ms): (&str, Vec<f32>, f64) = match outcome {
+            Ok(va_bridge::DecodeOutcome::Decoded(vf))
+                if vf.fourcc == 0x3231_564E || vf.fourcc == 0x5034_3434 =>
+            {
                 let planar = vf.fourcc == 0x5034_3434;
                 let (u_off, v_off, step, shifts) = if planar {
                     assert!(vf.num_layers >= 3, "444P export must carry 3 layers");
@@ -406,9 +413,32 @@ fn main() {
                 );
                 (if planar { "vcn-zc-444" } else { "vcn-zc" }, v, k)
             }
-            (None, derived) => match derived {
-            Err(va_bridge::VaError::Unsupported(reason)) => {
-                // Blocker-2 product behavior: non-4:2:0 falls back to turbo.
+            Ok(va_bridge::DecodeOutcome::Decoded(vf)) => {
+                println!("[parity] {name}: VCN decoded fourcc=0x{:08x} — no kernel arm, CPU path", vf.fourcc);
+                let t1 = Instant::now();
+                let rgb = image::DynamicImage::ImageRgb8(
+                    image::RgbImage::from_raw(tw as u32, th as u32, turbo.data.clone())
+                        .expect("turbo rgb"),
+                );
+                let rgb = rgb
+                    .resize_exact(
+                        img_w as u32,
+                        img_h as u32,
+                        image::imageops::FilterType::CatmullRom,
+                    )
+                    .to_rgb8();
+                let plane = img_h * img_w;
+                let mut chw = vec![0f32; 3 * plane];
+                for (i, px) in rgb.pixels().enumerate() {
+                    chw[i] = px[0] as f32 / 127.5 - 1.0;
+                    chw[plane + i] = px[1] as f32 / 127.5 - 1.0;
+                    chw[2 * plane + i] = px[2] as f32 / 127.5 - 1.0;
+                }
+                let fb = extract_patches(&chw, 3, img_h, img_w, PATCH, TEMPORAL, SMS);
+                ("cpu-fallback", fb, t1.elapsed().as_secs_f64() * 1e3)
+            }
+            Ok(va_bridge::DecodeOutcome::Unsupported(reason)) => {
+                // Product behavior: VCN-unsupported streams fall back to turbo.
                 println!("[parity] {name}: VCN unsupported ({reason}) — turbo CPU fallback");
                 let t1 = Instant::now();
                 let rgb = image::DynamicImage::ImageRgb8(
@@ -433,29 +463,6 @@ fn main() {
                 ("cpu-fallback", fb, t1.elapsed().as_secs_f64() * 1e3)
             }
             Err(e) => panic!("vcn decode of {name}: {e}"),
-            Ok(d) => {
-                println!(
-                    "[parity] derived: {}x{} fourcc=0x{:08x} y_pitch={} uv_pitch={}",
-                    d.width, d.height, d.fourcc, d.y_pitch, d.uv_pitch
-                );
-                let (sw, sh) = (d.width as usize, d.height as usize);
-                let cw = (sw + 1) / 2;
-                assert_eq!(d.y.len(), sw * sh);
-                assert_eq!(d.uv.len(), cw * ((sh + 1) / 2) * 2);
-                // Packed NV12 upload (packed pitches: y=w, uv=2*cw); upload is
-                // inside the kernel timing since a derived product path pays it.
-                let mut nv12 = Vec::with_capacity(d.y.len() + d.uv.len());
-                nv12.extend_from_slice(&d.y);
-                nv12.extend_from_slice(&d.uv);
-                let d_surf = hip.malloc(nv12.len()).expect("malloc surf");
-                let t_up = Instant::now();
-                hip.memcpy_htod(&d_surf, &nv12).expect("htod surf");
-                let up_ms = t_up.elapsed().as_secs_f64() * 1e3;
-                let (v, k) = run_kernels(d_surf.as_ptr() as u64, sw as u32, (2 * cw) as u32, (sw * sh) as u32, (sw * sh) as u32 + 1, 2, (1, 1), sw, sh);
-                hip.free(d_surf).unwrap();
-                ("vcn", v, k + up_ms)
-            }
-            },
         };
         let r = rel_l1(&cpu_patches, &got);
         worst = worst.max(r);

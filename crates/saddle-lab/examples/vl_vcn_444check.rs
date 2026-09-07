@@ -10,8 +10,8 @@ fn clamp(v: f32) -> u8 {
 
 fn main() {
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../benchmarks/vision/images");
-    let sess = va_bridge::VaSession::open().expect("va open");
-    println!("[444check] {}", sess.vendor());
+    let mut sess = va_bridge::VaSession::open().expect("va open");
+    println!("[444check] {} (node {})", sess.vendor(), sess.node());
     for name in ["barney_cigar.jpg", "scene_1.jpg", "doge.jpeg", "scene_2.jpg", "general_qa.jpg"] {
         let bytes = std::fs::read(dir.join(name)).unwrap();
         let turbo = libjpeg_turbo_rs::decompress_to(&bytes, libjpeg_turbo_rs::PixelFormat::Rgb).unwrap();
@@ -59,32 +59,33 @@ fn main() {
                 maxrgb = maxrgb.max(d);
             }
         }
-        // Zero-copy question: import the exported dma-buf into HIP and read the
-        // Y plane back linearly (pitch-aware). If the surface is tiled this is
-        // garbage; if the driver honoured a linear modifier it matches derived Y.
-        if std::env::var_os("HIPFIRE_VCN_ZEROCOPY").is_some() {
-            match sess.decode_jpeg(&bytes) {
-                Ok(vf) => {
-                    let pitch = vf.y_pitch() as usize;
-                    match vf.mapping.copy_to_host(0, pitch * h) {
-                        Ok(buf) => {
-                            let mut d = 0f64;
-                            for y in 0..h {
-                                for x in 0..w {
-                                    d += (buf[y * pitch + x] as i32 - f.planes[0][y * w + x] as i32).abs() as f64;
-                                }
+        // Zero-copy check: import the exported dma-buf into HIP and read the
+        // Y plane back linearly (pitch-aware). Surfaces are linear-only, so
+        // this matches derived Y.
+        match sess.decode_jpeg(&bytes) {
+            Ok(va_bridge::DecodeOutcome::Decoded(vf)) => {
+                let pitch = vf.y_pitch() as usize;
+                match vf.copy_to_host(0, pitch * h) {
+                    Ok(buf) => {
+                        let mut d = 0f64;
+                        for y in 0..h {
+                            for x in 0..w {
+                                d += (buf[y * pitch + x] as i32 - f.planes[0][y * w + x] as i32).abs() as f64;
                             }
-                            println!(
-                                "{name:18}   dma-buf import (pitch {pitch}, {} layers): Y vs derived-Y mean|d|={:.3} LSB",
-                                vf.num_layers,
-                                d / (w * h) as f64
-                            );
                         }
-                        Err(e) => println!("{name:18}   dma-buf copy_to_host: {e}"),
+                        println!(
+                            "{name:18}   dma-buf import (pitch {pitch}, {} layers): Y vs derived-Y mean|d|={:.3} LSB",
+                            vf.num_layers,
+                            d / (w * h) as f64
+                        );
                     }
+                    Err(e) => println!("{name:18}   dma-buf copy_to_host: {e}"),
                 }
-                Err(e) => println!("{name:18}   dma-buf path: {e}"),
             }
+            Ok(va_bridge::DecodeOutcome::Unsupported(reason)) => {
+                println!("{name:18}   dma-buf path: unsupported ({reason})")
+            }
+            Err(e) => println!("{name:18}   dma-buf path: {e}"),
         }
         println!(
             "{name:18} {w}x{h} VCN fourcc={fourcc} planes={} | Y vs turbo-luma mean|d|={:.3} LSB | host-RGB vs turbo mean|d|={:.3} max={}",

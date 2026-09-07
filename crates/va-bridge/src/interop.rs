@@ -126,13 +126,11 @@ impl HipMapping {
                 flags: 0,
                 reserved: [0; 16],
             };
-            if std::env::var_os("HIPFIRE_VCN_DEBUG").is_some() {
-                let raw: &[u8] = unsafe {
-                    std::slice::from_raw_parts(
-                        (&desc as *const HipExtMemHandleDesc) as *const u8,
-                        std::mem::size_of::<HipExtMemHandleDesc>(),
-                    )
-                };
+            if hipfire_config::developer_var("HIPFIRE_VCN_DEBUG").is_ok() {
+                let raw: &[u8] = std::slice::from_raw_parts(
+                    (&desc as *const HipExtMemHandleDesc) as *const u8,
+                    std::mem::size_of::<HipExtMemHandleDesc>(),
+                );
                 eprintln!(
                     "[va-bridge] import desc ({}B): {}",
                     raw.len(),
