@@ -18,6 +18,7 @@ pub struct LoadedModule {
 }
 
 /// A compute kernel ready for dispatch.
+#[derive(Clone)]
 pub struct Kernel {
     pub name: String,
     pub code_va: u64,
@@ -34,6 +35,28 @@ pub struct Kernel {
 /// A command buffer that accumulates PM4 dispatch packets.
 pub struct CommandBuffer {
     pub(crate) dwords: Vec<u32>,
+}
+
+/// LDS allocation granularity for COMPUTE_PGM_RSRC2.LDS_SIZE (bits [20:14]):
+/// gfx6-gfx10 count 512-byte blocks; gfx11+ (incl. gfx12) count 256-byte
+/// blocks. Measured on gfx1201 2026-09-07: encoding 1024 B as 2 (512-byte
+/// rule) or 8 (128-byte rule) both allocate 512 B and the upper half of every
+/// LDS store silently vanishes; 4 blocks of 256 B is exact. hipcc leaves this
+/// field 0 in the descriptor (ROCr derives it from group_segment_fixed_size),
+/// so it must always be derived here.
+pub fn lds_granularity(gfx_arch: &str) -> u32 {
+    let n: u32 = gfx_arch.trim_start_matches("gfx").parse().unwrap_or(0);
+    if n >= 1100 { 256 } else { 512 }
+}
+
+/// COMPUTE_PGM_RSRC2 with LDS_SIZE derived from the kernel's static LDS plus
+/// `dynamic_lds` bytes. Descriptors from hipcc already carry a correct field;
+/// descriptors from other toolchains (e.g. rustc's amdgcn target) leave it 0
+/// while still declaring `group_segment_fixed_size`, so always derive it.
+fn rsrc2_with_lds(k: &Kernel, dynamic_lds: u32, granularity: u32) -> u32 {
+    let total = k.group_segment_size + dynamic_lds;
+    let blocks = (total + granularity - 1) / granularity;
+    (k.pgm_rsrc2 & !(0x7F << 14)) | ((blocks & 0x7F) << 14)
 }
 
 // PM4 helpers
@@ -119,71 +142,17 @@ impl CommandBuffer {
     /// Append a single dispatch to this command buffer.
     /// `kernarg_va`: GPU virtual address of the kernarg buffer for this dispatch.
     pub fn dispatch(&mut self, k: &Kernel, grid: [u32; 3], block: [u32; 3], kernarg_va: u64) {
-        let d = &mut self.dwords;
-
-        // COMPUTE_PGM_LO/HI
-        d.push(pkt3(SET_SH_REG, 3));
-        d.push(0x020C);
-        d.push((k.code_va >> 8) as u32);
-        d.push((k.code_va >> 40) as u32);
-
-        // COMPUTE_PGM_RSRC1/RSRC2
-        d.push(pkt3(SET_SH_REG, 3));
-        d.push(0x0212);
-        d.push(k.pgm_rsrc1);
-        d.push(k.pgm_rsrc2);
-
-        // COMPUTE_PGM_RSRC3 (GFX10 required)
-        d.push(pkt3(SET_SH_REG, 2));
-        d.push(0x0228);
-        d.push(0);
-
-        // COMPUTE_TMPRING_SIZE = 0 (no scratch)
-        d.push(pkt3(SET_SH_REG, 2));
-        d.push(0x0218);
-        d.push(0);
-
-        // COMPUTE_NUM_THREAD_X/Y/Z
-        d.push(pkt3(SET_SH_REG, 4));
-        d.push(0x0207);
-        d.push(block[0]);
-        d.push(block[1]);
-        d.push(block[2]);
-
-        // COMPUTE_RESOURCE_LIMITS = 0
-        d.push(pkt3(SET_SH_REG, 2));
-        d.push(0x0215);
-        d.push(0);
-
-        // USER_DATA — fill with zeros, place kernarg pointer at the right index
-        if k.user_sgpr_count > 0 {
-            d.push(pkt3(SET_SH_REG, 1 + k.user_sgpr_count));
-            d.push(0x0240); // COMPUTE_USER_DATA_0
-            for i in 0..k.user_sgpr_count {
-                if Some(i) == k.kernarg_sgpr_idx {
-                    d.push(kernarg_va as u32);
-                } else if Some(i) == k.kernarg_sgpr_idx.map(|x| x + 1) {
-                    d.push((kernarg_va >> 32) as u32);
-                } else {
-                    d.push(0);
-                }
-            }
-        }
-
-        // DISPATCH_DIRECT
-        // CS_EN=1 | CS_W32_EN=1 (HIP on RDNA always wave32)
-        let di = (1u32 << 0) | (1 << 15);
-        d.push(pkt3(DISPATCH_DIRECT, 4));
-        d.push(grid[0]);
-        d.push(grid[1]);
-        d.push(grid[2]);
-        d.push(di);
+        self.dispatch_with_lds(k, grid, block, kernarg_va, 0, 512)
     }
 
-    /// Append a dispatch with explicit dynamic LDS (shared memory) size.
-    /// `lds_bytes` is the dynamic shared memory in bytes (added to kernel's static LDS).
+    /// `dispatch` with explicit dynamic LDS and the device's LDS granularity
+    /// (see [`lds_granularity`]).
+    pub fn dispatch_lds(&mut self, k: &Kernel, grid: [u32; 3], block: [u32; 3], kernarg_va: u64, dynamic_lds: u32, granularity: u32) {
+        self.dispatch_with_lds(k, grid, block, kernarg_va, dynamic_lds, granularity)
+    }
+
     pub fn dispatch_with_lds(&mut self, k: &Kernel, grid: [u32; 3], block: [u32; 3],
-                              kernarg_va: u64, lds_bytes: u32) {
+                              kernarg_va: u64, lds_bytes: u32, granularity: u32) {
         let d = &mut self.dwords;
 
         // COMPUTE_PGM_LO/HI
@@ -197,13 +166,8 @@ impl CommandBuffer {
         d.push(0x0212);
         d.push(k.pgm_rsrc1);
 
-        // COMPUTE_PGM_RSRC2 with LDS_SIZE override
-        // LDS_SIZE field is bits [20:14] — number of 512-byte blocks
-        // Total LDS = kernel static + dynamic lds_bytes
-        let total_lds = k.group_segment_size + lds_bytes;
-        let lds_blocks = (total_lds + 511) / 512; // round up to 512-byte blocks
-        let rsrc2_base = k.pgm_rsrc2 & !(0x7F << 14); // clear existing LDS_SIZE
-        let rsrc2 = rsrc2_base | ((lds_blocks & 0x7F) << 14);
+        // COMPUTE_PGM_RSRC2 with LDS_SIZE derived (see rsrc2_with_lds).
+        let rsrc2 = rsrc2_with_lds(k, lds_bytes, granularity);
 
         d.push(pkt3(SET_SH_REG, 2));
         d.push(0x0213); // COMPUTE_PGM_RSRC2 offset (0x0212 + 1)
@@ -357,7 +321,7 @@ impl DispatchQueue {
 
         // Build PM4
         let mut cb = CommandBuffer::new();
-        cb.dispatch(kernel, grid, block, self.ka_buf.gpu_addr);
+        cb.dispatch_lds(kernel, grid, block, self.ka_buf.gpu_addr, 0, lds_granularity(&dev.info.gfx_arch));
 
         // Upload IB
         let ib_bytes = cb.as_bytes();
@@ -489,7 +453,7 @@ impl FastDispatch {
 
         // Build PM4 directly into persistent IB mapping
         let mut cb = CommandBuffer::new();
-        cb.dispatch(kernel, grid, block, self.ka_buf.gpu_addr);
+        cb.dispatch_lds(kernel, grid, block, self.ka_buf.gpu_addr, 0, lds_granularity(&dev.info.gfx_arch));
         let dwords = &cb.dwords;
         unsafe {
             std::ptr::copy_nonoverlapping(

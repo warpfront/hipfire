@@ -86,7 +86,7 @@ fn main() {
     let mut cb = CommandBuffer::new();
     // Override LDS size: set group_segment_size for the dynamic shared memory
     cb.dispatch_with_lds(kernel, [batch, 1, 1], [block_size, 1, 1],
-        dq.kernarg_buf().gpu_addr, lds_bytes);
+        dq.kernarg_buf().gpu_addr, lds_bytes, redline::dispatch::lds_granularity(&dev.info.gfx_arch));
 
     dq.submit(&dev, &cb,
         &[dq.kernarg_buf(), &module.code_buf, &x_buf, &w_buf, &out_buf]).unwrap();

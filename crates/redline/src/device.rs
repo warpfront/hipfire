@@ -114,8 +114,12 @@ impl Device {
                     _ => "gfx10xx",
                 }
             }
-            145 | 146 | 147 => "gfx1100", // RDNA3
-            148 | 149 => "gfx1200",       // RDNA4
+            // Families per /usr/include/drm/amdgpu_drm.h (AMDGPU_FAMILY_GC_*).
+            145 | 146 | 147 => "gfx1100", // GC 11.0.0 / 11.0.2 / 11.0.3 (RDNA3 dGPU)
+            148 => "gfx1103",             // GC 11.0.1 (Phoenix APU, RDNA3)
+            149 | 151 => "gfx1036",       // GC 10.3.6 / 10.3.7 (RDNA2 APUs)
+            150 | 154 => "gfx1150",       // GC 11.5.0 / 11.5.4 (Strix, Strix Halo — RDNA3.5)
+            152 => "gfx1200",             // GC 12.0.0 (RDNA4: gfx1200 / gfx1201)
             _ => "unknown",
         };
 
