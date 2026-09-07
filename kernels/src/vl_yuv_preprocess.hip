@@ -157,7 +157,11 @@ extern "C" __global__ void vl_extract_patches(const float* __restrict__ chw, uns
                                               unsigned int w, unsigned int patch,
                                               unsigned int temporal, unsigned int sms,
                                               float* __restrict__ out) {
-    const size_t idx = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+    // 32-bit index, widened once. Computing this as a 64-bit product stops
+    // LLVM narrowing the seven u64 div/rem chains below to 32-bit expansions:
+    // 1315 -> 730 instructions and 28 -> 16 VGPRs on gfx1201 (2026-09-07 A/B).
+    // Output elements never approach 2^32 (a 4096x4096 image is ~1e8).
+    const size_t idx = (size_t)(blockIdx.x * blockDim.x + threadIdx.x);
     const size_t P = patch;
     const size_t patch_elems = (size_t)temporal * 3 * P * P;
     const size_t ph = h / P;
