@@ -1061,6 +1061,8 @@ pub const GEMM_MQ6G256_SRC: &str = include_str!("../../../kernels/src/gemm_mq6g2
 pub const GEMV_MQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip");
+pub const FUSED_RMSNORM_MQ_ROTATE_WG_SRC: &str =
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_wg.hip");
 pub const FUSED_RMSNORM_MQ_ROTATE_WAVEGRID_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_wavegrid.gfx1100.hip");
 pub const RMSNORM_REDUCE_GFX1100_SRC: &str =

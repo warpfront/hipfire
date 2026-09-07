@@ -934,7 +934,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "fused_rmsnorm_mq_rotate"
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
-        | "fused_rmsnorm_mq_rotate_vecsum_sign_lds" => {
+        | "fused_rmsnorm_mq_rotate_vecsum_sign_lds"
+        | "fused_rmsnorm_mq_rotate_wg" => {
             Some(vec![read(0), read(8), read(16), read(24), write(32)])
         }
         "fused_rmsnorm_mq_rotate_wavegrid" => Some(vec![
@@ -1551,6 +1552,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_rmsnorm_mq_rotate_vecsum"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_const"
         | "fused_rmsnorm_mq_rotate_vecsum_sign_lds"
+        | "fused_rmsnorm_mq_rotate_wg"
         | "fused_sigmoid_alpha_gate_f32"
         | "fused_silu_mul_mq_rotate"
         | "gated_norm_f32"
@@ -5891,6 +5893,7 @@ mod tests {
         "fused_rmsnorm_mq_rotate_vecsum_sign_const",
         "fused_rmsnorm_mq_rotate_vecsum_sign_lds",
         "fused_rmsnorm_mq_rotate_wavegrid",
+        "fused_rmsnorm_mq_rotate_wg",
         "rmsnorm_reduce_gfx1100",
         "rotate_with_rms_gfx1100",
         "fused_qkvza_hfq4g256",

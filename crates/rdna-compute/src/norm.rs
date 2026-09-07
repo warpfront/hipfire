@@ -4308,10 +4308,13 @@ impl Gpu {
         n_v_heads: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.is_gfx1100() || head_dim != 128 || n_v_heads > 256 {
+        if !(self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201())
+            || head_dim != 128
+            || n_v_heads > 256
+        {
             return Err(hip_bridge::HipError::new(
                 0,
-                "conv scalar-prep fusion requires gfx1100, head_dim=128, n_v_heads<=256",
+                "conv scalar-prep fusion requires gfx1100/gfx1201, head_dim=128, n_v_heads<=256",
             ));
         }
 

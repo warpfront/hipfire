@@ -5801,7 +5801,8 @@ fn conv_scalar_prep_enabled(
     };
     let shape = hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_SHAPE").ok();
     enabled
-        && gpu.arch_caps.is_gfx1100()
+        && (gpu.arch_caps.is_gfx1100()
+            || (gpu.arch_caps.is_gfx1201() && mode.as_deref() == Some("1")))
         && n_v_heads <= 256
         && shape.as_deref().is_none_or(|v| v == "b256")
         && conv_qknorm_enabled(gpu, config, quant)
