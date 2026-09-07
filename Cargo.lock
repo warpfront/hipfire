@@ -1847,6 +1847,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
+name = "libjpeg-turbo-rs"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a0d8a1c652b51dbb85c3c3164b1da63b88dafcc3fc12ecceb52f7577738c21f1"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "libloading"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2928,10 +2937,13 @@ dependencies = [
  "hipfire-detect",
  "hipfire-dispatch",
  "hipfire-runtime",
+ "image",
  "libc",
+ "libjpeg-turbo-rs",
  "rdna-compute",
  "serde",
  "serde_json",
+ "va-bridge",
 ]
 
 [[package]]
@@ -3653,6 +3665,14 @@ dependencies = [
  "getrandom 0.4.3",
  "js-sys",
  "wasm-bindgen",
+]
+
+[[package]]
+name = "va-bridge"
+version = "0.1.0"
+dependencies = [
+ "hipfire-config",
+ "libloading",
 ]
 
 [[package]]
