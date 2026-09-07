@@ -199,9 +199,9 @@ impl RegSet {
 fn select_reg_set(discovery: u32) -> Option<RegSet> {
     match discovery {
         0x050000 | 0x050001 | 0x040003 => Some(RegSet::V3),
-        0x040000 | 0x040002 | 0x040004 | 0x040005 | 0x040006 | 0x030101 | 0x030102
-        | 0x030000 | 0x030002 | 0x030010 | 0x030021 | 0x020500 | 0x020600 | 0x020000
-        | 0x020002 | 0x020003 | 0x020200 => Some(RegSet::V2),
+        0x040000 | 0x040002 | 0x040004 | 0x040005 | 0x040006 | 0x030101 | 0x030102 | 0x030000
+        | 0x030002 | 0x030010 | 0x030021 | 0x020500 | 0x020600 | 0x020000 | 0x020002 | 0x020003
+        | 0x020200 => Some(RegSet::V2),
         _ => None,
     }
 }
@@ -568,10 +568,7 @@ impl VcnJpegDecoder {
         // bsd_size/4 (radeon_vcn_dec_jpeg.c:30, 421, 275).
         let mut bs_host = vec![0u8; bsd_size as usize];
         bs_host[..stream.len()].copy_from_slice(&stream);
-        dev.upload(
-            self.bs.as_ref().expect("bitstream BO allocated"),
-            &bs_host,
-        )?;
+        dev.upload(self.bs.as_ref().expect("bitstream BO allocated"), &bs_host)?;
 
         // Build + upload the register IB.
         let luma_off = layout.plane_offsets[0];
@@ -826,7 +823,10 @@ impl<'a> PendingJpeg<'a> {
 
     /// The output surface BO (GPU-owned until the terminal wait).
     pub fn surface(&self) -> &GpuBuffer {
-        self.dec().surf.as_ref().expect("surface live during flight")
+        self.dec()
+            .surf
+            .as_ref()
+            .expect("surface live during flight")
     }
 
     /// Geometry of the output surface.
@@ -854,7 +854,12 @@ impl<'a> PendingJpeg<'a> {
     /// returns [`ReadyJpeg`] for CPU readback; timeout or error poisons the
     /// decoder. Must not be used after handing `ready_syncobj` to a
     /// consumer submit — that flight belongs to [`PendingJpeg::complete_after`].
-    pub fn wait_decode(mut self, dev: &Device, queue: &ComputeQueue, timeout_ns: u64) -> Result<ReadyJpeg<'a>> {
+    pub fn wait_decode(
+        mut self,
+        dev: &Device,
+        queue: &ComputeQueue,
+        timeout_ns: u64,
+    ) -> Result<ReadyJpeg<'a>> {
         // Copy the fence first: `wait_fence` runs while no decoder borrow is
         // held, so poisoning below never aliases.
         let fence = self.fence;
@@ -967,11 +972,24 @@ mod tests {
             (0x402f, 0x40e1, 0x40e0, 0x401f, 0x4020)
         );
         assert_eq!(
-            (v2.addr_mode, v2.y_tile, v2.uv_tile, v2.write_hi, v2.write_lo),
+            (
+                v2.addr_mode,
+                v2.y_tile,
+                v2.uv_tile,
+                v2.write_hi,
+                v2.write_lo
+            ),
             (0x4027, 0x4024, 0x4025, 0x40e3, 0x40e2)
         );
         assert_eq!(
-            (v2.tier, v2.outbuf_cntl, v2.outbuf_rptr, v2.outbuf_wptr, v2.index, v2.data),
+            (
+                v2.tier,
+                v2.outbuf_cntl,
+                v2.outbuf_rptr,
+                v2.outbuf_wptr,
+                v2.index,
+                v2.data
+            ),
             (0x400f, 0x401c, 0x401e, 0x401d, 0x402c, 0x402d)
         );
         // V3 specifics.
@@ -981,7 +999,13 @@ mod tests {
             (0x4051, 0x40b3, 0x40b2, 0x4043, 0x4044)
         );
         assert_eq!(
-            (v3.addr_mode, v3.y_tile, v3.uv_tile, v3.write_hi, v3.write_lo),
+            (
+                v3.addr_mode,
+                v3.y_tile,
+                v3.uv_tile,
+                v3.write_hi,
+                v3.write_lo
+            ),
             (0x404b, 0x4048, 0x4049, 0x40b5, 0x40b4)
         );
         assert_eq!(

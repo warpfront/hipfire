@@ -56,13 +56,19 @@ fn doge_decode_parity() {
     );
     // Packet dump (dword list) of the submitted IB.
     let words = pend.ib_dwords();
-    eprintln!("[gate] IB: {} dwords ({} bytes)", words.len(), words.len() * 4);
+    eprintln!(
+        "[gate] IB: {} dwords ({} bytes)",
+        words.len(),
+        words.len() * 4
+    );
     for (i, chunk) in words.chunks(8).enumerate() {
         let hex: Vec<String> = chunk.iter().map(|w| format!("{w:#010x}")).collect();
         eprintln!("[gate] IB[{i:02}]: {}", hex.join(" "));
     }
 
-    let ready = pend.wait_decode(&dev, &queue, TIMEOUT_NS).expect("wait_decode");
+    let ready = pend
+        .wait_decode(&dev, &queue, TIMEOUT_NS)
+        .expect("wait_decode");
     assert_eq!(ready.layout(), layout);
     // Surface readback while the flight is still borrowed.
     let surf = ready.surface();
@@ -77,7 +83,11 @@ fn doge_decode_parity() {
     let va = va_bridge::VaSession::open().expect("va session for oracle");
     let oracle = va.decode_jpeg_planes(&jpeg).expect("oracle decode");
     assert_eq!((oracle.width, oracle.height), (layout.width, layout.height));
-    eprintln!("[gate] oracle: fourcc={:#010x} planes={}", oracle.fourcc, oracle.planes.len());
+    eprintln!(
+        "[gate] oracle: fourcc={:#010x} planes={}",
+        oracle.fourcc,
+        oracle.planes.len()
+    );
 
     let (diff_count, max_abs) = diff_valid_rows(&layout, &host, &oracle.planes);
     eprintln!("[gate] diff_count={diff_count} max_abs={max_abs}");
@@ -105,18 +115,19 @@ fn diff_valid_rows(
     let pitch = layout.pitch as usize;
     let mut diff = 0u64;
     let mut max_abs = 0u8;
-    let mut cmp_row = |surf_off: usize, stride: usize, row_bytes: usize, rows: usize, plane: &[u8]| {
-        for r in 0..rows {
-            let a = &host[surf_off + r * stride..surf_off + r * stride + row_bytes];
-            let b = &plane[r * row_bytes..(r + 1) * row_bytes];
-            for (&x, &y) in a.iter().zip(b.iter()) {
-                if x != y {
-                    diff += 1;
-                    max_abs = max_abs.max(x.abs_diff(y));
+    let mut cmp_row =
+        |surf_off: usize, stride: usize, row_bytes: usize, rows: usize, plane: &[u8]| {
+            for r in 0..rows {
+                let a = &host[surf_off + r * stride..surf_off + r * stride + row_bytes];
+                let b = &plane[r * row_bytes..(r + 1) * row_bytes];
+                for (&x, &y) in a.iter().zip(b.iter()) {
+                    if x != y {
+                        diff += 1;
+                        max_abs = max_abs.max(x.abs_diff(y));
+                    }
                 }
             }
-        }
-    };
+        };
     match layout.format {
         JpegNativeFormat::Nv12 => {
             assert_eq!(oracle.len(), 2);
