@@ -56,7 +56,9 @@ impl Device {
         let mut minor = 0u32;
         let ret = unsafe { (drm.device_initialize)(fd, &mut major, &mut minor, &mut handle) };
         if ret != 0 {
-            unsafe { libc::close(fd); }
+            unsafe {
+                libc::close(fd);
+            }
             return Err(RedlineError {
                 code: ret,
                 message: format!("amdgpu_device_initialize failed: {ret}"),
@@ -69,14 +71,20 @@ impl Device {
         let mut gpu_info = AmdgpuGpuInfo::default();
         let ret = unsafe { (drm.query_gpu_info)(handle, &mut gpu_info) };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: format!("query_gpu_info failed: {ret}") });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("query_gpu_info failed: {ret}"),
+            });
         }
 
         // Query VRAM heap
         let mut heap = HeapInfo::default();
         let ret = unsafe { (drm.query_heap_info)(handle, AMDGPU_GEM_DOMAIN_VRAM, 0, &mut heap) };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: format!("query_heap_info failed: {ret}") });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("query_heap_info failed: {ret}"),
+            });
         }
 
         // Map family_id + asic_id to gfx arch string
@@ -90,24 +98,24 @@ impl Device {
                     0x3c | 0x3d | 0x3e | 0x3f => "gfx906",
                     _ => "gfx900",
                 }
-            },
-            142 => "gfx902",  // AMDGPU_FAMILY_RV (Raven Ridge)
+            }
+            142 => "gfx902", // AMDGPU_FAMILY_RV (Raven Ridge)
             143 => {
                 // AMDGPU_FAMILY_NV: distinguish by asic_id
                 // Navi10=0x731x, Navi12=0x736x, Navi14=0x734x (RDNA1)
                 // Navi21=0x73Ax, Navi22=0x73Cx, Navi23=0x73Ex (RDNA2)
                 match (gpu_info.asic_id >> 4) & 0xF {
-                    1 => "gfx1010",       // Navi 10 (RX 5600/5700)
-                    6 => "gfx1011",       // Navi 12
-                    3 | 4 => "gfx1012",   // Navi 14 (RX 5300/5500)
+                    1 => "gfx1010",         // Navi 10 (RX 5600/5700)
+                    6 => "gfx1011",         // Navi 12
+                    3 | 4 => "gfx1012",     // Navi 14 (RX 5300/5500)
                     0xA | 0xB => "gfx1030", // Navi 21 (RX 6800/6900)
                     0xC | 0xD => "gfx1031", // Navi 22 (RX 6700)
                     0xE | 0xF => "gfx1032", // Navi 23 (RX 6600)
                     _ => "gfx10xx",
                 }
-            },
+            }
             145 | 146 | 147 => "gfx1100", // RDNA3
-            148 | 149 => "gfx1200",        // RDNA4
+            148 | 149 => "gfx1200",       // RDNA4
             _ => "unknown",
         };
 
@@ -124,39 +132,99 @@ impl Device {
             gfx_arch: gfx_arch.to_string(),
         };
 
-        eprintln!("[redline] GPU: {} (asic 0x{:x}) — {} CUs, {} SEs, {:.1} GB VRAM",
-            info.gfx_arch, info.asic_id, info.num_cu, info.num_shader_engines,
-            info.vram_total_bytes as f64 / 1e9);
+        eprintln!(
+            "[redline] GPU: {} (asic 0x{:x}) — {} CUs, {} SEs, {:.1} GB VRAM",
+            info.gfx_arch,
+            info.asic_id,
+            info.num_cu,
+            info.num_shader_engines,
+            info.vram_total_bytes as f64 / 1e9
+        );
 
-        Ok(Self { drm, handle, fd, info })
+        Ok(Self {
+            drm,
+            handle,
+            fd,
+            info,
+        })
     }
 
     /// Allocate VRAM buffer object with GPU virtual address mapping.
     pub fn alloc_vram(&self, size: u64) -> Result<GpuBuffer> {
+        self.alloc_bo(
+            size,
+            AMDGPU_GEM_DOMAIN_VRAM,
+            AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
+        )
+    }
+
+    /// Allocate GTT (host-visible) buffer object with GPU virtual address mapping.
+    /// Used for VCN JPEG bitstream/IB uploads on the direct-ring path.
+    pub fn alloc_gtt(&self, size: u64) -> Result<GpuBuffer> {
+        self.alloc_bo(
+            size,
+            AMDGPU_GEM_DOMAIN_GTT,
+            AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
+        )
+    }
+
+    /// Query hardware IP block info (e.g. VCN JPEG = ip_type 8, instance 0).
+    pub fn query_hw_ip_info(&self, ip_type: u32, ip_instance: u32) -> Result<HwIpInfo> {
+        let mut info = HwIpInfo::default();
+        let ret =
+            unsafe { (self.drm.query_hw_ip_info)(self.handle, ip_type, ip_instance, &mut info) };
+        if ret != 0 {
+            return Err(RedlineError {
+                code: ret,
+                message: format!("query_hw_ip_info({ip_type},{ip_instance}) failed: {ret}"),
+            });
+        }
+        Ok(info)
+    }
+
+    /// Shared BO + VA-range allocation backing alloc_vram/alloc_gtt.
+    fn alloc_bo(&self, size: u64, domain: u32, flags: u64) -> Result<GpuBuffer> {
         let aligned_size = (size + 4095) & !4095; // page-align
 
         // 1. Allocate backing storage (BO)
         let req = AmdgpuBoAllocRequest {
             alloc_size: aligned_size,
             phys_alignment: 4096,
-            preferred_heap: AMDGPU_GEM_DOMAIN_VRAM,
-            flags: AMDGPU_GEM_CREATE_CPU_ACCESS_REQUIRED,
+            preferred_heap: domain,
+            flags,
         };
         let mut bo_handle: AmdgpuBoHandle = std::ptr::null_mut();
         let ret = unsafe { (self.drm.bo_alloc)(self.handle, &req, &mut bo_handle) };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: format!("bo_alloc({aligned_size} bytes) failed: {ret}") });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("bo_alloc({aligned_size} bytes) failed: {ret}"),
+            });
         }
 
         // 2. Allocate GPU virtual address range
         let mut gpu_addr: u64 = 0;
         let mut va_handle: AmdgpuVaHandle = std::ptr::null_mut();
         let ret = unsafe {
-            (self.drm.va_range_alloc)(self.handle, 0, aligned_size, 4096, 0, &mut gpu_addr, &mut va_handle, 0)
+            (self.drm.va_range_alloc)(
+                self.handle,
+                0,
+                aligned_size,
+                4096,
+                0,
+                &mut gpu_addr,
+                &mut va_handle,
+                0,
+            )
         };
         if ret != 0 {
-            unsafe { (self.drm.bo_free)(bo_handle); }
-            return Err(RedlineError { code: ret, message: format!("va_range_alloc failed: {ret}") });
+            unsafe {
+                (self.drm.bo_free)(bo_handle);
+            }
+            return Err(RedlineError {
+                code: ret,
+                message: format!("va_range_alloc failed: {ret}"),
+            });
         }
 
         // 3. Map BO to virtual address
@@ -168,7 +236,10 @@ impl Device {
                 (self.drm.va_range_free)(va_handle);
                 (self.drm.bo_free)(bo_handle);
             }
-            return Err(RedlineError { code: ret, message: format!("bo_va_op MAP failed: {ret}") });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("bo_va_op MAP failed: {ret}"),
+            });
         }
 
         Ok(GpuBuffer {
@@ -185,7 +256,10 @@ impl Device {
         let mut cpu_ptr: *mut c_void = std::ptr::null_mut();
         let ret = unsafe { (self.drm.bo_cpu_map)(buf.handle, &mut cpu_ptr) };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: format!("bo_cpu_map failed: {ret}") });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("bo_cpu_map failed: {ret}"),
+            });
         }
         unsafe {
             std::ptr::copy_nonoverlapping(data.as_ptr(), cpu_ptr as *mut u8, data.len());
@@ -200,7 +274,10 @@ impl Device {
         let mut cpu_ptr: *mut c_void = std::ptr::null_mut();
         let ret = unsafe { (self.drm.bo_cpu_map)(buf.handle, &mut cpu_ptr) };
         if ret != 0 {
-            return Err(RedlineError { code: ret, message: format!("bo_cpu_map failed: {ret}") });
+            return Err(RedlineError {
+                code: ret,
+                message: format!("bo_cpu_map failed: {ret}"),
+            });
         }
         unsafe {
             std::ptr::copy_nonoverlapping(cpu_ptr as *const u8, data.as_mut_ptr(), data.len());
@@ -216,7 +293,10 @@ impl Device {
             (self.drm.va_range_free)(buf.va_handle);
             let ret = (self.drm.bo_free)(buf.handle);
             if ret != 0 {
-                return Err(RedlineError { code: ret, message: format!("bo_free failed: {ret}") });
+                return Err(RedlineError {
+                    code: ret,
+                    message: format!("bo_free failed: {ret}"),
+                });
             }
         }
         Ok(())
