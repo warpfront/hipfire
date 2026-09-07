@@ -17,3 +17,11 @@ lab = []
 [[example]]
 name = "parse_fixtures"
 required-features = ["lab"]
+
+[[example]]
+name = "h264_smoke"
+required-features = ["lab"]
+
+[[example]]
+name = "profile_probe"
+required-features = ["lab"]

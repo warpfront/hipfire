@@ -430,3 +430,98 @@ impl std::fmt::Display for VaError {
     }
 }
 impl std::error::Error for VaError {}
+// ── Video decode profiles (va/va.h `VAProfileType`) ─────────────────────────
+// Ground truth: /usr/include/va/va.h @ libva 2.23 (`apt-get download
+// libva-dev`); values re-verified with a C printout (see size_check.c in the
+// experiment notes). Only the vcn-video lane uses these.
+pub const VA_PROFILE_H264_HIGH: i32 = 7;
+pub const VA_PROFILE_HEVC_MAIN: i32 = 17;
+pub const VA_PROFILE_AV1_PROFILE0: i32 = 32;
+pub const VA_INVALID_SURFACE: u32 = 0xffff_ffff;
+// ── H.264 decode structs (va/va.h "H.264/AVC data structures") ──────────────
+// Transcribed from libva 2.23 va.h; C `sizeof` ground truth from the same
+// header (gcc LP64): VAPictureH264=36, VAPictureParameterBufferH264=672,
+// VAIQMatrixBufferH264=240, VASliceParameterBufferH264=3128.
+pub const VA_PICTURE_H264_INVALID: u32 = 0x0000_0001;
+pub const VA_PICTURE_H264_SHORT_TERM_REFERENCE: u32 = 0x0000_0008;
+pub const VA_PICTURE_H264_LONG_TERM_REFERENCE: u32 = 0x0000_0010;
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VaPictureH264 {
+    pub picture_id: u32,
+    pub frame_idx: u32,
+    pub flags: u32,
+    pub top_field_order_cnt: i32,
+    pub bottom_field_order_cnt: i32,
+    pub va_reserved: [u32; 4],
+}
+const _: () = assert!(std::mem::size_of::<VaPictureH264>() == 36);
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VaPicParamH264 {
+    pub curr_pic: VaPictureH264,
+    pub reference_frames: [VaPictureH264; 16],
+    pub picture_width_in_mbs_minus1: u16,
+    pub picture_height_in_mbs_minus1: u16,
+    pub bit_depth_luma_minus8: u8,
+    pub bit_depth_chroma_minus8: u8,
+    pub num_ref_frames: u8,
+    pub seq_fields: u32,
+    pub num_slice_groups_minus1: u8,
+    pub slice_group_map_type: u8,
+    pub slice_group_change_rate_minus1: u16,
+    pub pic_init_qp_minus26: i8,
+    pub pic_init_qs_minus26: i8,
+    pub chroma_qp_index_offset: i8,
+    pub second_chroma_qp_index_offset: i8,
+    pub pic_fields: u32,
+    pub frame_num: u16,
+    pub va_reserved: [u32; 8],
+}
+const _: () = assert!(std::mem::size_of::<VaPicParamH264>() == 672);
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VaIqMatrixH264 {
+    /// 4x4 scaling lists, in raster scan order (6 = Y/Cb/Cr intra + inter).
+    pub scaling_list_4x4: [[u8; 16]; 6],
+    /// 8x8 scaling lists, in raster scan order ([0] = intra Y, [1] = inter Y).
+    pub scaling_list_8x8: [[u8; 64]; 2],
+    pub va_reserved: [u32; 4],
+}
+const _: () = assert!(std::mem::size_of::<VaIqMatrixH264>() == 240);
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct VaSliceParamH264 {
+    pub slice_data_size: u32,
+    pub slice_data_offset: u32,
+    pub slice_data_flag: u32,
+    pub slice_data_bit_offset: u16,
+    pub first_mb_in_slice: u16,
+    pub slice_type: u8,
+    pub direct_spatial_mv_pred_flag: u8,
+    pub num_ref_idx_l0_active_minus1: u8,
+    pub num_ref_idx_l1_active_minus1: u8,
+    pub cabac_init_idc: u8,
+    pub slice_qp_delta: i8,
+    pub disable_deblocking_filter_idc: u8,
+    pub slice_alpha_c0_offset_div2: i8,
+    pub slice_beta_offset_div2: i8,
+    pub ref_pic_list0: [VaPictureH264; 32],
+    pub ref_pic_list1: [VaPictureH264; 32],
+    pub luma_log2_weight_denom: u8,
+    pub chroma_log2_weight_denom: u8,
+    pub luma_weight_l0_flag: u8,
+    pub luma_weight_l0: [i16; 32],
+    pub luma_offset_l0: [i16; 32],
+    pub chroma_weight_l0_flag: u8,
+    pub chroma_weight_l0: [[i16; 2]; 32],
+    pub chroma_offset_l0: [[i16; 2]; 32],
+    pub luma_weight_l1_flag: u8,
+    pub luma_weight_l1: [i16; 32],
+    pub luma_offset_l1: [i16; 32],
+    pub chroma_weight_l1_flag: u8,
+    pub chroma_weight_l1: [[i16; 2]; 32],
+    pub chroma_offset_l1: [[i16; 2]; 32],
+    pub va_reserved: [u32; 4],
+}
+const _: () = assert!(std::mem::size_of::<VaSliceParamH264>() == 3128);

@@ -22,13 +22,15 @@
 //! session teardown; `Err` is real failures only.
 
 mod ffi;
+mod h264;
 mod interop;
 mod jpeg;
 pub use ffi::{
     VaBufferId, VaConfigId, VaContextId, VaDisplay, VaDrmPrimeDescriptor, VaDrmPrimeLayer,
     VaDrmPrimeObject, VaError, VaJpegHuffmanBuffer, VaJpegIQMatrix, VaJpegPicParam,
     VaJpegSliceParam, VaLib, VaSurfaceId, VA_EXPORT_SURFACE_READ_ONLY,
-    VA_EXPORT_SURFACE_SEPARATE_LAYERS, VA_FOURCC_NV12, VA_MEM_TYPE_DRM_PRIME_2, VA_STATUS_SUCCESS,
+    VA_EXPORT_SURFACE_SEPARATE_LAYERS, VA_FOURCC_NV12, VA_MEM_TYPE_DRM_PRIME_2,
+    VA_PROFILE_AV1_PROFILE0, VA_PROFILE_H264_HIGH, VA_PROFILE_HEVC_MAIN, VA_STATUS_SUCCESS,
 };
 pub use interop::HipMapping;
 pub use jpeg::{parse_for_va, JpegVaParams};
@@ -149,6 +151,12 @@ pub struct VaSession {
     config: VaConfigId,
     node: String,
     pool: HashMap<PoolKey, PooledEntry>,
+    /// HIP imports backing the most recent `h264::decode_h264_annexb_zc`
+    /// frames. The video lane has no surface pool, so each zc frame's import
+    /// lives here (not in the `Copy` `VcnFrame`); frames are valid until the
+    /// next zc decode or the session drops — the video analogue of the pool
+    /// contract above.
+    video_zc: Vec<HipMapping>,
 }
 
 /// Pool key: the VA render-target format (from the SOF0 sampling factors)
@@ -192,6 +200,12 @@ impl VaSession {
     /// Open the first working render-node candidate, initialise VA, create
     /// the JPEG-baseline VLD config. See [`candidate_nodes`] for selection.
     pub fn open() -> Result<Self, VaError> {
+        Self::open_profile(VA_PROFILE_JPEG_BASELINE)
+    }
+
+    /// Open the first working render node with a VLD config for `profile`
+    /// (see `ffi::VA_PROFILE_*`; video lane uses H.264 High = 7).
+    pub(crate) fn open_profile(profile: i32) -> Result<Self, VaError> {
         let mut lib = Some(VaLib::load()?);
         let mut last_err = VaError::NoRenderNode;
         for node in candidate_nodes() {
@@ -199,7 +213,7 @@ impl VaSession {
                 Some(l) => l,
                 None => break,
             };
-            match Self::open_node(l, &node) {
+            match Self::open_node(l, &node, profile) {
                 Ok(s) => return Ok(s),
                 Err((l, e)) => {
                     lib = Some(l);
@@ -210,7 +224,7 @@ impl VaSession {
         Err(last_err)
     }
 
-    fn open_node(lib: VaLib, node: &str) -> Result<Self, (VaLib, VaError)> {
+    fn open_node(lib: VaLib, node: &str, profile: i32) -> Result<Self, (VaLib, VaError)> {
         // O_RDWR: radeonsi winsys creation (GEM backing) fails on O_RDONLY
         // with EACCES (`amdgpu_bo_cpu_map failed (-13)`), which surfaces as
         // vaInitialize succeeding but context creation segfaulting.
@@ -248,7 +262,7 @@ impl VaSession {
                 std::ffi::CStr::from_ptr(p).to_string_lossy().into_owned()
             }
         };
-        // JPEG baseline advertised?
+        // Requested profile advertised?
         let max = unsafe { (lib.va_max_profiles)(dpy) }.max(0) as usize;
         let mut profiles = vec![0i32; max.min(64).max(1)];
         let mut n = profiles.len() as i32;
@@ -264,20 +278,20 @@ impl VaSession {
             };
             return Err((lib, e));
         }
-        if !profiles[..n.max(0) as usize].contains(&VA_PROFILE_JPEG_BASELINE) {
+        if !profiles[..n.max(0) as usize].contains(&profile) {
             unsafe {
                 (lib.va_terminate)(dpy);
             }
             return Err((
                 lib,
-                VaError::Unsupported("driver has no VAProfileJPEGBaseline"),
+                VaError::Unsupported("driver lacks the requested VA profile"),
             ));
         }
         let mut config = 0;
         let st = unsafe {
             (lib.va_create_config)(
                 dpy,
-                VA_PROFILE_JPEG_BASELINE,
+                profile,
                 VA_ENTRYPOINT_VLD,
                 std::ptr::null_mut(),
                 0,
@@ -289,7 +303,7 @@ impl VaSession {
                 (lib.va_terminate)(dpy);
             }
             let e = VaError::Status {
-                op: "vaCreateConfig(JPEG,VLD)",
+                op: "vaCreateConfig(VLD)",
                 code: st,
                 msg: lib.error_str(st),
             };
@@ -303,6 +317,7 @@ impl VaSession {
             config,
             node: node.to_string(),
             pool: HashMap::new(),
+            video_zc: Vec::new(),
         })
     }
 
@@ -809,7 +824,7 @@ unsafe extern "C" {
     fn close(fd: i32) -> i32;
     fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
 }
-fn libc_close(fd: i32) {
+pub(crate) fn libc_close(fd: i32) {
     // SAFETY: close(2) on an owned fd; return value intentionally ignored.
     unsafe {
         close(fd);
@@ -944,4 +959,20 @@ pub struct DerivedPlanes {
     pub height: u32,
     pub fourcc: u32,
     pub planes: Vec<Vec<u8>>,
+}
+
+/// The H.264 lane's derived frame (see `h264::decode_h264_collect`): packed
+/// NV12 luma + interleaved chroma read back through `vaDeriveImage`.
+/// (`experiment/vcn-video`; restored verbatim in the vcn-consolidated merge —
+/// it lived beside the old JPEG derived path the pool lane deleted.)
+pub struct DerivedFrame {
+    pub width: u32,
+    pub height: u32,
+    pub fourcc: u32,
+    pub y_pitch: u32,
+    pub uv_pitch: u32,
+    /// Packed luma, `width * height` bytes.
+    pub y: Vec<u8>,
+    /// Packed interleaved chroma, `(width/2) * (height/2) * 2` bytes.
+    pub uv: Vec<u8>,
 }
