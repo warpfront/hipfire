@@ -66,13 +66,21 @@ fn main() {
         let mut ys: Vec<Vec<u8>> = Vec::new();
         let mut per: Vec<f64> = Vec::new();
         for (mi, module) in mods.iter().enumerate() {
-            let kern = Kernel::find(module, "gemv_mq4g256v2").expect("gemv_mq4g256v2");
+            // GEMV_SYMBOL_A / _B, GEMV_BLOCK_A / _B, GEMV_GRID_DIV_A / _B override per arm.
+            let sfx = if mi == 0 { "A" } else { "B" };
+            let sym = std::env::var(format!("GEMV_SYMBOL_{sfx}")).unwrap_or_else(|_| "gemv_mq4g256v2".into());
+            let block: u32 = std::env::var(format!("GEMV_BLOCK_{sfx}")).ok().and_then(|v| v.parse().ok()).unwrap_or(32);
+            let grid_div: u32 = std::env::var(format!("GEMV_GRID_DIV_{sfx}")).ok().and_then(|v| v.parse().ok()).unwrap_or(1);
+            let kern = Kernel::find(module, &sym).unwrap_or_else(|| panic!("{sym}"));
             let gran = redline::dispatch::lds_granularity(&dev.info.gfx_arch);
             let run = |n: usize| -> f64 {
                 let mut cb = CommandBuffer::new();
                 for i in 0..n {
-                    cb.dispatch_lds(kern, [m, 1, 1], [32, 1, 1], d_ka.gpu_addr, 0, gran);
-                    cb.barrier(fence.gpu_addr, (mi * 100_000 + i + 1) as u32);
+                    cb.dispatch_lds(kern, [(m + grid_div - 1) / grid_div, 1, 1], [block, 1, 1], d_ka.gpu_addr, 0, gran);
+                    // Production gfx12 tape inter-node barrier (redline-rocr pm4.rs).
+                    cb.push_raw(&[0xc000_4600, 0x407]);
+                    cb.push_raw(&[0xc006_5800, 0, u32::MAX, 0x00ff_ffff, 0, 0, 0x0000_000a, 0x10180]);
+                    let _ = (i, mi);
                 }
                 let bos = [&module.code_buf, &d_w, &d_x, &d_y, &d_ka, &fence];
                 dq.submit(&dev, &cb, &bos).unwrap(); // warm
