@@ -284,7 +284,7 @@ fn main() {
         };
         // Shared kernel stage: NV12 at `surf_a` (device) -> CHW f32 -> patches.
         // Returns (patches, kernel ms incl. sync; excludes the parity D2H).
-        let run_kernels = |surf_a: u64, y_pitch: u32, uv_pitch: u32, uv_offset: u32, sw: usize, sh: usize| -> (Vec<f32>, f64) {
+        let run_kernels = |surf_a: u64, y_pitch: u32, uv_pitch: u32, u_offset: u32, v_offset: u32, chroma_step: u32, shifts: (u32, u32), sw: usize, sh: usize| -> (Vec<f32>, f64) {
             let (t_h, t_w) = smart_resize(sh, sw, FACTOR, MIN_PX, MAX_PX);
             assert_eq!((t_h, t_w), (img_h, img_w), "smart_resize mismatch vs repo path");
             let n_chw = 3 * t_h * t_w;
@@ -294,16 +294,19 @@ fn main() {
             let d_out = hip.malloc(n_elem * 4).expect("malloc patches");
             let mut surf_a = surf_a;
             let mut chw_a = d_chw.as_ptr() as u64;
-            let (mut y_pitch, mut uv_pitch, mut uv_offset) = (y_pitch, uv_pitch, uv_offset);
+            let (mut y_pitch, mut uv_pitch) = (y_pitch, uv_pitch);
+            let (mut u_offset, mut v_offset, mut chroma_step) = (u_offset, v_offset, chroma_step);
             let (mut src_w, mut src_h) = (sw as u32, sh as u32);
-            let (mut sh_v, mut sv_v) = (1u32, 1u32);
+            let (mut sh_v, mut sv_v) = shifts;
             let (mut dst_w, mut dst_h) = (t_w as u32, t_h as u32);
             let t1 = Instant::now();
             let mut p1: Vec<*mut c_void> = vec![
                 (&mut surf_a as *mut u64).cast(),
                 (&mut y_pitch as *mut u32).cast(),
                 (&mut uv_pitch as *mut u32).cast(),
-                (&mut uv_offset as *mut u32).cast(),
+                (&mut u_offset as *mut u32).cast(),
+                (&mut v_offset as *mut u32).cast(),
+                (&mut chroma_step as *mut u32).cast(),
                 (&mut src_w as *mut u32).cast(),
                 (&mut src_h as *mut u32).cast(),
                 (&mut sh_v as *mut u32).cast(),
@@ -353,9 +356,9 @@ fn main() {
         let mut planar_444 = false;
         let zc = if zerocopy {
             match sess.decode_jpeg(&bytes) {
-                Ok(vf) if vf.fourcc == 0x3231_564E => Some(vf),
+                Ok(vf) if vf.fourcc == 0x3231_564E || vf.fourcc == 0x5034_3434 => Some(vf),
                 Ok(vf) => {
-                    println!("[parity] {name}: VCN decoded fourcc=0x{:08x} (444P) — kernel has no planar arm yet, CPU path", vf.fourcc);
+                    println!("[parity] {name}: VCN decoded fourcc=0x{:08x} — no kernel arm, CPU path", vf.fourcc);
                     planar_444 = true;
                     None
                 }
@@ -382,15 +385,26 @@ fn main() {
         let dec_ms = t0.elapsed().as_secs_f64() * 1e3;
         let (path, got, kern_ms): (&str, Vec<f32>, f64) = match (zc, derived) {
             (Some(vf), _) => {
+                let planar = vf.fourcc == 0x5034_3434;
+                let (u_off, v_off, step, shifts) = if planar {
+                    assert!(vf.num_layers >= 3, "444P export must carry 3 layers");
+                    assert_eq!(vf.layers[1].pitch[0], vf.layers[2].pitch[0]);
+                    (vf.layers[1].offset[0], vf.layers[2].offset[0], 1u32, (0u32, 0u32))
+                } else {
+                    (vf.uv_offset(), vf.uv_offset() + 1, 2u32, (1u32, 1u32))
+                };
                 let (v, k) = run_kernels(
                     vf.device_ptr() as u64,
                     vf.y_pitch(),
-                    vf.uv_pitch(),
-                    vf.uv_offset(),
+                    if planar { vf.layers[1].pitch[0] } else { vf.uv_pitch() },
+                    u_off,
+                    v_off,
+                    step,
+                    shifts,
                     vf.width as usize,
                     vf.height as usize,
                 );
-                ("vcn-zc", v, k)
+                (if planar { "vcn-zc-444" } else { "vcn-zc" }, v, k)
             }
             (None, derived) => match derived {
             Err(va_bridge::VaError::Unsupported(reason)) => {
@@ -437,7 +451,7 @@ fn main() {
                 let t_up = Instant::now();
                 hip.memcpy_htod(&d_surf, &nv12).expect("htod surf");
                 let up_ms = t_up.elapsed().as_secs_f64() * 1e3;
-                let (v, k) = run_kernels(d_surf.as_ptr() as u64, sw as u32, (2 * cw) as u32, (sw * sh) as u32, sw, sh);
+                let (v, k) = run_kernels(d_surf.as_ptr() as u64, sw as u32, (2 * cw) as u32, (sw * sh) as u32, (sw * sh) as u32 + 1, 2, (1, 1), sw, sh);
                 hip.free(d_surf).unwrap();
                 ("vcn", v, k + up_ms)
             }

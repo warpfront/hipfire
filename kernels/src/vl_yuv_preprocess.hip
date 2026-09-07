@@ -64,10 +64,12 @@ __device__ float vl_sample_plane(const unsigned char* __restrict__ base, int pit
     return wsum != 0.0f ? acc / wsum : acc;
 }
 
-// NV12/NV24 (interleaved UV) chroma sample: plane holds U,V bytes alternating.
-__device__ __forceinline__ void vl_sample_chroma(const unsigned char* __restrict__ base, int pitch,
-                                                 int w2, int h2, float fx, float fy, float* u,
-                                                 float* v) {
+// Chroma sample from either an interleaved plane (NV12/NV24: u_base = plane,
+// v_base = plane + 1, step 2) or two planar planes (444P/422P: step 1).
+__device__ __forceinline__ void vl_sample_chroma(const unsigned char* __restrict__ u_base,
+                                                 const unsigned char* __restrict__ v_base,
+                                                 int pitch, int step, int w2, int h2, float fx,
+                                                 float fy, float* u, float* v) {
     const int x0 = (int)floorf(fx) - 1;
     const int y0 = (int)floorf(fy) - 1;
     float au = 0.0f, av = 0.0f, wsum = 0.0f;
@@ -75,14 +77,15 @@ __device__ __forceinline__ void vl_sample_chroma(const unsigned char* __restrict
     for (int j = 0; j < 4; j++) {
         const int yy = vl_clampi(y0 + j, 0, h2 - 1);
         const float wy = vl_cubic(fy - (float)(y0 + j));
-        const unsigned char* row = base + (size_t)yy * (size_t)pitch;
+        const unsigned char* row_u = u_base + (size_t)yy * (size_t)pitch;
+        const unsigned char* row_v = v_base + (size_t)yy * (size_t)pitch;
 #pragma unroll
         for (int i = 0; i < 4; i++) {
             const int xx = vl_clampi(x0 + i, 0, w2 - 1);
             const float wx = vl_cubic(fx - (float)(x0 + i));
             const float wgt = wx * wy;
-            au += wgt * (float)row[2 * xx];
-            av += wgt * (float)row[2 * xx + 1];
+            au += wgt * (float)row_u[step * xx];
+            av += wgt * (float)row_v[step * xx];
             wsum += wgt;
         }
     }
@@ -96,7 +99,11 @@ __device__ __forceinline__ void vl_sample_chroma(const unsigned char* __restrict
 
 extern "C" __global__ void vl_nv12_to_rgb_norm(
     const unsigned char* __restrict__ surf_base,  // imported dma-buf base
-    unsigned int y_pitch, unsigned int uv_pitch, unsigned int uv_offset, unsigned int src_w,
+    unsigned int y_pitch, unsigned int uv_pitch,
+    // chroma plane bases relative to surf_base and the byte step between
+    // horizontally adjacent samples: NV12 -> (uv_off, uv_off + 1, 2);
+    // planar 444P/422P -> (u_off, v_off, 1).
+    unsigned int u_offset, unsigned int v_offset, unsigned int chroma_step, unsigned int src_w,
     unsigned int src_h,
     // chroma subsampling shifts: 420 -> (1,1); 444 -> (0,0)
     unsigned int chroma_shift_x, unsigned int chroma_shift_y,
@@ -114,16 +121,17 @@ extern "C" __global__ void vl_nv12_to_rgb_norm(
     const float yv =
         vl_sample_plane(surf_base, (int)y_pitch, (int)src_w, (int)src_h, sx, sy);
 
-    const unsigned char* uv_base = surf_base + uv_offset;
-    const int cw = (int)(src_w >> chroma_shift_x);
-    const int ch = (int)(src_h >> chroma_shift_y);
+    const unsigned char* u_base = surf_base + u_offset;
+    const unsigned char* v_base = surf_base + v_offset;
+    const int cw = (int)((src_w + (1u << chroma_shift_x) - 1u) >> chroma_shift_x);
+    const int ch = (int)((src_h + (1u << chroma_shift_y) - 1u) >> chroma_shift_y);
     // Centered chroma siting (JFIF: chroma[i] is the 2x2-block average,
     // nominally at luma S*i + (S-1)/2), matching libjpeg's fancy-upsample
     // phase. (Was off by half a chroma tap: +0.25 instead of -0.25.)
     const float cx = (sx - 0.5f * (float)((1u << chroma_shift_x) - 1u)) / (float)(1u << chroma_shift_x);
     const float cy = (sy - 0.5f * (float)((1u << chroma_shift_y) - 1u)) / (float)(1u << chroma_shift_y);
     float cb, cr;
-    vl_sample_chroma(uv_base, (int)uv_pitch, cw, ch, cx, cy, &cb, &cr);
+    vl_sample_chroma(u_base, v_base, (int)uv_pitch, (int)chroma_step, cw, ch, cx, cy, &cb, &cr);
 
     // Full-range BT.601 (JFIF), matching the image-crate CPU conversion.
     float r = yv + 1.402f * (cr - 128.0f);

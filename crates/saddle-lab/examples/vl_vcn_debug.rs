@@ -388,6 +388,8 @@ fn main() {
         let mut p0 = W as u32;
         let mut p1 = W as u32;
         let mut off = (W * H) as u32;
+        let mut voff = (W * H) as u32 + 1;
+        let mut cstep = 2u32;
         let mut sw_ = W as u32;
         let mut sh_ = H as u32;
         let mut shx = 1u32;
@@ -399,6 +401,8 @@ fn main() {
             (&mut p0 as *mut u32).cast(),
             (&mut p1 as *mut u32).cast(),
             (&mut off as *mut u32).cast(),
+            (&mut voff as *mut u32).cast(),
+            (&mut cstep as *mut u32).cast(),
             (&mut sw_ as *mut u32).cast(),
             (&mut sh_ as *mut u32).cast(),
             (&mut shx as *mut u32).cast(),
