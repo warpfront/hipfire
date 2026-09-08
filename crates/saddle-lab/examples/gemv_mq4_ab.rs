@@ -27,7 +27,7 @@ use hip_bridge::{DeviceBuffer, Function, HipRuntime, Module, Stream};
 use std::ffi::c_void;
 use std::path::PathBuf;
 use std::process::Command;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// Default shapes (Qwen3.8-27B: hidden 5120, intermediate 17408, vocab 248320)
 /// plus the two tail-path shapes (5 groups: quads=1 tail=1; 7 groups: tail=3).
@@ -1011,27 +1011,14 @@ fn main() {
             cli.iters
         );
 
-        // Warm full rotations per arm (no timing); arm order for warmup follows reverse flag too.
+        // Arm order for timing follows reverse flag; baseline ratio still arms[0].
         let mut order: Vec<usize> = (0..arms.len()).collect();
         if cli.reverse {
             order.reverse();
         }
-        // Reference for ratio is always arms[0] (baseline), regardless of reverse.
-        for &ai in &order {
-            let arm = &arms[ai];
-            for r in 0..rotations.max(1) {
-                for s in 0..slots {
-                    let slot = (r * slots + s) % slots;
-                    let d_a = if arm.layout_soa {
-                        &d_soa[slot]
-                    } else {
-                        &d_aos[slot]
-                    };
-                    launch_once(&hip, &stream, arm, d_a, &d_xs[slot], &d_ys[ai], m, k);
-                }
-            }
-        }
-        hip.stream_synchronize(&stream).expect("warmup sync");
+        // Fixed wall-clock warm per arm immediately before its timed windows.
+        const WARMUP_MS: u64 = 250;
+        println!("[gemv-ab] per-arm wall warmup_ms={WARMUP_MS}");
 
         struct Row {
             name: String,
@@ -1047,6 +1034,23 @@ fn main() {
 
         for &ai in &order {
             let arm = &arms[ai];
+            // Warm this arm alone ≥WARMUP_MS wall time: full timed_iters
+            // rotations, one stream_synchronize per warm batch. No events.
+            let warm_for = Duration::from_millis(WARMUP_MS);
+            let t_warm = Instant::now();
+            while t_warm.elapsed() < warm_for {
+                for it in 0..timed_iters {
+                    let slot = it % slots;
+                    let d_a = if arm.layout_soa {
+                        &d_soa[slot]
+                    } else {
+                        &d_aos[slot]
+                    };
+                    launch_once(&hip, &stream, arm, d_a, &d_xs[slot], &d_ys[ai], m, k);
+                }
+                hip.stream_synchronize(&stream)
+                    .expect("per-arm warmup sync");
+            }
             // No host uploads/mallocs inside the event window: all d_* live.
             // Three raw whole-batch GPU windows (timed_iters launches each,
             // round-robin slots). No per-rotation/per-kernel sync. Headline =

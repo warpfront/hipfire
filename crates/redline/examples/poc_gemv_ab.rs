@@ -24,6 +24,11 @@
 //! used for marginal us/dispatch. Logical-byte rate is analytical only —
 //! not a DRAM claim. Production barrier dwords are unchanged; never call
 //! `CommandBuffer::barrier`.
+//!
+//! Warning: gfx1100 repeated-submission A/A warmup produced an illegal PM4
+//! command / ring reset in this research probe, so its throughput is not
+//! accepted evidence pending root cause; use the HIP probe for this layout
+//! experiment.
 use redline::device::{Device, GpuBuffer};
 use redline::dispatch::{CommandBuffer, DispatchQueue, KernargBuilder, Kernel, LoadedModule};
 use std::time::Instant;
@@ -63,7 +68,7 @@ fn fnv1a64(data: &[u8]) -> u64 {
     let mut h = 0xcbf2_9ce4_8422_2325u64;
     for &b in data {
         h ^= b as u64;
-        h = h.wrapping_mul(0x1000_0000_01b3);
+        h = h.wrapping_mul(0x0100_0000_01b3);
     }
     h
 }
@@ -637,10 +642,20 @@ fn main() {
                 .count();
             if diff != 0 {
                 eprintln!("FAIL M={m} K={k} slot={slot}: A/B y-bit-diff rows={diff} (all-row)");
-                for (row, (a, b)) in ya.chunks_exact(4).zip(yb.chunks_exact(4)).enumerate().filter(|(_, (a, b))| a != b).take(4) {
+                for (row, (a, b)) in ya
+                    .chunks_exact(4)
+                    .zip(yb.chunks_exact(4))
+                    .enumerate()
+                    .filter(|(_, (a, b))| a != b)
+                    .take(4)
+                {
                     let a = u32::from_le_bytes(a.try_into().unwrap());
                     let b = u32::from_le_bytes(b.try_into().unwrap());
-                    eprintln!("  row={row} A={a:08x} ({}) B={b:08x} ({})", f32::from_bits(a), f32::from_bits(b));
+                    eprintln!(
+                        "  row={row} A={a:08x} ({}) B={b:08x} ({})",
+                        f32::from_bits(a),
+                        f32::from_bits(b)
+                    );
                 }
                 std::process::exit(1);
             }
@@ -724,8 +739,19 @@ fn main() {
             let cb1 = build_cb(kern, slots_arm, 1, m, block, grid_div, gran);
             let cbn = build_cb(kern, slots_arm, n_iters, m, block, grid_div, gran);
 
-            // Warm: one full rotation set (n_iters already multiple of slots).
-            dq.submit(&dev, &cbn, &bos).unwrap();
+            // CPU input construction can let DPM fall idle. Warm each arm for
+            // at least 250 ms, not merely one short rotation, before sampling.
+            let warm_start = Instant::now();
+            loop {
+                dq.submit(&dev, &cbn, &bos).unwrap();
+                if warm_start.elapsed() >= std::time::Duration::from_millis(250) {
+                    break;
+                }
+            }
+            eprintln!(
+                "  arm={label} warmup_ms={:.1}",
+                warm_start.elapsed().as_secs_f64() * 1e3
+            );
 
             let mut t1_samples = [0f64; 3];
             for s in &mut t1_samples {
