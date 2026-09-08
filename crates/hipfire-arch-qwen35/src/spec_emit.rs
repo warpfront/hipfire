@@ -32,9 +32,15 @@ pub struct Qwen35Emit<'a> {
     /// Index into the freshly-decoded byte stream past which bytes have not yet
     /// been fed to the filter (the daemon's old `bytes_fed_to_filter`).
     bytes_fed_to_filter: usize,
-    /// Every committed token in order, for byte decoding + the cache-store the
-    /// daemon does after the loop (exposed via [`Self::streamed_tokens`]).
+    /// Every committed token in order, for the cache-store the daemon does
+    /// after the loop (exposed via [`Self::streamed_tokens`]).
     streamed_tokens: Vec<u32>,
+    /// Cumulative raw bytes of `streamed_tokens` (appended per commit via
+    /// `append_token_bytes`; byte-identical to
+    /// `decode_bytes(&streamed_tokens)` by the tokenizer concat contract).
+    /// Replaces the per-step full-history re-decode. Append-only within a
+    /// turn alongside `streamed_tokens`; both reset together in `from_ctx`.
+    raw_bytes: Vec<u8>,
     /// Incremental tool-protocol authority. Fed only EosFilter-emitted UTF-8.
     router: ToolOutputRouter,
     /// Incremental reasoning/content authority, upstream of tool routing.
@@ -129,6 +135,7 @@ impl<'a> Qwen35Emit<'a> {
             filter: EosFilter::new(qwen_dflash_eos_filter_config()),
             bytes_fed_to_filter: 0,
             streamed_tokens: Vec::new(),
+            raw_bytes: Vec::new(),
             router: if tool_protocol_enabled {
                 ToolOutputRouter::new()
             } else {
@@ -244,10 +251,11 @@ impl<'a> Qwen35Emit<'a> {
             id: token,
             idx: self.streamed_tokens.len() - 1,
         });
-        let all_bytes = self.tokenizer.decode_bytes(&self.streamed_tokens);
-        let new_bytes = &all_bytes[self.bytes_fed_to_filter..];
-        self.bytes_fed_to_filter = all_bytes.len();
-        let action = self.filter.observe(new_bytes);
+        self.tokenizer
+            .append_token_bytes(token, &mut self.raw_bytes);
+        let fed = self.bytes_fed_to_filter;
+        let action = self.filter.observe(&self.raw_bytes[fed..]);
+        self.bytes_fed_to_filter = self.raw_bytes.len();
         self.apply_filter_action(action, &mut events);
         events
     }
@@ -274,14 +282,26 @@ impl<'a> Qwen35Emit<'a> {
 
     /// User stop-sequence match against the decoded streamed suffix.
     /// Shared by `begin` (first token) and `observe` (later tokens).
+    ///
+    /// Uses the cumulative `raw_bytes` image (no full-history re-decode).
+    /// Stop strings without U+FFFD take the raw-byte suffix fast path
+    /// (`lossy(raw).ends_with(s) ⟺ raw.ends_with(s.as_bytes())`). Stop
+    /// strings that contain U+FFFD compare against
+    /// `String::from_utf8_lossy(raw)` so invalid/incomplete trailing bytes
+    /// match baseline `decode(&streamed_tokens).ends_with(s)` semantics.
     fn matches_stop_sequence(&self) -> bool {
         if self.stop.is_empty() {
             return false;
         }
-        let decoded_suffix = self.tokenizer.decode(&self.streamed_tokens);
-        self.stop
-            .iter()
-            .any(|s| decoded_suffix.ends_with(s.as_str()))
+        let mut lossy: Option<std::borrow::Cow<'_, str>> = None;
+        self.stop.iter().any(|s| {
+            if s.contains('\u{FFFD}') {
+                let view = lossy.get_or_insert_with(|| String::from_utf8_lossy(&self.raw_bytes));
+                view.ends_with(s.as_str())
+            } else {
+                self.raw_bytes.ends_with(s.as_bytes())
+            }
+        })
     }
 
     /// True when this turn ended on a decoded EOT (token id or filter stop_at).
@@ -384,8 +404,7 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
 
         // max_think_tokens enforcement. Mirrors 4632-4664.
         if self.max_think_tokens > 0 {
-            let raw_so_far = self.tokenizer.decode_bytes(&self.streamed_tokens);
-            let raw_str = std::str::from_utf8(&raw_so_far).unwrap_or("");
+            let raw_str = std::str::from_utf8(&self.raw_bytes).unwrap_or("");
             let in_think = currently_in_think(raw_str, self.open_think_prefix);
             if in_think && !self.prev_in_think {
                 self.think_count = 0;
@@ -950,6 +969,84 @@ mod tests {
         }
         assert!(saw_stop, "multi-token stop must still fire via observe");
         assert!(n > 1, "multi-token stop must not only hit begin");
+    }
+
+    #[test]
+    fn stop_sequence_lossy_fffd_and_raw_fastpath() {
+        // Consumer-contract regression: stop decision must match legacy
+        // `decode(history).ends_with(stop)` for arbitrary Rust stop strings,
+        // including those with U+FFFD (invalid/incomplete UTF-8 suffix), while
+        // replacement-free stops keep the raw-byte fast path.
+        let tok = test_tokenizer();
+        // Synthetic GPT-2 vocab: raw byte `b` is token id `100 + b`.
+        let id = |b: u8| 100u32 + b as u32;
+        let fffd = "\u{FFFD}".to_string();
+
+        let drive = |ids: &[u32], stop: Vec<String>| -> Option<StopReason> {
+            let mut emit = Qwen35Emit::from_ctx(SpecEmitCtx {
+                tokenizer: &tok,
+                eos: 9,
+                im_end: Some(1),
+                tools: None,
+                enable_grammar: false,
+                stop,
+                max_think: 0,
+                max_tokens: 256,
+                assistant_prefix: AssistantPrefix::Plain,
+                think_mode: hipfire_runtime::prompt_frame::ThinkMode::NonThink,
+                decoded_vocab: None,
+            });
+            let mut first = true;
+            let mut last = None;
+            for &t in ids {
+                let outcome = if first {
+                    first = false;
+                    emit.begin(t)
+                } else {
+                    emit.observe(t)
+                };
+                last = outcome.stop;
+                if last.is_some() {
+                    break;
+                }
+            }
+            last
+        };
+
+        // 1) Lone invalid byte 0xFF with stop "�" → StopSequence (lossy).
+        assert_eq!(
+            drive(&[id(0xFF)], vec![fffd.clone()]),
+            Some(StopReason::StopSequence),
+            "0xFF must match stop U+FFFD via lossy baseline"
+        );
+
+        // 2) Incomplete UTF-8 lead byte alone (0xE4) with stop "�" → stop.
+        assert_eq!(
+            drive(&[id(0xE4)], vec![fffd.clone()]),
+            Some(StopReason::StopSequence),
+            "incomplete UTF-8 suffix must match stop U+FFFD"
+        );
+
+        // 3) Clean ASCII must NOT fire stop "�".
+        assert_eq!(
+            drive(&[id(b'h'), id(b'i')], vec![fffd.clone()]),
+            None,
+            "valid ASCII must not match U+FFFD stop"
+        );
+
+        // 4) Replacement-free stop still fires (raw-byte fast path).
+        assert_eq!(
+            drive(&[id(b'h'), id(b'i')], vec!["hi".to_string()]),
+            Some(StopReason::StopSequence),
+            "normal stop without U+FFFD must still match"
+        );
+
+        // 5) Multi-token invalid tail: "x" then 0xFF with stop "x�".
+        assert_eq!(
+            drive(&[id(b'x'), id(0xFF)], vec!["x\u{FFFD}".to_string()]),
+            Some(StopReason::StopSequence),
+            "prefixed U+FFFD stop must match lossy image"
+        );
     }
 
     #[test]

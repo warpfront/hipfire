@@ -17,9 +17,12 @@
 //! `experiment/vcn-jpeg`); [`VaSession::decode_jpeg_planes`] remains as the
 //! `vaDeriveImage` oracle for `vl_vcn_444check`.
 //!
-//! [`DecodeOutcome`]: `Decoded` carries the pooled frame, `Unsupported`
-//! (progressive/arithmetic/12-bit/CMYK) means "take the CPU path" with NO
-//! session teardown; `Err` is real failures only.
+//! [`DecodeOutcome`]: explicit-session contract — `Decoded` carries the
+//! pooled frame, `Unsupported` (progressive/arithmetic/12-bit/CMYK) means
+//! "take the CPU path" with NO session teardown; `Err` is real failures
+//! only. The shared session instead returns [`SharedDecodeOutcome`], whose
+//! [`SharedVcnLease`] holds the pool mutex until the consumer's device reads
+//! complete, so a same-key decode cannot overwrite the surface mid-read.
 
 mod ffi;
 mod h264;
@@ -37,14 +40,21 @@ pub use jpeg::{parse_for_va, JpegVaParams};
 
 use ffi::{VA_ENTRYPOINT_VLD, VA_PROFILE_JPEG_BASELINE};
 use std::collections::HashMap;
-use std::ffi::{c_char, c_int, c_void};
+use std::ffi::c_void;
+// Unix-only imports: VA-API/DRM render nodes, fd ownership, and PCI/sysfs
+// probing have no backend off Unix. Non-Unix builds compile the public API
+// against stubs below and every caller takes the CPU path.
+#[cfg(unix)]
+use std::ffi::{c_char, c_int};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, OwnedFd};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 /// DRM render-node candidates, in order: `HIPFIRE_VCN_DRM_NODE` (via
 /// `developer_var`) wins; otherwise the node whose PCI slot matches HIP
 /// device 0; otherwise every `renderD*` node, sorted (the planes oracle
 /// needs no HIP runtime, so a missing HIP library still gets a scan).
+#[cfg(unix)]
 fn candidate_nodes() -> Vec<String> {
     if let Ok(one) = hipfire_config::developer_var("HIPFIRE_VCN_DRM_NODE") {
         return vec![one];
@@ -59,6 +69,7 @@ fn candidate_nodes() -> Vec<String> {
 
 /// Every DRM render node, sorted by name; the hardcoded 128..132 fallback
 /// only fires when sysfs is unreadable.
+#[cfg(unix)]
 fn sysfs_render_nodes() -> Vec<String> {
     let mut out = Vec::new();
     if let Ok(rd) = std::fs::read_dir("/sys/class/drm") {
@@ -81,6 +92,7 @@ fn sysfs_render_nodes() -> Vec<String> {
 /// PCI bus id (`0000:03:00.0` form) of a HIP device, dlopen'd from the same
 /// `libamdhip64` instance `hip-bridge` uses. `va-bridge` must not depend on
 /// `hip-bridge` (same layer), so the one symbol is resolved locally.
+#[cfg(unix)]
 fn hip_pci_bus_id(device: i32) -> Option<String> {
     let candidates =
         hipfire_config::rocm::library_candidates(hipfire_config::rocm::HIP_RUNTIME_LIBRARIES);
@@ -110,6 +122,7 @@ fn hip_pci_bus_id(device: i32) -> Option<String> {
 
 /// `/dev/dri/<node>` whose `device/uevent` `PCI_SLOT_NAME` matches `pci`
 /// (case-insensitive; both are `domain:bus:device.function`).
+#[cfg(unix)]
 fn render_node_for_pci(pci: &str) -> Option<String> {
     let want = pci.trim().to_ascii_lowercase();
     let rd = std::fs::read_dir("/sys/class/drm").ok()?;
@@ -142,15 +155,27 @@ fn render_node_for_pci(pci: &str) -> Option<String> {
 /// (always `DRM_FORMAT_MOD_LINEAR`), exports + imports once, and every later
 /// decode of that key costs only parse + submit + sync. The pooled device
 /// pointer is stable per key; its *contents* reflect the most recent decode
-/// of that key — consume (launch + sync kernels) before the next decode.
+/// of that key. Explicit-session owners serialize on `&mut`; shared-session
+/// consumers hold a [`SharedVcnLease`] instead, which blocks the next shared
+/// decode until their reads complete.
 pub struct VaSession {
     lib: VaLib,
     dpy: VaDisplay,
+    /// DRM fd backing `dpy`. Unix-only (see above); non-Unix never opens a
+    /// session, so the field is absent there and `open` fails closed.
+    #[cfg(unix)]
     _drm_fd: OwnedFd,
     vendor: String,
     config: VaConfigId,
     node: String,
     pool: HashMap<PoolKey, PooledEntry>,
+    /// Quarantine flag for the process-wide shared session (see
+    /// [`VaSession::quarantine_shared`]): set under the already-held pool
+    /// mutex when a consumer's terminal sync fails, while possibly-live GPU
+    /// reads are still outstanding. A poisoned session is retained — never
+    /// decoded through or torn down — and every later shared decode fails
+    /// closed to the CPU fallback. Explicit-session owners never set this.
+    poisoned: bool,
     /// HIP imports backing the most recent `h264::decode_h264_annexb_zc`
     /// frames. The video lane has no surface pool, so each zc frame's import
     /// lives here (not in the `Copy` `VcnFrame`); frames are valid until the
@@ -190,9 +215,16 @@ struct PooledEntry {
 /// ones for the process (VA init failure is environmental, not transient).
 static PROBE_FAILED: OnceLock<()> = OnceLock::new();
 
+/// Process-wide pooled VCN session for the product decode path. Module scope
+/// (not function-local) so [`VaSession::shared_decode_jpeg_lease`] and
+/// [`VaSession::try_shared_decode_jpeg`] observe one pool: two function-local
+/// statics would be two sessions and the lease exclusion would be fiction.
+static SHARED: std::sync::LazyLock<Mutex<Option<VaSession>>> =
+    std::sync::LazyLock::new(|| Mutex::new(None));
+
 // The VA display handle is a raw pointer, so `VaSession` is `!Send` by
 // default. Sharing is explicitly single-threaded behind the caller's
-// `&mut` (or the `shared_decode_jpeg` mutex); cross-thread transfer of the
+// `&mut` (or the shared-session lease); cross-thread transfer of the
 // session itself is the caller's responsibility, as with `HipMapping`.
 unsafe impl Send for VaSession {}
 
@@ -205,6 +237,7 @@ impl VaSession {
 
     /// Open the first working render node with a VLD config for `profile`
     /// (see `ffi::VA_PROFILE_*`; video lane uses H.264 High = 7).
+    #[cfg(unix)]
     pub(crate) fn open_profile(profile: i32) -> Result<Self, VaError> {
         let mut lib = Some(VaLib::load()?);
         let mut last_err = VaError::NoRenderNode;
@@ -223,7 +256,14 @@ impl VaSession {
         }
         Err(last_err)
     }
+    /// Non-Unix stub: VA-API/DRM has no backend here, so session open fails
+    /// closed; every caller maps this to the CPU path (never a build failure).
+    #[cfg(not(unix))]
+    pub(crate) fn open_profile(_profile: i32) -> Result<Self, VaError> {
+        Err(VaError::NoRenderNode)
+    }
 
+    #[cfg(unix)]
     fn open_node(lib: VaLib, node: &str, profile: i32) -> Result<Self, (VaLib, VaError)> {
         // O_RDWR: radeonsi winsys creation (GEM backing) fails on O_RDONLY
         // with EACCES (`amdgpu_bo_cpu_map failed (-13)`), which surfaces as
@@ -317,6 +357,7 @@ impl VaSession {
             config,
             node: node.to_string(),
             pool: HashMap::new(),
+            poisoned: false,
             video_zc: Vec::new(),
         })
     }
@@ -334,8 +375,8 @@ impl VaSession {
     /// Open a session when VCN JPEG is available, else `None`. A failure is
     /// cached in a [`OnceLock`] so repeated probes never spam dlopen/VA
     /// init; a success always opens fresh (the caller holds the session and
-    /// its pool — see [`VaSession::shared_decode_jpeg`] for the process-wide
-    /// pooled session the product path uses).
+    /// its pool — see [`VaSession::shared_decode_jpeg_lease`] for the
+    /// process-wide pooled session the product path uses).
     pub fn probe() -> Option<VaSession> {
         if PROBE_FAILED.get().is_some() {
             return None;
@@ -353,17 +394,117 @@ impl VaSession {
     /// first use; `Err(NoRenderNode | Dlopen | MissingSymbol)` means "no
     /// VCN — take the CPU path", any other `Err` is a real failure.
     /// `Ok(Unsupported)` is a per-stream CPU fallback with no teardown.
-    pub fn shared_decode_jpeg(jpeg: &[u8]) -> Result<DecodeOutcome, VaError> {
-        static SHARED: std::sync::LazyLock<Mutex<Option<VaSession>>> =
-            std::sync::LazyLock::new(|| Mutex::new(None));
+    ///
+    /// The decoded frame is leased, not copied: the returned
+    /// [`SharedVcnLease`] holds the session mutex until the consumer's
+    /// device reads complete (see its release-boundary docs). A `Copy` frame
+    /// here previously let a same-key decode on another thread overwrite the
+    /// surface mid-read; no unguarded shared-frame result escapes anymore.
+    pub fn shared_decode_jpeg_lease(jpeg: &[u8]) -> Result<SharedDecodeOutcome<'static>, VaError> {
         let mut guard = SHARED.lock().unwrap_or_else(|e| e.into_inner());
+        // Quarantined (see `quarantine_shared`): fail closed to the CPU path
+        // without waiting — the pooled surface may still be under hung reads.
+        if guard.as_ref().is_some_and(|s| s.poisoned) {
+            return Err(VaError::Status {
+                op: "shared VCN session",
+                code: -1,
+                msg: "shared VCN session quarantined after terminal sync failure".to_string(),
+            });
+        }
         if guard.is_none() {
             *guard = Some(VaSession::open()?);
         }
-        guard
+        match guard
             .as_mut()
             .expect("pooled VCN session just opened")
             .decode_jpeg(jpeg)
+        {
+            Ok(DecodeOutcome::Decoded(frame)) => Ok(SharedDecodeOutcome::Decoded(SharedVcnLease {
+                _guard: guard,
+                frame,
+            })),
+            Ok(DecodeOutcome::Unsupported(reason)) => Ok(SharedDecodeOutcome::Unsupported(reason)),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Non-blocking variant of [`Self::shared_decode_jpeg_lease`]: `Ok(None)`
+    /// means the shared session is currently leased to another consumer
+    /// (their surface may still be mid-read — assume nothing about contents).
+    /// Lock poisoning is recovered like the blocking path. Exists for
+    /// contention probes (`vl_vcn_lease_race`); the product path takes the
+    /// blocking lease.
+    pub fn try_shared_decode_jpeg(
+        jpeg: &[u8],
+    ) -> Result<Option<SharedDecodeOutcome<'static>>, VaError> {
+        let mut guard = match SHARED.try_lock() {
+            Ok(g) => g,
+            Err(std::sync::TryLockError::WouldBlock) => return Ok(None),
+            Err(std::sync::TryLockError::Poisoned(e)) => e.into_inner(),
+        };
+        // Quarantined: an error, not contention — `Ok(None)` would spin the
+        // probe's exclusion check forever. Fails closed to the CPU path.
+        if guard.as_ref().is_some_and(|s| s.poisoned) {
+            return Err(VaError::Status {
+                op: "shared VCN session",
+                code: -1,
+                msg: "shared VCN session quarantined after terminal sync failure".to_string(),
+            });
+        }
+        if guard.is_none() {
+            *guard = Some(VaSession::open()?);
+        }
+        match guard
+            .as_mut()
+            .expect("pooled VCN session just opened")
+            .decode_jpeg(jpeg)
+        {
+            Ok(DecodeOutcome::Decoded(frame)) => {
+                Ok(Some(SharedDecodeOutcome::Decoded(SharedVcnLease {
+                    _guard: guard,
+                    frame,
+                })))
+            }
+            Ok(DecodeOutcome::Unsupported(reason)) => {
+                Ok(Some(SharedDecodeOutcome::Unsupported(reason)))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Quarantine the shared session after a consumer's terminal sync fails.
+    ///
+    /// Takes the outstanding lease BY VALUE: the pool mutex is already held
+    /// inside it, so locking here would self-deadlock, and dropping the
+    /// guard normally (no forgetting) means no wedged requests. The flag is
+    /// pool state under that same mutex; the backing session and its HIP
+    /// mappings are RETAINED — never decoded through again, never torn down
+    /// — so nothing is freed or reused under possibly-live GPU reads (a
+    /// `sync_with_deadline` `Err` means "stopped waiting", not "GPU
+    /// stopped"). Every later shared decode fails closed to the CPU path;
+    /// the request at hand takes the CPU fallback on its retained bytes.
+    /// Pre-enqueue early errors and unconsumed leases keep the normal
+    /// release (no quarantine: nothing was ever launched).
+    ///
+    /// Simulated-fault probe recipe (proves the observable quarantine
+    /// behavior WITHOUT injecting a real GPU hang — label it simulated, not
+    /// a timeout reproduction): (1) lease-decode A and prove contender
+    /// exclusion via `try_shared_decode_jpeg(B) == Ok(None)`; (2) consume A
+    /// with a successful terminal sync; (3) INSTEAD of dropping the lease,
+    /// pass it here to simulate a completion failure; (4) assert
+    /// `try_shared_decode_jpeg(B)` and `shared_decode_jpeg_lease(B)` both
+    /// return `Err(VaError::Status)` naming quarantine — refusal happens
+    /// before any parse/render, so the pool is never reused. Poison is
+    /// process-lifetime: run quarantine assertions last. (No CPU-only unit
+    /// test covers this: a lease requires a live VA session, so the
+    /// hardware probe owns the regression.)
+    pub fn quarantine_shared(mut lease: SharedVcnLease<'_>) {
+        lease
+            ._guard
+            .as_mut()
+            .expect("quarantined lease holds a live shared session")
+            .poisoned = true;
+        drop(lease);
     }
 
     /// Allocate a pooled surface + decode context for `key`. Linear
@@ -820,21 +961,32 @@ impl VaSession {
 }
 
 // `libc` is not a workspace dep; close(2)/lseek(2) via direct externs.
+// Unix-only: these symbols don't exist elsewhere, so the externs and the
+// real wrappers are gated and stubbed (callers take CPU fallback there).
+#[cfg(unix)]
 unsafe extern "C" {
     fn close(fd: i32) -> i32;
     fn lseek(fd: i32, offset: i64, whence: i32) -> i64;
 }
+#[cfg(unix)]
 pub(crate) fn libc_close(fd: i32) {
     // SAFETY: close(2) on an owned fd; return value intentionally ignored.
     unsafe {
         close(fd);
     }
 }
+#[cfg(not(unix))]
+pub(crate) fn libc_close(_fd: i32) {}
 /// SEEK_END probe for diagnostics; -1 on error (fd untouched otherwise).
+#[cfg(unix)]
 fn libc_lseek_end(fd: i32) -> i64 {
     // SAFETY: lseek(2) with SEEK_END does not mutate file offset usefully
     // for dma-bufs and returns the size; -1 on error.
     unsafe { lseek(fd, 0, 2) }
+}
+#[cfg(not(unix))]
+fn libc_lseek_end(_fd: i32) -> i64 {
+    -1
 }
 
 impl Drop for VaSession {
@@ -854,14 +1006,63 @@ impl Drop for VaSession {
     }
 }
 
-/// Product decode contract. `Decoded` carries the pooled frame;
+/// Explicit-session decode contract ([`VaSession::decode_jpeg`], oracles and
+/// examples holding their own session). `Decoded` carries the pooled frame;
 /// `Unsupported` (progressive/arithmetic/12-bit/CMYK — anything
 /// [`parse_for_va`] rejects) means "take the CPU path" with NO session
 /// teardown. `Err` is real failures only.
+///
+/// The shared (process-wide) session never returns this: concurrent callers
+/// cannot hold `&mut` on one session, so it returns [`SharedDecodeOutcome`]
+/// (leased) instead. See [`SharedVcnLease`].
 #[derive(Clone, Copy)]
 pub enum DecodeOutcome {
     Decoded(VcnFrame),
     Unsupported(&'static str),
+}
+
+/// Shared-session decode contract ([`VaSession::shared_decode_jpeg_lease`]).
+/// Like [`DecodeOutcome`], but the decoded frame rides inside a
+/// [`SharedVcnLease`] holding the session mutex, so no unguarded
+/// shared-frame result escapes. `Unsupported` and `Err` hold no lease (the
+/// mutex is released before return — nothing is outstanding).
+pub enum SharedDecodeOutcome<'a> {
+    Decoded(SharedVcnLease<'a>),
+    Unsupported(&'static str),
+}
+
+/// Exclusive lease on a shared-session decode result.
+///
+/// [`VaSession::shared_decode_jpeg_lease`] locks the process-wide session
+/// mutex into this guard: while the lease lives, no other thread can decode
+/// through the shared session, so the pooled surface the [`VcnFrame`]
+/// metadata points at cannot be overwritten. Neither `Clone` nor `Copy` —
+/// there is exactly one owner.
+///
+/// Release boundary: drop the lease only after the consumer's device reads
+/// are proven complete (checked HIP stream/device synchronization or event
+/// completion), never at kernel-launch time. Launch is asynchronous; the
+/// surface is still being read until the sync returns `Ok`.
+///
+/// Single-lease rule: the shared mutex is not reentrant. Never hold two
+/// leases at once — decode image N+1 only after the previous lease is
+/// consumed — or the second decode self-deadlocks.
+pub struct SharedVcnLease<'a> {
+    /// Held exclusively until the consumer's reads complete. Underscored:
+    /// the lock itself is the value (its `Drop` releases the session);
+    /// callers observe the frame through [`Self::frame`], never the session.
+    _guard: MutexGuard<'a, Option<VaSession>>,
+    /// Metadata snapshot (geometry, layout, device pointer) of the pooled
+    /// surface at decode time. Meaningful only while the lease lives.
+    frame: VcnFrame,
+}
+
+impl SharedVcnLease<'_> {
+    /// The decoded frame: geometry + layer layout + pooled device pointer.
+    /// Valid only while this lease is alive — never copy it out.
+    pub fn frame(&self) -> &VcnFrame {
+        &self.frame
+    }
 }
 
 /// A VCN-decoded frame: geometry + layer layout + the pooled device pointer.
@@ -869,6 +1070,8 @@ pub enum DecodeOutcome {
 /// The pointer is stable per (`rt_format`, width, height) pool key, but its
 /// *contents* reflect the most recent decode of that key — launch + sync
 /// consumer kernels before the next decode. Valid until the session drops.
+/// Shared-session callers never receive this directly (see
+/// [`SharedVcnLease`]); only explicit-session owners holding `&mut` do.
 #[derive(Clone, Copy)]
 pub struct VcnFrame {
     pub width: u32,

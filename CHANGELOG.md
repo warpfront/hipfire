@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Opt-in VCN JPEG preprocessing for existing VL serving: `image.decode` stays `cpu` by default; `vcn`/`auto` attempt shared VCN decode and fall back to CPU on unsupported inputs, platforms, or decode failure. This is a JPEG prepass only — not a replacement vision tokenizer or learned tower.
+- Incremental CPU stream detokenization: text streaming appends newly committed token bytes while preserving GPT-2/SentencePiece Unicode holdback and lossy stop semantics.
+
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 
 - Source-aware admission and refusal-before-teardown (#682, #687).

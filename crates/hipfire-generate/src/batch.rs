@@ -141,8 +141,14 @@ pub fn is_batch_request_eligible(
             || sampling.presence_penalty != 0.0
             || sampling.frequency_penalty != 0.0,
         force_ar_chat: false,
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
-        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE").ok().as_deref() != Some("0"),
+        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
+            .ok()
+            .as_deref()
+            == Some("0"),
+        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
+            .ok()
+            .as_deref()
+            != Some("0"),
         supports_temp_swor,
         supports_chain_nucleus_verify,
         kv_adaptive: has_adaptive,
@@ -780,6 +786,7 @@ pub fn drive_qwen_continuous_batch(
                 lane.rng_state = next_rng as u64;
                 lane.conversation_tokens = Vec::new();
                 lane.streamed_tokens = Vec::new();
+                lane.streamed_bytes = Vec::new();
                 lane.bytes_fed_to_filter = 0;
                 lane.prefill_done_at = Some(Instant::now());
             }
@@ -888,11 +895,13 @@ pub fn drive_qwen_continuous_batch(
                 None => continue,
             };
             let producer = unsafe { &mut *prod_ptr };
-            let mut future_streamed = lane.streamed_tokens.clone();
-            future_streamed.push(cur_token);
-            let all_bytes = tokenizer.decode_bytes(&future_streamed);
-            let prev_fed = lane.bytes_fed_to_filter.min(all_bytes.len());
-            let token_bytes = all_bytes[prev_fed..].to_vec();
+            // Per-token delta only (tokenizer concat contract): `bytes_fed_to_filter`
+            // already equals `decode_bytes(&streamed_tokens).len()` from the
+            // previous commit, so the unfed suffix of the cumulative decode is
+            // exactly this token's bytes — no history clone + full re-decode.
+            let token_bytes = tokenizer.decode_token_bytes(cur_token);
+            let all_len = lane.bytes_fed_to_filter.saturating_add(token_bytes.len());
+            debug_assert!(lane.bytes_fed_to_filter <= all_len);
             let _scope = BatchAttemptScope::enter(key.attempt_id);
             // TTFT: host Instant immediately before the first classified emit.
             if lane.first_token_at.is_none() {
@@ -903,7 +912,6 @@ pub fn drive_qwen_continuous_batch(
                 let lane_conv = &mut lane.conversation_tokens as *mut Vec<u32>;
                 let lane_stream = &mut lane.streamed_tokens as *mut Vec<u32>;
                 let lane_fed = &mut lane.bytes_fed_to_filter as *mut usize;
-                let all_len = all_bytes.len();
                 let mut res: Result<bool, _> = Ok(false);
                 unsafe {
                     res = producer.commit_and_classify(
@@ -1838,6 +1846,7 @@ pub fn drive_lfm_continuous_batch(
                     lane.seq_pos = prompt_tokens.len();
                     lane.next_token = None;
                     lane.streamed_tokens = Vec::new();
+                    lane.streamed_bytes = Vec::new();
                     lane.bytes_fed_to_filter = 0;
                     lane.prefill_done_at = Some(Instant::now());
                     lane.first_token_at = None;
@@ -2008,6 +2017,7 @@ pub fn drive_lfm_continuous_batch(
                 lane.rng_state = next_rng as u64;
                 lane.conversation_tokens = Vec::new();
                 lane.streamed_tokens = Vec::new();
+                lane.streamed_bytes = Vec::new();
                 lane.bytes_fed_to_filter = 0;
                 lane.prefill_done_at = Some(Instant::now());
             }
@@ -2138,12 +2148,14 @@ pub fn drive_lfm_continuous_batch(
             }
             // Cumulative byte-correct incremental decode with holdback.
             // Never use `tokenizer.decode(&[cur_token])` (lossy, splits UTF-8 into FFFD).
-            // Instead decode all streamed tokens + cur_token as bytes and emit only the
-            // newly completed UTF-8 prefix beyond `bytes_fed_to_filter`.
-            let mut future_streamed = lane.streamed_tokens.clone();
-            future_streamed.push(cur_token);
-            let all_bytes = tokenizer.decode_bytes(&future_streamed);
-            let valid_len = match std::str::from_utf8(&all_bytes) {
+            // Instead append this token's bytes to the lane's cumulative
+            // buffer (byte-identical to decoding streamed + cur_token by the
+            // tokenizer concat contract) and emit only the newly completed
+            // UTF-8 prefix beyond `bytes_fed_to_filter`.
+            let pre_len = lane.streamed_bytes.len();
+            tokenizer.append_token_bytes(cur_token, &mut lane.streamed_bytes);
+            let all_bytes = &lane.streamed_bytes;
+            let valid_len = match std::str::from_utf8(all_bytes) {
                 Ok(_) => all_bytes.len(),
                 Err(e) => e.valid_up_to(),
             };
@@ -2187,6 +2199,9 @@ pub fn drive_lfm_continuous_batch(
                     sched.lane_capacity,
                     lane.max_active_lanes.max(1),
                 );
+                // The suppressed token is never committed: roll the scratch
+                // buffer back so it stays the exact image of `streamed_tokens`.
+                lane.streamed_bytes.truncate(pre_len);
                 to_await.push((idx, key.clone(), pending_done));
                 continue;
             }
@@ -2501,8 +2516,14 @@ pub fn is_qwen_ep_batch_request_eligible(
             || sampling.presence_penalty != 0.0
             || sampling.frequency_penalty != 0.0,
         force_ar_chat: false,
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
-        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE").ok().as_deref() != Some("0"),
+        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
+            .ok()
+            .as_deref()
+            == Some("0"),
+        fast_sample_on: hipfire_config::developer_var("HIPFIRE_FAST_SAMPLE")
+            .ok()
+            .as_deref()
+            != Some("0"),
         supports_temp_swor: m
             .speculator
             .as_ref()
@@ -3069,6 +3090,7 @@ pub fn drive_qwen35_ep_continuous_batch(
                 lane.rng_state = next_rng as u64;
                 lane.conversation_tokens = Vec::new();
                 lane.streamed_tokens = Vec::new();
+                lane.streamed_bytes = Vec::new();
                 lane.bytes_fed_to_filter = 0;
                 lane.prefill_done_at = Some(Instant::now());
             }
@@ -3176,11 +3198,13 @@ pub fn drive_qwen35_ep_continuous_batch(
                 None => continue,
             };
             let producer = unsafe { &mut *prod_ptr };
-            let mut future_streamed = lane.streamed_tokens.clone();
-            future_streamed.push(cur_token);
-            let all_bytes = tokenizer.decode_bytes(&future_streamed);
-            let prev_fed = lane.bytes_fed_to_filter.min(all_bytes.len());
-            let token_bytes = all_bytes[prev_fed..].to_vec();
+            // Per-token delta only (tokenizer concat contract): `bytes_fed_to_filter`
+            // already equals `decode_bytes(&streamed_tokens).len()` from the
+            // previous commit, so the unfed suffix of the cumulative decode is
+            // exactly this token's bytes — no history clone + full re-decode.
+            let token_bytes = tokenizer.decode_token_bytes(cur_token);
+            let all_len = lane.bytes_fed_to_filter.saturating_add(token_bytes.len());
+            debug_assert!(lane.bytes_fed_to_filter <= all_len);
             let _scope = BatchAttemptScope::enter(key.attempt_id);
             if lane.first_token_at.is_none() {
                 lane.first_token_at = Some(Instant::now());
@@ -3190,7 +3214,6 @@ pub fn drive_qwen35_ep_continuous_batch(
                 let lane_conv = &mut lane.conversation_tokens as *mut Vec<u32>;
                 let lane_stream = &mut lane.streamed_tokens as *mut Vec<u32>;
                 let lane_fed = &mut lane.bytes_fed_to_filter as *mut usize;
-                let all_len = all_bytes.len();
                 let mut res: Result<bool, _> = Ok(false);
                 unsafe {
                     res = producer.commit_and_classify(

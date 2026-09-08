@@ -133,7 +133,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 |---|---|---|
 | `HIPFIRE_VISION_SIDECAR` | explicit vision-tower path (overrides the registry sidecar); empty opts out | Read via `developer_var` (env beats `developer.vision_sidecar`); wired into the daemon load as `params["vision"]`. Skipped while `vision_mode=off`. |
 | `HIPFIRE_VISION_MODE` | tower sidecar gate: `off` (default) / `auto` / `on` | Env-compat for config `vision.mode`; projected into load params as `vision_mode` and enforced daemon-side. |
-| `HIPFIRE_IMAGE_DECODE` | VL image JPEG decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed, else cpu) | Env-compat for config `image.decode`; read via process snapshot in `hipfire-arch-qwen35-vl`. `vcn`/`auto` need the `vcn-jpeg` cargo feature. |
+| `HIPFIRE_IMAGE_DECODE` | VL image JPEG decode path: `cpu` (default) / `vcn` / `auto` | Env-compat for config `image.decode`; read via process snapshot in `hipfire-arch-qwen35-vl`. The standard daemon build compiles the `vcn-jpeg` path in (default feature). Runtime default remains `cpu`, which never enters the VCN prepass. `vcn` and `auto` attempt shared VCN JPEG decode and fall back to CPU for unsupported inputs, platforms where VCN is unavailable, or decode failure. When VCN runs, pooled decode surfaces stay leased until GPU preprocessing completes; the learned vision tower is unchanged. |
 
 ### Graph / MMQ / prefill
 

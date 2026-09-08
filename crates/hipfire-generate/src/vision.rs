@@ -496,8 +496,21 @@ pub fn generate_vl(
     // and no CPU pixels, so the early returns below still own no request
     // GPU buffers (see the invariant above). The retained bytes feed the
     // last-resort CPU decode if the later kernel launches fail.
+    //
+    // Gated on `resolve_image_decode()` BEFORE touching the source: the
+    // default (`cpu`) path must not pay a file read / base64 decode here
+    // only to discard it in `vcn_decode` and redo it below. Bytes are
+    // retained only for an attempted VCN path.
+    //
+    // `VcnDecoded` holds the shared session lease (see its docs): at most
+    // one lives per request — a second `vcn_decode` while this is alive
+    // self-deadlocks — and `vcn_to_patches` consumes it right after its
+    // terminal sync, never across generation.
     #[cfg(feature = "vcn-jpeg")]
-    let vcn_prepass: Option<(image::VcnDecoded, Vec<u8>)> = (|| {
+    let vcn_prepass: Option<(image::VcnDecoded<'static>, Vec<u8>)> = (|| {
+        if image::resolve_image_decode() == image::ImageDecode::Cpu {
+            return None;
+        }
         let bytes = match image_source {
             ImageSource::Path(path) => std::fs::read(path).ok()?,
             ImageSource::Base64(b64) => decode_image_bytes(b64).ok()?,
@@ -757,9 +770,14 @@ pub fn generate_vl(
     #[cfg(feature = "vcn-jpeg")]
     let visual_tokens = match vcn_prepass {
         Some((d, bytes)) => {
+            // By value: `vcn_to_patches` consumes the session lease after
+            // its terminal sync, so the surface is reusable (and the mutex
+            // free) before the tower runs. The retained source bytes live
+            // until all CPU fallbacks below are past, then release with the
+            // match scope.
             let vcn_patches = match image::vcn_to_patches(
                 gpu,
-                &d,
+                d,
                 vision_config.patch_size,
                 vision_config.temporal_patch_size,
                 vision_config.spatial_merge_size,
@@ -818,7 +836,7 @@ pub fn generate_vl(
                     }
                 }
                 None => {
-                    let (pixels, _, _) = match image::load_and_preprocess_from_bytes(
+                    let (pixels, fb_h, fb_w) = match image::load_and_preprocess_from_bytes(
                         &bytes,
                         vision_config.patch_size,
                         vision_config.spatial_merge_size,
@@ -829,6 +847,20 @@ pub fn generate_vl(
                             return;
                         }
                     };
+                    // The VCN dims above came from the same JPEG SOF geometry
+                    // through the same `smart_resize`, so these must agree.
+                    // Fail the request rather than feed `extract_patches`
+                    // mismatched geometry (silent corruption).
+                    if (fb_h, fb_w) != (img_h, img_w) {
+                        write_error(
+                            stdout,
+                            id,
+                            &format!(
+                                "VCN/CPU resize mismatch (vcn {img_h}x{img_w} vs cpu {fb_h}x{fb_w}) — refusing to encode mismatched geometry"
+                            ),
+                        );
+                        return;
+                    }
                     let patches = hipfire_arch_qwen35_vl::image::extract_patches(
                         &pixels,
                         3,
@@ -907,6 +939,20 @@ pub fn generate_vl(
     };
     #[cfg(not(feature = "vcn-jpeg"))]
     let visual_tokens = {
+        // `image.decode = vcn|auto` requests the VCN path, but this binary
+        // was built without the `vcn-jpeg` cargo feature (the standard
+        // daemon build carries it; custom builds may not). CPU decode is
+        // correct — warn once so the operator intent never silently no-ops.
+        static VCN_FEATURE_WARNED: std::sync::Once = std::sync::Once::new();
+        if hipfire_arch_qwen35_vl::image::resolve_image_decode()
+            != hipfire_arch_qwen35_vl::image::ImageDecode::Cpu
+        {
+            VCN_FEATURE_WARNED.call_once(|| {
+                eprintln!(
+                    "[daemon/vl] image.decode requests VCN but this binary lacks the `vcn-jpeg` feature — CPU fallback"
+                );
+            });
+        }
         let patches = hipfire_arch_qwen35_vl::image::extract_patches(
             &pixels,
             3,
@@ -1157,6 +1203,9 @@ pub fn generate_vl(
     let t_prefill = Instant::now();
     let mut generated = 0;
     let mut streamed_tokens: Vec<u32> = Vec::new();
+    // Cumulative raw bytes of `streamed_tokens` (tokenizer concat
+    // contract): per-commit append replaces the full-history re-decode.
+    let mut streamed_bytes: Vec<u8> = Vec::new();
     let mut emitted_bytes = 0usize;
     // Typed-emission state for the v2 stream contract (see
     // `vl_route_decode_text`): EosFilter owns UTF-8 boundaries + EOT marker
@@ -1266,9 +1315,9 @@ pub fn generate_vl(
             t0.elapsed().as_millis() as u64,
         );
 
-        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-        let new_bytes = &all_bytes[emitted_bytes..];
-        emitted_bytes = all_bytes.len();
+        tokenizer.append_token_bytes(next_token, &mut streamed_bytes);
+        let new_bytes = &streamed_bytes[emitted_bytes..];
+        emitted_bytes = streamed_bytes.len();
         if vl_route_decode_text(stdout, id, &mut vl_filter, &mut vl_think, new_bytes) {
             break;
         }
@@ -1426,9 +1475,9 @@ pub fn generate_vl(
                             t0.elapsed().as_millis() as u64,
                         );
 
-                        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
-                        let new_bytes = &all_bytes[emitted_bytes..];
-                        emitted_bytes = all_bytes.len();
+                        tokenizer.append_token_bytes(t, &mut streamed_bytes);
+                        let new_bytes = &streamed_bytes[emitted_bytes..];
+                        emitted_bytes = streamed_bytes.len();
                         // Same typed routing as the main decode site: the
                         // forced `</think>` closer is consumed by the router
                         // (channel flips to content), never emitted literally.
@@ -1905,6 +1954,9 @@ pub fn generate_vl_dots_ocr(
     };
     let t_gen = Instant::now();
     let mut streamed: Vec<u32> = Vec::new();
+    // Cumulative raw bytes of `streamed` (tokenizer concat contract):
+    // per-commit append replaces the full-history re-decode.
+    let mut streamed_bytes: Vec<u8> = Vec::new();
     let mut emitted_bytes = 0usize;
     let mut generated = 0usize;
     // No ngram loop-guard here: dots.ocr layout-JSON legitimately repeats
@@ -1926,8 +1978,8 @@ pub fn generate_vl_dots_ocr(
         streamed.push(next);
 
         // Incremental UTF-8 streaming — only emit complete code points.
-        let all_bytes = tokenizer.decode_bytes(&streamed);
-        let new_bytes = &all_bytes[emitted_bytes..];
+        tokenizer.append_token_bytes(next, &mut streamed_bytes);
+        let new_bytes = &streamed_bytes[emitted_bytes..];
         let valid_len = match std::str::from_utf8(new_bytes) {
             Ok(_) => new_bytes.len(),
             Err(e) => e.valid_up_to(),
@@ -2084,6 +2136,9 @@ pub fn run_dots_ocr_ngram_loop(
 
     let t_gen = Instant::now();
     let mut streamed: Vec<u32> = Vec::new();
+    // Cumulative raw bytes of `streamed` (tokenizer concat contract):
+    // per-commit append replaces the full-history re-decode.
+    let mut streamed_bytes: Vec<u8> = Vec::new();
     let mut emitted_bytes = 0usize;
     let mut generated = 0usize;
     // n-gram context (committed generated tail; the drafter holds the prompt
@@ -2115,8 +2170,8 @@ pub fn run_dots_ocr_ngram_loop(
             emitted.push(tok);
             // Incremental UTF-8 streaming — only emit complete code points
             // (byte-identical to the AR path).
-            let all_bytes = tokenizer.decode_bytes(&streamed);
-            let new_bytes = &all_bytes[emitted_bytes..];
+            tokenizer.append_token_bytes(tok, &mut streamed_bytes);
+            let new_bytes = &streamed_bytes[emitted_bytes..];
             let valid_len = match std::str::from_utf8(new_bytes) {
                 Ok(_) => new_bytes.len(),
                 Err(e) => e.valid_up_to(),
@@ -2329,6 +2384,9 @@ pub fn generate_dots_ocr_text(
     };
     let t_gen = Instant::now();
     let mut streamed: Vec<u32> = Vec::new();
+    // Cumulative raw bytes of `streamed` (tokenizer concat contract):
+    // per-commit append replaces the full-history re-decode.
+    let mut streamed_bytes: Vec<u8> = Vec::new();
     let mut emitted_bytes = 0usize;
     let mut generated = 0usize;
 
@@ -2341,8 +2399,8 @@ pub fn generate_dots_ocr_text(
         streamed.push(next);
 
         // Incremental UTF-8 streaming — only emit complete code points.
-        let all_bytes = tokenizer.decode_bytes(&streamed);
-        let new_bytes = &all_bytes[emitted_bytes..];
+        tokenizer.append_token_bytes(next, &mut streamed_bytes);
+        let new_bytes = &streamed_bytes[emitted_bytes..];
         let valid_len = match std::str::from_utf8(new_bytes) {
             Ok(_) => new_bytes.len(),
             Err(e) => e.valid_up_to(),

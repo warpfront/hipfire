@@ -4,8 +4,8 @@
 
 //! `vl_vcn_parity`: VCN JPEG → `pixel_values` parity vs the CPU oracles.
 //!
-//! Experiment `experiment/vcn-jpeg` + `experiment/vcn-ring` only; requires
-//! `--features vcn-jpeg` (default-off, no default-build-graph change).
+//! Developer parity probe; requires `--features vcn-jpeg` on saddle-lab.
+//! The daemon includes that path by default; runtime image decode stays CPU.
 //!
 //! Run (device 0, GPU lock held by the caller):
 //! ```sh
@@ -583,10 +583,7 @@ fn main() {
         .unwrap_or_default();
     let kern_iters: usize = args
         .iter()
-        .find_map(|a| {
-            a.strip_prefix("--kern-iters=")
-                .and_then(|v| v.parse().ok())
-        })
+        .find_map(|a| a.strip_prefix("--kern-iters=").and_then(|v| v.parse().ok()))
         .unwrap_or(0);
     let drm_node: Option<String> = args
         .iter()
@@ -712,6 +709,7 @@ fn main() {
         "path",
         if kern_iters > 0 { "    us/iter" } else { "" }
     );
+    let mut ran = 0;
     let mut worst_va = 0.0f64;
     let mut worst_rl = 0.0f64;
     // Timing accumulators for the final table (p50 columns + detail triples).
@@ -728,9 +726,19 @@ fn main() {
     }
     let mut timings: Vec<Timing> = Vec::new();
     for name in fixtures {
-        if !only.is_empty() && !only.iter().any(|o| o.as_str() == name) {
+        // Accept basenames (`doge.jpeg`) AND paths
+        // (`benchmarks/vision/images/doge.jpeg`, absolute or relative): a
+        // path filter that matches zero fixtures previously ran an empty
+        // pass and exited 0 — false proof. See the `ran == 0` guard below.
+        if !only.is_empty()
+            && !only.iter().any(|o| {
+                let q = o.as_str();
+                q == name || q.rsplit('/').next().is_some_and(|b| b == name)
+            })
+        {
             continue;
         }
+        ran += 1;
         let bytes = std::fs::read(img_dir.join(name)).expect("fixture read");
         println!(
             "[parity] --- {name} md5={} ({}B)",
@@ -952,8 +960,8 @@ fn main() {
             );
         }
         let outcome = outcome.expect("at least one decode attempt");
-        let (path, got, kern_ms, kern_per_iter): (&str, Vec<f32>, f64, Option<f64>) =
-            match outcome {
+        let (path, got, kern_ms, kern_per_iter): (&str, Vec<f32>, f64, Option<f64>) = match outcome
+        {
             Ok(va_bridge::DecodeOutcome::Decoded(vf))
                 if vf.fourcc == 0x3231_564E || vf.fourcc == 0x5034_3434 =>
             {
@@ -1042,9 +1050,8 @@ fn main() {
         worst_va = worst_va.max(r);
         // Bit-exactness aid: md5 over the raw LE f32 bytes of the VCN-path
         // output and (once per fixture) the CPU reference vector.
-        let got_bytes: &[u8] = unsafe {
-            std::slice::from_raw_parts(got.as_ptr() as *const u8, got.len() * 4)
-        };
+        let got_bytes: &[u8] =
+            unsafe { std::slice::from_raw_parts(got.as_ptr() as *const u8, got.len() * 4) };
         println!("[parity] {name}: out_md5={}", md5hex(got_bytes));
         let ref_bytes: &[u8] = unsafe {
             std::slice::from_raw_parts(cpu_patches.as_ptr() as *const u8, cpu_patches.len() * 4)
@@ -1052,9 +1059,9 @@ fn main() {
         println!("[parity] {name}: ref_md5={}", md5hex(ref_bytes));
         if kern_iters > 0 {
             match kern_per_iter {
-                Some(us) => println!(
-                    "[parity] {name}: kern_iters={kern_iters} per_iter_us={us:.1} (gpu)"
-                ),
+                Some(us) => {
+                    println!("[parity] {name}: kern_iters={kern_iters} per_iter_us={us:.1} (gpu)")
+                }
                 None => println!(
                     "[parity] {name}: kern_iters={kern_iters} skipped ({path}, no kernels)"
                 ),
@@ -1513,6 +1520,16 @@ fn main() {
                 ctx.dev.free_buffer(b).expect("free rl buf");
             }
         }
+    }
+    if !only.is_empty() && ran == 0 {
+        eprintln!(
+            "[parity] filter matched zero fixtures ({}) — refusing empty pass",
+            only.iter()
+                .map(|s| s.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        std::process::exit(1);
     }
     println!("[parity] worst VA rel-L1 = {worst_va:.3e} (equivalence bound 1e-2)");
     assert!(worst_va <= 1e-2, "VA oracle parity bound violated");

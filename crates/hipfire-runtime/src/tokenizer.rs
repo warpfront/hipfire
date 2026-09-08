@@ -317,7 +317,6 @@ fn sp_dummy_prefix_from_hf_json(tok: &serde_json::Value) -> bool {
         || pre_tokenizer.map(pretokenizer_prepends).unwrap_or(false)
 }
 
-
 impl Tokenizer {
     /// Load tokenizer from GGUF metadata.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
@@ -796,37 +795,69 @@ impl Tokenizer {
     /// Decode tokens to raw bytes (for incremental UTF-8 streaming).
     /// Use with `std::str::from_utf8()` + `valid_up_to()` to emit only
     /// complete UTF-8 sequences, buffering partial multi-byte chars.
+    ///
+    /// Concat contract (load-bearing for streaming): each id maps
+    /// independently — the GPT-2 char table and the `▁`+hex-escape expansion
+    /// below hold no cross-token state — so for every id sequence
+    /// `decode_bytes(ids)` is byte-identical to concatenating
+    /// [`Self::decode_token_bytes`] per id. Streaming loops MUST append per
+    /// commit via [`Self::append_token_bytes`] into a cumulative scratch
+    /// buffer instead of re-decoding the full history each step (O(N²)).
+    /// The committed `streamed_tokens` history stays authoritative for
+    /// rollback/metrics/cache-store; the scratch buffer is its exact image
+    /// and MUST be truncated/reset wherever the history is.
     pub fn decode_bytes(&self, tokens: &[u32]) -> Vec<u8> {
         let mut bytes = Vec::new();
         for &id in tokens {
-            if let Some(tok) = self.vocab.get(id as usize) {
-                if self.is_gpt2_bpe {
-                    for ch in tok.chars() {
-                        match ch {
-                            'Ġ' => bytes.push(b' '),
-                            'Ċ' => bytes.push(b'\n'),
-                            'ĉ' => bytes.push(b'\t'),
-                            c if c.is_ascii() => bytes.push(c as u8),
-                            c => {
-                                if let Some(b) = gpt2_char_to_byte(c) {
-                                    bytes.push(b);
-                                } else {
-                                    let mut buf = [0u8; 4];
-                                    let s = c.encode_utf8(&mut buf);
-                                    bytes.extend_from_slice(s.as_bytes());
-                                }
+            self.append_token_bytes(id, &mut bytes);
+        }
+        bytes
+    }
+
+    /// Raw bytes for a single token id: the per-token projection of
+    /// [`Self::decode_bytes`]. Unknown ids contribute nothing, mirroring
+    /// `decode_bytes`' skip. Prefer [`Self::append_token_bytes`] in loops to
+    /// reuse scratch instead of allocating per token.
+    pub fn decode_token_bytes(&self, id: u32) -> Vec<u8> {
+        let mut out = Vec::new();
+        self.append_token_bytes(id, &mut out);
+        out
+    }
+
+    /// Append a single token's raw bytes to caller-owned scratch.
+    ///
+    /// Streaming entry point (see [`Self::decode_bytes`] concat contract).
+    /// Never lossy-decodes: multi-byte chars split across tokens reassemble
+    /// in the cumulative buffer; emit sides hold back the incomplete tail
+    /// via `from_utf8` + `valid_up_to` (or the EosFilter, which owns UTF-8
+    /// boundaries on filter-fed paths).
+    pub fn append_token_bytes(&self, id: u32, bytes: &mut Vec<u8>) {
+        if let Some(tok) = self.vocab.get(id as usize) {
+            if self.is_gpt2_bpe {
+                for ch in tok.chars() {
+                    match ch {
+                        'Ġ' => bytes.push(b' '),
+                        'Ċ' => bytes.push(b'\n'),
+                        'ĉ' => bytes.push(b'\t'),
+                        c if c.is_ascii() => bytes.push(c as u8),
+                        c => {
+                            if let Some(b) = gpt2_char_to_byte(c) {
+                                bytes.push(b);
+                            } else {
+                                let mut buf = [0u8; 4];
+                                let s = c.encode_utf8(&mut buf);
+                                bytes.extend_from_slice(s.as_bytes());
                             }
                         }
                     }
-                } else {
-                    // hunt3 H-C: byte-correct path — <0xHH> fallback tokens must
-                    // emit raw bytes, not `byte as char` re-UTF8-encoded codepoints.
-                    let decoded = tok.replace('▁', " ");
-                    bytes.extend_from_slice(&decode_hex_escapes_bytes(&decoded));
                 }
+            } else {
+                // hunt3 H-C: byte-correct path — <0xHH> fallback tokens must
+                // emit raw bytes, not `byte as char` re-UTF8-encoded codepoints.
+                let decoded = tok.replace('▁', " ");
+                bytes.extend_from_slice(&decode_hex_escapes_bytes(&decoded));
             }
         }
-        bytes
     }
 
     /// Encode text to token IDs.
@@ -2155,6 +2186,266 @@ mod sp_tests {
         assert_eq!(tok.encode_sentencepiece("hello world"), vec![0, 1]);
     }
 }
+#[cfg(test)]
+mod incremental_decode_tests {
+    //! Regression for the streaming concat contract
+    //! ([`Tokenizer::decode_bytes`]): per-commit `append_token_bytes` into a
+    //! cumulative scratch buffer must stay byte-identical to re-decoding the
+    //! full history, for both GPT-2 BPE and SentencePiece (hex-fallback +
+    //! specials), with UTF-8 holdback, cross-token stop suffixes, and
+    //! reset/truncate reuse all preserved.
+    use super::*;
+
+    /// Synthetic GPT-2 byte-level tokenizer. Decode never consults
+    /// `byte_to_id`, so `None` suffices here (production GPT-2 always
+    /// carries full 256-byte coverage).
+    fn synth_gpt2(vocab: &[&str]) -> Tokenizer {
+        let vocab: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
+        let token_to_id: HashMap<String, u32> = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i as u32))
+            .collect();
+        Tokenizer {
+            vocab,
+            token_to_id,
+            merges: Vec::new(),
+            merge_pair_rank: HashMap::new(),
+            byte_to_id: None,
+            special_tokens: Vec::new(),
+            bos_id: 0,
+            eos_id: 0,
+            add_bos: false,
+            eot_id: None,
+            is_gpt2_bpe: true,
+            sp_dummy_prefix: true,
+        }
+    }
+
+    /// Synthetic SentencePiece tokenizer (mirror of `sp_tests::synth_sp`).
+    fn synth_sp2(vocab: &[&str]) -> Tokenizer {
+        let vocab: Vec<String> = vocab.iter().map(|s| s.to_string()).collect();
+        let token_to_id: HashMap<String, u32> = vocab
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (s.clone(), i as u32))
+            .collect();
+        Tokenizer {
+            vocab,
+            token_to_id,
+            merges: Vec::new(),
+            merge_pair_rank: HashMap::new(),
+            byte_to_id: None,
+            special_tokens: Vec::new(),
+            bos_id: 0,
+            eos_id: 0,
+            add_bos: false,
+            eot_id: None,
+            is_gpt2_bpe: false,
+            sp_dummy_prefix: true,
+        }
+    }
+
+    /// Incremental image of a history: what every streaming loop now keeps.
+    fn image_of(tok: &Tokenizer, ids: &[u32]) -> Vec<u8> {
+        let mut buf = Vec::new();
+        for &id in ids {
+            tok.append_token_bytes(id, &mut buf);
+        }
+        buf
+    }
+
+    #[test]
+    fn gpt2_append_matches_hardcoded_corpus_with_escapes_and_special() {
+        // Independent byte oracle (not decode_bytes/append helper-vs-helper):
+        // Ġ/Ċ/ĉ escapes, mapped non-ASCII é → 0xE9, unmapped € → UTF-8,
+        // structural special, unknown id contributes nothing.
+        let tok = synth_gpt2(&["Hello", "Ġworld", "Ċ", "ĉ", "é", "€", "<|im_end|>"]);
+        let ids: [u32; 10] = [0, 1, 2, 0, 3, 4, 5, 6, 9999, 1];
+        let pieces: [&[u8]; 10] = [
+            b"Hello",
+            b" world",
+            b"\n",
+            b"Hello",
+            b"\t",
+            &[0xE9],
+            &[0xE2, 0x82, 0xAC], // €
+            b"<|im_end|>",
+            b"", // unknown id
+            b" world",
+        ];
+        let mut expected = Vec::new();
+        let mut buf = Vec::new();
+        for (i, &id) in ids.iter().enumerate() {
+            tok.append_token_bytes(id, &mut buf);
+            expected.extend_from_slice(pieces[i]);
+            assert_eq!(buf, expected, "gpt2 cumulative prefix after id[{i}]={id}");
+            assert_eq!(
+                tok.decode_token_bytes(id),
+                pieces[i],
+                "gpt2 per-id piece {i}"
+            );
+        }
+        assert_eq!(
+            expected,
+            b"Hello world\nHello\t\xe9\xe2\x82\xac<|im_end|> world"
+        );
+        // decode_bytes must agree with the same independent corpus.
+        assert_eq!(tok.decode_bytes(&ids), expected);
+    }
+
+    #[test]
+    fn sp_append_matches_hardcoded_corpus_hex_fallback_and_specials() {
+        // Independent byte oracle: ▁→space, CJK split across three <0xHH>
+        // fallbacks, ASCII hex fallback, structural special, non-matching
+        // "<0xZZ>" literal, whole multi-byte char token, unknown id empty.
+        let tok = synth_sp2(&[
+            "▁hello",
+            "▁world",
+            "<0xE4>",
+            "<0xB8>",
+            "<0xAD>",
+            "<0x0A>",
+            "<|im_end|>",
+            "<0xZZ>",
+            "🦀",
+        ]);
+        let ids: [u32; 10] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9999];
+        let crab = "🦀".as_bytes();
+        let pieces: [&[u8]; 10] = [
+            b" hello",
+            b" world",
+            &[0xE4],
+            &[0xB8],
+            &[0xAD],
+            &[0x0A],
+            b"<|im_end|>",
+            b"<0xZZ>",
+            crab,
+            b"", // unknown id
+        ];
+        let mut expected = Vec::new();
+        let mut buf = Vec::new();
+        for (i, &id) in ids.iter().enumerate() {
+            tok.append_token_bytes(id, &mut buf);
+            expected.extend_from_slice(pieces[i]);
+            assert_eq!(buf, expected, "sp cumulative prefix after id[{i}]={id}");
+            assert_eq!(tok.decode_token_bytes(id), pieces[i], "sp per-id piece {i}");
+        }
+        let mut full_expected = b" hello world".to_vec();
+        full_expected.extend_from_slice(&[0xE4, 0xB8, 0xAD, 0x0A]);
+        full_expected.extend_from_slice(b"<|im_end|><0xZZ>");
+        full_expected.extend_from_slice(crab);
+        assert_eq!(expected, full_expected);
+        assert_eq!(tok.decode_bytes(&ids), expected);
+        // Lossy string view of the CJK-reassembled prefix (consumer-visible).
+        assert_eq!(tok.decode(&[0, 1, 2, 3, 4]), " hello world中");
+    }
+
+    #[test]
+    fn incremental_utf8_holdback_reassembles_split_char() {
+        // "中" = E4 B8 AD arriving one token per commit. The emit side holds
+        // back the incomplete tail via from_utf8 + valid_up_to (the exact
+        // idiom batch/vision sites use) and must never surface U+FFFD.
+        let tok = synth_sp2(&["<0xE4>", "<0xB8>", "<0xAD>"]);
+        let mut buf = Vec::new();
+        let mut fed = 0usize;
+        let mut emitted = Vec::new();
+        for &id in &[2u32, 0, 1] {
+            tok.append_token_bytes(id, &mut buf);
+            // Reordered commits still reassemble whatever the buffer holds;
+            // holdback applies to the unfed delta.
+            let new_bytes = &buf[fed..];
+            let valid_len = match std::str::from_utf8(new_bytes) {
+                Ok(_) => new_bytes.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            emitted.extend_from_slice(&new_bytes[..valid_len]);
+            fed += valid_len;
+        }
+        // Commits arrived AD,E4,B8-ordered: buffer holds those raw bytes, and
+        // holdback emitted only the leading valid prefix (none here — the
+        // first byte AD starts a 3-byte sequence completed out of order).
+        assert_eq!(buf, vec![0xAD, 0xE4, 0xB8]);
+        assert!(emitted.is_empty());
+
+        // In-order commits emit nothing until the char completes, then all.
+        let mut buf = Vec::new();
+        let mut fed = 0usize;
+        let mut out = String::new();
+        for &id in &[0u32, 1, 2] {
+            tok.append_token_bytes(id, &mut buf);
+            let new_bytes = &buf[fed..];
+            let valid_len = match std::str::from_utf8(new_bytes) {
+                Ok(_) => new_bytes.len(),
+                Err(e) => e.valid_up_to(),
+            };
+            let frag = std::str::from_utf8(&new_bytes[..valid_len]).unwrap();
+            assert!(!frag.contains('\u{FFFD}'));
+            out.push_str(frag);
+            fed += valid_len;
+        }
+        assert_eq!(out, "中");
+        assert_eq!(buf, "中".as_bytes().to_vec());
+    }
+
+    #[test]
+    fn stop_suffix_split_across_tokens_matches_full_decode() {
+        // Byte-suffix check on the cumulative buffer must agree with
+        // `decode(full).ends_with(stop)` at EVERY prefix — including a stop
+        // split across token and UTF-8 boundaries. (Spec-emit uses the
+        // suffix form to avoid re-decoding history per token.)
+        let tok = synth_gpt2(&["a", "Ċ", "b"]);
+        let ids = [0u32, 1, 1, 2]; // "a\n\nb"
+        let mut buf = Vec::new();
+        for (n, &id) in ids.iter().enumerate() {
+            tok.append_token_bytes(id, &mut buf);
+            for stop in ["\n\n", "a\n\n", "b", "a\n\nb", "c"] {
+                let suffix = buf.ends_with(stop.as_bytes());
+                let full = String::from_utf8_lossy(&buf);
+                assert_eq!(
+                    suffix,
+                    full.ends_with(stop),
+                    "prefix {n} stop {stop:?}: raw={buf:?} lossy={full:?}"
+                );
+            }
+        }
+        assert!(buf.ends_with(b"\n\nb"));
+
+        // Stop containing a split multi-byte char: "中" as E4 B8 AD tokens.
+        let sp = synth_sp2(&["a", "<0xE4>", "<0xB8>", "<0xAD>"]);
+        let mut buf = Vec::new();
+        for (n, &id) in [0u32, 1, 2, 3].iter().enumerate() {
+            sp.append_token_bytes(id, &mut buf);
+            let suffix = buf.ends_with("中".as_bytes());
+            let full = String::from_utf8_lossy(&buf);
+            assert_eq!(suffix, full.ends_with("中"), "sp prefix {n}");
+        }
+        assert!(buf.ends_with("中".as_bytes()));
+    }
+
+    #[test]
+    fn buffer_reset_truncate_reuse_matches_fresh_decode() {
+        // Reset (lane reseed) and truncate (rollback to a history prefix)
+        // must keep the scratch buffer the exact image of the history.
+        let tok = synth_gpt2(&["Hello", "Ġworld", "Ċ", "!"]);
+        let mut buf = Vec::new();
+        for &id in &[0u32, 1, 2] {
+            tok.append_token_bytes(id, &mut buf);
+        }
+        // Rollback: drop the last commit's bytes, continue with a new token.
+        let after_two = image_of(&tok, &[0, 1]);
+        buf.truncate(after_two.len());
+        tok.append_token_bytes(3, &mut buf);
+        assert_eq!(buf, tok.decode_bytes(&[0, 1, 3]));
+        // Reset + reuse: a cleared buffer over new ids equals a fresh decode.
+        buf.clear();
+        for &id in &[2u32, 2, 0] {
+            tok.append_token_bytes(id, &mut buf);
+        }
+        assert_eq!(buf, tok.decode_bytes(&[2, 2, 0]));
+    }
+}
 
 #[cfg(test)]
 mod prompt_norm_tests {
@@ -2454,7 +2745,6 @@ mod prompt_norm_tests {
     }
 }
 
-
 #[cfg(test)]
 mod sp_dummy_prefix_tests {
     //! Config-driven SP dummy-prefix coverage (gemma4 first-word bug,
@@ -2528,8 +2818,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_no_dummy_prefix_first_word_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(t.bos_id, 2, "generation_config bos override");
         let mut ids = vec![t.bos_id];
         ids.extend(t.encode("The capital of France is"));
@@ -2538,8 +2827,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_chat_tail_thought_channel_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(
             t.encode("<|channel>thought\n<channel|>The capital of France is"),
             vec![100, 45518, 107, 101, 818, 5279, 529, 7001, 563],

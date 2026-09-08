@@ -23,7 +23,7 @@ ep-fault-inject = []
 serve-fault-inject = []
 # VCN JPEG experiment (experiment/vcn-jpeg): default-off, pulls the VA-API
 # bridge + turbo oracle only when requested.
-vcn-jpeg = ["dep:va-bridge", "dep:libjpeg-turbo-rs", "dep:image", "dep:redline", "redline/vcn-jpeg"]
+vcn-jpeg = ["dep:va-bridge", "dep:libjpeg-turbo-rs", "dep:image", "dep:redline", "redline/vcn-jpeg", "hipfire-arch-qwen35-vl/vcn-jpeg"]
 # VCN video experiment (experiment/vcn-video): default-off, VA-API bridge only.
 vcn-video = ["dep:va-bridge"]
 
@@ -271,6 +271,10 @@ required-features = ["vcn-jpeg"]
 
 [[example]]
 name = "vl_vcn_444check"
+required-features = ["vcn-jpeg"]
+
+[[example]]
+name = "vl_vcn_lease_race"
 required-features = ["vcn-jpeg"]
 
 [[example]]

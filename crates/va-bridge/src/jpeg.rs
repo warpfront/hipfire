@@ -426,15 +426,14 @@ mod tests {
     }
 
     #[test]
-    fn rejects_444_sampling_at_sof() {
-        // SOI + SOF0 with three 1x1 components (4:4:4); the VCN-output
-        // gate fires at SOF0, before any VA object exists.
-        let mut v = vec![0xFF, 0xD8];
-        v.extend([
-            0xFF, 0xC0, 0x00, 0x11, 0x08, 0x00, 0x10, 0x00, 0x10, 0x03, //
-            0x01, 0x11, 0x00, 0x02, 0x11, 0x01, 0x03, 0x11, 0x01,
-        ]);
-        v.extend([0xFF, 0xD9]);
-        assert!(matches!(parse_for_va(&v), Err(VaError::Unsupported(_))));
+    fn parses_baseline_444_barney_cigar() {
+        // Committed YUV444 baseline (vcn-zc-444 on hardware parity).
+        // MD5 72f3437ea54e23ad2ff724ecef960471; 640×468.
+        let jpeg = include_bytes!("../../../benchmarks/vision/images/barney_cigar.jpg");
+        let p = parse_for_va(jpeg).expect("444 baseline must parse");
+        assert_eq!((p.width, p.height), (640, 468));
+        assert_eq!(p.pic.num_components, 3);
+        assert_eq!((p.max_h, p.max_v), (1, 1));
+        assert_eq!(p.rt_format, VA_RT_FORMAT_YUV444);
     }
 }
