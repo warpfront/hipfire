@@ -941,13 +941,15 @@ fn main() {
                             let got = f32::from_bits(bits[row]);
                             let abs_err = (got - expect).abs();
                             let rel = (abs_err as f64) / (expect.abs() as f64).max(1e-30);
-                            // HIP FMA vs CPU plain float: finite + rel <= 1e-4.
-                            // NaN comparisons fail open without the finite gates.
+                            // CPU unfused vs GPU contracted FMA: near-zero
+                            // cancellation can inflate relative error while
+                            // abs stays tiny. Fail only when both abs>1e-5
+                            // AND rel>1e-4. Finite gates keep NaN open-fail.
                             let ok = expect.is_finite()
                                 && got.is_finite()
                                 && abs_err.is_finite()
                                 && rel.is_finite()
-                                && rel <= 1e-4;
+                                && !((abs_err as f64) > 1e-5 && rel > 1e-4);
                             if !ok {
                                 slot_ok = false;
                                 any_fail = true;
