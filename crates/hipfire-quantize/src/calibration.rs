@@ -3,29 +3,33 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
+use crate::dequant::*;
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
 use crate::reap_overlay;
-use crate::dequant::*;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 pub(crate) static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 pub(crate) static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
-
 
 pub(crate) fn resolve_model_path(input: &str) -> String {
     let path = Path::new(input);
@@ -226,6 +230,10 @@ pub(crate) fn safetensors_to_ggml_name(name: &str) -> Option<String> {
         "self_attn.k_proj" => "attn_k",
         "self_attn.v_proj" => "attn_v",
         "self_attn.o_proj" => "attn_output",
+        // Spark-X2.5 fused QKV + headwise attn output gate (not MLP gate_proj).
+        "self_attn.q_k_v_proj" => "attn_qkv",
+        "self_attn.g_proj" => "attn_gate",
+        "self_attn.out_proj" => "attn_output",
         // Glimmer gates attention output before o_proj under a name Qwen does
         // not use (see hipfire-arch-muse-glimmer lib.rs). llama.cpp exports it
         // as blk.{N}.attn_gate, so without this arm the 52 Glimmer gate tensors
@@ -594,7 +602,11 @@ pub(crate) fn awq_eligible(name: &str) -> bool {
         || name.ends_with("v_proj.weight")
         || name.ends_with("qkv_proj.weight")
         || name.ends_with("wqkv.weight")
-        // MLP input projections (HF + hipfire-internal naming).
+        // Spark-X2.5 fused Q|K|V projection [q+k+v, hidden].
+        || name.ends_with("q_k_v_proj.weight")
+        // Spark-X2.5 headwise attn output gate [n_heads, hidden] — input-side
+        // (post-RMSNorm hidden). Distinct from mlp.gate_proj / MoE router.
+        || name.ends_with("g_proj.weight")
         || name.ends_with("gate_proj.weight")
         || name.ends_with("up_proj.weight")
         || name.ends_with("w_gate.weight")
@@ -972,7 +984,9 @@ fn apply_gemma4_fields(
 /// the `.hfq` header's metadata blob. A future engine-side `from_hfq` for
 /// Llama-style models can read these fields the same way the existing
 /// `from_gguf` reads them today.
-pub(crate) fn gguf_meta_to_json(meta: &HashMap<String, gguf_input::MetaValue>) -> serde_json::Value {
+pub(crate) fn gguf_meta_to_json(
+    meta: &HashMap<String, gguf_input::MetaValue>,
+) -> serde_json::Value {
     let mut map = serde_json::Map::new();
     for (k, v) in meta {
         let json_v = mv_to_json(v);
@@ -1203,12 +1217,18 @@ mod gemma4_config_tests {
             .map(|i| MetaValue::U32(if i % 6 == 5 { 1 } else { 8 }))
             .collect();
         let pattern: Vec<MetaValue> = (0..48).map(|i| MetaValue::Bool(i % 6 != 5)).collect();
-        m.insert("gemma4_text.attention.head_count".into(), MetaValue::U32(16));
+        m.insert(
+            "gemma4_text.attention.head_count".into(),
+            MetaValue::U32(16),
+        );
         m.insert(
             "gemma4_text.attention.head_count_kv".into(),
             MetaValue::Array(kv_arr),
         );
-        m.insert("gemma4_text.attention.key_length".into(), MetaValue::U32(512));
+        m.insert(
+            "gemma4_text.attention.key_length".into(),
+            MetaValue::U32(512),
+        );
         m.insert(
             "gemma4_text.attention.key_length_swa".into(),
             MetaValue::U32(256),
@@ -1236,7 +1256,10 @@ mod gemma4_config_tests {
             "gemma4_text.embedding_length_per_layer_input".into(),
             MetaValue::U32(0),
         );
-        m.insert("gemma4_text.feed_forward_length".into(), MetaValue::U32(15360));
+        m.insert(
+            "gemma4_text.feed_forward_length".into(),
+            MetaValue::U32(15360),
+        );
         m.insert(
             "gemma4_text.final_logit_softcapping".into(),
             MetaValue::F32(30.0),
@@ -1296,9 +1319,7 @@ mod gemma4_name_translation_tests {
 
     #[test]
     fn gemma4_sandwich_norms_map_to_loader_names() {
-        let f = |slot: &str| {
-            gguf_to_safetensors_name(&format!("blk.7.{slot}.weight"), 13).unwrap()
-        };
+        let f = |slot: &str| gguf_to_safetensors_name(&format!("blk.7.{slot}.weight"), 13).unwrap();
         assert_eq!(f("attn_norm"), "model.layers.7.input_layernorm.weight");
         assert_eq!(
             f("post_attention_norm"),

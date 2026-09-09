@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::OnceLock;
 
 use hipfire_loader::{AsstTurnCache, LoadedModel};
+use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::prompt_frame::{AssistantPrefix, ThinkMode};
 use std::io::Write;
 use std::time::Instant;
@@ -2055,7 +2056,10 @@ pub fn generate_gemma4(
     // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -2266,7 +2270,10 @@ pub fn generate_gemma4(
     // avoids that, which is how the numbers above were taken.
     let eagle_active = bundle.eagle.is_some()
         && temp <= 1e-6
-        && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() == Some("1");
+        && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
+            .ok()
+            .as_deref()
+            == Some("1");
     if eagle_active {
         let draft_len = bundle.eagle.as_ref().unwrap().draft_len;
         // Seed hidden = post-`model.norm` hidden of the last prompt position
@@ -4238,7 +4245,10 @@ pub fn generate_muse_glimmer(
     // ── Prompt build (same two-path branch as the gemma4 AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -4475,7 +4485,10 @@ pub fn generate_muse_glimmer(
             .ok()
             .as_deref()
             == Some("0");
-        let trace = hipfire_config::developer_var("HIPFIRE_GLIMMER_CACHE_TRACE").ok().as_deref() == Some("1");
+        let trace = hipfire_config::developer_var("HIPFIRE_GLIMMER_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1");
         if cache_disabled {
             // Opting out of the cache does NOT restore the CLI's per-request
             // reset — arch 14 is in the cache_capable allowlist either way, so
@@ -4642,7 +4655,10 @@ pub fn generate_muse_glimmer(
             &bundle.weights,
         );
     let fast_sample_on = hipfire_runtime::config::get().dflash_fast_sample;
-    let temp_spec_env_off = hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
+    let temp_spec_env_off = hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
+        .ok()
+        .as_deref()
+        == Some("0");
     let spec_mode = glimmer_spec_admission(
         bundle.drafter.is_some(),
         max_tokens,
@@ -4661,7 +4677,9 @@ pub fn generate_muse_glimmer(
     // Shared by native AR, profit probes, and post-retirement AR tail.
     let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
     let gpu_sample = !matches!(
-        hipfire_config::developer_var("HIPFIRE_GLIMMER_GPU_SAMPLE").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_GLIMMER_GPU_SAMPLE")
+            .ok()
+            .as_deref(),
         Some("0")
     );
     let mut gpu_rng: u32 = (rng.next_u64() as u32) | 1;
@@ -4681,7 +4699,9 @@ pub fn generate_muse_glimmer(
         .ok()
         .as_deref()
         == Some("0");
-    let profit_guard_diag_off = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref()
+    let profit_guard_diag_off = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG")
+        .ok()
+        .as_deref()
         == Some("1")
         || hipfire_config::developer_var("HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT")
             .ok()
@@ -4783,8 +4803,10 @@ pub fn generate_muse_glimmer(
         if !skip_spec_loop {
             loop {
                 let t_window = std::time::Instant::now();
-                let do_window_timing =
-                    hipfire_config::developer_var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
+                let do_window_timing = hipfire_config::developer_var("HIPFIRE_GLIMMER_TIMING")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
                 if generated_count >= max_tokens {
                     break;
                 }
@@ -5079,7 +5101,10 @@ pub fn generate_muse_glimmer(
                 let t_after_drafter = t_window.elapsed();
                 // Bring-up diagnostic: HIPFIRE_GLIMMER_SPEC_DIAG=1 — device mode
                 // does not require/download host hidden; print backend + logical length.
-                if hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref() == Some("1")
+                if hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
                     && windows < 2
                 {
                     let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
@@ -5962,7 +5987,10 @@ pub fn generate_lfm2moe(
         // Jinja default-ON (flipped 2026-06-09): render through the model's chat
         // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
         // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -6349,7 +6377,10 @@ pub fn generate_minimax(
         // jinja on for both (falls back to Plain only when the .hfq carries no
         // template).
         // Jinja default-ON (flipped 2026-06-09); opt out with HIPFIRE_JINJA_CHAT=0.
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -6513,7 +6544,11 @@ pub fn generate_minimax(
             // the degenerate pure-extension case (rewind is then a no-op).
             let cache_hit = lcp > 0 && lcp < prompt_ids.len();
             let partial = lcp < prior_len;
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
                 eprintln!(
                 "[minimax-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
                 prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
@@ -6772,7 +6807,10 @@ pub fn generate_cohere2moe(
         // (b) never matches across turns so the LCP prompt-cache is dead. Force
         // jinja on (falls back to Plain only when the .hfq carries no template).
         // Jinja default-ON; opt out with HIPFIRE_JINJA_CHAT=0.
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -6826,7 +6864,11 @@ pub fn generate_cohere2moe(
             match render_result {
                 Ok(rendered) => {
                     primed_think = rendered.trim_end().ends_with("<think>");
-                    if hipfire_config::developer_var("HIPFIRE_C2M_DUMP_PROMPT").ok().as_deref() == Some("1") {
+                    if hipfire_config::developer_var("HIPFIRE_C2M_DUMP_PROMPT")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
                         let ids = tokenizer.encode(&rendered);
                         eprintln!(
                             "[c2m prompt dump] rendered chars={} tokens={}\n>>> HEAD(400):\n{}\n>>> TAIL(800):\n{}\n<<< end",
@@ -6937,7 +6979,11 @@ pub fn generate_cohere2moe(
         // the degenerate pure-extension case (rewind is then a no-op).
         let cache_hit = lcp > 0 && lcp < prompt_ids.len();
         let partial = lcp < prior_len;
-        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             eprintln!(
                 "[cohere2moe-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
                 prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
@@ -8456,4 +8502,652 @@ fn maple_argmax(logits: &[f32], vocab_size: usize) -> u32 {
         }
     }
     best as u32
+}
+
+/// Spark-X2.5 (arch_id=16) ordinary AR path.
+///
+/// Mirrors `generate_lfm2moe` / `generate_maple` shape:
+/// JinjaChatFrame (enable_thinking, NO tools), cold-reset every turn,
+/// per-token prefill, host-side sample_token, EOS/stop/reasoning, JSONL
+/// token/done. No early-route, batch, EP, or DFlash.
+///
+/// Spark is excluded from `GenerationRoute::supports_tools`: `tools` is not a
+/// parameter (the dispatch refuses tool-bearing requests) and tool-bearing
+/// history is refused before rendering. A failed official-template render is a
+/// terminal error, never a Plain fallback (the fallback cannot replay
+/// history). Sampling is temp/top_p/top_k only: non-neutral min_p or
+/// repeat/presence/frequency penalties fail closed. `max_think_tokens` is
+/// enforced by splicing the tokenized close sequence through KV (qwen-AR
+/// think-cap pattern), never by client-side relabeling.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_spark25(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    // Spark's host sampler honors temp/top_p/top_k only: any non-neutral
+    // value below fails closed (see the validation block).
+    repeat_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    max_tokens: usize,
+    max_think_tokens: usize,
+    assistant_prefix: AssistantPrefix,
+    enable_thinking: bool,
+    stop: &[String],
+    request_seed: u32,
+) {
+    let tokenizer = match m.tokenizer.as_ref() {
+        Some(t) => t,
+        None => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "tokenizer not loaded",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    };
+    if m.spark25().is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "spark25 state missing on arch_id=16 generate",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // Fail-closed sampling contract. The host sampler below
+    // (`deepseek4::sampling::sample_token`) honors temp/top_p/top_k only, so a
+    // non-neutral value for any other control is an unsupported request, not a
+    // silently droppable knob. Neutrals match the dispatch definitions
+    // (`dflash_min_p_present`, `nonneutral_penalties` in ar.rs): min_p
+    // unset/<=0, repeat_penalty == 1.0, presence/frequency == 0.0.
+    if min_p.map(|p| p > 0.0).unwrap_or(false) {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "spark25 does not support min_p (got {}); request min_p=0 or omit it",
+                min_p.unwrap_or(0.0)
+            ),
+            "unsupported",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    if repeat_penalty != 1.0 {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "spark25 does not support repeat_penalty (got {repeat_penalty}); \
+                 request repeat_penalty=1.0 or omit it"
+            ),
+            "unsupported",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    if presence_penalty != 0.0 {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "spark25 does not support presence_penalty (got {presence_penalty}); \
+                 request presence_penalty=0.0 or omit it"
+            ),
+            "unsupported",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+    if frequency_penalty != 0.0 {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "spark25 does not support frequency_penalty (got {frequency_penalty}); \
+                 request frequency_penalty=0.0 or omit it"
+            ),
+            "unsupported",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // Spark is excluded from `GenerationRoute::supports_tools`, and the
+    // dispatch refuses non-empty `tools` before this path runs. Tool-bearing
+    // HISTORY would still reach the Jinja render below, where the pinned
+    // template's `.function.*` probes fail on the runtime's flat `ToolCall`
+    // shape. Fail closed before rendering instead of dropping history.
+    if let Some(history) = messages_history {
+        let tool_bearing = history.iter().any(|msg| {
+            !msg.tool_calls.is_empty()
+                || matches!(msg.role, hipfire_runtime::prompt_frame::Role::Tool)
+        });
+        if tool_bearing {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "spark25 does not support tool history (tool_calls or tool-role messages); \
+                 request without tools",
+                "unsupported",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    }
+
+    let mut primed_think = false;
+    let prompt_ids: Vec<u32> = if let Some(template) = m.chat_template.as_ref() {
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking,
+            bos_token: None,
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let rendered = if messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages_slice: &[hipfire_runtime::prompt_frame::Message] = match messages_history {
+                Some(h) if !h.is_empty() => h,
+                _ => {
+                    let mut v = Vec::new();
+                    if let Some(sys) = system_prompt {
+                        v.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: sys.to_string(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                    }
+                    v.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        tool_plan: String::new(),
+                    });
+                    synthesized = v;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages_slice, None, None)
+        } else {
+            frame.render()
+        };
+        match rendered {
+            Ok(rendered) => {
+                primed_think = rendered.trim_end().ends_with("<think>");
+                tokenizer.encode(&rendered)
+            }
+            Err(e) => {
+                // Fail closed: the template is the official prompt path, and the
+                // Plain fallback cannot replay history — falling back would
+                // silently discard prior turns.
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &format!("spark25 chat template render failed: {e}"),
+                    "validation",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return;
+            }
+        }
+    } else {
+        // No official template: the Plain frame carries system + latest user
+        // turn only, so a multi-turn history would be silently dropped.
+        if messages_history.is_some_and(|h| !h.is_empty()) {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "spark25 multi-turn history requires a chat template, and this arch-16 container embeds none \
+                 — re-convert with tokenizer_config.chat_template or request a single turn",
+                "unsupported",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return;
+        }
+        primed_think = matches!(
+            assistant_prefix,
+            hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+        );
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: system_prompt,
+            user: prompt,
+            assistant_prefix,
+            raw: false,
+        }
+        .build()
+    };
+
+    if prompt_ids.is_empty() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "empty prompt after tokenize",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let eos_tok = m.spark25().unwrap().eos_tok;
+    // Config eos is 1; also catch common chat/end tokens via single-id encode.
+    let stop_toks: Vec<u32> = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        let mut v = vec![eos_tok, hipfire_arch_spark25::SPARK25_EOS_FALLBACK];
+        for s in [
+            "<eos>",
+            "<|im_end|>",
+            "</s>",
+            "<|endoftext|>",
+            "<end_of_turn>",
+        ] {
+            let ids = tk.encode(s);
+            if ids.len() == 1 && !v.contains(&ids[0]) {
+                v.push(ids[0]);
+            }
+        }
+        v.dedup();
+        v
+    };
+
+    let cap = m.spark25().unwrap().state.max_seq;
+    // Occupied decode positions are prompt + completions - 1: the final
+    // sampled token needs no feedback position of its own (the mid-decode
+    // guard below stops at max_seq instead). saturating_sub keeps
+    // max_tokens == 0 (prompt-only zero-token terminal) from underflowing.
+    if prompt_ids
+        .len()
+        .saturating_add(max_tokens.saturating_sub(1))
+        > cap
+    {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "prompt exceeds context capacity: prompt={} + max_tokens={} > capacity={} \
+                 — reload model with a larger max_seq",
+                prompt_ids.len(),
+                max_tokens,
+                cap
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // REQUIRED cold-reset every turn (session lifecycle). Full conversation is
+    // re-rendered into the prompt; retaining prior KV would leak across requests.
+    if let Err(e) = m.spark25_mut().unwrap().reset_session_state(gpu) {
+        emit_error_with_id(stdout, id, format!("spark25 state reset failed: {e}"));
+        let _ = stdout.flush();
+        return;
+    }
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
+    let t0 = Instant::now();
+
+    // Prefill: per-token decode_step; last-position logits seed decode.
+    // No abort check while holding the bundle mut-borrow (maple/minimax style).
+    let mut last_logits: Vec<f32> = Vec::new();
+    {
+        let b = m.spark25_mut().unwrap();
+        let cfg = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        let mut position = state.n_tokens as u32;
+        for &tok in &prompt_ids {
+            match hipfire_arch_spark25::forward::decode_step(
+                cfg, weights, state, gpu, tok, position,
+            ) {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("spark25 prefill failed: {e}"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+            position += 1;
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let t_prefill = Instant::now();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+
+    emit_gen_start(
+        stdout,
+        id,
+        primed_think,
+        crate::common::gen_start_contract_version_for_arch(16),
+    );
+
+    let top_k_host = top_k.map(|k| k as usize).unwrap_or(0);
+    let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
+    let mut generated_count: usize = 0;
+    let mut hit_eos = false;
+    let mut hit_stop = false;
+    let mut streamed_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut bytes_emitted: usize = 0;
+    // Qwen3-class <think> markers (Spark template is qwen3 reasoning compatible).
+    let mut think_router = MapleThoughtRouter::new(primed_think, max_think_tokens);
+    let mut think_close_injected = false;
+    let decode_t0 = Instant::now();
+
+    loop {
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+        if generated_count >= max_tokens {
+            break;
+        }
+        let next_tok =
+            deepseek4::sampling::sample_token(&last_logits, temp, top_k_host, top_p, &mut rng);
+        if stop_toks.contains(&next_tok) {
+            hit_eos = true;
+            break;
+        }
+
+        let mut think_cap_hit = false;
+        streamed_tokens.push(next_tok);
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        let pending = &all_bytes[bytes_emitted.min(all_bytes.len())..];
+        let valid_len = match std::str::from_utf8(pending) {
+            Ok(_) => pending.len(),
+            Err(e) if e.error_len().is_none() => e.valid_up_to(),
+            Err(_) => pending.len(),
+        };
+        if valid_len > 0 {
+            let frag = String::from_utf8_lossy(&pending[..valid_len]).into_owned();
+            bytes_emitted += valid_len;
+            // Request stop sequences (string suffix over full decoded stream).
+            if !stop.is_empty() {
+                let decoded_suffix = tokenizer.decode(&streamed_tokens);
+                if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
+                    hit_stop = true;
+                    // Emit up to but not including the stop string? Emit the
+                    // fragment then break — client sees the stop tail; common
+                    // AR path breaks without stripping. Match that.
+                    let envelope = serde_json::json!({
+                        "type": "token",
+                        "id": id,
+                        "text": frag,
+                        "attempt_id": active_attempt_id(),
+                    });
+                    let _ = writeln!(stdout, "{}", envelope);
+                    let _ = stdout.flush();
+                    m.conversation_tokens.push(next_tok);
+                    generated_count += 1;
+                    break;
+                }
+            }
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": frag,
+                "attempt_id": active_attempt_id(),
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+            // max_think_tokens enforcement: the router only DETECTS the cap
+            // here. The actual close is spliced through KV after this token's
+            // decode step below (qwen-AR think-cap pattern) — never
+            // client-side relabeling.
+            think_cap_hit = think_router.observe(&frag).is_some();
+        } else {
+            let frag = String::from_utf8_lossy(pending).into_owned();
+            if frag.contains("<think>") || frag.contains("</think>") {
+                think_cap_hit = think_router.observe(&frag).is_some();
+            }
+        }
+
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+
+        let step = {
+            let b = m.spark25_mut().unwrap();
+            let cfg = &b.config;
+            let weights = &b.weights;
+            let state = &mut b.state;
+            if state.n_tokens >= state.max_seq {
+                // Capacity guard mid-decode — stop cleanly with the just-emitted token.
+                None
+            } else {
+                let position = state.n_tokens as u32;
+                Some(hipfire_arch_spark25::forward::decode_step(
+                    cfg, weights, state, gpu, next_tok, position,
+                ))
+            }
+        };
+        match step {
+            None => break,
+            Some(Ok(logits)) => last_logits = logits,
+            Some(Err(e)) => {
+                emit_error_with_id(stdout, id, format!("spark25 decode failed: {e}"));
+                let _ = stdout.flush();
+                return;
+            }
+        }
+        // Think-cap splice (established qwen-AR/vision pattern): when the cap
+        // fired this iteration, feed the actual tokenized close sequence
+        // through the same KV-write + emit + history path as a sampled token,
+        // so the model continues conditioned on a closed think block. Clipped
+        // to the remaining max_tokens budget: with no room for the full
+        // close, or when think re-opens after the forced close, terminate
+        // safely with the committed prefix instead of pretending the answer
+        // continues with unclosed KV.
+        if think_cap_hit && !think_close_injected {
+            think_close_injected = true;
+            let close_tokens = {
+                let tokenizer = m.tokenizer.as_ref().unwrap();
+                tokenizer.encode(&think_continuation())
+            };
+            if close_tokens.is_empty()
+                || close_tokens.len() > max_tokens.saturating_sub(generated_count)
+            {
+                break;
+            }
+            let mut splice_truncated = false;
+            for &t in &close_tokens {
+                let step = {
+                    let b = m.spark25_mut().unwrap();
+                    let cfg = &b.config;
+                    let weights = &b.weights;
+                    let state = &mut b.state;
+                    if state.n_tokens >= state.max_seq {
+                        // KV full: terminate safely with the committed prefix.
+                        None
+                    } else {
+                        let position = state.n_tokens as u32;
+                        Some(hipfire_arch_spark25::forward::decode_step(
+                            cfg, weights, state, gpu, t, position,
+                        ))
+                    }
+                };
+                match step {
+                    None => {
+                        splice_truncated = true;
+                        break;
+                    }
+                    Some(Ok(logits)) => {
+                        last_logits = logits;
+                        streamed_tokens.push(t);
+                        m.conversation_tokens.push(t);
+                        generated_count += 1;
+                    }
+                    Some(Err(e)) => {
+                        emit_error_with_id(
+                            stdout,
+                            id,
+                            format!("spark25 think-close splice failed: {e}"),
+                        );
+                        let _ = stdout.flush();
+                        return;
+                    }
+                }
+            }
+            // Emit the spliced close as one envelope and advance the UTF-8
+            // carry over the extended stream: the delta from bytes_emitted is
+            // exactly the close text.
+            {
+                let tokenizer = m.tokenizer.as_ref().unwrap();
+                let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+                if bytes_emitted < all_bytes.len() {
+                    let frag = String::from_utf8_lossy(&all_bytes[bytes_emitted..]).into_owned();
+                    bytes_emitted = all_bytes.len();
+                    let envelope = serde_json::json!({
+                        "type": "token",
+                        "id": id,
+                        "text": frag,
+                        "attempt_id": active_attempt_id(),
+                    });
+                    let _ = writeln!(stdout, "{}", envelope);
+                    let _ = stdout.flush();
+                }
+            }
+            if splice_truncated {
+                break;
+            }
+        } else if think_cap_hit {
+            // Think re-opened after the forced close: terminate safely rather
+            // than looping the cap.
+            break;
+        }
+    }
+
+    // Flush UTF-8 carry at end of stream.
+    if !streamed_tokens.is_empty() {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
+        if bytes_emitted < all_bytes.len() {
+            let frag = String::from_utf8_lossy(&all_bytes[bytes_emitted..]).into_owned();
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": frag,
+                "attempt_id": active_attempt_id(),
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
+    }
+
+    if check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        return;
+    }
+
+    m.seq_pos = m.spark25().unwrap().state.n_tokens;
+
+    let t_end = Instant::now();
+    let decode_s = t_end.duration_since(decode_t0).as_secs_f64();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
+    let tok_s = rate(generated_count, total_s);
+    let prefill_tok_s = rate(prompt_ids.len(), prefill_s);
+    let decode_tok_s = rate(generated_count, decode_s);
+
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let tool_calls = if hit_eos {
+        hipfire_runtime::emit_text::extract_tool_calls_from_text(
+            &tokenizer.decode(&streamed_tokens),
+        )
+    } else {
+        Vec::new()
+    };
+    let finish_reason = if hit_stop {
+        "stop"
+    } else if !hit_eos {
+        "length"
+    } else if !tool_calls.is_empty() {
+        "tool_calls"
+    } else {
+        "stop"
+    };
+
+    let mut pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 10.0).round() / 10.0,
+        "prefill_tokens": prompt_ids.len(),
+        "prefill_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+        "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
+        "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+        "ttft_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,
+        "total_ms": ((total_s * 1000.0) * 10.0).round() / 10.0,
+        "finish_reason": finish_reason,
+        "attempt_id": active_attempt_id(),
+    });
+    hipfire_engine::emit::stage_terminal_tool_calls(&mut pending_done, finish_reason, &tool_calls);
+    hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
+    let _ = stdout.flush();
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Abort => {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
+    }
 }

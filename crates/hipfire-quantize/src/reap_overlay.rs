@@ -483,6 +483,8 @@ fn tensor_matches(name: &str, arch: ReapArch, ov: &QuantOverride) -> bool {
             name == "embed.weight"
                 || name.contains("embed_tokens")
                 || name.contains("tok_embeddings")
+                || name.contains("word_embeddings")
+                || name.contains("model.embedding")
         }
     }
 }

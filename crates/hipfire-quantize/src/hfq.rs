@@ -439,8 +439,12 @@ pub(crate) fn kmap_resolve_mode(
     }
 
     // Rule 2: embeddings, lm_head, output projection
+    // Spark uses model.embedding; Maple uses word_embeddings; LLaMA embed_tokens.
     if name.contains("embed_tokens")
         || name.contains("token_embd")
+        || name.contains("word_embeddings")
+        || name.contains(".embedding.")
+        || name.ends_with(".embedding.weight")
         || name.contains("lm_head")
         || name.ends_with("output.weight")
     {

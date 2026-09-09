@@ -2205,6 +2205,72 @@ impl Gpu {
         result
     }
 
+    /// Headwise broadcast `x *= sigmoid(gate)`: `x[h*head_dim+j] *=
+    /// sigmoid(gate[h])` in place, where `n_heads = gate.numel()` and
+    /// `x.numel() == n_heads * head_dim`. Spark-X2.5's attention output gate
+    /// (`g_proj`: one scalar per head, e.g. 16 scalars over q_dim 4096 with
+    /// head_dim 256) broadcasts over each contiguous head before `out_proj`.
+    /// Per-lane math is bit-identical to `sigmoid_mul_f32`; only the gate
+    /// indexing differs — NEVER an elementwise gate of `x.numel()` lanes.
+    /// Graph-safe via `launch_maybe_blob`, like `sigmoid_mul_f32`.
+    pub fn sigmoid_mul_broadcast_f32(
+        &mut self,
+        x: &GpuTensor,
+        gate: &GpuTensor,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "sigmoid_mul_broadcast",
+            kernels::SIGMOID_MUL_BROADCAST_SRC,
+            "sigmoid_mul_broadcast_f32",
+        )?;
+        let n_heads = gate.numel();
+        assert!(
+            head_dim > 0,
+            "sigmoid_mul_broadcast_f32: head_dim must be nonzero"
+        );
+        assert_eq!(
+            x.numel(),
+            n_heads * head_dim,
+            "sigmoid_mul_broadcast_f32: x.numel() must equal gate.numel() * head_dim"
+        );
+        let mut xp = x.buf.as_ptr();
+        let mut gp = gate.buf.as_ptr();
+        let mut n = x.numel() as i32;
+        let mut hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut n as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise1_bytes(n as usize) * 3;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "fused", "sigmoid_mul_broadcast_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "sigmoid_mul_broadcast_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(gp);
+                b.push_i32(n);
+                b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Per-row temperature-scaled softmax probability gather. For each row
     /// `r` in `[0, n_rows)`, returns `probs_out[r] = softmax(logits[r] / temp)[indices[r]]`
     /// — i.e., the softmax probability of the specified token id in that
@@ -4837,6 +4903,65 @@ impl Gpu {
                 &mut params,
             )
         }
+    }
+
+    /// Exact-erf gated GELU: out[i] = gelu_erf(gate[i]) * up[i] with
+    /// gelu_erf(x) = 0.5*x*(1+erf(x/sqrt(2))) — HF `ACT2FN["gelu"]`, the MLP
+    /// activation Spark-X2.5 uses. NOT the tanh approximation (`gelu_tanh_f32`,
+    /// HF `gelu_pytorch_tanh`); the two differ by up to ~1e-3 mid-range.
+    /// Fused to avoid an intermediate buffer; `out` may alias `gate`/`up`
+    /// (each element is read once before it is written). Graph-safe via
+    /// `launch_maybe_blob`, like `silu_mul_f32`.
+    pub fn gelu_erf_mul_f32(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gelu_erf_mul",
+            kernels::GELU_ERF_MUL_SRC,
+            "gelu_erf_mul_f32",
+        )?;
+
+        let n = gate.numel() as i32;
+        let mut gate_ptr = gate.buf.as_ptr();
+        let mut up_ptr = up.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut n_val = n;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gate_ptr as *mut _ as *mut c_void,
+            &mut up_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "gelu_erf_mul_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "gelu_erf_mul_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gate_ptr);
+                b.push_ptr(up_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Bias-add: x[batch, n] += bias[n] (in-place, broadcast over batch dim)

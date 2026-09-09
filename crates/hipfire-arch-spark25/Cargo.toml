@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-arch-spark25"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Spark-X2.5-4B architecture (hybrid 3:1 sliding/full attention, dual RoPE partial/full, headwise sigmoid-gated attention, exact-GELU SwiGLU, tied embedding) for hipfire"
+
+[features]
+default = ["deltanet"]
+deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+
+[dependencies]
+hipfire-config = { path = "../hipfire-config" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true

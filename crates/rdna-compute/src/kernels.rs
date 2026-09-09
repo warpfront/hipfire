@@ -3430,7 +3430,6 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_MW_LDS_SRC: &str =
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_LDSSTAGE_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage.hip");
 
-
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma.hip");
 pub const GEMM_GATE_UP_MQ6G256V2_WMMA_SRC: &str =
@@ -4977,6 +4976,12 @@ pub const SILU_SRC: &str = include_str!("../../../kernels/src/silu.hip");
 /// Saves one kernel launch + one intermediate buffer.
 pub const SILU_MUL_SRC: &str = include_str!("../../../kernels/src/silu_mul.hip");
 
+/// Exact-erf gated GELU: out[i] = gelu_erf(gate[i]) * up[i] with
+/// gelu_erf(x) = 0.5*x*(1+erf(x/sqrt(2))) — HF `ACT2FN["gelu"]`, the MLP
+/// activation Spark-X2.5 uses. NOT the tanh approximation (`GELU_TANH_SRC`,
+/// HF `gelu_pytorch_tanh`); kept separate so the formulas cannot be confused.
+pub const GELU_ERF_MUL_SRC: &str = include_str!("../../../kernels/src/gelu_erf_mul_f32.hip");
+
 /// FLUX VAE decoder kernels (f32, channel-major `[c][h][w]`, correctness-
 /// first companions of the CPU `hipfire_arch_diffusion::vae` reference).
 /// `vae_conv3x3` is 3x3 stride-1 pad-1; `vae_conv1x1` is a per-pixel linear
@@ -5636,6 +5641,13 @@ pub const FUSED_SIGMOID_ALPHA_GATE_SRC: &str =
 /// Fused sigmoid(gate) * x — the FA attention epilogue that used to be
 /// `sigmoid_f32(gate)` + `mul_f32(attn_out, gate, attn_out)`.
 pub const SIGMOID_MUL_SRC: &str = include_str!("../../../kernels/src/sigmoid_mul.hip");
+
+/// Headwise broadcast sigmoid gate: x[h*head_dim+j] *= sigmoid(gate[h]).
+/// Per-lane math is bit-identical to `SIGMOID_MUL_SRC`; only the gate
+/// indexing differs (one scalar per contiguous head, e.g. Spark-X2.5's
+/// 16-element attention output gate over q_dim = n_heads * head_dim).
+pub const SIGMOID_MUL_BROADCAST_SRC: &str =
+    include_str!("../../../kernels/src/sigmoid_mul_broadcast_f32.hip");
 
 /// Top-K=128 extraction over a logits vector. Lets the host sampler work
 /// on a 1 KB GPU-side candidate set instead of DtoH'ing the full 600 KB

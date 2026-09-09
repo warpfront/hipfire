@@ -182,6 +182,7 @@ one** matching carrier (zero → error; two → ambiguous error).
 | `MinimaxCarrier` | 10 | `hipfire-arch-minimax` |
 | `Lfm2MoeCarrier` | 11 | `hipfire-arch-lfm2moe` |
 | `Cohere2MoeCarrier` | 12 | `hipfire-arch-cohere2moe` |
+| `Spark25Carrier` | 16 | `hipfire-arch-spark25` (Spark-X2.5 hybrid GQA; ordinary AR only) |
 
 Canonical numeric registry: [`architecture-ids.md`](architecture-ids.md).
 
@@ -218,6 +219,7 @@ the facade/re-export plus bring-up/carrier surface. Other runtime-owned pieces
 | `hipfire-arch-minimax` | MiniMax-M2 MoE |
 | `hipfire-arch-lfm2moe` | LFM2.5 dense + LFM2.5-MoE hybrid short-conv / GQA |
 | `hipfire-arch-cohere2moe` | Cohere2-MoE / North-Mini-Code |
+| `hipfire-arch-spark25` | Spark-X2.5 hybrid sliding/full GQA + headwise sigmoid gate; dense AR only |
 | `hipfire-arch-diffusion` | Latent image diffusion: FLUX.1 MMDiT (40) and FLUX.2 Klein (45) — components, not chat trunks |
 | `hipfire-arch-toy` | Template only (`arch_id = 0xFF`); daemon must not dispatch |
 

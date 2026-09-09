@@ -60,6 +60,25 @@ pub(crate) fn should_quantize(name: &str) -> bool {
     name.contains("weight")
 }
 
+/// True for the token embedding table that must stay Q8 under MQ* formats.
+///
+/// Covers HF conventions:
+/// - `*embed_tokens*` (LLaMA/Qwen/Gemma/Glimmer/…)
+/// - `model.embedding.weight` (Spark-X2.5 tied head; exact segment, not
+///   `pos_embed` / `patch_embedding`)
+/// - `*word_embeddings*` (Maple)
+/// - GGUF `token_embd`
+pub(crate) fn is_embed_tensor(name: &str) -> bool {
+    name.contains("embed_tokens")
+        || name.contains("token_embd")
+        || name.contains("word_embeddings")
+        // Spark-X2.5: `model.embedding.weight`. Require the `.embedding.`
+        // path segment so vision `pos_embed` / `patch_embedding` stay out.
+        || name.contains(".embedding.")
+        || name.ends_with(".embedding.weight")
+        || name == "embedding.weight"
+}
+
 pub(crate) fn is_deepseek4_keep_f16(name: &str) -> bool {
     name.ends_with(".compressor.wkv.weight")
         || name.ends_with(".compressor.wgate.weight")
@@ -549,6 +568,32 @@ mod product_tier_tests {
         // embed
         assert_eq!(q8_class_of("model.embed_tokens.weight"), Some("embed"));
         assert_eq!(q8_class_of("embed.weight"), Some("embed"));
+        assert!(is_embed_tensor("model.embed_tokens.weight"));
+        assert!(is_embed_tensor("model.language_model.embed_tokens.weight"));
+        assert!(is_embed_tensor("model.embedding.weight"));
+        assert!(is_embed_tensor("model.word_embeddings.weight"));
+        assert!(!is_embed_tensor("model.layers.0.self_attn.g_proj.weight"));
+        assert!(!is_embed_tensor(
+            "model.layers.0.self_attn.q_k_v_proj.weight"
+        ));
+        assert_eq!(
+            q8_class_of("model.embedding.weight"),
+            Some("embed"),
+            "Spark tied embed table is class embed"
+        );
+        assert_eq!(
+            q8_class_of("model.layers.0.self_attn.g_proj.weight"),
+            Some("attn"),
+            "Spark headwise g_proj is attn-gate class, not router/mlp"
+        );
+        assert_eq!(
+            q8_class_of("model.layers.0.self_attn.q_k_v_proj.weight"),
+            Some("attn")
+        );
+        assert_eq!(
+            q8_class_of("model.layers.0.self_attn.out_proj.weight"),
+            Some("attn")
+        );
         // router
         assert_eq!(q8_class_of("layers.0.mlp.gate.weight"), Some("router"));
         // ssm_out most-specific before attn

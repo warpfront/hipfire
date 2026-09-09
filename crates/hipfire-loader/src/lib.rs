@@ -367,6 +367,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Lfm2MoeCarrier,
     &Cohere2MoeCarrier,
     &MapleCarrier,
+    &Spark25Carrier,
     &Gemma4Carrier,
     &MuseGlimmerCarrier,
     &FluxDiffusionCarrier,
@@ -1173,6 +1174,19 @@ impl LoadedModel {
         self.state
             .as_deref_mut()
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_maple::MapleBundle>())
+    }
+
+    /// Spark-X2.5 bundle if this model is arch_id=16, else None.
+    pub fn spark25(&self) -> Option<&hipfire_arch_spark25::Spark25Bundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_spark25::Spark25Bundle>())
+    }
+
+    pub fn spark25_mut(&mut self) -> Option<&mut hipfire_arch_spark25::Spark25Bundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_spark25::Spark25Bundle>())
     }
 
     /// DeepSeek V4 bundle if this model is a single-GPU arch_id=9, else None.
@@ -4229,6 +4243,10 @@ mod registry_tests {
             (11, false, "lfm2moe"),
             (12, false, "cohere2moe"),
             (40, false, "flux"),
+            (15, false, "maple"),
+            (15, true, "maple"),
+            (16, false, "spark2_5"),
+            (16, true, "spark2_5"),
             (40, true, "flux"),
             (45, false, "flux"),
             (45, true, "flux"),
@@ -4366,6 +4384,8 @@ mod registry_tests {
             "cohere2moe",
             "gemma4",
             "muse_glimmer",
+            "maple",
+            "spark2_5",
         ] {
             let c = REGISTRY.iter().find(|c| c.name() == name).unwrap();
             assert!(
@@ -4462,6 +4482,20 @@ mod registry_tests {
             ArchCaps {
                 reasoning_contract: ReasoningContract::MuseGlimmer,
                 semantic_contract_version: Some(2),
+                ..text_only
+            }
+        );
+        assert_eq!(
+            caps_of("maple"),
+            ArchCaps {
+                reasoning_contract: ReasoningContract::QwenJinja,
+                ..text_only
+            }
+        );
+        assert_eq!(
+            caps_of("spark2_5"),
+            ArchCaps {
+                reasoning_contract: ReasoningContract::QwenJinja,
                 ..text_only
             }
         );

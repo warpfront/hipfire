@@ -44,6 +44,7 @@ hipfire-arch-lfm2-vl = { path = "../hipfire-arch-lfm2-vl" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
 hipfire-arch-maple = { path = "../hipfire-arch-maple" }
+hipfire-arch-spark25 = { path = "../hipfire-arch-spark25" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
 base64 = "0.22"

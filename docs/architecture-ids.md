@@ -33,9 +33,10 @@ remain fail-closed for every route outside that exact row; source-derived routin
 | 13 | Gemma 4 (dense text) | `hipfire-arch-gemma4` | `Gemma4Carrier` | Hybrid 5:1 sliding(RoPE θ=10k, hd 256)/full(partial RoPE θ=1e6, hd 512, K=V sharing) GQA, sandwich RMSNorm + `layer_scalar`, gelu_pytorch_tanh SwiGLU, tied lm_head, final logit softcap 30. Dir `gemma4` / `gemma4_text` → 13. Carrier also claims 22. |
 | 14 | Muse Glimmer (dense text) | `hipfire-arch-muse-glimmer` | `MuseGlimmerCarrier` | 3:1 sliding(RoPE θ=500k, SWA 2048)/full(**NoPE**, `layer_rope_theta[i]==0`) GQA 32:2 hd 128, sandwich RMSNorm (`rms_norm_eps` 1e-5 pre / `post_norm_eps` 1e-8 post), scale-less QK-norm + `qk_scale_factor` 3.87, `self_attn.gate_proj` gated attention, silu SwiGLU, **untied** lm_head, `output_multiplier` 0.196116 then softcap 20. Dir `muse_glimmer` / `muse_glimmer_text` → 14. Carrier claims 14 only; the arch-23 drafter rides `HIPFIRE_DFLASH_DRAFT`. `pp>1` and `params.drafter` are refused. |
 | 15 | Maple-Preview (natively-ternary MoE) | `hipfire-arch-maple` | `MapleCarrier` | 3:1 sliding(RoPE θ=10k, SWA 512)/full(**NoPE**, `nope_on_global_attention`) GQA 16:4 hd 128, **QK-norm applied BEFORE RoPE**, **partial rotary 0.5** (first 64 of 128 dims), MoE on EVERY layer (256 experts top-8, `moe_intermediate_size` 512, no shared experts, softmax→topk→renorm), **clamped SwiGLU** `silu(clamp(gate,max=7))*clamp(up,-7,7)`, **untied** lm_head, embedding tensor is `model.word_embeddings` (not `embed_tokens`). Weights are natively ternary and carried losslessly by qt=51 `MQ2G256LloydU`; `intermediate_size` 4096 and `quantize`/`preaffine` are dead keys. Dir `maple` → 15. |
+| 16 | Spark-X2.5 (dense text) | `hipfire-arch-spark25` | `Spark25Carrier` | 3:1 sliding(RoPE θ=1e4, SWA 512, hd 256 full)/full(partial RoPE θ=5e6, prf 0.25 → 64 rot dims) GQA 16:4 hd 256, **no** QK-norm/sandwich/layer_scalar/output scales. Fused `self_attn.q_k_v_proj` [q+k+v, hidden], headwise `g_proj` [n_heads, hidden] sigmoid gate before `out_proj`, exact-erf GELU SwiGLU, **tied** head via `model.embedding` (no `lm_head` tensor). Dir `model_type`/`architectures` `spark2_5` / `Spark2_5ForCausalLM` → 16 only (no alias). |
 
-Ids **2–4** are unused in the carrier registry (not claimed). Do not invent
-assignments without a carrier + source mapping.
+Ids **2–4** and **17–19** are unused in the carrier registry (not claimed). Do not invent
+assignments without a carrier + source mapping. Id **16** is Spark-X2.5.
 
 ## Sidecar / reserved ids
 
@@ -54,10 +55,10 @@ them for ordinary dispatch.
 ## Image-generation component ids (40–47)
 
 Diffusion checkpoints are **components, not chat models**: loadable for image
-generation, never text-served. The block is deliberately **high** — ids 16–19
-stay free for the next sequential primary text arches, which a component
-claim would silently collide with (the registry disjointness sweep covers
-0..=64, so 40+ is still test-enforced).
+generation, never text-served. The block is deliberately **high** — ids 17–19
+stay free for the next sequential primary text arches (16 is Spark-X2.5), which a
+component claim would silently collide with (the registry disjointness sweep
+covers 0..=64, so 40+ is still test-enforced).
 
 The block is **grouped by family, extension-only**: FLUX.1 owns 40–43 (trunk +
 its two text encoders + the VAE it shares with FLUX.2), FLUX.2 owns 45–46 (44
@@ -86,7 +87,7 @@ sidecars next to the trunk file; no carrier claims a sidecar id on its own.
 | Namespace | Origin | Examples |
 |---|---|---|
 | HFQ header | `HfqFile::arch_id` written at quantize/pack time | Primary table above; sidecars 20/21 |
-| Safetensors dir | `derive_arch_id(&config)` | `llama`/`mistral`→0, `qwen3`→1, `qwen3.5`/`qwen3.6` (+experts→6 else 5), `qwen2`→7, `dots_ocr`→8, `deepseek_v4`→9, `minimax_m2`→10, `lfm2`/`lfm2_moe`/`lfm2_vl`→11 (runtime `arch_mapping.rs` MODEL_TYPE_TO_ARCH_ID also carries `lfm2_vl`), `cohere2_moe`→12 |
+| Safetensors dir | `derive_arch_id(&config)` | `llama`/`mistral`→0, `qwen3`→1, `qwen3.5`/`qwen3.6` (+experts→6 else 5), `qwen2`→7, `dots_ocr`→8, `deepseek_v4`→9, `minimax_m2`→10, `lfm2`/`lfm2_moe`/`lfm2_vl`→11, `cohere2_moe`→12, `gemma4`/`gemma4_text`→13, `muse_glimmer`→14, `maple`→15, `spark2_5`→16 (runtime `arch_mapping.rs` MODEL_TYPE_TO_ARCH_ID; longest-key substring on `architectures`) |
 
 `Carrier::claims_arch_id(arch_id, is_dir)` may distinguish the two namespaces.
 Today’s carriers are disjoint on bare id for the ids they claim; registry unit
@@ -101,7 +102,7 @@ for `0xFF`).
 | Load (single arch-dispatch) | `hipfire_loader::load_model` → `REGISTRY` probe |
 | EP load | `hipfire_loader::load_model_ep` (9, 10) |
 | Spec target / emitter by id | `hipfire_loader::carrier_for` |
-| Generate short-circuits | `crates/hipfire-daemon/src/main.rs` `generate` (EP first; then 7, 9, 11, 12, 10, 8; else qwen35/llama body) |
+| Generate short-circuits | `crates/hipfire-daemon/src/main.rs` `generate` (EP first; then 7, 9, 11, 12, 10, 8, 16 via generate route; else qwen35/llama body) |
 | Trait contract | `crates/hipfire-runtime/src/arch.rs` |
 
 Vision-capable loads: Qwen3.5-VL rides ids **5/6** with optional vision

@@ -17,6 +17,7 @@ use hipfire_engine::redline::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
 use hipfire_loader::{AsstTurnCache, LoadedModel};
+use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::spec::{
     ClientEvent, EvictRetain, FinishSummary, SpecTarget, Speculator, StopReason,
@@ -680,8 +681,12 @@ pub fn emit_committed_event(
     t_ms: u64,
 ) {
     use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1"));
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_EMIT_TOKEN_IDS")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
     if !*ENABLED {
         return;
     }
@@ -1146,6 +1151,11 @@ pub fn fail_closed_reset_target_and_spec(
         }
         if let Some(bundle) = m.muse_glimmer_mut() {
             bundle.reset_session_state();
+        }
+        if let Some(b) = m.spark25_mut() {
+            if let Err(e) = b.reset_session_state(gpu) {
+                push_reset_err(&mut first_err, "spark25.reset_session_state", e);
+            }
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             if let Some(b) = m.state.as_mut().and_then(|s| {

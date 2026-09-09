@@ -1099,6 +1099,11 @@ pub(crate) fn run() {
     // (not RMSNorm-anchored) corrupts AWQ saliency for FFN; embed/lm_head are
     // tied + scaled by √3840 making AWQ scale saliency meaningless there.
     let is_gemma4_family = arch_id == 13 || arch_id == 22;
+    // Spark-X2.5 (arch_id 16): dense 3:1 SWA hybrid. Keep HF names verbatim
+    // (fused q_k_v_proj, headwise g_proj, out_proj, model.embedding). Not
+    // MoE-like — mq4v2 / mq{2,3,5,6}v2 dense path is admitted. tie_word_embeddings
+    // means the checkpoint has no lm_head tensor to write.
+    let is_spark25 = arch_id == 16;
     let is_moe_like =
         is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
     if (use_mq6g256v2 || use_mq5g256v2 || use_mq3g256v2 || use_mq2g256v2) && is_moe_like {
@@ -1195,6 +1200,12 @@ pub(crate) fn run() {
     if is_minimax {
         eprintln!(
             "  MiniMax-M2 detected — per-expert tensors ship pre-split; quantizing each as HFQ4G256 2D weight."
+        );
+    }
+    if is_spark25 {
+        eprintln!(
+            "  Spark-X2.5 detected — dense hybrid; preserving HF names \
+             (q_k_v_proj / g_proj / out_proj / model.embedding); embed Q8; no MoE fuse."
         );
     }
     if is_cohere2moe {
@@ -5002,7 +5013,7 @@ fn handle_main_quant(
 
         // Q8HFQ path: split-metadata per-row layout (needs M and K)
         // Exclude embeddings — they use a lookup kernel, not GEMV
-        if flags.use_q8hfq && meta.shape.len() == 2 && !name.contains("embed_tokens") {
+        if flags.use_q8hfq && meta.shape.len() == 2 && !is_embed_tensor(name) {
             let m = meta.shape[0];
             let k = meta.shape[1];
             let (quantized, row_stride) = quantize_q8hfq(&f32_data, m, k);
@@ -5157,7 +5168,7 @@ fn handle_main_quant(
                     // pre-scale actively harmful.
                     debug_assert!(
                         !(flags.is_gemma4_family
-                            && (name.contains("embed_tokens") || name.contains("lm_head"))),
+                            && (is_embed_tensor(name) || name.contains("lm_head"))),
                         "gemma4 embed/lm_head reached the MQ4 AWQ path — the outer.kmap Q8 \
                              guard should have prevented this (arch {} tensor {})",
                         flags.arch_id,
@@ -5443,9 +5454,10 @@ fn handle_main_quant(
                 let this_q4as8 = flags.use_fast && !this_q8; // FFN tensors in q8-fast mode
                 let this_q4k = flags.use_q4k_all || flags.use_q4k_q8embed || flags.use_mixed;
 
-                // Embeddings stored as Q8 in HFQ4 mode — Q4 is too lossy for
-                // large-dim models (9B: dim=4096, values ~0.016, Q4 step ~0.007)
-                let is_embed = name.contains("embed_tokens");
+                // Embeddings stay Q8 under MQ* (lookup kernel; qt44 unsupported).
+                // `is_embed_tensor` covers Spark `model.embedding.weight`, not only
+                // `embed_tokens` — without it dense --format mq4v2 emitted unloadable qt44.
+                let is_embed = is_embed_tensor(name);
 
                 let tier_lift = flags
                     .product_tier
@@ -5674,6 +5686,8 @@ fn handle_main_quant(
                     || flags.use_mq4_mq2lloyd_gptq_all)
                     && is_embed
                 {
+                    // MQ4 family incl. mq4v2/qt44: official embed is qt3 Q8F16.
+                    // Linear weights fall through to MQ4G256V2 below.
                     let q = quantize_q8f16(&f32_data);
                     (q, QuantType::Q8F16, 32u32, "Q8_F16")
                 } else if flags.use_mq4g256
@@ -6539,7 +6553,7 @@ fn handle_main_quant(
                             k_dim_dbg,
                             k_dim_dbg % 256,
                             kmap_level,
-                            name.contains("embed_tokens"),
+                            is_embed_tensor(name),
                         );
                     std::process::exit(1);
                 }

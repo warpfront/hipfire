@@ -495,6 +495,11 @@ mod tests {
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2_moe" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "lfm2" })), 11);
         assert_eq!(derive_arch_id(&json!({ "model_type": "cohere2_moe" })), 12);
+        assert_eq!(derive_arch_id(&json!({ "model_type": "spark2_5" })), 16);
+        assert_eq!(
+            derive_arch_id(&json!({ "architectures": ["Spark2_5ForCausalLM"] })),
+            16
+        );
     }
 
     /// A diffusers FLUX transformer component config (`model_type: "flux"`)

@@ -1325,6 +1325,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-spark25"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-toy"
 version = "0.3.0"
 dependencies = [
@@ -1484,6 +1497,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-spark25",
  "hipfire-config",
  "hipfire-engine",
  "hipfire-loader",
@@ -1514,6 +1528,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-spark25",
  "hipfire-config",
  "hipfire-runtime",
  "rdna-compute",

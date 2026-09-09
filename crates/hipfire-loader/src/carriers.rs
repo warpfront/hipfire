@@ -1910,6 +1910,78 @@ impl Carrier for MapleCarrier {
     }
 }
 
+// ─── Spark25Carrier ──────────────────────────────────────────────────
+// spark2_5 (arch_id 16). Dense hybrid GQA AR only — no dflash/batch/EP/PP.
+// Thin Maple-style body: resolve_source_meta + load_spark25_bundle + skeleton.
+pub struct Spark25Carrier;
+impl Carrier for Spark25Carrier {
+    fn name(&self) -> &'static str {
+        "spark2_5"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 16
+    }
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        _is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        if pp > 1 {
+            return Err("spark2_5: pp>1 unsupported via registry".into());
+        }
+        Ok(())
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            // QwenJinja: enable_thinking + <think>…</think> via JinjaChatFrame.
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            // Legacy wire: no router-backed semantic v2 producer.
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        // generation_config: temperature 1.0, top_p 0.95, top_k unset.
+        saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err("spark2_5: pp>1 unsupported via registry".into());
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_spark25::load_spark25_bundle(src, ctx)?;
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
+            speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
+    }
+}
+
 // ─── Gemma4Carrier ───────────────────────────────────────────────────
 
 fn gemma4_use_lowered(

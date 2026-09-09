@@ -1223,6 +1223,12 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(48),
         ]),
         "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
+        // Spark-X2.5 exact-erf gated GELU: gate/up read, out written.
+        "gelu_erf_mul_f32" => Some(vec![read(0), read(8), write(16)]),
+        // Spark-X2.5 headwise broadcast gate: x is read-modify-written in
+        // place (read+write at @0; write covers the RMW dependency, the
+        // explicit read records the consumer edge), gate read at @8.
+        "sigmoid_mul_broadcast_f32" => Some(vec![read(0), write(0), read(8)]),
         "gemma4_ple_gelu_mul_strided_f32" => Some(vec![read(0), read(8), write(16)]),
         _ => None,
     }
@@ -1545,6 +1551,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rmsnorm_reduce_gfx1100"
         | "hc_input_map_4stream"
         | "sigmoid_mul_f32" => Some(32),
+        // gelu_erf_mul: 3 ptrs + i32 = 28, padded to 32. sigmoid broadcast:
+        // 2 ptrs + 2xi32 = 24, padded to 32 (launch path pads blobs to 16).
+        "gelu_erf_mul_f32" | "sigmoid_mul_broadcast_f32" => Some(32),
         "gemma4_ple_gelu_mul_strided_f32" => Some(48),
         "attention_flash_q8_0_reduce"
         | "fused_rmsnorm_mq_rotate"
@@ -6519,6 +6528,54 @@ mod tests {
         assert_eq!(blob.len(), 40, "explicit kernel arguments occupy 40 bytes");
         blob.pad_to(16);
         assert_eq!(blob.len(), 48, "recorded launches are padded to 16 bytes");
+        assert_eq!(expected_kernarg_bytes(kernel), Some(blob.len()));
+    }
+
+    #[test]
+    fn spark_gelu_erf_mul_keeps_padded_replay_contract() {
+        let kernel = "gelu_erf_mul_f32";
+        let effects = pointer_effects(kernel).expect("Spark GELU erf contract");
+        assert_eq!(effects.len(), 3);
+        assert_eq!(effects[0].offset, 0);
+        assert_eq!(effects[0].mode, RecordedAccessMode::Read);
+        assert_eq!(effects[1].offset, 8);
+        assert_eq!(effects[1].mode, RecordedAccessMode::Read);
+        assert_eq!(effects[2].offset, 16);
+        assert_eq!(effects[2].mode, RecordedAccessMode::Write);
+
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..3 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        assert_eq!(blob.len(), 28, "explicit kernel arguments occupy 28 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 32, "recorded launches are padded to 16 bytes");
+        assert_eq!(expected_kernarg_bytes(kernel), Some(blob.len()));
+    }
+
+    #[test]
+    fn spark_sigmoid_mul_broadcast_keeps_padded_replay_contract() {
+        let kernel = "sigmoid_mul_broadcast_f32";
+        let effects = pointer_effects(kernel).expect("Spark broadcast gate contract");
+        assert_eq!(effects.len(), 3);
+        // In-place read-modify-write on x: read edge plus write edge at @0.
+        assert_eq!(effects[0].offset, 0);
+        assert_eq!(effects[0].mode, RecordedAccessMode::Read);
+        assert_eq!(effects[1].offset, 0);
+        assert_eq!(effects[1].mode, RecordedAccessMode::Write);
+        assert_eq!(effects[2].offset, 8);
+        assert_eq!(effects[2].mode, RecordedAccessMode::Read);
+
+        let mut blob = hip_bridge::KernargBlob::new();
+        for _ in 0..2 {
+            blob.push_ptr(std::ptr::null());
+        }
+        blob.push_i32(0);
+        blob.push_i32(0);
+        assert_eq!(blob.len(), 24, "explicit kernel arguments occupy 24 bytes");
+        blob.pad_to(16);
+        assert_eq!(blob.len(), 32, "recorded launches are padded to 16 bytes");
         assert_eq!(expected_kernarg_bytes(kernel), Some(blob.len()));
     }
 

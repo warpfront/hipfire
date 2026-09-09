@@ -211,6 +211,19 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
             reason: "maple not a serve-hardening retry candidate yet",
         },
     };
+    const SPARK25: ResetCoreCoverage = ResetCoreCoverage {
+        arch: "spark2_5",
+        recurrent_or_conv: true,
+        s_ef_residual: true,
+        kv_or_aux_caches: true,
+        graphs: false,
+        drafter: false,
+        adaptive: false,
+        host_position_and_conversation: true,
+        eligibility: RetryResetEligibility::Ineligible {
+            reason: "spark2_5 not a serve-hardening retry candidate yet",
+        },
+    };
     // Image-gen component (arch 40): never a text retry candidate.
     const FLUX: ResetCoreCoverage = ResetCoreCoverage {
         arch: "flux",
@@ -252,6 +265,7 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         GEMMA4,
         MUSE_GLIMMER,
         MAPLE,
+        SPARK25,
         FLUX,
         FLUX2,
     ]
@@ -552,6 +566,7 @@ mod tests {
                 13 => Some("gemma4"),
                 14 => Some("muse_glimmer"),
                 15 => Some("maple"),
+                16 => Some("spark2_5"),
                 40 => Some("flux"),
                 45 => Some("flux2"),
                 // Drafter sidecars (22, 23) are intentionally not retry

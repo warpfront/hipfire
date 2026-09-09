@@ -81,13 +81,16 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     ("muse_glimmer_text", 14),
     // arch 15 — maple (Maple-Preview 20B-A1B, natively-ternary 256-expert MoE)
     ("maple", 15),
+    // arch 16 — spark2_5 (Spark-X2.5 dense hybrid GQA; exact model_type only,
+    // no spark25 alias — unknown variants must fail closed).
+    ("spark2_5", 16),
     // arch 22 — gemma4 EAGLE drafter (single-block spec-decode head for arch 13)
     ("gemma4_unified_assistant", 22),
     // arch 23 — muse_glimmer DFlash drafter
     ("muse_glimmer_assistant", 23),
     // arch 40 — flux MMDiT diffusion trunk (image-gen component block 40–47;
-    // high by design so the sequential primary range 16–19 stays free for
-    // future text arches; never a chat-serve trunk — see
+    // high by design so the sequential primary range 17–19 stays free for
+    // future text arches; 16 is spark2_5; never a chat-serve trunk — see
     // docs/architecture-ids.md § Image-generation component ids)
     ("flux", 40),
     // arch 45 — flux2 MMDiT diffusion trunk (FLUX.2 Klein; 44 is intentionally

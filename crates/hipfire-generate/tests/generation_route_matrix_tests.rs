@@ -150,6 +150,17 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
             },
         ),
         (
+            // Spark-X2.5 has no spec/batch/EP. has_speculator true must still
+            // select Spark25Ar (caps declare no dflash/MTP).
+            GenerationRoute::Spark25Ar,
+            GenerationRouteInputs {
+                arch_id: 16,
+                has_speculator: true,
+                temp: 0.0,
+                ..base()
+            },
+        ),
+        (
             GenerationRoute::MiniMaxAr,
             GenerationRouteInputs {
                 arch_id: 10,
@@ -842,9 +853,9 @@ fn pure_gate_tools_absent_always_allowed() {
 }
 
 #[test]
-fn all_variant_count_is_twenty_two() {
+fn all_variant_count_is_twenty_three() {
     // Pin count so accidental ALL edits surface here too.
-    // 22 since MapleAr (arch 15) joined; was 21.
-    assert_eq!(GenerationRoute::ALL.len(), 22);
-    assert_eq!(capability_rows().len(), 22);
+    // 23 since Spark25Ar (arch 16) joined; was 22 with MapleAr.
+    assert_eq!(GenerationRoute::ALL.len(), 23);
+    assert_eq!(capability_rows().len(), 23);
 }
