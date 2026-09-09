@@ -16,6 +16,7 @@
 //! selection disables the automatic default.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::iter::ExactSizeIterator;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -1668,39 +1669,22 @@ fn apply_qwen_q8_full_attention_visibility(
     }
 }
 
-/// Publish/acquire visibility for producer/consumer sharing edges in a
-/// retained single-queue AQL batch.
-///
-/// The default batch headers only order dispatches (`barrier`); on gfx1201
-/// that ordering alone neither flushes a producer's writes to the coherence
-/// point nor invalidates a consumer's vector cache for a reused buffer. Any
-/// dispatch that shares a global allocation with an earlier dispatch through
-/// a write on either side (the recorded `accesses`, recovered from typed
-/// kernel signatures at capture time) therefore needs the captured HIP
-/// system scopes at that edge, not just queue order. Spark's retained tape
-/// (typed `copy_f32_buffer` splits, `rope_f32`, `attention_q8_0_kv_swa`,
-/// exact-erf `gelu_erf_mul_f32`, headwise `sigmoid_mul_broadcast_f32`, and
-/// `gemv_q8_0`/`gemv_mq4g256v2_multirow_r2` around `mq_rotate_x`) is dense
-/// with such edges while matching none of the narrow name-based special
-/// cases in the constructor below; with barrier-only headers its
-/// multi-position AQL shadow diverged in both logits and KV while HIP/blob
-/// replay of the same tape stayed exact.
-///
-/// Only missing scopes are filled, reusing the same release/acquire pair
-/// the `mq_rotate_x` case already uses (an edge whose both ends need
-/// scoping collapses to `RECORDED_DISPATCH`, as does a half-scoped
-/// acquire/release-only header that also needs the other side). The
-/// barrier bit and any existing Agent/System scope are never narrowed,
-/// and triples without an existing constant (independent and agent-pair
-/// headers) keep their header while the edge's other end still lands its
-/// half, as do dispatches with unknown effects. Adding visibility is
-/// strictly conservative: it cannot change values on tapes that already
-/// pass, only stale-cache reads on tapes that do not.
-fn apply_retained_aql_sharing_visibility(
-    launches: &[RecordedHipLaunch],
-    headers: &mut [HeaderPolicy],
-) {
-    debug_assert_eq!(launches.len(), headers.len());
+/// Per-dispatch publish/acquire obligations derived from allocation-wide
+/// RAW/WAR/WAW edges on a retained execution order.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+struct RetainedSharingVisibility {
+    release: bool,
+    acquire: bool,
+}
+
+/// Derive System release/acquire obligations from typed resource accesses in
+/// execution order. Unknown-effect launches are skipped without clearing the
+/// slots they may sit between. Allocation-wide metadata may over-approximate
+/// subrange writes; every write is flagged against the live slot on arrival so
+/// earlier writers stay covered through the last-writer chain.
+fn derive_retained_sharing_visibility<'a>(
+    launches: impl ExactSizeIterator<Item = &'a RecordedHipLaunch>,
+) -> Vec<RetainedSharingVisibility> {
     let mut needs_release = vec![false; launches.len()];
     let mut needs_acquire = vec![false; launches.len()];
     // Bounded frontier: one slot per allocation holding the latest writer
@@ -1727,7 +1711,7 @@ fn apply_retained_aql_sharing_visibility(
         readers_since_write: Vec<usize>,
     }
     let mut frontier: BTreeMap<u64, AllocationFrontier> = BTreeMap::new();
-    for (index, launch) in launches.iter().enumerate() {
+    for (index, launch) in launches.enumerate() {
         let Some(accesses) = launch.accesses.as_deref() else {
             continue;
         };
@@ -1769,14 +1753,101 @@ fn apply_retained_aql_sharing_visibility(
             }
         }
     }
+    needs_release
+        .into_iter()
+        .zip(needs_acquire)
+        .map(|(release, acquire)| RetainedSharingVisibility { release, acquire })
+        .collect()
+}
+
+/// Spark retained tapes are identified by the full capture containing both
+/// current Spark-only semantic markers. Prefix profiling must use the same
+/// contract, so the check inspects the whole tape rather than a requested
+/// prefix. No model id, filename, or input-shape gates.
+fn uses_spark_retained_visibility_contract(recorded: &[RecordedHipLaunch]) -> bool {
+    let mut has_gelu_erf_mul = false;
+    let mut has_sigmoid_mul_broadcast = false;
+    for launch in recorded {
+        match launch.kernel.as_str() {
+            "gelu_erf_mul_f32" => has_gelu_erf_mul = true,
+            "sigmoid_mul_broadcast_f32" => has_sigmoid_mul_broadcast = true,
+            _ => {}
+        }
+        if has_gelu_erf_mul && has_sigmoid_mul_broadcast {
+            return true;
+        }
+    }
+    false
+}
+
+/// Build the Spark PM4 visibility plan for a finalized execution order.
+/// Fail closed when any ordered launch lacks typed accesses rather than
+/// falling back to adjacent name-pair guesses.
+fn spark_retained_pm4_visibility_plan(
+    order: &[usize],
+    recorded: &[RecordedHipLaunch],
+) -> Result<Vec<RetainedSharingVisibility>, String> {
+    for &index in order {
+        let launch = recorded.get(index).ok_or_else(|| {
+            format!("Spark retained PM4 visibility order index {index} is out of range")
+        })?;
+        if launch.accesses.is_none() {
+            return Err(format!(
+                "Spark retained PM4 visibility requires typed resource accesses for kernel `{}`",
+                launch.kernel
+            ));
+        }
+    }
+    Ok(derive_retained_sharing_visibility(
+        order.iter().map(|&index| &recorded[index]),
+    ))
+}
+
+/// Publish/acquire visibility for producer/consumer sharing edges in a
+/// retained single-queue AQL batch.
+///
+/// The default batch headers only order dispatches (`barrier`); on gfx1201
+/// that ordering alone neither flushes a producer's writes to the coherence
+/// point nor invalidates a consumer's vector cache for a reused buffer. Any
+/// dispatch that shares a global allocation with an earlier dispatch through
+/// a write on either side (the recorded `accesses`, recovered from typed
+/// kernel signatures at capture time) therefore needs the captured HIP
+/// system scopes at that edge, not just queue order. Spark's retained tape
+/// (typed `copy_f32_buffer` splits, `rope_f32`, `attention_q8_0_kv_swa`,
+/// exact-erf `gelu_erf_mul_f32`, headwise `sigmoid_mul_broadcast_f32`, and
+/// `gemv_q8_0`/`gemv_mq4g256v2_multirow_r2` around `mq_rotate_x`) is dense
+/// with such edges while matching none of the narrow name-based special
+/// cases in the constructor below; with barrier-only headers its
+/// multi-position AQL shadow diverged in both logits and KV while HIP/blob
+/// replay of the same tape stayed exact.
+///
+/// Only missing scopes are filled, reusing the same release/acquire pair
+/// the `mq_rotate_x` case already uses (an edge whose both ends need
+/// scoping collapses to `RECORDED_DISPATCH`, as does a half-scoped
+/// acquire/release-only header that also needs the other side). The
+/// barrier bit and any existing Agent/System scope are never narrowed,
+/// and triples without an existing constant (independent and agent-pair
+/// headers) keep their header while the edge's other end still lands its
+/// half, as do dispatches with unknown effects. Adding visibility is
+/// strictly conservative: it cannot change values on tapes that already
+/// pass, only stale-cache reads on tapes that do not.
+///
+/// Derivation is delegated to [`derive_retained_sharing_visibility`]; this
+/// wrapper only applies the existing additive `HeaderPolicy` mapping.
+fn apply_retained_aql_sharing_visibility(
+    launches: &[RecordedHipLaunch],
+    headers: &mut [HeaderPolicy],
+) {
+    debug_assert_eq!(launches.len(), headers.len());
+    let visibility = derive_retained_sharing_visibility(launches.iter());
     // Additive scope union: fill only the missing (None) side with System
     // scope. The barrier bit and any existing Agent/System scope are never
     // narrowed, and triples without an existing constant (independent and
     // agent-pair headers) keep their current header while the edge's other
     // end still lands its half.
     for (index, header) in headers.iter_mut().enumerate() {
-        let acquire = needs_acquire[index];
-        let release = needs_release[index];
+        let acquire = visibility[index].acquire;
+        let release = visibility[index].release;
         if !acquire && !release {
             continue;
         }
@@ -4957,6 +5028,14 @@ impl ReplayController {
                     .to_owned(),
             );
         }
+        let spark_retained_visibility = pm4_architecture == Pm4Architecture::Gfx12
+            && uses_spark_retained_visibility_contract(&self.recorded);
+        if spark_retained_visibility && queue_limit != 1 {
+            return Err(
+                "Spark retained PM4 resource visibility requires single-queue PM4 replay"
+                    .to_owned(),
+            );
+        }
         let mut dependency_fence = None;
         let mut dispatch_boundaries = Vec::new();
         let (graph, command_dwords) = if queue_limit == 1 {
@@ -4989,6 +5068,13 @@ impl ReplayController {
                     );
                     order
                 }
+            };
+            // Resource-derived System visibility is indexed by execution
+            // position on the finalized order, never by capture index.
+            let spark_visibility = if spark_retained_visibility {
+                Some(spark_retained_pm4_visibility_plan(&order, &self.recorded)?)
+            } else {
+                None
             };
             let dependency_mode = match gfx1010_dependency {
                 Gfx1010DependencyPolicy::ReleaseWait => {
@@ -5047,7 +5133,16 @@ impl ReplayController {
                     // acquire after the writer is too late for this hazard.
                     let gfx12_pre_dispatch_acquire = pm4_architecture == Pm4Architecture::Gfx12
                         && requires_gfx12_pre_dispatch_vmem_acquire(current);
-                    if gfx12_pre_dispatch_acquire || !independent {
+                    // Spark retained tapes need allocation-frontier acquires
+                    // before consumers and reused writers. Union with the
+                    // existing pre-writer reason so one boundary still emits
+                    // exactly one wait and one System acquire.
+                    let spark_resource_acquire = spark_visibility
+                        .as_ref()
+                        .is_some_and(|plan| plan[position].acquire);
+                    let gfx12_system_visibility =
+                        gfx12_pre_dispatch_acquire || spark_resource_acquire;
+                    if gfx12_system_visibility || !independent {
                         dependency_waits += 1;
                         boundary.wait_compute_idle = true;
                         commands.wait_compute_idle()?;
@@ -5057,7 +5152,7 @@ impl ReplayController {
                         || self
                             .pm4_mid_acquire_policy
                             .acquire_between(previous, current);
-                    if gfx12_pre_dispatch_acquire {
+                    if gfx12_system_visibility {
                         dependency_acquires += 1;
                         boundary.acquire_vmem = true;
                         commands.gfx12_system_acquire()?;
@@ -8011,6 +8106,198 @@ mod tests {
         assert!(!frontier.independent(&unknown));
         frontier.advance(&unknown, false);
         assert!(!frontier.independent(&write_b));
+    }
+
+    fn access_launch(kernel: &str, base: u64, mode: RecordedAccessMode) -> RecordedHipLaunch {
+        RecordedHipLaunch {
+            kernel: kernel.to_owned(),
+            artifact: None,
+            grid: [1; 3],
+            block: [1; 3],
+            shared_mem: 0,
+            grid_binding: None,
+            kernarg: Vec::new(),
+            accesses: Some(vec![RecordedResourceAccess {
+                allocation_base: base,
+                allocation_bytes: 0x100,
+                access_base: base,
+                mode,
+            }]),
+        }
+    }
+
+    #[test]
+    fn retained_sharing_visibility_tracks_nonadjacent_raw_and_reuse() {
+        let launches = [
+            access_launch("w_a", 0x1000, RecordedAccessMode::Write),
+            access_launch("w_b", 0x2000, RecordedAccessMode::Write),
+            access_launch("r_a", 0x1000, RecordedAccessMode::Read),
+            access_launch("w_a2", 0x1000, RecordedAccessMode::Write),
+            access_launch("r_b1", 0x2000, RecordedAccessMode::Read),
+            access_launch("r_b2", 0x2000, RecordedAccessMode::Read),
+        ];
+        let visibility = derive_retained_sharing_visibility(launches.iter());
+        assert_eq!(visibility.len(), 6);
+        // Non-adjacent RAW: writer releases, later reader acquires.
+        assert_eq!(
+            visibility[0],
+            RetainedSharingVisibility {
+                release: true,
+                acquire: false,
+            }
+        );
+        assert_eq!(
+            visibility[2],
+            RetainedSharingVisibility {
+                release: true,
+                acquire: true,
+            }
+        );
+        // Later WAR/WAW reuse of A: prior reader releases, reused writer acquires.
+        assert_eq!(
+            visibility[3],
+            RetainedSharingVisibility {
+                release: false,
+                acquire: true,
+            }
+        );
+        // Disjoint B writer only releases for its later readers.
+        assert_eq!(
+            visibility[1],
+            RetainedSharingVisibility {
+                release: true,
+                acquire: false,
+            }
+        );
+        // Read/read on B: both acquire the writer, neither releases the other.
+        assert_eq!(
+            visibility[4],
+            RetainedSharingVisibility {
+                release: false,
+                acquire: true,
+            }
+        );
+        assert_eq!(
+            visibility[5],
+            RetainedSharingVisibility {
+                release: false,
+                acquire: true,
+            }
+        );
+    }
+
+    #[test]
+    fn retained_sharing_visibility_indexes_execution_position_not_capture() {
+        let recorded = [
+            access_launch("write_a", 0x1000, RecordedAccessMode::Write),
+            access_launch("write_b", 0x2000, RecordedAccessMode::Write),
+            access_launch("read_a", 0x1000, RecordedAccessMode::Read),
+        ];
+        // Execute write_b, write_a, read_a. Capture index 2 (read_a) lands at
+        // execution position 2; capture index 1 (write_b) lands at position 0.
+        let order = [1usize, 0, 2];
+        let by_position = derive_retained_sharing_visibility(order.iter().map(|i| &recorded[*i]));
+        let by_capture = derive_retained_sharing_visibility(recorded.iter());
+
+        assert_eq!(
+            by_position[0],
+            RetainedSharingVisibility {
+                release: false,
+                acquire: false,
+            },
+            "write_b at position 0 has no consumers in this order"
+        );
+        assert_eq!(
+            by_position[1],
+            RetainedSharingVisibility {
+                release: true,
+                acquire: false,
+            }
+        );
+        assert_eq!(
+            by_position[2],
+            RetainedSharingVisibility {
+                release: false,
+                acquire: true,
+            }
+        );
+        // Capture-index lookup at the read's execution slot would miss the
+        // acquire (slot 1 is write_b in capture order).
+        assert!(!by_capture[1].acquire);
+        assert!(by_position[2].acquire);
+        assert_eq!(by_position[2], by_capture[2]);
+        assert_eq!(by_position[1], by_capture[0]);
+    }
+
+    #[test]
+    fn spark_retained_visibility_contract_scopes_and_fail_closed() {
+        let old_model = [
+            access_launch("rmsnorm_f32", 0x1000, RecordedAccessMode::Write),
+            access_launch("mq_rotate_x", 0x1000, RecordedAccessMode::Write),
+            access_launch("gemv_q8_0", 0x2000, RecordedAccessMode::Write),
+        ];
+        assert!(!uses_spark_retained_visibility_contract(&old_model));
+
+        let gelu_only = [
+            access_launch("gelu_erf_mul_f32", 0x1000, RecordedAccessMode::Write),
+            access_launch("rmsnorm_f32", 0x2000, RecordedAccessMode::Write),
+        ];
+        assert!(!uses_spark_retained_visibility_contract(&gelu_only));
+
+        let sigmoid_only = [
+            access_launch(
+                "sigmoid_mul_broadcast_f32",
+                0x1000,
+                RecordedAccessMode::Write,
+            ),
+            access_launch("add_inplace_f32", 0x1000, RecordedAccessMode::Write),
+        ];
+        assert!(!uses_spark_retained_visibility_contract(&sigmoid_only));
+
+        let spark = [
+            access_launch("rmsnorm_f32", 0x1000, RecordedAccessMode::Write),
+            access_launch(
+                "sigmoid_mul_broadcast_f32",
+                0x2000,
+                RecordedAccessMode::Write,
+            ),
+            access_launch("gelu_erf_mul_f32", 0x3000, RecordedAccessMode::Write),
+        ];
+        assert!(uses_spark_retained_visibility_contract(&spark));
+
+        // Markers anywhere on the full tape activate the contract even when a
+        // short prefix would not contain both names.
+        let full_tape = [
+            access_launch("copy_f32_buffer", 0x1000, RecordedAccessMode::Write),
+            access_launch("gelu_erf_mul_f32", 0x2000, RecordedAccessMode::Write),
+            access_launch(
+                "sigmoid_mul_broadcast_f32",
+                0x3000,
+                RecordedAccessMode::Write,
+            ),
+        ];
+        assert!(uses_spark_retained_visibility_contract(&full_tape));
+
+        let unknown = RecordedHipLaunch {
+            accesses: None,
+            ..access_launch("copy_f32_buffer", 0x1000, RecordedAccessMode::Read)
+        };
+        let order = [0usize, 1, 2];
+        let recorded = [
+            access_launch(
+                "sigmoid_mul_broadcast_f32",
+                0x1000,
+                RecordedAccessMode::Write,
+            ),
+            unknown,
+            access_launch("gelu_erf_mul_f32", 0x2000, RecordedAccessMode::Write),
+        ];
+        let err = spark_retained_pm4_visibility_plan(&order, &recorded).unwrap_err();
+        assert!(
+            err.contains("copy_f32_buffer"),
+            "unknown-access rejection must name the kernel: {err}"
+        );
+        assert!(spark_retained_pm4_visibility_plan(&[0, 2], &recorded).is_ok());
     }
 
     #[test]
