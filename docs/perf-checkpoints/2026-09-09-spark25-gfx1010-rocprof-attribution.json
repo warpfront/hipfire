@@ -1,0 +1,196 @@
+{
+  "source": "a4856e4cb",
+  "method": "Parent parses raw rocprof CSV; last measured prefill from first embedding after warmup last head through final Q8 head. Kernel interval union; HIP API waits overlap GPU, not additive CPU cost. Instrumentation affected, not throughput acceptance.",
+  "windows": [
+    {
+      "tokens": 302,
+      "start_ns": 60399980616981,
+      "end_ns": 60402223034545,
+      "window_ms": 2242.417564,
+      "gpu_union_ms": 1853.410537,
+      "not_covered_by_kernel_ms": 389.007027,
+      "kernels": {
+        "gemm_mq4g256v2_residual_simt": {
+          "calls": 1080,
+          "ms": 1430.988515
+        },
+        "attention_q8_0_kv_swa": {
+          "calls": 10872,
+          "ms": 183.468062
+        },
+        "rope_f32": {
+          "calls": 8154,
+          "ms": 92.135088
+        },
+        "kv_cache_write_q8_0": {
+          "calls": 21744,
+          "ms": 88.727899
+        },
+        "rope_partial_halfsplit_f32": {
+          "calls": 2718,
+          "ms": 30.828933
+        },
+        "mq_rotate_x": {
+          "calls": 1080,
+          "ms": 7.482773
+        },
+        "__amd_rocclr_fillBufferUnAligned": {
+          "calls": 1080,
+          "ms": 5.355059
+        },
+        "gelu_erf_mul_f32": {
+          "calls": 180,
+          "ms": 3.973975
+        },
+        "rmsnorm_f32": {
+          "calls": 361,
+          "ms": 3.277064
+        },
+        "add_inplace_f32": {
+          "calls": 360,
+          "ms": 2.634465
+        },
+        "embedding_q8": {
+          "calls": 302,
+          "ms": 1.897875
+        },
+        "sigmoid_mul_broadcast_f32": {
+          "calls": 180,
+          "ms": 1.569313
+        },
+        "gemv_q8_0": {
+          "calls": 1,
+          "ms": 1.024476
+        },
+        "__amd_rocclr_copyBuffer": {
+          "calls": 7,
+          "ms": 0.04704
+        }
+      },
+      "hip_api_overlapping_ms": {
+        "hipMemcpy": {
+          "calls": 8,
+          "ms": 2018.578356
+        },
+        "hipModuleLaunchKernel": {
+          "calls": 47022,
+          "ms": 187.070344
+        },
+        "hipMemset": {
+          "calls": 1080,
+          "ms": 4.468405
+        },
+        "hipFree": {
+          "calls": 4,
+          "ms": 4.334513
+        },
+        "hipMalloc": {
+          "calls": 5,
+          "ms": 0.165559
+        }
+      }
+    },
+    {
+      "tokens": 1160,
+      "start_ns": 60575478313704,
+      "end_ns": 60585050670479,
+      "window_ms": 9572.356775,
+      "gpu_union_ms": 7885.10289,
+      "not_covered_by_kernel_ms": 1687.253885,
+      "kernels": {
+        "gemm_mq4g256v2_residual_simt": {
+          "calls": 4104,
+          "ms": 5484.893523
+        },
+        "attention_q8_0_kv_swa": {
+          "calls": 41760,
+          "ms": 1472.03044
+        },
+        "rope_f32": {
+          "calls": 31320,
+          "ms": 361.088447
+        },
+        "kv_cache_write_q8_0": {
+          "calls": 83520,
+          "ms": 340.518485
+        },
+        "rope_partial_halfsplit_f32": {
+          "calls": 10440,
+          "ms": 123.992092
+        },
+        "mq_rotate_x": {
+          "calls": 4104,
+          "ms": 28.114846
+        },
+        "__amd_rocclr_fillBufferUnAligned": {
+          "calls": 4104,
+          "ms": 21.660907
+        },
+        "gelu_erf_mul_f32": {
+          "calls": 684,
+          "ms": 15.452065
+        },
+        "rmsnorm_f32": {
+          "calls": 1369,
+          "ms": 12.574072
+        },
+        "add_inplace_f32": {
+          "calls": 1368,
+          "ms": 9.931703
+        },
+        "embedding_q8": {
+          "calls": 1160,
+          "ms": 7.301572
+        },
+        "sigmoid_mul_broadcast_f32": {
+          "calls": 684,
+          "ms": 6.375742
+        },
+        "gemv_q8_0": {
+          "calls": 1,
+          "ms": 1.023317
+        },
+        "__amd_rocclr_copyBuffer": {
+          "calls": 21,
+          "ms": 0.145679
+        }
+      },
+      "hip_api_overlapping_ms": {
+        "hipMemcpy": {
+          "calls": 22,
+          "ms": 8714.085374
+        },
+        "hipModuleLaunchKernel": {
+          "calls": 180503,
+          "ms": 731.742141
+        },
+        "hipMemset": {
+          "calls": 4104,
+          "ms": 17.042578
+        },
+        "hipFree": {
+          "calls": 3,
+          "ms": 6.171129
+        },
+        "hipMalloc": {
+          "calls": 5,
+          "ms": 0.061434
+        }
+      }
+    }
+  ],
+  "date": "2026-09-09T19:15:50.725Z",
+  "lifecycle": "historical",
+  "authority": "Diagnostic rocprof attribution only; instrumented times are not throughput acceptance",
+  "disposition": "Prioritize FP32 SIMT projection kernel plus zero-copy batched RoPE/KV/attention; user provisional target800–1000tok/s",
+  "model_md5": "26c877594d9b90114a02a729cc7c5194",
+  "hipfire_md5": "387b3382bc8340ee9bcd105d589038e8",
+  "daemon_md5": "6ea7184ad796ea46ab27569211b27404",
+  "gpu": "hipx RX5700XT gfx1010 GPU3",
+  "evidence": "/mnt/nas/kaden/hipfire-validation/spark25/gfx1010-prefill/rocprof-800",
+  "capture": "rocprofv3 directly around daemon under supervisor because native Engine teardown SIGKILLs direct child; supervisor permits daemon EOF and profiler flush. Native bench runs1,warmups1,max_tokens1; AR q8 max_seq4096; committed302/1160-token prompts. No internal GPU timers.",
+  "prompt_md5": [
+    "973900074bfd15d4adeeecdff3359082",
+    "0ee8f86ada3683eda452bc294ec824a9"
+  ]
+}
