@@ -233,6 +233,7 @@ pub enum BenchDecodeRoute {
     Lfm2Moe,
     Qwen35,
     MuseGlimmer,
+    Spark25,
     Unsupported,
 }
 pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
@@ -241,6 +242,7 @@ pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
         11 => BenchDecodeRoute::Lfm2Moe,
         5 | 6 => BenchDecodeRoute::Qwen35,
         14 => BenchDecodeRoute::MuseGlimmer,
+        16 => BenchDecodeRoute::Spark25,
         _ => BenchDecodeRoute::Unsupported,
     }
 }
@@ -4524,13 +4526,14 @@ mod registry_tests {
             );
         }
 
-        // ── bench_decode_route: 9, 11, 5|6, 14; everything else Unsupported ──
-        for id in 0u32..=14 {
+        // ── bench_decode_route: 9, 11, 5|6, 14, 16; everything else Unsupported ──
+        for id in 0u32..=16 {
             let want = match id {
                 9 => BenchDecodeRoute::Deepseek4,
                 11 => BenchDecodeRoute::Lfm2Moe,
                 5 | 6 => BenchDecodeRoute::Qwen35,
                 14 => BenchDecodeRoute::MuseGlimmer,
+                16 => BenchDecodeRoute::Spark25,
                 _ => BenchDecodeRoute::Unsupported,
             };
             assert_eq!(bench_decode_route(id), want, "bench_decode_route({id})");

@@ -1952,6 +1952,31 @@ impl Carrier for Spark25Carrier {
         // generation_config: temperature 1.0, top_p 0.95, top_k unset.
         saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
     }
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        _prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = m.spark25_mut().expect("arch_id=16 requires spark25 bundle");
+        let config = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        let mut ok = true;
+        for (i, &tok) in synthetic.iter().enumerate() {
+            if hipfire_arch_spark25::forward::decode_step(
+                config, weights, state, gpu, tok, i as u32,
+            )
+            .is_err()
+            {
+                ok = false;
+                break;
+            }
+        }
+        Some(ok)
+    }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
             return Err("spark2_5: pp>1 unsupported via registry".into());

@@ -20,19 +20,20 @@ use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_qwen35::carrier::Qwen35Bundle;
 use hipfire_arch_qwen35::dflash_verify_pm4::{
-    DFLASH_VERIFY_PM4_BLOCK, DflashVerifyPm4, DflashVerifyPm4Phase,
+    DflashVerifyPm4, DflashVerifyPm4Phase, DFLASH_VERIFY_PM4_BLOCK,
 };
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative::{
-    DeltaNetSnapshot, GdnTape, HiddenStateRingBuffer, ModelSlot, VerifyScratch,
-    verify_dflash_block, verify_dflash_block_retained,
+    verify_dflash_block, verify_dflash_block_retained, DeltaNetSnapshot, GdnTape,
+    HiddenStateRingBuffer, ModelSlot, VerifyScratch,
 };
+use hipfire_arch_spark25 as spark25;
 use hipfire_engine::redline::{
-    RedlineRegionHash, redline_append_buffer, redline_append_tensor, redline_append_tensor_region,
-    redline_capture_json, redline_hash,
+    redline_append_buffer, redline_append_tensor, redline_append_tensor_region,
+    redline_capture_json, redline_hash, RedlineRegionHash,
 };
-use hipfire_loader::LoadedModel;
 use hipfire_loader::spec_build::Qwen35SlotGuard;
+use hipfire_loader::LoadedModel;
 use rdna_compute::replay::ReplayQuiescence;
 use std::any::Any;
 use std::io::Read;
@@ -109,10 +110,32 @@ impl RedlineDsparkVerifySnapshot {
 }
 
 #[derive(PartialEq)]
+pub struct RedlineSpark25Snapshot {
+    pub logits: Vec<u8>,
+    /// Both KV families in deterministic order: sliding
+    /// (k_gpu+v_gpu+k_scales+v_scales) then full (same chain).
+    pub kv: Vec<u8>,
+    pub n_tokens: usize,
+}
+
+impl RedlineSpark25Snapshot {
+    pub fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "logits_bytes": self.logits.len(),
+            "logits_hash": format!("{:016x}", redline_hash(&self.logits)),
+            "kv_bytes": self.kv.len(),
+            "kv_hash": format!("{:016x}", redline_hash(&self.kv)),
+            "n_tokens": self.n_tokens,
+        })
+    }
+}
+
+#[derive(PartialEq)]
 pub enum RedlineSnapshot {
     Qwen(RedlineQwenSnapshot),
     Deepseek4(RedlineDeepseek4Snapshot),
     Lfm2Moe(RedlineLfm2MoeSnapshot),
+    Spark25(RedlineSpark25Snapshot),
 }
 
 impl RedlineSnapshot {
@@ -121,6 +144,7 @@ impl RedlineSnapshot {
             Self::Qwen(snapshot) => &snapshot.logits,
             Self::Deepseek4(snapshot) => &snapshot.logits,
             Self::Lfm2Moe(snapshot) => &snapshot.logits,
+            Self::Spark25(snapshot) => &snapshot.logits,
         }
     }
 
@@ -129,6 +153,7 @@ impl RedlineSnapshot {
             Self::Qwen(snapshot) => &snapshot.kv,
             Self::Deepseek4(snapshot) => &snapshot.kv,
             Self::Lfm2Moe(snapshot) => &snapshot.kv,
+            Self::Spark25(snapshot) => &snapshot.kv,
         }
     }
 
@@ -137,6 +162,18 @@ impl RedlineSnapshot {
             Self::Qwen(snapshot) => &snapshot.recurrent,
             Self::Deepseek4(snapshot) => &snapshot.recurrent,
             Self::Lfm2Moe(snapshot) => &snapshot.recurrent,
+            // Spark carries no recurrent/conv state; the unified `kv` holds
+            // both cache families. Empty slice, no allocation.
+            Self::Spark25(_) => &[],
+        }
+    }
+
+    /// Host-side token cursor. Only Spark snapshots carry it; all other
+    /// arches compare as `None` so their parity is unchanged.
+    pub fn n_tokens(&self) -> Option<usize> {
+        match self {
+            Self::Spark25(snapshot) => Some(snapshot.n_tokens),
+            Self::Qwen(_) | Self::Deepseek4(_) | Self::Lfm2Moe(_) => None,
         }
     }
 
@@ -145,7 +182,7 @@ impl RedlineSnapshot {
     pub fn gdn_frame(&self) -> Option<u32> {
         match self {
             Self::Qwen(snapshot) => Some(snapshot.gdn_frame),
-            Self::Deepseek4(_) | Self::Lfm2Moe(_) => None,
+            Self::Deepseek4(_) | Self::Lfm2Moe(_) | Self::Spark25(_) => None,
         }
     }
 
@@ -154,15 +191,16 @@ impl RedlineSnapshot {
             Self::Qwen(snapshot) => snapshot.json(),
             Self::Deepseek4(snapshot) => snapshot.json(),
             Self::Lfm2Moe(snapshot) => snapshot.json(),
+            Self::Spark25(snapshot) => snapshot.json(),
         }
     }
 }
-
 fn redline_snapshots_bit_exact(lhs: &RedlineSnapshot, rhs: &RedlineSnapshot) -> bool {
     lhs.logits() == rhs.logits()
         && lhs.kv() == rhs.kv()
         && lhs.recurrent() == rhs.recurrent()
         && lhs.gdn_frame() == rhs.gdn_frame()
+        && lhs.n_tokens() == rhs.n_tokens()
 }
 
 pub fn redline_qwen_snapshot(
@@ -335,6 +373,53 @@ pub fn redline_is_dense_lfm(loaded: &LoadedModel) -> bool {
     bundle.config.is_dense()
 }
 
+pub fn redline_spark25_snapshot(
+    gpu: &rdna_compute::Gpu,
+    bundle: &spark25::Spark25Bundle,
+) -> Result<RedlineSpark25Snapshot, String> {
+    let mut logits = Vec::new();
+    redline_append_buffer(gpu, &mut logits, &bundle.state.logits.buf)?;
+    let mut kv = Vec::new();
+    for cache in [&bundle.state.kv_sliding, &bundle.state.kv_full] {
+        for tensor in cache
+            .k_gpu
+            .iter()
+            .chain(cache.v_gpu.iter())
+            .chain(cache.k_scales.iter())
+            .chain(cache.v_scales.iter())
+        {
+            redline_append_buffer(gpu, &mut kv, &tensor.buf)?;
+        }
+    }
+    Ok(RedlineSpark25Snapshot {
+        logits,
+        kv,
+        n_tokens: bundle.state.n_tokens,
+    })
+}
+
+pub fn redline_reset_spark25(
+    gpu: &mut rdna_compute::Gpu,
+    bundle: &mut spark25::Spark25Bundle,
+) -> Result<(), String> {
+    bundle.state.reset(gpu)?;
+    gpu.invalidate_graph_state();
+    gpu.hip
+        .device_synchronize()
+        .map_err(|error| error.to_string())
+}
+
+pub fn redline_is_spark25(loaded: &LoadedModel) -> bool {
+    if loaded.pp != 1 || loaded.ep.is_some() {
+        return false;
+    }
+    loaded
+        .state
+        .as_ref()
+        .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<spark25::Spark25Bundle>())
+        .is_some()
+}
+
 pub fn redline_append_tensor_slice(
     gpu: &rdna_compute::Gpu,
     output: &mut Vec<u8>,
@@ -460,8 +545,14 @@ pub fn redline_snapshot(
             return Err("retained snapshot requires dense LFM".to_string());
         }
         redline_lfm2moe_snapshot(gpu, bundle).map(RedlineSnapshot::Lfm2Moe)
+    } else if let Some(bundle) = loaded
+        .state
+        .as_ref()
+        .and_then(|s| (s.as_ref() as &dyn Any).downcast_ref::<spark25::Spark25Bundle>())
+    {
+        redline_spark25_snapshot(gpu, bundle).map(RedlineSnapshot::Spark25)
     } else {
-        Err("retained snapshot requires Qwen3.5, DeepSeek4 or dense LFM".to_string())
+        Err("retained snapshot requires Qwen3.5, DeepSeek4, dense LFM or Spark2.5".to_string())
     }
 }
 
@@ -737,8 +828,40 @@ pub fn redline_prime_retained_fixture(
             .device_synchronize()
             .map_err(|error| error.to_string())?;
         Ok(())
+    } else if let Some(bundle) = loaded
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>())
+    {
+        redline_reset_spark25(gpu, bundle)?;
+        for pos in 0..context {
+            let token = 10 + (pos as u32 % 1000);
+            spark25::forward::prepare_retained_decode_inputs(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                token,
+                pos as u32,
+            )?;
+            spark25::forward::run_retained_decode_body(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                pos as u32,
+            )?;
+            // Retained body advances no host cursor; commit per position so
+            // the primed state matches an ordinary decode run.
+            bundle.state.n_tokens = pos + 1;
+        }
+        loaded.seq_pos = context;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| error.to_string())?;
+        Ok(())
     } else {
-        Err("retained fixture requires Qwen3.5, DeepSeek4 or dense LFM".to_string())
+        Err("retained fixture requires Qwen3.5, DeepSeek4, dense LFM or Spark2.5".to_string())
     }
 }
 
@@ -792,8 +915,21 @@ pub fn redline_prepare_retained_fixture(
             token_id,
             context as u32,
         )
+    } else if let Some(bundle) = loaded
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>())
+    {
+        spark25::forward::prepare_retained_decode_inputs(
+            &bundle.config,
+            &bundle.weights,
+            &mut bundle.state,
+            gpu,
+            token_id,
+            context as u32,
+        )
     } else {
-        Err("retained fixture requires Qwen3.5, DeepSeek4 or dense LFM".to_string())
+        Err("retained fixture requires Qwen3.5, DeepSeek4, dense LFM or Spark2.5".to_string())
     }
 }
 
@@ -868,8 +1004,37 @@ pub fn redline_run_direct_fixture(
         }
         loaded.seq_pos = context + iterations;
         Ok(())
+    } else if let Some(bundle) = loaded
+        .state
+        .as_mut()
+        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>())
+    {
+        for index in 0..iterations {
+            let token = 101 + index as u32;
+            let pos = (context + index) as u32;
+            spark25::forward::prepare_retained_decode_inputs(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                token,
+                pos,
+            )?;
+            spark25::forward::run_retained_decode_body(
+                &bundle.config,
+                &bundle.weights,
+                &mut bundle.state,
+                gpu,
+                pos,
+            )?;
+            // Retained body advances no host cursor; the direct HIP oracle
+            // commits both so replay arms compare against identical state.
+            bundle.state.n_tokens = context + index + 1;
+        }
+        loaded.seq_pos = context + iterations;
+        Ok(())
     } else {
-        Err("retained fixture requires Qwen3.5, DeepSeek4 or dense LFM".to_string())
+        Err("retained fixture requires Qwen3.5, DeepSeek4, dense LFM or Spark2.5".to_string())
     }
 }
 
@@ -1299,6 +1464,277 @@ pub fn redline_bench_decode_lfm2moe(
     }
 }
 
+pub fn redline_bench_decode_spark25(
+    gpu: &mut rdna_compute::Gpu,
+    loaded: &mut LoadedModel,
+    msg: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    if !redline_is_spark25(loaded) {
+        return Err("bench_decode requires a loaded single-GPU Spark2.5 model".to_string());
+    }
+    let context = msg
+        .get("context_tokens")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(128) as usize;
+    let iterations = msg
+        .get("iterations")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(1) as usize;
+    let capture = msg
+        .get("redline_capture")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let product_route = msg
+        .get("redline_product_route")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let capture_detail = msg
+        .get("redline_detail")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    if capture && product_route {
+        return Err("redline_capture and redline_product_route are mutually exclusive".to_string());
+    }
+    if context == 0 || iterations == 0 {
+        return Err("bench_decode context_tokens and iterations must be non-zero".to_string());
+    }
+    if capture && iterations != 1 {
+        return Err("redline_capture requires iterations==1".to_string());
+    }
+    if context.saturating_add(iterations).saturating_add(32) > loaded.physical_cap {
+        return Err(format!(
+            "bench_decode context+iterations exceeds loaded physical_cap={}",
+            loaded.physical_cap
+        ));
+    }
+    // Capture/forward cleanup: guarantee reset on every path.
+    let mut capture_started = false;
+    let inner =
+        (|| -> Result<serde_json::Value, String> {
+            loaded.seq_pos = 0;
+            loaded.conversation_tokens.clear();
+            redline_prime_retained_fixture(gpu, loaded, context)
+                .map_err(|error| format!("bench_decode prefill prime failed: {error}"))?;
+            loaded.seq_pos = context;
+            if capture {
+                redline_prepare_retained_fixture(gpu, loaded, 101, context)
+                    .map_err(|error| format!("bench_decode stage failed: {error}"))?;
+                gpu.replay
+                    .begin_capture()
+                    .map_err(|reason| format!("redline decode capture refused: {reason}"))?;
+                capture_started = true;
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|error| error.to_string())?;
+                let started = Instant::now();
+                {
+                    let bundle = match loaded.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>()
+                    }) {
+                        Some(bundle) => bundle,
+                        None => unreachable!(),
+                    };
+                    spark25::forward::run_retained_decode_body(
+                        &bundle.config,
+                        &bundle.weights,
+                        &mut bundle.state,
+                        gpu,
+                        context as u32,
+                    )
+                    .map_err(|error| format!("bench_decode forward failed: {error}"))?;
+                }
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|error| error.to_string())?;
+                let elapsed = started.elapsed().as_secs_f64();
+                let summary = gpu
+                    .replay
+                    .finish_capture()
+                    .map_err(|reason| format!("redline decode capture failed: {reason}"))?;
+                capture_started = false;
+                loaded.seq_pos = 0;
+                loaded.conversation_tokens.clear();
+                let bundle = match loaded.state.as_mut().and_then(|s| {
+                    (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>()
+                }) {
+                    Some(bundle) => bundle,
+                    None => unreachable!(),
+                };
+                redline_reset_spark25(gpu, bundle)?;
+                let mut response = serde_json::json!({
+                    "type": "decode_result",
+                    "context_tokens": context,
+                    "iterations": iterations,
+                    "ms": elapsed * 1000.0,
+                    "us_per_token": elapsed * 1_000_000.0 / iterations as f64,
+                    "tok_s": iterations as f64 / elapsed.max(f64::MIN_POSITIVE),
+                });
+                response["redline_capture"] = redline_capture_json(gpu, summary, capture_detail);
+                Ok(response)
+            } else if product_route {
+                // Production timed arm: ordinary Spark decode_step. There is no
+                // decode_step_with_retained_replay production path for Spark, so
+                // this arm is plain AR by construction — never the retained body,
+                // and retained_replay_observed is always false.
+                gpu.replay.begin_replay_observation_window();
+                let replay_before = gpu.replay.replay_observation();
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|error| error.to_string())?;
+                let started = Instant::now();
+                for i in 0..iterations {
+                    let token = 101 + (i as u32 % 1000);
+                    let pos = (context + i) as u32;
+                    {
+                        let bundle = match loaded.state.as_mut().and_then(|s| {
+                            (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>()
+                        }) {
+                            Some(bundle) => bundle,
+                            None => unreachable!(),
+                        };
+                        let _ = spark25::forward::decode_step(
+                            &bundle.config,
+                            &bundle.weights,
+                            &mut bundle.state,
+                            gpu,
+                            token,
+                            pos,
+                        )
+                        .map_err(|error| format!("bench_decode forward failed: {error}"))?;
+                    }
+                    loaded.seq_pos = context + i + 1;
+                }
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|error| error.to_string())?;
+                let elapsed = started.elapsed().as_secs_f64();
+                let replay_after = gpu.replay.replay_observation();
+                loaded.seq_pos = 0;
+                loaded.conversation_tokens.clear();
+                let bundle = match loaded.state.as_mut().and_then(|s| {
+                    (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>()
+                }) {
+                    Some(bundle) => bundle,
+                    None => unreachable!(),
+                };
+                redline_reset_spark25(gpu, bundle)?;
+                let mut response = serde_json::json!({
+                    "type": "decode_result",
+                    "context_tokens": context,
+                    "iterations": iterations,
+                    "ms": elapsed * 1000.0,
+                    "us_per_token": elapsed * 1_000_000.0 / iterations as f64,
+                    "tok_s": iterations as f64 / elapsed.max(f64::MIN_POSITIVE),
+                });
+                let prepared = gpu.replay.prepared_route_identity().map(|identity| {
+                    serde_json::json!({
+                        "dispatches": identity.dispatch_count,
+                        "packets": identity.packet_count,
+                        "queue_id": identity.queue_id,
+                        "command_dwords": identity.command_dwords,
+                        "queues": identity.queue_count,
+                        "phases": identity.phase_count,
+                    })
+                });
+                let sequence = gpu.replay.capture_summary();
+                let replay_delta = replay_after.count.saturating_sub(replay_before.count);
+                response["redline_route"] = serde_json::json!({
+                    "requested_backend": format!("{:?}", gpu.replay.request()).to_ascii_lowercase(),
+                    "transport": gpu.replay.transport_name(),
+                    "state": format!("{:?}", gpu.replay.state()).to_ascii_lowercase(),
+                    "fallback_reason": gpu.replay.fallback_reason(),
+                    "execution_mode": "plain_ar",
+                    "prepared": prepared,
+                    "sequence": {
+                        "launches": sequence.launch_count,
+                        "unique_kernels": sequence.unique_kernel_count,
+                        "hash": format!("{:016x}", sequence.sequence_hash),
+                    },
+                    "observed": {
+                        "count_before": replay_before.count,
+                        "count_after": replay_after.count,
+                        "count_delta": replay_delta,
+                        "first_position": replay_after.first_position,
+                        "last_position": replay_after.last_position,
+                    },
+                    "retained_replay_observed": false,
+                });
+                Ok(response)
+            } else {
+                // Manual oracle timing path: stage outside, retained body only.
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|error| error.to_string())?;
+                let started = Instant::now();
+                for i in 0..iterations {
+                    let token = 101 + (i as u32 % 1000);
+                    let pos = context + i;
+                    redline_prepare_retained_fixture(gpu, loaded, token, pos)?;
+                    {
+                        let bundle = match loaded.state.as_mut().and_then(|s| {
+                            (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>()
+                        }) {
+                            Some(bundle) => bundle,
+                            None => unreachable!(),
+                        };
+                        spark25::forward::run_retained_decode_body(
+                            &bundle.config,
+                            &bundle.weights,
+                            &mut bundle.state,
+                            gpu,
+                            pos as u32,
+                        )
+                        .map_err(|error| format!("bench_decode forward failed: {error}"))?;
+                        bundle.state.n_tokens = pos + 1;
+                    }
+                    loaded.seq_pos = context + i + 1;
+                }
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|error| error.to_string())?;
+                let elapsed = started.elapsed().as_secs_f64();
+                loaded.seq_pos = 0;
+                loaded.conversation_tokens.clear();
+                let bundle = match loaded.state.as_mut().and_then(|s| {
+                    (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>()
+                }) {
+                    Some(bundle) => bundle,
+                    None => unreachable!(),
+                };
+                redline_reset_spark25(gpu, bundle)?;
+                Ok(serde_json::json!({
+                    "type": "decode_result",
+                    "context_tokens": context,
+                    "iterations": iterations,
+                    "ms": elapsed * 1000.0,
+                    "us_per_token": elapsed * 1_000_000.0 / iterations as f64,
+                    "tok_s": iterations as f64 / elapsed.max(f64::MIN_POSITIVE),
+                }))
+            }
+        })();
+    match inner {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            if capture_started {
+                gpu.replay.poison("bench_decode aborted during capture");
+            }
+            // Ensure host state is cleaned even on failure.
+            loaded.seq_pos = 0;
+            loaded.conversation_tokens.clear();
+            if let Some(bundle) = loaded
+                .state
+                .as_mut()
+                .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>())
+            {
+                let _ = redline_reset_spark25(gpu, bundle);
+            } else {
+                let _ = gpu.hip.device_synchronize();
+            }
+            Err(error)
+        }
+    }
+}
+
 pub fn redline_shadow_deepseek4(
     gpu: &mut rdna_compute::Gpu,
     loaded: &mut LoadedModel,
@@ -1312,9 +1748,11 @@ pub fn redline_shadow_deepseek4(
             (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
         });
     let is_lfm = redline_is_dense_lfm(loaded);
-    if !is_ds4 && !is_lfm {
+    let is_spark = redline_is_spark25(loaded);
+    if !is_ds4 && !is_lfm && !is_spark {
         return Err(
-            "redline shadow requires a loaded single-GPU DeepSeek4 or dense LFM model".to_string(),
+            "redline shadow requires a loaded single-GPU DeepSeek4, dense LFM or Spark2.5 model"
+                .to_string(),
         );
     }
     if is_ds4 {
@@ -1417,7 +1855,7 @@ pub fn redline_shadow_deepseek4(
                 Err(error)
             }
         }
-    } else {
+    } else if is_lfm {
         // Dense LFM retained shadow: each oracle arm starts from identical prime;
         // PM4/blob stage inputs before each replay and commit host n_tokens after success.
         let prepared = if pm4 {
@@ -1551,6 +1989,143 @@ pub fn redline_shadow_deepseek4(
                         .downcast_mut::<hipfire_arch_lfm2moe::Lfm2MoeBundle>()
                 }) {
                     let _ = redline_reset_lfm2moe(gpu, bundle);
+                    loaded.seq_pos = 0;
+                    loaded.conversation_tokens.clear();
+                    let _ = gpu.hip.device_synchronize();
+                }
+                Err(error)
+            }
+        }
+    } else {
+        // Spark2.5 retained shadow: same three-oracle shape as dense LFM.
+        // PM4/blob stage inputs before each replay and commit host
+        // n_tokens/seq_pos after success, matching the direct HIP arm.
+        let prepared = if pm4 {
+            let launch_count = gpu.replay.recorded_launches().len();
+            gpu.replay
+                .prepare_pm4_prefix(gpu.device_id as usize, launch_count)
+                .map(|(dispatches, dwords, queue)| (dispatches, 1, queue, Some(dwords)))
+        } else {
+            gpu.replay
+                .prepare_linear_aql(gpu.device_id as usize)
+                .map(|(dispatches, packets, queue)| (dispatches, packets, queue, None))
+        }
+        .map_err(|reason| format!("redline AQL prepare failed: {reason}"))?;
+        let frame_checkpoint = rdna_compute::norm::gdn_requant_frame_checkpoint();
+        let inner = (|| -> Result<serde_json::Value, String> {
+            redline_prime_retained_fixture(gpu, loaded, context)?;
+            let started = Instant::now();
+            let mut gpu_us = 0.0;
+            for index in 0..iterations {
+                redline_prepare_retained_fixture(gpu, loaded, 101 + index as u32, context + index)?;
+                // Input staging runs on the HIP stream, while retained AQL/PM4
+                // executes on a ROCr queue. Complete the producer handoff
+                // before the replay queue reads h and pos_buf.
+                gpu.hip
+                    .device_synchronize()
+                    .map_err(|error| error.to_string())?;
+                if pm4 {
+                    let timing = unsafe { gpu.replay.replay_pm4(context + index) }?;
+                    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>()
+                    }) {
+                        bundle.state.n_tokens = context + index + 1;
+                        loaded.seq_pos = context + index + 1;
+                    }
+                    gpu_us += timing.span_microseconds();
+                } else {
+                    let timing = unsafe { gpu.replay.replay_linear_aql(context + index) }?;
+                    if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                        (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>()
+                    }) {
+                        bundle.state.n_tokens = context + index + 1;
+                        loaded.seq_pos = context + index + 1;
+                    }
+                    gpu_us += timing.span_microseconds();
+                }
+            }
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())?;
+            let aql_host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+            let aql_snapshot = redline_snapshot(gpu, loaded)?;
+            redline_prime_retained_fixture(gpu, loaded, context)?;
+            for index in 0..iterations {
+                redline_prepare_retained_fixture(gpu, loaded, 101 + index as u32, context + index)?;
+                gpu.replay_recorded_hip_prefix(prepared.0)
+                    .map_err(|error| error.to_string())?;
+                if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                    (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>()
+                }) {
+                    bundle.state.n_tokens = context + index + 1;
+                    loaded.seq_pos = context + index + 1;
+                }
+            }
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())?;
+            let blob_snapshot = redline_snapshot(gpu, loaded)?;
+            rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+            redline_prime_retained_fixture(gpu, loaded, context)?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())?;
+            let started = Instant::now();
+            redline_run_direct_fixture(gpu, loaded, context, iterations)?;
+            gpu.hip
+                .device_synchronize()
+                .map_err(|error| error.to_string())?;
+            let hip_host_us = started.elapsed().as_secs_f64() * 1_000_000.0;
+            let hip_snapshot = redline_snapshot(gpu, loaded)?;
+            let logits_equal = aql_snapshot.logits() == hip_snapshot.logits();
+            let kv_equal = aql_snapshot.kv() == hip_snapshot.kv();
+            let recurrent_equal = aql_snapshot.recurrent() == hip_snapshot.recurrent();
+            let gdn_frame_equal = aql_snapshot.gdn_frame() == hip_snapshot.gdn_frame();
+            let blob_gdn_frame_equal = aql_snapshot.gdn_frame() == blob_snapshot.gdn_frame();
+            let blob_bit_exact = redline_snapshots_bit_exact(&aql_snapshot, &blob_snapshot);
+            Ok(serde_json::json!({
+                "type": "redline_shadow_result",
+                "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
+                "context_tokens": context,
+                "iterations": iterations,
+                "dispatches": prepared.0,
+                "packets": prepared.1,
+                "queue_id": prepared.2,
+                "command_dwords": prepared.3,
+                "bit_exact": redline_snapshots_bit_exact(&aql_snapshot, &hip_snapshot),
+                "blob_bit_exact": blob_bit_exact,
+                "logits_equal": logits_equal,
+                "kv_equal": kv_equal,
+                "recurrent_equal": recurrent_equal,
+                "gdn_frame_equal": gdn_frame_equal,
+                "blob_gdn_frame_equal": blob_gdn_frame_equal,
+                "aql_host_us": aql_host_us,
+                "aql_gpu_us": gpu_us,
+                "hip_host_us": hip_host_us,
+                "aql": aql_snapshot.json(),
+                "hip": hip_snapshot.json(),
+                "blob": blob_snapshot.json(),
+            }))
+        })();
+        match inner {
+            Ok(value) => {
+                rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                    (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>()
+                }) {
+                    let _ = redline_reset_spark25(gpu, bundle);
+                    loaded.seq_pos = 0;
+                    loaded.conversation_tokens.clear();
+                    let _ = gpu.hip.device_synchronize();
+                }
+                Ok(value)
+            }
+            Err(error) => {
+                rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
+                if let Some(bundle) = loaded.state.as_mut().and_then(|s| {
+                    (s.as_mut() as &mut dyn Any).downcast_mut::<spark25::Spark25Bundle>()
+                }) {
+                    let _ = redline_reset_spark25(gpu, bundle);
                     loaded.seq_pos = 0;
                     loaded.conversation_tokens.clear();
                     let _ = gpu.hip.device_synchronize();
@@ -3217,6 +3792,7 @@ pub fn handle_redline_shadow(
         loaded.state.as_ref().is_some_and(|s| {
             (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
         }) || redline_is_dense_lfm(loaded)
+            || redline_is_spark25(loaded)
     }) {
         let loaded = model.as_mut().expect("retained route checked");
         match redline_shadow_deepseek4(gpu, loaded, pm4, context, iterations) {
@@ -3246,7 +3822,7 @@ pub fn handle_redline_shadow(
         emit_uncorrelated_error(
             stdout,
             None,
-            "redline_shadow_aql requires a loaded single-GPU Qwen3.5, DeepSeek4 or dense LFM model",
+            "redline_shadow_aql requires a loaded single-GPU Qwen3.5, DeepSeek4, dense LFM or Spark2.5 model",
             "unsupported",
             false,
             false,
@@ -4336,7 +4912,7 @@ pub fn handle_redline_prefix_shadow(
 
 #[cfg(test)]
 mod redline_snapshot_tests {
-    use super::{RedlineQwenSnapshot, RedlineSnapshot, redline_snapshots_bit_exact};
+    use super::{redline_snapshots_bit_exact, RedlineQwenSnapshot, RedlineSnapshot};
 
     fn qwen_snapshot(gdn_frame: u32) -> RedlineSnapshot {
         RedlineSnapshot::Qwen(RedlineQwenSnapshot {

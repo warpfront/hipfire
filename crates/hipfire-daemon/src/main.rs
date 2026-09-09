@@ -71,12 +71,12 @@ use hipfire_generate::redline::{
     handle_redline_dspark_shadow_pm4, handle_redline_pm4_prefix_profile,
     handle_redline_prefix_shadow, handle_redline_probe_aql, handle_redline_shadow,
     redline_append_tensor_slice, redline_bench_decode_deepseek4, redline_bench_decode_lfm2moe,
-    redline_deepseek4_snapshot, redline_dspark_shadow_block, redline_dspark_verify_guard,
-    redline_dspark_verify_snapshot, redline_is_dense_lfm, redline_lfm2moe_snapshot,
-    redline_pm4_prefix_profile_deepseek4, redline_prepare_retained_fixture,
-    redline_prime_deepseek4, redline_prime_dspark_shadow_arm, redline_prime_qwen,
-    redline_prime_retained_fixture, redline_qwen_debug_hashes, redline_qwen_snapshot,
-    redline_reset_deepseek4, redline_reset_lfm2moe, redline_reset_qwen,
+    redline_bench_decode_spark25, redline_deepseek4_snapshot, redline_dspark_shadow_block,
+    redline_dspark_verify_guard, redline_dspark_verify_snapshot, redline_is_dense_lfm,
+    redline_lfm2moe_snapshot, redline_pm4_prefix_profile_deepseek4,
+    redline_prepare_retained_fixture, redline_prime_deepseek4, redline_prime_dspark_shadow_arm,
+    redline_prime_qwen, redline_prime_retained_fixture, redline_qwen_debug_hashes,
+    redline_qwen_snapshot, redline_reset_deepseek4, redline_reset_lfm2moe, redline_reset_qwen,
     redline_run_deepseek4_decode, redline_run_direct_fixture, redline_run_dspark_capture_arm,
     redline_run_dspark_direct_arm, redline_run_dspark_replay_arm, redline_shadow_deepseek4,
     redline_shadow_dspark_verify_pm4, redline_snapshot, RedlineDeepseek4Snapshot, RedlineDsparkArm,
@@ -1822,6 +1822,7 @@ fn main() {
                             12 => "north_mini_code",
                             13 => "gemma4",
                             14 => "muse_glimmer",
+                            16 => "spark2_5",
                             40 => "flux_mmdit",
                             45 => "flux2_mmdit",
                             _ => "qwen3",
@@ -3699,6 +3700,7 @@ fn main() {
                         12 => "north_mini_code",
                         13 => "gemma4",
                         14 => "muse_glimmer",
+                        16 => "spark2_5",
                         40 => "flux_mmdit",
                         45 => "flux2_mmdit",
                         _ => "qwen3",
@@ -4019,6 +4021,22 @@ fn main() {
                     }
                     hipfire_loader::BenchDecodeRoute::Lfm2Moe => {
                         match redline_bench_decode_lfm2moe(&mut gpu, m, &msg) {
+                            Ok(response) => {
+                                let _ = writeln!(stdout, "{response}");
+                            }
+                            Err(reason) => {
+                                let _ = writeln!(
+                                    stdout,
+                                    "{}",
+                                    serde_json::json!({"type": "error", "message": reason})
+                                );
+                            }
+                        }
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    hipfire_loader::BenchDecodeRoute::Spark25 => {
+                        match redline_bench_decode_spark25(&mut gpu, m, &msg) {
                             Ok(response) => {
                                 let _ = writeln!(stdout, "{response}");
                             }

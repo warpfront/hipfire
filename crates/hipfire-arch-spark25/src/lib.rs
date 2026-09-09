@@ -20,6 +20,6 @@ pub use bundle::{
 pub use config::{Spark25Config, Spark25LayerType};
 pub use forward::{
     decode_step, decode_step_body, decode_step_body_capture, decode_step_capture, prefill,
-    prefill_from,
+    prefill_from, prepare_retained_decode_inputs, run_retained_decode_body,
 };
 pub use spark25::{Spark25LayerWeights, Spark25State, Spark25Weights};

@@ -1066,7 +1066,11 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         // LFM retained-PM4 fallback: state is RMW at @8 (write covers RMW).
         "conv1d_gated_decode_f32" => Some(vec![read(0), write(8), read(16), write(24)]),
         // LFM retained-PM4 fallback: q/k/v read, out write, pos read.
-        "attention_q8_0_kv" => Some(vec![read(0), read(8), read(16), write(24), read(32)]),
+        // SWA sister (Spark/LFM windowed path): same five pointer slots; trailing
+        // window i32 only changes scalar tail (still 64 B padded).
+        "attention_q8_0_kv" | "attention_q8_0_kv_swa" => {
+            Some(vec![read(0), read(8), read(16), write(24), read(32)])
+        }
         "conv1d_silu_split_f32" => Some(vec![
             write(0),
             write(8),
@@ -1196,7 +1200,12 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]),
         "deinterleave_f32" => Some(vec![read(0), write(8), write(16)]),
         "rmsnorm_f32" | "rmsnorm_f32_warp_reduce" => Some(vec![read(0), read(8), write(16)]),
-        "rope_partial_halfsplit_f32" => Some(vec![write(0), write(8), read(16)]),
+        // RoPE q/k are RMW in place (write covers RMW); pos is read-only.
+        // halfsplit and interleaved share the three-pointer prefix; interleaved
+        // adds n_rot (still 48 B after pad_to(16)). rope_f32 omits n_rot (40→48).
+        "rope_f32" | "rope_partial_halfsplit_f32" | "rope_partial_interleaved_f32" => {
+            Some(vec![write(0), write(8), read(16)])
+        }
         "kv_cache_write_asym_k_fwht3" => {
             Some(vec![write(0), read(8), read(16), read(24), read(32)])
         }
@@ -1225,11 +1234,16 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
         // Spark-X2.5 exact-erf gated GELU: gate/up read, out written.
         "gelu_erf_mul_f32" => Some(vec![read(0), read(8), write(16)]),
+        // Spark-X2.5 tied Q8 lm_head: weight/input read, logits written.
+        // 3 ptr + 2xi32 = 32 (already aligned).
+        "gemv_q8_0" => Some(vec![read(0), read(8), write(16)]),
         // Spark-X2.5 headwise broadcast gate: x is read-modify-written in
         // place (read+write at @0; write covers the RMW dependency, the
         // explicit read records the consumer edge), gate read at @8.
         "sigmoid_mul_broadcast_f32" => Some(vec![read(0), write(0), read(8)]),
         "gemma4_ple_gelu_mul_strided_f32" => Some(vec![read(0), read(8), write(16)]),
+        // Typed F32 D2D: dst written, src read. 2 ptr + i32 = 20 → 32 padded.
+        "copy_f32_buffer" => Some(vec![write(0), read(8)]),
         _ => None,
     }
 }
@@ -1255,6 +1269,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "state_overlap_shift_f32_buf"
             | "state_ring_write_f32_buf"
             | "add_inplace_f32"
+            | "gemv_q8_0"
     ) {
         return Some(32);
     }
@@ -1553,7 +1568,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "sigmoid_mul_f32" => Some(32),
         // gelu_erf_mul: 3 ptrs + i32 = 28, padded to 32. sigmoid broadcast:
         // 2 ptrs + 2xi32 = 24, padded to 32 (launch path pads blobs to 16).
-        "gelu_erf_mul_f32" | "sigmoid_mul_broadcast_f32" => Some(32),
+        // copy_f32_buffer: 2 ptr + i32 = 20, padded to 32.
+        "gelu_erf_mul_f32" | "sigmoid_mul_broadcast_f32" | "copy_f32_buffer" => Some(32),
         "gemma4_ple_gelu_mul_strided_f32" => Some(48),
         "attention_flash_q8_0_reduce"
         | "fused_rmsnorm_mq_rotate"
@@ -1581,7 +1597,11 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "kv_cache_write_q8_0_pair"
         | "mq_rotate_x"
         | "repeat_interleave_qk_f32"
+        // rope_f32: 3 ptr + 3 i32 + f32 = 40 → 48. halfsplit/interleaved:
+        // 3 ptr + 4 i32 + f32 = 44 → 48.
+        | "rope_f32"
         | "rope_partial_halfsplit_f32"
+        | "rope_partial_interleaved_f32"
         | "conv1d_gated_decode_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
@@ -1597,7 +1617,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100"
-        | "attention_q8_0_kv" => Some(64),
+        // attention_q8_0_kv: 5 ptr + 4 i32 + f32 = 60 → 64.
+        // attention_q8_0_kv_swa: 5 ptr + 5 i32 + f32 = 64 (already aligned).
+        | "attention_q8_0_kv"
+        | "attention_q8_0_kv_swa" => Some(64),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
@@ -1641,6 +1664,143 @@ fn apply_qwen_q8_full_attention_visibility(
         }
         if full_attention_body && kernel == "gemv_hfq4g256_residual" {
             full_attention_body = false;
+        }
+    }
+}
+
+/// Publish/acquire visibility for producer/consumer sharing edges in a
+/// retained single-queue AQL batch.
+///
+/// The default batch headers only order dispatches (`barrier`); on gfx1201
+/// that ordering alone neither flushes a producer's writes to the coherence
+/// point nor invalidates a consumer's vector cache for a reused buffer. Any
+/// dispatch that shares a global allocation with an earlier dispatch through
+/// a write on either side (the recorded `accesses`, recovered from typed
+/// kernel signatures at capture time) therefore needs the captured HIP
+/// system scopes at that edge, not just queue order. Spark's retained tape
+/// (typed `copy_f32_buffer` splits, `rope_f32`, `attention_q8_0_kv_swa`,
+/// exact-erf `gelu_erf_mul_f32`, headwise `sigmoid_mul_broadcast_f32`, and
+/// `gemv_q8_0`/`gemv_mq4g256v2_multirow_r2` around `mq_rotate_x`) is dense
+/// with such edges while matching none of the narrow name-based special
+/// cases in the constructor below; with barrier-only headers its
+/// multi-position AQL shadow diverged in both logits and KV while HIP/blob
+/// replay of the same tape stayed exact.
+///
+/// Only missing scopes are filled, reusing the same release/acquire pair
+/// the `mq_rotate_x` case already uses (an edge whose both ends need
+/// scoping collapses to `RECORDED_DISPATCH`, as does a half-scoped
+/// acquire/release-only header that also needs the other side). The
+/// barrier bit and any existing Agent/System scope are never narrowed,
+/// and triples without an existing constant (independent and agent-pair
+/// headers) keep their header while the edge's other end still lands its
+/// half, as do dispatches with unknown effects. Adding visibility is
+/// strictly conservative: it cannot change values on tapes that already
+/// pass, only stale-cache reads on tapes that do not.
+fn apply_retained_aql_sharing_visibility(
+    launches: &[RecordedHipLaunch],
+    headers: &mut [HeaderPolicy],
+) {
+    debug_assert_eq!(launches.len(), headers.len());
+    let mut needs_release = vec![false; launches.len()];
+    let mut needs_acquire = vec![false; launches.len()];
+    // Bounded frontier: one slot per allocation holding the latest writer
+    // and the readers since that writer. This preserves every true sharing
+    // edge without retaining the whole tape:
+    // - a read needs the latest writer (RAW); older writers were superseded
+    //   by barrier-ordered overwrites, so their values are dead to it;
+    // - a write needs the latest writer (WAW) and every reader since that
+    //   writer (WAR); pre-write readers were already flagged when the
+    //   superseding write arrived.
+    // Allocation-wide metadata may over-approximate a write that only
+    // touches a subrange, so an earlier subrange writer must never be
+    // silently dropped: every write is flagged against the live slot on
+    // arrival, which publishes each writer through the last-writer chain
+    // (each superseding write flags its predecessor WAW) before the slot
+    // moves on. A later reader then acquires against the latest writer
+    // while every earlier writer in the chain already carries its release,
+    // so the cache-wide acquire/release scopes still cover the earlier
+    // subrange. Unknown-effect dispatches are skipped without clearing the
+    // slots they may sit between.
+    #[derive(Default)]
+    struct AllocationFrontier {
+        last_writer: Option<usize>,
+        readers_since_write: Vec<usize>,
+    }
+    let mut frontier: BTreeMap<u64, AllocationFrontier> = BTreeMap::new();
+    for (index, launch) in launches.iter().enumerate() {
+        let Some(accesses) = launch.accesses.as_deref() else {
+            continue;
+        };
+        // Phase 1: flag against live state. Merging happens afterwards so a
+        // dispatch never flags itself.
+        for access in accesses {
+            let Some(slot) = frontier.get(&access.allocation_base) else {
+                continue;
+            };
+            match access.mode {
+                RecordedAccessMode::Read => {
+                    if let Some(writer) = slot.last_writer {
+                        needs_release[writer] = true;
+                        needs_acquire[index] = true;
+                    }
+                }
+                RecordedAccessMode::Write => {
+                    if let Some(writer) = slot.last_writer {
+                        needs_release[writer] = true;
+                        needs_acquire[index] = true;
+                    }
+                    for reader in &slot.readers_since_write {
+                        needs_release[*reader] = true;
+                        needs_acquire[index] = true;
+                    }
+                }
+            }
+        }
+        // Phase 2: merge. A write supersedes the slot: predecessors were
+        // flagged in phase 1 (or by the earlier chain link), so the slot
+        // moves on with only the new writer live.
+        for access in accesses {
+            let slot = frontier.entry(access.allocation_base).or_default();
+            if access.mode == RecordedAccessMode::Write {
+                slot.last_writer = Some(index);
+                slot.readers_since_write.clear();
+            } else if slot.readers_since_write.last() != Some(&index) {
+                slot.readers_since_write.push(index);
+            }
+        }
+    }
+    // Additive scope union: fill only the missing (None) side with System
+    // scope. The barrier bit and any existing Agent/System scope are never
+    // narrowed, and triples without an existing constant (independent and
+    // agent-pair headers) keep their current header while the edge's other
+    // end still lands its half.
+    for (index, header) in headers.iter_mut().enumerate() {
+        let acquire = needs_acquire[index];
+        let release = needs_release[index];
+        if !acquire && !release {
+            continue;
+        }
+        if *header == HeaderPolicy::BATCH_BOUNDARY_INTERNAL_SERIAL {
+            if acquire && release {
+                *header = HeaderPolicy::RECORDED_DISPATCH;
+            } else if acquire {
+                *header = HeaderPolicy::BATCH_INTERNAL_ACQUIRE_SYSTEM;
+            } else {
+                *header = HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM;
+            }
+        } else if *header == HeaderPolicy::BATCH_BOUNDARY_FIRST_SERIAL && release {
+            // The batch entry already acquires; a producing first dispatch
+            // still has to publish before later consumers read it back.
+            *header = HeaderPolicy::RECORDED_DISPATCH;
+        } else if *header == HeaderPolicy::BATCH_INTERNAL_ACQUIRE_SYSTEM && release {
+            // Already acquires for its own input; the sharing edge also
+            // needs it to publish for later consumers.
+            *header = HeaderPolicy::RECORDED_DISPATCH;
+        } else if *header == HeaderPolicy::BATCH_INTERNAL_RELEASE_SYSTEM && acquire {
+            // Already publishes for its consumer; the sharing edge also
+            // needs it to acquire its own input (rotation reading the
+            // normalized buffer, RMW reading its target).
+            *header = HeaderPolicy::RECORDED_DISPATCH;
         }
     }
 }
@@ -2677,6 +2837,10 @@ fn required_mid_acquire(previous: &str, current: &str) -> bool {
     // Without it the first divergent launch in the 0.8B tape is this exact
     // pair (launches 12 -> 13); logits, KV, and recurrent state then drift.
     if previous == "fused_silu_mul_mq_rotate" && current.starts_with("gemv_hfq4g256_residual") {
+        return true;
+    }
+    // The Q8 head consumes the freshly normalized input through vector cache.
+    if previous == "rmsnorm_f32" && current == "gemv_q8_0" {
         return true;
     }
     // LFM's rotated projection buffer is consumed immediately by GEMV. A
@@ -4424,6 +4588,11 @@ impl ReplayController {
             }
         }
         apply_qwen_q8_full_attention_visibility(&self.recorded[..prefix], &mut headers);
+        // True producer/consumer sharing edges (allocation overlap with a
+        // write on either side) need system publish/acquire, not just queue
+        // order. Fills only missing scopes; barriers, stronger scopes, and
+        // every special case above are preserved.
+        apply_retained_aql_sharing_visibility(&self.recorded[..prefix], &mut headers);
         let graph = if self.request == ReplayBackendRequest::Auto {
             SingleQueueBatchGraph::create_unprofiled_with_dispatch_headers(
                 &device,

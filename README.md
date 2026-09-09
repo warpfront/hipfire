@@ -144,12 +144,24 @@ The registry currently contains 80 curated model entries. Run
 | LFM2.5 | `lfm2.5:350m`, `lfm2.5:1.2b`, `lfm2.5:1.2b-thinking`, `lfm2.5:8b-a1b` |
 | NEX N2 Mini | `nex-n2:mini` |
 | VibeThinker-3B | `vibethinker:3b`, `vibethinker:3b-mq6` |
+| Spark-X2.5 | Local MQ4V2 HFQ only — **no** registry pull tag. Convert [XHToken/Spark-X2.5-4B](https://huggingface.co/XHToken/Spark-X2.5-4B/tree/5e10fcc0286756aebf7c41dc52c1e42d95c70281) @ `5e10fcc0286756aebf7c41dc52c1e42d95c70281` |
 
 Common aliases include `qwen3.5`, `qwen3.6`, `qwen3.8`, `qwen3`, `carnice`,
 `qwopus`, `deepseek4`, `deepseek-v4`, `muse-glimmer`, `ornith`, `ornith-1.5`, `ornith-1.5:fast`, and `vibethinker`.
 
 Carnice uses the Hermes tool-call format. Plain Qwen 3.5 and 3.6 use
 their native Qwen XML tool-call format.
+
+Spark-X2.5-4B runs as a local converted MQ4V2 HFQ (linear projections
+`MQ4G256V2`, tied embedding/head `Q8F16`): native exact-erf GELU, headwise
+sigmoid attention gate, and 3:1 sliding/full GQA. Product generation is
+**plain AR** only — speculation, continuous batching, prompt cache, tools, and
+non-neutral `min_p` / repeat / presence / frequency controls fail closed. Set
+`memory.max_seq` within the attention LDS budget (the default `32768` exceeds
+the ~15872 cap on 64 KiB GPUs with `head_dim` 256; **4096** is validated). For
+`hipfire run`, pass `--repeat-penalty 1` (standard bench is neutral `1.0`;
+older `1.1` results are not comparable). Retained PM4/AQL paths exist for
+diagnostics and are **not** the product default.
 
 See [docs/MODELS.md](docs/MODELS.md) for sizes, minimum VRAM,
 recommended sampling settings, sidecars, artifact provenance, and
@@ -189,6 +201,10 @@ safe. It does not replace the model implementation or bypass hipfire's
 correctness gates.
 
 ## Performance snapshots
+
+Native greedy bench now uses repetition penalty `1.0`. Older results measured
+with penalty `1.1` are a different workload even on the same prompt; leave
+historical tables as published and do not treat them as comparable.
 
 ### Historical — 7900 XTX (gfx1100)
 
