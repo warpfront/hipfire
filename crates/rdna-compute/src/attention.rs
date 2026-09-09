@@ -142,6 +142,205 @@ fn wmma_fa_min_batch() -> usize {
         .unwrap_or(16)
 }
 
+// ── strided Q8_0 SWA launch validation (baseline + tiled candidate) ─────────
+//
+// The query-tiled flash candidate
+// (`Gpu::attention_q8_0_flash_tiled_swa_strided_gfx1010`) shares the baseline
+// strided layout, ABI, and buffer-size contract, so it reuses the validator
+// below instead of duplicating it. Only LDS sizing differs (context-sized in
+// the baseline, constant here).
+
+/// Dynamic LDS bytes for
+/// [`Gpu::attention_q8_0_flash_tiled_swa_strided_gfx1010`].
+///
+/// Kernel layout (see
+/// `kernels/src/attention_q8_0_flash_tiled_swa_strided_gfx1010.hip`: BR=8,
+/// BC=32, block=256, head_dim 256 only): `scores[8][32] + m/l/corr[3][8] +
+/// Q[8][256]` f32, plus staged K/V tiles of 32 rows × 276 B each (`(256/32) *
+/// 34` payload bytes + 4 B padding per row).
+const FLASH_TILED_SWA_STRIDED_GFX1010_LDS_BYTES: usize =
+    8 * 32 * 4 + 3 * 8 * 4 + 8 * 256 * 4 + 2 * 32 * 276;
+
+// The budget above holds only at head_dim 256; the launcher rejects any other
+// head_dim before compiling, so a layout change must update both together.
+const _: () = assert!(FLASH_TILED_SWA_STRIDED_GFX1010_LDS_BYTES == 26976);
+
+/// Pre-launch check sequence shared by the strided Q8_0 SWA attention
+/// launchers: buffer extents, head geometry, dtypes, and scalar bounds.
+///
+/// This is the exact pre-LDS check sequence of
+/// [`Gpu::attention_q8_0_kv_batched_swa_strided_gfx1010`], extracted so the
+/// query-tiled candidate reuses it instead of duplicating it. `max_ctx_len`
+/// is `Some` for the baseline (which sizes LDS from context) and `None` for
+/// the tiled candidate (constant [`FLASH_TILED_SWA_STRIDED_GFX1010_LDS_BYTES`],
+/// no context sizing). Check order and messages are identical for both
+/// callers; only the baseline's context-capacity checks are gated on `Some`.
+#[allow(clippy::too_many_arguments)]
+fn validate_strided_swa_geometry(
+    who: &str,
+    qkv: &GpuTensor,
+    k_cache: &GpuTensor,
+    v_cache: &GpuTensor,
+    out: &GpuTensor,
+    positions: &GpuTensor,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    max_seq: usize,
+    max_ctx_len: Option<usize>,
+    batch_size: usize,
+    q_stride: usize,
+) -> HipResult<()> {
+    if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{who}: invalid head geometry"),
+        ));
+    }
+    if n_heads % n_kv_heads != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{who}: n_heads ({n_heads}) not divisible by n_kv_heads ({n_kv_heads})"),
+        ));
+    }
+    if head_dim % 32 != 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{who}: head_dim ({head_dim}) not divisible by 32"),
+        ));
+    }
+    if max_seq == 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{who}: max_seq must be > 0"),
+        ));
+    }
+    if let Some(max_ctx_len) = max_ctx_len {
+        if max_ctx_len == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{who}: max_ctx_len must be > 0"),
+            ));
+        }
+        if max_ctx_len > max_seq {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{who}: max_ctx_len ({max_ctx_len}) exceeds max_seq ({max_seq})"),
+            ));
+        }
+    }
+    if q_stride == 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{who}: q_stride must be > 0"),
+        ));
+    }
+    let q_dim = n_heads.checked_mul(head_dim).ok_or_else(|| {
+        hip_bridge::HipError::new(0, &format!("{who}: n_heads*head_dim overflow"))
+    })?;
+    if q_dim > q_stride {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{who}: q_dim ({q_dim}) exceeds q_stride ({q_stride})"),
+        ));
+    }
+    if qkv.dtype != DType::F32 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{who}: qkv must be F32 (got {:?})", qkv.dtype),
+        ));
+    }
+    if out.dtype != DType::F32 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{who}: out must be F32 (got {:?})", out.dtype),
+        ));
+    }
+    if positions.buf.size() < batch_size.saturating_mul(4) {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{who}: positions buffer too small (have {} need {} for batch_size={batch_size})",
+                positions.buf.size(),
+                batch_size * 4
+            ),
+        ));
+    }
+    let qkv_need = batch_size
+        .checked_mul(q_stride)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{who}: qkv size overflow")))?;
+    if qkv.buf.size() < qkv_need {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{who}: qkv buffer too small (have {} need {qkv_need})",
+                qkv.buf.size()
+            ),
+        ));
+    }
+    let out_need = batch_size
+        .checked_mul(q_dim)
+        .and_then(|n| n.checked_mul(4))
+        .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{who}: out size overflow")))?;
+    if out.buf.size() < out_need {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{who}: out buffer too small (have {} need {out_need})",
+                out.buf.size()
+            ),
+        ));
+    }
+    let blocks_per_head = head_dim / 32;
+    let total_blocks = n_kv_heads.checked_mul(blocks_per_head).ok_or_else(|| {
+        hip_bridge::HipError::new(0, &format!("{who}: total_blocks overflow"))
+    })?;
+    let per_pos_bytes = total_blocks.checked_mul(34).ok_or_else(|| {
+        hip_bridge::HipError::new(0, &format!("{who}: per_pos_bytes overflow"))
+    })?;
+    let cache_need = max_seq
+        .checked_mul(per_pos_bytes)
+        .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{who}: cache size overflow")))?;
+    if k_cache.buf.size() < cache_need {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{who}: k_cache buffer too small (have {} need {cache_need})",
+                k_cache.buf.size()
+            ),
+        ));
+    }
+    if v_cache.buf.size() < cache_need {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{who}: v_cache buffer too small (have {} need {cache_need})",
+                v_cache.buf.size()
+            ),
+        ));
+    }
+    if n_heads > i32::MAX as usize
+        || n_kv_heads > i32::MAX as usize
+        || head_dim > i32::MAX as usize
+        || max_seq > i32::MAX as usize
+        || batch_size > i32::MAX as usize
+        || q_stride > i32::MAX as usize
+    {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{who}: scalar exceeds i32"),
+        ));
+    }
+    if n_heads > u32::MAX as usize || batch_size > u32::MAX as usize {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!("{who}: grid dimension exceeds u32"),
+        ));
+    }
+    Ok(())
+}
+
 impl Gpu {
     /// DSpark bidirectional staging assembly (on-GPU; replaces a host
     /// d2h+assemble+h2d that forced ~2 stream syncs per stage).
@@ -2353,152 +2552,21 @@ impl Gpu {
                 &format!("{WHO}: exact gfx1010 required (got {})", self.arch),
             ));
         }
-        if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{WHO}: invalid head geometry"),
-            ));
-        }
-        if n_heads % n_kv_heads != 0 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{WHO}: n_heads ({n_heads}) not divisible by n_kv_heads ({n_kv_heads})"),
-            ));
-        }
-        if head_dim % 32 != 0 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{WHO}: head_dim ({head_dim}) not divisible by 32"),
-            ));
-        }
-        if max_seq == 0 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{WHO}: max_seq must be > 0"),
-            ));
-        }
-        if max_ctx_len == 0 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{WHO}: max_ctx_len must be > 0"),
-            ));
-        }
-        if max_ctx_len > max_seq {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{WHO}: max_ctx_len ({max_ctx_len}) exceeds max_seq ({max_seq})"),
-            ));
-        }
-        if q_stride == 0 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{WHO}: q_stride must be > 0"),
-            ));
-        }
-        let q_dim = n_heads.checked_mul(head_dim).ok_or_else(|| {
-            hip_bridge::HipError::new(0, &format!("{WHO}: n_heads*head_dim overflow"))
-        })?;
-        if q_dim > q_stride {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{WHO}: q_dim ({q_dim}) exceeds q_stride ({q_stride})"),
-            ));
-        }
-        if qkv.dtype != DType::F32 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{WHO}: qkv must be F32 (got {:?})", qkv.dtype),
-            ));
-        }
-        if out.dtype != DType::F32 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{WHO}: out must be F32 (got {:?})", out.dtype),
-            ));
-        }
-        if positions.buf.size() < batch_size.saturating_mul(4) {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "{WHO}: positions buffer too small (have {} need {} for batch_size={batch_size})",
-                    positions.buf.size(),
-                    batch_size * 4
-                ),
-            ));
-        }
-        let qkv_need = batch_size
-            .checked_mul(q_stride)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{WHO}: qkv size overflow")))?;
-        if qkv.buf.size() < qkv_need {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "{WHO}: qkv buffer too small (have {} need {qkv_need})",
-                    qkv.buf.size()
-                ),
-            ));
-        }
-        let out_need = batch_size
-            .checked_mul(q_dim)
-            .and_then(|n| n.checked_mul(4))
-            .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{WHO}: out size overflow")))?;
-        if out.buf.size() < out_need {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "{WHO}: out buffer too small (have {} need {out_need})",
-                    out.buf.size()
-                ),
-            ));
-        }
-        let blocks_per_head = head_dim / 32;
-        let total_blocks = n_kv_heads.checked_mul(blocks_per_head).ok_or_else(|| {
-            hip_bridge::HipError::new(0, &format!("{WHO}: total_blocks overflow"))
-        })?;
-        let per_pos_bytes = total_blocks.checked_mul(34).ok_or_else(|| {
-            hip_bridge::HipError::new(0, &format!("{WHO}: per_pos_bytes overflow"))
-        })?;
-        let cache_need = max_seq
-            .checked_mul(per_pos_bytes)
-            .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{WHO}: cache size overflow")))?;
-        if k_cache.buf.size() < cache_need {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "{WHO}: k_cache buffer too small (have {} need {cache_need})",
-                    k_cache.buf.size()
-                ),
-            ));
-        }
-        if v_cache.buf.size() < cache_need {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "{WHO}: v_cache buffer too small (have {} need {cache_need})",
-                    v_cache.buf.size()
-                ),
-            ));
-        }
-        if n_heads > i32::MAX as usize
-            || n_kv_heads > i32::MAX as usize
-            || head_dim > i32::MAX as usize
-            || max_seq > i32::MAX as usize
-            || batch_size > i32::MAX as usize
-            || window > i32::MAX as usize
-            || q_stride > i32::MAX as usize
-        {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{WHO}: scalar exceeds i32"),
-            ));
-        }
-        if n_heads > u32::MAX as usize || batch_size > u32::MAX as usize {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!("{WHO}: grid dimension exceeds u32"),
-            ));
-        }
+        validate_strided_swa_geometry(
+            WHO,
+            qkv,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            Some(max_ctx_len),
+            batch_size,
+            q_stride,
+        )?;
 
         // LDS = (max_ctx + block + head_dim) * 4; block = next_pow2(max(max_ctx, hd)).min(256)
         let block_size = (max_ctx_len.max(head_dim) as u32)
@@ -2567,6 +2635,159 @@ impl Gpu {
             [n_heads as u32, batch_size as u32, 1],
             [block_size, 1, 1],
             shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b.push_i32(win);
+                b.push_i32(qs);
+                b.push_i32(bs);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Query-tiled Q8_0 flash attention over strided QKV rows (Spark chunk prefill).
+    ///
+    /// Standalone gfx1010 candidate; not wired into forward/dispatch. Same plain
+    /// single-arena K/V, strided-Q/packed-out layout, causal/SWA masking, and
+    /// 13-arg ABI as
+    /// [`Self::attention_q8_0_kv_batched_swa_strided_gfx1010`]: query at
+    /// `qkv[row * q_stride + head * head_dim]`, packed out
+    /// `[batch × n_heads × head_dim]`, per-row causal bound
+    /// `seq = positions[row] + 1`, `window == 0` full causal, otherwise
+    /// `t_lo = max(0, seq - window)`. Each workgroup scores BR=8 query rows
+    /// against shared BC=32 K/V tiles with an online softmax, so each K/V tile
+    /// is staged once per 8 queries instead of restreamed per query. Dynamic
+    /// LDS is the constant [`FLASH_TILED_SWA_STRIDED_GFX1010_LDS_BYTES`],
+    /// independent of context length, hence no `max_ctx_len` parameter.
+    /// `max_seq` is carried (unused by the kernel) to keep the 13-arg ABI
+    /// identical. Buffers are borrowed immutably; only packed `out` rows are
+    /// written. gfx1010-only with head_dim 256; anything else errors before
+    /// any compile or mutation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_flash_tiled_swa_strided_gfx1010(
+        &mut self,
+        qkv: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        batch_size: usize,
+        window: usize,
+        q_stride: usize,
+    ) -> HipResult<()> {
+        const WHO: &str = "attention_q8_0_flash_tiled_swa_strided_gfx1010";
+        // N=0 safe no-op before bind/launch.
+        if batch_size == 0 {
+            return Ok(());
+        }
+        if !self.arch_caps.is_gfx1010() {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!("{WHO}: exact gfx1010 required (got {})", self.arch),
+            ));
+        }
+        // The 26976 B LDS budget and 276 B K/V staging stride hold only at
+        // head_dim 256; reject before any compile or mutation.
+        if head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{WHO}: head_dim ({head_dim}) must be 256"),
+            ));
+        }
+        validate_strided_swa_geometry(
+            WHO,
+            qkv,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            None,
+            batch_size,
+            q_stride,
+        )?;
+        let lds_limit = self.attention_q8_0_kv_independent_shared_mem_limit();
+        if FLASH_TILED_SWA_STRIDED_GFX1010_LDS_BYTES > lds_limit {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{WHO}: LDS {} exceeds device shared-memory limit {lds_limit} \
+                     (head_dim={head_dim})",
+                    FLASH_TILED_SWA_STRIDED_GFX1010_LDS_BYTES,
+                ),
+            ));
+        }
+
+        self.bind_thread()?;
+        // Fresh module_name == kernel entry; the gfx1010 source is self-contained,
+        // so no strip/prepend allocation on this path.
+        self.ensure_kernel(
+            WHO,
+            kernels::ATTENTION_Q8_0_FLASH_TILED_SWA_STRIDED_GFX1010_SRC,
+            WHO,
+        )?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = qkv.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ms = max_seq as i32;
+        let mut sc = scale;
+        let mut win = window as i32;
+        let mut qs = q_stride as i32;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut win as *mut _ as *mut c_void,
+            &mut qs as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        let grid_x = batch_size.div_ceil(8);
+        let bytes =
+            crate::profile::attention_q8_0_kv_bytes(n_heads, n_kv_heads, head_dim, max_seq)
+                * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "attention", WHO, bytes);
+        // Blob: 5 ptr + 4 i32 + f32 + 3 i32 = 72, natural pad → 80B replay contract.
+        let result = self.launch_maybe_blob(
+            WHO,
+            [grid_x as u32, n_heads as u32, 1],
+            [256, 1, 1],
+            FLASH_TILED_SWA_STRIDED_GFX1010_LDS_BYTES as u32,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();

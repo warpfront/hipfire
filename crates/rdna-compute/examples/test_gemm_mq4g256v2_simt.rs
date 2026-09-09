@@ -2,9 +2,9 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Real-GPU numerical probe for `gemm_mq4g256v2_residual_simt` and the five
+//! Real-GPU numerical probe for `gemm_mq4g256v2_residual_simt` and the four
 //! temporary FP32 gfx1010 plain-set SIMT experiment variants
-//! (`gemm_mq4g256v2_set_simt_variant`), including cooperative LDS `SetM4N32Lds`.
+//! (`gemm_mq4g256v2_set_simt_variant`).
 //!
 //! Oracles (residual must agree with both within strict F32 tol):
 //!   1. Existing per-row `gemv_hfq4g256_residual_mq4v2` on the same weights/X
@@ -14,8 +14,6 @@
 //! existing residual-SIMT launcher started from +0 Y (and GEMV-from-+0) on
 //! finite synthetic fixtures. Stale Y must be overwritten; capacity tails
 //! beyond active N stay untouched. Residual keeps nonzero Y+= semantics.
-//! `SetM4N32Lds` also proves NaN-stale Y overwrite with finite bit-exact
-//! residual-from-0 oracle agreement and Y capacity canaries.
 //!
 //! Fixtures force dual-half headers to differ (disjoint half ranges) so a
 //! wrong half-header select fails loudly. Also checks finite outputs and that
@@ -35,19 +33,13 @@
 //!
 //! Defaults exercise N∈{1,3,7,8,9,16}, K∈{256,768,1024,2560}, M∈{16,33}
 //! plus a representative larger M (CLI M or 512), then bounded non-cross-product
-//! boundary shapes (R2 odd-M, M4/M5 LDS row edges, K=512 group tails, tile
-//! edges, Spark K, N32/33/63/65). Optional `--timing` / `--timing-reverse`
-//! run the Spark projection census (N∈{64,46,8,32,33,63,65} plus representative
-//! M1024/4096) host-timed launch+completion over residual-from-zero and each
-//! set arm (warmups 10, measured ≥5, raw samples + median). Reverse flips the
-//! full six-entry order (residual + five set arms) for matched F/R/R/F
-//! fresh-process bias checks. Direct variant launches are labeled
-//! `dispatch=direct_variant`; `policy_route` reports whether production
-//! geometry would select LDS under the checked N≥32 /
-//! ceil(M/4)*ceil(N/32)≥cu_count_or_default admission (scheduler property,
-//! not a physical-CU claim). Machine-readable `RESULT*` / `RESULT_SET*` /
-//! `RESULT_MALFORMED*` / `RESULT_EMPTY*` / `RESULT_TIMING*` /
-//! `RESULT_LDS_NAN*` lines.
+//! boundary shapes (R2 odd-M, tile edges, Spark K). Optional `--timing` /
+//! `--timing-reverse` run the Spark projection census (N∈{64,46,8}) host-timed
+//! launch+completion over residual-from-zero and each set arm (warmups 10,
+//! measured ≥5, raw samples + median). Reverse flips the full five-entry order
+//! for matched F/R/R/F fresh-process bias checks. Machine-readable `RESULT*` /
+//! `RESULT_SET*` / `RESULT_MALFORMED*` / `RESULT_EMPTY*` / `RESULT_TIMING*` lines.
+
 
 use rdna_compute::gemm::Mq4g256v2SimtSetVariant;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -70,8 +62,8 @@ const SET_VARIANTS: &[Mq4g256v2SimtSetVariant] = &[
     Mq4g256v2SimtSetVariant::SetR1T8G1,
     Mq4g256v2SimtSetVariant::SetR1T16G1,
     Mq4g256v2SimtSetVariant::SetR2T8G1,
-    Mq4g256v2SimtSetVariant::SetM4N32Lds,
 ];
+
 
 /// Non-cross-product boundary shapes from the validation recipe.
 fn boundary_shapes() -> Vec<(usize, usize, usize)> {
@@ -82,26 +74,12 @@ fn boundary_shapes() -> Vec<(usize, usize, usize)> {
             out.push((m, 256, n));
         }
     }
-    // LDS row_tile=4 edges: full tile (M=4) and odd-row tail (M=5).
-    // Bounded N set covers underfill, full N32 tile, and ragged N33.
-    for &m in &[4usize, 5] {
-        for &n in &[1usize, 8, 16, 32, 33] {
-            out.push((m, 256, n));
-        }
-    }
     // Tile edges around T8/T16 with production-ish K.
     for &n in &[15usize, 16, 17] {
         out.push((33, 2560, n));
     }
     for &n in &[31usize, 32, 33] {
         out.push((33, 4096, n));
-    }
-    // K=512 (=2 groups): group-count mod-4 tail + LDS N32/33/63/65 edges.
-    // Not crossed with the full M×N grid — three representative M only.
-    for &m in &[4usize, 5, 33] {
-        for &n in &[32usize, 33, 63, 65] {
-            out.push((m, 512, n));
-        }
     }
     // Spark long-K loops + ragged production N tails.
     for &m in &[3usize, 33] {
@@ -112,15 +90,16 @@ fn boundary_shapes() -> Vec<(usize, usize, usize)> {
     out
 }
 
+
 fn set_variant_name(v: Mq4g256v2SimtSetVariant) -> &'static str {
     match v {
         Mq4g256v2SimtSetVariant::SetR1T8Q4 => "SetR1T8Q4",
         Mq4g256v2SimtSetVariant::SetR1T8G1 => "SetR1T8G1",
         Mq4g256v2SimtSetVariant::SetR1T16G1 => "SetR1T16G1",
         Mq4g256v2SimtSetVariant::SetR2T8G1 => "SetR2T8G1",
-        Mq4g256v2SimtSetVariant::SetM4N32Lds => "SetM4N32Lds",
     }
 }
+
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -466,25 +445,6 @@ fn main() {
         eprintln!("  plain/lmhead overwrite: SKIP (arch={arch}, not gfx1010)");
         println!("RESULT case=plain_lmhead_overwrite arch={arch} status=SKIP");
     }
-
-    // SetM4N32Lds NaN-stale overwrite + canary + finite bit-exact residual oracle.
-    if arch.starts_with("gfx1010") {
-        match run_lds_nan_stale_suite(&mut gpu, &arch) {
-            Ok(n_ok) => {
-                eprintln!("  SetM4N32Lds NaN-stale suite: PASS ({n_ok} checks)");
-                println!("RESULT case=lds_nan_stale_suite arch={arch} checks={n_ok} status=PASS");
-            }
-            Err(e) => {
-                failures += 1;
-                eprintln!("  SetM4N32Lds NaN-stale suite: FAIL {e}");
-                println!("RESULT case=lds_nan_stale_suite arch={arch} status=FAIL err={e}");
-            }
-        }
-    } else {
-        eprintln!("  SetM4N32Lds NaN-stale suite: SKIP (arch={arch}, not gfx1010)");
-        println!("RESULT case=lds_nan_stale_suite arch={arch} status=SKIP");
-    }
-
 
     // Direct empty M/N no-op: residual + every set arm leave Y unchanged.
     match run_empty_suite(&mut gpu, &arch) {
@@ -1025,124 +985,6 @@ fn run_plain_lmhead_overwrite(gpu: &mut Gpu) -> Result<(), String> {
     Ok(())
 }
 
-/// Direct `SetM4N32Lds` NaN-stale Y overwrite proofs for barrier / odd-row /
-/// ragged-token edges. Finite bit-exact residual-from-0 oracle; Y capacity
-/// canaries beyond active N must stay untouched. Direct variant API — no
-/// production shape admission.
-fn run_lds_nan_stale_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
-    // (m,k,n,tag): full tile, odd row, ragged N, barrier K=512 tails.
-    const CASES: &[(usize, usize, usize, &str)] = &[
-        (4, 256, 32, "full_tile_m4n32"),
-        (5, 256, 33, "odd_row_ragged_n33"),
-        (1, 256, 63, "underfill_row_n63"),
-        (3, 512, 65, "odd_m_k512_n65"),
-        (4, 512, 32, "k512_full_n32"),
-        (5, 512, 63, "odd_row_k512_n63"),
-    ];
-    let max_n = CASES.iter().map(|c| c.2).max().unwrap_or(1);
-    let mut checks = 0usize;
-    let variant = Mq4g256v2SimtSetVariant::SetM4N32Lds;
-    let vname = set_variant_name(variant);
-
-    for &(m, k, n, tag) in CASES {
-        let groups_per_row = k / GROUP;
-        let row_bytes = groups_per_row * GROUP_BYTES;
-        let weight_bytes =
-            synth_mq4g256v2_weights(m, k, 0x4A4Eu64.wrapping_add(m as u64 * 31 + n as u64));
-        assert_dual_half_headers_differ(&weight_bytes, m, groups_per_row);
-        let a_raw = gpu
-            .upload_raw(&weight_bytes, &[m * row_bytes])
-            .map_err(|e| format!("{vname}/{tag} upload a: {e}"))?;
-
-        let x_host = synth_x(n, k, 0x4A4E_00u64.wrapping_add(n as u64));
-        let x_gpu = gpu
-            .upload_f32(&x_host, &[n * k])
-            .map_err(|e| format!("{vname}/{tag} upload x: {e}"))?;
-
-        // Capacity Y: NaN active region + deterministic canary beyond n.
-        let y_cap = max_n * m;
-        let mut y_nan_full = vec![0.0f32; y_cap];
-        for slot in y_nan_full.iter_mut().take(n * m) {
-            *slot = f32::NAN;
-        }
-        let guard = synth_y_guard(max_n, m, 0xCADAu64.wrapping_add(tag.as_bytes()[0] as u64));
-        if n < max_n {
-            for b in n..max_n {
-                y_nan_full[b * m..(b + 1) * m].copy_from_slice(&guard[b * m..(b + 1) * m]);
-            }
-        }
-        let y_guard_snapshot = y_nan_full[n * m..].to_vec();
-
-        // Residual-from-+0 bit-exact oracle.
-        let y_zero = vec![0.0f32; y_cap];
-        let y_res_gpu = gpu
-            .upload_f32(&y_zero, &[y_cap])
-            .map_err(|e| format!("{vname}/{tag} residual upload: {e}"))?;
-        gpu.gemm_mq4g256v2_residual_simt(&a_raw, &x_gpu, &y_res_gpu, m, k, n)
-            .map_err(|e| format!("{vname}/{tag} residual oracle: {e}"))?;
-        gpu.hip
-            .device_synchronize()
-            .map_err(|e| format!("{vname}/{tag} residual sync: {e}"))?;
-        let y_res_full = gpu
-            .download_f32(&y_res_gpu)
-            .map_err(|e| format!("{vname}/{tag} residual download: {e}"))?;
-        let y_res = &y_res_full[..n * m];
-        if !y_res.iter().all(|v| v.is_finite()) {
-            return Err(format!("{vname}/{tag}: residual oracle non-finite"));
-        }
-
-        // Direct LDS arm from NaN-stale Y.
-        let y_lds_gpu = gpu
-            .upload_f32(&y_nan_full, &[y_cap])
-            .map_err(|e| format!("{vname}/{tag} nan y upload: {e}"))?;
-        gpu.gemm_mq4g256v2_set_simt_variant(&a_raw, &x_gpu, &y_lds_gpu, m, k, n, variant)
-            .map_err(|e| format!("{vname}/{tag} launch: {e}"))?;
-        gpu.hip
-            .device_synchronize()
-            .map_err(|e| format!("{vname}/{tag} sync: {e}"))?;
-        let y_got_full = gpu
-            .download_f32(&y_lds_gpu)
-            .map_err(|e| format!("{vname}/{tag} download: {e}"))?;
-        let y_got = &y_got_full[..n * m];
-
-        let finite = y_got.iter().all(|v| v.is_finite());
-        let bitdiff = raw_bitdiff(y_got, y_res);
-        let guard_ok = if n < max_n {
-            y_got_full[n * m..] == y_guard_snapshot[..]
-        } else {
-            true
-        };
-        // NaN cannot equal product bit-for-bit; overwrite must clear every NaN.
-        let nan_cleared = y_got.iter().all(|v| !v.is_nan());
-
-        if !finite {
-            return Err(format!("{vname}/{tag}: non-finite active output after NaN stale"));
-        }
-        if !nan_cleared {
-            return Err(format!("{vname}/{tag}: NaN remained in active Y"));
-        }
-        if bitdiff != 0 {
-            let (i, a, b) = first_bit_mismatch(y_got, y_res).unwrap_or((0, 0.0, 0.0));
-            return Err(format!(
-                "{vname}/{tag}: bitdiff vs residual-from-0 = {bitdiff} first i={i} (b={} r={}) got={a:.8e} want={b:.8e}",
-                i / m,
-                i % m
-            ));
-        }
-        if !guard_ok {
-            return Err(format!("{vname}/{tag}: Y capacity canary beyond N mutated"));
-        }
-
-        println!(
-            "RESULT_LDS_NAN case={tag} variant={vname} arch={arch} M={m} K={k} N={n} bitdiff_residual={bitdiff} finite=1 nan_cleared=1 guard_ok={} dispatch=direct_variant status=PASS",
-            guard_ok as u8
-        );
-        checks += 1;
-    }
-    Ok(checks)
-}
-
-
 // ── empty M/N direct no-op ────────────────────────────────────────────────
 
 fn run_empty_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
@@ -1486,38 +1328,20 @@ const SPARK_SHAPES: &[SparkShape] = &[
         k: 10240,
         multiplicity: 1,
     },
-    // Representative M for simple LDS admission/tails (not production projection names).
-    SparkShape {
-        name: "rep_m1024",
-        m: 1024,
-        k: 2560,
-        multiplicity: 1,
-    },
-    SparkShape {
-        name: "rep_m4096",
-        m: 4096,
-        k: 2560,
-        multiplicity: 1,
-    },
 ];
 
-// Real Spark N plus LDS census tails; existing 64/46/8 stay first for continuity.
-const SPARK_NS: &[usize] = &[64, 46, 8, 32, 33, 63, 65];
+const SPARK_NS: &[usize] = &[64, 46, 8];
 const TIMING_WARMUPS: usize = 10;
 const TIMING_ITERS: usize = 5;
 
 fn run_spark_timing(gpu: &mut Gpu, arch: &str, reverse: bool) -> Result<(), String> {
     let order = if reverse { "reverse" } else { "forward" };
-    let cu_count_or_default = probe_cu_count_or_default(gpu);
     eprintln!(
-        "=== spark projection timing (host-timed launch+completion; Y upload excluded; order={order}; cu_count_or_default={cu_count_or_default} scheduler admission property) ==="
-    );
-    println!(
-        "RESULT_TIMING_META arch={arch} order={order} cu_count_or_default={cu_count_or_default} cu_count_note=scheduler_admission_property_not_physical_cu_claim dispatch_note=direct_variant_launches_not_production_router"
+        "=== spark projection timing (host-timed launch+completion; Y upload excluded; order={order}) ==="
     );
 
-    // Six-entry schedule: residual baseline then five set arms. Reverse flips
-    // the entire list (not just variants) for matched F/R/R/F bias checks.
+    // Five-entry schedule: residual baseline then four set arms. Reverse flips
+    // the entire list (not just variants) for matched F/R bias checks.
     let mut entries: Vec<(&'static str, Option<Mq4g256v2SimtSetVariant>)> =
         Vec::with_capacity(1 + SET_VARIANTS.len());
     entries.push(("residual_from_zero", None));
@@ -1552,17 +1376,6 @@ fn run_spark_timing(gpu: &mut Gpu, arch: &str, reverse: bool) -> Result<(), Stri
                 .upload_f32(&y_zero, &[y_elems])
                 .map_err(|e| format!("timing y: {e}"))?;
 
-            let policy_route = policy_route_label(arch, m, n, cu_count_or_default);
-            let policy_lds = lds_policy_would_select(arch, m, n, cu_count_or_default);
-            let m_tiles = m.div_ceil(4);
-            let n_tiles = n.div_ceil(32);
-            let blocks = m_tiles.saturating_mul(n_tiles);
-            println!(
-                "RESULT_TIMING_ROUTE shape={} M={m} K={k} N={n} arch={arch} cu_count_or_default={cu_count_or_default} m_tiles={m_tiles} n_tiles={n_tiles} workgroups={blocks} policy_route={policy_route} policy_lds={} note=checked_policy_prediction_not_observed_router",
-                shape.name,
-                policy_lds as u8
-            );
-
             for &(name, variant) in &entries {
                 // Residual from +0; set arms from stale. Y htod outside timed window.
                 let y_host: &[f32] = match variant {
@@ -1585,8 +1398,6 @@ fn run_spark_timing(gpu: &mut Gpu, arch: &str, reverse: bool) -> Result<(), Stri
                     shape.multiplicity,
                     order,
                     &samples,
-                    policy_route,
-                    cu_count_or_default,
                 );
             }
         }
@@ -1643,8 +1454,6 @@ fn emit_timing(
     multiplicity: usize,
     order: &str,
     samples_us: &[f64],
-    policy_route: &str,
-    cu_count_or_default: usize,
 ) {
     let mut sorted = samples_us.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -1661,53 +1470,14 @@ fn emit_timing(
         .collect::<Vec<_>>()
         .join(",");
     eprintln!(
-        "  timing {shape} entry={entry} order={order} M={m} K={k} N={n} mult={multiplicity} dispatch=direct_variant policy_route={policy_route} measurement=host_launch_completion: median={median:.1}µs samples=[{samples_str}]"
+        "  timing {shape} entry={entry} order={order} M={m} K={k} N={n} mult={multiplicity} measurement=host_launch_completion: median={median:.1}µs samples=[{samples_str}]"
     );
     println!(
-        "RESULT_TIMING shape={shape} entry={entry} M={m} K={k} N={n} multiplicity={multiplicity} arch={arch} order={order} dispatch=direct_variant policy_route={policy_route} cu_count_or_default={cu_count_or_default} measurement=host_launch_completion median_us={median:.3} samples_us={samples_str} warmups={TIMING_WARMUPS} iters={}",
+        "RESULT_TIMING shape={shape} entry={entry} M={m} K={k} N={n} multiplicity={multiplicity} arch={arch} order={order} measurement=host_launch_completion median_us={median:.3} samples_us={samples_str} warmups={TIMING_WARMUPS} iters={}",
         samples_us.len()
     );
 }
 
-/// Mirror of Gpu::cu_count_or_default as published scheduler admission property.
-/// Not claimed to be physical CU count.
-fn probe_cu_count_or_default(gpu: &Gpu) -> usize {
-    gpu.hip
-        .get_device_attribute(
-            rdna_compute::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
-            gpu.device_id,
-        )
-        .ok()
-        .filter(|&v| v > 0)
-        .map(|v| {
-            rdna_compute::profiler::hip_mp_count_to_cu_count(&gpu.arch, v as u32) as usize
-        })
-        .filter(|&v| (4..=256).contains(&v))
-        .unwrap_or(16)
-}
-
-/// Checked production LDS admission: exact gfx1010, N>=32, and
-/// ceil(M/4)*ceil(N/32) >= cu_count_or_default. Probe prediction only.
-fn lds_policy_would_select(arch: &str, m: usize, n: usize, cu_count_or_default: usize) -> bool {
-    if !arch.starts_with("gfx1010") {
-        return false;
-    }
-    if n < 32 {
-        return false;
-    }
-    let Some(blocks) = m.div_ceil(4).checked_mul(n.div_ceil(32)) else {
-        return false;
-    };
-    blocks >= cu_count_or_default
-}
-
-fn policy_route_label(arch: &str, m: usize, n: usize, cu_count_or_default: usize) -> &'static str {
-    if lds_policy_would_select(arch, m, n, cu_count_or_default) {
-        "SetM4N32Lds"
-    } else {
-        "SetR1T8Q4"
-    }
-}
 
 // ── synthetic fixtures ────────────────────────────────────────────────────
 

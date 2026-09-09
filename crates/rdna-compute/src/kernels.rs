@@ -3133,12 +3133,6 @@ pub const GEMM_MQ4G256V2_RESIDUAL_SIMT_SRC: &str =
 /// GEMM_MQ4G256V2_RESIDUAL_SIMT_SRC. Cleanup removes this after selection.
 pub const GEMM_MQ4G256V2_SIMT_EXPERIMENTS_GFX1010_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_simt_experiments_gfx1010.hip");
-/// gfx1010 cooperative M4×N32 LDS plain-set GEMM (Y = A·X). Dedicated TU —
-/// never bundled into the four-arm experiments source. Fixed LDS 36864,
-/// dynamic launch LDS 0, block 256, grid [ceil(M/4), ceil(N/32)].
-pub const GEMM_MQ4G256V2_SET_SIMT_M4N32_LDS_GFX1010_SRC: &str =
-    include_str!("../../../kernels/src/gemm_mq4g256v2_set_simt_m4n32_lds_gfx1010.hip");
-
 
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma.hip");
@@ -5372,6 +5366,15 @@ pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =
 /// Portable ATTENTION_Q8_0_KV_BATCHED_SRC / SWA unchanged.
 pub const ATTENTION_Q8_0_KV_BATCHED_SWA_STRIDED_GFX1010_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_kv_batched_swa_strided_gfx1010.hip");
+
+/// Query-tiled FP32 SIMT flash attention over strided QKV rows (Spark chunk
+/// prefill), gfx1010-only standalone candidate. Entry:
+/// attention_q8_0_flash_tiled_swa_strided_gfx1010. Same 13-arg ABI as
+/// ATTENTION_Q8_0_KV_BATCHED_SWA_STRIDED_GFX1010_SRC above; BR=8/BC=32
+/// online-softmax tiling reuses K/V across 8 queries per workgroup. No
+/// WMMA/FP16 products; the portable baseline is unchanged.
+pub const ATTENTION_Q8_0_FLASH_TILED_SWA_STRIDED_GFX1010_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_flash_tiled_swa_strided_gfx1010.hip");
 
 /// Query-tiled Q8_0 flash prefill attention. LDS depends only on BR/BC,
 /// never on context length, so one kernel serves every sequence length.

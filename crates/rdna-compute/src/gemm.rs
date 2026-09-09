@@ -413,7 +413,7 @@ fn mqv2_prefill_batch_tile(
 }
 
 /// gfx1010 MQ4G256V2 FP32 SIMT plain-set experiment arm (temporary).
-/// Whole-engine provisional chooser is [`Gpu::choose_gfx1010_mq4g256v2_simt_set_variant`].
+/// Compile-time whole-engine selector is [`GFX1010_MQ4G256V2_SIMT_SET_VARIANT`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Mq4g256v2SimtSetVariant {
     /// Control: R1/T8 four-groups-live body with Y= store (not Y+=).
@@ -424,14 +424,10 @@ pub enum Mq4g256v2SimtSetVariant {
     SetR1T16G1,
     /// R2/T8 dual-row one-group schedule (grid.x = ceil(M/2)).
     SetR2T8G1,
-    /// Cooperative M4×N32 LDS dequant set (dedicated gfx1010 source; fixed LDS 36864).
-    SetM4N32Lds,
 }
 
 /// Tile/entry description for residual or plain-set SIMT launch.
 /// Tile values are compile constants, never caller kernargs.
-/// `dynamic_lds_bytes` is HIP dynamic shared-memory launch bytes (always 0 here);
-/// the LDS candidate declares fixed group-segment LDS in-kernel, not via this field.
 #[derive(Clone, Copy, Debug)]
 struct Mq4g256v2SimtSpec {
     func: &'static str,
@@ -472,34 +468,13 @@ impl Mq4g256v2SimtSetVariant {
                 block: 32,
                 dynamic_lds_bytes: 0,
             },
-            Self::SetM4N32Lds => Mq4g256v2SimtSpec {
-                func: "gemm_mq4g256v2_set_simt_m4n32_lds_gfx1010",
-                row_tile: 4,
-                batch_tile: 32,
-                block: 256,
-                // Fixed LDS is in-kernel; dynamic launch reservation must stay 0.
-                dynamic_lds_bytes: 0,
-            },
-        }
-    }
-
-    /// Module name + HIP source for the selected plain-set arm.
-    fn module_and_source(self) -> (&'static str, &'static str) {
-        match self {
-            Self::SetM4N32Lds => (
-                MQ4G256V2_SET_SIMT_M4N32_LDS_MODULE,
-                kernels::GEMM_MQ4G256V2_SET_SIMT_M4N32_LDS_GFX1010_SRC,
-            ),
-            Self::SetR1T8Q4 | Self::SetR1T8G1 | Self::SetR1T16G1 | Self::SetR2T8G1 => (
-                MQ4G256V2_SIMT_EXPERIMENTS_MODULE,
-                kernels::GEMM_MQ4G256V2_SIMT_EXPERIMENTS_GFX1010_SRC,
-            ),
         }
     }
 }
 
-/// Q4 fallback/control when LDS shape admission fails (provisional whole-engine).
-const GFX1010_MQ4G256V2_SIMT_SET_FALLBACK: Mq4g256v2SimtSetVariant =
+/// Whole-engine gfx1010 plain MQ4V2 SIMT set arm. Overwrite-only control;
+/// parent retunes from measurements then deletes temporary surfaces.
+const GFX1010_MQ4G256V2_SIMT_SET_VARIANT: Mq4g256v2SimtSetVariant =
     Mq4g256v2SimtSetVariant::SetR1T8Q4;
 
 /// Residual oracle: R1/T8, same grid as production `gemm_mq4g256v2_residual_simt`.
@@ -513,17 +488,6 @@ const MQ4G256V2_RESIDUAL_SIMT_SPEC: Mq4g256v2SimtSpec = Mq4g256v2SimtSpec {
 
 const MQ4G256V2_SIMT_EXPERIMENTS_MODULE: &str = "gemm_mq4g256v2_simt_experiments_gfx1010";
 
-/// Dedicated cooperative LDS set candidate (not bundled with the four experiment arms).
-const MQ4G256V2_SET_SIMT_M4N32_LDS_MODULE: &str = "gemm_mq4g256v2_set_simt_m4n32_lds_gfx1010";
-
-/// In-kernel fixed group-segment bytes for SetM4N32Lds (X 32768 + W 4096).
-const MQ4G256V2_SET_SIMT_M4N32_LDS_FIXED_BYTES: usize = 36864;
-
-/// HIP `hipDeviceAttributeMaxSharedMemoryPerBlock` (CUDA-compatible block).
-const HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK: i32 = 74;
-
-/// Conservative per-block shared-memory ceiling when the device attribute is unavailable.
-const SHARED_MEM_LIMIT_FALLBACK_BYTES: usize = 64 * 1024;
 
 /// Validated launch dimensions/bytes for gfx1010 MQ4G256V2 FP32 SIMT.
 /// Built only after A/X/Y extents, X/Y F32 dtypes, K alignment, checked products,
@@ -26197,52 +26161,6 @@ impl Gpu {
             .unwrap_or(16)
     }
 
-    /// Per-block shared-memory limit for launch/resource gates.
-    /// Falls back to 64 KiB when the device attribute is unavailable.
-    fn shared_mem_limit(&self) -> usize {
-        match self.hip.get_device_attribute(
-            HIP_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK,
-            self.device_id,
-        ) {
-            Ok(v) if v > 0 => v as usize,
-            _ => SHARED_MEM_LIMIT_FALLBACK_BYTES,
-        }
-    }
-
-    /// Provisional whole-engine plain-set chooser for exact gfx1010.
-    /// Selects SetM4N32Lds when N >= 32 and workgroups
-    /// `ceil(M/4)*ceil(N/32)` cover the published scheduler admission property
-    /// from [`Self::cu_count_or_default`]; otherwise Q4 fallback.
-    /// Checked mul overflow fails closed to Q4. Shape admission only — does not
-    /// re-run full tensor validation.
-    fn choose_gfx1010_mq4g256v2_simt_set_variant(
-        &self,
-        m: usize,
-        n: usize,
-    ) -> Mq4g256v2SimtSetVariant {
-        let Some(workgroups) = m.div_ceil(4).checked_mul(n.div_ceil(32)) else {
-            return GFX1010_MQ4G256V2_SIMT_SET_FALLBACK;
-        };
-        if n >= 32 && workgroups >= self.cu_count_or_default() {
-            Mq4g256v2SimtSetVariant::SetM4N32Lds
-        } else {
-            GFX1010_MQ4G256V2_SIMT_SET_FALLBACK
-        }
-    }
-
-    /// Gate fixed 36864 LDS for SetM4N32Lds before ensure_kernel / cache work.
-    fn ensure_set_simt_m4n32_lds_shared_mem(&self, who: &str) -> HipResult<()> {
-        let limit = self.shared_mem_limit();
-        if limit < MQ4G256V2_SET_SIMT_M4N32_LDS_FIXED_BYTES {
-            return Err(hip_bridge::HipError::new(
-                1,
-                &format!(
-                    "{who}: fixed LDS {MQ4G256V2_SET_SIMT_M4N32_LDS_FIXED_BYTES} exceeds shared_mem_limit {limit}"
-                ),
-            ));
-        }
-        Ok(())
-    }
 
     pub fn gemm_f32_register_tiled(
         &mut self,
@@ -30807,10 +30725,7 @@ impl Gpu {
     /// Lab/probe direct entry for exact-gfx1010 MQ4G256V2 FP32 plain-set SIMT arms.
     /// Validates then launches the selected experiment entry (Y = A·X overwrite).
     /// Empty M/N is a no-op (no arch gate); non-empty requires exact gfx1010
-    /// before ensure_kernel/launch. Does not apply production shape admission
-    /// (N>=32 / workgroup floor) so edge probes exercise all tails. Malformed
-    /// args leave Y unchanged. LDS arm checks fixed 36864 fits shared_mem_limit
-    /// before compile/cache invalidation.
+    /// before ensure_kernel/launch. Malformed args leave Y unchanged.
     pub fn gemm_mq4g256v2_set_simt_variant(
         &mut self,
         a_raw: &GpuTensor,
@@ -30833,21 +30748,26 @@ impl Gpu {
                 &format!("{}: exact gfx1010 required (got {})", spec.func, self.arch),
             ));
         }
-        if matches!(variant, Mq4g256v2SimtSetVariant::SetM4N32Lds) {
-            self.ensure_set_simt_m4n32_lds_shared_mem(spec.func)?;
-        }
-        let (module, src) = variant.module_and_source();
-        self.launch_mq4g256v2_simt_validated(a_raw, x, y, &v, module, src, &spec, 1)
+        self.launch_mq4g256v2_simt_validated(
+            a_raw,
+            x,
+            y,
+            &v,
+            MQ4G256V2_SIMT_EXPERIMENTS_MODULE,
+            kernels::GEMM_MQ4G256V2_SIMT_EXPERIMENTS_GFX1010_SRC,
+            &spec,
+            1,
+        )
     }
+
 
     /// MQ4 v2 (qt=44) — plain batched GEMM `gemm_hfq4g256` sibling.
     /// On WMMA arches (gfx1100/1101/1102/1150/1151/gfx1200/1201) this method
     /// provides plain-GEMM semantics by zeroing output and routing through the
     /// arch-aware residual WMMA path. On exact gfx1010 with N>1 and K%256==0 it
-    /// dispatches the provisional FP32 SIMT plain-set chooser (Y = A·X overwrite;
-    /// no memset): LDS when admitted, else Q4 fallback. V2 bytes cannot be
-    /// decoded by the v1 scalar kernel (fp16 s0/z0/s1/z1 vs f32 scale/zero) and
-    /// would produce noise (WT2 KLD 12.1).
+    /// dispatches the compile-time FP32 SIMT plain-set arm (Y = A·X overwrite;
+    /// no memset). V2 bytes cannot be decoded by the v1 scalar kernel (fp16
+    /// s0/z0/s1/z1 vs f32 scale/zero) and would produce noise (WT2 KLD 12.1).
     pub fn gemm_mq4g256v2(
         &mut self,
         a_raw: &GpuTensor,
@@ -30871,20 +30791,22 @@ impl Gpu {
             }
             return self.gemm_hfq4g256_residual_mq4v2(a_raw, x, y, m, k, batch_size);
         }
-        // gfx1010 FP32 SIMT plain-set: choose then validate once, overwrite Y (no memset).
+        // gfx1010 FP32 SIMT plain-set: validate once then overwrite Y (no memset).
         // Branch domain unchanged: exact gfx1010, N>1, K nonzero multiple of 256.
         if self.arch_caps.is_gfx1010() && batch_size > 1 && k != 0 && k % 256 == 0 {
-            let variant = self.choose_gfx1010_mq4g256v2_simt_set_variant(m, batch_size);
-            let spec = variant.spec();
+            let spec = GFX1010_MQ4G256V2_SIMT_SET_VARIANT.spec();
             let Some(v) = validate_mq4g256v2_simt(a_raw, x, y, m, k, batch_size, &spec)? else {
                 return Ok(());
             };
-            if matches!(variant, Mq4g256v2SimtSetVariant::SetM4N32Lds) {
-                self.ensure_set_simt_m4n32_lds_shared_mem(spec.func)?;
-            }
-            let (module, src) = variant.module_and_source();
             return self.launch_mq4g256v2_simt_validated(
-                a_raw, x, y, &v, module, src, &spec, 1,
+                a_raw,
+                x,
+                y,
+                &v,
+                MQ4G256V2_SIMT_EXPERIMENTS_MODULE,
+                kernels::GEMM_MQ4G256V2_SIMT_EXPERIMENTS_GFX1010_SRC,
+                &spec,
+                1,
             );
         }
         Err(hip_bridge::HipError::new(
@@ -30898,8 +30820,8 @@ impl Gpu {
     /// MQ4 v2 (qt=44) — batched lm_head sibling of `gemm_hfq4g256_batched_lmhead`.
     /// Mirrors the v1 variant-selection logic: N=1 keeps `gemv_mq4g256v2`; WMMA
     /// eligibility gate, fp16 cache stomp, memset zero, gfx12 vs gfx11 dispatch.
-    /// On exact gfx1010 with N>1 and K%256==0, validates then runs the provisional
-    /// FP32 SIMT plain-set chooser (Y overwrite; no memset); fp16_x_source_ptr is
+    /// On exact gfx1010 with N>1 and K%256==0, validates then runs the compile-time
+    /// FP32 SIMT plain-set arm (Y overwrite; no memset); fp16_x_source_ptr is
     /// cleared after successful validation and before launch. Dedicated V2 WMMA
     /// residual sources stay unchanged.
     pub fn gemm_mq4g256v2_batched_lmhead(
@@ -30949,20 +30871,20 @@ impl Gpu {
         // N=1 already returned via gemv above; WMMA arches already handled.
         // Validate before any mutation so malformed args leave Y/cache untouched.
         if self.arch_caps.is_gfx1010() && batch_size > 1 && k != 0 && k % 256 == 0 {
-            let variant = self.choose_gfx1010_mq4g256v2_simt_set_variant(m, batch_size);
-            let spec = variant.spec();
+            let spec = GFX1010_MQ4G256V2_SIMT_SET_VARIANT.spec();
             let Some(v) = validate_mq4g256v2_simt(a_raw, x, y, m, k, batch_size, &spec)? else {
                 return Ok(());
             };
-            // Shared-mem gate before cache invalidation / ensure_kernel.
-            if matches!(variant, Mq4g256v2SimtSetVariant::SetM4N32Lds) {
-                self.ensure_set_simt_m4n32_lds_shared_mem(spec.func)?;
-            }
-            // Cache invalidation only after successful validation (+ LDS gate).
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
-            let (module, src) = variant.module_and_source();
             return self.launch_mq4g256v2_simt_validated(
-                a_raw, x, y, &v, module, src, &spec, 1,
+                a_raw,
+                x,
+                y,
+                &v,
+                MQ4G256V2_SIMT_EXPERIMENTS_MODULE,
+                kernels::GEMM_MQ4G256V2_SIMT_EXPERIMENTS_GFX1010_SRC,
+                &spec,
+                1,
             );
         }
         Err(hip_bridge::HipError::new(
