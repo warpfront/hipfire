@@ -3,6 +3,7 @@
 ## Unreleased
 
 - Opt-in VCN JPEG preprocessing for existing VL serving: `image.decode` stays `cpu` by default; `vcn`/`auto` attempt shared VCN decode with guarded JPEG dimensions and validated VA plane layout/ownership, falling back to CPU on unsupported inputs, unavailable platforms, or recoverable decode failure. A failed terminal GPU completion fails closed (quarantine + request error + nonzero daemon exit; restart required) instead of unsafe same-device CPU fallback. This is a JPEG prepass only — not a replacement vision tokenizer or learned tower.
+- Spark-X2.5-4B on gfx1010: automatic 64-token chunked prefill via FP32 SIMT MQ4V2 projections (causal/SWA attention remains per-token; other GPUs and plain AR decode unchanged), with pre-mutation shape/extent validation and cancellation rollback-error propagation.
 
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 

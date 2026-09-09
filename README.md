@@ -162,7 +162,10 @@ non-neutral `min_p` / repeat / presence / frequency controls fail closed. Set
 `memory.max_seq` within the attention LDS budget (the default `32768` exceeds
 the ~15872 cap on 64 KiB GPUs with `head_dim` 256; **4096** is validated). For
 `hipfire run`, pass `--repeat-penalty 1` (standard bench is neutral `1.0`;
-older `1.1` results are not comparable). Retained PM4/AQL paths exist for
+older `1.1` results are not comparable). On **gfx1010**, prefill automatically
+uses 64-token chunks with FP32 SIMT MQ4V2 projections (8-row weight reuse);
+causal/sliding-window attention stays per-token, and other-GPU and plain-AR
+decode routes are unchanged. Retained PM4/AQL paths exist for
 diagnostics and are **not** the product default.
 
 NeoHorse-1-4B is an Apache-2.0 Qwen3.5-4B text-only model that loads through

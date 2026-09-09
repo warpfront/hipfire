@@ -1,0 +1,1402 @@
+{
+  "date": "2026-09-09T17:17:37.243Z",
+  "lifecycle": "historical",
+  "authority": "Measured fixture-bound evidence; not a current default, automatic baseline, or admission decision",
+  "disposition": "Accept gfx1010 Spark prefill optimization under this exact fixture; no PM4-prefill claim",
+  "gpu": "RX5700XT gfx1010, hipx HIP_VISIBLE_DEVICES=3, PCI0000:99:00.0",
+  "rocm": "7.15.26333",
+  "model": {
+    "path": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+    "bytes": 2374662144,
+    "md5": "26c877594d9b90114a02a729cc7c5194"
+  },
+  "baseline": {
+    "local_source": "34f54854e90813167e152ab44906df970b94845b",
+    "remote_source": "e1510ffbca3fb6ae8480f10503cf5936b41205a1",
+    "hipfire_md5": "77c8a076cb10ca92e779224a52dc04d9",
+    "daemon_md5": "a53cbad4c93aacba7d4168522523a63d",
+    "model_md5": "26c877594d9b90114a02a729cc7c5194",
+    "prompt_md5": {
+      "glimmer_prefill_256.txt": "973900074bfd15d4adeeecdff3359082",
+      "glimmer_prefill_1024.txt": "0ee8f86ada3683eda452bc294ec824a9"
+    },
+    "gpu": "RX5700XT gfx1010, hipx HIP_VISIBLE_DEVICES=3, PCI0000:99:00.0",
+    "protocol": "three fresh processes per prompt, three warmups then one measurement; AR noslots stateless q8 max_seq4096 max_tokens128, HIPFIRE_DPM_WARMUP_SECS=10",
+    "acceptance": "Prefill improvement exceeding measured spread and 5% on both prompt buckets; investigate decode regression >5%; numeric/state parity plus serve battery/chain and retained contract checks required."
+  },
+  "candidate": {
+    "source": "a4856e4cb",
+    "hipfire_md5": "387b3382bc8340ee9bcd105d589038e8",
+    "daemon_md5": "6ea7184ad796ea46ab27569211b27404",
+    "kernel_probe_md5": "c863cf26eeb543eb97a16b3d709e2db1",
+    "model_probe_md5": "e547b48e4f8ae7b2425fb10bce70c13e"
+  },
+  "protocol": "Three fresh native hipfire bench processes per prompt and arm; three warmups then one measured run each; AR, noslots, stateless, q8, max_seq4096, max_tokens128, HIPFIRE_LOCAL=1, HIPFIRE_DPM_WARMUP_SECS=10; byte-identical committed prompts",
+  "measurements": [
+    {
+      "size": 256,
+      "baseline": {
+        "prefill": [
+          60.1,
+          59.9,
+          59.9
+        ],
+        "decode": [
+          56.9,
+          56.8,
+          56.8
+        ],
+        "prefillMedian": 59.9,
+        "decodeMedian": 56.8,
+        "promptTokens": 302,
+        "promptMd5": "973900074bfd15d4adeeecdff3359082",
+        "reports": [
+          {
+            "protocol": "native-generate-v1",
+            "model": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+            "loaded": {
+              "type": "loaded",
+              "arch": "spark2_5",
+              "dim": 2560,
+              "layers": 36,
+              "vocab": 131072,
+              "vl": false,
+              "reasoning_contract": "qwen_jinja",
+              "reasoning_effort_native": false,
+              "reasoning_efforts": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "cache_capable": false,
+              "retry_reset_eligible": false,
+              "continuous_batch_capable": false
+            },
+            "gpu": {
+              "type": "diag",
+              "arch": "gfx1010",
+              "hip_version": "7.15",
+              "vram_free_mb": 5216,
+              "vram_total_mb": 8176,
+              "model_loaded": true,
+              "model_arch": "spark2_5",
+              "kernels": 0,
+              "kernel_hashes": 0
+            },
+            "vram_free_before_mb": 8154,
+            "max_tokens": 128,
+            "runs": 1,
+            "batch": 1,
+            "prompt_tokens": 302,
+            "prompt_md5": "973900074bfd15d4adeeecdff3359082",
+            "prompt_chars": 1024,
+            "warnings": [],
+            "decode_tok_s": {
+              "median": 56.9,
+              "mean": 56.9,
+              "min": 56.9,
+              "max": 56.9,
+              "stdev": 0
+            },
+            "prefill_tok_s": {
+              "median": 60.1,
+              "mean": 60.1,
+              "min": 60.1,
+              "max": 60.1,
+              "stdev": 0
+            },
+            "wall_tok_s": {
+              "median": 17.6,
+              "mean": 17.6,
+              "min": 17.6,
+              "max": 17.6,
+              "stdev": 0
+            },
+            "ttft_ms": {
+              "median": 5025.1,
+              "mean": 5025.1,
+              "min": 5025.1,
+              "max": 5025.1,
+              "stdev": 0
+            },
+            "samples": {
+              "decode": [
+                56.9
+              ],
+              "prefill": [
+                60.1
+              ],
+              "wall": [
+                17.6
+              ],
+              "ttft_ms": [
+                5025.1
+              ]
+            }
+          },
+          {
+            "protocol": "native-generate-v1",
+            "model": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+            "loaded": {
+              "type": "loaded",
+              "arch": "spark2_5",
+              "dim": 2560,
+              "layers": 36,
+              "vocab": 131072,
+              "vl": false,
+              "reasoning_contract": "qwen_jinja",
+              "reasoning_effort_native": false,
+              "reasoning_efforts": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "cache_capable": false,
+              "retry_reset_eligible": false,
+              "continuous_batch_capable": false
+            },
+            "gpu": {
+              "type": "diag",
+              "arch": "gfx1010",
+              "hip_version": "7.15",
+              "vram_free_mb": 5216,
+              "vram_total_mb": 8176,
+              "model_loaded": true,
+              "model_arch": "spark2_5",
+              "kernels": 0,
+              "kernel_hashes": 0
+            },
+            "vram_free_before_mb": 8154,
+            "max_tokens": 128,
+            "runs": 1,
+            "batch": 1,
+            "prompt_tokens": 302,
+            "prompt_md5": "973900074bfd15d4adeeecdff3359082",
+            "prompt_chars": 1024,
+            "warnings": [],
+            "decode_tok_s": {
+              "median": 56.8,
+              "mean": 56.8,
+              "min": 56.8,
+              "max": 56.8,
+              "stdev": 0
+            },
+            "prefill_tok_s": {
+              "median": 59.9,
+              "mean": 59.9,
+              "min": 59.9,
+              "max": 59.9,
+              "stdev": 0
+            },
+            "wall_tok_s": {
+              "median": 17.5,
+              "mean": 17.5,
+              "min": 17.5,
+              "max": 17.5,
+              "stdev": 0
+            },
+            "ttft_ms": {
+              "median": 5041.6,
+              "mean": 5041.6,
+              "min": 5041.6,
+              "max": 5041.6,
+              "stdev": 0
+            },
+            "samples": {
+              "decode": [
+                56.8
+              ],
+              "prefill": [
+                59.9
+              ],
+              "wall": [
+                17.5
+              ],
+              "ttft_ms": [
+                5041.6
+              ]
+            }
+          },
+          {
+            "protocol": "native-generate-v1",
+            "model": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+            "loaded": {
+              "type": "loaded",
+              "arch": "spark2_5",
+              "dim": 2560,
+              "layers": 36,
+              "vocab": 131072,
+              "vl": false,
+              "reasoning_contract": "qwen_jinja",
+              "reasoning_effort_native": false,
+              "reasoning_efforts": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "cache_capable": false,
+              "retry_reset_eligible": false,
+              "continuous_batch_capable": false
+            },
+            "gpu": {
+              "type": "diag",
+              "arch": "gfx1010",
+              "hip_version": "7.15",
+              "vram_free_mb": 5216,
+              "vram_total_mb": 8176,
+              "model_loaded": true,
+              "model_arch": "spark2_5",
+              "kernels": 0,
+              "kernel_hashes": 0
+            },
+            "vram_free_before_mb": 8154,
+            "max_tokens": 128,
+            "runs": 1,
+            "batch": 1,
+            "prompt_tokens": 302,
+            "prompt_md5": "973900074bfd15d4adeeecdff3359082",
+            "prompt_chars": 1024,
+            "warnings": [],
+            "decode_tok_s": {
+              "median": 56.8,
+              "mean": 56.8,
+              "min": 56.8,
+              "max": 56.8,
+              "stdev": 0
+            },
+            "prefill_tok_s": {
+              "median": 59.9,
+              "mean": 59.9,
+              "min": 59.9,
+              "max": 59.9,
+              "stdev": 0
+            },
+            "wall_tok_s": {
+              "median": 17.5,
+              "mean": 17.5,
+              "min": 17.5,
+              "max": 17.5,
+              "stdev": 0
+            },
+            "ttft_ms": {
+              "median": 5041.6,
+              "mean": 5041.6,
+              "min": 5041.6,
+              "max": 5041.6,
+              "stdev": 0
+            },
+            "samples": {
+              "decode": [
+                56.8
+              ],
+              "prefill": [
+                59.9
+              ],
+              "wall": [
+                17.5
+              ],
+              "ttft_ms": [
+                5041.6
+              ]
+            }
+          }
+        ]
+      },
+      "candidate": {
+        "prefill": [
+          155.1,
+          154.1,
+          155.4
+        ],
+        "decode": [
+          56.9,
+          56.7,
+          56.8
+        ],
+        "prefillMedian": 155.1,
+        "decodeMedian": 56.8,
+        "promptTokens": 302,
+        "promptMd5": "973900074bfd15d4adeeecdff3359082",
+        "reports": [
+          {
+            "protocol": "native-generate-v1",
+            "model": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+            "loaded": {
+              "type": "loaded",
+              "arch": "spark2_5",
+              "dim": 2560,
+              "layers": 36,
+              "vocab": 131072,
+              "vl": false,
+              "reasoning_contract": "qwen_jinja",
+              "reasoning_effort_native": false,
+              "reasoning_efforts": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "cache_capable": false,
+              "retry_reset_eligible": false,
+              "continuous_batch_capable": false
+            },
+            "gpu": {
+              "type": "diag",
+              "arch": "gfx1010",
+              "hip_version": "7.15",
+              "vram_free_mb": 5216,
+              "vram_total_mb": 8176,
+              "model_loaded": true,
+              "model_arch": "spark2_5",
+              "kernels": 0,
+              "kernel_hashes": 0
+            },
+            "vram_free_before_mb": 8154,
+            "max_tokens": 128,
+            "runs": 1,
+            "batch": 1,
+            "prompt_tokens": 302,
+            "prompt_md5": "973900074bfd15d4adeeecdff3359082",
+            "prompt_chars": 1024,
+            "warnings": [],
+            "decode_tok_s": {
+              "median": 56.9,
+              "mean": 56.9,
+              "min": 56.9,
+              "max": 56.9,
+              "stdev": 0
+            },
+            "prefill_tok_s": {
+              "median": 155.1,
+              "mean": 155.1,
+              "min": 155.1,
+              "max": 155.1,
+              "stdev": 0
+            },
+            "wall_tok_s": {
+              "median": 30.5,
+              "mean": 30.5,
+              "min": 30.5,
+              "max": 30.5,
+              "stdev": 0
+            },
+            "ttft_ms": {
+              "median": 1947.7,
+              "mean": 1947.7,
+              "min": 1947.7,
+              "max": 1947.7,
+              "stdev": 0
+            },
+            "samples": {
+              "decode": [
+                56.9
+              ],
+              "prefill": [
+                155.1
+              ],
+              "wall": [
+                30.5
+              ],
+              "ttft_ms": [
+                1947.7
+              ]
+            }
+          },
+          {
+            "protocol": "native-generate-v1",
+            "model": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+            "loaded": {
+              "type": "loaded",
+              "arch": "spark2_5",
+              "dim": 2560,
+              "layers": 36,
+              "vocab": 131072,
+              "vl": false,
+              "reasoning_contract": "qwen_jinja",
+              "reasoning_effort_native": false,
+              "reasoning_efforts": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "cache_capable": false,
+              "retry_reset_eligible": false,
+              "continuous_batch_capable": false
+            },
+            "gpu": {
+              "type": "diag",
+              "arch": "gfx1010",
+              "hip_version": "7.15",
+              "vram_free_mb": 5216,
+              "vram_total_mb": 8176,
+              "model_loaded": true,
+              "model_arch": "spark2_5",
+              "kernels": 0,
+              "kernel_hashes": 0
+            },
+            "vram_free_before_mb": 8154,
+            "max_tokens": 128,
+            "runs": 1,
+            "batch": 1,
+            "prompt_tokens": 302,
+            "prompt_md5": "973900074bfd15d4adeeecdff3359082",
+            "prompt_chars": 1024,
+            "warnings": [],
+            "decode_tok_s": {
+              "median": 56.7,
+              "mean": 56.7,
+              "min": 56.7,
+              "max": 56.7,
+              "stdev": 0
+            },
+            "prefill_tok_s": {
+              "median": 154.1,
+              "mean": 154.1,
+              "min": 154.1,
+              "max": 154.1,
+              "stdev": 0
+            },
+            "wall_tok_s": {
+              "median": 30.3,
+              "mean": 30.3,
+              "min": 30.3,
+              "max": 30.3,
+              "stdev": 0
+            },
+            "ttft_ms": {
+              "median": 1960.2,
+              "mean": 1960.2,
+              "min": 1960.2,
+              "max": 1960.2,
+              "stdev": 0
+            },
+            "samples": {
+              "decode": [
+                56.7
+              ],
+              "prefill": [
+                154.1
+              ],
+              "wall": [
+                30.3
+              ],
+              "ttft_ms": [
+                1960.2
+              ]
+            }
+          },
+          {
+            "protocol": "native-generate-v1",
+            "model": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+            "loaded": {
+              "type": "loaded",
+              "arch": "spark2_5",
+              "dim": 2560,
+              "layers": 36,
+              "vocab": 131072,
+              "vl": false,
+              "reasoning_contract": "qwen_jinja",
+              "reasoning_effort_native": false,
+              "reasoning_efforts": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "cache_capable": false,
+              "retry_reset_eligible": false,
+              "continuous_batch_capable": false
+            },
+            "gpu": {
+              "type": "diag",
+              "arch": "gfx1010",
+              "hip_version": "7.15",
+              "vram_free_mb": 5216,
+              "vram_total_mb": 8176,
+              "model_loaded": true,
+              "model_arch": "spark2_5",
+              "kernels": 0,
+              "kernel_hashes": 0
+            },
+            "vram_free_before_mb": 8154,
+            "max_tokens": 128,
+            "runs": 1,
+            "batch": 1,
+            "prompt_tokens": 302,
+            "prompt_md5": "973900074bfd15d4adeeecdff3359082",
+            "prompt_chars": 1024,
+            "warnings": [],
+            "decode_tok_s": {
+              "median": 56.8,
+              "mean": 56.8,
+              "min": 56.8,
+              "max": 56.8,
+              "stdev": 0
+            },
+            "prefill_tok_s": {
+              "median": 155.4,
+              "mean": 155.4,
+              "min": 155.4,
+              "max": 155.4,
+              "stdev": 0
+            },
+            "wall_tok_s": {
+              "median": 30.5,
+              "mean": 30.5,
+              "min": 30.5,
+              "max": 30.5,
+              "stdev": 0
+            },
+            "ttft_ms": {
+              "median": 1944,
+              "mean": 1944,
+              "min": 1944,
+              "max": 1944,
+              "stdev": 0
+            },
+            "samples": {
+              "decode": [
+                56.8
+              ],
+              "prefill": [
+                155.4
+              ],
+              "wall": [
+                30.5
+              ],
+              "ttft_ms": [
+                1944
+              ]
+            }
+          }
+        ]
+      },
+      "speedup": 2.5893155258764606
+    },
+    {
+      "size": 1024,
+      "baseline": {
+        "prefill": [
+          56.5,
+          56.6,
+          56.4
+        ],
+        "decode": [
+          53.6,
+          53.7,
+          53.6
+        ],
+        "prefillMedian": 56.5,
+        "decodeMedian": 53.6,
+        "promptTokens": 1160,
+        "promptMd5": "0ee8f86ada3683eda452bc294ec824a9",
+        "reports": [
+          {
+            "protocol": "native-generate-v1",
+            "model": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+            "loaded": {
+              "type": "loaded",
+              "arch": "spark2_5",
+              "dim": 2560,
+              "layers": 36,
+              "vocab": 131072,
+              "vl": false,
+              "reasoning_contract": "qwen_jinja",
+              "reasoning_effort_native": false,
+              "reasoning_efforts": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "cache_capable": false,
+              "retry_reset_eligible": false,
+              "continuous_batch_capable": false
+            },
+            "gpu": {
+              "type": "diag",
+              "arch": "gfx1010",
+              "hip_version": "7.15",
+              "vram_free_mb": 5216,
+              "vram_total_mb": 8176,
+              "model_loaded": true,
+              "model_arch": "spark2_5",
+              "kernels": 0,
+              "kernel_hashes": 0
+            },
+            "vram_free_before_mb": 8154,
+            "max_tokens": 128,
+            "runs": 1,
+            "batch": 1,
+            "prompt_tokens": 1160,
+            "prompt_md5": "0ee8f86ada3683eda452bc294ec824a9",
+            "prompt_chars": 4096,
+            "warnings": [],
+            "decode_tok_s": {
+              "median": 53.6,
+              "mean": 53.6,
+              "min": 53.6,
+              "max": 53.6,
+              "stdev": 0
+            },
+            "prefill_tok_s": {
+              "median": 56.5,
+              "mean": 56.5,
+              "min": 56.5,
+              "max": 56.5,
+              "stdev": 0
+            },
+            "wall_tok_s": {
+              "median": 5.6,
+              "mean": 5.6,
+              "min": 5.6,
+              "max": 5.6,
+              "stdev": 0
+            },
+            "ttft_ms": {
+              "median": 20538.2,
+              "mean": 20538.2,
+              "min": 20538.2,
+              "max": 20538.2,
+              "stdev": 0
+            },
+            "samples": {
+              "decode": [
+                53.6
+              ],
+              "prefill": [
+                56.5
+              ],
+              "wall": [
+                5.6
+              ],
+              "ttft_ms": [
+                20538.2
+              ]
+            }
+          },
+          {
+            "protocol": "native-generate-v1",
+            "model": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+            "loaded": {
+              "type": "loaded",
+              "arch": "spark2_5",
+              "dim": 2560,
+              "layers": 36,
+              "vocab": 131072,
+              "vl": false,
+              "reasoning_contract": "qwen_jinja",
+              "reasoning_effort_native": false,
+              "reasoning_efforts": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "cache_capable": false,
+              "retry_reset_eligible": false,
+              "continuous_batch_capable": false
+            },
+            "gpu": {
+              "type": "diag",
+              "arch": "gfx1010",
+              "hip_version": "7.15",
+              "vram_free_mb": 5216,
+              "vram_total_mb": 8176,
+              "model_loaded": true,
+              "model_arch": "spark2_5",
+              "kernels": 0,
+              "kernel_hashes": 0
+            },
+            "vram_free_before_mb": 8154,
+            "max_tokens": 128,
+            "runs": 1,
+            "batch": 1,
+            "prompt_tokens": 1160,
+            "prompt_md5": "0ee8f86ada3683eda452bc294ec824a9",
+            "prompt_chars": 4096,
+            "warnings": [],
+            "decode_tok_s": {
+              "median": 53.7,
+              "mean": 53.7,
+              "min": 53.7,
+              "max": 53.7,
+              "stdev": 0
+            },
+            "prefill_tok_s": {
+              "median": 56.6,
+              "mean": 56.6,
+              "min": 56.6,
+              "max": 56.6,
+              "stdev": 0
+            },
+            "wall_tok_s": {
+              "median": 5.6,
+              "mean": 5.6,
+              "min": 5.6,
+              "max": 5.6,
+              "stdev": 0
+            },
+            "ttft_ms": {
+              "median": 20506.7,
+              "mean": 20506.7,
+              "min": 20506.7,
+              "max": 20506.7,
+              "stdev": 0
+            },
+            "samples": {
+              "decode": [
+                53.7
+              ],
+              "prefill": [
+                56.6
+              ],
+              "wall": [
+                5.6
+              ],
+              "ttft_ms": [
+                20506.7
+              ]
+            }
+          },
+          {
+            "protocol": "native-generate-v1",
+            "model": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+            "loaded": {
+              "type": "loaded",
+              "arch": "spark2_5",
+              "dim": 2560,
+              "layers": 36,
+              "vocab": 131072,
+              "vl": false,
+              "reasoning_contract": "qwen_jinja",
+              "reasoning_effort_native": false,
+              "reasoning_efforts": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "cache_capable": false,
+              "retry_reset_eligible": false,
+              "continuous_batch_capable": false
+            },
+            "gpu": {
+              "type": "diag",
+              "arch": "gfx1010",
+              "hip_version": "7.15",
+              "vram_free_mb": 5216,
+              "vram_total_mb": 8176,
+              "model_loaded": true,
+              "model_arch": "spark2_5",
+              "kernels": 0,
+              "kernel_hashes": 0
+            },
+            "vram_free_before_mb": 8154,
+            "max_tokens": 128,
+            "runs": 1,
+            "batch": 1,
+            "prompt_tokens": 1160,
+            "prompt_md5": "0ee8f86ada3683eda452bc294ec824a9",
+            "prompt_chars": 4096,
+            "warnings": [],
+            "decode_tok_s": {
+              "median": 53.6,
+              "mean": 53.6,
+              "min": 53.6,
+              "max": 53.6,
+              "stdev": 0
+            },
+            "prefill_tok_s": {
+              "median": 56.4,
+              "mean": 56.4,
+              "min": 56.4,
+              "max": 56.4,
+              "stdev": 0
+            },
+            "wall_tok_s": {
+              "median": 5.6,
+              "mean": 5.6,
+              "min": 5.6,
+              "max": 5.6,
+              "stdev": 0
+            },
+            "ttft_ms": {
+              "median": 20551.6,
+              "mean": 20551.6,
+              "min": 20551.6,
+              "max": 20551.6,
+              "stdev": 0
+            },
+            "samples": {
+              "decode": [
+                53.6
+              ],
+              "prefill": [
+                56.4
+              ],
+              "wall": [
+                5.6
+              ],
+              "ttft_ms": [
+                20551.6
+              ]
+            }
+          }
+        ]
+      },
+      "candidate": {
+        "prefill": [
+          138,
+          138,
+          138.8
+        ],
+        "decode": [
+          53.6,
+          53.5,
+          53.6
+        ],
+        "prefillMedian": 138,
+        "decodeMedian": 53.6,
+        "promptTokens": 1160,
+        "promptMd5": "0ee8f86ada3683eda452bc294ec824a9",
+        "reports": [
+          {
+            "protocol": "native-generate-v1",
+            "model": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+            "loaded": {
+              "type": "loaded",
+              "arch": "spark2_5",
+              "dim": 2560,
+              "layers": 36,
+              "vocab": 131072,
+              "vl": false,
+              "reasoning_contract": "qwen_jinja",
+              "reasoning_effort_native": false,
+              "reasoning_efforts": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "cache_capable": false,
+              "retry_reset_eligible": false,
+              "continuous_batch_capable": false
+            },
+            "gpu": {
+              "type": "diag",
+              "arch": "gfx1010",
+              "hip_version": "7.15",
+              "vram_free_mb": 5216,
+              "vram_total_mb": 8176,
+              "model_loaded": true,
+              "model_arch": "spark2_5",
+              "kernels": 0,
+              "kernel_hashes": 0
+            },
+            "vram_free_before_mb": 8154,
+            "max_tokens": 128,
+            "runs": 1,
+            "batch": 1,
+            "prompt_tokens": 1160,
+            "prompt_md5": "0ee8f86ada3683eda452bc294ec824a9",
+            "prompt_chars": 4096,
+            "warnings": [],
+            "decode_tok_s": {
+              "median": 53.6,
+              "mean": 53.6,
+              "min": 53.6,
+              "max": 53.6,
+              "stdev": 0
+            },
+            "prefill_tok_s": {
+              "median": 138,
+              "mean": 138,
+              "min": 138,
+              "max": 138,
+              "stdev": 0
+            },
+            "wall_tok_s": {
+              "median": 11.9,
+              "mean": 11.9,
+              "min": 11.9,
+              "max": 11.9,
+              "stdev": 0
+            },
+            "ttft_ms": {
+              "median": 8403.6,
+              "mean": 8403.6,
+              "min": 8403.6,
+              "max": 8403.6,
+              "stdev": 0
+            },
+            "samples": {
+              "decode": [
+                53.6
+              ],
+              "prefill": [
+                138
+              ],
+              "wall": [
+                11.9
+              ],
+              "ttft_ms": [
+                8403.6
+              ]
+            }
+          },
+          {
+            "protocol": "native-generate-v1",
+            "model": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+            "loaded": {
+              "type": "loaded",
+              "arch": "spark2_5",
+              "dim": 2560,
+              "layers": 36,
+              "vocab": 131072,
+              "vl": false,
+              "reasoning_contract": "qwen_jinja",
+              "reasoning_effort_native": false,
+              "reasoning_efforts": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "cache_capable": false,
+              "retry_reset_eligible": false,
+              "continuous_batch_capable": false
+            },
+            "gpu": {
+              "type": "diag",
+              "arch": "gfx1010",
+              "hip_version": "7.15",
+              "vram_free_mb": 5216,
+              "vram_total_mb": 8176,
+              "model_loaded": true,
+              "model_arch": "spark2_5",
+              "kernels": 0,
+              "kernel_hashes": 0
+            },
+            "vram_free_before_mb": 8154,
+            "max_tokens": 128,
+            "runs": 1,
+            "batch": 1,
+            "prompt_tokens": 1160,
+            "prompt_md5": "0ee8f86ada3683eda452bc294ec824a9",
+            "prompt_chars": 4096,
+            "warnings": [],
+            "decode_tok_s": {
+              "median": 53.5,
+              "mean": 53.5,
+              "min": 53.5,
+              "max": 53.5,
+              "stdev": 0
+            },
+            "prefill_tok_s": {
+              "median": 138,
+              "mean": 138,
+              "min": 138,
+              "max": 138,
+              "stdev": 0
+            },
+            "wall_tok_s": {
+              "median": 11.9,
+              "mean": 11.9,
+              "min": 11.9,
+              "max": 11.9,
+              "stdev": 0
+            },
+            "ttft_ms": {
+              "median": 8405.5,
+              "mean": 8405.5,
+              "min": 8405.5,
+              "max": 8405.5,
+              "stdev": 0
+            },
+            "samples": {
+              "decode": [
+                53.5
+              ],
+              "prefill": [
+                138
+              ],
+              "wall": [
+                11.9
+              ],
+              "ttft_ms": [
+                8405.5
+              ]
+            }
+          },
+          {
+            "protocol": "native-generate-v1",
+            "model": "/mnt/nas/kaden/hipfire-validation/spark25/spark-x2.5-4b.mq4v2.hfq",
+            "loaded": {
+              "type": "loaded",
+              "arch": "spark2_5",
+              "dim": 2560,
+              "layers": 36,
+              "vocab": 131072,
+              "vl": false,
+              "reasoning_contract": "qwen_jinja",
+              "reasoning_effort_native": false,
+              "reasoning_efforts": [
+                "low",
+                "medium",
+                "high",
+                "xhigh",
+                "max"
+              ],
+              "cache_capable": false,
+              "retry_reset_eligible": false,
+              "continuous_batch_capable": false
+            },
+            "gpu": {
+              "type": "diag",
+              "arch": "gfx1010",
+              "hip_version": "7.15",
+              "vram_free_mb": 5216,
+              "vram_total_mb": 8176,
+              "model_loaded": true,
+              "model_arch": "spark2_5",
+              "kernels": 0,
+              "kernel_hashes": 0
+            },
+            "vram_free_before_mb": 8154,
+            "max_tokens": 128,
+            "runs": 1,
+            "batch": 1,
+            "prompt_tokens": 1160,
+            "prompt_md5": "0ee8f86ada3683eda452bc294ec824a9",
+            "prompt_chars": 4096,
+            "warnings": [],
+            "decode_tok_s": {
+              "median": 53.6,
+              "mean": 53.6,
+              "min": 53.6,
+              "max": 53.6,
+              "stdev": 0
+            },
+            "prefill_tok_s": {
+              "median": 138.8,
+              "mean": 138.8,
+              "min": 138.8,
+              "max": 138.8,
+              "stdev": 0
+            },
+            "wall_tok_s": {
+              "median": 11.9,
+              "mean": 11.9,
+              "min": 11.9,
+              "max": 11.9,
+              "stdev": 0
+            },
+            "ttft_ms": {
+              "median": 8357.7,
+              "mean": 8357.7,
+              "min": 8357.7,
+              "max": 8357.7,
+              "stdev": 0
+            },
+            "samples": {
+              "decode": [
+                53.6
+              ],
+              "prefill": [
+                138.8
+              ],
+              "wall": [
+                11.9
+              ],
+              "ttft_ms": [
+                8357.7
+              ]
+            }
+          }
+        ]
+      },
+      "speedup": 2.4424778761061945
+    }
+  ],
+  "correctness": {
+    "kernel": {
+      "numerical_cases": 72,
+      "malformed_cases": 33,
+      "gemv_bit_exact": true,
+      "logical_extent_regression": "short_Y rejected before mutation even when pooled allocation capacity is sufficient"
+    },
+    "model": {
+      "mode": "spark25 serial-vs-chunked prefill parity",
+      "arch": "gfx1010",
+      "chunk": 64,
+      "tolerance": 0.00009999999747378752,
+      "shapes": [
+        {
+          "n": 65,
+          "compare": {
+            "hidden_worst_max_abs": 0,
+            "hidden_worst_layer": 0,
+            "logits_max_abs": 0,
+            "argmax_equal": true,
+            "ntokens": [
+              65,
+              65
+            ],
+            "ntokens_equal": true,
+            "kv_bytes": 95569920,
+            "kv_diff_bytes": 0,
+            "kv_first_diff": null,
+            "kv_equal": true,
+            "pass": true
+          }
+        },
+        {
+          "n": 70,
+          "compare": {
+            "hidden_worst_max_abs": 0,
+            "hidden_worst_layer": 0,
+            "logits_max_abs": 0,
+            "argmax_equal": true,
+            "ntokens": [
+              70,
+              70
+            ],
+            "ntokens_equal": true,
+            "kv_bytes": 95569920,
+            "kv_diff_bytes": 0,
+            "kv_first_diff": null,
+            "kv_equal": true,
+            "pass": true
+          }
+        },
+        {
+          "n": 127,
+          "compare": {
+            "hidden_worst_max_abs": 0,
+            "hidden_worst_layer": 0,
+            "logits_max_abs": 0,
+            "argmax_equal": true,
+            "ntokens": [
+              127,
+              127
+            ],
+            "ntokens_equal": true,
+            "kv_bytes": 95569920,
+            "kv_diff_bytes": 0,
+            "kv_first_diff": null,
+            "kv_equal": true,
+            "pass": true
+          }
+        },
+        {
+          "n": 511,
+          "compare": {
+            "hidden_worst_max_abs": 0,
+            "hidden_worst_layer": 0,
+            "logits_max_abs": 0,
+            "argmax_equal": true,
+            "ntokens": [
+              511,
+              511
+            ],
+            "ntokens_equal": true,
+            "kv_bytes": 95569920,
+            "kv_diff_bytes": 0,
+            "kv_first_diff": null,
+            "kv_equal": true,
+            "pass": true
+          }
+        },
+        {
+          "n": 512,
+          "compare": {
+            "hidden_worst_max_abs": 0,
+            "hidden_worst_layer": 0,
+            "logits_max_abs": 0,
+            "argmax_equal": true,
+            "ntokens": [
+              512,
+              512
+            ],
+            "ntokens_equal": true,
+            "kv_bytes": 95569920,
+            "kv_diff_bytes": 0,
+            "kv_first_diff": null,
+            "kv_equal": true,
+            "pass": true
+          }
+        },
+        {
+          "n": 513,
+          "compare": {
+            "hidden_worst_max_abs": 0,
+            "hidden_worst_layer": 0,
+            "logits_max_abs": 0,
+            "argmax_equal": true,
+            "ntokens": [
+              513,
+              513
+            ],
+            "ntokens_equal": true,
+            "kv_bytes": 95569920,
+            "kv_diff_bytes": 0,
+            "kv_first_diff": null,
+            "kv_equal": true,
+            "pass": true
+          }
+        },
+        {
+          "n": 1160,
+          "compare": {
+            "hidden_worst_max_abs": 0,
+            "hidden_worst_layer": 0,
+            "logits_max_abs": 0,
+            "argmax_equal": true,
+            "ntokens": [
+              1160,
+              1160
+            ],
+            "ntokens_equal": true,
+            "kv_bytes": 95569920,
+            "kv_diff_bytes": 0,
+            "kv_first_diff": null,
+            "kv_equal": true,
+            "pass": true
+          }
+        }
+      ],
+      "extension": {
+        "hidden_worst_max_abs": 0,
+        "hidden_worst_layer": 0,
+        "logits_max_abs": 0,
+        "argmax_equal": true,
+        "ntokens": [
+          70,
+          70
+        ],
+        "ntokens_equal": true,
+        "kv_bytes": 95569920,
+        "kv_diff_bytes": 0,
+        "kv_first_diff": null,
+        "kv_equal": true,
+        "pass": true,
+        "prefill_from_max_abs": 0,
+        "prefill_from_agrees": true
+      },
+      "extension_swa": {
+        "hidden_worst_max_abs": 0,
+        "hidden_worst_layer": 0,
+        "logits_max_abs": 0,
+        "argmax_equal": true,
+        "ntokens": [
+          530,
+          530
+        ],
+        "ntokens_equal": true,
+        "kv_bytes": 95569920,
+        "kv_diff_bytes": 0,
+        "kv_first_diff": null,
+        "kv_equal": true,
+        "pass": true,
+        "prefill_from_max_abs": 0,
+        "prefill_from_agrees": true
+      },
+      "decode_continuation": {
+        "logits_max_abs": 0,
+        "argmax_equal": true,
+        "pass": true
+      },
+      "cancel_probe": {
+        "aborted": true,
+        "abort_error": "spark25 prefill aborted",
+        "recovered": true,
+        "pass": true
+      },
+      "invalid_inputs": {
+        "cases": [
+          {
+            "case": "scratch_geometry_mismatch",
+            "rejected": true,
+            "error": "spark25: prefill validation: scratch geometry mismatch (reallocate for this config)",
+            "ntokens_unchanged": true,
+            "kv_unchanged": true,
+            "pass": true
+          },
+          {
+            "case": "out_of_capacity_range",
+            "rejected": true,
+            "error": "spark25: prefill end position 1222 exceeds max_seq 1220",
+            "ntokens_unchanged": true,
+            "kv_unchanged": true,
+            "pass": true
+          },
+          {
+            "case": "i32_unrepresentable_start",
+            "rejected": true,
+            "error": "spark25: prefill end position 4294967296 exceeds i32 range",
+            "ntokens_unchanged": true,
+            "kv_unchanged": true,
+            "pass": true
+          }
+        ],
+        "recovery": {
+          "logits_max_abs": 0,
+          "finite_and_cardinality_ok": true,
+          "pass": true
+        },
+        "pass": true
+      },
+      "pass": true
+    },
+    "serve": {
+      "battery_turns": 5,
+      "chain_turns": 5,
+      "max_chain_context": 791,
+      "all_stop": true,
+      "decoded_text_inspected": true,
+      "all_ten_texts_match_previous_outputs": true,
+      "note": "Prior serve request envelopes differ; this is output agreement, not a byte-identical request A/B. The baseline already contains the replacement character in the battery arithmetic answer."
+    },
+    "retained_decode": {
+      "backend": "aql_packets",
+      "context": 512,
+      "captures": 3,
+      "stable": true,
+      "launches": 1046,
+      "kernels": 12,
+      "shadow_iterations": 3,
+      "bit_exact": true,
+      "logits_equal": true,
+      "kv_equal": true,
+      "note": "--skip-prefill: decode regression coverage only, not new SIMT prefill replay coverage"
+    },
+    "cpu_tests": {
+      "suites": 42,
+      "passed": 2755,
+      "failed": 0,
+      "ignored": 3
+    }
+  },
+  "caveats": [
+    "verify-bind-thread.sh still reports six pre-existing dispatch.rs methods; file git blob c91132d8b54664b0cf48973bb9bdc8ca30409dc7 is unchanged from pre-task source.",
+    "Single-sample per-process stdev=0 is not cross-process spread; all three fresh-process samples are preserved.",
+    "Raw diagnostic microtimings are not product throughput claims."
+  ],
+  "evidence_root": "/mnt/nas/kaden/hipfire-validation/spark25/gfx1010-prefill"
+}
