@@ -3133,6 +3133,11 @@ pub const GEMM_MQ4G256V2_RESIDUAL_SIMT_SRC: &str =
 /// GEMM_MQ4G256V2_RESIDUAL_SIMT_SRC. Cleanup removes this after selection.
 pub const GEMM_MQ4G256V2_SIMT_EXPERIMENTS_GFX1010_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_simt_experiments_gfx1010.hip");
+/// Standalone gfx1010 FP32 plain-set M4×N2 register-only SIMT experiment (Y = A·X).
+/// Separate TU from the four-arm Q4 experiments; not on production or replay routes.
+pub const GEMM_MQ4G256V2_SET_SIMT_M4N2_REGISTER_GFX1010_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_set_simt_m4n2_register_gfx1010.hip");
+
 
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma.hip");

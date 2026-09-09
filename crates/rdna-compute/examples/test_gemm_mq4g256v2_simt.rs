@@ -2,9 +2,10 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Real-GPU numerical probe for `gemm_mq4g256v2_residual_simt` and the four
+//! Real-GPU numerical probe for `gemm_mq4g256v2_residual_simt`, the four
 //! temporary FP32 gfx1010 plain-set SIMT experiment variants
-//! (`gemm_mq4g256v2_set_simt_variant`).
+//! (`gemm_mq4g256v2_set_simt_variant`), and the standalone M4×N2 register-only
+//! direct candidate (`gemm_mq4g256v2_set_simt_m4n2_register_gfx1010`).
 //!
 //! Oracles (residual must agree with both within strict F32 tol):
 //!   1. Existing per-row `gemv_hfq4g256_residual_mq4v2` on the same weights/X
@@ -21,11 +22,12 @@
 //! must not pass). The overwrite proof compares product equality — it does not
 //! observe memset.
 //!
-//! Malformed-call gate (residual + every set arm; plain + batched_lmhead on
-//! gfx1010): insufficient A/X/Y extents, wrong X/Y dtype, i32 M/K/N overflow,
-//! and A/X/Y byte-count overflow. Every case must return `Err` **and** leave a
-//! sentinel Y pattern byte-unchanged (catches mutation-before-validation).
-//! Direct empty M/N no-ops must leave Y unchanged for residual and set arms.
+//! Malformed-call gate (residual + every set arm + register candidate; plain +
+//! batched_lmhead on gfx1010): insufficient A/X/Y extents, wrong X/Y dtype,
+//! i32 M/K/N overflow, and A/X/Y byte-count overflow. Every case must return
+//! `Err` **and** leave a sentinel Y pattern byte-unchanged (catches
+//! mutation-before-validation). Direct empty M/N no-ops must leave Y unchanged
+//! for residual, set arms, and the register candidate.
 //!
 //! Usage:
 //!   cargo run --release -p rdna-compute --example test_gemm_mq4g256v2_simt \
@@ -33,17 +35,19 @@
 //!
 //! Defaults exercise N∈{1,3,7,8,9,16}, K∈{256,768,1024,2560}, M∈{16,33}
 //! plus a representative larger M (CLI M or 512), then bounded non-cross-product
-//! boundary shapes (R2 odd-M, tile edges, Spark K). Optional `--timing` /
-//! `--timing-reverse` run the Spark projection census (N∈{64,46,8}) host-timed
-//! launch+completion over residual-from-zero and each set arm (warmups 10,
-//! measured ≥5, raw samples + median). Reverse flips the full five-entry order
-//! for matched F/R/R/F fresh-process bias checks. Machine-readable `RESULT*` /
-//! `RESULT_SET*` / `RESULT_MALFORMED*` / `RESULT_EMPTY*` / `RESULT_TIMING*` lines.
+//! boundary shapes (R2 odd-M, tile edges, Spark K, M4N2 row/group-tail edges).
+//! Optional `--timing` / `--timing-reverse` run the Spark projection census
+//! (N∈{64,46,8}) host-timed launch+completion over residual-from-zero, each set
+//! arm, and the direct register candidate (warmups 10, measured ≥5, raw samples
+//! + median). Reverse flips the full six-entry order for matched F/R/R/F
+//! fresh-process bias checks. Machine-readable `RESULT*` / `RESULT_SET*` /
+//! `RESULT_MALFORMED*` / `RESULT_EMPTY*` / `RESULT_TIMING*` lines.
 
 
 use rdna_compute::gemm::Mq4g256v2SimtSetVariant;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
+
 
 const GROUP: usize = 256;
 const HALF: usize = 128;
@@ -57,13 +61,56 @@ const DEFAULT_NS: &[usize] = &[1, 3, 7, 8, 9, 16];
 const DEFAULT_KS: &[usize] = &[256, 768, 1024, 2560];
 const SMALL_MS: &[usize] = &[16, 33];
 
-const SET_VARIANTS: &[Mq4g256v2SimtSetVariant] = &[
-    Mq4g256v2SimtSetVariant::SetR1T8Q4,
-    Mq4g256v2SimtSetVariant::SetR1T8G1,
-    Mq4g256v2SimtSetVariant::SetR1T16G1,
-    Mq4g256v2SimtSetVariant::SetR2T8G1,
+/// Probe-local set dispatch: production enum arms plus standalone register
+/// candidate. Does not extend `Mq4g256v2SimtSetVariant`.
+#[derive(Clone, Copy)]
+enum SetProbeEntry {
+    Existing(Mq4g256v2SimtSetVariant),
+    RegisterM4N2,
+}
+
+const SET_PROBE_ENTRIES: &[SetProbeEntry] = &[
+    SetProbeEntry::Existing(Mq4g256v2SimtSetVariant::SetR1T8Q4),
+    SetProbeEntry::Existing(Mq4g256v2SimtSetVariant::SetR1T8G1),
+    SetProbeEntry::Existing(Mq4g256v2SimtSetVariant::SetR1T16G1),
+    SetProbeEntry::Existing(Mq4g256v2SimtSetVariant::SetR2T8G1),
+    SetProbeEntry::RegisterM4N2,
 ];
 
+impl SetProbeEntry {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Existing(v) => set_variant_name(v),
+            Self::RegisterM4N2 => "SetM4N2Register",
+        }
+    }
+
+    fn call(
+        self,
+        gpu: &mut Gpu,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<(), hip_bridge::HipError> {
+        match self {
+            Self::Existing(v) => gpu.gemm_mq4g256v2_set_simt_variant(a, x, y, m, k, n, v),
+            Self::RegisterM4N2 => {
+                gpu.gemm_mq4g256v2_set_simt_m4n2_register_gfx1010(a, x, y, m, k, n)
+            }
+        }
+    }
+
+    /// Honest host-launch labeling for timing rows.
+    fn dispatch(self) -> &'static str {
+        match self {
+            Self::Existing(_) => "set_variant",
+            Self::RegisterM4N2 => "direct_candidate",
+        }
+    }
+}
 
 /// Non-cross-product boundary shapes from the validation recipe.
 fn boundary_shapes() -> Vec<(usize, usize, usize)> {
@@ -81,15 +128,22 @@ fn boundary_shapes() -> Vec<(usize, usize, usize)> {
     for &n in &[31usize, 32, 33] {
         out.push((33, 4096, n));
     }
-    // Spark long-K loops + ragged production N tails.
+    // Spark long-K loops + ragged production N tails (include register candidate).
     for &m in &[3usize, 33] {
         for &n in &[8usize, 46, 63, 64, 65] {
             out.push((m, 10240, n));
         }
     }
+    // M4×N2 register candidate row / group-tail edges.
+    out.push((1, 256, 1));
+    out.push((3, 256, 2));
+    out.push((4, 256, 2));
+    out.push((5, 256, 3));
+    out.push((5, 512, 3));
+    out.push((5, 768, 3));
+    out.push((5, 1024, 3));
     out
 }
-
 
 fn set_variant_name(v: Mq4g256v2SimtSetVariant) -> &'static str {
     match v {
@@ -303,7 +357,7 @@ fn main() {
                         }
                         Err(e) => {
                             failures += 1;
-                            cases += SET_VARIANTS.len();
+                            cases += SET_PROBE_ENTRIES.len();
                             eprintln!("  set {label}: ERROR {e}");
                             println!("RESULT_SET case={label} arch={arch} status=ERROR err={e}");
                         }
@@ -418,7 +472,7 @@ fn main() {
                     }
                     Err(e) => {
                         failures += 1;
-                        cases += SET_VARIANTS.len();
+                        cases += SET_PROBE_ENTRIES.len();
                         eprintln!("  set {label}: ERROR {e}");
                         println!("RESULT_SET case={label} arch={arch} status=ERROR err={e}");
                     }
@@ -446,7 +500,7 @@ fn main() {
         println!("RESULT case=plain_lmhead_overwrite arch={arch} status=SKIP");
     }
 
-    // Direct empty M/N no-op: residual + every set arm leave Y unchanged.
+    // Direct empty M/N no-op: residual + set arms + register candidate leave Y unchanged.
     match run_empty_suite(&mut gpu, &arch) {
         Ok(n_ok) => {
             eprintln!("  empty suite: PASS ({n_ok} checks)");
@@ -774,13 +828,14 @@ fn run_set_variants(
         y_gemv[b * m..(b + 1) * m].copy_from_slice(&got);
     }
 
-    let mut reports = Vec::with_capacity(SET_VARIANTS.len());
-    for &variant in SET_VARIANTS {
-        let name = set_variant_name(variant);
+    let mut reports = Vec::with_capacity(SET_PROBE_ENTRIES.len());
+    for &entry in SET_PROBE_ENTRIES {
+        let name = entry.name();
         let y_gpu = gpu
             .upload_f32(&y_stale_full, &[y_cap])
             .map_err(|e| format!("{name} upload y: {e}"))?;
-        gpu.gemm_mq4g256v2_set_simt_variant(a_raw, &x_gpu, &y_gpu, m, k, n, variant)
+        entry
+            .call(gpu, a_raw, &x_gpu, &y_gpu, m, k, n)
             .map_err(|e| format!("{name} launch: {e}"))?;
         gpu.hip
             .device_synchronize()
@@ -1045,13 +1100,13 @@ fn run_empty_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
     })?;
 
     if arch.starts_with("gfx1010") {
-        for &variant in SET_VARIANTS {
-            let name = set_variant_name(variant);
+        for &entry in SET_PROBE_ENTRIES {
+            let name = entry.name();
             one(name, 0, n0, &mut |gpu| {
-                gpu.gemm_mq4g256v2_set_simt_variant(&a_ok, &x_ok, &y, 0, k0, n0, variant)
+                entry.call(gpu, &a_ok, &x_ok, &y, 0, k0, n0)
             })?;
             one(name, m0, 0, &mut |gpu| {
-                gpu.gemm_mq4g256v2_set_simt_variant(&a_ok, &x_ok, &y, m0, k0, 0, variant)
+                entry.call(gpu, &a_ok, &x_ok, &y, m0, k0, 0)
             })?;
         }
     }
@@ -1067,7 +1122,7 @@ enum MalformedEntry {
     Residual,
     Plain,
     Lmhead,
-    Set(Mq4g256v2SimtSetVariant),
+    Set(SetProbeEntry),
 }
 
 impl MalformedEntry {
@@ -1076,7 +1131,7 @@ impl MalformedEntry {
             Self::Residual => "residual_simt",
             Self::Plain => "plain",
             Self::Lmhead => "batched_lmhead",
-            Self::Set(v) => set_variant_name(v),
+            Self::Set(v) => v.name(),
         }
     }
 
@@ -1094,7 +1149,7 @@ impl MalformedEntry {
             Self::Residual => gpu.gemm_mq4g256v2_residual_simt(a, x, y, m, k, n),
             Self::Plain => gpu.gemm_mq4g256v2(a, x, y, m, k, n),
             Self::Lmhead => gpu.gemm_mq4g256v2_batched_lmhead(a, x, y, m, k, n),
-            Self::Set(v) => gpu.gemm_mq4g256v2_set_simt_variant(a, x, y, m, k, n, v),
+            Self::Set(v) => v.call(gpu, a, x, y, m, k, n),
         }
     }
 }
@@ -1139,7 +1194,7 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
 
     let mut entries = vec![MalformedEntry::Residual];
     if arch.starts_with("gfx1010") {
-        for &v in SET_VARIANTS {
+        for &v in SET_PROBE_ENTRIES {
             entries.push(MalformedEntry::Set(v));
         }
         entries.push(MalformedEntry::Plain);
@@ -1340,13 +1395,34 @@ fn run_spark_timing(gpu: &mut Gpu, arch: &str, reverse: bool) -> Result<(), Stri
         "=== spark projection timing (host-timed launch+completion; Y upload excluded; order={order}) ==="
     );
 
-    // Five-entry schedule: residual baseline then four set arms. Reverse flips
-    // the entire list (not just variants) for matched F/R bias checks.
-    let mut entries: Vec<(&'static str, Option<Mq4g256v2SimtSetVariant>)> =
-        Vec::with_capacity(1 + SET_VARIANTS.len());
-    entries.push(("residual_from_zero", None));
-    for &v in SET_VARIANTS {
-        entries.push((set_variant_name(v), Some(v)));
+    // Six-entry schedule: residual baseline, four set arms, direct register
+    // candidate. Reverse flips the entire list for matched F/R bias checks.
+    #[derive(Clone, Copy)]
+    enum TimingEntry {
+        Residual,
+        Set(SetProbeEntry),
+    }
+    impl TimingEntry {
+        fn name(self) -> &'static str {
+            match self {
+                Self::Residual => "residual_from_zero",
+                Self::Set(v) => v.name(),
+            }
+        }
+        fn dispatch(self) -> &'static str {
+            match self {
+                Self::Residual => "residual_simt",
+                Self::Set(v) => v.dispatch(),
+            }
+        }
+        fn from_zero(self) -> bool {
+            matches!(self, Self::Residual)
+        }
+    }
+    let mut entries: Vec<TimingEntry> = Vec::with_capacity(1 + SET_PROBE_ENTRIES.len());
+    entries.push(TimingEntry::Residual);
+    for &v in SET_PROBE_ENTRIES {
+        entries.push(TimingEntry::Set(v));
     }
     if reverse {
         entries.reverse();
@@ -1376,22 +1452,24 @@ fn run_spark_timing(gpu: &mut Gpu, arch: &str, reverse: bool) -> Result<(), Stri
                 .upload_f32(&y_zero, &[y_elems])
                 .map_err(|e| format!("timing y: {e}"))?;
 
-            for &(name, variant) in &entries {
-                // Residual from +0; set arms from stale. Y htod outside timed window.
-                let y_host: &[f32] = match variant {
-                    None => &y_zero,
-                    Some(_) => &y_stale,
+            for &entry in &entries {
+                // Residual from +0; set/candidate from stale. Y htod outside timed window.
+                let y_host: &[f32] = if entry.from_zero() {
+                    &y_zero
+                } else {
+                    &y_stale
                 };
-                let samples = time_launch_completion_us(gpu, &y_gpu, y_host, |gpu| match variant {
-                    None => gpu.gemm_mq4g256v2_residual_simt(&a_raw, &x_gpu, &y_gpu, m, k, n),
-                    Some(v) => {
-                        gpu.gemm_mq4g256v2_set_simt_variant(&a_raw, &x_gpu, &y_gpu, m, k, n, v)
+                let samples = time_launch_completion_us(gpu, &y_gpu, y_host, |gpu| match entry {
+                    TimingEntry::Residual => {
+                        gpu.gemm_mq4g256v2_residual_simt(&a_raw, &x_gpu, &y_gpu, m, k, n)
                     }
+                    TimingEntry::Set(v) => v.call(gpu, &a_raw, &x_gpu, &y_gpu, m, k, n),
                 })?;
                 emit_timing(
                     arch,
                     shape.name,
-                    name,
+                    entry.name(),
+                    entry.dispatch(),
                     m,
                     k,
                     n,
@@ -1448,6 +1526,7 @@ fn emit_timing(
     arch: &str,
     shape: &str,
     entry: &str,
+    dispatch: &str,
     m: usize,
     k: usize,
     n: usize,
@@ -1470,10 +1549,10 @@ fn emit_timing(
         .collect::<Vec<_>>()
         .join(",");
     eprintln!(
-        "  timing {shape} entry={entry} order={order} M={m} K={k} N={n} mult={multiplicity} measurement=host_launch_completion: median={median:.1}µs samples=[{samples_str}]"
+        "  timing {shape} entry={entry} dispatch={dispatch} order={order} M={m} K={k} N={n} mult={multiplicity} measurement=host_launch_completion: median={median:.1}µs samples=[{samples_str}]"
     );
     println!(
-        "RESULT_TIMING shape={shape} entry={entry} M={m} K={k} N={n} multiplicity={multiplicity} arch={arch} order={order} measurement=host_launch_completion median_us={median:.3} samples_us={samples_str} warmups={TIMING_WARMUPS} iters={}",
+        "RESULT_TIMING shape={shape} entry={entry} dispatch={dispatch} M={m} K={k} N={n} multiplicity={multiplicity} arch={arch} order={order} measurement=host_launch_completion median_us={median:.3} samples_us={samples_str} warmups={TIMING_WARMUPS} iters={}",
         samples_us.len()
     );
 }

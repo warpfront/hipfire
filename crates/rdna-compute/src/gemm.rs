@@ -488,6 +488,20 @@ const MQ4G256V2_RESIDUAL_SIMT_SPEC: Mq4g256v2SimtSpec = Mq4g256v2SimtSpec {
 
 const MQ4G256V2_SIMT_EXPERIMENTS_MODULE: &str = "gemm_mq4g256v2_simt_experiments_gfx1010";
 
+/// Standalone gfx1010 M4×N2 register-only plain-set SIMT experiment (Y = A·X).
+/// Not wired into production enum/selector or replay registration.
+const MQ4G256V2_SET_SIMT_M4N2_REGISTER_GFX1010_SPEC: Mq4g256v2SimtSpec = Mq4g256v2SimtSpec {
+    func: "gemm_mq4g256v2_set_simt_m4n2_register_gfx1010",
+    row_tile: 4,
+    batch_tile: 2,
+    block: 32,
+    dynamic_lds_bytes: 0,
+};
+
+const MQ4G256V2_SET_SIMT_M4N2_REGISTER_GFX1010_MODULE: &str =
+    "gemm_mq4g256v2_set_simt_m4n2_register_gfx1010";
+
+
 
 /// Validated launch dimensions/bytes for gfx1010 MQ4G256V2 FP32 SIMT.
 /// Built only after A/X/Y extents, X/Y F32 dtypes, K alignment, checked products,
@@ -30759,6 +30773,56 @@ impl Gpu {
             1,
         )
     }
+
+    /// Standalone exact-gfx1010 MQ4G256V2 FP32 plain-set M4×N2 register-only SIMT.
+    /// Validates then launches `gemm_mq4g256v2_set_simt_m4n2_register_gfx1010` (Y = A·X).
+    /// Empty M/N is a no-op (no arch/replay gate); non-empty requires exact gfx1010 and
+    /// rejects replay recording / graph capture before ensure_kernel. Not on production
+    /// or retained-replay routes. Malformed args leave Y unchanged.
+    pub fn gemm_mq4g256v2_set_simt_m4n2_register_gfx1010(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let spec = MQ4G256V2_SET_SIMT_M4N2_REGISTER_GFX1010_SPEC;
+        // Empty no-op before arch/replay gates (same residual empty semantics).
+        let Some(v) = validate_mq4g256v2_simt(a_raw, x, y, m, k, n, &spec)? else {
+            return Ok(());
+        };
+        if !self.arch_caps.is_gfx1010() {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!("{}: exact gfx1010 required (got {})", spec.func, self.arch),
+            ));
+        }
+        // Standalone-only: refuse recording/capture before ensure_kernel so Y and
+        // the kernel cache stay untouched (no replay registration for this entry).
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "{}: standalone-only (reject replay recording and graph capture)",
+                    spec.func
+                ),
+            ));
+        }
+        self.launch_mq4g256v2_simt_validated(
+            a_raw,
+            x,
+            y,
+            &v,
+            MQ4G256V2_SET_SIMT_M4N2_REGISTER_GFX1010_MODULE,
+            kernels::GEMM_MQ4G256V2_SET_SIMT_M4N2_REGISTER_GFX1010_SRC,
+            &spec,
+            1,
+        )
+    }
+
 
 
     /// MQ4 v2 (qt=44) — plain batched GEMM `gemm_hfq4g256` sibling.
