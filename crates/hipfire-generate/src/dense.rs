@@ -245,6 +245,67 @@ mod deepseek4_reasoning_prefix_tests {
     }
 }
 
+#[cfg(test)]
+mod lfm2moe_think_close_tests {
+    use super::lfm2moe_think_close_tokens;
+
+    /// LFM-shaped tokenizer fixture: `lfm2_moe` arch without an explicit
+    /// `add_bos_token` (so the LFM default applies), BOS id 1, and
+    /// `<think>`/`</think>` as single special ids like the pinned 2.6B vocab
+    /// (124901/124902 range).
+    fn lfm_close_meta() -> String {
+        serde_json::json!({
+            "architecture": "lfm2_moe",
+            "tokenizer": serde_json::json!({
+                "model": {
+                    "type": "BPE",
+                    "vocab": { "<unk>": 0, "h": 3, "i": 4, "\u{2581}": 5 },
+                    "merges": []
+                },
+                "added_tokens": [
+                    {"id": 1, "content": "<|startoftext|>", "special": true},
+                    {"id": 2, "content": "<|endoftext|>", "special": true},
+                    {"id": 124901, "content": "<think>", "special": true},
+                    {"id": 124902, "content": "</think>", "special": true}
+                ]
+            })
+            .to_string(),
+            "generation_config": { "bos_token_id": 1, "eos_token_id": 2 },
+            "tokenizer_config": {}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn think_close_splice_carries_no_bos() {
+        // The mid-turn KV splice must never inject a stream-start BOS:
+        // `encode` auto-prepends it for LFM (`add_bos`), so the helper must
+        // strip exactly that prepend and nothing else.
+        let tok =
+            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&lfm_close_meta())
+                .expect("meta");
+        assert!(tok.add_bos, "fixture must reproduce the LFM add_bos default");
+        assert_eq!(tok.bos_id, 1);
+        let raw = tok.encode("</think>\n\n");
+        assert_eq!(
+            raw.first().copied(),
+            Some(1),
+            "fixture must reproduce the auto-prepend hazard"
+        );
+        let close = lfm2moe_think_close_tokens(&tok, "</think>\n\n");
+        assert_eq!(
+            close,
+            raw[1..],
+            "strip exactly the auto-prepended BOS, preserving every content id"
+        );
+        assert_eq!(
+            close.first().copied(),
+            Some(124902),
+            "close tag resolves via the special-token table, not BPE pieces"
+        );
+    }
+}
+
 /// Typed daemon error envelope (Increment B / Task 13).
 ///
 /// Wire: `{type:error, id?, message, class, retryable, rolled_back, attempt_id}`.
@@ -5938,6 +5999,126 @@ pub fn generate_muse_glimmer(
         m.seq_pos = 0;
     }
 }
+/// Tokenize a think-close continuation for a mid-stream KV splice.
+///
+/// Separated so the BOS-strip rule is stated once and unit-testable; see the
+/// body for why `encode`'s auto-prepended BOS must go.
+fn lfm2moe_think_close_tokens(tokenizer: &hipfire_runtime::tokenizer::Tokenizer, text: &str) -> Vec<u32> {
+    let mut ids = tokenizer.encode(text);
+    // `encode` prepends `bos_id` for BOS-trained tokenizers (LFM `add_bos`).
+    // A think-close splice is mid-stream, never a stream start, so drop
+    // exactly that auto-prepend. This keys on the tokenizer's own `add_bos`
+    // flag and a leading `bos_id`: the continuation never starts with the BOS
+    // literal, so a leading BOS id can only be the auto-prepend, never
+    // content. Without this the splice would inject a stray BOS mid-turn.
+    if tokenizer.add_bos && ids.first() == Some(&tokenizer.bos_id) {
+        ids.remove(0);
+    }
+    ids
+}
+///
+/// Splice the tokenized think-close continuation through LFM KV + stream.
+///
+/// Shared by the pre-decode immediate close (disabled / cap-1 with a primed
+/// prompt) and the mid-decode budget force-close. Each close token runs the
+/// same KV-write + emit + history path as a sampled token so generation
+/// continues conditioned on a closed think block, with authoritative ids and
+/// accounting. Returns `Ok(true)` when the full close landed, `Ok(false)`
+/// when the remaining `max_tokens` budget could not fit it (caller breaks to
+/// terminal with the committed prefix instead of pretending the answer
+/// continues with unclosed KV).
+#[allow(clippy::too_many_arguments)]
+fn lfm2moe_splice_think_close(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    last_logits: &mut Vec<f32>,
+    streamed_tokens: &mut Vec<u32>,
+    bytes_emitted: &mut usize,
+    generated_count: &mut usize,
+    max_tokens: usize,
+) -> Result<bool, String> {
+    let close_tokens = {
+        let tokenizer = m.tokenizer.as_ref().ok_or_else(|| "tokenizer not loaded".to_string())?;
+        lfm2moe_think_close_tokens(tokenizer, &think_continuation())
+    };
+    if close_tokens.is_empty() || close_tokens.len() > max_tokens.saturating_sub(*generated_count) {
+        return Ok(false);
+    }
+    for &t in &close_tokens {
+        let step = {
+            let b = m.lfm2moe_mut().ok_or_else(|| "lfm2moe_config missing on arch_id=11 generate".to_string())?;
+            let cfg = &b.config;
+            let weights = &b.weights;
+            let state = &mut b.state;
+            let position = state.n_tokens as u32;
+            lfm2moe::forward::decode_step(cfg, weights, state, gpu, t, position)
+        };
+        match step {
+            Ok(logits) => {
+                *last_logits = logits;
+                streamed_tokens.push(t);
+                m.conversation_tokens.push(t);
+                *generated_count += 1;
+            }
+            Err(e) => return Err(format!("lfm2moe think-close splice failed: {e:?}")),
+        }
+    }
+    // Emit the spliced close as one envelope and advance the UTF-8 carry over
+    // the extended stream: the delta from bytes_emitted is exactly the close
+    // text (same pattern as the spark think-cap splice).
+    {
+        let tokenizer = m.tokenizer.as_ref().ok_or_else(|| "tokenizer not loaded".to_string())?;
+        let all_bytes = tokenizer.decode_bytes(streamed_tokens);
+        if *bytes_emitted < all_bytes.len() {
+            let frag = String::from_utf8_lossy(&all_bytes[*bytes_emitted..]).into_owned();
+            *bytes_emitted = all_bytes.len();
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": frag,
+                "attempt_id": active_attempt_id(),
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
+    }
+    Ok(true)
+}
+/// LFM2.5-MoE (arch_id=11) ordinary AR path.
+///
+/// Mirrors `generate_spark25` shape: JinjaChatFrame prompt, cold-reset every
+/// turn, per-token prefill, host-side sample_token, streamed UTF-8 decode,
+/// think-cap splice through KV, JSONL token/done with real prompt usage and
+/// length-vs-stop terminal. No batch, EP, spec, or DFlash.
+///
+/// Reasoning runs on the shared think-tag/Jinja contract (`QwenJinja` in
+/// `Lfm2MoeCarrier::caps`): the pinned vendor template's generation prompt
+/// unconditionally ends with `<|im_start|>assistant\n<think>` — it takes no
+/// `enable_thinking` kwarg — so `primed_think` is observed from the rendered
+/// prompt via `render_tail_opens_think`, never a constant, and
+/// `started_in_think` on `gen_start` reports exactly that. The legacy
+/// `ThinkChannelRouter` serve fold splits `reasoning_content`/answer from the
+/// verbatim `<think>` text, which is why a primed turn re-emits the `<think>\n`
+/// opener display-only (already in KV from prefill) and every close — natural
+/// or forced — is emitted as text: the stream stays a well-formed block.
+/// Nothing visible is ever stripped to mask framing.
+///
+/// Think-budget semantics are the engine-wide `max_think_tokens` encoding:
+/// 0 = uncapped, 1 = immediately closed, N = force-close after N reasoning
+/// tokens by splicing the tokenized `think_continuation()` through the same
+/// KV-write + emit + history path as sampled tokens (qwen-AR/spark pattern),
+/// never by client-side relabeling. `enable_thinking=false` (explicit
+/// disabled) with a primed prompt closes immediately: the template cannot not
+/// prime, so disabled is honored by closing, not by stripping the primer out
+/// of the prompt (which would desync KV) or by ignoring the control.
+///
+/// Tools stay refused upstream (`supports_tools` excludes LFM routes and the
+/// semantic route policy fails closed): this path extracts no tool calls and
+/// stages none — model-emitted text streams verbatim and the terminal is
+/// stop/length only.
+#[allow(clippy::too_many_arguments)]
 pub fn generate_lfm2moe(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -5949,6 +6130,9 @@ pub fn generate_lfm2moe(
     top_p: f32,
     max_tokens: usize,
     max_think_tokens: usize,
+    assistant_prefix: AssistantPrefix,
+    enable_thinking: bool,
+    stop: &[String],
     tools: Option<&[serde_json::Value]>,
     messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
@@ -5978,6 +6162,13 @@ pub fn generate_lfm2moe(
     }
 
     // ── Prompt build (same two-path branch as the minimax AR path) ──
+    // `primed_think` records whether the RENDERED prompt actually ends with
+    // the `<think>` generation-primer — observed via `render_tail_opens_think`,
+    // never a constant. The pinned LFM2.5 template always primes (it takes no
+    // `enable_thinking` kwarg); older non-thinking LFM templates and the Plain
+    // fallback do not. Upstream rendering is preserved verbatim: no prompt
+    // text is stripped.
+    let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
         // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
@@ -5999,7 +6190,7 @@ pub fn generate_lfm2moe(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: max_think_tokens != 1,
+                enable_thinking,
                 bos_token: None,
                 reasoning_strength: None,
                 reasoning_effort: None,
@@ -6042,25 +6233,36 @@ pub fn generate_lfm2moe(
                 frame.render()
             };
             match render_result {
-                Ok(rendered) => tokenizer.encode(&rendered),
+                Ok(rendered) => {
+                    primed_think = render_tail_opens_think(&rendered);
+                    tokenizer.encode(&rendered)
+                }
                 Err(e) => {
                     eprintln!("[daemon] jinja render failed in lfm2moe path ({e}) — falling back to Plain");
+                    primed_think = matches!(
+                        assistant_prefix,
+                        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                    );
                     hipfire_runtime::prompt_frame::ChatFrame {
                         tokenizer,
                         system: system_prompt,
                         user: prompt,
-                        assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        assistant_prefix,
                         raw: false,
                     }
                     .build()
                 }
             }
         } else {
+            primed_think = matches!(
+                assistant_prefix,
+                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+            );
             hipfire_runtime::prompt_frame::ChatFrame {
                 tokenizer,
                 system: system_prompt,
                 user: prompt,
-                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                assistant_prefix,
                 raw: false,
             }
             .build()
@@ -6092,7 +6294,7 @@ pub fn generate_lfm2moe(
     // single id (true for `<|im_end|>`). NOTE it does NOT round-trip for
     // `<|endoftext|>` (encode yields subwords, not the special id), so the
     // reliable catch for that one is the string-level guard in the decode loop
-    // below, which matches on the DECODED frag.
+    // below, which matches on the single-token DECODED frag.
     let stop_toks: Vec<u32> = {
         let tk = m.tokenizer.as_ref().unwrap();
         let mut v = vec![eos_tok];
@@ -6132,8 +6334,14 @@ pub fn generate_lfm2moe(
     // This was the root cause of the 3-minute hang on native `hipfire serve`
     // for LFM2.5-230M/350M (direct `infer_lfm2moe` bypasses the gate and was
     // coherent). Mirrors the DS4 fix `e99583afa` and Qwen's `emit_gen_start`.
+    //
+    // `started_in_think` is `primed_think` — the OBSERVED rendered-prompt
+    // state, not a constant. The legacy ThinkChannelRouter serve fold keys the
+    // whole reasoning span off it; hardcoding false misfiles the always-primed
+    // LFM2.5 reasoning as answer content. `contract_version` stays the
+    // carrier's (None): no router-backed producer, legacy fold applies.
     let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
+    emit_gen_start(stdout, id, primed_think, gen_contract);
 
     // Cross-conversation reset (FIX: LFM turn-to-turn KV accumulation). The
     // prior design only reset on capacity overflow, so every request APPENDED to
@@ -6190,6 +6398,25 @@ pub fn generate_lfm2moe(
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
+    let prefill_s = prefill_ms as f64 / 1000.0;
+
+    // A primed prompt left the model inside an already-open `<think>` span and
+    // it never emits the opening tag itself, so every downstream `<think>`
+    // consumer (serve reasoning_content/content split, run/chat-path stripper,
+    // history stripThinkingInline — all keyed on a LEADING `<think>`) would
+    // never engage, leaking chain-of-thought into `message.content`. The
+    // primer is already in the KV from prefill; re-emit it into the token
+    // stream (display-only, not pushed to state) so the turn is a well-formed
+    // `<think>...</think>...` block for every consumer (minimax/cohere
+    // pattern). No-op for templates that don't prime think.
+    if primed_think {
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"type": "token", "id": id, "text": "<think>\n", "attempt_id": active_attempt_id()})
+        );
+        let _ = stdout.flush();
+    }
 
     // ── Decode loop. Sample host-side from the running logits vector.
     // Abort is checked at the top of every iteration so a mid-decode
@@ -6204,69 +6431,220 @@ pub fn generate_lfm2moe(
     let mut rng = deepseek4::sampling::Xorshift::new(seed);
 
     let mut generated_count: usize = 0;
-    let decode_t0 = Instant::now();
-    loop {
-        if check_abort(id) {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
-            return;
-        }
-        if generated_count >= max_tokens {
-            break;
-        }
-        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
-        if stop_toks.contains(&next_tok) {
-            break;
-        }
-
-        let frag = {
-            let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
-        };
-        // String-level EOS-class guard. The id-based `stop_toks` above misses
-        // `<|endoftext|>` because encoding the literal STRING doesn't round-trip
-        // to the special-token id (it yields subwords), so the real token id is
-        // never in the set. The daemon decodes one token at a time, so the
-        // leaking turn-end token arrives as its own frag — catch it on the
-        // decoded text and stop WITHOUT emitting (was: "...Paris.<|endoftext|>").
-        if matches!(frag.trim(), "<|endoftext|>" | "</s>" | "<|im_end|>") {
-            break;
-        }
-        let envelope = serde_json::json!({
-            "type": "token",
-            "id": id,
-            "text": frag,
-            "attempt_id": active_attempt_id(),
-        });
-        let _ = writeln!(stdout, "{}", envelope);
-        let _ = stdout.flush();
-        m.conversation_tokens.push(next_tok);
-        generated_count += 1;
-
-        // Check abort before the next GPU decode_step to avoid launching
-        // more work after the client has already cancelled.
-        if check_abort(id) {
-            let ep = production_fail_closed_rollback(m, gpu, None, None);
-            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
-            return;
-        }
-
-        let step = {
-            let b = m.lfm2moe_mut().unwrap();
-            let cfg = &b.config;
-            let weights = &b.weights;
-            let state = &mut b.state;
-            let position = state.n_tokens as u32;
-            lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
-        };
-        match step {
-            Ok(logits) => last_logits = logits,
+    let mut hit_eos = false;
+    let mut hit_stop = false;
+    let mut streamed_tokens: Vec<u32> = Vec::with_capacity(max_tokens);
+    let mut bytes_emitted: usize = 0;
+    // Immediate close: a primed prompt with thinking explicitly disabled
+    // (`enable_thinking=false`) or the immediate-close cap (`1`) starts the
+    // turn in answer mode with empty reasoning. The pinned template cannot
+    // not prime, so disabled is honored by closing through KV here — not by
+    // stripping the primer (KV desync) and not by ignoring the control. When
+    // the remaining budget cannot fit the close, decode is skipped and the
+    // turn terminates with the committed prefix below.
+    let mut decode_open = true;
+    if primed_think && (!enable_thinking || max_think_tokens == 1) {
+        match lfm2moe_splice_think_close(
+            m,
+            gpu,
+            stdout,
+            id,
+            &mut last_logits,
+            &mut streamed_tokens,
+            &mut bytes_emitted,
+            &mut generated_count,
+            max_tokens,
+        ) {
+            Ok(true) => {}
+            Ok(false) => decode_open = false,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("lfm2moe decode failed: {e:?}"));
+                emit_error_with_id(stdout, id, e);
+                let _ = stdout.flush();
                 return;
             }
         }
     }
+    // Explicit thinking cap enforcement: `max_think_tokens` is an orthogonal
+    // force-close cap (0 = uncapped) that, when reached inside an open think
+    // span, splices the tokenized close through KV so the model answers
+    // within budget instead of running away to `max_tokens` (the reported
+    // max_think_tokens=8 leak). Tracks model-emitted `<think>` re-opens too.
+    let mut think_router = MapleThoughtRouter::new(primed_think && decode_open, max_think_tokens);
+    let mut think_close_injected = primed_think && decode_open && (!enable_thinking || max_think_tokens == 1);
+    let decode_t0 = Instant::now();
+    if decode_open {
+        loop {
+            if check_abort(id) {
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+                return;
+            }
+            if generated_count >= max_tokens {
+                break;
+            }
+            let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+            if stop_toks.contains(&next_tok) {
+                hit_eos = true;
+                break;
+            }
+            // String-level EOS-class guard. The id-based `stop_toks` above
+            // misses `<|endoftext|>` because encoding the literal STRING
+            // doesn't round-trip to the special-token id (it yields subwords),
+            // so the real token id is never in the set. The daemon decodes one
+            // token at a time, so the leaking turn-end token arrives as its own
+            // frag — catch it on the single-token DECODED text and stop WITHOUT
+            // emitting (was: "...Paris.<|endoftext|>").
+            {
+                let frag0 = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
+                if matches!(frag0.trim(), "<|endoftext|>" | "</s>" | "<|im_end|>") {
+                    hit_eos = true;
+                    break;
+                }
+            }
+            let mut think_cap_hit = false;
+            streamed_tokens.push(next_tok);
+            // Streaming UTF-8 reassembly: decode the whole run and emit only
+            // the delta's longest valid UTF-8 prefix, carrying any partial
+            // trailing code point into the next token (maple/spark pattern).
+            // A per-token `decode(&[tok])` runs `from_utf8_lossy` over half a
+            // code point and emits U+FFFD replacement chars.
+            let all_bytes = m.tokenizer.as_ref().unwrap().decode_bytes(&streamed_tokens);
+            let pending = &all_bytes[bytes_emitted.min(all_bytes.len())..];
+            let valid_len = match std::str::from_utf8(pending) {
+                Ok(_) => pending.len(),
+                // Only a truncated final code point may be held back.
+                // Genuinely invalid bytes must not buffer forever — emit them
+                // lossily and move on, or the stream would stall.
+                Err(e) if e.error_len().is_none() => e.valid_up_to(),
+                Err(_) => pending.len(),
+            };
+            if valid_len > 0 {
+                let frag = String::from_utf8_lossy(&pending[..valid_len]).into_owned();
+                bytes_emitted += valid_len;
+                // Request stop sequences: match on the full decoded stream so
+                // stops spanning a token boundary still hit. On a hit the
+                // fragment is emitted and the turn ends as `stop` (common AR
+                // convention: the stop tail stays client-visible).
+                if !stop.is_empty() {
+                    let decoded_suffix = m.tokenizer.as_ref().unwrap().decode(&streamed_tokens);
+                    if stop.iter().any(|s| decoded_suffix.ends_with(s.as_str())) {
+                        hit_stop = true;
+                        let envelope = serde_json::json!({
+                            "type": "token",
+                            "id": id,
+                            "text": frag,
+                            "attempt_id": active_attempt_id(),
+                        });
+                        let _ = writeln!(stdout, "{}", envelope);
+                        let _ = stdout.flush();
+                        m.conversation_tokens.push(next_tok);
+                        generated_count += 1;
+                        break;
+                    }
+                }
+                let envelope = serde_json::json!({
+                    "type": "token",
+                    "id": id,
+                    "text": frag,
+                    "attempt_id": active_attempt_id(),
+                });
+                let _ = writeln!(stdout, "{}", envelope);
+                let _ = stdout.flush();
+                // max_think_tokens enforcement: the router only DETECTS the
+                // cap here. The actual close is spliced through KV after this
+                // token's decode step below (qwen-AR think-cap pattern) —
+                // never client-side relabeling.
+                think_cap_hit = think_router.observe(&frag).is_some();
+            } else {
+                // Still advance the router when no valid UTF-8 delta was
+                // emitted (split code point), so the think-token count stays
+                // in sync with the model's token stream.
+                let frag = String::from_utf8_lossy(pending).into_owned();
+                if frag.contains("<think>") || frag.contains("</think>") {
+                    think_cap_hit = think_router.observe(&frag).is_some();
+                }
+            }
+            m.conversation_tokens.push(next_tok);
+            generated_count += 1;
+
+            // Check abort before the next GPU decode_step to avoid launching
+            // more work after the client has already cancelled.
+            if check_abort(id) {
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+                return;
+            }
+
+            let step = {
+                let b = m.lfm2moe_mut().unwrap();
+                let cfg = &b.config;
+                let weights = &b.weights;
+                let state = &mut b.state;
+                let position = state.n_tokens as u32;
+                lfm2moe::forward::decode_step(cfg, weights, state, gpu, next_tok, position)
+            };
+            match step {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("lfm2moe decode failed: {e:?}"));
+                    return;
+                }
+            }
+            // Think-cap splice (established qwen-AR/spark pattern): when the
+            // cap fired this iteration, feed the actual tokenized close
+            // sequence through the same KV-write + emit + history path as a
+            // sampled token, so the model continues conditioned on a closed
+            // think block. Clipped to the remaining max_tokens budget: with no
+            // room for the full close, or when think re-opens after the forced
+            // close, terminate safely with the committed prefix instead of
+            // pretending the answer continues with unclosed KV.
+            if think_cap_hit && !think_close_injected {
+                think_close_injected = true;
+                match lfm2moe_splice_think_close(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    &mut last_logits,
+                    &mut streamed_tokens,
+                    &mut bytes_emitted,
+                    &mut generated_count,
+                    max_tokens,
+                ) {
+                    Ok(true) => {}
+                    Ok(false) => break,
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, e);
+                        return;
+                    }
+                }
+            } else if think_cap_hit {
+                // Think re-opened after the forced close: terminate safely
+                // rather than looping the cap.
+                break;
+            }
+        }
+    }
+
+    // Flush any bytes still held back by the UTF-8 carry. Reaching here with
+    // a non-empty tail means the run ended (EOS or max_tokens) mid-code-point;
+    // dropping it would silently truncate the reply's last character.
+    if !streamed_tokens.is_empty() {
+        let all_bytes = m.tokenizer.as_ref().unwrap().decode_bytes(&streamed_tokens);
+        if bytes_emitted < all_bytes.len() {
+            let frag = String::from_utf8_lossy(&all_bytes[bytes_emitted..]).into_owned();
+            bytes_emitted = all_bytes.len();
+            let envelope = serde_json::json!({
+                "type": "token",
+                "id": id,
+                "text": frag,
+                "attempt_id": active_attempt_id(),
+            });
+            let _ = writeln!(stdout, "{}", envelope);
+            let _ = stdout.flush();
+        }
+    }
+    let _ = bytes_emitted;
 
     // Abort latched between loop exit and commit must not proceed to the
     // two-phase commit handshake — emit the attested `aborted` terminal
@@ -6279,20 +6657,37 @@ pub fn generate_lfm2moe(
 
     m.seq_pos = m.lfm2moe().unwrap().state.n_tokens;
 
-    let decode_ms = decode_t0.elapsed().as_millis().max(1);
-    let total_ms = t0.elapsed().as_millis().max(1);
-    let tok_s = if generated_count > 0 {
-        (generated_count as f64 * 1000.0) / decode_ms as f64
+    let t_end = Instant::now();
+    let decode_s = t_end.duration_since(decode_t0).as_secs_f64();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let rate = |n: usize, s: f64| if s > 0.0 { n as f64 / s } else { 0.0 };
+    let tok_s = rate(generated_count, total_s);
+    let prefill_tok_s = rate(prompt_ids.len(), prefill_s);
+    let decode_tok_s = rate(generated_count, decode_s);
+    // Terminal classification: `stop` only when a real end-of-turn token (or
+    // request stop sequence) landed; `max_tokens` exhaustion — including an
+    // unterminated think span cut at the cap — is `length`, never a normal
+    // stop. Tools are refused upstream, so no tool_calls terminal exists here.
+    let finish_reason = if hit_stop {
+        "stop"
+    } else if !hit_eos {
+        "length"
     } else {
-        0.0
+        "stop"
     };
     let pending_done = serde_json::json!({
         "type": "done",
         "id": id,
         "tokens": generated_count,
         "tok_s": (tok_s * 100.0).round() / 100.0,
-        "prefill_ms": prefill_ms,
-        "total_ms": total_ms,
+        "prompt_tokens": prompt_ids.len(),
+        "prefill_tokens": prompt_ids.len(),
+        "prefill_ms": (prefill_ms as f64 * 10.0).round() / 10.0,
+        "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
+        "decode_tok_s": (decode_tok_s * 10.0).round() / 10.0,
+        "ttft_ms": (prefill_ms as f64 * 10.0).round() / 10.0,
+        "total_ms": (total_s * 1000.0 * 10.0).round() / 10.0,
+        "finish_reason": finish_reason,
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
@@ -6303,6 +6698,7 @@ pub fn generate_lfm2moe(
         }
     }
 }
+
 /// MiniMax-M2 (arch_id=10) generate path — minimal AR bring-up.
 ///
 /// Mirrors `generate_lfm2moe`'s shape (prefill loop / chunked batched prefill,

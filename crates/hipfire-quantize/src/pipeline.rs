@@ -1193,9 +1193,20 @@ pub(crate) fn run() {
         );
     }
     if is_lfm2moe {
-        eprintln!(
-            "  LFM2.5 detected — experts → MQ4G256, expert_bias → F32, all else (conv/attn/dense/router/embed/norms) → Q8."
-        );
+        // Two recipes, and the banner used to describe only the MoE one. A dense
+        // LFM2.5 mq4v2 convert actually ships embed_tokens plus every 2D
+        // projection as MQ4G256V2 and keeps only the norms and the conv1d filter
+        // at Q8, so the old "all else → Q8" line contradicted the per-tensor log
+        // printed immediately below it.
+        if use_mq4v2 {
+            eprintln!(
+                "  LFM2.5 detected — embed + 2D projections (conv in/out, attn, dense FFN) → MQ4G256V2; norms + conv1d filter → Q8 (dequantized to F32 on load)."
+            );
+        } else {
+            eprintln!(
+                "  LFM2.5 detected — experts → MQ4G256, expert_bias → F32, all else (conv/attn/dense/router/embed/norms) → Q8."
+            );
+        }
     }
     if is_minimax {
         eprintln!(

@@ -1587,7 +1587,6 @@ pub fn generate(
             let _ = (
                 budget_alert_at_tok,
                 budget_alert_text,
-                assistant_prefix,
                 pflash_state,
                 pflash_cfg,
                 think_mode,
@@ -1604,6 +1603,9 @@ pub fn generate(
                 top_p,
                 max_tokens,
                 max_think_tokens,
+                assistant_prefix,
+                enable_thinking,
+                stop,
                 tools,
                 messages_history,
             );
@@ -1613,7 +1615,6 @@ pub fn generate(
             let _ = (
                 budget_alert_at_tok,
                 budget_alert_text,
-                assistant_prefix,
                 pflash_state,
                 pflash_cfg,
                 think_mode,
@@ -1630,6 +1631,9 @@ pub fn generate(
                 top_p,
                 max_tokens,
                 max_think_tokens,
+                assistant_prefix,
+                enable_thinking,
+                stop,
                 tools,
                 messages_history,
             );

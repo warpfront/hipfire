@@ -1535,7 +1535,15 @@ impl Carrier for Lfm2MoeCarrier {
             // artifacts WITHOUT vision tensors still load fine and refuse
             // images at the daemon gate via `has_vision_encoder() == false`.
             supports_images: true,
-            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+            // Think-tag/Jinja reasoning contract: LFM2.5's pinned vendor
+            // template primes every assistant turn with `<think>` and replays
+            // prior-turn reasoning via `thinking`/`reasoning_content`, so the
+            // shared QwenJinja think-tag controls (thinking_enabled toggle,
+            // max_think_tokens cap, open/closed assistant prefix) accurately
+            // describe the implemented behavior. semantic_contract_version
+            // stays None: no router-backed producer — the legacy
+            // ThinkChannelRouter fold splits reasoning from verbatim text.
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
