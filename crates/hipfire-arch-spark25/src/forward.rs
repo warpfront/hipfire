@@ -9,7 +9,11 @@
 //!     n1 = rmsnorm(x, input_layernorm, 1e-6) -> tmp
 //!     qkv = q_k_v_proj(n1)   // single GEMV then split Q|K|V
 //!     gate_raw = g_proj(n1)  // [n_heads]
-//!     RoPE: sliding full half-split; full partial half-split
+//!     RoPE: sliding full half-split (rope_f32, theta 1e4); full contiguous-block
+//!     partial half-split (first 64 dims, pairs (i,i+32), denominator 64, theta
+//!     5e6) per modeling_spark.py compute_rope_cos_sin/apply_rotary_pos_emb.
+//!     MUST NOT use rope_partial_halved_f32 here: that is Gemma-4 proportional
+//!     RoPE (pairs (i,i+head_dim/2), denominator head_dim).
 //!     KV write + attention_q8_0_kv_swa(window sliding / 0 full)
 //!     attn_out *= sigmoid(gate) headwise BEFORE out_proj
 //!     attn_out = out_proj(attn_out); x = residual + attn_out
@@ -174,14 +178,19 @@ pub fn decode_step_body_capture(
             )
             .map_err(|e| format!("spark25 L{layer_idx}: rope_f32: {e:?}"))?;
         } else {
-            gpu.rope_partial_halved_f32(
+            // Contiguous-block partial RoPE: first n_rot dims rotate as pairs
+            // (i, i+n_rot/2) with inv_freq denominator n_rot (full: 64 dims,
+            // theta 5e6). rope_partial_interleaved_f32 dispatches the halfsplit
+            // kernel by default, which is exactly this HF convention.
+            let n_rot = n_rot_pairs * 2;
+            gpu.rope_partial_interleaved_f32(
                 &state.q,
                 &state.k,
                 &state.pos_buf,
                 n_heads,
                 n_kv,
                 head_dim,
-                n_rot_pairs,
+                n_rot,
                 theta,
             )
             .map_err(|e| format!("spark25 L{layer_idx}: rope_partial: {e:?}"))?;
@@ -315,8 +324,8 @@ pub fn decode_step_body(
                 .map_err(|e| format!("spark25 L{layer_idx}: g_proj: {e}"))?;
         }
 
-        // RoPE: sliding full half-split; full partial half-split.
-        // No QK-norm on Spark.
+        // RoPE: sliding full half-split (rope_f32); full contiguous-block partial
+        // half-split (first n_rot dims, denominator n_rot). No QK-norm on Spark.
         if n_rot_pairs == 0 {
             // degenerate — skip
         } else if n_rot_pairs * 2 >= head_dim {
@@ -331,14 +340,16 @@ pub fn decode_step_body(
             )
             .map_err(|e| format!("spark25 L{layer_idx}: rope_f32: {e:?}"))?;
         } else {
-            gpu.rope_partial_halved_f32(
+            // Same contiguous-block partial RoPE as above (see comment there).
+            let n_rot = n_rot_pairs * 2;
+            gpu.rope_partial_interleaved_f32(
                 &state.q,
                 &state.k,
                 &state.pos_buf,
                 n_heads,
                 n_kv,
                 head_dim,
-                n_rot_pairs,
+                n_rot,
                 theta,
             )
             .map_err(|e| format!("spark25 L{layer_idx}: rope_partial: {e:?}"))?;
