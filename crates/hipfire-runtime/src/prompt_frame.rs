@@ -1130,6 +1130,10 @@ fn strip_generation_tags(template: &str) -> String {
     let mut i = 0;
     let bytes = template.as_bytes();
     while i < bytes.len() {
+        // `i` only ever rests on char boundaries (it advances by full
+        // scalars below, or past ASCII `%}`), and `{`/`%` are ASCII so
+        // they can never match a UTF-8 continuation byte — these slices
+        // cannot panic on multibyte templates.
         if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'%' {
             if let Some(end) = template[i..].find("%}") {
                 let inner = &template[i + 2..i + end];
@@ -1144,8 +1148,17 @@ fn strip_generation_tags(template: &str) -> String {
                 }
             }
         }
-        out.push(bytes[i] as char);
-        i += 1;
+        // Emit one full UTF-8 scalar. The old `bytes[i] as char` re-read
+        // every byte as Latin-1, so a template literal like Spark's
+        // `<｜start▁of▁sentence｜>` rendered as mojibake (`<ï½…ï½>`)
+        // that matches no special token and BPE-fragments the prompt.
+        let len = template[i..]
+            .chars()
+            .next()
+            .map(|c| c.len_utf8())
+            .unwrap_or(1);
+        out.push_str(&template[i..i + len]);
+        i += len;
     }
     out
 }
@@ -1885,6 +1898,32 @@ mod tests {
             vocab = vocab_block,
         );
         Tokenizer::from_hf_json(&json).expect("test tokenizer without think tokens")
+    }
+
+    /// Like `make_tokenizer` but with Spark-X2.5-shaped non-ASCII
+    /// sentence-boundary markers as atomic added tokens (canonical UTF-8,
+    /// as the real tokenizer.json carries them). Used to prove the
+    /// markers survive the render pipeline and encode atomically.
+    fn spark_marker_tokenizer() -> Tokenizer {
+        let mut entries: Vec<String> = Vec::new();
+        entries.push(r#""Ġ": 8"#.to_string());
+        for b in 0u32..=255u32 {
+            let ch = byte_to_gpt2_char_test(b as u8);
+            let escaped = json_escape(&ch.to_string());
+            entries.push(format!(r#""{}": {}"#, escaped, 100 + b));
+        }
+        let vocab_block = entries.join(", ");
+        let json = format!(
+            r#"{{
+                "model": {{"type": "BPE", "vocab": {{ {vocab} }}, "merges": []}},
+                "added_tokens": [
+                    {{"id": 20, "content": "<｜start▁of▁sentence｜>", "special": true}},
+                    {{"id": 21, "content": "<｜end▁of▁sentence｜>", "special": true}}
+                ]
+            }}"#,
+            vocab = vocab_block,
+        );
+        Tokenizer::from_hf_json(&json).expect("spark-marker test tokenizer")
     }
 
     /// Mirror of `byte_to_gpt2_char` from tokenizer.rs (private). The
@@ -3568,6 +3607,100 @@ SYS:{{ build_system_message(system_message) }}:END
             strip_generation_tags("{{ generation }}{% set endgeneration = 1 %}"),
             "{{ generation }}{% set endgeneration = 1 %}"
         );
+    }
+
+    #[test]
+    fn strip_generation_tags_preserves_multibyte_special_literals() {
+        // Spark-X2.5's template embeds non-ASCII sentence-boundary
+        // literals (`｜` U+FF5C, `▁` U+2581). A byte-wise copy re-reads
+        // each UTF-8 byte as Latin-1 (`<｜…｜>` → `<ï½…ï½>`), so the
+        // rendered prompt matches no special token and BPE-fragments
+        // (32 → 143 prompt tokens on the served battery prompt).
+        // Stripping must be byte-identical outside removed markers.
+        let src = "<｜start▁of▁sentence｜><|System|>\nX<｜end▁of▁sentence｜>{% generation %}G{% endgeneration %}中文 🙂";
+        assert_eq!(
+            strip_generation_tags(src),
+            "<｜start▁of▁sentence｜><|System|>\nX<｜end▁of▁sentence｜>G中文 🙂"
+        );
+        // No markers at all: pure identity, byte-for-byte.
+        let plain = "{% for m in messages %}<｜start▁of▁sentence｜>{{ m.content }}<｜end▁of▁sentence｜>{% endfor %}";
+        assert_eq!(strip_generation_tags(plain), plain);
+        // Markers adjacent to multibyte literals still strip cleanly.
+        assert_eq!(
+            strip_generation_tags("<｜start▁of▁sentence｜>{%- generation -%}G{%- endgeneration -%}<｜end▁of▁sentence｜>"),
+            "<｜start▁of▁sentence｜>G<｜end▁of▁sentence｜>"
+        );
+    }
+
+    #[test]
+    fn jinja_spark_shaped_nonascii_markers_render_and_encode_atomically() {
+        // End-to-end over the real render pipeline (strip + parenthesize +
+        // minijinja env): Spark-shaped non-ASCII boundary markers must
+        // reach the rendered prompt as canonical UTF-8 and encode as
+        // single special-token IDs. Pre-fix, strip mangled them to
+        // Latin-1 mojibake that matched no special and BPE-fragmented.
+        let tok = spark_marker_tokenizer();
+        let template = "\
+{%- if not messages %}{{- raise_exception('No messages provided.') }}{%- endif -%}\
+{%- for m in messages -%}\
+{%- if m.role == 'user' -%}\
+{{- '<｜start▁of▁sentence｜><|User|>' + m.content + '<｜end▁of▁sentence｜>' -}}\
+{%- endif -%}\
+{%- endfor -%}\
+{%- if add_generation_prompt -%}\
+{{- '<｜start▁of▁sentence｜><|Bot|>' -}}\
+{%- endif -%}";
+        let messages = vec![Message {
+            role: Role::User,
+            content: "hi".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }];
+        let frame = JinjaChatFrame {
+            tokenizer: &tok,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let out = frame
+            .render_messages(&messages, None, None)
+            .expect("spark-shaped template renders");
+        assert!(
+            out.contains("<｜start▁of▁sentence｜><|User|>hi<｜end▁of▁sentence｜>"),
+            "user turn framing must survive as canonical UTF-8: {out:?}"
+        );
+        assert!(
+            out.contains("<｜start▁of▁sentence｜><|Bot|>"),
+            "generation prompt must survive as canonical UTF-8: {out:?}"
+        );
+        assert!(
+            !out.contains('ï') && !out.contains('â'),
+            "latin-1 mojibake must not appear in the render: {out:?}"
+        );
+        // Boundary markers must be atomic single IDs, not BPE fragments.
+        let ids = tok.encode(&out);
+        assert_eq!(
+            ids.iter().filter(|id| **id == 20).count(),
+            2,
+            "BOS marker must encode atomically twice: {ids:?}"
+        );
+        assert_eq!(
+            ids.iter().filter(|id| **id == 21).count(),
+            1,
+            "EOS marker must encode atomically once: {ids:?}"
+        );
+        // Canonical decode of the boundary IDs (guards the other half of
+        // the boundary against a mojibake-spelling "fix").
+        assert_eq!(tok.decode(&[20]), "<｜start▁of▁sentence｜>");
+        assert_eq!(tok.decode(&[21]), "<｜end▁of▁sentence｜>");
     }
 
     #[test]
