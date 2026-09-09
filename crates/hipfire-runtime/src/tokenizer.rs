@@ -55,9 +55,12 @@ pub enum TokenizerError {
     MetadataMissing { field: &'static str },
     /// Raw JSON did not parse.
     MalformedJson(serde_json::Error),
-    /// `byte_to_gpt2_char(b)` produced a char with no entry in `token_to_id`.
-    /// GPT-2 BPE tokenizers MUST cover every byte 0..=255; without this,
-    /// `encode_gpt2_bpe`'s initial seed would silently map to id 0.
+    /// `byte_to_gpt2_char(b)` produced a char with no entry in `token_to_id`,
+    /// for a byte that CAN occur in valid UTF-8 input. GPT-2 BPE tokenizers
+    /// MUST cover every such byte; without this, `encode_gpt2_bpe`'s initial
+    /// seed would silently map to id 0. Bytes that can never occur in valid
+    /// UTF-8 (0xC0, 0xC1, 0xF5..=0xFF) are admitted as `BYTE_ID_ABSENT`
+    /// sentinels instead — see `byte_never_in_valid_utf8`.
     MissingByteSymbol { byte: u8, char: char },
     /// A merge rule referenced a left or right symbol with no entry in `token_to_id`.
     MissingMergeOperand {
@@ -135,10 +138,13 @@ pub struct Tokenizer {
     /// subtle field-vs-method confusion at call sites.
     merge_pair_rank: HashMap<(u32, u32), u32>,
     /// For GPT-2 BPE only: byte `b` → token id of `byte_to_gpt2_char(b).to_string()`.
-    /// Construction guarantees every byte 0..=255 has a valid id (else
-    /// `from_*` returns `MissingByteSymbol`), so `encode_gpt2_bpe`'s initial
-    /// seed is infallible. `None` for SentencePiece tokenizers (no
-    /// byte-level encoding).
+    /// Construction guarantees every byte reachable from valid UTF-8 input has
+    /// a valid id (else `from_*` returns `MissingByteSymbol`). Bytes that can
+    /// never occur in valid UTF-8 (`byte_never_in_valid_utf8`) hold the
+    /// `BYTE_ID_ABSENT` sentinel; `encode_gpt2_chunk` panics fail-closed if one
+    /// is ever presented (unreachable via the `&str` encode API — it would mean
+    /// the caller smuggled non-UTF-8 bytes through). `None` for SentencePiece
+    /// tokenizers (no byte-level encoding).
     byte_to_id: Option<[u32; 256]>,
     /// Special tokens: strings like "<|im_start|>" → their token ID.
     /// Sorted longest-first for greedy matching.
@@ -229,25 +235,44 @@ fn resolve_merges(
     Ok((merges, merge_pair_rank))
 }
 
+/// Sentinel in `byte_to_id` for bytes admittable-but-absent: the byte's
+/// GPT-2 char has no vocab entry AND the byte can never occur in valid UTF-8
+/// input (see `byte_never_in_valid_utf8`). `u32::MAX` cannot collide with a
+/// real token id (vocabs are ~1e5 entries); the encoder treats it as a
+/// fail-closed contract violation, never as a token id.
+const BYTE_ID_ABSENT: u32 = u32::MAX;
+
+/// True for byte values that can never occur in a well-formed UTF-8 string:
+/// 0xC0 and 0xC1 (overlong-encodings-only lead bytes, rejected by every
+/// conformant decoder) and 0xF5..=0xFF (4-byte leads past U+10FFFF plus the
+/// invalid FE/FF sentinels). The public encode API takes `&str` (always valid
+/// UTF-8), so these bytes are unreachable there; a byte-level BPE vocabulary
+/// that omits exactly these symbols — e.g. Spark X2.5's 243-symbol alphabet —
+/// is complete for its input contract, not lossy.
+fn byte_never_in_valid_utf8(b: u8) -> bool {
+    matches!(b, 0xC0 | 0xC1 | 0xF5..=0xFF)
+}
+
 /// For GPT-2 BPE tokenizers: build the byte → token-id lookup table by
 /// running every byte 0..=255 through `byte_to_gpt2_char` and resolving
-/// the resulting char string against `token_to_id`. Returns `Err` on the
-/// first byte whose char isn't in the vocab — that would silently corrupt
-/// `encode_gpt2_bpe`'s initial seed (#203).
+/// the resulting char string against `token_to_id`. Bytes reachable from
+/// valid UTF-8 input without a vocab entry are `Err(MissingByteSymbol)` —
+/// that would silently corrupt `encode_gpt2_bpe`'s initial seed (#203).
+/// Bytes unreachable in valid UTF-8 without an entry get `BYTE_ID_ABSENT`.
 fn build_byte_to_id(token_to_id: &HashMap<String, u32>) -> Result<[u32; 256], TokenizerError> {
     let mut out = [0u32; 256];
     let mut buf = [0u8; 4];
     for b in 0u32..=255 {
-        let ch = byte_to_gpt2_char(b as u8);
+        let byte = b as u8;
+        let ch = byte_to_gpt2_char(byte);
         let s = ch.encode_utf8(&mut buf);
-        let id = token_to_id
-            .get(s)
-            .copied()
-            .ok_or(TokenizerError::MissingByteSymbol {
-                byte: b as u8,
-                char: ch,
-            })?;
-        out[b as usize] = id;
+        match token_to_id.get(s) {
+            Some(&id) => out[b as usize] = id,
+            None if byte_never_in_valid_utf8(byte) => out[b as usize] = BYTE_ID_ABSENT,
+            None => {
+                return Err(TokenizerError::MissingByteSymbol { byte, char: ch });
+            }
+        }
     }
     Ok(out)
 }
@@ -316,7 +341,6 @@ fn sp_dummy_prefix_from_hf_json(tok: &serde_json::Value) -> bool {
     normalizer.map(normalizer_prepends).unwrap_or(false)
         || pre_tokenizer.map(pretokenizer_prepends).unwrap_or(false)
 }
-
 
 impl Tokenizer {
     /// Load tokenizer from GGUF metadata.
@@ -405,7 +429,7 @@ impl Tokenizer {
 
         // Resolve merges to token ids; reject inconsistent vocab/merges (#203).
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)?;
-        // For GPT-2 BPE, every byte 0..=255 must have a vocab entry. SP doesn't need this.
+        // For GPT-2 BPE, every byte reachable from valid UTF-8 input must have a vocab entry. SP doesn't need this.
         let byte_to_id = if is_gpt2_bpe {
             Some(build_byte_to_id(&token_to_id)?)
         } else {
@@ -1048,16 +1072,25 @@ impl Tokenizer {
     /// is tiny.
     fn encode_gpt2_chunk(&self, chunk_bytes: &[u8], out: &mut Vec<u32>) {
         // 1. Convert chunk bytes to GPT-2 byte-encoded symbol IDs.
-        // Construction guarantees `byte_to_id` covers every byte 0..=255
-        // for GPT-2 BPE tokenizers (else `from_*` returned
-        // `MissingByteSymbol`), so the table lookup is infallible.
+        // Construction guarantees `byte_to_id` covers every byte reachable
+        // from valid UTF-8 input for GPT-2 BPE tokenizers (else `from_*`
+        // returned `MissingByteSymbol`). Bytes unreachable in valid UTF-8
+        // hold `BYTE_ID_ABSENT`; presenting one here means non-UTF-8 bytes
+        // reached a `&str`-only API — fail closed, never map to id 0/UNK.
         let byte_to_id = self
             .byte_to_id
             .as_ref()
             .expect("encode_gpt2_chunk called on non-GPT2 tokenizer");
         let mut syms: Vec<u32> = chunk_bytes
             .iter()
-            .map(|&b| byte_to_id[b as usize])
+            .map(|&b| {
+                let id = byte_to_id[b as usize];
+                assert!(
+                    id != BYTE_ID_ABSENT,
+                    "encode_gpt2_chunk: byte 0x{b:02x} has no vocab symbol and cannot occur in valid UTF-8 input"
+                );
+                id
+            })
             .collect();
         let n = syms.len();
         if n == 0 {
@@ -1752,12 +1785,11 @@ mod bpe_tests {
             .collect();
         let (merges, merge_pair_rank) = resolve_merges(&merges_strings, &token_to_id)
             .expect("synth: merges must be consistent with vocab");
-        // Test-only `byte_to_id`: best-effort fill, defaults to 0 for any
-        // byte whose char isn't in vocab. Production constructors require
-        // full 256-byte coverage (else MissingByteSymbol). The BPE tests
-        // deliberately use minimal vocabs and only feed ASCII inputs whose
-        // bytes ARE present.
-        let mut byte_to_id_arr = [0u32; 256];
+        // Test-only `byte_to_id`: best-effort fill, `BYTE_ID_ABSENT` for any
+        // byte whose char isn't in vocab (mirrors production semantics for
+        // UTF-8-unreachable bytes). The BPE tests deliberately use minimal
+        // vocabs and only feed inputs whose bytes ARE present.
+        let mut byte_to_id_arr = [BYTE_ID_ABSENT; 256];
         for b in 0u32..=255 {
             let ch = byte_to_gpt2_char(b as u8);
             let mut buf = [0u8; 4];
@@ -1874,6 +1906,41 @@ mod bpe_tests {
         // pointing at vocab id 2 ("aaaa").
         assert_eq!(out.len(), 256);
         assert!(out.iter().all(|&id| id == 2));
+    }
+
+    #[test]
+    fn sparse_vocab_valid_unicode_roundtrip() {
+        // Vocab covers only the byte symbols reachable from the test inputs
+        // (plus no merges): valid Unicode must encode to byte ids and decode
+        // back byte-identically, even though 200+ byte symbols are absent.
+        // This is the Spark X2.5 shape (243/256 symbols) in miniature.
+        for text in ["café 中文 🙂", "Àÿ", "\0\t\n"] {
+            let mut seen = [false; 256];
+            let mut vocab: Vec<String> = Vec::new();
+            for &b in text.as_bytes() {
+                if !seen[b as usize] {
+                    seen[b as usize] = true;
+                    vocab.push(byte_to_gpt2_char(b).to_string());
+                }
+            }
+            let refs: Vec<&str> = vocab.iter().map(|s| s.as_str()).collect();
+            let tok = synth(&refs, &[]);
+            let ids = tok.encode_gpt2_bpe(text);
+            assert_eq!(ids.len(), text.as_bytes().len());
+            assert_eq!(tok.decode(&ids), text);
+        }
+    }
+
+    #[test]
+    #[should_panic]
+    fn unreachable_byte_encode_fails_closed() {
+        // A chunk containing a UTF-8-unreachable byte (0xFF: no vocab symbol,
+        // `BYTE_ID_ABSENT` sentinel) must panic, never silently emit id 0 or
+        // UNK. Unreachable via the `&str` API; this calls the byte-level
+        // chunk entry directly to lock the fail-closed contract.
+        let tok = synth(&["a"], &[]);
+        let mut out = Vec::new();
+        tok.encode_gpt2_chunk(&[0xFF], &mut out);
     }
 }
 
@@ -2005,6 +2072,22 @@ mod consistency_tests {
                 char: 'A',
             } => {}
             other => panic!("expected MissingByteSymbol{{0x41,'A'}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_reachable_byte_gap_despite_unreachable_gaps() {
+        // Contrast: a missing byte that CAN occur in valid UTF-8 (0xE4, lead
+        // byte for CJK blocks) still fails closed with MissingByteSymbol,
+        // even though it is not one of the admitted C0/C1/F5..FF gaps.
+        let meta = gpt2_meta_full_bytes(Some(0xE4), &[], &[]);
+        let err = match Tokenizer::from_gguf_meta_json(&meta) {
+            Err(e) => e,
+            Ok(_) => panic!("expected Err, got Ok"),
+        };
+        match err {
+            TokenizerError::MissingByteSymbol { byte: 0xE4, .. } => {}
+            other => panic!("expected MissingByteSymbol{{0xE4}}, got {other:?}"),
         }
     }
 
@@ -2454,7 +2537,6 @@ mod prompt_norm_tests {
     }
 }
 
-
 #[cfg(test)]
 mod sp_dummy_prefix_tests {
     //! Config-driven SP dummy-prefix coverage (gemma4 first-word bug,
@@ -2528,8 +2610,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_no_dummy_prefix_first_word_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(t.bos_id, 2, "generation_config bos override");
         let mut ids = vec![t.bos_id];
         ids.extend(t.encode("The capital of France is"));
@@ -2538,8 +2619,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_chat_tail_thought_channel_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(
             t.encode("<|channel>thought\n<channel|>The capital of France is"),
             vec![100, 45518, 107, 101, 818, 5279, 529, 7001, 563],
