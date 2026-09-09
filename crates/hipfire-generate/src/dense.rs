@@ -281,10 +281,12 @@ mod lfm2moe_think_close_tests {
         // The mid-turn KV splice must never inject a stream-start BOS:
         // `encode` auto-prepends it for LFM (`add_bos`), so the helper must
         // strip exactly that prepend and nothing else.
-        let tok =
-            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&lfm_close_meta())
-                .expect("meta");
-        assert!(tok.add_bos, "fixture must reproduce the LFM add_bos default");
+        let tok = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&lfm_close_meta())
+            .expect("meta");
+        assert!(
+            tok.add_bos,
+            "fixture must reproduce the LFM add_bos default"
+        );
         assert_eq!(tok.bos_id, 1);
         let raw = tok.encode("</think>\n\n");
         assert_eq!(
@@ -6003,7 +6005,10 @@ pub fn generate_muse_glimmer(
 ///
 /// Separated so the BOS-strip rule is stated once and unit-testable; see the
 /// body for why `encode`'s auto-prepended BOS must go.
-fn lfm2moe_think_close_tokens(tokenizer: &hipfire_runtime::tokenizer::Tokenizer, text: &str) -> Vec<u32> {
+fn lfm2moe_think_close_tokens(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    text: &str,
+) -> Vec<u32> {
     let mut ids = tokenizer.encode(text);
     // `encode` prepends `bos_id` for BOS-trained tokenizers (LFM `add_bos`).
     // A think-close splice is mid-stream, never a stream start, so drop
@@ -6040,7 +6045,10 @@ fn lfm2moe_splice_think_close(
     max_tokens: usize,
 ) -> Result<bool, String> {
     let close_tokens = {
-        let tokenizer = m.tokenizer.as_ref().ok_or_else(|| "tokenizer not loaded".to_string())?;
+        let tokenizer = m
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| "tokenizer not loaded".to_string())?;
         lfm2moe_think_close_tokens(tokenizer, &think_continuation())
     };
     if close_tokens.is_empty() || close_tokens.len() > max_tokens.saturating_sub(*generated_count) {
@@ -6048,7 +6056,9 @@ fn lfm2moe_splice_think_close(
     }
     for &t in &close_tokens {
         let step = {
-            let b = m.lfm2moe_mut().ok_or_else(|| "lfm2moe_config missing on arch_id=11 generate".to_string())?;
+            let b = m
+                .lfm2moe_mut()
+                .ok_or_else(|| "lfm2moe_config missing on arch_id=11 generate".to_string())?;
             let cfg = &b.config;
             let weights = &b.weights;
             let state = &mut b.state;
@@ -6069,7 +6079,10 @@ fn lfm2moe_splice_think_close(
     // the extended stream: the delta from bytes_emitted is exactly the close
     // text (same pattern as the spark think-cap splice).
     {
-        let tokenizer = m.tokenizer.as_ref().ok_or_else(|| "tokenizer not loaded".to_string())?;
+        let tokenizer = m
+            .tokenizer
+            .as_ref()
+            .ok_or_else(|| "tokenizer not loaded".to_string())?;
         let all_bytes = tokenizer.decode_bytes(streamed_tokens);
         if *bytes_emitted < all_bytes.len() {
             let frag = String::from_utf8_lossy(&all_bytes[*bytes_emitted..]).into_owned();
@@ -6470,7 +6483,8 @@ pub fn generate_lfm2moe(
     // within budget instead of running away to `max_tokens` (the reported
     // max_think_tokens=8 leak). Tracks model-emitted `<think>` re-opens too.
     let mut think_router = MapleThoughtRouter::new(primed_think && decode_open, max_think_tokens);
-    let mut think_close_injected = primed_think && decode_open && (!enable_thinking || max_think_tokens == 1);
+    let mut think_close_injected =
+        primed_think && decode_open && (!enable_thinking || max_think_tokens == 1);
     let decode_t0 = Instant::now();
     if decode_open {
         loop {
@@ -6482,7 +6496,8 @@ pub fn generate_lfm2moe(
             if generated_count >= max_tokens {
                 break;
             }
-            let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+            let next_tok =
+                deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
             if stop_toks.contains(&next_tok) {
                 hit_eos = true;
                 break;
@@ -9233,28 +9248,92 @@ pub fn generate_spark25(
 
     let t0 = Instant::now();
 
-    // Prefill: per-token decode_step; last-position logits seed decode.
-    // No abort check while holding the bundle mut-borrow (maple/minimax style).
+    // Prefill: chunked batched prefill on gfx1010 (abort-checked between
+    // chunks), per-token decode_step elsewhere; last-position logits seed
+    // decode. Decode loop, think-cap splice, sampling, and envelopes below
+    // are untouched.
     let mut last_logits: Vec<f32> = Vec::new();
+    // Set when the gfx1010 chunked prefill observed an abort between chunks
+    // (partial prefix already rewound below); translated to the cancelled
+    // pair after the bundle borrow ends.
+    let mut prefill_aborted: Option<String> = None;
     {
         let b = m.spark25_mut().unwrap();
         let cfg = &b.config;
         let weights = &b.weights;
         let state = &mut b.state;
-        let mut position = state.n_tokens as u32;
-        for &tok in &prompt_ids {
-            match hipfire_arch_spark25::forward::decode_step(
-                cfg, weights, state, gpu, tok, position,
+        let position = state.n_tokens as u32;
+        if gpu.arch.as_str() == "gfx1010" {
+            let chunk = prompt_ids
+                .len()
+                .min(hipfire_arch_spark25::forward::SPARK_PREFILL_CHUNK);
+            let scratch =
+                match hipfire_arch_spark25::forward::SparkPrefillScratch::new(gpu, cfg, chunk) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("spark25 prefill failed: {e}"));
+                        let _ = stdout.flush();
+                        return;
+                    }
+                };
+            match hipfire_arch_spark25::forward::prefill_chunked_cancellable(
+                cfg,
+                weights,
+                state,
+                gpu,
+                &prompt_ids,
+                position,
+                &scratch,
+                &|| check_abort(id),
             ) {
-                Ok(logits) => last_logits = logits,
+                Ok(logits) => {
+                    last_logits = logits;
+                    scratch.free_gpu(gpu);
+                }
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("spark25 prefill failed: {e}"));
-                    let _ = stdout.flush();
-                    return;
+                    scratch.free_gpu(gpu);
+                    if e.contains("abort") {
+                        // Chunk-atomic abort: rewind any partial prefix so no
+                        // partial prefix escapes (generate cold-resets anyway).
+                        if let Err(re) = state.reset(gpu) {
+                            emit_error_with_id(
+                                stdout,
+                                id,
+                                format!("spark25 prefill abort reset failed: {re}"),
+                            );
+                            let _ = stdout.flush();
+                            return;
+                        }
+                        prefill_aborted = Some(e);
+                    } else {
+                        emit_error_with_id(stdout, id, format!("spark25 prefill failed: {e}"));
+                        let _ = stdout.flush();
+                        return;
+                    }
                 }
             }
-            position += 1;
+        } else {
+            let mut position = position;
+            for &tok in &prompt_ids {
+                match hipfire_arch_spark25::forward::decode_step(
+                    cfg, weights, state, gpu, tok, position,
+                ) {
+                    Ok(logits) => last_logits = logits,
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("spark25 prefill failed: {e}"));
+                        let _ = stdout.flush();
+                        return;
+                    }
+                }
+                position += 1;
+            }
         }
+    }
+    if prefill_aborted.is_some() {
+        // Same cancelled pair as the decode-loop abort below.
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
     }
     for &tok in &prompt_ids {
         m.conversation_tokens.push(tok);

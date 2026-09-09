@@ -456,6 +456,10 @@ name = "test_gemm_hfq4g256_residual"
 required-features = ["lab"]
 
 [[example]]
+name = "test_gemm_mq4g256v2_simt"
+required-features = ["lab"]
+
+[[example]]
 name = "test_gemm_mq3g256_lloyd_residual_wmma"
 required-features = ["lab"]
 

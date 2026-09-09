@@ -1972,18 +1972,10 @@ impl Carrier for Spark25Carrier {
         let config = &b.config;
         let weights = &b.weights;
         let state = &mut b.state;
-        let mut ok = true;
-        for (i, &tok) in synthetic.iter().enumerate() {
-            if hipfire_arch_spark25::forward::decode_step(
-                config, weights, state, gpu, tok, i as u32,
-            )
-            .is_err()
-            {
-                ok = false;
-                break;
-            }
-        }
-        Some(ok)
+        // Route through the arch prefill entry point so the native bench
+        // path exercises the production prefill dispatch (chunked batched
+        // prefill on gfx1010, serial decode_step loop elsewhere).
+        Some(hipfire_arch_spark25::forward::prefill(config, weights, state, gpu, synthetic).is_ok())
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {

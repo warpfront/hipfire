@@ -30343,17 +30343,109 @@ impl Gpu {
         ))
     }
 
+    /// gfx1010 FP32-SIMT batched MQ4G256V2 residual GEMM (`Y += A·X`).
+    ///
+    /// F32 X/Y throughout (no `ensure_fp16_x`). Ports the HFQ4 residual F32
+    /// SIMT tile (`BATCH_TILE=8`, grid `[M, ceil(N/8)]`, block `[32,1,1]`,
+    /// LDS 0) with MQ4G256V2 dual-half headers. Caller owns residual preload;
+    /// plain/`=` callers must zero Y before this entry. Rejects non-multiple
+    /// K or overflow; empty M/N is a no-op.
+    pub fn gemm_mq4g256v2_residual_simt(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        if k == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gemm_mq4g256v2_residual_simt: K must be a nonzero multiple of 256 (got {k})"
+                ),
+            ));
+        }
+        // A: M * (K/256) * 136; X: N*K*4; Y RMW: N*M*4.
+        let _a_bytes = m
+            .checked_mul(k / 256)
+            .and_then(|g| g.checked_mul(136))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(1, "gemm_mq4g256v2_residual_simt: A size overflow")
+            })?;
+        let _x_bytes = batch_size
+            .checked_mul(k)
+            .and_then(|e| e.checked_mul(4))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(1, "gemm_mq4g256v2_residual_simt: X size overflow")
+            })?;
+        let _y_bytes = batch_size
+            .checked_mul(m)
+            .and_then(|e| e.checked_mul(4))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(1, "gemm_mq4g256v2_residual_simt: Y size overflow")
+            })?;
+
+        const MODULE: &str = "gemm_mq4g256v2_residual_simt";
+        const FUNC: &str = "gemm_mq4g256v2_residual_simt";
+        self.ensure_kernel(MODULE, kernels::GEMM_MQ4G256V2_RESIDUAL_SIMT_SRC, FUNC)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        const BATCH_TILE: usize = 8;
+        let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
+        // Weight + F32 X + Y residual read/write.
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 4 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [m as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// MQ4 v2 (qt=44) — plain batched GEMM `gemm_hfq4g256` sibling.
-    /// GEMM_MQ4G256V2 scalar sources do NOT exist; the only V2 compute
-    /// kernels are the dedicated WMMA residual/gate_up/qkvza family
-    /// (`GEMM_MQ4G256V2_RESIDUAL_WMMA_*_SRC` etc.). On WMMA arches
-    /// (gfx1100/1101/1102/1150/1151/gfx1200/1201) this method provides
-    /// plain-GEMM semantics by zeroing output and routing through the
-    /// arch-aware residual WMMA path (`gemm_hfq4g256_residual_mq4v2`,
-    /// which dispatches gfx12 vs gfx11 internally). On non-WMMA arches
-    /// it preserves the clear scalar-missing error — V2 bytes (fp16
-    /// s0/z0/s1/z1) cannot be decoded by the v1 scalar kernel (f32
-    /// scale/zero) and would produce noise (WT2 KLD 12.1).
+    /// On WMMA arches (gfx1100/1101/1102/1150/1151/gfx1200/1201) this method
+    /// provides plain-GEMM semantics by zeroing output and routing through the
+    /// arch-aware residual WMMA path. On exact gfx1010 with N>1 and K%256==0 it
+    /// zeros Y then dispatches the FP32 SIMT residual (`gemm_mq4g256v2_residual_simt`).
+    /// V2 bytes cannot be decoded by the v1 scalar kernel (fp16 s0/z0/s1/z1 vs
+    /// f32 scale/zero) and would produce noise (WT2 KLD 12.1).
     pub fn gemm_mq4g256v2(
         &mut self,
         a_raw: &GpuTensor,
@@ -30377,21 +30469,29 @@ impl Gpu {
             }
             return self.gemm_hfq4g256_residual_mq4v2(a_raw, x, y, m, k, batch_size);
         }
+        // gfx1010 FP32 SIMT residual: plain `=` via zero-Y then Y+=.
+        if self.arch_caps.is_gfx1010() && batch_size > 1 && k != 0 && k % 256 == 0 {
+            match self.active_stream.as_ref() {
+                Some(stream) => self
+                    .hip
+                    .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+            }
+            return self.gemm_mq4g256v2_residual_simt(a_raw, x, y, m, k, batch_size);
+        }
         Err(hip_bridge::HipError::new(
             0,
-            "qt=44 gemm_mq4g256v2: requires WMMA (gfx1100/gfx1101/gfx1102/gfx1150/gfx1151/gfx1200/gfx1201); \
-             no GEMM_MQ4G256V2 scalar source exists (would need GEMM_MQ4G256V2_SRC). V2 bytes cannot be \
-             decoded by the v1 scalar kernel (fp16 s0/z0/s1/z1 vs f32 scale/zero).",
+            "qt=44 gemm_mq4g256v2: requires WMMA (gfx1100/gfx1101/gfx1102/gfx1150/gfx1151/gfx1200/gfx1201) \
+             or gfx1010 N>1 with K%256==0 SIMT residual; no generic V2 scalar source exists. V2 bytes \
+             cannot be decoded by the v1 scalar kernel (fp16 s0/z0/s1/z1 vs f32 scale/zero).",
         ))
     }
 
     /// MQ4 v2 (qt=44) — batched lm_head sibling of `gemm_hfq4g256_batched_lmhead`.
-    /// Mirrors the v1 variant-selection logic exactly: wmma eligibility gate,
-    /// fp16 cache stomp, memset zero, gfx12 vs gfx11 dispatch, and the
-    /// gfx1100 rm muse gate. Only the v2 SRC constant, `gemm_mq4g256v2` module
-    /// name, and `gemm_mq4g256v2` kernel symbol change where a v2 source exists.
-    /// Dedicated V2 WMMA residual sources exist for gfx12 and gfx11; the
-    /// generic scalar fallback remains intentionally unavailable.
+    /// Mirrors the v1 variant-selection logic: N=1 keeps `gemv_mq4g256v2`; WMMA
+    /// eligibility gate, fp16 cache stomp, memset zero, gfx12 vs gfx11 dispatch.
+    /// On exact gfx1010 with N>1 and K%256==0, zeros Y then runs the FP32 SIMT
+    /// residual. Dedicated V2 WMMA residual sources stay unchanged.
     pub fn gemm_mq4g256v2_batched_lmhead(
         &mut self,
         a_raw: &GpuTensor,
@@ -30435,10 +30535,22 @@ impl Gpu {
                 "qt=44 gemm_mq4g256v2_batched_lmhead: no WMMA source for this arch",
             ));
         }
+        // gfx1010 FP32 SIMT residual for batched lm_head (`=` via zero-Y + +=).
+        // N=1 already returned via gemv above; WMMA arches already handled.
+        if self.arch_caps.is_gfx1010() && batch_size > 1 && k != 0 && k % 256 == 0 {
+            self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
+            match self.active_stream.as_ref() {
+                Some(stream) => self
+                    .hip
+                    .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
+                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+            }
+            return self.gemm_mq4g256v2_residual_simt(a_raw, x, y, m, k, batch_size);
+        }
         Err(hip_bridge::HipError::new(
             0,
             "qt=44 gemm_mq4g256v2_batched_lmhead: scalar fallback has no v2 source \
-             (GEMM_MQ4G256V2_SRC missing) — would mis-decode v2 bytes as v1",
+             (use WMMA arches or gfx1010 N>1 K%256==0 SIMT residual) — would mis-decode v2 bytes as v1",
         ))
     }
     /// Alias with correct HFQ container naming: `hfq4g256v2` is the versioned

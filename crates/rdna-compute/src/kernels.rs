@@ -3123,6 +3123,12 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
 /// admitting RDNA3 cannot alter the certified gfx12 code object.
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma.hip");
+/// gfx1010 FP32-SIMT batched MQ4G256V2 residual GEMM (Y += A·X).
+/// Clones the HFQ4 residual F32 path with dual-half V2 headers; no WMMA/FP16 X.
+/// BATCH_TILE=8, grid [M, ceil(N/8)], block [32,1,1], LDS 0.
+pub const GEMM_MQ4G256V2_RESIDUAL_SIMT_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_simt.hip");
+
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma.hip");
 pub const GEMM_MQ6G256V2_RESIDUAL_WMMA_SRC: &str =

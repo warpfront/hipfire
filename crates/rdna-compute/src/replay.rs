@@ -835,8 +835,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     ) {
         return Some(vec![read(0), read(8), write(16)]);
     }
-    // Dense shared-expert V2 residual WMMA GEMM (prefill/batched). 3 pointers + 3 i32
-    // (M,K,batch). Y is write (output) via residual path; distinct symbols per arch tile.
+    // Dense shared-expert V2 residual GEMM (prefill/batched). 3 pointers + 3 i32
+    // (M,K,N). Y is write/RMW; includes WMMA tiles and gfx1010 FP32 SIMT (F32 X).
     if matches!(
         kernel,
         "gemm_mq4g256v2_residual_wmma"
@@ -857,7 +857,10 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
+            | "gemm_mq4g256v2_residual_simt"
     ) {
+        // A@0 read, X@8 read, Y@16 RMW (recorded as write). Spans from M/K/N
+        // live in kernarg i32s @24/@28/@32 (allocation-wide via address range).
         return Some(vec![read(0), read(8), write(16)]);
     }
 
@@ -1516,7 +1519,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
+            | "gemm_mq4g256v2_residual_simt"
     ) {
+        // 3 ptr + M,K,N i32 = 36 → pad_to(16) = 48.
         return Some(48);
     }
 
@@ -7372,8 +7377,8 @@ mod tests {
             }
         }
 
-        // Dense GEMM residual WMMA: 3 ptr + M,K,batch = 36 → 48 padded.
-        // Covers plain and arch-tiled gfx11/gfx12 variants admitted to slots/prefill.
+        // Dense GEMM residual: 3 ptr + M,K,batch = 36 → 48 padded.
+        // Covers plain WMMA tiles + gfx1010 FP32 SIMT residual (same ABI, F32 X).
         for symbol in [
             "gemm_mq4g256v2_residual_wmma",
             "gemm_mq4g256v2_residual_wmma_gfx12",
@@ -7393,6 +7398,7 @@ mod tests {
             "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage",
             "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds",
             "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds",
+            "gemm_mq4g256v2_residual_simt",
         ] {
             let mut blob = hip_bridge::KernargBlob::new();
             for _ in 0..3 {
