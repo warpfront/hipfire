@@ -4733,7 +4733,7 @@ fn bench_generate_request_reasoning(
         "prompt": prompt,
         "temperature": 0.0,
         "top_p": 1.0,
-        "repeat_penalty": 1.1,
+        "repeat_penalty": 1.0,
         "max_tokens": max_tokens,
         "attempt_id": 1,
     });

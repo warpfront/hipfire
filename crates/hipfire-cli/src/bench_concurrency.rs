@@ -258,7 +258,7 @@ pub fn batch_request(prompt: &str, max_tokens: u64, id: &str) -> serde_json::Val
         "prompt": prompt,
         "temperature": 0.0,
         "top_p": 1.0,
-        "repeat_penalty": 1.1,
+        "repeat_penalty": 1.0,
         "max_tokens": max_tokens,
         "attempt_id": 1,
         "serve_continuous_batch": true,
