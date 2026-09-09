@@ -15,15 +15,21 @@
 //! plain / batched-lmhead entries zero Y before the residual kernel on
 //! gfx1010 (stale Y must not pass).
 //!
+//! Malformed-call gate (residual always; plain + batched_lmhead on gfx1010):
+//! insufficient A/X/Y extents, wrong X/Y dtype, i32 M/K/N overflow, and
+//! A/X/Y byte-count overflow. Every case must return `Err` **and** leave a
+//! sentinel Y pattern byte-unchanged (catches zero-before-validation).
+//!
 //! Usage:
 //!   cargo run --release -p rdna-compute --example test_gemm_mq4g256v2_simt \
 //!     --features lab -- [M] [K] [N1 N2 ...]
 //!
 //! Defaults exercise N∈{1,3,7,8,9,16}, K∈{256,768,1024,2560}, M∈{16,33}
-//! plus a representative larger M (CLI M or 512). Optional shape timing is
-//! reported after warmup; no absolute speed gate.
+//! plus a representative larger M (CLI M or 512) — 3×4×6 = 72 oracle cases
+//! when defaults are left alone. Optional shape timing after warmup; no
+//! absolute speed gate. Machine-readable `RESULT*` / `RESULT_MALFORMED*` lines.
 
-use rdna_compute::{DType, Gpu};
+use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
 const GROUP: usize = 256;
@@ -116,7 +122,6 @@ fn main() {
                     &mut gpu,
                     &a_raw,
                     &w_dequant,
-                    &weight_bytes,
                     &x_host,
                     &y_init_host,
                     &y_guard_host,
@@ -187,7 +192,7 @@ fn main() {
     // Plain / batched-lmhead zeroing gate — only meaningful on gfx1010 where
     // the SIMT fallback is auto-selected for N>1.
     if arch.starts_with("gfx1010") {
-        match run_plain_lmhead_zeroing(&mut gpu, &arch) {
+        match run_plain_lmhead_zeroing(&mut gpu) {
             Ok(()) => {
                 eprintln!("  plain/lmhead zeroing (gfx1010): PASS");
                 println!("RESULT case=plain_lmhead_zeroing arch={arch} status=PASS");
@@ -201,6 +206,19 @@ fn main() {
     } else {
         eprintln!("  plain/lmhead zeroing: SKIP (arch={arch}, not gfx1010)");
         println!("RESULT case=plain_lmhead_zeroing arch={arch} status=SKIP");
+    }
+
+    // Malformed-call gate: Err + sentinel Y preserved.
+    match run_malformed_suite(&mut gpu, &arch) {
+        Ok(n_ok) => {
+            eprintln!("  malformed suite: PASS ({n_ok} checks)");
+            println!("RESULT case=malformed_suite arch={arch} checks={n_ok} status=PASS");
+        }
+        Err(e) => {
+            failures += 1;
+            eprintln!("  malformed suite: FAIL {e}");
+            println!("RESULT case=malformed_suite arch={arch} status=FAIL err={e}");
+        }
     }
 
     eprintln!("\n=== summary: {cases} shape cases, failures={failures} arch={arch} ===");
@@ -226,9 +244,8 @@ struct ShapeReport {
 
 fn run_shape(
     gpu: &mut Gpu,
-    a_raw: &rdna_compute::GpuTensor,
+    a_raw: &GpuTensor,
     w_dequant: &[Vec<f32>],
-    _weight_bytes: &[u8],
     x_host: &[f32],
     y_init_host: &[f32],
     y_guard_host: &[f32],
@@ -322,7 +339,6 @@ fn run_shape(
     for b in 0..n {
         let x = &x_n[b * k..(b + 1) * k];
         for row in 0..m {
-            let mut acc = 0.0f32;
             // Match GEMV 4-acc interleave + pairwise combine for tight F32 parity.
             let gpr = k / GROUP;
             let quads = gpr >> 2;
@@ -348,8 +364,7 @@ fn run_shape(
             if tail >= 3 {
                 acc2 = dog_group(acc2, w, x, (quads << 2) + 2);
             }
-            acc = (acc0 + acc1) + (acc2 + acc3);
-            y_cpu[b * m + row] += acc;
+            y_cpu[b * m + row] += (acc0 + acc1) + (acc2 + acc3);
         }
     }
 
@@ -439,7 +454,7 @@ fn compare_tol(got: &[f32], want: &[f32]) -> (f32, f32, Option<(usize, f32, f32)
 
 fn time_shape(
     gpu: &mut Gpu,
-    a_raw: &rdna_compute::GpuTensor,
+    a_raw: &GpuTensor,
     x_host: &[f32],
     y_init_host: &[f32],
     m: usize,
@@ -526,7 +541,7 @@ fn time_shape(
 
 /// On gfx1010, plain + batched-lmhead must zero Y before residual += so stale
 /// Y cannot pass. Uses a small fixed shape.
-fn run_plain_lmhead_zeroing(gpu: &mut Gpu, _arch: &str) -> Result<(), String> {
+fn run_plain_lmhead_zeroing(gpu: &mut Gpu) -> Result<(), String> {
     let m = 32usize;
     let k = 256usize;
     let n = 4usize;
@@ -612,6 +627,260 @@ fn run_plain_lmhead_zeroing(gpu: &mut Gpu, _arch: &str) -> Result<(), String> {
     }
 
     Ok(())
+}
+
+// ── malformed-call gate ───────────────────────────────────────────────────
+
+/// Entry points exercised by the malformed suite.
+#[derive(Clone, Copy)]
+enum MalformedEntry {
+    Residual,
+    Plain,
+    Lmhead,
+}
+
+impl MalformedEntry {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Residual => "residual_simt",
+            Self::Plain => "plain",
+            Self::Lmhead => "batched_lmhead",
+        }
+    }
+
+    fn call(
+        self,
+        gpu: &mut Gpu,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Result<(), hip_bridge::HipError> {
+        match self {
+            Self::Residual => gpu.gemm_mq4g256v2_residual_simt(a, x, y, m, k, n),
+            Self::Plain => gpu.gemm_mq4g256v2(a, x, y, m, k, n),
+            Self::Lmhead => gpu.gemm_mq4g256v2_batched_lmhead(a, x, y, m, k, n),
+        }
+    }
+}
+
+/// Malformed residual (+ gfx1010 plain/lmhead) checks.
+///
+/// Only honest small allocations + oversized scalar dims. No fabricated
+/// buffer extents (`DeviceBuffer::from_raw` size-lies are forbidden — a
+/// future validator regression must not turn into an OOB launch). Which
+/// guard rejects first is irrelevant; the observable contract is `Err`
+/// and unchanged sentinel Y bytes.
+fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
+    // Small valid payloads for base tensors.
+    let m0 = 8usize;
+    let k0 = 256usize;
+    let n0 = 4usize; // >1 so plain/lmhead take the gfx1010 SIMT branch
+    let a_bytes_ok = m0 * (k0 / GROUP) * GROUP_BYTES;
+    let weight = synth_mq4g256v2_weights(m0, k0, 0xBAD_C0DEu64);
+    let a_ok = gpu
+        .upload_raw(&weight, &[a_bytes_ok])
+        .map_err(|e| format!("malformed a_ok: {e}"))?;
+    let x_ok = gpu
+        .upload_f32(&synth_x(n0, k0, 0x111u64), &[n0 * k0])
+        .map_err(|e| format!("malformed x_ok: {e}"))?;
+
+    // Sentinel Y: unique nonzero pattern; small real allocation (16 f32).
+    // short_Y and oversized-dim cases pass this buffer as Y so a
+    // zero-before-validation bug would clear the pattern.
+    const Y_SENT_LEN: usize = 16;
+    let y_sentinel: Vec<f32> = (0..Y_SENT_LEN)
+        .map(|i| 7.25 + (i as f32) * 0.03125)
+        .collect();
+    let y_real = gpu
+        .upload_f32(&y_sentinel, &[Y_SENT_LEN])
+        .map_err(|e| format!("malformed y_real: {e}"))?;
+
+    // Undersized siblings of A/X (still nonzero so dtype/extent paths matter).
+    let a_short = gpu
+        .upload_raw(&[0u8; 64], &[64])
+        .map_err(|e| format!("malformed a_short: {e}"))?;
+    let x_short = gpu
+        .upload_f32(&[1.0f32; 8], &[8])
+        .map_err(|e| format!("malformed x_short: {e}"))?;
+    let x_f16 = gpu
+        .alloc_tensor(&[n0 * k0], DType::F16)
+        .map_err(|e| format!("malformed x_f16: {e}"))?;
+    let y_f16 = gpu
+        .alloc_tensor(&[n0 * m0], DType::F16)
+        .map_err(|e| format!("malformed y_f16: {e}"))?;
+
+    let mut entries = vec![MalformedEntry::Residual];
+    if arch.starts_with("gfx1010") {
+        entries.push(MalformedEntry::Plain);
+        entries.push(MalformedEntry::Lmhead);
+    }
+
+    let mut checks = 0usize;
+
+    // Helper: run one case, require Err + sentinel intact on y_real.
+    // `y` may be y_real itself or a different buffer (bad_y_dtype); the
+    // sentinel check always reads the honest y_real allocation.
+    let mut one = |entry: MalformedEntry,
+                   tag: &str,
+                   a: &GpuTensor,
+                   x: &GpuTensor,
+                   y: &GpuTensor,
+                   m: usize,
+                   k: usize,
+                   n: usize|
+     -> Result<(), String> {
+        gpu.hip
+            .memcpy_htod(&y_real.buf, bytes_of(&y_sentinel))
+            .map_err(|e| format!("{tag} reseat sentinel: {e}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("{tag} sync pre: {e}"))?;
+
+        let res = entry.call(gpu, a, x, y, m, k, n);
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("{tag} sync post: {e}"))?;
+
+        match res {
+            Ok(()) => {
+                return Err(format!(
+                    "{}/{}: expected Err, got Ok (would mask zero-before-validation)",
+                    entry.name(),
+                    tag
+                ));
+            }
+            Err(e) => {
+                println!(
+                    "RESULT_MALFORMED entry={} case={} arch={} status=ERR msg={}",
+                    entry.name(),
+                    tag,
+                    arch,
+                    e
+                );
+            }
+        }
+
+        let got = gpu
+            .download_f32(&y_real)
+            .map_err(|e| format!("{tag} download sentinel: {e}"))?;
+        if got.len() < y_sentinel.len() || got[..y_sentinel.len()] != y_sentinel[..] {
+            let mut detail = String::from("sentinel mutated");
+            for i in 0..y_sentinel.len().min(got.len()) {
+                if got[i].to_bits() != y_sentinel[i].to_bits() {
+                    detail = format!(
+                        "sentinel mutated at i={i}: got={:.6e} want={:.6e}",
+                        got[i], y_sentinel[i]
+                    );
+                    break;
+                }
+            }
+            return Err(format!("{}/{}: {detail}", entry.name(), tag));
+        }
+        checks += 1;
+        Ok(())
+    };
+
+    // Scalar boundaries used for overflow / i32 cases. Honest small buffers
+    // mean an earlier guard (byte overflow or extent) may fire before the
+    // named one — that is accepted.
+    let m_i32 = (i32::MAX as usize).saturating_add(1);
+    let k_i32 = ((i32::MAX as usize).saturating_add(256)) & !255; // >i32::MAX, %256==0
+    let n_i32 = (i32::MAX as usize).saturating_add(1);
+    let m_a_ovf = usize::MAX / 8;
+    let n_x_ovf = usize::MAX / 8;
+    // Prefer M > K so N*M*4 is likelier to overflow before N*K*4 if products
+    // reach the y_bytes check; still Err either way with small buffers.
+    let m_y_ovf = 1024usize;
+    let n_y_ovf = (usize::MAX / (m_y_ovf.saturating_mul(4).max(1))).saturating_add(1);
+
+    for entry in entries {
+        // Insufficient A extent (claim m0×k0 against 64 B).
+        one(entry, "short_A", &a_short, &x_ok, &y_real, m0, k0, n0)?;
+
+        // Insufficient X extent.
+        one(entry, "short_X", &a_ok, &x_short, &y_real, m0, k0, n0)?;
+
+        // Insufficient Y extent: claim n0×m0 against 16-float sentinel.
+        // Primary zero-before-validation canary.
+        one(entry, "short_Y", &a_ok, &x_ok, &y_real, m0, k0, n0)?;
+
+        // Wrong X dtype.
+        one(entry, "bad_x_dtype", &a_ok, &x_f16, &y_real, m0, k0, n0)?;
+
+        // Wrong Y dtype — call arg is y_f16; sentinel lives on y_real and
+        // must still be untouched after the Err.
+        one(entry, "bad_y_dtype", &a_ok, &x_ok, &y_f16, m0, k0, n0)?;
+
+        // Byte-count overflow via oversized scalars (no huge alloc).
+        one(
+            entry,
+            "overflow_y_bytes",
+            &a_ok,
+            &x_ok,
+            &y_real,
+            m_y_ovf,
+            k0,
+            n_y_ovf,
+        )?;
+        one(
+            entry,
+            "overflow_a_bytes",
+            &a_ok,
+            &x_ok,
+            &y_real,
+            m_a_ovf,
+            k0,
+            n0,
+        )?;
+        one(
+            entry,
+            "overflow_x_bytes",
+            &a_ok,
+            &x_ok,
+            &y_real,
+            m0,
+            k0,
+            n_x_ovf,
+        )?;
+
+        // i32-boundary scalars with honest small buffers. Extent/overflow
+        // may reject first; contract is still Err + sentinel intact.
+        one(
+            entry,
+            "i32_overflow_M",
+            &a_ok,
+            &x_ok,
+            &y_real,
+            m_i32,
+            k0,
+            n0,
+        )?;
+        one(
+            entry,
+            "i32_overflow_K",
+            &a_ok,
+            &x_ok,
+            &y_real,
+            m0,
+            k_i32,
+            n0,
+        )?;
+        one(
+            entry,
+            "i32_overflow_N",
+            &a_ok,
+            &x_ok,
+            &y_real,
+            m0,
+            k0,
+            n_i32,
+        )?;
+    }
+
+    Ok(checks)
 }
 
 // ── synthetic fixtures ────────────────────────────────────────────────────

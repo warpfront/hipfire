@@ -244,9 +244,18 @@ fn main() {
 ///
 /// Compares the production chunked helpers (`prefill_chunked_cancellable` /
 /// `prefill_chunked_capture`) against the serial `decode_step` baseline on the
-/// SAME loaded quantized weights — no golden hashes. Probe shapes cover ragged
-/// chunk tails (65/70/127 @ chunk 64) and SWA window boundaries (511/512/513),
-/// plus a prefix-extension probe, a decode-continuation probe, and a
+/// SAME loaded quantized weights — no golden hashes. Requires `arch ==
+/// "gfx1010"` (the production SIMT route): any other GPU route fails closed
+/// instead of passing on WMMA. Rejects non-finite hidden/logit data, invalid
+/// tolerances, and layer/vector cardinality mismatches — plus a CPU-only
+/// self-check that the comparator gate itself rejects NaN/Inf and
+/// cardinality mismatches. Probe shapes cover ragged chunk tails (65/70/127
+/// @ chunk 64) and SWA window boundaries (511/512/513), plus a long
+/// 1160-token serial-vs-chunked case, two prefix-extension probes (40+30 and
+/// 500+30 across the 512-token SWA boundary), a decode-continuation probe, an
+/// invalid-input guard group (mismatched scratch geometry, out-of-capacity
+/// range, i32-unrepresentable start — each must fail before any state
+/// mutation, with a recovery-logits check afterwards), and a
 /// cancel/reset/recovery probe. Prints one JSON object to stdout and returns
 /// the process exit code: 0 on pass, 1 on any mismatch or kernel failure.
 #[cfg(feature = "deltanet")]
@@ -254,10 +263,100 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
     use hipfire_arch_spark25::config::Spark25Config;
     use hipfire_arch_spark25::forward::{
         decode_step, decode_step_capture, prefill_chunked_cancellable, prefill_chunked_capture,
-        prefill_from, SparkPrefillScratch, SPARK_PREFILL_CHUNK,
+        prefill_from, validate_spark_prefill_inputs, SparkPrefillScratch, SPARK_PREFILL_CHUNK,
     };
     use hipfire_arch_spark25::spark25::{Spark25State, Spark25Weights};
 
+    // A non-finite or negative tolerance would make every comparison
+    // meaningless (NaN comparisons never pass; a negative tolerance can
+    // never be satisfied). Fail closed before touching the GPU.
+    if !tol.is_finite() || tol < 0.0 {
+        println!(
+            "{}",
+            serde_json::json!({
+                "mode": "spark25 serial-vs-chunked prefill parity",
+                "tolerance": tol,
+                "pass": false,
+                "error": format!(
+                    "invalid parity tolerance {tol}: must be finite and non-negative"
+                ),
+            })
+        );
+        return 1;
+    }
+
+    // CPU-only regression for the comparison false-pass fix. The raw max-abs
+    // comparison reports zero error on NaN (`f32::max` ignores NaN), so only
+    // `probe_vectors_ok` stands between non-finite data and a false pass: it
+    // must reject NaN/Inf and cardinality mismatches, and accept clean
+    // matching vectors. Runs before any GPU work.
+    {
+        let clean = vec![0.5f32, -1.0, 2.0, 0.25];
+        let clean_logits = vec![1.0f32, -2.0, 0.5, 3.0, 0.0, -0.5, 1.5, 2.5];
+        let gate = |s_rows: &[Vec<f32>], c_rows: &[Vec<f32>], s_l: &[f32], c_l: &[f32]| {
+            probe_vectors_ok(s_rows, c_rows, s_l, c_l, 1, 4, 8)
+        };
+        let mut nan_row = clean.clone();
+        nan_row[1] = f32::NAN;
+        let mut inf_logits = clean_logits.clone();
+        inf_logits[3] = f32::INFINITY;
+        let short_row = vec![0.5f32, -1.0];
+        let short_logits = vec![1.0f32, -2.0];
+        let failure: Option<String> = if gate(
+            &[clean.clone()],
+            &[clean.clone()],
+            &clean_logits,
+            &clean_logits,
+        )
+        .is_some()
+        {
+            Some("clean vectors wrongly rejected".into())
+        } else if gate(&[clean.clone()], &[nan_row], &clean_logits, &clean_logits).is_none() {
+            Some("NaN hidden wrongly accepted (the original false-pass)".into())
+        } else if gate(
+            &[clean.clone()],
+            &[clean.clone()],
+            &clean_logits,
+            &inf_logits,
+        )
+        .is_none()
+        {
+            Some("Inf logits wrongly accepted".into())
+        } else if gate(&[clean.clone()], &[short_row], &clean_logits, &clean_logits).is_none() {
+            Some("short hidden row wrongly accepted".into())
+        } else if gate(
+            &[clean.clone()],
+            &[clean.clone()],
+            &clean_logits,
+            &short_logits,
+        )
+        .is_none()
+        {
+            Some("short logits wrongly accepted".into())
+        } else if gate(
+            &[clean.clone(), clean.clone()],
+            &[clean.clone()],
+            &clean_logits,
+            &clean_logits,
+        )
+        .is_none()
+        {
+            Some("layer count mismatch wrongly accepted".into())
+        } else {
+            None
+        };
+        if let Some(err) = failure {
+            println!(
+                "{}",
+                serde_json::json!({
+                    "mode": "spark25 serial-vs-chunked prefill parity",
+                    "pass": false,
+                    "error": format!("comparator self-check failed: {err}"),
+                })
+            );
+            return 1;
+        }
+    }
     fn max_abs(v: &[f32]) -> f32 {
         v.iter().fold(0.0f32, |m, &x| m.max(x.abs()))
     }
@@ -274,6 +373,54 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
             }
         }
         best
+    }
+    /// Reject inputs that would let the parity comparison false-pass:
+    /// non-finite values (`f32::max` and `>` comparisons both ignore NaN),
+    /// wrong layer counts, or wrong per-layer / logits vector lengths.
+    /// Returns `Some(reason)` when the probe must fail without comparing.
+    fn probe_vectors_ok(
+        s_rows: &[Vec<f32>],
+        c_rows: &[Vec<f32>],
+        s_logits: &[f32],
+        c_logits: &[f32],
+        n_layers: usize,
+        dim: usize,
+        vocab: usize,
+    ) -> Option<String> {
+        if s_rows.len() != n_layers || c_rows.len() != n_layers {
+            return Some(format!(
+                "layer cardinality mismatch: serial={} chunked={} expected={n_layers}",
+                s_rows.len(),
+                c_rows.len()
+            ));
+        }
+        for (l, (a, b)) in s_rows.iter().zip(c_rows.iter()).enumerate() {
+            if a.len() != dim || b.len() != dim {
+                return Some(format!(
+                    "layer {l} vector cardinality mismatch: serial={} chunked={} expected={dim}",
+                    a.len(),
+                    b.len()
+                ));
+            }
+            if a.iter().chain(b.iter()).any(|x| !x.is_finite()) {
+                return Some(format!("layer {l} hidden contains NaN/Inf"));
+            }
+        }
+        if s_logits.len() != vocab || c_logits.len() != vocab {
+            return Some(format!(
+                "logits cardinality mismatch: serial={} chunked={} expected={vocab}",
+                s_logits.len(),
+                c_logits.len()
+            ));
+        }
+        if s_logits
+            .iter()
+            .chain(c_logits.iter())
+            .any(|x| !x.is_finite())
+        {
+            return Some("logits contain NaN/Inf".to_string());
+        }
+        None
     }
     fn download_kv_bytes(
         gpu: &mut rdna_compute::Gpu,
@@ -316,13 +463,7 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
                 logits = decode_step_capture(cfg, weights, state, gpu, tok, pos as u32, &mut cap)?;
                 let rows = cap
                     .iter()
-                    .map(|c| {
-                        if c.len() >= cfg.dim {
-                            c[c.len() - cfg.dim..].to_vec()
-                        } else {
-                            c.clone()
-                        }
-                    })
+                    .map(|c| c[c.len().saturating_sub(cfg.dim)..].to_vec())
                     .collect();
                 return Ok((rows, logits));
             } else {
@@ -351,13 +492,7 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
         let logits = r?;
         let rows = cap
             .iter()
-            .map(|c| {
-                if c.len() >= cfg.dim {
-                    c[c.len() - cfg.dim..].to_vec()
-                } else {
-                    c.clone()
-                }
-            })
+            .map(|c| c[c.len().saturating_sub(cfg.dim)..].to_vec())
             .collect();
         Ok((rows, logits))
     }
@@ -372,7 +507,15 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
         s_kv: &[u8],
         c_kv: &[u8],
         tol: f32,
+        dim: usize,
+        vocab: usize,
+        n_layers: usize,
     ) -> serde_json::Value {
+        if let Some(err) =
+            probe_vectors_ok(s_rows, c_rows, s_logits, c_logits, n_layers, dim, vocab)
+        {
+            return serde_json::json!({"pass": false, "error": err});
+        }
         let mut layers_ok = true;
         let mut worst = 0.0f32;
         let mut worst_layer = 0usize;
@@ -437,19 +580,35 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
 
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     let arch = gpu.arch.clone();
-    let mut hfq = hipfire_runtime::hfq::HfqFile::open(hfq_path).expect("open hfq");
+    // This diagnostic validates the gfx1010 production SIMT route. Any other
+    // arch would exercise WMMA instead, so passing there would prove nothing
+    // about the new kernel. Fail closed rather than false-pass.
+    if arch != "gfx1010" {
+        println!(
+            "{}",
+            serde_json::json!({
+                "mode": "spark25 serial-vs-chunked prefill parity",
+                "arch": arch,
+                "pass": false,
+                "skipped": true,
+                "error": "parity diagnostic requires arch gfx1010 (production SIMT route); refusing to report pass on another GPU route",
+            })
+        );
+        return 1;
+    }
+    let hfq = hipfire_runtime::hfq::HfqFile::open(hfq_path).expect("open hfq");
     let cfg = Spark25Config::from_hfq(&hfq).expect("config");
     eprintln!(
         "parity: dim={} layers={} vocab={} SWA={} arch={} tol={tol}",
         cfg.dim, cfg.n_layers, cfg.vocab_size, cfg.sliding_window, arch,
     );
     let weights = Spark25Weights::load(&hfq, &cfg, &mut gpu).expect("weights");
-    // Largest probe is 513 tokens plus one decode-continuation step.
-    let mut state = Spark25State::new(&cfg, &mut gpu, 600).expect("state");
-    if state.max_seq < 530 {
+    // Largest probe is 1160 tokens plus one decode-continuation step.
+    let mut state = Spark25State::new(&cfg, &mut gpu, 1220).expect("state");
+    if state.max_seq < 1170 {
         println!(
             "{}",
-            serde_json::json!({"pass": false, "error": format!("state max_seq {} < 530; cannot cover SWA 513 probe", state.max_seq)})
+            serde_json::json!({"pass": false, "error": format!("state max_seq {} < 1170; cannot cover 1160-token parity probe", state.max_seq)})
         );
         return 1;
     }
@@ -464,8 +623,9 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
     };
     let mut all_pass = true;
     let mut shape_results = Vec::new();
-    // Ragged chunk tails (64+1, 64+6, 64+63) and SWA window boundaries.
-    for &n in &[65usize, 70, 127, 511, 512, 513] {
+    // Ragged chunk tails (64+1, 64+6, 64+63), SWA window boundaries, and a
+    // long 1160-token serial-vs-chunked case through the production chunk helper.
+    for &n in &[65usize, 70, 127, 511, 512, 513, 1160] {
         eprintln!("parity: shape {n}");
         let tokens = synth(n);
         let serial: (Vec<Vec<f32>>, Vec<f32>, usize, Vec<u8>, Option<String>) =
@@ -507,8 +667,18 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
         match (&serial.4, &chunked.4) {
             (None, None) => {
                 let cmp = compare_probe(
-                    &serial.0, &chunked.0, &serial.1, &chunked.1, serial.2, chunked.2, &serial.3,
-                    &chunked.3, tol,
+                    &serial.0,
+                    &chunked.0,
+                    &serial.1,
+                    &chunked.1,
+                    serial.2,
+                    chunked.2,
+                    &serial.3,
+                    &chunked.3,
+                    tol,
+                    cfg.dim,
+                    cfg.vocab_size,
+                    cfg.n_layers,
                 );
                 if cmp.get("pass") != Some(&serde_json::Value::Bool(true)) {
                     all_pass = false;
@@ -524,12 +694,13 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
         }
         shape_results.push(entry);
     }
-    // Prefix extension: prefill 40, extend 30 more. Serial extends with the
-    // per-token loop (capturing the last row); chunked extends with a second
-    // production call at start_pos=40. Also checks `prefill_from` agrees.
-    eprintln!("parity: prefix extension 40+30");
-    let ext_tokens = synth(70);
-    let extension = (|| -> Result<serde_json::Value, String> {
+    // Prefix extension, run twice: 40+30 (short smoke) and 500+30 (crosses
+    // the 512-token SWA boundary, so the extension chunk must read evicted
+    // sliding-window history). Serial extends with the per-token loop
+    // (capturing the last row); chunked extends with a second production
+    // call at start_pos=prefix. Also checks `prefill_from` agrees.
+    let mut run_extension = |prefix: usize, total: usize| -> Result<serde_json::Value, String> {
+        let ext_tokens = synth(total);
         state.reset(&mut gpu).map_err(|e| format!("reset: {e}"))?;
         let mut s_logits = Vec::new();
         let mut s_rows: Vec<Vec<f32>> = Vec::new();
@@ -551,10 +722,28 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
         let s_kv = download_kv_bytes(&mut gpu, &state)?;
         // `prefill_from` must agree with the manual loop.
         state.reset(&mut gpu)?;
-        for (p, &t) in ext_tokens[..40].iter().enumerate() {
+        for (p, &t) in ext_tokens[..prefix].iter().enumerate() {
             decode_step(&cfg, &weights, &mut state, &mut gpu, t, p as u32)?;
         }
-        let pf_logits = prefill_from(&cfg, &weights, &mut state, &mut gpu, &ext_tokens[40..], 40)?;
+        let pf_logits = prefill_from(
+            &cfg,
+            &weights,
+            &mut state,
+            &mut gpu,
+            &ext_tokens[prefix..],
+            prefix as u32,
+        )?;
+        if pf_logits.len() != cfg.vocab_size
+            || s_logits.len() != cfg.vocab_size
+            || pf_logits
+                .iter()
+                .chain(s_logits.iter())
+                .any(|x| !x.is_finite())
+        {
+            return Err(
+                "prefill_from comparison hit non-finite data or logits cardinality mismatch".into(),
+            );
+        }
         let pf_abs = max_abs_diff(&s_logits, &pf_logits);
         // Chunked extension from a reset state.
         state.reset(&mut gpu)?;
@@ -564,25 +753,58 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
             &weights,
             &mut state,
             &mut gpu,
-            &ext_tokens[..40],
+            &ext_tokens[..prefix],
             0,
             &scratch,
             &|| false,
         );
         scratch.free_gpu(&mut gpu);
         r0?;
-        let (c_rows, c_logits) =
-            chunked_last_row(&cfg, &weights, &mut state, &mut gpu, &ext_tokens[40..], 40)?;
+        let (c_rows, c_logits) = chunked_last_row(
+            &cfg,
+            &weights,
+            &mut state,
+            &mut gpu,
+            &ext_tokens[prefix..],
+            prefix as u32,
+        )?;
         let c_n = state.n_tokens;
         let c_kv = download_kv_bytes(&mut gpu, &state)?;
         let mut v = compare_probe(
-            &s_rows, &c_rows, &s_logits, &c_logits, s_n, c_n, &s_kv, &c_kv, tol,
+            &s_rows,
+            &c_rows,
+            &s_logits,
+            &c_logits,
+            s_n,
+            c_n,
+            &s_kv,
+            &c_kv,
+            tol,
+            cfg.dim,
+            cfg.vocab_size,
+            cfg.n_layers,
         );
         v["prefill_from_max_abs"] = serde_json::json!(pf_abs);
         v["prefill_from_agrees"] = serde_json::json!(pf_abs <= tol);
         Ok(v)
-    })();
-    let extension = match extension {
+    };
+    eprintln!("parity: prefix extension 40+30");
+    let extension = match run_extension(40, 70) {
+        Ok(v) => {
+            if v.get("pass") != Some(&serde_json::Value::Bool(true))
+                || v.get("prefill_from_agrees") != Some(&serde_json::Value::Bool(true))
+            {
+                all_pass = false;
+            }
+            v
+        }
+        Err(e) => {
+            all_pass = false;
+            serde_json::json!({"pass": false, "error": e})
+        }
+    };
+    eprintln!("parity: prefix extension 500+30 across SWA512");
+    let extension_swa = match run_extension(500, 530) {
         Ok(v) => {
             if v.get("pass") != Some(&serde_json::Value::Bool(true))
                 || v.get("prefill_from_agrees") != Some(&serde_json::Value::Bool(true))
@@ -607,6 +829,17 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
         state.reset(&mut gpu)?;
         let _ = chunked_last_row(&cfg, &weights, &mut state, &mut gpu, &cont_tokens, 0)?;
         let c_c = decode_step(&cfg, &weights, &mut state, &mut gpu, next_tok, 127)?;
+        if s_c.len() != cfg.vocab_size || c_c.len() != cfg.vocab_size {
+            return Err(format!(
+                "continuation logits cardinality mismatch: serial={} chunked={} expected={}",
+                s_c.len(),
+                c_c.len(),
+                cfg.vocab_size
+            ));
+        }
+        if s_c.iter().chain(c_c.iter()).any(|x| !x.is_finite()) {
+            return Err("continuation logits contain NaN/Inf".into());
+        }
         let d = max_abs_diff(&s_c, &c_c);
         let arg_eq = argmax(&s_c) == argmax(&c_c);
         Ok(serde_json::json!({
@@ -646,7 +879,9 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
             &|| true,
         );
         scratch.free_gpu(&mut gpu);
-        let aborted = matches!(&r, Err(e) if e.to_lowercase().contains("abort"));
+        // Exact successful-cancellation marker: a combined abort+rollback
+        // failure must stay an error, never count as a clean cancel.
+        let aborted = matches!(&r, Err(e) if e == "spark25 prefill aborted");
         state.reset(&mut gpu)?;
         let recovered = if aborted {
             let t3 = synth(3);
@@ -683,6 +918,161 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
             serde_json::json!({"pass": false, "error": e})
         }
     };
+    // Invalid-input guards: each bad request must return Err BEFORE any
+    // state mutation. A 6-token clean run fixes the reference logits for a
+    // post-guard recovery step; a 5-token base state is snapshotted
+    // (n_tokens, full KV bytes) and re-compared after every case. Shapes are
+    // tiny on purpose: the capacity case uses a near-limit start position,
+    // not a huge allocation.
+    eprintln!("parity: invalid-input guards");
+    let invalid_inputs = (|| -> Result<serde_json::Value, String> {
+        let setup6 = synth(6);
+        state.reset(&mut gpu).map_err(|e| format!("reset: {e}"))?;
+        let mut ref_logits = Vec::new();
+        for (pos, &tok) in setup6.iter().enumerate() {
+            ref_logits = decode_step(&cfg, &weights, &mut state, &mut gpu, tok, pos as u32)?;
+        }
+        state.reset(&mut gpu).map_err(|e| format!("reset: {e}"))?;
+        for (pos, &tok) in setup6[..5].iter().enumerate() {
+            decode_step(&cfg, &weights, &mut state, &mut gpu, tok, pos as u32)?;
+        }
+        let snap_n = state.n_tokens;
+        let snap_kv = download_kv_bytes(&mut gpu, &state)?;
+        let scratch = SparkPrefillScratch::new(&mut gpu, &cfg, SPARK_PREFILL_CHUNK)?;
+        // Inner closure so a KV-download failure still frees scratch in the
+        // outer scope before propagating (no path leaks the scratch).
+        let inner = (|| -> Result<serde_json::Value, String> {
+            let mut cases = Vec::new();
+            // (1) Valid scratch reused with a mismatched cloned config.
+            {
+                let mut bad_cfg = cfg.clone();
+                bad_cfg.dim += 1;
+                let tokens4 = synth(4);
+                let r = prefill_chunked_cancellable(
+                    &bad_cfg,
+                    &weights,
+                    &mut state,
+                    &mut gpu,
+                    &tokens4,
+                    0,
+                    &scratch,
+                    &|| false,
+                );
+                let kv_after = download_kv_bytes(&mut gpu, &state)?;
+                let unchanged = state.n_tokens == snap_n && kv_after == snap_kv;
+                cases.push(serde_json::json!({
+                    "case": "scratch_geometry_mismatch",
+                    "rejected": r.is_err(),
+                    "error": match &r {
+                        Err(e) => serde_json::Value::from(e.clone()),
+                        Ok(_) => serde_json::Value::Null,
+                    },
+                    "ntokens_unchanged": state.n_tokens == snap_n,
+                    "kv_unchanged": kv_after == snap_kv,
+                    "pass": r.is_err() && unchanged,
+                }));
+            }
+            // (2) Out-of-capacity input range via a near-limit start.
+            {
+                let tokens4 = synth(4);
+                let bad_start = (state.max_seq - 2) as u32;
+                let r = prefill_chunked_cancellable(
+                    &cfg,
+                    &weights,
+                    &mut state,
+                    &mut gpu,
+                    &tokens4,
+                    bad_start,
+                    &scratch,
+                    &|| false,
+                );
+                let kv_after = download_kv_bytes(&mut gpu, &state)?;
+                let unchanged = state.n_tokens == snap_n && kv_after == snap_kv;
+                cases.push(serde_json::json!({
+                    "case": "out_of_capacity_range",
+                    "rejected": r.is_err(),
+                    "error": match &r {
+                        Err(e) => serde_json::Value::from(e.clone()),
+                        Ok(_) => serde_json::Value::Null,
+                    },
+                    "ntokens_unchanged": state.n_tokens == snap_n,
+                    "kv_unchanged": kv_after == snap_kv,
+                    "pass": r.is_err() && unchanged,
+                }));
+            }
+            // (3) i32-unrepresentable start through the device-free validation
+            // seam (a real state can never reach this guard past the capacity
+            // check, so the seam isolates it with a synthetic huge max_seq;
+            // it takes no state and performs no GPU work).
+            {
+                let r = validate_spark_prefill_inputs(
+                    &cfg,
+                    &scratch,
+                    weights.layers.len(),
+                    &state.kv_slot_for_layer,
+                    state.kv_sliding.k_gpu.len(),
+                    state.kv_sliding.v_gpu.len(),
+                    state.kv_full.k_gpu.len(),
+                    state.kv_full.v_gpu.len(),
+                    usize::MAX,
+                    1,
+                    u32::MAX,
+                    None,
+                );
+                let kv_after = download_kv_bytes(&mut gpu, &state)?;
+                let unchanged = state.n_tokens == snap_n && kv_after == snap_kv;
+                cases.push(serde_json::json!({
+                    "case": "i32_unrepresentable_start",
+                    "rejected": r.is_err(),
+                    "error": match &r {
+                        Err(e) => serde_json::Value::from(e.clone()),
+                        Ok(_) => serde_json::Value::Null,
+                    },
+                    "ntokens_unchanged": state.n_tokens == snap_n,
+                    "kv_unchanged": kv_after == snap_kv,
+                    "pass": r.is_err() && unchanged,
+                }));
+            }
+            // Recovery: the untouched base state must still serve the 6th
+            // token with reference-matching logits.
+            let rec_logits = decode_step(&cfg, &weights, &mut state, &mut gpu, setup6[5], 5)?;
+            let rec_ok = ref_logits.len() == cfg.vocab_size
+                && rec_logits.len() == cfg.vocab_size
+                && ref_logits
+                    .iter()
+                    .chain(rec_logits.iter())
+                    .all(|x| x.is_finite());
+            let rec_abs = max_abs_diff(&ref_logits, &rec_logits);
+            let recovery = serde_json::json!({
+                "logits_max_abs": rec_abs,
+                "finite_and_cardinality_ok": rec_ok,
+                "pass": rec_ok && rec_abs <= tol,
+            });
+            let pass = cases
+                .iter()
+                .all(|c| c.get("pass") == Some(&serde_json::Value::Bool(true)))
+                && recovery.get("pass") == Some(&serde_json::Value::Bool(true));
+            Ok(serde_json::json!({
+                "cases": cases,
+                "recovery": recovery,
+                "pass": pass,
+            }))
+        })();
+        scratch.free_gpu(&mut gpu);
+        inner
+    })();
+    let invalid_inputs = match invalid_inputs {
+        Ok(v) => {
+            if v.get("pass") != Some(&serde_json::Value::Bool(true)) {
+                all_pass = false;
+            }
+            v
+        }
+        Err(e) => {
+            all_pass = false;
+            serde_json::json!({"pass": false, "error": e})
+        }
+    };
     println!(
         "{}",
         serde_json::json!({
@@ -692,8 +1082,10 @@ fn run_serial_vs_chunked_parity(hfq_path: &std::path::Path, tol: f32) -> i32 {
             "tolerance": tol,
             "shapes": shape_results,
             "extension": extension,
+            "extension_swa": extension_swa,
             "decode_continuation": continuation,
             "cancel_probe": cancel_probe,
+            "invalid_inputs": invalid_inputs,
             "pass": all_pass,
         })
     );

@@ -9292,9 +9292,10 @@ pub fn generate_spark25(
                 }
                 Err(e) => {
                     scratch.free_gpu(gpu);
-                    if e.contains("abort") {
-                        // Chunk-atomic abort: rewind any partial prefix so no
-                        // partial prefix escapes (generate cold-resets anyway).
+                    // Exact successful-cancellation marker only: a combined
+                    // abort+rollback failure must stay an error, never read as
+                    // a clean cancel.
+                    if e == "spark25 prefill aborted" {
                         if let Err(re) = state.reset(gpu) {
                             emit_error_with_id(
                                 stdout,

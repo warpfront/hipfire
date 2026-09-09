@@ -411,6 +411,131 @@ fn mqv2_prefill_batch_tile(
     }
 }
 
+/// Validated launch dimensions/bytes for gfx1010 MQ4G256V2 FP32 SIMT residual.
+/// Built only after A/X/Y extents, X/Y F32 dtypes, K alignment, checked products,
+/// and i32/u32 representability all pass — so memset/ensure_kernel/launch can
+/// reuse the numbers without repeating unchecked arithmetic.
+struct Mq4g256v2SimtLaunch {
+    a_bytes: usize,
+    x_bytes: usize,
+    y_bytes: usize,
+    m_i32: i32,
+    k_i32: i32,
+    n_i32: i32,
+    grid_m: u32,
+    grid_n_tiles: u32,
+}
+
+/// Single checked validation path for `gemm_mq4g256v2_residual_simt` and the
+/// gfx1010 plain-entry branches that zero Y then call it.
+///
+/// Ordering: empty M/N no-op → nonzero K%256 → X/Y F32 → checked A/X/Y byte
+/// products → actual buffer/view extents → i32 scalars → u32 grid dims.
+/// Returns `Ok(None)` for the intentional empty-M/N no-op; `Ok(Some(_))` only
+/// when every check passed. Does not allocate or copy payloads.
+fn validate_mq4g256v2_residual_simt(
+    a_raw: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch_size: usize,
+) -> HipResult<Option<Mq4g256v2SimtLaunch>> {
+    const WHO: &str = "gemm_mq4g256v2_residual_simt";
+    const BATCH_TILE: usize = 8;
+
+    // Preserve intentional empty M/N no-op before any other check or mutation.
+    if m == 0 || batch_size == 0 {
+        return Ok(None);
+    }
+    if k == 0 || k % 256 != 0 {
+        return Err(hip_bridge::HipError::new(
+            1,
+            &format!("{WHO}: K must be a nonzero multiple of 256 (got {k})"),
+        ));
+    }
+    if x.dtype != DType::F32 {
+        return Err(hip_bridge::HipError::new(
+            1,
+            &format!("{WHO}: X must be F32 (got {:?})", x.dtype),
+        ));
+    }
+    if y.dtype != DType::F32 {
+        return Err(hip_bridge::HipError::new(
+            1,
+            &format!("{WHO}: Y must be F32 (got {:?})", y.dtype),
+        ));
+    }
+
+    // A: M * (K/256) * 136; X: N*K*4; Y RMW: N*M*4.
+    let a_bytes = m
+        .checked_mul(k / 256)
+        .and_then(|g| g.checked_mul(136))
+        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: A size overflow")))?;
+    let x_bytes = batch_size
+        .checked_mul(k)
+        .and_then(|e| e.checked_mul(4))
+        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: X size overflow")))?;
+    let y_bytes = batch_size
+        .checked_mul(m)
+        .and_then(|e| e.checked_mul(4))
+        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: Y size overflow")))?;
+
+    // Accessible buffer/view extents (sub_offset views report the view size).
+    if a_raw.buf.size() < a_bytes {
+        return Err(hip_bridge::HipError::new(
+            1,
+            &format!(
+                "{WHO}: A buffer too small (have {} need {a_bytes})",
+                a_raw.buf.size()
+            ),
+        ));
+    }
+    if x.buf.size() < x_bytes {
+        return Err(hip_bridge::HipError::new(
+            1,
+            &format!(
+                "{WHO}: X buffer too small (have {} need {x_bytes})",
+                x.buf.size()
+            ),
+        ));
+    }
+    if y.buf.size() < y_bytes {
+        return Err(hip_bridge::HipError::new(
+            1,
+            &format!(
+                "{WHO}: Y buffer too small (have {} need {y_bytes})",
+                y.buf.size()
+            ),
+        ));
+    }
+
+    let m_i32 = i32::try_from(m)
+        .map_err(|_| hip_bridge::HipError::new(1, &format!("{WHO}: M exceeds i32")))?;
+    let k_i32 = i32::try_from(k)
+        .map_err(|_| hip_bridge::HipError::new(1, &format!("{WHO}: K exceeds i32")))?;
+    let n_i32 = i32::try_from(batch_size)
+        .map_err(|_| hip_bridge::HipError::new(1, &format!("{WHO}: N exceeds i32")))?;
+
+    let batch_tiles = batch_size.div_ceil(BATCH_TILE);
+    let grid_m = u32::try_from(m)
+        .map_err(|_| hip_bridge::HipError::new(1, &format!("{WHO}: M grid dim exceeds u32")))?;
+    let grid_n_tiles = u32::try_from(batch_tiles).map_err(|_| {
+        hip_bridge::HipError::new(1, &format!("{WHO}: N-tile grid dim exceeds u32"))
+    })?;
+
+    Ok(Some(Mq4g256v2SimtLaunch {
+        a_bytes,
+        x_bytes,
+        y_bytes,
+        m_i32,
+        k_i32,
+        n_i32,
+        grid_m,
+        grid_n_tiles,
+    }))
+}
+
 impl Gpu {
     /// CDNA3-only: prefill GEMM used by `gemm_hfq4g256` rocBLAS path.
     ///
@@ -30349,7 +30474,8 @@ impl Gpu {
     /// SIMT tile (`BATCH_TILE=8`, grid `[M, ceil(N/8)]`, block `[32,1,1]`,
     /// LDS 0) with MQ4G256V2 dual-half headers. Caller owns residual preload;
     /// plain/`=` callers must zero Y before this entry. Rejects non-multiple
-    /// K or overflow; empty M/N is a no-op.
+    /// K or overflow; empty M/N is a no-op. Shared validation runs before any
+    /// ensure_kernel/launch (and before memset in plain wrappers).
     pub fn gemm_mq4g256v2_residual_simt(
         &mut self,
         a_raw: &GpuTensor,
@@ -30360,36 +30486,10 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if m == 0 || batch_size == 0 {
+        // Validate before ensure_kernel or launch; empty M/N returns Ok(()).
+        let Some(v) = validate_mq4g256v2_residual_simt(a_raw, x, y, m, k, batch_size)? else {
             return Ok(());
-        }
-        if k == 0 || k % 256 != 0 {
-            return Err(hip_bridge::HipError::new(
-                1,
-                &format!(
-                    "gemm_mq4g256v2_residual_simt: K must be a nonzero multiple of 256 (got {k})"
-                ),
-            ));
-        }
-        // A: M * (K/256) * 136; X: N*K*4; Y RMW: N*M*4.
-        let _a_bytes = m
-            .checked_mul(k / 256)
-            .and_then(|g| g.checked_mul(136))
-            .ok_or_else(|| {
-                hip_bridge::HipError::new(1, "gemm_mq4g256v2_residual_simt: A size overflow")
-            })?;
-        let _x_bytes = batch_size
-            .checked_mul(k)
-            .and_then(|e| e.checked_mul(4))
-            .ok_or_else(|| {
-                hip_bridge::HipError::new(1, "gemm_mq4g256v2_residual_simt: X size overflow")
-            })?;
-        let _y_bytes = batch_size
-            .checked_mul(m)
-            .and_then(|e| e.checked_mul(4))
-            .ok_or_else(|| {
-                hip_bridge::HipError::new(1, "gemm_mq4g256v2_residual_simt: Y size overflow")
-            })?;
+        };
 
         const MODULE: &str = "gemm_mq4g256v2_residual_simt";
         const FUNC: &str = "gemm_mq4g256v2_residual_simt";
@@ -30398,9 +30498,9 @@ impl Gpu {
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
-        let mut n_val = batch_size as i32;
+        let mut m_val = v.m_i32;
+        let mut k_val = v.k_i32;
+        let mut n_val = v.n_i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut a_ptr as *mut _ as *mut c_void,
             &mut x_ptr as *mut _ as *mut c_void,
@@ -30410,15 +30510,12 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
 
-        const BATCH_TILE: usize = 8;
-        let batch_tiles = (batch_size + BATCH_TILE - 1) / BATCH_TILE;
-        // Weight + F32 X + Y residual read/write.
-        let bytes =
-            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 4 + batch_size * m * 4 * 2;
+        // Weight + F32 X + Y residual read/write — reuse validated byte counts.
+        let bytes = v.a_bytes + v.x_bytes + v.y_bytes.saturating_mul(2);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
         let result = self.launch_maybe_blob(
             FUNC,
-            [m as u32, batch_tiles as u32, 1],
+            [v.grid_m, v.grid_n_tiles, 1],
             [32, 1, 1],
             0,
             &mut params,
@@ -30470,12 +30567,14 @@ impl Gpu {
             return self.gemm_hfq4g256_residual_mq4v2(a_raw, x, y, m, k, batch_size);
         }
         // gfx1010 FP32 SIMT residual: plain `=` via zero-Y then Y+=.
+        // Validate before memset so malformed args never clear the wrong span.
         if self.arch_caps.is_gfx1010() && batch_size > 1 && k != 0 && k % 256 == 0 {
+            let Some(v) = validate_mq4g256v2_residual_simt(a_raw, x, y, m, k, batch_size)? else {
+                return Ok(());
+            };
             match self.active_stream.as_ref() {
-                Some(stream) => self
-                    .hip
-                    .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
-                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+                Some(stream) => self.hip.memset_async(&y.buf, 0, v.y_bytes, stream)?,
+                None => self.hip.memset(&y.buf, 0, v.y_bytes)?,
             }
             return self.gemm_mq4g256v2_residual_simt(a_raw, x, y, m, k, batch_size);
         }
@@ -30537,13 +30636,15 @@ impl Gpu {
         }
         // gfx1010 FP32 SIMT residual for batched lm_head (`=` via zero-Y + +=).
         // N=1 already returned via gemv above; WMMA arches already handled.
+        // Validate before memset so malformed args never clear the wrong span.
         if self.arch_caps.is_gfx1010() && batch_size > 1 && k != 0 && k % 256 == 0 {
+            let Some(v) = validate_mq4g256v2_residual_simt(a_raw, x, y, m, k, batch_size)? else {
+                return Ok(());
+            };
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
             match self.active_stream.as_ref() {
-                Some(stream) => self
-                    .hip
-                    .memset_async(&y.buf, 0, batch_size * m * 4, stream)?,
-                None => self.hip.memset(&y.buf, 0, batch_size * m * 4)?,
+                Some(stream) => self.hip.memset_async(&y.buf, 0, v.y_bytes, stream)?,
+                None => self.hip.memset(&y.buf, 0, v.y_bytes)?,
             }
             return self.gemm_mq4g256v2_residual_simt(a_raw, x, y, m, k, batch_size);
         }

@@ -500,16 +500,28 @@ impl Spark25State {
     }
 
     /// REQUIRED session lifecycle: zero both KV caches and rewind the token cursor.
+    ///
+    /// Always rewinds the host cursor (`n_tokens`, `pos_host`) and always
+    /// attempts BOTH cache clears, even if the first fails, so a partially
+    /// cleared state is never reported as clean: single-side failures return
+    /// that side's error, dual failures return both combined.
     pub fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.n_tokens = 0;
         *self.pos_host = 0;
-        self.kv_sliding
+        let sliding = self
+            .kv_sliding
             .clear_gpu(gpu)
-            .map_err(|e| format!("spark25 reset: clear sliding kv: {e:?}"))?;
-        self.kv_full
+            .map_err(|e| format!("spark25 reset: clear sliding kv: {e:?}"));
+        let full = self
+            .kv_full
             .clear_gpu(gpu)
-            .map_err(|e| format!("spark25 reset: clear full kv: {e:?}"))?;
-        Ok(())
+            .map_err(|e| format!("spark25 reset: clear full kv: {e:?}"));
+        match (sliding, full) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) => Err(e),
+            (Ok(()), Err(e)) => Err(e),
+            (Err(a), Err(b)) => Err(format!("spark25 reset failed: [{a}] [{b}]")),
+        }
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {

@@ -469,18 +469,26 @@ pub struct SparkPrefillScratch {
     x_batch: GpuTensor,
     n1: GpuTensor,
     qkv_batch: GpuTensor,
-    q_batch: GpuTensor,
-    k_batch: GpuTensor,
-    v_batch: GpuTensor,
     attn_out_batch: GpuTensor,
     gate_batch: GpuTensor,
     tmp_batch: GpuTensor,
     gate_ffn_batch: GpuTensor,
     up_ffn_batch: GpuTensor,
     ffn_out_batch: GpuTensor,
-    /// F32 storage holding i32 position bits (same cosmetic dtype as llama PBS).
+    /// F32 storage holding one i32 position-bits element per chunk row.
+    /// Uploaded once per chunk; per-row `sub_offset` views feed RoPE,
+    /// KV-write and attention directly (no per-row H2D).
     positions: GpuTensor,
     chunk: usize,
+    /// Exact config geometry this scratch was allocated for. Validated on
+    /// every public entry point so cross-config reuse fails closed instead
+    /// of tripping a `sub_offset` assert mid-request.
+    dim: usize,
+    hidden: usize,
+    q_dim: usize,
+    kv_dim: usize,
+    qkv_rows: usize,
+    n_heads: usize,
 }
 
 impl SparkPrefillScratch {
@@ -496,7 +504,7 @@ impl SparkPrefillScratch {
         let kv_dim = cfg.kv_dim();
         let qkv_rows = cfg.qkv_rows();
         let n_heads = cfg.n_heads;
-        if dim == 0 || hidden == 0 || q_dim == 0 || kv_dim == 0 || n_heads == 0 {
+        if dim == 0 || hidden == 0 || q_dim == 0 || kv_dim == 0 || qkv_rows == 0 || n_heads == 0 {
             return Err("spark25: SparkPrefillScratch: invalid config geometry".into());
         }
         spark_prefill_scratch_alloc(gpu, chunk, dim, hidden, q_dim, kv_dim, qkv_rows, n_heads)
@@ -507,9 +515,6 @@ impl SparkPrefillScratch {
             x_batch,
             n1,
             qkv_batch,
-            q_batch,
-            k_batch,
-            v_batch,
             attn_out_batch,
             gate_batch,
             tmp_batch,
@@ -517,15 +522,12 @@ impl SparkPrefillScratch {
             up_ffn_batch,
             ffn_out_batch,
             positions,
-            chunk: _,
+            ..
         } = self;
         for t in [
             x_batch,
             n1,
             qkv_batch,
-            q_batch,
-            k_batch,
-            v_batch,
             attn_out_batch,
             gate_batch,
             tmp_batch,
@@ -544,9 +546,6 @@ impl SparkPrefillScratch {
             cfg.dim
                 + cfg.dim
                 + cfg.qkv_rows()
-                + cfg.q_dim()
-                + cfg.kv_dim()
-                + cfg.kv_dim()
                 + cfg.q_dim()
                 + cfg.n_heads
                 + cfg.dim
@@ -569,14 +568,11 @@ fn spark_prefill_scratch_alloc(
     qkv_rows: usize,
     n_heads: usize,
 ) -> Result<SparkPrefillScratch, String> {
-    let mut owned: Vec<GpuTensor> = Vec::with_capacity(13);
-    let specs: [(usize, &str); 13] = [
+    let mut owned: Vec<GpuTensor> = Vec::with_capacity(10);
+    let specs: [(usize, &str); 10] = [
         (dim, "x_batch"),
         (dim, "n1"),
         (qkv_rows, "qkv_batch"),
-        (q_dim, "q_batch"),
-        (kv_dim, "k_batch"),
-        (kv_dim, "v_batch"),
         (q_dim, "attn_out_batch"),
         (n_heads, "gate_batch"),
         (dim, "tmp_batch"),
@@ -611,9 +607,6 @@ fn spark_prefill_scratch_alloc(
         x_batch: it.next().unwrap(),
         n1: it.next().unwrap(),
         qkv_batch: it.next().unwrap(),
-        q_batch: it.next().unwrap(),
-        k_batch: it.next().unwrap(),
-        v_batch: it.next().unwrap(),
         attn_out_batch: it.next().unwrap(),
         gate_batch: it.next().unwrap(),
         tmp_batch: it.next().unwrap(),
@@ -622,6 +615,12 @@ fn spark_prefill_scratch_alloc(
         ffn_out_batch: it.next().unwrap(),
         positions: it.next().unwrap(),
         chunk,
+        dim,
+        hidden,
+        q_dim,
+        kv_dim,
+        qkv_rows,
+        n_heads,
     })
 }
 
@@ -694,6 +693,205 @@ pub fn prefill_chunked_capture(
     )
 }
 
+/// Exact error returned when chunked prefill is cancelled AND the rollback
+/// reset succeeds. Combined rollback-failure errors deliberately never contain
+/// this string, so even substring matching cannot mistake a dirty-state
+/// failure for a clean cancellation.
+const PREFILL_ABORTED: &str = "spark25 prefill aborted";
+
+/// Cheap host-side validation for a chunked-prefill request.
+///
+/// Reads only host metadata (shapes, buffer sizes, mapping lengths) — no GPU
+/// calls and no heap allocation — so it runs before any device mutation and
+/// doubles as a device-free unit-test seam: every argument is a plain scalar
+/// or slice, constructible without a GPU.
+///
+/// Rejects: degenerate geometry, scratch allocated for a different config,
+/// undersized scratch extents, layer-vector length mismatches, stale KV slot
+/// indices, and positions not representable as the i32 `pos_buf` payload —
+/// all of which would otherwise panic in `sub_offset` or index out of range
+/// after partial prefix mutation.
+pub fn validate_spark_prefill_inputs(
+    cfg: &Spark25Config,
+    scratch: &SparkPrefillScratch,
+    n_weight_layers: usize,
+    kv_slot_for_layer: &[usize],
+    sliding_k_layers: usize,
+    sliding_v_layers: usize,
+    full_k_layers: usize,
+    full_v_layers: usize,
+    max_seq: usize,
+    tokens_len: usize,
+    start_pos: u32,
+    capture_len: Option<usize>,
+) -> Result<(), String> {
+    if tokens_len == 0 {
+        return Ok(());
+    }
+    let q_dim = cfg.q_dim();
+    let kv_dim = cfg.kv_dim();
+    let qkv_rows = cfg.qkv_rows();
+    if cfg.dim == 0
+        || cfg.hidden_dim == 0
+        || cfg.n_layers == 0
+        || cfg.n_heads == 0
+        || cfg.n_kv_heads == 0
+        || cfg.head_dim == 0
+        || q_dim == 0
+        || kv_dim == 0
+        || qkv_rows == 0
+    {
+        return Err("spark25: prefill validation: invalid config geometry".into());
+    }
+    if cfg.layer_types.len() != cfg.n_layers {
+        return Err(format!(
+            "spark25: prefill validation: layer_types len {} != n_layers {}",
+            cfg.layer_types.len(),
+            cfg.n_layers
+        ));
+    }
+    // Fused-row consistency plus the checked element/byte products the body
+    // relies on (no wrapping widths or byte counts).
+    let kv_pair = kv_dim
+        .checked_mul(2)
+        .ok_or_else(|| "spark25: prefill validation: kv pair width overflow".to_string())?;
+    if q_dim
+        .checked_add(kv_pair)
+        .ok_or_else(|| "spark25: prefill validation: qkv row width overflow".to_string())?
+        != qkv_rows
+    {
+        return Err("spark25: prefill validation: qkv row width mismatch".into());
+    }
+    for (width, name) in [
+        (cfg.dim, "dim"),
+        (cfg.hidden_dim, "hidden_dim"),
+        (q_dim, "q_dim"),
+        (kv_dim, "kv_dim"),
+        (qkv_rows, "qkv_rows"),
+        (cfg.n_heads, "n_heads"),
+        (1usize, "positions"),
+    ] {
+        width
+            .checked_mul(4)
+            .ok_or_else(|| format!("spark25: prefill validation: {name} byte size overflow"))?;
+    }
+    // Scratch must be allocated for exactly this config.
+    if scratch.chunk == 0 {
+        return Err("spark25: SparkPrefillScratch chunk must be > 0".into());
+    }
+    if scratch.dim != cfg.dim
+        || scratch.hidden != cfg.hidden_dim
+        || scratch.q_dim != q_dim
+        || scratch.kv_dim != kv_dim
+        || scratch.qkv_rows != qkv_rows
+        || scratch.n_heads != cfg.n_heads
+    {
+        return Err(
+            "spark25: prefill validation: scratch geometry mismatch (reallocate for this config)"
+                .into(),
+        );
+    }
+    // Every scratch extent must hold a full chunk: exact element count plus a
+    // backing buffer large enough for the checked byte count, so no later
+    // `sub_offset` can trip its bounds assert.
+    fn expect_extent(t: &GpuTensor, chunk: usize, width: usize, label: &str) -> Result<(), String> {
+        let n = chunk
+            .checked_mul(width)
+            .ok_or_else(|| format!("spark25: prefill validation: scratch {label} size overflow"))?;
+        if t.numel() != n {
+            return Err(format!(
+                "spark25: prefill validation: scratch {label} extent {} != chunk {chunk} x width {width}",
+                t.numel()
+            ));
+        }
+        let bytes = n.checked_mul(4).ok_or_else(|| {
+            format!("spark25: prefill validation: scratch {label} byte size overflow")
+        })?;
+        if t.buf.size() < bytes {
+            return Err(format!(
+                "spark25: prefill validation: scratch {label} buffer {} < {bytes} bytes",
+                t.buf.size()
+            ));
+        }
+        Ok(())
+    }
+    let chunk = scratch.chunk;
+    expect_extent(&scratch.x_batch, chunk, cfg.dim, "x_batch")?;
+    expect_extent(&scratch.n1, chunk, cfg.dim, "n1")?;
+    expect_extent(&scratch.qkv_batch, chunk, qkv_rows, "qkv_batch")?;
+    expect_extent(&scratch.attn_out_batch, chunk, q_dim, "attn_out_batch")?;
+    expect_extent(&scratch.gate_batch, chunk, cfg.n_heads, "gate_batch")?;
+    expect_extent(&scratch.tmp_batch, chunk, cfg.dim, "tmp_batch")?;
+    expect_extent(
+        &scratch.gate_ffn_batch,
+        chunk,
+        cfg.hidden_dim,
+        "gate_ffn_batch",
+    )?;
+    expect_extent(&scratch.up_ffn_batch, chunk, cfg.hidden_dim, "up_ffn_batch")?;
+    expect_extent(
+        &scratch.ffn_out_batch,
+        chunk,
+        cfg.hidden_dim,
+        "ffn_out_batch",
+    )?;
+    expect_extent(&scratch.positions, chunk, 1, "positions")?;
+    // Position range plus i32 representability (the per-row `pos_buf`
+    // payload) before any mutation.
+    let start = start_pos as usize;
+    let end = start
+        .checked_add(tokens_len)
+        .ok_or_else(|| "spark25: prefill position range overflow".to_string())?;
+    if end > max_seq {
+        return Err(format!(
+            "spark25: prefill end position {end} exceeds max_seq {max_seq}"
+        ));
+    }
+    if end - 1 > i32::MAX as usize {
+        return Err(format!(
+            "spark25: prefill end position {end} exceeds i32 range"
+        ));
+    }
+    // Layer-vector lengths indexed by the body.
+    if n_weight_layers != cfg.n_layers {
+        return Err(format!(
+            "spark25: prefill validation: weight layers {n_weight_layers} != n_layers {}",
+            cfg.n_layers
+        ));
+    }
+    if kv_slot_for_layer.len() != cfg.n_layers {
+        return Err(format!(
+            "spark25: prefill validation: kv slot map len {} != n_layers {}",
+            kv_slot_for_layer.len(),
+            cfg.n_layers
+        ));
+    }
+    if let Some(len) = capture_len {
+        if len < cfg.n_layers {
+            return Err(format!(
+                "spark25: capture len {len} < n_layers {}",
+                cfg.n_layers
+            ));
+        }
+    }
+    // Every layer's KV slot must address a live slot in its own cache.
+    // Plain loop: no allocation, and `layer_types` was length-checked above.
+    for (layer_idx, &slot) in kv_slot_for_layer.iter().enumerate() {
+        if cfg.is_sliding(layer_idx) {
+            if slot >= sliding_k_layers || slot >= sliding_v_layers {
+                return Err(format!(
+                    "spark25 L{layer_idx}: kv_slot {slot} out of range (sliding k={sliding_k_layers} v={sliding_v_layers})"
+                ));
+            }
+        } else if slot >= full_k_layers || slot >= full_v_layers {
+            return Err(format!(
+                "spark25 L{layer_idx}: kv_slot {slot} out of range (full k={full_k_layers} v={full_v_layers})"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn prefill_chunked_impl(
     cfg: &Spark25Config,
     weights: &Spark25Weights,
@@ -708,33 +906,20 @@ fn prefill_chunked_impl(
     if tokens.is_empty() {
         return Ok(Vec::new());
     }
-    let n = tokens.len();
-    let start = start_pos as usize;
-    let end = start
-        .checked_add(n)
-        .ok_or_else(|| "spark25: prefill position range overflow".to_string())?;
-    if end > state.max_seq {
-        return Err(format!(
-            "spark25: prefill end position {end} exceeds max_seq {}",
-            state.max_seq
-        ));
-    }
-    if scratch.chunk == 0 {
-        return Err("spark25: SparkPrefillScratch chunk must be > 0".into());
-    }
-    // Active batch cannot exceed allocated chunk capacity.
-    if scratch.x_batch.numel() < scratch.chunk.saturating_mul(cfg.dim) {
-        return Err("spark25: SparkPrefillScratch capacity mismatch".into());
-    }
-    if let Some(cap) = capture.as_ref() {
-        if cap.len() < cfg.n_layers {
-            return Err(format!(
-                "spark25: capture len {} < n_layers {}",
-                cap.len(),
-                cfg.n_layers
-            ));
-        }
-    }
+    validate_spark_prefill_inputs(
+        cfg,
+        scratch,
+        weights.layers.len(),
+        &state.kv_slot_for_layer,
+        state.kv_sliding.k_gpu.len(),
+        state.kv_sliding.v_gpu.len(),
+        state.kv_full.k_gpu.len(),
+        state.kv_full.v_gpu.len(),
+        state.max_seq,
+        tokens.len(),
+        start_pos,
+        capture.as_ref().map(|cap| cap.len()),
+    )?;
 
     // All bounds checked — from here any failure resets state (fail closed).
     match prefill_chunked_body(
@@ -749,10 +934,18 @@ fn prefill_chunked_impl(
         abort,
     ) {
         Ok(logits) => Ok(logits),
-        Err(e) => {
-            let _ = state.reset(gpu);
-            Err(e)
-        }
+        Err(original) => match state.reset(gpu) {
+            Ok(()) => Err(original),
+            Err(reset_err) => Err(if original == PREFILL_ABORTED {
+                // Cancelled, but the rollback itself failed: the state may
+                // still hold a partial prefix. This deliberately avoids the
+                // exact abort sentinel so it is never mistaken for a clean
+                // cancellation.
+                format!("spark25 prefill cancelled but rollback reset failed: {reset_err}")
+            } else {
+                format!("spark25 prefill failed: {original}; rollback reset failed: {reset_err}")
+            }),
+        },
     }
 }
 
@@ -777,17 +970,19 @@ fn prefill_chunked_body(
     let head_dim = cfg.head_dim;
     let rms_eps = cfg.rms_norm_eps;
     let dim_bytes = dim * 4;
-    let q_bytes = q_dim * 4;
-    let kv_bytes = kv_dim * 4;
     let n = tokens.len();
     let chunk_cap = scratch.chunk;
+
+    // Host staging for the per-chunk positions upload, allocated once per
+    // request and reused across chunks (no per-chunk/per-layer allocation).
+    let mut pos_host: Vec<i32> = Vec::with_capacity(chunk_cap);
 
     let mut offset = 0usize;
     let mut last_c = 0usize;
 
     while offset < n {
         if abort() {
-            return Err("spark25 prefill aborted".into());
+            return Err(PREFILL_ABORTED.into());
         }
         let c = (n - offset).min(chunk_cap);
         last_c = c;
@@ -798,16 +993,12 @@ fn prefill_chunked_body(
         let x = scratch.x_batch.sub_offset(0, c * dim);
         let n1 = scratch.n1.sub_offset(0, c * dim);
         let qkv = scratch.qkv_batch.sub_offset(0, c * qkv_rows);
-        let q = scratch.q_batch.sub_offset(0, c * q_dim);
-        let k = scratch.k_batch.sub_offset(0, c * kv_dim);
-        let v = scratch.v_batch.sub_offset(0, c * kv_dim);
         let attn_out = scratch.attn_out_batch.sub_offset(0, c * q_dim);
         let gate = scratch.gate_batch.sub_offset(0, c * n_heads);
         let tmp = scratch.tmp_batch.sub_offset(0, c * dim);
         let gate_ffn = scratch.gate_ffn_batch.sub_offset(0, c * hidden);
         let up_ffn = scratch.up_ffn_batch.sub_offset(0, c * hidden);
         let ffn_out = scratch.ffn_out_batch.sub_offset(0, c * hidden);
-        let pos_view = scratch.positions.sub_offset(0, c);
 
         for r in 0..c {
             let row = scratch.x_batch.sub_offset(r * dim, dim);
@@ -815,16 +1006,18 @@ fn prefill_chunked_body(
                 .map_err(|e| format!("spark25 prefill embed[{}]: {e}", pos0 + r))?;
         }
 
-        let pos_host: Vec<i32> = (0..c).map(|r| (pos0 + r) as i32).collect();
+        // One positions H2D per chunk; per-row views below feed RoPE/KV/attention.
+        pos_host.clear();
+        pos_host.extend((0..c).map(|r| (pos0 + r) as i32));
         let pos_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(pos_host.as_ptr() as *const u8, c * 4) };
         gpu.hip
-            .memcpy_htod(&pos_view.buf, pos_bytes)
+            .memcpy_htod(&scratch.positions.buf, pos_bytes)
             .map_err(|e| format!("spark25 prefill htod positions: {e:?}"))?;
 
         for layer_idx in 0..cfg.n_layers {
             if abort() {
-                return Err("spark25 prefill aborted".into());
+                return Err(PREFILL_ABORTED.into());
             }
             let lw = &weights.layers[layer_idx];
             let kv_slot = state.kv_slot_for_layer[layer_idx];
@@ -838,8 +1031,8 @@ fn prefill_chunked_body(
 
             weight_gemm(gpu, &lw.q_k_v_proj, &n1, &qkv, c)
                 .map_err(|e| format!("spark25 L{layer_idx} chunk@{pos0}: q_k_v_proj: {e}"))?;
-            split_qkv_batch(gpu, &qkv, &q, &k, &v, c, q_dim, kv_dim, q_bytes, kv_bytes)
-                .map_err(|e| format!("spark25 L{layer_idx} chunk@{pos0}: {e}"))?;
+            // Q/K/V stay in their fused `qkv` rows: disjoint per-row views below
+            // (RoPE updates Q/K in place, V untouched) — no D2D copies.
 
             if cfg.headwise_attn_output_gate {
                 weight_gemm(gpu, &lw.g_proj, &n1, &gate, c)
@@ -864,38 +1057,30 @@ fn prefill_chunked_body(
                 }
                 for r in 0..c {
                     let pos = (pos0 + r) as u32;
-                    gpu.hip
-                        .memcpy_htod(&state.pos_buf, &(pos as i32).to_ne_bytes())
-                        .map_err(|e| {
-                            format!("spark25 L{layer_idx} chunk@{pos0}: htod pos {pos}: {e:?}")
-                        })?;
-
-                    let q_row = scratch.q_batch.sub_offset(r * q_dim, q_dim);
-                    let k_row = scratch.k_batch.sub_offset(r * kv_dim, kv_dim);
-                    let v_row = scratch.v_batch.sub_offset(r * kv_dim, kv_dim);
+                    // Disjoint views into this row's fused Q|K|V plus its
+                    // pre-uploaded position word (one H2D per chunk).
+                    let row_base = r * qkv_rows;
+                    let q_row = scratch.qkv_batch.sub_offset(row_base, q_dim);
+                    let k_row = scratch.qkv_batch.sub_offset(row_base + q_dim, kv_dim);
+                    let v_row = scratch
+                        .qkv_batch
+                        .sub_offset(row_base + q_dim + kv_dim, kv_dim);
+                    let pos_row = scratch.positions.sub_offset(r, 1);
                     let out_row = scratch.attn_out_batch.sub_offset(r * q_dim, q_dim);
 
                     if n_rot_pairs == 0 {
                         // degenerate — skip
                     } else if n_rot_pairs * 2 >= head_dim {
-                        gpu.rope_f32(
-                            &q_row,
-                            &k_row,
-                            &state.pos_buf,
-                            n_heads,
-                            n_kv,
-                            head_dim,
-                            theta,
-                        )
-                        .map_err(|e| {
-                            format!("spark25 L{layer_idx} chunk@{pos0}: rope_f32 r{r}: {e:?}")
-                        })?;
+                        gpu.rope_f32(&q_row, &k_row, &pos_row.buf, n_heads, n_kv, head_dim, theta)
+                            .map_err(|e| {
+                                format!("spark25 L{layer_idx} chunk@{pos0}: rope_f32 r{r}: {e:?}")
+                            })?;
                     } else {
                         let n_rot = n_rot_pairs * 2;
                         gpu.rope_partial_interleaved_f32(
                             &q_row,
                             &k_row,
-                            &state.pos_buf,
+                            &pos_row.buf,
                             n_heads,
                             n_kv,
                             head_dim,
@@ -910,7 +1095,7 @@ fn prefill_chunked_body(
                     gpu.kv_cache_write_q8_0(
                         &kv.k_gpu[kv_slot],
                         &k_row,
-                        &state.pos_buf,
+                        &pos_row.buf,
                         n_kv,
                         head_dim,
                     )
@@ -920,7 +1105,7 @@ fn prefill_chunked_body(
                     gpu.kv_cache_write_q8_0(
                         &kv.v_gpu[kv_slot],
                         &v_row,
-                        &state.pos_buf,
+                        &pos_row.buf,
                         n_kv,
                         head_dim,
                     )
@@ -934,7 +1119,7 @@ fn prefill_chunked_body(
                         &kv.k_gpu[kv_slot],
                         &kv.v_gpu[kv_slot],
                         &out_row,
-                        &state.pos_buf,
+                        &pos_row.buf,
                         seq_hint,
                         n_heads,
                         n_kv,
@@ -1012,40 +1197,4 @@ fn prefill_chunked_body(
 
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("spark25: download logits: {e:?}"))
-}
-
-/// Split fused QKV batch rows: each row is contiguous Q|K|V.
-fn split_qkv_batch(
-    gpu: &mut Gpu,
-    qkv: &GpuTensor,
-    q: &GpuTensor,
-    k: &GpuTensor,
-    v: &GpuTensor,
-    batch: usize,
-    q_dim: usize,
-    kv_dim: usize,
-    q_bytes: usize,
-    kv_bytes: usize,
-) -> Result<(), String> {
-    let qkv_row = q_dim + 2 * kv_dim;
-    let qkv_row_bytes = qkv_row * 4;
-    for r in 0..batch {
-        let src_base = r * qkv_row_bytes;
-        let q_dst = r * q_bytes;
-        let k_dst = r * kv_bytes;
-        let v_dst = r * kv_bytes;
-        gpu.memcpy_dtod_at_auto(&q.buf, q_dst, &qkv.buf, src_base, q_bytes)
-            .map_err(|e| format!("split q r{r}: {e:?}"))?;
-        gpu.memcpy_dtod_at_auto(&k.buf, k_dst, &qkv.buf, src_base + q_bytes, kv_bytes)
-            .map_err(|e| format!("split k r{r}: {e:?}"))?;
-        gpu.memcpy_dtod_at_auto(
-            &v.buf,
-            v_dst,
-            &qkv.buf,
-            src_base + q_bytes + kv_bytes,
-            kv_bytes,
-        )
-        .map_err(|e| format!("split v r{r}: {e:?}"))?;
-    }
-    Ok(())
 }
