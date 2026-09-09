@@ -2,33 +2,44 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Real-GPU numerical probe for `gemm_mq4g256v2_residual_simt` (gfx1010
-//! FP32-intermediate batched residual MQ4G256V2 GEMM).
+//! Real-GPU numerical probe for `gemm_mq4g256v2_residual_simt` and the four
+//! temporary FP32 gfx1010 plain-set SIMT experiment variants
+//! (`gemm_mq4g256v2_set_simt_variant`).
 //!
-//! Oracles (both must agree with the SIMT launcher within strict F32 tol):
+//! Oracles (residual must agree with both within strict F32 tol):
 //!   1. Existing per-row `gemv_hfq4g256_residual_mq4v2` on the same weights/X
-//!   2. Independent host V2 dual-half dequant + F32 dot + residual
+//!   2. Independent host V2 dual-half dequant + F32 four-chain dot + residual
+//!
+//! Set arms additionally require raw bit-identical active output versus the
+//! existing residual-SIMT launcher started from +0 Y (and GEMV-from-+0) on
+//! finite synthetic fixtures. Stale Y must be overwritten; capacity tails
+//! beyond active N stay untouched. Residual keeps nonzero Y+= semantics.
 //!
 //! Fixtures force dual-half headers to differ (disjoint half ranges) so a
-//! wrong half-header select fails loudly. Also checks nonzero residual init,
-//! ragged-N capacity tails untouched, finite outputs, and that public
-//! plain / batched-lmhead entries zero Y before the residual kernel on
-//! gfx1010 (stale Y must not pass).
+//! wrong half-header select fails loudly. Also checks finite outputs and that
+//! public plain / batched-lmhead entries overwrite stale Y on gfx1010 (stale Y
+//! must not pass). The overwrite proof compares product equality — it does not
+//! observe memset.
 //!
-//! Malformed-call gate (residual always; plain + batched_lmhead on gfx1010):
-//! insufficient A/X/Y extents, wrong X/Y dtype, i32 M/K/N overflow, and
-//! A/X/Y byte-count overflow. Every case must return `Err` **and** leave a
-//! sentinel Y pattern byte-unchanged (catches zero-before-validation).
+//! Malformed-call gate (residual + every set arm; plain + batched_lmhead on
+//! gfx1010): insufficient A/X/Y extents, wrong X/Y dtype, i32 M/K/N overflow,
+//! and A/X/Y byte-count overflow. Every case must return `Err` **and** leave a
+//! sentinel Y pattern byte-unchanged (catches mutation-before-validation).
+//! Direct empty M/N no-ops must leave Y unchanged for residual and set arms.
 //!
 //! Usage:
 //!   cargo run --release -p rdna-compute --example test_gemm_mq4g256v2_simt \
-//!     --features lab -- [M] [K] [N1 N2 ...]
+//!     --features lab -- [M] [K] [N1 N2 ...] [--timing]
 //!
 //! Defaults exercise N∈{1,3,7,8,9,16}, K∈{256,768,1024,2560}, M∈{16,33}
-//! plus a representative larger M (CLI M or 512) — 3×4×6 = 72 oracle cases
-//! when defaults are left alone. Optional shape timing after warmup; no
-//! absolute speed gate. Machine-readable `RESULT*` / `RESULT_MALFORMED*` lines.
+//! plus a representative larger M (CLI M or 512), then bounded non-cross-product
+//! boundary shapes (R2 odd-M, tile edges, Spark K). Optional `--timing` runs the
+//! Spark projection census (N∈{64,46,8}) kernel-only residual-from-zero vs each
+//! set arm (warmups 10, measured ≥5, raw samples + median). Machine-readable
+//! `RESULT*` / `RESULT_SET*` / `RESULT_MALFORMED*` / `RESULT_EMPTY*` /
+//! `RESULT_TIMING*` lines.
 
+use rdna_compute::gemm::Mq4g256v2SimtSetVariant;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
@@ -44,12 +55,61 @@ const DEFAULT_NS: &[usize] = &[1, 3, 7, 8, 9, 16];
 const DEFAULT_KS: &[usize] = &[256, 768, 1024, 2560];
 const SMALL_MS: &[usize] = &[16, 33];
 
+const SET_VARIANTS: &[Mq4g256v2SimtSetVariant] = &[
+    Mq4g256v2SimtSetVariant::SetR1T8Q4,
+    Mq4g256v2SimtSetVariant::SetR1T8G1,
+    Mq4g256v2SimtSetVariant::SetR1T16G1,
+    Mq4g256v2SimtSetVariant::SetR2T8G1,
+];
+
+/// Non-cross-product boundary shapes from the validation recipe.
+fn boundary_shapes() -> Vec<(usize, usize, usize)> {
+    let mut out = Vec::new();
+    // R2 clamp / store ownership on odd and tiny M.
+    for &m in &[1usize, 2, 3] {
+        for &n in &[1usize, 8, 9, 16] {
+            out.push((m, 256, n));
+        }
+    }
+    // Tile edges around T8/T16 with production-ish K.
+    for &n in &[15usize, 16, 17] {
+        out.push((33, 2560, n));
+    }
+    for &n in &[31usize, 32, 33] {
+        out.push((33, 4096, n));
+    }
+    // Spark long-K loops + ragged production N tails.
+    for &m in &[3usize, 33] {
+        for &n in &[8usize, 46, 63, 64, 65] {
+            out.push((m, 10240, n));
+        }
+    }
+    out
+}
+
+fn set_variant_name(v: Mq4g256v2SimtSetVariant) -> &'static str {
+    match v {
+        Mq4g256v2SimtSetVariant::SetR1T8Q4 => "SetR1T8Q4",
+        Mq4g256v2SimtSetVariant::SetR1T8G1 => "SetR1T8G1",
+        Mq4g256v2SimtSetVariant::SetR1T16G1 => "SetR1T16G1",
+        Mq4g256v2SimtSetVariant::SetR2T8G1 => "SetR2T8G1",
+    }
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let cli_m: Option<usize> = args.get(1).and_then(|s| s.parse().ok());
-    let cli_k: Option<usize> = args.get(2).and_then(|s| s.parse().ok());
-    let cli_ns: Option<Vec<usize>> = if args.len() > 3 {
-        let v: Vec<usize> = args[3..].iter().filter_map(|s| s.parse().ok()).collect();
+    let timing_mode = args.iter().any(|a| a == "--timing");
+    let pos: Vec<String> = args
+        .iter()
+        .skip(1)
+        .filter(|a| a.as_str() != "--timing")
+        .cloned()
+        .collect();
+
+    let cli_m: Option<usize> = pos.get(0).and_then(|s| s.parse().ok());
+    let cli_k: Option<usize> = pos.get(1).and_then(|s| s.parse().ok());
+    let cli_ns: Option<Vec<usize>> = if pos.len() > 2 {
+        let v: Vec<usize> = pos[2..].iter().filter_map(|s| s.parse().ok()).collect();
         if v.is_empty() {
             None
         } else {
@@ -61,9 +121,9 @@ fn main() {
 
     let mut gpu = Gpu::init().expect("gpu init");
     let arch = gpu.arch.clone();
-    eprintln!("=== gemm_mq4g256v2_residual_simt probe ===");
-    eprintln!("arch={arch}");
-    println!("RESULT_META arch={arch}");
+    eprintln!("=== gemm_mq4g256v2 residual+set SIMT probe ===");
+    eprintln!("arch={arch} timing_mode={timing_mode}");
+    println!("RESULT_META arch={arch} timing_mode={}", timing_mode as u8);
 
     let large_m = cli_m.unwrap_or(512);
     let mut m_list: Vec<usize> = SMALL_MS.to_vec();
@@ -85,32 +145,49 @@ fn main() {
 
     eprintln!("shapes: M={m_list:?} K={k_list:?} N={n_list:?}  tol abs={ABS_TOL} rel={REL_TOL}");
 
-    let max_n = *n_list.iter().max().unwrap();
-    let max_m = *m_list.iter().max().unwrap();
-    let max_k = *k_list.iter().max().unwrap();
+    // Envelope covers default grid + boundary shapes so guards stay valid.
+    let bounds = boundary_shapes();
+    let max_n = n_list
+        .iter()
+        .copied()
+        .chain(bounds.iter().map(|s| s.2))
+        .max()
+        .unwrap_or(1);
+    let max_m = m_list
+        .iter()
+        .copied()
+        .chain(bounds.iter().map(|s| s.0))
+        .max()
+        .unwrap_or(1);
+    let max_k = k_list
+        .iter()
+        .copied()
+        .chain(bounds.iter().map(|s| s.1))
+        .max()
+        .unwrap_or(GROUP);
 
     // Shared host activations / residual init sized to the matrix envelope.
     let x_host = synth_x(max_n, max_k, 0xA11CE_u64);
     let y_init_host = synth_y_init(max_n, max_m, 0xBEEF_u64);
     // Guard sentinels beyond each active N: distinct nonzero pattern.
     let y_guard_host = synth_y_guard(max_n, max_m, 0xDEAD_u64);
+    let y_stale_host = synth_y_stale(max_n, max_m, 0x51A1Eu64);
 
     let mut failures = 0usize;
     let mut cases = 0usize;
 
+    // ── default residual + set cross-product ──
     for &m in &m_list {
         for &k in &k_list {
             let groups_per_row = k / GROUP;
             let row_bytes = groups_per_row * GROUP_BYTES;
             let weight_bytes = synth_mq4g256v2_weights(m, k, 0xC0DE_FACEu64);
-            // Sanity: dual-half headers must differ on at least one group.
             assert_dual_half_headers_differ(&weight_bytes, m, groups_per_row);
 
             let a_raw = gpu
                 .upload_raw(&weight_bytes, &[m * row_bytes])
                 .expect("upload weights");
 
-            // Precompute CPU dequant rows once per (m,k).
             let w_dequant: Vec<Vec<f32>> = (0..m)
                 .map(|row| dequant_row_v2(&weight_bytes, row, k))
                 .collect();
@@ -135,7 +212,7 @@ fn main() {
                     Ok(rep) => {
                         let status = if rep.ok { "PASS" } else { "FAIL" };
                         eprintln!(
-                            "  {label}: max_abs={:.6e} max_norm={:.6e} gemv_abs={:.6e} cpu_abs={:.6e} finite=1 residual_nz={} guard_ok={} [{status}]",
+                            "  residual {label}: max_abs={:.6e} max_norm={:.6e} gemv_abs={:.6e} cpu_abs={:.6e} finite=1 residual_nz={} guard_ok={} [{status}]",
                             rep.max_abs_all,
                             rep.max_norm_all,
                             rep.max_abs_gemv,
@@ -144,7 +221,7 @@ fn main() {
                             rep.guard_ok,
                         );
                         println!(
-                            "RESULT case={label} arch={arch} max_abs={:.9e} max_norm={:.9e} gemv_abs={:.9e} cpu_abs={:.9e} residual_nz={} guard_ok={} status={}",
+                            "RESULT case={label} kind=residual arch={arch} max_abs={:.9e} max_norm={:.9e} gemv_abs={:.9e} cpu_abs={:.9e} residual_nz={} guard_ok={} status={}",
                             rep.max_abs_all,
                             rep.max_norm_all,
                             rep.max_abs_gemv,
@@ -162,49 +239,214 @@ fn main() {
                     }
                     Err(e) => {
                         failures += 1;
-                        eprintln!("  {label}: ERROR {e}");
-                        println!("RESULT case={label} arch={arch} status=ERROR err={e}");
+                        eprintln!("  residual {label}: ERROR {e}");
+                        println!(
+                            "RESULT case={label} kind=residual arch={arch} status=ERROR err={e}"
+                        );
                     }
                 }
-            }
 
-            // Optional shape timing (no absolute gate) at max N for this M/K.
-            if let Some(&n_time) = n_list.iter().filter(|&&n| n > 1).max() {
-                if let Err(e) = time_shape(
-                    &mut gpu,
-                    &a_raw,
-                    &x_host,
-                    &y_init_host,
-                    m,
-                    k,
-                    n_time,
-                    max_m,
-                    max_k,
-                    &arch,
-                ) {
-                    eprintln!("  timing M={m} K={k} N={n_time}: {e}");
+                if arch.starts_with("gfx1010") {
+                    match run_set_variants(
+                        &mut gpu,
+                        &a_raw,
+                        &x_host,
+                        &y_stale_host,
+                        &y_guard_host,
+                        m,
+                        k,
+                        n,
+                        max_n,
+                        max_m,
+                        max_k,
+                    ) {
+                        Ok(reps) => {
+                            for rep in reps {
+                                cases += 1;
+                                let status = if rep.ok { "PASS" } else { "FAIL" };
+                                eprintln!(
+                                    "  set {} {label}: bitdiff_res={} bitdiff_gemv={} guard_ok={} finite={} stale_overwritten={} [{status}]",
+                                    rep.variant,
+                                    rep.bitdiff_residual,
+                                    rep.bitdiff_gemv,
+                                    rep.guard_ok,
+                                    rep.finite,
+                                    rep.stale_overwritten,
+                                );
+                                println!(
+                                    "RESULT_SET case={label} variant={} arch={arch} bitdiff_residual={} bitdiff_gemv={} guard_ok={} finite={} stale_overwritten={} status={}",
+                                    rep.variant,
+                                    rep.bitdiff_residual,
+                                    rep.bitdiff_gemv,
+                                    rep.guard_ok as u8,
+                                    rep.finite as u8,
+                                    rep.stale_overwritten as u8,
+                                    if rep.ok { "PASS" } else { "FAIL" }
+                                );
+                                if !rep.ok {
+                                    failures += 1;
+                                    if let Some(d) = &rep.detail {
+                                        eprintln!("    detail: {d}");
+                                    }
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            failures += 1;
+                            cases += SET_VARIANTS.len();
+                            eprintln!("  set {label}: ERROR {e}");
+                            println!("RESULT_SET case={label} arch={arch} status=ERROR err={e}");
+                        }
+                    }
                 }
             }
         }
     }
 
-    // Plain / batched-lmhead zeroing gate — only meaningful on gfx1010 where
+    // ── bounded boundary coverage (non-cross-product) ──
+    eprintln!("boundary shapes: {} cases", bounds.len());
+    // Group by (m,k) to reuse uploads.
+    let mut bound_groups: Vec<(usize, usize, Vec<usize>)> = Vec::new();
+    for &(m, k, n) in &bounds {
+        if let Some(g) = bound_groups
+            .iter_mut()
+            .find(|(mm, kk, _)| *mm == m && *kk == k)
+        {
+            if !g.2.contains(&n) {
+                g.2.push(n);
+            }
+        } else {
+            bound_groups.push((m, k, vec![n]));
+        }
+    }
+    for (m, k, ns) in bound_groups {
+        let groups_per_row = k / GROUP;
+        let row_bytes = groups_per_row * GROUP_BYTES;
+        let weight_bytes =
+            synth_mq4g256v2_weights(m, k, 0xB0A7Du64.wrapping_add(m as u64 * 17 + k as u64));
+        assert_dual_half_headers_differ(&weight_bytes, m, groups_per_row);
+        let a_raw = gpu
+            .upload_raw(&weight_bytes, &[m * row_bytes])
+            .expect("upload boundary weights");
+        let w_dequant: Vec<Vec<f32>> = (0..m)
+            .map(|row| dequant_row_v2(&weight_bytes, row, k))
+            .collect();
+        for n in ns {
+            cases += 1;
+            let label = format!("bound_M={m} K={k} N={n}");
+            match run_shape(
+                &mut gpu,
+                &a_raw,
+                &w_dequant,
+                &x_host,
+                &y_init_host,
+                &y_guard_host,
+                m,
+                k,
+                n,
+                max_n,
+                max_m,
+                max_k,
+            ) {
+                Ok(rep) => {
+                    println!(
+                        "RESULT case={label} kind=residual_bound arch={arch} max_abs={:.9e} residual_nz={} guard_ok={} status={}",
+                        rep.max_abs_all,
+                        rep.residual_nonzero as u8,
+                        rep.guard_ok as u8,
+                        if rep.ok { "PASS" } else { "FAIL" }
+                    );
+                    if !rep.ok {
+                        failures += 1;
+                        if let Some(d) = &rep.detail {
+                            eprintln!("  residual {label}: FAIL {d}");
+                        }
+                    }
+                }
+                Err(e) => {
+                    failures += 1;
+                    eprintln!("  residual {label}: ERROR {e}");
+                    println!(
+                        "RESULT case={label} kind=residual_bound arch={arch} status=ERROR err={e}"
+                    );
+                }
+            }
+            if arch.starts_with("gfx1010") {
+                match run_set_variants(
+                    &mut gpu,
+                    &a_raw,
+                    &x_host,
+                    &y_stale_host,
+                    &y_guard_host,
+                    m,
+                    k,
+                    n,
+                    max_n,
+                    max_m,
+                    max_k,
+                ) {
+                    Ok(reps) => {
+                        for rep in reps {
+                            cases += 1;
+                            println!(
+                                "RESULT_SET case={label} variant={} arch={arch} bitdiff_residual={} bitdiff_gemv={} guard_ok={} finite={} stale_overwritten={} status={}",
+                                rep.variant,
+                                rep.bitdiff_residual,
+                                rep.bitdiff_gemv,
+                                rep.guard_ok as u8,
+                                rep.finite as u8,
+                                rep.stale_overwritten as u8,
+                                if rep.ok { "PASS" } else { "FAIL" }
+                            );
+                            if !rep.ok {
+                                failures += 1;
+                                if let Some(d) = &rep.detail {
+                                    eprintln!("  set {} {label}: FAIL {d}", rep.variant);
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        failures += 1;
+                        cases += SET_VARIANTS.len();
+                        eprintln!("  set {label}: ERROR {e}");
+                        println!("RESULT_SET case={label} arch={arch} status=ERROR err={e}");
+                    }
+                }
+            }
+        }
+    }
+
+    // Plain / batched-lmhead overwrite gate — only meaningful on gfx1010 where
     // the SIMT fallback is auto-selected for N>1.
     if arch.starts_with("gfx1010") {
-        match run_plain_lmhead_zeroing(&mut gpu) {
+        match run_plain_lmhead_overwrite(&mut gpu) {
             Ok(()) => {
-                eprintln!("  plain/lmhead zeroing (gfx1010): PASS");
-                println!("RESULT case=plain_lmhead_zeroing arch={arch} status=PASS");
+                eprintln!("  plain/lmhead overwrite (gfx1010): PASS");
+                println!("RESULT case=plain_lmhead_overwrite arch={arch} status=PASS");
             }
             Err(e) => {
                 failures += 1;
-                eprintln!("  plain/lmhead zeroing (gfx1010): FAIL {e}");
-                println!("RESULT case=plain_lmhead_zeroing arch={arch} status=FAIL err={e}");
+                eprintln!("  plain/lmhead overwrite (gfx1010): FAIL {e}");
+                println!("RESULT case=plain_lmhead_overwrite arch={arch} status=FAIL err={e}");
             }
         }
     } else {
-        eprintln!("  plain/lmhead zeroing: SKIP (arch={arch}, not gfx1010)");
-        println!("RESULT case=plain_lmhead_zeroing arch={arch} status=SKIP");
+        eprintln!("  plain/lmhead overwrite: SKIP (arch={arch}, not gfx1010)");
+        println!("RESULT case=plain_lmhead_overwrite arch={arch} status=SKIP");
+    }
+
+    // Direct empty M/N no-op: residual + every set arm leave Y unchanged.
+    match run_empty_suite(&mut gpu, &arch) {
+        Ok(n_ok) => {
+            eprintln!("  empty suite: PASS ({n_ok} checks)");
+            println!("RESULT case=empty_suite arch={arch} checks={n_ok} status=PASS");
+        }
+        Err(e) => {
+            failures += 1;
+            eprintln!("  empty suite: FAIL {e}");
+            println!("RESULT case=empty_suite arch={arch} status=FAIL err={e}");
+        }
     }
 
     // Malformed-call gate: Err + sentinel Y preserved.
@@ -217,6 +459,19 @@ fn main() {
             failures += 1;
             eprintln!("  malformed suite: FAIL {e}");
             println!("RESULT case=malformed_suite arch={arch} status=FAIL err={e}");
+        }
+    }
+
+    // Optional Spark-projection timing (does not affect numerical pass/fail).
+    if timing_mode {
+        if arch.starts_with("gfx1010") {
+            if let Err(e) = run_spark_timing(&mut gpu, &arch) {
+                eprintln!("  spark timing: {e}");
+                println!("RESULT_TIMING case=spark_timing arch={arch} status=ERROR err={e}");
+            }
+        } else {
+            eprintln!("  spark timing: SKIP (arch={arch}, not gfx1010)");
+            println!("RESULT_TIMING case=spark_timing arch={arch} status=SKIP");
         }
     }
 
@@ -241,6 +496,17 @@ struct ShapeReport {
     detail: Option<String>,
 }
 
+struct SetReport {
+    variant: &'static str,
+    bitdiff_residual: usize,
+    bitdiff_gemv: usize,
+    guard_ok: bool,
+    finite: bool,
+    stale_overwritten: bool,
+    ok: bool,
+    detail: Option<String>,
+}
+
 fn run_shape(
     gpu: &mut Gpu,
     a_raw: &GpuTensor,
@@ -256,7 +522,6 @@ fn run_shape(
     max_k: usize,
 ) -> Result<ShapeReport, String> {
     // Active views: x is [n,k] taken from envelope [max_n, max_k] with row stride max_k.
-    // Build contiguous x_n / y_n for this shape.
     let mut x_n = vec![0.0f32; n * k];
     for b in 0..n {
         let src = &x_host[b * max_k..b * max_k + k];
@@ -290,9 +555,6 @@ fn run_shape(
     let y_gpu = gpu
         .upload_f32(&y_full, &[y_cap])
         .map_err(|e| format!("upload y: {e}"))?;
-    // Active Y view is the full capacity buffer; kernel only writes first n rows.
-    // Launcher takes y with numel covering active region; pass capacity tensor
-    // and rely on kernel ragged-N predicates for the rest.
 
     gpu.gemm_mq4g256v2_residual_simt(a_raw, &x_gpu, &y_gpu, m, k, n)
         .map_err(|e| format!("simt launch: {e}"))?;
@@ -421,6 +683,156 @@ fn run_shape(
     })
 }
 
+/// Zero-residual GPU oracles + each set arm from stale Y; require bitdiff=0.
+fn run_set_variants(
+    gpu: &mut Gpu,
+    a_raw: &GpuTensor,
+    x_host: &[f32],
+    y_stale_host: &[f32],
+    y_guard_host: &[f32],
+    m: usize,
+    k: usize,
+    n: usize,
+    max_n: usize,
+    max_m: usize,
+    max_k: usize,
+) -> Result<Vec<SetReport>, String> {
+    let mut x_n = vec![0.0f32; n * k];
+    for b in 0..n {
+        x_n[b * k..(b + 1) * k].copy_from_slice(&x_host[b * max_k..b * max_k + k]);
+    }
+
+    // Capacity Y with stale active region + guard beyond n.
+    let y_cap = max_n * m;
+    let mut y_stale_full = vec![0.0f32; y_cap];
+    for b in 0..n {
+        y_stale_full[b * m..(b + 1) * m].copy_from_slice(&y_stale_host[b * max_m..b * max_m + m]);
+    }
+    if n < max_n {
+        for b in n..max_n {
+            y_stale_full[b * m..(b + 1) * m]
+                .copy_from_slice(&y_guard_host[b * max_m..b * max_m + m]);
+        }
+    }
+    let y_guard_snapshot = y_stale_full[n * m..].to_vec();
+    let y_stale_active = y_stale_full[..n * m].to_vec();
+
+    let x_gpu = gpu
+        .upload_f32(&x_n, &[n * k])
+        .map_err(|e| format!("set upload x: {e}"))?;
+
+    // Residual-from-+0 GPU oracle (existing residual symbol).
+    let y_zero = vec![0.0f32; y_cap];
+    let y_res_gpu = gpu
+        .upload_f32(&y_zero, &[y_cap])
+        .map_err(|e| format!("set residual oracle upload: {e}"))?;
+    gpu.gemm_mq4g256v2_residual_simt(a_raw, &x_gpu, &y_res_gpu, m, k, n)
+        .map_err(|e| format!("set residual oracle: {e}"))?;
+    gpu.hip
+        .device_synchronize()
+        .map_err(|e| format!("set residual sync: {e}"))?;
+    let y_res_full = gpu
+        .download_f32(&y_res_gpu)
+        .map_err(|e| format!("set residual download: {e}"))?;
+    let y_res = &y_res_full[..n * m];
+
+    // GEMV-from-+0 oracle.
+    let mut y_gemv = vec![0.0f32; n * m];
+    let x_row = gpu
+        .alloc_tensor(&[k], DType::F32)
+        .map_err(|e| format!("set gemv x_row: {e}"))?;
+    let y_row = gpu
+        .alloc_tensor(&[m], DType::F32)
+        .map_err(|e| format!("set gemv y_row: {e}"))?;
+    for b in 0..n {
+        gpu.hip
+            .memcpy_htod(&x_row.buf, bytes_of(&x_n[b * k..(b + 1) * k]))
+            .map_err(|e| format!("set gemv x: {e}"))?;
+        let zero_row = vec![0.0f32; m];
+        gpu.hip
+            .memcpy_htod(&y_row.buf, bytes_of(&zero_row))
+            .map_err(|e| format!("set gemv y: {e}"))?;
+        gpu.gemv_hfq4g256_residual_mq4v2(a_raw, &x_row, &y_row, m, k)
+            .map_err(|e| format!("set gemv: {e}"))?;
+        let got = gpu
+            .download_f32(&y_row)
+            .map_err(|e| format!("set gemv dl: {e}"))?;
+        y_gemv[b * m..(b + 1) * m].copy_from_slice(&got);
+    }
+
+    let mut reports = Vec::with_capacity(SET_VARIANTS.len());
+    for &variant in SET_VARIANTS {
+        let name = set_variant_name(variant);
+        let y_gpu = gpu
+            .upload_f32(&y_stale_full, &[y_cap])
+            .map_err(|e| format!("{name} upload y: {e}"))?;
+        gpu.gemm_mq4g256v2_set_simt_variant(a_raw, &x_gpu, &y_gpu, m, k, n, variant)
+            .map_err(|e| format!("{name} launch: {e}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("{name} sync: {e}"))?;
+        let y_got_full = gpu
+            .download_f32(&y_gpu)
+            .map_err(|e| format!("{name} download: {e}"))?;
+        let y_got = &y_got_full[..n * m];
+
+        let guard_ok = if n < max_n {
+            y_got_full[n * m..] == y_guard_snapshot[..]
+        } else {
+            true
+        };
+        let finite = y_got.iter().all(|v| v.is_finite());
+        let bitdiff_residual = raw_bitdiff(y_got, y_res);
+        let bitdiff_gemv = raw_bitdiff(y_got, &y_gemv);
+
+        // Overwrite proof: active output matches residual-from-0 product, and
+        // is not the stale pattern (unless product and stale coincide).
+        let stale_overwritten = finite
+            && bitdiff_residual == 0
+            && (y_got != y_stale_active.as_slice() || y_res == y_stale_active.as_slice());
+
+        let mut detail = None;
+        let mut ok =
+            finite && guard_ok && bitdiff_residual == 0 && bitdiff_gemv == 0 && stale_overwritten;
+        if !finite {
+            ok = false;
+            detail = Some(format!("{name}: non-finite active output"));
+        } else if bitdiff_residual != 0 {
+            ok = false;
+            let (i, a, b) = first_bit_mismatch(y_got, y_res).unwrap_or((0, 0.0, 0.0));
+            detail = Some(format!(
+                "{name} vs residual-from-0 bitdiff={bitdiff_residual} first i={i} (b={} r={}) got={a:.8e} want={b:.8e}",
+                i / m,
+                i % m
+            ));
+        } else if bitdiff_gemv != 0 {
+            ok = false;
+            let (i, a, b) = first_bit_mismatch(y_got, &y_gemv).unwrap_or((0, 0.0, 0.0));
+            detail = Some(format!(
+                "{name} vs gemv-from-0 bitdiff={bitdiff_gemv} first i={i} got={a:.8e} want={b:.8e}"
+            ));
+        } else if !guard_ok {
+            ok = false;
+            detail = Some(format!("{name}: ragged-N guard region mutated"));
+        } else if !stale_overwritten {
+            ok = false;
+            detail = Some(format!("{name}: stale Y not overwritten"));
+        }
+
+        reports.push(SetReport {
+            variant: name,
+            bitdiff_residual,
+            bitdiff_gemv,
+            guard_ok,
+            finite,
+            stale_overwritten,
+            ok,
+            detail,
+        });
+    }
+    Ok(reports)
+}
+
 fn dog_group(mut acc: f32, w: &[f32], x: &[f32], g: usize) -> f32 {
     let base = g * GROUP;
     // Full 256-dot for the group (CPU reference; GPU splits across 32 lanes
@@ -451,95 +863,26 @@ fn compare_tol(got: &[f32], want: &[f32]) -> (f32, f32, Option<(usize, f32, f32)
     (max_abs, max_norm, first)
 }
 
-fn time_shape(
-    gpu: &mut Gpu,
-    a_raw: &GpuTensor,
-    x_host: &[f32],
-    y_init_host: &[f32],
-    m: usize,
-    k: usize,
-    n: usize,
-    max_m: usize,
-    max_k: usize,
-    arch: &str,
-) -> Result<(), String> {
-    let mut x_n = vec![0.0f32; n * k];
-    for b in 0..n {
-        x_n[b * k..(b + 1) * k].copy_from_slice(&x_host[b * max_k..b * max_k + k]);
-    }
-    let mut y_n = vec![0.0f32; n * m];
-    for b in 0..n {
-        y_n[b * m..(b + 1) * m].copy_from_slice(&y_init_host[b * max_m..b * max_m + m]);
-    }
-    let x_gpu = gpu.upload_f32(&x_n, &[n * k]).map_err(|e| format!("{e}"))?;
-    let y_gpu = gpu.upload_f32(&y_n, &[n * m]).map_err(|e| format!("{e}"))?;
-
-    // Warmup
-    for _ in 0..3 {
-        gpu.hip
-            .memcpy_htod(&y_gpu.buf, bytes_of(&y_n))
-            .map_err(|e| format!("{e}"))?;
-        gpu.gemm_mq4g256v2_residual_simt(a_raw, &x_gpu, &y_gpu, m, k, n)
-            .map_err(|e| format!("{e}"))?;
-        gpu.hip.device_synchronize().map_err(|e| format!("{e}"))?;
-    }
-
-    // Timed SIMT
-    let iters = 5usize;
-    let mut simt_us = 0.0f64;
-    for _ in 0..iters {
-        gpu.hip
-            .memcpy_htod(&y_gpu.buf, bytes_of(&y_n))
-            .map_err(|e| format!("{e}"))?;
-        gpu.hip.device_synchronize().map_err(|e| format!("{e}"))?;
-        let t = Instant::now();
-        gpu.gemm_mq4g256v2_residual_simt(a_raw, &x_gpu, &y_gpu, m, k, n)
-            .map_err(|e| format!("{e}"))?;
-        gpu.hip.device_synchronize().map_err(|e| format!("{e}"))?;
-        simt_us += t.elapsed().as_secs_f64() * 1e6;
-    }
-    simt_us /= iters as f64;
-
-    // Timed GEMV × N
-    let x_row = gpu
-        .alloc_tensor(&[k], DType::F32)
-        .map_err(|e| format!("{e}"))?;
-    let y_row = gpu
-        .alloc_tensor(&[m], DType::F32)
-        .map_err(|e| format!("{e}"))?;
-    let mut gemv_us = 0.0f64;
-    for _ in 0..iters {
-        gpu.hip.device_synchronize().map_err(|e| format!("{e}"))?;
-        let t = Instant::now();
-        for b in 0..n {
-            gpu.hip
-                .memcpy_htod(&x_row.buf, bytes_of(&x_n[b * k..(b + 1) * k]))
-                .map_err(|e| format!("{e}"))?;
-            gpu.hip
-                .memcpy_htod(&y_row.buf, bytes_of(&y_n[b * m..(b + 1) * m]))
-                .map_err(|e| format!("{e}"))?;
-            gpu.gemv_hfq4g256_residual_mq4v2(a_raw, &x_row, &y_row, m, k)
-                .map_err(|e| format!("{e}"))?;
-        }
-        gpu.hip.device_synchronize().map_err(|e| format!("{e}"))?;
-        gemv_us += t.elapsed().as_secs_f64() * 1e6;
-    }
-    gemv_us /= iters as f64;
-
-    eprintln!(
-        "  timing M={m} K={k} N={n}: simt={simt_us:.1}µs gemv×{n}={gemv_us:.1}µs ratio={:.2}x (informational)",
-        gemv_us / simt_us
-    );
-    println!(
-        "RESULT_TIMING case=M={m}_K={k}_N={n} arch={arch} simt_us={simt_us:.3} gemv_us={gemv_us:.3} ratio={:.6}",
-        gemv_us / simt_us
-    );
-    Ok(())
+fn raw_bitdiff(a: &[f32], b: &[f32]) -> usize {
+    assert_eq!(a.len(), b.len());
+    a.iter()
+        .zip(b.iter())
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count()
 }
 
-/// On gfx1010, plain + batched-lmhead must zero Y before residual += so stale
-/// Y cannot pass. Uses a small fixed shape.
-fn run_plain_lmhead_zeroing(gpu: &mut Gpu) -> Result<(), String> {
+fn first_bit_mismatch(a: &[f32], b: &[f32]) -> Option<(usize, f32, f32)> {
+    a.iter()
+        .zip(b.iter())
+        .enumerate()
+        .find(|(_, (x, y))| x.to_bits() != y.to_bits())
+        .map(|(i, (x, y))| (i, *x, *y))
+}
+
+/// On gfx1010, plain + batched-lmhead must overwrite stale Y so residual
+/// product (from +0) is observed. Does not assert memset; only product
+/// equality. Uses a small fixed shape.
+fn run_plain_lmhead_overwrite(gpu: &mut Gpu) -> Result<(), String> {
     let m = 32usize;
     let k = 256usize;
     let n = 4usize;
@@ -575,7 +918,7 @@ fn run_plain_lmhead_zeroing(gpu: &mut Gpu) -> Result<(), String> {
     let (abs_p, _, fail_p) = compare_tol(&y_plain, &y_ref);
     if let Some((i, a, b)) = fail_p {
         return Err(format!(
-            "plain did not zero Y: i={i} got={a:.6e} want={b:.6e} (stale was {:.6e}) max_abs={abs_p:.6e}",
+            "plain did not overwrite stale Y: i={i} got={a:.6e} want={b:.6e} (stale was {:.6e}) max_abs={abs_p:.6e}",
             stale[i]
         ));
     }
@@ -590,12 +933,12 @@ fn run_plain_lmhead_zeroing(gpu: &mut Gpu) -> Result<(), String> {
     let (abs_l, _, fail_l) = compare_tol(&y_lm, &y_ref);
     if let Some((i, a, b)) = fail_l {
         return Err(format!(
-            "batched_lmhead did not zero Y: i={i} got={a:.6e} want={b:.6e} (stale was {:.6e}) max_abs={abs_l:.6e}",
+            "batched_lmhead did not overwrite stale Y: i={i} got={a:.6e} want={b:.6e} (stale was {:.6e}) max_abs={abs_l:.6e}",
             stale[i]
         ));
     }
 
-    // Residual path must KEEP stale (not zero): control that residual ≠ plain.
+    // Residual path must KEEP stale (not overwrite): control residual ≠ plain.
     let y_res_gpu = gpu
         .upload_f32(&stale, &[n * m])
         .map_err(|e| format!("{e}"))?;
@@ -620,11 +963,86 @@ fn run_plain_lmhead_zeroing(gpu: &mut Gpu) -> Result<(), String> {
     }
     if !residual_differs {
         return Err(
-            "residual launcher appears to have cleared Y (plain-vs-residual control failed)".into(),
+            "residual launcher appears to have overwritten Y (plain-vs-residual control failed)"
+                .into(),
         );
     }
 
     Ok(())
+}
+
+// ── empty M/N direct no-op ────────────────────────────────────────────────
+
+fn run_empty_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
+    let m0 = 8usize;
+    let k0 = 256usize;
+    let n0 = 4usize;
+    let a_bytes = m0 * (k0 / GROUP) * GROUP_BYTES;
+    let weight = synth_mq4g256v2_weights(m0, k0, 0xE0E0u64);
+    let a_ok = gpu
+        .upload_raw(&weight, &[a_bytes])
+        .map_err(|e| format!("empty a: {e}"))?;
+    let x_ok = gpu
+        .upload_f32(&synth_x(n0.max(1), k0, 0x222u64), &[n0.max(1) * k0])
+        .map_err(|e| format!("empty x: {e}"))?;
+    const Y_LEN: usize = 32;
+    let y = gpu
+        .upload_f32(&vec![0.0f32; Y_LEN], &[Y_LEN])
+        .map_err(|e| format!("empty y: {e}"))?;
+
+    let mut checks = 0usize;
+    let mut one = |entry: &str,
+                   m: usize,
+                   n: usize,
+                   call: &mut dyn FnMut(&mut Gpu) -> Result<(), hip_bridge::HipError>|
+     -> Result<(), String> {
+        let nbytes = y.buf.size();
+        let pattern = canary_bytes(b"empty", entry.as_bytes(), nbytes);
+        gpu.hip
+            .memcpy_htod(&y.buf, &pattern)
+            .map_err(|e| format!("empty canary: {e}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("empty sync pre: {e}"))?;
+        call(gpu).map_err(|e| format!("{entry} empty M={m} N={n}: unexpected Err {e}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("empty sync post: {e}"))?;
+        let mut got = vec![0u8; nbytes];
+        gpu.hip
+            .memcpy_dtoh(&mut got, &y.buf)
+            .map_err(|e| format!("empty dl: {e}"))?;
+        if got != pattern {
+            return Err(format!(
+                "{entry} empty M={m} N={n}: Y mutated (no-op must not touch Y)"
+            ));
+        }
+        println!("RESULT_EMPTY entry={entry} case=M={m}_N={n} arch={arch} status=PASS");
+        checks += 1;
+        Ok(())
+    };
+
+    // Residual empty M / empty N.
+    one("residual_simt", 0, n0, &mut |gpu| {
+        gpu.gemm_mq4g256v2_residual_simt(&a_ok, &x_ok, &y, 0, k0, n0)
+    })?;
+    one("residual_simt", m0, 0, &mut |gpu| {
+        gpu.gemm_mq4g256v2_residual_simt(&a_ok, &x_ok, &y, m0, k0, 0)
+    })?;
+
+    if arch.starts_with("gfx1010") {
+        for &variant in SET_VARIANTS {
+            let name = set_variant_name(variant);
+            one(name, 0, n0, &mut |gpu| {
+                gpu.gemm_mq4g256v2_set_simt_variant(&a_ok, &x_ok, &y, 0, k0, n0, variant)
+            })?;
+            one(name, m0, 0, &mut |gpu| {
+                gpu.gemm_mq4g256v2_set_simt_variant(&a_ok, &x_ok, &y, m0, k0, 0, variant)
+            })?;
+        }
+    }
+
+    Ok(checks)
 }
 
 // ── malformed-call gate ───────────────────────────────────────────────────
@@ -635,6 +1053,7 @@ enum MalformedEntry {
     Residual,
     Plain,
     Lmhead,
+    Set(Mq4g256v2SimtSetVariant),
 }
 
 impl MalformedEntry {
@@ -643,6 +1062,7 @@ impl MalformedEntry {
             Self::Residual => "residual_simt",
             Self::Plain => "plain",
             Self::Lmhead => "batched_lmhead",
+            Self::Set(v) => set_variant_name(v),
         }
     }
 
@@ -660,19 +1080,19 @@ impl MalformedEntry {
             Self::Residual => gpu.gemm_mq4g256v2_residual_simt(a, x, y, m, k, n),
             Self::Plain => gpu.gemm_mq4g256v2(a, x, y, m, k, n),
             Self::Lmhead => gpu.gemm_mq4g256v2_batched_lmhead(a, x, y, m, k, n),
+            Self::Set(v) => gpu.gemm_mq4g256v2_set_simt_variant(a, x, y, m, k, n, v),
         }
     }
 }
 
-/// Malformed residual (+ gfx1010 plain/lmhead) checks.
+/// Malformed residual + set arms (+ gfx1010 plain/lmhead) checks.
 ///
 /// Only honest small allocations + oversized scalar dims. No fabricated
 /// buffer extents. Which guard rejects first is irrelevant; the observable
 /// contract is `Err` and unchanged bytes in the **actual Y buffer passed**
-/// to the call (catches zero-before-validation on that tensor, including
+/// to the call (catches mutation-before-validation on that tensor, including
 /// wrong-dtype Y).
 fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
-    // Small valid payloads for base tensors.
     let m0 = 8usize;
     let k0 = 256usize;
     let n0 = 4usize; // >1 so plain/lmhead take the gfx1010 SIMT branch
@@ -685,14 +1105,11 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
         .upload_f32(&synth_x(n0, k0, 0x111u64), &[n0 * k0])
         .map_err(|e| format!("malformed x_ok: {e}"))?;
 
-    // Small F32 Y used by short_Y + oversized-dim cases. Capacity may be
-    // pool-rounded above logical 16×f32; canary uses the real buf.size().
     const Y_SENT_LEN: usize = 16;
     let y_f32 = gpu
         .upload_f32(&vec![0.0f32; Y_SENT_LEN], &[Y_SENT_LEN])
         .map_err(|e| format!("malformed y_f32: {e}"))?;
 
-    // Undersized siblings of A/X (still nonzero so dtype/extent paths matter).
     let a_short = gpu
         .upload_raw(&[0u8; 64], &[64])
         .map_err(|e| format!("malformed a_short: {e}"))?;
@@ -702,20 +1119,21 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
     let x_f16 = gpu
         .alloc_tensor(&[n0 * k0], DType::F16)
         .map_err(|e| format!("malformed x_f16: {e}"))?;
-    // Distinct wrong-dtype Y: canary must snapshot *this* buffer, not y_f32.
     let y_f16 = gpu
         .alloc_tensor(&[n0 * m0], DType::F16)
         .map_err(|e| format!("malformed y_f16: {e}"))?;
 
     let mut entries = vec![MalformedEntry::Residual];
     if arch.starts_with("gfx1010") {
+        for &v in SET_VARIANTS {
+            entries.push(MalformedEntry::Set(v));
+        }
         entries.push(MalformedEntry::Plain);
         entries.push(MalformedEntry::Lmhead);
     }
 
     let mut checks = 0usize;
 
-    // Helper: Err + the *passed* Y buffer's real device bytes unchanged.
     let mut one = |entry: MalformedEntry,
                    tag: &str,
                    a: &GpuTensor,
@@ -729,8 +1147,6 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
         if nbytes == 0 {
             return Err(format!("{}/{}: Y buffer reports size 0", entry.name(), tag));
         }
-        // Unique nonzero pattern covering the full allocated device buffer
-        // (including any pool-rounded tail past logical numel).
         let pattern = canary_bytes(tag.as_bytes(), entry.name().as_bytes(), nbytes);
         gpu.hip
             .memcpy_htod(&y.buf, &pattern)
@@ -747,7 +1163,7 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
         match res {
             Ok(()) => {
                 return Err(format!(
-                    "{}/{}: expected Err, got Ok (would mask zero-before-validation)",
+                    "{}/{}: expected Err, got Ok (would mask mutation-before-validation)",
                     entry.name(),
                     tag
                 ));
@@ -783,39 +1199,20 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
         Ok(())
     };
 
-    // Scalar boundaries used for overflow / i32 cases. Honest small buffers
-    // mean an earlier guard (byte overflow or extent) may fire before the
-    // named one — that is accepted.
     let m_i32 = (i32::MAX as usize).saturating_add(1);
-    let k_i32 = ((i32::MAX as usize).saturating_add(256)) & !255; // >i32::MAX, %256==0
+    let k_i32 = ((i32::MAX as usize).saturating_add(256)) & !255;
     let n_i32 = (i32::MAX as usize).saturating_add(1);
     let m_a_ovf = usize::MAX / 8;
     let n_x_ovf = usize::MAX / 8;
-    // Prefer M > K so N*M*4 is likelier to overflow before N*K*4 if products
-    // reach the y_bytes check; still Err either way with small buffers.
     let m_y_ovf = 1024usize;
     let n_y_ovf = (usize::MAX / (m_y_ovf.saturating_mul(4).max(1))).saturating_add(1);
 
     for entry in entries {
-        // Insufficient A extent (claim m0×k0 against 64 B).
         one(entry, "short_A", &a_short, &x_ok, &y_f32, m0, k0, n0)?;
-
-        // Insufficient X extent.
         one(entry, "short_X", &a_ok, &x_short, &y_f32, m0, k0, n0)?;
-
-        // Insufficient Y extent: claim n0×m0 against small F32 Y.
-        // Kept unchanged as the zero-before-validation canary that caught
-        // pool-rounded capacity accepting short logical Y (numel guard fix
-        // lands in gemm.rs via Gfx10DispatchFix).
         one(entry, "short_Y", &a_ok, &x_ok, &y_f32, m0, k0, n0)?;
-
-        // Wrong X dtype.
         one(entry, "bad_x_dtype", &a_ok, &x_f16, &y_f32, m0, k0, n0)?;
-
-        // Wrong Y dtype — canary snapshots y_f16 itself, not y_f32.
         one(entry, "bad_y_dtype", &a_ok, &x_ok, &y_f16, m0, k0, n0)?;
-
-        // Byte-count overflow via oversized scalars (no huge alloc).
         one(
             entry,
             "overflow_y_bytes",
@@ -846,9 +1243,6 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
             k0,
             n_x_ovf,
         )?;
-
-        // i32-boundary scalars with honest small buffers. Extent/overflow
-        // may reject first; contract is still Err + passed-Y intact.
         one(entry, "i32_overflow_M", &a_ok, &x_ok, &y_f32, m_i32, k0, n0)?;
         one(entry, "i32_overflow_K", &a_ok, &x_ok, &y_f32, m0, k_i32, n0)?;
         one(entry, "i32_overflow_N", &a_ok, &x_ok, &y_f32, m0, k0, n_i32)?;
@@ -875,10 +1269,185 @@ fn canary_bytes(tag: &[u8], entry: &[u8], nbytes: usize) -> Vec<u8> {
     }
     for slot in &mut out {
         state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
-        // Keep nonzero so a full zero-fill is always a detectable mutation.
         *slot = ((state >> 33) as u8) | 1;
     }
     out
+}
+
+// ── optional Spark projection timing ──────────────────────────────────────
+
+struct SparkShape {
+    name: &'static str,
+    m: usize,
+    k: usize,
+    multiplicity: usize,
+}
+
+const SPARK_SHAPES: &[SparkShape] = &[
+    SparkShape {
+        name: "qkv",
+        m: 6144,
+        k: 2560,
+        multiplicity: 1,
+    },
+    SparkShape {
+        name: "head_gate",
+        m: 16,
+        k: 2560,
+        multiplicity: 1,
+    },
+    SparkShape {
+        name: "attn_out",
+        m: 2560,
+        k: 4096,
+        multiplicity: 1,
+    },
+    SparkShape {
+        name: "ffn_gate_up",
+        m: 10240,
+        k: 2560,
+        multiplicity: 2,
+    },
+    SparkShape {
+        name: "ffn_down",
+        m: 2560,
+        k: 10240,
+        multiplicity: 1,
+    },
+];
+
+const SPARK_NS: &[usize] = &[64, 46, 8];
+const TIMING_WARMUPS: usize = 10;
+const TIMING_ITERS: usize = 5;
+
+fn run_spark_timing(gpu: &mut Gpu, arch: &str) -> Result<(), String> {
+    eprintln!("=== spark projection timing (kernel-only) ===");
+    for shape in SPARK_SHAPES {
+        let m = shape.m;
+        let k = shape.k;
+        let row_bytes = (k / GROUP) * GROUP_BYTES;
+        let weight_bytes = synth_mq4g256v2_weights(m, k, 0x71ME_u64.wrapping_add(m as u64));
+        let a_raw = gpu
+            .upload_raw(&weight_bytes, &[m * row_bytes])
+            .map_err(|e| format!("timing weights {}: {e}", shape.name))?;
+
+        for &n in SPARK_NS {
+            let x_host = synth_x(n, k, 0x71XEu64);
+            let x_gpu = gpu
+                .upload_f32(&x_host, &[n * k])
+                .map_err(|e| format!("timing x: {e}"))?;
+            let y_elems = n * m;
+            let y_zero = vec![0.0f32; y_elems];
+            let y_gpu = gpu
+                .upload_f32(&y_zero, &[y_elems])
+                .map_err(|e| format!("timing y: {e}"))?;
+
+            // Baseline: residual from zero.
+            let samples_res = time_kernel_us(gpu, &y_gpu, &y_zero, |gpu| {
+                gpu.gemm_mq4g256v2_residual_simt(&a_raw, &x_gpu, &y_gpu, m, k, n)
+            })?;
+            emit_timing(
+                arch,
+                shape.name,
+                "residual_from_zero",
+                m,
+                k,
+                n,
+                shape.multiplicity,
+                &samples_res,
+            );
+
+            for &variant in SET_VARIANTS {
+                let name = set_variant_name(variant);
+                // Stale init so set path does real overwrite work; timing is
+                // kernel-only (htod of Y excluded from measured window).
+                let stale: Vec<f32> = (0..y_elems).map(|i| 1234.0 + (i as f32) * 0.001).collect();
+                let samples = time_kernel_us(gpu, &y_gpu, &stale, |gpu| {
+                    gpu.gemm_mq4g256v2_set_simt_variant(&a_raw, &x_gpu, &y_gpu, m, k, n, variant)
+                })?;
+                emit_timing(
+                    arch,
+                    shape.name,
+                    name,
+                    m,
+                    k,
+                    n,
+                    shape.multiplicity,
+                    &samples,
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+fn time_kernel_us<F>(
+    gpu: &mut Gpu,
+    y_gpu: &GpuTensor,
+    y_host: &[f32],
+    mut launch: F,
+) -> Result<Vec<f64>, String>
+where
+    F: FnMut(&mut Gpu) -> Result<(), hip_bridge::HipError>,
+{
+    for _ in 0..TIMING_WARMUPS {
+        gpu.hip
+            .memcpy_htod(&y_gpu.buf, bytes_of(y_host))
+            .map_err(|e| format!("warmup htod: {e}"))?;
+        launch(gpu).map_err(|e| format!("warmup launch: {e}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("warmup sync: {e}"))?;
+    }
+    let mut samples = Vec::with_capacity(TIMING_ITERS);
+    for _ in 0..TIMING_ITERS {
+        gpu.hip
+            .memcpy_htod(&y_gpu.buf, bytes_of(y_host))
+            .map_err(|e| format!("timed htod: {e}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("pre sync: {e}"))?;
+        let t = Instant::now();
+        launch(gpu).map_err(|e| format!("timed launch: {e}"))?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|e| format!("post sync: {e}"))?;
+        samples.push(t.elapsed().as_secs_f64() * 1e6);
+    }
+    Ok(samples)
+}
+
+fn emit_timing(
+    arch: &str,
+    shape: &str,
+    entry: &str,
+    m: usize,
+    k: usize,
+    n: usize,
+    multiplicity: usize,
+    samples_us: &[f64],
+) {
+    let mut sorted = samples_us.to_vec();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let median = if sorted.is_empty() {
+        0.0
+    } else if sorted.len() % 2 == 1 {
+        sorted[sorted.len() / 2]
+    } else {
+        0.5 * (sorted[sorted.len() / 2 - 1] + sorted[sorted.len() / 2])
+    };
+    let samples_str = samples_us
+        .iter()
+        .map(|v| format!("{v:.3}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    eprintln!(
+        "  timing {shape} entry={entry} M={m} K={k} N={n} mult={multiplicity}: median={median:.1}µs samples=[{samples_str}]"
+    );
+    println!(
+        "RESULT_TIMING shape={shape} entry={entry} M={m} K={k} N={n} multiplicity={multiplicity} arch={arch} median_us={median:.3} samples_us={samples_str} warmups={TIMING_WARMUPS} iters={}",
+        samples_us.len()
+    );
 }
 
 // ── synthetic fixtures ────────────────────────────────────────────────────
@@ -908,7 +1477,6 @@ fn synth_y_init(n: usize, m: usize, seed: u64) -> Vec<f32> {
     (0..n * m)
         .map(|_| {
             let u = (next() as f32) / (u32::MAX as f32);
-            // Nonzero residual in (-0.5, 0.5), avoid exact zeros.
             let v = u - 0.5;
             if v.abs() < 1e-3 {
                 0.25
@@ -928,8 +1496,24 @@ fn synth_y_guard(n: usize, m: usize, seed: u64) -> Vec<f32> {
     (0..n * m)
         .map(|i| {
             let u = (next() as f32) / (u32::MAX as f32);
-            // Distinct sentinel magnitude so accidental writes stand out.
             42.0 + u + (i as f32) * 1e-4
+        })
+        .collect()
+}
+
+/// Large nonzero stale pattern for set overwrite proofs.
+fn synth_y_stale(n: usize, m: usize, seed: u64) -> Vec<f32> {
+    let mut state = seed;
+    let mut next = || {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(0x51A1E);
+        (state >> 33) as u32
+    };
+    (0..n * m)
+        .map(|i| {
+            let u = (next() as f32) / (u32::MAX as f32);
+            1000.0 + 250.0 * u + (i as f32) * 0.125
         })
         .collect()
 }
@@ -939,7 +1523,6 @@ fn synth_y_guard(n: usize, m: usize, seed: u64) -> Vec<f32> {
 /// stay disjoint so a wrong half-header select fails loudly, but magnitudes
 /// stay modest so F32 assoc between CPU sequential dots and GPU warp
 /// reduction stays inside strict tol.
-
 fn synth_mq4g256v2_weights(m: usize, k: usize, seed: u64) -> Vec<u8> {
     assert_eq!(k % GROUP, 0);
     let mut w = vec![0.0f32; m * k];

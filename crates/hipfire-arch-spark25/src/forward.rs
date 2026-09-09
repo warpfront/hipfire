@@ -1077,7 +1077,7 @@ fn prefill_chunked_body(
                 if n_rot_pairs == 0 {
                     // degenerate — skip
                 } else if n_rot_pairs * 2 >= head_dim {
-                    gpu.rope_batched_strided_f32(
+                    gpu.rope_batched_strided_f32_gfx1010(
                         &qkv,
                         &positions,
                         n_heads,
@@ -1090,11 +1090,11 @@ fn prefill_chunked_body(
                         qkv_rows,
                     )
                     .map_err(|e| {
-                        format!("spark25 L{layer_idx} chunk@{pos0}: rope_batched_strided: {e:?}")
+                        format!("spark25 L{layer_idx} chunk@{pos0}: rope_batched_strided_gfx1010: {e:?}")
                     })?;
                 } else {
                     let n_rot = n_rot_pairs * 2;
-                    gpu.rope_partial_interleaved_batched_strided_f32(
+                    gpu.rope_partial_interleaved_batched_strided_f32_gfx1010(
                         &qkv,
                         &positions,
                         n_heads,
@@ -1110,12 +1110,12 @@ fn prefill_chunked_body(
                     )
                     .map_err(|e| {
                         format!(
-                            "spark25 L{layer_idx} chunk@{pos0}: rope_partial_batched_strided: {e:?}"
+                            "spark25 L{layer_idx} chunk@{pos0}: rope_partial_batched_strided_gfx1010: {e:?}"
                         )
                     })?;
                 }
 
-                gpu.kv_cache_write_q8_0_batched_strided(
+                gpu.kv_cache_write_q8_0_batched_strided_gfx1010(
                     &kv.k_gpu[kv_slot],
                     &qkv,
                     &positions,
@@ -1128,7 +1128,7 @@ fn prefill_chunked_body(
                 .map_err(|e| {
                     format!("spark25 L{layer_idx} chunk@{pos0}: kv write k batched: {e:?}")
                 })?;
-                gpu.kv_cache_write_q8_0_batched_strided(
+                gpu.kv_cache_write_q8_0_batched_strided_gfx1010(
                     &kv.v_gpu[kv_slot],
                     &qkv,
                     &positions,
@@ -1143,7 +1143,7 @@ fn prefill_chunked_body(
                 })?;
 
                 let maxctx = pos0 + c;
-                gpu.attention_q8_0_kv_batched_swa_strided(
+                gpu.attention_q8_0_kv_batched_swa_strided_gfx1010(
                     &qkv,
                     &kv.k_gpu[kv_slot],
                     &kv.v_gpu[kv_slot],
@@ -1162,7 +1162,6 @@ fn prefill_chunked_body(
                     format!("spark25 L{layer_idx} chunk@{pos0}: attn swa batched: {e:?}")
                 })?;
             }
-
 
             // Headwise sigmoid: gate[i/head_dim] with n_heads_total = c*n_heads.
             if cfg.headwise_attn_output_gate {

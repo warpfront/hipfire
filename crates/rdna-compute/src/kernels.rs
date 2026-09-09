@@ -3128,6 +3128,11 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC: &str =
 /// BATCH_TILE=8, grid [M, ceil(N/8)], block [32,1,1], LDS 0.
 pub const GEMM_MQ4G256V2_RESIDUAL_SIMT_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_simt.hip");
+/// Temporary gfx1010 FP32 plain-set SIMT experiment arms (Y = A·X).
+/// Four candidate entries share this TU; residual oracle stays on
+/// GEMM_MQ4G256V2_RESIDUAL_SIMT_SRC. Cleanup removes this after selection.
+pub const GEMM_MQ4G256V2_SIMT_EXPERIMENTS_GFX1010_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_simt_experiments_gfx1010.hip");
 
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma.hip");
@@ -5018,6 +5023,16 @@ pub const ROPE_SRC: &str = include_str!("../../../kernels/src/rope.hip");
 /// Grid: [half, batch_size, 1]. Each thread handles one (position, freq_index) pair.
 pub const ROPE_BATCHED_SRC: &str = include_str!("../../../kernels/src/rope_batched.hip");
 
+/// gfx1010 strided in-place batched RoPE over packed qkv rows.
+/// Entry: rope_batched_strided_f32_gfx1010. Portable ROPE_BATCHED_SRC unchanged.
+pub const ROPE_BATCHED_STRIDED_GFX1010_SRC: &str =
+    include_str!("../../../kernels/src/rope_batched_strided_gfx1010.hip");
+
+/// gfx1010 strided partial batched RoPE (nrot/pos_offset/interleaved).
+/// Entry: rope_partial_batched_strided_f32_gfx1010.
+pub const ROPE_PARTIAL_BATCHED_STRIDED_GFX1010_SRC: &str =
+    include_str!("../../../kernels/src/rope_partial_batched_strided_gfx1010.hip");
+
 /// Single-head causal attention on GPU.
 /// One thread block per query head. Handles GQA (kv_group heads share same KV).
 /// q: [n_heads * head_dim], k_cache: [seq_len * n_kv_heads * head_dim],
@@ -5305,6 +5320,12 @@ pub const ATTENTION_DECODE_BATCHED_HISTORY_SRC: &str =
 pub const KV_CACHE_WRITE_Q8_0_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_q8_0_batched.hip");
 
+/// gfx1010 strided batched Q8_0 KV cache write from packed qkv rows.
+/// Entry: kv_cache_write_q8_0_batched_strided_gfx1010.
+/// Portable KV_CACHE_WRITE_Q8_0_BATCHED_SRC unchanged.
+pub const KV_CACHE_WRITE_Q8_0_BATCHED_STRIDED_GFX1010_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_q8_0_batched_strided_gfx1010.hip");
+
 /// Quantize KV vector to Q8_0 format (same as GGML Q8_0 / existing GEMV kernels).
 /// Block: [f16 scale (2B)][int8 × 32 (32B)] = 34 bytes per 32 elements.
 /// head_dim=128 → 4 blocks × 34 = 136 bytes per head.
@@ -5339,6 +5360,12 @@ pub const ATTENTION_Q8_0_KV_SWA_SRC: &str =
 /// one launch with per-row causal windows from a positions[] array.
 pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip");
+
+/// gfx1010 strided batched SWA Q8_0 attention over packed qkv rows.
+/// Entry: attention_q8_0_kv_batched_swa_strided_gfx1010.
+/// Portable ATTENTION_Q8_0_KV_BATCHED_SRC / SWA unchanged.
+pub const ATTENTION_Q8_0_KV_BATCHED_SWA_STRIDED_GFX1010_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_kv_batched_swa_strided_gfx1010.hip");
 
 /// Query-tiled Q8_0 flash prefill attention. LDS depends only on BR/BC,
 /// never on context length, so one kernel serves every sequence length.

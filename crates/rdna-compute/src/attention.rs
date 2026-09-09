@@ -1647,8 +1647,9 @@ impl Gpu {
     /// (`qdim` / `qdim+kvdim`). Positions are absolute i32 values stored in
     /// the existing F32/raw4 allocation; range/slot validity is a caller
     /// precondition (no host readback).
+    /// gfx1010-only; other arches get an exact-gfx1010 error before any compile.
     #[allow(clippy::too_many_arguments)]
-    pub fn kv_cache_write_q8_0_batched_strided(
+    pub fn kv_cache_write_q8_0_batched_strided_gfx1010(
         &mut self,
         dst: &GpuTensor,
         qkv: &GpuTensor,
@@ -1659,15 +1660,23 @@ impl Gpu {
         stride: usize,
         col: usize,
     ) -> HipResult<()> {
-        const WHO: &str = "kv_cache_write_q8_0_batched_strided";
+        const WHO: &str = "kv_cache_write_q8_0_batched_strided_gfx1010";
         // N=0 is a safe no-op before any bind/launch.
         if batch_size == 0 {
             return Ok(());
         }
+        if !self.arch_caps.is_gfx1010() {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!("{WHO}: exact gfx1010 required (got {})", self.arch),
+            ));
+        }
         if n_kv_heads == 0 || head_dim == 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!("{WHO}: invalid head geometry (n_kv_heads={n_kv_heads}, head_dim={head_dim})"),
+                &format!(
+                    "{WHO}: invalid head geometry (n_kv_heads={n_kv_heads}, head_dim={head_dim})"
+                ),
             ));
         }
         if head_dim % 32 != 0 {
@@ -1677,17 +1686,18 @@ impl Gpu {
             ));
         }
         if stride == 0 {
-            return Err(hip_bridge::HipError::new(0, &format!("{WHO}: stride must be > 0")));
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{WHO}: stride must be > 0"),
+            ));
         }
-        let kv_dim = n_kv_heads
-            .checked_mul(head_dim)
-            .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{WHO}: n_kv_heads*head_dim overflow")))?;
+        let kv_dim = n_kv_heads.checked_mul(head_dim).ok_or_else(|| {
+            hip_bridge::HipError::new(0, &format!("{WHO}: n_kv_heads*head_dim overflow"))
+        })?;
         if col.checked_add(kv_dim).is_none_or(|end| end > stride) {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "{WHO}: col {col} + kv_dim {kv_dim} exceeds stride {stride}"
-                ),
+                &format!("{WHO}: col {col} + kv_dim {kv_dim} exceeds stride {stride}"),
             ));
         }
         if qkv.dtype != DType::F32 {
@@ -1723,7 +1733,10 @@ impl Gpu {
         // dst capacity vs absolute positions is a Spark host precondition;
         // only require a non-empty cache buffer here.
         if dst.buf.size() == 0 {
-            return Err(hip_bridge::HipError::new(0, &format!("{WHO}: dst buffer is empty")));
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{WHO}: dst buffer is empty"),
+            ));
         }
         if n_kv_heads > i32::MAX as usize
             || head_dim > i32::MAX as usize
@@ -1736,9 +1749,9 @@ impl Gpu {
                 &format!("{WHO}: scalar exceeds i32"),
             ));
         }
-        let total_blocks = n_kv_heads
-            .checked_mul(head_dim / 32)
-            .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{WHO}: total_blocks overflow")))?;
+        let total_blocks = n_kv_heads.checked_mul(head_dim / 32).ok_or_else(|| {
+            hip_bridge::HipError::new(0, &format!("{WHO}: total_blocks overflow"))
+        })?;
         if total_blocks > u32::MAX as usize || batch_size > u32::MAX as usize {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -1747,16 +1760,13 @@ impl Gpu {
         }
 
         self.bind_thread()?;
-        // Fresh module_name == kernel entry so the in-memory module cache
-        // cannot return a stale pre-strided object. Source #includes
-        // kv_slot_desc.h (used by sibling kernels in the same TU); strip and
-        // prepend like the slots path — this kernel itself is plain-arena.
-        if !self.functions.contains_key(WHO) {
-            let stripped = kernels::KV_CACHE_WRITE_Q8_0_BATCHED_SRC
-                .replace("#include \"kv_slot_desc.h\"", "");
-            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
-            self.ensure_kernel(WHO, &src, WHO)?;
-        }
+        // Fresh module_name == kernel entry; the gfx1010 source is self-contained
+        // (no kv_slot_desc.h), so no strip/prepend allocation on this path.
+        self.ensure_kernel(
+            WHO,
+            kernels::KV_CACHE_WRITE_Q8_0_BATCHED_STRIDED_GFX1010_SRC,
+            WHO,
+        )?;
         let mut d = dst.buf.as_ptr();
         let mut s = qkv.buf.as_ptr();
         let mut p = positions.buf.as_ptr();
@@ -1796,7 +1806,6 @@ impl Gpu {
             },
         )
     }
-
 
     /// Lane-major Q8 KV write for independent-sequence decode.
     pub fn kv_cache_write_q8_0_independent(
@@ -2315,8 +2324,9 @@ impl Gpu {
     /// (`scores[max_ctx] + workspace[block] + q_shared[hd]`) and must be
     /// `≥ max(positions)+1` with `max_ctx_len ≤ max_seq`. Positions are
     /// absolute i32-in-F32; no host readback.
+    /// gfx1010-only; other arches get an exact-gfx1010 error before any compile.
     #[allow(clippy::too_many_arguments)]
-    pub fn attention_q8_0_kv_batched_swa_strided(
+    pub fn attention_q8_0_kv_batched_swa_strided_gfx1010(
         &mut self,
         qkv: &GpuTensor,
         k_cache: &GpuTensor,
@@ -2332,10 +2342,16 @@ impl Gpu {
         window: usize,
         q_stride: usize,
     ) -> HipResult<()> {
-        const WHO: &str = "attention_q8_0_kv_batched_swa_strided";
+        const WHO: &str = "attention_q8_0_kv_batched_swa_strided_gfx1010";
         // N=0 safe no-op before bind/launch.
         if batch_size == 0 {
             return Ok(());
+        }
+        if !self.arch_caps.is_gfx1010() {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!("{WHO}: exact gfx1010 required (got {})", self.arch),
+            ));
         }
         if n_heads == 0 || n_kv_heads == 0 || head_dim == 0 {
             return Err(hip_bridge::HipError::new(
@@ -2346,9 +2362,7 @@ impl Gpu {
         if n_heads % n_kv_heads != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "{WHO}: n_heads ({n_heads}) not divisible by n_kv_heads ({n_kv_heads})"
-                ),
+                &format!("{WHO}: n_heads ({n_heads}) not divisible by n_kv_heads ({n_kv_heads})"),
             ));
         }
         if head_dim % 32 != 0 {
@@ -2372,9 +2386,7 @@ impl Gpu {
         if max_ctx_len > max_seq {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "{WHO}: max_ctx_len ({max_ctx_len}) exceeds max_seq ({max_seq})"
-                ),
+                &format!("{WHO}: max_ctx_len ({max_ctx_len}) exceeds max_seq ({max_seq})"),
             ));
         }
         if q_stride == 0 {
@@ -2383,15 +2395,13 @@ impl Gpu {
                 &format!("{WHO}: q_stride must be > 0"),
             ));
         }
-        let q_dim = n_heads
-            .checked_mul(head_dim)
-            .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{WHO}: n_heads*head_dim overflow")))?;
+        let q_dim = n_heads.checked_mul(head_dim).ok_or_else(|| {
+            hip_bridge::HipError::new(0, &format!("{WHO}: n_heads*head_dim overflow"))
+        })?;
         if q_dim > q_stride {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "{WHO}: q_dim ({q_dim}) exceeds q_stride ({q_stride})"
-                ),
+                &format!("{WHO}: q_dim ({q_dim}) exceeds q_stride ({q_stride})"),
             ));
         }
         if qkv.dtype != DType::F32 {
@@ -2443,12 +2453,12 @@ impl Gpu {
             ));
         }
         let blocks_per_head = head_dim / 32;
-        let total_blocks = n_kv_heads
-            .checked_mul(blocks_per_head)
-            .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{WHO}: total_blocks overflow")))?;
-        let per_pos_bytes = total_blocks
-            .checked_mul(34)
-            .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{WHO}: per_pos_bytes overflow")))?;
+        let total_blocks = n_kv_heads.checked_mul(blocks_per_head).ok_or_else(|| {
+            hip_bridge::HipError::new(0, &format!("{WHO}: total_blocks overflow"))
+        })?;
+        let per_pos_bytes = total_blocks.checked_mul(34).ok_or_else(|| {
+            hip_bridge::HipError::new(0, &format!("{WHO}: per_pos_bytes overflow"))
+        })?;
         let cache_need = max_seq
             .checked_mul(per_pos_bytes)
             .ok_or_else(|| hip_bridge::HipError::new(0, &format!("{WHO}: cache size overflow")))?;
@@ -2510,14 +2520,13 @@ impl Gpu {
         }
 
         self.bind_thread()?;
-        // Fresh module_name == kernel entry; strip/prepend kv_slot_desc.h for
-        // sibling kernels in the same TU (this kernel is plain-arena).
-        if !self.functions.contains_key(WHO) {
-            let stripped = kernels::ATTENTION_Q8_0_KV_BATCHED_SRC
-                .replace("#include \"kv_slot_desc.h\"", "");
-            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
-            self.ensure_kernel(WHO, &src, WHO)?;
-        }
+        // Fresh module_name == kernel entry; the gfx1010 source is self-contained
+        // (no kv_slot_desc.h), so no strip/prepend allocation on this path.
+        self.ensure_kernel(
+            WHO,
+            kernels::ATTENTION_Q8_0_KV_BATCHED_SWA_STRIDED_GFX1010_SRC,
+            WHO,
+        )?;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_ptr = qkv.buf.as_ptr();
         let mut k_ptr = k_cache.buf.as_ptr();
@@ -2582,7 +2591,6 @@ impl Gpu {
         }
         result
     }
-
 
     /// Q8 attention for a batch of independent decode sequences. Every row
     /// reads a private lane-major KV slice of `lane_capacity` positions.

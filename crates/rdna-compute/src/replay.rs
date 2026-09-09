@@ -858,6 +858,11 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
             | "gemm_mq4g256v2_residual_simt"
+            // Temporary plain-set SIMT arms (Y write-only; recorder mode is write).
+            | "gemm_mq4g256v2_set_simt_r1t8_q4_gfx1010"
+            | "gemm_mq4g256v2_set_simt_r1t8_g1_gfx1010"
+            | "gemm_mq4g256v2_set_simt_r1t16_g1_gfx1010"
+            | "gemm_mq4g256v2_set_simt_r2t8_g1_gfx1010"
     ) {
         // A@0 read, X@8 read, Y@16 RMW (recorded as write). Spans from M/K/N
         // live in kernarg i32s @24/@28/@32 (allocation-wide via address range).
@@ -1078,7 +1083,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         // Spark chunk-batched SWA: same five pointer slots as single-query SWA
         // (qkv/K/V read, out write, positions read); trailing window/qstride/bs
         // only widen the scalar tail (80 B padded).
-        "attention_q8_0_kv_batched_swa_strided" => {
+        "attention_q8_0_kv_batched_swa_strided"
+        | "attention_q8_0_kv_batched_swa_strided_gfx1010" => {
             Some(vec![read(0), read(8), read(16), write(24), read(32)])
         }
         "conv1d_silu_split_f32" => Some(vec![
@@ -1220,16 +1226,19 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         // (write covers RMW); positions read-only. Full and partial share the
         // two-pointer prefix; partial adds nrot/pos_offset/interleaved
         // (still 64 B after pad_to(16)). full is 48 B.
-        "rope_batched_strided_f32" | "rope_partial_batched_strided_f32" => {
-            Some(vec![write(0), read(8)])
-        }
+        "rope_batched_strided_f32"
+        | "rope_batched_strided_f32_gfx1010"
+        | "rope_partial_batched_strided_f32"
+        | "rope_partial_batched_strided_f32_gfx1010" => Some(vec![write(0), read(8)]),
         "kv_cache_write_asym_k_fwht3" => {
             Some(vec![write(0), read(8), read(16), read(24), read(32)])
         }
         "kv_cache_write_q8_0" => Some(vec![write(0), read(8), read(16)]),
         // Spark chunk-batched Q8 KV writer: plain single-arena dst write,
         // strided qkv + positions read (same three-pointer prefix as single).
-        "kv_cache_write_q8_0_batched_strided" => Some(vec![write(0), read(8), read(16)]),
+        "kv_cache_write_q8_0_batched_strided" | "kv_cache_write_q8_0_batched_strided_gfx1010" => {
+            Some(vec![write(0), read(8), read(16)])
+        }
         "attention_flash_fwht3_tile" => Some(vec![
             read(0),
             read(8),
@@ -1536,6 +1545,11 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
             | "gemm_mq4g256v2_residual_simt"
+            // Temporary plain-set SIMT arms: same 3 ptr + M,K,N → 48 padded.
+            | "gemm_mq4g256v2_set_simt_r1t8_q4_gfx1010"
+            | "gemm_mq4g256v2_set_simt_r1t8_g1_gfx1010"
+            | "gemm_mq4g256v2_set_simt_r1t16_g1_gfx1010"
+            | "gemm_mq4g256v2_set_simt_r2t8_g1_gfx1010"
     ) {
         // 3 ptr + M,K,N i32 = 36 → pad_to(16) = 48.
         return Some(48);
@@ -1627,7 +1641,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         // rope_batched_strided: 2 ptr + 3 i32 + f32 + 4 i32 = 48.
         // kv_cache_write_q8_0_batched_strided: 3 ptr + 5 i32 = 44 → 48.
         | "rope_batched_strided_f32"
+        | "rope_batched_strided_f32_gfx1010"
         | "kv_cache_write_q8_0_batched_strided"
+        | "kv_cache_write_q8_0_batched_strided_gfx1010"
         | "conv1d_gated_decode_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
@@ -1648,7 +1664,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_q8_0_kv"
         | "attention_q8_0_kv_swa"
         // rope_partial_batched_strided: 2 ptr + 4 i32 + f32 + 5 i32 = 60 → 64.
-        | "rope_partial_batched_strided_f32" => Some(64),
+        | "rope_partial_batched_strided_f32"
+        | "rope_partial_batched_strided_f32_gfx1010" => Some(64),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
@@ -1658,7 +1675,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"
         // attention_q8_0_kv_batched_swa_strided: 5 ptr + 4 i32 + f32 + 3 i32 = 72 → 80.
-        | "attention_q8_0_kv_batched_swa_strided" => Some(80),
+        | "attention_q8_0_kv_batched_swa_strided"
+        | "attention_q8_0_kv_batched_swa_strided_gfx1010" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_k2048"
@@ -7423,6 +7441,11 @@ mod tests {
             "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds",
             "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds",
             "gemm_mq4g256v2_residual_simt",
+            // Temporary plain-set SIMT experiment arms (same 48-B ABI).
+            "gemm_mq4g256v2_set_simt_r1t8_q4_gfx1010",
+            "gemm_mq4g256v2_set_simt_r1t8_g1_gfx1010",
+            "gemm_mq4g256v2_set_simt_r1t16_g1_gfx1010",
+            "gemm_mq4g256v2_set_simt_r2t8_g1_gfx1010",
         ] {
             let mut blob = hip_bridge::KernargBlob::new();
             for _ in 0..3 {

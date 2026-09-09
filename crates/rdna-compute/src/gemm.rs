@@ -412,9 +412,85 @@ fn mqv2_prefill_batch_tile(
     }
 }
 
-/// Validated launch dimensions/bytes for gfx1010 MQ4G256V2 FP32 SIMT residual.
+/// gfx1010 MQ4G256V2 FP32 SIMT plain-set experiment arm (temporary).
+/// Compile-time whole-engine selector is [`GFX1010_MQ4G256V2_SIMT_SET_VARIANT`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mq4g256v2SimtSetVariant {
+    /// Control: R1/T8 four-groups-live body with Y= store (not Y+=).
+    SetR1T8Q4,
+    /// R1/T8 one-group-at-a-time schedule.
+    SetR1T8G1,
+    /// R1/T16 one-group schedule (grid.y = ceil(N/16)).
+    SetR1T16G1,
+    /// R2/T8 dual-row one-group schedule (grid.x = ceil(M/2)).
+    SetR2T8G1,
+}
+
+/// Tile/entry description for residual or plain-set SIMT launch.
+/// Tile values are compile constants, never caller kernargs.
+#[derive(Clone, Copy, Debug)]
+struct Mq4g256v2SimtSpec {
+    func: &'static str,
+    row_tile: usize,
+    batch_tile: usize,
+    block: u32,
+    static_lds_bytes: u32,
+}
+
+impl Mq4g256v2SimtSetVariant {
+    const fn spec(self) -> Mq4g256v2SimtSpec {
+        match self {
+            Self::SetR1T8Q4 => Mq4g256v2SimtSpec {
+                func: "gemm_mq4g256v2_set_simt_r1t8_q4_gfx1010",
+                row_tile: 1,
+                batch_tile: 8,
+                block: 32,
+                static_lds_bytes: 0,
+            },
+            Self::SetR1T8G1 => Mq4g256v2SimtSpec {
+                func: "gemm_mq4g256v2_set_simt_r1t8_g1_gfx1010",
+                row_tile: 1,
+                batch_tile: 8,
+                block: 32,
+                static_lds_bytes: 0,
+            },
+            Self::SetR1T16G1 => Mq4g256v2SimtSpec {
+                func: "gemm_mq4g256v2_set_simt_r1t16_g1_gfx1010",
+                row_tile: 1,
+                batch_tile: 16,
+                block: 32,
+                static_lds_bytes: 0,
+            },
+            Self::SetR2T8G1 => Mq4g256v2SimtSpec {
+                func: "gemm_mq4g256v2_set_simt_r2t8_g1_gfx1010",
+                row_tile: 2,
+                batch_tile: 8,
+                block: 32,
+                static_lds_bytes: 0,
+            },
+        }
+    }
+}
+
+/// Whole-engine gfx1010 plain MQ4V2 SIMT set arm. Overwrite-only control;
+/// parent retunes from measurements then deletes temporary surfaces.
+const GFX1010_MQ4G256V2_SIMT_SET_VARIANT: Mq4g256v2SimtSetVariant =
+    Mq4g256v2SimtSetVariant::SetR1T8Q4;
+
+/// Residual oracle: R1/T8, same grid as production `gemm_mq4g256v2_residual_simt`.
+const MQ4G256V2_RESIDUAL_SIMT_SPEC: Mq4g256v2SimtSpec = Mq4g256v2SimtSpec {
+    func: "gemm_mq4g256v2_residual_simt",
+    row_tile: 1,
+    batch_tile: 8,
+    block: 32,
+    static_lds_bytes: 0,
+};
+
+const MQ4G256V2_SIMT_EXPERIMENTS_MODULE: &str = "gemm_mq4g256v2_simt_experiments_gfx1010";
+
+/// Validated launch dimensions/bytes for gfx1010 MQ4G256V2 FP32 SIMT.
 /// Built only after A/X/Y extents, X/Y F32 dtypes, K alignment, checked products,
-/// and i32/u32 representability all pass — so memset/ensure_kernel/launch can
+/// and i32/u32 representability all pass — so ensure_kernel/launch can
 /// reuse the numbers without repeating unchecked arithmetic.
 struct Mq4g256v2SimtLaunch {
     a_bytes: usize,
@@ -423,28 +499,29 @@ struct Mq4g256v2SimtLaunch {
     m_i32: i32,
     k_i32: i32,
     n_i32: i32,
+    /// grid.x = ceil(M / row_tile)
     grid_m: u32,
+    /// grid.y = ceil(N / batch_tile)
     grid_n_tiles: u32,
 }
 
-/// Single checked validation path for `gemm_mq4g256v2_residual_simt` and the
-/// gfx1010 plain-entry branches that zero Y then call it.
+/// Shared checked validation for residual and plain-set SIMT paths.
 ///
 /// Ordering: empty M/N no-op → nonzero K%256 → X/Y F32 → checked A/X/Y byte
 /// products → logical shape extents (numel / byte_size) → physical buf.size()
-/// → i32 scalars → u32 grid dims. Returns `Ok(None)` for the intentional
-/// empty-M/N no-op; `Ok(Some(_))` only when every check passed. Does not
-/// allocate or copy payloads.
-fn validate_mq4g256v2_residual_simt(
+/// → i32 scalars → u32 grid dims (`ceil(M/row_tile)`, `ceil(N/batch_tile)`).
+/// Returns `Ok(None)` for the intentional empty-M/N no-op; `Ok(Some(_))` only
+/// when every check passed. Does not allocate, copy, memset, or invalidate cache.
+fn validate_mq4g256v2_simt(
     a_raw: &GpuTensor,
     x: &GpuTensor,
     y: &GpuTensor,
     m: usize,
     k: usize,
     batch_size: usize,
+    spec: &Mq4g256v2SimtSpec,
 ) -> HipResult<Option<Mq4g256v2SimtLaunch>> {
-    const WHO: &str = "gemm_mq4g256v2_residual_simt";
-    const BATCH_TILE: usize = 8;
+    let who = spec.func;
 
     // Preserve intentional empty M/N no-op before any other check or mutation.
     if m == 0 || batch_size == 0 {
@@ -453,38 +530,38 @@ fn validate_mq4g256v2_residual_simt(
     if k == 0 || k % 256 != 0 {
         return Err(hip_bridge::HipError::new(
             1,
-            &format!("{WHO}: K must be a nonzero multiple of 256 (got {k})"),
+            &format!("{who}: K must be a nonzero multiple of 256 (got {k})"),
         ));
     }
     if x.dtype != DType::F32 {
         return Err(hip_bridge::HipError::new(
             1,
-            &format!("{WHO}: X must be F32 (got {:?})", x.dtype),
+            &format!("{who}: X must be F32 (got {:?})", x.dtype),
         ));
     }
     if y.dtype != DType::F32 {
         return Err(hip_bridge::HipError::new(
             1,
-            &format!("{WHO}: Y must be F32 (got {:?})", y.dtype),
+            &format!("{who}: Y must be F32 (got {:?})", y.dtype),
         ));
     }
     // A: M * (K/256) * MQ4V2_GROUP_BYTES; X elems N*K; Y elems N*M.
     let a_bytes = m
         .checked_mul(k / 256)
         .and_then(|g| g.checked_mul(MQ4V2_GROUP_BYTES))
-        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: A size overflow")))?;
+        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{who}: A size overflow")))?;
     let x_elems = batch_size
         .checked_mul(k)
-        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: X size overflow")))?;
+        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{who}: X size overflow")))?;
     let y_elems = batch_size
         .checked_mul(m)
-        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: Y size overflow")))?;
+        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{who}: Y size overflow")))?;
     let x_bytes = x_elems
         .checked_mul(4)
-        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: X size overflow")))?;
+        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{who}: X size overflow")))?;
     let y_bytes = y_elems
         .checked_mul(4)
-        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: Y size overflow")))?;
+        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{who}: Y size overflow")))?;
 
     // Logical shape extents first: pool DeviceBuffers often round physical
     // capacity up, so buf.size() alone can hide short numel/byte_size views.
@@ -493,7 +570,7 @@ fn validate_mq4g256v2_residual_simt(
         return Err(hip_bridge::HipError::new(
             1,
             &format!(
-                "{WHO}: A logical extent too small (have {} need {a_bytes})",
+                "{who}: A logical extent too small (have {} need {a_bytes})",
                 a_raw.byte_size()
             ),
         ));
@@ -502,7 +579,7 @@ fn validate_mq4g256v2_residual_simt(
         return Err(hip_bridge::HipError::new(
             1,
             &format!(
-                "{WHO}: X logical extent too small (have {} elems need {x_elems})",
+                "{who}: X logical extent too small (have {} elems need {x_elems})",
                 x.numel()
             ),
         ));
@@ -511,7 +588,7 @@ fn validate_mq4g256v2_residual_simt(
         return Err(hip_bridge::HipError::new(
             1,
             &format!(
-                "{WHO}: Y logical extent too small (have {} elems need {y_elems})",
+                "{who}: Y logical extent too small (have {} elems need {y_elems})",
                 y.numel()
             ),
         ));
@@ -522,7 +599,7 @@ fn validate_mq4g256v2_residual_simt(
         return Err(hip_bridge::HipError::new(
             1,
             &format!(
-                "{WHO}: A buffer too small (have {} need {a_bytes})",
+                "{who}: A buffer too small (have {} need {a_bytes})",
                 a_raw.buf.size()
             ),
         ));
@@ -531,7 +608,7 @@ fn validate_mq4g256v2_residual_simt(
         return Err(hip_bridge::HipError::new(
             1,
             &format!(
-                "{WHO}: X buffer too small (have {} need {x_bytes})",
+                "{who}: X buffer too small (have {} need {x_bytes})",
                 x.buf.size()
             ),
         ));
@@ -540,24 +617,26 @@ fn validate_mq4g256v2_residual_simt(
         return Err(hip_bridge::HipError::new(
             1,
             &format!(
-                "{WHO}: Y buffer too small (have {} need {y_bytes})",
+                "{who}: Y buffer too small (have {} need {y_bytes})",
                 y.buf.size()
             ),
         ));
     }
 
     let m_i32 = i32::try_from(m)
-        .map_err(|_| hip_bridge::HipError::new(1, &format!("{WHO}: M exceeds i32")))?;
+        .map_err(|_| hip_bridge::HipError::new(1, &format!("{who}: M exceeds i32")))?;
     let k_i32 = i32::try_from(k)
-        .map_err(|_| hip_bridge::HipError::new(1, &format!("{WHO}: K exceeds i32")))?;
+        .map_err(|_| hip_bridge::HipError::new(1, &format!("{who}: K exceeds i32")))?;
     let n_i32 = i32::try_from(batch_size)
-        .map_err(|_| hip_bridge::HipError::new(1, &format!("{WHO}: N exceeds i32")))?;
+        .map_err(|_| hip_bridge::HipError::new(1, &format!("{who}: N exceeds i32")))?;
 
-    let batch_tiles = batch_size.div_ceil(BATCH_TILE);
-    let grid_m = u32::try_from(m)
-        .map_err(|_| hip_bridge::HipError::new(1, &format!("{WHO}: M grid dim exceeds u32")))?;
+    debug_assert!(spec.row_tile > 0 && spec.batch_tile > 0);
+    let grid_rows = m.div_ceil(spec.row_tile);
+    let batch_tiles = batch_size.div_ceil(spec.batch_tile);
+    let grid_m = u32::try_from(grid_rows)
+        .map_err(|_| hip_bridge::HipError::new(1, &format!("{who}: M grid dim exceeds u32")))?;
     let grid_n_tiles = u32::try_from(batch_tiles).map_err(|_| {
-        hip_bridge::HipError::new(1, &format!("{WHO}: N-tile grid dim exceeds u32"))
+        hip_bridge::HipError::new(1, &format!("{who}: N-tile grid dim exceeds u32"))
     })?;
 
     Ok(Some(Mq4g256v2SimtLaunch {
@@ -570,6 +649,18 @@ fn validate_mq4g256v2_residual_simt(
         grid_m,
         grid_n_tiles,
     }))
+}
+
+/// Residual R1/T8 validation (unchanged public residual path).
+fn validate_mq4g256v2_residual_simt(
+    a_raw: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch_size: usize,
+) -> HipResult<Option<Mq4g256v2SimtLaunch>> {
+    validate_mq4g256v2_simt(a_raw, x, y, m, k, batch_size, &MQ4G256V2_RESIDUAL_SIMT_SPEC)
 }
 
 impl Gpu {
@@ -30511,7 +30602,7 @@ impl Gpu {
     /// LDS 0) with MQ4G256V2 dual-half headers. Caller owns residual preload;
     /// plain/`=` callers must zero Y before this entry. Rejects non-multiple
     /// K or overflow; empty M/N is a no-op. Shared validation runs before any
-    /// ensure_kernel/launch (and before memset in plain wrappers).
+    /// ensure_kernel/launch.
     pub fn gemm_mq4g256v2_residual_simt(
         &mut self,
         a_raw: &GpuTensor,
@@ -30546,7 +30637,7 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
 
-        // Weight + F32 X + Y residual read/write — reuse validated byte counts.
+        // Logical operand footprint (A+X+2Y residual RMW) — not an HBM claim.
         let bytes = v.a_bytes + v.x_bytes + v.y_bytes.saturating_mul(2);
         let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
         let result = self.launch_maybe_blob(
@@ -30572,13 +30663,108 @@ impl Gpu {
         result
     }
 
+    /// Shared validated SIMT launch (residual or plain-set experiment).
+    /// Caller must already have validated; does not bind_thread, memset, or
+    /// invalidate caches. `y_profile_mul` is 2 for residual RMW and 1 for set
+    /// write — logical operand footprint only, not HBM traffic.
+    fn launch_mq4g256v2_simt_validated(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        v: &Mq4g256v2SimtLaunch,
+        module: &str,
+        src: &str,
+        spec: &Mq4g256v2SimtSpec,
+        y_profile_mul: usize,
+    ) -> HipResult<()> {
+        self.ensure_kernel(module, src, spec.func)?;
+
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = v.m_i32;
+        let mut k_val = v.k_i32;
+        let mut n_val = v.n_i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+
+        let bytes = v.a_bytes + v.x_bytes + v.y_bytes.saturating_mul(y_profile_mul);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", spec.func, bytes);
+        let result = self.launch_maybe_blob(
+            spec.func,
+            [v.grid_m, v.grid_n_tiles, 1],
+            [spec.block, 1, 1],
+            spec.static_lds_bytes,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Lab/probe direct entry for exact-gfx1010 MQ4G256V2 FP32 plain-set SIMT arms.
+    /// Validates then launches the selected experiment entry (Y = A·X overwrite).
+    /// Empty M/N is a no-op (no arch gate); non-empty requires exact gfx1010
+    /// before ensure_kernel/launch. Malformed args leave Y unchanged.
+    pub fn gemm_mq4g256v2_set_simt_variant(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        variant: Mq4g256v2SimtSetVariant,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let spec = variant.spec();
+        // Empty no-op before arch gate (same residual empty semantics).
+        let Some(v) = validate_mq4g256v2_simt(a_raw, x, y, m, k, n, &spec)? else {
+            return Ok(());
+        };
+        if !self.arch_caps.is_gfx1010() {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!("{}: exact gfx1010 required (got {})", spec.func, self.arch),
+            ));
+        }
+        self.launch_mq4g256v2_simt_validated(
+            a_raw,
+            x,
+            y,
+            &v,
+            MQ4G256V2_SIMT_EXPERIMENTS_MODULE,
+            kernels::GEMM_MQ4G256V2_SIMT_EXPERIMENTS_GFX1010_SRC,
+            &spec,
+            1,
+        )
+    }
+
     /// MQ4 v2 (qt=44) — plain batched GEMM `gemm_hfq4g256` sibling.
     /// On WMMA arches (gfx1100/1101/1102/1150/1151/gfx1200/1201) this method
     /// provides plain-GEMM semantics by zeroing output and routing through the
     /// arch-aware residual WMMA path. On exact gfx1010 with N>1 and K%256==0 it
-    /// zeros Y then dispatches the FP32 SIMT residual (`gemm_mq4g256v2_residual_simt`).
-    /// V2 bytes cannot be decoded by the v1 scalar kernel (fp16 s0/z0/s1/z1 vs
-    /// f32 scale/zero) and would produce noise (WT2 KLD 12.1).
+    /// dispatches the compile-time FP32 SIMT plain-set arm (Y = A·X overwrite;
+    /// no memset). V2 bytes cannot be decoded by the v1 scalar kernel (fp16
+    /// s0/z0/s1/z1 vs f32 scale/zero) and would produce noise (WT2 KLD 12.1).
     pub fn gemm_mq4g256v2(
         &mut self,
         a_raw: &GpuTensor,
@@ -30602,17 +30788,23 @@ impl Gpu {
             }
             return self.gemm_hfq4g256_residual_mq4v2(a_raw, x, y, m, k, batch_size);
         }
-        // gfx1010 FP32 SIMT residual: plain `=` via zero-Y then Y+=.
-        // Validate before memset so malformed args never clear the wrong span.
+        // gfx1010 FP32 SIMT plain-set: validate once then overwrite Y (no memset).
+        // Branch domain unchanged: exact gfx1010, N>1, K nonzero multiple of 256.
         if self.arch_caps.is_gfx1010() && batch_size > 1 && k != 0 && k % 256 == 0 {
-            let Some(v) = validate_mq4g256v2_residual_simt(a_raw, x, y, m, k, batch_size)? else {
+            let spec = GFX1010_MQ4G256V2_SIMT_SET_VARIANT.spec();
+            let Some(v) = validate_mq4g256v2_simt(a_raw, x, y, m, k, batch_size, &spec)? else {
                 return Ok(());
             };
-            match self.active_stream.as_ref() {
-                Some(stream) => self.hip.memset_async(&y.buf, 0, v.y_bytes, stream)?,
-                None => self.hip.memset(&y.buf, 0, v.y_bytes)?,
-            }
-            return self.gemm_mq4g256v2_residual_simt(a_raw, x, y, m, k, batch_size);
+            return self.launch_mq4g256v2_simt_validated(
+                a_raw,
+                x,
+                y,
+                &v,
+                MQ4G256V2_SIMT_EXPERIMENTS_MODULE,
+                kernels::GEMM_MQ4G256V2_SIMT_EXPERIMENTS_GFX1010_SRC,
+                &spec,
+                1,
+            );
         }
         Err(hip_bridge::HipError::new(
             0,
@@ -30625,8 +30817,10 @@ impl Gpu {
     /// MQ4 v2 (qt=44) — batched lm_head sibling of `gemm_hfq4g256_batched_lmhead`.
     /// Mirrors the v1 variant-selection logic: N=1 keeps `gemv_mq4g256v2`; WMMA
     /// eligibility gate, fp16 cache stomp, memset zero, gfx12 vs gfx11 dispatch.
-    /// On exact gfx1010 with N>1 and K%256==0, zeros Y then runs the FP32 SIMT
-    /// residual. Dedicated V2 WMMA residual sources stay unchanged.
+    /// On exact gfx1010 with N>1 and K%256==0, validates then runs the compile-time
+    /// FP32 SIMT plain-set arm (Y overwrite; no memset); fp16_x_source_ptr is
+    /// cleared after successful validation and before launch. Dedicated V2 WMMA
+    /// residual sources stay unchanged.
     pub fn gemm_mq4g256v2_batched_lmhead(
         &mut self,
         a_raw: &GpuTensor,
@@ -30670,19 +30864,25 @@ impl Gpu {
                 "qt=44 gemm_mq4g256v2_batched_lmhead: no WMMA source for this arch",
             ));
         }
-        // gfx1010 FP32 SIMT residual for batched lm_head (`=` via zero-Y + +=).
+        // gfx1010 FP32 SIMT plain-set for batched lm_head (Y overwrite, no memset).
         // N=1 already returned via gemv above; WMMA arches already handled.
-        // Validate before memset so malformed args never clear the wrong span.
+        // Validate before any mutation so malformed args leave Y/cache untouched.
         if self.arch_caps.is_gfx1010() && batch_size > 1 && k != 0 && k % 256 == 0 {
-            let Some(v) = validate_mq4g256v2_residual_simt(a_raw, x, y, m, k, batch_size)? else {
+            let spec = GFX1010_MQ4G256V2_SIMT_SET_VARIANT.spec();
+            let Some(v) = validate_mq4g256v2_simt(a_raw, x, y, m, k, batch_size, &spec)? else {
                 return Ok(());
             };
             self.scratch.fp16_x_source_ptr = std::ptr::null_mut();
-            match self.active_stream.as_ref() {
-                Some(stream) => self.hip.memset_async(&y.buf, 0, v.y_bytes, stream)?,
-                None => self.hip.memset(&y.buf, 0, v.y_bytes)?,
-            }
-            return self.gemm_mq4g256v2_residual_simt(a_raw, x, y, m, k, batch_size);
+            return self.launch_mq4g256v2_simt_validated(
+                a_raw,
+                x,
+                y,
+                &v,
+                MQ4G256V2_SIMT_EXPERIMENTS_MODULE,
+                kernels::GEMM_MQ4G256V2_SIMT_EXPERIMENTS_GFX1010_SRC,
+                &spec,
+                1,
+            );
         }
         Err(hip_bridge::HipError::new(
             0,
