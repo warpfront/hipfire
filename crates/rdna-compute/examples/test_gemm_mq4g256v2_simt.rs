@@ -29,15 +29,16 @@
 //!
 //! Usage:
 //!   cargo run --release -p rdna-compute --example test_gemm_mq4g256v2_simt \
-//!     --features lab -- [M] [K] [N1 N2 ...] [--timing]
+//!     --features lab -- [M] [K] [N1 N2 ...] [--timing|--timing-reverse]
 //!
 //! Defaults exercise N∈{1,3,7,8,9,16}, K∈{256,768,1024,2560}, M∈{16,33}
 //! plus a representative larger M (CLI M or 512), then bounded non-cross-product
-//! boundary shapes (R2 odd-M, tile edges, Spark K). Optional `--timing` runs the
-//! Spark projection census (N∈{64,46,8}) host-timed launch+completion residual-from-zero vs each
-//! set arm (warmups 10, measured ≥5, raw samples + median). Machine-readable
-//! `RESULT*` / `RESULT_SET*` / `RESULT_MALFORMED*` / `RESULT_EMPTY*` /
-//! `RESULT_TIMING*` lines.
+//! boundary shapes (R2 odd-M, tile edges, Spark K). Optional `--timing` /
+//! `--timing-reverse` run the Spark projection census (N∈{64,46,8}) host-timed
+//! launch+completion over residual-from-zero and each set arm (warmups 10,
+//! measured ≥5, raw samples + median). Reverse flips the full five-entry order
+//! for matched F/R/R/F fresh-process bias checks. Machine-readable `RESULT*` /
+//! `RESULT_SET*` / `RESULT_MALFORMED*` / `RESULT_EMPTY*` / `RESULT_TIMING*` lines.
 
 use rdna_compute::gemm::Mq4g256v2SimtSetVariant;
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -98,11 +99,13 @@ fn set_variant_name(v: Mq4g256v2SimtSetVariant) -> &'static str {
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
-    let timing_mode = args.iter().any(|a| a == "--timing");
+    let timing_reverse = args.iter().any(|a| a == "--timing-reverse");
+    let timing_mode = timing_reverse || args.iter().any(|a| a == "--timing");
+    let timing_order = if timing_reverse { "reverse" } else { "forward" };
     let pos: Vec<String> = args
         .iter()
         .skip(1)
-        .filter(|a| a.as_str() != "--timing")
+        .filter(|a| a.as_str() != "--timing" && a.as_str() != "--timing-reverse")
         .cloned()
         .collect();
 
@@ -122,8 +125,11 @@ fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     let arch = gpu.arch.clone();
     eprintln!("=== gemm_mq4g256v2 residual+set SIMT probe ===");
-    eprintln!("arch={arch} timing_mode={timing_mode}");
-    println!("RESULT_META arch={arch} timing_mode={}", timing_mode as u8);
+    eprintln!("arch={arch} timing_mode={timing_mode} order={timing_order}");
+    println!(
+        "RESULT_META arch={arch} timing_mode={} order={timing_order}",
+        timing_mode as u8
+    );
 
     let large_m = cli_m.unwrap_or(512);
     let mut m_list: Vec<usize> = SMALL_MS.to_vec();
@@ -465,13 +471,17 @@ fn main() {
     // Optional Spark-projection timing (does not affect numerical pass/fail).
     if timing_mode {
         if arch.starts_with("gfx1010") {
-            if let Err(e) = run_spark_timing(&mut gpu, &arch) {
+            if let Err(e) = run_spark_timing(&mut gpu, &arch, timing_reverse) {
                 eprintln!("  spark timing: {e}");
-                println!("RESULT_TIMING case=spark_timing arch={arch} status=ERROR err={e}");
+                println!(
+                    "RESULT_TIMING case=spark_timing arch={arch} order={timing_order} status=ERROR err={e}"
+                );
             }
         } else {
             eprintln!("  spark timing: SKIP (arch={arch}, not gfx1010)");
-            println!("RESULT_TIMING case=spark_timing arch={arch} status=SKIP");
+            println!(
+                "RESULT_TIMING case=spark_timing arch={arch} order={timing_order} status=SKIP"
+            );
         }
     }
 
@@ -1320,8 +1330,24 @@ const SPARK_NS: &[usize] = &[64, 46, 8];
 const TIMING_WARMUPS: usize = 10;
 const TIMING_ITERS: usize = 5;
 
-fn run_spark_timing(gpu: &mut Gpu, arch: &str) -> Result<(), String> {
-    eprintln!("=== spark projection timing (host-timed launch+completion; Y upload excluded) ===");
+fn run_spark_timing(gpu: &mut Gpu, arch: &str, reverse: bool) -> Result<(), String> {
+    let order = if reverse { "reverse" } else { "forward" };
+    eprintln!(
+        "=== spark projection timing (host-timed launch+completion; Y upload excluded; order={order}) ==="
+    );
+
+    // Five-entry schedule: residual baseline then four set arms. Reverse flips
+    // the entire list (not just variants) for matched F/R bias checks.
+    let mut entries: Vec<(&'static str, Option<Mq4g256v2SimtSetVariant>)> =
+        Vec::with_capacity(1 + SET_VARIANTS.len());
+    entries.push(("residual_from_zero", None));
+    for &v in SET_VARIANTS {
+        entries.push((set_variant_name(v), Some(v)));
+    }
+    if reverse {
+        entries.reverse();
+    }
+
     for shape in SPARK_SHAPES {
         let m = shape.m;
         let k = shape.k;
@@ -1338,32 +1364,25 @@ fn run_spark_timing(gpu: &mut Gpu, arch: &str) -> Result<(), String> {
                 .map_err(|e| format!("timing x: {e}"))?;
             let y_elems = n * m;
             let y_zero = vec![0.0f32; y_elems];
+            // Stale init so set path does real overwrite work.
+            let y_stale: Vec<f32> = (0..y_elems)
+                .map(|i| 1234.0 + (i as f32) * 0.001)
+                .collect();
             let y_gpu = gpu
                 .upload_f32(&y_zero, &[y_elems])
                 .map_err(|e| format!("timing y: {e}"))?;
 
-            // Baseline: residual from zero.
-            let samples_res = time_launch_completion_us(gpu, &y_gpu, &y_zero, |gpu| {
-                gpu.gemm_mq4g256v2_residual_simt(&a_raw, &x_gpu, &y_gpu, m, k, n)
-            })?;
-            emit_timing(
-                arch,
-                shape.name,
-                "residual_from_zero",
-                m,
-                k,
-                n,
-                shape.multiplicity,
-                &samples_res,
-            );
-
-            for &variant in SET_VARIANTS {
-                let name = set_variant_name(variant);
-                // Stale init so set path does real overwrite work; timing is
-                // host-timed launch+completion (htod of Y excluded from measured window).
-                let stale: Vec<f32> = (0..y_elems).map(|i| 1234.0 + (i as f32) * 0.001).collect();
-                let samples = time_launch_completion_us(gpu, &y_gpu, &stale, |gpu| {
-                    gpu.gemm_mq4g256v2_set_simt_variant(&a_raw, &x_gpu, &y_gpu, m, k, n, variant)
+            for &(name, variant) in &entries {
+                // Residual from +0; set arms from stale. Y htod outside timed window.
+                let y_host: &[f32] = match variant {
+                    None => &y_zero,
+                    Some(_) => &y_stale,
+                };
+                let samples = time_launch_completion_us(gpu, &y_gpu, y_host, |gpu| match variant {
+                    None => gpu.gemm_mq4g256v2_residual_simt(&a_raw, &x_gpu, &y_gpu, m, k, n),
+                    Some(v) => {
+                        gpu.gemm_mq4g256v2_set_simt_variant(&a_raw, &x_gpu, &y_gpu, m, k, n, v)
+                    }
                 })?;
                 emit_timing(
                     arch,
@@ -1373,6 +1392,7 @@ fn run_spark_timing(gpu: &mut Gpu, arch: &str) -> Result<(), String> {
                     k,
                     n,
                     shape.multiplicity,
+                    order,
                     &samples,
                 );
             }
@@ -1428,6 +1448,7 @@ fn emit_timing(
     k: usize,
     n: usize,
     multiplicity: usize,
+    order: &str,
     samples_us: &[f64],
 ) {
     let mut sorted = samples_us.to_vec();
@@ -1445,10 +1466,10 @@ fn emit_timing(
         .collect::<Vec<_>>()
         .join(",");
     eprintln!(
-        "  timing {shape} entry={entry} M={m} K={k} N={n} mult={multiplicity} measurement=host_launch_completion: median={median:.1}µs samples=[{samples_str}]"
+        "  timing {shape} entry={entry} order={order} M={m} K={k} N={n} mult={multiplicity} measurement=host_launch_completion: median={median:.1}µs samples=[{samples_str}]"
     );
     println!(
-        "RESULT_TIMING shape={shape} entry={entry} M={m} K={k} N={n} multiplicity={multiplicity} arch={arch} measurement=host_launch_completion median_us={median:.3} samples_us={samples_str} warmups={TIMING_WARMUPS} iters={}",
+        "RESULT_TIMING shape={shape} entry={entry} M={m} K={k} N={n} multiplicity={multiplicity} arch={arch} order={order} measurement=host_launch_completion median_us={median:.3} samples_us={samples_str} warmups={TIMING_WARMUPS} iters={}",
         samples_us.len()
     );
 }
