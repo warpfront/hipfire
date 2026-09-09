@@ -669,10 +669,10 @@ impl MalformedEntry {
 /// Malformed residual (+ gfx1010 plain/lmhead) checks.
 ///
 /// Only honest small allocations + oversized scalar dims. No fabricated
-/// buffer extents (`DeviceBuffer::from_raw` size-lies are forbidden — a
-/// future validator regression must not turn into an OOB launch). Which
-/// guard rejects first is irrelevant; the observable contract is `Err`
-/// and unchanged sentinel Y bytes.
+/// buffer extents. Which guard rejects first is irrelevant; the observable
+/// contract is `Err` and unchanged bytes in the **actual Y buffer passed**
+/// to the call (catches zero-before-validation on that tensor, including
+/// wrong-dtype Y).
 fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
     // Small valid payloads for base tensors.
     let m0 = 8usize;
@@ -687,16 +687,12 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
         .upload_f32(&synth_x(n0, k0, 0x111u64), &[n0 * k0])
         .map_err(|e| format!("malformed x_ok: {e}"))?;
 
-    // Sentinel Y: unique nonzero pattern; small real allocation (16 f32).
-    // short_Y and oversized-dim cases pass this buffer as Y so a
-    // zero-before-validation bug would clear the pattern.
+    // Small F32 Y used by short_Y + oversized-dim cases. Capacity may be
+    // pool-rounded above logical 16×f32; canary uses the real buf.size().
     const Y_SENT_LEN: usize = 16;
-    let y_sentinel: Vec<f32> = (0..Y_SENT_LEN)
-        .map(|i| 7.25 + (i as f32) * 0.03125)
-        .collect();
-    let y_real = gpu
-        .upload_f32(&y_sentinel, &[Y_SENT_LEN])
-        .map_err(|e| format!("malformed y_real: {e}"))?;
+    let y_f32 = gpu
+        .upload_f32(&vec![0.0f32; Y_SENT_LEN], &[Y_SENT_LEN])
+        .map_err(|e| format!("malformed y_f32: {e}"))?;
 
     // Undersized siblings of A/X (still nonzero so dtype/extent paths matter).
     let a_short = gpu
@@ -708,6 +704,7 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
     let x_f16 = gpu
         .alloc_tensor(&[n0 * k0], DType::F16)
         .map_err(|e| format!("malformed x_f16: {e}"))?;
+    // Distinct wrong-dtype Y: canary must snapshot *this* buffer, not y_f32.
     let y_f16 = gpu
         .alloc_tensor(&[n0 * m0], DType::F16)
         .map_err(|e| format!("malformed y_f16: {e}"))?;
@@ -720,9 +717,7 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
 
     let mut checks = 0usize;
 
-    // Helper: run one case, require Err + sentinel intact on y_real.
-    // `y` may be y_real itself or a different buffer (bad_y_dtype); the
-    // sentinel check always reads the honest y_real allocation.
+    // Helper: Err + the *passed* Y buffer's real device bytes unchanged.
     let mut one = |entry: MalformedEntry,
                    tag: &str,
                    a: &GpuTensor,
@@ -732,9 +727,16 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
                    k: usize,
                    n: usize|
      -> Result<(), String> {
+        let nbytes = y.buf.size();
+        if nbytes == 0 {
+            return Err(format!("{}/{}: Y buffer reports size 0", entry.name(), tag));
+        }
+        // Unique nonzero pattern covering the full allocated device buffer
+        // (including any pool-rounded tail past logical numel).
+        let pattern = canary_bytes(tag.as_bytes(), entry.name().as_bytes(), nbytes);
         gpu.hip
-            .memcpy_htod(&y_real.buf, bytes_of(&y_sentinel))
-            .map_err(|e| format!("{tag} reseat sentinel: {e}"))?;
+            .memcpy_htod(&y.buf, &pattern)
+            .map_err(|e| format!("{tag} y canary upload: {e}"))?;
         gpu.hip
             .device_synchronize()
             .map_err(|e| format!("{tag} sync pre: {e}"))?;
@@ -763,21 +765,21 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
             }
         }
 
-        let got = gpu
-            .download_f32(&y_real)
-            .map_err(|e| format!("{tag} download sentinel: {e}"))?;
-        if got.len() < y_sentinel.len() || got[..y_sentinel.len()] != y_sentinel[..] {
-            let mut detail = String::from("sentinel mutated");
-            for i in 0..y_sentinel.len().min(got.len()) {
-                if got[i].to_bits() != y_sentinel[i].to_bits() {
-                    detail = format!(
-                        "sentinel mutated at i={i}: got={:.6e} want={:.6e}",
-                        got[i], y_sentinel[i]
-                    );
-                    break;
-                }
-            }
-            return Err(format!("{}/{}: {detail}", entry.name(), tag));
+        let mut got = vec![0u8; nbytes];
+        gpu.hip
+            .memcpy_dtoh(&mut got, &y.buf)
+            .map_err(|e| format!("{tag} y canary download: {e}"))?;
+        if got != pattern {
+            let first = got
+                .iter()
+                .zip(pattern.iter())
+                .position(|(a, b)| a != b)
+                .unwrap_or(0);
+            return Err(format!(
+                "{}/{}: passed Y buffer mutated at byte {first} (len={nbytes})",
+                entry.name(),
+                tag
+            ));
         }
         checks += 1;
         Ok(())
@@ -798,20 +800,21 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
 
     for entry in entries {
         // Insufficient A extent (claim m0×k0 against 64 B).
-        one(entry, "short_A", &a_short, &x_ok, &y_real, m0, k0, n0)?;
+        one(entry, "short_A", &a_short, &x_ok, &y_f32, m0, k0, n0)?;
 
         // Insufficient X extent.
-        one(entry, "short_X", &a_ok, &x_short, &y_real, m0, k0, n0)?;
+        one(entry, "short_X", &a_ok, &x_short, &y_f32, m0, k0, n0)?;
 
-        // Insufficient Y extent: claim n0×m0 against 16-float sentinel.
-        // Primary zero-before-validation canary.
-        one(entry, "short_Y", &a_ok, &x_ok, &y_real, m0, k0, n0)?;
+        // Insufficient Y extent: claim n0×m0 against small F32 Y.
+        // Kept unchanged as the zero-before-validation canary that caught
+        // pool-rounded capacity accepting short logical Y (numel guard fix
+        // lands in gemm.rs via Gfx10DispatchFix).
+        one(entry, "short_Y", &a_ok, &x_ok, &y_f32, m0, k0, n0)?;
 
         // Wrong X dtype.
-        one(entry, "bad_x_dtype", &a_ok, &x_f16, &y_real, m0, k0, n0)?;
+        one(entry, "bad_x_dtype", &a_ok, &x_f16, &y_f32, m0, k0, n0)?;
 
-        // Wrong Y dtype — call arg is y_f16; sentinel lives on y_real and
-        // must still be untouched after the Err.
+        // Wrong Y dtype — canary snapshots y_f16 itself, not y_f32.
         one(entry, "bad_y_dtype", &a_ok, &x_ok, &y_f16, m0, k0, n0)?;
 
         // Byte-count overflow via oversized scalars (no huge alloc).
@@ -820,7 +823,7 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
             "overflow_y_bytes",
             &a_ok,
             &x_ok,
-            &y_real,
+            &y_f32,
             m_y_ovf,
             k0,
             n_y_ovf,
@@ -830,7 +833,7 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
             "overflow_a_bytes",
             &a_ok,
             &x_ok,
-            &y_real,
+            &y_f32,
             m_a_ovf,
             k0,
             n0,
@@ -840,47 +843,44 @@ fn run_malformed_suite(gpu: &mut Gpu, arch: &str) -> Result<usize, String> {
             "overflow_x_bytes",
             &a_ok,
             &x_ok,
-            &y_real,
+            &y_f32,
             m0,
             k0,
             n_x_ovf,
         )?;
 
         // i32-boundary scalars with honest small buffers. Extent/overflow
-        // may reject first; contract is still Err + sentinel intact.
-        one(
-            entry,
-            "i32_overflow_M",
-            &a_ok,
-            &x_ok,
-            &y_real,
-            m_i32,
-            k0,
-            n0,
-        )?;
-        one(
-            entry,
-            "i32_overflow_K",
-            &a_ok,
-            &x_ok,
-            &y_real,
-            m0,
-            k_i32,
-            n0,
-        )?;
-        one(
-            entry,
-            "i32_overflow_N",
-            &a_ok,
-            &x_ok,
-            &y_real,
-            m0,
-            k0,
-            n_i32,
-        )?;
+        // may reject first; contract is still Err + passed-Y intact.
+        one(entry, "i32_overflow_M", &a_ok, &x_ok, &y_f32, m_i32, k0, n0)?;
+        one(entry, "i32_overflow_K", &a_ok, &x_ok, &y_f32, m0, k_i32, n0)?;
+        one(entry, "i32_overflow_N", &a_ok, &x_ok, &y_f32, m0, k0, n_i32)?;
     }
 
     Ok(checks)
+}
+
+/// Deterministic nonzero canary covering `nbytes` of a device Y buffer.
+fn canary_bytes(tag: &[u8], entry: &[u8], nbytes: usize) -> Vec<u8> {
+    let mut out = vec![0u8; nbytes];
+    let mut state = 0xC4A1_u64
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(nbytes as u64);
+    for b in tag {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(*b as u64);
+    }
+    for b in entry {
+        state = state
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(*b as u64);
+    }
+    for slot in &mut out {
+        state = state.wrapping_mul(6364136223846793005).wrapping_add(1);
+        // Keep nonzero so a full zero-fill is always a detectable mutation.
+        *slot = ((state >> 33) as u8) | 1;
+    }
+    out
 }
 
 // ── synthetic fixtures ────────────────────────────────────────────────────

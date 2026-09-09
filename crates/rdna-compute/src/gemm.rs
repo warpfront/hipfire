@@ -6,6 +6,7 @@
 
 use crate::dispatch::{
     DType, Gpu, GpuTensor, FP8_WMMA_MIN_BATCH, LLOYD_MQ3_GROUP_BYTES, LLOYD_MQ4_GROUP_BYTES,
+    MQ4V2_GROUP_BYTES,
 };
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
@@ -430,9 +431,10 @@ struct Mq4g256v2SimtLaunch {
 /// gfx1010 plain-entry branches that zero Y then call it.
 ///
 /// Ordering: empty M/N no-op → nonzero K%256 → X/Y F32 → checked A/X/Y byte
-/// products → actual buffer/view extents → i32 scalars → u32 grid dims.
-/// Returns `Ok(None)` for the intentional empty-M/N no-op; `Ok(Some(_))` only
-/// when every check passed. Does not allocate or copy payloads.
+/// products → logical shape extents (numel / byte_size) → physical buf.size()
+/// → i32 scalars → u32 grid dims. Returns `Ok(None)` for the intentional
+/// empty-M/N no-op; `Ok(Some(_))` only when every check passed. Does not
+/// allocate or copy payloads.
 fn validate_mq4g256v2_residual_simt(
     a_raw: &GpuTensor,
     x: &GpuTensor,
@@ -466,22 +468,56 @@ fn validate_mq4g256v2_residual_simt(
             &format!("{WHO}: Y must be F32 (got {:?})", y.dtype),
         ));
     }
-
-    // A: M * (K/256) * 136; X: N*K*4; Y RMW: N*M*4.
+    // A: M * (K/256) * MQ4V2_GROUP_BYTES; X elems N*K; Y elems N*M.
     let a_bytes = m
         .checked_mul(k / 256)
-        .and_then(|g| g.checked_mul(136))
+        .and_then(|g| g.checked_mul(MQ4V2_GROUP_BYTES))
         .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: A size overflow")))?;
-    let x_bytes = batch_size
+    let x_elems = batch_size
         .checked_mul(k)
-        .and_then(|e| e.checked_mul(4))
         .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: X size overflow")))?;
-    let y_bytes = batch_size
+    let y_elems = batch_size
         .checked_mul(m)
-        .and_then(|e| e.checked_mul(4))
+        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: Y size overflow")))?;
+    let x_bytes = x_elems
+        .checked_mul(4)
+        .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: X size overflow")))?;
+    let y_bytes = y_elems
+        .checked_mul(4)
         .ok_or_else(|| hip_bridge::HipError::new(1, &format!("{WHO}: Y size overflow")))?;
 
-    // Accessible buffer/view extents (sub_offset views report the view size).
+    // Logical shape extents first: pool DeviceBuffers often round physical
+    // capacity up, so buf.size() alone can hide short numel/byte_size views.
+    // A is quantized MQ4V2 — use tensor byte_size(), not float element counts.
+    if a_raw.byte_size() < a_bytes {
+        return Err(hip_bridge::HipError::new(
+            1,
+            &format!(
+                "{WHO}: A logical extent too small (have {} need {a_bytes})",
+                a_raw.byte_size()
+            ),
+        ));
+    }
+    if x.numel() < x_elems {
+        return Err(hip_bridge::HipError::new(
+            1,
+            &format!(
+                "{WHO}: X logical extent too small (have {} elems need {x_elems})",
+                x.numel()
+            ),
+        ));
+    }
+    if y.numel() < y_elems {
+        return Err(hip_bridge::HipError::new(
+            1,
+            &format!(
+                "{WHO}: Y logical extent too small (have {} elems need {y_elems})",
+                y.numel()
+            ),
+        ));
+    }
+
+    // Physical accessible buffer/view prefix (sub_offset views report view size).
     if a_raw.buf.size() < a_bytes {
         return Err(hip_bridge::HipError::new(
             1,
