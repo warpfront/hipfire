@@ -34,7 +34,7 @@
 //! Defaults exercise N∈{1,3,7,8,9,16}, K∈{256,768,1024,2560}, M∈{16,33}
 //! plus a representative larger M (CLI M or 512), then bounded non-cross-product
 //! boundary shapes (R2 odd-M, tile edges, Spark K). Optional `--timing` runs the
-//! Spark projection census (N∈{64,46,8}) kernel-only residual-from-zero vs each
+//! Spark projection census (N∈{64,46,8}) host-timed launch+completion residual-from-zero vs each
 //! set arm (warmups 10, measured ≥5, raw samples + median). Machine-readable
 //! `RESULT*` / `RESULT_SET*` / `RESULT_MALFORMED*` / `RESULT_EMPTY*` /
 //! `RESULT_TIMING*` lines.
@@ -1321,18 +1321,18 @@ const TIMING_WARMUPS: usize = 10;
 const TIMING_ITERS: usize = 5;
 
 fn run_spark_timing(gpu: &mut Gpu, arch: &str) -> Result<(), String> {
-    eprintln!("=== spark projection timing (kernel-only) ===");
+    eprintln!("=== spark projection timing (host-timed launch+completion; Y upload excluded) ===");
     for shape in SPARK_SHAPES {
         let m = shape.m;
         let k = shape.k;
         let row_bytes = (k / GROUP) * GROUP_BYTES;
-        let weight_bytes = synth_mq4g256v2_weights(m, k, 0x71ME_u64.wrapping_add(m as u64));
+        let weight_bytes = synth_mq4g256v2_weights(m, k, 0x71AE_u64.wrapping_add(m as u64));
         let a_raw = gpu
             .upload_raw(&weight_bytes, &[m * row_bytes])
             .map_err(|e| format!("timing weights {}: {e}", shape.name))?;
 
         for &n in SPARK_NS {
-            let x_host = synth_x(n, k, 0x71XEu64);
+            let x_host = synth_x(n, k, 0x71CE_u64);
             let x_gpu = gpu
                 .upload_f32(&x_host, &[n * k])
                 .map_err(|e| format!("timing x: {e}"))?;
@@ -1343,7 +1343,7 @@ fn run_spark_timing(gpu: &mut Gpu, arch: &str) -> Result<(), String> {
                 .map_err(|e| format!("timing y: {e}"))?;
 
             // Baseline: residual from zero.
-            let samples_res = time_kernel_us(gpu, &y_gpu, &y_zero, |gpu| {
+            let samples_res = time_launch_completion_us(gpu, &y_gpu, &y_zero, |gpu| {
                 gpu.gemm_mq4g256v2_residual_simt(&a_raw, &x_gpu, &y_gpu, m, k, n)
             })?;
             emit_timing(
@@ -1360,9 +1360,9 @@ fn run_spark_timing(gpu: &mut Gpu, arch: &str) -> Result<(), String> {
             for &variant in SET_VARIANTS {
                 let name = set_variant_name(variant);
                 // Stale init so set path does real overwrite work; timing is
-                // kernel-only (htod of Y excluded from measured window).
+                // host-timed launch+completion (htod of Y excluded from measured window).
                 let stale: Vec<f32> = (0..y_elems).map(|i| 1234.0 + (i as f32) * 0.001).collect();
-                let samples = time_kernel_us(gpu, &y_gpu, &stale, |gpu| {
+                let samples = time_launch_completion_us(gpu, &y_gpu, &stale, |gpu| {
                     gpu.gemm_mq4g256v2_set_simt_variant(&a_raw, &x_gpu, &y_gpu, m, k, n, variant)
                 })?;
                 emit_timing(
@@ -1381,7 +1381,10 @@ fn run_spark_timing(gpu: &mut Gpu, arch: &str) -> Result<(), String> {
     Ok(())
 }
 
-fn time_kernel_us<F>(
+/// Host-timed launch+completion samples (µs). Wall clock covers Rust launch
+/// call through `device_synchronize`; Y upload is outside the measured window.
+/// Not a GPU-event kernel-only duration — rocprof owns true kernel times.
+fn time_launch_completion_us<F>(
     gpu: &mut Gpu,
     y_gpu: &GpuTensor,
     y_host: &[f32],
@@ -1442,10 +1445,10 @@ fn emit_timing(
         .collect::<Vec<_>>()
         .join(",");
     eprintln!(
-        "  timing {shape} entry={entry} M={m} K={k} N={n} mult={multiplicity}: median={median:.1}µs samples=[{samples_str}]"
+        "  timing {shape} entry={entry} M={m} K={k} N={n} mult={multiplicity} measurement=host_launch_completion: median={median:.1}µs samples=[{samples_str}]"
     );
     println!(
-        "RESULT_TIMING shape={shape} entry={entry} M={m} K={k} N={n} multiplicity={multiplicity} arch={arch} median_us={median:.3} samples_us={samples_str} warmups={TIMING_WARMUPS} iters={}",
+        "RESULT_TIMING shape={shape} entry={entry} M={m} K={k} N={n} multiplicity={multiplicity} arch={arch} measurement=host_launch_completion median_us={median:.3} samples_us={samples_str} warmups={TIMING_WARMUPS} iters={}",
         samples_us.len()
     );
 }

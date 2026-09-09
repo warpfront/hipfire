@@ -906,6 +906,12 @@ fn prefill_chunked_impl(
     if tokens.is_empty() {
         return Ok(Vec::new());
     }
+        if gpu.arch != "gfx1010" {
+            return Err(format!(
+                "spark25 prefill chunked: exact gfx1010 required (got {})",
+                gpu.arch
+            ));
+        }
     validate_spark_prefill_inputs(
         cfg,
         scratch,
