@@ -31,8 +31,8 @@
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
-const NH: usize = 8;
-const NKV: usize = 2;
+const NH: usize = 16;
+const NKV: usize = 4;
 const HD: usize = 256;
 const TOL: f32 = 1e-4;
 const WARMUPS: usize = 10;
@@ -126,7 +126,7 @@ fn main() {
     emit_json_array("timings", &v.timings);
     print!(",\n");
     println!(
-        r#"  "note": "host_launch_plus_completion timings; not kernel-only; full-model parity not claimed""#
+        r#"  "note": "host_launch_completion_per_call samples+median; not kernel-only; full-model parity not claimed""#
     );
     println!("}}");
 
@@ -765,7 +765,7 @@ fn run_timings(gpu: &mut Gpu, reverse: bool, v: &mut Verdict) {
         let out_c = gpu.zeros(&[bs * q_dim], DType::F32).expect("time out c");
 
         for &window in &windows {
-            let measure_baseline = |gpu: &mut Gpu| -> f64 {
+            let measure_baseline = |gpu: &mut Gpu| -> [f64; SAMPLES] {
                 for _ in 0..WARMUPS {
                     gpu.attention_q8_0_kv_batched_swa_strided_gfx1010(
                         &qkv,
@@ -785,8 +785,9 @@ fn run_timings(gpu: &mut Gpu, reverse: bool, v: &mut Verdict) {
                     .expect("warmup baseline");
                 }
                 gpu.hip.device_synchronize().expect("sync");
-                let t0 = Instant::now();
-                for _ in 0..SAMPLES {
+                let mut samples = [0.0f64; SAMPLES];
+                for s in &mut samples {
+                    let t0 = Instant::now();
                     gpu.attention_q8_0_kv_batched_swa_strided_gfx1010(
                         &qkv,
                         &k_cache,
@@ -803,11 +804,12 @@ fn run_timings(gpu: &mut Gpu, reverse: bool, v: &mut Verdict) {
                         q_stride,
                     )
                     .expect("sample baseline");
+                    gpu.hip.device_synchronize().expect("sync");
+                    *s = t0.elapsed().as_secs_f64() * 1e6;
                 }
-                gpu.hip.device_synchronize().expect("sync");
-                t0.elapsed().as_secs_f64() * 1e3 / SAMPLES as f64
+                samples
             };
-            let measure_candidate = |gpu: &mut Gpu| -> f64 {
+            let measure_candidate = |gpu: &mut Gpu| -> [f64; SAMPLES] {
                 for _ in 0..WARMUPS {
                     gpu.attention_q8_0_flash_tiled_swa_strided_gfx1010(
                         &qkv,
@@ -826,8 +828,9 @@ fn run_timings(gpu: &mut Gpu, reverse: bool, v: &mut Verdict) {
                     .expect("warmup candidate");
                 }
                 gpu.hip.device_synchronize().expect("sync");
-                let t0 = Instant::now();
-                for _ in 0..SAMPLES {
+                let mut samples = [0.0f64; SAMPLES];
+                for s in &mut samples {
+                    let t0 = Instant::now();
                     gpu.attention_q8_0_flash_tiled_swa_strided_gfx1010(
                         &qkv,
                         &k_cache,
@@ -843,9 +846,10 @@ fn run_timings(gpu: &mut Gpu, reverse: bool, v: &mut Verdict) {
                         q_stride,
                     )
                     .expect("sample candidate");
+                    gpu.hip.device_synchronize().expect("sync");
+                    *s = t0.elapsed().as_secs_f64() * 1e6;
                 }
-                gpu.hip.device_synchronize().expect("sync");
-                t0.elapsed().as_secs_f64() * 1e3 / SAMPLES as f64
+                samples
             };
 
             // Both entry orders within the probe. `--reverse` only flips which
@@ -856,17 +860,21 @@ fn run_timings(gpu: &mut Gpu, reverse: bool, v: &mut Verdict) {
                 [("baseline_then_candidate", false), ("candidate_then_baseline", true)]
             };
             for &(order, cand_first) in &orders {
-                let (base_ms, cand_ms) = if cand_first {
-                    let c_ms = measure_candidate(gpu);
-                    let b_ms = measure_baseline(gpu);
-                    (b_ms, c_ms)
+                let (base_samples, cand_samples) = if cand_first {
+                    let c = measure_candidate(gpu);
+                    let b = measure_baseline(gpu);
+                    (b, c)
                 } else {
-                    let b_ms = measure_baseline(gpu);
-                    let c_ms = measure_candidate(gpu);
-                    (b_ms, c_ms)
+                    let b = measure_baseline(gpu);
+                    let c = measure_candidate(gpu);
+                    (b, c)
                 };
+                let base_med = median_us(base_samples);
+                let cand_med = median_us(cand_samples);
                 v.timings.push(format!(
-                    r#"{{"bs":{bs},"ctx":{ctx},"window":{window},"order":"{order}","baseline_ms":{base_ms:.4},"candidate_ms":{cand_ms:.4},"warmups":{WARMUPS},"samples":{SAMPLES},"metric":"host_launch_plus_completion"}}"#
+                    r#"{{"bs":{bs},"ctx":{ctx},"window":{window},"order":"{order}","baseline_median_us":{base_med:.3},"candidate_median_us":{cand_med:.3},"baseline_samples_us":{},"candidate_samples_us":{},"warmups":{WARMUPS},"sample_count":{SAMPLES},"metric":"host_launch_completion_per_call"}}"#,
+                    format_samples_us(&base_samples),
+                    format_samples_us(&cand_samples),
                 ));
             }
         }
@@ -903,4 +911,24 @@ fn download_bytes(gpu: &Gpu, t: &GpuTensor) -> Vec<u8> {
     let mut v = vec![0u8; n];
     gpu.hip.memcpy_dtoh(&mut v, &t.buf).expect("memcpy_dtoh");
     v
+}
+
+/// Median of a chronological per-call sample array. Sorts a stack copy so the
+/// raw order stays available for JSON emission.
+fn median_us(samples: [f64; SAMPLES]) -> f64 {
+    let mut sorted = samples;
+    sorted.sort_by(|a, b| a.total_cmp(b));
+    sorted[SAMPLES / 2]
+}
+
+fn format_samples_us(samples: &[f64; SAMPLES]) -> String {
+    let mut s = String::from("[");
+    for (i, v) in samples.iter().enumerate() {
+        if i > 0 {
+            s.push(',');
+        }
+        s.push_str(&format!("{v:.3}"));
+    }
+    s.push(']');
+    s
 }
