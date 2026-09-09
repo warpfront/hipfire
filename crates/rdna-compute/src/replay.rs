@@ -1084,10 +1084,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         // (qkv/K/V read, out write, positions read); trailing window/qstride/bs
         // only widen the scalar tail (80 B padded).
         "attention_q8_0_kv_batched_swa_strided"
-        | "attention_q8_0_kv_batched_swa_strided_gfx1010"
-        // Query-tiled flash candidate: same five pointer slots (qkv/K/V read,
-        // out write, positions read); LDS-staged tiles never spill to memory.
-        | "attention_q8_0_flash_tiled_swa_strided_gfx1010" => {
+        | "attention_q8_0_kv_batched_swa_strided_gfx1010" => {
             Some(vec![read(0), read(8), read(16), write(24), read(32)])
         }
         "conv1d_silu_split_f32" => Some(vec![
@@ -1678,10 +1675,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
         | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"
         // attention_q8_0_kv_batched_swa_strided: 5 ptr + 4 i32 + f32 + 3 i32 = 72 → 80.
-        // The query-tiled flash candidate keeps the identical 13-arg ABI.
         | "attention_q8_0_kv_batched_swa_strided"
-        | "attention_q8_0_kv_batched_swa_strided_gfx1010"
-        | "attention_q8_0_flash_tiled_swa_strided_gfx1010" => Some(80),
+        | "attention_q8_0_kv_batched_swa_strided_gfx1010" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_k2048"

@@ -5367,15 +5367,6 @@ pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =
 pub const ATTENTION_Q8_0_KV_BATCHED_SWA_STRIDED_GFX1010_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_kv_batched_swa_strided_gfx1010.hip");
 
-/// Query-tiled FP32 SIMT flash attention over strided QKV rows (Spark chunk
-/// prefill), gfx1010-only standalone candidate. Entry:
-/// attention_q8_0_flash_tiled_swa_strided_gfx1010. Same 13-arg ABI as
-/// ATTENTION_Q8_0_KV_BATCHED_SWA_STRIDED_GFX1010_SRC above; BR=8/BC=32
-/// online-softmax tiling reuses K/V across 8 queries per workgroup. No
-/// WMMA/FP16 products; the portable baseline is unchanged.
-pub const ATTENTION_Q8_0_FLASH_TILED_SWA_STRIDED_GFX1010_SRC: &str =
-    include_str!("../../../kernels/src/attention_q8_0_flash_tiled_swa_strided_gfx1010.hip");
-
 /// Query-tiled Q8_0 flash prefill attention. LDS depends only on BR/BC,
 /// never on context length, so one kernel serves every sequence length.
 pub const ATTENTION_Q8_0_FLASH_PREFILL_SRC: &str =

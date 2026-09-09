@@ -802,7 +802,3 @@ required-features = ["lab"]
 [[example]]
 name = "bench_attention_flux_vt"
 required-features = ["lab"]
-
-[[example]]
-name = "test_spark_attn_tiled_gfx1010_parity"
-required-features = ["lab"]
