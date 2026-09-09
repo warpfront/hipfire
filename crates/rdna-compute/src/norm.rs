@@ -881,6 +881,233 @@ impl Gpu {
         }
     }
 
+    /// Batched strided RoPE over packed QKV rows in one launch.
+    /// `qkv` rows are `stride` floats; Q starts at `qoff`, K at `koff`.
+    /// `positions` holds `bs` consecutive absolute i32 positions (F32/raw 4-byte
+    /// allocation is fine). V and padding lanes outside Q/K are untouched.
+    /// Grid: [ceil((hd/2)/block), bs, 1], block = min(256, hd/2). 48B kernarg.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_batched_strided_f32(
+        &mut self,
+        qkv: &GpuTensor,
+        positions: &GpuTensor,
+        nhq: usize,
+        nhk: usize,
+        hd: usize,
+        fb: f32,
+        bs: usize,
+        qoff: usize,
+        koff: usize,
+        stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // N=0 is a safe no-op before any mutation or launch.
+        if bs == 0 {
+            return Ok(());
+        }
+        if hd == 0 || hd % 2 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("rope_batched_strided_f32: hd must be even and > 0 (got {hd})"),
+            ));
+        }
+        if nhq == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rope_batched_strided_f32: nhq must be > 0",
+            ));
+        }
+        if stride == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rope_batched_strided_f32: stride must be > 0",
+            ));
+        }
+        let qdim = nhq.checked_mul(hd).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "rope_batched_strided_f32: nhq*hd overflow")
+        })?;
+        let kvdim = nhk.checked_mul(hd).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "rope_batched_strided_f32: nhk*hd overflow")
+        })?;
+        let q_end = qoff.checked_add(qdim).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "rope_batched_strided_f32: qoff+qdim overflow")
+        })?;
+        let k_end = koff.checked_add(kvdim).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "rope_batched_strided_f32: koff+kvdim overflow")
+        })?;
+        if q_end > stride {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_batched_strided_f32: Q region [{qoff},{q_end}) exceeds stride {stride}"
+                ),
+            ));
+        }
+        if k_end > stride {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_batched_strided_f32: K region [{koff},{k_end}) exceeds stride {stride}"
+                ),
+            ));
+        }
+        // Non-overlapping Q/K regions within the row.
+        if !(q_end <= koff || k_end <= qoff) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_batched_strided_f32: Q [{qoff},{q_end}) overlaps K [{koff},{k_end}) within stride {stride}"
+                ),
+            ));
+        }
+        if qkv.dtype != DType::F32 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_batched_strided_f32: qkv dtype must be F32 (got {:?})",
+                    qkv.dtype
+                ),
+            ));
+        }
+        // Scalar / grid limits before mutation.
+        if nhq > i32::MAX as usize
+            || nhk > i32::MAX as usize
+            || hd > i32::MAX as usize
+            || bs > i32::MAX as usize
+            || qoff > i32::MAX as usize
+            || koff > i32::MAX as usize
+            || stride > i32::MAX as usize
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rope_batched_strided_f32: nhq/nhk/hd/bs/qoff/koff/stride exceed i32::MAX",
+            ));
+        }
+        let f32b = 4usize;
+        let qkv_need = bs
+            .checked_mul(stride)
+            .and_then(|n| n.checked_mul(f32b))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "rope_batched_strided_f32: bs*stride overflow")
+            })?;
+        let pos_need = bs.checked_mul(4).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "rope_batched_strided_f32: bs*4 positions overflow")
+        })?;
+        if qkv.buf.size() < qkv_need {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_batched_strided_f32: qkv buffer too small (have {} need {qkv_need} for [{bs},{stride}] F32)",
+                    qkv.buf.size()
+                ),
+            ));
+        }
+        if positions.buf.size() < pos_need {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_batched_strided_f32: positions buffer too small (have {} need {pos_need} for {bs} i32)",
+                    positions.buf.size()
+                ),
+            ));
+        }
+        // Optional shape product cross-check when metadata is populated.
+        if !qkv.shape.is_empty() {
+            let n: usize = qkv.shape.iter().product();
+            if n.checked_mul(f32b).is_some_and(|b| b < qkv_need) {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "rope_batched_strided_f32: qkv shape {:?} product too small for [{bs},{stride}]",
+                        qkv.shape
+                    ),
+                ));
+            }
+        }
+        if !positions.shape.is_empty() {
+            let n: usize = positions.shape.iter().product();
+            // Positions may be F32-typed storage holding raw i32 words.
+            let elem = positions.dtype.size().max(1);
+            if n.checked_mul(elem).is_some_and(|b| b < pos_need) {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "rope_batched_strided_f32: positions shape {:?} product too small for {bs} i32",
+                        positions.shape
+                    ),
+                ));
+            }
+        }
+
+        // Fresh module_name == kernel entry so the in-memory module cache cannot
+        // return the older non-strided rope_batched module.
+        self.ensure_kernel(
+            "rope_batched_strided_f32",
+            kernels::ROPE_BATCHED_SRC,
+            "rope_batched_strided_f32",
+        )?;
+        let qp = qkv.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let nhq_i = nhq as i32;
+        let nhk_i = nhk as i32;
+        let hd_i = hd as i32;
+        let fb_v = fb;
+        let bs_i = bs as i32;
+        let qoff_i = qoff as i32;
+        let koff_i = koff as i32;
+        let stride_i = stride as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &nhq_i as *const _ as *mut c_void,
+            &nhk_i as *const _ as *mut c_void,
+            &hd_i as *const _ as *mut c_void,
+            &fb_v as *const _ as *mut c_void,
+            &bs_i as *const _ as *mut c_void,
+            &qoff_i as *const _ as *mut c_void,
+            &koff_i as *const _ as *mut c_void,
+            &stride_i as *const _ as *mut c_void,
+        ];
+        let half = (hd / 2) as u32;
+        let block = 256u32.min(half.max(1));
+        let grid_x = (half + block - 1) / block;
+        if grid_x == 0 || bs as u64 > u32::MAX as u64 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rope_batched_strided_f32: grid dimensions exceed u32",
+            ));
+        }
+        let bytes = crate::profile::rope_bytes(nhq, nhk, hd) * bs;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "rope", "rope_batched_strided_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "rope_batched_strided_f32",
+            [grid_x, bs as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(pp);
+                b.push_i32(nhq_i);
+                b.push_i32(nhk_i);
+                b.push_i32(hd_i);
+                b.push_f32(fb_v);
+                b.push_i32(bs_i);
+                b.push_i32(qoff_i);
+                b.push_i32(koff_i);
+                b.push_i32(stride_i);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+
     // ── DeltaNet ops (feature-gated) ─────────────────────────────────────
 
     /// Partial interleaved RoPE for Qwen3.5 full attention layers.
@@ -1255,6 +1482,284 @@ impl Gpu {
         }
         result
     }
+
+    /// Batched strided partial RoPE over packed QKV rows.
+    /// Rotates the first `nrot` dims of every Q/K head; dims [nrot, hd) and V
+    /// are pass-through. Pair layout follows `rope_interleaved_legacy` (half-
+    /// split default; interleaved pairs under the legacy flag). Positions are
+    /// absolute i32 words (`positions[b] + pos_offset`). Grid:
+    /// [ceil((nrot/2)/block), bs, 1], block = min(32, nrot/2). 64B kernarg.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_partial_interleaved_batched_strided_f32(
+        &mut self,
+        qkv: &GpuTensor,
+        positions: &GpuTensor,
+        nhq: usize,
+        nhk: usize,
+        hd: usize,
+        nrot: usize,
+        fb: f32,
+        bs: usize,
+        pos_offset: i32,
+        qoff: usize,
+        koff: usize,
+        stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        // N=0 is a safe no-op before any mutation or launch.
+        if bs == 0 {
+            return Ok(());
+        }
+        if hd == 0 || hd % 2 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_partial_interleaved_batched_strided_f32: hd must be even and > 0 (got {hd})"
+                ),
+            ));
+        }
+        if nrot == 0 || nrot % 2 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_partial_interleaved_batched_strided_f32: nrot must be even and > 0 (got {nrot})"
+                ),
+            ));
+        }
+        if nrot > hd {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_partial_interleaved_batched_strided_f32: nrot {nrot} must be <= hd {hd}"
+                ),
+            ));
+        }
+        if nhq == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rope_partial_interleaved_batched_strided_f32: nhq must be > 0",
+            ));
+        }
+        if stride == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rope_partial_interleaved_batched_strided_f32: stride must be > 0",
+            ));
+        }
+        let qdim = nhq.checked_mul(hd).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                "rope_partial_interleaved_batched_strided_f32: nhq*hd overflow",
+            )
+        })?;
+        let kvdim = nhk.checked_mul(hd).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                "rope_partial_interleaved_batched_strided_f32: nhk*hd overflow",
+            )
+        })?;
+        let q_end = qoff.checked_add(qdim).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                "rope_partial_interleaved_batched_strided_f32: qoff+qdim overflow",
+            )
+        })?;
+        let k_end = koff.checked_add(kvdim).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                "rope_partial_interleaved_batched_strided_f32: koff+kvdim overflow",
+            )
+        })?;
+        if q_end > stride {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_partial_interleaved_batched_strided_f32: Q region [{qoff},{q_end}) exceeds stride {stride}"
+                ),
+            ));
+        }
+        if k_end > stride {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_partial_interleaved_batched_strided_f32: K region [{koff},{k_end}) exceeds stride {stride}"
+                ),
+            ));
+        }
+        if !(q_end <= koff || k_end <= qoff) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_partial_interleaved_batched_strided_f32: Q [{qoff},{q_end}) overlaps K [{koff},{k_end}) within stride {stride}"
+                ),
+            ));
+        }
+        if qkv.dtype != DType::F32 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_partial_interleaved_batched_strided_f32: qkv dtype must be F32 (got {:?})",
+                    qkv.dtype
+                ),
+            ));
+        }
+        if nhq > i32::MAX as usize
+            || nhk > i32::MAX as usize
+            || hd > i32::MAX as usize
+            || nrot > i32::MAX as usize
+            || bs > i32::MAX as usize
+            || qoff > i32::MAX as usize
+            || koff > i32::MAX as usize
+            || stride > i32::MAX as usize
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rope_partial_interleaved_batched_strided_f32: nhq/nhk/hd/nrot/bs/qoff/koff/stride exceed i32::MAX",
+            ));
+        }
+        let f32b = 4usize;
+        let qkv_need = bs
+            .checked_mul(stride)
+            .and_then(|n| n.checked_mul(f32b))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    "rope_partial_interleaved_batched_strided_f32: bs*stride overflow",
+                )
+            })?;
+        let pos_need = bs.checked_mul(4).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                "rope_partial_interleaved_batched_strided_f32: bs*4 positions overflow",
+            )
+        })?;
+        if qkv.buf.size() < qkv_need {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_partial_interleaved_batched_strided_f32: qkv buffer too small (have {} need {qkv_need} for [{bs},{stride}] F32)",
+                    qkv.buf.size()
+                ),
+            ));
+        }
+        if positions.buf.size() < pos_need {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_partial_interleaved_batched_strided_f32: positions buffer too small (have {} need {pos_need} for {bs} i32)",
+                    positions.buf.size()
+                ),
+            ));
+        }
+        if !qkv.shape.is_empty() {
+            let n: usize = qkv.shape.iter().product();
+            if n.checked_mul(f32b).is_some_and(|b| b < qkv_need) {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "rope_partial_interleaved_batched_strided_f32: qkv shape {:?} product too small for [{bs},{stride}]",
+                        qkv.shape
+                    ),
+                ));
+            }
+        }
+        if !positions.shape.is_empty() {
+            let n: usize = positions.shape.iter().product();
+            let elem = positions.dtype.size().max(1);
+            if n.checked_mul(elem).is_some_and(|b| b < pos_need) {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "rope_partial_interleaved_batched_strided_f32: positions shape {:?} product too small for {bs} i32",
+                        positions.shape
+                    ),
+                ));
+            }
+        }
+
+        // One kernel handles both pair layouts via the interleaved flag.
+        // module_name == entry so cache cannot return a prior halfsplit module.
+        let legacy = self.flags.rope_interleaved_legacy;
+        let interleaved = if legacy { 1i32 } else { 0i32 };
+        self.ensure_kernel(
+            "rope_partial_batched_strided_f32",
+            kernels::ROPE_PARTIAL_HALFSPLIT_BATCHED_SRC,
+            "rope_partial_batched_strided_f32",
+        )?;
+        let qp = qkv.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let nhq_i = nhq as i32;
+        let nhk_i = nhk as i32;
+        let hd_i = hd as i32;
+        let nr_i = nrot as i32;
+        let fb_v = fb;
+        let bs_i = bs as i32;
+        let po = pos_offset;
+        let qoff_i = qoff as i32;
+        let koff_i = koff as i32;
+        let stride_i = stride as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &nhq_i as *const _ as *mut c_void,
+            &nhk_i as *const _ as *mut c_void,
+            &hd_i as *const _ as *mut c_void,
+            &nr_i as *const _ as *mut c_void,
+            &fb_v as *const _ as *mut c_void,
+            &bs_i as *const _ as *mut c_void,
+            &po as *const _ as *mut c_void,
+            &qoff_i as *const _ as *mut c_void,
+            &koff_i as *const _ as *mut c_void,
+            &stride_i as *const _ as *mut c_void,
+            &interleaved as *const _ as *mut c_void,
+        ];
+        let n_pairs = (nrot / 2) as u32;
+        let block = 32u32.min(n_pairs.max(1));
+        let grid_x = (n_pairs + block - 1) / block;
+        if grid_x == 0 || bs as u64 > u32::MAX as u64 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rope_partial_interleaved_batched_strided_f32: grid dimensions exceed u32",
+            ));
+        }
+        let bytes = crate::profile::rope_bytes(nhq, nhk, hd) * bs;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "rope",
+            "rope_partial_batched_strided_f32",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "rope_partial_batched_strided_f32",
+            [grid_x, bs as u32, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(pp);
+                b.push_i32(nhq_i);
+                b.push_i32(nhk_i);
+                b.push_i32(hd_i);
+                b.push_i32(nr_i);
+                b.push_f32(fb_v);
+                b.push_i32(bs_i);
+                b.push_i32(po);
+                b.push_i32(qoff_i);
+                b.push_i32(koff_i);
+                b.push_i32(stride_i);
+                b.push_i32(interleaved);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
 
     /// 3D mrope, half-split. `pos_buf3` holds exactly 3 i32: (t, h, w).
     /// `section` is `mrope_section`; only [1] and [2] are needed by the

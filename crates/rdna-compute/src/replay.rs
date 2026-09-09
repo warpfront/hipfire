@@ -1075,6 +1075,12 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "attention_q8_0_kv" | "attention_q8_0_kv_swa" => {
             Some(vec![read(0), read(8), read(16), write(24), read(32)])
         }
+        // Spark chunk-batched SWA: same five pointer slots as single-query SWA
+        // (qkv/K/V read, out write, positions read); trailing window/qstride/bs
+        // only widen the scalar tail (80 B padded).
+        "attention_q8_0_kv_batched_swa_strided" => {
+            Some(vec![read(0), read(8), read(16), write(24), read(32)])
+        }
         "conv1d_silu_split_f32" => Some(vec![
             write(0),
             write(8),
@@ -1210,10 +1216,20 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "rope_f32" | "rope_partial_halfsplit_f32" | "rope_partial_interleaved_f32" => {
             Some(vec![write(0), write(8), read(16)])
         }
+        // Spark chunk-batched RoPE: single strided qkv is RMW in place
+        // (write covers RMW); positions read-only. Full and partial share the
+        // two-pointer prefix; partial adds nrot/pos_offset/interleaved
+        // (still 64 B after pad_to(16)). full is 48 B.
+        "rope_batched_strided_f32" | "rope_partial_batched_strided_f32" => {
+            Some(vec![write(0), read(8)])
+        }
         "kv_cache_write_asym_k_fwht3" => {
             Some(vec![write(0), read(8), read(16), read(24), read(32)])
         }
         "kv_cache_write_q8_0" => Some(vec![write(0), read(8), read(16)]),
+        // Spark chunk-batched Q8 KV writer: plain single-arena dst write,
+        // strided qkv + positions read (same three-pointer prefix as single).
+        "kv_cache_write_q8_0_batched_strided" => Some(vec![write(0), read(8), read(16)]),
         "attention_flash_fwht3_tile" => Some(vec![
             read(0),
             read(8),
@@ -1608,6 +1624,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "rope_f32"
         | "rope_partial_halfsplit_f32"
         | "rope_partial_interleaved_f32"
+        // rope_batched_strided: 2 ptr + 3 i32 + f32 + 4 i32 = 48.
+        // kv_cache_write_q8_0_batched_strided: 3 ptr + 5 i32 = 44 → 48.
+        | "rope_batched_strided_f32"
+        | "kv_cache_write_q8_0_batched_strided"
         | "conv1d_gated_decode_f32" => Some(48),
         "conv1d_silu_split_f32"
         | "gated_norm_mq_rotate_gfx1100"
@@ -1626,7 +1646,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         // attention_q8_0_kv: 5 ptr + 4 i32 + f32 = 60 → 64.
         // attention_q8_0_kv_swa: 5 ptr + 5 i32 + f32 = 64 (already aligned).
         | "attention_q8_0_kv"
-        | "attention_q8_0_kv_swa" => Some(64),
+        | "attention_q8_0_kv_swa"
+        // rope_partial_batched_strided: 2 ptr + 4 i32 + f32 + 5 i32 = 60 → 64.
+        | "rope_partial_batched_strided_f32" => Some(64),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine" => Some(64),
@@ -1634,7 +1656,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "fused_qkv_hfq4g256"
         | "fused_qkv_mq4g256v2"
         | "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100"
-        | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate" => Some(80),
+        | "moe_router_softmax_topk_k8_wave64_exact_shared_silu_mq_rotate"
+        // attention_q8_0_kv_batched_swa_strided: 5 ptr + 4 i32 + f32 + 3 i32 = 72 → 80.
+        | "attention_q8_0_kv_batched_swa_strided" => Some(80),
         "attention_flash_fwht3_tile"
         | "fused_qkvza_hfq4g256"
         | "fused_qkvza_hfq4g256_k2048"

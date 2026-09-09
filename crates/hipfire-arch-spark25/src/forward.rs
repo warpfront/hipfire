@@ -921,6 +921,23 @@ fn prefill_chunked_impl(
         capture.as_ref().map(|cap| cap.len()),
     )?;
 
+    // GPU LDS preflight for batched SWA attention (host validator is device-free).
+    // Same envelope as attention_q8_0_kv_swa / independent LDS helper: maxctx for
+    // this request is start_pos+tokens_len, already bounds-checked against max_seq.
+    let maxctx = (start_pos as usize)
+        .checked_add(tokens.len())
+        .ok_or_else(|| "spark25: prefill maxctx overflow".to_string())?;
+    let shm_limit = gpu.attention_q8_0_kv_independent_shared_mem_limit();
+    let lds_bytes =
+        rdna_compute::attention::attention_q8_0_kv_independent_lds_bytes(maxctx, cfg.head_dim);
+    if lds_bytes > shm_limit {
+        return Err(format!(
+            "spark25: prefill maxctx {maxctx} needs attention LDS {lds_bytes} bytes \
+             exceeding device shared-mem limit {shm_limit} (head_dim {})",
+            cfg.head_dim
+        ));
+    }
+
     // All bounds checked — from here any failure resets state (fail closed).
     match prefill_chunked_body(
         cfg,
@@ -1006,7 +1023,7 @@ fn prefill_chunked_body(
                 .map_err(|e| format!("spark25 prefill embed[{}]: {e}", pos0 + r))?;
         }
 
-        // One positions H2D per chunk; per-row views below feed RoPE/KV/attention.
+        // One positions H2D per chunk; c-row view feeds batched RoPE/KV/attention.
         pos_host.clear();
         pos_host.extend((0..c).map(|r| (pos0 + r) as i32));
         let pos_bytes: &[u8] =
@@ -1031,15 +1048,16 @@ fn prefill_chunked_body(
 
             weight_gemm(gpu, &lw.q_k_v_proj, &n1, &qkv, c)
                 .map_err(|e| format!("spark25 L{layer_idx} chunk@{pos0}: q_k_v_proj: {e}"))?;
-            // Q/K/V stay in their fused `qkv` rows: disjoint per-row views below
-            // (RoPE updates Q/K in place, V untouched) — no D2D copies.
+            // Q/K/V stay in fused `qkv` rows (RoPE updates Q/K in place, V untouched)
+            // — zero-copy strided batch kernels, no D2D pack/split.
 
             if cfg.headwise_attn_output_gate {
                 weight_gemm(gpu, &lw.g_proj, &n1, &gate, c)
                     .map_err(|e| format!("spark25 L{layer_idx} chunk@{pos0}: g_proj: {e}"))?;
             }
 
-            // Incremental per-row: RoPE → KV write → SWA attention (causality).
+            // Chunk-batched: one RoPE + two KV writers + one SWA attention.
+            // Causality holds because each query's seq bound is positions[row]+1.
             let seq_need = pos0 + c;
             {
                 let kv = if is_sliding {
@@ -1055,83 +1073,96 @@ fn prefill_chunked_body(
                         kv.k_gpu.len()
                     ));
                 }
-                for r in 0..c {
-                    let pos = (pos0 + r) as u32;
-                    // Disjoint views into this row's fused Q|K|V plus its
-                    // pre-uploaded position word (one H2D per chunk).
-                    let row_base = r * qkv_rows;
-                    let q_row = scratch.qkv_batch.sub_offset(row_base, q_dim);
-                    let k_row = scratch.qkv_batch.sub_offset(row_base + q_dim, kv_dim);
-                    let v_row = scratch
-                        .qkv_batch
-                        .sub_offset(row_base + q_dim + kv_dim, kv_dim);
-                    let pos_row = scratch.positions.sub_offset(r, 1);
-                    let out_row = scratch.attn_out_batch.sub_offset(r * q_dim, q_dim);
-
-                    if n_rot_pairs == 0 {
-                        // degenerate — skip
-                    } else if n_rot_pairs * 2 >= head_dim {
-                        gpu.rope_f32(&q_row, &k_row, &pos_row.buf, n_heads, n_kv, head_dim, theta)
-                            .map_err(|e| {
-                                format!("spark25 L{layer_idx} chunk@{pos0}: rope_f32 r{r}: {e:?}")
-                            })?;
-                    } else {
-                        let n_rot = n_rot_pairs * 2;
-                        gpu.rope_partial_interleaved_f32(
-                            &q_row,
-                            &k_row,
-                            &pos_row.buf,
-                            n_heads,
-                            n_kv,
-                            head_dim,
-                            n_rot,
-                            theta,
-                        )
-                        .map_err(|e| {
-                            format!("spark25 L{layer_idx} chunk@{pos0}: rope_partial r{r}: {e:?}")
-                        })?;
-                    }
-
-                    gpu.kv_cache_write_q8_0(
-                        &kv.k_gpu[kv_slot],
-                        &k_row,
-                        &pos_row.buf,
-                        n_kv,
-                        head_dim,
-                    )
-                    .map_err(|e| {
-                        format!("spark25 L{layer_idx} chunk@{pos0}: kv write k r{r}: {e:?}")
-                    })?;
-                    gpu.kv_cache_write_q8_0(
-                        &kv.v_gpu[kv_slot],
-                        &v_row,
-                        &pos_row.buf,
-                        n_kv,
-                        head_dim,
-                    )
-                    .map_err(|e| {
-                        format!("spark25 L{layer_idx} chunk@{pos0}: kv write v r{r}: {e:?}")
-                    })?;
-
-                    let seq_hint = pos as usize + 1;
-                    gpu.attention_q8_0_kv_swa(
-                        &q_row,
-                        &kv.k_gpu[kv_slot],
-                        &kv.v_gpu[kv_slot],
-                        &out_row,
-                        &pos_row.buf,
-                        seq_hint,
+                let positions = scratch.positions.sub_offset(0, c);
+                if n_rot_pairs == 0 {
+                    // degenerate — skip
+                } else if n_rot_pairs * 2 >= head_dim {
+                    gpu.rope_batched_strided_f32(
+                        &qkv,
+                        &positions,
                         n_heads,
                         n_kv,
                         head_dim,
-                        kv.physical_cap,
-                        window,
+                        theta,
+                        c,
+                        0,
+                        q_dim,
+                        qkv_rows,
                     )
                     .map_err(|e| {
-                        format!("spark25 L{layer_idx} chunk@{pos0}: attn swa r{r}: {e:?}")
+                        format!("spark25 L{layer_idx} chunk@{pos0}: rope_batched_strided: {e:?}")
+                    })?;
+                } else {
+                    let n_rot = n_rot_pairs * 2;
+                    gpu.rope_partial_interleaved_batched_strided_f32(
+                        &qkv,
+                        &positions,
+                        n_heads,
+                        n_kv,
+                        head_dim,
+                        n_rot,
+                        theta,
+                        c,
+                        0,
+                        0,
+                        q_dim,
+                        qkv_rows,
+                    )
+                    .map_err(|e| {
+                        format!(
+                            "spark25 L{layer_idx} chunk@{pos0}: rope_partial_batched_strided: {e:?}"
+                        )
                     })?;
                 }
+
+                gpu.kv_cache_write_q8_0_batched_strided(
+                    &kv.k_gpu[kv_slot],
+                    &qkv,
+                    &positions,
+                    n_kv,
+                    head_dim,
+                    c,
+                    qkv_rows,
+                    q_dim,
+                )
+                .map_err(|e| {
+                    format!("spark25 L{layer_idx} chunk@{pos0}: kv write k batched: {e:?}")
+                })?;
+                gpu.kv_cache_write_q8_0_batched_strided(
+                    &kv.v_gpu[kv_slot],
+                    &qkv,
+                    &positions,
+                    n_kv,
+                    head_dim,
+                    c,
+                    qkv_rows,
+                    q_dim + kv_dim,
+                )
+                .map_err(|e| {
+                    format!("spark25 L{layer_idx} chunk@{pos0}: kv write v batched: {e:?}")
+                })?;
+
+                let maxctx = pos0 + c;
+                gpu.attention_q8_0_kv_batched_swa_strided(
+                    &qkv,
+                    &kv.k_gpu[kv_slot],
+                    &kv.v_gpu[kv_slot],
+                    &attn_out,
+                    &positions,
+                    n_heads,
+                    n_kv,
+                    head_dim,
+                    kv.physical_cap,
+                    maxctx,
+                    c,
+                    window,
+                    qkv_rows,
+                )
+                .map_err(|e| {
+                    format!("spark25 L{layer_idx} chunk@{pos0}: attn swa batched: {e:?}")
+                })?;
             }
+
 
             // Headwise sigmoid: gate[i/head_dim] with n_heads_total = c*n_heads.
             if cfg.headwise_attn_output_gate {
