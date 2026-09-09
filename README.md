@@ -145,6 +145,7 @@ The registry currently contains 80 curated model entries. Run
 | NEX N2 Mini | `nex-n2:mini` |
 | VibeThinker-3B | `vibethinker:3b`, `vibethinker:3b-mq6` |
 | Spark-X2.5 | Local MQ4V2 HFQ only — **no** registry pull tag. Convert [XHToken/Spark-X2.5-4B](https://huggingface.co/XHToken/Spark-X2.5-4B/tree/5e10fcc0286756aebf7c41dc52c1e42d95c70281) @ `5e10fcc0286756aebf7c41dc52c1e42d95c70281` |
+| NeoHorse-1-4B | Local MQ4V2 HFQ only — **no** registry pull tag. Convert [TokenRhythm/NeoHorse-1-4B](https://huggingface.co/TokenRhythm/NeoHorse-1-4B/tree/ae08176a14f85b52d2e61c9963c9a00766de79f6) @ `ae08176a14f85b52d2e61c9963c9a00766de79f6` |
 
 Common aliases include `qwen3.5`, `qwen3.6`, `qwen3.8`, `qwen3`, `carnice`,
 `qwopus`, `deepseek4`, `deepseek-v4`, `muse-glimmer`, `ornith`, `ornith-1.5`, `ornith-1.5:fast`, and `vibethinker`.
@@ -162,6 +163,12 @@ the ~15872 cap on 64 KiB GPUs with `head_dim` 256; **4096** is validated). For
 `hipfire run`, pass `--repeat-penalty 1` (standard bench is neutral `1.0`;
 older `1.1` results are not comparable). Retained PM4/AQL paths exist for
 diagnostics and are **not** the product default.
+
+NeoHorse-1-4B is an Apache-2.0 Qwen3.5-4B text-only model that loads through
+the existing Qwen3.5 text conversion/load/runtime as a local MQ4V2 HFQ
+(`--format mq4v2`). There is **no** registry pull tag. Product generation is
+validated **plain AR** only — upstream MTP config is not an exercised hipfire
+path (no MTP or DFlash validation).
 
 See [docs/MODELS.md](docs/MODELS.md) for sizes, minimum VRAM,
 recommended sampling settings, sidecars, artifact provenance, and
