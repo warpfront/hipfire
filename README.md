@@ -146,6 +146,7 @@ The registry currently contains 80 curated model entries. Run
 | VibeThinker-3B | `vibethinker:3b`, `vibethinker:3b-mq6` |
 | Spark-X2.5 | Local MQ4V2 HFQ only — **no** registry pull tag. Convert [XHToken/Spark-X2.5-4B](https://huggingface.co/XHToken/Spark-X2.5-4B/tree/5e10fcc0286756aebf7c41dc52c1e42d95c70281) @ `5e10fcc0286756aebf7c41dc52c1e42d95c70281` |
 | NeoHorse-1-4B | Local MQ4V2 HFQ only — **no** registry pull tag. Convert [TokenRhythm/NeoHorse-1-4B](https://huggingface.co/TokenRhythm/NeoHorse-1-4B/tree/ae08176a14f85b52d2e61c9963c9a00766de79f6) @ `ae08176a14f85b52d2e61c9963c9a00766de79f6` |
+| LFM2.5-2.6B | Local MQ4V2 HFQ only — **no** registry pull tag. Convert [LiquidAI/LFM2.5-2.6B](https://huggingface.co/LiquidAI/LFM2.5-2.6B/tree/654f9463ce32b05d0429d76fe1f580b27d4c1ac0) @ `654f9463ce32b05d0429d76fe1f580b27d4c1ac0` |
 
 Common aliases include `qwen3.5`, `qwen3.6`, `qwen3.8`, `qwen3`, `carnice`,
 `qwopus`, `deepseek4`, `deepseek-v4`, `muse-glimmer`, `ornith`, `ornith-1.5`, `ornith-1.5:fast`, and `vibethinker`.
@@ -169,6 +170,19 @@ the existing Qwen3.5 text conversion/load/runtime as a local MQ4V2 HFQ
 (`--format mq4v2`). There is **no** registry pull tag. Product generation is
 validated **plain AR** only — upstream MTP config is not an exercised hipfire
 path (no MTP or DFlash validation).
+
+LFM2.5-2.6B is a local MQ4V2 HFQ (`hipfire quantize --format mq4v2`; 266
+tensors: 167 `MQ4G256V2` + 99 Q8) on the existing arch_id=11 LFM route. There
+is **no** registry pull tag (`lfm2.5:2.6b` is not published). License is LFM
+Open License v1.0 (`lfm1.0`), not Apache-2.0: the Commercial Use grant is
+conditioned on the licensee not exceeding $10M annual revenue; that threshold
+does not apply to qualified non-profits for non-commercial/research use.
+Validated **plain AR** only (gfx1201 and gfx1010); DFlash/MTP were not
+exercised. Reasoning controls work (`enable_thinking`, `max_think_tokens`,
+reasoning/answer separation). Tools are refused before generation on the
+`lfm_ar` producer route (fail-closed). LFM cold-resets state per turn by design
+(hybrid conv+GQA cannot rewind), so multi-turn re-prefills history and
+cached-token reuse does not apply.
 
 See [docs/MODELS.md](docs/MODELS.md) for sizes, minimum VRAM,
 recommended sampling settings, sidecars, artifact provenance, and

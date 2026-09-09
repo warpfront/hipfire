@@ -168,6 +168,16 @@ Vision-tower **loading** is registry-driven the same way: every `qwen3.8:27b*` t
 
 Registry `recommended_settings` for LFM tags is low temperature (0.05–0.2) with `repeat_penalty` 1.05 — applied by the CLI resolver. Do not treat a registry `sampling` field as active defaults.
 
+**Local-only (not a registry tag):** LFM2.5-2.6B. Convert
+[LiquidAI/LFM2.5-2.6B](https://huggingface.co/LiquidAI/LFM2.5-2.6B/tree/654f9463ce32b05d0429d76fe1f580b27d4c1ac0)
+@ `654f9463ce32b05d0429d76fe1f580b27d4c1ac0` with `hipfire quantize --format mq4v2`
+(arch_id=11). `lfm2.5:2.6b` is **not** among the registry tags above. License is
+LFM Open License v1.0 (`lfm1.0`): Commercial Use grant conditioned on ≤$10M
+annual revenue; that threshold does not apply to qualified non-profits for
+non-commercial/research use. Product path is validated plain AR only; tools are
+refused before generation on `lfm_ar`; per-turn state reset means prefix-cache
+reuse does not apply. No DFlash/MTP claim.
+
 ### Gemma4 (registry — no published artifact yet)
 
 > **No hipfire-quantized Gemma4 `.hfq`/`.mq4` artifact has been published.** The
