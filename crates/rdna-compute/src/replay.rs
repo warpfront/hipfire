@@ -863,6 +863,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemm_mq4g256v2_set_simt_r1t8_g1_gfx1010"
             | "gemm_mq4g256v2_set_simt_r1t16_g1_gfx1010"
             | "gemm_mq4g256v2_set_simt_r2t8_g1_gfx1010"
+            | "gemm_mq4g256v2_set_simt_m4n32_lds_gfx1010"
     ) {
         // A@0 read, X@8 read, Y@16 RMW (recorded as write). Spans from M/K/N
         // live in kernarg i32s @24/@28/@32 (allocation-wide via address range).
@@ -1550,6 +1551,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemm_mq4g256v2_set_simt_r1t8_g1_gfx1010"
             | "gemm_mq4g256v2_set_simt_r1t16_g1_gfx1010"
             | "gemm_mq4g256v2_set_simt_r2t8_g1_gfx1010"
+            | "gemm_mq4g256v2_set_simt_m4n32_lds_gfx1010"
     ) {
         // 3 ptr + M,K,N i32 = 36 → pad_to(16) = 48.
         return Some(48);
@@ -7446,6 +7448,7 @@ mod tests {
             "gemm_mq4g256v2_set_simt_r1t8_g1_gfx1010",
             "gemm_mq4g256v2_set_simt_r1t16_g1_gfx1010",
             "gemm_mq4g256v2_set_simt_r2t8_g1_gfx1010",
+            "gemm_mq4g256v2_set_simt_m4n32_lds_gfx1010",
         ] {
             let mut blob = hip_bridge::KernargBlob::new();
             for _ in 0..3 {

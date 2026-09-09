@@ -3133,6 +3133,12 @@ pub const GEMM_MQ4G256V2_RESIDUAL_SIMT_SRC: &str =
 /// GEMM_MQ4G256V2_RESIDUAL_SIMT_SRC. Cleanup removes this after selection.
 pub const GEMM_MQ4G256V2_SIMT_EXPERIMENTS_GFX1010_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_simt_experiments_gfx1010.hip");
+/// gfx1010 cooperative M4×N32 LDS plain-set GEMM (Y = A·X). Dedicated TU —
+/// never bundled into the four-arm experiments source. Fixed LDS 36864,
+/// dynamic launch LDS 0, block 256, grid [ceil(M/4), ceil(N/32)].
+pub const GEMM_MQ4G256V2_SET_SIMT_M4N32_LDS_GFX1010_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_set_simt_m4n32_lds_gfx1010.hip");
+
 
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma.hip");
