@@ -4049,7 +4049,20 @@ fn e8_soa_experts() -> bool {
     })
 }
 
-const MQ4_G256_QUANT_TYPE: u8 = 13;
+/// Quant types that share the 136 B/group stride and can be packed into
+/// layer-level blobs via `try_load_packed_mq4_experts`. All three have
+/// identical byte layout for concatenation purposes — only the 8-byte group
+/// header interpretation differs, which is handled by kernel dispatch on
+/// `gpu_dtype`. qt=30 (MQ4G256Lloyd, 160 B/group) and qt=47 (MQ6G256V2,
+/// 200 B/group) are excluded because their strides differ.
+fn packable_mq4_dtype(qt: u8) -> Option<DType> {
+    match qt {
+        13 => Some(DType::MQ4G256),
+        44 => Some(DType::MQ4G256V2),
+        45 => Some(DType::MQ4CG256),
+        _ => None,
+    }
+}
 
 struct PackedMq4ExpertSpec {
     gate_up_name: String,
@@ -4128,6 +4141,7 @@ fn try_load_packed_mq4_experts(
     let mut specs = Vec::with_capacity(expert_ids.len());
     let mut gate_up_stride = None;
     let mut down_stride = None;
+    let mut expert_dtype: Option<DType> = None;
     for &expert_id in expert_ids {
         let gate_up_bare = format!("{p}.mlp.experts.{expert_id}.gate_up_proj.weight");
         let down_bare = format!("{p}.mlp.experts.{expert_id}.down_proj.weight");
@@ -4150,8 +4164,19 @@ fn try_load_packed_mq4_experts(
         else {
             return Ok(None);
         };
-        if gate_up_qt != MQ4_G256_QUANT_TYPE || down_qt != MQ4_G256_QUANT_TYPE {
+        let Some(gu_dt) = packable_mq4_dtype(gate_up_qt) else {
             return Ok(None);
+        };
+        let Some(dn_dt) = packable_mq4_dtype(down_qt) else {
+            return Ok(None);
+        };
+        if gu_dt != dn_dt {
+            return Ok(None);
+        }
+        match expert_dtype {
+            None => expert_dtype = Some(gu_dt),
+            Some(dt) if dt == gu_dt => {}
+            Some(_) => return Ok(None),
         }
         match gate_up_stride {
             None => gate_up_stride = Some(gate_up_bytes),
@@ -4291,11 +4316,12 @@ fn try_load_packed_mq4_experts(
         );
     }
 
+    let expert_dtype = expert_dtype.expect("non-empty packed MQ4 expert list");
     let mut experts = Vec::with_capacity(specs.len());
     for (slot, spec) in specs.iter().enumerate() {
         let mut gate_up = WeightTensor {
             buf: gate_up_owner.sub_offset(slot * gate_up_stride, gate_up_stride),
-            gpu_dtype: DType::MQ4G256,
+            gpu_dtype: expert_dtype,
             m: 2 * mi,
             k: dim,
             row_stride: 0,
@@ -4305,7 +4331,7 @@ fn try_load_packed_mq4_experts(
         gate_up.awq_scale = load_awq_scale_for(hfq, gpu, &spec.gate_up_name, dim);
         let mut down = WeightTensor {
             buf: down_owner.sub_offset(slot * down_stride, down_stride),
-            gpu_dtype: DType::MQ4G256,
+            gpu_dtype: expert_dtype,
             m: dim,
             k: mi,
             row_stride: 0,
