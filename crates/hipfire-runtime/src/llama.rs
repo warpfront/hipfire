@@ -8081,7 +8081,7 @@ mod tests {
         let max_seq = 32_768;
         let expected_tile =
             rdna_compute::attention::q8_flash_tile_size("gfx1100", 16, 8, 128, max_seq);
-        assert_eq!(expected_tile, 32);
+        assert_eq!(expected_tile, 128);
         assert_eq!(
             llama_flash_partials_len("gfx1100", 16, 8, 128, max_seq),
             16 * max_seq.div_ceil(expected_tile) * 130

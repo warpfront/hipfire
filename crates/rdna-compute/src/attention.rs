@@ -72,9 +72,14 @@ fn q8_flash_default_tile_size(
         && n_kv_heads == 2
         && head_dim == 256
         && max_seq == 2_048;
+    // gfx1100 keeps tile32 for short KV, where it was the measured winner.
+    // Past 8K, tile128 cuts the number of partials and reduction work by 4x;
+    // keep the perf choice atom-specific so unmeasured RDNA3 siblings retain
+    // their existing defaults.
+    let gfx1100_short_kv = arch == "gfx1100" && max_seq <= 8_192;
     if gfx12_small_dense_shape {
         16
-    } else if arch == "gfx1100" || gfx1151_radiowave_shape {
+    } else if gfx1100_short_kv || gfx1151_radiowave_shape {
         32
     } else {
         128
@@ -16304,6 +16309,23 @@ mod tests {
         assert_eq!(q8_flash_default_tile_size("gfx1100", 1, 1, 64, 8_192), 32);
         assert_eq!(
             q8_flash_default_tile_size("gfx1200", 16, 2, 256, 2_048),
+            128
+        );
+    }
+
+    #[test]
+    fn gfx1100_q8_tile128_is_long_context_only() {
+        assert_eq!(q8_flash_default_tile_size("gfx1100", 16, 8, 128, 8_192), 32);
+        assert_eq!(
+            q8_flash_default_tile_size("gfx1100", 16, 8, 128, 8_193),
+            128
+        );
+        assert_eq!(
+            q8_flash_default_tile_size("gfx1100", 16, 8, 128, 32_768),
+            128
+        );
+        assert_eq!(
+            q8_flash_default_tile_size("gfx1101", 16, 8, 128, 32_768),
             128
         );
     }
