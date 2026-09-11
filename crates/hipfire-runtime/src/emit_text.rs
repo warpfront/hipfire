@@ -841,12 +841,25 @@ fn extract_qwen_xml_tool_call_inner(
     if strict && !rest.chars().all(|c| c.is_whitespace()) {
         return None;
     }
-    // Strict: nothing after </function> either.
+    // Strict: after </function>, allow only whitespace or duplicate copies of
+    // that same closer. The duplicate is content-free and has been observed on
+    // otherwise valid greedy tool-call output; anything else still fails
+    // closed as malformed protocol.
     if strict {
         if let Some(end) = after_name.find("</function>") {
-            let after_close = &after_name[end + "</function>".len()..];
-            if !after_close.chars().all(|c| c.is_whitespace()) {
+            let mut tail = after_name[end + "</function>".len()..].trim_start();
+            let mut dropped = 0usize;
+            while let Some(rest) = tail.strip_prefix("</function>") {
+                tail = rest.trim_start();
+                dropped += 1;
+            }
+            if !tail.chars().all(|c| c.is_whitespace()) {
                 return None;
+            }
+            if dropped > 0 {
+                eprintln!(
+                    "[hipfire] tool_call: dropped {dropped} duplicated </function> closer(s)"
+                );
             }
         }
     }
@@ -1712,6 +1725,36 @@ mod tests {
     #[test]
     fn router_qwen_xml_trailing_garbage_after_params_fail_closed() {
         let s = "<tool_call><function=write_file><parameter=path>/tmp/x</parameter>TRAIL</function></tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty());
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_qwen_xml_duplicate_function_closer_is_repaired() {
+        let s = "<tool_call><function=read_file><parameter=path>src/main.rs</parameter></function>\n</function>\n</tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "src/main.rs");
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_qwen_xml_multiple_duplicate_function_closers_are_repaired() {
+        let s = "<tool_call><function=read_file><parameter=path>x</parameter></function></function> </function></tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["path"], "x");
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_qwen_xml_duplicate_closer_with_trailing_content_fails_closed() {
+        let s = "<tool_call><function=read_file><parameter=path>x</parameter></function></function>extra</tool_call>";
         let (vis, calls, term) = feed(&[s]);
         assert_eq!(term, Terminal::Malformed);
         assert!(calls.is_empty());
