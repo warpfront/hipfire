@@ -1580,7 +1580,7 @@
    "commands": {
     "negative": [],
     "positive": [
-     "HIPFIRE_QWEN35_RESET_MODEL=/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
+     "HIPFIRE_QWEN35_RESET_MODEL=/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
     ]
    },
    "env": {
@@ -1613,7 +1613,7 @@
    "commands": {
     "negative": [],
     "positive": [
-     "HIPFIRE_HAVE_2_GPU=1 HIPFIRE_PP_RESET_MODEL=/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt HIPFIRE_PP_DEVICES=0,1 HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw pp_qwen35 -- --ignored --test-threads=1"
+     "HIPFIRE_HAVE_2_GPU=1 HIPFIRE_PP_RESET_MODEL=/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt HIPFIRE_PP_DEVICES=0,1 HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw pp_qwen35 -- --ignored --test-threads=1"
     ]
    },
    "env": {

@@ -353,7 +353,8 @@ def row_mapping(ctx, row, out):
     base = os.path.basename(model)
     return {"$MODEL": model, "$MODEL_ALT": os.path.join(models_dir(), base), "$MODEL_DIR": os.path.dirname(model),
             "$MODELS_DIR": models_dir(), "$OUT": out, "$DAEMON_BIN": ctx["daemon_bin"] or "",
-            "$CLI_BIN": ctx["cli_bin"] or "", "$PROMPT": row.get("prompt", "")}
+            "$CLI_BIN": ctx["cli_bin"] or "", "$PROMPT": row.get("prompt", ""),
+            "$DAEMON_FI_BIN": os.environ.get("HIPFIRE_DAEMON_FI_BIN", "")}
 def prompt_identity(ctx, row, mapping):
     if row.get("prompt"):
         return hashlib.md5(row["prompt"].encode()).hexdigest()
@@ -512,7 +513,8 @@ def show_plan(rows, ctx):
         m = {"$MODEL": ctx["fixture_paths"].get((row.get("fixtures", [""]) or [""])[0], "$MODEL"),
              "$MODEL_ALT": "$MODEL_ALT", "$MODEL_DIR": "$MODEL_DIR",
              "$MODELS_DIR": models_dir(), "$OUT": "$OUT", "$DAEMON_BIN": ctx["daemon_bin"] or "$DAEMON_BIN",
-             "$CLI_BIN": ctx["cli_bin"] or "hipfire", "$PROMPT": row.get("prompt", "")}
+             "$CLI_BIN": ctx["cli_bin"] or "hipfire", "$PROMPT": row.get("prompt", ""),
+             "$DAEMON_FI_BIN": os.environ.get("HIPFIRE_DAEMON_FI_BIN", "")}
         print("== %s [%s] %s probe=%s ==" % (row["id"], row["milestone"],
                                              row.get("route", ""), row.get("probe", "")))
         print("   hosts: %s fixtures: %s" % (",".join(row.get("hosts", [])), ",".join(row.get("fixtures", [])) or "-"))
