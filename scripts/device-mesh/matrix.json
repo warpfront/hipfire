@@ -1612,6 +1612,26 @@
   {
    "commands": {
     "negative": [],
+    "positive": []
+   },
+   "fixtures": [],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g4-spec-route-fault-coverage",
+   "milestone": "G4.7",
+   "note": "#666 G4.7 pairs each positive route with its fail-closed route, but the serve-fault-inject injector does not fire on the DFlash speculative-decode route. Measured on gfx1201 at 72f8a5904: qwen35_reset_hw single_qwen35 passes with no draft and fails 'fault did not fire (got done)' when HIPFIRE_DFLASH_DRAFT forces a draft, i.e. the faulted turn completes successfully instead of rolling back. The AR reset/rollback route is proven (g4-reset-single); the spec route's fail-closed half has no probe because the injector cannot reach it.",
+   "predicate": {
+    "kind": "none"
+   },
+   "probe": "none",
+   "route": "single/spec-decode-fault-rollback"
+  },
+  {
+   "commands": {
+    "negative": [],
     "positive": [
      "HIPFIRE_HAVE_2_GPU=1 HIPFIRE_PP_RESET_MODEL=/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt HIPFIRE_PP_DEVICES=0,1 HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw pp_qwen35 -- --ignored --test-threads=1"
     ]
