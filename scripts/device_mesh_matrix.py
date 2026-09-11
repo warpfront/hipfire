@@ -466,7 +466,9 @@ def execute_row(ctx, row, out, timeout):
     for cmd in row.get("commands", {}).get("positive", []):
         for assign in re.findall(r'HIPFIRE_\w*FIXTURE="?([^"\s]+)"?', subst(cmd, mapping)):
             paths += [p for p in assign.split(",") if p.startswith("/")]
-    missing = [p for p in paths if not os.path.isfile(p)]
+    # A fixture may legitimately be a directory (HIPFIRE_DENSE_FIXTURE points at
+    # the model store, not one file).
+    missing = [p for p in paths if not (os.path.isfile(p) or os.path.isdir(p))]
     if missing:
         return "hardware-blocked", "fixtures absent: %s" % missing, detail
     if row.get("positive_session") and mapping["$MODEL"]:
