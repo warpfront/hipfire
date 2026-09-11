@@ -137,11 +137,26 @@ def eval_cargo(text, minimum):
     return (s["summaries"] and not s["failed"] and s["passed"] >= minimum,
             "cargo: passed=%d failed=%d min=%d" % (s["passed"], s["failed"], minimum))
 
+def degenerate_text(content):
+    """A lifecycle row fails on DEGENERATE output, not on truncation.
+    `runaway` in serve_harness is simply finish=="length", so a healthy long
+    answer that reaches the token cap trips it. Judge the text instead: an
+    attractor or repetition loop collapses the distinct-word ratio, while real
+    prose and code stay far above it (measured 0.34-0.65 on this fixture set)."""
+    words = (content or "").split()
+    if len(words) < 64:
+        return True  # a cap-truncated row with almost no text is not healthy
+    return len(set(words)) / len(words) < 0.2
+
 def eval_serve_rows(rows, expect_clean):
     if not isinstance(rows, list) or not rows:
         return False, "serve: --out holds no rows"
-    bad = [i for i, r in enumerate(rows) if not isinstance(r, dict)
-           or r.get("attractor") or r.get("empty") or r.get("runaway")]
+    def flagged(r):
+        if not isinstance(r, dict) or r.get("attractor") or r.get("empty"):
+            return True
+        # Truncation alone is not a defect; degenerate truncation is.
+        return bool(r.get("runaway")) and degenerate_text(r.get("content"))
+    bad = [i for i, r in enumerate(rows) if flagged(r)]
     if expect_clean:
         return not bad, "serve: %d rows, %d flagged %s" % (len(rows), len(bad), bad)
     return bool(bad), "serve-negative: %d rows, %d flagged %s" % (len(rows), len(bad), bad)
@@ -572,6 +587,17 @@ def self_test():
     check("serve-dirty-fails", not eval_serve_rows(SAMPLE_SERVE_DIRTY, True)[0])
     check("serve-negative-accounting", eval_serve_rows(SAMPLE_SERVE_DIRTY, False)[0])
     check("serve-empty-fails", not eval_serve_rows([], True)[0])
+    # Truncation is not degeneracy: a healthy answer that reaches the token cap
+    # must pass, a repetition loop or a cap-hit-with-no-text must not.
+    long_ok = [{"finish": "length", "runaway": True,
+                "content": " ".join("w%d" % i for i in range(400))}]
+    check("serve-long-truncated-passes", eval_serve_rows(long_ok, True)[0])
+    check("serve-repetition-loop-fails",
+          not eval_serve_rows([{"finish": "length", "runaway": True,
+                                "content": "yes no " * 400}], True)[0])
+    check("serve-stub-truncation-fails",
+          not eval_serve_rows([{"finish": "length", "runaway": True,
+                                "content": "short " * 10}], True)[0])
     check("redline-pass", eval_redline(SAMPLE_REDLINE, True)[0])
     # Real reports carry sibling fields next to `sequence_stable` (`measurement`,
     # `captures`, `context_tokens`). A shape-blind walk over decode.values()
