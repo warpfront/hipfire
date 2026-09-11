@@ -150,10 +150,20 @@ def eval_redline(report, require_stable):
     if not isinstance(report, dict) or report.get("pass") is not True:
         return False, "redline: report pass != true"
     if require_stable:
+        # `prefill` is a map {context_tokens: result}; `decode` is ONE result
+        # dict. Iterating decode.values() walks its fields (`measurement`,
+        # `captures`, ...) and fails a passing report on the first field that
+        # happens to be a dict without the key. Pick the result nodes by shape.
         for section in ("prefill", "decode"):
             node = report.get(section, {})
-            for item in node.values() if isinstance(node, dict) else [node]:
-                if isinstance(item, dict) and item.get("sequence_stable") is not True:
+            if not isinstance(node, dict):
+                return False, "redline: %s missing" % section
+            results = [node] if "sequence_stable" in node else [
+                v for v in node.values() if isinstance(v, dict)]
+            if not results:
+                return False, "redline: %s reports no capture" % section
+            for item in results:
+                if item.get("sequence_stable") is not True:
                     return False, "redline: %s not sequence_stable" % section
         shadow = report.get("aql_shadow")
         if isinstance(shadow, dict) and shadow.get("bit_exact") is not True:
@@ -227,6 +237,8 @@ def subst(node, mapping):
     if isinstance(node, list):
         return [subst(v, mapping) for v in node]
     if isinstance(node, str):
+        if not mapping:
+            return node  # empty alternation matches "" and KeyErrors on every gap
         pattern = "|".join(re.escape(k) for k in sorted(mapping, key=len, reverse=True))
         return re.sub(pattern, lambda m: mapping[m.group(0)], node)
     return node
@@ -529,8 +541,26 @@ def self_test():
     check("serve-negative-accounting", eval_serve_rows(SAMPLE_SERVE_DIRTY, False)[0])
     check("serve-empty-fails", not eval_serve_rows([], True)[0])
     check("redline-pass", eval_redline(SAMPLE_REDLINE, True)[0])
+    # Real reports carry sibling fields next to `sequence_stable` (`measurement`,
+    # `captures`, `context_tokens`). A shape-blind walk over decode.values()
+    # failed a passing report on the `measurement` dict; pin the real shape.
+    real_decode = {"pass": True, "prefill": {"2": {"sequence_stable": True}},
+                   "decode": {"context_tokens": 124, "sequence_stable": True,
+                              "captures": [{"type": "decode_result"}],
+                              "measurement": {"tok_s": 32.9}}}
+    check("redline-real-decode-shape", eval_redline(real_decode, True)[0])
+    unstable = json.loads(json.dumps(real_decode))
+    unstable["decode"]["sequence_stable"] = False
+    check("redline-real-decode-unstable-fails", not eval_redline(unstable, True)[0])
     check("redline-tamper", not eval_redline({"pass": True, "prefill": {"1": {}}}, True)[0])
     check("redline-pass-false", not eval_redline({"pass": False}, False)[0])
+    # exec_probe must RETURN its result: falling off the end made every
+    # cargo/serve row raise "NoneType is not a container".
+    probe_ctx = {"mapping": {}, "row_env": {}, "cli_bin": "", "daemon_bin": ""}
+    check("probe-returns-dict", isinstance(exec_probe(probe_ctx, "python3 -c pass", 60), dict))
+    check("probe-reports-rc", exec_probe(probe_ctx, "python3 -c pass", 60).get("rc") == 0)
+    check("probe-skips-display-only",
+          "skipped" in exec_probe(probe_ctx, "some-display-only-command", 60))
     check("run-text", eval_run_text("Paris is the capital.\n", 1)[0])
     check("run-forbidden", not eval_run_text("daemon error: [CLS-001] nope", 1)[0])
     run = {"events": SAMPLE_WIRE_DONE, "generates": ["r1"], "loaded": [SAMPLE_WIRE_DONE[0]]}

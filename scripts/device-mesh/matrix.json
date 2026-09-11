@@ -32,7 +32,7 @@
     ],
     "positive": [
      "$DAEMON_BIN  # piped-stdin JSONL session (HIPFIRE_DETERMINISTIC=1); see positive_session",
-     "hipfire run --kv-mode q8 qwen3.8:27b-mq4-xt \"Write a haiku about rivers.\""
+     "hipfire run --temp 0 --kv-mode q8 qwen3.8:27b-mq4-xt \"Write a haiku about rivers.\""
     ]
    },
    "env": {
@@ -193,7 +193,7 @@
     ],
     "positive": [
      "$DAEMON_BIN  # piped-stdin JSONL session (HIPFIRE_DETERMINISTIC=1); see positive_session",
-     "hipfire run --kv-mode q8 ornith-1.5:35b-a3b-mq4r \"Explain recursion in one paragraph.\""
+     "hipfire run --temp 0 --kv-mode q8 ornith-1.5:35b-a3b-mq4r \"Explain recursion in one paragraph.\""
     ]
    },
    "env": {
@@ -464,7 +464,7 @@
      "$DAEMON_BIN  # load with max_seq=0 (contradictory cell); expect wire error with zero side effects, prior model still serves"
     ],
     "positive": [
-     "python3 scripts/serve_harness.py --port 28501 --model $MODEL --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 1024 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-refusal --out $OUT/g1-refusal.json --serve-log $OUT/g1-refusal.serve.log"
+     "python3 scripts/serve_harness.py --port 28501 --model $MODEL --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-refusal --out $OUT/g1-refusal.json --serve-log $OUT/g1-refusal.serve.log"
     ]
    },
    "env": {
@@ -670,7 +670,7 @@
      "python3 scripts/serve_harness.py --port 28503 --model /nonexistent.mq4 --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --home $OUT/home-nope --out $OUT/nope.json  # expect nonzero exit, no serve spawned"
     ],
     "positive": [
-     "python3 scripts/serve_harness.py --port 28502 --model $MODEL --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 1024 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-battery-27b --out $OUT/g1-battery-27b.json --serve-log $OUT/g1-battery-27b.serve.log"
+     "python3 scripts/serve_harness.py --port 28502 --model $MODEL --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-battery-27b --out $OUT/g1-battery-27b.json --serve-log $OUT/g1-battery-27b.serve.log"
     ]
    },
    "env": {
@@ -704,8 +704,8 @@
      "python3 scripts/serve_harness.py --port 28506 --model $MODEL --mode session --session /nonexistent-session.json --home $OUT/home-nope --out $OUT/nope.json  # expect nonzero exit on malformed session"
     ],
     "positive": [
-     "python3 scripts/serve_harness.py --port 28504 --model $MODEL --mode chain --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 1024 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-chain-27b --out $OUT/g1-chain-27b.json --serve-log $OUT/g1-chain-27b.serve.log",
-     "python3 scripts/serve_harness.py --port 28505 --model $MODEL --mode session --session benchmarks/sessions/mv_session_coding.json --max-tokens 1024 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-session-27b --out $OUT/g1-session-27b.json --serve-log $OUT/g1-session-27b.serve.log"
+     "python3 scripts/serve_harness.py --port 28504 --model $MODEL --mode chain --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-chain-27b --out $OUT/g1-chain-27b.json --serve-log $OUT/g1-chain-27b.serve.log",
+     "python3 scripts/serve_harness.py --port 28505 --model $MODEL --mode session --session benchmarks/sessions/mv_session_coding.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-session-27b --out $OUT/g1-session-27b.json --serve-log $OUT/g1-session-27b.serve.log"
     ]
    },
    "env": {
@@ -739,7 +739,7 @@
      "python3 scripts/serve_harness.py --port 28508 --model /nonexistent-a3b.mq4p --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --home $OUT/home-nope --out $OUT/nope.json  # expect nonzero exit, no serve spawned"
     ],
     "positive": [
-     "python3 scripts/serve_harness.py --port 28507 --model $MODEL --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 1024 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-battery-a3b --out $OUT/g1-battery-a3b.json --serve-log $OUT/g1-battery-a3b.serve.log"
+     "python3 scripts/serve_harness.py --port 28507 --model $MODEL --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-battery-a3b --out $OUT/g1-battery-a3b.json --serve-log $OUT/g1-battery-a3b.serve.log"
     ]
    },
    "env": {
@@ -1440,11 +1440,11 @@
   {
    "commands": {
     "negative": [
-     "hipfire run --kv-mode q8 /nonexistent-llama.hf4 \"The capital of France is located in\"  # expect nonzero fail-closed exit"
+     "hipfire run --temp 0 --kv-mode q8 /nonexistent-llama.hf4 \"The capital of France is located in\"  # expect nonzero fail-closed exit"
     ],
     "positive": [
-     "hipfire run --kv-mode q8 qwen3:0.6b \"The capital of France is located in\"",
-     "hipfire run --kv-mode q8 qwen3:0.6b \"The capital of France is located in\"  # immediate reload: byte-identical decode expected"
+     "hipfire run --temp 0 --kv-mode q8 qwen3:0.6b \"The capital of France is located in\"",
+     "hipfire run --temp 0 --kv-mode q8 qwen3:0.6b \"The capital of France is located in\"  # immediate reload: byte-identical decode expected"
     ]
    },
    "env": {
@@ -1480,11 +1480,11 @@
   {
    "commands": {
     "negative": [
-     "hipfire run --kv-mode q8 /nonexistent-27b.mq4 \"Write a haiku about rivers.\"  # expect nonzero fail-closed exit"
+     "hipfire run --temp 0 --kv-mode q8 /nonexistent-27b.mq4 \"Write a haiku about rivers.\"  # expect nonzero fail-closed exit"
     ],
     "positive": [
-     "hipfire run --kv-mode q8 qwen3.8:27b-mq4-xt \"Write a haiku about rivers.\"",
-     "hipfire run --kv-mode q8 ornith-1.5:35b-a3b-mq4r \"Explain recursion in one paragraph.\""
+     "hipfire run --temp 0 --kv-mode q8 qwen3.8:27b-mq4-xt \"Write a haiku about rivers.\"",
+     "hipfire run --temp 0 --kv-mode q8 ornith-1.5:35b-a3b-mq4r \"Explain recursion in one paragraph.\""
     ]
    },
    "env": {
@@ -1719,10 +1719,10 @@
   {
    "commands": {
     "negative": [
-     "python3 scripts/serve_harness.py --port 28510 --model $MODEL --mode battery --prompts-file benchmarks/prompts/g45_parser_finalization.json --max-tokens 1 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-nope --out $OUT/nope.json  # length-cap truncation: every fail_closed step must still terminate, never emit post-terminal bytes"
+     "python3 scripts/serve_harness.py --port 28510 --model $MODEL --mode session --session benchmarks/prompts/g45_parser_finalization.json --max-tokens 1 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-nope --out $OUT/nope.json  # length-cap truncation: every fail_closed step must still terminate, never emit post-terminal bytes"
     ],
     "positive": [
-     "python3 scripts/serve_harness.py --port 28509 --model $MODEL --mode battery --prompts-file benchmarks/prompts/g45_parser_finalization.json --max-tokens 128 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-parser --out $OUT/g4-parser.json --serve-log $OUT/g4-parser.serve.log"
+     "python3 scripts/serve_harness.py --port 28509 --model $MODEL --mode session --session benchmarks/prompts/g45_parser_finalization.json --max-tokens 128 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-parser --out $OUT/g4-parser.json --serve-log $OUT/g4-parser.serve.log"
     ]
    },
    "env": {
@@ -1756,9 +1756,9 @@
      "python3 scripts/serve_harness.py --port 28514 --model $MODEL --mode session --session /nonexistent-session.json --home $OUT/home-nope --out $OUT/nope.json  # expect nonzero exit on malformed session"
     ],
     "positive": [
-     "python3 scripts/serve_harness.py --port 28511 --model $MODEL --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 1024 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-battery --out $OUT/g4-battery.json --serve-log $OUT/g4-battery.serve.log",
-     "python3 scripts/serve_harness.py --port 28512 --model $MODEL --mode chain --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 1024 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-chain --out $OUT/g4-chain.json --serve-log $OUT/g4-chain.serve.log",
-     "python3 scripts/serve_harness.py --port 28513 --model $MODEL --mode session --session benchmarks/sessions/mv_session_coding.json --max-tokens 1024 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-session --out $OUT/g4-session.json --serve-log $OUT/g4-session.serve.log"
+     "python3 scripts/serve_harness.py --port 28511 --model $MODEL --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-battery --out $OUT/g4-battery.json --serve-log $OUT/g4-battery.serve.log",
+     "python3 scripts/serve_harness.py --port 28512 --model $MODEL --mode chain --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-chain --out $OUT/g4-chain.json --serve-log $OUT/g4-chain.serve.log",
+     "python3 scripts/serve_harness.py --port 28513 --model $MODEL --mode session --session benchmarks/sessions/mv_session_coding.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-session --out $OUT/g4-session.json --serve-log $OUT/g4-session.serve.log"
     ]
    },
    "env": {
@@ -1859,7 +1859,7 @@
      "python3 scripts/serve_harness.py --port 28516 --model $MODEL --tp 3 --devices 0,1 --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --home $OUT/home-nope --out $OUT/nope.json  # tp degree exceeding visible devices must fail closed"
     ],
     "positive": [
-     "python3 scripts/serve_harness.py --port 28515 --model $MODEL --tp 2 --devices 0,1 --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 1024 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-mesh-tp --out $OUT/g4-mesh-tp.json --serve-log $OUT/g4-mesh-tp.serve.log"
+     "python3 scripts/serve_harness.py --port 28515 --model $MODEL --tp 2 --devices 0,1 --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-mesh-tp --out $OUT/g4-mesh-tp.json --serve-log $OUT/g4-mesh-tp.serve.log"
     ]
    },
    "env": {
