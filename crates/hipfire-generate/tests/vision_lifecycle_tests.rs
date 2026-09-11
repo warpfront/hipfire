@@ -205,10 +205,7 @@ fn spawn_child(scenario: &str) -> (Child, BufReader<ChildStdout>, ChildStdin) {
     let pid = child.id();
     std::thread::spawn(move || {
         std::thread::sleep(Duration::from_secs(1800));
-        let _ = Command::new("kill")
-            .arg("-9")
-            .arg(pid.to_string())
-            .status();
+        let _ = Command::new("kill").arg("-9").arg(pid.to_string()).status();
     });
     (child, BufReader::new(stdout), stdin)
 }
@@ -222,7 +219,6 @@ struct Transcript {
 fn events_for(t: &Transcript, id: &str) -> Vec<Event> {
     t.events.iter().filter(|e| e.id == id).cloned().collect()
 }
-
 
 fn gen_starts(t: &Transcript, id: &str) -> usize {
     events_for(t, id)
@@ -267,7 +263,6 @@ fn vision_lifecycle_child() {
         return;
     }
     match scenario.as_str() {
-
         "vl" => child_vl_matrix(),
         "dots" => child_dots_matrix(),
         other => panic!("unknown matrix {other:?}"),
@@ -366,18 +361,32 @@ fn vl_lifecycle_matrix() {
         Some(true),
         "prefill fault must attest rollback"
     );
-    // Second-turn reuse after cancel+fault equals the baseline.
+    // Every turn that recovers from a cancel or an injected fault must decode
+    // exactly what an untouched fresh context decodes. The reference is t5 —
+    // the turn after a full unload/reload, whose buffers provably cannot hold
+    // state from an earlier turn — so an equality failure here is residue from
+    // the cancel/fault path and nothing else.
+    //
+    // t1 is deliberately NOT the reference: the warmup turn leaves the context
+    // populated, so t1 decodes APPENDED at a nonzero sequence offset (different
+    // rope phase, different tile count) while t4/t5/t7/t9 decode fresh.
+    // Requiring byte equality across that offset asserts something no
+    // quantized-KV tier guarantees: measured top-1 margins at the divergent
+    // step are 0.24-1.39 logits, so the argmax flip lands differently per tier
+    // (Asym3 happened to agree; Fwht2/Fwht3/Fwht4 all pick the other token,
+    // and all four tiers agree with each other in each context).
     let t1 = token_text(&transcript, "g48-vl-t1");
-    assert!(!t1.is_empty(), "baseline turn streamed no text");
-    assert_eq!(token_text(&transcript, "g48-vl-t4"), t1);
-    // Fresh-load equality across unload/reload.
-    assert_eq!(token_text(&transcript, "g48-vl-t5"), t1);
+    assert!(!t1.is_empty(), "baseline appended turn streamed no text");
+    let fresh = token_text(&transcript, "g48-vl-t5");
+    assert!(!fresh.is_empty(), "fresh-load turn streamed no text");
+    // Reuse after cancel + injected prefill fault.
+    assert_eq!(token_text(&transcript, "g48-vl-t4"), fresh);
     // Cancel during decode, then reuse.
     assert_outcome(&transcript, "g48-vl-t6", TerminalOutcome::Cancel);
-    assert_eq!(token_text(&transcript, "g48-vl-t7"), t1);
+    assert_eq!(token_text(&transcript, "g48-vl-t7"), fresh);
     // Injected decode fault, then reuse.
     assert_outcome(&transcript, "g48-vl-t8", TerminalOutcome::Error);
-    assert_eq!(token_text(&transcript, "g48-vl-t9"), t1);
+    assert_eq!(token_text(&transcript, "g48-vl-t9"), fresh);
 }
 
 /// dots.ocr lifecycle matrix (AR + n-gram spec + text-only paths).
@@ -499,10 +508,7 @@ fn emit_marker(text: &str) {
 
 #[cfg(test)]
 fn vram_free_bytes(gpu: &rdna_compute::Gpu) -> usize {
-    gpu.hip
-        .get_vram_info()
-        .expect("child VRAM query")
-        .0 as usize
+    gpu.hip.get_vram_info().expect("child VRAM query").0 as usize
 }
 
 /// Pay the one-time ROCm first-allocation reservation up front (mirrors the
@@ -531,9 +537,9 @@ fn spawn_committer(id: &str, attempt: u64) {
                 .mu
                 .lock()
                 .map(|g| {
-                    g.active.as_ref().is_some_and(|a| {
-                        a.id == id && a.attempt_id == attempt && a.ready
-                    })
+                    g.active
+                        .as_ref()
+                        .is_some_and(|a| a.id == id && a.attempt_id == attempt && a.ready)
                 })
                 .unwrap_or(false);
             if ready {
@@ -832,27 +838,126 @@ fn child_dots_matrix() {
     // Warmup turn BEFORE the VRAM baseline: first-use kernel compiles land
     // here (rope/attention/gather kernels compile on first use), so later
     // per-turn/unload accounting measures owned state only.
-    dots_turn(&mut m, &mut gpu, "g48-dots-warm", 100, &image, prompt, 16, true);
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-warm",
+        100,
+        &image,
+        prompt,
+        16,
+        true,
+    );
     let vram_base = vram_free_bytes(&gpu);
 
     // AR: baseline, prefill cancel, prefill fault, reuse; argmax fault,
     // reuse; decode fault, reuse; decode cancel, reuse.
-    dots_turn(&mut m, &mut gpu, "g48-dots-d1", 101, &image, prompt, 16, true);
-    dots_turn(&mut m, &mut gpu, "g48-dots-d2", 102, &image, prompt, 16, false);
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-d1",
+        101,
+        &image,
+        prompt,
+        16,
+        true,
+    );
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-d2",
+        102,
+        &image,
+        prompt,
+        16,
+        false,
+    );
     std::env::set_var("HIPFIRE_DOTS_FAULT", "prefill");
-    dots_turn(&mut m, &mut gpu, "g48-dots-d3", 103, &image, prompt, 16, false);
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-d3",
+        103,
+        &image,
+        prompt,
+        16,
+        false,
+    );
     std::env::remove_var("HIPFIRE_DOTS_FAULT");
-    dots_turn(&mut m, &mut gpu, "g48-dots-d4", 104, &image, prompt, 16, true);
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-d4",
+        104,
+        &image,
+        prompt,
+        16,
+        true,
+    );
     std::env::set_var("HIPFIRE_DOTS_FAULT", "argmax");
-    dots_turn(&mut m, &mut gpu, "g48-dots-d5", 105, &image, prompt, 16, false);
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-d5",
+        105,
+        &image,
+        prompt,
+        16,
+        false,
+    );
     std::env::remove_var("HIPFIRE_DOTS_FAULT");
-    dots_turn(&mut m, &mut gpu, "g48-dots-d6", 106, &image, prompt, 16, true);
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-d6",
+        106,
+        &image,
+        prompt,
+        16,
+        true,
+    );
     std::env::set_var("HIPFIRE_DOTS_FAULT", "decode");
-    dots_turn(&mut m, &mut gpu, "g48-dots-d7", 107, &image, prompt, 16, false);
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-d7",
+        107,
+        &image,
+        prompt,
+        16,
+        false,
+    );
     std::env::remove_var("HIPFIRE_DOTS_FAULT");
-    dots_turn(&mut m, &mut gpu, "g48-dots-d8", 108, &image, prompt, 16, true);
-    dots_turn(&mut m, &mut gpu, "g48-dots-d9", 109, &image, prompt, 32, false);
-    dots_turn(&mut m, &mut gpu, "g48-dots-d10", 110, &image, prompt, 16, true);
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-d8",
+        108,
+        &image,
+        prompt,
+        16,
+        true,
+    );
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-d9",
+        109,
+        &image,
+        prompt,
+        32,
+        false,
+    );
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-d10",
+        110,
+        &image,
+        prompt,
+        16,
+        true,
+    );
 
     // Unload/reload with the n-gram drafter armed: spec success must be
     // byte-identical to AR; spec fault fails closed; reuse recovers.
@@ -881,12 +986,48 @@ fn child_dots_matrix() {
     emit_marker("SECTION reload-spec-ok");
     // Warmup spec turn: first-use verify-path kernels/scratch land here so
     // the final unload accounting (against the phase-1 baseline) stays clean.
-    dots_turn(&mut m, &mut gpu, "g48-dots-swarm", 114, &image, prompt, 16, true);
-    dots_turn(&mut m, &mut gpu, "g48-dots-s1", 111, &image, prompt, 16, true);
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-swarm",
+        114,
+        &image,
+        prompt,
+        16,
+        true,
+    );
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-s1",
+        111,
+        &image,
+        prompt,
+        16,
+        true,
+    );
     std::env::set_var("HIPFIRE_DOTS_FAULT", "spec");
-    dots_turn(&mut m, &mut gpu, "g48-dots-s2", 112, &image, prompt, 16, false);
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-s2",
+        112,
+        &image,
+        prompt,
+        16,
+        false,
+    );
     std::env::remove_var("HIPFIRE_DOTS_FAULT");
-    dots_turn(&mut m, &mut gpu, "g48-dots-s3", 113, &image, prompt, 16, true);
+    dots_turn(
+        &mut m,
+        &mut gpu,
+        "g48-dots-s3",
+        113,
+        &image,
+        prompt,
+        16,
+        true,
+    );
 
     // Text-only path on the same bundle: success, decode cancel, reuse.
     let text_prompt = "List three office supplies.";
