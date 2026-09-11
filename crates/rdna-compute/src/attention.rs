@@ -3896,7 +3896,7 @@ impl Gpu {
         batch_size: usize,
         partials: &GpuTensor,
     ) -> HipResult<bool> {
-        if !self.arch_caps.is_gfx1100() {
+        if !(self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1201()) {
             return Ok(false);
         }
         let dpt = head_dim / 32;

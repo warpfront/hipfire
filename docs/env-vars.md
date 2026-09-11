@@ -178,7 +178,7 @@ diagnostic and developer harness exports pending their cleanup.
 | `HIPFIRE_MAX_REQUEST_BYTES` | Body cap |
 | `HIPFIRE_SERVE_MAX_QUEUE` / `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` | Admission queue |
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | Research budget nudge |
-| `HIPFIRE_FA_PERTOKEN_MIN_CTX` | Context length past which an exact-gfx1100 Q8 small-batch (n = 4..32, head_dim 128/256, sequential non-tree, graph capture off) attend step leaves the batched flash kernel for the multi-row tile; default `4096`, `0` disables the route. Other arches, KV modes, shapes, and semantics retain the batched route. |
+| `HIPFIRE_FA_PERTOKEN_MIN_CTX` | Context length past which an exact-gfx1100 or exact-gfx1201 Q8 small-batch (n = 4..32, head_dim 128/256, sequential non-tree, graph capture off) attend step leaves the batched flash kernel for the multi-row tile; default `4096`, `0` disables the route. Other arches, KV modes, shapes, and semantics retain the batched route. |
 | `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path, tried before the ROCm root. For distributions whose ROCm prefix does not carry RCCL (nixpkgs: `rocmtoolkit-merged` has HIP/HSA, `librccl` is a separate store path). |
 | `HIPFIRE_DEVICES` / `HIPFIRE_TP` / `HIPFIRE_TP_USE_RCCL` | Multi-GPU / TP. `HIPFIRE_DEVICES` is the compatibility alias for `hardware.devices`; startup lowers its physical list to ROCr selectors plus matching HIP logical selectors. |
 | `HIPFIRE_ALLOW_MIXED_ARCH=1` | Mixed arch pairs |
