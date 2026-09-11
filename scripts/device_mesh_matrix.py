@@ -459,6 +459,13 @@ def execute_row(ctx, row, out, timeout):
     if needs_gpu(row) and not has_gpu():
         return "hardware-blocked", "no HIP GPU (/dev/kfd and /dev/dri absent)", detail
     paths = [ctx["fixture_paths"].get(t, "") for t in row.get("fixtures", [])] + row.get("fixture_files", [])
+    # Rows that carry their fixture inline as an env prefix (HIPFIRE_*_FIXTURE=
+    # /path[,/path]) are just as host-dependent as a declared fixture: on a host
+    # without that sidecar the command runs and reports zero tests, which is
+    # indistinguishable from a broken filter. Gate on the paths themselves.
+    for cmd in row.get("commands", {}).get("positive", []):
+        for assign in re.findall(r'HIPFIRE_\w*FIXTURE="?([^"\s]+)"?', subst(cmd, mapping)):
+            paths += [p for p in assign.split(",") if p.startswith("/")]
     missing = [p for p in paths if not os.path.isfile(p)]
     if missing:
         return "hardware-blocked", "fixtures absent: %s" % missing, detail
