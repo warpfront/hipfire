@@ -1072,6 +1072,20 @@ pub trait MtpDrafter {
         Ok(false)
     }
 
+    /// Repair a terminal that retained only a strict prefix of the most recent
+    /// MTP window. Implementations with a valid pre-window snapshot restore it
+    /// and replay only the committable prefix.
+    fn mtp_repair_terminal_prefix(
+        &mut self,
+        _gpu: &mut Gpu,
+        _target: &mut dyn SpecTarget,
+        _window_start: usize,
+        _window_seed: u32,
+        _consumed: &[u32],
+    ) -> Result<bool, String> {
+        Ok(false)
+    }
+
     /// Reset drafter-local state for a fresh conversation (MTP cache + any
     /// captured graphs). The target's KV/recurrent reset is the daemon's job.
     /// Returns `Err` when any HIP step required for a clean drafter fails.
@@ -1256,6 +1270,18 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
     ) -> Result<bool, String> {
         self.arch
             .mtp_forced_advance(gpu, target, tokens, start_pos, abort)
+    }
+
+    fn repair_terminal_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        window_seed: u32,
+        consumed: &[u32],
+    ) -> Result<bool, String> {
+        self.arch
+            .mtp_repair_terminal_prefix(gpu, target, window_start, window_seed, consumed)
     }
 
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {

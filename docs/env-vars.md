@@ -112,6 +112,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`** | Distinct from config `dflash_mode` apply path — product CLI also uses load params |
 | `HIPFIRE_DFLASH_NGRAM_BLOCK` | set/clear from config | |
 | `HIPFIRE_DFLASH_CKPT_RESUME` / `HIPFIRE_CACHE_CKPT_*` | checkpointing | Qwen DFlash path |
+| `HIPFIRE_SPEC_WINDOW_ROLLBACK` | on unless `0` | Enables retained pre-window repair for strict-prefix speculative terminals; `0` keeps the conservative reset path. |
 | `HIPFIRE_DFLASH_VERIFY_PM4` | **unset / off**; `1` opts in | Retained-PM4 route for the fixed B=16 DFlash2 chain target-verify forward. Admitted only on exact gfx1201, single GPU, dense recurrent Qwen3.5-family target, Q8 KV + Q8 DeltaNet state, DFlash2 selector + dynamic-conv draft, `target_layer_ids == [5,19,33,47,61]`, no DDTree. Every other configuration reports a specific `disabled` reason and runs the unchanged HIP/HipGraph path. |
 | `HIPFIRE_DRAFT_MAX` | routes to active mech window | CLI |
 | `HIPFIRE_DRAFT_F16` | on unless `0` | RuntimeConfig |
@@ -1016,6 +1017,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_SMOKE_STEPS` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/examples/a3b_smoke_forward.rs |
 | `HIPFIRE_SPECULATION` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_SPEC_PHASES` | crates/hipfire-arch-qwen35/src/speculative.rs |
+| `HIPFIRE_SPEC_WINDOW_ROLLBACK` | crates/hipfire-arch-qwen35/src/mtp_speculator.rs |
 | `HIPFIRE_SPILL_DIR` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_SWEEP_MAX` | scripts/ddtree_budget_sweep.sh |
 | `HIPFIRE_SWEEP_OUT` | scripts/mq3-mq2-sweep.sh, scripts/spec_decode_genre_sweep.sh |
