@@ -89,7 +89,11 @@ def sha256_cached(path, cache):
     return cache[path]["sha256"]
 
 def run_cmd(argv, env_extra, timeout):
+    # Isolated HIPFIRE_HOME: the operator's ~/.hipfire/config.toml (dflash_mode,
+    # kv overrides, per-model config) must never decide a matrix row's outcome.
     env = dict(os.environ, **(env_extra or {}))
+    env.setdefault("HIPFIRE_HOME", os.path.join(env.get("MATRIX_ISOLATED_HOME", "/tmp/device-mesh-matrix-home"), ".hipfire"))
+    os.makedirs(env["HIPFIRE_HOME"], exist_ok=True)
     start = time.time()
     try:
         proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
