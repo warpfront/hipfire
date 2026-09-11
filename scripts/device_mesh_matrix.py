@@ -323,6 +323,7 @@ def exec_probe(ctx, cmd, timeout):
     idx = argv.index("--out") if "--out" in argv else -1
     res["out_path"] = argv[idx + 1] if 0 <= idx < len(argv) - 1 else None
     res["cmd"] = stripped
+    return res
 
 def needs_gpu(row):
     if row.get("fixtures") or row.get("positive_session") or row.get("negative_session"):
