@@ -26,33 +26,42 @@
 //!   bit-identical across fresh processes, tokens exact throughout. The
 //!   `pp_parity.rs` bit-exact floor does not transfer to fwht3+Q8 on 27B
 //!   (validated there on asym3+0.8B).
-//! * TP2-vs-single — BOUNDED (tokens `assert_eq`, max abs logit diff <= 1e-2).
+//! * TP2-vs-single — BOUNDED (tokens `assert_eq`, max abs logit diff <= 1.0).
 //!   Dense TP shards heads/projections per rank and sums the row-parallel
 //!   partials through the deterministic rooted peer reduce
-//!   (`dense_tp_all_reduce_sum_f32` → `all_reduce_sum_f32_peer_rooted`, order
-//!   `(((r0+r1)+r2)+r3)`), which is a different f32 summation order than the
-//!   single route's direct accumulation — so `assert_eq` on logits is
-//!   unwarranted. Precedent: `qwen_dense_tp2_parity.rs` claims argmax-exact +
-//!   relative error < 3e-3, never bit-exact. No new `pub` seam needed: every
-//!   symbol below is already exported from `hipfire_arch_qwen35::qwen35`.
-//! * EP2-vs-single (MoE) — BOUNDED. The router/top-k run replicated on every
-//!   rank (`run_moe_ep` contract), but each rank accumulates only its owned
-//!   experts into a zeroed partial and the partials are summed by RCCL
-//!   `ncclAllReduce` (the `all_reduce_sum_f32_decode` default path) — a
-//!   different f32 summation order than the single route's direct expert
-//!   accumulation, with different expert groupings (stride `e%2`). Comparison
-//!   is snapshot lockstep (see below): top-k is a discrete decision and
-//!   1e-5-scale grouping noise can flip an expert, injecting expert-scale
-//!   perturbations that persist in state (measured: deterministic 6.5e-2 cliff
-//!   at pos 2, token flip at pos 5 on two prompts) — interleaved forcing
-//!   cannot gate EP routes.
-//! * EP4-vs-EP2 (MoE) — BOUNDED, same snapshot-lockstep design: both sides run
-//!   the same replicated router/top-k and the same RCCL decode reduce, but
-//!   the expert-to-rank groupings differ (stride `e%4` vs `e%2`), so the
-//!   partial contents and the RCCL summation order differ. The rooted-peer
-//!   order (`multi_gpu.rs:1759`) is NOT the decode path — it is opt-in via
-//!   `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` only (`ep.rs`) — verified, so
-//!   `assert_eq` on these logits is unwarranted.
+//!   (`dense_tp_all_reduce_sum_f32` → `all_reduce_sum_f32_peer_rooted`,
+//!   `forward.rs:3664`), a different f32 summation order than the single
+//!   route's direct accumulation — so `assert_eq` on logits is unwarranted. On
+//!   top of the order term, per-step Q8 recurrent-state writes diverge by
+//!   quantization LSBs and the barely-contractive DN recurrence (α≈0.99)
+//!   random-walks the difference up: measured pos0 2.141e-3 — bit-identical
+//!   across PP/TP/EF-on/EF-off runs, i.e. a deterministic multi-standup
+//!   first-write effect — growing to worst 4.6e-1 over 27 positions EF-on
+//!   (3.0 with `HIPFIRE_DN_STATE_EF=0`). Bound 1.0 is 2x measured worst;
+//!   tokens exact throughout (3 runs). Precedent: `qwen_dense_tp2_parity.rs`
+//!   claims argmax-exact + relative error < 3e-3, never bit-exact.
+//! * EP2-vs-single (MoE) — MEASURING-BUT-RED (bound 1e-3 asserted, test fails
+//!   honestly). Snapshot lockstep pins KV + DeltaNet + the FULL scratch (30
+//!   fixed + 14 MoE-opt incl. top-k indices/weights and `moe_down_expanded` +
+//!   pos_bufs, all by true `DeviceBuffer::size`) yet the run holds ~1e-5 for
+//!   17 positions then trips a deterministic 3.599e-2 cliff at pos 17 —
+//!   bit-identical to the earlier KV/DN-only snapshot run, so the carrier
+//!   lives OUTSIDE the snapshot set (suspects: `EpMesh.partials`, RCCL/peer
+//!   staging, rank streams, per-rank expert shard/dummy state, or a
+//!   routing-dependent dropped/duplicated expert; top-k is discrete and
+//!   1e-5-scale grouping noise flips experts under interleaved forcing —
+//!   measured 6.5e-2 cliff at pos 2, token flip at pos 5 — so lockstep, not
+//!   interleaving, is the design). The bound is NOT widened to hide it.
+//! * EP4-vs-EP2 (MoE) — MEASURING-BUT-RED (bound 1e-3 asserted, test fails
+//!   honestly). Same snapshot-lockstep design (EP2 rank-0 bytes are the
+//!   reference); pos 0–1 hold ~1e-5, then a deterministic 2.695e-3 cliff at
+//!   pos 2 — a DIFFERENT position and magnitude than EP2-vs-single's
+//!   pos-17/3.6e-2, so the trip is route-pair-specific (stride `e%4` vs `e%2`
+//!   partial contents + RCCL summation order), not a universal step counter.
+//!   Same out-of-snapshot suspect set as EP2. The rooted-peer order
+//!   (`multi_gpu.rs:1759`) is NOT the decode path — opt-in via
+//!   `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` only — so `assert_eq` is unwarranted
+//!   and the bound is NOT widened to hide the trip.
 //!
 //! Loader note: `load_model_ep` (loader `lib.rs`) has NO MoE serve path —
 //! `qwen35_ep_moe_refusal` refuses `num_experts > 0` ("use TP or single-GPU")
@@ -100,11 +109,13 @@ const MOE_SIZE: u64 = 18_700_570_368;
 const MOE_SHA256: &str = "84103fcc8ade42aa2ac8ec01176df7a4ead5e94810597c9fae2f6763152a3ac6";
 
 // Absolute logit bounds for the bounded relationships. Set from measured
-// worst-case per-position diffs (see evidence output) with headroom; a wrong
-// expert / wrong reduction / wrong band would move logits by orders of
-// magnitude more, and any token flip inside a bound is a hard failure.
+// worst-case per-position diffs (see evidence output) at ~2x headroom, rounded
+// up; a wrong expert / wrong reduction / wrong band would move logits by
+// orders of magnitude more, and any token flip inside a bound is a hard
+// failure. TP measured worst 4.6e-1 (EF-on, 27 positions) → 1.0; PP measured
+// worst 8.1e-1 → 2.0.
 const BOUND_PP_ABS: f32 = 2.0;
-const BOUND_TP_ABS: f32 = 1e-2;
+const BOUND_TP_ABS: f32 = 1.0;
 const BOUND_EP_ABS: f32 = 1e-3;
 
 // ── gates / fixtures ─────────────────────────────────────────────────────────
@@ -579,18 +590,24 @@ fn qwen35_pp2_vs_single_oracle() {
 
 // ── 2. TP2 vs single (dense, BOUNDED) ────────────────────────────────────────
 
-/// `qwen35_tp2_vs_single_oracle` — dense 27B, tensor-parallel TP=2 vs single.
-///
-/// Relationship: BOUNDED (tokens `assert_eq`, max abs logit diff <= 1e-2).
+/// Relationship: BOUNDED (tokens `assert_eq`, max abs logit diff <= 1.0).
 /// Dense TP shards heads/projections per rank
 /// (`load_weights_dense_tp_rank` over `dense_tp_rank_layouts`) and sums the
 /// row-parallel partials through the deterministic rooted peer reduce
-/// (`dense_tp_all_reduce_sum_f32` → `all_reduce_sum_f32_peer_rooted`, order
-/// `(((r0+r1)+r2)+r3)`), a different f32 summation order than the single
-/// route's direct accumulation — so `assert_eq` on logits is unwarranted.
-/// Precedent: `qwen_dense_tp2_parity.rs` claims argmax-exact + relative error
-/// < 3e-3, never bit-exact. No new `pub` seam needed: every symbol below is
-/// already exported from `hipfire_arch_qwen35::qwen35`.
+/// (`dense_tp_all_reduce_sum_f32` → `all_reduce_sum_f32_peer_rooted`,
+/// `forward.rs:3664`), a different f32 summation order than the single route's
+/// direct accumulation — so `assert_eq` on logits is unwarranted. On top of the
+/// order term, the per-step Q8 recurrent-state writes diverge by quantization
+/// LSBs (reduce-rounding-perturbed inputs flip quantize decisions in later DN
+/// layers) and the barely-contractive DN recurrence (α≈0.99) random-walks the
+/// difference up over positions: measured pos0 2.141e-3 — bit-identical across
+/// PP/TP/EF-on/EF-off runs, i.e. a deterministic multi-standup first-write
+/// effect, NOT f32 order — growing to worst 4.6e-1 over 27 positions EF-on
+/// (3.0 with `HIPFIRE_DN_STATE_EF=0`, so EF sigma-delta damps ~6x). Bound 1.0
+/// is 2x measured worst. Precedent: `qwen_dense_tp2_parity.rs` claims
+/// argmax-exact + relative error < 3e-3, never bit-exact. No new `pub` seam
+/// needed: every symbol below is already exported from
+/// `hipfire_arch_qwen35::qwen35`.
 #[test]
 #[ignore]
 fn qwen35_tp2_vs_single_oracle() {
@@ -762,9 +779,19 @@ fn qwen35_tp2_vs_single_oracle() {
         } else {
             next_token
         };
+        // Anti-vacuity knob (default OFF): `HIPFIRE_ORACLE_DIVERGE=1` forces the
+        // mesh side onto a wrong token while the single route stays on the true
+        // one, driving a real numerical divergence through the forward path so a
+        // red run proves the bound/token asserts can fire. Committed runs leave
+        // it unset.
+        let mesh_token = if std::env::var("HIPFIRE_ORACLE_DIVERGE").as_deref() == Ok("1") {
+            token.wrapping_add(1)
+        } else {
+            token
+        };
         let single_logits = single.step(token, pos);
         qwen35::forward_scratch_dense_tp(
-            &mut gpus, &shard, &weights, &configs, token, pos, &mut kvs, &mut dns, &scratches,
+            &mut gpus, &shard, &weights, &configs, mesh_token, pos, &mut kvs, &mut dns, &scratches,
         )
         .expect("tp forward_scratch_dense_tp");
         gpus.devices[0].bind_thread().expect("tp bind0");
@@ -799,7 +826,7 @@ fn qwen35_tp2_vs_single_oracle() {
         worst,
         Some(BOUND_TP_ABS),
         "bounded",
-        "per-rank head/projection shards + rooted peer reduce sum before the residual update: provably different f32 summation order than direct single-route accumulation (qwen_dense_tp2_parity.rs precedent)",
+        "per-rank head/projection shards + rooted peer reduce (forward.rs:3664 dense_tp_all_reduce_sum_f32 -> all_reduce_sum_f32_peer_rooted): different f32 summation order than single-route accumulation (qwen_dense_tp2_parity.rs precedent), plus per-step Q8 recurrent-state LSB divergence random-walking up through the barely-contractive DN recurrence (pos0 2.141e-3 identical across PP/TP/EF-on/EF-off; EF-on worst 4.6e-1 vs EF-off 3.0)",
     );
     eprintln!("{TEST}: PASS — {total} committed positions, worst logit diff {worst:.3e}");
 
@@ -1273,17 +1300,31 @@ impl EpMesh {
     }
 }
 
-// ── 3. EP2 vs single (MoE, BOUNDED) ──────────────────────────────────────────
+// ── 3. EP2 vs single (MoE, MEASURING-BUT-RED) ───────────────────────────────────
 
-/// `qwen35_ep2_vs_single_oracle` — MoE A3B, expert-parallel EP=2 vs single.
+/// `qwen35_ep2_vs_single_oracle` — MoE A3B (256 experts, top_k=8),
+/// expert-parallel EP=2 vs single.
 ///
-/// Relationship: BOUNDED (tokens `assert_eq`, max abs logit diff <= 1e-3).
-/// Router/top-k run replicated on every rank (`run_moe_ep` contract), but each
-/// rank accumulates only its owned experts into a zeroed partial and the
-/// partials are summed by RCCL `ncclAllReduce` (the `all_reduce_sum_f32_decode`
-/// default path). Comparison is snapshot lockstep: the reference state is
-/// snapshotted before every step and restored into all ranks, so the discrete
-/// router sees identical inputs and only grouping rounding remains.
+/// Relationship: MEASURING-BUT-RED (tokens `assert_eq`, max abs logit diff
+/// <= 1e-3, asserted and FAILING honestly — do not widen). Router/top-k run
+/// replicated on every rank (`run_moe_ep` contract), but each rank accumulates
+/// only its owned experts into a zeroed partial and the partials are summed by
+/// RCCL `ncclAllReduce` (the `all_reduce_sum_f32_decode` default path).
+/// Comparison is snapshot lockstep: the reference single route's KV + DeltaNet
+/// + FULL scratch (30 fixed + 14 MoE-opt + pos_bufs, true `DeviceBuffer::size`)
+/// are snapshotted pre-step and restored into both ranks, so the discrete
+/// router sees identical inputs and only grouping rounding (~1e-5) remains.
+/// MEASURED: pos 0–16 hold 3e-6..2e-5, then a deterministic 3.599e-2 cliff at
+/// pos 17 — bit-identical to the earlier KV/DN-only snapshot run, so the full-
+/// scratch extension changed NOTHING and the carrier lives OUTSIDE the
+/// snapshot set. Out-of-snapshot state (maintainer suspect list): per-rank
+/// `EpMesh.partials` routed accumulators, RCCL/peer-reduce staging and rank
+/// streams, per-rank expert shard/zero-dummy weights (a routing-dependent
+/// dropped/duplicated expert fits: deterministic, snapshot-immune, trips when
+/// first selected). Token-exactness past pos 16 is UNPROVEN (the bound fires
+/// first). Also observed: solo EP=2 greedy (the EP4 reference run) flips off
+/// the single trajectory at pos 5 (78937 vs 325) — unpinned recurrence
+/// amplifies the ~1e-5 per-step route math within 5 steps.
 #[test]
 #[ignore]
 fn qwen35_ep2_vs_single_oracle() {
@@ -1486,17 +1527,23 @@ fn qwen35_ep2_vs_single_oracle() {
     mesh.free();
 }
 
-// ── 4. EP4 vs EP2 (MoE, BOUNDED) ─────────────────────────────────────────────
+// ── 4. EP4 vs EP2 (MoE, MEASURING-BUT-RED) ──────────────────────────────────────
 
 /// `qwen35_ep4_vs_ep2_oracle` — MoE A3B, expert-parallel EP=4 vs EP=2.
 ///
-/// Relationship: BOUNDED (tokens `assert_eq`, max abs logit diff <= 1e-3).
-/// Both sides run the same replicated router/top-k and the same RCCL decode
-/// reduce, but the expert-to-rank groupings differ (stride `e%4` vs `e%2`), so
-/// the partial contents and the RCCL summation order differ. The rooted-peer
-/// order (`multi_gpu.rs:1759`) would fix the reduction order, but it is NOT
-/// the decode path — opt-in via `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` only —
-/// so `assert_eq` on these logits is unwarranted under the production default.
+/// Relationship: MEASURING-BUT-RED (tokens `assert_eq`, max abs logit diff
+/// <= 1e-3, asserted and FAILING honestly — do not widen). Both sides run the
+/// same replicated router/top-k and the same RCCL decode reduce, but the
+/// expert-to-rank groupings differ (stride `e%4` vs `e%2`), so the partial
+/// contents and the RCCL summation order differ. MEASURED: pos 0–1 hold
+/// ~1e-5, then a deterministic 2.695e-3 cliff at pos 2 — a DIFFERENT position
+/// and magnitude than EP2-vs-single's pos-17/3.6e-2, so the trip is
+/// route-pair-specific, not a universal step counter. Same out-of-snapshot
+/// suspect set as EP2 (partials, RCCL/peer staging, streams, shard/dummy
+/// state, routing-dependent dropped/duplicated expert). The rooted-peer order
+/// (`multi_gpu.rs:1759`) would fix the reduction order, but it is NOT the
+/// decode path — opt-in via `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` only — so
+/// `assert_eq` on these logits is unwarranted under the production default.
 #[test]
 #[ignore]
 fn qwen35_ep4_vs_ep2_oracle() {
