@@ -461,6 +461,35 @@ const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
 /// can still OOM at allocation; that VRAM validation is out of scope here.
 const MAX_REQUESTED_SEQ: usize = 1024 * 1024;
 
+/// #666 G1: lower bound on a request-driven `max_seq` (1), symmetric with
+/// `MAX_REQUESTED_SEQ`. A resolved `max_seq` of 0 reaches
+/// `saddle-core/src/kv.rs:3434` (`physical_cap (0) must be in
+/// (0, max_seq_len=0]`), whose assertion panics and kills the daemon process,
+/// taking the resident model down with it. Admission refuses 0 fail-closed
+/// before any teardown or KV allocation; the assertion stays as a
+/// last-resort invariant.
+const MIN_REQUESTED_SEQ: usize = 1;
+
+/// Parse `params.max_seq` (default 4096) with fail-closed floor admission.
+/// `Err` carries the wire refusal message; callers emit it via
+/// `emit_uncorrelated_error(..., "validation", ...)` and `continue` before
+/// any teardown or allocation. Shared by the pre-teardown guard at the top
+/// of the `load` arm and both downstream `max_seq` read sites so the refusal
+/// is not order-dependent.
+fn admitted_requested_max_seq(msg: &serde_json::Value) -> Result<usize, String> {
+    let requested = msg
+        .get("params")
+        .and_then(|p| p.get("max_seq"))
+        .and_then(|v| v.as_u64())
+        .unwrap_or(4096) as usize;
+    if requested < MIN_REQUESTED_SEQ {
+        return Err(format!(
+            "load refused: max_seq {requested} below floor {MIN_REQUESTED_SEQ} (max_seq must be >= 1)"
+        ));
+    }
+    Ok(requested)
+}
+
 /// Typed active-attempt error writer used by generation failure paths and tests.
 fn write_typed_error(
     stdout: &mut impl std::io::Write,
@@ -982,6 +1011,16 @@ fn main() {
                     .and_then(|p| p.get("experimental_multi_slot"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // #666 G1: fail-closed floor admission BEFORE any teardown or
+                // allocation on either branch below. A resolved max_seq of 0
+                // would panic KV allocation (saddle-core/src/kv.rs:3434
+                // physical_cap invariant) and kill the daemon; refuse it here
+                // so the resident model keeps serving.
+                if let Err(e) = admitted_requested_max_seq(&msg) {
+                    emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if experimental_multi_slot {
                     // Experimental slot backend is an alternate model owner, not a batch-mode switch.
                     // Validate mutually exclusive knobs before any GPU work.
@@ -1091,11 +1130,23 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    let requested_max_seq = msg
-                        .get("params")
-                        .and_then(|p| p.get("max_seq"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(4096) as usize;
+                    // #666 G1: floor re-checked here (already refused pre-teardown
+                    // above) so this site is never order-dependent.
+                    let requested_max_seq = match admitted_requested_max_seq(&msg) {
+                        Ok(requested) => requested,
+                        Err(e) => {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &e,
+                                "validation",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    };
                     let max_seq = requested_max_seq.min(MAX_REQUESTED_SEQ);
                     let n_slots = msg
                         .get("params")
@@ -1207,11 +1258,16 @@ fn main() {
                 // max_seq drives a multi-GB KV allocation and OOMs the daemon at
                 // load. Emit an info event when the clamp actually fires so the
                 // operator sees the truncation rather than silently getting 1M.
-                let requested_max_seq = msg
-                    .get("params")
-                    .and_then(|p| p.get("max_seq"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(4096) as usize;
+                // #666 G1: floor re-checked here (already refused pre-teardown
+                // above) so this site is never order-dependent.
+                let requested_max_seq = match admitted_requested_max_seq(&msg) {
+                    Ok(requested) => requested,
+                    Err(e) => {
+                        emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
                 let max_seq = requested_max_seq.min(MAX_REQUESTED_SEQ);
                 if requested_max_seq > MAX_REQUESTED_SEQ {
                     let _ = writeln!(
