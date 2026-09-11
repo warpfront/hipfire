@@ -1533,7 +1533,6 @@ impl Lfm2MoeState {
                 hipfire_runtime::kv_mode::resolve(
                     "",
                     &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY,
-                    cfg.head_dim,
                 )
                 .mode,
                 hipfire_runtime::llama::KvTarget::Single(gpu),

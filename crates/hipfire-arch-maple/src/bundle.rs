@@ -120,11 +120,7 @@ pub fn load_maple_from_hfq_with_head(
     let config = MapleConfig::from_hfq(hfq)?;
     let weights = MapleWeights::load(hfq, &config, gpu)?;
     let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
-        hipfire_runtime::kv_mode::resolve(
-            kv_mode_raw,
-            &hipfire_runtime::kv_mode::MAPLE_POLICY,
-            config.head_dim,
-        );
+        hipfire_runtime::kv_mode::resolve(kv_mode_raw, &hipfire_runtime::kv_mode::MAPLE_POLICY);
     if let Some(w) = warning {
         eprintln!("  KV cache: {w} (site maple)");
     }

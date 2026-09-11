@@ -10,7 +10,7 @@
 use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// The resolved, validated KV-cache mode (plus one resolver-internal sentinel).
+/// The resolved, validated KV-cache mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvMode {
     Q8,
@@ -25,11 +25,6 @@ pub enum KvMode {
     Fwht2,
     Fwht3,
     Fwht4,
-    /// SENTINEL — not an allocatable mode. Emitted only by site 3's
-    /// `normalize_dir` for its `auto`-set (`"" | "auto" | "turbo" | "turbo3"`).
-    /// `resolve` collapses it to `Asym3` (head_dim == 256) or `Q8` (else)
-    /// *before returning*, so `KvCache::from_mode` never sees it.
-    Asym3Auto,
 }
 
 /// KV storage backend selection.
@@ -454,10 +449,6 @@ impl KvCache {
                 .checked_div(2)
                 .and_then(|n| n.checked_add(4))
                 .ok_or_else(|| hip_bridge::HipError::new(0, "VMM 4-bit K head stride overflowed")),
-            KvMode::Asym3Auto => Err(hip_bridge::HipError::new(
-                0,
-                "KV mode Asym3Auto must be resolved before VMM layout",
-            )),
         }
     }
 
@@ -587,12 +578,6 @@ impl KvCache {
                     }
                 }
             },
-            KvMode::Asym3Auto => {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    "KV mode Asym3Auto must be resolved before VMM layout",
-                ));
-            }
         }
         Ok(())
     }
@@ -637,7 +622,6 @@ impl KvCache {
                     256
                 }
             }
-            KvMode::Asym3Auto => 0,
         };
         let uses_fwht_signs = matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4);
         Ok(VmmKvLayout {
@@ -793,7 +777,6 @@ impl KvCache {
             KvMode::Fwht2 => (false, false, false, true, true),
             KvMode::Fwht3 => (false, false, true, false, true),
             KvMode::Fwht4 => (false, true, false, false, true),
-            KvMode::Asym3Auto => (false, false, false, false, false),
             // Bf16 is NOT representable in this 5-flag VMM bundle — all-false
             // here would decode as KTier::F32 and hand a bf16 buffer to the
             // F32 kernels, which read it at twice the stride. It can never
@@ -813,12 +796,6 @@ impl KvCache {
         single_gpu: bool,
         dims: &KvDims,
     ) -> HipResult<()> {
-        if mode == KvMode::Asym3Auto {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "KV mode Asym3Auto must be resolved before allocation",
-            ));
-        }
         if matches!(mode, KvMode::Asym4 | KvMode::Asym3) && dims.head_dim != 256 {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -4226,7 +4203,6 @@ mod vmm_layout_tests {
             KvMode::Asym2 | KvMode::Fwht2 => 4 + head_dim / 4,
             KvMode::Asym3 | KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
             KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
-            KvMode::Asym3Auto => panic!("Asym3Auto is not a layout mode"),
             KvMode::Bf16 => panic!("bf16 is not a VMM layout mode"),
         }
     }
@@ -4353,7 +4329,7 @@ mod vmm_layout_tests {
     }
 
     #[test]
-    fn validate_mode_rejects_multi_gpu_flat_and_asym3auto_vmm() {
+    fn validate_mode_rejects_multi_gpu_and_flat_vmm() {
         let mask = vmm_mask_dims(4, 256, 4096, 1024);
         let err = KvCache::validate_mode_with_backend(KvMode::Fwht3, KvBackend::Vmm, false, &mask)
             .unwrap_err()
@@ -4371,12 +4347,6 @@ mod vmm_layout_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("filtered"), "{err}");
-
-        let err =
-            KvCache::validate_mode_with_backend(KvMode::Asym3Auto, KvBackend::Vmm, true, &mask)
-                .unwrap_err()
-                .to_string();
-        assert!(err.contains("Asym3Auto"), "{err}");
     }
 
     #[test]
