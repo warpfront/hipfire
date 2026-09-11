@@ -1530,6 +1530,58 @@ pub fn maybe_inject_fault_after_prefill_dflash(
     true
 }
 
+/// Fire one-shot after-first-decode fault on qwen DFlash (live slot/spec path).
+///
+/// Sits with the prefill seam above, not after the first `spec.step`: the
+/// prefill already ran the first target decode (KV/recurrent/drafter advanced,
+/// `first_token` sampled), and the emitter's `begin` below makes that token
+/// wire-visible — firing later would leak a `token` before the fail-closed
+/// terminal the AR loop attests at `ar.rs:4249`. Consumes the same
+/// `test_fault_after_first_decode` arm (`take_generation_fault_after_first_decode`,
+/// armed by `RequestFaultGuard`; no new mechanism, no new wire field) and
+/// produces the same single correlated `error` terminal. Returns true when
+/// the fault was taken (caller must return immediately).
+#[cfg(feature = "serve-fault-inject")]
+pub fn maybe_inject_fault_after_first_decode_dflash(
+    arch_id: u32,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    slot: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+) -> bool {
+    if !take_generation_fault_after_first_decode() {
+        return false;
+    }
+    if !matches!(arch_id, 5 | 6) {
+        return false;
+    }
+    let ep = crate::common::production_fail_closed_rollback_live(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        slot,
+        spec,
+    );
+    crate::common::emit_fail_closed_error(
+        stdout,
+        Some(id),
+        "injected fault after first decode",
+        "gpu",
+        true,
+        &ep,
+    );
+    true
+}
+
 // ── G4.10 generation-fault hooks (test-only) ──
 
 // Test-only fault points for the dense/AR generation loops.
