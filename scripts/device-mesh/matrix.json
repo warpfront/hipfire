@@ -1611,10 +1611,16 @@
   },
   {
    "commands": {
-    "negative": [],
-    "positive": []
+    "positive": [
+     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_DFLASH_DRAFT=/home/kaden/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw dflash_qwen35 -- --ignored --test-threads=1"
+    ],
+    "negative": [
+     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
+    ]
    },
-   "fixtures": [],
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
    "hosts": [
     "gfx1100",
     "gfx1201",
@@ -1622,12 +1628,16 @@
    ],
    "id": "g4-spec-route-fault-coverage",
    "milestone": "G4.7",
-   "note": "#666 G4.7 pairs each positive route with its fail-closed route, but the serve-fault-inject injector does not fire on the DFlash speculative-decode route. Measured on gfx1201 at 72f8a5904: qwen35_reset_hw single_qwen35 passes with no draft and fails 'fault did not fire (got done)' when HIPFIRE_DFLASH_DRAFT forces a draft, i.e. the faulted turn completes successfully instead of rolling back. The AR reset/rollback route is proven (g4-reset-single); the spec route's fail-closed half has no probe because the injector cannot reach it.",
    "predicate": {
-    "kind": "none"
+    "kind": "cargo",
+    "min_passed": 1
    },
-   "probe": "none",
-   "route": "single/spec-decode-fault-rollback"
+   "probe": "thin-driver",
+   "route": "single/spec-decode-fault-rollback",
+   "negative_predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   }
   },
   {
    "commands": {
@@ -1960,20 +1970,71 @@
     },
     {
      "race_sends": [
-      {"type": "generate", "id": "r1", "attempt_id": 1, "prompt": "Write a one-sentence greeting.", "temperature": 0.0, "seed": 12345, "max_tokens": 32, "thinking_enabled": false},
-      {"type": "generate", "id": "r2", "attempt_id": 1, "prompt": "Explain recursion in one paragraph.", "temperature": 0.0, "seed": 23456, "max_tokens": 64, "thinking_enabled": false},
-      {"type": "generate", "id": "r3", "attempt_id": 1, "prompt": "Write a one-sentence greeting.", "temperature": 0.0, "seed": -1, "max_tokens": 16, "thinking_enabled": false},
-      {"type": "abort", "id": "r1", "attempt_id": 999},
-      {"type": "abort", "id": "r2", "attempt_id": 1}
+      {
+       "type": "generate",
+       "id": "r1",
+       "attempt_id": 1,
+       "prompt": "Write a one-sentence greeting.",
+       "temperature": 0.0,
+       "seed": 12345,
+       "max_tokens": 32,
+       "thinking_enabled": false
+      },
+      {
+       "type": "generate",
+       "id": "r2",
+       "attempt_id": 1,
+       "prompt": "Explain recursion in one paragraph.",
+       "temperature": 0.0,
+       "seed": 23456,
+       "max_tokens": 64,
+       "thinking_enabled": false
+      },
+      {
+       "type": "generate",
+       "id": "r3",
+       "attempt_id": 1,
+       "prompt": "Write a one-sentence greeting.",
+       "temperature": 0.0,
+       "seed": -1,
+       "max_tokens": 16,
+       "thinking_enabled": false
+      },
+      {
+       "type": "abort",
+       "id": "r1",
+       "attempt_id": 999
+      },
+      {
+       "type": "abort",
+       "id": "r2",
+       "attempt_id": 1
+      }
      ],
-     "race_terminals": ["r1", "r2", "r3"]
+     "race_terminals": [
+      "r1",
+      "r2",
+      "r3"
+     ]
     },
     {
      "quiet_ms": 5000,
      "quiet_sends": [
-      {"type": "commit", "id": "r1", "attempt_id": 1},
-      {"type": "abort", "id": "r2", "attempt_id": 1},
-      {"type": "abort", "id": "r1", "attempt_id": 2}
+      {
+       "type": "commit",
+       "id": "r1",
+       "attempt_id": 1
+      },
+      {
+       "type": "abort",
+       "id": "r2",
+       "attempt_id": 1
+      },
+      {
+       "type": "abort",
+       "id": "r1",
+       "attempt_id": 2
+      }
      ]
     },
     {

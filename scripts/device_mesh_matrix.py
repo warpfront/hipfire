@@ -562,7 +562,7 @@ def execute_row(ctx, row, out, timeout):
     # without that sidecar the command runs and reports zero tests, which is
     # indistinguishable from a broken filter. Gate on the paths themselves.
     for cmd in row.get("commands", {}).get("positive", []):
-        for assign in re.findall(r'HIPFIRE_\w*FIXTURE="?([^"\s]+)"?', subst(cmd, mapping)):
+        for assign in re.findall(r'HIPFIRE_(?:\w*FIXTURE|DFLASH_DRAFT|\w*RESET_MODEL)="?([^"\s]+)"?', subst(cmd, mapping)):
             paths += [p for p in assign.split(",") if p.startswith("/")]
     # A fixture may legitimately be a directory (HIPFIRE_DENSE_FIXTURE points at
     # the model store, not one file).
