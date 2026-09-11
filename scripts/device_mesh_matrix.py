@@ -17,6 +17,9 @@ from datetime import datetime, timezone
 
 CARGO_RE = re.compile(r"test result:\s*(\w+)\.\s*(\d+) passed;\s*(\d+) failed")
 FORBID_RUN = ("daemon error", "[unsupported", "[CLS-", "Traceback")
+# Documented per-arch limits of a probe path (not tree defects). A row hitting
+# one of these is hardware-blocked on that arch, exactly like an absent fixture.
+CAPABILITY_GAPS = ("PM4 dispatch does not yet support scratch",)
 SAMPLE_CARGO_PASS = "test result: ok. 5 passed; 0 failed; 0 ignored; finished in 1.2s\n"
 SAMPLE_CARGO_FAIL = "test result: FAILED. 4 passed; 1 failed; 0 ignored; finished in 2.0s\n"
 SAMPLE_SERVE_CLEAN = [{"attractor": False, "empty": False, "runaway": False, "visible": "Paris."}]
@@ -512,6 +515,14 @@ def execute_row(ctx, row, out, timeout):
                         for i, s in enumerate(sessions)]
     detail["probes"] += [{"cmd": r.get("cmd", ""), "rc": r.get("rc"), "tail": r.get("out", "")[-2000:]}
                          for r in positives]
+    # Documented per-arch capability gaps are not tree defects and must not be
+    # filed as regressions. The PM4 replay path cannot dispatch a kernel that
+    # needs scratch on GFX10/GFX11, and which kernel gets selected is arch
+    # dependent — gfx1100 picks a scratch-free variant, gfx1151 does not.
+    for res in positives:
+        gap = next((mark for mark in CAPABILITY_GAPS if mark in res.get("out", "")), "")
+        if gap:
+            return "hardware-blocked", "capability gap on this arch: %s" % gap, detail
     if kind == "cargo":
         good, note = eval_cargo("\n".join(r["out"] for r in positives), pred.get("min_passed", 1))
     elif kind == "serve":
