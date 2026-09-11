@@ -16,7 +16,6 @@ import time
 from datetime import datetime, timezone
 
 CARGO_RE = re.compile(r"test result:\s*(\w+)\.\s*(\d+) passed;\s*(\d+) failed")
-ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S+")
 FORBID_RUN = ("daemon error", "[unsupported", "[CLS-", "Traceback")
 SAMPLE_CARGO_PASS = "test result: ok. 5 passed; 0 failed; 0 ignored; finished in 1.2s\n"
 SAMPLE_CARGO_FAIL = "test result: FAILED. 4 passed; 1 failed; 0 ignored; finished in 2.0s\n"
@@ -73,8 +72,7 @@ def load_digest_cache(out):
         return {}, path
 
 def sha256_cached(path, cache):
-    # Sidecar avoids re-hashing 15-80 GB files every run; no CLI digest
-    # cache exists (hipfire-registry only validates pinned digests).
+    # Sidecar avoids re-hashing 80 GB files; no CLI digest cache exists.
     try:
         st = os.stat(path)
     except OSError:
@@ -91,8 +89,7 @@ def sha256_cached(path, cache):
     return cache[path]["sha256"]
 
 def run_cmd(argv, env_extra, timeout):
-    env = dict(os.environ)
-    env.update(env_extra or {})
+    env = dict(os.environ, **(env_extra or {}))
     start = time.time()
     try:
         proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
@@ -127,11 +124,9 @@ def has_gpu():
     return os.path.exists("/dev/kfd") or os.path.exists("/dev/dri")
 
 def parse_cargo(text):
-    passed = failed = 0
-    for match in CARGO_RE.finditer(text):
-        passed += int(match.group(2))
-        failed += int(match.group(3))
-    return {"summaries": "test result:" in text, "passed": passed, "failed": failed}
+    counts = [(int(m.group(2)), int(m.group(3))) for m in CARGO_RE.finditer(text)]
+    return {"summaries": "test result:" in text, "passed": sum(p for p, _ in counts),
+            "failed": sum(f for _, f in counts)}
 
 def eval_cargo(text, minimum):
     s = parse_cargo(text)
@@ -169,10 +164,9 @@ def eval_run_text(text, min_chars, forbid=FORBID_RUN):
 def event_text(events):
     parts = []
     for e in events:
-        if not isinstance(e, dict) or e.get("type") in ("commit_ready", "commit"):
-            continue
-        parts += [e[k] for k in ("text", "token", "content", "delta")
-                  if isinstance(e.get(k), str) and e[k]]
+        if isinstance(e, dict) and e.get("type") not in ("commit_ready", "commit"):
+            parts += [e[k] for k in ("text", "token", "content", "delta")
+                      if isinstance(e.get(k), str) and e[k]]
     return "".join(parts)
 
 def id_events(run, rid):
@@ -196,8 +190,7 @@ def eval_wire(runs, kind, pred):
         ok = len(arches) >= 2 and all(a is not None and a == arches[0] for a in arches)
         return ok, "wire: arch across source paths: %s" % arches
     if kind == "wire_error":
-        errs = wire_errors(runs)
-        return bool(errs), "wire-negative: %d error terminal(s)" % len(errs)
+        return bool(wire_errors(runs)), "wire-negative: %d error(s)" % len(wire_errors(runs))
     if kind == "wire_vl_false_then_done":
         vls = [l.get("vl") for run in runs for l in run.get("loaded", [])]
         if any(v is not False for v in vls):
@@ -216,11 +209,12 @@ def eval_wire(runs, kind, pred):
         same = all(t == texts[0] for t in texts[1:])
         return same, "wire: %d done text(s) identical=%s" % (len(texts), same)
     if kind == "wire_active_survives_bad_load":
-        if not wire_errors(runs):
-            return False, "wire: negative probe produced no error terminal"
+        errs = wire_errors(runs)
+        dones = [(terminal_of(r, g) or {}).get("type") == "done" and bool(event_text(id_events(r, g)).strip())
+                 for r in runs for g in r.get("generates", [])]
         texts = wire_texts(runs)
-        same = len(texts) >= 2 and all(t == texts[0] and t.strip() for t in texts)
-        return same, "wire: errors=%d identical dones=%s" % (len(wire_errors(runs)), same)
+        same = len(texts) >= 2 and all(t == texts[0] for t in texts[1:])
+        return bool(errs) and dones and all(dones), "wire: errors=%d usable=%s identical=%s" % (len(errs), all(dones), same)
     return False, "wire: unknown predicate %s" % kind
 
 def subst(node, mapping):
@@ -229,15 +223,15 @@ def subst(node, mapping):
     if isinstance(node, list):
         return [subst(v, mapping) for v in node]
     if isinstance(node, str):
-        for k, v in mapping.items():
-            node = node.replace(k, v)
+        pattern = "|".join(re.escape(k) for k in sorted(mapping, key=len, reverse=True))
+        return re.sub(pattern, lambda m: mapping[m.group(0)], node)
     return node
 
-def drive_session(daemon_bin, script, mapping, timeout):
+def drive_session(daemon_bin, script, mapping, env, timeout):
     run = {"events": [], "generates": [], "loaded": [], "broken": ""}
     try:
         proc = subprocess.Popen([daemon_bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, bufsize=1)
+                                stderr=subprocess.PIPE, text=True, bufsize=1, env=dict(os.environ, **env))
     except OSError as exc:
         return dict(run, broken="spawn: %s" % exc)
     lines = queue.Queue()
@@ -248,9 +242,9 @@ def drive_session(daemon_bin, script, mapping, timeout):
         finally:
             lines.put(None)
     threading.Thread(target=pump, daemon=True).start()
-    deadline = time.time() + timeout
+    budgets = {"until": 0.0}
     def read_line(context):
-        rest = deadline - time.time()
+        rest = budgets["until"] - time.time()
         if rest <= 0:
             raise TimeoutError("%s: timed out" % context)
         try:
@@ -269,6 +263,7 @@ def drive_session(daemon_bin, script, mapping, timeout):
                 return event
     try:
         for op in script:
+            budgets["until"] = time.time() + timeout
             request = subst(op["send"], mapping)
             proc.stdin.write(json.dumps(request) + "\n")
             proc.stdin.flush()
@@ -278,11 +273,10 @@ def drive_session(daemon_bin, script, mapping, timeout):
                 while True:
                     event = json.loads(read_line("generate %s" % rid))
                     run["events"].append(event)
-                    mine = event.get("id") == rid
-                    if mine and event.get("type") == "commit_ready":
+                    if event.get("id") == rid and event.get("type") == "commit_ready":
                         commit = {"type": "commit", "id": rid, "attempt_id": request.get("attempt_id", 1)}
                         proc.stdin.write(json.dumps(commit) + "\n")
-                    if mine and event.get("type") in ("done", "error"):
+                    if event.get("id") == rid and event.get("type") in ("done", "error"):
                         break
             elif "expect_terminal" in op:
                 wait_for(op["expect_terminal"], "terminal")
@@ -307,14 +301,13 @@ def drive_session(daemon_bin, script, mapping, timeout):
 
 def split_env(cmd):
     extra = {}
-    while True:
-        head, _, rest = cmd.partition(" ")
-        if ENV_ASSIGN_RE.match(head) and "=" in head:
-            key, _, val = head.partition("=")
-            extra[key] = val
-            cmd = rest.lstrip()
-        else:
-            return extra, cmd
+    while re.match(r"[A-Za-z_][A-Za-z0-9_]*=\S", cmd):
+        head, _, cmd = cmd.partition(" ")
+        key, _, val = head.partition("=")
+        if len(val) >= 2 and val.startswith('"') and val.endswith('"'):
+            val = val[1:-1]
+        extra[key] = val
+    return extra, cmd.lstrip()
 
 def exec_probe(ctx, cmd, timeout):
     expanded = subst(cmd, ctx["mapping"])
@@ -322,15 +315,14 @@ def exec_probe(ctx, cmd, timeout):
     argv = shlex.split(stripped)
     if not argv:
         return {"skipped": "empty command"}
-    if argv[0] == "hipfire" and ctx["cli_bin"]:
-        argv = [ctx["cli_bin"]] + argv[1:]
+    if argv[0] == "hipfire" and ctx["cli_bin"]: argv = [ctx["cli_bin"]] + argv[1:]
     first = os.path.basename(argv[0])
     if first not in ("cargo", "python3") and argv[0] != ctx["cli_bin"]:
         return {"skipped": "display-only; covered by session driver"}
     res = run_cmd(argv, dict(ctx["row_env"], **env_extra), timeout)
     idx = argv.index("--out") if "--out" in argv else -1
     res["out_path"] = argv[idx + 1] if 0 <= idx < len(argv) - 1 else None
-    return res
+    res["cmd"] = stripped
 
 def needs_gpu(row):
     if row.get("fixtures") or row.get("positive_session") or row.get("negative_session"):
@@ -357,15 +349,16 @@ def prompt_identity(ctx, row, mapping):
                     pass
     return ""
 def fixture_identity(ctx, row):
+    pairs = [(t, ctx["fixture_paths"].get(t, "")) for t in row.get("fixtures", [])]
+    pairs += [(os.path.basename(p), p) for p in row.get("fixture_files", [])]
     out = []
-    for tag in row.get("fixtures", []):
-        path = ctx["fixture_paths"].get(tag, "")
+    for tag, path in pairs:
         try:
             size = os.path.getsize(path)
         except OSError:
             size = -1
-        sha = sha256_cached(path, ctx["digests"]) if size >= 0 else "missing"
-        out.append({"tag": tag, "file": path, "size_bytes": size, "sha256": sha})
+        out.append({"tag": tag, "file": path, "size_bytes": size,
+                    "sha256": sha256_cached(path, ctx["digests"]) if size >= 0 else "missing"})
     return out
 
 def extend_outs(rows, results):
@@ -377,17 +370,17 @@ def extend_outs(rows, results):
         except (TypeError, OSError, ValueError):
             pass
 
-def run_negatives(ctx, row, mapping, timeout):
+def run_negatives(ctx, row, mapping, env, timeout):
     pred = row.get("negative_predicate") or {}
     kind = pred.get("kind", "")
     if row.get("negative_session"):
-        runs = [drive_session(ctx["daemon_bin"], row["negative_session"], mapping, timeout)]
+        runs = [drive_session(ctx["daemon_bin"], row["negative_session"], mapping, env, timeout)]
         return eval_wire(runs, kind, pred), runs
     results = [r for r in (exec_probe(ctx, c, timeout) for c in row.get("commands", {}).get("negative", []))
                if "skipped" not in r]
     if kind == "expect_nonzero":
-        good = bool(results) and all(r["rc"] != 0 for r in results)
-        return (good, "negative: rcs=%s" % [r["rc"] for r in results]), results
+        return (bool(results) and all(r["rc"] != 0 for r in results),
+                "negative: rcs=%s" % [r["rc"] for r in results]), results
     if kind == "cargo":
         return eval_cargo("\n".join(r["out"] for r in results), pred.get("min_passed", 1)), results
     if kind == "serve":
@@ -398,31 +391,46 @@ def run_negatives(ctx, row, mapping, timeout):
 
 def execute_row(ctx, row, out, timeout):
     mapping = row_mapping(ctx, row, out)
+    env = {k: subst(v, mapping) for k, v in ctx["row_env"].items()}
+    sub = dict(ctx, row_env=env)
     detail = {"mapping_model": mapping["$MODEL"]}
     if row.get("probe") == "none":
         return "rerun-required", "no existing probe: %s" % row.get("note", ""), detail
     if needs_gpu(row) and not has_gpu():
         return "hardware-blocked", "no HIP GPU (/dev/kfd and /dev/dri absent)", detail
-    for tag in row.get("fixtures", []):
-        path = ctx["fixture_paths"].get(tag, "")
-        if not os.path.isfile(path):
-            return "hardware-blocked", "fixture %s absent at %s" % (tag, path), detail
-    pred, kind, repeat = row.get("predicate", {}), row.get("predicate", {}).get("kind", ""), int(row.get("repeat", 1))
+    paths = [ctx["fixture_paths"].get(t, "") for t in row.get("fixtures", [])] + row.get("fixture_files", [])
+    missing = [p for p in paths if not os.path.isfile(p)]
+    if missing:
+        return "hardware-blocked", "fixtures absent: %s" % missing, detail
+    if row.get("positive_session") and mapping["$MODEL"]:
+        link = os.path.join(out, "%s-alt.mq4" % row["id"])
+        try:
+            os.path.exists(link) and os.unlink(link)
+            os.symlink(mapping["$MODEL"], link)
+            mapping["$MODEL_ALT"] = link
+        except OSError:
+            pass
+    pred = row.get("predicate", {})
+    kind, repeat = pred.get("kind", ""), int(row.get("repeat", 1))
     positives, sessions = [], []
     if row.get("positive_session"):
         if not ctx["daemon_bin"]:
             return "failed", "no daemon binary (HIPFIRE_DAEMON_BIN or target/*/daemon)", detail
         for _ in range(repeat):
-            sessions.append(drive_session(ctx["daemon_bin"], row["positive_session"], mapping, timeout))
+            sessions.append(drive_session(ctx["daemon_bin"], row["positive_session"], mapping, env, timeout))
             if sessions[-1].get("broken"):
                 break
     for cmd in row.get("commands", {}).get("positive", []):
-        res = exec_probe(ctx, cmd, timeout)
-        if "skipped" not in res:
-            positives.append(res)
-    broken = [s["broken"] for s in sessions if s.get("broken")]
+        positives += [r for r in [exec_probe(sub, cmd, timeout)] if "skipped" not in r]
+    broken = next((s["broken"] for s in sessions if s.get("broken")), "")
     if broken:
-        return "failed", "session driver: %s" % broken[0], detail
+        return "failed", "session driver: %s" % broken, detail
+    detail["probes"] = [{"session": i, "broken": s.get("broken", ""),
+                         "texts": [event_text(id_events(s, g))[:200] for g in s.get("generates", [])],
+                         "terminals": [(terminal_of(s, g) or {}).get("type") for g in s.get("generates", [])]}
+                        for i, s in enumerate(sessions)]
+    detail["probes"] += [{"cmd": r.get("cmd", ""), "rc": r.get("rc"), "tail": r.get("out", "")[-2000:]}
+                         for r in positives]
     if kind == "cargo":
         good, note = eval_cargo("\n".join(r["out"] for r in positives), pred.get("min_passed", 1))
     elif kind == "serve":
@@ -431,8 +439,7 @@ def execute_row(ctx, row, out, timeout):
         good, note = eval_serve_rows(rows, True)
     elif kind == "redline":
         try:
-            reports = [json.load(open(res["out_path"]))
-                       for res in positives if res.get("out_path")]
+            reports = [json.load(open(r["out_path"])) for r in positives if r.get("out_path")]
         except (OSError, ValueError) as exc:
             return "failed", "unreadable redline report: %s" % exc, detail
         if not reports:
@@ -458,7 +465,7 @@ def execute_row(ctx, row, out, timeout):
     if not good:
         return "failed", "positive: %s" % note, detail
     if row.get("negative_session") or row.get("commands", {}).get("negative"):
-        (ngood, nnote), _ = run_negatives(ctx, row, mapping, timeout)
+        (ngood, nnote), _ = run_negatives(ctx, row, mapping, env, timeout)
         detail["negative_note"] = nnote
         if not ngood:
             return "failed", "negative: %s" % nnote, detail
@@ -485,18 +492,16 @@ def make_receipt(ctx, row, out, disposition, note, detail, elapsed):
 
 def show_plan(rows, ctx):
     for row in rows:
-        first = (row.get("fixtures", [""]) or [""])[0]
-        m = {"$MODEL": ctx["fixture_paths"].get(first, "$MODEL"), "$MODEL_ALT": "$MODEL_ALT", "$MODEL_DIR": "$MODEL_DIR",
+        m = {"$MODEL": ctx["fixture_paths"].get((row.get("fixtures", [""]) or [""])[0], "$MODEL"),
+             "$MODEL_ALT": "$MODEL_ALT", "$MODEL_DIR": "$MODEL_DIR",
              "$MODELS_DIR": models_dir(), "$OUT": "$OUT", "$DAEMON_BIN": ctx["daemon_bin"] or "$DAEMON_BIN",
              "$CLI_BIN": ctx["cli_bin"] or "hipfire", "$PROMPT": row.get("prompt", "")}
         print("== %s [%s] %s probe=%s ==" % (row["id"], row["milestone"],
                                              row.get("route", ""), row.get("probe", "")))
-        print("   hosts: %s fixtures: %s" % (",".join(row.get("hosts", [])),
-                                             ",".join(row.get("fixtures", [])) or "-"))
-        for cmd in row.get("commands", {}).get("positive", []):
-            print("   + %s" % subst(cmd, m))
-        for cmd in row.get("commands", {}).get("negative", []):
-            print("   - %s" % subst(cmd, m))
+        print("   hosts: %s fixtures: %s" % (",".join(row.get("hosts", [])), ",".join(row.get("fixtures", [])) or "-"))
+        for mark, key in (("+", "positive"), ("-", "negative")):
+            for cmd in row.get("commands", {}).get(key, []):
+                print("   %s %s" % (mark, subst(cmd, m)))
         for key, mark in (("positive_session", "+"), ("negative_session", "-")):
             if row.get(key):
                 extra = " x%d" % row["repeat"] if key == "positive_session" and row.get("repeat", 1) > 1 else ""
@@ -532,9 +537,8 @@ def self_test():
     check("wire-vl-true-fails", not eval_wire([bad_vl], "wire_vl_false_then_done", {})[0])
     for name, ok in checks:
         print("   [%s] %s" % ("PASS" if ok else "FAIL", name))
-    ok_all = all(ok for _, ok in checks)
-    print("device_mesh_matrix: self-test %s (%d checks)" % ("OK" if ok_all else "FAILED", len(checks)))
-    return 0 if ok_all else 1
+    print("device_mesh_matrix: self-test %s (%d checks)" % ("OK" if all(ok for _, ok in checks) else "FAILED", len(checks)))
+    return 0 if all(ok for _, ok in checks) else 1
 
 def main(argv=None):
     ap = argparse.ArgumentParser(description="G1-G4 device-mesh acceptance matrix runner")
@@ -584,10 +588,8 @@ def main(argv=None):
         summary["rows"].append({"id": row["id"], "milestone": row["milestone"], "disposition": disposition,
                                 "note": note, "elapsed_s": elapsed, "receipt": path})
         print("%-28s %-6s %-16s %s" % (row["id"], row["milestone"], disposition, note))
-    with open(cache_path, "w") as fh:
-        json.dump(ctx["digests"], fh, indent=2)
-    with open(os.path.join(out, "summary.json"), "w") as fh:
-        json.dump(summary, fh, indent=2)
+    json.dump(ctx["digests"], open(cache_path, "w"), indent=2)
+    json.dump(summary, open(os.path.join(out, "summary.json"), "w"), indent=2)
     counts = {}
     for e in summary["rows"]:
         counts[e["disposition"]] = counts.get(e["disposition"], 0) + 1
