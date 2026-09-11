@@ -1739,7 +1739,7 @@
   {
    "commands": {
     "negative": [
-     "python3 scripts/serve_harness.py --port 28510 --model $MODEL --mode session --session benchmarks/prompts/g45_parser_finalization.json --max-tokens 1 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-nope --out $OUT/nope.json  # length-cap truncation: every fail_closed step must still terminate, never emit post-terminal bytes"
+     "python3 scripts/serve_harness.py --port 28510 --model $MODEL --mode session --session benchmarks/prompts/g45_parser_finalization.json --max-tokens 8 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-nope --out $OUT/nope.json  # length-cap truncation: every fail_closed step must still terminate, never emit post-terminal bytes"
     ],
     "positive": [
      "python3 scripts/serve_harness.py --port 28509 --model $MODEL --mode session --session benchmarks/prompts/g45_parser_finalization.json --max-tokens 128 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-parser --out $OUT/g4-parser.json --serve-log $OUT/g4-parser.serve.log"

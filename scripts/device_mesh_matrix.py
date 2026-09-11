@@ -367,7 +367,10 @@ def split_env(cmd):
 def exec_probe(ctx, cmd, timeout):
     expanded = subst(cmd, ctx["mapping"])
     env_extra, stripped = split_env(expanded)
-    argv = shlex.split(stripped)
+    # comments=True: catalogue commands carry trailing `# why this row exists`
+    # notes. Without it shlex hands `#` and every following word to the command
+    # as argv, which silently changes the prompt / flags being measured.
+    argv = shlex.split(stripped, comments=True)
     if not argv:
         return {"skipped": "empty command"}
     if argv[0] == "hipfire" and ctx["cli_bin"]: argv = [ctx["cli_bin"]] + argv[1:]
@@ -617,6 +620,10 @@ def self_test():
     probe_ctx = {"mapping": {}, "row_env": {}, "cli_bin": "", "daemon_bin": ""}
     check("probe-returns-dict", isinstance(exec_probe(probe_ctx, "python3 -c pass", 60), dict))
     check("probe-reports-rc", exec_probe(probe_ctx, "python3 -c pass", 60).get("rc") == 0)
+    check("probe-strips-trailing-comment",
+          shlex.split("cmd --flag x  # note words here", comments=True) == ["cmd", "--flag", "x"])
+    check("probe-keeps-quoted-hash",
+          shlex.split('cmd "a # b"', comments=True) == ["cmd", "a # b"])
     check("probe-skips-display-only",
           "skipped" in exec_probe(probe_ctx, "some-display-only-command", 60))
     check("run-text", eval_run_text("Paris is the capital.\n", 1)[0])
