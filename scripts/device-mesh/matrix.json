@@ -1929,9 +1929,16 @@
   {
    "commands": {
     "negative": [],
-    "positive": []
+    "positive": [
+     "$DAEMON_BIN  # race session (HIPFIRE_DETERMINISTIC=1); see positive_session"
+    ]
    },
-   "fixtures": [],
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
    "hosts": [
     "gfx1100",
     "gfx1201",
@@ -1939,11 +1946,52 @@
    ],
    "id": "g4-terminal-races-physical",
    "milestone": "G4.6",
-   "note": "#666 G4.6 requires concurrent done/error/cancel races, duplicate and late writers, and wrong-attempt writers on the daemon protocol with exactly-one-terminal evidence. Unit contracts exist (g4-terminal-unit); no existing physical daemon-protocol race probe.",
+   "note": "#666 G4.6 physical race probe: three requests admitted before any terminal is collected (r1 valid done, r2 aborted cancel, r3 seed-rejected error) with a wrong-attempt abort for r1 in flight, then a quiet drain carrying a duplicate commit for r1, a late abort for r2, and a wrong-attempt abort for r1. Oracle wire_exactly_one_terminal: exactly one terminal per id, no post-terminal bytes.",
+   "positive_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "race_sends": [
+      {"type": "generate", "id": "r1", "attempt_id": 1, "prompt": "Write a one-sentence greeting.", "temperature": 0.0, "seed": 12345, "max_tokens": 32, "thinking_enabled": false},
+      {"type": "generate", "id": "r2", "attempt_id": 1, "prompt": "Explain recursion in one paragraph.", "temperature": 0.0, "seed": 23456, "max_tokens": 64, "thinking_enabled": false},
+      {"type": "generate", "id": "r3", "attempt_id": 1, "prompt": "Write a one-sentence greeting.", "temperature": 0.0, "seed": -1, "max_tokens": 16, "thinking_enabled": false},
+      {"type": "abort", "id": "r1", "attempt_id": 999},
+      {"type": "abort", "id": "r2", "attempt_id": 1}
+     ],
+     "race_terminals": ["r1", "r2", "r3"]
+    },
+    {
+     "quiet_ms": 5000,
+     "quiet_sends": [
+      {"type": "commit", "id": "r1", "attempt_id": 1},
+      {"type": "abort", "id": "r2", "attempt_id": 1},
+      {"type": "abort", "id": "r1", "attempt_id": 2}
+     ]
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
    "predicate": {
-    "kind": "none"
+    "expect": {
+     "r1": "done",
+     "r2": "done",
+     "r3": "error"
+    },
+    "kind": "wire_exactly_one_terminal"
    },
-   "probe": "none",
+   "probe": "thin-driver",
    "route": "single/concurrent-terminal-races"
   },
   {

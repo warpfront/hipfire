@@ -277,6 +277,35 @@ def eval_wire(runs, kind, pred):
         texts = wire_texts(runs)
         same = len(texts) >= 2 and all(t == texts[0] for t in texts[1:])
         return bool(errs) and dones and all(dones), "wire: errors=%d usable=%s identical=%s" % (len(errs), all(dones), same)
+    if kind == "wire_exactly_one_terminal":
+        # G4.6 race contract, per admitted request id: exactly one terminal
+        # (done/error; a cancel surfaces as done with finish_reason aborted),
+        # correlated to a known id, with no post-terminal bytes for that id.
+        ids = [rid for run in runs for rid in run.get("generates", [])]
+        if not ids:
+            return False, "wire: no generate ids admitted"
+        expect = pred.get("expect", {}) or {}
+        bad = []
+        for run in runs:
+            known = set(run.get("generates", []))
+            for rid in run.get("generates", []):
+                evs = id_events(run, rid)
+                terms = [e for e in evs if e.get("type") in ("done", "error")]
+                if len(terms) != 1:
+                    bad.append("%s: %d terminals" % (rid, len(terms)))
+                    continue
+                want = expect.get(rid)
+                if want and terms[0].get("type") != want:
+                    bad.append("%s: terminal=%s want %s" % (rid, terms[0].get("type"), want))
+                    continue
+                pos = next(i for i, e in enumerate(evs) if e is terms[0])
+                if pos != len(evs) - 1:
+                    bad.append("%s: %d post-terminal event(s)" % (rid, len(evs) - 1 - pos))
+            for e in run.get("events", []):
+                if (isinstance(e, dict) and e.get("type") in ("done", "error")
+                        and e.get("id") is not None and e.get("id") not in known):
+                    bad.append("unknown-id terminal: %r" % (e.get("id"),))
+        return not bad, "wire: %d id(s) exactly-one-terminal, bad=%s" % (len(ids), bad)
     return False, "wire: unknown predicate %s" % kind
 
 def subst(node, mapping):
@@ -334,6 +363,60 @@ def drive_session(daemon_bin, script, mapping, env, timeout):
     try:
         for op in script:
             budgets["until"] = time.time() + timeout
+            if "race_sends" in op:
+                # More than one request in flight: write every send before
+                # collecting any terminal, so done/error/cancel interleave at
+                # the daemon instead of being serialized by the driver. A
+                # sequential write-then-wait loop cannot express this: the
+                # second request would never be admitted until the first
+                # resolves, and no abort could land mid-flight.
+                sends = [subst(s, mapping) for s in op["race_sends"]]
+                attempts = {}
+                for req in sends:
+                    proc.stdin.write(json.dumps(req) + "\n")
+                    if isinstance(req, dict) and req.get("type") == "generate" and req.get("id"):
+                        run["generates"].append(req["id"])
+                        attempts[req["id"]] = req.get("attempt_id", 1)
+                proc.stdin.flush()
+                pending = [subst(t, mapping) for t in op.get("race_terminals", [])]
+                if not pending:
+                    raise ValueError("race_sends needs a non-empty race_terminals list")
+                while pending:
+                    event = json.loads(read_line("race terminal %s" % ",".join(pending)))
+                    run["events"].append(event)
+                    etype, eid = event.get("type"), event.get("id")
+                    if etype == "commit_ready" and eid in pending:
+                        proc.stdin.write(json.dumps({"type": "commit", "id": eid,
+                                                     "attempt_id": attempts.get(eid, 1)}) + "\n")
+                        proc.stdin.flush()
+                    elif etype in ("done", "error") and eid in pending:
+                        # Any error here IS a terminal for that id (the daemon
+                        # emits correlated errors only as terminals), so unlike
+                        # wait_for there is no error-shortcircuit: an unknown-id
+                        # error is recorded and the predicate fails it.
+                        pending = [p for p in pending if p != eid]
+                continue
+            if "quiet_sends" in op:
+                # Stale-control probe: every id is already terminal, so these
+                # duplicate/late/wrong-attempt writers must produce no further
+                # bytes for the retired ids. Drain a fixed window and record
+                # anything heard; the predicate fails post-terminal bytes.
+                for req in [subst(s, mapping) for s in op["quiet_sends"]]:
+                    proc.stdin.write(json.dumps(req) + "\n")
+                proc.stdin.flush()
+                deadline = time.time() + float(op.get("quiet_ms", 5000)) / 1000.0
+                while True:
+                    rest = deadline - time.time()
+                    if rest <= 0:
+                        break
+                    try:
+                        line = lines.get(timeout=rest)
+                    except queue.Empty:
+                        break
+                    if line is None:
+                        raise EOFError("quiet drain: daemon closed stdout")
+                    run["events"].append(json.loads(line))
+                continue
             request = subst(op["send"], mapping)
             proc.stdin.write(json.dumps(request) + "\n")
             proc.stdin.flush()
@@ -667,6 +750,41 @@ def self_test():
     check("wire-vl", eval_wire([run], "wire_vl_false_then_done", {})[0])
     bad_vl = {"events": [{"type": "loaded", "vl": True}], "generates": [], "loaded": [{"vl": True}]}
     check("wire-vl-true-fails", not eval_wire([bad_vl], "wire_vl_false_then_done", {})[0])
+    # G4.6 race oracle: three concurrently admitted ids resolving to done /
+    # cancel-as-done / error, with duplicate-commit + late-abort +
+    # wrong-attempt-abort after the terminals producing no further bytes.
+    race_clean = {"events": [
+        {"type": "token", "id": "r1", "text": "hi"},
+        {"type": "commit_ready", "id": "r1"},
+        {"type": "error", "id": "r3", "message": "seed must be non-negative, got -1"},
+        {"type": "aborted", "id": "r2", "reason": "client_cancelled", "attempt_id": 1},
+        {"type": "done", "id": "r1", "tokens": 1},
+        {"type": "done", "id": "r2", "finish_reason": "aborted", "completion_tokens": 0}],
+        "generates": ["r1", "r2", "r3"], "loaded": []}
+    race_pred = {"expect": {"r1": "done", "r2": "done", "r3": "error"}}
+    check("wire-race-clean", eval_wire([race_clean], "wire_exactly_one_terminal", race_pred)[0])
+    def race_variant(extra=None, drop_terminal=None, extra_terminal=None):
+        run = json.loads(json.dumps(race_clean))
+        if drop_terminal:
+            run["events"] = [e for e in run["events"]
+                             if not (e.get("id") == drop_terminal and e.get("type") in ("done", "error"))]
+        if extra_terminal:
+            run["events"].append(dict(extra_terminal))
+        if extra:
+            run["events"].append(dict(extra))
+        return run
+    check("wire-race-dup-terminal-fails",
+          not eval_wire([race_variant(extra_terminal={"type": "done", "id": "r1", "tokens": 1})],
+                        "wire_exactly_one_terminal", race_pred)[0])
+    check("wire-race-post-terminal-token-fails",
+          not eval_wire([race_variant(extra={"type": "token", "id": "r1", "text": "late"})],
+                        "wire_exactly_one_terminal", race_pred)[0])
+    check("wire-race-missing-terminal-fails",
+          not eval_wire([race_variant(drop_terminal="r2")],
+                        "wire_exactly_one_terminal", race_pred)[0])
+    check("wire-race-unknown-id-terminal-fails",
+          not eval_wire([race_variant(extra_terminal={"type": "done", "id": "rx", "tokens": 1})],
+                        "wire_exactly_one_terminal", race_pred)[0])
     for name, ok in checks:
         print("   [%s] %s" % ("PASS" if ok else "FAIL", name))
     print("device_mesh_matrix: self-test %s (%d checks)" % ("OK" if all(ok for _, ok in checks) else "FAILED", len(checks)))
