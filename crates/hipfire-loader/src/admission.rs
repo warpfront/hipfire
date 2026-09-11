@@ -293,6 +293,153 @@ fn flux_arch_refusal(arch_id: u32, gpu_arch: &str) -> Option<String> {
     })
 }
 
+/// Pipeline/tensor-parallel geometry admission (#666 G2). `Gpus::init_uniform`
+/// refuses `n_layers < n_devices` deep inside GPU init (`multi_gpu.rs`) —
+/// after the daemon has already torn down the resident model for the pp path
+/// — and `init_tp`/`init_ep` refuse a zero degree or an unsatisfiable device
+/// count the same way. These gates mirror those deep invariants here, before
+/// any teardown, so an impossible `pp`/`tp` leaves the prior model serving.
+/// The `init_*` checks stay as last-resort invariants; this is an additional
+/// earlier gate, not a replacement.
+///
+/// Reachability: `admit_source` holds the already-open source but no per-arch
+/// config parser (the `config_from_hfq` readers live in the feature-gated
+/// arch crates, which this unconditional module cannot import). `n_layers` is
+/// therefore probed out of the HF `{config}` envelope (`num_hidden_layers`,
+/// the HF-convention key every pp-capable source carries, descending into
+/// `text_config` exactly as qwen35 `from_config_value` does) rather than
+/// parsed per-arch. A source with no layer key fails this gate open (`None`)
+/// — the visible-device gate below still guards it, and every non-qwen35
+/// `pp > 1` is already refused by `admit_topology` before this runs.
+fn n_layers_from_metadata_json(metadata_json: &str) -> Option<usize> {
+    let meta: serde_json::Value = serde_json::from_str(metadata_json).ok()?;
+    let config = meta.get("config").unwrap_or(&meta);
+    // Composite checkpoints nest the trunk config under `text_config`
+    // (mirrors qwen35 `from_config_value`, which descends there first).
+    // Probe the nested node, then the outer node, then the flat blob.
+    let text_config = config.get("text_config");
+    for node in [text_config.unwrap_or(config), config, &meta] {
+        for key in ["num_hidden_layers", "n_layers", "num_layers"] {
+            if let Some(n) = node.get(key).and_then(|v| v.as_u64()) {
+                if n > 0 {
+                    return Some(n as usize);
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Layer count declared by an already-open source, via the metadata envelope
+/// probe above. Read-only: parses the in-memory JSON the open already
+/// returned; touches no GPU state.
+fn source_n_layers(source: &ModelSource) -> Option<usize> {
+    match source {
+        ModelSource::Hfq(hfq) => n_layers_from_metadata_json(&hfq.metadata_json),
+        ModelSource::Dir(dir) => n_layers_from_metadata_json(
+            hipfire_runtime::model_source::ModelSource::metadata_json(dir),
+        ),
+    }
+}
+
+/// Count a comma-separated device list (`hardware.devices`, visibility envs).
+fn count_device_list(value: &str) -> usize {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .count()
+}
+
+/// Visible HIP device count for the pp/tp geometry gates. Read-only
+/// precedence: `hardware.devices` (the same source
+/// `Gpus::resolve_device_ids` consults) first, then the visibility envs the
+/// daemon inherits, then a `hipGetDeviceCount` query — which initializes no
+/// device, creates no context, and allocates nothing. `None` = unknown (e.g.
+/// CPU-only unit tests) and the device-count gate is skipped; the `n_layers`
+/// gate still guards `pp`.
+fn visible_device_count() -> Option<usize> {
+    if let Some(devices) = hipfire_runtime::config::get().devices.as_deref() {
+        return Some(count_device_list(devices));
+    }
+    for var in [
+        hipfire_config::HIP_VISIBLE_DEVICES,
+        hipfire_config::ROCR_VISIBLE_DEVICES,
+    ] {
+        if let Ok(value) = std::env::var(var) {
+            if !value.trim().is_empty() {
+                return Some(count_device_list(&value));
+            }
+        }
+    }
+    hip_bridge::HipRuntime::load()
+        .and_then(|hip| hip.device_count())
+        .map(|n| n.max(0) as usize)
+        .ok()
+}
+
+/// Pipeline-parallel geometry refusal. `pp == 0` can never satisfy
+/// `init_uniform` (`n_devices must be >= 1`); `pp` above the source's layer
+/// count can never satisfy its `n_layers < n_devices` invariant (each device
+/// must own at least one layer); `pp` above the visible device count can
+/// never bind its ranks. `pp == 1` always passes: a single device owns every
+/// layer by construction.
+fn pp_geometry_refusal(
+    pp: usize,
+    n_layers: Option<usize>,
+    n_devices: Option<usize>,
+) -> Option<String> {
+    if pp == 0 {
+        return Some(
+            "load refused: pp=0 is not a valid pipeline-parallel degree \
+             (Gpus::init_uniform requires n_devices >= 1; multi_gpu.rs)"
+                .to_string(),
+        );
+    }
+    if let Some(layers) = n_layers {
+        if pp > layers {
+            return Some(format!(
+                "load refused: pp={pp} exceeds n_layers={layers} for this source \
+                 (Gpus::init_uniform refuses n_layers < n_devices — each device must \
+                 own at least one layer; multi_gpu.rs)"
+            ));
+        }
+    }
+    if let Some(devices) = n_devices {
+        if pp > devices {
+            return Some(format!(
+                "load refused: pp={pp} exceeds visible HIP device count={devices} \
+                 (Gpus::init_uniform cannot bind that many ranks; multi_gpu.rs)"
+            ));
+        }
+    }
+    None
+}
+
+/// Expert/tensor-parallel geometry refusal. Unlike `pp`, `tp` shards
+/// within-layer work (`init_tp`/`init_ep` run every layer on every rank), so
+/// the layer count does not bound it — only the zero degree
+/// (`init_ep: ep_size must be >= 1`, `init_tp: tp_size must be >= 1`) and the
+/// visible device count (one device per rank) do. `tp == 1` always passes.
+fn tp_geometry_refusal(tp: usize, n_devices: Option<usize>) -> Option<String> {
+    if tp == 0 {
+        return Some(
+            "load refused: tp=0 is not a valid parallel degree \
+             (Gpus::init_ep/init_tp require ep_size/tp_size >= 1; multi_gpu.rs)"
+                .to_string(),
+        );
+    }
+    if let Some(devices) = n_devices {
+        if tp > devices {
+            return Some(format!(
+                "load refused: tp={tp} exceeds visible HIP device count={devices} \
+                 (Gpus::init_ep/init_tp need one device per rank; multi_gpu.rs)"
+            ));
+        }
+    }
+    None
+}
+
 /// Read-only source admission: open the source, classify `arch_id` + vision,
 /// decide the effective topology, and refuse every unsupported/contradictory
 /// combination — without touching GPU state, VMM, or any prior model.
@@ -310,6 +457,15 @@ pub fn admit_source(
     head: Option<&str>,
     max_seq: usize,
 ) -> Result<SourceAdmission, String> {
+    // #666 G2: zero parallel degrees are never servable (see the geometry
+    // gates above) and previously collapsed silently into `Single`, hiding
+    // a meaningless request. Refuse before the source is even opened.
+    if pp == 0 {
+        return Err(pp_geometry_refusal(pp, None, None).expect("pp=0 always refuses"));
+    }
+    if tp == 0 {
+        return Err(tp_geometry_refusal(tp, None).expect("tp=0 always refuses"));
+    }
     let mut source = ModelSource::from_path(path)?;
     let arch_id = source
         .arch_id()
@@ -346,6 +502,12 @@ pub fn admit_source(
         if let Some(refusal) = ep_vmm_refusal(arch_id, kv_backend) {
             return Err(refusal);
         }
+        // #666 G2: refuse an unsatisfiable rank count before any teardown or
+        // GPU init (`init_ep` needs one device per rank). Runs after the
+        // arch/VMM refusals above so their messages are unchanged.
+        if let Some(refusal) = tp_geometry_refusal(tp, visible_device_count()) {
+            return Err(refusal);
+        }
         (EffectiveTopology::Expert(tp), None)
     } else {
         // Single / pipeline-parallel via the carrier registry.
@@ -366,6 +528,16 @@ pub fn admit_source(
             );
         }
         carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
+        // #666 G2: refuse an impossible pipeline degree before any teardown
+        // (`init_uniform` would fail `n_layers < n_devices` deep in GPU init
+        // with the resident model already gone). Runs after the carrier's
+        // own topology refusal so currently-refused archs keep their message;
+        // only sources that would otherwise proceed to GPU init reach this.
+        if let Some(refusal) =
+            pp_geometry_refusal(pp, source_n_layers(&source), visible_device_count())
+        {
+            return Err(refusal);
+        }
         let topology = if pp > 1 {
             EffectiveTopology::Pipeline(pp)
         } else {
@@ -479,6 +651,90 @@ mod tests {
         // Non-diffusion archs never hit this gate, on any arch string.
         assert_eq!(flux_arch_refusal(5, "gfx1201"), None);
         assert_eq!(flux_arch_refusal(9, "gfx1201"), None);
+    }
+
+    /// #666 G2 geometry gates: the metadata probe reads the HF `{config}`
+    /// envelope every pp-capable source carries, and fails open (`None`) on
+    /// sources with no layer key rather than refusing a servable load.
+    #[test]
+    fn metadata_probe_reads_layer_keys() {
+        let enveloped = r#"{"config":{"num_hidden_layers":64}}"#;
+        assert_eq!(n_layers_from_metadata_json(enveloped), Some(64));
+        // Composite checkpoints nest the trunk under `text_config` (the
+        // production qwen3.8 envelope); the nested node wins.
+        assert_eq!(
+            n_layers_from_metadata_json(
+                r#"{"config":{"text_config":{"num_hidden_layers":64},"vision_config":{}}}"#
+            ),
+            Some(64)
+        );
+        assert_eq!(
+            n_layers_from_metadata_json(r#"{"config":{"n_layers":32}}"#),
+            Some(32)
+        );
+        // Flat (unenveloped) metadata and zero layers fail open, not refused.
+        assert_eq!(
+            n_layers_from_metadata_json(r#"{"num_hidden_layers":12}"#),
+            Some(12)
+        );
+        assert_eq!(n_layers_from_metadata_json("{}"), None);
+        assert_eq!(
+            n_layers_from_metadata_json(r#"{"config":{"num_hidden_layers":0}}"#),
+            None
+        );
+        assert_eq!(n_layers_from_metadata_json("not json"), None);
+    }
+
+    /// `pp` geometry mirrors `Gpus::init_uniform`'s deep invariants
+    /// (`n_devices >= 1`, `n_layers >= n_devices`): pp=99 on a 64-layer
+    /// source refuses naming `init_uniform`; pp=1 (the default) and any
+    /// servable degree pass; unknown geometry fails open.
+    #[test]
+    fn pp_geometry_mirrors_init_uniform() {
+        let err_zero = pp_geometry_refusal(0, Some(64), Some(4)).expect("pp=0 refuses");
+        assert!(err_zero.contains("pp=0"), "reason: {err_zero}");
+        assert!(
+            err_zero.contains("init_uniform"),
+            "names deep site: {err_zero}"
+        );
+        let err = pp_geometry_refusal(99, Some(64), Some(4)).expect("pp=99 refuses");
+        assert!(err.contains("pp=99"), "reason: {err}");
+        assert!(err.contains("n_layers=64"), "reason: {err}");
+        assert!(err.contains("init_uniform"), "names deep site: {err}");
+        let err = pp_geometry_refusal(8, Some(64), Some(4)).expect("pp=8 > 4 devices");
+        assert!(err.contains("device count=4"), "reason: {err}");
+        // Servable degrees pass untouched.
+        assert_eq!(pp_geometry_refusal(1, Some(64), Some(4)), None);
+        assert_eq!(pp_geometry_refusal(4, Some(64), Some(4)), None);
+        assert_eq!(pp_geometry_refusal(64, Some(64), Some(64)), None);
+        // Unknown geometry fails open — the deep check stays last-resort.
+        assert_eq!(pp_geometry_refusal(99, None, None), None);
+        assert_eq!(pp_geometry_refusal(1, None, None), None);
+    }
+
+    /// `tp` geometry mirrors `init_tp`/`init_ep`: no layer bound (every rank
+    /// runs every layer), only the zero degree and the device count.
+    #[test]
+    fn tp_geometry_checks_degree_and_devices_only() {
+        let err_zero = tp_geometry_refusal(0, Some(4)).expect("tp=0 refuses");
+        assert!(err_zero.contains("tp=0"), "reason: {err_zero}");
+        assert!(err_zero.contains("init_ep"), "names deep site: {err_zero}");
+        let err = tp_geometry_refusal(99, Some(4)).expect("tp=99 refuses");
+        assert!(err.contains("tp=99"), "reason: {err}");
+        assert!(err.contains("device count=4"), "reason: {err}");
+        assert_eq!(tp_geometry_refusal(1, Some(4)), None);
+        assert_eq!(tp_geometry_refusal(4, Some(4)), None);
+        assert_eq!(tp_geometry_refusal(99, None), None);
+    }
+
+    /// Device-list counting follows the comma-separated convention shared by
+    /// `hardware.devices` and the visibility envs.
+    #[test]
+    fn device_list_counting() {
+        assert_eq!(count_device_list("0,1,2,3"), 4);
+        assert_eq!(count_device_list("0"), 1);
+        assert_eq!(count_device_list(" 0, 1 ,,"), 2);
+        assert_eq!(count_device_list(""), 0);
     }
 
     /// Vision-sidecar fixtures: minimal HFQ files via the in-memory writer.
