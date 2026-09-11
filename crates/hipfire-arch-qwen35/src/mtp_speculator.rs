@@ -15,10 +15,11 @@
 
 use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
 use crate::mtp_spec::{
-    prefill_trunk_and_mtp_cache, sample_from_logits, spec_step_mtp_compressed_serial_with_k,
+    prefill_trunk_and_mtp_cache, prefill_trunk_and_mtp_cache_with_boundary, sample_from_logits,
+    spec_step_mtp_compressed_serial_with_k,
     spec_step_mtp_compressed_serial_with_takeover_candidates, MtpSamplingConfig, MtpSpecState,
 };
-use crate::speculative::ModelSlot;
+use crate::speculative::{take_dn_checkpoint, DeltaNetSnapshot, ModelSlot};
 use hipfire_runtime::ngram_mod::{NgramModConfig, NgramModPool};
 use hipfire_runtime::spec::{
     terminal_prefix_replay, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow, SpecGrammar,
@@ -77,6 +78,11 @@ pub struct Qwen35MtpDrafter {
     stats: MtpRequestStats,
     /// Identity of the window whose pre-verify state is still in `trunk_snap`.
     last_window: Option<(usize, u32)>,
+    /// Bounded recurrent-state snapshots used to resume a divergent re-render.
+    checkpoints: Vec<(usize, DeltaNetSnapshot)>,
+    checkpoint_resume: bool,
+    checkpoint_interval: usize,
+    checkpoint_cap: usize,
 }
 
 impl Qwen35MtpDrafter {
@@ -95,6 +101,21 @@ impl Qwen35MtpDrafter {
             ngram_retired: false,
             stats: MtpRequestStats::default(),
             last_window: None,
+            checkpoints: Vec::new(),
+            checkpoint_resume: hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
+                .ok()
+                .as_deref()
+                != Some("0"),
+            checkpoint_interval: hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2048usize)
+                .max(256),
+            checkpoint_cap: hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8usize)
+                .max(1),
         }
     }
 
@@ -210,6 +231,12 @@ impl Qwen35MtpDrafter {
         }
         Ok(())
     }
+
+    fn clear_checkpoints(&mut self, gpu: &mut Gpu) {
+        for (_, snapshot) in self.checkpoints.drain(..) {
+            snapshot.free_gpu(gpu);
+        }
+    }
 }
 
 impl MtpDrafter for Qwen35MtpDrafter {
@@ -243,8 +270,38 @@ impl MtpDrafter for Qwen35MtpDrafter {
                 .map_err(|e| format!("mtp state reset: {e}"))?;
         }
 
-        prefill_trunk_and_mtp_cache(gpu, slot, &self.head, state, fill_tokens, start_pos)
-            .map_err(|e| format!("mtp prefill: {e}"))?;
+        let mut checkpoints = std::mem::take(&mut self.checkpoints);
+        if !cache_hit {
+            for (_, snapshot) in checkpoints.drain(..) {
+                snapshot.free_gpu(gpu);
+            }
+        }
+        let checkpoint_resume = self.checkpoint_resume;
+        let checkpoint_interval = self.checkpoint_interval;
+        let checkpoint_cap = self.checkpoint_cap;
+        let prefill = prefill_trunk_and_mtp_cache_with_boundary(
+            gpu,
+            slot,
+            &self.head,
+            state,
+            fill_tokens,
+            start_pos,
+            |gpu, slot, position| {
+                if checkpoint_resume {
+                    take_dn_checkpoint(
+                        &mut checkpoints,
+                        &slot.dn_state,
+                        gpu,
+                        position,
+                        checkpoint_interval,
+                        checkpoint_cap,
+                    );
+                }
+                Ok(())
+            },
+        );
+        self.checkpoints = checkpoints;
+        prefill.map_err(|e| format!("mtp prefill: {e}"))?;
         if abort() {
             return Err("aborted".into());
         }
@@ -467,6 +524,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.last_window = None;
         self.reset_ngram_request();
+        self.clear_checkpoints(gpu);
         if let Some(state) = self.state.as_mut() {
             state
                 .reset(gpu)
@@ -477,6 +535,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
 
     fn mtp_reset_for_realign(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.last_window = None;
+        self.clear_checkpoints(gpu);
         if let Some(state) = self.state.as_mut() {
             state
                 .reset(gpu)
@@ -485,11 +544,51 @@ impl MtpDrafter for Qwen35MtpDrafter {
         Ok(())
     }
 
+    fn mtp_checkpoint_positions(&self) -> Vec<usize> {
+        if self.checkpoint_resume {
+            self.checkpoints
+                .iter()
+                .map(|(position, _)| *position)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn mtp_rewind_to(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<usize, String> {
+        self.last_window = None;
+        let Some(index) = self
+            .checkpoints
+            .iter()
+            .rposition(|(checkpoint, _)| *checkpoint == position)
+        else {
+            return Err(format!(
+                "qwen35 MTP checkpoint {position} was advertised but is no longer resident"
+            ));
+        };
+        let slot = Self::slot(target)?;
+        self.checkpoints[index]
+            .1
+            .restore_to(&mut slot.dn_state, gpu)
+            .map_err(|e| format!("qwen35 MTP checkpoint restore at {position}: {e}"))?;
+        for (_, snapshot) in self.checkpoints.drain(index + 1..) {
+            snapshot.free_gpu(gpu);
+        }
+        Ok(position)
+    }
+
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
-        if let Some(state) = self.state {
+        let mut this = *self;
+        this.clear_checkpoints(gpu);
+        if let Some(state) = this.state {
             state.free_gpu(gpu);
         }
-        self.head.free_gpu(gpu);
+        this.head.free_gpu(gpu);
     }
 
     fn k(&self) -> usize {

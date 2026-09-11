@@ -1086,6 +1086,23 @@ pub trait MtpDrafter {
         Ok(false)
     }
 
+    /// Positions of MTP recurrent-state checkpoints available for a divergent
+    /// rendered-history resume.
+    fn mtp_checkpoint_positions(&self) -> Vec<usize> {
+        Vec::new()
+    }
+
+    /// Restore the MTP target's recurrent state to an advertised checkpoint
+    /// and discard checkpoints from the now-stale future.
+    fn mtp_rewind_to(
+        &mut self,
+        _gpu: &mut Gpu,
+        _target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<usize, String> {
+        Ok(position)
+    }
+
     /// Reset drafter-local state for a fresh conversation (MTP cache + any
     /// captured graphs). The target's KV/recurrent reset is the daemon's job.
     /// Returns `Err` when any HIP step required for a clean drafter fails.
@@ -1290,6 +1307,19 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
 
     fn reset_for_realign(&mut self, gpu: &mut Gpu) -> Result<(), String> {
         self.arch.mtp_reset_for_realign(gpu)
+    }
+
+    fn checkpoint_positions(&self) -> Vec<usize> {
+        self.arch.mtp_checkpoint_positions()
+    }
+
+    fn rewind_to(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<usize, String> {
+        self.arch.mtp_rewind_to(gpu, target, position)
     }
 
     fn block_size(&self) -> usize {
@@ -1889,6 +1919,65 @@ mod tests {
             drafts_generated: 4,
         })
         .is_err());
+    }
+
+    #[test]
+    fn mtp_adapter_exposes_drafter_checkpoint_positions() {
+        struct CheckpointDrafter;
+
+        impl MtpDrafter for CheckpointDrafter {
+            fn mtp_prefill(
+                &mut self,
+                _gpu: &mut Gpu,
+                _target: &mut dyn SpecTarget,
+                _prompt_tokens: &[u32],
+                _fill_tokens: &[u32],
+                _start_pos: usize,
+                _cache_hit: bool,
+                _abort: &dyn Fn() -> bool,
+            ) -> Result<u32, String> {
+                unreachable!()
+            }
+
+            fn mtp_step(
+                &mut self,
+                _gpu: &mut Gpu,
+                _target: &mut dyn SpecTarget,
+                _position: usize,
+                _seed: u32,
+                _emitted: &[u32],
+                _k: usize,
+                _eos: u32,
+                _grammar: Option<&mut dyn SpecGrammar>,
+            ) -> Result<MtpWindow, String> {
+                unreachable!()
+            }
+
+            fn mtp_reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+                Ok(())
+            }
+
+            fn mtp_free(self: Box<Self>, _gpu: &mut Gpu) {}
+
+            fn k(&self) -> usize {
+                4
+            }
+
+            fn ctx_capacity(&self) -> usize {
+                32_768
+            }
+
+            fn requires_greedy(&self) -> bool {
+                true
+            }
+
+            fn mtp_checkpoint_positions(&self) -> Vec<usize> {
+                vec![2_048, 4_096]
+            }
+        }
+
+        let spec = MtpSpeculator::new(CheckpointDrafter);
+        assert_eq!(spec.checkpoint_positions(), vec![2_048, 4_096]);
     }
 
     // ── SpecEmit seam types ─────────────────────────────────────────────────
