@@ -4,7 +4,7 @@
 
 //! G4.7 Qwen3.5 reset/rollback hardware tests.
 //!
-//! Both tests are `#[ignore]`d: they need a real HIP GPU, a real Qwen3.5
+//! All three tests are `#[ignore]`d: they need a real HIP GPU, a real Qwen3.5
 //! model file, and a daemon binary built with `--features
 //! serve-fault-inject` (the `test_fault_after_*` request fields are compiled
 //! out otherwise; a fault request that returns `done` instead of `error`
@@ -23,6 +23,11 @@
 //!
 //! Each fault case runs 3× in fresh processes (`HIPFIRE_RESET_ROUNDS`
 //! overrides for time-boxed runs; default 3).
+//!
+//! The `dflash_*` test additionally needs `HIPFIRE_DFLASH_DRAFT` (a DFlash
+//! draft); it forces the draft through the daemon env so every turn takes the
+//! speculative-decode route, and asserts `dflash:true` on each clean `done`
+//! so a silent AR fallback cannot pass as spec coverage.
 //!
 //! Reset-phase HIP failure (`rolled_back=false` on the wire) is not
 //! forceable on healthy hardware; that half of the contract is pinned by
@@ -78,6 +83,28 @@ fn rounds() -> usize {
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(3)
+}
+/// DFlash draft for the spec-route test. Skips when unset (there is no
+/// default draft path to fall back to). The spec test passes the draft
+/// explicitly through the daemon env, overriding any ambient value, so its
+/// turns take the speculative-decode route by construction.
+fn draft_path() -> Option<PathBuf> {
+    match std::env::var("HIPFIRE_DFLASH_DRAFT") {
+        Ok(p) => {
+            let p = PathBuf::from(p);
+            if !p.is_file() {
+                panic!(
+                    "HIPFIRE_DFLASH_DRAFT={} is not a readable file",
+                    p.display()
+                );
+            }
+            Some(p)
+        }
+        Err(_) => {
+            eprintln!("skip: HIPFIRE_DFLASH_DRAFT unset (spec-route test needs a DFlash draft)");
+            None
+        }
+    }
 }
 
 fn daemon_bin() -> PathBuf {
@@ -358,8 +385,10 @@ fn session_unload(s: &mut Session, context: &str) {
 /// Assert one committed `done`. Single-AR `done` carries `finish_reason stop`;
 /// the PP `done` envelope has no `finish_reason`, so there the commit is
 /// proven by exactly-one-`done` with no `aborted` (the abort path emits the
-/// `aborted`+`done(aborted)` pair instead).
-fn assert_done_stop(events: &[Value], context: &str, what: &str, pp: bool) {
+/// `aborted`+`done(aborted)` pair instead). With `expect_dflash`, the `done`
+/// must also carry the spec route's `dflash:true` marker, so a silent AR
+/// fallback cannot pass as spec coverage.
+fn assert_done_stop(events: &[Value], context: &str, what: &str, pp: bool, expect_dflash: bool) {
     let done: Vec<&Value> = events
         .iter()
         .filter(|e| e.get("type").and_then(|v| v.as_str()) == Some("done"))
@@ -384,15 +413,34 @@ fn assert_done_stop(events: &[Value], context: &str, what: &str, pp: bool) {
             "{context}: {what} must commit (finish stop)"
         );
     }
+    if expect_dflash {
+        assert_eq!(
+            done[0].get("dflash"),
+            Some(&Value::Bool(true)),
+            "{context}: {what} must take the spec route (done.dflash=true)"
+        );
+    }
 }
 
 /// Clean-generate text for one fresh daemon process (load → gen → unload).
-fn clean_bytes(model: &str, pp: Option<u64>, extra_env: &[(&str, &str)], context: &str) -> String {
+fn clean_bytes(
+    model: &str,
+    pp: Option<u64>,
+    extra_env: &[(&str, &str)],
+    context: &str,
+    expect_dflash: bool,
+) -> String {
     let id = "fresh";
     let mut s = Session::spawn(extra_env);
     session_load(&mut s, model, pp, context);
     let events = session_generate(&mut s, id, 7001, false, false, context);
-    assert_done_stop(&events, context, "fresh clean generate", pp.is_some());
+    assert_done_stop(
+        &events,
+        context,
+        "fresh clean generate",
+        pp.is_some(),
+        expect_dflash,
+    );
     let text = token_text(&events_for_id(&events, id));
     assert!(
         !text.is_empty(),
@@ -411,6 +459,7 @@ fn fault_round(
     extra_env: &[(&str, &str)],
     baseline: &str,
     context: &str,
+    expect_dflash: bool,
 ) {
     let mut s = Session::spawn(extra_env);
     session_load(&mut s, model, pp, context);
@@ -420,7 +469,13 @@ fn fault_round(
     let decode = session_generate(&mut s, "fault-decode", 7003, false, true, context);
     assert_fault_terminal(&decode, "fault-decode", context, &tail);
     let retry = session_generate(&mut s, "retry", 7004, false, false, context);
-    assert_done_stop(&retry, context, "post-fault retry", pp.is_some());
+    assert_done_stop(
+        &retry,
+        context,
+        "post-fault retry",
+        pp.is_some(),
+        expect_dflash,
+    );
     let retry_text = token_text(&events_for_id(&retry, "retry"));
     assert_eq!(
         retry_text, baseline,
@@ -446,8 +501,8 @@ fn single_qwen35_reset_rolls_back_and_recovers() {
     let extra_env: &[(&str, &str)] = &[];
     for round in 0..rounds() {
         let ctx = format!("single round {round}");
-        let baseline = clean_bytes(&model, None, extra_env, &ctx);
-        fault_round(&model, None, extra_env, &baseline, &ctx);
+        let baseline = clean_bytes(&model, None, extra_env, &ctx, false);
+        fault_round(&model, None, extra_env, &baseline, &ctx, false);
     }
     // Report identity for the run log.
     let mut fp = HashMap::new();
@@ -483,11 +538,41 @@ fn pp_qwen35_reset_rolls_back_and_recovers() {
         let ctx = format!("pp round {round}");
         // pp:2 load routes every generate through generate_multi
         // (select_generation_route pins pp>1 to PipelineParallel).
-        let baseline = clean_bytes(&model, Some(2), &extra_env, &ctx);
-        fault_round(&model, Some(2), &extra_env, &baseline, &ctx);
+        let baseline = clean_bytes(&model, Some(2), &extra_env, &ctx, false);
+        fault_round(&model, Some(2), &extra_env, &baseline, &ctx, false);
     }
     let mut fp = HashMap::new();
     fp.insert("model", model);
     fp.insert("prompt", PROMPT.to_string());
     eprintln!("pp_qwen35_reset_rolls_back_and_recovers ok: {fp:?}");
+}
+
+#[test]
+#[ignore = "requires real HIP GPU + HIPFIRE_QWEN35_RESET_MODEL (dense Qwen3.5 MQ4) + HIPFIRE_DFLASH_DRAFT (DFlash draft) + daemon built with --features serve-fault-inject"]
+fn dflash_qwen35_reset_rolls_back_and_recovers() {
+    let _guard = lock();
+    if !has_gpu() {
+        eprintln!("skip: no GPU (/dev/kfd and /dev/dri absent)");
+        return;
+    }
+    let Some(model) = model_path("HIPFIRE_QWEN35_RESET_MODEL") else {
+        return;
+    };
+    let Some(draft) = draft_path() else {
+        return;
+    };
+    let model = model.display().to_string();
+    let draft = draft.display().to_string();
+    let extra_env = [("HIPFIRE_DFLASH_DRAFT", draft.as_str())];
+    for round in 0..rounds() {
+        let ctx = format!("dflash round {round}");
+        let baseline = clean_bytes(&model, None, &extra_env, &ctx, true);
+        fault_round(&model, None, &extra_env, &baseline, &ctx, true);
+    }
+    // Report identity for the run log.
+    let mut fp = HashMap::new();
+    fp.insert("model", model);
+    fp.insert("draft", draft);
+    fp.insert("prompt", PROMPT.to_string());
+    eprintln!("dflash_qwen35_reset_rolls_back_and_recovers ok: {fp:?}");
 }

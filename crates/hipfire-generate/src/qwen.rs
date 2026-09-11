@@ -3328,6 +3328,29 @@ pub fn generate_spec(
         drop(guard);
         return None;
     }
+    // serve-fault-inject: after-first-decode fault on the spec route. Sits
+    // with the prefill seam (not after the first spec.step): the prefill
+    // already ran the first target decode and `begin` below makes the first
+    // token wire-visible, so firing later would leak a `token` before the
+    // fail-closed terminal. Consumes the same `test_fault_after_first_decode`
+    // arm the AR loop consults at `ar.rs:4249` — no new mechanism.
+    #[cfg(feature = "serve-fault-inject")]
+    if maybe_inject_fault_after_first_decode_dflash(
+        arch_id,
+        &mut m.seq_pos,
+        &mut m.conversation_tokens,
+        &mut m.prefill_checkpoints,
+        &mut m.dflash_checkpoints,
+        &mut m.asst_turn_cache,
+        gpu,
+        stdout,
+        id,
+        slot,
+        spec.as_mut(),
+    ) {
+        drop(guard);
+        return None;
+    }
 
     let t_prefill = Instant::now();
 
