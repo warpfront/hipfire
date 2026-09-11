@@ -811,12 +811,22 @@ impl SlotBackend {
         });
         // If no session accepted, we still need to handle terminal: directly emit cancelled? But we have pending_done
         if accepted_session.is_some() {
-            let _ =
-                batch_mark_ready_with_pending(id, attempt_id, admission, ticket, pending_done.clone());
+            let _ = batch_mark_ready_with_pending(
+                id,
+                attempt_id,
+                admission,
+                ticket,
+                pending_done.clone(),
+            );
         } else {
             // No session: treat as ready with dummy ticket to allow commit wait? Just emit done directly
-            let _ =
-                batch_mark_ready_with_pending(id, attempt_id, admission, ticket, pending_done.clone());
+            let _ = batch_mark_ready_with_pending(
+                id,
+                attempt_id,
+                admission,
+                ticket,
+                pending_done.clone(),
+            );
         }
         let mut commit_ready = pending_done.clone();
         if let Some(map) = commit_ready.as_object_mut() {
