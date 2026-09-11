@@ -693,6 +693,26 @@ def main(argv=None):
         unmapped = [r["id"] for r in rows if r.get("probe") == "none"]
         print("no existing probe: %s" % ", ".join(unmapped) if unmapped else "all rows mapped")
         return 0
+    # Evidence integrity: --host-class only SELECTS rows; it does not prove which
+    # GPU answered. A wrong HIP_VISIBLE_DEVICES index silently files a whole run
+    # under the wrong architecture (observed: a "gfx1151" run that actually ran
+    # on an 8 GB gfx1010 and OOMed). Ask the daemon which device it opened.
+    if args.host_class and daemon_bin:
+        # The daemon initializes HIP lazily, on the first message: an immediate
+        # EOF prints no banner. A ping is the cheapest thing that opens device 0.
+        probe = run_cmd(["sh", "-c", 'printf \'{"type":"ping"}\\n\' | "$0"', daemon_bin], {}, 120)
+        seen = re.findall(r"GPU dev \d+: (gfx\w+)", probe.get("out", ""))
+        if not seen:
+            print("cannot determine GPU arch from %s; refusing to file mislabeled evidence"
+                  % daemon_bin, file=sys.stderr)
+            return 2
+        if seen[0] != args.host_class:
+            print("host-class mismatch: --host-class %s but device 0 is %s "
+                  "(check HIP_VISIBLE_DEVICES=%r)"
+                  % (args.host_class, seen[0], os.environ.get("HIP_VISIBLE_DEVICES", "")),
+                  file=sys.stderr)
+            return 2
+        ctx["platform"]["gpu_arch_verified"] = seen[0]
     os.makedirs(os.path.join(out, "receipts"), exist_ok=True)
     ctx["digests"], cache_path = load_digest_cache(out)
     summary = {"schema": "device-mesh-matrix-summary-v1", "produced_utc": datetime.now(timezone.utc).isoformat(),
