@@ -32,7 +32,13 @@ required_features_daemon    == 0
 # with the sticky GPU-fault latch (370592d17) and DFlash sidecar plumbing
 # (351c326e0). See commit message.
 # One additional call argument passes max_seq to pre-teardown source admission.
-daemon_lines                <= 4816
+# RATCHET-RAISE 4816 -> 4840: traded 24 lines of daemon main.rs for fail-closed
+# max_seq floor admission. A `load` carrying max_seq=0 previously panicked the
+# KV physical_cap assertion and killed the daemon process with the resident
+# model still serving; the guard refuses it before any teardown or allocation.
+# The load arm was sitting exactly at the old ceiling, so no correctness fix
+# there fits under it. Paid down when the arm's branch duplication is factored.
+daemon_lines                <= 4840
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
