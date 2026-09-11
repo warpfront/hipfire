@@ -88,12 +88,18 @@ def sha256_cached(path, cache):
     cache[path] = {"key": key, "sha256": digest.hexdigest()}
     return cache[path]["sha256"]
 
-def run_cmd(argv, env_extra, timeout):
-    # Isolated HIPFIRE_HOME: the operator's ~/.hipfire/config.toml (dflash_mode,
-    # kv overrides, per-model config) must never decide a matrix row's outcome.
+def isolated_env(env_extra):
+    """Child env with an isolated HIPFIRE_HOME. The operator's
+    ~/.hipfire/config.toml (mtp, dflash_mode, kv overrides, per-model config)
+    must never decide a matrix row's outcome — that config differs per host,
+    which silently turns one host's pass into another host's failure."""
     env = dict(os.environ, **(env_extra or {}))
     env.setdefault("HIPFIRE_HOME", os.path.join(env.get("MATRIX_ISOLATED_HOME", "/tmp/device-mesh-matrix-home"), ".hipfire"))
     os.makedirs(env["HIPFIRE_HOME"], exist_ok=True)
+    return env
+
+def run_cmd(argv, env_extra, timeout):
+    env = isolated_env(env_extra)
     start = time.time()
     try:
         proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
@@ -286,7 +292,8 @@ def drive_session(daemon_bin, script, mapping, env, timeout):
     run = {"events": [], "generates": [], "loaded": [], "broken": ""}
     try:
         proc = subprocess.Popen([daemon_bin], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                stderr=subprocess.PIPE, text=True, bufsize=1, env=dict(os.environ, **env))
+                                stderr=subprocess.PIPE, text=True, bufsize=1,
+                                env=isolated_env(env))
     except OSError as exc:
         return dict(run, broken="spawn: %s" % exc)
     lines = queue.Queue()
@@ -316,6 +323,11 @@ def drive_session(daemon_bin, script, mapping, env, timeout):
             if event.get("type") == want:
                 run["loaded"].extend([event] if want == "loaded" else [])
                 return event
+            if event.get("type") == "error" and want != "error":
+                # The daemon already answered; waiting out the rest of the
+                # budget turns a one-line diagnosis into an opaque timeout.
+                raise TimeoutError("%s: got error instead: %s"
+                                   % (context, (event.get("message") or "")[:160]))
     try:
         for op in script:
             budgets["until"] = time.time() + timeout
