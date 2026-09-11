@@ -98,7 +98,7 @@ def run_cmd(argv, env_extra, timeout):
     try:
         proc = subprocess.run(argv, env=env, capture_output=True, text=True, timeout=timeout)
         return {"rc": proc.returncode, "out": proc.stdout + proc.stderr,
-                "elapsed": round(time.time() - start, 1)}
+                "stdout": proc.stdout, "elapsed": round(time.time() - start, 1)}
     except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
         rc = 124 if isinstance(exc, subprocess.TimeoutExpired) else 127
         return {"rc": rc, "out": "%s" % exc, "elapsed": 0.0}
@@ -145,6 +145,30 @@ def eval_serve_rows(rows, expect_clean):
     if expect_clean:
         return not bad, "serve: %d rows, %d flagged %s" % (len(rows), len(bad), bad)
     return bool(bad), "serve-negative: %d rows, %d flagged %s" % (len(rows), len(bad), bad)
+
+def eval_serve_expect(rows, expect_file):
+    """Session fixtures that deliberately exercise fail-closed routes declare a
+    per-step `expect` list of finish reasons. "0 flagged" is the wrong oracle
+    there: a `fail_closed` step that finishes `stop` is the FAILURE, and its
+    `error`/`length` finish is the pass. Compare each row to its declared set."""
+    try:
+        steps = json.load(open(expect_file)).get("steps", [])
+    except (OSError, ValueError) as exc:
+        return False, "serve-expect: unreadable fixture %s" % exc
+    if not isinstance(rows, list) or not rows:
+        return False, "serve: --out holds no rows"
+    if len(rows) != len(steps):
+        return False, "serve-expect: %d rows vs %d declared steps" % (len(rows), len(steps))
+    bad = []
+    for i, (row, step) in enumerate(zip(rows, steps)):
+        want = step.get("expect_finish") or step.get("expect") or ["stop"]
+        got = row.get("finish")
+        # A positive step must also be non-degenerate; a fail-closed step is
+        # judged only on reaching its declared terminal.
+        degenerate = step.get("kind") != "fail_closed" and (row.get("attractor") or row.get("empty"))
+        if got not in want or degenerate:
+            bad.append("%d:%s(want %s)" % (i, got, "/".join(want)))
+    return not bad, "serve-expect: %d steps, %d off-contract %s" % (len(steps), len(bad), bad)
 
 def eval_redline(report, require_stable):
     if not isinstance(report, dict) or report.get("pass") is not True:
@@ -454,7 +478,10 @@ def execute_row(ctx, row, out, timeout):
     elif kind == "serve":
         rows = []
         extend_outs(rows, positives)
-        good, note = eval_serve_rows(rows, True)
+        if pred.get("expect_file"):
+            good, note = eval_serve_expect(rows, pred["expect_file"])
+        else:
+            good, note = eval_serve_rows(rows, True)
     elif kind == "redline":
         try:
             reports = [json.load(open(r["out_path"])) for r in positives if r.get("out_path")]
@@ -469,7 +496,10 @@ def execute_row(ctx, row, out, timeout):
         oks = [eval_run_text(r["out"], pred.get("min_chars", 1)) for r in positives]
         good, note = all(o for o, _ in oks), "; ".join(m for _, m in oks)
     elif kind == "run_reload_equal":
-        texts = [r["out"] for r in positives if r["rc"] == 0]
+        # Byte-identity is a claim about the DECODED TEXT. `out` merges stderr,
+        # which carries the GPU banner, kernel-cache lines and per-run timings —
+        # two identical decodes can never match there.
+        texts = [r.get("stdout", r["out"]) for r in positives if r["rc"] == 0]
         groups = pred.get("identical_text_groups", [])
         clean = len(texts) >= 2 and all(r["rc"] == 0 for r in positives)
         clean = clean and all(eval_run_text(t, pred.get("min_chars", 1))[0] for t in texts)

@@ -1745,7 +1745,8 @@
     "kind": "serve"
    },
    "predicate": {
-    "kind": "serve"
+    "kind": "serve",
+    "expect_file": "benchmarks/prompts/g45_parser_finalization.json"
    },
    "probe": "existing",
    "route": "single/terminal-safe-parser-finalization"
