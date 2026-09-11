@@ -14,12 +14,12 @@ pub struct KvModePolicy {
     pub site: &'static str,
     /// Site-LOCAL alias expansion: raw string → the [`KvMode`] it denotes ON
     /// THIS SITE, or `None` for "this site does not recognize this string".
-    /// `"auto"` expands to `Asym3Auto` on site 3 but to `Q8` on site 6 — that
-    /// divergence lives here, per-policy. There is no global alias table.
+    /// `"auto"` expands to `Fwht3` on the full-ladder sites but to `Q8` on
+    /// site 6 — that divergence lives here, per-policy. There is no global
+    /// alias table.
     pub normalize_alias: fn(&str) -> Option<KvMode>,
     /// Modes this site has a constructor for. `resolve` rejects anything else
-    /// and falls to `default`. (The `Asym3Auto` sentinel is listed here on
-    /// site 3 so it survives the accept check; `resolve` collapses it after.)
+    /// and falls to `default`.
     pub accepted: &'static [KvMode],
     /// What an unrecognized / recognized-but-unaccepted string resolves to.
     pub default: KvMode,
@@ -28,7 +28,7 @@ pub struct KvModePolicy {
 /// The result of [`resolve`]: the concrete mode plus an optional operator-facing
 /// warning (preserves each ladder's "unrecognized, defaulting to …" diagnostic).
 pub struct ResolveResult {
-    /// Guaranteed NOT `KvMode::Asym3Auto`.
+    /// The resolved concrete mode.
     pub mode: KvMode,
     /// `Some` when a non-empty raw input was not honored as requested. `None`
     /// when the request was honored OR when the input was unset (`""`).
@@ -38,13 +38,14 @@ pub struct ResolveResult {
 use KvMode::*;
 
 /// Shared alias table for the two single-GPU full-ladder sites (1 & 2).
-/// "auto"/"turbo"/"turbo3" mean asym3 HERE (qwen35 is always head_dim == 256),
-/// so they map to the concrete `Asym3`, NOT the `Asym3Auto` sentinel.
+/// "auto"/"turbo"/"turbo3" mean fwht3: Fwht3 supersedes Asym3 as the default
+/// tier. Explicit `"asym3"` still maps to `Asym3` unchanged.
 fn normalize_full(raw: &str) -> Option<KvMode> {
     match raw {
         "q8" => Some(Q8),
         "asym2" | "turbo2" => Some(Asym2),
-        "asym3" | "turbo3" | "turbo" | "auto" => Some(Asym3),
+        "asym3" => Some(Asym3),
+        "auto" | "turbo" | "turbo3" => Some(Fwht3),
         "asym4" | "turbo4" => Some(Asym4),
         "fwht2" => Some(Fwht2),
         "fwht3" => Some(Fwht3),
@@ -54,13 +55,12 @@ fn normalize_full(raw: &str) -> Option<KvMode> {
 }
 
 const FULL_LADDER: &[KvMode] = &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4];
-
-/// Site 1 — qwen35 HFQ in-place carrier (pp=1). carrier.rs:65. Default asym3.
+/// Site 1 — qwen35 HFQ in-place carrier (pp=1). carrier.rs:65. Default fwht3.
 pub const QWEN35_HFQ_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen35-hfq",
     normalize_alias: normalize_full,
     accepted: FULL_LADDER,
-    default: Asym3,
+    default: Fwht3,
 };
 
 /// Site 2 — qwen35 PaRo loader (filtered/capped). carriers.rs:333. Default q8.
@@ -75,22 +75,23 @@ pub const QWEN35_PARO_POLICY: KvModePolicy = KvModePolicy {
 };
 
 /// Site 3 — Dir/safetensors llama/qwen3 PaRo (capped, flat n_layers).
-/// carriers.rs:492. The ONLY site with a head_dim-conditional, carried by the
-/// `Asym3Auto` sentinel. Explicit `"asym3"` is UNCONDITIONAL (panics @128 in
+/// carriers.rs:492. A Flat site: Fwht3 has no Flat constructor, so the
+/// auto-set (`"" | "auto" | "turbo" | "turbo3"`) resolves to plain Q8.
+/// Explicit `"asym3"` is UNCONDITIONAL (panics @128 in
 /// the constructor — current behavior, preserved).
 fn normalize_dir(raw: &str) -> Option<KvMode> {
     match raw {
         "q8" => Some(Q8),
         "asym3" => Some(Asym3), // UNCONDITIONAL
         "asym4" | "turbo4" => Some(Asym4),
-        "" | "auto" | "turbo" | "turbo3" => Some(Asym3Auto), // CONDITIONAL sentinel
-        _ => None,                                           // asym2/fwht*/garbage → default
+        "" | "auto" | "turbo" | "turbo3" => Some(Q8),
+        _ => None, // asym2/fwht*/garbage → default
     }
 }
 pub const DIR_SAFETENSORS_POLICY: KvModePolicy = KvModePolicy {
     site: "dir-safetensors",
     normalize_alias: normalize_dir,
-    accepted: &[Q8, Asym3, Asym4, Asym3Auto],
+    accepted: &[Q8, Asym3, Asym4],
     default: Q8, // recognized-but-unaccepted AND unrecognized both → plain q8
 };
 
@@ -116,7 +117,7 @@ pub const HFQ_Q8_ONLY_POLICY: KvModePolicy = KvModePolicy {
 };
 
 /// Site 6 — qwen35 HFQ pp>1 (multi-GPU). carriers.rs:131. Default q8,
-/// `"auto" → q8` (NOT asym3 — opposite of site 3), narrow accept
+/// `"auto" → q8` (NOT fwht3 — unlike sites 1 & 2), narrow accept
 /// {q8, asym3, fwht3, fwht2}. This is why aliases can't be globally normalized.
 fn normalize_pp(raw: &str) -> Option<KvMode> {
     match raw {
@@ -170,9 +171,8 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
     accepted: &[Q8, Bf16],
     default: Bf16,
 };
-
-/// Pure: `&str + &'static policy + usize → ResolveResult`. No GPU, no env read.
-pub fn resolve(raw: &str, policy: &KvModePolicy, head_dim: usize) -> ResolveResult {
+/// Pure: `&str + &'static policy → ResolveResult`. No GPU, no env read.
+pub fn resolve(raw: &str, policy: &KvModePolicy) -> ResolveResult {
     // 1. site-LOCAL alias expansion.
     let requested: Option<KvMode> = (policy.normalize_alias)(raw);
 
@@ -192,18 +192,6 @@ pub fn resolve(raw: &str, policy: &KvModePolicy, head_dim: usize) -> ResolveResu
         }
     };
 
-    // 3. collapse the head_dim-conditional sentinel. Only site 3 produces it.
-    let mode = match mode {
-        KvMode::Asym3Auto => {
-            if head_dim == 256 {
-                KvMode::Asym3
-            } else {
-                KvMode::Q8
-            }
-        }
-        m => m,
-    };
-
     ResolveResult { mode, warning }
 }
 
@@ -214,17 +202,17 @@ mod tests {
     #[test]
     fn truth_table_maple() {
         let p = &MAPLE_POLICY;
-        assert_eq!(resolve("bf16", p, 128).mode, KvMode::Bf16);
-        assert_eq!(resolve("q8", p, 128).mode, KvMode::Q8);
+        assert_eq!(resolve("bf16", p).mode, KvMode::Bf16);
+        assert_eq!(resolve("q8", p).mode, KvMode::Q8);
         // Unset and "auto" both mean BF16, SILENTLY — bf16 is the shipped
         // default and must not print a warning on every load.
-        assert_eq!(resolve("", p, 128).mode, KvMode::Bf16);
-        assert!(resolve("", p, 128).warning.is_none());
-        assert_eq!(resolve("auto", p, 128).mode, KvMode::Bf16);
-        assert!(resolve("auto", p, 128).warning.is_none());
+        assert_eq!(resolve("", p).mode, KvMode::Bf16);
+        assert!(resolve("", p).warning.is_none());
+        assert_eq!(resolve("auto", p).mode, KvMode::Bf16);
+        assert!(resolve("auto", p).warning.is_none());
         // Asking for q8 explicitly is HONORED and must not warn — it is a
         // supported tier and an intentional memory saving, not a degradation.
-        assert!(resolve("q8", p, 128).warning.is_none());
+        assert!(resolve("q8", p).warning.is_none());
 
         // Every ROTATED / block-quantized tier must be REFUSED and warn.
         // These have no sliding-window attention kernel, so silently accepting
@@ -233,11 +221,11 @@ mod tests {
         for m in [
             "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo",
         ] {
-            let r = resolve(m, p, 128);
+            let r = resolve(m, p);
             assert_eq!(r.mode, KvMode::Bf16, "{m} must fall back to the default");
             assert!(r.warning.is_some(), "{m} must warn, not silently downgrade");
         }
-        let garbage = resolve("garbage", p, 128);
+        let garbage = resolve("garbage", p);
         assert_eq!(garbage.mode, KvMode::Bf16);
         assert!(garbage.warning.is_some());
     }
@@ -255,7 +243,7 @@ mod tests {
             &QWEN35_PP_POLICY,
             &DIR_SAFETENSORS_POLICY,
         ] {
-            let r = resolve("bf16", p, 256);
+            let r = resolve("bf16", p);
             assert_ne!(r.mode, KvMode::Bf16, "site {} must not accept bf16", p.site);
             assert!(
                 r.warning.is_some(),
@@ -268,122 +256,129 @@ mod tests {
     #[test]
     fn truth_table_qwen35_hfq() {
         let p = &QWEN35_HFQ_POLICY;
-        assert_eq!(resolve("q8", p, 256).mode, KvMode::Q8);
-        assert_eq!(resolve("asym4", p, 256).mode, KvMode::Asym4);
-        assert_eq!(resolve("turbo4", p, 256).mode, KvMode::Asym4);
-        assert_eq!(resolve("asym2", p, 256).mode, KvMode::Asym2);
-        assert_eq!(resolve("turbo2", p, 256).mode, KvMode::Asym2);
-        assert_eq!(resolve("asym3", p, 256).mode, KvMode::Asym3);
-        assert_eq!(resolve("turbo3", p, 256).mode, KvMode::Asym3);
-        assert_eq!(resolve("turbo", p, 256).mode, KvMode::Asym3);
-        assert_eq!(resolve("auto", p, 256).mode, KvMode::Asym3);
-        assert_eq!(resolve("fwht3", p, 256).mode, KvMode::Fwht3);
-        assert_eq!(resolve("fwht2", p, 256).mode, KvMode::Fwht2);
-        assert_eq!(resolve("fwht4", p, 256).mode, KvMode::Fwht4);
-        assert_eq!(resolve("", p, 256).mode, KvMode::Asym3); // default, silent
-        assert!(resolve("", p, 256).warning.is_none());
-        assert_eq!(resolve("garbage", p, 256).mode, KvMode::Asym3); // unrecognized → default
-        assert!(resolve("garbage", p, 256).warning.is_some()); // ...and WARNS
+        assert_eq!(resolve("q8", p).mode, KvMode::Q8);
+        assert_eq!(resolve("asym4", p).mode, KvMode::Asym4);
+        assert_eq!(resolve("turbo4", p).mode, KvMode::Asym4);
+        assert_eq!(resolve("asym2", p).mode, KvMode::Asym2);
+        assert_eq!(resolve("turbo2", p).mode, KvMode::Asym2);
+        // Explicit asym3 keeps working: fwht3 supersedes it as the DEFAULT,
+        // not as a tier.
+        assert_eq!(resolve("asym3", p).mode, KvMode::Asym3);
+        assert!(resolve("asym3", p).warning.is_none());
+        // auto/turbo/turbo3 now mean fwht3 (accepted → honored silently).
+        assert_eq!(resolve("turbo3", p).mode, KvMode::Fwht3);
+        assert_eq!(resolve("turbo", p).mode, KvMode::Fwht3);
+        assert_eq!(resolve("auto", p).mode, KvMode::Fwht3);
+        assert!(resolve("auto", p).warning.is_none());
+        assert_eq!(resolve("fwht3", p).mode, KvMode::Fwht3);
+        assert_eq!(resolve("fwht2", p).mode, KvMode::Fwht2);
+        assert_eq!(resolve("fwht4", p).mode, KvMode::Fwht4);
+        assert_eq!(resolve("", p).mode, KvMode::Fwht3); // default, silent
+        assert!(resolve("", p).warning.is_none());
+        assert_eq!(resolve("garbage", p).mode, KvMode::Fwht3); // unrecognized → default
+        assert!(resolve("garbage", p).warning.is_some()); // ...and WARNS
     }
 
     #[test]
     fn truth_table_qwen35_paro_no_asym3_arm() {
         let p = &QWEN35_PARO_POLICY;
-        assert_eq!(resolve("asym3", p, 256).mode, KvMode::Q8); // no-asym3-arm quirk → q8
-        assert!(resolve("asym3", p, 256).warning.is_some());
-        assert_eq!(resolve("turbo3", p, 256).mode, KvMode::Q8); // alias of asym3 → q8 too
-        assert_eq!(resolve("auto", p, 256).mode, KvMode::Q8);
-        assert_eq!(resolve("asym4", p, 256).mode, KvMode::Asym4);
-        assert_eq!(resolve("asym2", p, 256).mode, KvMode::Asym2);
-        assert_eq!(resolve("fwht2", p, 256).mode, KvMode::Fwht2);
-        assert_eq!(resolve("fwht3", p, 256).mode, KvMode::Fwht3);
-        assert_eq!(resolve("fwht4", p, 256).mode, KvMode::Fwht4);
-        assert_eq!(resolve("", p, 256).mode, KvMode::Q8); // default
+        assert_eq!(resolve("asym3", p).mode, KvMode::Q8); // no-asym3-arm quirk → q8
+        assert!(resolve("asym3", p).warning.is_some());
+        // auto/turbo/turbo3 now mean fwht3 (accepted here → honored silently).
+        assert_eq!(resolve("turbo3", p).mode, KvMode::Fwht3);
+        assert!(resolve("turbo3", p).warning.is_none());
+        assert_eq!(resolve("turbo", p).mode, KvMode::Fwht3);
+        assert_eq!(resolve("auto", p).mode, KvMode::Fwht3);
+        assert!(resolve("auto", p).warning.is_none());
+        assert_eq!(resolve("asym4", p).mode, KvMode::Asym4);
+        assert_eq!(resolve("asym2", p).mode, KvMode::Asym2);
+        assert_eq!(resolve("fwht2", p).mode, KvMode::Fwht2);
+        assert_eq!(resolve("fwht3", p).mode, KvMode::Fwht3);
+        assert_eq!(resolve("fwht4", p).mode, KvMode::Fwht4);
+        assert_eq!(resolve("", p).mode, KvMode::Q8); // default
     }
 
     #[test]
     fn truth_table_dir_safetensors_all_branches() {
         let p = &DIR_SAFETENSORS_POLICY;
-        // auto-set: head_dim-CONDITIONAL
-        assert_eq!(resolve("", p, 256).mode, KvMode::Asym3);
-        assert_eq!(resolve("", p, 128).mode, KvMode::Q8);
-        assert_eq!(resolve("auto", p, 256).mode, KvMode::Asym3);
-        assert_eq!(resolve("auto", p, 128).mode, KvMode::Q8);
-        assert_eq!(resolve("turbo", p, 128).mode, KvMode::Q8);
-        assert_eq!(resolve("turbo3", p, 128).mode, KvMode::Q8);
+        // auto-set: Flat site, Fwht3 has no Flat constructor → plain Q8.
+        assert_eq!(resolve("", p).mode, KvMode::Q8);
+        assert!(resolve("", p).warning.is_none());
+        assert_eq!(resolve("auto", p).mode, KvMode::Q8);
+        assert_eq!(resolve("turbo", p).mode, KvMode::Q8);
+        assert_eq!(resolve("turbo3", p).mode, KvMode::Q8);
         // explicit asym3: UNCONDITIONAL (asym3 even @128 — constructor then panics)
-        assert_eq!(resolve("asym3", p, 256).mode, KvMode::Asym3);
-        assert_eq!(resolve("asym3", p, 128).mode, KvMode::Asym3);
+        assert_eq!(resolve("asym3", p).mode, KvMode::Asym3);
+        assert!(resolve("asym3", p).warning.is_none());
         // asym4
-        assert_eq!(resolve("asym4", p, 256).mode, KvMode::Asym4);
-        assert_eq!(resolve("turbo4", p, 256).mode, KvMode::Asym4);
+        assert_eq!(resolve("asym4", p).mode, KvMode::Asym4);
+        assert_eq!(resolve("turbo4", p).mode, KvMode::Asym4);
         // recognized-but-unaccepted + unrecognized: UNCONDITIONAL q8
-        assert_eq!(resolve("asym2", p, 256).mode, KvMode::Q8);
-        assert_eq!(resolve("fwht3", p, 256).mode, KvMode::Q8);
-        assert_eq!(resolve("garbage", p, 256).mode, KvMode::Q8);
-        assert_eq!(resolve("q8", p, 256).mode, KvMode::Q8);
+        assert_eq!(resolve("asym2", p).mode, KvMode::Q8);
+        assert_eq!(resolve("fwht3", p).mode, KvMode::Q8);
+        assert_eq!(resolve("garbage", p).mode, KvMode::Q8);
+        assert_eq!(resolve("q8", p).mode, KvMode::Q8);
     }
 
     #[test]
     fn truth_table_qwen35_pp_auto_is_q8() {
         let p = &QWEN35_PP_POLICY;
-        assert_eq!(resolve("auto", p, 256).mode, KvMode::Q8); // "auto" → q8 here
-        assert_eq!(resolve("", p, 256).mode, KvMode::Q8);
-        assert_eq!(resolve("q8", p, 256).mode, KvMode::Q8);
-        assert_eq!(resolve("asym3", p, 256).mode, KvMode::Asym3);
-        assert_eq!(resolve("turbo3", p, 256).mode, KvMode::Asym3);
-        assert_eq!(resolve("fwht2", p, 256).mode, KvMode::Fwht2);
-        assert_eq!(resolve("fwht3", p, 256).mode, KvMode::Fwht3);
-        assert_eq!(resolve("asym2", p, 256).mode, KvMode::Q8); // not accepted → default
-        assert!(resolve("asym2", p, 256).warning.is_some());
-        assert_eq!(resolve("asym4", p, 256).mode, KvMode::Q8); // not accepted → default
-        assert!(resolve("asym4", p, 256).warning.is_some());
+        assert_eq!(resolve("auto", p).mode, KvMode::Q8); // "auto" → q8 here
+        assert_eq!(resolve("", p).mode, KvMode::Q8);
+        assert_eq!(resolve("q8", p).mode, KvMode::Q8);
+        assert_eq!(resolve("asym3", p).mode, KvMode::Asym3);
+        assert!(resolve("asym3", p).warning.is_none());
+        assert_eq!(resolve("turbo3", p).mode, KvMode::Asym3);
+        assert_eq!(resolve("fwht2", p).mode, KvMode::Fwht2);
+        assert_eq!(resolve("fwht3", p).mode, KvMode::Fwht3);
+        assert_eq!(resolve("asym2", p).mode, KvMode::Q8); // not accepted → default
+        assert!(resolve("asym2", p).warning.is_some());
+        assert_eq!(resolve("asym4", p).mode, KvMode::Q8); // not accepted → default
+        assert!(resolve("asym4", p).warning.is_some());
     }
 
     #[test]
     fn truth_table_llama_hfq_expanded() {
         let p = &LLAMA_HFQ_POLICY;
         // Default and explicit q8 → Q8.
-        assert_eq!(resolve("", p, 128).mode, KvMode::Q8);
-        assert_eq!(resolve("", p, 256).mode, KvMode::Q8); // default is Q8, not Asym3
-        assert_eq!(resolve("q8", p, 128).mode, KvMode::Q8);
-        // Asym3/Asym4 accepted — reach from_mode where head_dim gate fires.
-        assert_eq!(resolve("asym3", p, 128).mode, KvMode::Asym3);
-        assert_eq!(resolve("asym3", p, 256).mode, KvMode::Asym3);
-        assert_eq!(resolve("asym4", p, 128).mode, KvMode::Asym4);
-        assert_eq!(resolve("turbo3", p, 128).mode, KvMode::Asym3);
-        assert_eq!(resolve("turbo4", p, 256).mode, KvMode::Asym4);
-        // auto/turbo normalize to Asym3 (accepted → pass through).
-        assert_eq!(resolve("auto", p, 256).mode, KvMode::Asym3);
-        // Unaccepted modes (asym2/fwht*) silently fall to Q8 default.
-        assert_eq!(resolve("asym2", p, 128).mode, KvMode::Q8);
-        assert!(resolve("asym2", p, 128).warning.is_some());
-        assert_eq!(resolve("fwht3", p, 256).mode, KvMode::Q8);
+        assert_eq!(resolve("", p).mode, KvMode::Q8);
+        assert!(resolve("", p).warning.is_none());
+        assert_eq!(resolve("q8", p).mode, KvMode::Q8);
+        // Explicit Asym3/Asym4 accepted — reach from_mode where head_dim gate fires.
+        assert_eq!(resolve("asym3", p).mode, KvMode::Asym3);
+        assert!(resolve("asym3", p).warning.is_none());
+        assert_eq!(resolve("asym4", p).mode, KvMode::Asym4);
+        assert_eq!(resolve("turbo4", p).mode, KvMode::Asym4);
+        // auto/turbo/turbo3 normalize to Fwht3, which has no Flat constructor
+        // and is NOT accepted here → Q8 default WITH warning. This is the fix
+        // for the qwen3:0.6b load failure (auto used to resolve Asym3 and
+        // hard-fail with "asym3 KV cache requires head_dim=256").
+        assert_eq!(resolve("auto", p).mode, KvMode::Q8);
+        assert!(resolve("auto", p).warning.is_some());
+        assert_eq!(resolve("turbo", p).mode, KvMode::Q8);
+        assert!(resolve("turbo", p).warning.is_some());
+        assert_eq!(resolve("turbo3", p).mode, KvMode::Q8);
+        assert!(resolve("turbo3", p).warning.is_some());
+        // Unaccepted modes (asym2/fwht*) fall to Q8 default with warning.
+        assert_eq!(resolve("asym2", p).mode, KvMode::Q8);
+        assert!(resolve("asym2", p).warning.is_some());
+        assert_eq!(resolve("fwht3", p).mode, KvMode::Q8);
+        assert!(resolve("fwht3", p).warning.is_some());
         // Unrecognized strings also fall to Q8 with warning.
-        assert_eq!(resolve("garbage", p, 256).mode, KvMode::Q8);
-        assert!(resolve("garbage", p, 256).warning.is_some());
+        assert_eq!(resolve("garbage", p).mode, KvMode::Q8);
+        assert!(resolve("garbage", p).warning.is_some());
     }
 
     #[test]
     fn truth_table_hfq_q8_only() {
         let p = &HFQ_Q8_ONLY_POLICY;
-        assert_eq!(resolve("", p, 128).mode, KvMode::Q8);
-        assert_eq!(resolve("q8", p, 128).mode, KvMode::Q8);
-        assert_eq!(resolve("asym3", p, 128).mode, KvMode::Q8); // unaccepted → q8
-        assert_eq!(resolve("fwht4", p, 256).mode, KvMode::Q8);
-        assert_eq!(resolve("garbage", p, 256).mode, KvMode::Q8);
-    }
-
-    #[test]
-    fn resolve_never_returns_sentinel() {
-        // The sentinel must always collapse before return, on every policy.
-        for raw in ["", "auto", "turbo", "turbo3", "asym3", "q8", "garbage"] {
-            for hd in [128usize, 256] {
-                assert_ne!(
-                    resolve(raw, &DIR_SAFETENSORS_POLICY, hd).mode,
-                    KvMode::Asym3Auto
-                );
-            }
-        }
+        assert_eq!(resolve("", p).mode, KvMode::Q8);
+        assert_eq!(resolve("q8", p).mode, KvMode::Q8);
+        assert_eq!(resolve("asym3", p).mode, KvMode::Q8); // unaccepted → q8
+        assert!(resolve("asym3", p).warning.is_some());
+        assert_eq!(resolve("auto", p).mode, KvMode::Q8); // fwht3 alias, unaccepted → q8
+        assert!(resolve("auto", p).warning.is_some());
+        assert_eq!(resolve("fwht4", p).mode, KvMode::Q8);
+        assert_eq!(resolve("garbage", p).mode, KvMode::Q8);
     }
 }

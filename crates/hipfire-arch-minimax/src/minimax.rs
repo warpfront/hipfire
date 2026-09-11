@@ -1004,17 +1004,17 @@ impl MiniMaxState {
             max_seq, // already clamped to MINIMAX_ATTN_LDS_MAX_SEQ above
             physical_cap: None,
         };
-        let kv = <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode(
-            hipfire_runtime::kv_mode::resolve(
-                "",
-                &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY,
-                cfg.head_dim,
+        let kv =
+            <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode(
+                hipfire_runtime::kv_mode::resolve(
+                    "",
+                    &hipfire_runtime::kv_mode::HFQ_Q8_ONLY_POLICY,
+                )
+                .mode,
+                hipfire_runtime::llama::KvTarget::Single(gpu),
+                &dims,
             )
-            .mode,
-            hipfire_runtime::llama::KvTarget::Single(gpu),
-            &dims,
-        )
-        .map_err(|e| format!("minimax: kv cache: {e:?}"))?;
+            .map_err(|e| format!("minimax: kv cache: {e:?}"))?;
         let pos_buf = gpu
             .hip
             .malloc(4)

@@ -676,7 +676,6 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 hipfire_runtime::kv_mode::resolve(
                     ctx.kv_mode_override.unwrap_or(""),
                     &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
-                    config.head_dim,
                 )
                 .mode,
                 KvTarget::Single(ctx.gpu),
@@ -726,7 +725,6 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
             let rr = hipfire_runtime::kv_mode::resolve(
                 &kv_mode_str,
                 &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
-                config.head_dim,
             );
             if let Some(w) = rr.warning {
                 eprintln!(

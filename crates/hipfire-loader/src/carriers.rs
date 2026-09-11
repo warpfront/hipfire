@@ -213,11 +213,10 @@ fn kv_mode_from_ctx(ctx: &LoadCtx) -> String {
 fn resolve_kv_mode(
     ctx: &LoadCtx,
     policy: &hipfire_runtime::kv_mode::KvModePolicy,
-    head_dim: usize,
 ) -> hipfire_runtime::kv_mode::KvMode {
     let kv_mode = kv_mode_from_ctx(ctx);
     let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
-        hipfire_runtime::kv_mode::resolve(&kv_mode, policy, head_dim);
+        hipfire_runtime::kv_mode::resolve(&kv_mode, policy);
     if let Some(w) = warning {
         eprintln!("  KV cache: {w} (site {})", policy.site);
     }
@@ -292,11 +291,7 @@ fn load_qwen35_pp(
         .iter()
         .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
         .collect();
-    let mode = resolve_kv_mode(
-        ctx,
-        &hipfire_runtime::kv_mode::QWEN35_PP_POLICY,
-        config.head_dim,
-    );
+    let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PP_POLICY);
     let dims = hipfire_runtime::llama::KvDims {
         layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
         n_kv_heads: config.n_kv_heads,
@@ -658,11 +653,7 @@ impl Carrier for Qwen35Carrier {
                     .iter()
                     .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                     .collect();
-                let mode = resolve_kv_mode(
-                    ctx,
-                    &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY,
-                    config.head_dim,
-                );
+                let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY);
                 let dims = hipfire_runtime::llama::KvDims {
                     layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
                     n_kv_heads: config.n_kv_heads,

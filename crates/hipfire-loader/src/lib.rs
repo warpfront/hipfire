@@ -3677,9 +3677,9 @@ fn load_model_tp_qwen35_dense(
     let kv_trim = kv_raw.trim();
     let kv_lower = kv_trim.to_ascii_lowercase();
     let kv_mode_resolved = if kv_lower.is_empty() {
-        kv_mode::resolve("", &kv_mode::QWEN35_HFQ_POLICY, config.head_dim).mode
+        kv_mode::resolve("", &kv_mode::QWEN35_HFQ_POLICY).mode
     } else {
-        let rr = kv_mode::resolve(&kv_lower, &kv_mode::QWEN35_HFQ_POLICY, config.head_dim);
+        let rr = kv_mode::resolve(&kv_lower, &kv_mode::QWEN35_HFQ_POLICY);
         if rr.warning.is_some() {
             return Err(format!(
                 "unsupported kv_mode '{kv_trim}' (expected q8|asym2|asym3|asym4|fwht2|fwht3|fwht4)"
