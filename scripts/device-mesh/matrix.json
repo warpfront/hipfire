@@ -1711,7 +1711,7 @@
   {
    "commands": {
     "positive": [
-     "HIPFIRE_VISION_FIXTURE=\"/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt,/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq\" HIPFIRE_DOTS_OCR_FIXTURE=/home/kaden/.hipfire/models/dots-ocr.q8.hfq cargo test -p hipfire-generate --locked --features serve-fault-inject --test vision_lifecycle_tests -- --ignored --test-threads=1"
+     "HIPFIRE_VISION_FIXTURE=\"/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt,/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq\" HIPFIRE_DOTS_OCR_FIXTURE=/home/kaden/.hipfire/models/dots-ocr.q8.hfq cargo test -p hipfire-generate --locked --test vision_lifecycle_tests -- --ignored --test-threads=1"
     ],
     "negative": [
      "cargo test -p hipfire-generate --locked --test vision_lifecycle_tests vision_fixture_pair_rejects -- --test-threads=1"
