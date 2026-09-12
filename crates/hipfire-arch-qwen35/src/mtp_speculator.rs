@@ -15,14 +15,15 @@
 
 use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
 use crate::mtp_spec::{
-    prefill_trunk_and_mtp_cache, sample_from_logits, spec_step_mtp_compressed_serial_with_k,
+    prefill_trunk_and_mtp_cache, prefill_trunk_and_mtp_cache_with_boundary, sample_from_logits,
+    spec_step_mtp_compressed_serial_with_k,
     spec_step_mtp_compressed_serial_with_takeover_candidates, MtpSamplingConfig, MtpSpecState,
 };
-use crate::speculative::ModelSlot;
+use crate::speculative::{take_dn_checkpoint, DeltaNetSnapshot, ModelSlot};
 use hipfire_runtime::ngram_mod::{NgramModConfig, NgramModPool};
 use hipfire_runtime::spec::{
-    MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow, SpecGrammar, SpecRequestConfig,
-    SpecTarget, Speculator,
+    terminal_prefix_replay, MtpDrafter, MtpRequestStats, MtpSpeculator, MtpWindow, SpecGrammar,
+    SpecRequestConfig, SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
 
@@ -75,6 +76,13 @@ pub struct Qwen35MtpDrafter {
     ngram_retired: bool,
     /// Request-local wire counters (reset on configure_request).
     stats: MtpRequestStats,
+    /// Identity of the window whose pre-verify state is still in `trunk_snap`.
+    last_window: Option<(usize, u32)>,
+    /// Bounded recurrent-state snapshots used to resume a divergent re-render.
+    checkpoints: Vec<(usize, DeltaNetSnapshot)>,
+    checkpoint_resume: bool,
+    checkpoint_interval: usize,
+    checkpoint_cap: usize,
 }
 
 impl Qwen35MtpDrafter {
@@ -92,6 +100,22 @@ impl Qwen35MtpDrafter {
             ngram_emitted_len: 0,
             ngram_retired: false,
             stats: MtpRequestStats::default(),
+            last_window: None,
+            checkpoints: Vec::new(),
+            checkpoint_resume: hipfire_config::developer_var("HIPFIRE_DFLASH_CKPT_RESUME")
+                .ok()
+                .as_deref()
+                != Some("0"),
+            checkpoint_interval: hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(2048usize)
+                .max(256),
+            checkpoint_cap: hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_MAX")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8usize)
+                .max(1),
         }
     }
 
@@ -106,7 +130,11 @@ impl Qwen35MtpDrafter {
     /// Install sampling without changing the independent MTP draft-confidence
     /// cutoff initialized by `MtpSpecState` from its arch/env default.
     fn apply_request(state: &mut MtpSpecState, cfg: SpecRequestConfig) {
-        let top_p = if cfg.top_p > 0.0 { cfg.top_p.min(1.0) } else { 1.0 };
+        let top_p = if cfg.top_p > 0.0 {
+            cfg.top_p.min(1.0)
+        } else {
+            1.0
+        };
         state.set_sampling(
             MtpSamplingConfig {
                 temp: cfg.temp,
@@ -164,14 +192,17 @@ impl Qwen35MtpDrafter {
     /// n-gram-mod without reallocating/destroying warm prefix state.
     fn ensure_state(&mut self, gpu: &mut Gpu, slot: &ModelSlot) -> Result<(), String> {
         if self.state.is_none() {
-            let verify_capacity =
-                if hipfire_config::developer_var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1") {
-                    ngram_mod_env_config()
-                        .map(|cfg| self.max_n.max(cfg.n_max))
-                        .unwrap_or(self.max_n)
-                } else {
-                    self.max_n
-                };
+            let verify_capacity = if hipfire_config::developer_var("HIPFIRE_MTP_NGRAM")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                ngram_mod_env_config()
+                    .map(|cfg| self.max_n.max(cfg.n_max))
+                    .unwrap_or(self.max_n)
+            } else {
+                self.max_n
+            };
             let mut st = MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(
                 gpu,
                 slot,
@@ -200,6 +231,12 @@ impl Qwen35MtpDrafter {
         }
         Ok(())
     }
+
+    fn clear_checkpoints(&mut self, gpu: &mut Gpu) {
+        for (_, snapshot) in self.checkpoints.drain(..) {
+            snapshot.free_gpu(gpu);
+        }
+    }
 }
 
 impl MtpDrafter for Qwen35MtpDrafter {
@@ -213,6 +250,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         cache_hit: bool,
         abort: &dyn Fn() -> bool,
     ) -> Result<u32, String> {
+        self.last_window = None;
         if abort() {
             return Err("aborted".into());
         }
@@ -232,8 +270,38 @@ impl MtpDrafter for Qwen35MtpDrafter {
                 .map_err(|e| format!("mtp state reset: {e}"))?;
         }
 
-        prefill_trunk_and_mtp_cache(gpu, slot, &self.head, state, fill_tokens, start_pos)
-            .map_err(|e| format!("mtp prefill: {e}"))?;
+        let mut checkpoints = std::mem::take(&mut self.checkpoints);
+        if !cache_hit {
+            for (_, snapshot) in checkpoints.drain(..) {
+                snapshot.free_gpu(gpu);
+            }
+        }
+        let checkpoint_resume = self.checkpoint_resume;
+        let checkpoint_interval = self.checkpoint_interval;
+        let checkpoint_cap = self.checkpoint_cap;
+        let prefill = prefill_trunk_and_mtp_cache_with_boundary(
+            gpu,
+            slot,
+            &self.head,
+            state,
+            fill_tokens,
+            start_pos,
+            |gpu, slot, position| {
+                if checkpoint_resume {
+                    take_dn_checkpoint(
+                        &mut checkpoints,
+                        &slot.dn_state,
+                        gpu,
+                        position,
+                        checkpoint_interval,
+                        checkpoint_cap,
+                    );
+                }
+                Ok(())
+            },
+        );
+        self.checkpoints = checkpoints;
+        prefill.map_err(|e| format!("mtp prefill: {e}"))?;
         if abort() {
             return Err("aborted".into());
         }
@@ -335,6 +403,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
             }
             .map_err(|e| e.to_string())?
         };
+        self.last_window = Some((position, seed));
         let budget = if used_ngram {
             k
         } else if modifier && retired {
@@ -352,10 +421,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
             self.stats.ngram_mod_drafts += r.drafts_generated;
             self.stats.ngram_mod_accepted += r.accept_count;
             if let Some(pool) = self.ngram_pool.as_mut() {
-                let _ = pool.record_draft_result(
-                    r.drafts_generated as u32,
-                    r.accept_count as u32,
-                );
+                let _ = pool.record_draft_result(r.drafts_generated as u32, r.accept_count as u32);
             }
             if r.accept_count > 0 {
                 self.ngram_retired = true;
@@ -395,6 +461,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
         start_pos: usize,
         abort: &dyn Fn() -> bool,
     ) -> Result<bool, String> {
+        self.last_window = None;
         // Forced tokens must land in BOTH the trunk and the MTP head KV /
         // prev_hidden. Plain spec_advance only moves trunk state, leaving an
         // unwritten hole in the head that poisons later draft steps.
@@ -412,8 +479,52 @@ impl MtpDrafter for Qwen35MtpDrafter {
         Ok(true)
     }
 
+    fn mtp_repair_terminal_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        window_seed: u32,
+        consumed: &[u32],
+    ) -> Result<bool, String> {
+        if hipfire_config::developer_var("HIPFIRE_SPEC_WINDOW_ROLLBACK")
+            .ok()
+            .as_deref()
+            == Some("0")
+        {
+            return Ok(false);
+        }
+        let Some((saved_start, saved_seed)) = self.last_window.take() else {
+            return Ok(false);
+        };
+        if (saved_start, saved_seed) != (window_start, window_seed) {
+            return Err(format!(
+                "qwen35 MTP terminal repair window mismatch (saved pos={saved_start} seed={saved_seed}, requested pos={window_start} seed={window_seed})"
+            ));
+        }
+
+        let slot = Self::slot(target)?;
+        let Some(state) = self.state.as_mut() else {
+            return Ok(false);
+        };
+        state
+            .trunk_snap
+            .restore_to(&mut slot.dn_state, gpu)
+            .map_err(|e| format!("qwen35 MTP terminal repair restore: {e}"))?;
+
+        let replay = terminal_prefix_replay(window_seed, consumed);
+        if replay.is_empty() {
+            return Ok(true);
+        }
+        prefill_trunk_and_mtp_cache(gpu, slot, &self.head, state, &replay, window_start)
+            .map_err(|e| format!("qwen35 MTP terminal repair replay: {e}"))?;
+        Ok(true)
+    }
+
     fn mtp_reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.last_window = None;
         self.reset_ngram_request();
+        self.clear_checkpoints(gpu);
         if let Some(state) = self.state.as_mut() {
             state
                 .reset(gpu)
@@ -423,6 +534,8 @@ impl MtpDrafter for Qwen35MtpDrafter {
     }
 
     fn mtp_reset_for_realign(&mut self, gpu: &mut Gpu) -> Result<(), String> {
+        self.last_window = None;
+        self.clear_checkpoints(gpu);
         if let Some(state) = self.state.as_mut() {
             state
                 .reset(gpu)
@@ -431,11 +544,51 @@ impl MtpDrafter for Qwen35MtpDrafter {
         Ok(())
     }
 
+    fn mtp_checkpoint_positions(&self) -> Vec<usize> {
+        if self.checkpoint_resume {
+            self.checkpoints
+                .iter()
+                .map(|(position, _)| *position)
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    fn mtp_rewind_to(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+    ) -> Result<usize, String> {
+        self.last_window = None;
+        let Some(index) = self
+            .checkpoints
+            .iter()
+            .rposition(|(checkpoint, _)| *checkpoint == position)
+        else {
+            return Err(format!(
+                "qwen35 MTP checkpoint {position} was advertised but is no longer resident"
+            ));
+        };
+        let slot = Self::slot(target)?;
+        self.checkpoints[index]
+            .1
+            .restore_to(&mut slot.dn_state, gpu)
+            .map_err(|e| format!("qwen35 MTP checkpoint restore at {position}: {e}"))?;
+        for (_, snapshot) in self.checkpoints.drain(index + 1..) {
+            snapshot.free_gpu(gpu);
+        }
+        Ok(position)
+    }
+
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
-        if let Some(state) = self.state {
+        let mut this = *self;
+        this.clear_checkpoints(gpu);
+        if let Some(state) = this.state {
             state.free_gpu(gpu);
         }
-        self.head.free_gpu(gpu);
+        this.head.free_gpu(gpu);
     }
 
     fn k(&self) -> usize {
