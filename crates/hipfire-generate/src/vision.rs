@@ -1219,14 +1219,11 @@ pub fn generate_vl(
     };
     let prefill_tokens = prompt_tokens.len();
     let t0 = Instant::now();
-    // Test-only fault hook (G4.8 lifecycle evidence): `HIPFIRE_VISION_FAULT`
-    // `=prefill` fails this request through the fail-closed error epilogue
-    // after prefill; `=decode` fails it on the first decode iteration.
-    // Gated on `serve-fault-inject`: a default build has no env read at all.
-    #[cfg(feature = "serve-fault-inject")]
-    let vl_fault = hipfire_config::developer_var("HIPFIRE_VISION_FAULT").ok();
-    #[cfg(not(feature = "serve-fault-inject"))]
-    let vl_fault: Option<String> = None;
+    // Test-only fault point (G4.8 lifecycle evidence), armed in-process via
+    // `common::arm_vision_fault`: `"prefill"` fails this request through the
+    // fail-closed error epilogue after prefill; `"decode"` fails it on the
+    // first decode iteration. Unarmed (production) => one thread-local load.
+    let vl_fault: Option<&'static str> = crate::common::peek_vision_fault();
 
     // Mirror the text path: <think>/</think> as paired open/close. The
     // previous implementation queried "💭" twice (open == close) which
@@ -1382,12 +1379,12 @@ pub fn generate_vl(
     // Injected prefill fault (test hook): prefill committed decoder state,
     // so fail through the canonical error epilogue exactly like a real
     // forward failure.
-    if vl_fault.as_deref() == Some("prefill") {
+    if vl_fault == Some("prefill") {
         vl_forward_fail(
             stdout,
             id,
             "forward_scratch (injected-fault)",
-            "HIPFIRE_VISION_FAULT=prefill",
+            "injected vision fault: prefill",
             gpu,
             dn,
             kv,
@@ -1515,12 +1512,12 @@ pub fn generate_vl(
         }
         // Injected decode fault (test hook): fails on the first iteration
         // through the canonical error epilogue.
-        if vl_fault.as_deref() == Some("decode") {
+        if vl_fault == Some("decode") {
             vl_forward_fail(
                 stdout,
                 id,
                 "forward_scratch (decode, injected-fault)",
-                "HIPFIRE_VISION_FAULT=decode",
+                "injected vision fault: decode",
                 gpu,
                 dn,
                 kv,
@@ -2225,20 +2222,18 @@ pub fn generate_vl_dots_ocr(
         dots_ar_cancel(state, gpu, stdout, id, 0);
         return;
     }
-    // Test-only fault hook (G4.8 lifecycle evidence): `HIPFIRE_DOTS_FAULT`
-    // `=prefill` fails this request through the fail-closed error epilogue
-    // once prefill has committed decoder state. Unset → no behavior change.
-    #[cfg(feature = "serve-fault-inject")]
-    let dots_fault = hipfire_config::developer_var("HIPFIRE_DOTS_FAULT").ok();
-    #[cfg(not(feature = "serve-fault-inject"))]
-    let dots_fault: Option<String> = None;
-    if dots_fault.as_deref() == Some("prefill") {
+    // Test-only fault point (G4.8 lifecycle evidence), armed in-process via
+    // `common::arm_dots_fault`: `"prefill"` fails this request through the
+    // fail-closed error epilogue once prefill has committed decoder state;
+    // `"argmax"` / `"decode"` fail at those seams. Unarmed => no behavior change.
+    let dots_fault: Option<&'static str> = crate::common::peek_dots_fault();
+    if dots_fault == Some("prefill") {
         dots_ar_fail(
             state,
             gpu,
             stdout,
             id,
-            "dots.ocr batched prefill failed: injected fault (HIPFIRE_DOTS_FAULT=prefill)",
+            "dots.ocr batched prefill failed: injected fault (injected fault: prefill)",
         );
         return;
     }
@@ -2286,13 +2281,13 @@ pub fn generate_vl_dots_ocr(
     } else {
         text_cfg.eos_token_ids.clone()
     };
-    if dots_fault.as_deref() == Some("argmax") {
+    if dots_fault == Some("argmax") {
         dots_ar_fail(
             state,
             gpu,
             stdout,
             id,
-            "dots.ocr argmax failed: injected fault (HIPFIRE_DOTS_FAULT=argmax)",
+            "dots.ocr argmax failed: injected fault (injected fault: argmax)",
         );
         return;
     }
@@ -2324,13 +2319,13 @@ pub fn generate_vl_dots_ocr(
             dots_ar_cancel(state, gpu, stdout, id, generated);
             return;
         }
-        if dots_fault.as_deref() == Some("decode") {
+        if dots_fault == Some("decode") {
             dots_ar_fail(
                 state,
                 gpu,
                 stdout,
                 id,
-                "dots.ocr decode failed: injected fault (HIPFIRE_DOTS_FAULT=decode)",
+                "dots.ocr decode failed: injected fault (injected fault: decode)",
             );
             return;
         }
@@ -2582,22 +2577,17 @@ pub fn run_dots_ocr_ngram_loop(
             break;
         }
         let max_emit = max_tokens.saturating_sub(generated);
-        // Test-only fault hook (G4.8 lifecycle evidence): `HIPFIRE_DOTS_FAULT`
-        // `=spec` fails through the same fail-closed path as a real verify
-        // failure. Gated on `serve-fault-inject`; a default build never reads it.
-        #[cfg(feature = "serve-fault-inject")]
-        let dots_spec_fault =
-            hipfire_config::developer_var("HIPFIRE_DOTS_FAULT").as_deref() == Ok("spec");
-        #[cfg(not(feature = "serve-fault-inject"))]
-        let dots_spec_fault = false;
-        if dots_spec_fault {
+        // Test-only fault point (G4.8 lifecycle evidence), armed in-process via
+        // `common::arm_dots_fault("spec")`: fails through the same fail-closed
+        // path as a real verify failure. Unarmed => no behavior change.
+        if crate::common::peek_dots_fault() == Some("spec") {
             dots_spec_fail(
                 bundle,
                 spec,
                 gpu,
                 stdout,
                 id,
-                "dots.ocr spec_step: injected fault (HIPFIRE_DOTS_FAULT=spec)",
+                "dots.ocr spec_step: injected fault (injected fault: spec)",
             );
             return;
         }

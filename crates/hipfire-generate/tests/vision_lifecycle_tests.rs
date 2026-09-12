@@ -40,7 +40,7 @@
 //! pipe: the child runs a stdin reader thread applying `ABORT <id>
 //! <attempt>` via `apply_terminal_control`; the parent sends it after
 //! `READY <id>` (prefill cancel) or after the first `token` line
-//! (decode cancel). Faults use the `HIPFIRE_VISION_FAULT` /
+//! (decode cancel). Faults are armed in-process via `common::arm_vision_fault` /
 //! `HIPFIRE_DOTS_FAULT` hooks, which exercise the production error
 //! epilogues without touching production behavior when unset.
 
@@ -715,9 +715,9 @@ fn child_vl_matrix() {
     // T4 reuse-after-fault.
     vl_turn(&mut m, &mut gpu, "g48-vl-t1", 1, &image, prompt, 8, true);
     vl_turn(&mut m, &mut gpu, "g48-vl-t2", 2, &image, prompt, 8, false);
-    std::env::set_var("HIPFIRE_VISION_FAULT", "prefill");
+    hipfire_generate::common::arm_vision_fault(Some("prefill"));
     vl_turn(&mut m, &mut gpu, "g48-vl-t3", 3, &image, prompt, 8, false);
-    std::env::remove_var("HIPFIRE_VISION_FAULT");
+    hipfire_generate::common::arm_vision_fault(None);
     vl_turn(&mut m, &mut gpu, "g48-vl-t4", 4, &image, prompt, 8, true);
 
     // Unload/reload: paired accounting, then fresh-load equality.
@@ -743,9 +743,9 @@ fn child_vl_matrix() {
     vl_turn(&mut m, &mut gpu, "g48-vl-t6", 6, &image, prompt, 32, false);
     vl_turn(&mut m, &mut gpu, "g48-vl-t7", 7, &image, prompt, 8, true);
     // T8 injected decode fault; T9 reuse.
-    std::env::set_var("HIPFIRE_VISION_FAULT", "decode");
+    hipfire_generate::common::arm_vision_fault(Some("decode"));
     vl_turn(&mut m, &mut gpu, "g48-vl-t8", 8, &image, prompt, 8, false);
-    std::env::remove_var("HIPFIRE_VISION_FAULT");
+    hipfire_generate::common::arm_vision_fault(None);
     vl_turn(&mut m, &mut gpu, "g48-vl-t9", 9, &image, prompt, 8, true);
 }
 
@@ -872,7 +872,7 @@ fn child_dots_matrix() {
         16,
         false,
     );
-    std::env::set_var("HIPFIRE_DOTS_FAULT", "prefill");
+    hipfire_generate::common::arm_dots_fault(Some("prefill"));
     dots_turn(
         &mut m,
         &mut gpu,
@@ -883,7 +883,7 @@ fn child_dots_matrix() {
         16,
         false,
     );
-    std::env::remove_var("HIPFIRE_DOTS_FAULT");
+    hipfire_generate::common::arm_dots_fault(None);
     dots_turn(
         &mut m,
         &mut gpu,
@@ -894,7 +894,7 @@ fn child_dots_matrix() {
         16,
         true,
     );
-    std::env::set_var("HIPFIRE_DOTS_FAULT", "argmax");
+    hipfire_generate::common::arm_dots_fault(Some("argmax"));
     dots_turn(
         &mut m,
         &mut gpu,
@@ -905,7 +905,7 @@ fn child_dots_matrix() {
         16,
         false,
     );
-    std::env::remove_var("HIPFIRE_DOTS_FAULT");
+    hipfire_generate::common::arm_dots_fault(None);
     dots_turn(
         &mut m,
         &mut gpu,
@@ -916,7 +916,7 @@ fn child_dots_matrix() {
         16,
         true,
     );
-    std::env::set_var("HIPFIRE_DOTS_FAULT", "decode");
+    hipfire_generate::common::arm_dots_fault(Some("decode"));
     dots_turn(
         &mut m,
         &mut gpu,
@@ -927,7 +927,7 @@ fn child_dots_matrix() {
         16,
         false,
     );
-    std::env::remove_var("HIPFIRE_DOTS_FAULT");
+    hipfire_generate::common::arm_dots_fault(None);
     dots_turn(
         &mut m,
         &mut gpu,
@@ -1006,7 +1006,7 @@ fn child_dots_matrix() {
         16,
         true,
     );
-    std::env::set_var("HIPFIRE_DOTS_FAULT", "spec");
+    hipfire_generate::common::arm_dots_fault(Some("spec"));
     dots_turn(
         &mut m,
         &mut gpu,
@@ -1017,7 +1017,7 @@ fn child_dots_matrix() {
         16,
         false,
     );
-    std::env::remove_var("HIPFIRE_DOTS_FAULT");
+    hipfire_generate::common::arm_dots_fault(None);
     dots_turn(
         &mut m,
         &mut gpu,

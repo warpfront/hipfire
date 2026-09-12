@@ -412,7 +412,6 @@ pub fn reset_mesh_request_state(
     }
 }
 
-
 fn emit_active_error_route_aware(
     stdout: &mut impl std::io::Write,
     id: Option<&str>,
@@ -1635,6 +1634,49 @@ std::thread_local! {
         const { std::cell::Cell::new(false) };
     static GENERATION_FAULT_AFTER_FIRST_DECODE: std::cell::Cell<bool> =
         const { std::cell::Cell::new(false) };
+}
+
+// Test-only fault points for the vision (Qwen35-VL / dots.ocr) generation
+// paths (G4.8 lifecycle evidence). Same contract as the dense points above:
+// always compiled, never armed in production, one thread-local load when
+// unarmed. Unlike the dense points these carry a *site* ("prefill",
+// "decode", "argmax", "spec") because the vision matrix injects at several
+// seams. Unlike the one-shot dense points these are STICKY: several
+// generate entries share prefill helpers, so a consuming read at one entry
+// would hide the site from the loop that owns it (dots.ocr's spec loop).
+// The test clears them with `arm_*(None)` after each turn, exactly as it
+// used to unset the env. Previously these were `HIPFIRE_*_FAULT`
+// env reads, which violated the config-owned rule and could not be observed
+// through the process snapshot once the test toggled them mid-run.
+std::thread_local! {
+    static VISION_FAULT: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+    static DOTS_FAULT: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm (or clear with `None`) the Qwen35-VL fault at `site`.
+#[doc(hidden)]
+pub fn arm_vision_fault(site: Option<&'static str>) {
+    VISION_FAULT.with(|c| *c.borrow_mut() = site);
+}
+
+/// Read the armed Qwen35-VL fault site without disarming it.
+#[doc(hidden)]
+pub fn peek_vision_fault() -> Option<&'static str> {
+    VISION_FAULT.with(|c| *c.borrow())
+}
+
+/// Arm (or clear with `None`) the dots.ocr fault at `site`.
+#[doc(hidden)]
+pub fn arm_dots_fault(site: Option<&'static str>) {
+    DOTS_FAULT.with(|c| *c.borrow_mut() = site);
+}
+
+/// Read the armed dots.ocr fault site without disarming it.
+#[doc(hidden)]
+pub fn peek_dots_fault() -> Option<&'static str> {
+    DOTS_FAULT.with(|c| *c.borrow())
 }
 
 /// Arm (or disarm) the after-prefill fault.
