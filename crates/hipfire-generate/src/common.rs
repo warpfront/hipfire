@@ -372,6 +372,46 @@ pub fn production_pp_fail_closed_rollback(
         }
     }
 }
+/// Reset one mesh-backed request through the route's complete lifecycle owner.
+///
+/// PP owns a daemon `Gpu` handle in addition to its per-rank `Gpus`, so callers
+/// pass `Some(gpu)` and this dispatches to the all-device PP epilogue. Dense TP
+/// EP owns all device handles inside `LoadedModel::ep`, so it passes `None` and
+/// reuses the EP all-rank reset. A missing handle is itself an unattested
+/// failure; no caller may continue toward a normal terminal on that path.
+pub fn reset_mesh_request_state(
+    m: &mut LoadedModel,
+    gpu: Option<&mut rdna_compute::Gpu>,
+) -> RollbackEpilogue {
+    if m.pp > 1 {
+        return match gpu {
+            Some(gpu) => production_pp_fail_closed_rollback(m, gpu),
+            None => {
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+                RollbackEpilogue {
+                    rolled_back: false,
+                    context: Some("PP reset missing daemon GPU handle".to_string()),
+                }
+            }
+        };
+    }
+    if m.ep.is_some() {
+        return crate::qwen::ep_reset_after_abort(m);
+    }
+    match gpu {
+        Some(gpu) => production_fail_closed_rollback(m, gpu, None, None),
+        None => {
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            RollbackEpilogue {
+                rolled_back: false,
+                context: Some("mesh reset has no EP or daemon GPU handle".to_string()),
+            }
+        }
+    }
+}
+
 
 fn emit_active_error_route_aware(
     stdout: &mut impl std::io::Write,

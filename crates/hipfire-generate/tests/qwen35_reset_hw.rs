@@ -15,7 +15,8 @@
 //! on the parsed wire events:
 //!
 //! - fault after prefill / after first decode → exactly one `error`
-//!   terminal with wire-visible `rolled_back=true`, no `done`, no tokens;
+//!   terminal with wire-visible `rolled_back=true`, no `token`, `committed`,
+//!   `done`, or `aborted`;
 //! - the next clean request serves `done` with bytes identical to a
 //!   fresh-daemon run (no assistant-cache store of the failed turn, no
 //!   recurrent/KV drift);
@@ -154,6 +155,7 @@ impl Session {
             .stderr(Stdio::piped())
             .env("HIPFIRE_DETERMINISTIC", "1")
             .envs(extra_env.iter().copied())
+            .env("HIPFIRE_EMIT_TOKEN_IDS", "1")
             .spawn()
             .unwrap_or_else(|e| panic!("spawn daemon {}: {e}", bin.display()));
         let stdin = child.stdin.take().expect("daemon stdin");
@@ -317,12 +319,10 @@ fn assert_fault_terminal(events: &[Value], id: &str, context: &str, stderr_tail:
         errors[0]
     );
     assert!(
-        !types.iter().any(|t| t == "done" || t == "aborted"),
-        "{context}: fault must not emit done/aborted for {id}: {types:?}"
-    );
-    assert!(
-        !types.iter().any(|t| t == "token"),
-        "{context}: fault seam fires before token visibility for {id}: {types:?}"
+        !types
+            .iter()
+            .any(|t| matches!(t.as_str(), "token" | "committed" | "done" | "aborted")),
+        "{context}: fault must not emit token/committed/done/aborted for {id}: {types:?}"
     );
 }
 

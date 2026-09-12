@@ -2409,7 +2409,7 @@ pub fn generate(
             return;
         }
         GenerationRoute::PipelineParallel => {
-            crate::qwen::generate_multi(
+            crate::qwen::generate_mesh_carrier(
                 m,
                 gpu,
                 pflash_state,

@@ -391,12 +391,17 @@ fn unattested_epilogue_error_carries_reset_context() {
         .collect();
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0]["rolled_back"], false);
+    let message = errors[0]["message"].as_str().unwrap();
     assert!(
-        errors[0]["message"]
-            .as_str()
-            .unwrap()
-            .contains("device_synchronize failed: injected"),
+        message.contains("device_synchronize failed: injected"),
         "unattested error must carry reset context: {events:?}"
+    );
+    assert_eq!(
+        message
+            .matches("device_synchronize failed: injected")
+            .count(),
+        1,
+        "reset context must be appended exactly once: {events:?}"
     );
     teardown();
 }
@@ -515,10 +520,11 @@ fn qwen_single_downshift_fail_error_shape_attested() {
     teardown();
 }
 
-/// Injected after-first-decode seam, single-AR terminal: `gpu`/retryable
-/// error with attested `rolled_back=true`, matching the prefill seam.
+/// Direct single-AR fail-closed error-emitter wire shape: `gpu`/retryable
+/// error with attested `rolled_back=true`. This synthetic test does not
+/// replace the ignored hardware production seam.
 #[test]
-fn qwen_single_injected_first_decode_shape_attested() {
+fn qwen_single_fail_closed_writer_wire_shape() {
     let _guard = lock();
     let id = "g47-seam-decode";
     fresh_controlled_attempt(id, 71_011);
@@ -549,17 +555,21 @@ fn qwen_single_injected_first_decode_shape_attested() {
     assert_eq!(errors[0]["class"], "gpu");
     assert_eq!(errors[0]["retryable"], true);
     assert_eq!(errors[0]["rolled_back"], true);
-    assert!(
-        events.iter().all(|event| event["type"] != "done"),
-        "seam must not emit done: {events:?}"
+    assert_eq!(
+        events.len(),
+        2,
+        "single fail-closed writer must emit only gen_start and error: {events:?}"
     );
+    assert_eq!(events[0]["type"], "gen_start");
+    assert_eq!(events[1]["type"], "error");
     teardown();
 }
 
-/// Injected after-first-decode seam, PP terminal: same classification through
-/// the pipeline-parallel route with attested `rolled_back=true`.
+/// Direct pipeline-parallel fail-closed error-emitter wire shape with
+/// attested `rolled_back=true`. This synthetic test does not replace the
+/// ignored hardware production seam.
 #[test]
-fn pp_injected_first_decode_shape_attested() {
+fn pp_fail_closed_writer_wire_shape() {
     let _guard = lock();
     let id = "g47-pp-seam-decode";
     fresh_controlled_attempt(id, 71_012);
@@ -589,9 +599,13 @@ fn pp_injected_first_decode_shape_attested() {
     assert_eq!(errors.len(), 1);
     assert_eq!(errors[0]["message"], "injected fault after first decode");
     assert_eq!(errors[0]["rolled_back"], true);
-    assert!(
-        events.iter().all(|event| event["type"] != "done"),
-        "seam must not emit done: {events:?}"
+    assert_eq!(errors[0]["id"], id);
+    assert_eq!(
+        events.len(),
+        2,
+        "PP fail-closed writer must emit only gen_start and error: {events:?}"
     );
+    assert_eq!(events[0]["type"], "gen_start");
+    assert_eq!(events[1]["type"], "error");
     teardown();
 }
