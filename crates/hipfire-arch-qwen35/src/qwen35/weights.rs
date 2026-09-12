@@ -1647,8 +1647,8 @@ impl DeltaNetState {
         // unique_ratio 0.625 vs 0.555, max_freq 0.055 vs 0.078. Also makes the DN
         // state DETERMINISTIC (no stochastic dither). Opt OUT with
         // HIPFIRE_DN_STATE_EF=0. Q8-only (FP32 has no requant; Q4 EF is future
-        // work; the multi-GPU band split is still stochastic — new_with_quant_multi
-        // leaves s_ef_residual empty). Residual is f16 per-element.
+        // work). The multi-GPU band split (`new_with_quant_multi` below) uses
+        // the same rule and geometry. Residual is f16 per-element.
         let ef_enabled = quant == StateQuant::Q8
             && hipfire_config::developer_var("HIPFIRE_DN_STATE_EF")
                 .map(|v| v != "0")
@@ -1806,9 +1806,23 @@ impl DeltaNetState {
             + config.linear_num_value_heads * config.linear_value_head_dim;
         let conv_state_size = conv_channels * (config.conv_kernel_dim - 1);
 
+        // Same EF sigma-delta rule as the single path (`new_batched_with_quant`):
+        // Q8 + `HIPFIRE_DN_STATE_EF` default-ON. Each residual is f16 per state
+        // element, allocated on the LA-layer's owning device so `ef_residual()`
+        // returns `Some` and the DeltaNet kernel takes the deterministic
+        // sigma-delta branch instead of stochastic dither. No further plumbing
+        // is needed: `forward_scratch_layers_multi` already runs each layer on
+        // `gpus.devices[device_for_layer]` and passes
+        // `ef_residual(delta_layer_idx)` alongside the same-device S/scales.
+        let ef_enabled = quant == StateQuant::Q8
+            && hipfire_config::developer_var("HIPFIRE_DN_STATE_EF")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+
         let mut s_matrices = Vec::new();
         let mut s_scales = Vec::new();
         let mut conv_states = Vec::new();
+        let mut s_ef_residual = Vec::new();
         let mut la_to_device: Vec<u8> = Vec::new();
 
         for (orig_layer_idx, lt) in config.layer_types.iter().enumerate() {
@@ -1829,7 +1843,10 @@ impl DeltaNetState {
                 }
                 StateQuant::Q8 => {
                     let buf = g.hip.malloc(s_size)?;
-                    g.hip.memset(&buf, 0, s_size)?;
+                    if let Err(e) = g.hip.memset(&buf, 0, s_size) {
+                        let _ = g.hip.free(buf);
+                        return Err(e);
+                    }
                     s_matrices.push(GpuTensor {
                         buf,
                         shape: vec![s_size],
@@ -1839,7 +1856,10 @@ impl DeltaNetState {
                 }
                 StateQuant::Q4 => {
                     let buf = g.hip.malloc(s_size / 2)?;
-                    g.hip.memset(&buf, 0, s_size / 2)?;
+                    if let Err(e) = g.hip.memset(&buf, 0, s_size / 2) {
+                        let _ = g.hip.free(buf);
+                        return Err(e);
+                    }
                     s_matrices.push(GpuTensor {
                         buf,
                         shape: vec![s_size / 2],
@@ -1848,6 +1868,9 @@ impl DeltaNetState {
                     s_scales.push(g.zeros(&[n_heads * s_dim], DType::F32)?);
                 }
             }
+            if ef_enabled {
+                s_ef_residual.push(g.zeros(&[s_size], DType::F16)?);
+            }
             conv_states.push(g.zeros(&[conv_state_size], DType::F32)?);
         }
         Ok((
@@ -1855,10 +1878,10 @@ impl DeltaNetState {
                 s_matrices,
                 s_scales,
                 conv_states,
-                // EF residual not wired for the multi-GPU band split (would need
-                // per-device residual alloc routed by device_for_layer); empty ⇒
-                // ef_residual() returns None ⇒ kernel uses the stochastic path.
-                s_ef_residual: Vec::new(),
+                // Per-device EF residuals (Q8 + HIPFIRE_DN_STATE_EF default-ON);
+                // empty only when EF is off (FP32/Q4/HIPFIRE_DN_STATE_EF=0) ⇒
+                // ef_residual() returns None ⇒ kernel uses stochastic requant.
+                s_ef_residual,
                 quant,
             },
             la_to_device,
@@ -1877,7 +1900,7 @@ impl DeltaNetState {
         for (i, t) in self.conv_states.into_iter().enumerate() {
             let _ = gpus.devices[la_to_device[i] as usize].free_tensor(t);
         }
-        // Empty today (multi-GPU EF not wired); free if/when residuals land.
+        // Per-device EF residuals ride along when EF is on (Q8 default-ON).
         for (i, t) in self.s_ef_residual.into_iter().enumerate() {
             let _ = gpus.devices[la_to_device[i] as usize].free_tensor(t);
         }
