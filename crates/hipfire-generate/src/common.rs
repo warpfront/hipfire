@@ -297,6 +297,122 @@ pub fn production_fail_closed_rollback_live(
     epilogue
 }
 
+/// Pipeline-parallel production fail-closed rollback (G4.7).
+///
+/// Extends [`production_fail_closed_rollback`] — host cursors, asst-turn
+/// cache clear, pp-aware recurrent/DN reset via [`reset_qwen35_recurrent`]
+/// (per-LA-device `bind_thread` + memset with error accumulation), llama KV
+/// arm, checkpoint rings, spec reset, single-`gpu` graph invalidate + sync —
+/// to the full PP device set: captured graphs are invalidated and the device
+/// is synchronized on `gpu` AND every `m.pp_gpus` device, each under its own
+/// `bind_thread`, with every failure accumulated via [`push_reset_err`].
+/// `rolled_back` is true only when every reset and every per-device sync
+/// succeeds.
+///
+/// `gpu` is the daemon's single handle (bound to the same physical device as
+/// `pp_gpus.devices[0]`); the shared HIP heap does not imply shared graph
+/// handles or drained streams, so per-device invalidate + sync is required
+/// (precedent: `ep_reset_after_abort` in qwen.rs).
+///
+/// A missing `pp_gpus` with `pp > 1` is recorded as an attestation error
+/// (fail-closed); with `pp <= 1` this degrades to the single-device rollback.
+pub fn production_pp_fail_closed_rollback(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    let single = fail_closed_reset_target_and_spec(m, gpu, None, None);
+    let mut first_err: Option<String> = single.context;
+    if m.pp > 1 {
+        match m.pp_gpus.as_mut() {
+            Some(gpus) => {
+                for (rank, dev) in gpus.devices.iter_mut().enumerate() {
+                    if let Err(e) = dev.bind_thread() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("pp rank{rank} graph bind_thread"),
+                            e,
+                        );
+                    }
+                    dev.invalidate_graph_state();
+                }
+                for (rank, dev) in gpus.devices.iter_mut().enumerate() {
+                    if let Err(e) = dev.bind_thread() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("pp rank{rank} sync bind_thread"),
+                            e,
+                        );
+                    }
+                    if let Err(e) = dev.hip.device_synchronize() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("pp rank{rank} device_synchronize"),
+                            e,
+                        );
+                    }
+                }
+            }
+            None => push_reset_err(&mut first_err, "pp_gpus", "pp>1 with no pp_gpus"),
+        }
+    }
+    match first_err {
+        None => RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        },
+        Some(e) => {
+            // Unattested: no replay observation may survive a dirty turn.
+            gpu.replay.invalidate_replay_observation_window();
+            RollbackEpilogue {
+                rolled_back: false,
+                context: Some(e),
+            }
+        }
+    }
+}
+/// Reset one mesh-backed request through the route's complete lifecycle owner.
+///
+/// PP owns a daemon `Gpu` handle in addition to its per-rank `Gpus`, so callers
+/// pass `Some(gpu)` and this dispatches to the all-device PP epilogue. Dense TP
+/// EP owns all device handles inside `LoadedModel::ep`, so it passes `None` and
+/// reuses the EP all-rank reset. A missing handle is itself an unattested
+/// failure; no caller may continue toward a normal terminal on that path.
+pub fn reset_mesh_request_state(
+    m: &mut LoadedModel,
+    gpu: Option<&mut rdna_compute::Gpu>,
+) -> RollbackEpilogue {
+    if m.pp > 1 {
+        return match gpu {
+            Some(gpu) => production_pp_fail_closed_rollback(m, gpu),
+            None => {
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+                RollbackEpilogue {
+                    rolled_back: false,
+                    context: Some("PP reset missing daemon GPU handle".to_string()),
+                }
+            }
+        };
+    }
+    if m.ep.is_some() {
+        return crate::qwen::ep_reset_after_abort(m);
+    }
+    match gpu {
+        Some(gpu) => production_fail_closed_rollback(m, gpu, None, None),
+        None => {
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            RollbackEpilogue {
+                rolled_back: false,
+                context: Some("mesh reset has no EP or daemon GPU handle".to_string()),
+            }
+        }
+    }
+}
+
+
 fn emit_active_error_route_aware(
     stdout: &mut impl std::io::Write,
     id: Option<&str>,
@@ -1452,6 +1568,142 @@ pub fn maybe_inject_fault_after_prefill_dflash(
         &ep,
     );
     true
+}
+
+/// Fire one-shot after-first-decode fault on qwen DFlash (live slot/spec path).
+///
+/// Sits with the prefill seam above, not after the first `spec.step`: the
+/// prefill already ran the first target decode (KV/recurrent/drafter advanced,
+/// `first_token` sampled), and the emitter's `begin` below makes that token
+/// wire-visible — firing later would leak a `token` before the fail-closed
+/// terminal the AR loop attests at `ar.rs:4249`. Consumes the same
+/// `test_fault_after_first_decode` arm (`take_generation_fault_after_first_decode`,
+/// armed by `RequestFaultGuard`; no new mechanism, no new wire field) and
+/// produces the same single correlated `error` terminal. Returns true when
+/// the fault was taken (caller must return immediately).
+#[cfg(feature = "serve-fault-inject")]
+pub fn maybe_inject_fault_after_first_decode_dflash(
+    arch_id: u32,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    slot: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+) -> bool {
+    if !take_generation_fault_after_first_decode() {
+        return false;
+    }
+    if !matches!(arch_id, 5 | 6) {
+        return false;
+    }
+    let ep = crate::common::production_fail_closed_rollback_live(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        slot,
+        spec,
+    );
+    crate::common::emit_fail_closed_error(
+        stdout,
+        Some(id),
+        "injected fault after first decode",
+        "gpu",
+        true,
+        &ep,
+    );
+    true
+}
+
+// ── G4.10 generation-fault hooks (test-only) ──
+
+// Test-only fault points for the dense/AR generation loops.
+//
+// Always compiled (unlike the `serve-fault-inject` wire hook) so ignored GPU
+// tests can arm faults without feature flags. Production never arms these;
+// an unarmed `take_*` is one thread-local load with no behavior change.
+// Both points are one-shot: taking an armed fault disarms it.
+std::thread_local! {
+    static GENERATION_FAULT_AFTER_PREFILL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static GENERATION_FAULT_AFTER_FIRST_DECODE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+/// Arm (or disarm) the after-prefill fault.
+#[doc(hidden)]
+pub fn arm_generation_fault_after_prefill(armed: bool) {
+    GENERATION_FAULT_AFTER_PREFILL.with(|c| c.set(armed));
+}
+
+/// Take the armed after-prefill fault, disarming it.
+#[doc(hidden)]
+pub fn take_generation_fault_after_prefill() -> bool {
+    GENERATION_FAULT_AFTER_PREFILL.with(|c| c.replace(false))
+}
+
+/// Arm (or disarm) the after-first-decode fault.
+#[doc(hidden)]
+pub fn arm_generation_fault_after_first_decode(armed: bool) {
+    GENERATION_FAULT_AFTER_FIRST_DECODE.with(|c| c.set(armed));
+}
+
+/// Take the armed after-first-decode fault, disarming it.
+#[doc(hidden)]
+pub fn take_generation_fault_after_first_decode() -> bool {
+    GENERATION_FAULT_AFTER_FIRST_DECODE.with(|c| c.replace(false))
+}
+
+/// Arm the generation fault hooks from a daemon `generate` request carrying
+/// `test_fault_after_prefill` / `test_fault_after_first_decode` booleans.
+/// Missing or non-boolean fields disarm. Test-only wiring; the hooks are
+/// default-off and one-shot.
+#[doc(hidden)]
+pub fn arm_generation_faults_from_request(msg: &serde_json::Value) {
+    let flag = |k: &str| msg.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    arm_generation_fault_after_prefill(flag("test_fault_after_prefill"));
+    arm_generation_fault_after_first_decode(flag("test_fault_after_first_decode"));
+}
+
+/// Disarm every generation fault hook on this thread.
+#[doc(hidden)]
+pub fn disarm_generation_faults() {
+    arm_generation_fault_after_prefill(false);
+    arm_generation_fault_after_first_decode(false);
+}
+
+/// Test-only per-request fault arming for the daemon (`serve-fault-inject`):
+/// arms the AR after-prefill hook and the generation hooks from the request's
+/// `test_fault_*` booleans, and disarms all of them on drop so an unconsumed
+/// arm cannot leak into the next request on this thread.
+#[cfg(feature = "serve-fault-inject")]
+#[doc(hidden)]
+pub struct RequestFaultGuard;
+#[cfg(feature = "serve-fault-inject")]
+impl RequestFaultGuard {
+    pub fn arm_from_request(msg: &serde_json::Value) -> Self {
+        let want = msg
+            .get("test_fault_after_prefill")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        crate::ar::arm_fault_after_prefill(want);
+        arm_generation_faults_from_request(msg);
+        Self
+    }
+}
+#[cfg(feature = "serve-fault-inject")]
+impl Drop for RequestFaultGuard {
+    fn drop(&mut self) {
+        crate::ar::arm_fault_after_prefill(false);
+        disarm_generation_faults();
+    }
 }
 
 // ── test-support helpers, moved with the daemon test modules ──

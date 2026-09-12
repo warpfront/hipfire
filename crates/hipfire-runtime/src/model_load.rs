@@ -141,6 +141,25 @@ pub trait WeightSource {
     fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer);
 }
 
+/// Deterministic failure points for the staged load transaction.
+///
+/// Typed test seam, never environment-controlled: the production route always
+/// runs with `fault = None`. Mirrors `DeepseekV4DsparkFault` for the DSpark
+/// sidecar loader — each variant fires AFTER the named owner is published to
+/// staging, so the existing reverse-order rollback must reclaim it.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagedLoadFault {
+    /// Fail after the embedding is published (rollback frees the embedding).
+    AfterEmbed,
+    /// Fail after the final norm is published (frees norm + embedding).
+    AfterFinalNorm,
+    /// Fail after the output/lm_head is published (frees output + norm + embedding).
+    AfterOutput,
+    /// Fail after layer `usize` is published (frees that layer and everything staged before it).
+    AfterLayer(usize),
+}
+
 /// Resource-neutral operations used by the staged load transaction.
 ///
 /// Keeping the transaction separate from HIP resource types gives the CPU
@@ -170,6 +189,10 @@ trait StagedLoadOps {
     fn free_output(&mut self, output: Self::Output, aliases_embedding: bool);
     fn free_final_norm(&mut self, norm: Self::Norm);
     fn free_embed(&mut self, embedding: Self::Embedding);
+    /// Build the injected-fault error for [`StagedLoadFault`]. Called only by
+    /// the with-fault seam when it runs with `Some`; the production path
+    /// (`None`) never invokes it, so its wording is test-only.
+    fn injected_error(fault: StagedLoadFault) -> Self::Error;
 }
 
 struct StagedWeights<E, N, O, L> {
@@ -192,6 +215,21 @@ fn run_staged_load<O: StagedLoadOps>(
     n_devices: usize,
     can_alias: bool,
 ) -> Result<StagedWeights<O::Embedding, O::Norm, O::Output, O::Layer>, O::Error> {
+    run_staged_load_with_fault(ops, n_devices, can_alias, None)
+}
+
+/// [`run_staged_load`] with a deterministic post-publication fault.
+///
+/// Each `Some` fault fires AFTER the named owner is admitted to staging, so a
+/// failing run exercises the exact reverse-order rollback the production path
+/// relies on. Crates drive this through [`load_weights_with_fault`];
+/// `StagedLoadOps` is crate-private, so this runner stays private too.
+fn run_staged_load_with_fault<O: StagedLoadOps>(
+    ops: &mut O,
+    n_devices: usize,
+    can_alias: bool,
+    fault: Option<StagedLoadFault>,
+) -> Result<StagedWeights<O::Embedding, O::Norm, O::Output, O::Layer>, O::Error> {
     ops.prepare(n_devices)?;
     let mut staged_embedding = None;
     let mut staged_norm = None;
@@ -201,9 +239,15 @@ fn run_staged_load<O: StagedLoadOps>(
     let result = (|| {
         let (embedding, format) = ops.read_embed()?;
         staged_embedding = Some((embedding, format));
+        if fault == Some(StagedLoadFault::AfterEmbed) {
+            return Err(O::injected_error(StagedLoadFault::AfterEmbed));
+        }
 
         let norm = ops.read_final_norm()?;
         staged_norm = Some(norm);
+        if fault == Some(StagedLoadFault::AfterFinalNorm) {
+            return Err(O::injected_error(StagedLoadFault::AfterFinalNorm));
+        }
 
         let (output, aliases_embedding) = ops.read_output(
             &staged_embedding
@@ -217,9 +261,15 @@ fn run_staged_load<O: StagedLoadOps>(
             can_alias,
         )?;
         staged_output = Some((output, aliases_embedding));
+        if fault == Some(StagedLoadFault::AfterOutput) {
+            return Err(O::injected_error(StagedLoadFault::AfterOutput));
+        }
 
         for layer_idx in 0..ops.n_layers() {
             staged_layers.push(ops.read_layer(layer_idx)?);
+            if fault == Some(StagedLoadFault::AfterLayer(layer_idx)) {
+                return Err(O::injected_error(StagedLoadFault::AfterLayer(layer_idx)));
+            }
         }
 
         let (token_embd, embd_format) = staged_embedding.take().expect("embedding staged");
@@ -320,6 +370,13 @@ impl<S: WeightSource> StagedLoadOps for GpuStagedLoadOps<'_, S> {
     fn free_embed(&mut self, embedding: Self::Embedding) {
         let _ = self.devices[0].free_tensor(embedding);
     }
+
+    fn injected_error(fault: StagedLoadFault) -> Self::Error {
+        hip_bridge::HipError::new(
+            0,
+            &format!("model_load: injected staged-load failure at {fault:?}"),
+        )
+    }
 }
 
 /// Drive a `WeightSource` across a device slice. Single shared copy of the
@@ -328,6 +385,32 @@ pub fn load_weights<S: WeightSource>(
     source: &mut S,
     devices: &mut [Gpu],
     layout: &Layout,
+) -> HipResult<LoadedWeights<S::Layer>> {
+    load_weights_inner(source, devices, layout, None)
+}
+
+/// Deterministic fault-injection seam over the production staged transaction.
+///
+/// The production route always calls [`load_weights`] (fault `None`), so a
+/// fault is unreachable without this seam. Mirrors
+/// `DeepseekV4::load_dspark_with_fault`: typed, never environment-controlled;
+/// fixture tests fail a real load after one publication boundary and prove
+/// rollback reclaims every staged owner.
+#[doc(hidden)]
+pub fn load_weights_with_fault<S: WeightSource>(
+    source: &mut S,
+    devices: &mut [Gpu],
+    layout: &Layout,
+    fault: StagedLoadFault,
+) -> HipResult<LoadedWeights<S::Layer>> {
+    load_weights_inner(source, devices, layout, Some(fault))
+}
+
+fn load_weights_inner<S: WeightSource>(
+    source: &mut S,
+    devices: &mut [Gpu],
+    layout: &Layout,
+    fault: Option<StagedLoadFault>,
 ) -> HipResult<LoadedWeights<S::Layer>> {
     let n_devices = devices.len();
     if n_devices == 0 {
@@ -344,7 +427,10 @@ pub fn load_weights<S: WeightSource>(
         devices,
         layout,
     };
-    let staged = run_staged_load(&mut ops, n_devices, n_devices == 1)?;
+    let staged = match fault {
+        None => run_staged_load(&mut ops, n_devices, n_devices == 1)?,
+        Some(fault) => run_staged_load_with_fault(&mut ops, n_devices, n_devices == 1, Some(fault))?,
+    };
     Ok(LoadedWeights {
         token_embd: staged.token_embd,
         embd_format: staged.embd_format,
@@ -565,6 +651,10 @@ mod tests {
         fn free_embed(&mut self, embedding: Self::Embedding) {
             self.allocator.free(embedding);
         }
+
+        fn injected_error(fault: StagedLoadFault) -> Self::Error {
+            format!("model_load: injected staged-load failure at {fault:?}")
+        }
     }
 
     #[test]
@@ -584,6 +674,77 @@ mod tests {
                 run_staged_load(&mut source, 2, false).is_err(),
                 "{failure:?} must fail"
             );
+            source.assert_clean();
+        }
+    }
+
+    #[test]
+    fn cpu_staged_load_with_fault_rolls_back_after_publication() {
+        // The pre-publication sweep above fails each read before staging; the
+        // seam instead fails AFTER the named owner is admitted, so rollback
+        // must reclaim already-published owners (embed alone through the full
+        // four-layer sweep).
+        let faults = [
+            StagedLoadFault::AfterEmbed,
+            StagedLoadFault::AfterFinalNorm,
+            StagedLoadFault::AfterOutput,
+            StagedLoadFault::AfterLayer(0),
+            StagedLoadFault::AfterLayer(3),
+        ];
+        for fault in faults {
+            let mut source = TestWeightSource::new(4, None);
+            let err = match run_staged_load_with_fault(&mut source, 2, false, Some(fault)) {
+                Ok(_) => panic!("seam fault {fault:?} must fire after publication"),
+                Err(err) => err,
+            };
+            assert!(
+                err.contains("injected staged-load failure"),
+                "{fault:?} error bypassed the fault seam: {err}"
+            );
+            source.assert_clean();
+        }
+    }
+
+    #[test]
+    fn cpu_production_path_has_no_fault_parameter() {
+        // `run_staged_load` takes no fault argument (compiler-enforced by its
+        // signature): the same source that fails under every seam fault loads
+        // cleanly through the production entry, so the hook is unreachable
+        // without the test seam. Each fault is followed by an immediate
+        // production retry to prove the released owners are reusable.
+        let faults = [
+            StagedLoadFault::AfterEmbed,
+            StagedLoadFault::AfterFinalNorm,
+            StagedLoadFault::AfterOutput,
+            StagedLoadFault::AfterLayer(0),
+            StagedLoadFault::AfterLayer(3),
+        ];
+        for fault in faults {
+            let mut source = TestWeightSource::new(4, None);
+            assert!(
+                run_staged_load_with_fault(&mut source, 2, false, Some(fault)).is_err(),
+                "seam fault {fault:?} must fire"
+            );
+            source.assert_clean();
+            let loaded = run_staged_load(&mut source, 2, false)
+                .expect("production retry after seam fault");
+            // Non-aliased output owns primary + metadata: 1 embed + 1 norm +
+            // 2 output + 4 layers live after a clean production load.
+            assert_eq!(source.allocator.live.len(), 8);
+            let StagedWeights {
+                token_embd,
+                output_norm,
+                output,
+                layers,
+                lm_head_aliases_embd,
+                ..
+            } = loaded;
+            for (layer_idx, layer) in layers.into_iter().enumerate().rev() {
+                source.free_layer(layer_idx, layer);
+            }
+            source.free_output(output, lm_head_aliases_embd);
+            source.free_final_norm(output_norm);
+            source.free_embed(token_embd);
             source.assert_clean();
         }
     }

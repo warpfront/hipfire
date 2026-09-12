@@ -39,8 +39,9 @@ pub use forward::{
     Qwen35ScratchSet,
 };
 pub use load::{
-    load_weights, load_weights_dense_tp_rank, load_weights_ep_rank, preflight_weights_dense_tp,
-    set_ep_expert_shard, EpShardGuard, HfqSource, Layout, ParoSource,
+    load_weights, load_weights_dense_tp_rank, load_weights_ep_rank, load_weights_with_fault,
+    preflight_weights_dense_tp, set_ep_expert_shard, EpShardGuard, HfqSource, Layout, ParoSource,
+    StagedLoadFault,
 };
 pub use prefill::{
     forward_prefill_batch, forward_prefill_batch_capped,

@@ -82,6 +82,25 @@ pub fn emit_active_attempt_error(
     );
 }
 
+/// Fail-closed operation-failure terminal for the dense AR family (G4.10).
+///
+/// Runs the complete production rollback, then emits exactly one correlated
+/// fail-closed error (no `done`, no assistant-cache store). `rolled_back` and
+/// any reset context come from the attested epilogue, never a literal.
+/// Classification stays `internal`/non-retryable, matching the historical
+/// `emit_error_with_id` sites this replaces.
+pub fn dense_fail_closed_error(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    message: &str,
+) {
+    let ep = production_fail_closed_rollback(m, gpu, None, None);
+    emit_fail_closed_error(stdout, Some(id), message, "internal", false, &ep);
+}
+
+
 /// Speculative wire terminal after `Deepseek4Emit::finish` + length known.
 /// Length always suppresses call release and cache; malformed is error XOR done.
 #[derive(Debug, Clone, PartialEq)]
@@ -453,10 +472,21 @@ pub fn generate_deepseek4_spec(
     let decoded_vocab: Option<std::sync::Arc<Vec<String>>> =
         if tools.map_or(false, |t| !t.is_empty()) {
             if m.decoded_vocab.is_none() {
-                let tok = m.tokenizer.as_ref().expect("tokenizer present");
-                let n = tok.vocab_size();
-                let v: Vec<String> = (0..n).map(|id| tok.decode(&[id as u32])).collect();
-                m.decoded_vocab = Some(std::sync::Arc::new(v));
+                match m.tokenizer.as_ref() {
+                    Some(tok) => {
+                        let n = tok.vocab_size();
+                        let v: Vec<String> = (0..n).map(|id| tok.decode(&[id as u32])).collect();
+                        m.decoded_vocab = Some(std::sync::Arc::new(v));
+                    }
+                    None => {
+                        // Unreachable (tokenizer checked at entry) but fail-closed:
+                        // the cache-miss teardown above already mutated GPU
+                        // state, so roll back instead of panicking.
+                        let ep = production_fail_closed_rollback(m, gpu, None, None);
+                        emit_fail_closed_error(stdout, Some(id), "tokenizer not loaded", "internal", false, &ep);
+                        return;
+                    }
+                }
             }
             m.decoded_vocab.clone()
         } else {
@@ -589,7 +619,18 @@ pub fn generate_deepseek4_spec(
         hit_length_cap,
     ) {
         Ds4SpecWireTerminal::Malformed(action) => {
-            // No epilogue on SpecRun — still fail-closed without claiming rollback.
+            // Post-decode malformed turn: complete rollback first so the next
+            // request starts clean, then emit the single malformed terminal
+            // with the attested `rolled_back` (plus reset context when
+            // unattested). Never `done`, never cache store.
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            let mut action = action;
+            action.rolled_back = ep.rolled_back;
+            if let Some(ctx) = ep.context.as_ref() {
+                if !ep.rolled_back {
+                    action.message = format!("{} ({ctx})", action.message);
+                }
+            }
             emit_ds4_malformed_action(stdout, id, &action);
             return;
         }
@@ -762,9 +803,16 @@ pub fn generate_deepseek4(
         eos_tok,
         ..
     } = &mut *b;
-    let pbs = pbs
-        .as_mut()
-        .expect("deepseek4_pbs missing on arch_id=9 generate");
+    let pbs = match pbs.as_mut() {
+        Some(p) => p,
+        None => {
+            // Pre-mutation validation (no GPU work yet): bare correlated error,
+            // never a panic. A missing PBS is a load-time invariant violation.
+            emit_active_attempt_error(stdout, Some(id), "deepseek4_pbs missing on arch_id=9 generate", "internal", false, false);
+            let _ = stdout.flush();
+            return;
+        }
+    };
     let cfg = &*cfg;
     let weights = &*weights;
     let eos_tok = *eos_tok;
@@ -967,7 +1015,7 @@ pub fn generate_deepseek4(
     // KV ends at start_pos + suffix_tokens.len() (== prompt_ids.len()) and
     // decode appends max_tokens. forward_prefill_batch_chunked writes into a KV
     // sized for m.physical_cap; overrunning it is a KV-overrun panic that takes
-    // down serve. Emit a clean error and return BEFORE prefill.
+    // down serve.
     // saturating_add: an adversarially huge max_tokens must not wrap usize and
     // slip under the cap.
     if (start_pos as usize)
@@ -975,15 +1023,24 @@ pub fn generate_deepseek4(
         .saturating_add(max_tokens)
         > m.physical_cap
     {
-        let _ = writeln!(
+        // Post-teardown-mutation (cache reset above) but pre-gen_start: roll
+        // back silently, then emit one correlated capacity terminal (which
+        // claims the wire transaction). Never the raw unclaimed envelope.
+        let cap = m.physical_cap;
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(
             stdout,
-            r#"{{"type":"error","id":"{}","message":"prompt exceeds checkpoint context capacity: prompt={} + max_tokens={} > capacity={}"}}"#,
-            id,
-            start_pos as usize + suffix_tokens.len(),
-            max_tokens,
-            m.physical_cap
+            Some(id),
+            &format!(
+                "prompt exceeds checkpoint context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq",
+                start_pos as usize + suffix_tokens.len(),
+                max_tokens,
+                cap
+            ),
+            "context_length",
+            false,
+            &ep,
         );
-        let _ = stdout.flush();
         return;
     }
 
@@ -1001,7 +1058,11 @@ pub fn generate_deepseek4(
     let last_logits = match prefill_result {
         Ok(l) => l,
         Err(e) => {
-            emit_error_with_id(stdout, id, format!("deepseek4prefill failed: {e:?}"));
+            // Post-mutation (cache reset above) but pre-gen_start: roll back
+            // silently, then emit one correlated terminal (which claims the
+            // wire transaction). Never a bare error on dirty state.
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_fail_closed_error(stdout, Some(id), &format!("deepseek4prefill failed: {e:?}"), "internal", false, &ep);
             return;
         }
     };
@@ -1299,8 +1360,10 @@ pub fn generate_deepseek4(
                     pos += 1;
                 }
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("deepseek4decode failed: {e:?}"));
-                    let _ = stdout.flush();
+                    // Post-gen_start operation failure: complete rollback +
+                    // one correlated fail-closed error (no `done`, no cache).
+                    let ep = production_fail_closed_rollback(m, gpu, None, None);
+                    emit_fail_closed_error(stdout, Some(id), &format!("deepseek4decode failed: {e:?}"), "internal", false, &ep);
                     return;
                 }
             }
@@ -1343,7 +1406,17 @@ pub fn generate_deepseek4(
         );
         let (finish_reason, wire_tool_calls, store_cache) = match &terminal {
             Ds4ArEpRouteTerminal::Malformed(action) => {
-                emit_ds4_malformed_action(stdout, id, action);
+                // Post-decode malformed turn: complete rollback first, then the
+                // single malformed terminal with the attested `rolled_back`.
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                let mut action = action.clone();
+                action.rolled_back = ep.rolled_back;
+                if let Some(ctx) = ep.context.as_ref() {
+                    if !ep.rolled_back {
+                        action.message = format!("{} ({ctx})", action.message);
+                    }
+                }
+                emit_ds4_malformed_action(stdout, id, &action);
                 return;
             }
             Ds4ArEpRouteTerminal::Safe {
@@ -1470,6 +1543,20 @@ pub fn generate_deepseek4(
         eprintln!("[req {id}] drafter=ar tau=1.00 tok/s={tok_s:.1} decode ({generated_count} tok, autoregressive)");
     }
 }
+/// Map a hetero attested-reset outcome to the shared epilogue shape.
+fn hetero_attested_epilogue(result: Result<(), String>) -> RollbackEpilogue {
+    match result {
+        Ok(()) => RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        },
+        Err(error) => RollbackEpilogue {
+            rolled_back: false,
+            context: Some(format!("heterogeneous rollback failed: {error}")),
+        },
+    }
+}
+
 pub fn ds4_heterogeneous_client_abort(
     model: &mut hipfire_arch_deepseek4::heterogeneous::DeepseekV4HeterogeneousModel,
     seq_pos: &mut usize,
@@ -1480,16 +1567,7 @@ pub fn ds4_heterogeneous_client_abort(
 ) {
     *seq_pos = 0;
     conversation_tokens.clear();
-    let epilogue = match model.reset_for_request_attested() {
-        Ok(()) => RollbackEpilogue {
-            rolled_back: true,
-            context: None,
-        },
-        Err(error) => RollbackEpilogue {
-            rolled_back: false,
-            context: Some(format!("heterogeneous rollback failed: {error}")),
-        },
-    };
+    let epilogue = hetero_attested_epilogue(model.reset_for_request_attested());
     if epilogue.rolled_back {
         eprintln!(
             "[req {id}] drafter=ar-heterogeneous abort=client rollback=attested post_join=true completion_tokens={completion_tokens}"
@@ -1497,6 +1575,27 @@ pub fn ds4_heterogeneous_client_abort(
     }
     emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
 }
+
+/// Fail-closed operation-failure terminal for the DS4 heterogeneous route.
+///
+/// Same attested reset as [`ds4_heterogeneous_client_abort`] (host cursors +
+/// `reset_for_request_attested` over both GPUs), but emits exactly one
+/// correlated fail-closed error instead of the cancellation lifecycle:
+/// no `done`, no assistant-cache store, no tool-call release.
+pub fn ds4_heterogeneous_fail_closed_error(
+    model: &mut hipfire_arch_deepseek4::heterogeneous::DeepseekV4HeterogeneousModel,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    message: String,
+) {
+    *seq_pos = 0;
+    conversation_tokens.clear();
+    let epilogue = hetero_attested_epilogue(model.reset_for_request_attested());
+    emit_fail_closed_error(stdout, Some(id), &message, "internal", false, &epilogue);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn generate_deepseek4_heterogeneous(
     m: &mut LoadedModel,
@@ -1575,10 +1674,17 @@ pub fn generate_deepseek4_heterogeneous(
             return;
         };
         if let Err(error) = bundle.model.reset_for_request() {
-            emit_error_with_id(
+            // First mutation failed: attest through the full reset before the
+            // single correlated terminal (reset error stays visible when
+            // unattested).
+            let message = format!("deepseek4 heterogeneous reset failed: {error}");
+            ds4_heterogeneous_fail_closed_error(
+                &mut bundle.model,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
                 stdout,
                 id,
-                format!("deepseek4 heterogeneous reset failed: {error}"),
+                message,
             );
             return;
         }
@@ -1601,10 +1707,15 @@ pub fn generate_deepseek4_heterogeneous(
                     return;
                 }
                 Err(error) => {
-                    emit_error_with_id(
+                    let message =
+                        format!("deepseek4 heterogeneous prefill failed: {error}");
+                    ds4_heterogeneous_fail_closed_error(
+                        &mut bundle.model,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
                         stdout,
                         id,
-                        format!("deepseek4 heterogeneous prefill failed: {error}"),
+                        message,
                     );
                     return;
                 }
@@ -1671,7 +1782,16 @@ pub fn generate_deepseek4_heterogeneous(
             (s.as_mut() as &mut dyn Any)
                 .downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>()
         }) else {
-            emit_error_with_id(stdout, id, "deepseek4 heterogeneous state disappeared");
+            // Bundle vanished mid-decode: no hetero GPU handle to attest
+            // through. Clear host cursors and emit one correlated UNATTESTED
+            // terminal (reset gap stays visible in the context).
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            let ep = RollbackEpilogue {
+                rolled_back: false,
+                context: Some("heterogeneous rollback failed: state missing".to_string()),
+            };
+            emit_fail_closed_error(stdout, Some(id), "deepseek4 heterogeneous state disappeared", "internal", false, &ep);
             return;
         };
         match bundle
@@ -1691,10 +1811,15 @@ pub fn generate_deepseek4_heterogeneous(
                 return;
             }
             Err(error) => {
-                emit_error_with_id(
+                let message =
+                    format!("deepseek4 heterogeneous decode failed: {error}");
+                ds4_heterogeneous_fail_closed_error(
+                    &mut bundle.model,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
                     stdout,
                     id,
-                    format!("deepseek4 heterogeneous decode failed: {error}"),
+                    message,
                 );
                 return;
             }
@@ -1718,6 +1843,27 @@ pub fn generate_deepseek4_heterogeneous(
         ds4_ar_ep_finish_route(dsml_malformed, emit_tool_calls_buf, generated >= max_tokens);
     let (finish_reason, wire_tool_calls) = match terminal {
         Ds4ArEpRouteTerminal::Malformed(action) => {
+            // Post-decode malformed turn: complete rollback first, then the
+            // single malformed terminal with the attested `rolled_back`.
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            let epilogue = match m.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any)
+                    .downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>()
+            }) {
+                Some(bundle) => hetero_attested_epilogue(bundle.model.reset_for_request_attested()),
+                None => RollbackEpilogue {
+                    rolled_back: false,
+                    context: Some("heterogeneous rollback failed: state missing".to_string()),
+                },
+            };
+            let mut action = action;
+            action.rolled_back = epilogue.rolled_back;
+            if let Some(ctx) = epilogue.context.as_ref() {
+                if !epilogue.rolled_back {
+                    action.message = format!("{} ({ctx})", action.message);
+                }
+            }
             emit_ds4_malformed_action(stdout, id, &action);
             return;
         }
@@ -1751,11 +1897,16 @@ pub fn generate_deepseek4_heterogeneous(
             (s.as_mut() as &mut dyn Any)
                 .downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>()
         }) else {
-            emit_error_with_id(
-                stdout,
-                id,
-                "deepseek4 heterogeneous state disappeared on abort",
-            );
+            // Abort raced a vanished bundle: no hetero GPU handle to attest
+            // through. Clear host cursors and emit one correlated UNATTESTED
+            // terminal.
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            let ep = RollbackEpilogue {
+                rolled_back: false,
+                context: Some("heterogeneous rollback failed: state missing".to_string()),
+            };
+            emit_fail_closed_error(stdout, Some(id), "deepseek4 heterogeneous state disappeared on abort", "internal", false, &ep);
             return;
         };
         ds4_heterogeneous_client_abort(
@@ -6766,7 +6917,13 @@ pub fn generate_lfm2moe(
     // prompt each turn; it now does so from position 0 with no stale KV. A
     // continuing conversation re-prefills its whole history from the prompt, so
     // multi-turn is preserved (validated: Bjorn/axolotl recall).
-    let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
+    // Post-gen_start mutation: a failed turn reset must fail closed (rollback +
+    // one correlated terminal), never continue prefill on dirty state.
+    let turn_reset = m.lfm2moe_mut().unwrap().state.reset(gpu);
+    if let Err(e) = turn_reset {
+        dense_fail_closed_error(m, gpu, stdout, id, &format!("lfm2moe turn reset failed: {e:?}"));
+        return;
+    }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
 
@@ -6778,6 +6935,7 @@ pub fn generate_lfm2moe(
     // tokens) does not run the full prefill before honoring the cancel. ──
     let mut last_logits: Vec<f32> = Vec::new();
     let mut prefill_aborted = false;
+    let mut prefill_fail: Option<String> = None;
     {
         let b = m.lfm2moe_mut().unwrap();
         let cfg = &b.config;
@@ -6792,12 +6950,18 @@ pub fn generate_lfm2moe(
             match lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                 Ok(logits) => last_logits = logits,
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("lfm2moe prefill failed: {e:?}"));
-                    return;
+                    prefill_fail = Some(format!("lfm2moe prefill failed: {e:?}"));
+                    break;
                 }
             }
             position += 1;
         }
+    }
+    // Post-gen_start operation failure: complete rollback + one correlated
+    // fail-closed error (no `done`, no cache store).
+    if let Some(msg) = prefill_fail {
+        dense_fail_closed_error(m, gpu, stdout, id, &msg);
+        return;
     }
     if prefill_aborted || check_abort(id) {
         let ep = production_fail_closed_rollback(m, gpu, None, None);
@@ -6808,6 +6972,12 @@ pub fn generate_lfm2moe(
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
+    // Test-only fault seam (G4.10): fires after GPU/KV mutation, before any
+    // token visibility. Reroutes through the production fail-closed terminal.
+    if take_generation_fault_after_prefill() {
+        dense_fail_closed_error(m, gpu, stdout, id, "injected fault after prefill");
+        return;
+    }
 
     // ── Decode loop. Sample host-side from the running logits vector.
     // Abort is checked at the top of every iteration so a mid-decode
@@ -6880,9 +7050,15 @@ pub fn generate_lfm2moe(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("lfm2moe decode failed: {e:?}"));
+                dense_fail_closed_error(m, gpu, stdout, id, &format!("lfm2moe decode failed: {e:?}"));
                 return;
             }
+        }
+        // Test-only fault seam (G4.10): fires after the first decode step's
+        // GPU/KV mutation. Same production fail-closed terminal as prefill.
+        if generated_count == 1 && take_generation_fault_after_first_decode() {
+            dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
+            return;
         }
     }
 
@@ -7202,6 +7378,8 @@ pub fn generate_minimax(
     // push to `m.conversation_tokens` in the same scope. The LAST forward's
     // logits are the predictions for the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
+    let mut prefill_aborted = false;
+    let mut prefill_fail: Option<String> = None;
     {
         let b = m.minimax_mut().unwrap();
         let cfg = &b.config;
@@ -7225,15 +7403,17 @@ pub fn generate_minimax(
             // MiniMax-M2 (256 experts/top-8). Shorter prompts fall to the
             // indexed path inside forward_batch (below the grouped gate).
             for chunk in prefill_ids.chunks(512) {
+                // Abort is checked per chunk so a client cancel during a long
+                // prompt does not run the full prefill before honoring it.
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 match minimax::forward::forward_batch(cfg, weights, state, gpu, chunk, pos) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("minimax batch prefill failed: {e:?}"),
-                        );
-                        return;
+                        prefill_fail = Some(format!("minimax batch prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 pos += chunk.len();
@@ -7241,21 +7421,42 @@ pub fn generate_minimax(
         } else {
             let mut position = state.n_tokens as u32;
             for &tok in &prefill_ids {
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 match minimax::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, format!("minimax prefill failed: {e:?}"));
-                        return;
+                        prefill_fail = Some(format!("minimax prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 position += 1;
             }
         }
     }
+    // Post-prompt operation failure: complete rollback + one correlated
+    // fail-closed error (no `done`, no cache store).
+    if let Some(msg) = prefill_fail {
+        dense_fail_closed_error(m, gpu, stdout, id, &msg);
+        return;
+    }
+    if prefill_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
+    }
     for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
+    // Test-only fault seam (G4.10): fires after GPU/KV mutation, before any
+    // token visibility. Reroutes through the production fail-closed terminal.
+    if take_generation_fault_after_prefill() {
+        dense_fail_closed_error(m, gpu, stdout, id, "injected fault after prefill");
+        return;
+    }
 
     // MiniMax-M2's chat template unconditionally primes the assistant turn
     // with `<think>\n` (chat_template.jinja generation-prompt block), so the
@@ -7289,6 +7490,13 @@ pub fn generate_minimax(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
+        // Decode-side abort check: a mid-decode client cancel stops the loop
+        // immediately instead of running the full `max_tokens` of wasted work.
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -7315,6 +7523,14 @@ pub fn generate_minimax(
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
+        // Check abort before the next GPU decode_step to avoid launching
+        // more work after the client has already cancelled.
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+
         // Advance one step on the freshly sampled token.
         let step = {
             let b = m.minimax_mut().unwrap();
@@ -7330,9 +7546,15 @@ pub fn generate_minimax(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("minimax decode failed: {e:?}"));
+                dense_fail_closed_error(m, gpu, stdout, id, &format!("minimax decode failed: {e:?}"));
                 return;
             }
+        }
+        // Test-only fault seam (G4.10): fires after the first decode step's
+        // GPU/KV mutation. Same production fail-closed terminal as prefill.
+        if generated_count == 1 && take_generation_fault_after_first_decode() {
+            dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
+            return;
         }
     }
 
@@ -7359,7 +7581,10 @@ pub fn generate_minimax(
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
         ClientTerminalDecision::Abort => {
-            emit_aborted_terminal_after_abort(stdout, id, generated_count);
+            // Abort after commit staging: roll back before emitting the
+            // cancellation lifecycle (or unattested fail-closed error).
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
         }
     }
 }
@@ -7567,18 +7792,20 @@ pub fn generate_cohere2moe(
             prompt_ids.len(),
             max_seq,
         );
-        emit_error_with_id(
+        // Refusal after prompt build but before any GPU work: roll back
+        // through the attested path (covers the KV reset the old code did
+        // with a discarded result) and emit one correlated terminal.
+        dense_fail_closed_error(
+            m,
+            gpu,
             stdout,
             id,
-            format!(
+            &format!(
                 "cohere2moe: prompt is {} tokens but KV capacity (max_seq) is {} — load with a larger max_seq or shorten the prompt",
                 prompt_ids.len(),
                 max_seq
             ),
         );
-        let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
         return;
     }
     // Cap generation so prefill(prompt) + decode(max_tokens) never exceeds the
@@ -7644,6 +7871,8 @@ pub fn generate_cohere2moe(
     // Q8/F16 expert tiers (no indexed kernel) fall back to per-token decode_step.
     // The LAST forward's logits predict the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
+    let mut prefill_aborted = false;
+    let mut prefill_fail: Option<String> = None;
     {
         let b = m.cohere2moe_mut().unwrap();
         let cfg = &b.config;
@@ -7652,6 +7881,12 @@ pub fn generate_cohere2moe(
         if cohere2moe::forward::forward_batch_supported(weights) && prefill_ids.len() > 1 {
             let mut i = 0;
             while i < prefill_ids.len() {
+                // Abort is checked per chunk so a client cancel during a long
+                // prompt does not run the full prefill before honoring it.
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 let end = (i + 256).min(prefill_ids.len());
                 let start_pos = state.n_tokens;
                 match cohere2moe::forward::forward_batch(
@@ -7664,12 +7899,8 @@ pub fn generate_cohere2moe(
                 ) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("cohere2moe batched prefill failed: {e:?}"),
-                        );
-                        return;
+                        prefill_fail = Some(format!("cohere2moe batched prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 i = end;
@@ -7677,21 +7908,42 @@ pub fn generate_cohere2moe(
         } else {
             let mut position = state.n_tokens as u32;
             for &tok in &prefill_ids {
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 match cohere2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, format!("cohere2moe prefill failed: {e:?}"));
-                        return;
+                        prefill_fail = Some(format!("cohere2moe prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 position += 1;
             }
         }
     }
+    // Post-prompt operation failure: complete rollback + one correlated
+    // fail-closed error (no `done`, no cache store).
+    if let Some(msg) = prefill_fail {
+        dense_fail_closed_error(m, gpu, stdout, id, &msg);
+        return;
+    }
+    if prefill_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
+    }
     for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
+    // Test-only fault seam (G4.10): fires after GPU/KV mutation, before any
+    // token visibility. Reroutes through the production fail-closed terminal.
+    if take_generation_fault_after_prefill() {
+        dense_fail_closed_error(m, gpu, stdout, id, "injected fault after prefill");
+        return;
+    }
 
     // Re-emit a leading `<think>\n` opener into the token stream (display-only,
     // not pushed to state) when the rendered prompt primed the assistant turn
@@ -7829,6 +8081,14 @@ pub fn generate_cohere2moe(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
+        // Decode-side abort check: a mid-decode client cancel stops the loop
+        // immediately instead of running the full `max_tokens` of wasted work.
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+
         if generated_count >= max_tokens {
             break;
         }
@@ -8017,9 +8277,15 @@ pub fn generate_cohere2moe(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("cohere2moe decode failed: {e:?}"));
+                dense_fail_closed_error(m, gpu, stdout, id, &format!("cohere2moe decode failed: {e:?}"));
                 return;
             }
+        }
+        // Test-only fault seam (G4.10): fires after the first decode step's
+        // GPU/KV mutation. Same production fail-closed terminal as prefill.
+        if generated_count == 1 && take_generation_fault_after_first_decode() {
+            dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
+            return;
         }
     }
 
@@ -8105,7 +8371,10 @@ pub fn generate_cohere2moe(
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
         ClientTerminalDecision::Abort => {
-            emit_aborted_terminal_after_abort(stdout, id, generated_count);
+            // Abort after commit staging: roll back before emitting the
+            // cancellation lifecycle (or unattested fail-closed error).
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
         }
     }
 }
@@ -8256,14 +8525,26 @@ pub fn generate_qwen2(
     // logits in state.logits — these are the predictions for the
     // first generated token.
     for &tok in &prompt_ids {
+        // Abort is checked per token so a client cancel during a long
+        // prompt does not run the full prefill before honoring it.
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+            return;
+        }
         if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
-            emit_error_with_id(stdout, id, format!("qwen2 prefill failed: {e:?}"));
-            let _ = stdout.flush();
+            dense_fail_closed_error(m, gpu, stdout, id, &format!("qwen2 prefill failed: {e:?}"));
             return;
         }
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
+    // Test-only fault seam (G4.10): fires after GPU/KV mutation, before any
+    // token visibility. Reroutes through the production fail-closed terminal.
+    if take_generation_fault_after_prefill() {
+        dense_fail_closed_error(m, gpu, stdout, id, "injected fault after prefill");
+        return;
+    }
 
     // Decode loop. Greedy argmax for now (see fn doc for sampling
     // scope). The first generated token is argmax of the prefill's
@@ -8275,13 +8556,19 @@ pub fn generate_qwen2(
     let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
-            emit_error_with_id(stdout, id, format!("argmax failed: {e:?}"));
-            let _ = stdout.flush();
+            dense_fail_closed_error(m, gpu, stdout, id, &format!("qwen2 argmax failed: {e:?}"));
             return;
         }
     };
 
     loop {
+        // Decode-side abort check: a mid-decode client cancel stops the loop
+        // immediately instead of running the full `max_tokens` of wasted work.
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -8309,13 +8596,17 @@ pub fn generate_qwen2(
         match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
             Ok(t) => next_tok = t,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("forward_step_greedy failed: {e:?}"));
-                let _ = stdout.flush();
+                dense_fail_closed_error(m, gpu, stdout, id, &format!("qwen2 decode failed: {e:?}"));
                 return;
             }
         }
+        // Test-only fault seam (G4.10): fires after the first decode step's
+        // GPU/KV mutation. Same production fail-closed terminal as prefill.
+        if generated_count == 1 && take_generation_fault_after_first_decode() {
+            dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
+            return;
+        }
     }
-
     // Daemon bookkeeping: seq_pos matches Qwen2State's internal cursor.
     m.seq_pos = state.next_pos;
 
@@ -8340,7 +8631,10 @@ pub fn generate_qwen2(
             crate::ar::emit_active_route_done_value(stdout, &pending_done)
         }
         ClientTerminalDecision::Abort => {
-            emit_aborted_terminal_after_abort(stdout, id, generated_count);
+            // Abort after commit staging: roll back before emitting the
+            // cancellation lifecycle (or unattested fail-closed error).
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
         }
     }
 }

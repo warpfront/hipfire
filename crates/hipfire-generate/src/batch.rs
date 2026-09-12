@@ -85,6 +85,40 @@ fn emit_batch_admission_error(
     }
     batch_clear_terminal_at_generation(id, attempt_id, admission);
 }
+/// Retire one lane whose GPU reset failed before the lane is freed for reuse.
+/// Emits a visible fail-closed error (`rolled_back=false`, never retried)
+/// through the landed AttemptKey claim, then frees the scheduler lane for
+/// that admission only. Ordinary and EP drivers call this independently so
+/// one dirty lane cannot be silently reused while its peers keep serving;
+/// EP batch state additionally poisons the GPU lane internally on reset
+/// failure, ordinary lanes escalate on next touch when the device is bad.
+fn retire_lane_after_reset_failure(
+    sched: &mut ContinuousBatchScheduler,
+    stdout: &mut impl Write,
+    key: &AttemptKey,
+    admission: BatchGeneration,
+    lane_idx: usize,
+    context: &str,
+    err: &dyn std::fmt::Display,
+) {
+    // Same keyed error half as `emit_batch_admission_error`, but WITHOUT its
+    // trailing registry clear: `abort_lane` below validates the owner
+    // against the live registry entry, so the lane must still be claimed
+    // when it runs. Abort clears the admission on success.
+    {
+        let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+        emit_active_attempt_error(
+            stdout,
+            Some(&key.id),
+            &format!("reset lane {lane_idx} ({context}) failed; lane retired: {err}"),
+            "gpu",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+    }
+    let _ = sched.abort_lane(lane_idx, key, admission);
+}
 /// Emit the assignment-time LFM capacity failure. The caller must hold the
 /// exact `BatchAttemptScope`; the route adapter claims the terminal and releases
 /// the matching LFM-AR start latch before the scheduler retires the lane.
@@ -1297,8 +1331,11 @@ pub fn drive_qwen_continuous_batch(
                     "[batch] qwen mark_awaiting_commit failed lane {idx} id={} — aborting lane",
                     key.id
                 );
-                let _ = batch_state.reset_lane(gpu, &config, idx);
-                let _ = sched.abort_lane(idx, &key, admission);
+                if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
+                    retire_lane_after_reset_failure(sched, stdout, &key, admission, idx, "mark_awaiting_commit", &e);
+                } else {
+                    let _ = sched.abort_lane(idx, &key, admission);
+                }
                 producers[idx] = None;
                 continue;
             }
@@ -1308,8 +1345,11 @@ pub fn drive_qwen_continuous_batch(
                 writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
             };
             if !write_ok {
-                let _ = batch_state.reset_lane(gpu, &config, idx);
-                let _ = sched.abort_lane(idx, &key, admission);
+                if let Err(e) = batch_state.reset_lane(gpu, &config, idx) {
+                    retire_lane_after_reset_failure(sched, stdout, &key, admission, idx, "commit_ready publish", &e);
+                } else {
+                    let _ = sched.abort_lane(idx, &key, admission);
+                }
                 producers[idx] = None;
             }
             // On success, lane stays AwaitingClient reserved until commit/abort decision.
@@ -2056,8 +2096,11 @@ pub fn drive_lfm_continuous_batch(
                 } else {
                     // Partial assign failure: rollback any already-assigned lanes.
                     for (k, t) in assigned_keys.iter().zip(assigned_tickets.iter()) {
-                        let _ = batch_state.reset_lane(gpu, config, t.lane);
-                        let _ = sched.abort_lane(t.lane, k, t.admission);
+                        if let Err(e) = batch_state.reset_lane(gpu, config, t.lane) {
+                            retire_lane_after_reset_failure(sched, stdout, k, t.admission, t.lane, "partial assign rollback", &e);
+                        } else {
+                            let _ = sched.abort_lane(t.lane, k, t.admission);
+                        }
                     }
                 }
             }
@@ -2184,8 +2227,11 @@ pub fn drive_lfm_continuous_batch(
                 let marked = sched.mark_awaiting_commit(lane_idx, pending_done.clone());
                 if !marked {
                     // Failed to mark — rollback lane without publishing.
-                    let _ = batch_state.reset_lane(gpu, config, lane_idx);
-                    let _ = sched.abort_lane(lane_idx, &key, admission);
+                    if let Err(e) = batch_state.reset_lane(gpu, config, lane_idx) {
+                        retire_lane_after_reset_failure(sched, stdout, &key, admission, lane_idx, "mark_awaiting_commit", &e);
+                    } else {
+                        let _ = sched.abort_lane(lane_idx, &key, admission);
+                    }
                     continue;
                 }
                 let write_ok = {
@@ -2195,8 +2241,11 @@ pub fn drive_lfm_continuous_batch(
                 };
                 if !write_ok {
                     // Publication failed — rollback attested reset and free lane.
-                    let _ = batch_state.reset_lane(gpu, config, lane_idx);
-                    let _ = sched.abort_lane(lane_idx, &key, admission);
+                    if let Err(e) = batch_state.reset_lane(gpu, config, lane_idx) {
+                        retire_lane_after_reset_failure(sched, stdout, &key, admission, lane_idx, "commit_ready publish", &e);
+                    } else {
+                        let _ = sched.abort_lane(lane_idx, &key, admission);
+                    }
                 }
                 continue;
             }
@@ -2592,8 +2641,11 @@ pub fn drive_lfm_continuous_batch(
                     "[batch] mark_awaiting_commit failed for lane {idx} id={} — aborting lane",
                     key.id
                 );
-                let _ = batch_state.reset_lane(gpu, config, idx);
-                let _ = sched.abort_lane(idx, &key, admission);
+                if let Err(e) = batch_state.reset_lane(gpu, config, idx) {
+                    retire_lane_after_reset_failure(sched, stdout, &key, admission, idx, "mark_awaiting_commit", &e);
+                } else {
+                    let _ = sched.abort_lane(idx, &key, admission);
+                }
                 continue;
             }
             let write_ok = {
@@ -2602,8 +2654,11 @@ pub fn drive_lfm_continuous_batch(
                 writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
             };
             if !write_ok {
-                let _ = batch_state.reset_lane(gpu, config, idx);
-                let _ = sched.abort_lane(idx, &key, admission);
+                if let Err(e) = batch_state.reset_lane(gpu, config, idx) {
+                    retire_lane_after_reset_failure(sched, stdout, &key, admission, idx, "commit_ready publish", &e);
+                } else {
+                    let _ = sched.abort_lane(idx, &key, admission);
+                }
                 continue;
             }
         }
@@ -3761,8 +3816,11 @@ pub fn drive_qwen35_ep_continuous_batch(
                     "[batch][EP] qwen mark_awaiting_commit failed lane {idx} id={} — aborting lane",
                     key.id
                 );
-                let _ = batch_state.reset_lane(gpus, config, idx);
-                let _ = sched.abort_lane(idx, &key, admission);
+                if let Err(e) = batch_state.reset_lane(gpus, config, idx) {
+                    retire_lane_after_reset_failure(sched, stdout, &key, admission, idx, "mark_awaiting_commit", &e);
+                } else {
+                    let _ = sched.abort_lane(idx, &key, admission);
+                }
                 producers[idx] = None;
                 continue;
             }
@@ -3772,8 +3830,11 @@ pub fn drive_qwen35_ep_continuous_batch(
                 writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
             };
             if !write_ok {
-                let _ = batch_state.reset_lane(gpus, config, idx);
-                let _ = sched.abort_lane(idx, &key, admission);
+                if let Err(e) = batch_state.reset_lane(gpus, config, idx) {
+                    retire_lane_after_reset_failure(sched, stdout, &key, admission, idx, "commit_ready publish", &e);
+                } else {
+                    let _ = sched.abort_lane(idx, &key, admission);
+                }
                 producers[idx] = None;
             }
         }
@@ -4980,6 +5041,118 @@ mod tests {
             attempt_id,
             reuse_admission
         ));
+        set_active_attempt_id(0);
+        clear_terminal_control();
+    }
+    /// A lane whose GPU reset fails is retired with a visible
+    /// `rolled_back=false` error keyed by its own AttemptKey claim; the
+    /// peer lane keeps serving untouched. Ordinary and EP drivers call
+    /// `retire_lane_after_reset_failure` independently per failed lane,
+    /// so both flavors are exercised here through their own admissions.
+    #[test]
+    fn lane_reset_failure_retires_with_visible_unattested_error() {
+        let _guard = lock();
+        batch_clear_all_terminals();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+
+        let mut sched = ContinuousBatchScheduler::new(2, 8);
+        let mut lanes = Vec::new();
+        for (id, attempt_id) in [("retire-ordinary", 701_u64), ("retire-ep", 702_u64)] {
+            let admission = batch_announce_terminal(id, attempt_id).expect("batch admission");
+            let key = AttemptKey::new(id, attempt_id);
+            assert!(sched.enqueue(BatchPendingRequest {
+                key: key.clone(),
+                admission,
+                original_msg: serde_json::json!({
+                    "type": "generate",
+                    "id": id,
+                    "attempt_id": attempt_id,
+                }),
+                prompt: "hello".to_string(),
+                prompt_tokens: vec![1, 2, 3],
+                started_in_think: false,
+                system: None,
+                assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                max_think_tokens: 0,
+                max_tokens: 4,
+                client_seed: None,
+                sampling: BatchSampling {
+                    temp: 0.0,
+                    top_p: 1.0,
+                    top_k: None,
+                    min_p: None,
+                    repeat_penalty: 1.0,
+                    presence_penalty: 0.0,
+                    frequency_penalty: 0.0,
+                    repeat_window: 128,
+                },
+            }));
+            let (assigned_key, ticket) = sched.try_assign_one().expect("assigned lane");
+            assert_eq!(assigned_key, key);
+            lanes.push((key, admission, ticket.lane));
+        }
+        let mut output = Vec::new();
+        let (first, second) = (&lanes[0], &lanes[1]);
+        retire_lane_after_reset_failure(
+            &mut sched,
+            &mut output,
+            &first.0,
+            first.1,
+            first.2,
+            "commit_ready publish",
+            &"injected reset failure",
+        );
+        // The peer lane keeps serving untouched: it still holds its key and
+        // its admission is still live after the first lane retired.
+        assert!(
+            sched.lanes[second.2].key().is_some_and(|k| k == &second.0),
+            "peer lane keeps its key"
+        );
+        assert!(
+            batch_terminal_generation(&second.0.id, second.0.attempt_id).is_some(),
+            "peer admission stays live"
+        );
+        retire_lane_after_reset_failure(
+            &mut sched,
+            &mut output,
+            &second.0,
+            second.1,
+            second.2,
+            "mark_awaiting_commit",
+            &"injected reset failure",
+        );
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&output)
+            .expect("UTF-8 error envelopes")
+            .lines()
+            .filter(|line| !line.is_empty())
+            .map(|line| serde_json::from_str(line).expect("JSON event"))
+            .collect();
+        assert_eq!(events.len(), 2, "one visible error per retired lane");
+        for (event, (key, _, _)) in events.iter().zip(lanes.iter()) {
+            assert_eq!(event["type"], "error");
+            assert_eq!(event["id"].as_str(), Some(key.id.as_str()));
+            assert_eq!(event["attempt_id"].as_u64(), Some(key.attempt_id));
+            assert_eq!(event["class"].as_str(), Some("gpu"));
+            assert_eq!(event["retryable"], serde_json::json!(false));
+            assert_eq!(event["rolled_back"], serde_json::json!(false));
+            assert!(
+                event["message"].as_str().is_some_and(|m| m.contains("lane retired")),
+                "reset failure stays visible: {}",
+                event["message"]
+            );
+        }
+        for (key, admission, lane_idx) in &lanes {
+            assert!(
+                sched.lanes[*lane_idx].key().is_none(),
+                "failed lane is retired, not reused"
+            );
+            assert_eq!(
+                batch_terminal_generation(&key.id, key.attempt_id),
+                None,
+                "retired admission cleared independently"
+            );
+        }
         set_active_attempt_id(0);
         clear_terminal_control();
     }

@@ -44,7 +44,6 @@ use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
 use hipfire_engine::wire_seed::parse_wire_seed;
 #[cfg(feature = "serve-fault-inject")]
-use hipfire_generate::ar::arm_fault_after_prefill;
 #[cfg(feature = "serve-fault-inject")]
 use hipfire_generate::ar::take_fault_after_prefill;
 use hipfire_generate::ar::{
@@ -197,17 +196,7 @@ fn announce_generate_terminal(
 }
 
 // ── serve-fault-inject (test-only; compiled out of production) ─────────
-// One-shot after-prefill GPU fault arm. Armed from generate parse when the
-// feature is on and the request carries test_fault_after_prefill:true.
-
-#[cfg(feature = "serve-fault-inject")]
-struct FaultAfterPrefillGuard;
-#[cfg(feature = "serve-fault-inject")]
-impl Drop for FaultAfterPrefillGuard {
-    fn drop(&mut self) {
-        arm_fault_after_prefill(false);
-    }
-}
+// Per-request fault arming lives in hipfire_generate::common::RequestFaultGuard.
 
 #[cfg(feature = "serve-fault-inject")]
 fn write_test_state_snapshot(
@@ -461,6 +450,14 @@ const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
 /// can still OOM at allocation; that VRAM validation is out of scope here.
 const MAX_REQUESTED_SEQ: usize = 1024 * 1024;
 
+/// #666 G1: lower bound on a request-driven `max_seq`, symmetric with
+/// `MAX_REQUESTED_SEQ`. A resolved `max_seq` of 0 reaches the
+/// `saddle-core/src/kv.rs` `physical_cap (0) must be in (0, max_seq_len=0]`
+/// assertion, which panics and kills the daemon, taking the resident model
+/// with it. The `load` arm refuses 0 fail-closed before any teardown or KV
+/// allocation; the assertion stays as a last-resort invariant.
+const MIN_REQUESTED_SEQ: usize = 1;
+
 /// Typed active-attempt error writer used by generation failure paths and tests.
 fn write_typed_error(
     stdout: &mut impl std::io::Write,
@@ -678,7 +675,7 @@ fn receive_startup_config(
             None => DaemonMsg::Regular(msg),
         };
         return Ok(Some((config, Some(pending), false)));
-}
+    }
 }
 
 fn main() {
@@ -982,6 +979,23 @@ fn main() {
                     .and_then(|p| p.get("experimental_multi_slot"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
+                // #666 G1: fail-closed floor admission BEFORE any teardown or
+                // allocation on either branch below; both downstream read
+                // sites reuse `requested_seq`, so the refusal cannot be
+                // outflanked by branch order.
+                let requested_seq = msg
+                    .get("params")
+                    .and_then(|p| p.get("max_seq"))
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(4096) as usize;
+                if requested_seq < MIN_REQUESTED_SEQ {
+                    let e = format!(
+                        "load refused: max_seq {requested_seq} below floor {MIN_REQUESTED_SEQ}"
+                    );
+                    emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
+                    let _ = stdout.flush();
+                    continue;
+                }
                 if experimental_multi_slot {
                     // Experimental slot backend is an alternate model owner, not a batch-mode switch.
                     // Validate mutually exclusive knobs before any GPU work.
@@ -1091,11 +1105,8 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
-                    let requested_max_seq = msg
-                        .get("params")
-                        .and_then(|p| p.get("max_seq"))
-                        .and_then(|v| v.as_u64())
-                        .unwrap_or(4096) as usize;
+                    // Floor already admitted pre-teardown above.
+                    let requested_max_seq = requested_seq;
                     let max_seq = requested_max_seq.min(MAX_REQUESTED_SEQ);
                     let n_slots = msg
                         .get("params")
@@ -1207,11 +1218,8 @@ fn main() {
                 // max_seq drives a multi-GB KV allocation and OOMs the daemon at
                 // load. Emit an info event when the clamp actually fires so the
                 // operator sees the truncation rather than silently getting 1M.
-                let requested_max_seq = msg
-                    .get("params")
-                    .and_then(|p| p.get("max_seq"))
-                    .and_then(|v| v.as_u64())
-                    .unwrap_or(4096) as usize;
+                // Floor already admitted pre-teardown above.
+                let requested_max_seq = requested_seq;
                 let max_seq = requested_max_seq.min(MAX_REQUESTED_SEQ);
                 if requested_max_seq > MAX_REQUESTED_SEQ {
                     let _ = writeln!(
@@ -2298,14 +2306,8 @@ fn main() {
                     }
                 };
                 #[cfg(feature = "serve-fault-inject")]
-                let _fault_guard = {
-                    let want = msg
-                        .get("test_fault_after_prefill")
-                        .and_then(|v| v.as_bool())
-                        .unwrap_or(false);
-                    arm_fault_after_prefill(want);
-                    FaultAfterPrefillGuard
-                };
+                let _fault_guard =
+                    hipfire_generate::common::RequestFaultGuard::arm_from_request(&msg);
                 // Experimental slot backend dispatches before the ordinary model path.
                 // This preserves byte-for-byte default behavior when absent, and in experimental
                 // mode owns exactly one SlotEngine/weight set with no ordinary-model fallback.
@@ -3101,8 +3103,11 @@ fn main() {
                     if ep_batch_eligible {
                         let _ = batch_transition_to_queued(id, gen_attempt_id, admission);
                         if batch_check_abort(id, gen_attempt_id, admission) {
-                            let _scope =
-                                BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission);
+                            let _scope = BatchAttemptScope::enter_for_generation(
+                                id,
+                                gen_attempt_id,
+                                admission,
+                            );
                             hipfire_generate::ar::emit_generation_start(
                                 hipfire_generate::ar::GenerationRoute::QwenAr,
                                 &mut stdout,
@@ -3243,8 +3248,11 @@ fn main() {
                     if ep_batch_staged {
                         // EP requests without serve_continuous_batch or with excluded features must error.
                         if !ep_batch_eligible {
-                            let _scope =
-                                BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission);
+                            let _scope = BatchAttemptScope::enter_for_generation(
+                                id,
+                                gen_attempt_id,
+                                admission,
+                            );
                             let ep = hipfire_generate::common::RollbackEpilogue {
                                 rolled_back: true,
                                 context: None,
@@ -3271,8 +3279,11 @@ fn main() {
                         let _ = batch_transition_to_queued(id, gen_attempt_id, admission);
                         // If already aborted, emit cancelled and do not enqueue.
                         if batch_check_abort(id, gen_attempt_id, admission) {
-                            let _scope =
-                                BatchAttemptScope::enter_for_generation(id, gen_attempt_id, admission);
+                            let _scope = BatchAttemptScope::enter_for_generation(
+                                id,
+                                gen_attempt_id,
+                                admission,
+                            );
                             hipfire_generate::ar::emit_generation_start(
                                 hipfire_generate::ar::GenerationRoute::QwenAr,
                                 &mut stdout,
@@ -3457,12 +3468,11 @@ fn main() {
                                         "[batch] impossible arch {} reached scheduler — fail closed",
                                         arch
                                     );
-                                    let _scope =
-                                        BatchAttemptScope::enter_for_generation(
-                                            id,
-                                            gen_attempt_id,
-                                            admission,
-                                        );
+                                    let _scope = BatchAttemptScope::enter_for_generation(
+                                        id,
+                                        gen_attempt_id,
+                                        admission,
+                                    );
                                     let ep = hipfire_generate::common::RollbackEpilogue {
                                         rolled_back: true,
                                         context: None,
@@ -4606,8 +4616,6 @@ mod tests {
         AttemptKey, BatchAttemptScope,
     };
 
-
-
     #[test]
     fn vision_mode_off_drops_even_an_explicit_sidecar() {
         // Hard override, mirroring the `dflash_mode=off` draft guard: a
@@ -4779,8 +4787,7 @@ mod tests {
         ] {
             let id = format!("admission-batch-{offset}");
             let attempt = 70_001 + offset;
-            let admission =
-                batch_announce_terminal(&id, attempt).expect("batch admission");
+            let admission = batch_announce_terminal(&id, attempt).expect("batch admission");
             let mut out = Vec::new();
             emit_batch_admission_error(
                 &mut out,
