@@ -111,17 +111,21 @@ pub fn emit_reasoning_token(stdout: &mut impl std::io::Write, id: &str, text: &s
     let _ = stdout.flush();
 }
 
-/// Canonical `{name, arguments}` array for staged terminal / tool_calls events.
+/// Canonical `{id?, name, arguments}` array for staged terminal / tool_calls events.
 pub fn tool_calls_canonical_json(
     calls: &[hipfire_runtime::prompt_frame::ToolCall],
 ) -> Vec<serde_json::Value> {
     calls
         .iter()
         .map(|tc| {
-            serde_json::json!({
+            let mut value = serde_json::json!({
                 "name": tc.name,
                 "arguments": tc.arguments,
-            })
+            });
+            if let Some(id) = tc.id.as_deref() {
+                value["id"] = serde_json::Value::String(id.to_owned());
+            }
+            value
         })
         .collect()
 }
@@ -361,4 +365,31 @@ pub fn emit_qwen_ar_cancelled_outcome(
         return TerminalEmitOutcome::new(true, false);
     }
     TerminalEmitOutcome::new(true, stdout.flush().is_ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hipfire_runtime::prompt_frame::ToolCall;
+
+    #[test]
+    fn canonical_tool_calls_preserve_optional_server_id() {
+        let calls = vec![
+            ToolCall {
+                id: Some("call_hf_1_2_0".into()),
+                name: "echo".into(),
+                arguments: serde_json::json!({"text":"hi"}),
+                rendered_body: None,
+            },
+            ToolCall {
+                id: None,
+                name: "legacy".into(),
+                arguments: serde_json::json!({}),
+                rendered_body: None,
+            },
+        ];
+        let values = tool_calls_canonical_json(&calls);
+        assert_eq!(values[0]["id"], "call_hf_1_2_0");
+        assert!(values[1].get("id").is_none());
+    }
 }

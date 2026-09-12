@@ -23,13 +23,15 @@
 //! `SlotEngine`. Generate validates text-only supported wire fields and builds
 //! prompt/convo/continuation with the CLI `slots.rs` semantics.
 
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, RecvTimeoutError};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use hipfire_arch_qwen35::spec_emit::Qwen35Emit;
-use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token};
+use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token, stage_terminal_tool_calls};
 use hipfire_engine::terminal::{
     batch_bind_active, batch_check_abort, batch_clear_terminal_at_generation,
     batch_mark_ready_with_pending, batch_transition_to_queued, batch_wait_decision,
@@ -41,7 +43,8 @@ use hipfire_generate::ar::{
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::prompt_frame::{
-    AssistantPrefix, ChatFrame, JinjaChatFrame, Message, Role, ThinkMode,
+    continuation_suffix_tool_results, qwen35_grammar_on, AssistantPrefix, ChatFrame,
+    JinjaChatFrame, Message, Role, ThinkMode, ToolCall,
 };
 use hipfire_runtime::serve::{Continuation, DoneReason, Event, SubmitRequest};
 use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx};
@@ -76,6 +79,131 @@ pub struct SlotBackend {
     layers: usize,
     vocab: usize,
     active: AtomicUsize,
+    tool_grammar: bool,
+    pending_tools: Mutex<PendingToolBroker>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingToolCall {
+    id: String,
+    name: String,
+}
+
+#[derive(Clone, Debug)]
+struct PendingToolTurn {
+    session: u64,
+    convo: Vec<u64>,
+    calls: Vec<PendingToolCall>,
+}
+
+#[derive(Default)]
+struct PendingToolBroker {
+    by_session: HashMap<u64, PendingToolTurn>,
+    by_call: HashMap<String, u64>,
+}
+
+#[derive(Debug)]
+struct ToolResultClaim {
+    session: u64,
+    results: Vec<String>,
+}
+
+impl PendingToolBroker {
+    fn remove_session(&mut self, session: u64) {
+        if let Some(turn) = self.by_session.remove(&session) {
+            for call in turn.calls {
+                self.by_call.remove(&call.id);
+            }
+        }
+    }
+
+    fn register(&mut self, session: u64, convo: Vec<u64>, calls: &[ToolCall]) {
+        self.remove_session(session);
+        let calls = calls
+            .iter()
+            .filter_map(|call| {
+                call.id.as_ref().map(|id| PendingToolCall {
+                    id: id.clone(),
+                    name: call.name.clone(),
+                })
+            })
+            .collect::<Vec<_>>();
+        if calls.is_empty() {
+            return;
+        }
+        for call in &calls {
+            self.by_call.insert(call.id.clone(), session);
+        }
+        self.by_session.insert(
+            session,
+            PendingToolTurn {
+                session,
+                convo,
+                calls,
+            },
+        );
+    }
+
+    /// Resolve and consume one complete tool-result turn atomically. Consuming
+    /// before submit makes retries fail closed; the caller closes the session
+    /// if admission or generation subsequently fails.
+    fn claim(
+        &mut self,
+        messages: &[Message],
+        convo: &[u64],
+    ) -> Result<Option<ToolResultClaim>, String> {
+        let results = trailing_tool_results(messages)?;
+        if results.is_empty() {
+            return Ok(None);
+        }
+        let mut sessions = HashSet::new();
+        for (_, id, _) in &results {
+            let session = self
+                .by_call
+                .get(id)
+                .copied()
+                .ok_or_else(|| format!("unknown or stale tool_call_id {id:?}"))?;
+            sessions.insert(session);
+        }
+        if sessions.len() != 1 {
+            return Err("tool results span multiple pending slot sessions".to_string());
+        }
+        let session = *sessions.iter().next().expect("one session");
+        let pending = self
+            .by_session
+            .get(&session)
+            .ok_or_else(|| "pending tool turn disappeared".to_string())?;
+        if pending.session != session || pending.convo != convo {
+            return Err("tool results do not match the pending conversation".to_string());
+        }
+        if pending.calls.len() != results.len() {
+            return Err("tool-result turn must answer every pending call exactly once".to_string());
+        }
+        let mut by_id = HashMap::new();
+        for (name, id, content) in results {
+            if by_id.insert(id.clone(), (name, content)).is_some() {
+                return Err(format!("duplicate tool_call_id {id:?}"));
+            }
+        }
+        let mut ordered = Vec::with_capacity(pending.calls.len());
+        for call in &pending.calls {
+            let Some((name, content)) = by_id.remove(&call.id) else {
+                return Err(format!("missing result for tool_call_id {:?}", call.id));
+            };
+            if name.as_deref().is_some_and(|name| name != call.name) {
+                return Err(format!(
+                    "tool result name does not match pending call {:?}",
+                    call.id
+                ));
+            }
+            ordered.push(content);
+        }
+        self.remove_session(session);
+        Ok(Some(ToolResultClaim {
+            session,
+            results: ordered,
+        }))
+    }
 }
 
 impl SlotBackend {
@@ -94,6 +222,10 @@ impl SlotBackend {
         let chat_template = preflight.chat_template;
         let vocab = preflight.vocab;
         let tokenizer = preflight.tokenizer;
+        let tool_grammar = qwen35_grammar_on(
+            std::env::var("HIPFIRE_TOOL_GRAMMAR").ok().as_deref(),
+            model_path,
+        );
 
         let n_slots = n_slots.max(1);
         let cap_tokens = cap_tokens.max(1);
@@ -120,6 +252,8 @@ impl SlotBackend {
             layers,
             vocab,
             active: AtomicUsize::new(0),
+            tool_grammar,
+            pending_tools: Mutex::new(PendingToolBroker::default()),
         })
     }
 
@@ -148,6 +282,14 @@ impl SlotBackend {
         }
         Some(SlotGuard { backend: self })
     }
+
+    fn close_session(&self, session: u64) {
+        self.pending_tools
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .remove_session(session);
+        let _ = self.engine.close(session);
+    }
     /// Reset idle sessions. May reject if requests are in flight. Checked teardown.
     pub fn reset(&self) -> Result<(), String> {
         if self.active_count() > 0 {
@@ -157,6 +299,12 @@ impl SlotBackend {
         if res.is_ok() {
             // Clear keyed registry on successful teardown is done by daemon, but also clear here for safety.
             hipfire_engine::terminal::batch_clear_all_terminals();
+            let mut pending = self
+                .pending_tools
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            pending.by_session.clear();
+            pending.by_call.clear();
         }
         res
     }
@@ -438,14 +586,15 @@ impl SlotBackend {
         // Additional contradiction: if max_think==1 but thinking_enabled true? Already handled as authority wins, but spec says reject contradictions. If fallback path derived enabled true but max_think==1 would have been false, but since thinking_enabled absent we use max_think, so not contradictory.
         // If has_think false, ensure plain regardless.
 
-        // Build prompt/convo/continuation using CLI slots semantics with system+name identity.
-        let (system, turns, last_user) = match project_messages(msg) {
-            Ok(v) => v,
-            Err(e) => {
+        // Consume only the gateway-projected tool contract. Raw OpenAI
+        // tool_choice never reaches this owner.
+        let tools = match projected_tools(msg) {
+            Ok(tools) => tools,
+            Err(reason) => {
                 hipfire_engine::emit::emit_active_attempt_error(
                     stdout,
                     Some(id),
-                    &e,
+                    &reason,
                     "validation",
                     false,
                     false,
@@ -454,59 +603,67 @@ impl SlotBackend {
                 return Ok(());
             }
         };
-        // Build convo with system hash + name-aware user hashes
-        let convo = if let Some(arr) = msg.get("messages").and_then(|v| v.as_array()) {
-            let mut msgs: Vec<Message> = Vec::new();
-            for m in arr {
-                let role = match m.get("role").and_then(|v| v.as_str()) {
-                    Some("system") => Role::System,
-                    Some("assistant") => Role::Assistant,
-                    Some("tool") => Role::User,
-                    _ => Role::User,
-                };
-                let content = m
-                    .get("content")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("")
-                    .to_owned();
-                let name = m.get("name").and_then(|v| v.as_str()).map(|s| s.to_owned());
-                msgs.push(Message {
-                    role,
-                    content,
-                    reasoning_content: None,
-                    name: name.clone(),
-                    rendered_name: None,
-                    tool_calls: Vec::new(),
-                    tool_call_id: None,
-                    tool_plan: String::new(),
-                });
+        if let Err(reason) = validate_projected_tool_policy(msg, tools) {
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &reason,
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        }
+        let messages = match project_jinja_messages(msg) {
+            Ok(messages) => messages,
+            Err(reason) => {
+                hipfire_engine::emit::emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &reason,
+                    "validation",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return Ok(());
             }
-            build_convo_from_messages(&msgs)
-        } else {
-            // Fallback prompt-only path: single user is last_user, no history turns
-            let mut c = Vec::new();
-            c.push(system_hash(system.as_deref()));
-            c.push(turn_hash_named(None, &last_user));
-            c
         };
+        // Tool-choice projection may add a transient system instruction to
+        // the rendered prompt.  The gateway also carries its normalized view
+        // from immediately before that mutation; use it for stable ownership
+        // across the subsequent tool-result request (whose choice is commonly
+        // `none`).  Direct daemon callers retain the historical fallback.
+        let conversation_messages = if let Some(identity) = msg.get("conversation_messages") {
+            let identity_request = serde_json::json!({ "messages": identity });
+            match project_jinja_messages(&identity_request) {
+                Ok(messages) => messages,
+                Err(reason) => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("invalid projected conversation identity: {reason}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+            }
+        } else {
+            messages.clone()
+        };
+        let convo = build_convo_from_messages(&conversation_messages);
+        let last_user = messages
+            .iter()
+            .rev()
+            .find(|message| message.role == Role::User)
+            .expect("projection requires a user message");
 
         let (prompt_tokens, started_in_think) =
             if let Some(template) = self.chat_template.as_deref() {
-                let messages = match project_jinja_messages(msg) {
-                    Ok(messages) => messages,
-                    Err(reason) => {
-                        hipfire_engine::emit::emit_active_attempt_error(
-                            stdout,
-                            Some(id),
-                            &reason,
-                            "validation",
-                            false,
-                            false,
-                        );
-                        let _ = stdout.flush();
-                        return Ok(());
-                    }
-                };
                 let frame = JinjaChatFrame {
                     tokenizer: &self.tokenizer,
                     template,
@@ -517,7 +674,7 @@ impl SlotBackend {
                     reasoning_strength: None,
                     reasoning_effort: None,
                 };
-                let rendered = match frame.render_messages(&messages, None, None) {
+                let rendered = match frame.render_messages(&messages, tools, None) {
                     Ok(rendered) => rendered,
                     Err(reason) => {
                         hipfire_engine::emit::emit_active_attempt_error(
@@ -535,6 +692,23 @@ impl SlotBackend {
                 let started = rendered.trim_end().ends_with("<think>");
                 (self.tokenizer.encode(&rendered), started)
             } else {
+                if tools.is_some()
+                    || messages
+                        .iter()
+                        .any(|message| message.role == Role::Tool || !message.tool_calls.is_empty())
+                {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        "tool requests require a model chat_template in experimental multi-slot",
+                        "unsupported",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+                let (system, turns, _) = project_messages(msg).expect("validated projection");
                 let history: Vec<(Role, &str)> = turns
                     .iter()
                     .map(|(role, text)| (*role, text.as_str()))
@@ -542,7 +716,7 @@ impl SlotBackend {
                 let frame = ChatFrame {
                     tokenizer: &self.tokenizer,
                     system: system.as_deref(),
-                    user: &last_user,
+                    user: &last_user.content,
                     assistant_prefix: expected_prefix,
                     raw: false,
                 };
@@ -576,10 +750,36 @@ impl SlotBackend {
             return Ok(());
         }
         let prompt_len = prompt_tokens.len();
-        let continuation = if convo.len() >= 3 {
+        let tool_claim = match self
+            .pending_tools
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .claim(&messages, &convo)
+        {
+            Ok(claim) => claim,
+            Err(reason) => {
+                hipfire_engine::emit::emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &reason,
+                    "validation",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return Ok(());
+            }
+        };
+        let claimed_session = tool_claim.as_ref().map(|claim| claim.session);
+        let continuation = if let Some(claim) = tool_claim {
+            Continuation::ToolResults {
+                tokens: continuation_suffix_tool_results(&self.tokenizer, &claim.results, prefix),
+                session: claim.session,
+            }
+        } else if convo.len() >= 3 {
             Continuation::UserTurn(hipfire_runtime::prompt_frame::continuation_suffix(
                 &self.tokenizer,
-                &last_user,
+                &last_user.content,
                 prefix,
             ))
         } else {
@@ -592,6 +792,9 @@ impl SlotBackend {
         let _route_scope = GenerationRouteScope::enter(GenerationRoute::QwenAr, id);
         emit_generation_start(GenerationRoute::QwenAr, stdout, id, started_in_think);
         if batch_check_abort(id, attempt_id, admission) {
+            if let Some(session) = claimed_session {
+                self.close_session(session);
+            }
             emit_active_route_cancel(stdout, id, 0);
             batch_clear_terminal_at_generation(id, attempt_id, admission);
             return Ok(());
@@ -602,7 +805,7 @@ impl SlotBackend {
         let (tx, rx) = mpsc::channel::<Event>();
         let req = SubmitRequest {
             prompt_tokens,
-            convo,
+            convo: convo.clone(),
             continuation,
             max_tokens,
             temperature,
@@ -612,6 +815,9 @@ impl SlotBackend {
             reply: tx,
         };
         if let Err(e) = self.engine.submit(req) {
+            if let Some(session) = claimed_session {
+                self.close_session(session);
+            }
             emit_qwen_ar_slot_error(
                 stdout,
                 id,
@@ -653,7 +859,9 @@ impl SlotBackend {
             );
             let _ = stdout.flush();
             if let Some(sess) = accepted_session.take() {
-                let _ = self.engine.close(sess);
+                self.close_session(sess);
+            } else if let Some(session) = claimed_session {
+                self.close_session(session);
             }
             return Ok(());
         }
@@ -661,8 +869,8 @@ impl SlotBackend {
             tokenizer: &self.tokenizer,
             eos: self.tokenizer.eos_id,
             im_end: self.tokenizer.special_token_id("<|im_end|>"),
-            tools: None,
-            enable_grammar: false,
+            tools,
+            enable_grammar: self.tool_grammar,
             stop: Vec::new(),
             max_think: 0,
             max_tokens,
@@ -670,22 +878,18 @@ impl SlotBackend {
             think_mode,
             decoded_vocab: None,
         });
-        let render_events = |events: Vec<ClientEvent>, stdout: &mut W| -> Result<(), String> {
-            for event in events {
-                match event {
-                    ClientEvent::Token(text) => emit_visible_token(stdout, id, &text),
-                    ClientEvent::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
-                    ClientEvent::Committed { .. } => {}
-                    ClientEvent::ToolCalls(_) => {
-                        return Err(
-                            "model emitted tool calls on a tool-disabled multi-slot request"
-                                .to_string(),
-                        )
+        let render_events =
+            |events: Vec<ClientEvent>, stdout: &mut W, tool_calls: &mut Vec<ToolCall>| {
+                for event in events {
+                    match event {
+                        ClientEvent::Token(text) => emit_visible_token(stdout, id, &text),
+                        ClientEvent::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                        ClientEvent::Committed { .. } => {}
+                        ClientEvent::ToolCalls(mut calls) => tool_calls.append(&mut calls),
                     }
                 }
-            }
-            Ok(())
-        };
+            };
+        let mut terminal_tool_calls = Vec::new();
         let mut first_token = true;
 
         let mut done_reason: Option<(DoneReason, usize)> = None;
@@ -695,7 +899,9 @@ impl SlotBackend {
             if batch_check_abort(id, attempt_id, admission) {
                 drop(rx);
                 if let Some(sess) = accepted_session.take() {
-                    let _ = self.engine.close(sess);
+                    self.close_session(sess);
+                } else if let Some(session) = claimed_session {
+                    self.close_session(session);
                 }
                 emit_active_route_cancel(stdout, id, produced);
                 return Ok(());
@@ -707,6 +913,17 @@ impl SlotBackend {
                         reused,
                         prefill,
                     } => {
+                        if let Some(expected) =
+                            claimed_session.filter(|expected| *expected != session)
+                        {
+                            self.close_session(expected);
+                            accepted_session = Some(session);
+                            rejected = Some(
+                                "tool-result reentry was admitted on the wrong slot session"
+                                    .to_string(),
+                            );
+                            break;
+                        }
                         accepted_session = Some(session);
                         cached_tokens = reused;
                         prefill_tokens = prefill;
@@ -725,10 +942,7 @@ impl SlotBackend {
                         } else {
                             emitter.observe(tok_id)
                         };
-                        if let Err(reason) = render_events(outcome.events, stdout) {
-                            rejected = Some(reason);
-                            break;
-                        }
+                        render_events(outcome.events, stdout, &mut terminal_tool_calls);
                         produced += 1;
                     }
                     Event::Done { reason, generated } => {
@@ -748,7 +962,9 @@ impl SlotBackend {
         if let Some(reason) = rejected {
             drop(rx);
             if let Some(sess) = accepted_session.take() {
-                let _ = self.engine.close(sess);
+                self.close_session(sess);
+            } else if let Some(session) = claimed_session {
+                self.close_session(session);
             }
             emit_qwen_ar_slot_error(
                 stdout,
@@ -761,12 +977,37 @@ impl SlotBackend {
             let _ = stdout.flush();
             return Ok(());
         }
-        let summary = emitter.finish();
-        if let Err(reason) = render_events(summary.events, stdout) {
-            if let Some(sess) = accepted_session.take() {
-                let _ = self.engine.close(sess);
+        if accepted_session.is_none() {
+            if let Some(session) = claimed_session {
+                self.close_session(session);
             }
-            emit_qwen_ar_slot_error(stdout, id, &reason, "internal", false, false);
+            emit_qwen_ar_slot_error(
+                stdout,
+                id,
+                "multi_slot stream ended before session acceptance",
+                "internal",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        }
+        let summary = emitter.finish();
+        render_events(summary.events, stdout, &mut terminal_tool_calls);
+        if matches!(summary.finish_reason, "malformed_protocol" | "open_think") {
+            if let Some(sess) = accepted_session.take() {
+                self.close_session(sess);
+            } else if let Some(session) = claimed_session {
+                self.close_session(session);
+            }
+            emit_qwen_ar_slot_error(
+                stdout,
+                id,
+                &format!("unsafe multi_slot terminal: {}", summary.finish_reason),
+                "generation",
+                false,
+                false,
+            );
             let _ = stdout.flush();
             return Ok(());
         }
@@ -774,7 +1015,9 @@ impl SlotBackend {
         let (reason, generated) = done_reason.unwrap_or((DoneReason::Eos, produced));
         if matches!(reason, DoneReason::ClientGone) {
             if let Some(sess) = accepted_session.take() {
-                let _ = self.engine.close(sess);
+                self.close_session(sess);
+            } else if let Some(session) = claimed_session {
+                self.close_session(session);
             }
             emit_active_route_cancel(stdout, id, produced);
             return Ok(());
@@ -782,16 +1025,35 @@ impl SlotBackend {
 
         // Stage normal done payload and await commit via keyed registry.
         let finish_reason = match reason {
-            DoneReason::MaxTokens => "length",
-            _ => "stop",
+            DoneReason::MaxTokens if !summary.decoded_eot => "length",
+            _ => summary.finish_reason,
         };
+        if finish_reason != "tool_calls" {
+            terminal_tool_calls.clear();
+        } else {
+            let Some(session) = accepted_session else {
+                emit_qwen_ar_slot_error(
+                    stdout,
+                    id,
+                    "tool-call terminal missing accepted slot session",
+                    "internal",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return Ok(());
+            };
+            for (index, call) in terminal_tool_calls.iter_mut().enumerate() {
+                call.id = Some(format!("call_hf_{session:016x}_{attempt_id:016x}_{index}"));
+            }
+        }
         let total_s = t_start.elapsed().as_secs_f64();
         let tok_s = if total_s > 0.0 {
             produced as f64 / total_s
         } else {
             0.0
         };
-        let pending_done = serde_json::json!({
+        let mut pending_done = serde_json::json!({
             "type": "done",
             "id": id,
             "attempt_id": attempt_id,
@@ -802,32 +1064,12 @@ impl SlotBackend {
             "prefill_tokens": prefill_tokens,
             "tok_s": (tok_s * 10.0).round() / 10.0,
         });
+        stage_terminal_tool_calls(&mut pending_done, finish_reason, &terminal_tool_calls);
 
         // Mark ready with exact pending done, publish commit_ready, poll keyed Commit/Abort with normal timeout
-        let ticket = accepted_ticket.unwrap_or(LaneTicket {
-            lane: 0,
-            generation: 0,
-            admission,
-        });
-        // If no session accepted, we still need to handle terminal: directly emit cancelled? But we have pending_done
-        if accepted_session.is_some() {
-            let _ = batch_mark_ready_with_pending(
-                id,
-                attempt_id,
-                admission,
-                ticket,
-                pending_done.clone(),
-            );
-        } else {
-            // No session: treat as ready with dummy ticket to allow commit wait? Just emit done directly
-            let _ = batch_mark_ready_with_pending(
-                id,
-                attempt_id,
-                admission,
-                ticket,
-                pending_done.clone(),
-            );
-        }
+        let ticket = accepted_ticket.expect("accepted session binds a lane ticket");
+        let _ =
+            batch_mark_ready_with_pending(id, attempt_id, admission, ticket, pending_done.clone());
         let mut commit_ready = pending_done.clone();
         if let Some(map) = commit_ready.as_object_mut() {
             map.insert(
@@ -842,13 +1084,21 @@ impl SlotBackend {
             batch_wait_decision(id, attempt_id, admission, CLIENT_TERMINAL_COMMIT_TIMEOUT);
         match decision {
             hipfire_engine::terminal::ClientTerminalDecision::Commit => {
+                if let Some(session) = accepted_session {
+                    self.pending_tools
+                        .lock()
+                        .unwrap_or_else(|error| error.into_inner())
+                        .register(session, convo.clone(), &terminal_tool_calls);
+                }
                 // Emit byte-identical done through the route adapter so the
                 // keyed claim and route-start latch are retired together.
                 emit_active_route_done(stdout, id, &pending_done);
             }
             hipfire_engine::terminal::ClientTerminalDecision::Abort => {
                 if let Some(sess) = accepted_session.take() {
-                    let _ = self.engine.close(sess);
+                    self.close_session(sess);
+                } else if let Some(session) = claimed_session {
+                    self.close_session(session);
                 }
                 emit_active_route_cancel(stdout, id, produced);
             }
@@ -1058,32 +1308,18 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
             .and_then(|v| v.as_array())
             .is_some_and(|messages| {
                 messages.iter().any(|message| {
-                    message.get("role").and_then(|v| v.as_str()) == Some("tool")
-                        || message
-                            .get("tool_calls")
-                            .and_then(|v| v.as_array())
-                            .is_some_and(|calls| !calls.is_empty())
-                        || message
-                            .get("content")
-                            .and_then(|v| v.as_array())
-                            .is_some_and(|parts| {
-                                parts.iter().any(|part| {
-                                    part.get("type").and_then(|v| v.as_str()) == Some("image_url")
-                                })
+                    message
+                        .get("content")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|parts| {
+                            parts.iter().any(|part| {
+                                part.get("type").and_then(|v| v.as_str()) == Some("image_url")
                             })
+                        })
                 })
             })
     {
-        return Some(
-            "images and tool-result roles are not supported in experimental multi-slot".to_string(),
-        );
-    }
-    if msg
-        .get("tools")
-        .and_then(|v| v.as_array())
-        .is_some_and(|tools| !tools.is_empty())
-    {
-        return Some("tools not supported in experimental multi-slot".to_string());
+        return Some("images are not supported in experimental multi-slot".to_string());
     }
     if msg.get("stop").is_some_and(|v| !v.is_null()) {
         return Some("custom stop not supported in experimental multi-slot".to_string());
@@ -1235,6 +1471,7 @@ fn project_jinja_messages(msg: &serde_json::Value) -> Result<Vec<Message>, Strin
         let role = match message.get("role").and_then(|value| value.as_str()) {
             Some("system") => Role::System,
             Some("assistant") => Role::Assistant,
+            Some("tool") => Role::Tool,
             Some("user") | None => Role::User,
             Some(other) => {
                 return Err(format!(
@@ -1242,6 +1479,31 @@ fn project_jinja_messages(msg: &serde_json::Value) -> Result<Vec<Message>, Strin
                 ))
             }
         };
+        let tool_calls = message
+            .get("tool_calls")
+            .and_then(serde_json::Value::as_array)
+            .map(|calls| {
+                calls
+                    .iter()
+                    .map(|call| {
+                        serde_json::from_value::<ToolCall>(call.clone())
+                            .map_err(|error| format!("invalid assistant tool call: {error}"))
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .transpose()?
+            .unwrap_or_default();
+        if !tool_calls.is_empty() && role != Role::Assistant {
+            return Err("tool_calls are only valid on assistant messages".to_string());
+        }
+        let tool_call_id = message
+            .get("tool_call_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|id| !id.is_empty())
+            .map(str::to_owned);
+        if role == Role::Tool && tool_call_id.is_none() {
+            return Err("tool message requires a non-empty tool_call_id".to_string());
+        }
         projected.push(Message {
             role,
             content: message
@@ -1258,15 +1520,103 @@ fn project_jinja_messages(msg: &serde_json::Value) -> Result<Vec<Message>, Strin
                 .and_then(|value| value.as_str())
                 .map(str::to_owned),
             rendered_name: None,
-            tool_calls: Vec::new(),
-            tool_call_id: None,
-            tool_plan: String::new(),
+            tool_calls,
+            tool_call_id,
+            tool_plan: message
+                .get("tool_plan")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_owned(),
         });
     }
     if !projected.iter().any(|message| message.role == Role::User) {
         return Err("messages must contain at least one user message".to_string());
     }
     Ok(projected)
+}
+
+fn projected_tools(msg: &serde_json::Value) -> Result<Option<&[serde_json::Value]>, String> {
+    match msg.get("tools") {
+        None | Some(serde_json::Value::Null) => Ok(None),
+        Some(serde_json::Value::Array(tools)) if tools.is_empty() => Ok(None),
+        Some(serde_json::Value::Array(tools)) => Ok(Some(tools)),
+        Some(_) => Err("projected tools must be an array".to_string()),
+    }
+}
+
+fn validate_projected_tool_policy(
+    msg: &serde_json::Value,
+    tools: Option<&[serde_json::Value]>,
+) -> Result<(), String> {
+    match msg.get("tool_choice_policy") {
+        None => Ok(()),
+        Some(serde_json::Value::String(policy)) if policy == "auto" => Ok(()),
+        Some(serde_json::Value::String(policy)) if policy == "none" => {
+            if tools.is_some() {
+                Err("projected tool_choice none must not carry tools".to_string())
+            } else {
+                Ok(())
+            }
+        }
+        Some(serde_json::Value::String(policy)) if policy == "required" => tools
+            .filter(|tools| !tools.is_empty())
+            .map(|_| ())
+            .ok_or_else(|| "projected tool_choice required needs tools".to_string()),
+        Some(serde_json::Value::Object(policy)) => {
+            let name = policy
+                .get("function")
+                .and_then(serde_json::Value::as_str)
+                .filter(|name| !name.is_empty())
+                .ok_or_else(|| "invalid projected function tool_choice".to_string())?;
+            let tools =
+                tools.ok_or_else(|| "projected function tool_choice needs tools".to_string())?;
+            if tools.iter().all(|tool| {
+                tool.get("function")
+                    .unwrap_or(tool)
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(name)
+            }) {
+                Ok(())
+            } else {
+                Err("projected function tool_choice contains a different tool".to_string())
+            }
+        }
+        Some(_) => Err("invalid projected tool_choice policy".to_string()),
+    }
+}
+
+fn trailing_tool_results(
+    messages: &[Message],
+) -> Result<Vec<(Option<String>, String, String)>, String> {
+    if messages
+        .last()
+        .is_none_or(|message| message.role != Role::Tool)
+    {
+        return Ok(Vec::new());
+    }
+    let assistant = messages
+        .iter()
+        .rposition(|message| message.role == Role::Assistant && !message.tool_calls.is_empty())
+        .ok_or_else(|| "tool results have no preceding assistant tool calls".to_string())?;
+    let tail = &messages[assistant + 1..];
+    if tail.is_empty() || tail.iter().any(|message| message.role != Role::Tool) {
+        return Err(
+            "tool-result messages must directly follow the assistant tool-call turn".to_string(),
+        );
+    }
+    tail.iter()
+        .map(|message| {
+            Ok((
+                message.name.clone(),
+                message
+                    .tool_call_id
+                    .clone()
+                    .ok_or_else(|| "tool result missing tool_call_id".to_string())?,
+                message.content.clone(),
+            ))
+        })
+        .collect()
 }
 
 /// Build convo hashes from turns + last_user (user turns only) with system and name identity.
@@ -1335,9 +1685,9 @@ mod tests {
     }
 
     #[test]
-    fn generate_caps_rejects_tools_and_stop_and_logprobs() {
+    fn generate_caps_accepts_tools_and_rejects_stop_and_logprobs() {
         let m = json!({"tools": [{"type":"function"}], "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m).is_some());
+        assert!(validate_generate_caps(&m).is_none());
         let m2 = json!({"stop": ["END"], "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m2).is_some());
         let m3 = json!({"logprobs": true, "experimental_multi_slot": true});
@@ -1434,23 +1784,122 @@ mod tests {
             "messages": [
                 {"role": "system", "content": "system"},
                 {"role": "user", "content": "question"},
-                {
-                    "role": "assistant",
-                    "content": "answer",
-                    "reasoning_content": "reason"
-                }
+                {"role": "assistant", "content": "answer", "reasoning_content": "reason",
+                 "tool_calls": [{"id":"call_1","name":"echo","arguments":{"text":"x"}}]},
+                {"role":"tool","content":"x","name":"echo","tool_call_id":"call_1"}
             ]
         }))
         .unwrap();
-        assert_eq!(messages.len(), 3);
+        assert_eq!(messages.len(), 4);
         assert_eq!(messages[0].role, Role::System);
         assert_eq!(messages[1].role, Role::User);
         assert_eq!(messages[2].role, Role::Assistant);
         assert_eq!(messages[2].reasoning_content.as_deref(), Some("reason"));
-        assert!(project_jinja_messages(&json!({
-            "messages": [{"role": "tool", "content": "result"}]
+        assert_eq!(messages[2].tool_calls[0].id.as_deref(), Some("call_1"));
+        assert_eq!(messages[3].role, Role::Tool);
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("call_1"));
+    }
+
+    #[test]
+    fn pending_tool_broker_orders_parallel_results_and_consumes_once() {
+        let base = project_jinja_messages(&json!({
+            "messages": [{"role":"user","content":"use both"}]
         }))
-        .is_err());
+        .unwrap();
+        let convo = build_convo_from_messages(&base);
+        let calls = vec![
+            ToolCall {
+                id: Some("call_a".into()),
+                name: "first".into(),
+                arguments: json!({}),
+                rendered_body: None,
+            },
+            ToolCall {
+                id: Some("call_b".into()),
+                name: "second".into(),
+                arguments: json!({}),
+                rendered_body: None,
+            },
+        ];
+        let mut broker = PendingToolBroker::default();
+        broker.register(17, convo.clone(), &calls);
+        let messages = project_jinja_messages(&json!({
+            "messages": [
+                {"role":"user","content":"use both"},
+                {"role":"assistant","content":"","tool_calls":[
+                    {"id":"call_a","name":"first","arguments":{}},
+                    {"id":"call_b","name":"second","arguments":{}}
+                ]},
+                {"role":"tool","name":"second","tool_call_id":"call_b","content":"B"},
+                {"role":"tool","name":"first","tool_call_id":"call_a","content":"A"}
+            ]
+        }))
+        .unwrap();
+        let claim = broker.claim(&messages, &convo).unwrap().expect("claim");
+        assert_eq!(claim.session, 17);
+        assert_eq!(claim.results, ["A", "B"]);
+        assert!(
+            broker.claim(&messages, &convo).is_err(),
+            "reentry ids are one-shot"
+        );
+    }
+
+    #[test]
+    fn pending_tool_broker_rejects_cross_session_and_name_mismatch() {
+        let base = project_jinja_messages(&json!({
+            "messages": [{"role":"user","content":"use tool"}]
+        }))
+        .unwrap();
+        let convo = build_convo_from_messages(&base);
+        let mut broker = PendingToolBroker::default();
+        broker.register(
+            1,
+            convo.clone(),
+            &[ToolCall {
+                id: Some("call_a".into()),
+                name: "first".into(),
+                arguments: json!({}),
+                rendered_body: None,
+            }],
+        );
+        broker.register(
+            2,
+            convo.clone(),
+            &[ToolCall {
+                id: Some("call_b".into()),
+                name: "second".into(),
+                arguments: json!({}),
+                rendered_body: None,
+            }],
+        );
+        let mixed = project_jinja_messages(&json!({"messages":[
+            {"role":"user","content":"use tool"},
+            {"role":"assistant","content":"","tool_calls":[
+                {"id":"call_a","name":"first","arguments":{}},
+                {"id":"call_b","name":"second","arguments":{}}
+            ]},
+            {"role":"tool","tool_call_id":"call_a","content":"A"},
+            {"role":"tool","tool_call_id":"call_b","content":"B"}
+        ]}))
+        .unwrap();
+        assert!(broker
+            .claim(&mixed, &convo)
+            .unwrap_err()
+            .contains("multiple"));
+
+        let wrong_name = project_jinja_messages(&json!({"messages":[
+            {"role":"user","content":"use tool"},
+            {"role":"assistant","content":"","tool_calls":[{"id":"call_a","name":"first","arguments":{}}]},
+            {"role":"tool","name":"wrong","tool_call_id":"call_a","content":"A"}
+        ]})).unwrap();
+        assert!(broker
+            .claim(&wrong_name, &convo)
+            .unwrap_err()
+            .contains("name"));
+        assert!(
+            broker.by_call.contains_key("call_a"),
+            "failed claims must not consume state"
+        );
     }
 
     #[test]
@@ -1492,18 +1941,23 @@ mod tests {
             json!({"presence_penalty": 0.1}),
             json!({"min_p": 0.05}),
             json!({"reasoning_effort": "high"}),
-            json!({"messages": [{"role": "tool", "content": "result"}]}),
-            json!({"messages": [{
-                "role": "assistant",
-                "content": "",
-                "tool_calls": [{"id": "call_0"}]
-            }]}),
         ] {
             assert!(
                 validate_generate_caps(&request).is_some(),
                 "unsupported request passed: {request}"
             );
         }
+        assert!(validate_generate_caps(&json!({
+            "tools": [{"type":"function","function":{"name":"echo"}}],
+            "messages": [
+                {"role":"user","content":"echo hi"},
+                {"role":"assistant","content":"","tool_calls":[{
+                    "id":"call_0","name":"echo","arguments":{"text":"hi"}
+                }]},
+                {"role":"tool","tool_call_id":"call_0","content":"hi"}
+            ]
+        }))
+        .is_none());
     }
 
     #[test]

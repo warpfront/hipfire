@@ -234,8 +234,13 @@ pub(crate) fn tool_call_from_canonical_value(
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
+    let id = obj
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .filter(|id| !id.is_empty())
+        .map(str::to_owned);
     Ok(ToolCall {
-        id: None,
+        id,
         name,
         arguments,
         rendered_body: None,
@@ -429,6 +434,17 @@ pub(crate) enum ToolChoicePolicy {
     Required,
     /// Specific function object — forward only that tool; mandate a matching call.
     Function(String),
+}
+
+impl ToolChoicePolicy {
+    fn daemon_projection(&self) -> serde_json::Value {
+        match self {
+            Self::Auto => serde_json::Value::String("auto".into()),
+            Self::None => serde_json::Value::String("none".into()),
+            Self::Required => serde_json::Value::String("required".into()),
+            Self::Function(name) => serde_json::json!({ "function": name }),
+        }
+    }
 }
 
 fn tool_schema_name(tool: &serde_json::Value) -> Option<&str> {
@@ -1527,6 +1543,11 @@ pub(crate) fn fold_complete_request_stream(
 pub(crate) struct RequestContract {
     pub max_tokens: u64,
     pub messages: serde_json::Value,
+    /// Normalized/default-system-projected messages before tool-choice prompt
+    /// instructions are added.  Slot ownership uses this stable view so a
+    /// normal tool-result request may change `tool_choice` without changing
+    /// conversation identity.
+    pub conversation_messages: serde_json::Value,
     pub tool_choice_policy: ToolChoicePolicy,
     pub forwarded_tools: Option<serde_json::Value>,
 }
@@ -1566,11 +1587,13 @@ pub(crate) fn project_request_contract(
     let mut messages = normalize_openai_messages(body.get("messages"), include_reasoning);
     let default_system = request_string(resolved, "prompt.system", None)?;
     inject_default_system_message(&mut messages, default_system.as_deref());
+    let conversation_messages = messages.clone();
     let (tool_choice_policy, forwarded_tools) =
         project_tool_choice(body.get("tool_choice"), body.get("tools"), &mut messages)?;
     Ok(RequestContract {
         max_tokens,
         messages,
+        conversation_messages,
         tool_choice_policy,
         forwarded_tools,
     })
@@ -1660,6 +1683,7 @@ pub(crate) fn complete_request_attempt(
             runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
         }
         let normalized_messages = contract.messages;
+        let conversation_messages = contract.conversation_messages;
         let tool_choice_policy = contract.tool_choice_policy;
         let forwarded_tools = contract.forwarded_tools;
         let mut generate = serde_json::json!({
@@ -1751,6 +1775,11 @@ pub(crate) fn complete_request_attempt(
         }
         if runtime.multi_slot_enabled {
             generate["experimental_multi_slot"] = serde_json::Value::Bool(true);
+            generate["conversation_messages"] = conversation_messages;
+            // The gateway has already validated and projected the raw OpenAI
+            // choice. Carry only that typed decision across the slot wire;
+            // the daemon must never reinterpret the original HTTP body.
+            generate["tool_choice_policy"] = tool_choice_policy.daemon_projection();
             // Re-check the fully projected wire request, not only the raw HTTP
             // body: registry/config defaults may have inserted a penalty or
             // reasoning control the slot sampler cannot honor.
@@ -2090,7 +2119,7 @@ pub(crate) fn complete_request_attempt(
 /// Whether the experimental multi-slot daemon path can honour this request.
 ///
 /// Pure pre-send gate. Temperature / top_p / top_k remain supported. Rejects
-/// images, tools, non-null stop, logprobs, non-neutral repeat/frequency/
+/// images, non-null stop, logprobs, non-neutral repeat/frequency/
 /// presence penalties, min_p, reasoning caps >= 2, and named thinking budgets
 /// other than `"off"`. Callers with `serve.multi_slot` enabled must surface the
 /// error — there is no ordinary-model fallback in that mode.
@@ -2102,24 +2131,6 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
             .is_some_and(|value| !value.is_null())
     {
         return Err("images are not supported".to_owned());
-    }
-    if body
-        .get("tools")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|tools| !tools.is_empty())
-    {
-        return Err("tools are not supported".to_owned());
-    }
-    if body
-        .get("messages")
-        .and_then(serde_json::Value::as_array)
-        .is_some_and(|messages| {
-            messages.iter().any(|message| {
-                message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
-            })
-        })
-    {
-        return Err("tool-result roles are not supported".to_owned());
     }
     if body.get("stop").is_some_and(|value| !value.is_null()) {
         return Err("stop sequences are not supported".to_owned());
@@ -2834,7 +2845,7 @@ pub(crate) fn openai_tool_call_adapter_results(
         .enumerate()
         .map(|(index, call)| OpenAiToolCallAdapterResult {
             index,
-            id: format!("call_{index}"),
+            id: call.id.clone().unwrap_or_else(|| format!("call_{index}")),
             name: call.name.clone(),
             arguments: serde_json::to_string(&call.arguments).unwrap_or_else(|_| "{}".into()),
         })
@@ -5354,6 +5365,19 @@ mod tests {
     }
 
     #[test]
+    fn openai_adapter_preserves_daemon_owned_call_ids() {
+        let parsed = tool_call_from_canonical_value(&serde_json::json!({
+            "id": "call_hf_0001_0002_0",
+            "name": "echo",
+            "arguments": {"text":"hello"}
+        }))
+        .expect("canonical call");
+        assert_eq!(parsed.id.as_deref(), Some("call_hf_0001_0002_0"));
+        let adapted = openai_tool_call_adapter_results(&[parsed]);
+        assert_eq!(adapted[0].id, "call_hf_0001_0002_0");
+    }
+
+    #[test]
     fn openai_stream_and_nonstream_share_one_adapter_result() {
         let calls = vec![
             sample_tc(
@@ -6681,6 +6705,33 @@ mod tests {
         assert_eq!(tool_schema_name(&arr[0]), Some("echo"));
     }
 
+    #[test]
+    fn tool_choice_instruction_does_not_change_conversation_identity() {
+        let resolved = contract_resolved_with_system("");
+        let tools = echo_and_translate_tools();
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "tool_choice": {
+                "type": "function",
+                "function": { "name": "echo" }
+            },
+            "tools": tools,
+            "messages": [
+                { "role": "system", "content": "stable system" },
+                { "role": "user", "content": "hi" }
+            ]
+        });
+        let contract = project_request_contract(&body, &resolved, false).expect("specific");
+        assert_eq!(
+            contract.conversation_messages[0]["content"],
+            "stable system"
+        );
+        assert_eq!(
+            contract.messages[0]["content"],
+            "stable system\n\nYou must call the `echo` tool."
+        );
+    }
+
     /// Experimental multi-slot accepts sampling that the daemon slot engine
     /// implements (temperature/top_p/top_k) and rejects every other listed
     /// capability before the generate is sent.
@@ -6707,6 +6758,10 @@ mod tests {
         assert!(ok(serde_json::json!({ "repeat_penalty": 1.0 })));
         assert!(ok(serde_json::json!({ "min_p": 0.0 })));
         assert!(ok(serde_json::json!({ "tools": [] })));
+        assert!(ok(serde_json::json!({
+            "tools": [{"type": "function", "function": {"name": "x"}}],
+            "messages": [{"role":"tool","tool_call_id":"call_x","content":"ok"}]
+        })));
 
         err_contains(
             serde_json::json!({
@@ -6719,10 +6774,6 @@ mod tests {
                 }]
             }),
             "images",
-        );
-        err_contains(
-            serde_json::json!({ "tools": [{"type": "function", "function": {"name": "x"}}] }),
-            "tools",
         );
         err_contains(serde_json::json!({ "stop": ["\n\n"] }), "stop");
         err_contains(serde_json::json!({ "stop": "END" }), "stop");
