@@ -57,6 +57,20 @@ pub fn emit_active_attempt_error(
     retryable: bool,
     rolled_back: bool,
 ) {
+    let attempt_id = active_attempt_id();
+    // Attempt zero is reserved for emit_uncorrelated_error before admission.
+    if attempt_id == 0 {
+        return;
+    }
+    if crate::ar::active_generation_route().is_some() {
+        crate::ar::emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
+        return;
+    }
+    if let Some(id) = id {
+        if !claim_wire_terminal(id, attempt_id) {
+            return;
+        }
+    }
     write_error_envelope(
         stdout,
         id,
@@ -64,9 +78,28 @@ pub fn emit_active_attempt_error(
         class,
         retryable,
         rolled_back,
-        active_attempt_id(),
+        attempt_id,
     );
 }
+
+/// Fail-closed operation-failure terminal for the dense AR family (G4.10).
+///
+/// Runs the complete production rollback, then emits exactly one correlated
+/// fail-closed error (no `done`, no assistant-cache store). `rolled_back` and
+/// any reset context come from the attested epilogue, never a literal.
+/// Classification stays `internal`/non-retryable, matching the historical
+/// `emit_error_with_id` sites this replaces.
+pub fn dense_fail_closed_error(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    message: &str,
+) {
+    let ep = production_fail_closed_rollback(m, gpu, None, None);
+    emit_fail_closed_error(stdout, Some(id), message, "internal", false, &ep);
+}
+
 
 /// Speculative wire terminal after `Deepseek4Emit::finish` + length known.
 /// Length always suppresses call release and cache; malformed is error XOR done.
@@ -439,10 +472,21 @@ pub fn generate_deepseek4_spec(
     let decoded_vocab: Option<std::sync::Arc<Vec<String>>> =
         if tools.map_or(false, |t| !t.is_empty()) {
             if m.decoded_vocab.is_none() {
-                let tok = m.tokenizer.as_ref().expect("tokenizer present");
-                let n = tok.vocab_size();
-                let v: Vec<String> = (0..n).map(|id| tok.decode(&[id as u32])).collect();
-                m.decoded_vocab = Some(std::sync::Arc::new(v));
+                match m.tokenizer.as_ref() {
+                    Some(tok) => {
+                        let n = tok.vocab_size();
+                        let v: Vec<String> = (0..n).map(|id| tok.decode(&[id as u32])).collect();
+                        m.decoded_vocab = Some(std::sync::Arc::new(v));
+                    }
+                    None => {
+                        // Unreachable (tokenizer checked at entry) but fail-closed:
+                        // the cache-miss teardown above already mutated GPU
+                        // state, so roll back instead of panicking.
+                        let ep = production_fail_closed_rollback(m, gpu, None, None);
+                        emit_fail_closed_error(stdout, Some(id), "tokenizer not loaded", "internal", false, &ep);
+                        return;
+                    }
+                }
             }
             m.decoded_vocab.clone()
         } else {
@@ -480,11 +524,11 @@ pub fn generate_deepseek4_spec(
     // (prompt_frame.rs): NonThink renders `<｜Assistant｜></think>`, so the model
     // begins in visible-answer mode; High/Max render the `<think>` open-token,
     // so it begins inside the reasoning span.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Deepseek4Spec),
         stdout,
         id,
         !matches!(think_mode, ThinkMode::NonThink),
-        ds4_gen_start_contract_version(),
     );
     let prompt_tokens_total = prompt_ids.len();
     let run = match crate::qwen::generate_spec(
@@ -501,6 +545,7 @@ pub fn generate_deepseek4_spec(
         SpecEmitRequest {
             im_end: None,
             tools: tools.map(|t| t.to_vec()),
+            enable_grammar: tools.is_some(),
             stop: Vec::new(),
             max_think: 0,
             assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
@@ -559,19 +604,33 @@ pub fn generate_deepseek4_spec(
     }
     // Semantic stop (StopSequence/EOS/ThinkCap) or decoded_eot at cap is not
     // length — preserves stop/tool_calls when generated == max_tokens.
-    let hit_length_cap = qwen_dflash_hit_length_cap(
-        run.generated,
-        max_tokens,
-        run.finish.decoded_eot,
-        run.semantic_stop.is_some(),
-    );
+    // A ctx-exhausted mid-loop break is a length stop even when the token
+    // budget is unspent: same `length` + no-store path as the cap below.
+    let hit_length_cap = run.ctx_exhausted
+        || qwen_dflash_hit_length_cap(
+            run.generated,
+            max_tokens,
+            run.finish.decoded_eot,
+            run.semantic_stop.is_some(),
+        );
     match ds4_spec_wire_terminal(
         run.finish.finish_reason,
         run.finish.tool_calls,
         hit_length_cap,
     ) {
         Ds4SpecWireTerminal::Malformed(action) => {
-            // No epilogue on SpecRun — still fail-closed without claiming rollback.
+            // Post-decode malformed turn: complete rollback first so the next
+            // request starts clean, then emit the single malformed terminal
+            // with the attested `rolled_back` (plus reset context when
+            // unattested). Never `done`, never cache store.
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            let mut action = action;
+            action.rolled_back = ep.rolled_back;
+            if let Some(ctx) = ep.context.as_ref() {
+                if !ep.rolled_back {
+                    action.message = format!("{} ({ctx})", action.message);
+                }
+            }
             emit_ds4_malformed_action(stdout, id, &action);
             return;
         }
@@ -671,7 +730,7 @@ pub fn generate_deepseek4_spec(
                     run.streamed_tokens.clone(),
                 );
             }
-            emit_staged_terminal_done(stdout, &pending_done);
+            crate::ar::emit_active_route_done_value(stdout, &pending_done);
             // Per-request debug summary (stderr → serve.log): active drafter, τ, tok/s.
             eprintln!(
                 "[req {id}] drafter={drafter} tau={tau:.2} tok/s={tok_s:.1} decode ({} tok, {} windows, accept={accept_pct:.0}%)",
@@ -744,9 +803,16 @@ pub fn generate_deepseek4(
         eos_tok,
         ..
     } = &mut *b;
-    let pbs = pbs
-        .as_mut()
-        .expect("deepseek4_pbs missing on arch_id=9 generate");
+    let pbs = match pbs.as_mut() {
+        Some(p) => p,
+        None => {
+            // Pre-mutation validation (no GPU work yet): bare correlated error,
+            // never a panic. A missing PBS is a load-time invariant violation.
+            emit_active_attempt_error(stdout, Some(id), "deepseek4_pbs missing on arch_id=9 generate", "internal", false, false);
+            let _ = stdout.flush();
+            return;
+        }
+    };
     let cfg = &*cfg;
     let weights = &*weights;
     let eos_tok = *eos_tok;
@@ -949,7 +1015,7 @@ pub fn generate_deepseek4(
     // KV ends at start_pos + suffix_tokens.len() (== prompt_ids.len()) and
     // decode appends max_tokens. forward_prefill_batch_chunked writes into a KV
     // sized for m.physical_cap; overrunning it is a KV-overrun panic that takes
-    // down serve. Emit a clean error and return BEFORE prefill.
+    // down serve.
     // saturating_add: an adversarially huge max_tokens must not wrap usize and
     // slip under the cap.
     if (start_pos as usize)
@@ -957,15 +1023,24 @@ pub fn generate_deepseek4(
         .saturating_add(max_tokens)
         > m.physical_cap
     {
-        let _ = writeln!(
+        // Post-teardown-mutation (cache reset above) but pre-gen_start: roll
+        // back silently, then emit one correlated capacity terminal (which
+        // claims the wire transaction). Never the raw unclaimed envelope.
+        let cap = m.physical_cap;
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_fail_closed_error(
             stdout,
-            r#"{{"type":"error","id":"{}","message":"prompt exceeds checkpoint context capacity: prompt={} + max_tokens={} > capacity={}"}}"#,
-            id,
-            start_pos as usize + suffix_tokens.len(),
-            max_tokens,
-            m.physical_cap
+            Some(id),
+            &format!(
+                "prompt exceeds checkpoint context capacity: prompt={} + max_tokens={} > capacity={} — reload model with a larger max_seq",
+                start_pos as usize + suffix_tokens.len(),
+                max_tokens,
+                cap
+            ),
+            "context_length",
+            false,
+            &ep,
         );
-        let _ = stdout.flush();
         return;
     }
 
@@ -983,7 +1058,11 @@ pub fn generate_deepseek4(
     let last_logits = match prefill_result {
         Ok(l) => l,
         Err(e) => {
-            emit_error_with_id(stdout, id, format!("deepseek4prefill failed: {e:?}"));
+            // Post-mutation (cache reset above) but pre-gen_start: roll back
+            // silently, then emit one correlated terminal (which claims the
+            // wire transaction). Never a bare error on dirty state.
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_fail_closed_error(stdout, Some(id), &format!("deepseek4prefill failed: {e:?}"), "internal", false, &ep);
             return;
         }
     };
@@ -1184,11 +1263,11 @@ pub fn generate_deepseek4(
         // stream with "stream must begin with gen_start; got token before
         // contract latch". Placed after prefill and grammar setup but before
         // the first `sample_token`, so no token can outrun it.
-        emit_gen_start(
+        crate::ar::emit_generation_start(
+            crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Deepseek4Ar),
             stdout,
             id,
             !matches!(think_mode, ThinkMode::NonThink),
-            ds4_gen_start_contract_version(),
         );
 
         // Apply mask to the prefill-returned logits before the first
@@ -1281,8 +1360,10 @@ pub fn generate_deepseek4(
                     pos += 1;
                 }
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("deepseek4decode failed: {e:?}"));
-                    let _ = stdout.flush();
+                    // Post-gen_start operation failure: complete rollback +
+                    // one correlated fail-closed error (no `done`, no cache).
+                    let ep = production_fail_closed_rollback(m, gpu, None, None);
+                    emit_fail_closed_error(stdout, Some(id), &format!("deepseek4decode failed: {e:?}"), "internal", false, &ep);
                     return;
                 }
             }
@@ -1325,7 +1406,17 @@ pub fn generate_deepseek4(
         );
         let (finish_reason, wire_tool_calls, store_cache) = match &terminal {
             Ds4ArEpRouteTerminal::Malformed(action) => {
-                emit_ds4_malformed_action(stdout, id, action);
+                // Post-decode malformed turn: complete rollback first, then the
+                // single malformed terminal with the attested `rolled_back`.
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                let mut action = action.clone();
+                action.rolled_back = ep.rolled_back;
+                if let Some(ctx) = ep.context.as_ref() {
+                    if !ep.rolled_back {
+                        action.message = format!("{} ({ctx})", action.message);
+                    }
+                }
+                emit_ds4_malformed_action(stdout, id, &action);
                 return;
             }
             Ds4ArEpRouteTerminal::Safe {
@@ -1444,7 +1535,7 @@ pub fn generate_deepseek4(
                 cached_seq,
             );
         }
-        emit_staged_terminal_done(stdout, &pending_done);
+        crate::ar::emit_active_route_done_value(stdout, &pending_done);
         // Per-request debug summary: this request ran autoregressive (no drafter),
         // e.g. spec disabled or a temp path the loaded drafter can't verify. Making
         // the AR fall-through visible is the point — a "stall" is often just AR.
@@ -1452,6 +1543,20 @@ pub fn generate_deepseek4(
         eprintln!("[req {id}] drafter=ar tau=1.00 tok/s={tok_s:.1} decode ({generated_count} tok, autoregressive)");
     }
 }
+/// Map a hetero attested-reset outcome to the shared epilogue shape.
+fn hetero_attested_epilogue(result: Result<(), String>) -> RollbackEpilogue {
+    match result {
+        Ok(()) => RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        },
+        Err(error) => RollbackEpilogue {
+            rolled_back: false,
+            context: Some(format!("heterogeneous rollback failed: {error}")),
+        },
+    }
+}
+
 pub fn ds4_heterogeneous_client_abort(
     model: &mut hipfire_arch_deepseek4::heterogeneous::DeepseekV4HeterogeneousModel,
     seq_pos: &mut usize,
@@ -1462,28 +1567,35 @@ pub fn ds4_heterogeneous_client_abort(
 ) {
     *seq_pos = 0;
     conversation_tokens.clear();
-    let reset = model.reset_for_request_attested();
-    match reset {
-        Ok(()) => {
-            eprintln!(
-                "[req {id}] drafter=ar-heterogeneous abort=client rollback=attested post_join=true completion_tokens={completion_tokens}"
-            );
-            let (aborted, done) =
-                ds4_ep_abort_wire_events(id, completion_tokens, active_attempt_id());
-            let _ = writeln!(stdout, "{aborted}");
-            let _ = writeln!(stdout, "{done}");
-            let _ = stdout.flush();
-        }
-        Err(error) => emit_active_attempt_error(
-            stdout,
-            Some(id),
-            &format!("client cancelled; heterogeneous rollback failed: {error}"),
-            "runtime",
-            false,
-            false,
-        ),
+    let epilogue = hetero_attested_epilogue(model.reset_for_request_attested());
+    if epilogue.rolled_back {
+        eprintln!(
+            "[req {id}] drafter=ar-heterogeneous abort=client rollback=attested post_join=true completion_tokens={completion_tokens}"
+        );
     }
+    emit_spec_cancel_after_rollback(stdout, id, completion_tokens, &epilogue);
 }
+
+/// Fail-closed operation-failure terminal for the DS4 heterogeneous route.
+///
+/// Same attested reset as [`ds4_heterogeneous_client_abort`] (host cursors +
+/// `reset_for_request_attested` over both GPUs), but emits exactly one
+/// correlated fail-closed error instead of the cancellation lifecycle:
+/// no `done`, no assistant-cache store, no tool-call release.
+pub fn ds4_heterogeneous_fail_closed_error(
+    model: &mut hipfire_arch_deepseek4::heterogeneous::DeepseekV4HeterogeneousModel,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    message: String,
+) {
+    *seq_pos = 0;
+    conversation_tokens.clear();
+    let epilogue = hetero_attested_epilogue(model.reset_for_request_attested());
+    emit_fail_closed_error(stdout, Some(id), &message, "internal", false, &epilogue);
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn generate_deepseek4_heterogeneous(
     m: &mut LoadedModel,
@@ -1562,10 +1674,17 @@ pub fn generate_deepseek4_heterogeneous(
             return;
         };
         if let Err(error) = bundle.model.reset_for_request() {
-            emit_error_with_id(
+            // First mutation failed: attest through the full reset before the
+            // single correlated terminal (reset error stays visible when
+            // unattested).
+            let message = format!("deepseek4 heterogeneous reset failed: {error}");
+            ds4_heterogeneous_fail_closed_error(
+                &mut bundle.model,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
                 stdout,
                 id,
-                format!("deepseek4 heterogeneous reset failed: {error}"),
+                message,
             );
             return;
         }
@@ -1588,10 +1707,15 @@ pub fn generate_deepseek4_heterogeneous(
                     return;
                 }
                 Err(error) => {
-                    emit_error_with_id(
+                    let message =
+                        format!("deepseek4 heterogeneous prefill failed: {error}");
+                    ds4_heterogeneous_fail_closed_error(
+                        &mut bundle.model,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
                         stdout,
                         id,
-                        format!("deepseek4 heterogeneous prefill failed: {error}"),
+                        message,
                     );
                     return;
                 }
@@ -1604,11 +1728,11 @@ pub fn generate_deepseek4_heterogeneous(
         (logits, prefill_t0.elapsed().as_millis())
     };
 
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Deepseek4Ar),
         stdout,
         id,
         !matches!(think_mode, ThinkMode::NonThink),
-        ds4_gen_start_contract_version(),
     );
     let top_k = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_TOP_K")
         .ok()
@@ -1658,7 +1782,16 @@ pub fn generate_deepseek4_heterogeneous(
             (s.as_mut() as &mut dyn Any)
                 .downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>()
         }) else {
-            emit_error_with_id(stdout, id, "deepseek4 heterogeneous state disappeared");
+            // Bundle vanished mid-decode: no hetero GPU handle to attest
+            // through. Clear host cursors and emit one correlated UNATTESTED
+            // terminal (reset gap stays visible in the context).
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            let ep = RollbackEpilogue {
+                rolled_back: false,
+                context: Some("heterogeneous rollback failed: state missing".to_string()),
+            };
+            emit_fail_closed_error(stdout, Some(id), "deepseek4 heterogeneous state disappeared", "internal", false, &ep);
             return;
         };
         match bundle
@@ -1678,10 +1811,15 @@ pub fn generate_deepseek4_heterogeneous(
                 return;
             }
             Err(error) => {
-                emit_error_with_id(
+                let message =
+                    format!("deepseek4 heterogeneous decode failed: {error}");
+                ds4_heterogeneous_fail_closed_error(
+                    &mut bundle.model,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
                     stdout,
                     id,
-                    format!("deepseek4 heterogeneous decode failed: {error}"),
+                    message,
                 );
                 return;
             }
@@ -1705,6 +1843,27 @@ pub fn generate_deepseek4_heterogeneous(
         ds4_ar_ep_finish_route(dsml_malformed, emit_tool_calls_buf, generated >= max_tokens);
     let (finish_reason, wire_tool_calls) = match terminal {
         Ds4ArEpRouteTerminal::Malformed(action) => {
+            // Post-decode malformed turn: complete rollback first, then the
+            // single malformed terminal with the attested `rolled_back`.
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            let epilogue = match m.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any)
+                    .downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>()
+            }) {
+                Some(bundle) => hetero_attested_epilogue(bundle.model.reset_for_request_attested()),
+                None => RollbackEpilogue {
+                    rolled_back: false,
+                    context: Some("heterogeneous rollback failed: state missing".to_string()),
+                },
+            };
+            let mut action = action;
+            action.rolled_back = epilogue.rolled_back;
+            if let Some(ctx) = epilogue.context.as_ref() {
+                if !epilogue.rolled_back {
+                    action.message = format!("{} ({ctx})", action.message);
+                }
+            }
             emit_ds4_malformed_action(stdout, id, &action);
             return;
         }
@@ -1738,11 +1897,16 @@ pub fn generate_deepseek4_heterogeneous(
             (s.as_mut() as &mut dyn Any)
                 .downcast_mut::<hipfire_loader::Deepseek4HeterogeneousBundle>()
         }) else {
-            emit_error_with_id(
-                stdout,
-                id,
-                "deepseek4 heterogeneous state disappeared on abort",
-            );
+            // Abort raced a vanished bundle: no hetero GPU handle to attest
+            // through. Clear host cursors and emit one correlated UNATTESTED
+            // terminal.
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            let ep = RollbackEpilogue {
+                rolled_back: false,
+                context: Some("heterogeneous rollback failed: state missing".to_string()),
+            };
+            emit_fail_closed_error(stdout, Some(id), "deepseek4 heterogeneous state disappeared on abort", "internal", false, &ep);
             return;
         };
         ds4_heterogeneous_client_abort(
@@ -1759,7 +1923,7 @@ pub fn generate_deepseek4_heterogeneous(
     m.conversation_tokens.clear();
     m.conversation_tokens.extend_from_slice(&prompt_ids);
     m.conversation_tokens.extend_from_slice(&emitted_tokens);
-    emit_staged_terminal_done(stdout, &pending_done);
+    crate::ar::emit_active_route_done_value(stdout, &pending_done);
     eprintln!(
         "[req {id}] drafter=ar-heterogeneous tau=1.00 tok/s={tok_s:.1} decode ({generated} tok)"
     );
@@ -2002,6 +2166,287 @@ mod gemma4_prefill_batch_tests {
 }
 
 #[allow(clippy::too_many_arguments)]
+pub fn generate_gemma4_lowered(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    max_tokens: usize,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    max_think_tokens: usize,
+    enable_thinking: bool,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    logprobs_top_k: Option<usize>,
+    request_seed: u32,
+) {
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded");
+        return;
+    }
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Unknown),
+        stdout,
+        id,
+        false,
+    );
+
+    let Some(bundle_ref) = m.gemma4_lowered_mut() else {
+        emit_error_with_id(stdout, id, "gemma4 lowered bundle missing");
+        return;
+    };
+    let bos_tok = bundle_ref.config.bos_token;
+    let cfg_eos_tok = bundle_ref.config.eos_token;
+    let bundle = bundle_ref as *mut hipfire_loader::Gemma4LoweredBundle;
+
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let try_jinja = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0")
+            && m.chat_template.is_some();
+        let mut ids = if try_jinja {
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template: m.chat_template.as_ref().unwrap(),
+                system: system_prompt,
+                user: prompt,
+                enable_thinking,
+                bos_token: Some("<bos>"),
+                reasoning_strength: None,
+                reasoning_effort: None,
+            };
+            let rendered = if tools.is_some() || messages_history.is_some() {
+                let synthesized;
+                let history = match messages_history {
+                    Some(history) => history,
+                    None => {
+                        let mut messages = Vec::new();
+                        if let Some(system) = system_prompt {
+                            messages.push(hipfire_runtime::prompt_frame::Message {
+                                role: hipfire_runtime::prompt_frame::Role::System,
+                                content: system.to_owned(),
+                                reasoning_content: None,
+                                name: None,
+                                rendered_name: None,
+                                tool_calls: Vec::new(),
+                                tool_call_id: None,
+                                tool_plan: String::new(),
+                            });
+                        }
+                        messages.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::User,
+                            content: prompt.to_owned(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                        synthesized = messages;
+                        &synthesized
+                    }
+                };
+                frame.render_messages(history, tools, None)
+            } else {
+                frame.render()
+            };
+            match rendered {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(error) => {
+                    eprintln!("[daemon] jinja render failed in Gemma4 lowered path ({error}); using raw prompt");
+                    tokenizer.encode(prompt)
+                }
+            }
+        } else {
+            tokenizer.encode(prompt)
+        };
+        if ids.first() != Some(&bos_tok) {
+            ids.insert(0, bos_tok);
+        }
+        ids
+    };
+
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        return;
+    }
+    if prompt_ids.len() + max_tokens > m.max_seq {
+        emit_error_with_id(
+            stdout,
+            id,
+            format!(
+                "gemma4 lowered request needs {} KV positions but max_seq is {}",
+                prompt_ids.len() + max_tokens,
+                m.max_seq
+            ),
+        );
+        return;
+    }
+
+    // The lowered route does not yet publish a prompt-cache contract. Rebuild
+    // the full Jinja frame from position zero so stale KV can never leak across
+    // requests; absolute-position writes overwrite every row that is observed.
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    let t0 = Instant::now();
+    for (pos, &token) in prompt_ids.iter().enumerate() {
+        let result = unsafe {
+            gemma4::lowered::forward_scratch(
+                gpu,
+                &(*bundle).weights,
+                &(*bundle).config,
+                token,
+                pos,
+                &mut (*bundle).kv_sliding,
+                &mut (*bundle).kv_full,
+                &(*bundle).scratch,
+            )
+        };
+        if let Err(error) = result {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!("gemma4 lowered prefill failed: {error:?}"),
+            );
+            return;
+        }
+    }
+    m.conversation_tokens.extend_from_slice(&prompt_ids);
+    m.seq_pos = prompt_ids.len();
+    let prefill_ms = t0.elapsed().as_millis();
+
+    let stop_set = unsafe { [cfg_eos_tok, (*bundle).eos_tok, 106] };
+    let sampler_cfg = hipfire_runtime::sampler::SamplerConfig {
+        temperature: temp,
+        top_p,
+        repeat_penalty,
+        repeat_window,
+        presence_penalty,
+        frequency_penalty,
+        blocked_tokens: Vec::new(),
+        top_k,
+        min_p,
+    };
+    let mut rng_state = request_seed;
+    let mut router = GemmaThoughtRouter::new(enable_thinking, max_think_tokens);
+    let mut generated = 0usize;
+    let mut ttft_ms = None;
+    let decode_t0 = Instant::now();
+
+    while generated < max_tokens {
+        let next = unsafe {
+            hipfire_runtime::sampler::sample(
+                gpu,
+                &(*bundle).scratch.logits,
+                &(*bundle).scratch.sample_buf,
+                &(*bundle).scratch.repeat_buf,
+                (*bundle).config.vocab_size,
+                &m.conversation_tokens,
+                &sampler_cfg,
+                &mut rng_state,
+            )
+        };
+        if stop_set.contains(&next) {
+            break;
+        }
+        if ttft_ms.is_none() {
+            ttft_ms = Some(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        let frag = m.tokenizer.as_ref().unwrap().decode(&[next]);
+        let host_logits = if logprobs_top_k.is_some() {
+            unsafe { gpu.download_f32(&(*bundle).scratch.logits).ok() }
+        } else {
+            None
+        };
+        for event in router.push(&frag).0 {
+            match event {
+                GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+                GemmaEmit::Token(text) => {
+                    let mut envelope = serde_json::json!({
+                        "type": "token", "id": id, "text": text,
+                        "attempt_id": active_attempt_id(),
+                    });
+                    if let Some(logits) = host_logits.as_ref() {
+                        if let Some((logprob, top)) = crate::common::token_logprob_fields(
+                            logits,
+                            next,
+                            logprobs_top_k,
+                            m.tokenizer.as_ref().unwrap(),
+                        ) {
+                            envelope["logprob"] = serde_json::json!(logprob);
+                            envelope["top_logprobs"] = top;
+                        }
+                    }
+                    let _ = writeln!(stdout, "{envelope}");
+                    let _ = stdout.flush();
+                }
+            }
+        }
+        m.conversation_tokens.push(next);
+        generated += 1;
+        let pos = m.seq_pos;
+        let result = unsafe {
+            gemma4::lowered::forward_scratch(
+                gpu,
+                &(*bundle).weights,
+                &(*bundle).config,
+                next,
+                pos,
+                &mut (*bundle).kv_sliding,
+                &mut (*bundle).kv_full,
+                &(*bundle).scratch,
+            )
+        };
+        if let Err(error) = result {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!("gemma4 lowered decode failed: {error:?}"),
+            );
+            return;
+        }
+        m.seq_pos += 1;
+    }
+    for event in router.flush() {
+        match event {
+            GemmaEmit::Reasoning(text) => emit_reasoning_token(stdout, id, &text),
+            GemmaEmit::Token(text) => emit_visible_token(stdout, id, &text),
+        }
+    }
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let decode_tok_s = generated as f64 * 1000.0 / decode_ms as f64;
+    let prefill_tok_s = prompt_ids.len() as f64 * 1000.0 / prefill_ms.max(1) as f64;
+    let _ = writeln!(
+        stdout,
+        r#"{{"type":"done","id":"{}","tokens":{},"tok_s":{:.2},"prefill_tokens":{},"prefill_ms":{},"prefill_tok_s":{:.2},"decode_tok_s":{:.2},"ttft_ms":{:.3},"total_ms":{},"attempt_id":{}}}"#,
+        id,
+        generated,
+        decode_tok_s,
+        prompt_ids.len(),
+        prefill_ms,
+        prefill_tok_s,
+        decode_tok_s,
+        ttft_ms.unwrap_or(total_ms as f64),
+        total_ms,
+        active_attempt_id(),
+    );
+    let _ = stdout.flush();
+}
+
+#[allow(clippy::too_many_arguments)]
 pub fn generate_gemma4(
     m: &mut LoadedModel,
     gpu: &mut rdna_compute::Gpu,
@@ -2030,8 +2475,12 @@ pub fn generate_gemma4(
     // StreamContractGate fail-closes on any event preceding `gen_start`, so
     // without this the first `token` is rejected, the client aborts, and the
     // HTTP handler waits forever. Same fix as DS4 (e99583afa) and lfm2moe.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::Unknown),
+        stdout,
+        id,
+        false,
+    );
     let Some(bundle) = m
         .state
         .as_mut()
@@ -2051,7 +2500,10 @@ pub fn generate_gemma4(
     // ── Prompt build (same two-path branch as the lfm2moe AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -2262,7 +2714,10 @@ pub fn generate_gemma4(
     // avoids that, which is how the numbers above were taken.
     let eagle_active = bundle.eagle.is_some()
         && temp <= 1e-6
-        && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() == Some("1");
+        && hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
+            .ok()
+            .as_deref()
+            == Some("1");
     if eagle_active {
         let draft_len = bundle.eagle.as_ref().unwrap().draft_len;
         // Seed hidden = post-`model.norm` hidden of the last prompt position
@@ -2896,38 +3351,38 @@ impl GemmaThoughtRouter {
         loop {
             match self.state {
                 GemmaChannel::AwaitingThought => {
-                    if let Some(pos) = self.pending.find("<|channel>thought") {
-                        let mut header_end = pos + "<|channel>thought".len();
+                    const CHANNEL_OPEN: &str = "<|channel>";
+                    const THOUGHT_OPEN: &str = "<|channel>thought";
+
+                    // A thought channel is optional and may be split across
+                    // decoded fragments. Hold only while the bytes seen so far
+                    // can still become the canonical opening header.
+                    if THOUGHT_OPEN.starts_with(&self.pending) {
+                        break;
+                    }
+                    if self.pending.starts_with(THOUGHT_OPEN) {
+                        let mut header_end = THOUGHT_OPEN.len();
                         if self.pending[header_end..].starts_with('\n') {
                             header_end += 1;
-                        }
-                        if pos > 0 {
-                            let pre = self.pending[..pos].to_string();
-                            self.pending.drain(..pos);
-                            header_end -= pos;
-                            if !pre.is_empty() && !gemma_is_marker_prefix(&pre) {
-                                out.push(GemmaEmit::Token(pre));
-                            }
-                            continue;
                         }
                         self.pending.drain(..header_end);
                         self.state = GemmaChannel::Reasoning;
                         continue;
-                    } else {
-                        let hold = gemma_longest_marker_suffix(&self.pending);
-                        if hold == 0 || hold >= self.pending.len() {
-                            break;
-                        }
-                        let emit_len = self.pending.len() - hold;
-                        if emit_len > 0 {
-                            let text = self.pending[..emit_len].to_string();
-                            self.pending.drain(..emit_len);
-                            if !text.is_empty() && !gemma_is_marker_prefix(&text) {
-                                out.push(GemmaEmit::Token(text));
-                            }
-                        }
-                        break;
                     }
+
+                    // The response schema makes the thought header optional.
+                    // Once the buffered bytes cannot form that header, route
+                    // them as answer content. Some Gemma4 checkpoints emit an
+                    // orphan `<|channel>` before an otherwise valid answer;
+                    // consume that control token without dropping its payload.
+                    if self.pending.starts_with(CHANNEL_OPEN) {
+                        self.pending.drain(..CHANNEL_OPEN.len());
+                        if self.pending.starts_with('\n') {
+                            self.pending.drain(..1);
+                        }
+                    }
+                    self.state = GemmaChannel::Answer;
+                    continue;
                 }
                 GemmaChannel::Reasoning => {
                     if let Some(pos) = self.pending.find("<channel|>") {
@@ -2960,30 +3415,63 @@ impl GemmaThoughtRouter {
                     }
                 }
                 GemmaChannel::Answer => {
-                    if let Some(pos) = self.pending.find("<turn|>") {
-                        if pos > 0 {
-                            let text = self.pending[..pos].to_string();
-                            self.pending.drain(..pos);
-                            if !text.is_empty() {
-                                out.push(GemmaEmit::Token(text));
+                    // Answer must chunk-safely strip any Gemma channel
+                    // control markers, including canonical <|channel|>
+                    // forms, orphan <|channel> variants, and markers
+                    // arriving after a forced max-think transition.
+                    // Preserve payload before/after each marker and hold
+                    // a suffix that could still become a marker.
+                    const ANSWER_MARKERS: &[&str] = &[
+                        "<|channel>thought",
+                        "<|channel>",
+                        "<|channel|>",
+                        "<channel|>",
+                        "<|turn>",
+                        "<turn|>",
+                    ];
+                    loop {
+                        let hold = gemma_longest_marker_suffix(&self.pending);
+                        let search_len = self.pending.len().saturating_sub(hold);
+                        let searchable = &self.pending[..search_len];
+                        let mut best_pos: Option<usize> = None;
+                        let mut best_len = 0usize;
+                        for &m in ANSWER_MARKERS {
+                            if let Some(pos) = searchable.find(m) {
+                                if best_pos.is_none()
+                                    || pos < best_pos.unwrap()
+                                    || (pos == best_pos.unwrap() && m.len() > best_len)
+                                {
+                                    best_pos = Some(pos);
+                                    best_len = m.len();
+                                }
+                            }
+                        }
+                        if let Some(pos) = best_pos {
+                            if pos > 0 {
+                                let text = self.pending[..pos].to_string();
+                                self.pending.drain(..pos);
+                                if !text.is_empty() {
+                                    out.push(GemmaEmit::Token(text));
+                                }
+                                continue;
+                            }
+                            self.pending.drain(..best_len);
+                            if self.pending.starts_with('\n') {
+                                self.pending.drain(..1);
+                            }
+                            if self.pending.is_empty() {
+                                break;
                             }
                             continue;
                         }
-                        self.pending.drain(.."<turn|>".len());
-                        if !self.pending.is_empty() && !gemma_is_marker_prefix(&self.pending) {
-                            let tail = std::mem::take(&mut self.pending);
-                            out.push(GemmaEmit::Token(tail));
+                        if search_len > 0 {
+                            let text = self.pending[..search_len].to_string();
+                            self.pending.drain(..search_len);
+                            if !text.is_empty() {
+                                out.push(GemmaEmit::Token(text));
+                            }
                         }
                         break;
-                    }
-                    let hold = gemma_longest_marker_suffix(&self.pending);
-                    let emit_len = self.pending.len().saturating_sub(hold);
-                    if emit_len > 0 {
-                        let text = self.pending[..emit_len].to_string();
-                        self.pending.drain(..emit_len);
-                        if !text.is_empty() {
-                            out.push(GemmaEmit::Token(text));
-                        }
                     }
                     break;
                 }
@@ -3016,7 +3504,7 @@ impl GemmaThoughtRouter {
         if self.pending.is_empty() {
             return Vec::new();
         }
-        if self.state == GemmaChannel::AwaitingThought {
+        if self.state == GemmaChannel::AwaitingThought && gemma_is_marker_prefix(&self.pending) {
             self.pending.clear();
             return Vec::new();
         }
@@ -3036,17 +3524,312 @@ pub fn gemma_is_marker_prefix(s: &str) -> bool {
     const MARKERS: &[&str] = &[
         "<|channel>thought",
         "<|channel>",
+        "<|channel|>",
         "<channel|>",
         "<|turn>",
         "<turn|>",
     ];
-    MARKERS.iter().any(|m| m.starts_with(s) || s.starts_with(m))
+    MARKERS.iter().any(|m| m.starts_with(s))
+}
+
+#[cfg(test)]
+mod gemma_thought_router_tests {
+    use super::{gemma_is_marker_prefix, GemmaChannel, GemmaEmit, GemmaThoughtRouter};
+
+    fn route(enable_thinking: bool, chunks: &[&str]) -> (String, String, GemmaChannel) {
+        let mut router = GemmaThoughtRouter::new(enable_thinking, 0);
+        let mut visible = String::new();
+        let mut reasoning = String::new();
+        for chunk in chunks {
+            for event in router.push(chunk).0 {
+                match event {
+                    GemmaEmit::Reasoning(text) => reasoning.push_str(&text),
+                    GemmaEmit::Token(text) => visible.push_str(&text),
+                }
+            }
+        }
+        for event in router.flush() {
+            match event {
+                GemmaEmit::Reasoning(text) => reasoning.push_str(&text),
+                GemmaEmit::Token(text) => visible.push_str(&text),
+            }
+        }
+        (visible, reasoning, router.state)
+    }
+
+    #[test]
+    fn gemma_router_routes_canonical_thought_then_answer() {
+        let (visible, reasoning, state) = route(
+            true,
+            &["<|channel>", "thought", "\nplan<channel|>\nanswer<turn|>"],
+        );
+        assert_eq!(reasoning, "plan");
+        assert_eq!(visible, "answer");
+        assert_eq!(state, GemmaChannel::Answer);
+    }
+
+    #[test]
+    fn gemma_router_recovers_orphan_channel_before_answer() {
+        let (visible, reasoning, state) =
+            route(true, &["<|channel>", "\n", "```python\nprint('ok')\n```"]);
+        assert_eq!(visible, "```python\nprint('ok')\n```");
+        assert!(reasoning.is_empty());
+        assert_eq!(state, GemmaChannel::Answer);
+    }
+
+    #[test]
+    fn gemma_router_orphan_channel_is_chunk_boundary_invariant() {
+        let full = "<|channel>\nanswer";
+        let expected = route(true, &[full]);
+        for split in 1..full.len() {
+            if full.is_char_boundary(split) {
+                assert_eq!(route(true, &[&full[..split], &full[split..]]), expected);
+            }
+        }
+    }
+
+    #[test]
+    fn gemma_router_thinking_request_can_emit_direct_answer() {
+        let (visible, reasoning, state) = route(true, &["direct answer"]);
+        assert_eq!(visible, "direct answer");
+        assert!(reasoning.is_empty());
+        assert_eq!(state, GemmaChannel::Answer);
+    }
+
+    #[test]
+    fn gemma_router_drops_only_an_unfinished_control_marker_at_eos() {
+        let (visible, reasoning, state) = route(true, &["<|chan"]);
+        assert!(visible.is_empty());
+        assert!(reasoning.is_empty());
+        assert_eq!(state, GemmaChannel::AwaitingThought);
+    }
+
+    #[test]
+    fn gemma_marker_prefix_does_not_classify_marker_plus_payload() {
+        assert!(gemma_is_marker_prefix("<|chan"));
+        assert!(gemma_is_marker_prefix("<|channel>"));
+        assert!(!gemma_is_marker_prefix("<|channel>\nanswer"));
+    }
+
+    fn route_with_cap(
+        enable_thinking: bool,
+        max_think_tokens: usize,
+        chunks: &[&str],
+    ) -> (String, String, GemmaChannel) {
+        let mut router = GemmaThoughtRouter::new(enable_thinking, max_think_tokens);
+        let mut visible = String::new();
+        let mut reasoning = String::new();
+        for chunk in chunks {
+            for event in router.push(chunk).0 {
+                match event {
+                    GemmaEmit::Reasoning(text) => reasoning.push_str(&text),
+                    GemmaEmit::Token(text) => visible.push_str(&text),
+                }
+            }
+        }
+        for event in router.flush() {
+            match event {
+                GemmaEmit::Reasoning(text) => reasoning.push_str(&text),
+                GemmaEmit::Token(text) => visible.push_str(&text),
+            }
+        }
+        (visible, reasoning, router.state)
+    }
+
+    fn assert_no_markers(s: &str) {
+        for m in &[
+            "<|channel>thought",
+            "<|channel>",
+            "<|channel|>",
+            "<channel|>",
+            "<|turn>",
+            "<turn|>",
+        ] {
+            assert!(!s.contains(m), "visible leaked marker {:?} in {:?}", m, s);
+        }
+    }
+
+    #[test]
+    fn gemma_router_thinking_off_strips_all_channel_markers_every_split() {
+        // Thinking-off starts in Answer; every channel/turn marker must be
+        // stripped chunk-safely regardless of split.
+        let full = "pre<|channel>mid<channel|>post<|channel|>inner<|channel>thought\nX<channel|>tail<|turn>end<turn|>after";
+        let expected = route_with_cap(false, 0, &[full]);
+        assert_no_markers(&expected.0);
+        // Adjacent payload must survive: markers stripped, text joined.
+        assert_eq!(expected.0, "premidpostinnerXtailendafter");
+        for split in 1..full.len() {
+            if !full.is_char_boundary(split) {
+                continue;
+            }
+            let got = route_with_cap(false, 0, &[&full[..split], &full[split..]]);
+            assert_eq!(got, expected, "mismatch at split {}", split);
+            assert_no_markers(&got.0);
+        }
+        // Also verify orphan <|channel> with newline framing is stripped.
+        let full2 = "<|channel>\nanswer";
+        let exp2 = route_with_cap(false, 0, &[full2]);
+        assert_eq!(exp2.0, "answer");
+        for split in 1..full2.len() {
+            if !full2.is_char_boundary(split) {
+                continue;
+            }
+            assert_eq!(
+                route_with_cap(false, 0, &[&full2[..split], &full2[split..]]),
+                exp2
+            );
+        }
+        // Canonical <|channel|> in thinking-off must also be stripped.
+        let full3 = "A<|channel|>B";
+        let exp3 = route_with_cap(false, 0, &[full3]);
+        assert_eq!(exp3.0, "AB");
+        assert_no_markers(&exp3.0);
+        for split in 1..full3.len() {
+            if !full3.is_char_boundary(split) {
+                continue;
+            }
+            assert_eq!(
+                route_with_cap(false, 0, &[&full3[..split], &full3[split..]]),
+                exp3
+            );
+        }
+    }
+
+    #[test]
+    fn gemma_router_forced_close_strips_markers_after_transition_every_split() {
+        // Force max-think after one reasoning push, then ensure every
+        // subsequent channel/turn marker in Answer is stripped at every
+        // split, preserving adjacent payload.
+        let pre = "<|channel>thought\nAAA<channel|>";
+        let post = "BBB<|channel>CCC<channel|>DDD<|channel|>EEE<|turn>FFF<turn|>GGG";
+        let full = format!("{}{}", pre, post);
+        // full = "<|channel>thought\nAAA<channel|>BBB<|channel>CCC<channel|>DDD<|channel|>EEE<|turn>FFF<turn|>GGG"
+        // With max_think=1 the router forces to Answer after the first
+        // reasoning push; the trailing <channel|> that closes thought and
+        // all markers inside post must be stripped, not leaked.
+        let expected = route_with_cap(true, 1, &[&full]);
+        assert!(expected.1.contains("AAA") || expected.0.contains("AAA"));
+        assert_no_markers(&expected.0);
+        // Answer payload should be the post text with markers removed.
+        // Post without markers: "BBBCCCDDDEEEFFFGGG"
+        assert_eq!(expected.0, "BBBCCCDDDEEEFFFGGG");
+        // For split invariance after forced close, keep the reasoning header
+        // as one chunk and only split the post payload. Splitting the header
+        // itself changes per-push reasoning counting and is not required to
+        // be invariant for this test.
+        for split in 0..=post.len() {
+            if split != 0 && !post.is_char_boundary(split) {
+                continue;
+            }
+            let got = if split == 0 || split == post.len() {
+                route_with_cap(true, 1, &[&full])
+            } else {
+                let c1 = &post[..split];
+                let c2 = &post[split..];
+                route_with_cap(true, 1, &[pre, c1, c2])
+            };
+            assert_eq!(got.0, expected.0, "forced mismatch at post split {}", split);
+            assert_no_markers(&got.0);
+        }
+        // Also test forced transition where pending marker is split across
+        // the forced boundary: reasoning chunk ends with partial marker prefix.
+        let full2 = "<|channel>thought\nRR<channel|>XX<|channel>YY";
+        let exp2 = route_with_cap(true, 1, &[full2]);
+        assert_no_markers(&exp2.0);
+        // Split only the post part after the forced close to keep reasoning counting stable
+        let pre2 = "<|channel>thought\nRR<channel|>";
+        let post2 = "XX<|channel>YY";
+        let exp2_post = route_with_cap(true, 1, &[full2]);
+        for split in 0..=post2.len() {
+            if split != 0 && !post2.is_char_boundary(split) {
+                continue;
+            }
+            let got = if split == 0 || split == post2.len() {
+                route_with_cap(true, 1, &[full2])
+            } else {
+                route_with_cap(true, 1, &[pre2, &post2[..split], &post2[split..]])
+            };
+            assert_eq!(
+                got.0, exp2.0,
+                "forced split2 mismatch at post split {}",
+                split
+            );
+            assert_no_markers(&got.0);
+        }
+        // Verify that a marker arriving strictly after forced transition
+        // as a separate push is still stripped at every internal split.
+        for payload in &[
+            "hello<channel|>world",
+            "hello<|channel>world",
+            "hello<|channel|>world",
+            "hello<turn|>world",
+            "hello<|turn>world",
+        ] {
+            let expected_payload = (*payload)
+                .replace("<|channel>thought", "")
+                .replace("<|channel>", "")
+                .replace("<|channel|>", "")
+                .replace("<channel|>", "")
+                .replace("<|turn>", "")
+                .replace("<turn|>", "");
+            for split in 0..=payload.len() {
+                if split != 0 && !payload.is_char_boundary(split) {
+                    continue;
+                }
+                // Build payload split after forced transition.
+                let full = if split == 0 || split == payload.len() {
+                    format!("<|channel>thought\nZ<channel|>{}", payload)
+                } else {
+                    // Simulate payload split across two pushes after forced.
+                    // Create a single concatenated string and test split invariance
+                    // via the full-string split test already done; here just
+                    // verify the payload alone after forced.
+                    let c1 = &payload[..split];
+                    let c2 = &payload[split..];
+                    let mut rr = GemmaThoughtRouter::new(true, 1);
+                    let _ = rr.push("<|channel>thought\nZ");
+                    let mut vis = String::new();
+                    for ev in rr.push("<channel|>").0 {
+                        if let GemmaEmit::Token(t) = ev {
+                            vis.push_str(&t);
+                        }
+                    }
+                    for ev in rr.push(c1).0 {
+                        if let GemmaEmit::Token(t) = ev {
+                            vis.push_str(&t);
+                        }
+                    }
+                    for ev in rr.push(c2).0 {
+                        if let GemmaEmit::Token(t) = ev {
+                            vis.push_str(&t);
+                        }
+                    }
+                    for ev in rr.flush() {
+                        if let GemmaEmit::Token(t) = ev {
+                            vis.push_str(&t);
+                        }
+                    }
+                    assert_eq!(
+                        vis, expected_payload,
+                        "payload {:?} split {}",
+                        payload, split
+                    );
+                    assert_no_markers(&vis);
+                    continue;
+                };
+                let got = route_with_cap(true, 1, &[&full]);
+                assert!(got.0.contains(&expected_payload) || got.0 == expected_payload);
+                assert_no_markers(&got.0);
+            }
+        }
+    }
 }
 
 pub fn gemma_longest_marker_suffix(s: &str) -> usize {
     const MARKERS: &[&str] = &[
         "<|channel>thought",
         "<|channel>",
+        "<|channel|>",
         "<channel|>",
         "<|turn>",
         "<turn|>",
@@ -3725,22 +4508,11 @@ pub fn glimmer_commit_terminal(
 ) -> bool {
     match await_client_terminal_commit(stdout, id, pending_done) {
         ClientTerminalDecision::Commit => {
-            emit_staged_terminal_done(stdout, pending_done);
+            crate::ar::emit_active_route_done_value(stdout, pending_done);
             true
         }
         ClientTerminalDecision::Abort => {
-            let attempt_id = active_attempt_id();
-            let _ = writeln!(
-                stdout,
-                "{}",
-                hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id)
-            );
-            let _ = writeln!(
-                stdout,
-                "{}",
-                hipfire_runtime::semantic::wire_aborted_done(id, generated, attempt_id)
-            );
-            let _ = stdout.flush();
+            crate::ar::emit_active_route_cancel(stdout, id, generated);
             false
         }
     }
@@ -4201,8 +4973,12 @@ pub fn generate_muse_glimmer(
     //
     // `gen_start` then `error` with no tokens in between is a legal sequence; latching early
     // costs nothing and makes every arch-14 failure routable.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::GlimmerAr),
+        stdout,
+        id,
+        false,
+    );
 
     if m.tokenizer.is_none() {
         emit_error_with_id(stdout, id, "tokenizer not loaded");
@@ -4234,7 +5010,10 @@ pub fn generate_muse_glimmer(
     // ── Prompt build (same two-path branch as the gemma4 AR path) ──
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         let mut ids: Vec<u32> = if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -4471,7 +5250,10 @@ pub fn generate_muse_glimmer(
             .ok()
             .as_deref()
             == Some("0");
-        let trace = hipfire_config::developer_var("HIPFIRE_GLIMMER_CACHE_TRACE").ok().as_deref() == Some("1");
+        let trace = hipfire_config::developer_var("HIPFIRE_GLIMMER_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1");
         if cache_disabled {
             // Opting out of the cache does NOT restore the CLI's per-request
             // reset — arch 14 is in the cache_capable allowlist either way, so
@@ -4638,7 +5420,10 @@ pub fn generate_muse_glimmer(
             &bundle.weights,
         );
     let fast_sample_on = hipfire_runtime::config::get().dflash_fast_sample;
-    let temp_spec_env_off = hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0");
+    let temp_spec_env_off = hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
+        .ok()
+        .as_deref()
+        == Some("0");
     let spec_mode = glimmer_spec_admission(
         bundle.drafter.is_some(),
         max_tokens,
@@ -4657,7 +5442,9 @@ pub fn generate_muse_glimmer(
     // Shared by native AR, profit probes, and post-retirement AR tail.
     let top_k_opt = if top_k > 0 { Some(top_k as u32) } else { None };
     let gpu_sample = !matches!(
-        hipfire_config::developer_var("HIPFIRE_GLIMMER_GPU_SAMPLE").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_GLIMMER_GPU_SAMPLE")
+            .ok()
+            .as_deref(),
         Some("0")
     );
     let mut gpu_rng: u32 = (rng.next_u64() as u32) | 1;
@@ -4677,7 +5464,9 @@ pub fn generate_muse_glimmer(
         .ok()
         .as_deref()
         == Some("0");
-    let profit_guard_diag_off = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref()
+    let profit_guard_diag_off = hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG")
+        .ok()
+        .as_deref()
         == Some("1")
         || hipfire_config::developer_var("HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT")
             .ok()
@@ -4779,8 +5568,10 @@ pub fn generate_muse_glimmer(
         if !skip_spec_loop {
             loop {
                 let t_window = std::time::Instant::now();
-                let do_window_timing =
-                    hipfire_config::developer_var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
+                let do_window_timing = hipfire_config::developer_var("HIPFIRE_GLIMMER_TIMING")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
                 if generated_count >= max_tokens {
                     break;
                 }
@@ -5075,7 +5866,10 @@ pub fn generate_muse_glimmer(
                 let t_after_drafter = t_window.elapsed();
                 // Bring-up diagnostic: HIPFIRE_GLIMMER_SPEC_DIAG=1 — device mode
                 // does not require/download host hidden; print backend + logical length.
-                if hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG").ok().as_deref() == Some("1")
+                if hipfire_config::developer_var("HIPFIRE_GLIMMER_SPEC_DIAG")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
                     && windows < 2
                 {
                     let l2 = |v: &[f32]| -> f32 { v.iter().map(|x| x * x).sum::<f32>().sqrt() };
@@ -5958,7 +6752,10 @@ pub fn generate_lfm2moe(
         // Jinja default-ON (flipped 2026-06-09): render through the model's chat
         // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
         // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -6100,8 +6897,12 @@ pub fn generate_lfm2moe(
     // This was the root cause of the 3-minute hang on native `hipfire serve`
     // for LFM2.5-230M/350M (direct `infer_lfm2moe` bypasses the gate and was
     // coherent). Mirrors the DS4 fix `e99583afa` and Qwen's `emit_gen_start`.
-    let gen_contract = gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::LfmAr),
+        stdout,
+        id,
+        false,
+    );
 
     // Cross-conversation reset (FIX: LFM turn-to-turn KV accumulation). The
     // prior design only reset on capacity overflow, so every request APPENDED to
@@ -6116,7 +6917,13 @@ pub fn generate_lfm2moe(
     // prompt each turn; it now does so from position 0 with no stale KV. A
     // continuing conversation re-prefills its whole history from the prompt, so
     // multi-turn is preserved (validated: Bjorn/axolotl recall).
-    let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
+    // Post-gen_start mutation: a failed turn reset must fail closed (rollback +
+    // one correlated terminal), never continue prefill on dirty state.
+    let turn_reset = m.lfm2moe_mut().unwrap().state.reset(gpu);
+    if let Err(e) = turn_reset {
+        dense_fail_closed_error(m, gpu, stdout, id, &format!("lfm2moe turn reset failed: {e:?}"));
+        return;
+    }
     m.seq_pos = 0;
     m.conversation_tokens.clear();
 
@@ -6128,6 +6935,7 @@ pub fn generate_lfm2moe(
     // tokens) does not run the full prefill before honoring the cancel. ──
     let mut last_logits: Vec<f32> = Vec::new();
     let mut prefill_aborted = false;
+    let mut prefill_fail: Option<String> = None;
     {
         let b = m.lfm2moe_mut().unwrap();
         let cfg = &b.config;
@@ -6142,12 +6950,18 @@ pub fn generate_lfm2moe(
             match lfm2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                 Ok(logits) => last_logits = logits,
                 Err(e) => {
-                    emit_error_with_id(stdout, id, format!("lfm2moe prefill failed: {e:?}"));
-                    return;
+                    prefill_fail = Some(format!("lfm2moe prefill failed: {e:?}"));
+                    break;
                 }
             }
             position += 1;
         }
+    }
+    // Post-gen_start operation failure: complete rollback + one correlated
+    // fail-closed error (no `done`, no cache store).
+    if let Some(msg) = prefill_fail {
+        dense_fail_closed_error(m, gpu, stdout, id, &msg);
+        return;
     }
     if prefill_aborted || check_abort(id) {
         let ep = production_fail_closed_rollback(m, gpu, None, None);
@@ -6158,6 +6972,12 @@ pub fn generate_lfm2moe(
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
+    // Test-only fault seam (G4.10): fires after GPU/KV mutation, before any
+    // token visibility. Reroutes through the production fail-closed terminal.
+    if take_generation_fault_after_prefill() {
+        dense_fail_closed_error(m, gpu, stdout, id, "injected fault after prefill");
+        return;
+    }
 
     // ── Decode loop. Sample host-side from the running logits vector.
     // Abort is checked at the top of every iteration so a mid-decode
@@ -6230,9 +7050,15 @@ pub fn generate_lfm2moe(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("lfm2moe decode failed: {e:?}"));
+                dense_fail_closed_error(m, gpu, stdout, id, &format!("lfm2moe decode failed: {e:?}"));
                 return;
             }
+        }
+        // Test-only fault seam (G4.10): fires after the first decode step's
+        // GPU/KV mutation. Same production fail-closed terminal as prefill.
+        if generated_count == 1 && take_generation_fault_after_first_decode() {
+            dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
+            return;
         }
     }
 
@@ -6264,7 +7090,9 @@ pub fn generate_lfm2moe(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
             let ep = production_fail_closed_rollback(m, gpu, None, None);
             emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
@@ -6345,7 +7173,10 @@ pub fn generate_minimax(
         // jinja on for both (falls back to Plain only when the .hfq carries no
         // template).
         // Jinja default-ON (flipped 2026-06-09); opt out with HIPFIRE_JINJA_CHAT=0.
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -6509,7 +7340,11 @@ pub fn generate_minimax(
             // the degenerate pure-extension case (rewind is then a no-op).
             let cache_hit = lcp > 0 && lcp < prompt_ids.len();
             let partial = lcp < prior_len;
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
                 eprintln!(
                 "[minimax-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
                 prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
@@ -6543,6 +7378,8 @@ pub fn generate_minimax(
     // push to `m.conversation_tokens` in the same scope. The LAST forward's
     // logits are the predictions for the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
+    let mut prefill_aborted = false;
+    let mut prefill_fail: Option<String> = None;
     {
         let b = m.minimax_mut().unwrap();
         let cfg = &b.config;
@@ -6566,15 +7403,17 @@ pub fn generate_minimax(
             // MiniMax-M2 (256 experts/top-8). Shorter prompts fall to the
             // indexed path inside forward_batch (below the grouped gate).
             for chunk in prefill_ids.chunks(512) {
+                // Abort is checked per chunk so a client cancel during a long
+                // prompt does not run the full prefill before honoring it.
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 match minimax::forward::forward_batch(cfg, weights, state, gpu, chunk, pos) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("minimax batch prefill failed: {e:?}"),
-                        );
-                        return;
+                        prefill_fail = Some(format!("minimax batch prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 pos += chunk.len();
@@ -6582,21 +7421,42 @@ pub fn generate_minimax(
         } else {
             let mut position = state.n_tokens as u32;
             for &tok in &prefill_ids {
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 match minimax::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, format!("minimax prefill failed: {e:?}"));
-                        return;
+                        prefill_fail = Some(format!("minimax prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 position += 1;
             }
         }
     }
+    // Post-prompt operation failure: complete rollback + one correlated
+    // fail-closed error (no `done`, no cache store).
+    if let Some(msg) = prefill_fail {
+        dense_fail_closed_error(m, gpu, stdout, id, &msg);
+        return;
+    }
+    if prefill_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
+    }
     for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
+    // Test-only fault seam (G4.10): fires after GPU/KV mutation, before any
+    // token visibility. Reroutes through the production fail-closed terminal.
+    if take_generation_fault_after_prefill() {
+        dense_fail_closed_error(m, gpu, stdout, id, "injected fault after prefill");
+        return;
+    }
 
     // MiniMax-M2's chat template unconditionally primes the assistant turn
     // with `<think>\n` (chat_template.jinja generation-prompt block), so the
@@ -6630,6 +7490,13 @@ pub fn generate_minimax(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
+        // Decode-side abort check: a mid-decode client cancel stops the loop
+        // immediately instead of running the full `max_tokens` of wasted work.
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -6656,6 +7523,14 @@ pub fn generate_minimax(
         m.conversation_tokens.push(next_tok);
         generated_count += 1;
 
+        // Check abort before the next GPU decode_step to avoid launching
+        // more work after the client has already cancelled.
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+
         // Advance one step on the freshly sampled token.
         let step = {
             let b = m.minimax_mut().unwrap();
@@ -6671,9 +7546,15 @@ pub fn generate_minimax(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("minimax decode failed: {e:?}"));
+                dense_fail_closed_error(m, gpu, stdout, id, &format!("minimax decode failed: {e:?}"));
                 return;
             }
+        }
+        // Test-only fault seam (G4.10): fires after the first decode step's
+        // GPU/KV mutation. Same production fail-closed terminal as prefill.
+        if generated_count == 1 && take_generation_fault_after_first_decode() {
+            dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
+            return;
         }
     }
 
@@ -6696,8 +7577,15 @@ pub fn generate_minimax(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            // Abort after commit staging: roll back before emitting the
+            // cancellation lifecycle (or unattested fail-closed error).
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
     }
 }
 /// Cohere2-MoE / North-Mini-Code (arch_id=12) generate path. Mirrors
@@ -6768,7 +7656,10 @@ pub fn generate_cohere2moe(
         // (b) never matches across turns so the LCP prompt-cache is dead. Force
         // jinja on (falls back to Plain only when the .hfq carries no template).
         // Jinja default-ON; opt out with HIPFIRE_JINJA_CHAT=0.
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -6822,7 +7713,11 @@ pub fn generate_cohere2moe(
             match render_result {
                 Ok(rendered) => {
                     primed_think = rendered.trim_end().ends_with("<think>");
-                    if hipfire_config::developer_var("HIPFIRE_C2M_DUMP_PROMPT").ok().as_deref() == Some("1") {
+                    if hipfire_config::developer_var("HIPFIRE_C2M_DUMP_PROMPT")
+                        .ok()
+                        .as_deref()
+                        == Some("1")
+                    {
                         let ids = tokenizer.encode(&rendered);
                         eprintln!(
                             "[c2m prompt dump] rendered chars={} tokens={}\n>>> HEAD(400):\n{}\n>>> TAIL(800):\n{}\n<<< end",
@@ -6897,18 +7792,20 @@ pub fn generate_cohere2moe(
             prompt_ids.len(),
             max_seq,
         );
-        emit_error_with_id(
+        // Refusal after prompt build but before any GPU work: roll back
+        // through the attested path (covers the KV reset the old code did
+        // with a discarded result) and emit one correlated terminal.
+        dense_fail_closed_error(
+            m,
+            gpu,
             stdout,
             id,
-            format!(
+            &format!(
                 "cohere2moe: prompt is {} tokens but KV capacity (max_seq) is {} — load with a larger max_seq or shorten the prompt",
                 prompt_ids.len(),
                 max_seq
             ),
         );
-        let _ = m.cohere2moe_mut().unwrap().state.reset(gpu);
-        m.seq_pos = 0;
-        m.conversation_tokens.clear();
         return;
     }
     // Cap generation so prefill(prompt) + decode(max_tokens) never exceeds the
@@ -6933,7 +7830,11 @@ pub fn generate_cohere2moe(
         // the degenerate pure-extension case (rewind is then a no-op).
         let cache_hit = lcp > 0 && lcp < prompt_ids.len();
         let partial = lcp < prior_len;
-        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+        if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1")
+        {
             eprintln!(
                 "[cohere2moe-cache] prior_len={} rendered_len={} lcp={} hit={} partial={} n_tokens={}",
                 prior_len, prompt_ids.len(), lcp, cache_hit, cache_hit && partial,
@@ -6970,6 +7871,8 @@ pub fn generate_cohere2moe(
     // Q8/F16 expert tiers (no indexed kernel) fall back to per-token decode_step.
     // The LAST forward's logits predict the first generated token. ──
     let mut last_logits: Vec<f32> = Vec::new();
+    let mut prefill_aborted = false;
+    let mut prefill_fail: Option<String> = None;
     {
         let b = m.cohere2moe_mut().unwrap();
         let cfg = &b.config;
@@ -6978,6 +7881,12 @@ pub fn generate_cohere2moe(
         if cohere2moe::forward::forward_batch_supported(weights) && prefill_ids.len() > 1 {
             let mut i = 0;
             while i < prefill_ids.len() {
+                // Abort is checked per chunk so a client cancel during a long
+                // prompt does not run the full prefill before honoring it.
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 let end = (i + 256).min(prefill_ids.len());
                 let start_pos = state.n_tokens;
                 match cohere2moe::forward::forward_batch(
@@ -6990,12 +7899,8 @@ pub fn generate_cohere2moe(
                 ) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(
-                            stdout,
-                            id,
-                            format!("cohere2moe batched prefill failed: {e:?}"),
-                        );
-                        return;
+                        prefill_fail = Some(format!("cohere2moe batched prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 i = end;
@@ -7003,21 +7908,42 @@ pub fn generate_cohere2moe(
         } else {
             let mut position = state.n_tokens as u32;
             for &tok in &prefill_ids {
+                if check_abort(id) {
+                    prefill_aborted = true;
+                    break;
+                }
                 match cohere2moe::forward::decode_step(cfg, weights, state, gpu, tok, position) {
                     Ok(logits) => last_logits = logits,
                     Err(e) => {
-                        emit_error_with_id(stdout, id, format!("cohere2moe prefill failed: {e:?}"));
-                        return;
+                        prefill_fail = Some(format!("cohere2moe prefill failed: {e:?}"));
+                        break;
                     }
                 }
                 position += 1;
             }
         }
     }
+    // Post-prompt operation failure: complete rollback + one correlated
+    // fail-closed error (no `done`, no cache store).
+    if let Some(msg) = prefill_fail {
+        dense_fail_closed_error(m, gpu, stdout, id, &msg);
+        return;
+    }
+    if prefill_aborted || check_abort(id) {
+        let ep = production_fail_closed_rollback(m, gpu, None, None);
+        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+        return;
+    }
     for &tok in &prefill_ids {
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
+    // Test-only fault seam (G4.10): fires after GPU/KV mutation, before any
+    // token visibility. Reroutes through the production fail-closed terminal.
+    if take_generation_fault_after_prefill() {
+        dense_fail_closed_error(m, gpu, stdout, id, "injected fault after prefill");
+        return;
+    }
 
     // Re-emit a leading `<think>\n` opener into the token stream (display-only,
     // not pushed to state) when the rendered prompt primed the assistant turn
@@ -7155,6 +8081,14 @@ pub fn generate_cohere2moe(
     let mut generated_count: usize = 0;
     let decode_t0 = Instant::now();
     loop {
+        // Decode-side abort check: a mid-decode client cancel stops the loop
+        // immediately instead of running the full `max_tokens` of wasted work.
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
+
         if generated_count >= max_tokens {
             break;
         }
@@ -7343,9 +8277,15 @@ pub fn generate_cohere2moe(
         match step {
             Ok(logits) => last_logits = logits,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("cohere2moe decode failed: {e:?}"));
+                dense_fail_closed_error(m, gpu, stdout, id, &format!("cohere2moe decode failed: {e:?}"));
                 return;
             }
+        }
+        // Test-only fault seam (G4.10): fires after the first decode step's
+        // GPU/KV mutation. Same production fail-closed terminal as prefill.
+        if generated_count == 1 && take_generation_fault_after_first_decode() {
+            dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
+            return;
         }
     }
 
@@ -7427,8 +8367,15 @@ pub fn generate_cohere2moe(
     });
     stage_terminal_tool_calls(&mut pending_done, finish_reason, &held_tool_calls);
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            // Abort after commit staging: roll back before emitting the
+            // cancellation lifecycle (or unattested fail-closed error).
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
     }
 }
 /// Qwen2 generate path (arch_id=7, hipfire-arch-qwen2).
@@ -7578,14 +8525,26 @@ pub fn generate_qwen2(
     // logits in state.logits — these are the predictions for the
     // first generated token.
     for &tok in &prompt_ids {
+        // Abort is checked per token so a client cancel during a long
+        // prompt does not run the full prefill before honoring it.
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+            return;
+        }
         if let Err(e) = qwen2::forward_step(gpu, weights, cfg, state, tok) {
-            emit_error_with_id(stdout, id, format!("qwen2 prefill failed: {e:?}"));
-            let _ = stdout.flush();
+            dense_fail_closed_error(m, gpu, stdout, id, &format!("qwen2 prefill failed: {e:?}"));
             return;
         }
         m.conversation_tokens.push(tok);
     }
     let prefill_ms = t0.elapsed().as_millis();
+    // Test-only fault seam (G4.10): fires after GPU/KV mutation, before any
+    // token visibility. Reroutes through the production fail-closed terminal.
+    if take_generation_fault_after_prefill() {
+        dense_fail_closed_error(m, gpu, stdout, id, "injected fault after prefill");
+        return;
+    }
 
     // Decode loop. Greedy argmax for now (see fn doc for sampling
     // scope). The first generated token is argmax of the prefill's
@@ -7597,13 +8556,19 @@ pub fn generate_qwen2(
     let mut next_tok = match gpu.argmax_f32(&state.logits, cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
-            emit_error_with_id(stdout, id, format!("argmax failed: {e:?}"));
-            let _ = stdout.flush();
+            dense_fail_closed_error(m, gpu, stdout, id, &format!("qwen2 argmax failed: {e:?}"));
             return;
         }
     };
 
     loop {
+        // Decode-side abort check: a mid-decode client cancel stops the loop
+        // immediately instead of running the full `max_tokens` of wasted work.
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
@@ -7631,13 +8596,17 @@ pub fn generate_qwen2(
         match qwen2::forward_step_greedy(gpu, weights, cfg, state, next_tok) {
             Ok(t) => next_tok = t,
             Err(e) => {
-                emit_error_with_id(stdout, id, format!("forward_step_greedy failed: {e:?}"));
-                let _ = stdout.flush();
+                dense_fail_closed_error(m, gpu, stdout, id, &format!("qwen2 decode failed: {e:?}"));
                 return;
             }
         }
+        // Test-only fault seam (G4.10): fires after the first decode step's
+        // GPU/KV mutation. Same production fail-closed terminal as prefill.
+        if generated_count == 1 && take_generation_fault_after_first_decode() {
+            dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
+            return;
+        }
     }
-
     // Daemon bookkeeping: seq_pos matches Qwen2State's internal cursor.
     m.seq_pos = state.next_pos;
 
@@ -7658,8 +8627,15 @@ pub fn generate_qwen2(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            // Abort after commit staging: roll back before emitting the
+            // cancellation lifecycle (or unattested fail-closed error).
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+        }
     }
 }
 
@@ -8166,11 +9142,11 @@ pub fn generate_maple(
     //     answer text: observed live on the first `.mq2lloydu` run, where the
     //     model's "The user wants me to write a hello world in Zig…" reasoning
     //     was returned as `content` with `reasoning_content` empty.
-    emit_gen_start(
+    crate::ar::emit_generation_start(
+        crate::ar::active_generation_route().unwrap_or(crate::ar::GenerationRoute::MapleAr),
         stdout,
         id,
         primed_think,
-        crate::common::gen_start_contract_version_for_arch(15),
     );
 
     // Decode. Greedy argmax over the CPU-side logits `forward_batch` /
@@ -8182,7 +9158,7 @@ pub fn generate_maple(
     // `<|endoftext|>` (151643) is not Maple's declared eos — config.json says
     // 151645 — but emitting it mid-chat is a terminal condition either way, and
     // continuing past it produces garbage. Stop on both.
-    let eos_set: [u32; 2] = [eos_tok, 151643];
+    let eos_set: [u32; 2] = [eos_tok, hipfire_runtime::chatml::ENDOFTEXT];
     let mut hit_eos = false;
     // Explicit thinking cap enforcement. The HTTP layer resolves `max_think_tokens`
     // via the QwenJinja contract; without this router Maple would ignore it and
@@ -8360,8 +9336,12 @@ pub fn generate_maple(
     hipfire_engine::emit::emit_tool_calls_event(stdout, id, &tool_calls);
     let _ = stdout.flush();
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            emit_aborted_terminal_after_abort(stdout, id, generated_count);
+        }
     }
 }
 

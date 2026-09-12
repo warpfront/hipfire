@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/hip-bridge",
+    "crates/va-bridge",
     "crates/hsa-bridge",
     "crates/rdna-compute",
     "crates/saddle-core",
@@ -24,6 +25,7 @@ members = [
     "crates/hipfire-arch-cohere2moe",
     "crates/hipfire-arch-maple",
     "crates/hipfire-arch-dots-ocr",
+    "crates/hipfire-arch-diffusion",
     "crates/hipfire-quantize",
     "crates/saddle-quant",
     "crates/hipfire-detect",
@@ -31,7 +33,6 @@ members = [
     "crates/redline",
     "crates/redline-rocr",
     "crates/redline-dispatch",
-    "crates/radiowave",
     "crates/hipfire-dispatch",
     "crates/hipfire-dispatch-tests",
     "crates/hipfire-tui",
@@ -47,14 +48,30 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0"
+version = "0.3.1"
 edition = "2021"
 # Outbound license for the work as a whole. Individual files whose authors
 # have not elected Apache-2.0 keep an MIT SPDX header; see LICENSE and NOTICE.
 license = "Apache-2.0"
 
 [workspace.dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = "4.6"
+fancy-regex = "0.14"
 half = "2.7"
+image = { version = "0.25", default-features = false, features = ["png"] }
+libjpeg-turbo-rs = "0.8"
 libloading = "0.9"
+libm = "0.2"
+memmap2 = "0.9"
+minijinja = "2"
+minijinja-contrib = "2"
 proptest = { version = "1.11", default-features = false, features = ["std"] }
+rayon = "1"
+regex = "1"
 safetensors = "0.8"
+serde = "1"
+serde_json = "1"
+sha2 = "0.10"
+thiserror = "2"

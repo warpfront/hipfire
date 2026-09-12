@@ -65,7 +65,7 @@ impl ArchModel for MapleBundle {
 /// Maple's end-of-turn token. The checkpoint ships the Qwen tokenizer and
 /// `config.json` declares `eos_token_id` 151645 (`<|im_end|>`), not the
 /// `<|endoftext|>` (151643) that a vocab heuristic would pick.
-pub const MAPLE_EOS_FALLBACK: u32 = 151645;
+pub const MAPLE_EOS_FALLBACK: u32 = hipfire_runtime::chatml::IM_END;
 
 /// Resolve the end-of-turn id from the tokenizer, falling back to the
 /// config-declared ChatML id.
@@ -83,14 +83,48 @@ pub fn resolve_eos(tokenizer: &hipfire_runtime::tokenizer::Tokenizer) -> u32 {
 ///
 /// Split out from the carrier so an offline harness (the coherence example)
 /// can build the same bundle without going through the loader registry.
+/// `kv_mode_raw` is the UNRESOLVED request string (`--kv-mode`, `""` for the
+/// default). It is resolved here rather than by the caller because this is the
+/// first point where `config.head_dim` exists, and `resolve` takes it. Modes
+/// outside `MAPLE_POLICY`'s accept set fall back to the site default (bf16)
+/// with a warning — never silently serving a tier that cannot carry Maple's
+/// 3:1 sliding-window layers.
 pub fn load_maple_from_hfq(
     hfq: &mut HfqFile,
     gpu: &mut Gpu,
     max_seq: usize,
+    kv_mode_raw: &str,
 ) -> Result<MapleBundle, String> {
+    load_maple_from_hfq_with_head(hfq, gpu, max_seq, kv_mode_raw, None)
+}
+
+/// `load_maple_from_hfq` with an optional HEAD OVERLAY: a single-tensor `.hfq`
+/// built by `hipfire-quantize --head-only` whose `lm_head.weight` shadows the
+/// base's. One 6.5 GB body then serves every head carrier, instead of shipping
+/// a near-identical full model per carrier.
+///
+/// Attached BEFORE `MapleWeights::load`, because the loader reads the head
+/// through the same `find_tensor_info` path the overlay shadows — attaching
+/// afterwards would silently load the base's head and produce a model that
+/// looks right and is not the one requested.
+pub fn load_maple_from_hfq_with_head(
+    hfq: &mut HfqFile,
+    gpu: &mut Gpu,
+    max_seq: usize,
+    kv_mode_raw: &str,
+    head_overlay: Option<&std::path::Path>,
+) -> Result<MapleBundle, String> {
+    if let Some(head) = head_overlay {
+        hfq.attach_head_overlay(head)?;
+    }
     let config = MapleConfig::from_hfq(hfq)?;
     let weights = MapleWeights::load(hfq, &config, gpu)?;
-    let state = MapleState::new_with_max_seq(gpu, &config, max_seq)?;
+    let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
+        hipfire_runtime::kv_mode::resolve(kv_mode_raw, &hipfire_runtime::kv_mode::MAPLE_POLICY);
+    if let Some(w) = warning {
+        eprintln!("  KV cache: {w} (site maple)");
+    }
+    let state = MapleState::new_with_max_seq(gpu, &config, max_seq, mode)?;
     let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
         .map_err(|e| format!("maple: tokenizer not found: {e}"))?;
     let eos_tok = resolve_eos(&tokenizer);

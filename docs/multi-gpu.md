@@ -59,7 +59,6 @@ Source of truth: `Gpus` in `multi_gpu.rs`.
    - Escape hatch: `HIPFIRE_PP_LAYERS=a,b,…` → `Gpus::init_layers` (length must
      equal `pp`, sum must equal `n_layers`). Skips the uniform free-VRAM delta
      check; still enforces arch match unless overridden.
-   - `Gpus::init_vram_weighted` is **not implemented** (returns a scheduled-for-v1.1 error).
 3. **Placement convention (Variant 2)** — `output_device = last` device holds
    `output_norm + lm_head`. Device 0 holds the embedding side of the split.
 4. **Boundary traffic** — at each band edge, `boundary_copy` moves the residual
@@ -83,7 +82,9 @@ Source of truth: `Gpus` in `multi_gpu.rs`.
 EP topology is different: `init_tp` sets every device’s layer map as “all layers
 on rank 0” for PP helpers, while the EP forward ignores bands and shards experts.
 RCCL all-reduce is used unless `HIPFIRE_TP_USE_RCCL=0` (host fallback not
-implemented — that opt-out errors).
+implemented — that opt-out errors). Non-standard ROCm layouts (e.g. nixpkgs
+splitting `librccl` out of the ROCm root) set `HIPFIRE_RCCL_LIB` to the full
+`librccl.so` path; the loader tries that before the ROCm root candidates.
 
 ### Peer / fabric checks (host)
 
@@ -145,6 +146,7 @@ Canonical table: [`env-vars.md`](env-vars.md) (`MULTI-GPU` group). Short map:
 | `HIPFIRE_DETERMINISTIC` | Deterministic WMMA reduction path (parity / bisect) |
 | `HIPFIRE_TP` | EP degree (CLI `--tp` sets this) |
 | `HIPFIRE_TP_USE_RCCL` | `0` opts out of RCCL (errors; no host AR yet) |
+| `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path tried before the ROCm root (nixpkgs / split RCCL installs) |
 | `HIPFIRE_PP_PFLASH=1` | **Experimental** — accept PFlash compose with `pp>1` (not a product default; not route-certified) |
 | `HIPFIRE_PP_DFLASH=1` | **Experimental** — accept DFlash draft field with `pp>1` (cross-card spec generate is **not** fully implemented; see daemon refusal text) |
 
@@ -175,7 +177,7 @@ EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep`
 ### Architectural limits (current)
 
 - Homogeneous **exact arch string** by default (`ALLOW_MIXED_ARCH` is opt-in).
-- No automatic VRAM-weighted split (`init_vram_weighted` stub).
+- No automatic VRAM-weighted split.
 - PP decode is sequential across bands (no async multi-band pipeline / per-band
   graph capture as a documented product path).
 - Experimental `HIPFIRE_PP_*` flags are **not** admissions and are not
@@ -398,7 +400,7 @@ Direct daemon JSON (driving without the CLI):
 | `HIPFIRE_DETERMINISTIC=1` | Force k2 WMMA reduction (no atomicAdd) — bit-identical across processes/pp configs at ~33% perf cost on small-batch decode |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB=N` | Pre-flight VRAM-asymmetry tolerance for `Gpus::init_uniform` (default 2.0) |
 | `HIPFIRE_PREFILL_BATCHED=0` | Disable batched WMMA prefill (per-token fallback). Diagnostic for ksplit non-det isolation |
-| `HIPFIRE_PREFILL_MAX_BATCH=N` | Override per-chunk prefill batch (default `PREFILL_MAX_BATCH`); chunks > N split with peer-copy at boundary |
+| `HIPFIRE_PREFILL_MAX_BATCH=N` | Override per-chunk prefill batch. When unset/invalid: arch defaults are **512** on exact `gfx1100`, **384** on exact `gfx1201`, else **256** (`PREFILL_MAX_BATCH`). Under TP, `prefill_max_batch_tp` uses default×`tp` (cap **2048**). An explicit `HIPFIRE_PREFILL_MAX_BATCH` wins over both the arch default and the TP scale. Chunks > N split with peer-copy at the boundary |
 | `HIPFIRE_WO_WMMA_VARIANT={k2,ksplit,k4,…}` | Manual override of the wo-residual GEMM variant — see `dispatch.rs` auto-dispatch |
 
 ### Refusal matrix at load (`pp > 1`)
@@ -438,7 +440,7 @@ Refused at load time:
 
 Architectural limits in v1:
 - Homogeneous arch only (`init_uniform` hard-fails on arch mismatch)
-- Uniform layer split — `init_layers(per_device)` is the manual escape hatch; `init_vram_weighted` stubbed
+- Uniform layer split — `init_layers(per_device)` is the manual escape hatch
 - Per-token decode (no async stream pipeline / per-band graph capture) — v1.1
 - Pipelined prefill (chunk N+1 on dev_0 while chunk N processes on dev_1) — v1.1
 

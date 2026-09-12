@@ -297,13 +297,13 @@ pub(crate) fn validate_fixed_tier_spec(spec: &str) -> Result<(), String> {
 /// Fail before worker threads if any unknown class/dtype token appears in the
 /// two fixed-tier env strings. Called at CLI boundary before rayon spawn.
 pub(crate) fn validate_env_fixed_tier_or_exit() {
-    if let Ok(spec) = std::env::var("HIPFIRE_Q8_CLASSES") {
+    if let Ok(spec) = hipfire_config::developer_var("HIPFIRE_Q8_CLASSES") {
         if let Err(e) = validate_q8_classes_spec(&spec) {
             eprintln!("error: HIPFIRE_Q8_CLASSES: {e}");
             std::process::exit(2);
         }
     }
-    if let Ok(spec) = std::env::var("HIPFIRE_FIXED_TIER") {
+    if let Ok(spec) = hipfire_config::developer_var("HIPFIRE_FIXED_TIER") {
         if let Err(e) = validate_fixed_tier_spec(&spec) {
             eprintln!("error: HIPFIRE_FIXED_TIER: {e}");
             std::process::exit(2);
@@ -400,7 +400,7 @@ pub(crate) fn is_q8_tensor(name: &str) -> bool {
     if fixed_tier_override_applies(name) {
         return true;
     }
-    match std::env::var("HIPFIRE_Q8_CLASSES") {
+    match hipfire_config::developer_var("HIPFIRE_Q8_CLASSES") {
         Ok(list) => {
             // validated at startup; still handle empty list as no lift.
             // `attn_full` independently retains self-attention without linear_attn.
@@ -460,7 +460,7 @@ fn active_fixed_tier_map() -> Option<HashMap<String, String>> {
     if let Some(map) = fixed_tier_map_cli() {
         return Some(map);
     }
-    let spec = std::env::var("HIPFIRE_FIXED_TIER").ok()?;
+    let spec = hipfire_config::developer_var("HIPFIRE_FIXED_TIER").ok()?;
     match parse_fixed_tier(&spec) {
         Ok(map) => Some(map),
         Err(e) => {

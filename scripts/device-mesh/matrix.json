@@ -1,0 +1,2103 @@
+{
+ "defaults": {
+  "cli_bin_env": "HIPFIRE_CLI_BIN",
+  "daemon_bin_env": "HIPFIRE_DAEMON_BIN",
+  "deterministic_env": {
+   "HIPFIRE_DETERMINISTIC": "1"
+  },
+  "models_dir_env": "HIPFIRE_MODELS_DIR",
+  "serve_prompts": "benchmarks/prompts/hw-gate/serve-battery.json",
+  "serve_session_file": "benchmarks/sessions/mv_session_coding.json"
+ },
+ "disposition_values": [
+  "current",
+  "rerun-required",
+  "historical",
+  "semantics-only",
+  "emulated",
+  "failed",
+  "hardware-blocked"
+ ],
+ "evidence_policy": "issue warpfront/hipfire#666: exact base/producer commits, fixture identities (model sha256, prompt md5, binary md5s, GPU/ROCm/RCCL ids), positive + negative probe commands, disposition.",
+ "notes": [
+  "Runner inventory only: never claims a row passes without executing it on hardware.",
+  "probe=existing reuses an in-tree harness/test. probe=thin-driver executes the daemon JSONL protocol directly (G1/G2 load-preservation rows). probe=none has no existing probe and is reported as 'no existing probe'.",
+  "serve/redline/daemon rows need a real HIP GPU and registry artifacts; the runner records hardware-blocked when /dev/kfd and /dev/dri are both absent."
+ ],
+ "rows": [
+  {
+   "commands": {
+    "negative": [
+     "printf '%s\\n' '{\"type\":\"load\",\"model\":\"$MODEL\",\"params\":{\"max_seq\":2048}}' '{\"type\":\"generate\",\"id\":\"bad1\",\"attempt_id\":1,\"prompt\":\"Write a one-sentence greeting.\",\"temperature\":0.0,\"seed\":12345,\"max_tokens\":64,\"thinking_enabled\":false}' | $DAEMON_BIN  # inject: second request names /nonexistent.mq4; expect wire error, active model still serves"
+    ],
+    "positive": [
+     "$DAEMON_BIN  # piped-stdin JSONL session (HIPFIRE_DETERMINISTIC=1); see positive_session",
+     "hipfire run --temp 0 --kv-mode q8 qwen3.8:27b-mq4-xt \"Write a haiku about rivers.\""
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g1-fresh-27b",
+   "milestone": "G1",
+   "negative_predicate": {
+    "kind": "wire_active_survives_bad_load"
+   },
+   "negative_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t0",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 1,
+      "id": "pre",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "error",
+     "send": {
+      "model": "/nonexistent.mq4",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 2,
+      "id": "post",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "positive_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t0",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 1,
+      "id": "r1",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    },
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 2,
+      "id": "r2",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "predicate": {
+    "identical_text_groups": [
+     [
+      0,
+      1
+     ]
+    ],
+    "kind": "wire_reload_equal"
+   },
+   "probe": "thin-driver",
+   "prompt": "Write a one-sentence greeting.",
+   "route": "single/fresh-daemon-load-generate-unload-reload"
+  },
+  {
+   "commands": {
+    "negative": [
+     "printf '%s\\n' '{\"type\":\"load\",\"model\":\"$MODEL\",\"params\":{\"max_seq\":2048}}' '{\"type\":\"load\",\"model\":\"/nonexistent-a3b.mq4p\",\"params\":{\"max_seq\":2048}}' | $DAEMON_BIN  # expect wire error; prior model still serves"
+    ],
+    "positive": [
+     "$DAEMON_BIN  # piped-stdin JSONL session (HIPFIRE_DETERMINISTIC=1); see positive_session",
+     "hipfire run --temp 0 --kv-mode q8 ornith-1.5:35b-a3b-mq4r \"Explain recursion in one paragraph.\""
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "ornith-1.5:35b-a3b-mq4r"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g1-fresh-a3b",
+   "milestone": "G1",
+   "negative_predicate": {
+    "kind": "wire_active_survives_bad_load"
+   },
+   "negative_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t0",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 1,
+      "id": "pre",
+      "max_tokens": 64,
+      "prompt": "Explain recursion in one paragraph.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "error",
+     "send": {
+      "model": "/nonexistent-a3b.mq4p",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 2,
+      "id": "post",
+      "max_tokens": 64,
+      "prompt": "Explain recursion in one paragraph.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "positive_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t0",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 1,
+      "id": "r1",
+      "max_tokens": 64,
+      "prompt": "Explain recursion in one paragraph.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    },
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 2,
+      "id": "r2",
+      "max_tokens": 64,
+      "prompt": "Explain recursion in one paragraph.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "predicate": {
+    "identical_text_groups": [
+     [
+      0,
+      1
+     ]
+    ],
+    "kind": "wire_reload_equal"
+   },
+   "probe": "thin-driver",
+   "prompt": "Explain recursion in one paragraph.",
+   "route": "single/fresh-daemon-load-generate-unload-reload"
+  },
+  {
+   "commands": {
+    "negative": [
+     "$DAEMON_BIN  # load with pp=99 on the dense single; expect wire error, model still serves (see negative_session)"
+    ],
+    "positive": [
+     "$DAEMON_BIN  # 4x load/generate/unload in fresh processes (HIPFIRE_DETERMINISTIC=1); rocm-smi sampled per cycle"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g1-four-cycles",
+   "milestone": "G1",
+   "negative_predicate": {
+    "kind": "wire_active_survives_bad_load"
+   },
+   "negative_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "expect": "error",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048,
+       "pp": 99
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 9,
+      "id": "post",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "positive_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t0",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 1,
+      "id": "r1",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "predicate": {
+    "cycles": 4,
+    "kind": "wire_four_cycles"
+   },
+   "probe": "thin-driver",
+   "prompt": "Write a one-sentence greeting.",
+   "repeat": 4,
+   "route": "single/synchronized-cycles-stable-vram"
+  },
+  {
+   "commands": {
+    "negative": [
+     "$DAEMON_BIN  # load with max_seq=0 (contradictory cell); expect wire error with zero side effects, prior model still serves"
+    ],
+    "positive": [
+     "python3 scripts/serve_harness.py --port 28501 --model $MODEL --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-refusal --out $OUT/g1-refusal.json --serve-log $OUT/g1-refusal.serve.log"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_MODELS_DIR": "$MODELS_DIR",
+    "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
+    "HIPFIRE_CLI_BIN": "$CLI_BIN"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g1-refusal-zero-side-effect",
+   "milestone": "G1",
+   "negative_predicate": {
+    "kind": "wire_active_survives_bad_load"
+   },
+   "negative_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t0",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 1,
+      "id": "pre",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "error",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 0
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 2,
+      "id": "post",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "predicate": {
+    "kind": "serve"
+   },
+   "probe": "existing",
+   "prompt": "Write a one-sentence greeting.",
+   "route": "single/refusal-matrix-zero-side-effects"
+  },
+  {
+   "commands": {
+    "negative": [
+     "$DAEMON_BIN  # load with params vision=/nonexistent-vision.hfq; expect wire error, text route still serves"
+    ],
+    "positive": [
+     "$DAEMON_BIN  # load qwen3.8:27b-mq4-xt, assert loaded.vl==false (vision_config embedded, no tower), generate done"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g1-text-with-vision-meta",
+   "milestone": "G1",
+   "negative_predicate": {
+    "kind": "wire_active_survives_bad_load"
+   },
+   "negative_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "expect": "error",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048,
+       "vision": "/nonexistent-vision.hfq",
+       "vision_mode": "on"
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 2,
+      "id": "post",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "positive_session": [
+    {
+     "assert_loaded": {
+      "vl": false
+     },
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t0",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 1,
+      "id": "r1",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "predicate": {
+    "kind": "wire_vl_false_then_done"
+   },
+   "probe": "thin-driver",
+   "prompt": "Write a one-sentence greeting.",
+   "route": "single/text-with-vision-config-no-tower"
+  },
+  {
+   "commands": {
+    "negative": [
+     "python3 scripts/serve_harness.py --port 28503 --model /nonexistent.mq4 --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --home $OUT/home-nope --out $OUT/nope.json  # expect nonzero exit, no serve spawned"
+    ],
+    "positive": [
+     "python3 scripts/serve_harness.py --port 28502 --model $MODEL --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-battery-27b --out $OUT/g1-battery-27b.json --serve-log $OUT/g1-battery-27b.serve.log"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_MODELS_DIR": "$MODELS_DIR",
+    "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
+    "HIPFIRE_CLI_BIN": "$CLI_BIN"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g1-serve-battery-27b",
+   "milestone": "G1",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "predicate": {
+    "kind": "serve"
+   },
+   "probe": "existing",
+   "route": "single/serve-battery"
+  },
+  {
+   "commands": {
+    "negative": [
+     "python3 scripts/serve_harness.py --port 28506 --model $MODEL --mode session --session /nonexistent-session.json --home $OUT/home-nope --out $OUT/nope.json  # expect nonzero exit on malformed session"
+    ],
+    "positive": [
+     "python3 scripts/serve_harness.py --port 28504 --model $MODEL --mode chain --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-chain-27b --out $OUT/g1-chain-27b.json --serve-log $OUT/g1-chain-27b.serve.log",
+     "python3 scripts/serve_harness.py --port 28505 --model $MODEL --mode session --session benchmarks/sessions/mv_session_coding.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-session-27b --out $OUT/g1-session-27b.json --serve-log $OUT/g1-session-27b.serve.log"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_MODELS_DIR": "$MODELS_DIR",
+    "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
+    "HIPFIRE_CLI_BIN": "$CLI_BIN"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g1-serve-chain-session-27b",
+   "milestone": "G1",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "predicate": {
+    "kind": "serve"
+   },
+   "probe": "existing",
+   "route": "single/serve-chain-session"
+  },
+  {
+   "commands": {
+    "negative": [
+     "python3 scripts/serve_harness.py --port 28508 --model /nonexistent-a3b.mq4p --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --home $OUT/home-nope --out $OUT/nope.json  # expect nonzero exit, no serve spawned"
+    ],
+    "positive": [
+     "python3 scripts/serve_harness.py --port 28507 --model $MODEL --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g1-battery-a3b --out $OUT/g1-battery-a3b.json --serve-log $OUT/g1-battery-a3b.serve.log"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_MODELS_DIR": "$MODELS_DIR",
+    "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
+    "HIPFIRE_CLI_BIN": "$CLI_BIN"
+   },
+   "fixtures": [
+    "ornith-1.5:35b-a3b-mq4r"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g1-serve-battery-a3b",
+   "milestone": "G1",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "predicate": {
+    "kind": "serve"
+   },
+   "probe": "existing",
+   "route": "single/serve-battery"
+  },
+  {
+   "commands": {
+    "negative": [
+     "printf '%s\\n' '{\"type\":\"load\",\"model\":\"/nonexistent.mq4\",\"params\":{\"max_seq\":2048}}' | $DAEMON_BIN  # expect wire error, nothing torn down"
+    ],
+    "positive": [
+     "$DAEMON_BIN  # rerun of g1-fresh-27b positive_session on the final composed head"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g2-repeat-27b",
+   "milestone": "G2",
+   "negative_predicate": {
+    "kind": "wire_active_survives_bad_load"
+   },
+   "negative_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "expect": "error",
+     "send": {
+      "model": "/nonexistent.mq4",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 2,
+      "id": "post",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "positive_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t0",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 1,
+      "id": "r1",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    },
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 2,
+      "id": "r2",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "predicate": {
+    "identical_text_groups": [
+     [
+      0,
+      1
+     ]
+    ],
+    "kind": "wire_reload_equal"
+   },
+   "probe": "thin-driver",
+   "prompt": "Write a one-sentence greeting.",
+   "rerun_of": "g1-fresh-27b",
+   "route": "single/admission-repeat-preservation"
+  },
+  {
+   "commands": {
+    "negative": [
+     "printf '%s\\n' '{\"type\":\"load\",\"model\":\"/nonexistent-a3b.mq4p\",\"params\":{\"max_seq\":2048}}' | $DAEMON_BIN  # expect wire error, nothing torn down"
+    ],
+    "positive": [
+     "$DAEMON_BIN  # rerun of g1-fresh-a3b positive_session on the final composed head"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "ornith-1.5:35b-a3b-mq4r"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g2-repeat-a3b",
+   "milestone": "G2",
+   "negative_predicate": {
+    "kind": "wire_active_survives_bad_load"
+   },
+   "negative_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "expect": "error",
+     "send": {
+      "model": "/nonexistent-a3b.mq4p",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 2,
+      "id": "post",
+      "max_tokens": 64,
+      "prompt": "Explain recursion in one paragraph.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "positive_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t0",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 1,
+      "id": "r1",
+      "max_tokens": 64,
+      "prompt": "Explain recursion in one paragraph.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    },
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 2,
+      "id": "r2",
+      "max_tokens": 64,
+      "prompt": "Explain recursion in one paragraph.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "predicate": {
+    "identical_text_groups": [
+     [
+      0,
+      1
+     ]
+    ],
+    "kind": "wire_reload_equal"
+   },
+   "probe": "thin-driver",
+   "prompt": "Explain recursion in one paragraph.",
+   "rerun_of": "g1-fresh-a3b",
+   "route": "single/admission-repeat-preservation"
+  },
+  {
+   "commands": {
+    "negative": [
+     "cargo test -p hipfire-loader --locked --lib sidecar_without_tower_refuses -- --test-threads=1 # vision sidecar without tower refuses (fail-closed counterpart)"
+    ],
+    "positive": [
+     "cargo test -p hipfire-loader --locked --lib -- --test-threads=1"
+    ]
+   },
+   "env": {},
+   "fixtures": [],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151",
+    "multi-gpu-2",
+    "multi-gpu-4"
+   ],
+   "id": "g2-loader-refusal-unit",
+   "milestone": "G2",
+   "negative_predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 15
+   },
+   "probe": "existing",
+   "route": "unit/admission-refusal-contracts"
+  },
+  {
+   "commands": {
+    "negative": [
+     "$DAEMON_BIN  # load with pp=99 (unsupported dense cell); expect wire error before teardown, prior model still serves"
+    ],
+    "positive": [
+     "$DAEMON_BIN  # load qwen3.8:27b-mq4-xt, refuse contradictory pp cell, prove zero side effects + prior model usable"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g2-admission-refusal-ledger",
+   "milestone": "G2",
+   "negative_predicate": {
+    "kind": "wire_active_survives_bad_load"
+   },
+   "negative_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "expect": "error",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048,
+       "pp": 99
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 9,
+      "id": "post",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "positive_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t0",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 1,
+      "id": "pre",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "error",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048,
+       "pp": 99
+      },
+      "type": "load"
+     }
+    },
+    {
+     "capture_text": "t1",
+     "expect_terminal": "done",
+     "handshake": true,
+     "send": {
+      "attempt_id": 2,
+      "id": "post",
+      "max_tokens": 64,
+      "prompt": "Write a one-sentence greeting.",
+      "seed": 12345,
+      "temperature": 0.0,
+      "thinking_enabled": false,
+      "type": "generate"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "predicate": {
+    "identical_text_groups": [
+     [
+      0,
+      1
+     ]
+    ],
+    "kind": "wire_reload_equal"
+   },
+   "probe": "thin-driver",
+   "prompt": "Write a one-sentence greeting.",
+   "route": "single/admission-refusal-zero-side-effects"
+  },
+  {
+   "commands": {
+    "negative": [
+     "$DAEMON_BIN  # load a directory path as model; expect wire error, no reclassification of the admitted model"
+    ],
+    "positive": [
+     "$DAEMON_BIN  # load qwen3.8:27b-mq4-xt via registry path, unload, reload via filename path; both loaded.arch identical"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g2-no-reclassify-rerun",
+   "milestone": "G2",
+   "negative_predicate": {
+    "kind": "wire_error"
+   },
+   "negative_session": [
+    {
+     "expect": "error",
+     "send": {
+      "model": "$MODELS_DIR",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    }
+   ],
+   "positive_session": [
+    {
+     "capture_loaded": "a0",
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    },
+    {
+     "capture_loaded": "a1",
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL_ALT",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "predicate": {
+    "kind": "wire_same_arch_twice"
+   },
+   "probe": "thin-driver",
+   "prompt": "Write a one-sentence greeting.",
+   "route": "single/source-path-stable-admission"
+  },
+  {
+   "commands": {
+    "negative": [
+     "cargo test -p hipfire-runtime --locked --lib rollback_reports_free_failure_without_counting_release -- --test-threads=1 # rollback accounting counterpart"
+    ],
+    "positive": [
+     "cargo test -p hipfire-runtime --locked --lib weight_manifest -- --test-threads=1"
+    ]
+   },
+   "env": {},
+   "fixtures": [],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151",
+    "multi-gpu-2",
+    "multi-gpu-4"
+   ],
+   "id": "g3-manifest-plan-unit",
+   "milestone": "G3",
+   "negative_predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 7
+   },
+   "probe": "existing",
+   "route": "unit/manifest-planning"
+  },
+  {
+   "commands": {
+    "negative": [
+     "cargo test -p hipfire-runtime --locked --lib allocation_journal_records_insertion_order_for_reverse_rollback -- --test-threads=1 # reverse-order rollback counterpart"
+    ],
+    "positive": [
+     "cargo test -p hipfire-runtime --locked --lib weight_store -- --test-threads=1"
+    ]
+   },
+   "env": {},
+   "fixtures": [],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151",
+    "multi-gpu-2",
+    "multi-gpu-4"
+   ],
+   "id": "g3-store-unit",
+   "milestone": "G3",
+   "negative_predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 10
+   },
+   "probe": "existing",
+   "route": "unit/store-transaction"
+  },
+  {
+   "commands": {
+    "negative": [
+     "cargo test -p hipfire-arch-llama --locked --lib typed_assembly_rolls_back_when_a_cell_is_not_resident -- --test-threads=1 # fault-injection counterpart"
+    ],
+    "positive": [
+     "cargo test -p hipfire-arch-llama --locked --lib carrier -- --test-threads=1"
+    ]
+   },
+   "env": {},
+   "fixtures": [],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151",
+    "multi-gpu-2",
+    "multi-gpu-4"
+   ],
+   "id": "g3-llama-carrier-unit",
+   "milestone": "G3",
+   "negative_predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 15
+   },
+   "probe": "existing",
+   "route": "unit/llama-manifest-carrier"
+  },
+  {
+   "commands": {
+    "negative": [
+     "cargo test -p hipfire-arch-llama --locked --lib production_awq_sidecar_selects_legacy_loader -- --test-threads=1 # AWQ sidecars stay on the legacy loader (retained route)"
+    ],
+    "positive": [
+     "G3_FIXTURE=$MODEL cargo test -p hipfire-arch-llama --locked --lib carrier::tests::pinned_fixture_manifest_legacy_parity_oracle -- --exact --test-threads=1"
+    ]
+   },
+   "env": {
+    "G3_FIXTURE": "$MODEL"
+   },
+   "fixtures": [
+    "qwen3:0.6b"
+   ],
+   "hosts": [
+    "gfx1151",
+    "gfx1201",
+    "gfx1100"
+   ],
+   "id": "g3-pinned-parity-oracle",
+   "milestone": "G3",
+   "negative_predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "probe": "existing",
+   "route": "single/manifest-vs-legacy-parity-oracle"
+  },
+  {
+   "commands": {
+    "negative": [
+     "hipfire run --temp 0 --kv-mode q8 /nonexistent-llama.hf4 \"The capital of France is located in\"  # expect nonzero fail-closed exit"
+    ],
+    "positive": [
+     "hipfire run --temp 0 --kv-mode q8 qwen3:0.6b \"The capital of France is located in\"",
+     "hipfire run --temp 0 --kv-mode q8 qwen3:0.6b \"The capital of France is located in\"  # immediate reload: byte-identical decode expected"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "qwen3:0.6b"
+   ],
+   "hosts": [
+    "gfx1151",
+    "gfx1201",
+    "gfx1100"
+   ],
+   "id": "g3-manifest-lifecycle-run",
+   "milestone": "G3",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "predicate": {
+    "identical_text_groups": [
+     [
+      0,
+      1
+     ]
+    ],
+    "kind": "run_reload_equal",
+    "min_chars": 1
+   },
+   "probe": "existing",
+   "prompt": "The capital of France is located in",
+   "route": "single/manifest-load-generate-reload"
+  },
+  {
+   "commands": {
+    "negative": [
+     "hipfire run --temp 0 --kv-mode q8 /nonexistent-27b.mq4 \"Write a haiku about rivers.\"  # expect nonzero fail-closed exit"
+    ],
+    "positive": [
+     "hipfire run --temp 0 --kv-mode q8 qwen3.8:27b-mq4-xt \"Write a haiku about rivers.\"",
+     "hipfire run --temp 0 --kv-mode q8 ornith-1.5:35b-a3b-mq4r \"Explain recursion in one paragraph.\""
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt",
+    "ornith-1.5:35b-a3b-mq4r"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g3-sentinel-bar",
+   "milestone": "G3",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "predicate": {
+    "kind": "run",
+    "min_chars": 1
+   },
+   "probe": "existing",
+   "route": "single/production-decode-inspection"
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "HIPFIRE_QWEN35_FIXTURE=$MODEL cargo test -p hipfire-arch-qwen35 --locked --lib qwen35_after_ -- --ignored --test-threads=1"
+    ]
+   },
+   "env": {
+    "HIPFIRE_QWEN35_FIXTURE": "$MODEL"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1151",
+    "gfx1201",
+    "gfx1100"
+   ],
+   "id": "g4-qwen35-fault-matrix",
+   "milestone": "G4.3",
+   "negative_predicate": {
+    "kind": "none",
+    "note": "fault tests are the negative of the happy load path (serve rows)"
+   },
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 5
+   },
+   "probe": "existing",
+   "route": "single/qwen35-staged-construction-rollback"
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "HIPFIRE_DSPARK_FIXTURE=/home/kaden/.hipfire/models/deepseek-v4-flash-0731-dspark.mq2r cargo test -p hipfire-arch-deepseek4 --locked dspark_after_ -- --ignored --test-threads=1"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DSPARK_FIXTURE": "/home/kaden/.hipfire/models/deepseek-v4-flash-0731-dspark.mq2r"
+   },
+   "fixtures": [
+    "ornith-1.5:35b-a3b-mq4r"
+   ],
+   "hosts": [
+    "gfx1151",
+    "gfx1201",
+    "gfx1100"
+   ],
+   "id": "g4-dspark-fault-matrix",
+   "milestone": "G4.4",
+   "negative_predicate": {
+    "kind": "none",
+    "note": "fault tests are the negative of the happy load path"
+   },
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 4
+   },
+   "probe": "existing",
+   "route": "single/dspark-staged-construction-rollback",
+   "fixture_files": [
+    "/home/kaden/.hipfire/models/deepseek-v4-flash-0731-dspark.mq2r"
+   ]
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "HIPFIRE_QWEN35_RESET_MODEL=/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
+    "HIPFIRE_QWEN35_RESET_MODEL": "$MODEL",
+    "HIPFIRE_RESET_ROUNDS": "1"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g4-reset-single",
+   "milestone": "G4.7",
+   "negative_predicate": {
+    "kind": "none",
+    "note": "fault rounds are the negative of the clean baseline inside the test"
+   },
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "probe": "existing",
+   "route": "single/text-reset-attested-rollback"
+  },
+  {
+   "commands": {
+    "positive": [
+     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_DFLASH_DRAFT=/home/kaden/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw dflash_qwen35 -- --ignored --test-threads=1"
+    ],
+    "negative": [
+     "HIPFIRE_QWEN35_RESET_MODEL=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw single_qwen35 -- --ignored --test-threads=1"
+    ]
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g4-spec-route-fault-coverage",
+   "milestone": "G4.7",
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "probe": "thin-driver",
+   "route": "single/spec-decode-fault-rollback",
+   "negative_predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   }
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "HIPFIRE_HAVE_2_GPU=1 HIPFIRE_PP_RESET_MODEL=/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt HIPFIRE_PP_DEVICES=0,1 HIPFIRE_RESET_ROUNDS=1 HIPFIRE_DAEMON_BIN=$DAEMON_FI_BIN cargo test -p hipfire-generate --locked --test qwen35_reset_hw pp_qwen35 -- --ignored --test-threads=1"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
+    "HIPFIRE_HAVE_2_GPU": "1",
+    "HIPFIRE_PP_DEVICES": "0,1",
+    "HIPFIRE_PP_RESET_MODEL": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+    "HIPFIRE_RESET_ROUNDS": "1"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "multi-gpu-2"
+   ],
+   "id": "g4-reset-pp",
+   "milestone": "G4.7",
+   "negative_predicate": {
+    "kind": "none",
+    "note": "fault rounds are the negative of the clean baseline inside the test"
+   },
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "probe": "existing",
+   "route": "pp/text-reset-attested-rollback"
+  },
+  {
+   "commands": {
+    "negative": [
+     "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-generate --locked --test dense_rollback_gpu dense_reset_phase_error_visible_and_unattested -- --ignored --exact --test-threads=1 # unattested reset-phase counterpart (rolled_back=false, still exactly one terminal)"
+    ],
+    "positive": [
+     "HIPFIRE_DENSE_FIXTURE=$MODEL_DIR cargo test -p hipfire-generate --locked --test dense_rollback_gpu -- --ignored --test-threads=1"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DENSE_FIXTURE": "$MODEL_DIR"
+   },
+   "fixtures": [
+    "qwen3:0.6b"
+   ],
+   "hosts": [
+    "gfx1151",
+    "gfx1201",
+    "gfx1100"
+   ],
+   "id": "g4-dense-rollback",
+   "milestone": "G4.10",
+   "negative_predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 3
+   },
+   "probe": "existing",
+   "route": "single/dense-route-rollback",
+   "fixture_files": [
+    "/home/kaden/.hipfire/models/lfm2.5-1.2b.mq4"
+   ]
+  },
+  {
+   "commands": {
+    "positive": [
+     "HIPFIRE_VISION_FIXTURE=\"/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt,/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq\" HIPFIRE_DOTS_OCR_FIXTURE=/home/kaden/.hipfire/models/dots-ocr.q8.hfq cargo test -p hipfire-generate --locked --test vision_lifecycle_tests -- --ignored --test-threads=1"
+    ],
+    "negative": [
+     "cargo test -p hipfire-generate --locked --test vision_lifecycle_tests vision_fixture_pair_rejects -- --test-threads=1"
+    ]
+   },
+   "env": {
+    "HIPFIRE_VISION_FIXTURE": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt,/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq",
+    "HIPFIRE_DOTS_OCR_FIXTURE": "/home/kaden/.hipfire/models/dots-ocr.q8.hfq"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g4-vision-lifecycle",
+   "milestone": "G4.8",
+   "negative_predicate": {
+    "kind": "cargo",
+    "min_passed": 1
+   },
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 2
+   },
+   "probe": "existing",
+   "route": "single/vision-ocr-lifecycle",
+   "fixture_files": [
+    "/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq",
+    "/home/kaden/.hipfire/models/dots-ocr.q8.hfq"
+   ],
+   "timeout": 2000
+  },
+  {
+   "commands": {
+    "negative": [
+     "python3 scripts/serve_harness.py --port 28510 --model $MODEL --mode session --session benchmarks/prompts/g45_parser_finalization_tampered.json --max-tokens 128 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-parser --out $OUT/g4-parser-neg.json --serve-log $OUT/g4-parser.serve.log"
+    ],
+    "positive": [
+     "python3 scripts/serve_harness.py --port 28509 --model $MODEL --mode session --session benchmarks/prompts/g45_parser_finalization.json --max-tokens 128 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-parser --out $OUT/g4-parser.json --serve-log $OUT/g4-parser.serve.log"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_MODELS_DIR": "$MODELS_DIR",
+    "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
+    "HIPFIRE_CLI_BIN": "$CLI_BIN"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1201",
+    "gfx1100",
+    "gfx1151"
+   ],
+   "id": "g4-parser-finalization",
+   "milestone": "G4.5",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "predicate": {
+    "kind": "serve",
+    "expect_file": "benchmarks/prompts/g45_parser_finalization.json"
+   },
+   "probe": "existing",
+   "route": "single/terminal-safe-parser-finalization"
+  },
+  {
+   "commands": {
+    "negative": [
+     "python3 scripts/serve_harness.py --port 28514 --model $MODEL --mode session --session /nonexistent-session.json --home $OUT/home-nope --out $OUT/nope.json  # expect nonzero exit on malformed session"
+    ],
+    "positive": [
+     "python3 scripts/serve_harness.py --port 28511 --model $MODEL --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-battery --out $OUT/g4-battery.json --serve-log $OUT/g4-battery.serve.log",
+     "python3 scripts/serve_harness.py --port 28512 --model $MODEL --mode chain --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-chain --out $OUT/g4-chain.json --serve-log $OUT/g4-chain.serve.log",
+     "python3 scripts/serve_harness.py --port 28513 --model $MODEL --mode session --session benchmarks/sessions/mv_session_coding.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-session --out $OUT/g4-session.json --serve-log $OUT/g4-session.serve.log"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_MODELS_DIR": "$MODELS_DIR",
+    "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
+    "HIPFIRE_CLI_BIN": "$CLI_BIN"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g4-serve-lifecycle",
+   "milestone": "G4",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "predicate": {
+    "kind": "serve"
+   },
+   "probe": "existing",
+   "route": "single/http-battery-chain-session"
+  },
+  {
+   "commands": {
+    "negative": [
+     "python3 scripts/redline_daemon_harness.py --model /nonexistent.mq4 --daemon $DAEMON_BIN --out $OUT/redline-nope.json  # expect nonzero exit, nothing captured"
+    ],
+    "positive": [
+     "python3 scripts/redline_daemon_harness.py --model $MODEL --daemon $DAEMON_BIN --kv-mode q8 --max-seq 4096 --prefill 2 --decode-context 124 --capture-repeats 2 --measure-repeats 1 --decode-iterations 1 --shadow-iterations 3 --pm4 --out $OUT/g4-redline.json"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_MODELS_DIR": "$MODELS_DIR",
+    "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
+    "HIPFIRE_CLI_BIN": "$CLI_BIN"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g4-redline-kernel",
+   "milestone": "G4.2",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "predicate": {
+    "kind": "redline",
+    "require_stable": true
+   },
+   "probe": "existing",
+   "route": "single/kernel-capture-parity"
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "cargo test -p hipfire-generate --locked --test terminal_control_tests -- --test-threads=1",
+     "cargo test -p hipfire-generate --locked --test qwen35_reset_terminals -- --test-threads=1",
+     "cargo test -p hipfire-generate --locked --test serve_fault_inject_tests -- --test-threads=1",
+     "cargo test -p hipfire-generate --locked --features serve-fault-inject --test serve_fault_inject_tests -- --test-threads=1"
+    ]
+   },
+   "env": {},
+   "fixtures": [],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151",
+    "multi-gpu-2",
+    "multi-gpu-4"
+   ],
+   "id": "g4-terminal-unit",
+   "milestone": "G4.6",
+   "negative_predicate": {
+    "kind": "none",
+    "note": "contract suites have no fail-closed counterpart at unit level"
+   },
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 3
+   },
+   "probe": "existing",
+   "route": "unit/exactly-once-terminal-contracts"
+  },
+  {
+   "commands": {
+    "negative": [
+     "python3 scripts/serve_harness.py --port 28516 --model $MODEL --tp 3 --devices 0,1 --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --home $OUT/home-nope --out $OUT/nope.json  # tp degree exceeding visible devices must fail closed"
+    ],
+    "positive": [
+     "python3 scripts/serve_harness.py --port 28515 --model $MODEL --tp 2 --devices 0,1 --mode battery --prompts-file benchmarks/prompts/hw-gate/serve-battery.json --max-tokens 2048 --thinking off --thinking-effort none --max-think-tokens 0 --home $OUT/home-g4-mesh-tp --out $OUT/g4-mesh-tp.json --serve-log $OUT/g4-mesh-tp.serve.log"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1",
+    "HIPFIRE_MODELS_DIR": "$MODELS_DIR",
+    "HIPFIRE_DAEMON_BIN": "$DAEMON_BIN",
+    "HIPFIRE_CLI_BIN": "$CLI_BIN"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "multi-gpu-2"
+   ],
+   "id": "g4-mesh-tp-serve",
+   "milestone": "G4.9",
+   "negative_predicate": {
+    "kind": "expect_nonzero"
+   },
+   "predicate": {
+    "kind": "serve"
+   },
+   "probe": "existing",
+   "route": "tp/mesh-carrier-serve"
+  },
+  {
+   "commands": {
+    "positive": [
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single -- --ignored --test-threads=1",
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_pp2_vs_single_oracle -- --ignored --exact --test-threads=1",
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_tp2_vs_single_oracle -- --ignored --exact --test-threads=1"
+    ],
+    "negative": []
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt",
+    "ornith-1.5:35b-a3b-mq4r"
+   ],
+   "hosts": [
+    "gfx1201"
+   ],
+   "id": "g1-route-oracles-nonllama",
+   "milestone": "G1",
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 4
+   },
+   "probe": "thin-driver",
+   "route": "single+pp+tp/route-oracles"
+  },
+  {
+   "id": "g5-ep-route-oracles",
+   "milestone": "G5",
+   "route": "ep/route-oracles",
+   "probe": "none",
+   "commands": {
+    "positive": [],
+    "negative": []
+   },
+   "fixtures": [],
+   "hosts": [
+    "gfx1201"
+   ],
+   "predicate": {
+    "kind": "none"
+   },
+   "note": "qwen35_ep2_vs_single_oracle and qwen35_ep4_vs_ep2_oracle exist on this head and are deliberately RED at 1e-3: sharded EP diverges from single by a top-k routing flip seeded by expert-parity vs slot-order f32 association (pos 17 / pos 2 on Q8 state; pos 5 on f32). Unchanged by canonical rooted reduce, EF residuals on multi, or f32 state. Pre-exists on master; daemon refuses MoE EP so no user exposure. Discharged by the G5 slot-order combine (G5-SLOT-COMBINE-PLAN.md)."
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": [
+     "$DAEMON_BIN  # race session (HIPFIRE_DETERMINISTIC=1); see positive_session"
+    ]
+   },
+   "env": {
+    "HIPFIRE_DETERMINISTIC": "1"
+   },
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt"
+   ],
+   "hosts": [
+    "gfx1100",
+    "gfx1201",
+    "gfx1151"
+   ],
+   "id": "g4-terminal-races-physical",
+   "milestone": "G4.6",
+   "note": "#666 G4.6 physical race probe: three requests admitted before any terminal is collected (r1 valid done, r2 aborted cancel, r3 seed-rejected error) with a wrong-attempt abort for r1 in flight, then a quiet drain carrying a duplicate commit for r1, a late abort for r2, and a wrong-attempt abort for r1. Oracle wire_exactly_one_terminal: exactly one terminal per id, no post-terminal bytes.",
+   "positive_session": [
+    {
+     "expect": "loaded",
+     "send": {
+      "model": "$MODEL",
+      "params": {
+       "max_seq": 2048
+      },
+      "type": "load"
+     }
+    },
+    {
+     "race_sends": [
+      {
+       "type": "generate",
+       "id": "r1",
+       "attempt_id": 1,
+       "prompt": "Write a one-sentence greeting.",
+       "temperature": 0.0,
+       "seed": 12345,
+       "max_tokens": 32,
+       "thinking_enabled": false
+      },
+      {
+       "type": "generate",
+       "id": "r2",
+       "attempt_id": 1,
+       "prompt": "Explain recursion in one paragraph.",
+       "temperature": 0.0,
+       "seed": 23456,
+       "max_tokens": 64,
+       "thinking_enabled": false
+      },
+      {
+       "type": "generate",
+       "id": "r3",
+       "attempt_id": 1,
+       "prompt": "Write a one-sentence greeting.",
+       "temperature": 0.0,
+       "seed": -1,
+       "max_tokens": 16,
+       "thinking_enabled": false
+      },
+      {
+       "type": "abort",
+       "id": "r1",
+       "attempt_id": 999
+      },
+      {
+       "type": "abort",
+       "id": "r2",
+       "attempt_id": 1
+      }
+     ],
+     "race_terminals": [
+      "r1",
+      "r2",
+      "r3"
+     ]
+    },
+    {
+     "quiet_ms": 5000,
+     "quiet_sends": [
+      {
+       "type": "commit",
+       "id": "r1",
+       "attempt_id": 1
+      },
+      {
+       "type": "abort",
+       "id": "r2",
+       "attempt_id": 1
+      },
+      {
+       "type": "abort",
+       "id": "r1",
+       "attempt_id": 2
+      }
+     ]
+    },
+    {
+     "expect": "unloaded",
+     "send": {
+      "type": "unload"
+     }
+    }
+   ],
+   "predicate": {
+    "expect": {
+     "r1": "done",
+     "r2": "done",
+     "r3": "error"
+    },
+    "kind": "wire_exactly_one_terminal"
+   },
+   "probe": "thin-driver",
+   "route": "single/concurrent-terminal-races"
+  },
+  {
+   "commands": {
+    "negative": [],
+    "positive": []
+   },
+   "fixtures": [],
+   "hosts": [
+    "multi-gpu-2",
+    "multi-gpu-4"
+   ],
+   "id": "g4-mesh-injected-failures",
+   "milestone": "G4.9",
+   "note": "#666 G4.9 requires injected prefill/forward/logit failures on generate_mesh_carrier with per-device graph/KV reset and next-request parity on distinct peer-accessible GPUs. No existing mesh-carrier fault-injection probe.",
+   "predicate": {
+    "kind": "none"
+   },
+   "probe": "none",
+   "route": "tp+pp/mesh-carrier-fault-injection"
+  }
+ ],
+ "version": 1
+}

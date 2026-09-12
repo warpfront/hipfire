@@ -52,6 +52,18 @@ name = "bench_decode_attention"
 required-features = ["lab"]
 
 [[example]]
+name = "bench_dflash_verify_shapes"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_flash_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "test_mq4v2_residual_ksplit_gfx1100"
+required-features = ["lab"]
+
+[[example]]
 name = "bench_dispatch_floor"
 required-features = ["lab"]
 
@@ -741,4 +753,52 @@ required-features = ["lab"]
 
 [[example]]
 name = "mq6v2_moe_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_vae_lds"
+required-features = ["lab"]
+
+[[example]]
+name = "test_attention_text_gqa"
+required-features = ["lab"]
+
+[[example]]
+name = "test_rope_2d_flux"
+required-features = ["lab"]
+
+[[example]]
+name = "test_modulate_f32"
+required-features = ["lab"]
+
+[[example]]
+name = "test_layernorm_modulate_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_qk_rmsnorm_rope_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_copy_rows_strided_f32_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_wide_lds_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_epilogue_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_attention_flux_vt_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "test_gemm_f16_x_f16_wmma_lds_parity"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_attention_flux_vt"
 required-features = ["lab"]

@@ -5,6 +5,7 @@
 //! Qwen3.5 continuous-batch state: `PrefillBatchScratch`, `Qwen35DecodeBatchState`,
 //! lane-mask helpers, and the independent-lane batched decode entry points.
 
+use super::config::DflashFusionCtx;
 use super::config::LayerType;
 use super::config::Qwen35Config;
 use super::forward::Qwen35Scratch;
@@ -92,6 +93,19 @@ pub struct PrefillBatchScratch {
     // FWHT-rotated fa_attn_out for feeding MQ4 wo.
     pub fa_attn_out_rot_batch: GpuTensor, // [N × n_heads × head_dim]
 
+    // ── Launch-fusion prescaffold (S3/S4/S9): exact-FP16 producer sidecars ──
+    // Allocated/freed and byte-accounted, but never written or read yet.
+    // S3 fills the projection-input family with bit-identical
+    // `fused_rmsnorm_mq_rotate` F32 + `convert_f32_to_f16` bytes; S4 fills
+    // the residual family; S9 consumes them from persistent prologues.
+    // Shapes mirror the F32 counterparts at half the bytes per element.
+    pub x_rot_f16_batch: GpuTensor, // [N × dim] F16, mirrors x_rot_batch
+    pub dn_normed_rot_f16_batch: GpuTensor, // [N × v_dim] F16, mirrors dn_normed_rot_batch
+    pub ffn_hidden_f16_batch: GpuTensor, // [N × hidden_dim] F16, mirrors ffn_hidden_batch
+    pub fa_attn_out_rot_f16_batch: GpuTensor, // [N × q_dim] F16, mirrors fa_attn_out_rot_batch
+    // Small persistent prologue-control tensor for S9 (counters/generations).
+    pub mq_prologue_ctrl: GpuTensor, // [256] bytes, Raw
+
     // ── MoE batched intermediates (allocated only when num_experts > 0) ──
     // All outputs of the fused 4-way router + shared-gate GEMM, plus the
     // per-token routed-expert gate/up/rot buffers consumed by the N-batched
@@ -177,6 +191,16 @@ impl PrefillBatchScratch {
         max_batch: usize,
         cap_gdn_tape: bool,
     ) -> HipResult<Self> {
+        Self::new_opt_with_alloc(gpu, config, max_batch, cap_gdn_tape, Gpu::alloc_tensor)
+    }
+
+    fn new_opt_with_alloc(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        max_batch: usize,
+        cap_gdn_tape: bool,
+        mut allocate: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
+    ) -> HipResult<Self> {
         let dim = config.dim;
         let hidden_dim = config.hidden_dim;
         let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -186,47 +210,28 @@ impl PrefillBatchScratch {
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
 
-        // hunt3 H-E residual: this struct literal allocates ~40 GpuTensors via
-        // `?` early-returns. PrefillBatchScratch has no Drop impl (GpuTensor
-        // carries no Gpu handle; free_tensor needs &mut Gpu), so a `?` failure
-        // partway through would drop the already-allocated tensors WITHOUT
-        // freeing them on the device — the exact intra-`new` leak the
-        // cross-band H-E recovery can't reach. OOM during new() is precisely
-        // when a mid-literal failure is most likely. Fix: route every alloc
-        // through a ledger and, on the first error, free everything allocated
-        // so far before propagating. `alloc!` records mandatory tensors;
-        // `alloc_opt!` records the inner tensor of an `if cond { Some(..) }`.
-        //
-        // The ledger stores non-owning aliases (DeviceBuffer has no Drop and
-        // GpuTensor is not Clone), so on success the aliases drop as no-ops and
-        // the real tensors live on in the struct (no double-free); on error we
-        // free each alias once, which releases the same pool buffer the
-        // partially-built (and about-to-be-dropped, never-freed) field held.
-        let mut ledger: Vec<GpuTensor> = Vec::with_capacity(48);
+        // Transactional construction: slots own every successful allocation
+        // until the struct is built. On an allocation error, reverse-drain the
+        // slots and free each actual owner before returning; GpuTensor has no
+        // Drop implementation that could release device memory for us.
+        let mut slots: Vec<Option<GpuTensor>> = Vec::with_capacity(54);
         macro_rules! alloc {
-            ($shape:expr, $dt:expr) => {
-                match gpu.alloc_tensor($shape, $dt) {
+            ($shape:expr, $dt:expr) => {{
+                match allocate(gpu, $shape, $dt) {
                     Ok(t) => {
-                        // SAFETY: alias lives only inside `new`; if used it is
-                        // freed in the error arm below (the original field is
-                        // dropped without freeing, no Drop on GpuTensor), and
-                        // on success it is dropped untouched (no Drop on
-                        // DeviceBuffer) while the original is moved into Self.
-                        ledger.push(GpuTensor {
-                            buf: unsafe { t.buf.alias() },
-                            shape: t.shape.clone(),
-                            dtype: t.dtype,
-                        });
-                        t
+                        slots.push(Some(t));
+                        slots.len() - 1
                     }
                     Err(e) => {
-                        for prev in ledger.drain(..) {
-                            let _ = gpu.free_tensor(prev);
+                        while let Some(slot) = slots.pop() {
+                            if let Some(t) = slot {
+                                let _ = gpu.free_tensor(t);
+                            }
                         }
                         return Err(e);
                     }
                 }
-            };
+            }};
         }
         macro_rules! alloc_opt {
             ($cond:expr, $shape:expr, $dt:expr) => {
@@ -237,163 +242,231 @@ impl PrefillBatchScratch {
                 }
             };
         }
+        macro_rules! take {
+            ($i:expr) => {{
+                slots[$i].take().expect("prefill scratch slot taken twice")
+            }};
+        }
 
         // Hoisted grouped-GEMM sizing (same value across the Path-2 fields).
         let grouped_m_total_max =
             moe_grouped_m_total_max(max_batch, config.num_experts_per_tok, config.num_experts);
         let grouped_total_slots_max = max_batch * config.num_experts_per_tok;
 
+        let i_x_batch = alloc!(&[max_batch * dim], DType::F32);
+        let i_x_rot_batch = alloc!(&[max_batch * dim], DType::F32);
+        let i_x_norm_batch = alloc!(&[max_batch * dim], DType::F32);
+        let i_dn_qkv_batch = alloc!(&[max_batch * qkv_dim], DType::F32);
+        let i_dn_z_batch = alloc!(&[max_batch * v_dim], DType::F32);
+        let i_dn_alpha_batch = alloc!(&[max_batch * n_v_heads], DType::F32);
+        let i_dn_beta_batch = alloc!(&[max_batch * n_v_heads], DType::F32);
+        let i_dn_q_raw_batch = alloc!(&[max_batch * k_dim], DType::F32);
+        let i_dn_k_raw_batch = alloc!(&[max_batch * k_dim], DType::F32);
+        let i_dn_v_batch = alloc!(&[max_batch * v_dim], DType::F32);
+        let i_dn_q_batch = alloc!(&[max_batch * v_dim], DType::F32);
+        let i_dn_k_batch = alloc!(&[max_batch * v_dim], DType::F32);
+        let i_dn_attn_out_batch = alloc!(&[max_batch * v_dim], DType::F32);
+        let i_dn_normed_batch = alloc!(&[max_batch * v_dim], DType::F32);
+        let i_gate_ffn_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
+        let i_up_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
+        let i_ffn_hidden_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
+        let i_dn_normed_rot_batch = alloc!(&[max_batch * v_dim], DType::F32);
+        // F32 dtype = 4 bytes/element, same layout as i32. The rope /
+        // attention / kv_write kernels cast the pointer to `const int*`,
+        // so dtype is cosmetic. Upload i32 bits via memcpy_htod.
+        let i_positions = alloc!(&[max_batch], DType::F32);
+        // Depth-based RoPE angles for DDTree verify (39aa358 fix):
+        // `positions` stays the flat linear KV slot index; this buffer
+        // carries `base_pos + depth(node)` so FA-layer RoPE rotates Q/K
+        // at the logically-correct phase while KV writes stay on
+        // distinct linear slots. Uploaded per cycle in tree-verify mode
+        // from `TreeVerifyCtx.positions`; FA RoPE kernels read it ONLY
+        // when `tree_verify.is_some()`. Same i32-in-F32 cosmetic dtype
+        // pattern as `positions`.
+        let i_rope_positions = alloc!(&[max_batch], DType::F32);
+        let i_tokens = alloc!(&[max_batch], DType::F32);
+        let i_fa_q_full_batch = alloc!(&[max_batch * q_dim * 2], DType::F32);
+        let i_fa_q_batch = alloc!(&[max_batch * q_dim], DType::F32);
+        let i_fa_gate_batch = alloc!(&[max_batch * q_dim], DType::F32);
+        let i_fa_k_batch = alloc!(&[max_batch * kv_dim], DType::F32);
+        let i_fa_v_batch = alloc!(&[max_batch * kv_dim], DType::F32);
+        let i_fa_attn_out_batch = alloc!(&[max_batch * q_dim], DType::F32);
+        let i_fa_attn_out_rot_batch = alloc!(&[max_batch * q_dim], DType::F32);
+        let i_x_rot_f16_batch = alloc!(&[max_batch * dim], DType::F16);
+        let i_dn_normed_rot_f16_batch = alloc!(&[max_batch * v_dim], DType::F16);
+        let i_ffn_hidden_f16_batch = alloc!(&[max_batch * hidden_dim], DType::F16);
+        let i_fa_attn_out_rot_f16_batch = alloc!(&[max_batch * q_dim], DType::F16);
+        // S9 prologue control plane: 256 bytes of device-resident
+        // counters/generations. Raw dtype counts bytes.
+        let i_mq_prologue_ctrl = alloc!(&[256], DType::Raw);
+        let i_moe_router_logits_batch = alloc_opt!(
+            config.num_experts > 0,
+            &[max_batch * config.num_experts],
+            DType::F32
+        );
+        let i_moe_shared_scalar_batch =
+            alloc_opt!(config.num_experts > 0, &[max_batch], DType::F32);
+        let i_moe_shared_gate_batch = alloc_opt!(
+            config.num_experts > 0,
+            &[max_batch * config.shared_expert_intermediate_size],
+            DType::F32
+        );
+        let i_moe_shared_up_batch = alloc_opt!(
+            config.num_experts > 0,
+            &[max_batch * config.shared_expert_intermediate_size],
+            DType::F32
+        );
+        let i_moe_shared_rot_batch = alloc_opt!(
+            config.num_experts > 0,
+            &[max_batch * config.shared_expert_intermediate_size],
+            DType::F32
+        );
+        let i_moe_topk_indices_batch = alloc_opt!(
+            config.num_experts > 0,
+            &[max_batch * config.num_experts_per_tok],
+            DType::F32
+        );
+        let i_moe_topk_weights_batch = alloc_opt!(
+            config.num_experts > 0,
+            &[max_batch * config.num_experts_per_tok],
+            DType::F32
+        );
+        let i_moe_gate_batch = alloc_opt!(
+            config.num_experts > 0,
+            &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
+            DType::F32
+        );
+        let i_moe_up_batch = alloc_opt!(
+            config.num_experts > 0,
+            &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
+            DType::F32
+        );
+        let i_moe_rot_batch = alloc_opt!(
+            config.num_experts > 0,
+            &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
+            DType::F32
+        );
+        let i_moe_down_expanded_batch = alloc_opt!(
+            config.num_experts > 0,
+            &[max_batch * config.num_experts_per_tok * config.dim],
+            DType::F32
+        );
+        // Path 2 scatter + grouped-WMMA-GEMM scratch (gated at runtime by
+        // HIPFIRE_MOE_GROUPED_GEMM=1). m_total_max = N*K_TOP + E*(BLOCK_M-1).
+        // i32 buffers stored as Raw (4 bytes/elem matches; no DType::I32 yet).
+        let i_moe_expert_token_counts = alloc_opt!(
+            config.num_experts > 0,
+            &[config.num_experts * 4],
+            DType::Raw
+        );
+        let i_moe_expert_offsets = alloc_opt!(
+            config.num_experts > 0,
+            &[(config.num_experts + 1) * 4],
+            DType::Raw
+        );
+        let i_moe_sorted_slot_index = alloc_opt!(
+            config.num_experts > 0,
+            &[grouped_m_total_max * 4],
+            DType::Raw
+        );
+        let i_moe_inverse_perm = alloc_opt!(
+            config.num_experts > 0,
+            &[grouped_total_slots_max * 4],
+            DType::Raw
+        );
+        let i_moe_expert_tile_ids = alloc_opt!(
+            config.num_experts > 0,
+            &[(grouped_m_total_max / MOE_GROUPED_BLOCK_M) * 4],
+            DType::Raw
+        );
+        let i_moe_y_gate_up_grouped = alloc_opt!(
+            config.num_experts > 0,
+            &[grouped_m_total_max * 2 * config.moe_intermediate_size],
+            DType::F32
+        );
+        let i_moe_y_down_grouped = alloc_opt!(
+            config.num_experts > 0,
+            &[grouped_m_total_max * config.dim],
+            DType::F32
+        );
+        let i_dn_s_tape_q8 = alloc_opt!(
+            cap_gdn_tape && config.linear_num_value_heads > 0,
+            &[max_batch
+                * config.linear_num_value_heads
+                * config.linear_value_head_dim
+                * config.linear_value_head_dim],
+            DType::Raw
+        );
+        let i_dn_s_tape_scales = alloc_opt!(
+            cap_gdn_tape && config.linear_num_value_heads > 0,
+            &[max_batch * config.linear_num_value_heads * config.linear_value_head_dim],
+            DType::F32
+        );
+        let i_dn_s_tape_f32 = alloc_opt!(
+            cap_gdn_tape && config.linear_num_value_heads > 0,
+            &[max_batch
+                * config.linear_num_value_heads
+                * config.linear_value_head_dim
+                * config.linear_value_head_dim],
+            DType::F32
+        );
+
         Ok(Self {
             max_batch,
-            x_batch: alloc!(&[max_batch * dim], DType::F32),
-            x_rot_batch: alloc!(&[max_batch * dim], DType::F32),
-            x_norm_batch: alloc!(&[max_batch * dim], DType::F32),
-            dn_qkv_batch: alloc!(&[max_batch * qkv_dim], DType::F32),
-            dn_z_batch: alloc!(&[max_batch * v_dim], DType::F32),
-            dn_alpha_batch: alloc!(&[max_batch * n_v_heads], DType::F32),
-            dn_beta_batch: alloc!(&[max_batch * n_v_heads], DType::F32),
-            dn_q_raw_batch: alloc!(&[max_batch * k_dim], DType::F32),
-            dn_k_raw_batch: alloc!(&[max_batch * k_dim], DType::F32),
-            dn_v_batch: alloc!(&[max_batch * v_dim], DType::F32),
-            dn_q_batch: alloc!(&[max_batch * v_dim], DType::F32),
-            dn_k_batch: alloc!(&[max_batch * v_dim], DType::F32),
-            dn_attn_out_batch: alloc!(&[max_batch * v_dim], DType::F32),
-            dn_normed_batch: alloc!(&[max_batch * v_dim], DType::F32),
-            gate_ffn_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
-            up_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
-            ffn_hidden_batch: alloc!(&[max_batch * hidden_dim], DType::F32),
-            dn_normed_rot_batch: alloc!(&[max_batch * v_dim], DType::F32),
-            // F32 dtype = 4 bytes/element, same layout as i32. The rope /
-            // attention / kv_write kernels cast the pointer to `const int*`,
-            // so dtype is cosmetic. Upload i32 bits via memcpy_htod.
-            positions: alloc!(&[max_batch], DType::F32),
-            // Depth-based RoPE angles for DDTree verify (39aa358 fix):
-            // `positions` stays the flat linear KV slot index; this buffer
-            // carries `base_pos + depth(node)` so FA-layer RoPE rotates Q/K
-            // at the logically-correct phase while KV writes stay on
-            // distinct linear slots. Uploaded per cycle in tree-verify mode
-            // from `TreeVerifyCtx.positions`; FA RoPE kernels read it ONLY
-            // when `tree_verify.is_some()`. Same i32-in-F32 cosmetic dtype
-            // pattern as `positions`.
-            rope_positions: alloc!(&[max_batch], DType::F32),
-            tokens: alloc!(&[max_batch], DType::F32),
-            fa_q_full_batch: alloc!(&[max_batch * q_dim * 2], DType::F32),
-            fa_q_batch: alloc!(&[max_batch * q_dim], DType::F32),
-            fa_gate_batch: alloc!(&[max_batch * q_dim], DType::F32),
-            fa_k_batch: alloc!(&[max_batch * kv_dim], DType::F32),
-            fa_v_batch: alloc!(&[max_batch * kv_dim], DType::F32),
-            fa_attn_out_batch: alloc!(&[max_batch * q_dim], DType::F32),
-            fa_attn_out_rot_batch: alloc!(&[max_batch * q_dim], DType::F32),
-            moe_router_logits_batch: alloc_opt!(
-                config.num_experts > 0,
-                &[max_batch * config.num_experts],
-                DType::F32
-            ),
-            moe_shared_scalar_batch: alloc_opt!(config.num_experts > 0, &[max_batch], DType::F32),
-            moe_shared_gate_batch: alloc_opt!(
-                config.num_experts > 0,
-                &[max_batch * config.shared_expert_intermediate_size],
-                DType::F32
-            ),
-            moe_shared_up_batch: alloc_opt!(
-                config.num_experts > 0,
-                &[max_batch * config.shared_expert_intermediate_size],
-                DType::F32
-            ),
-            moe_shared_rot_batch: alloc_opt!(
-                config.num_experts > 0,
-                &[max_batch * config.shared_expert_intermediate_size],
-                DType::F32
-            ),
-            moe_topk_indices_batch: alloc_opt!(
-                config.num_experts > 0,
-                &[max_batch * config.num_experts_per_tok],
-                DType::F32
-            ),
-            moe_topk_weights_batch: alloc_opt!(
-                config.num_experts > 0,
-                &[max_batch * config.num_experts_per_tok],
-                DType::F32
-            ),
-            moe_gate_batch: alloc_opt!(
-                config.num_experts > 0,
-                &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
-                DType::F32
-            ),
-            moe_up_batch: alloc_opt!(
-                config.num_experts > 0,
-                &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
-                DType::F32
-            ),
-            moe_rot_batch: alloc_opt!(
-                config.num_experts > 0,
-                &[max_batch * config.num_experts_per_tok * config.moe_intermediate_size],
-                DType::F32
-            ),
-            moe_down_expanded_batch: alloc_opt!(
-                config.num_experts > 0,
-                &[max_batch * config.num_experts_per_tok * config.dim],
-                DType::F32
-            ),
-            // Path 2 scatter + grouped-WMMA-GEMM scratch (gated at runtime by
-            // HIPFIRE_MOE_GROUPED_GEMM=1). m_total_max = N*K_TOP + E*(BLOCK_M-1).
-            // i32 buffers stored as Raw (4 bytes/elem matches; no DType::I32 yet).
-            moe_expert_token_counts: alloc_opt!(
-                config.num_experts > 0,
-                &[config.num_experts * 4],
-                DType::Raw
-            ),
-            moe_expert_offsets: alloc_opt!(
-                config.num_experts > 0,
-                &[(config.num_experts + 1) * 4],
-                DType::Raw
-            ),
-            moe_sorted_slot_index: alloc_opt!(
-                config.num_experts > 0,
-                &[grouped_m_total_max * 4],
-                DType::Raw
-            ),
-            moe_inverse_perm: alloc_opt!(
-                config.num_experts > 0,
-                &[grouped_total_slots_max * 4],
-                DType::Raw
-            ),
-            moe_expert_tile_ids: alloc_opt!(
-                config.num_experts > 0,
-                &[(grouped_m_total_max / MOE_GROUPED_BLOCK_M) * 4],
-                DType::Raw
-            ),
-            moe_y_gate_up_grouped: alloc_opt!(
-                config.num_experts > 0,
-                &[grouped_m_total_max * 2 * config.moe_intermediate_size],
-                DType::F32
-            ),
-            moe_y_down_grouped: alloc_opt!(
-                config.num_experts > 0,
-                &[grouped_m_total_max * config.dim],
-                DType::F32
-            ),
-            dn_s_tape_q8: alloc_opt!(
-                cap_gdn_tape && config.linear_num_value_heads > 0,
-                &[max_batch
-                    * config.linear_num_value_heads
-                    * config.linear_value_head_dim
-                    * config.linear_value_head_dim],
-                DType::Raw
-            ),
-            dn_s_tape_scales: alloc_opt!(
-                cap_gdn_tape && config.linear_num_value_heads > 0,
-                &[max_batch * config.linear_num_value_heads * config.linear_value_head_dim],
-                DType::F32
-            ),
-            dn_s_tape_f32: alloc_opt!(
-                cap_gdn_tape && config.linear_num_value_heads > 0,
-                &[max_batch
-                    * config.linear_num_value_heads
-                    * config.linear_value_head_dim
-                    * config.linear_value_head_dim],
-                DType::F32
-            ),
+            x_batch: take!(i_x_batch),
+            x_rot_batch: take!(i_x_rot_batch),
+            x_norm_batch: take!(i_x_norm_batch),
+            dn_qkv_batch: take!(i_dn_qkv_batch),
+            dn_z_batch: take!(i_dn_z_batch),
+            dn_alpha_batch: take!(i_dn_alpha_batch),
+            dn_beta_batch: take!(i_dn_beta_batch),
+            dn_q_raw_batch: take!(i_dn_q_raw_batch),
+            dn_k_raw_batch: take!(i_dn_k_raw_batch),
+            dn_v_batch: take!(i_dn_v_batch),
+            dn_q_batch: take!(i_dn_q_batch),
+            dn_k_batch: take!(i_dn_k_batch),
+            dn_attn_out_batch: take!(i_dn_attn_out_batch),
+            dn_normed_batch: take!(i_dn_normed_batch),
+            gate_ffn_batch: take!(i_gate_ffn_batch),
+            up_batch: take!(i_up_batch),
+            ffn_hidden_batch: take!(i_ffn_hidden_batch),
+            dn_normed_rot_batch: take!(i_dn_normed_rot_batch),
+            positions: take!(i_positions),
+            rope_positions: take!(i_rope_positions),
+            tokens: take!(i_tokens),
+            fa_q_full_batch: take!(i_fa_q_full_batch),
+            fa_q_batch: take!(i_fa_q_batch),
+            fa_gate_batch: take!(i_fa_gate_batch),
+            fa_k_batch: take!(i_fa_k_batch),
+            fa_v_batch: take!(i_fa_v_batch),
+            fa_attn_out_batch: take!(i_fa_attn_out_batch),
+            fa_attn_out_rot_batch: take!(i_fa_attn_out_rot_batch),
+            x_rot_f16_batch: take!(i_x_rot_f16_batch),
+            dn_normed_rot_f16_batch: take!(i_dn_normed_rot_f16_batch),
+            ffn_hidden_f16_batch: take!(i_ffn_hidden_f16_batch),
+            fa_attn_out_rot_f16_batch: take!(i_fa_attn_out_rot_f16_batch),
+            mq_prologue_ctrl: take!(i_mq_prologue_ctrl),
+            moe_router_logits_batch: i_moe_router_logits_batch.map(|i| take!(i)),
+            moe_shared_scalar_batch: i_moe_shared_scalar_batch.map(|i| take!(i)),
+            moe_shared_gate_batch: i_moe_shared_gate_batch.map(|i| take!(i)),
+            moe_shared_up_batch: i_moe_shared_up_batch.map(|i| take!(i)),
+            moe_shared_rot_batch: i_moe_shared_rot_batch.map(|i| take!(i)),
+            moe_topk_indices_batch: i_moe_topk_indices_batch.map(|i| take!(i)),
+            moe_topk_weights_batch: i_moe_topk_weights_batch.map(|i| take!(i)),
+            moe_gate_batch: i_moe_gate_batch.map(|i| take!(i)),
+            moe_up_batch: i_moe_up_batch.map(|i| take!(i)),
+            moe_rot_batch: i_moe_rot_batch.map(|i| take!(i)),
+            moe_down_expanded_batch: i_moe_down_expanded_batch.map(|i| take!(i)),
+            moe_expert_token_counts: i_moe_expert_token_counts.map(|i| take!(i)),
+            moe_expert_offsets: i_moe_expert_offsets.map(|i| take!(i)),
+            moe_sorted_slot_index: i_moe_sorted_slot_index.map(|i| take!(i)),
+            moe_inverse_perm: i_moe_inverse_perm.map(|i| take!(i)),
+            moe_expert_tile_ids: i_moe_expert_tile_ids.map(|i| take!(i)),
+            moe_y_gate_up_grouped: i_moe_y_gate_up_grouped.map(|i| take!(i)),
+            moe_y_down_grouped: i_moe_y_down_grouped.map(|i| take!(i)),
+            dn_s_tape_q8: i_dn_s_tape_q8.map(|i| take!(i)),
+            dn_s_tape_scales: i_dn_s_tape_scales.map(|i| take!(i)),
+            dn_s_tape_f32: i_dn_s_tape_f32.map(|i| take!(i)),
         })
     }
 
@@ -435,6 +508,11 @@ impl PrefillBatchScratch {
             self.fa_v_batch,
             self.fa_attn_out_batch,
             self.fa_attn_out_rot_batch,
+            self.x_rot_f16_batch,
+            self.dn_normed_rot_f16_batch,
+            self.ffn_hidden_f16_batch,
+            self.fa_attn_out_rot_f16_batch,
+            self.mq_prologue_ctrl,
         ] {
             note(gpu.free_tensor(t));
         }
@@ -502,6 +580,24 @@ impl Qwen35DecodeBatchState {
         lane_capacity: usize,
         sample_repeat_capacity: usize,
     ) -> HipResult<Self> {
+        Self::new_with_output_alloc(
+            gpu,
+            config,
+            max_batch,
+            lane_capacity,
+            sample_repeat_capacity,
+            Gpu::zeros,
+        )
+    }
+
+    fn new_with_output_alloc(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        max_batch: usize,
+        lane_capacity: usize,
+        sample_repeat_capacity: usize,
+        mut allocate_output: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
+    ) -> HipResult<Self> {
         if max_batch == 0 || lane_capacity == 0 || sample_repeat_capacity == 0 {
             return Err(HipError::new(
                 0,
@@ -529,10 +625,8 @@ impl Qwen35DecodeBatchState {
         // GpuTensor / KvCache / DeltaNetState / PrefillBatchScratch have no
         // freeing Drop (free needs &mut Gpu). A mid-`new` `?` would leak every
         // prior stage while the daemon falls back to sequential with the leak
-        // still resident. Stage each compound owner, then ordinary tensors
-        // through a ledger of non-owning aliases (same pattern as
-        // PrefillBatchScratch::new_opt): on error free aliases + compound
-        // owners before propagating; on success aliases drop as no-ops.
+        // still resident. Stage each compound owner, then stage ordinary
+        // tensors as actual owners until the struct is published.
         let kv_cache = llama::KvCache::new_gpu_q8_filtered(
             gpu,
             &is_kv_layer,
@@ -557,42 +651,53 @@ impl Qwen35DecodeBatchState {
             }
         };
 
-        let mut ledger: Vec<GpuTensor> = Vec::with_capacity(7);
-        macro_rules! zeros {
-            ($shape:expr) => {
-                match gpu.zeros($shape, DType::F32) {
+        // Keep the actual output owners in the ledger. Borrowed aliases cannot
+        // be passed to free_tensor, so they are not useful for rollback.
+        let mut outputs: Vec<Option<GpuTensor>> = Vec::with_capacity(7);
+        macro_rules! output {
+            ($shape:expr) => {{
+                match allocate_output(gpu, $shape, DType::F32) {
                     Ok(t) => {
-                        // SAFETY: alias lives only inside `new`. On error it is
-                        // freed below (original field drops without freeing);
-                        // on success it drops untouched while the original
-                        // moves into Self.
-                        ledger.push(GpuTensor {
-                            buf: unsafe { t.buf.alias() },
-                            shape: t.shape.clone(),
-                            dtype: t.dtype,
-                        });
-                        t
+                        outputs.push(Some(t));
+                        outputs.len() - 1
                     }
                     Err(e) => {
-                        for prev in ledger.drain(..) {
-                            let _ = gpu.free_tensor(prev);
+                        while let Some(slot) = outputs.pop() {
+                            if let Some(t) = slot {
+                                let _ = gpu.free_tensor(t);
+                            }
                         }
-                        pbs.free_gpu(gpu);
+                        let _ = pbs.free_gpu(gpu);
                         dn_state.free_gpu(gpu);
                         let _ = kv_cache.free_gpu(gpu);
                         return Err(e);
                     }
                 }
+            }};
+        }
+        macro_rules! take_output {
+            ($index:expr) => {
+                outputs[$index]
+                    .take()
+                    .expect("decode batch output staged twice or missing")
             };
         }
 
-        let final_hidden = zeros!(&[max_batch * config.dim]);
-        let logits = zeros!(&[max_batch * config.vocab_size]);
-        let lm_rot = zeros!(&[max_batch * config.dim]);
-        let sample_out = zeros!(&[max_batch * 2]);
-        let sample_repeat_tokens = zeros!(&[repeat_tokens_len]);
-        let sample_repeat_lengths = zeros!(&[max_batch]);
-        let sample_rng_states = zeros!(&[max_batch]);
+        let i_final_hidden = output!(&[max_batch * config.dim]);
+        let i_logits = output!(&[max_batch * config.vocab_size]);
+        let i_lm_rot = output!(&[max_batch * config.dim]);
+        let i_sample_out = output!(&[max_batch * 2]);
+        let i_sample_repeat_tokens = output!(&[repeat_tokens_len]);
+        let i_sample_repeat_lengths = output!(&[max_batch]);
+        let i_sample_rng_states = output!(&[max_batch]);
+
+        let final_hidden = take_output!(i_final_hidden);
+        let logits = take_output!(i_logits);
+        let lm_rot = take_output!(i_lm_rot);
+        let sample_out = take_output!(i_sample_out);
+        let sample_repeat_tokens = take_output!(i_sample_repeat_tokens);
+        let sample_repeat_lengths = take_output!(i_sample_repeat_lengths);
+        let sample_rng_states = take_output!(i_sample_rng_states);
         Ok(Self {
             max_batch,
             lane_capacity,
@@ -1178,6 +1283,12 @@ impl PrefillBatchScratch {
         add(cm(n, kv_dim)?, 4)?;
         add(cm(n, q_dim)?, 4)?;
         add(cm(n, q_dim)?, 4)?;
+        // Prescaffold F16 sidecars (same order as `new_opt`): half bytes.
+        add(cm(n, dim)?, 2)?;
+        add(cm(n, v_dim)?, 2)?;
+        add(cm(n, hd)?, 2)?;
+        add(cm(n, q_dim)?, 2)?;
+        add(256, 1)?;
         if config.num_experts > 0 {
             add(cm(n, config.num_experts as u64)?, 4)?;
             add(n, 4)?;
@@ -1657,9 +1768,182 @@ pub fn forward_decode_batch_prepared(
             lane_capacity: state.lane_capacity,
             active_mask,
         },
+        DflashFusionCtx::Off,
     )?;
 
     let logits = state.logits.sub_offset(0, n * config.vocab_size);
     let lm_rot = state.lm_rot.sub_offset(0, n * config.dim);
     lm_head_batched(gpu, &weights.output, &final_hidden, &lm_rot, &logits, n)
+}
+
+#[cfg(test)]
+mod allocation_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises real allocation rollback and retry"]
+    fn prefill_scratch_failure_preserves_reusable_allocations() {
+        let mut gpu = Gpu::init().expect("GPU required for allocation rollback");
+        let config = super::super::config::config_from_metadata_json(
+            &serde_json::json!({"config": {
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 1,
+                "head_dim": 16,
+                "vocab_size": 64,
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": 2,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "num_experts": 4,
+                "num_experts_per_tok": 2,
+                "moe_intermediate_size": 32,
+                "shared_expert_intermediate_size": 32
+            }})
+            .to_string(),
+        )
+        .expect("scratch fixture config");
+        let mut allocations = 0;
+        let warm = PrefillBatchScratch::new_opt_with_alloc(
+            &mut gpu,
+            &config,
+            2,
+            true,
+            |gpu, shape, dtype| {
+                allocations += 1;
+                gpu.alloc_tensor(shape, dtype)
+            },
+        )
+        .expect("warm scratch");
+        warm.free_gpu(&mut gpu).expect("release warm scratch");
+        let fresh_allocations = gpu.pool_stats().0;
+        let mut attempted = 0;
+        let failure = PrefillBatchScratch::new_opt_with_alloc(
+            &mut gpu,
+            &config,
+            2,
+            true,
+            |gpu, shape, dtype| {
+                attempted += 1;
+                if attempted == allocations {
+                    Err(HipError::new(
+                        2,
+                        "injected final scratch allocation failure",
+                    ))
+                } else {
+                    gpu.alloc_tensor(shape, dtype)
+                }
+            },
+        );
+        match failure {
+            Err(error) => assert_eq!(error.code, 2),
+            Ok(scratch) => {
+                scratch
+                    .free_gpu(&mut gpu)
+                    .expect("release unexpected success");
+                panic!("allocation fault did not trigger");
+            }
+        }
+        let retry = PrefillBatchScratch::new_opt(&mut gpu, &config, 2, true)
+            .expect("immediate retry after allocation failure");
+        retry.free_gpu(&mut gpu).expect("release retried scratch");
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed construction lost reusable allocations instead of rolling them back",
+        );
+        eprintln!("late failure at allocation {allocations}: retry reused the complete warm pool");
+        gpu.drain_pool();
+    }
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises decode batch final-output rollback and retry"]
+    fn decode_batch_final_output_failure_preserves_reusable_allocations() {
+        let mut gpu = Gpu::init().expect("GPU required for allocation rollback");
+        let config = super::super::config::config_from_metadata_json(
+            &serde_json::json!({"config": {
+                "hidden_size": 32,
+                "intermediate_size": 64,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 1,
+                "num_key_value_heads": 1,
+                "head_dim": 32,
+                "vocab_size": 64,
+                "linear_num_key_heads": 1,
+                "linear_num_value_heads": 1,
+                "linear_key_head_dim": 16,
+                "linear_value_head_dim": 16,
+                "linear_conv_kernel_dim": 2,
+                "layer_types": ["full_attention", "full_attention"]
+            }})
+            .to_string(),
+        )
+        .expect("decode batch fixture config");
+
+        let mut output_allocations = 0;
+        let warm = Qwen35DecodeBatchState::new_with_output_alloc(
+            &mut gpu,
+            &config,
+            1,
+            2,
+            2,
+            |gpu, shape, dtype| {
+                output_allocations += 1;
+                gpu.zeros(shape, dtype)
+            },
+        )
+        .expect("warm decode batch");
+        warm.free_gpu(&mut gpu).expect("release warm decode batch");
+        assert_eq!(
+            output_allocations, 7,
+            "constructor must stage seven outputs"
+        );
+        let fresh_allocations = gpu.pool_stats().0;
+
+        let mut attempted = 0;
+        let failure = Qwen35DecodeBatchState::new_with_output_alloc(
+            &mut gpu,
+            &config,
+            1,
+            2,
+            2,
+            |gpu, shape, dtype| {
+                attempted += 1;
+                if attempted == 7 {
+                    Err(HipError::new(
+                        2,
+                        "injected final decode batch output allocation failure",
+                    ))
+                } else {
+                    gpu.zeros(shape, dtype)
+                }
+            },
+        );
+        match failure {
+            Err(error) => assert_eq!(error.code, 2),
+            Ok(state) => {
+                state
+                    .free_gpu(&mut gpu)
+                    .expect("release unexpected decode batch success");
+                panic!("allocation fault did not trigger");
+            }
+        }
+        assert_eq!(attempted, 7, "failure must occur on the final output");
+
+        let retry = Qwen35DecodeBatchState::new(&mut gpu, &config, 1, 2, 2)
+            .expect("immediate retry after allocation failure");
+        retry
+            .free_gpu(&mut gpu)
+            .expect("release retried decode batch");
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed construction lost reusable allocations instead of rolling them back",
+        );
+        eprintln!(
+            "late failure at output allocation {attempted}: retry reused the complete warm pool"
+        );
+        gpu.drain_pool();
+    }
 }

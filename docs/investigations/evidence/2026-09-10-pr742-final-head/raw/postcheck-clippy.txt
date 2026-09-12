@@ -1,0 +1,196 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.46
+   Compiling unicode-ident v1.0.24
+    Checking cfg-if v1.0.4
+   Compiling serde_core v1.0.228
+    Checking itoa v1.0.18
+    Checking memchr v2.8.3
+   Compiling libc v0.2.186
+   Compiling serde v1.0.228
+    Checking equivalent v1.0.2
+   Compiling zmij v1.0.23
+   Compiling serde_json v1.0.150
+    Checking hashbrown v0.17.1
+   Compiling thiserror v2.0.18
+   Compiling version_check v0.9.5
+    Checking winnow v1.0.4
+    Checking winnow v0.7.15
+    Checking once_cell v1.21.4
+    Checking toml_writer v1.1.2+spec-1.1.0
+    Checking typenum v1.20.1
+   Compiling crossbeam-utils v0.8.22
+   Compiling crc32fast v1.5.0
+    Checking simd-adler32 v0.3.10
+   Compiling crossbeam-epoch v0.9.20
+    Checking pin-project-lite v0.2.17
+    Checking adler2 v2.0.1
+    Checking bitflags v2.13.1
+   Compiling crossbeam-deque v0.8.7
+    Checking cpufeatures v0.2.17
+   Compiling rayon-core v1.13.0
+    Checking regex-syntax v0.8.11
+   Compiling autocfg v1.5.1
+   Compiling rustix v1.1.4
+    Checking libloading v0.9.0
+    Checking either v1.16.0
+   Compiling getrandom v0.4.3
+    Checking linux-raw-sys v0.12.1
+   Compiling zerocopy v0.8.54
+    Checking smallvec v1.15.2
+    Checking fdeflate v0.3.7
+    Checking tracing-core v0.1.36
+    Checking miniz_oxide v0.8.9
+    Checking foldhash v0.2.0
+    Checking pxfm v0.1.30
+    Checking allocator-api2 v0.2.21
+    Checking fastrand v2.4.1
+   Compiling generic-array v0.14.7
+    Checking memo-map v0.3.3
+    Checking bytemuck v1.25.1
+    Checking byteorder-lite v0.1.0
+    Checking byteorder v1.5.0
+   Compiling libm v0.2.16
+    Checking bit-vec v0.8.0
+    Checking toml_parser v1.1.2+spec-1.1.0
+    Checking base64 v0.22.1
+    Checking bytes v1.12.1
+   Compiling shlex v2.0.1
+   Compiling num-traits v0.2.19
+   Compiling find-msvc-tools v0.1.9
+    Checking log v0.4.33
+    Checking indexmap v2.14.0
+   Compiling httparse v1.10.1
+    Checking zeroize v1.9.0
+    Checking aho-corasick v1.1.4
+    Checking futures-core v0.3.32
+    Checking bit-set v0.8.0
+   Compiling cc v1.2.65
+    Checking untrusted v0.9.0
+   Compiling rustls v0.23.40
+    Checking rustls-pki-types v1.14.1
+    Checking subtle v2.6.1
+    Checking utf8parse v0.2.2
+   Compiling cfg_aliases v0.2.2
+    Checking is_terminal_polyfill v1.70.2
+    Checking flate2 v1.1.9
+    Checking percent-encoding v2.3.2
+    Checking colorchoice v1.0.5
+    Checking utf8-zero v0.8.1
+    Checking anstyle-query v1.1.5
+    Checking anstyle v1.0.14
+   Compiling nix v0.31.3
+    Checking anstyle-parse v1.0.0
+    Checking futures-channel v0.3.32
+    Checking clap_lex v1.1.0
+   Compiling heck v0.5.0
+    Checking lazy_static v1.5.0
+    Checking atomic-waker v1.1.2
+    Checking httpdate v1.0.3
+    Checking slab v0.4.12
+    Checking futures-task v0.3.32
+    Checking strsim v0.11.1
+   Compiling anyhow v1.0.103
+    Checking sharded-slab v0.1.7
+    Checking tracing-log v0.2.0
+    Checking thread_local v1.1.10
+    Checking anstream v1.0.0
+    Checking webpki-roots v1.0.7
+   Compiling hipfire-cli v0.3.1 (/home/bjoern/hipfire/.claude/worktrees/g4-next-integration/crates/hipfire-cli)
+    Checking futures-sink v0.3.34
+    Checking nu-ansi-term v0.50.3
+    Checking md5 v0.8.1
+    Checking png v0.18.1
+   Compiling syn v2.0.119
+   Compiling syn v3.0.3
+    Checking clap_builder v4.6.0
+    Checking http v1.4.2
+    Checking crypto-common v0.1.7
+    Checking block-buffer v0.10.4
+    Checking digest v0.10.7
+    Checking regex-automata v0.4.16
+    Checking http-body v1.1.0
+    Checking ureq-proto v0.6.0
+    Checking sha2 v0.10.9
+   Compiling ring v0.17.14
+    Checking rayon v1.12.0
+    Checking http-body-util v0.1.5
+    Checking toml_datetime v0.7.5+spec-1.1.0
+    Checking serde_spanned v1.1.1
+    Checking hashbrown v0.16.1
+    Checking memmap2 v0.9.11
+    Checking getrandom v0.2.17
+    Checking socket2 v0.6.5
+    Checking mio v1.2.2
+    Checking tempfile v3.27.0
+    Checking toml v0.9.12+spec-1.1.0
+    Checking ctrlc v3.5.2
+    Checking moxcms v0.8.1
+    Checking regex v1.13.1
+    Checking fancy-regex v0.14.0
+    Checking matchers v0.2.0
+   Compiling tokio-macros v2.7.2
+    Checking tokio v1.53.1
+    Checking image v0.25.10
+   Compiling serde_derive v1.0.228
+   Compiling thiserror-impl v2.0.18
+   Compiling zerocopy-derive v0.8.54
+   Compiling tracing-attributes v0.1.31
+   Compiling futures-macro v0.3.32
+   Compiling clap_derive v4.6.1
+    Checking futures-util v0.3.32
+    Checking tracing v0.1.44
+    Checking hyper v1.11.0
+    Checking libjpeg-turbo-rs v0.8.0
+    Checking clap v4.6.1
+    Checking hyper-util v0.1.20
+    Checking tokio-util v0.7.19
+    Checking rustls-webpki v0.103.13
+    Checking hipfire-config v0.3.1 (/home/bjoern/hipfire/.claude/worktrees/g4-next-integration/crates/hipfire-config)
+    Checking radiowave v0.3.1 (/home/bjoern/hipfire/.claude/worktrees/g4-next-integration/crates/radiowave)
+    Checking minijinja v2.21.0
+    Checking safetensors v0.8.0
+    Checking tracing-serde v0.2.0
+    Checking tracing-subscriber v0.3.23
+error: doc list item overindented
+  --> crates/hipfire-config/src/rocm.rs:26:5
+   |
+26 | //!                            stripped so `/opt/rocm/hip` resolves to `/opt/rocm`.
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^ help: try using `     ` (5 spaces)
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#doc_overindented_list_items
+   = note: `-D clippy::doc-overindented-list-items` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::doc_overindented_list_items)]`
+
+error: redundant guard
+   --> crates/hipfire-config/src/rocm.rs:378:16
+    |
+378 |             if matches!(source, CompilerSource::Path | CompilerSource::OtherRoot) =>
+    |                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#redundant_guards
+    = note: `-D clippy::redundant-guards` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::redundant_guards)]`
+help: try
+    |
+377 -         (Some(compiler), Some(compiler_root), Some(source))
+378 -             if matches!(source, CompilerSource::Path | CompilerSource::OtherRoot) =>
+377 +         (Some(compiler), Some(compiler_root), Some(CompilerSource::Path | CompilerSource::OtherRoot)) =>
+    |
+
+error: this method chain can be written more clearly with `if .. else ..`
+   --> crates/hipfire-config/src/rocm.rs:673:5
+    |
+673 | /     (candidates.len() > 1)
+674 | |         .then_some(candidates)
+675 | |         .unwrap_or_default()
+    | |____________________________^ help: try: `if candidates.len() > 1 { candidates } else { Default::default() }`
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#obfuscated_if_else
+    = note: `-D clippy::obfuscated-if-else` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::obfuscated_if_else)]`
+
+error: could not compile `hipfire-config` (lib) due to 3 previous errors
+warning: build failed, waiting for other jobs to finish...

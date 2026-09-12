@@ -1,0 +1,49 @@
+{
+  "prompt_file": "prompt.txt",
+  "prompt_md5": "5393c3ad13f6c459e7e6124a69fc9f7e",
+  "prompt_bytes": 29,
+  "seed": 7,
+  "steps": 4,
+  "width": 768,
+  "height": 512,
+  "reference": "ref.png",
+  "reference_width": 768,
+  "reference_height": 512,
+  "cfg": 1.0,
+  "sampler": "euler",
+  "scheduler": "Flux2Scheduler (empirical mu, exponential shift)",
+  "source": "ComfyUI 0.31.0 on inferno02 gfx1151; UNETLoader flux-2-klein-4b.safetensors (weight_dtype default = bf16), CLIPLoader qwen_3_4b.safetensors type flux2, VAELoader flux2-vae.safetensors",
+  "graph": "comfy-graph.json",
+  "date": "2026-09-05",
+  "hipfire_commit": "fae3176d",
+  "latent_shape": [1, 128, 32, 48],
+  "velocity_regression_bar": 0.03,
+  "note_velocity_regression_bar": "2x the measured value at commit e25d44cb (step-1 velocity rel_l2 1.344e-2); a regression tripwire, not a correctness bound. The correctness ceiling stays VELOCITY_TOL = 0.15, the ComfyUI fp8-vs-bf16 bracket, unchanged. This is the tightest of the three bars because the edit path is the tightest measurement — a reference pins the trajectory — and it is exactly the fixture where a shared bar would have been 11x looser than the signal. See ../4b/meta.json note_velocity_regression_bar for the full rationale and the update rule.",
+  "md5": {
+    "ref.png": "6143af300c2b17f71590577efd520285",
+    "ref.latent": "92e3dc3783129d33601b041f39064f78",
+    "init.latent": "0d035c3ce53667468670aa28b424d845",
+    "step1.latent": "4546bc029103dc2b03a64c1b0ba36e0e",
+    "golden.latent": "e7887ecbfc275d459da4b72f7d2ce918",
+    "golden.png": "b09377b9c3506e52cfba640610b9b858",
+    "prompt.txt": "5393c3ad13f6c459e7e6124a69fc9f7e"
+  },
+
+  "note_conventions": "Latent order, normalization, noise extraction and schedule are identical to the txt2img fixture next door (../4b/meta.json) and are NOT re-derived here: pure transpose packed[(y*J + x)*128 + f] = comfy[f*I*J + y*J + x], already BatchNorm-normalized, ManualSigmas('0.5') for the noise, Flux2Scheduler for the sigmas. Read ../4b/meta.json first; this file records only what the EDIT path adds.",
+
+  "note_graph": "One graph (comfy-graph.json) produces all five artifacts from the SAME RandomNoise(7) node, so the noise the golden was made from is the noise the gate feeds in. Reference wiring, taken from ComfyUI's own Klein 4B edit template (image_flux2_klein_image_edit_4b_distilled, fetched from http://127.0.0.1:8188/templates/): LoadImage -> VAEEncode -> two ReferenceLatent nodes, one on the CLIPTextEncode conditioning and one on ConditioningZeroOut of it, feeding CFGGuider(cfg=1.0) as positive/negative. cfg 1.0 makes the negative branch inert (comfy/samplers.py drops uncond when math.isclose(cond_scale, 1.0)), so this is equivalent to the txt2img fixture's BasicGuider; the template's shape is kept anyway so the capture is the workflow users actually run. A SaveLatent hangs off the VAEEncode -> ref.latent.",
+
+  "note_resize": "THE ONE PLACE THE TEMPLATE AND HIPFIRE DISAGREE, and it is deliberately kept out of the comparison. ComfyUI's Klein edit template puts ImageScaleToTotalPixels(nearest-exact, megapixels=1.0, resolution_steps=1) between LoadImage and VAEEncode and then takes the OUTPUT size from GetImageSize of the scaled image (comfy_extras/nodes_post_processing.py: scale_by = sqrt(megapixels*1024*1024 / (w*h)); width = round(w*scale_by/steps)*steps). That rule scales to exactly 1 MP in BOTH directions and rounds to resolution_steps. hipfire's refimg::target_size caps AREA at 1024^2, never upscales, and floors each side to a multiple of 16. On a 768x512 reference the template would UPSCALE to ~1254x836 while hipfire leaves it alone. ref.png is 768x512 — under the cap, a multiple of 16 — so it is a fixed point of hipfire's rule, and the capture graph wires LoadImage -> VAEEncode directly (no scale node). Both sides therefore encode the SAME pixels and the gate measures the encode and the model, not two resamplers. The divergence itself is a product decision, not a gate failure.",
+
+  "note_ref_tokens": "Settled from comfy/ldm/flux/model.py::Flux._forward, not guessed. (1) ORDER: img = torch.cat([img, kontext], dim=1) — reference tokens come AFTER the generated tokens, which is what pipeline::generate_txt2img_steps_gpu does. (2) IDS: process_img(ref, index=index) with index += params.ref_index_scale per reference, and comfy/model_detection.py sets ref_index_scale = 10.0 for image_model == 'flux2', so reference i carries (10*(i+1), h, w, 0) — hipfire's flux::rope_ids_for_grid(grid, 10.0*(i+1)). (3) SPACE: model_base.Flux.extra_conds runs each reference through process_latent_in, which for latent_formats.Flux2 is the identity, so what SaveLatent writes is exactly what the trunk sees — and it is the same normalized space build_ref_tokens ends in. (4) The default method is 'index' (default_ref_method in model_detection.py); FluxKontextMultiReferenceLatentMethod is not in the template and is not needed for one reference. (5) The schedule is driven by the GENERATED grid only: Flux2Scheduler takes width/height, not the reference token count, and hipfire passes n_img (1536 here), not n_img + n_ref.",
+
+  "note_ref_latent_check": "ref.latent is the cheap check the gate runs BEFORE spending a denoise: hipfire's refimg::load_reference + pipeline::build_ref_tokens (GPU VAE encode + pack_latents + normalize_packed) against this file under the same pure transpose. No transformer and no schedule are in that path. Measured 2026-09-05: rel_l2 9.7122e-3, rel_inf 3.0133e-2, with hipfire mean/std -0.0822/0.9808 against ComfyUI's -0.0821/0.9807.",
+
+  "note_ref_tol": "THE BOUND ON THAT CHECK IS 0.02, NOT THE 5e-3 THE PLAN NAMED, and the reason is the same one that moved the txt2img bars: 5e-3 is gpu_klein_vae_parity's INTRA-hipfire number (the f16 GPU decoder against hipfire's own f32 CPU reference) and this is a CROSS-implementation comparison of a different kind. ComfyUI runs this VAE in bfloat16: comfy/sd.py's VAE.working_dtypes defaults to [bfloat16, float32] and the batch_norm_latent branch does not override it, so model_management.vae_dtype picks bf16 on any device that supports it, and AutoencoderKL.encode additionally casts the BatchNorm running_mean/running_var to z.dtype before applying them. bf16 carries 8 mantissa bits (2^-9 = 2e-3 per value) through a ~30-convolution encoder. Four independent measurements of that same band on this VAE: reference encode 9.712e-3 (768x512) and 1.126e-2 (992x688 snapped), and the decode direction — hipfire decoding ComfyUI's own latent against ComfyUI's own PNG — 7.635e-3 here and 8.435e-3 on the txt2img fixture. The bound is 2x the largest. Evidence that the residual is NUMERIC and not a convention: (a) mean and std agree to four significant digits; (b) the gate's border-vs-interior split reads 8.958e-3 border vs 9.797e-3 interior, and a padding, resample-alignment or downsample off-by-one lands on the border while a dtype difference does not; (c) PACK_ORDER=alt takes the same number to 1.400, so the check still discriminates a convention error by two orders; (d) gpu_klein_vae_parity puts hipfire's own two encoders at 2.556e-5 against each other, both f32, 380x tighter than either is from ComfyUI. REF_ENCODE=cpu reruns the check on the host encoder if the question comes up again.",
+
+  "note_snap_check": "The snap rule is exercised separately, because ref.png is deliberately a fixed point of it. --make-ref writes a 1000x700 Lanczos3 resize of ref.png; refimg::load_reference floors that to 992x688 (area 700000 is under the 1024^2 cap, so only the multiple-of-16 floor fires); --dump-snapped writes those exact pixels back out; ComfyUI VAEEncode of that PNG lands at rel_l2 1.1255e-2 against hipfire's reference tokens (border 1.030e-2, interior 1.134e-2 — broadband again). Run it with --ref-only, which stops before the denoise: a reference of a different geometry than the fixture's would make the model bars compare against a golden captured from a DIFFERENT reference.",
+
+  "note_gate_bars": "Same four model bars as ../4b, same sources: step-1 VELOCITY <= 0.15 (the ComfyUI fp8-vs-bf16 bracket, THE gate), one-step latent <= 0.0935, final latent <= 0.42, golden decode <= 0.05. The edit path adds the reference-latent bar at REF_TOL = 0.02 (see note_ref_tol). Measured 2026-09-05, model code fae3176d: ref latent 9.7122e-3, velocity 1.3442e-2, one-step 6.7872e-4, final 2.2955e-2, golden decode 7.6350e-3, our-decode-vs-ComfyUI-PNG 1.3873e-2. Every model bar is TIGHTER on the edit path than on txt2img (velocity 1.34e-2 vs 3.11e-2, final 2.30e-2 vs 2.20e-1), which is what a reference should do: it pins the trajectory, so there is less room for a per-step difference to integrate. PACK_ORDER=alt fails four of the five bars (ref 1.400, velocity 1.138, final 1.243, decode 1.277).",
+
+  "regenerate": "curl -s -F 'image=@ref.png' -F 'overwrite=true' http://127.0.0.1:8188/upload/image ; jq -c '{prompt: ., client_id: \"hipfire-klein-edit\"}' comfy-graph.json > /tmp/edit_post.json ; curl -s -X POST -H 'Content-Type: application/json' -d @/tmp/edit_post.json http://127.0.0.1:8188/prompt ; poll GET /history/<prompt_id> ; copy /home/user/comfy-outputs/latents/klein4bedit_{ref,init,step1,golden}_*.latent and /home/user/comfy-outputs/klein4bedit_golden_*.png here. ref.png itself came from hipfire: klein_txt2img --prompt 'a photograph of a leather handbag on a wooden table next to a cup of coffee, natural window light' --steps 4 --seed 11 --size 768x512. Check the regenerated init.latent by its STATISTICS (the gate asserts mean ~0 / std ~1), never by its size."
+}

@@ -141,7 +141,7 @@ def main():
             "suspected_regressions": [],
             "run_hardware": True,
             "run_hardware_reasons": ["safe"],
-            "routes": [{"mode": "battery", "tag": "qwen3.6:27b", "source": "sol", "why": "test"}],
+            "routes": [{"mode": "battery", "tag": "qwen3.8:27b-mq4-xt", "source": "sol", "why": "test"}],
             "unavailable_routes": [],
             "claim_assessment": "no claim",
             "questions_for_author": []

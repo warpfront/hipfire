@@ -14,20 +14,33 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
-use hipfire_engine::emit::{
-    emit_active_attempt_error, emit_gen_start, emit_qwen_ar_cancelled, emit_reasoning_token,
-    emit_visible_token, write_error,
-};
+use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token};
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
 use hipfire_engine::terminal::{
-    active_attempt_id, await_client_terminal_commit, check_abort, emit_staged_terminal_done,
-    ClientTerminalDecision,
+    active_attempt_id, await_client_terminal_commit, check_abort,
+    emit_aborted_terminal_after_abort, ClientTerminalDecision,
 };
+
+fn emit_active_attempt_error(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    crate::ar::emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
+}
+
+fn write_error(stdout: &mut impl std::io::Write, id: &str, message: &str) {
+    crate::ar::emit_active_route_error(stdout, Some(id), message, "internal", false, false);
+}
+
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::emit_text::{ThinkOutputRouter, ThinkRouteEvent};
 use hipfire_runtime::eos_filter::{EosFilter, FilterAction};
 use hipfire_runtime::sampler::{self, SamplerConfig};
-use hipfire_runtime::spec::{PrefillOutcome, Speculator};
+use hipfire_runtime::spec::{PrefillOutcome, SpecTarget};
 use std::any::Any;
 use std::io::Write;
 use std::path::Path;
@@ -178,26 +191,37 @@ pub fn vl_no_eviction_kv_cap(physical_cap: usize, max_seq: usize, adaptive_engag
     }
 }
 
-pub(crate) fn vl_cold_reset_uncommitted(
+/// Fail-closed rollback for uncommitted Qwen35-VL state — the VL analogue of
+/// the text-AR `reset_ar_uncommitted_state!` macro (same scope: host cursors,
+/// recurrent/conv state, KV offset, adaptive, prefill checkpoint ring), plus
+/// the shared graph/replay-invalidate + device-sync tail so the returned
+/// [`crate::common::RollbackEpilogue`] attests the device is drained.
+///
+/// Recurrent state resets via the canonical [`qwen35::DeltaNetState::reset`]
+/// (attested — a HIP failure reports `rolled_back=false` instead of being
+/// swallowed — covering every buffer class including future additions).
+/// Takes the live request pieces as disjoint borrows because the bundle
+/// itself stays borrowed by the caller (`&mut LoadedModel` is unreachable).
+/// Cancellation (which additionally clears the DFlash ring, speculator, and
+/// assistant-turn cache) uses [`vl_cancel_after_rollback`] instead.
+pub(crate) fn vl_rollback_uncommitted(
     gpu: &mut rdna_compute::Gpu,
-    dn: &qwen35::DeltaNetState,
+    dn: &mut qwen35::DeltaNetState,
     kv: &mut hipfire_runtime::llama::KvCache,
     kv_adaptive: &mut Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
-) {
-    for s in &dn.s_matrices {
-        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-    }
-    for s in &dn.s_scales {
-        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-    }
-    for s in &dn.conv_states {
-        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-    }
-    for s in &dn.s_ef_residual {
-        let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+) -> crate::common::RollbackEpilogue {
+    use crate::common::{
+        fail_closed_device_sync, fail_closed_epilogue_after_sync,
+        fail_closed_invalidate_graphs_and_replay, push_reset_err,
+    };
+    *seq_pos = 0;
+    conversation_tokens.clear();
+    let mut first_err: Option<String> = None;
+    if let Err(e) = dn.reset(gpu) {
+        push_reset_err(&mut first_err, "dn.reset", e);
     }
     kv.compact_offset = 0;
     if let Some(ad) = kv_adaptive.as_mut() {
@@ -205,9 +229,17 @@ pub(crate) fn vl_cold_reset_uncommitted(
             ad.reset_with_cache(gpu, kv);
         }
     }
-    *seq_pos = 0;
-    conversation_tokens.clear();
     free_checkpoints(prefill_checkpoints, gpu);
+    fail_closed_invalidate_graphs_and_replay(gpu);
+    let prior = match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    };
+    let epilogue = fail_closed_epilogue_after_sync(prior, fail_closed_device_sync(gpu));
+    if epilogue.rolled_back {
+        gpu.replay.begin_replay_observation_window();
+    }
+    epilogue
 }
 
 pub(crate) fn vl_adaptive_downshift_fail_closed(
@@ -215,7 +247,7 @@ pub(crate) fn vl_adaptive_downshift_fail_closed(
     seq_pos: &mut usize,
     gpu: &mut rdna_compute::Gpu,
     kv: &mut hipfire_runtime::llama::KvCache,
-    dn: &qwen35::DeltaNetState,
+    dn: &mut qwen35::DeltaNetState,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
     stdout: &mut std::io::Stdout,
@@ -241,9 +273,9 @@ pub(crate) fn vl_adaptive_downshift_fail_closed(
                 "[adaptive-kv] maybe_downshift error @ pos {} ({}): {:?} — poisoning model",
                 committed, phase, e
             );
-            // maybe_downshift already poisons on partial failure; cold-reset
+            // maybe_downshift already poisons on partial failure; rollback
             // leaves poison sticky (reset_with_cache skipped when poisoned).
-            vl_cold_reset_uncommitted(
+            let ep = vl_rollback_uncommitted(
                 gpu,
                 dn,
                 kv,
@@ -252,10 +284,13 @@ pub(crate) fn vl_adaptive_downshift_fail_closed(
                 conversation_tokens,
                 prefill_checkpoints,
             );
-            write_error(
+            crate::common::emit_fail_closed_error(
                 stdout,
-                id,
+                Some(id),
                 &format!("adaptive KV transition failed during {phase}: {e}"),
+                "internal",
+                false,
+                &ep,
             );
             true
         }
@@ -268,14 +303,14 @@ pub(crate) fn vl_forward_fail(
     phase: &str,
     err: impl std::fmt::Display,
     gpu: &mut rdna_compute::Gpu,
-    dn: &qwen35::DeltaNetState,
+    dn: &mut qwen35::DeltaNetState,
     kv: &mut hipfire_runtime::llama::KvCache,
     kv_adaptive: &mut Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     seq_pos: &mut usize,
     conversation_tokens: &mut Vec<u32>,
     prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
 ) {
-    vl_cold_reset_uncommitted(
+    let ep = vl_rollback_uncommitted(
         gpu,
         dn,
         kv,
@@ -284,7 +319,183 @@ pub(crate) fn vl_forward_fail(
         conversation_tokens,
         prefill_checkpoints,
     );
-    write_error(stdout, id, &format!("VL {phase}: {err}"));
+    crate::common::emit_fail_closed_error(
+        stdout,
+        Some(id),
+        &format!("VL {phase}: {err}"),
+        "internal",
+        false,
+        &ep,
+    );
+}
+
+/// Cancel epilogue for Qwen35-VL: canonical rollback first, then the
+/// route-aware cancelled pair — or a fail-closed error when rollback could
+/// not be attested (never a silent cancel over dirty state, never a `done`).
+pub(crate) fn vl_cancel_after_rollback(
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    generated: usize,
+    gpu: &mut rdna_compute::Gpu,
+    dn: &mut qwen35::DeltaNetState,
+    kv: &mut hipfire_runtime::llama::KvCache,
+    kv_adaptive: &mut Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    speculator: &mut Option<Box<dyn hipfire_runtime::spec::Speculator>>,
+) {
+    let ep = {
+        use crate::common::{
+            fail_closed_device_sync, fail_closed_epilogue_after_sync,
+            fail_closed_invalidate_graphs_and_replay, push_reset_err,
+        };
+        // Full production scope (mirrors
+        // `production_fail_closed_rollback` minus the `&mut LoadedModel`
+        // pieces the caller keeps borrowed): host cursors, assistant-turn
+        // cache, recurrent state, both checkpoint rings, speculator,
+        // graph/replay invalidation, device sync.
+        *seq_pos = 0;
+        conversation_tokens.clear();
+        asst_turn_cache.clear();
+        let mut first_err: Option<String> = None;
+        if let Err(e) = dn.reset(gpu) {
+            push_reset_err(&mut first_err, "dn.reset", e);
+        }
+        kv.compact_offset = 0;
+        if let Some(ad) = kv_adaptive.as_mut() {
+            if !ad.is_poisoned() {
+                ad.reset_with_cache(gpu, kv);
+            }
+        }
+        free_checkpoints(prefill_checkpoints, gpu);
+        free_checkpoints(dflash_checkpoints, gpu);
+        if let Some(s) = speculator.as_mut() {
+            if let Err(e) = s.reset(gpu) {
+                push_reset_err(&mut first_err, "spec.reset", e);
+            }
+        }
+        fail_closed_invalidate_graphs_and_replay(gpu);
+        let prior = match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+        let ep = fail_closed_epilogue_after_sync(prior, fail_closed_device_sync(gpu));
+        if ep.rolled_back {
+            gpu.replay.begin_replay_observation_window();
+        }
+        ep
+    };
+    crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+}
+
+/// Fail-closed rollback for the dots.ocr Qwen2 decoder state.
+///
+/// The vision tower is stateless one-shot (encode → splice → free), so the
+/// only request-mutated state is the text decoder: [`qwen2::Qwen2State`],
+/// whose `reset()` is an infallible O(1) cursor rewind (slots are
+/// overwritten in place). Dots turns never touch `LoadedModel` host cursors,
+/// checkpoint rings, the assistant-turn cache, or the speculator slot on the
+/// AR path — the shared graph/replay-invalidate + device-sync tail attests
+/// the device is drained. Same terminal discipline as the VL funnels above:
+/// error → correlated fail-closed error, cancel → cancelled pair (or a
+/// fail-closed error when unattested), never a normal `done`.
+pub(crate) fn dots_ar_rollback(
+    state: &mut qwen2::Qwen2State,
+    gpu: &mut rdna_compute::Gpu,
+) -> crate::common::RollbackEpilogue {
+    use crate::common::{
+        fail_closed_device_sync, fail_closed_epilogue_after_sync,
+        fail_closed_invalidate_graphs_and_replay,
+    };
+    state.reset();
+    fail_closed_invalidate_graphs_and_replay(gpu);
+    let epilogue = fail_closed_epilogue_after_sync(Ok(()), fail_closed_device_sync(gpu));
+    if epilogue.rolled_back {
+        gpu.replay.begin_replay_observation_window();
+    }
+    epilogue
+}
+
+pub(crate) fn dots_ar_fail(
+    state: &mut qwen2::Qwen2State,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    message: &str,
+) {
+    let ep = dots_ar_rollback(state, gpu);
+    crate::common::emit_fail_closed_error(stdout, Some(id), message, "internal", false, &ep);
+}
+
+pub(crate) fn dots_ar_cancel(
+    state: &mut qwen2::Qwen2State,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    generated: usize,
+) {
+    let ep = dots_ar_rollback(state, gpu);
+    crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+}
+
+/// Fail-closed rollback for the dots.ocr n-gram spec loop, which holds the
+/// bundle and speculator outside `LoadedModel`. Same order as
+/// [`crate::common::production_fail_closed_rollback_live`]: recurrent rewind
+/// via the [`SpecTarget`] hook, drafter reset, graph/replay invalidation,
+/// device sync, replay-observation reopen.
+pub(crate) fn dots_spec_rollback(
+    bundle: &mut hipfire_arch_dots_ocr::DotsOcrBundle,
+    spec: &mut dyn hipfire_runtime::spec::Speculator,
+    gpu: &mut rdna_compute::Gpu,
+) -> crate::common::RollbackEpilogue {
+    use crate::common::{
+        fail_closed_device_sync, fail_closed_epilogue_after_sync,
+        fail_closed_invalidate_graphs_and_replay, push_reset_err,
+    };
+    let mut first_err: Option<String> = None;
+    if let Err(e) = bundle.reset_recurrent(gpu) {
+        push_reset_err(&mut first_err, "reset_recurrent", e);
+    }
+    if let Err(e) = spec.reset(gpu) {
+        push_reset_err(&mut first_err, "spec.reset", e);
+    }
+    fail_closed_invalidate_graphs_and_replay(gpu);
+    let prior = match first_err {
+        Some(e) => Err(e),
+        None => Ok(()),
+    };
+    let epilogue = fail_closed_epilogue_after_sync(prior, fail_closed_device_sync(gpu));
+    if epilogue.rolled_back {
+        gpu.replay.begin_replay_observation_window();
+    }
+    epilogue
+}
+
+pub(crate) fn dots_spec_fail(
+    bundle: &mut hipfire_arch_dots_ocr::DotsOcrBundle,
+    spec: &mut dyn hipfire_runtime::spec::Speculator,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    message: &str,
+) {
+    let ep = dots_spec_rollback(bundle, spec, gpu);
+    crate::common::emit_fail_closed_error(stdout, Some(id), message, "internal", false, &ep);
+}
+
+pub(crate) fn dots_spec_cancel(
+    bundle: &mut hipfire_arch_dots_ocr::DotsOcrBundle,
+    spec: &mut dyn hipfire_runtime::spec::Speculator,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    generated: usize,
+) {
+    let ep = dots_spec_rollback(bundle, spec, gpu);
+    crate::common::emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
 }
 
 pub(crate) fn build_vl_mrope_ctx(
@@ -388,6 +599,24 @@ pub(crate) fn build_vl_mrope_ctx(
         built.rope_delta,
     ))
 }
+/// Strip an optional `data:...;base64,` prefix and base64-decode image bytes.
+/// Shared by the VCN pre-pass and the CPU fallback below so both see the
+/// same bytes (and the same errors).
+fn decode_image_bytes(b64: &str) -> Result<Vec<u8>, String> {
+    // A `data:` URL missing the comma separator is malformed — surface that
+    // explicitly rather than letting it fall through to a misleading
+    // "invalid byte 'd' at index 0" base64 error.
+    let raw_b64 = if let Some(rest) = b64.strip_prefix("data:") {
+        match rest.split_once(',') {
+            Some((_, after)) => after,
+            None => return Err("malformed data URL: missing ',' separator".to_string()),
+        }
+    } else {
+        b64
+    };
+    Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64)
+        .map_err(|e| format!("failed to decode base64 image data: {e}"))
+}
 
 pub fn generate_vl(
     m: &mut LoadedModel,
@@ -395,13 +624,14 @@ pub fn generate_vl(
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
+    let route = crate::ar::GenerationRoute::QwenAr;
+    let _route_scope = crate::ar::GenerationRouteScope::enter(route, params.id);
     // Stream-contract opener. MUST be the first event on this request's
     // stream: the HTTP CLI's StreamContractGate rejects any later event that
     // arrives without a preceding gen_start for this id — which stranded
     // image turns after the encoder finished ("no response bytes", wedged
     // slot; 2026-08-27 ledger finding b). Text-path generate() has emitted
     // this since the e99583afa-class fixes.
-    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
     // started_in_think mirrors the ChatFrame builder's own conditions: the
     // `<think>` opener lands in the prompt only for AssistantPrefix::OpenThink
     // AND a tokenizer that carries the special token (the builder falls back
@@ -414,7 +644,7 @@ pub fn generate_vl(
         .tokenizer
         .as_ref()
         .is_some_and(|t| t.special_token_id("<think>").is_some());
-    emit_gen_start(stdout, params.id, started_in_think, gen_contract);
+    crate::ar::emit_generation_start(route, stdout, params.id, started_in_think);
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU
@@ -473,68 +703,89 @@ pub fn generate_vl(
         .special_token_id("<|vision_end|>")
         .unwrap_or_else(|| panic!("VL tokenizer missing <|vision_end|> special token"));
 
-    // Image preprocessing (CPU decode + smart resize). Cheap relative to
-    // the GPU vision encoder, so we run it before the capacity check —
-    // we need img_h/img_w to estimate visual tokens, and rejecting an
-    // over-budget request before vision_forward saves expensive GPU work.
-    let (pixels, img_h, img_w) = match image_source {
-        ImageSource::Path(path) => {
-            eprintln!("[VL-DEBUG] preprocessing image: path: {}", path);
-            match image::load_and_preprocess(
-                Path::new(path),
-                vision_config.patch_size,
-                vision_config.spatial_merge_size,
-            ) {
-                Ok(result) => result,
-                Err(e) => {
-                    write_error(stdout, id, &e);
-                    return;
-                }
-            }
+    // VCN pre-pass (feature `vcn-jpeg` only): pooled libva decode plus
+    // resized target dims. No GPU allocation (the mapping is session-pooled)
+    // and no CPU pixels, so the early returns below still own no request
+    // GPU buffers (see the invariant above). The retained bytes feed the
+    // last-resort CPU decode if the later kernel launches fail.
+    //
+    // Gated on `resolve_image_decode()` BEFORE touching the source: the
+    // default (`cpu`) path must not pay a file read / base64 decode here
+    // only to discard it in `vcn_decode` and redo it below. Bytes are
+    // retained only for an attempted VCN path.
+    //
+    // `VcnDecoded` holds the shared session lease (see its docs): at most
+    // one lives per request — a second `vcn_decode` while this is alive
+    // self-deadlocks — and `vcn_to_patches` consumes it right after its
+    // terminal sync, never across generation.
+    #[cfg(feature = "vcn-jpeg")]
+    let vcn_prepass: Option<(image::VcnDecoded<'static>, Vec<u8>)> = (|| {
+        if image::resolve_image_decode() == image::ImageDecode::Cpu {
+            return None;
         }
-        ImageSource::Base64(b64) => {
-            // Strip optional `data:...;base64,` prefix. A `data:` URL
-            // missing the comma separator is malformed — surface that
-            // explicitly rather than letting it fall through to a
-            // misleading "invalid byte 'd' at index 0" base64 error.
-            let raw_b64 = if let Some(rest) = b64.strip_prefix("data:") {
-                match rest.split_once(',') {
-                    Some((_, after)) => after,
-                    None => {
-                        write_error(stdout, id, "malformed data URL: missing ',' separator");
+        let bytes = match image_source {
+            ImageSource::Path(path) => std::fs::read(path).ok()?,
+            ImageSource::Base64(b64) => decode_image_bytes(b64).ok()?,
+        };
+        image::vcn_decode(
+            &bytes,
+            vision_config.patch_size,
+            vision_config.spatial_merge_size,
+        )
+        .map(|d| (d, bytes))
+    })();
+    #[cfg(feature = "vcn-jpeg")]
+    let vcn_dims = vcn_prepass.as_ref().map(|(d, _)| (d.img_h, d.img_w));
+    #[cfg(not(feature = "vcn-jpeg"))]
+    let vcn_dims: Option<(usize, usize)> = None;
+
+    // Image preprocessing (CPU decode + smart resize, unless the VCN
+    // pre-pass hit). Cheap relative to the GPU vision encoder, so we run it
+    // before the capacity check — we need img_h/img_w to estimate visual
+    // tokens, and rejecting an over-budget request before vision_forward
+    // saves expensive GPU work.
+    let (pixels, img_h, img_w) = match vcn_dims {
+        Some((h, w)) => (Vec::new(), h, w),
+        None => match image_source {
+            ImageSource::Path(path) => {
+                eprintln!("[VL-DEBUG] preprocessing image: path: {}", path);
+                match image::load_and_preprocess(
+                    Path::new(path),
+                    vision_config.patch_size,
+                    vision_config.spatial_merge_size,
+                ) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        write_error(stdout, id, &e);
                         return;
                     }
                 }
-            } else {
-                b64
-            };
-            eprintln!(
-                "[VL-DEBUG] preprocessing image: <{}-byte buffer>",
-                raw_b64.len()
-            );
-            let bytes = match Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64) {
-                Ok(b) => b,
-                Err(e) => {
-                    write_error(
-                        stdout,
-                        id,
-                        &format!("failed to decode base64 image data: {e}"),
-                    );
-                    return;
-                }
-            };
-            match image::load_and_preprocess_from_bytes(
-                &bytes,
-                vision_config.patch_size,
-                vision_config.spatial_merge_size,
-            ) {
-                Ok(result) => result,
-                Err(e) => {
-                    write_error(stdout, id, &e);
-                    return;
+            }
+            ImageSource::Base64(b64) => {
+                let bytes = match decode_image_bytes(b64) {
+                    Ok(b) => b,
+                    Err(e) => {
+                        write_error(stdout, id, &e);
+                        return;
+                    }
+                };
+                eprintln!(
+                    "[VL-DEBUG] preprocessing image: <{}-byte buffer>",
+                    bytes.len()
+                );
+                match image::load_and_preprocess_from_bytes(
+                    &bytes,
+                    vision_config.patch_size,
+                    vision_config.spatial_merge_size,
+                ) {
+                    Ok(result) => result,
+                    Err(e) => {
+                        write_error(stdout, id, &e);
+                        return;
+                    }
                 }
             }
-        }
+        },
     };
     eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
 
@@ -584,22 +835,22 @@ pub fn generate_vl(
         // VL is qwen35-vl (arch 5/8); its recurrent state lives in the bundle
         // (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
         // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
-        // is live here.
+        // is live here. Uses the canonical `DeltaNetState::reset` so newly
+        // added recurrent buffers cannot leak across rollover boundaries, and
+        // a HIP failure refuses the request instead of serving on dirty state.
         if let Some(b) = m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
         }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
+            if let Err(e) = b.dn_state.reset(gpu) {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &format!("vision context reset failed: {e}"),
+                    "gpu",
+                    true,
+                    false,
+                );
+                return;
             }
         }
         if let Some(b) = m.state.as_mut().and_then(|s| {
@@ -724,40 +975,240 @@ pub fn generate_vl(
     };
     let mrope = mrope_ctx.as_ref();
 
-    // Now safe to run the expensive GPU vision encoder.
-    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
-        &pixels,
-        3,
-        img_h,
-        img_w,
-        vision_config.patch_size,
-        vision_config.temporal_patch_size,
-        vision_config.spatial_merge_size,
-    );
-    let visual_tokens = match qwen35_vl::vision_forward(
-        gpu,
-        vision_weights,
-        &vision_config,
-        &patches,
-        grid_h,
-        grid_w,
-    ) {
-        Ok(v) => v,
-        Err(e) => {
-            vl_forward_fail(
-                stdout,
-                id,
-                "vision_forward",
-                e,
+    // Now safe to run the expensive GPU vision encoder. VCN images arrive
+    // as a pooled decode: kernels build device patches (no CPU pixels, no
+    // upload) and the tower runs on the resident tensor; everything else
+    // takes today's extract + upload path.
+    #[cfg(feature = "vcn-jpeg")]
+    let visual_tokens = match vcn_prepass {
+        Some((d, bytes)) => {
+            // By value: `vcn_to_patches` consumes the session lease after
+            // its terminal sync, so the surface is reusable (and the mutex
+            // free) before the tower runs. The retained source bytes live
+            // until all CPU fallbacks below are past, then release with the
+            // match scope.
+            let vcn_patches = match image::vcn_to_patches(
                 gpu,
-                dn,
-                kv,
-                &mut m.kv_adaptive,
-                &mut m.seq_pos,
-                &mut m.conversation_tokens,
-                &mut m.prefill_checkpoints,
+                d,
+                vision_config.patch_size,
+                vision_config.temporal_patch_size,
+                vision_config.spatial_merge_size,
+            ) {
+                Ok(vp) => Some(vp),
+                Err(e) if e.fallback_safe() => {
+                    // Last-resort CPU decode of the retained bytes: a
+                    // `Recoverable` failure was proven pre-enqueue or
+                    // followed a successful terminal sync, so this GPU is
+                    // healthy and the fallback is safe.
+                    eprintln!("[daemon/vl] VCN patch build failed ({e}) — CPU fallback");
+                    None
+                }
+                Err(e) => {
+                    // `TerminalSync`: per the `sync_with_deadline` contract
+                    // the work was NOT cancelled and the device is suspect —
+                    // outstanding kernels may still read/write the pooled
+                    // surface and the retained request allocations. The
+                    // existing `vl_forward_fail` path is NOT safe here: it
+                    // runs HIP memset/reset/free calls against that suspect
+                    // device. Instead report the protocol error, flush, and
+                    // terminate the daemon WITHOUT destructors or GPU
+                    // cleanup (`process::exit` runs none, so no `Drop` impl
+                    // can touch the suspect device either). Later requests
+                    // cannot safely reuse this GPU; the supervisor must
+                    // restart the daemon. `bytes` is never decoded.
+                    let msg = format!(
+                        "VL vcn_terminal_sync: {e} (GPU work outstanding and uncancelled; daemon terminating)"
+                    );
+                    eprintln!("[daemon/vl] {msg}");
+                    write_error(stdout, id, &msg);
+                    let _ = stdout.flush();
+                    std::process::exit(1);
+                }
+            };
+            match vcn_patches {
+                Some(vp) => {
+                    // Owned input: `vision_forward_patches` frees `patches`
+                    // after patch embedding — nothing to release here, on
+                    // either outcome.
+                    match qwen35_vl::vision_forward_patches(
+                        gpu,
+                        vision_weights,
+                        &vision_config,
+                        vp.patches,
+                        vp.grid_h,
+                        vp.grid_w,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            vl_forward_fail(
+                                stdout,
+                                id,
+                                "vision_forward_vcn",
+                                e,
+                                gpu,
+                                dn,
+                                kv,
+                                &mut m.kv_adaptive,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                            );
+                            return;
+                        }
+                    }
+                }
+                None => {
+                    let (pixels, fb_h, fb_w) = match image::load_and_preprocess_from_bytes(
+                        &bytes,
+                        vision_config.patch_size,
+                        vision_config.spatial_merge_size,
+                    ) {
+                        Ok(result) => result,
+                        Err(e) => {
+                            write_error(stdout, id, &e);
+                            return;
+                        }
+                    };
+                    // The VCN dims above came from the same JPEG SOF geometry
+                    // through the same `smart_resize`, so these must agree.
+                    // Fail the request rather than feed `extract_patches`
+                    // mismatched geometry (silent corruption).
+                    if (fb_h, fb_w) != (img_h, img_w) {
+                        write_error(
+                            stdout,
+                            id,
+                            &format!(
+                                "VCN/CPU resize mismatch (vcn {img_h}x{img_w} vs cpu {fb_h}x{fb_w}) — refusing to encode mismatched geometry"
+                            ),
+                        );
+                        return;
+                    }
+                    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
+                        &pixels,
+                        3,
+                        img_h,
+                        img_w,
+                        vision_config.patch_size,
+                        vision_config.temporal_patch_size,
+                        vision_config.spatial_merge_size,
+                    );
+                    match qwen35_vl::vision_forward(
+                        gpu,
+                        vision_weights,
+                        &vision_config,
+                        &patches,
+                        grid_h,
+                        grid_w,
+                    ) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            vl_forward_fail(
+                                stdout,
+                                id,
+                                "vision_forward",
+                                e,
+                                gpu,
+                                dn,
+                                kv,
+                                &mut m.kv_adaptive,
+                                &mut m.seq_pos,
+                                &mut m.conversation_tokens,
+                                &mut m.prefill_checkpoints,
+                            );
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        None => {
+            let patches = hipfire_arch_qwen35_vl::image::extract_patches(
+                &pixels,
+                3,
+                img_h,
+                img_w,
+                vision_config.patch_size,
+                vision_config.temporal_patch_size,
+                vision_config.spatial_merge_size,
             );
-            return;
+            match qwen35_vl::vision_forward(
+                gpu,
+                vision_weights,
+                &vision_config,
+                &patches,
+                grid_h,
+                grid_w,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    vl_forward_fail(
+                        stdout,
+                        id,
+                        "vision_forward",
+                        e,
+                        gpu,
+                        dn,
+                        kv,
+                        &mut m.kv_adaptive,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                    );
+                    return;
+                }
+            }
+        }
+    };
+    #[cfg(not(feature = "vcn-jpeg"))]
+    let visual_tokens = {
+        // `image.decode = vcn|auto` requests the VCN path, but this binary
+        // was built without the `vcn-jpeg` cargo feature (the standard
+        // daemon build carries it; custom builds may not). CPU decode is
+        // correct — warn once so the operator intent never silently no-ops.
+        static VCN_FEATURE_WARNED: std::sync::Once = std::sync::Once::new();
+        if hipfire_arch_qwen35_vl::image::resolve_image_decode()
+            != hipfire_arch_qwen35_vl::image::ImageDecode::Cpu
+        {
+            VCN_FEATURE_WARNED.call_once(|| {
+                eprintln!(
+                    "[daemon/vl] image.decode requests VCN but this binary lacks the `vcn-jpeg` feature — CPU fallback"
+                );
+            });
+        }
+        let patches = hipfire_arch_qwen35_vl::image::extract_patches(
+            &pixels,
+            3,
+            img_h,
+            img_w,
+            vision_config.patch_size,
+            vision_config.temporal_patch_size,
+            vision_config.spatial_merge_size,
+        );
+        match qwen35_vl::vision_forward(
+            gpu,
+            vision_weights,
+            &vision_config,
+            &patches,
+            grid_h,
+            grid_w,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                vl_forward_fail(
+                    stdout,
+                    id,
+                    "vision_forward",
+                    e,
+                    gpu,
+                    dn,
+                    kv,
+                    &mut m.kv_adaptive,
+                    &mut m.seq_pos,
+                    &mut m.conversation_tokens,
+                    &mut m.prefill_checkpoints,
+                );
+                return;
+            }
         }
     };
 
@@ -768,6 +1219,11 @@ pub fn generate_vl(
     };
     let prefill_tokens = prompt_tokens.len();
     let t0 = Instant::now();
+    // Test-only fault point (G4.8 lifecycle evidence), armed in-process via
+    // `common::arm_vision_fault`: `"prefill"` fails this request through the
+    // fail-closed error epilogue after prefill; `"decode"` fails it on the
+    // first decode iteration. Unarmed (production) => one thread-local load.
+    let vl_fault: Option<&'static str> = crate::common::peek_vision_fault();
 
     // Mirror the text path: <think>/</think> as paired open/close. The
     // previous implementation queried "💭" twice (open == close) which
@@ -797,7 +1253,24 @@ pub fn generate_vl(
         // permanently (2026-08-27 ledger finding c — slot wedged ≥3 min on
         // every mid-encode disconnect before these polls existed).
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            // Abort with uncommitted prefill state: roll back through the
+            // canonical epilogue before the cancelled pair so the next
+            // request re-prefills from clean state (no deferred reset).
+            vl_cancel_after_rollback(
+                stdout,
+                id,
+                0,
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            );
             return;
         }
         if token == image_pad_id && visual_idx < n_visual_tokens {
@@ -903,6 +1376,25 @@ pub fn generate_vl(
     ) {
         return;
     }
+    // Injected prefill fault (test hook): prefill committed decoder state,
+    // so fail through the canonical error epilogue exactly like a real
+    // forward failure.
+    if vl_fault == Some("prefill") {
+        vl_forward_fail(
+            stdout,
+            id,
+            "forward_scratch (injected-fault)",
+            "injected vision fault: prefill",
+            gpu,
+            dn,
+            kv,
+            &mut m.kv_adaptive,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+        );
+        return;
+    }
 
     // hunt3 M-D: repeat-penalty / n-gram-block history must be scoped to the
     // GENERATED tokens only (mirrors the text path's `ngram_scope_start` set to
@@ -997,12 +1489,43 @@ pub fn generate_vl(
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
     'vl_generate: while generated < max_tokens {
-        // Decode-side client-cancel poll — same canonical-terminal rule as
-        // the prefill poll above; partial per-call state (seq_pos,
-        // conversation_tokens) is reclaimed by the next dispatch's
-        // non-zero-seq_pos reset, matching the dots.ocr cancel path.
+        // Decode-side client-cancel poll — roll back synchronously (same
+        // rule as the prefill poll above); the stale comment's deferred
+        // "next dispatch reset" no longer applies.
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            vl_cancel_after_rollback(
+                stdout,
+                id,
+                generated,
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+                &mut m.dflash_checkpoints,
+                &mut m.asst_turn_cache,
+                &mut m.speculator,
+            );
+            return;
+        }
+        // Injected decode fault (test hook): fails on the first iteration
+        // through the canonical error epilogue.
+        if vl_fault == Some("decode") {
+            vl_forward_fail(
+                stdout,
+                id,
+                "forward_scratch (decode, injected-fault)",
+                "injected vision fault: decode",
+                gpu,
+                dn,
+                kv,
+                &mut m.kv_adaptive,
+                &mut m.seq_pos,
+                &mut m.conversation_tokens,
+                &mut m.prefill_checkpoints,
+            );
             return;
         }
         // Commit KV for this sampled token BEFORE any client-visible emit so a
@@ -1375,7 +1898,24 @@ pub fn generate_vl(
     }
 
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, generated);
+        // Post-loop abort latch: same synchronous rollback as the in-loop
+        // polls — the done handshake below must never run on an aborted
+        // attempt.
+        vl_cancel_after_rollback(
+            stdout,
+            id,
+            generated,
+            gpu,
+            dn,
+            kv,
+            &mut m.kv_adaptive,
+            &mut m.seq_pos,
+            &mut m.conversation_tokens,
+            &mut m.prefill_checkpoints,
+            &mut m.dflash_checkpoints,
+            &mut m.asst_turn_cache,
+            &mut m.speculator,
+        );
         return;
     }
     // Flush any trailing partial think marker as ordinary text in its
@@ -1413,9 +1953,11 @@ pub fn generate_vl(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            crate::ar::emit_active_route_cancel(stdout, id, generated);
         }
     }
 }
@@ -1427,13 +1969,10 @@ pub fn generate_vl_dots_ocr(
     params: &GenerateVLParams,
 ) {
     use hipfire_arch_dots_ocr::image as dots_image;
+    let route = crate::ar::GenerationRoute::DotsOcr;
+    let _route_scope = crate::ar::GenerationRouteScope::enter(route, params.id);
     // Stream-contract opener — same HTTP-gate rationale as generate_vl above.
-    emit_gen_start(
-        stdout,
-        params.id,
-        false,
-        crate::common::gen_start_contract_version_for_arch(m.arch_id),
-    );
+    crate::ar::emit_generation_start(route, stdout, params.id, false);
     let t0 = Instant::now();
     let GenerateVLParams {
         id,
@@ -1518,7 +2057,9 @@ pub fn generate_vl_dots_ocr(
         return;
     }
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
+        // Cancel before prefill: decoder state is pristine but route through
+        // the fail-closed epilogue for a uniform cancel/reuse contract.
+        dots_ar_cancel(state, gpu, stdout, id, 0);
         return;
     }
 
@@ -1543,12 +2084,14 @@ pub fn generate_vl_dots_ocr(
         Ok(Some(t)) => t,
         Ok(None) => {
             let _ = gpu.free_tensor(patches_gpu);
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            dots_ar_cancel(state, gpu, stdout, id, 0);
             return;
         }
         Err(e) => {
             let _ = gpu.free_tensor(patches_gpu);
-            write_error(
+            dots_ar_fail(
+                state,
+                gpu,
                 stdout,
                 id,
                 &format!("dots.ocr vision_forward failed: {e:?}"),
@@ -1561,7 +2104,9 @@ pub fn generate_vl_dots_ocr(
         Ok(v) => v,
         Err(e) => {
             let _ = gpu.free_tensor(merged_gpu);
-            write_error(
+            dots_ar_fail(
+                state,
+                gpu,
                 stdout,
                 id,
                 &format!("dots.ocr merger download failed: {e:?}"),
@@ -1573,7 +2118,9 @@ pub fn generate_vl_dots_ocr(
     // Hard guard: merger output count MUST equal the imgpad-slot count, or
     // the splice silently corrupts the text context (PRD §"Vision token splicing").
     if merged.len() != n_visual * dim {
-        write_error(
+        dots_ar_fail(
+            state,
+            gpu,
             stdout,
             id,
             &format!(
@@ -1594,7 +2141,9 @@ pub fn generate_vl_dots_ocr(
     let emb_scratch = match gpu.alloc_tensor(&[dim], rdna_compute::DType::F32) {
         Ok(t) => t,
         Err(e) => {
-            write_error(
+            dots_ar_fail(
+                state,
+                gpu,
                 stdout,
                 id,
                 &format!("dots.ocr embed scratch alloc failed: {e:?}"),
@@ -1607,7 +2156,7 @@ pub fn generate_vl_dots_ocr(
     for (pos, &token) in prompt_ids.iter().enumerate() {
         if check_abort(id) {
             let _ = gpu.free_tensor(emb_scratch);
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            dots_ar_cancel(state, gpu, stdout, id, 0);
             return;
         }
         if token == dots_ocr::IMGPAD_ID {
@@ -1644,11 +2193,13 @@ pub fn generate_vl_dots_ocr(
     }
     let _ = gpu.free_tensor(emb_scratch);
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
+        dots_ar_cancel(state, gpu, stdout, id, 0);
         return;
     }
     if let Some(e) = embed_err {
-        write_error(
+        dots_ar_fail(
+            state,
+            gpu,
             stdout,
             id,
             &format!("dots.ocr prefill embed build failed: {e}"),
@@ -1658,7 +2209,9 @@ pub fn generate_vl_dots_ocr(
     if let Err(e) =
         qwen2::forward_prefill_batch_embeds(gpu, &weights.text, &text_cfg, state, &embeds)
     {
-        write_error(
+        dots_ar_fail(
+            state,
+            gpu,
             stdout,
             id,
             &format!("dots.ocr batched prefill failed: {e:?}"),
@@ -1666,7 +2219,22 @@ pub fn generate_vl_dots_ocr(
         return;
     }
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, 0);
+        dots_ar_cancel(state, gpu, stdout, id, 0);
+        return;
+    }
+    // Test-only fault point (G4.8 lifecycle evidence), armed in-process via
+    // `common::arm_dots_fault`: `"prefill"` fails this request through the
+    // fail-closed error epilogue once prefill has committed decoder state;
+    // `"argmax"` / `"decode"` fail at those seams. Unarmed => no behavior change.
+    let dots_fault: Option<&'static str> = crate::common::peek_dots_fault();
+    if dots_fault == Some("prefill") {
+        dots_ar_fail(
+            state,
+            gpu,
+            stdout,
+            id,
+            "dots.ocr batched prefill failed: injected fault (injected fault: prefill)",
+        );
         return;
     }
     let prefill_tokens = prompt_ids.len();
@@ -1713,10 +2281,26 @@ pub fn generate_vl_dots_ocr(
     } else {
         text_cfg.eos_token_ids.clone()
     };
+    if dots_fault == Some("argmax") {
+        dots_ar_fail(
+            state,
+            gpu,
+            stdout,
+            id,
+            "dots.ocr argmax failed: injected fault (injected fault: argmax)",
+        );
+        return;
+    }
     let mut next = match gpu.argmax_f32(&state.logits, text_cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
-            write_error(stdout, id, &format!("dots.ocr argmax failed: {e:?}"));
+            dots_ar_fail(
+                state,
+                gpu,
+                stdout,
+                id,
+                &format!("dots.ocr argmax failed: {e:?}"),
+            );
             return;
         }
     };
@@ -1732,7 +2316,17 @@ pub fn generate_vl_dots_ocr(
 
     while generated < max_tokens {
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            dots_ar_cancel(state, gpu, stdout, id, generated);
+            return;
+        }
+        if dots_fault == Some("decode") {
+            dots_ar_fail(
+                state,
+                gpu,
+                stdout,
+                id,
+                "dots.ocr decode failed: injected fault (injected fault: decode)",
+            );
             return;
         }
         if eos_set.contains(&next) {
@@ -1765,14 +2359,20 @@ pub fn generate_vl_dots_ocr(
         match qwen2::forward_step_greedy(gpu, &weights.text, &text_cfg, state, next) {
             Ok(t) => next = t,
             Err(e) => {
-                write_error(stdout, id, &format!("dots.ocr decode failed: {e:?}"));
+                dots_ar_fail(
+                    state,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("dots.ocr decode failed: {e:?}"),
+                );
                 return;
             }
         }
     }
 
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, generated);
+        dots_ar_cancel(state, gpu, stdout, id, generated);
         return;
     }
 
@@ -1806,9 +2406,11 @@ pub fn generate_vl_dots_ocr(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            crate::ar::emit_active_route_cancel(stdout, id, generated);
         }
     }
 }
@@ -1888,13 +2490,20 @@ pub fn run_dots_ocr_ngram_loop(
     ) {
         Ok(PrefillOutcome::Ready { first_token }) => first_token,
         Ok(PrefillOutcome::Aborted) => {
-            // Client cancel during n-gram prefill: cancel lifecycle only
-            // (no success done / commit_ready).
-            emit_qwen_ar_cancelled(stdout, id, 0);
+            // Client cancel during n-gram prefill: roll back drafter/target
+            // state, then the cancelled pair (no success done / commit_ready).
+            dots_spec_cancel(bundle, spec, gpu, stdout, id, 0);
             return;
         }
         Err(e) => {
-            write_error(stdout, id, &format!("dots.ocr spec prefill: {e}"));
+            dots_spec_fail(
+                bundle,
+                spec,
+                gpu,
+                stdout,
+                id,
+                &format!("dots.ocr spec prefill: {e}"),
+            );
             return;
         }
     };
@@ -1954,13 +2563,12 @@ pub fn run_dots_ocr_ngram_loop(
         if generated >= max_tokens {
             break;
         }
-        // Decode-side cancel: emit the canonical cancelled pair and stop —
-        // falling through to the done handshake on an aborted attempt strands
-        // the serve admission guard (2026-08-27 ledger finding-c class; same
-        // rule as the prefill-cancel site above). The caller restores
-        // bundle/spec state on return; the next request resets at prefill.
+        // Decode-side cancel: roll back drafter/target state, emit the
+        // cancelled pair and stop — falling through to the done handshake on
+        // an aborted attempt strands the serve admission guard (2026-08-27
+        // ledger finding-c class; same rule as the prefill-cancel site above).
         if check_abort(id) {
-            emit_qwen_ar_cancelled(stdout, id, generated);
+            dots_spec_cancel(bundle, spec, gpu, stdout, id, generated);
             return;
         }
         // Context-overflow guard (matches generate_spec): one window writes up
@@ -1969,13 +2577,37 @@ pub fn run_dots_ocr_ngram_loop(
             break;
         }
         let max_emit = max_tokens.saturating_sub(generated);
+        // Test-only fault point (G4.8 lifecycle evidence), armed in-process via
+        // `common::arm_dots_fault("spec")`: fails through the same fail-closed
+        // path as a real verify failure. Unarmed => no behavior change.
+        if crate::common::peek_dots_fault() == Some("spec") {
+            dots_spec_fail(
+                bundle,
+                spec,
+                gpu,
+                stdout,
+                id,
+                "dots.ocr spec_step: injected fault (injected fault: spec)",
+            );
+            return;
+        }
         let step = match spec.step(
             gpu, bundle, position, seed_token, &emitted, None, 0.0, max_emit,
         ) {
             Ok(s) => s,
             Err(e) => {
-                write_error(stdout, id, &format!("dots.ocr spec_step: {e}"));
-                break;
+                // Fail closed: roll back and return with the error terminal.
+                // The old `break` fell through to the success `done`
+                // handshake below, emitting error + done for one request.
+                dots_spec_fail(
+                    bundle,
+                    spec,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("dots.ocr spec_step: {e}"),
+                );
+                return;
             }
         };
         spec_cycles += 1;
@@ -2026,8 +2658,12 @@ pub fn run_dots_ocr_ngram_loop(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            emit_aborted_terminal_after_abort(stdout, id, generated);
+        }
     }
 }
 
@@ -2042,6 +2678,9 @@ pub fn generate_dots_ocr_text(
     top_p: f32,
     max_tokens: usize,
 ) {
+    let route = crate::ar::GenerationRoute::DotsOcr;
+    let _route_scope = crate::ar::GenerationRouteScope::enter(route, id);
+    crate::ar::emit_generation_start(route, stdout, id, false);
     let _ = (temp, top_p); // greedy decode for now; sampling left for future work
     let t0 = Instant::now();
 
@@ -2079,7 +2718,9 @@ pub fn generate_dots_ocr_text(
     let emb_scratch = match gpu.alloc_tensor(&[dim], rdna_compute::DType::F32) {
         Ok(t) => t,
         Err(e) => {
-            write_error(
+            dots_ar_fail(
+                state,
+                gpu,
                 stdout,
                 id,
                 &format!("dots.ocr embed scratch alloc failed: {e:?}"),
@@ -2089,6 +2730,13 @@ pub fn generate_dots_ocr_text(
     };
     let mut embed_err: Option<String> = None;
     for (pos, &token) in prompt_ids.iter().enumerate() {
+        // Cancel poll (parity with the image-conditioned AR loop): abort
+        // during the embedding build rolls back before any token is live.
+        if check_abort(id) {
+            let _ = gpu.free_tensor(emb_scratch);
+            dots_ar_cancel(state, gpu, stdout, id, 0);
+            return;
+        }
         let lookup = hipfire_runtime::llama::embedding_lookup_dispatch(
             gpu,
             weights.text.embd_format,
@@ -2111,7 +2759,9 @@ pub fn generate_dots_ocr_text(
     }
     let _ = gpu.free_tensor(emb_scratch);
     if let Some(e) = embed_err {
-        write_error(
+        dots_ar_fail(
+            state,
+            gpu,
             stdout,
             id,
             &format!("dots.ocr prefill embed build failed: {e}"),
@@ -2121,11 +2771,17 @@ pub fn generate_dots_ocr_text(
     if let Err(e) =
         qwen2::forward_prefill_batch_embeds(gpu, &weights.text, &text_cfg, state, &embeds)
     {
-        write_error(
+        dots_ar_fail(
+            state,
+            gpu,
             stdout,
             id,
             &format!("dots.ocr batched prefill failed: {e:?}"),
         );
+        return;
+    }
+    if check_abort(id) {
+        dots_ar_cancel(state, gpu, stdout, id, 0);
         return;
     }
     let prefill_tokens = prompt_ids.len();
@@ -2140,7 +2796,13 @@ pub fn generate_dots_ocr_text(
     let mut next = match gpu.argmax_f32(&state.logits, text_cfg.vocab_size) {
         Ok(t) => t,
         Err(e) => {
-            write_error(stdout, id, &format!("dots.ocr argmax failed: {e:?}"));
+            dots_ar_fail(
+                state,
+                gpu,
+                stdout,
+                id,
+                &format!("dots.ocr argmax failed: {e:?}"),
+            );
             return;
         }
     };
@@ -2150,6 +2812,12 @@ pub fn generate_dots_ocr_text(
     let mut generated = 0usize;
 
     while generated < max_tokens {
+        // Cancel poll: the image path has one per iteration; the text path
+        // previously ran to `max_tokens` uninterruptibly.
+        if check_abort(id) {
+            dots_ar_cancel(state, gpu, stdout, id, generated);
+            return;
+        }
         if eos_set.contains(&next) {
             break;
         }
@@ -2180,10 +2848,23 @@ pub fn generate_dots_ocr_text(
         match qwen2::forward_step_greedy(gpu, &weights.text, &text_cfg, state, next) {
             Ok(t) => next = t,
             Err(e) => {
-                write_error(stdout, id, &format!("dots.ocr decode failed: {e:?}"));
+                dots_ar_fail(
+                    state,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("dots.ocr decode failed: {e:?}"),
+                );
                 return;
             }
         }
+    }
+
+    // Post-loop abort latch (parity with the image path): a disconnect during
+    // the final iteration must cancel, never fall through to `done`.
+    if check_abort(id) {
+        dots_ar_cancel(state, gpu, stdout, id, generated);
+        return;
     }
 
     let decode_s = t_gen.elapsed().as_secs_f64();
@@ -2216,8 +2897,12 @@ pub fn generate_dots_ocr_text(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
+        ClientTerminalDecision::Abort => {
+            emit_aborted_terminal_after_abort(stdout, id, generated);
+        }
     }
 }
 
@@ -2547,6 +3232,11 @@ pub fn generate_lfm2_vl(
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
+    let route = crate::ar::GenerationRoute::LfmAr;
+    let _route_scope = crate::ar::GenerationRouteScope::enter(route, params.id);
+    // Stream contract opener must precede every validation result, including
+    // tokenizer and vision-capability errors.
+    crate::ar::emit_generation_start(route, stdout, params.id, false);
     let GenerateVLParams {
         id,
         prompt,
@@ -2584,11 +3274,6 @@ pub fn generate_lfm2_vl(
             return;
         }
     };
-
-    // Stream contract opener BEFORE any GPU work or event emission — the
-    // HTTP gate rejects a `token` that arrives without gen_start first.
-    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
 
     // Full-turn clock: preprocess + tower encode + prefill + decode. The
     // tower dominates image turns (~7–10 s of the ~22 s wall on gfx1101),
@@ -2804,7 +3489,7 @@ pub fn generate_lfm2_vl(
                 // top-of-loop abort check to avoid sampling empty logits,
                 // and would push the full prompt into conversation_tokens
                 // against a partially-filled KV.
-                emit_qwen_ar_cancelled(stdout, id, 0);
+                crate::ar::emit_active_route_cancel(stdout, id, 0);
                 return;
             }
             let res = if tok == image_token_id && vis_idx < n_visual_tokens {
@@ -2902,12 +3587,12 @@ pub fn generate_lfm2_vl(
     // `await_client_terminal_commit` would block forever waiting for a
     // commit that can never arrive and wedge the single slot (the exact
     // failure recorded in the 2026-08-27 serve ledger). Emits the CANONICAL
-    // cancelled-terminal pair via `emit_qwen_ar_cancelled` (wire `aborted` +
+    // cancelled-terminal pair via `emit_active_route_cancel` (wire `aborted` +
     // `aborted_done`) — serve's stream reader only releases an HTTP handler
     // on the recognized terminal dialect, so a raw custom event here would
     // hold the admission guard forever.
     if check_abort(id) {
-        emit_qwen_ar_cancelled(stdout, id, generated_count);
+        crate::ar::emit_active_route_cancel(stdout, id, generated_count);
         return;
     }
 
@@ -2928,12 +3613,14 @@ pub fn generate_lfm2_vl(
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
-        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Commit => {
+            crate::ar::emit_active_route_done_value(stdout, &pending_done)
+        }
         ClientTerminalDecision::Abort => {
             // Same release contract as the post-loop latch: the terminal pair
             // must be the recognized wire dialect or serve holds its
             // admission guard forever.
-            emit_qwen_ar_cancelled(stdout, id, generated_count);
+            crate::ar::emit_active_route_cancel(stdout, id, generated_count);
         }
     }
 }

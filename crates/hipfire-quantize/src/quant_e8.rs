@@ -3,30 +3,33 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
-use crate::quant_hfp4::{E2M1_LUT, e2m1_round, e4m3_scale_decode, e4m3_scale_encode_roundup};
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
+use crate::quant_hfp4::{e2m1_round, e4m3_scale_decode, e4m3_scale_encode_roundup, E2M1_LUT};
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
 use crate::e8;
+use crate::e8::*;
 use crate::e8_gptq;
+use crate::e8_gptq::*;
 use crate::gguf_input;
 use crate::reap_overlay;
-use crate::e8::*;
-use crate::e8_gptq::*;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 /// Quantize one row of K FP32 weights to mfp4-E8 byte format.
 /// Same E4M3 scale as mfp4+P; per-32-weight-block data = 4 E8 codewords (u32 each).
@@ -466,8 +469,10 @@ pub(crate) fn load_hessian_blocks(dir: &Path, tensor_name: &str) -> Vec<e8_gptq:
 /// loaded for this (tensor,expert) (Hessian-aware LDLQ ran); `fallback` =
 /// empty/missing Hessian -> silent RTN E8. ~0 fired with --hessian-dir set
 /// means a KEY-MISMATCH BUG (filenames != hessian_key), not a flat result.
-pub(crate) static GPTQ_E8_FIRED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub(crate) static GPTQ_E8_FALLBACK: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GPTQ_E8_FIRED: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+pub(crate) static GPTQ_E8_FALLBACK: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// GPTQ-E8 wrapper that wires the production helpers into the e8_gptq module.
 /// `h_blocks` empty -> RTN fallback (byte-identical to quantize_mfp4g32_e8_2d).
@@ -749,7 +754,7 @@ pub(crate) fn quantize_mfp4g32_e8_soa_awls_2d(
 /// Multiple paths are separated by `:` in `HIPFIRE_E8_IMATRIX`; raw sums are
 /// additive, so corpora with different row counts receive proportional weight.
 pub(crate) fn load_ds4_head_importance(k: usize) -> Result<Vec<f64>, String> {
-    let spec = std::env::var("HIPFIRE_E8_IMATRIX")
+    let spec = hipfire_config::developer_var("HIPFIRE_E8_IMATRIX")
         .map_err(|_| "mfp4e8soa-awls requires HIPFIRE_E8_IMATRIX".to_string())?;
     let mut total = vec![0.0f64; k];
     let mut files = 0usize;
@@ -1072,10 +1077,10 @@ pub(crate) fn dequant_hfp4g32_row(packed: &[u8], k: usize) -> Vec<f32> {
 mod awq_tests {
     use super::*;
     use crate::calibration::{awq_pre_scale_weights, compute_awq_scales};
-    use crate::quant_hfp4::{quantize_hfp4g32_row, quantize_mfp4g32_2d};
-    use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
-    use crate::model_filter::{is_q8_tensor, q8_class_of, should_quantize};
     use crate::dequant::{dequantize_e2m1_ue8m0_to_f32, e2m1_to_f32};
+    use crate::model_filter::{is_q8_tensor, q8_class_of, should_quantize};
+    use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
+    use crate::quant_hfp4::{quantize_hfp4g32_row, quantize_mfp4g32_2d};
 
     /// Verify geometric mean of computed AWQ scales is ~1.0 — the
     /// normalization in compute_awq_scales should center the scale
@@ -1186,9 +1191,9 @@ mod awq_tests {
 #[cfg(test)]
 mod hfp4_tests {
     use super::*;
-    use crate::quant_hfp4::{quantize_hfp4g32_row, quantize_mfp4g32_2d};
     use crate::dequant::{dequantize_e2m1_ue8m0_to_f32, e2m1_to_f32};
     use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
+    use crate::quant_hfp4::{quantize_hfp4g32_row, quantize_mfp4g32_2d};
 
     #[test]
     pub(crate) fn e2m1_round_matches_lattice() {

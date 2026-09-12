@@ -15,6 +15,13 @@ hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"]
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 
+[dev-dependencies]
+# Streaming MD5 of the pinned G3 fixture in tests: the tracker identity is an
+# MD5, so the lock must hash file content, not just compare size. Same direct
+# version pin as hipfire-cli / hipfire-detect (`md5 = "0.8"`).
+md5 = "0.8"
+tempfile = "3"
+
 # ---------------------------------------------------------------------------
 # Archived research probes.
 #

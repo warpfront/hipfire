@@ -134,7 +134,12 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
 #endif
 
-#if defined(HIPFIRE_RDNA3_MOE_GATE_UP_K2048)
+#if defined(HIPFIRE_MOE_GATE_UP_FIXED_GROUPS)
+    // Product shapes with a partial final quad provide their HFQ group count
+    // at compile time. Besides making the tail correct, this keeps the
+    // retained-PM4 kernel free of compiler-generated private scratch.
+    const int groups_per_row = HIPFIRE_MOE_GATE_UP_FIXED_GROUPS;
+#elif defined(HIPFIRE_RDNA3_MOE_GATE_UP_K2048)
     // The gfx1100 A3B decode route is fixed at K=2048. Host dispatch enforces
     // that contract so LLVM can delete the runtime divide and constant-fold
     // both row strides and the two-quad loop bound.
@@ -176,9 +181,14 @@ extern "C" __global__ void HIPFIRE_MOE_GATE_UP_KERNEL(
     float gacc0 = 0.0f, gacc1 = 0.0f, gacc2 = 0.0f, gacc3 = 0.0f;
     float uacc0 = 0.0f, uacc1 = 0.0f, uacc2 = 0.0f, uacc3 = 0.0f;
     const int quads = groups_per_row >> 2;
-    // R21c2_gateup_notail: target A3B mq4r decode has K/256 divisible by 4,
-    // so the HFQ4 group tail is cold code for this certify path.
+#if defined(HIPFIRE_MOE_GATE_UP_FIXED_GROUPS)
+    const int tail = HIPFIRE_MOE_GATE_UP_FIXED_GROUPS & 3;
+#else
+    // The generic production route is used by quad-aligned A3B shapes. Keep
+    // its historical zero-tail code shape; partial-quad shapes must dispatch
+    // through a fixed-group specialization so retained PM4 stays scratch-free.
     const int tail = 0;
+#endif
 
     #define DOG_X8(sc, zp, pk, a, x0, x1, x2, x3, x4, x5, x6, x7) do { \
         (a) += ((sc) * (float)((pk) & 0xFu)         + (zp)) * (x0) \

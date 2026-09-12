@@ -15,14 +15,22 @@ fn solid_png_bytes(r: u8, g: u8, b: u8, w: u32, h: u32) -> Vec<u8> {
 }
 
 fn solid_jpeg_bytes(r: u8, g: u8, b: u8, w: u32, h: u32) -> Vec<u8> {
-    let img: ImageBuffer<Rgb<u8>, Vec<u8>> = ImageBuffer::from_pixel(w, h, Rgb([r, g, b]));
-    let mut buf = Vec::new();
-    img.write_to(
-        &mut std::io::Cursor::new(&mut buf),
-        image::ImageFormat::Jpeg,
+    // The `image` crate is built without its `jpeg` feature (zune-jpeg is
+    // out of the lock), so its JPEG encoder is gone too. Encode with
+    // libjpeg-turbo-rs instead — the test only needs valid JPEG bytes.
+    let mut raw = Vec::with_capacity((w * h * 3) as usize);
+    for _ in 0..w * h {
+        raw.extend_from_slice(&[r, g, b]);
+    }
+    libjpeg_turbo_rs::compress(
+        &raw,
+        w as usize,
+        h as usize,
+        libjpeg_turbo_rs::PixelFormat::Rgb,
+        95,
+        libjpeg_turbo_rs::Subsampling::S444,
     )
-    .unwrap();
-    buf
+    .expect("turbo JPEG encode failed")
 }
 
 fn norm(v: u8) -> f32 {

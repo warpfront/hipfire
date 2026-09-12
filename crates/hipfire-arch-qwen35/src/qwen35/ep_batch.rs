@@ -13,6 +13,7 @@ use super::batch::valid_lane_mask;
 use super::batch::BatchSemantics;
 use super::batch::PrefillBatchScratch;
 use super::batch::Qwen35DecodeBatchState;
+use super::config::DflashFusionCtx;
 use super::config::LayerType;
 use super::config::Qwen35BatchCompatibility;
 use super::config::Qwen35BatchLoadConfig;
@@ -1540,6 +1541,7 @@ impl Qwen35DecodeBatchEpState {
                             None,
                             routed_out.as_ref(),
                             BatchSemantics::Sequential,
+                            DflashFusionCtx::Off,
                         )?;
                     }
                     if is_moe {
@@ -1802,6 +1804,7 @@ impl Qwen35DecodeBatchEpState {
                             lane_capacity: self.lane_capacity,
                             active_mask,
                         },
+                        DflashFusionCtx::Off,
                     )?;
                 }
                 if is_moe {
@@ -2289,8 +2292,8 @@ pub fn forward_ep(
 ///      accumulates into `pbs.x_batch` (replicated, added once per rank), the
 ///      **routed** combine into the zeroed partial (owned experts only; non-owned
 ///      read load-time zero-dummy → 0),
-///   3. (MoE only) `all_reduce_sum_f32` the `[n × dim]` partials across ranks and
-///      add into each rank's `pbs.x_batch`.
+///   3. (MoE only) canonically (`all_reduce_sum_f32_peer_rooted`) sum the
+///      `[n × dim]` partials across ranks and add into each rank's `pbs.x_batch`.
 /// Non-MoE (dense DeltaNet / FullAttn) layers run replicated, no partial, no
 /// all-reduce. Final norm + lm_head (last token) run on rank 0 → `scratch_per_rank[0].logits`.
 ///
@@ -2375,13 +2378,19 @@ pub fn forward_prefill_batch_ep(
 
     let ep_timing = hipfire_config::developer_var("HIPFIRE_EP_PREFILL_TIMING").is_ok();
     let ep_skip_ar = hipfire_config::developer_var("HIPFIRE_EP_SKIP_ALLREDUCE").is_ok(); // DIAGNOSTIC ONLY (wrong output)
-                                                                                         // Peer-direct all-reduce (bypass RCCL): the routed-partial sum goes through
-                                                                                         // Gpus::all_reduce_sum_f32_peer (direct P2P copy + local add), which is ~1 ms
-                                                                                         // vs RCCL's ~40 ms/call on hiptrx (gfx1201, PCIe). DEFAULT ON; opt back to
-                                                                                         // RCCL with HIPFIRE_EP_PEER_ALLREDUCE=0. The peer temps live in Gpus (shared
-                                                                                         // with TP), lazily sized to the largest count seen.
-    let ep_peer_ar =
-        hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE").as_deref() != Ok("0");
+                                                                                         // Canonical deterministic reduction: the routed-partial sum goes through
+                                                                                         // Gpus::all_reduce_sum_f32_peer_rooted (fixed left fold over ranks in
+                                                                                         // index order), which is ~1 ms vs RCCL's ~40 ms/call on hiptrx
+                                                                                         // (gfx1201, PCIe). DEFAULT (unset): rooted peer when peer access is
+                                                                                         // enabled, else RCCL. Explicit opt-ins only for the non-canonical
+                                                                                         // transports: HIPFIRE_EP_PEER_ALLREDUCE=0 → RCCL, =1 → legacy
+                                                                                         // unrooted peer (Gpus::all_reduce_sum_f32_peer). The peer temps live
+                                                                                         // in Gpus (shared with TP), lazily sized to the largest count seen;
+                                                                                         // rooted and unrooted share the same lease guard, so the canonical
+                                                                                         // default introduces no new lease conflict.
+    let ep_peer_ar_var = hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE");
+    let ep_peer_ar = ep_peer_ar_var.as_deref();
+    let ep_ar_canonical = !matches!(ep_peer_ar, Ok("0") | Ok("1"));
     let mut t_chunk = 0.0f64;
     let mut t_ar = 0.0f64;
     let mut t_add = 0.0f64;
@@ -2445,6 +2454,7 @@ pub fn forward_prefill_batch_ep(
                 false, // needs_last_token_logits (no lm_head in band)
                 None,  // max_layer
                 routed_out,
+                DflashFusionCtx::Off,
             )?;
         }
 
@@ -2456,11 +2466,33 @@ pub fn forward_prefill_batch_ep(
         if is_moe && !ep_skip_ar {
             let t_a = std::time::Instant::now();
             let refs: Vec<&hip_bridge::DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
-            if ep_peer_ar {
-                gpus.all_reduce_sum_f32_peer(&refs, n * dim)
+            // Selection log line: names the active path (once per process). The
+            // rooted and unrooted peer paths share the same lease guard and the
+            // same lazily-grown Gpus scratch, so error paths release nothing new:
+            // every failure propagates with `?` and the scratch stays owned by
+            // Gpus for reuse.
+            static PREFILL_AR_LOG: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+            let use_rooted = ep_ar_canonical && gpus.peer_access_enabled;
+            PREFILL_AR_LOG.get_or_init(|| {
+                let path = if use_rooted {
+                    "canonical rooted-peer (fixed left fold over ranks)"
+                } else if ep_ar_canonical {
+                    "RCCL (canonical rooted-peer unavailable: peer access disabled)"
+                } else if ep_peer_ar == Ok("0") {
+                    "RCCL (HIPFIRE_EP_PEER_ALLREDUCE=0)"
+                } else {
+                    "legacy unrooted peer (HIPFIRE_EP_PEER_ALLREDUCE=1)"
+                };
+                eprintln!("EP prefill all-reduce: {path}");
+            });
+            if use_rooted {
+                gpus.all_reduce_sum_f32_peer_rooted(&refs, n * dim)
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
+            } else if ep_ar_canonical || ep_peer_ar == Ok("0") {
+                gpus.all_reduce_sum_f32(&refs, n * dim)
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
             } else {
-                gpus.all_reduce_sum_f32(&refs, n * dim)
+                gpus.all_reduce_sum_f32_peer(&refs, n * dim)
                     .map_err(|e| HipError::new(0, &e.to_string()))?;
             }
             if ep_timing {
@@ -4328,6 +4360,7 @@ pub fn forward_prefill_batch_multi(
                         true, // needs_last_token_logits: preserve multi-GPU post-condition
                         None, // max_layer: multi-GPU PP path runs full stack
                         None, // routed_out: PP bands are multi-layer, not EP
+                        DflashFusionCtx::Off,
                     )?;
                 }
 

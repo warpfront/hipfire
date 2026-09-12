@@ -27,6 +27,10 @@ BOOTSTRAP_ENV = {
     "HIPFIRE_KERNEL_CACHE",
     "HIPFIRE_SPILL_DIR",
     "HIPFIRE_QUANT_DIAG_PATH",
+    # Read by the daemon's init_tracing() before the CLI has sent the process
+    # config; going through developer_var there installs the local fallback
+    # snapshot and makes the real install fail ("already initialized").
+    "HIPFIRE_LOG_FORMAT",
 }
 CENTRAL_CONFIG_READERS = {
     "crates/hipfire-config/src/lib.rs",

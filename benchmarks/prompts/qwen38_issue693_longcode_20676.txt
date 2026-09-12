@@ -1,0 +1,1974 @@
+[issue693] Summarize this code.
+
+
+// ==== admission.rs ====
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Nick Woolmer
+// hipfire — see LICENSE and NOTICE in the project root.
+//
+// AdmissionController — decides whether a session can be admitted, and with how
+// much context.
+//
+// In the test harnesses `kv_slots::preflight_alloc` is what stops an oversized
+// configuration. In the daemon that job is HERE. The difference matters: on this
+// hardware the GPU allocates from system RAM and the cgroup does NOT contain
+// amdgpu GTT, so a wrong decision here does not fail a request — it takes down
+// the user's desktop with a global OOM.
+
+/// What one loaded model costs, split into the part charged once and the part
+/// charged per session.
+#[derive(Debug, Clone, Copy)]
+pub struct ModelFootprint {
+    /// Charged ONCE, however many sessions are admitted.
+    pub weights_bytes: u64,
+    /// Charged per session, per token of granted context.
+    pub kv_bytes_per_token: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmitError {
+    PoolFull,
+    WouldExceedBudget { need: u64, available: u64 },
+}
+
+impl std::fmt::Display for AdmitError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let gib = |b: u64| b as f64 / 1073741824.0;
+        match self {
+            AdmitError::PoolFull => write!(f, "no free slot"),
+            AdmitError::WouldExceedBudget { need, available } => write!(
+                f,
+                "needs {:.2} GiB but only {:.2} GiB of the budget remains",
+                gib(*need),
+                gib(*available)
+            ),
+        }
+    }
+}
+
+pub struct AdmissionController {
+    footprint: ModelFootprint,
+    budget_bytes: u64,
+    /// Granted context per admitted session, in tokens.
+    admitted: Vec<usize>,
+    /// Host-tier budget for swapped-out snapshots. Separate from the VRAM
+    /// budget: admission is the production memory gate for BOTH, because the
+    /// control group does not contain amdgpu GTT.
+    host_budget: u64,
+    host_used: u64,
+}
+
+impl AdmissionController {
+    pub fn new(footprint: ModelFootprint, budget_bytes: u64) -> Self {
+        Self {
+            footprint,
+            budget_bytes,
+            admitted: Vec::new(),
+            host_budget: crate::swap::DEFAULT_HOST_BUDGET_BYTES,
+            host_used: 0,
+        }
+    }
+
+    /// Bytes currently committed: weights once (if anything is admitted) plus
+    /// each session's KV.
+    pub fn used_bytes(&self) -> u64 {
+        if self.admitted.is_empty() {
+            return 0;
+        }
+        let kv: u64 = self
+            .admitted
+            .iter()
+            .map(|&ctx| ctx as u64 * self.footprint.kv_bytes_per_token)
+            .sum();
+        self.footprint.weights_bytes + kv
+    }
+
+    /// Admit a session at `requested_ctx` tokens, or explain why not.
+    ///
+    /// Rejects rather than silently capping: a caller that asked for 128K and
+    /// silently got 8K would produce baffling truncation far from here.
+    pub fn admit(&mut self, requested_ctx: usize) -> Result<usize, AdmitError> {
+        let kv_need = requested_ctx as u64 * self.footprint.kv_bytes_per_token;
+        // Weights are charged once, on the first admission.
+        let weights_need = if self.admitted.is_empty() {
+            self.footprint.weights_bytes
+        } else {
+            0
+        };
+        let need = kv_need + weights_need;
+        let available = self.budget_bytes.saturating_sub(self.used_bytes());
+        // >= rather than >: an admission that would consume the LAST byte of
+        // budget is refused too, not just one that overflows it. On this
+        // hardware (no swap, cgroup does not contain amdgpu GTT) landing
+        // exactly on the edge leaves zero headroom for anything else running
+        // on the box, so it is treated the same as exceeding the budget.
+        if need >= available {
+            return Err(AdmitError::WouldExceedBudget { need, available });
+        }
+        self.admitted.push(requested_ctx);
+        Ok(requested_ctx)
+    }
+
+    /// Return a session's context allowance to the budget.
+    /// Reserve host-tier bytes for a swapped-out session. Returns false when
+    /// the budget cannot cover it, in which case the caller spills to disk
+    /// rather than exceeding the budget.
+    pub fn admit_host(&mut self, bytes: u64) -> bool {
+        if self.host_used.saturating_add(bytes) > self.host_budget {
+            return false;
+        }
+        self.host_used += bytes;
+        true
+    }
+
+    pub fn release_host(&mut self, bytes: u64) {
+        self.host_used = self.host_used.saturating_sub(bytes);
+    }
+
+    pub fn host_used_bytes(&self) -> u64 {
+        self.host_used
+    }
+
+    pub fn host_budget_bytes(&self) -> u64 {
+        self.host_budget
+    }
+
+    /// Set the host-tier budget. Defaults to `DEFAULT_HOST_BUDGET_BYTES`.
+    pub fn set_host_budget(&mut self, bytes: u64) {
+        self.host_budget = bytes;
+    }
+
+    pub fn release(&mut self, granted_ctx: usize) {
+        if let Some(i) = self.admitted.iter().position(|&c| c == granted_ctx) {
+            self.admitted.remove(i);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    /// qwen3.6:27b — 15.0 GB of weights, 34 KB of KV per token.
+    fn f27b() -> ModelFootprint {
+        ModelFootprint {
+            weights_bytes: 15 * GIB,
+            kv_bytes_per_token: 34 * 1024,
+        }
+    }
+
+    /// qwen3.6:35b-a3b — ~20 GB of weights, 10.6 KB of KV per token.
+    fn f35b() -> ModelFootprint {
+        ModelFootprint {
+            weights_bytes: 20 * GIB,
+            kv_bytes_per_token: 10_854,
+        }
+    }
+
+    #[test]
+    fn weights_are_charged_once_not_per_session() {
+        let mut a = AdmissionController::new(f27b(), 32 * GIB);
+        a.admit(1024).unwrap();
+        let after_one = a.used_bytes();
+        a.admit(1024).unwrap();
+        let after_two = a.used_bytes();
+        // The second session adds only its KV, never another copy of the weights.
+        assert!(after_two - after_one < GIB, "weights charged twice");
+        assert!(after_one >= 15 * GIB, "weights not charged at all");
+    }
+
+    #[test]
+    fn the_27b_cannot_take_four_agents_at_128k() {
+        // 15 GB + 4 x 4.25 GB = 32.25 GB against a 32 GB card.
+        let mut a = AdmissionController::new(f27b(), 32 * GIB);
+        for _ in 0..3 {
+            a.admit(128 * 1024).expect("first three must fit");
+        }
+        let e = a.admit(128 * 1024).unwrap_err();
+        assert!(
+            matches!(e, AdmitError::WouldExceedBudget { .. }),
+            "got {e:?}"
+        );
+    }
+
+    #[test]
+    fn the_27b_does_take_four_agents_at_96k() {
+        let mut a = AdmissionController::new(f27b(), 32 * GIB);
+        for i in 0..4 {
+            a.admit(96 * 1024)
+                .unwrap_or_else(|e| panic!("agent {i} rejected: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn the_35b_does_take_four_agents_at_128k() {
+        let mut a = AdmissionController::new(f35b(), 32 * GIB);
+        for i in 0..4 {
+            a.admit(128 * 1024)
+                .unwrap_or_else(|e| panic!("agent {i} rejected: {e:?}"));
+        }
+    }
+
+    #[test]
+    fn release_returns_budget_so_a_later_session_fits() {
+        let mut a = AdmissionController::new(f27b(), 32 * GIB);
+        for _ in 0..3 {
+            a.admit(128 * 1024).unwrap();
+        }
+        assert!(a.admit(128 * 1024).is_err());
+        a.release(128 * 1024);
+        a.admit(128 * 1024)
+            .expect("budget must be reusable after release");
+    }
+
+    #[test]
+    fn rejection_reports_the_numbers_not_just_a_failure() {
+        let mut a = AdmissionController::new(f27b(), 32 * GIB);
+        for _ in 0..3 {
+            a.admit(128 * 1024).unwrap();
+        }
+        match a.admit(128 * 1024).unwrap_err() {
+            AdmitError::WouldExceedBudget { need, available } => {
+                // `>=`, not `>`. Zero headroom is a rejection: 15 GiB of weights
+                // plus 4 x 4.25 GiB of KV is an EXACT tie with a 32 GiB budget,
+                // and a card with nothing left for activations, scratch and
+                // driver overhead does not fit the workload. The plan's comment
+                // claiming 32.25 GB was wrong -- 34 * 1024 IS the real per-token
+                // cost and the sum lands exactly on the budget.
+                assert!(
+                    need >= available,
+                    "need {need} should be at least available {available}"
+                );
+                assert!(available < 32 * GIB);
+            }
+            other => panic!("expected a budget rejection, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_single_session_over_budget_is_rejected_not_silently_capped() {
+        // One agent asking for more than the whole card can hold.
+        let mut a = AdmissionController::new(f27b(), 32 * GIB);
+        assert!(
+            a.admit(2 * 1024 * 1024).is_err(),
+            "must reject, not silently truncate"
+        );
+    }
+
+    #[test]
+    fn the_host_tier_has_its_own_budget() {
+        let mut a = AdmissionController::new(
+            ModelFootprint {
+                weights_bytes: 0,
+                kv_bytes_per_token: 0,
+            },
+            1 << 30,
+        );
+        a.set_host_budget(1000);
+        assert!(a.admit_host(600));
+        assert_eq!(a.host_used_bytes(), 600);
+        assert!(
+            !a.admit_host(600),
+            "the second must not fit; the caller spills to disk instead"
+        );
+        assert_eq!(a.host_used_bytes(), 600, "a refused admit reserves nothing");
+        a.release_host(600);
+        assert_eq!(a.host_used_bytes(), 0);
+        assert!(a.admit_host(600), "released budget must be reusable");
+    }
+}
+
+// ==== arch.rs ====
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! ## Status: intra-crate helper, NOT the architecture contract
+//!
+//! This trait once competed with `hipfire_loader::Carrier` to be "the" arch
+//! contract. It no longer does, and the distinction matters when adding a model:
+//!
+//! - **The contract** is `Carrier` (registration + load, in the loader because
+//!   `Carrier::load` returns `LoadedModel`) plus
+//!   [`crate::arch_model::ArchModel`] (the arch-agnostic view of a loaded model,
+//!   implemented in the arch crate).
+//! - **This trait** is a typed bring-up convenience — associated
+//!   `Config`/`Weights`/`State` plus `config_from_hfq` / `load_weights` /
+//!   `new_state`. It is used only *within* arch crates, by their own
+//!   `load_<arch>_bundle` functions. Measured: zero consumers in
+//!   `hipfire-loader`, `hipfire-generate` or `hipfire-daemon`.
+//!
+//! It is therefore optional. `hipfire-arch-muse-glimmer` implements it not at
+//! all and loads fine. Adopt it if the typed shape helps your crate; skip it if
+//! it does not. Its four override hooks were deleted as dead in an earlier pass.
+//!
+//! The bring-up contract for a hipfire architecture. Implement this
+//! trait in your arch crate (e.g. `hipfire-arch-qwen35`) to plug a
+//! model into the runtime. Generation, sampling, eviction, spec
+//! decode, paging, prompt framing, and EOS filtering all live in
+//! the runtime crate; the arch contributes only the model-specific
+//! pieces.
+//!
+//! Default impls cover the Qwen3.5 family conventions. Override only
+//! what diverges for your arch.
+//!
+//! # Worked examples
+//!
+//! - `crates/hipfire-arch-toy/` — minimum-viable stub, ~50 lines of
+//!   trait-impl with explanatory comments. Copy-paste this directory
+//!   as a starting point for a new arch.
+//! - `crates/hipfire-arch-qwen35/src/arch.rs` — full production impl
+//!   for the Qwen3.5 hybrid DeltaNet + MoE family. Read this for the
+//!   bar: how `config_from_hfq` walks the JSON metadata, how
+//!   `load_weights` drives the weight pager, how `new_state` allocates
+//!   GPU scratch.
+//! - `crates/hipfire-arch-llama/src/arch.rs` — second impl, dense
+//!   LLaMA / Mistral / plain-Qwen3 family. Demonstrates the trait at
+//!   facade-stage (forward body still in `hipfire-runtime::llama`,
+//!   PR 14 will physically split).
+//!
+//! # Why forward isn't on the trait
+//!
+//! Forward-pass dispatch is intentionally NOT routed through this
+//! trait. Reasons:
+//!   1. Forward signatures vary heavily across arches (number of
+//!      buffers, KV layout, hybrid-vs-dense paths, vision conditioning,
+//!      MoE expert management). Forcing one trait shape would either
+//!      bloat the contract or hide essential parameters behind opaque
+//!      slots.
+//!   2. Forward dispatch is hot-path. Static dispatch via concrete-type
+//!      function calls keeps the call graph fully inlinable; dyn-trait
+//!      dispatch in the inner loop costs measurable tok/s on small
+//!      models.
+//!   3. The trait's job is BRING-UP scaffolding (load → instantiate →
+//!      generation-loop wiring), not runtime polymorphism. Once an arch
+//!      is loaded, the daemon/CLI knows the concrete type at compile
+//!      time.
+
+use crate::hfq::HfqFile;
+use crate::llama::WeightTensor;
+use rdna_compute::{DType, Gpu};
+
+/// Bring-up contract for a hipfire architecture.
+///
+/// Implementors live in their own arch crate (`hipfire-arch-<name>`)
+/// and provide the three required types (Config / Weights / State)
+/// plus five required methods. The optional override hook lets
+/// an arch deviate from Qwen3.5 family defaults without growing a
+/// per-`arch_id` `match` ladder in the daemon.
+///
+/// # Required: associated types
+///
+/// - `Config` — model-shape constants parsed from HFQ metadata.
+///   Cheap to clone, sent across threads. Example: `Qwen35Config`
+///   in `hipfire-arch-qwen35` carries dim, n_layers, head counts,
+///   MoE topology, RoPE params.
+/// - `Weights` — GPU-resident model weights. Owns `WeightTensor`
+///   handles plus any host-side metadata for the weight pager.
+/// - `State` — GPU-resident per-decode scratch (KV cache, attention
+///   workspace, recurrent state for hybrid archs).
+///
+/// # Required: methods
+///
+/// See per-method docs below.
+///
+/// # Optional: override hook
+///
+/// `eos_filter_overrides`. Default impl matches Qwen3.5 conventions.
+/// Override per-arch when the arch's end-of-turn markers diverge.
+pub trait Architecture: Send + 'static {
+    type Weights;
+    type State;
+    type Config: Clone + Send + 'static;
+
+    /// Canonical arch_id marker for this family. Existing IDs:
+    /// 0 = LLaMA / Mistral, 1 = plain Qwen3 / Qwen2,
+    /// 5 = Qwen3.5 dense, 6 = Qwen3.5/3.6 MoE.
+    ///
+    /// The actual id loaded at runtime is `HfqFile::arch_id` and may
+    /// differ from this canonical marker for families that span
+    /// multiple ids (e.g. `Llama::arch_id() == 0` but covers both 0
+    /// and 1; the dense-vs-Qwen3-norm distinction is read off the HFQ
+    /// metadata inside `config_from_hfq`).
+    fn arch_id() -> u32;
+
+    /// Human-readable arch tag for logs and CLI dispatch (e.g. `"qwen35"`,
+    /// `"llama"`).
+    fn name() -> &'static str;
+
+    /// Parse model-shape constants out of `hfq.metadata_json`.
+    ///
+    /// Returns a typed `Config` or an error string. Implementations
+    /// generally use `serde_json` to walk the metadata blob and branch
+    /// on `hfq.arch_id` for variants within the family (e.g. dense vs
+    /// MoE, with-vs-without DeltaNet).
+    ///
+    /// # Worked example: Qwen3.5
+    ///
+    /// `hipfire_arch_qwen35::qwen35::config_from_hfq` parses the
+    /// metadata, branches `arch_id == 5` (dense) vs `arch_id == 6`
+    /// (MoE) for expert-count fields, fills defaults for missing
+    /// keys (e.g. `partial_rotary_factor`), and returns a
+    /// `Qwen35Config` with the full per-layer shape.
+    fn config_from_hfq(hfq: &HfqFile) -> Result<Self::Config, String>;
+
+    /// Load model weights from an HFQ file into GPU memory.
+    ///
+    /// PR 8 note: signature changed from `&mut HfqFile` (PR 7
+    /// scaffold) to `&HfqFile`. The mmap-backed HfqFile is read-only
+    /// at the syscall level and Qwen35::load_weights only reads
+    /// tensor data. Weight-pager state mutations happen on the
+    /// returned Weights object via interior mutability
+    /// (`RefCell<WeightPager>`), not on the file.
+    ///
+    /// # Worked example: Qwen3.5
+    ///
+    /// `hipfire_arch_qwen35::qwen35::load_weights` walks every layer's
+    /// QKV / output / FFN / norm tensors, hands each to
+    /// `WeightTensor::from_hfq_tensor` (which dispatches on the
+    /// HFQ quant_type to upload Q4F16G64 / F16 / F32 to GPU), and
+    /// assembles per-layer `LayerWeights` arrays. The weight pager
+    /// (lazy load + LRU eviction for >VRAM models) is wired through
+    /// `WeightTensor` and is not arch-specific.
+    fn load_weights(
+        hfq: &mut HfqFile,
+        cfg: &Self::Config,
+        gpu: &mut Gpu,
+    ) -> Result<Self::Weights, String>;
+
+    /// Allocate per-decode GPU scratch for this arch.
+    ///
+    /// Returns the `State` object the daemon's generation loop holds
+    /// for the lifetime of a session. Sized by `cfg`.
+    ///
+    /// # Worked examples
+    ///
+    /// - Hybrid LA + FA (`DeltaNetState::new` in
+    ///   `hipfire-arch-qwen35`) — KV cache for FA layers, recurrent
+    ///   state buffers for DeltaNet (LA) layers, plus shared
+    ///   attention scratch.
+    /// - Dense FA-only (`ForwardScratch::new` in
+    ///   `hipfire-runtime::llama`) — KV cache plus attention
+    ///   workspace; no recurrent state.
+    fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String>;
+
+    // Forward pass shapes are arch-specific; declare the surface but
+    // don't constrain types in this trait — concrete arch crates
+    // expose their own typed forward methods. The runtime's generic
+    // generation loop holds an `impl Architecture`-bound model and
+    // uses arch crate-specific call sites.
+    //
+    // Future PRs may tighten the forward signatures once we see what
+    // the qwen35 / qwen35-vl / llama splits actually need. For PR 7
+    // the trait is intentionally minimal — just enough scaffolding for
+    // a canary arch crate to implement and the runtime to type-check.
+
+
+    /// Override EOS handling for this arch. Default uses ChatML
+    /// `<|im_end|>` plus the `<think>` strip policy from runtime.
+    ///
+    /// Override to add arch-specific stop sequences (e.g. Gemma's
+    /// `<end_of_turn>`) and matching `holdback_prefixes` so the
+    /// stream doesn't leak the marker bytes to the visible output.
+    fn eos_filter_overrides(_cfg: &Self::Config) -> EosFilterOverrides {
+        EosFilterOverrides::default()
+    }
+}
+
+
+/// Per-arch overrides for EOS / end-of-turn filtering.
+///
+/// `hipfire_runtime::eos_filter` owns visible-stream EOS detection.
+/// The default implementation handles ChatML `<|im_end|>` plus
+/// `<think>` strip; per-arch overrides extend to additional markers.
+#[derive(Debug, Clone, Default)]
+pub struct EosFilterOverrides {
+    /// Byte sequences that signal end-of-turn for this arch. Streaming
+    /// stops (and the marker is not emitted) when the decoded byte
+    /// stream contains any sequence here.
+    /// Examples: Gemma4's `<end_of_turn>` (when forward-ported).
+    pub stop_at: Vec<Vec<u8>>,
+    /// Byte prefixes the streamer holds back until disambiguated.
+    /// Required so a partial decode of a `stop_at` marker doesn't leak
+    /// its initial bytes (e.g. holding back `<end_` until we see
+    /// either `<end_of_turn>` to stop or `<end_of_something_else>` to
+    /// flush).
+    pub holdback_prefixes: Vec<Vec<u8>>,
+    /// If `Some`, override whether to strip `<think>...</think>` blocks
+    /// from the visible stream. Default is on for thinking-mode arches.
+    pub strip_think: Option<bool>,
+}
+
+/// Architecture-owned iteration over weights eligible for load-time MMQ
+/// safety screening. Each implementation returns `(safe, unsafe)` counts.
+pub trait MmqScreenable {
+    fn screen_mmq_weights(&self, gpu: &mut Gpu) -> (usize, usize);
+}
+
+/// Screen one weight tensor when its storage layout is accepted by the HFQ4
+/// MMQ reference probe. The dtype guard is load-bearing: probing a different
+/// packed layout can read beyond the tensor buffer.
+pub fn screen_weight_tensor(
+    weight: &WeightTensor,
+    gpu: &mut Gpu,
+    safe: &mut usize,
+    unsafe_count: &mut usize,
+) {
+    if !matches!(weight.gpu_dtype, DType::HFQ4G256 | DType::MQ4G256) {
+        return;
+    }
+    if gpu.mmq_screen_weight(&weight.buf, weight.m, weight.k) {
+        *safe += 1;
+    } else {
+        *unsafe_count += 1;
+    }
+}
+
+/// Apply the current enable/architecture policy and screen an architecture's
+/// weights. Screening remains opt-in; disabled loads return immediately.
+pub fn maybe_screen_mmq(weights: &impl MmqScreenable, gpu: &mut Gpu) {
+    if !gpu.mmq_screen.enabled
+        || !matches!(
+            gpu.arch.as_str(),
+            "gfx906"
+                | "gfx1100"
+                | "gfx1101"
+                | "gfx1102"
+                | "gfx1103"
+                | "gfx1150"
+                | "gfx1151"
+                | "gfx1152"
+        )
+    {
+        return;
+    }
+
+    let started = std::time::Instant::now();
+    let (safe, unsafe_count) = weights.screen_mmq_weights(gpu);
+    eprintln!(
+        "  MMQ screening: {safe} safe, {unsafe_count} unsafe (threshold={:.2}, {:.1}ms)",
+        gpu.mmq_screen.threshold,
+        started.elapsed().as_secs_f64() * 1000.0,
+    );
+}
+
+// ==== arch_mapping.rs ====
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// Copyright (c) 2026 Nick Woolmer
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Single source of truth for `model_type` / `general.architecture` → `arch_id`.
+//!
+//! Why this table exists: three independent `model_type -> arch_id` maps
+//! drifted (safetensors_source.rs, quantize/src/pipeline.rs,
+//! quantize/src/pipeline_gguf.rs). One silently defaulted to llama (0) on
+//! unknown input, another returned UNCLAIMED, the third lacked entries. This
+//! module is the sole authority; the other sites call [`lookup_model_type`].
+//!
+//! The numeric ids are the HFQ `arch_id` stamped into the file header and
+//! claimed by `Carrier::claims_arch_id`. Changing any assignment is a
+//! wire-format / routing break, so keep them byte-identical.
+
+/// Canonical `model_type` (HF) / `general.architecture` (GGUF) → `arch_id`.
+///
+/// Covers the union of every string previously recognised by the three
+/// consumers. Strings absent from this table are *unknown* and must fail
+/// closed (not silently become llama 0). The qwen2 entry is intentionally
+/// `7` (Qwen2Carrier, loads Q/K/V biases); earlier `hipfire-quantize` builds
+/// mapped it to `1` (LLaMA) which dropped those biases — that was a bug and
+/// is corrected here. See `safetensors_source.rs` commit 9002d7f8b.
+///
+/// Sorted by `arch_id` then alphabetically for auditability.
+pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
+    // arch 0 — llama family
+    ("llama", 0),
+    ("mistral", 0),
+    // arch 1 — qwen3 (llama-family loader, no bias)
+    ("qwen3", 1),
+    // arch 5 — qwen3.5 dense (qwen3.5/qwen3.6 share the same loader, 5 dense / 6 MoE)
+    ("qwen3.5", 5),
+    ("qwen3.6", 5),
+    ("qwen35", 5),
+    ("qwen3_5", 5),
+    ("qwen3_5_text", 5),
+    ("qwen3_6", 5),
+    // arch 5 — ornith 1.5 dense (9B). Same loader as qwen3.5 dense (5); a3b MoE variant is 6.
+    ("ornith", 5),
+    ("ornith-1.5", 5),
+    ("ornith1.5", 5),
+    ("ornith_1.5", 5),
+    // arch 6 — qwen3.5 MoE (explicit model_type strings; the safetensors path also
+    // derives 6 from has_experts==true for the qwen3.5/3.6 family)
+    ("qwen3_5_moe", 6),
+    ("qwen3_5_moe_text", 6),
+    ("qwen3moe", 6),
+    // arch 6 — ornith 1.5 MoE (35B-A3B). Mirrors registry_gen arch_id_for ornith-1.5 + a3b.
+    ("ornith_moe", 6),
+    ("ornith-1.5_moe", 6),
+    ("ornith1.5_moe", 6),
+    ("ornith_1.5_moe", 6),
+    ("qwen2", 7),
+    // arch 8 — dots.ocr
+    ("dots_ocr", 8),
+    // arch 9 — deepseek_v4
+    ("deepseek_v4", 9),
+    // arch 10 — minimax_m2
+    ("minimax_m2", 10),
+    // arch 11 — lfm2 (dense) + lfm2_moe (MoE); both route to hipfire-arch-lfm2moe/11
+    ("lfm2", 11),
+    ("lfm2_moe", 11),
+    // lfm2_vl is the vision-language variant; it reuses the arch-11 text backbone
+    // (hipfire-arch-lfm2moe) plus an embedded SigLIP-2 vision tower + projector.
+    ("lfm2_vl", 11),
+    // arch 12 — cohere2_moe
+    ("cohere2_moe", 12),
+    // arch 13 — gemma4 family (dense + MoE unified; text decoder only). The
+    // four strings mirror pipeline.rs; gguf's old `starts_with("gemma4")`
+    // catch-all is intentionally replaced by this exact list so unknown
+    // `gemma4*` variants fail closed instead of silently becoming 13.
+    ("gemma4", 13),
+    ("gemma4_text", 13),
+    ("gemma4_unified", 13),
+    ("gemma4_unified_text", 13),
+    // arch 14 — muse_glimmer dense (52-layer + ViT)
+    ("muse_glimmer", 14),
+    ("muse_glimmer_text", 14),
+    // arch 15 — maple (Maple-Preview 20B-A1B, natively-ternary 256-expert MoE)
+    ("maple", 15),
+    // arch 22 — gemma4 EAGLE drafter (single-block spec-decode head for arch 13)
+    ("gemma4_unified_assistant", 22),
+    // arch 23 — muse_glimmer DFlash drafter
+    ("muse_glimmer_assistant", 23),
+];
+
+/// Look up an `arch_id` for a `model_type` / GGUF `general.architecture` string.
+///
+/// Returns `None` for unknown inputs — callers must fail closed (error
+/// naming the unrecognised string and listing `supported_model_types()`).
+/// The lookup is an exact string compare; no prefix or substring fallback,
+/// so a typo does not silently route to an unrelated arch.
+pub fn lookup_model_type(model_type: &str) -> Option<u32> {
+    for (k, v) in MODEL_TYPE_TO_ARCH_ID {
+        if *k == model_type {
+            return Some(*v);
+        }
+    }
+    None
+}
+
+/// Sorted list of every recognised `model_type` / architecture string, for
+/// error messages. Computed from [`MODEL_TYPE_TO_ARCH_ID`] so it cannot drift.
+pub fn supported_model_types() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = MODEL_TYPE_TO_ARCH_ID.iter().map(|(k, _)| *k).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
+/// Human-readable, comma-joined list for `eprintln!` diagnostics.
+pub fn supported_model_types_display() -> String {
+    supported_model_types().join(", ")
+}
+
+// ==== arch_model.rs ====
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! The architecture-agnostic view of a loaded model.
+//!
+//! ## Why this exists
+//!
+//! `hipfire_loader::ModelState` is a closed enum with one variant per
+//! architecture. Every crate that needed a scalar off a loaded model therefore
+//! had to name all eleven — including the product entry point, which computed
+//! *three integers* through a seven-arm architecture dispatch:
+//!
+//! ```text
+//! let (dim, layers, vocab) = match m.state.as_ref() {
+//!     Some(ModelState::Qwen35(b)) => (b.config.dim,         b.config.n_layers,          b.config.vocab_size),
+//!     Some(ModelState::Qwen2(b))  => (b.config.hidden_size, b.config.num_hidden_layers, b.config.vocab_size),
+//!     …
+//! ```
+//!
+//! Seven arms, one tuple, and the only real difference is that some configs
+//! spell it `dim`/`n_layers` and others `hidden_size`/`num_hidden_layers`. A
+//! naming inconsistency was being paid for with architecture dispatch in the
+//! daemon.
+//!
+//! Measured before this trait existed: the loader and daemon between them held
+//! 93 `ModelState::` references, but touched only **seven distinct members** of
+//! the bundles they unwrapped — `config` (26 hits, only ever for those three
+//! scalars), `state`, `reset_session_state`, `kv_cache`/`kv`, `dn_state` (since
+//! deleted as vestigial) and `weights` (free-on-unload). That is the whole
+//! surface, and it is what this trait exposes.
+//!
+//! ## Why it lives in `hipfire-runtime`
+//!
+//! `hipfire-loader` depends on every `hipfire-arch-*` crate; the arch crates
+//! must not depend on the loader. A trait that arch crates implement and the
+//! loader consumes therefore cannot live in the loader — that is a cycle. It
+//! also cannot live in `saddle-core`, which sits below the runtime and must not
+//! know about `KvCache`. `hipfire-runtime` is the one layer both sides already
+//! depend on, so it is where the contract belongs.
+//!
+//! ## What this is NOT
+//!
+//! Not a forward-pass abstraction. Generation stays in `hipfire-generate`,
+//! which is the architecture composition root by design and legitimately names
+//! arch crates. This trait exists so that *infrastructure* — load
+//! acknowledgement, session reset, unload — stops branching on architecture.
+
+use crate::llama::KvCache;
+use rdna_compute::Gpu;
+
+/// A loaded model, viewed without knowing its architecture.
+///
+/// Implemented by each architecture's bundle type in its own crate. The loader
+/// stores `Box<dyn ArchModel>` so that adding an architecture does not edit a
+/// closed enum, and the daemon asks questions instead of matching variants.
+pub trait ArchModel: Send + std::any::Any {
+    /// Hidden size. Spelled `dim` by some configs and `hidden_size` by others;
+    /// the implementor resolves that, not the caller.
+    fn dim(&self) -> usize;
+
+    /// Number of decoder layers (`n_layers` / `num_hidden_layers`).
+    fn n_layers(&self) -> usize;
+
+    /// Vocabulary size.
+    fn vocab_size(&self) -> usize;
+
+    /// Short stable identifier, e.g. `"qwen35"`. Matches the key used by
+    /// [`crate::reset_core`]'s inventory so the two cannot drift.
+    fn arch_key(&self) -> &'static str;
+
+    /// The model's KV cache, when it owns one directly.
+    ///
+    /// `None` is legitimate: some bundles keep the cache elsewhere, and callers
+    /// must treat absence as "not applicable", never as an error.
+    fn kv_cache_mut(&mut self) -> Option<&mut KvCache>;
+
+    /// Drop per-session state so the next turn starts clean — recurrent state,
+    /// conv rings, cache offsets. Position and conversation history are the
+    /// caller's concern, not the model's.
+    ///
+    /// Default is a no-op because a pure-attention model with no recurrent
+    /// state has nothing to reset, and forcing every implementor to write an
+    /// empty body would obscure the ones that genuinely do work here.
+    fn reset_session_state(&mut self, _gpu: &mut Gpu) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Downcast hatch for the architecture composition root.
+    ///
+    /// `hipfire-generate` legitimately needs the concrete bundle to call a
+    /// per-architecture forward pass — that is what a composition root does.
+    /// This exists so it can keep doing that once `ModelState` is replaced by
+    /// `Box<dyn ArchModel>`.
+    ///
+    /// Crucially it borrows only the receiver, so a caller can hold the
+    /// downcast bundle and a disjoint `LoadedModel` field at the same time.
+    /// A whole-struct accessor cannot: that distinction is why the accessor
+    /// experiment converted 15 sites of 154 and this hatch is expected to do
+    /// better.
+
+
+    /// Return every GPU buffer this model owns.
+    ///
+    /// Consumes the box: unload is terminal, and taking `self` by value makes
+    /// use-after-free a compile error rather than a runtime one.
+    fn free_gpu(self: Box<Self>, gpu: &mut Gpu);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A bundle with no recurrent state and no directly-owned cache still
+    /// satisfies the contract without writing either method — that is the point
+    /// of the defaults, and a regression here would force boilerplate into
+    /// every pure-attention arch crate.
+    struct Minimal {
+        dim: usize,
+    }
+
+    impl ArchModel for Minimal {
+        fn dim(&self) -> usize {
+            self.dim
+        }
+        fn n_layers(&self) -> usize {
+            2
+        }
+        fn vocab_size(&self) -> usize {
+            32
+        }
+        fn arch_key(&self) -> &'static str {
+            "minimal"
+        }
+        fn kv_cache_mut(&mut self) -> Option<&mut KvCache> {
+            None
+        }
+        fn free_gpu(self: Box<Self>, _gpu: &mut Gpu) {}
+    }
+
+    #[test]
+    fn defaults_cover_a_stateless_arch() {
+        let m = Minimal { dim: 8 };
+        assert_eq!(m.dim(), 8);
+        assert_eq!(m.arch_key(), "minimal");
+    }
+
+    #[test]
+    fn trait_is_object_safe() {
+        // The loader stores these behind a box; if this stops compiling the
+        // whole design is void, so pin it rather than discovering it later.
+        let m: Box<dyn ArchModel> = Box::new(Minimal { dim: 4 });
+        assert_eq!(m.n_layers(), 2);
+        assert_eq!(m.vocab_size(), 32);
+    }
+}
+
+// ==== arch_spec.rs ====
+//! Shared dense-transformer decode forward (N5 Phase B).
+//!
+//! A plain dense transformer layer is the same op sequence across arches —
+//! rmsnorm-rotate + QKV, optional attention bias, optional qk-norm, RoPE,
+//! attention, o_proj+residual, ffn rmsnorm-rotate + gate/up, SwiGLU,
+//! down+residual. llama and qwen2 hand-rolled byte-identical copies of it
+//! (qwen2 wrapped in the `SuperOp` interpreter, llama inline). This module
+//! factors that body into one [`dense_forward`] driver parameterized by a few
+//! config-derived [`DenseKnobs`], with the one genuinely non-shared piece — the
+//! KV-cache write + attention kernel family (llama's 7-tier KV ladder vs
+//! qwen2's flash/gqa selector) — left to each arch via [`DenseArch::attend`].
+//!
+//! This is the "ArchSpec" authoring surface (greenfield BET 2), scoped to its
+//! load/forward-time-durable core. Per the N4 review the design's `config:`
+//! rows are superseded by serde `RawConfig + finalize`, so there is no config
+//! schema here — each arch builds its own `Config` and derives `DenseKnobs`.
+//!
+//! Static dispatch only: [`dense_forward`] is generic over the concrete
+//! `A: DenseArch`, so the per-token call graph stays fully inlinable (no
+//! per-token `dyn`, per the forward-static rule in `arch.rs`). The driver feeds
+//! the already-static `hipfire_dispatch::execute_steps`; it is not a runtime
+//! op-interpreter.
+
+use hip_bridge::{DeviceBuffer, HipResult};
+use hipfire_dispatch::context::DispatchCtx;
+use hipfire_dispatch::families::gemv::WeightRef;
+use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
+use hipfire_dispatch::types::RotationPlan;
+use rdna_compute::{Gpu, GpuTensor};
+
+/// Config-derived scalars that parameterize the shared dense forward. Built once
+/// per forward from each arch's finalized `Config`.
+pub struct DenseKnobs {
+    /// Add q/k/v projection bias (qwen2: true; llama: false).
+    pub attn_bias: bool,
+    /// Apply per-head Q/K RMSNorm before RoPE (Qwen3-style; llama/qwen2: false).
+    pub qk_norm: bool,
+    pub rope_theta: f32,
+    pub norm_eps: f32,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub q_dim: usize,
+    pub kv_dim: usize,
+}
+
+/// Per-forward borrow of the shared decode scratch buffers. `pos_buf` is a raw
+/// `DeviceBuffer` (matches both arches' scratch layout).
+pub struct DenseScratch<'a> {
+    pub x: &'a GpuTensor,
+    pub tmp: &'a GpuTensor,
+    pub x_rot: &'a GpuTensor,
+    pub q: &'a GpuTensor,
+    pub k: &'a GpuTensor,
+    pub v: &'a GpuTensor,
+    pub attn_out: &'a GpuTensor,
+    pub o: &'a GpuTensor,
+    pub gate: &'a GpuTensor,
+    pub up: &'a GpuTensor,
+    pub ffn_hidden: &'a GpuTensor,
+    pub ffn_out: &'a GpuTensor,
+    pub pos_buf: &'a DeviceBuffer,
+}
+
+/// Per-layer borrow of one decoder layer's weights + its derived rotation plans.
+/// Bias/qk-norm tensors are `Option` (present only when the matching knob is on).
+pub struct DenseLayer<'a> {
+    pub attn_norm: &'a GpuTensor,
+    pub ffn_norm: &'a GpuTensor,
+    pub wq: WeightRef<'a>,
+    pub wk: WeightRef<'a>,
+    pub wv: WeightRef<'a>,
+    pub wo: WeightRef<'a>,
+    pub w_gate: WeightRef<'a>,
+    pub w_up: WeightRef<'a>,
+    pub w_down: WeightRef<'a>,
+    pub wq_bias: Option<&'a GpuTensor>,
+    pub wk_bias: Option<&'a GpuTensor>,
+    pub wv_bias: Option<&'a GpuTensor>,
+    pub q_norm: Option<&'a GpuTensor>,
+    pub k_norm: Option<&'a GpuTensor>,
+    pub qkv_rot: RotationPlan,
+    pub ffn_rot: RotationPlan,
+    pub qkv_awq: Option<&'a GpuTensor>,
+    pub ffn_awq: Option<&'a GpuTensor>,
+    /// Activation dim fed to `RmsnormAutomatic` (the projection's `k`).
+    pub qkv_k: usize,
+    pub ffn_k: usize,
+}
+
+/// A dense transformer arch expressed for the shared [`dense_forward`] driver.
+/// Implementors are thin per-forward borrow wrappers over the arch's weights +
+/// scratch + KV cache + config.
+pub trait DenseArch {
+    fn n_layers(&self) -> usize;
+    fn knobs(&self) -> &DenseKnobs;
+    fn scratch(&self) -> DenseScratch<'_>;
+    fn layer(&self, l: usize) -> DenseLayer<'_>;
+    /// KV-cache write + single-token attention for layer `l`. By this point q/k/v
+    /// are projected, biased, qk-normed and RoPE'd into the shared scratch; write
+    /// the attention result into `attn_out`. This is the one op that does NOT
+    /// unify across arches (different KV layouts + attention kernel families).
+    fn attend(&self, gpu: &mut Gpu, l: usize) -> HipResult<()>;
+    /// Optional data-returning companion to [`attend`]: build the
+    /// `(KvTierPlan, AttnParams)` for layer `l` so `dense_forward` can emit a
+    /// first-class `Step::Attend` in one contiguous step list. Default `None` →
+    /// the caller keeps using the side-effecting `attend`. Only arches whose
+    /// attention is a `KvTierPlan` family (llama) override this; bespoke-attention
+    /// arches (qwen2 GQA-flash) leave it `None`.
+    fn attend_plan(
+        &self,
+        _l: usize,
+    ) -> HipResult<
+        Option<(
+            hipfire_dispatch::families::kv_tier::KvTierPlan,
+            hipfire_dispatch::families::attention::AttnParams<'_>,
+        )>,
+    > {
+        Ok(None)
+    }
+}
+
+#[inline]
+fn herr(e: impl std::fmt::Display) -> hip_bridge::HipError {
+    hip_bridge::HipError::new(0, &e.to_string())
+}
+
+/// Shared dense-transformer decode forward for one token. Runs the per-layer op
+/// sequence; the caller does embedding (before) and final norm + lm_head +
+/// sampling (after), since those buffers/dtypes differ per arch.
+pub fn dense_forward<A: DenseArch>(gpu: &mut Gpu, ctx: &DispatchCtx, arch: &A) -> HipResult<()> {
+    let k = arch.knobs();
+    let s = arch.scratch();
+
+    for l in 0..arch.n_layers() {
+        let layer = arch.layer(l);
+
+        // The attention block as one contiguous step list: QKV (fuses to
+        // FusedQkv*), bias, qk-norm, RoPE — then, on the `Some` path, the
+        // first-class `Step::Attend` + o-proj, so the whole block is one
+        // `execute_steps` invocation (future cross-boundary fusion seam).
+        // match_prefix slices each fused pattern to its own window, so the
+        // QKV3/Gemv fusion still fires inside the longer list.
+        let mut steps: Vec<Step> = vec![
+            Step::RmsnormAutomatic {
+                x: s.x,
+                norm_weight: layer.attn_norm,
+                x_plain: s.tmp,
+                out: s.x_rot,
+                awq_scale: layer.qkv_awq,
+                k: layer.qkv_k,
+                eps: k.norm_eps,
+                rotation: layer.qkv_rot,
+            },
+            Step::Gemv {
+                w: &layer.wq,
+                input: GemvInput::Prerotated(s.x_rot),
+                out: s.q,
+            },
+            Step::Gemv {
+                w: &layer.wk,
+                input: GemvInput::Prerotated(s.x_rot),
+                out: s.k,
+            },
+            Step::Gemv {
+                w: &layer.wv,
+                input: GemvInput::Prerotated(s.x_rot),
+                out: s.v,
+            },
+        ];
+
+        // QKV bias (qwen2).
+        if k.attn_bias {
+            steps.push(Step::BiasAdd {
+                x: s.q,
+                bias: layer.wq_bias.expect("attn_bias: wq_bias"),
+                dim: k.q_dim,
+            });
+            steps.push(Step::BiasAdd {
+                x: s.k,
+                bias: layer.wk_bias.expect("attn_bias: wk_bias"),
+                dim: k.kv_dim,
+            });
+            steps.push(Step::BiasAdd {
+                x: s.v,
+                bias: layer.wv_bias.expect("attn_bias: wv_bias"),
+                dim: k.kv_dim,
+            });
+        }
+
+        // Per-head Q/K norm (Qwen3-style).
+        if k.qk_norm {
+            if let Some(qn) = layer.q_norm {
+                steps.push(Step::QkNorm {
+                    x: s.q,
+                    weight: qn,
+                    n_groups: k.n_heads,
+                    head_dim: k.head_dim,
+                    eps: k.norm_eps,
+                });
+            }
+            if let Some(kn) = layer.k_norm {
+                steps.push(Step::QkNorm {
+                    x: s.k,
+                    weight: kn,
+                    n_groups: k.n_kv_heads,
+                    head_dim: k.head_dim,
+                    eps: k.norm_eps,
+                });
+            }
+        }
+
+        // RoPE.
+        steps.push(Step::Rope {
+            q: s.q,
+            k: s.k,
+            pos_buf: s.pos_buf,
+            n_heads: k.n_heads,
+            n_kv_heads: k.n_kv_heads,
+            head_dim: k.head_dim,
+            theta: k.rope_theta,
+        });
+
+        let o_proj = Step::GemvResidual {
+            w: &layer.wo,
+            input: GemvInput::Raw(s.attn_out),
+            residual: s.x,
+            out: s.o,
+        };
+        match arch.attend_plan(l)? {
+            Some((plan, attn_io)) => {
+                // llama: attention is a first-class step → one contiguous list.
+                steps.push(Step::Attend { plan, io: attn_io });
+                steps.push(o_proj);
+                execute_steps(gpu, ctx, &steps).map_err(herr)?;
+            }
+            None => {
+                // Bespoke-attention arch (qwen2 GQA-flash): keep the split —
+                // pre-attend steps, then the side-effecting attend, then o-proj.
+                // Identical kernels/order to the pre-seam path.
+                execute_steps(gpu, ctx, &steps).map_err(herr)?;
+                arch.attend(gpu, l)?;
+                execute_steps(gpu, ctx, &[o_proj]).map_err(herr)?;
+            }
+        }
+
+        // FFN: rmsnorm-rotate + gate/up.
+        execute_steps(
+            gpu,
+            ctx,
+            &[
+                Step::RmsnormAutomatic {
+                    x: s.x,
+                    norm_weight: layer.ffn_norm,
+                    x_plain: s.tmp,
+                    out: s.x_rot,
+                    awq_scale: layer.ffn_awq,
+                    k: layer.ffn_k,
+                    eps: k.norm_eps,
+                    rotation: layer.ffn_rot,
+                },
+                Step::Gemv {
+                    w: &layer.w_gate,
+                    input: GemvInput::Prerotated(s.x_rot),
+                    out: s.gate,
+                },
+                Step::Gemv {
+                    w: &layer.w_up,
+                    input: GemvInput::Prerotated(s.x_rot),
+                    out: s.up,
+                },
+            ],
+        )
+        .map_err(herr)?;
+
+        // SwiGLU + down projection + residual.
+        gpu.silu_mul_f32(s.gate, s.up, s.ffn_hidden)?;
+        execute_steps(
+            gpu,
+            ctx,
+            &[Step::GemvResidual {
+                w: &layer.w_down,
+                input: GemvInput::Raw(s.ffn_hidden),
+                residual: s.x,
+                out: s.ffn_out,
+            }],
+        )
+        .map_err(herr)?;
+    }
+
+    Ok(())
+}
+
+// ==== augmentor.rs ====
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! WeightAugmentor — a plugin interface for transparently transforming weight
+//! tensors at load time. Arch crates call `load_weight()` and augmentors run
+//! automatically based on the model's QuantConfig.
+
+use crate::llama::WeightTensor;
+use crate::model_source::{ModelSource, QuantConfig};
+use hip_bridge::HipResult;
+use rdna_compute::Gpu;
+
+// ── Trait ──────────────────────────────────────────────────────────────────────
+
+/// A plugin that may replace or post-process a weight tensor at load time.
+///
+/// Implementors are registered in `DEFAULT_AUGMENTORS`. `load_weight()` iterates
+/// the list; the first active augmentor whose `try_load` returns `Some` wins.
+/// If no augmentor fires, the caller must use its own base-loading fallback.
+pub trait WeightAugmentor: Send + Sync {
+    fn name(&self) -> &'static str;
+
+    /// True if this augmentor applies to models with the given QuantConfig.
+    fn is_active_for(&self, qc: &QuantConfig) -> bool;
+
+    /// True if this augmentor applies to the given source (delegates to
+    /// is_active_for if quant_config is present, otherwise false).
+    fn is_active(&self, source: &dyn ModelSource) -> bool {
+        source
+            .quant_config()
+            .map(|qc| self.is_active_for(qc))
+            .unwrap_or(false)
+    }
+
+    /// Attempt to fully load the weight tensor named `base_name` (no extension).
+    /// Returns `Ok(Some(t))` if this augmentor handles it (e.g. PaRo: reads
+    /// `.qweight`, `.qzeros`, etc.), `Ok(None)` to pass to the next augmentor
+    /// or to the base loader.
+    fn try_load(
+        &self,
+        source: &dyn ModelSource,
+        base_name: &str,
+        out_dim: usize,
+        in_dim: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<Option<WeightTensor>>;
+}
+
+// ── Dispatch helper ────────────────────────────────────────────────────────────
+
+/// Try every active augmentor in order. Returns the first `Some(WeightTensor)`
+/// found, or `None` if no augmentor handled the tensor.
+///
+/// The caller is responsible for providing a fallback (standard HFQ loading or
+/// error) when `None` is returned.
+pub fn try_augmentors(
+    source: &dyn ModelSource,
+    base_name: &str,
+    out_dim: usize,
+    in_dim: usize,
+    gpu: &mut Gpu,
+    augmentors: &[&'static dyn WeightAugmentor],
+) -> HipResult<Option<WeightTensor>> {
+    for a in augmentors {
+        if a.is_active(source) {
+            if let Some(t) = a.try_load(source, base_name, out_dim, in_dim, gpu)? {
+                return Ok(Some(t));
+            }
+        }
+    }
+    Ok(None)
+}
+
+// ── ParoAugmentor ──────────────────────────────────────────────────────────────
+
+pub struct ParoAugmentor;
+
+impl ParoAugmentor {
+    pub fn is_active_for(qc: &QuantConfig) -> bool {
+        qc.method == "paroquant" && qc.krot > 0
+    }
+}
+
+impl WeightAugmentor for ParoAugmentor {
+    fn name(&self) -> &'static str {
+        "paroquant"
+    }
+
+    fn is_active_for(&self, qc: &QuantConfig) -> bool {
+        ParoAugmentor::is_active_for(qc)
+    }
+
+    fn try_load(
+        &self,
+        source: &dyn ModelSource,
+        base_name: &str,
+        out_dim: usize,
+        in_dim: usize,
+        gpu: &mut Gpu,
+    ) -> HipResult<Option<WeightTensor>> {
+        // Only fires if the quantized tensors actually exist for this weight.
+        // Some tensors are excluded from quantization (router, embeddings) and
+        // have no .qweight — paro_load_wt falls back to .weight for those.
+        if source
+            .tensor_info(&format!("{base_name}.qweight"))
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let qc = source
+            .quant_config()
+            .expect("ParoAugmentor: quant_config required");
+        let t = crate::paro::load_paro_weight(
+            source,
+            gpu,
+            base_name,
+            out_dim,
+            in_dim,
+            qc.group_size,
+            qc.krot,
+        )?;
+        Ok(Some(t))
+    }
+}
+
+// ── Default registry ───────────────────────────────────────────────────────────
+
+static PARO: ParoAugmentor = ParoAugmentor;
+
+/// Default augmentor set used by all arch crates. Extend per-arch by building
+/// a custom slice: `&[DEFAULT_AUGMENTORS, &[&MyAugmentor]].concat()`.
+pub static DEFAULT_AUGMENTORS: &[&dyn WeightAugmentor] = &[&PARO];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model_source::QuantConfig;
+
+    fn make_quant_config(krot: u8) -> QuantConfig {
+        QuantConfig {
+            method: "paroquant".into(),
+            bits: 4,
+            group_size: 128,
+            krot,
+            dynamic_excludes: vec![],
+        }
+    }
+
+    // Tests call the free function `ParoAugmentor::is_active_for(&QuantConfig)`
+    // which does not need a ModelSource — no mock needed for these three tests.
+
+    #[test]
+    fn paro_augmentor_active_when_krot_positive() {
+        let qc = make_quant_config(8);
+        assert!(ParoAugmentor::is_active_for(&qc));
+    }
+
+    #[test]
+    fn paro_augmentor_inactive_when_krot_zero() {
+        let qc = make_quant_config(0);
+        assert!(!ParoAugmentor::is_active_for(&qc));
+    }
+
+    #[test]
+    fn paro_augmentor_inactive_for_non_paro_method() {
+        let mut qc = make_quant_config(8);
+        qc.method = "awq".into();
+        assert!(!ParoAugmentor::is_active_for(&qc));
+    }
+}
+
+// ==== bf16_loader.rs ====
+//! GPTQ-target tensor-name predicate for the Tier-1 calibration path.
+//!
+//! The only live symbol here is [`is_gptq_target`], used by
+//! `calibration.rs` (`HessianCollector`) and mirrored from
+//! `scripts/collect_hessian.py` so the Tier-1 binary produces a
+//! byte-compatible HFHS-v1 output with the Tier-2 Python path.
+//!
+//! History: this module formerly also held a `load_bf16_model`
+//! safetensors-loader scaffold (`unimplemented!()`) plus its `Bf16Tensor`
+//! / `TrunkBF16` metadata structs, sketched in the 2026-05-19 Tier-1
+//! foundation series. They were never wired (the imatrix/hessian work
+//! moved to its own pipeline) and were removed as dead scaffold on
+//! 2026-06-15. Recover from git history if a BF16 calibration loader is
+//! revived.
+
+/// Returns true if a tensor name matches the GPTQ-target whitelist that
+/// `collect_hessian` should accumulate a Hessian for. Mirrors
+/// `scripts/collect_hessian.py::is_gptq_target` so the Tier 1 binary
+/// produces a byte-compatible HFHS-v1 output with the Tier 2 Python
+/// path.
+///
+/// Whitelist (suffixes matched against the last `.`-separated segment):
+///
+///   - Attention input projections: `q_proj`, `k_proj`, `v_proj`,
+///     `qkv_proj`
+///   - Attention output: `o_proj`, `out_proj`
+///   - MLP: `gate_proj`, `up_proj`, `down_proj`, `gate_up_proj`
+///   - Linear-attention (Gated DeltaNet):
+///     `in_proj_qkv`, `in_proj_z`, `in_proj_a`, `in_proj_b`
+///   - MoE router: `gate`
+#[allow(dead_code)]
+pub fn is_gptq_target(name: &str) -> bool {
+    const TARGETS: &[&str] = &[
+        "q_proj",
+        "k_proj",
+        "v_proj",
+        "qkv_proj",
+        "o_proj",
+        "out_proj",
+        "gate_proj",
+        "up_proj",
+        "down_proj",
+        "gate_up_proj",
+        "in_proj_qkv",
+        "in_proj_z",
+        "in_proj_a",
+        "in_proj_b",
+        "gate",
+    ];
+    // Strip a trailing `.weight` (HF safetensors stores Linear weights
+    // as `<module>.weight`; the GPTQ targets are checked on the module
+    // name, not the parameter name).
+    let bare = name.strip_suffix(".weight").unwrap_or(name);
+    let last = bare.rsplit('.').next().unwrap_or(bare);
+    TARGETS.contains(&last)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn gptq_target_recognizes_canonical_qwen35_names() {
+        assert!(is_gptq_target("model.layers.0.self_attn.q_proj.weight"));
+        assert!(is_gptq_target("model.layers.0.self_attn.k_proj.weight"));
+        assert!(is_gptq_target("model.layers.0.self_attn.v_proj.weight"));
+        assert!(is_gptq_target("model.layers.0.self_attn.o_proj.weight"));
+        assert!(is_gptq_target("model.layers.0.mlp.gate_proj.weight"));
+        assert!(is_gptq_target("model.layers.0.mlp.up_proj.weight"));
+        assert!(is_gptq_target("model.layers.0.mlp.down_proj.weight"));
+    }
+
+    #[test]
+    fn gptq_target_recognizes_moe_router() {
+        // Qwen3.5-A3B MoE router lives at `model.layers.N.mlp.gate.weight`
+        assert!(is_gptq_target("model.layers.0.mlp.gate.weight"));
+    }
+
+    #[test]
+    fn gptq_target_rejects_norms_and_embed() {
+        assert!(!is_gptq_target("model.embed_tokens.weight"));
+        assert!(!is_gptq_target("model.layers.0.input_layernorm.weight"));
+        assert!(!is_gptq_target("model.norm.weight"));
+        assert!(!is_gptq_target("lm_head.weight"));
+    }
+
+    #[test]
+    fn gptq_target_recognizes_deltanet_projections() {
+        assert!(is_gptq_target(
+            "model.layers.0.linear_attn.in_proj_qkv.weight"
+        ));
+        assert!(is_gptq_target(
+            "model.layers.0.linear_attn.in_proj_z.weight"
+        ));
+        assert!(is_gptq_target("model.layers.0.linear_attn.out_proj.weight"));
+    }
+}
+
+// ==== cache_plan.rs ====
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Pure, side-effect-free prompt-cache planner.
+//!
+//! Unifies the two per-arch LCP cache decisions that previously lived
+//! inline in `daemon.rs`:
+//!
+//! - **qwen35**: `plan_prompt_cache` (~lines 3811-3905 of `daemon.rs`)
+//! - **deepseek4**: inline LCP block (~lines 9411-9482 of `daemon.rs`)
+//!
+//! Call [`plan_cache`] with the appropriate [`CachePolicy`] for the arch.
+//! No GPU side-effects belong here; they move into the unified loop (T4).
+
+/// Outcome of [`plan_cache`]: how much of the prior conversation is cached
+/// and where the new prefill should start.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CachePlan {
+    /// Whether this turn can reuse the previous turn's recurrent state.
+    pub cache_hit: bool,
+    /// Token index in `rendered` at which the caller should begin prefilling.
+    /// On a hit, `rendered[start_pos..]` is the suffix to feed to the model.
+    pub start_pos: usize,
+    /// Number of tokens from `rendered` that are already in the model's state
+    /// (always equals `start_pos` — kept as a separate field for call-site
+    /// clarity when accounting).
+    pub cached_tokens: usize,
+    /// For qwen35 resume-from-checkpoint: if `Some(p)`, the caller should
+    /// rewind DeltaNet state to checkpoint `p` before prefilling the suffix.
+    /// Always `None` for deepseek4 (no checkpoints).
+    pub resume_from: Option<usize>,
+}
+
+impl CachePlan {
+    /// Canonical miss: cold-prefill the entire rendered conversation.
+    #[inline]
+    pub fn miss() -> Self {
+        CachePlan {
+            cache_hit: false,
+            start_pos: 0,
+            cached_tokens: 0,
+            resume_from: None,
+        }
+    }
+}
+
+/// How the planner handles an exact-match render (new render == prior, byte-for-byte).
+#[derive(Debug, PartialEq, Eq)]
+pub enum ExactMatch {
+    /// qwen35: exact-match degrades to a miss (the 1-token DeltaNet
+    /// over-advance that would result from advancing past the last token
+    /// is not safe).
+    Miss,
+    /// deepseek4: step `lcp` back one so prefilling always processes ≥ 1
+    /// token. The stepped-back `lcp` is then in the partial range
+    /// `(0, prior_len)`, which the `allow_partial=false` guard immediately
+    /// forces to a cold miss for DSA compressor-ring safety.
+    StepBack,
+}
+
+/// Per-arch cache policy knobs.
+///
+/// Construct via [`CachePolicy::qwen35`] or [`CachePolicy::deepseek4`].
+#[derive(Debug)]
+pub struct CachePolicy {
+    /// If `true`, a miss is forced when `rendered.len() < prior.len()`.
+    ///
+    /// **deepseek4** sets this `true` for DSA compressor-ring safety:
+    /// `generate_deepseek4` (daemon.rs ~9413) checks
+    /// `prompt_ids.len() < prior.len()` before computing LCP.
+    /// **qwen35** sets this `false` — it has no such constraint.
+    pub min_new_len_ge_prior: bool,
+    /// What to do when the new render is byte-identical to the prior.
+    ///
+    /// See [`ExactMatch`] variants for the per-arch rationale.
+    pub on_exact: ExactMatch,
+    /// Whether a partial prefix match (`0 < lcp < prior_len`) is accepted
+    /// as a cache hit.
+    ///
+    /// Both current arches set this `false`. The field is part of the
+    /// documented policy surface so the unified loop (T4) can enable it
+    /// for future arches without a new planner API.
+    pub allow_partial: bool,
+}
+
+impl CachePolicy {
+    /// Policy for **qwen35** (`plan_prompt_cache`, daemon.rs ~3811-3905).
+    ///
+    /// - No minimum-length constraint on the new render.
+    /// - Exact-match (`lcp == rendered.len()`) → miss (avoids DeltaNet over-advance).
+    /// - Partial divergence without a usable checkpoint → miss.
+    /// - Resume-from-checkpoint is a call-site toggle, not a policy knob.
+    pub fn qwen35() -> Self {
+        CachePolicy {
+            min_new_len_ge_prior: false,
+            on_exact: ExactMatch::Miss,
+            allow_partial: false,
+        }
+    }
+
+    /// Policy for **deepseek4** (inline LCP, daemon.rs ~9411-9482).
+    ///
+    /// - Rendered must be at least as long as the prior (DSA compressor-ring safety).
+    /// - Exact-match (`lcp == rendered.len()`) → step back one, which then
+    ///   falls into the partial-cold guard and becomes a miss.
+    /// - Any partial hit (`0 < lcp < prior_len`) → forced cold (DSA ring safety).
+    pub fn deepseek4() -> Self {
+        CachePolicy {
+            min_new_len_ge_prior: true,
+            on_exact: ExactMatch::StepBack,
+            allow_partial: false,
+        }
+    }
+}
+
+/// Compute the prompt-cache plan for one turn.
+///
+/// # Arguments
+/// - `rendered`        — the fully-rendered canonical conversation tokens for
+///                       this turn (already built by the caller).
+/// - `prior`           — `m.conversation_tokens` from the previous turn.
+/// - `policy`          — per-arch knobs; see [`CachePolicy::qwen35`] /
+///                       [`CachePolicy::deepseek4`].
+/// - `checkpoints`     — ascending DeltaNet checkpoint positions
+///                       (`m.dflash_checkpoints`); pass `&[]` for deepseek4.
+/// - `resume_enabled`  — whether to attempt resume-from-checkpoint on
+///                       divergence; `false` for deepseek4.
+///
+/// # Returns
+/// A [`CachePlan`] whose `start_pos` is the index into `rendered` at which
+/// the caller should begin prefilling. `cached_tokens == start_pos` always.
+pub fn plan_cache(
+    rendered: &[u32],
+    prior: &[u32],
+    policy: &CachePolicy,
+    checkpoints: &[usize],
+    resume_enabled: bool,
+) -> CachePlan {
+    // 1. No prior → miss.
+    if prior.is_empty() {
+        return CachePlan::miss();
+    }
+    // 2. ds4 ring-safety: new render must be at least as long as prior.
+    if policy.min_new_len_ge_prior && rendered.len() < prior.len() {
+        return CachePlan::miss();
+    }
+    // 3. Raw longest common prefix, bounded by both lengths.
+    let max_match = prior.len().min(rendered.len());
+    let mut lcp = 0usize;
+    while lcp < max_match && prior[lcp] == rendered[lcp] {
+        lcp += 1;
+    }
+    // 4. Exact-match edge: lcp consumed the WHOLE new render.
+    if lcp == rendered.len() && lcp > 0 {
+        match policy.on_exact {
+            ExactMatch::Miss => return CachePlan::miss(),
+            ExactMatch::StepBack => lcp -= 1, // falls into partial-cold below
+        }
+    }
+    // 5. Pure forward extension → hit.
+    if lcp == prior.len() && lcp < rendered.len() && lcp > 0 {
+        return CachePlan {
+            cache_hit: true,
+            start_pos: lcp,
+            cached_tokens: lcp,
+            resume_from: None,
+        };
+    }
+    // 6. Partial divergence (0 < lcp < prior_len).
+    if lcp > 0 && lcp < prior.len() {
+        if policy.allow_partial {
+            return CachePlan {
+                cache_hit: true,
+                start_pos: lcp,
+                cached_tokens: lcp,
+                resume_from: None,
+            };
+        }
+        if resume_enabled {
+            if let Some(&ckpt) = checkpoints
+                .iter()
+                .filter(|&&p| p <= lcp && p < rendered.len())
+                .max()
+            {
+                return CachePlan {
+                    cache_hit: true,
+                    start_pos: ckpt,
+                    cached_tokens: ckpt,
+                    resume_from: Some(ckpt),
+                };
+            }
+        }
+        return CachePlan::miss();
+    }
+    // 7. Otherwise miss (lcp == 0: total divergence).
+    CachePlan::miss()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn q() -> CachePolicy {
+        CachePolicy::qwen35()
+    }
+
+    fn d() -> CachePolicy {
+        CachePolicy::deepseek4()
+    }
+
+    fn check(plan: CachePlan, hit: bool, start: usize, resume: Option<usize>) {
+        assert_eq!(plan.cache_hit, hit);
+        assert_eq!(plan.start_pos, start);
+        assert_eq!(
+            plan.cached_tokens, start,
+            "cached_tokens must equal start_pos"
+        );
+        assert_eq!(plan.resume_from, resume);
+    }
+
+    #[test]
+    fn t01_empty_prior_miss() {
+        // branch: step 1 — no prior → miss
+        let plan = plan_cache(&[1, 2, 3], &[], &q(), &[], false);
+        check(plan, false, 0, None);
+    }
+
+    #[test]
+    fn t02_qwen35_forward_extension_hit() {
+        // branch: step 5 — pure forward extension
+        let plan = plan_cache(&[1, 2, 3, 4, 5], &[1, 2, 3], &q(), &[], false);
+        check(plan, true, 3, None);
+    }
+
+    #[test]
+    fn t03_ds4_forward_extension_hit() {
+        // branch: step 5 — pure forward extension (ds4 policy)
+        let plan = plan_cache(&[1, 2, 3, 4, 5], &[1, 2, 3], &d(), &[], false);
+        check(plan, true, 3, None);
+    }
+
+    #[test]
+    fn t04_qwen35_exact_match_miss() {
+        // branch: step 4 — exact-match → ExactMatch::Miss → miss
+        let plan = plan_cache(&[1, 2, 3], &[1, 2, 3], &q(), &[], false);
+        check(plan, false, 0, None);
+    }
+
+    #[test]
+    fn t05_ds4_exact_match_stepback_then_partial_cold() {
+        // branch: step 4 → StepBack (lcp=2), then step 6 partial-cold → miss
+        let plan = plan_cache(&[1, 2, 3], &[1, 2, 3], &d(), &[], false);
+        check(plan, false, 0, None);
+    }
+
+    #[test]
+    fn t06_qwen35_partial_no_resume_miss() {
+        // branch: step 6 — partial divergence, resume_enabled=false → miss
+        let plan = plan_cache(&[1, 2, 9, 9, 9], &[1, 2, 3, 4], &q(), &[], false);
+        check(plan, false, 0, None);
+    }
+
+    #[test]
+    fn t07_qwen35_partial_resume_latest_ckpt() {
+        // branch: step 6 — partial divergence, resume finds latest ckpt ≤ lcp(2)
+        let plan = plan_cache(&[1, 2, 9, 9, 9], &[1, 2, 3, 4], &q(), &[0, 1], true);
+        check(plan, true, 1, Some(1));
+    }
+
+    #[test]
+    fn t08_qwen35_partial_resume_ckpt_beyond_lcp_miss() {
+        // branch: step 6 — resume_enabled but ckpt=3 > lcp(2), filtered → miss
+        let plan = plan_cache(&[1, 2, 9, 9, 9], &[1, 2, 3, 4], &q(), &[3], true);
+        check(plan, false, 0, None);
+    }
+
+    #[test]
+    fn t09_ds4_partial_cold_miss() {
+        // branch: step 6 — ds4 partial → allow_partial=false, no resume → miss
+        let plan = plan_cache(&[1, 2, 9, 9, 9], &[1, 2, 3, 4], &d(), &[], false);
+        check(plan, false, 0, None);
+    }
+
+    #[test]
+    fn t10_ds4_rendered_shorter_than_prior_miss() {
+        // branch: step 2 — min_new_len_ge_prior triggers miss
+        let plan = plan_cache(&[1, 2, 3], &[1, 2, 3, 4, 5], &d(), &[], false);
+        check(plan, false, 0, None);
+    }
+
+    #[test]
+    fn t11_qwen35_rendered_shorter_full_prefix_exact_miss() {
+        // branch: step 4 — rendered shorter, all 3 rendered tokens match →
+        // lcp == rendered.len() → exact → ExactMatch::Miss
+        let plan = plan_cache(&[1, 2, 3], &[1, 2, 3, 4, 5], &q(), &[], false);
+        check(plan, false, 0, None);
+    }
+
+    #[test]
+    fn t12_ds4_forward_extension_cached_tokens_eq_start_pos() {
+        // branch: step 5 — forward extension; assert cached_tokens == start_pos == 3
+        let plan = plan_cache(&[1, 2, 3, 4], &[1, 2, 3], &d(), &[], false);
+        assert!(plan.cache_hit);
+        assert_eq!(plan.start_pos, 3);
+        assert_eq!(
+            plan.cached_tokens, plan.start_pos,
+            "cached_tokens must equal start_pos"
+        );
+    }
+}
+
+// ==== calibration.rs ====
+// SPDX-License-Identifier: Apache-2.0
+// hipfire — Tier-1 calibration collector (lib-ified core).
+//
+//! The reusable, model-agnostic calibration collector: an [`ActivationCapture`]
+//! that accumulates a per-tensor GPTQ Hessian (`Σ x·xᵀ`) and imatrix diagonal
+//! (`Σ x²`) on-GPU via the `calib_*_reduce_f32` kernels, and drains to HFQ
+//! tensors (`<name>.hessian` [K,K] + `<name>.imatrix` [K]) plus an
+//! internal-consistency metric (`diag(Σxxᵀ)` must equal `Σx²`).
+//!
+//! This is generic (hipfire-rdna + the HFQ writer only) so it sits in
+//! hipfire-runtime without a cycle on the arch crates. Callers (the
+//! `collect_artifacts` CLI, the daemon `Collect` op) own the forward loop +
+//! the model-specific taps (MoE router histogram, KLDREF) and arm this via
+//! `gpu.active_capture = Some(Arc::new(CalibCollector::default()))`.
+
+use crate::hfq::HfqMemTensor;
+use rdna_compute::{ActivationCapture, DType, Gpu, GpuTensor};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+fn f32_to_bf16_bits(v: f32) -> u16 {
+    (v.to_bits() >> 16) as u16
+}
+fn bf16_bits_to_f32(bits: u16) -> f32 {
+    f32::from_bits((bits as u32) << 16)
+}
+
+/// Rows buffered per tensor before flushing the outer-product. A single
+/// `calib_hessian_outer_f32` over `[FLUSH_BATCH, K]` is ~FLUSH_BATCH× more
+/// efficient than per-token (N=1) launches (the tiled GEMM is built for N≥16),
+/// so this is the dominant calibration-throughput lever.
+const FLUSH_BATCH: usize = 256;
+
+/// Calibration-only HFQM quant_type for compact Hessians:
+/// exact F32 diagonal followed by BF16 lower strict triangle.
+const QUANT_TYPE_HESSIAN_BF16_TRIL_DIAG_F32: u8 = 130;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HessianStorage {
+    DenseF32,
+    Bf16TrilDiagF32,
+}
+
+fn hessian_storage_from_env() -> HessianStorage {
+    match std::env::var("HIPFIRE_CALIB_HESSIAN_STORAGE")
+        .ok()
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("f32" | "dense-f32" | "full-f32" | "legacy") => HessianStorage::DenseF32,
+        _ => HessianStorage::Bf16TrilDiagF32,
+    }
+}
+
+fn compact_hessian_bytes(k: usize) -> u64 {
+    (k * 4 + k * (k - 1)) as u64
+}
+
+/// Per-tensor on-GPU accumulators + a small activation row buffer.
+struct Acc {
+    diag: GpuTensor,      // [K]   Σx²  (imatrix)
+    h: Option<GpuTensor>, // [K,K] Σxxᵀ (Hessian); `None` = imatrix-only tensor
+    /// Host f64 reference accumulator (`Some` only under `HIPFIRE_CALIB_F64_AUDIT`).
+    /// The GPU outer-product accumulates `Σxxᵀ` in f32; RDNA has no f64 matrix
+    /// units and only ~1:16 scalar f64, so a faithful f64 reference is computed
+    /// CPU-side from the same staged rows. `drain` then reports the max relative
+    /// f32-vs-f64 divergence — measure-first before deciding whether f32
+    /// accumulation needs replacing for large token counts.
+    h_f64: Option<Vec<f64>>,
+    buf: GpuTensor,  // [FLUSH_BATCH, K] staged activation rows
+    buf_rows: usize, // rows currently staged in `buf`
+    k: usize,
+    n_tokens: u64,
+}
+
+impl Acc {
+    /// Reduce the staged rows into the accumulators (one batched launch each),
+    /// then reset the buffer. No-op when empty. Imatrix-only tensors (`h` is
+    /// `None`) skip the [K,K] outer-product — this is how MoE routed experts
+    /// are captured: a full per-expert Hessian (256 experts × ~48 layers ×
+    /// [K,K]) is ~196 GB and does not fit, but the imatrix (Σx², a K-vector)
+    /// is ~100 MB and is the importance signal AWQ-style quant needs.
+    fn flush(&mut self, gpu: &mut Gpu) {
+        if self.buf_rows == 0 {
+            return;
+        }
+        gpu.calib_sumsq_reduce_f32(&self.buf, &self.diag, self.buf_rows, self.k)
+            .unwrap();
+        if let Some(h) = &self.h {
+            gpu.calib_hessian_outer_f32(&self.buf, h, self.buf_rows, self.k)
+                .unwrap();
+        }
+        // Audit: accumulate the same rows in f64 on the CPU (no GPU f64 path).
+        if let Some(h_f64) = &mut self.h_f64 {
+            let k = self.k;
+            let rows = gpu
+                .download_f32(&self.buf)
+                .expect("download buf (f64 audit)");
+            for r in 0..self.buf_rows {
+                let x = &rows[r * k..r * k + k];
+                for i in 0..k {
+                    let xi = x[i] as f64;
+                    let hrow = &mut h_f64[i * k..i * k + k];
+                    for j in 0..k {
+                        hrow[j] += xi * x[j] as f64;
+                    }
+                }
+            }
+        }
+        self.buf_rows = 0;
+    }
+}
+
+/// Unified Hessian + imatrix collector. Arm via `gpu.active_capture`.
+///
+/// By default every captured tensor accumulates a full [K,K] Hessian. Tensors
+/// whose canonical name contains any of `imatrix_only_substr` accumulate only
+/// the imatrix (Σx²); used for MoE routed experts whose full Hessians do not
+/// fit in memory (see [`Acc::flush`]).
+#[derive(Default)]
+pub struct CalibCollector {
+    accs: Mutex<HashMap<String, Acc>>,
+    imatrix_only_substr: Vec<String>,
+    /// When set (`HIPFIRE_CALIB_F64_AUDIT=1`), also accumulate each Hessian in
+    /// f64 on the CPU and report the f32-vs-f64 divergence in `drain`. Opt-in,
+    /// slow (CPU outer-products) — a measurement tool, not the default path.
+    f64_audit: bool,
+}
+
+/// `HIPFIRE_CALIB_F64_AUDIT=1` → run the CPU f64 reference accumulation.
+fn f64_audit_enabled() -> bool {
+    std::env::var("HIPFIRE_CALIB_F64_AUDIT").ok().as_deref() == Some("1")
+}
+
+impl CalibCollector {
+    pub fn new() -> Self {
+        Self {
+            accs: Mutex::new(HashMap::new()),
+            imatrix_only_substr: Vec::new(),
+            f64_audit: f64_audit_enabled(),
+        }
+    }
+
+    /// Collector that stores imatrix-only (no [K,K] Hessian) for any tensor
+    /// whose name contains one of `substr` (e.g. `".experts."` for MoE).
+    pub fn with_imatrix_only(substr: Vec<String>) -> Self {
+        Self {
+            accs: Mutex::new(HashMap::new()),
+            imatrix_only_substr: substr,
+            f64_audit: f64_audit_enabled(),
+        }
+    }
+
+    fn wants_hessian(&self, name: &str) -> bool {
+        !self.imatrix_only_substr.iter().any(|s| name.contains(s))
+    }
+
+    /// Number of distinct tensors captured so far.
+    pub fn len(&self) -> usize {
+        self.accs.lock().unwrap().len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Per-tensor descriptors (no GPU work): `name`, whether it has a full
+    /// Hessian, `k`, and `n_tokens`. The caller uses these to compute counts +
+    /// `name -> n_tokens` provenance for the metadata BEFORE the streaming write
+    /// (the HFQM index/metadata must be written ahead of the payloads).
+    pub fn tensor_descriptors(&self) -> Vec<CalibTensorDesc> {
+        let accs = self.accs.lock().unwrap();
+        let mut names: Vec<&String> = accs.keys().collect();
+        names.sort();
+        names
+            .iter()
+            .map(|name| {
+                let acc = &accs[*name];
+                CalibTensorDesc {
+                    name: (*name).clone(),
+                    has_hessian: acc.h.is_some(),
+                    k: acc.k,
+                    n_tokens: acc.n_tokens,
+                }
+            })
+            .collect()
+    }
+
+    /// Release all GPU accumulators owned by this collector. Grouped
+    /// calibration runs call this after streaming a part file so the next group
+    /// can reuse the memory instead of waiting for process teardown.
+    pub fn free_gpu(&self, gpu: &mut Gpu) {
+        let mut accs = self.accs.lock().unwrap();
+        for (_, acc) in accs.drain() {
+            let _ = gpu.free_tensor(acc.diag);
+            if let Some(h) = acc.h {
+                let _ = gpu.free_tensor(h);
+            }
+            let _ = gpu.free_tensor(acc.buf);
+        }
+    }
+
+    /// GuidedQuant capture: accumulate the per-token **Fisher-weighted** Hessian
+    /// `H̄ = Σ_n w[n]·xₙxₙᵀ` (and its diagonal) for `tensor_name`. `x` is the
+    /// linear's input activation `[n,k]` (a real contiguous block, not the shared
+    /// scratch the `ActivationCapture::capture` tap takes); `w` `[n]` is the
+    /// per-token weight the caller forms from that linear's output-grad `∂ℓ/∂z`
+    /// (see `calib_row_meansq_f32`). Unbuffered — one weighted outer-product +
+    /// weighted sumsq per call, fine offline. `w≡1` makes this identical to the
+    /// plain unweighted capture.
+    pub fn capture_weighted(
+        &self,
+        gpu: &mut Gpu,
+        tensor_name: &str,
+        x: &GpuTensor,
+        w: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) {
+        let mut accs = self.accs.lock().unwrap();
+        if !accs.contains_key(tensor_name) {
+            let diag = gpu.zeros(&[k], DType::F32).unwrap();
+            let h = if self.wants_hessian(tensor_name) {
+                Some(gpu.zeros(&[k, k], DType::F32).unwrap())
+            } else {
+                None
+            };
+            // No row buffering on this path; a minimal placeholder keeps `Acc`
+            // uniform (`flush` is a no-op while `buf_rows == 0`).
+            let buf = gpu.zeros(&[1, k], DType::F32).unwrap();
+            accs.insert(
+                tensor_name.to_string(),
+                Acc {
+                    diag,
+                    h,
+                    h_f64: None,
+                    buf,
+                    buf_rows: 0,
+                    k,
+                    n_tokens: 0,
+                },
+            );
+        }
+        let acc = accs.get_mut(tensor_name).unwrap();
+        gpu.calib_sumsq_weighted_f32(x, w, &acc.diag, n, k).unwrap();
+        if let Some(h) = &acc.h {
+            gpu.calib_hessian_outer_weighted_f32(x, w, h, n, k).unwrap();
+        }
+        acc.n_tokens += n as u64;
+    }
+
+    /// Stream the accumulated tensors into an HFQM `.calib.hfq` at `path`,
+    /// **one tensor at a time** (download → normalize `/ n_tokens` → write →
+    /// drop), so peak host memory is a single Hessian rather than all of them
+    /// (a 9B is ~32 GB if materialized at once). `extra` holds any small
+    /// already-in-RAM tensors (e.g. KLDREF) the caller wants in the same
+    /// package. The metadata + index are written first (payload sizes are
+    /// deterministic from `k`), then the payloads stream. Returns the max
+    /// relative `diag(H)`-vs-`Σx²` consistency error. Also runs the optional
+    /// f64 audit (`HIPFIRE_CALIB_F64_AUDIT`) during the 

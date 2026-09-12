@@ -172,16 +172,21 @@ fn read_text(path: &str) -> Result<String, String> {
 }
 
 fn find_daemon_binary() -> Result<PathBuf, String> {
-    // Prefer release; fall back to debug. Mirror the gate scripts'
-    // discovery behaviour.
-    let candidates = [
-        "target/release/daemon",
-        "target/debug/daemon",
-    ];
-    for c in candidates {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return Ok(p);
+    // Prefer release; fall back to debug. Platform-shaped names match
+    // hipfire-cli `daemon_bin_names` / `find_daemon_in`: Windows probes
+    // `.exe` then bare; Unix probes bare only (never `.exe`, so a stale
+    // PE left on a Linux tree cannot win over a real daemon).
+    let names: &[&str] = if cfg!(windows) {
+        &["daemon.exe", "daemon"]
+    } else {
+        &["daemon"]
+    };
+    for name in names {
+        for profile in ["release", "debug"] {
+            let p = PathBuf::from(format!("target/{profile}/{name}"));
+            if p.exists() {
+                return Ok(p);
+            }
         }
     }
     Err("daemon binary not found; run `cargo build --release -p hipfire-daemon` first".into())

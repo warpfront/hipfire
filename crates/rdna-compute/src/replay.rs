@@ -22,7 +22,7 @@ use std::sync::Arc;
 use hip_bridge::HipRuntime;
 use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache};
 use redline_dispatch::aql::{
-    load_symbols, BatchFencePolicy, Executable, Gfx10DispatchInitiatorPolicy,
+    load_symbols, BatchFencePolicy, Executable, FenceScope, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
     Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
     GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
@@ -338,7 +338,7 @@ impl Pm4Commands {
     }
 
     fn requires_dependency_acquire(&self) -> bool {
-        matches!(self, Self::Legacy { .. })
+        true
     }
 
     fn wait_compute_idle(&mut self) -> Result<(), String> {
@@ -850,9 +850,20 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "gemm_mq6g256v2_residual_wmma_gfx11_bt8"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_mw4_lds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_mw8_lds"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_ks8_lds"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
     ) {
+        return Some(vec![read(0), read(8), write(16)]);
+    }
+    // F16 dense batched GEMM (Maple router + DeepSeek compressor shapes). 3 pointers
+    // + 3 i32 (M,K,B) = 36 explicit bytes. A@0 and X@8 are reads; Y@16 is a pure
+    // overwrite (`Y[...] = acc`), so write — never an RMW. gfx11 and gfx12 are
+    // distinct symbols with one shared contract, like the residual `_wmma`/`_gfx12` pairs.
+    if matches!(kernel, "gemm_f16_x_f16_wmma" | "gemm_f16_x_f16_wmma_gfx12") {
         return Some(vec![read(0), read(8), write(16)]);
     }
 
@@ -1148,6 +1159,11 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc"
+        | "gemv_mq4g256_moe_gate_up_k8_indexed_k2816"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
@@ -1484,9 +1500,19 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemm_mq6g256v2_residual_wmma_gfx11_bt8"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_mw4_lds"
             | "gemm_mq4g256v2_residual_wmma_gfx1100_mw8_lds"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_ks8_lds"
+            | "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds"
             | "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds"
     ) {
+        return Some(48);
+    }
+    // F16 dense batched GEMM: 3 ptr + M,K,B = 36 → 48 padded. gfx11 and gfx12
+    // share one ABI — see `Gpu::gemm_f16_x_f16_wmma`, whose blob builder pushes
+    // the same 3 ptr + 3 i32 on both paths before the record path's pad_to(16).
+    if matches!(kernel, "gemm_f16_x_f16_wmma" | "gemm_f16_x_f16_wmma_gfx12") {
         return Some(48);
     }
 
@@ -1553,10 +1579,15 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc"
+        | "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave"
         | "gemv_hfq4g256_moe_gate_up_k8_indexed_wg2"
+        | "gemv_mq4g256_moe_gate_up_k8_indexed_k2816"
         | "gemv_hfq4g256_residual_sigmoid_scaled_gpu"
         | "gemv_mq4g256v2_residual_sigmoid_scaled_k512"
         | "hc_mix_4stream"
@@ -4407,6 +4438,28 @@ impl ReplayController {
             }
         }
         apply_qwen_q8_full_attention_visibility(&self.recorded[..prefix], &mut headers);
+        // A queue barrier orders execution but does not publish vector-cache
+        // writes to the next dispatch on gfx11/gfx12. Keep ordinary intra-tape
+        // ownership at agent scope, with system scope only at the external
+        // HIP/AQL entry and host-visible completion boundaries.
+        if Pm4Architecture::from_name(device.name())? != Pm4Architecture::Gfx10 {
+            headers.fill(HeaderPolicy::SAME_AGENT_DISPATCH);
+            if headers.len() == 1 {
+                headers[0] = HeaderPolicy::RECORDED_DISPATCH;
+            } else {
+                headers[0] = HeaderPolicy {
+                    barrier: true,
+                    acquire: FenceScope::System,
+                    release: FenceScope::Agent,
+                };
+                let last = headers.len() - 1;
+                headers[last] = HeaderPolicy {
+                    barrier: true,
+                    acquire: FenceScope::Agent,
+                    release: FenceScope::System,
+                };
+            }
+        }
         let graph = if self.request == ReplayBackendRequest::Auto {
             SingleQueueBatchGraph::create_unprofiled_with_dispatch_headers(
                 &device,
@@ -5937,6 +5990,11 @@ mod tests {
         "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_k2048",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc",
+        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc",
+        "gemv_mq4g256_moe_gate_up_k8_indexed_k2816",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_low_vgpr",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_pair_slc",
         "gemv_hfq4g256_moe_gate_up_k8_indexed_rank_interleave",
@@ -7058,6 +7116,10 @@ mod tests {
             "gemm_mq6g256v2_residual_wmma_gfx11_bt8",
             "gemm_mq4g256v2_residual_wmma_gfx1100_mw4_lds",
             "gemm_mq4g256v2_residual_wmma_gfx1100_mw8_lds",
+            "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds",
+            "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds",
+            "gemm_mq4g256v2_residual_wmma_gfx1100_ks8_lds",
+            "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage",
             "gemm_mq6g256v2_residual_wmma_gfx11_mw4_lds",
             "gemm_mq6g256v2_residual_wmma_gfx11_mw8_lds",
         ] {

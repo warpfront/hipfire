@@ -60,13 +60,39 @@ fn boxed_empty() -> BoxBody {
 }
 
 pub(crate) fn json_response(value: serde_json::Value, status: u16) -> Response<BoxBody> {
-    let bytes = serde_json::to_vec(&value).expect("JSON value serializes");
+    match json_response_result(&value, status) {
+        Ok(resp) => resp,
+        Err(message) => openai_error(&message, 500),
+    }
+}
+
+fn json_response_result(
+    value: &serde_json::Value,
+    status: u16,
+) -> Result<Response<BoxBody>, String> {
+    let bytes = serde_json::to_vec(value)
+        .map_err(|err| format!("failed to encode JSON response: {err}"))?;
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
         .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
         .body(boxed_full(bytes))
-        .unwrap()
+        .map_err(|err| format!("failed to build HTTP response: {err}"))
+}
+
+/// Last-resort 500 body with no serde dependency, so error rendering always
+/// terminates even if JSON encoding itself is what failed.
+fn static_server_error() -> Response<BoxBody> {
+    Response::builder()
+        .status(500)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
+        .body(boxed_full(
+            br#"{"error":{"message":"internal server error","type":"server_error"}}"#.to_vec(),
+        ))
+        // Static status, headers, and body: the builder cannot fail on these
+        // inputs, and there is no further fallback below this point.
+        .expect("static 500 response builds")
 }
 
 pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
@@ -75,20 +101,20 @@ pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
     } else {
         "server_error"
     };
-    json_response(
-        serde_json::json!({
+    json_response_result(
+        &serde_json::json!({
             "error": { "message": message, "type": error_type }
         }),
         status,
     )
+    .unwrap_or_else(|_| static_server_error())
 }
 
 pub(crate) fn admission_error_response(error: &AdmissionError) -> Response<BoxBody> {
     let mut resp = openai_error(&error.message, 503);
-    resp.headers_mut().insert(
-        header::RETRY_AFTER,
-        header::HeaderValue::from_str(&error.retry_after_seconds.to_string()).unwrap(),
-    );
+    if let Ok(retry_after) = header::HeaderValue::from_str(&error.retry_after_seconds.to_string()) {
+        resp.headers_mut().insert(header::RETRY_AFTER, retry_after);
+    }
     resp
 }
 
@@ -602,11 +628,281 @@ async fn handle_request(
             cancel_guard.disarm();
             response
         }
+        (Method::POST, "/v1/images/generations") => {
+            let max_bytes = shared.max_request_bytes;
+            if req
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length > max_bytes)
+            {
+                return openai_error(&format!("request body exceeds {max_bytes} bytes"), 413);
+            }
+            let body_val = match read_json_body(req.into_body(), max_bytes).await {
+                Ok(v) => v,
+                Err(err) => {
+                    let msg = err.to_string();
+                    let status = if msg.contains("exceeds") { 413 } else { 400 };
+                    return openai_error(&msg, status);
+                }
+            };
+            match handle_images_generations(shared, body_val).await {
+                Ok(resp) => resp,
+                Err(message) => openai_error(&message, images_error_status(&message)),
+            }
+        }
+        // OpenAI-shaped reference edit: `multipart/form-data` with one to four
+        // `image` file parts plus the text fields of `/v1/images/generations`.
+        // The image bytes travel in the request; the server never reads a
+        // client-named file.
+        (Method::POST, "/v1/images/edits") => {
+            let max_bytes = shared.max_request_bytes;
+            if req
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length > max_bytes)
+            {
+                return openai_error(&format!("request body exceeds {max_bytes} bytes"), 413);
+            }
+            let boundary = req
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .and_then(multipart_boundary)
+                .map(str::to_owned);
+            let Some(boundary) = boundary else {
+                return openai_error(
+                    "/v1/images/edits takes multipart/form-data with a boundary",
+                    400,
+                );
+            };
+            let bytes = match read_body_bytes(req.into_body(), max_bytes).await {
+                Ok(b) => b,
+                Err(err) => {
+                    let msg = err.to_string();
+                    let status = if msg.contains("exceeds") { 413 } else { 400 };
+                    return openai_error(&msg, status);
+                }
+            };
+            let body_val = match parse_multipart(&bytes, &boundary)
+                .and_then(|(f, i)| edits_form_to_body(f, i))
+            {
+                Ok(v) => v,
+                Err(message) => return openai_error(&message, 400),
+            };
+            match handle_images_generations(shared, body_val).await {
+                Ok(resp) => resp,
+                Err(message) => openai_error(&message, images_error_status(&message)),
+            }
+        }
         _ => openai_error("not found", 404),
     }
 }
 
+// ---------------------------------------------------------------------------
+// Images (OpenAI-compatible txt2img)
+// ---------------------------------------------------------------------------
+
+/// `/v1/images/generations`: validate the OpenAI-shaped body, forward it as
+/// one daemon `img_generate`, and return a single JSON response carrying the
+/// PNG as `b64_json`. The daemon (not the gateway) is the authority on
+/// sampler/geometry validation — everything it refuses surfaces as a 4xx
+/// here with its message.
+async fn handle_images_generations(
+    shared: Arc<ServeShared>,
+    body: serde_json::Value,
+) -> Result<Response<BoxBody>, String> {
+    let prompt = body
+        .get("prompt")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "prompt is required and must be a non-empty string".to_string())?;
+    let n = body.get("n").and_then(|v| v.as_u64()).unwrap_or(1);
+    if n != 1 {
+        return Err(format!("n={n} unsupported: one image per request"));
+    }
+    if let Some(format) = body.get("response_format").and_then(|v| v.as_str()) {
+        if format != "b64_json" {
+            return Err(format!(
+                "response_format {format:?} unsupported: b64_json only"
+            ));
+        }
+    }
+    // Size: OpenAI `size` string ("WxH") wins, else explicit width/height.
+    // Neither is required: a reference-image edit request (`images[]`, arch
+    // 44) that omits both lets the daemon default to the reference image's
+    // own size, so no width/height key is inserted into the forwarded
+    // request in that case.
+    let (width, height): (Option<u64>, Option<u64>) =
+        match body.get("size").and_then(|v| v.as_str()) {
+            Some(size) => {
+                let parts: Vec<&str> = size.split('x').collect();
+                if parts.len() != 2 {
+                    return Err(format!(
+                        "size {size:?} must be WIDTHxHEIGHT, e.g. \"1024x1024\""
+                    ));
+                }
+                let w: u64 = parts[0]
+                    .parse()
+                    .map_err(|_| format!("size width {:?} is not a number", parts[0]))?;
+                let h: u64 = parts[1]
+                    .parse()
+                    .map_err(|_| format!("size height {:?} is not a number", parts[1]))?;
+                (Some(w), Some(h))
+            }
+            None => (
+                body.get("width").and_then(|v| v.as_u64()),
+                body.get("height").and_then(|v| v.as_u64()),
+            ),
+        };
+    let steps = body.get("steps").and_then(|v| v.as_u64());
+    let seed = body.get("seed").and_then(|v| v.as_u64());
+    let sampler = body.get("sampler").and_then(|v| v.as_str());
+    let negative_prompt = body.get("negative_prompt").and_then(|v| v.as_str());
+    let backend = body.get("backend").and_then(|v| v.as_str());
+    if let Some(backend) = backend {
+        if !matches!(backend, "cpu" | "gpu") {
+            return Err(format!(
+                "backend {backend:?} unsupported: expected \"cpu\" or \"gpu\""
+            ));
+        }
+    }
+    let request_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
+    // Serialize against chat traffic and cap queue depth the same way the
+    // chat path does; the daemon processes messages sequentially.
+    let guard = shared.admission.acquire().map_err(|e| e.to_string())?;
+    let _guard = guard;
+
+    let (engine, loaded_model) = {
+        let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        (runtime.engine.clone(), runtime.current_path.clone())
+    };
+    let model_echo = loaded_model
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or(request_model)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let id = request_id();
+    let mut request = serde_json::json!({
+        "type": "img_generate",
+        "id": id,
+        "prompt": prompt,
+    });
+    if let Some(width) = width {
+        request["width"] = serde_json::json!(width);
+    }
+    if let Some(height) = height {
+        request["height"] = serde_json::json!(height);
+    }
+    // Reference images arrive only through `/v1/images/edits` (multipart file
+    // parts, the OpenAI shape), which puts their bytes under the internal
+    // `_reference_images` key. A client that sends `images` here is pointed
+    // at the right route; a path string is never forwarded to the daemon.
+    if body.get("images").is_some() {
+        return Err(
+            "images is not a field of /v1/images/generations; send the reference image \
+             files as multipart `image` parts to /v1/images/edits"
+                .to_string(),
+        );
+    }
+    if let Some(refs) = body.get("_reference_images") {
+        request["images"] = refs.clone();
+    }
+    if let Some(steps) = steps {
+        request["steps"] = serde_json::json!(steps);
+    }
+    if let Some(seed) = seed {
+        request["seed"] = serde_json::json!(seed);
+    }
+    // Forward the fail-closed surface so the daemon's single validation
+    // authority sees sampler/negative_prompt exactly as the client sent them.
+    if let Some(sampler) = sampler {
+        request["sampler"] = serde_json::json!(sampler);
+    }
+    if let Some(negative_prompt) = negative_prompt {
+        request["negative_prompt"] = serde_json::json!(negative_prompt);
+    }
+    if let Some(backend) = backend {
+        request["backend"] = serde_json::json!(backend);
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<serde_json::Value, String>>();
+    tokio::task::spawn_blocking(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.img_generate(&request, |_event| Ok(()))
+        }));
+        let result = match outcome {
+            Ok(Ok(done)) => Ok(done),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(payload) => Err(format!(
+                "image generation worker panicked: {}",
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string())
+            )),
+        };
+        let _ = tx.send(result);
+    });
+    let done = rx
+        .await
+        .map_err(|_| "image generation worker disconnected".to_string())?
+        .map_err(|e| e)?;
+
+    let b64 = done
+        .get("png_b64")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "daemon img_done missing png_b64".to_string())?
+        .to_owned();
+    let out_w = done
+        .get("width")
+        .and_then(|v| v.as_u64())
+        .or(width)
+        .unwrap_or(1024);
+    let out_h = done
+        .get("height")
+        .and_then(|v| v.as_u64())
+        .or(height)
+        .unwrap_or(1024);
+    {
+        let mut meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+        meta.requests_served += 1;
+    }
+    let response = serde_json::json!({
+        "created": unix_timestamp(),
+        "model": model_echo,
+        "data": [
+            {
+                "b64_json": b64,
+                "size": format!("{out_w}x{out_h}"),
+            }
+        ],
+        "hipfire": {
+            "seed": done.get("seed").and_then(|v| v.as_u64()).unwrap_or(0),
+            "steps": done.get("steps").and_then(|v| v.as_u64()).unwrap_or(0),
+            "width": out_w,
+            "height": out_h,
+            "ms": done.get("ms").and_then(|v| v.as_u64()).unwrap_or(0),
+        },
+    });
+    Ok(json_response(response, 200))
+}
+
 async fn read_json_body(body: Incoming, max_bytes: u64) -> Result<serde_json::Value> {
+    let bytes = read_body_bytes(body, max_bytes).await?;
+    serde_json::from_slice(&bytes).context("request body is not valid JSON")
+}
+
+async fn read_body_bytes(body: Incoming, max_bytes: u64) -> Result<Vec<u8>> {
     let mut bytes = Vec::new();
     let mut stream = body;
     while let Some(frame) = stream.frame().await {
@@ -624,7 +920,148 @@ async fn read_json_body(body: Incoming, max_bytes: u64) -> Result<serde_json::Va
     if bytes.len() as u64 > max_bytes {
         bail!("request body exceeds {max_bytes} bytes");
     }
-    serde_json::from_slice(&bytes).context("request body is not valid JSON")
+    Ok(bytes)
+}
+
+/// The `boundary` parameter of a `multipart/form-data` content type.
+fn multipart_boundary(content_type: &str) -> Option<&str> {
+    let mut parts = content_type.split(';');
+    if !parts
+        .next()?
+        .trim()
+        .eq_ignore_ascii_case("multipart/form-data")
+    {
+        return None;
+    }
+    parts
+        .map(str::trim)
+        .find_map(|p| p.strip_prefix("boundary="))
+        .map(|b| b.trim_matches('"'))
+        .filter(|b| !b.is_empty())
+}
+
+fn find_bytes(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// Minimal `multipart/form-data` reader for `/v1/images/edits`: the text
+/// fields as `(name, value)` and the raw bytes of every `image` file part, in
+/// order. Boundaries and part headers follow RFC 7578; nested multipart and
+/// transfer encodings are not accepted, which is all the OpenAI clients send.
+fn parse_multipart(
+    body: &[u8],
+    boundary: &str,
+) -> Result<(Vec<(String, String)>, Vec<Vec<u8>>), String> {
+    let delim = format!("--{boundary}");
+    let end_marker = format!("\r\n{delim}");
+    let mut fields = Vec::new();
+    let mut images = Vec::new();
+    let start = find_bytes(body, delim.as_bytes()).ok_or("multipart body has no boundary")?;
+    let mut rest = &body[start + delim.len()..];
+    loop {
+        if rest.starts_with(b"--") {
+            break;
+        }
+        let part_start = rest
+            .strip_prefix(b"\r\n")
+            .ok_or("malformed multipart part delimiter")?;
+        let hdr_end = find_bytes(part_start, b"\r\n\r\n")
+            .ok_or("multipart part without a header terminator")?;
+        let headers = std::str::from_utf8(&part_start[..hdr_end])
+            .map_err(|_| "multipart part headers are not UTF-8")?;
+        let content = &part_start[hdr_end + 4..];
+        let body_end =
+            find_bytes(content, end_marker.as_bytes()).ok_or("unterminated multipart part")?;
+        let part = &content[..body_end];
+        let mut name = None;
+        let mut is_file = false;
+        for line in headers.lines() {
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
+            if key.trim().eq_ignore_ascii_case("content-disposition") {
+                for param in value.split(';').map(str::trim) {
+                    if let Some(n) = param.strip_prefix("name=") {
+                        name = Some(n.trim_matches('"').to_string());
+                    }
+                    if param.starts_with("filename=") {
+                        is_file = true;
+                    }
+                }
+            }
+        }
+        let name = name.ok_or("multipart part without a name")?;
+        if name == "image" || name == "image[]" {
+            images.push(part.to_vec());
+        } else if is_file {
+            return Err(format!(
+                "unexpected file part {name:?}: only `image` file parts are accepted"
+            ));
+        } else {
+            fields.push((name, String::from_utf8_lossy(part).into_owned()));
+        }
+        rest = &content[body_end + end_marker.len()..];
+    }
+    Ok((fields, images))
+}
+
+/// `/v1/images/edits` body → the JSON the generations handler consumes: the
+/// text fields (numeric ones parsed), plus the image parts as base64 under
+/// the internal `_reference_images` key. At most four images.
+fn edits_form_to_body(
+    fields: Vec<(String, String)>,
+    images: Vec<Vec<u8>>,
+) -> Result<serde_json::Value, String> {
+    use base64::Engine as _;
+    if images.is_empty() {
+        return Err("an `image` file part is required".to_string());
+    }
+    if images.len() > 4 {
+        return Err("at most 4 reference images".to_string());
+    }
+    let mut body = serde_json::Map::new();
+    for (name, value) in fields {
+        let v = match name.as_str() {
+            "n" | "seed" | "steps" | "width" | "height" => serde_json::Value::from(
+                value
+                    .trim()
+                    .parse::<u64>()
+                    .map_err(|_| format!("{name} must be a non-negative integer, got {value:?}"))?,
+            ),
+            _ => serde_json::Value::from(value),
+        };
+        body.insert(name, v);
+    }
+    let refs: Vec<String> = images
+        .iter()
+        .map(|b| base64::engine::general_purpose::STANDARD.encode(b))
+        .collect();
+    body.insert("_reference_images".into(), serde_json::json!(refs));
+    Ok(serde_json::Value::Object(body))
+}
+
+fn images_error_status(message: &str) -> u16 {
+    let lower = message.to_ascii_lowercase();
+    if [
+        "refused",
+        "unsupported",
+        "invalid",
+        "required",
+        "must be",
+        "at most",
+        "not base64",
+        "reference image",
+        "not a field",
+        "multipart",
+        "no model loaded",
+    ]
+    .iter()
+    .any(|needle| lower.contains(needle))
+    {
+        400
+    } else {
+        500
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1085,5 +1522,57 @@ mod tests {
         let body = AckBody::new(b"x".to_vec(), ack_tx, acks);
         drop(body);
         assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)), Ok(Err(())));
+    }
+
+    /// `/v1/images/edits` reads the OpenAI multipart shape: text fields plus
+    /// `image` file parts, whose bytes (binary, CRLF included) reach the
+    /// daemon as base64 and never as a path.
+    #[test]
+    fn multipart_edit_form_carries_image_bytes_not_paths() {
+        let boundary = "xYz";
+        let png_bytes = b"\x89PNG\r\n\x1a\n\r\n--not-a-boundary".to_vec();
+        let mut body = Vec::new();
+        body.extend_from_slice(
+            b"--xYz\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nmake it blue\r\n",
+        );
+        body.extend_from_slice(
+            b"--xYz\r\nContent-Disposition: form-data; name=\"steps\"\r\n\r\n4\r\n",
+        );
+        body.extend_from_slice(
+            b"--xYz\r\nContent-Disposition: form-data; name=\"image\"; filename=\"ref.png\"\r\nContent-Type: image/png\r\n\r\n",
+        );
+        body.extend_from_slice(&png_bytes);
+        body.extend_from_slice(b"\r\n--xYz--\r\n");
+        assert_eq!(
+            multipart_boundary("multipart/form-data; boundary=xYz"),
+            Some(boundary)
+        );
+        assert_eq!(multipart_boundary("application/json"), None);
+        let (fields, images) = parse_multipart(&body, boundary).unwrap();
+        assert_eq!(
+            fields,
+            vec![
+                ("prompt".to_string(), "make it blue".to_string()),
+                ("steps".to_string(), "4".to_string())
+            ]
+        );
+        assert_eq!(images, vec![png_bytes.clone()]);
+        let json = edits_form_to_body(fields, images).unwrap();
+        assert_eq!(json["prompt"], "make it blue");
+        assert_eq!(json["steps"], 4);
+        use base64::Engine as _;
+        assert_eq!(
+            json["_reference_images"][0],
+            base64::engine::general_purpose::STANDARD.encode(&png_bytes)
+        );
+        // A file part under any other name is refused, and no image is an error.
+        let mut other = Vec::new();
+        other.extend_from_slice(b"--xYz\r\nContent-Disposition: form-data; name=\"mask\"; filename=\"m.png\"\r\n\r\nx\r\n--xYz--\r\n");
+        assert!(parse_multipart(&other, boundary)
+            .unwrap_err()
+            .contains("only `image`"));
+        assert!(edits_form_to_body(vec![], vec![])
+            .unwrap_err()
+            .contains("required"));
     }
 }

@@ -201,7 +201,7 @@ pub fn quantize_to_format(
                     "reap: MFP4-E8-SoA-GPTQ requires rank-2 tensor {name}"
                 ));
             };
-            let hessian_dir = std::env::var("HIPFIRE_E8_HESSIAN_DIR")
+            let hessian_dir = hipfire_config::developer_var("HIPFIRE_E8_HESSIAN_DIR")
                 .map_err(|_| "mfp4e8soa-gptq requires HIPFIRE_E8_HESSIAN_DIR".to_string())?;
             let h_blocks = load_hessian_blocks(std::path::Path::new(&hessian_dir), name);
             if h_blocks.len() != k / 256 {

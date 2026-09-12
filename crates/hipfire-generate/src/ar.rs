@@ -34,6 +34,8 @@ use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use std::any::Any;
+use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::io::Write;
 use std::time::Instant;
 
@@ -700,7 +702,10 @@ pub fn qwen_ar_eviction_prefill_chunk_limit(
 }
 
 pub fn ckpt_resume_enabled() -> bool {
-    hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_RESUME").ok().as_deref() != Some("0")
+    hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_RESUME")
+        .ok()
+        .as_deref()
+        != Some("0")
 }
 pub fn ckpt_interval() -> usize {
     hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
@@ -735,8 +740,9 @@ pub fn truncate_checkpoints(
 ///
 /// Selected once at the top of [`generate`] and is the sole authority for
 /// dispatch branch choice and tools capability. Precedence matches production:
-/// EP → arch short-circuits (Qwen2, DeepSeek4, LFM, Cohere, MiniMax, dots) →
-/// pp>1 → Qwen/LLaMA DFlash/spec (MTP uses the generic wrapper) → default AR/unknown.
+/// EP → Qwen dense TP semantic AR / arch short-circuits (Qwen2, DeepSeek4, LFM,
+/// Cohere, MiniMax, dots) → pp>1 → Qwen/LLaMA DFlash/spec (MTP uses the generic
+/// wrapper) → default AR/unknown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GenerationRoute {
     QwenAr,
@@ -847,6 +853,617 @@ impl GenerationRoute {
         }
     }
 }
+/// Terminal kind used by the production route adapter registry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTerminal {
+    Done,
+    Error,
+    Cancel,
+}
+
+/// Terminal payload accepted by every production route adapter. The borrowed
+/// payload keeps the adapter seam allocation-free for normal done/error paths.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteTerminalEvent<'a> {
+    Done {
+        pending: Option<&'a serde_json::Value>,
+    },
+    Error {
+        id: Option<&'a str>,
+        message: Option<&'a str>,
+        class: &'a str,
+        retryable: bool,
+        rolled_back: bool,
+    },
+    Cancel {
+        completion_tokens: usize,
+    },
+}
+
+pub type RouteStartAdapter = fn(&mut dyn Write, &str, bool);
+pub type RouteTerminalAdapter =
+    for<'a> fn(&mut dyn Write, &str, u64, RouteTerminalEvent<'a>) -> TerminalEmitOutcome;
+
+thread_local! {
+    /// A route can fall through from speculative capacity checks into AR.
+    /// Keep the start edge one-shot per `(id, attempt)` so a producer adapter
+    /// can be installed at both boundaries without duplicating `gen_start`.
+    static ROUTE_START_LATCH: RefCell<HashSet<(String, u64)>> = RefCell::new(HashSet::new());
+    static ACTIVE_GENERATION_ROUTE: Cell<Option<GenerationRoute>> =
+        const { Cell::new(None) };
+}
+
+fn claim_route_start(id: &str, attempt: u64) -> bool {
+    ROUTE_START_LATCH.with(|latch| latch.borrow_mut().insert((id.to_owned(), attempt)))
+}
+
+fn release_route_start(id: &str, attempt: u64) {
+    ROUTE_START_LATCH.with(|latch| {
+        latch.borrow_mut().remove(&(id.to_owned(), attempt));
+    });
+}
+/// Set the route used by route-aware production terminal wrappers for the
+/// current generation thread.
+pub fn set_generation_route(route: GenerationRoute) {
+    ACTIVE_GENERATION_ROUTE.with(|active| active.set(Some(route)));
+}
+
+/// Clear the producer route after a terminal event. Batch drivers do not own
+/// a [`GenerationRouteScope`], so terminal wrappers must release both the
+/// active route and its per-request start latch themselves.
+fn clear_generation_route() {
+    ACTIVE_GENERATION_ROUTE.with(|active| active.set(None));
+}
+
+/// Request-owned route/latch guard.
+///
+/// The route is thread-local because producer helpers do not all receive the
+/// selected route explicitly. Keep the previous value so nested producers and
+/// standalone entry points cannot erase an outer request's route when they
+/// return. The start latch is still keyed to the exact attempt captured on
+/// entry; dropping one guard never clears another request's latch.
+pub struct GenerationRouteScope {
+    id: String,
+    attempt: u64,
+    previous_route: Option<GenerationRoute>,
+}
+
+impl GenerationRouteScope {
+    pub fn enter(route: GenerationRoute, id: &str) -> Self {
+        let previous_route = active_generation_route();
+        set_generation_route(route);
+        Self {
+            id: id.to_owned(),
+            attempt: active_attempt_id(),
+            previous_route,
+        }
+    }
+}
+
+impl Drop for GenerationRouteScope {
+    fn drop(&mut self) {
+        release_route_start(&self.id, self.attempt);
+        ACTIVE_GENERATION_ROUTE.with(|active| active.set(self.previous_route));
+    }
+}
+
+pub fn active_generation_route() -> Option<GenerationRoute> {
+    ACTIVE_GENERATION_ROUTE.with(Cell::get)
+}
+
+/// Concrete start/terminal pair for one selected generation route.
+#[derive(Clone, Copy)]
+pub struct GenerationRouteAdapter {
+    pub route: GenerationRoute,
+    pub start: RouteStartAdapter,
+    pub terminal: RouteTerminalAdapter,
+}
+
+impl GenerationRouteAdapter {
+    /// Emit the default route start used by route-cardinality tests.
+    pub fn emit_start(self, output: &mut dyn Write, id: &str) {
+        self.emit_start_with(output, id, false);
+    }
+
+    /// Emit a route start from a real producer. The latch lives in the
+    /// production adapter so fallback paths cannot write a second `gen_start`.
+    pub fn emit_start_with(self, output: &mut dyn Write, id: &str, started_in_think: bool) {
+        if claim_route_start(id, active_attempt_id()) {
+            (self.start)(output, id, started_in_think);
+        }
+    }
+
+    /// Compact route-only terminal used by the exhaustive barrier test.
+    pub fn emit_terminal(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        terminal: RouteTerminal,
+    ) -> bool {
+        let event = match terminal {
+            RouteTerminal::Done => RouteTerminalEvent::Done { pending: None },
+            RouteTerminal::Error => RouteTerminalEvent::Error {
+                id: Some(id),
+                message: None,
+                class: "internal",
+                retryable: false,
+                rolled_back: true,
+            },
+            RouteTerminal::Cancel => RouteTerminalEvent::Cancel {
+                completion_tokens: 0,
+            },
+        };
+        self.emit_terminal_event(output, id, attempt, event)
+    }
+
+    pub fn emit_done(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        pending: &serde_json::Value,
+    ) -> bool {
+        self.emit_terminal_event(
+            output,
+            id,
+            attempt,
+            RouteTerminalEvent::Done {
+                pending: Some(pending),
+            },
+        )
+    }
+
+    pub fn emit_error(
+        self,
+        output: &mut dyn Write,
+        id: Option<&str>,
+        attempt: u64,
+        message: &str,
+        class: &str,
+        retryable: bool,
+        rolled_back: bool,
+    ) -> bool {
+        self.emit_terminal_event(
+            output,
+            id.unwrap_or(""),
+            attempt,
+            RouteTerminalEvent::Error {
+                id,
+                message: Some(message),
+                class,
+                retryable,
+                rolled_back,
+            },
+        )
+    }
+
+    pub fn emit_cancel(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        completion_tokens: usize,
+    ) -> bool {
+        self.emit_terminal_event(
+            output,
+            id,
+            attempt,
+            RouteTerminalEvent::Cancel { completion_tokens },
+        )
+    }
+
+    fn emit_terminal_event(
+        self,
+        output: &mut dyn Write,
+        id: &str,
+        attempt: u64,
+        event: RouteTerminalEvent<'_>,
+    ) -> bool {
+        let outcome = (self.terminal)(output, id, attempt, event);
+        if outcome.claimed() {
+            release_route_start(id, attempt);
+        }
+        outcome.delivered()
+    }
+}
+
+fn emit_route_terminal(
+    output: &mut dyn Write,
+    id: &str,
+    _attempt: u64,
+    event: RouteTerminalEvent<'_>,
+    route_name: &'static str,
+) -> TerminalEmitOutcome {
+    let mut buffer = Vec::new();
+    let staged = match event {
+        RouteTerminalEvent::Done {
+            pending: Some(pending),
+        } => emit_staged_terminal_done_outcome(&mut buffer, pending),
+        RouteTerminalEvent::Done { pending: None } => {
+            let pending = serde_json::json!({
+                "type": "done",
+                "id": id,
+                "attempt_id": active_attempt_id(),
+                "finish_reason": "stop",
+            });
+            emit_staged_terminal_done_outcome(&mut buffer, &pending)
+        }
+        RouteTerminalEvent::Error {
+            id: event_id,
+            message,
+            class,
+            retryable,
+            rolled_back,
+        } => {
+            let fallback;
+            let message = match message {
+                Some(message) => message,
+                None => {
+                    fallback = format!("{route_name} terminal error");
+                    &fallback
+                }
+            };
+            emit_active_attempt_error_outcome(
+                &mut buffer,
+                event_id,
+                message,
+                class,
+                retryable,
+                rolled_back,
+            )
+        }
+        RouteTerminalEvent::Cancel { completion_tokens } => {
+            emit_qwen_ar_cancelled_outcome(&mut buffer, id, completion_tokens)
+        }
+    };
+    if !staged.delivered() {
+        return staged;
+    }
+    if output.write_all(&buffer).is_err() {
+        return staged.with_delivery(false);
+    }
+    staged.with_delivery(output.flush().is_ok())
+}
+
+macro_rules! define_route_start {
+    ($name:ident, $arch:expr) => {
+        fn $name(output: &mut dyn Write, id: &str, started_in_think: bool) {
+            let mut buffer = Vec::new();
+            emit_gen_start(
+                &mut buffer,
+                id,
+                started_in_think,
+                gen_start_contract_version_for_arch($arch),
+            );
+            let _ = output.write_all(&buffer);
+            let _ = output.flush();
+        }
+    };
+}
+
+macro_rules! define_route_terminal {
+    ($name:ident, $route:expr) => {
+        fn $name(
+            output: &mut dyn Write,
+            id: &str,
+            attempt: u64,
+            event: RouteTerminalEvent<'_>,
+        ) -> TerminalEmitOutcome {
+            emit_route_terminal(output, id, attempt, event, $route.name())
+        }
+    };
+}
+
+define_route_start!(qwen_ar_route_start, 5);
+define_route_start!(qwen_dflash_route_start, 5);
+define_route_start!(qwen2_ar_route_start, 7);
+define_route_start!(qwen2_spec_route_start, 7);
+define_route_start!(deepseek4_ar_route_start, 9);
+fn deepseek4_ep_route_start(output: &mut dyn Write, id: &str, started_in_think: bool) {
+    let mut buffer = Vec::new();
+    crate::qwen::emit_ds4_ep_gen_start(
+        &mut buffer,
+        id,
+        if started_in_think {
+            ThinkMode::Low
+        } else {
+            ThinkMode::NonThink
+        },
+    );
+    let _ = output.write_all(&buffer);
+    let _ = output.flush();
+}
+define_route_start!(deepseek4_spec_route_start, 9);
+define_route_start!(cohere_ar_route_start, 12);
+define_route_start!(cohere_spec_route_start, 12);
+define_route_start!(maple_ar_route_start, 15);
+define_route_start!(minimax_ar_route_start, 10);
+define_route_start!(minimax_ep_route_start, 10);
+define_route_start!(minimax_spec_route_start, 10);
+define_route_start!(lfm_ar_route_start, 11);
+define_route_start!(lfm_spec_route_start, 11);
+define_route_start!(llama_ar_route_start, 0);
+define_route_start!(llama_spec_route_start, 0);
+define_route_start!(glimmer_ar_route_start, 14);
+define_route_start!(glimmer_spec_route_start, 14);
+define_route_start!(pipeline_parallel_route_start, 5);
+define_route_start!(dots_ocr_route_start, 8);
+define_route_start!(unknown_route_start, 255);
+
+define_route_terminal!(qwen_ar_route_terminal, GenerationRoute::QwenAr);
+define_route_terminal!(qwen_dflash_route_terminal, GenerationRoute::QwenDflash);
+define_route_terminal!(qwen2_ar_route_terminal, GenerationRoute::Qwen2Ar);
+define_route_terminal!(qwen2_spec_route_terminal, GenerationRoute::Qwen2Spec);
+define_route_terminal!(deepseek4_ar_route_terminal, GenerationRoute::Deepseek4Ar);
+define_route_terminal!(deepseek4_ep_route_terminal, GenerationRoute::Deepseek4Ep);
+define_route_terminal!(
+    deepseek4_spec_route_terminal,
+    GenerationRoute::Deepseek4Spec
+);
+define_route_terminal!(cohere_ar_route_terminal, GenerationRoute::CohereAr);
+define_route_terminal!(cohere_spec_route_terminal, GenerationRoute::CohereSpec);
+define_route_terminal!(maple_ar_route_terminal, GenerationRoute::MapleAr);
+define_route_terminal!(minimax_ar_route_terminal, GenerationRoute::MiniMaxAr);
+define_route_terminal!(minimax_ep_route_terminal, GenerationRoute::MiniMaxEp);
+define_route_terminal!(minimax_spec_route_terminal, GenerationRoute::MiniMaxSpec);
+define_route_terminal!(lfm_ar_route_terminal, GenerationRoute::LfmAr);
+define_route_terminal!(lfm_spec_route_terminal, GenerationRoute::LfmSpec);
+define_route_terminal!(llama_ar_route_terminal, GenerationRoute::LlamaAr);
+define_route_terminal!(llama_spec_route_terminal, GenerationRoute::LlamaSpec);
+define_route_terminal!(glimmer_ar_route_terminal, GenerationRoute::GlimmerAr);
+define_route_terminal!(glimmer_spec_route_terminal, GenerationRoute::GlimmerSpec);
+define_route_terminal!(
+    pipeline_parallel_route_terminal,
+    GenerationRoute::PipelineParallel
+);
+define_route_terminal!(dots_ocr_route_terminal, GenerationRoute::DotsOcr);
+define_route_terminal!(unknown_route_terminal, GenerationRoute::Unknown);
+
+/// Return the concrete lifecycle producer adapter for every route in
+/// `GenerationRoute::ALL`. `None` is reserved for future variants.
+pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRouteAdapter> {
+    let adapter = match route {
+        GenerationRoute::QwenAr => GenerationRouteAdapter {
+            route,
+            start: qwen_ar_route_start,
+            terminal: qwen_ar_route_terminal,
+        },
+        GenerationRoute::QwenDflash => GenerationRouteAdapter {
+            route,
+            start: qwen_dflash_route_start,
+            terminal: qwen_dflash_route_terminal,
+        },
+        GenerationRoute::Qwen2Ar => GenerationRouteAdapter {
+            route,
+            start: qwen2_ar_route_start,
+            terminal: qwen2_ar_route_terminal,
+        },
+        GenerationRoute::Qwen2Spec => GenerationRouteAdapter {
+            route,
+            start: qwen2_spec_route_start,
+            terminal: qwen2_spec_route_terminal,
+        },
+        GenerationRoute::Deepseek4Ar => GenerationRouteAdapter {
+            route,
+            start: deepseek4_ar_route_start,
+            terminal: deepseek4_ar_route_terminal,
+        },
+        GenerationRoute::Deepseek4Ep => GenerationRouteAdapter {
+            route,
+            start: deepseek4_ep_route_start,
+            terminal: deepseek4_ep_route_terminal,
+        },
+        GenerationRoute::Deepseek4Spec => GenerationRouteAdapter {
+            route,
+            start: deepseek4_spec_route_start,
+            terminal: deepseek4_spec_route_terminal,
+        },
+        GenerationRoute::CohereAr => GenerationRouteAdapter {
+            route,
+            start: cohere_ar_route_start,
+            terminal: cohere_ar_route_terminal,
+        },
+        GenerationRoute::CohereSpec => GenerationRouteAdapter {
+            route,
+            start: cohere_spec_route_start,
+            terminal: cohere_spec_route_terminal,
+        },
+        GenerationRoute::MapleAr => GenerationRouteAdapter {
+            route,
+            start: maple_ar_route_start,
+            terminal: maple_ar_route_terminal,
+        },
+        GenerationRoute::MiniMaxAr => GenerationRouteAdapter {
+            route,
+            start: minimax_ar_route_start,
+            terminal: minimax_ar_route_terminal,
+        },
+        GenerationRoute::MiniMaxEp => GenerationRouteAdapter {
+            route,
+            start: minimax_ep_route_start,
+            terminal: minimax_ep_route_terminal,
+        },
+        GenerationRoute::MiniMaxSpec => GenerationRouteAdapter {
+            route,
+            start: minimax_spec_route_start,
+            terminal: minimax_spec_route_terminal,
+        },
+        GenerationRoute::LfmAr => GenerationRouteAdapter {
+            route,
+            start: lfm_ar_route_start,
+            terminal: lfm_ar_route_terminal,
+        },
+        GenerationRoute::LfmSpec => GenerationRouteAdapter {
+            route,
+            start: lfm_spec_route_start,
+            terminal: lfm_spec_route_terminal,
+        },
+        GenerationRoute::LlamaAr => GenerationRouteAdapter {
+            route,
+            start: llama_ar_route_start,
+            terminal: llama_ar_route_terminal,
+        },
+        GenerationRoute::LlamaSpec => GenerationRouteAdapter {
+            route,
+            start: llama_spec_route_start,
+            terminal: llama_spec_route_terminal,
+        },
+        GenerationRoute::GlimmerAr => GenerationRouteAdapter {
+            route,
+            start: glimmer_ar_route_start,
+            terminal: glimmer_ar_route_terminal,
+        },
+        GenerationRoute::GlimmerSpec => GenerationRouteAdapter {
+            route,
+            start: glimmer_spec_route_start,
+            terminal: glimmer_spec_route_terminal,
+        },
+        GenerationRoute::PipelineParallel => GenerationRouteAdapter {
+            route,
+            start: pipeline_parallel_route_start,
+            terminal: pipeline_parallel_route_terminal,
+        },
+        GenerationRoute::DotsOcr => GenerationRouteAdapter {
+            route,
+            start: dots_ocr_route_start,
+            terminal: dots_ocr_route_terminal,
+        },
+        GenerationRoute::Unknown => GenerationRouteAdapter {
+            route,
+            start: unknown_route_start,
+            terminal: unknown_route_terminal,
+        },
+    };
+    Some(adapter)
+}
+
+fn production_route_adapter(route: GenerationRoute) -> GenerationRouteAdapter {
+    generation_route_adapter(route)
+        .unwrap_or_else(|| unreachable!("missing production adapter for {}", route.name()))
+}
+
+pub fn emit_generation_start(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: &str,
+    started_in_think: bool,
+) {
+    set_generation_route(route);
+    production_route_adapter(route).emit_start_with(output, id, started_in_think);
+}
+
+pub fn emit_generation_done(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: &str,
+    pending: &serde_json::Value,
+) -> bool {
+    let delivered =
+        production_route_adapter(route).emit_done(output, id, active_attempt_id(), pending);
+    clear_generation_route();
+    delivered
+}
+pub fn emit_generation_done_value(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    pending: &serde_json::Value,
+) -> bool {
+    let id = pending
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    emit_generation_done(route, output, id, pending)
+}
+
+pub fn emit_generation_error(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) -> bool {
+    let delivered = production_route_adapter(route).emit_error(
+        output,
+        id,
+        active_attempt_id(),
+        message,
+        class,
+        retryable,
+        rolled_back,
+    );
+    clear_generation_route();
+    delivered
+}
+
+pub fn emit_generation_cancel(
+    route: GenerationRoute,
+    output: &mut dyn Write,
+    id: &str,
+    completion_tokens: usize,
+) -> bool {
+    let delivered = production_route_adapter(route).emit_cancel(
+        output,
+        id,
+        active_attempt_id(),
+        completion_tokens,
+    );
+    clear_generation_route();
+    delivered
+}
+
+pub fn emit_active_route_error(
+    output: &mut dyn Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    if let Some(route) = active_generation_route() {
+        emit_generation_error(route, output, id, message, class, retryable, rolled_back);
+    } else {
+        let mut buffer = Vec::new();
+        hipfire_engine::emit::emit_active_attempt_error(
+            &mut buffer,
+            id,
+            message,
+            class,
+            retryable,
+            rolled_back,
+        );
+        let _ = output.write_all(&buffer);
+    }
+}
+
+pub fn emit_active_route_done(output: &mut dyn Write, id: &str, pending: &serde_json::Value) {
+    if let Some(route) = active_generation_route() {
+        emit_generation_done(route, output, id, pending);
+    } else {
+        let mut buffer = Vec::new();
+        emit_staged_terminal_done(&mut buffer, pending);
+        let _ = output.write_all(&buffer);
+    }
+}
+pub fn emit_active_route_done_value(output: &mut dyn Write, pending: &serde_json::Value) {
+    let id = pending
+        .get("id")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    emit_active_route_done(output, id, pending);
+}
+
+pub fn emit_active_route_cancel(output: &mut dyn Write, id: &str, completion_tokens: usize) {
+    if let Some(route) = active_generation_route() {
+        emit_generation_cancel(route, output, id, completion_tokens);
+    } else {
+        let mut buffer = Vec::new();
+        emit_qwen_ar_cancelled(&mut buffer, id, completion_tokens);
+        let _ = output.write_all(&buffer);
+    }
+}
 
 /// Pure inputs for [`select_generation_route`]. No GPU/env side effects.
 #[derive(Debug, Clone, Copy)]
@@ -881,6 +1498,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
     // 1. Expert-parallel first (before any arch short-circuit).
     if i.ep {
         return match i.arch_id {
+            5 | 6 => GenerationRoute::QwenAr,
             9 => GenerationRoute::Deepseek4Ep,
             10 => GenerationRoute::MiniMaxEp,
             // EP on an unregistered arch — still EP-served, not tool-safe.
@@ -1118,8 +1736,14 @@ pub fn generate(
         nonneutral_penalties: repeat_penalty != 1.0
             || presence_penalty != 0.0
             || frequency_penalty != 0.0,
-        force_ar_chat: hipfire_config::developer_var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0"),
-        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
+        force_ar_chat: hipfire_config::developer_var("HIPFIRE_DFLASH_CHAT")
+            .ok()
+            .as_deref()
+            == Some("0"),
+        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
+            .ok()
+            .as_deref()
+            == Some("0"),
         fast_sample_on: hipfire_runtime::config::get().dflash_fast_sample,
         supports_temp_swor,
         supports_chain_nucleus_verify,
@@ -1153,20 +1777,39 @@ pub fn generate(
         let _ = stdout.flush();
         return;
     }
+    let _route_scope = GenerationRouteScope::enter(selected_route, id);
 
     match hipfire_loader::generation_early_route(m.arch_id) {
         Some(hipfire_loader::GenerationEarlyRoute::Gemma4) => {
             // The loader publishes one of two mutually-exclusive Gemma4 states:
             // eager dense (ModelState::Gemma4) and lowered/MoE
-            // (ModelState::Gemma4Lowered). The generate body is eager-only, so a
-            // lowered load must fail loudly here rather than silently run eager
-            // against lowered weights.
+            // (ModelState::Gemma4Lowered). Lowered models are served by
+            // generate_gemma4_lowered below; eager models continue through
+            // generate_gemma4.
             if m.gemma4_lowered_mut().is_some() {
-                emit_error_with_id(
-                stdout,
-                id,
-                "gemma4 lowered/MoE generate not yet wired on this build (eager dense only) —                  reload without batched/WMMA prefill opt-in or the MoE variant",
-            );
+                crate::dense::generate_gemma4_lowered(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    prompt,
+                    system_prompt,
+                    temp,
+                    top_p,
+                    top_k,
+                    min_p,
+                    max_tokens,
+                    repeat_penalty,
+                    repeat_window,
+                    presence_penalty,
+                    frequency_penalty,
+                    max_think_tokens,
+                    enable_thinking,
+                    tools,
+                    messages_history,
+                    logprobs_top_k,
+                    request_seed,
+                );
                 return;
             }
             let _ = (
@@ -1305,8 +1948,9 @@ pub fn generate(
             );
             return;
         }
-        GenerationRoute::Unknown if m.ep.is_some() => {
-            // EP on an unregistered arch_id — preserve tool-free EP serve.
+        GenerationRoute::QwenAr | GenerationRoute::Unknown if m.ep.is_some() => {
+            // Dense Qwen TP is a QwenAr semantic producer; unknown EP
+            // architectures retain the historical tool-free EP fallback.
             let ep_sampling = crate::qwen::EpSampling {
                 temp,
                 top_p,
@@ -1765,7 +2409,7 @@ pub fn generate(
             return;
         }
         GenerationRoute::PipelineParallel => {
-            crate::qwen::generate_multi(
+            crate::qwen::generate_mesh_carrier(
                 m,
                 gpu,
                 pflash_state,
@@ -1907,9 +2551,14 @@ pub fn generate(
     // budget+beta+safety regardless of conversation length, so reset never
     // needs to fire — eviction reclaims slots after each token. When eviction
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
-    let tokenizer = m.tokenizer.as_ref().unwrap();
-    let prompt_est = tokenizer.encode(prompt).len() + 20;
-    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+    // Borrow `tokenizer` per-use (never held across whole-`m` calls): the
+    // context-full reset below reborrows `m` through the canonical reset.
+    let prompt_est = m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20;
+    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "[qwen-cache GEN-ENTRY] conv_tok={} seq_pos={}",
             m.conversation_tokens.len(),
@@ -1935,36 +2584,40 @@ pub fn generate(
         // HIPFIRE_DFLASH_CHAT=0), so its drafter state must not survive here.
         if let Some(s) = m.speculator.as_mut() {
             if let Err(e) = s.reset(gpu) {
-                crate::dense::emit_active_attempt_error(
+                // G4.7: attest the reset attempt (invalidate + sync) so the
+                // terminal reports whether retry is safe.
+                let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                crate::common::emit_fail_closed_error(
                     stdout,
                     Some(id),
                     &format!("context reset failed: {e}"),
                     "gpu",
                     true,
-                    false,
+                    &ep,
                 );
                 return;
             }
         }
         // Zero DeltaNet state on reset. qwen35 recurrent state lives in the
         // bundle (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
-        // Use the canonical reset so newly added recurrent buffers (notably the
-        // Q8 error-feedback residual) cannot leak across rollover boundaries.
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            if let Err(e) = b.dn_state.reset(gpu) {
-                crate::dense::emit_active_attempt_error(
-                    stdout,
-                    Some(id),
-                    &format!("context reset failed: {e}"),
-                    "gpu",
-                    true,
-                    false,
-                );
-                return;
-            }
-            b.kv_cache.compact_offset = 0;
+        // Canonical reset (G4.7 E4): replaces `dn_state.reset` so all four
+        // buffers (notably the Q8 error-feedback residual) accumulate errors
+        // instead of short-circuiting; KV compact_offset is handled inside.
+        // Single path only (pp>1 never reaches this route). Llama/adaptive
+        // arms below are unchanged.
+        if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
+            // G4.7: attest the reset attempt (invalidate + sync) so the
+            // terminal reports whether retry is safe.
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("context reset failed: {e}"),
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
         }
         if let Some(b) = m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
@@ -1981,6 +2634,7 @@ pub fn generate(
             }
         }
     }
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // `nl` is needed for the trailer write after natural <|im_end|>
     // termination; `im_end` derives the EOS-check token id. Other
@@ -2203,7 +2857,10 @@ pub fn generate(
     // Jinja default-ON (flipped 2026-06-09): render through the model's chat
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0");
     // Jinja renders the FULL conversation every turn (stateless full-render,
     // like crate::qwen::generate_dflash) — fire on every turn, not just `seq_pos == 0`.
     // `render_messages` below replays `messages_history` (all prior turns) and
@@ -2335,7 +2992,10 @@ pub fn generate(
     // (seq_pos=0, conversation_tokens.clear(), zero DeltaNet, KV
     // compact_offset=0) and prefill the FULL rendered prompt — DeltaNet
     // is not reversible to position M<N so partial rollback is unsafe.
-    let cache_kill_switch = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_kill_switch = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
+        .ok()
+        .as_deref()
+        == Some("0");
     let pflash_active = pflash_cfg
         .map(|c| !matches!(c.mode, hipfire_pflash::pflash::PflashMode::Off))
         .unwrap_or(false);
@@ -2351,7 +3011,10 @@ pub fn generate(
     // so the operator gets consistent rendering across all turns.
     // Cache-with-Jinja is a future project (would require Jinja-side
     // assistant-turn replay).
-    let jinja_active = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0")
+    let jinja_active = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0")
         && m.chat_template.is_some();
     // Cache-with-Jinja (item #37): `jinja_active` is NO LONGER a disqualifier.
     // When jinja is active the prompt-build below routes through
@@ -2363,7 +3026,11 @@ pub fn generate(
         && m.eviction.is_none()
         && !pflash_active
         && !m.conversation_tokens.is_empty();
-    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} !pflash={} jinja={} conv_tok={}",
             cache_eligible, cache_kill_switch, messages_history.is_some(),
@@ -2373,7 +3040,10 @@ pub fn generate(
     let mut cached_tokens_count: usize = 0;
     let new_tokens: Vec<u32> = if cache_eligible {
         let history = messages_history.unwrap();
-        let trace_cache = hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
+        let trace_cache = hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1");
         // Build the canonical full-conversation token stream, replaying
         // any historical assistant turn whose fingerprint matches a
         // cached emission (BPE-bijective replacement).
@@ -2382,11 +3052,12 @@ pub fn generate(
             // model's trained template, splicing each cached assistant turn's
             // VERBATIM tokens in place of its content (sentinel substitution).
             // The store side (`asst_turn_cache`) holds the GENERATED body only
-            // (post-primer); the template renders a history assistant turn as
-            // `<|im_start|>assistant\n{content}` with NO generation primer, so
-            // we prepend the assistant-opener primer (e.g. `<think>\n`) that
-            // THIS turn's cold render emitted — making the spliced stream
-            // byte-match `conversation_tokens` for a clean forward extension.
+            // (post-primer). Whether the template re-emits the generation
+            // primer (e.g. `<think>\n\n</think>\n\n`) on a HISTORY assistant
+            // turn is template-specific: Qwen3.5 renders history turns bare,
+            // Qwen3.8 re-emits the empty-think block. Prepend the primer THIS
+            // turn's cold render emitted only when the template does not, so
+            // the spliced stream byte-matches `conversation_tokens`.
             let primer: Vec<u32> = {
                 let im_start = tokenizer.special_token_id("<|im_start|>");
                 let opener_len = tokenizer.encode("<|im_start|>assistant\n").len();
@@ -2408,32 +3079,23 @@ pub fn generate(
                 reasoning_strength: None,
                 reasoning_effort,
             };
+            let primer: Vec<u32> =
+                if hipfire_runtime::prompt_frame::template_emits_history_primer(&frame, &primer) {
+                    Vec::new()
+                } else {
+                    primer
+                };
             let cache_ref = &mut m.asst_turn_cache;
             let built = hipfire_runtime::prompt_frame::build_cached_history_jinja(
                 &frame,
                 history,
                 tools,
                 |msg| {
-                    let normalized =
-                        crate::common::normalize_asst_turn_for_fingerprint(&msg.content);
-                    let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    // Content-only turn: see the dflash sibling above for why `text` is
-                    // `msg.content`.
-                    let hit = cache_ref.get(&fp).and_then(|turn| {
-                        turn.content.as_ref().map(|c| {
-                            let mut v = primer.clone();
-                            v.extend_from_slice(&c.token_ids);
-                            hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                                reasoning: None,
-                                tools: Vec::new(),
-                                content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
-                                    token_ids: v,
-                                    text: msg.content.clone(),
-                                }),
-                            }
-                        })
-                    });
+                    let hit = crate::qwen::qwen_jinja_lookup_turn(&mut *cache_ref, msg, &primer);
                     if trace_cache {
+                        let normalized =
+                            crate::common::normalize_asst_turn_for_fingerprint(&msg.content);
+                        let fp = crate::common::asst_turn_fingerprint(&normalized, &msg.tool_calls);
                         eprintln!(
                             "[qwen-cache jinja lookup] fp={:#018x} role={:?} content.len={}/stripped.len={} primer={} hit={}",
                             fp, msg.role, msg.content.len(), normalized.len(), primer.len(), hit.is_some(),
@@ -2808,41 +3470,37 @@ pub fn generate(
         // path is reachable by a DFlash-capable model.
         if let Some(s) = m.speculator.as_mut() {
             if let Err(e) = s.reset(gpu) {
-                crate::dense::emit_active_attempt_error(
+                // G4.7: attest the reset attempt (invalidate + sync) so the
+                // terminal reports whether retry is safe.
+                let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                crate::common::emit_fail_closed_error(
                     stdout,
                     Some(id),
                     &format!("prompt-cache reset failed: {e}"),
                     "gpu",
                     true,
-                    false,
+                    &ep,
                 );
                 return;
             }
         }
         // qwen35 recurrent state lives in the bundle (ModelState::Qwen35), not
-        // the always-None m.dn_state/m.kv_cache. Inlined (disjoint field access)
-        // because a `&tokenizer` borrow of `m` is live here.
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            let dn = &b.dn_state;
-            for s in &dn.s_matrices {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_scales {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.conv_states {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-            for s in &dn.s_ef_residual {
-                let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
-            }
-        }
-        if let Some(b) = m.state.as_mut().and_then(|s| {
-            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
-        }) {
-            b.kv_cache.compact_offset = 0;
+        // the always-None m.dn_state/m.kv_cache. Canonical reset — no m-derived
+        // loan spans this block (the `tokenizer` rebind below keeps later uses
+        // on a fresh loan), so the whole-`m` call compiles. Error accumulation
+        // replaces the swallowed memsets; on failure fail closed rather than
+        // serving over dirty state.
+        if let Err(e) = crate::common::reset_qwen35_recurrent(m, gpu) {
+            let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+            crate::common::emit_fail_closed_error(
+                stdout,
+                Some(id),
+                &format!("prompt-cache reset failed: {e}"),
+                "gpu",
+                true,
+                &ep,
+            );
+            return;
         }
         if let Some(b) = m.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
@@ -2850,6 +3508,11 @@ pub fn generate(
             b.kv.compact_offset = 0;
         }
     }
+    // Rebind `tokenizer` past the cold-reset above: the pre-reset borrow
+    // ended at its last use, and this fresh borrow starts after the
+    // whole-`m` canonical reset call, so no loan spans it. Uses below
+    // resolve to this binding; uses above resolved to the earlier one.
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // KV-budget guard. Without eviction the physical buffer is the hard cap;
     // we must fit prefill + generation + trailer in one allocation. With
@@ -2940,10 +3603,7 @@ pub fn generate(
         _ => None,
     };
     let prefill_tokens = new_tokens.len();
-    // Pure arch→contract selection (same function tests exercise).
-    // Qwen AR (5/6) advertises v2; DS4 and others stay unset.
-    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, started_in_think, gen_contract);
+    emit_generation_start(selected_route, stdout, id, started_in_think);
     let t0 = Instant::now();
 
     if hipfire_loader::carrier_for(m.arch_id)
@@ -3065,17 +3725,20 @@ pub fn generate(
                     None,
                     qwen35::PREFILL_MAX_BATCH,
                 ) {
-                    let action = qwen_ar_forward_fail_action();
-                    if action.reset_uncommitted_state {
-                        reset_ar_uncommitted_state!();
-                    }
-                    if action.emit_request_error {
-                        write_error(
-                            stdout,
-                            id,
-                            &qwen_ar_forward_fail_message("forward_prefill_batch", e),
-                        );
-                    }
+                    // G4.7 fail-closed: attested rollback + correlated error
+                    // (no done, no cache store). Terminal identical except
+                    // `rolled_back` is now attested. Drops live bundle borrows
+                    // first (diverging block; intact on fallthrough).
+                    let _ = (kv, dn, weights, config, scratch);
+                    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                    crate::common::emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &qwen_ar_forward_fail_message("forward_prefill_batch", e),
+                        "internal",
+                        false,
+                        &ep,
+                    );
                     return;
                 }
                 m.seq_pos += chunk_len;
@@ -3099,8 +3762,13 @@ pub fn generate(
                                 "[adaptive-kv] maybe_downshift error @ pos {} (eviction prefill): {:?} — poisoning model",
                                 m.seq_pos, e
                             );
-                            reset_ar_uncommitted_state!();
-                            crate::dense::emit_active_attempt_error(
+                            // G4.7 fail-closed: DN already advanced — full
+                            // attested rollback. Keeps `transient`/retryable;
+                            // only `rolled_back` is now attested.
+                            let _ = (kv, dn, weights, config, scratch);
+                            let ep =
+                                crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                            crate::common::emit_fail_closed_error(
                                 stdout,
                                 Some(id),
                                 &format!(
@@ -3108,9 +3776,8 @@ pub fn generate(
                                 ),
                                 "transient",
                                 true,
-                                false,
+                                &ep,
                             );
-                            let _ = stdout.flush();
                             return;
                         }
                     }
@@ -3147,17 +3814,19 @@ pub fn generate(
                 if let Err(e) = qwen35::forward_prefill_batch(
                     gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,
                 ) {
-                    let action = qwen_ar_forward_fail_action();
-                    if action.reset_uncommitted_state {
-                        reset_ar_uncommitted_state!();
-                    }
-                    if action.emit_request_error {
-                        write_error(
-                            stdout,
-                            id,
-                            &qwen_ar_forward_fail_message("forward_prefill_batch", e),
-                        );
-                    }
+                    // G4.7 fail-closed: attested rollback + correlated error
+                    // (no done, no cache store). Terminal identical except
+                    // `rolled_back` is now attested.
+                    let _ = (kv, dn, weights, config, scratch);
+                    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                    crate::common::emit_fail_closed_error(
+                        stdout,
+                        Some(id),
+                        &qwen_ar_forward_fail_message("forward_prefill_batch", e),
+                        "internal",
+                        false,
+                        &ep,
+                    );
                     return;
                 }
                 m.seq_pos += chunk.len();
@@ -3183,16 +3852,21 @@ pub fn generate(
                                 "[adaptive-kv] maybe_downshift error @ pos {} (prefill): {:?} — poisoning model",
                                 m.seq_pos, e
                             );
+                            // G4.7 fail-closed: DN already advanced — full
+                            // attested rollback. Keeps `transient`/retryable;
+                            // only `rolled_back` is now attested.
                             // maybe_downshift already poisons on partial failure; surface hard.
-                            crate::dense::emit_active_attempt_error(
+                            let _ = (kv, dn, weights, config, scratch);
+                            let ep =
+                                crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                            crate::common::emit_fail_closed_error(
                                 stdout,
                                 Some(id),
                                 &format!("adaptive KV transition failed during prefill: {e}"),
                                 "transient",
                                 true,
-                                false,
+                                &ep,
                             );
-                            let _ = stdout.flush();
                             return;
                         }
                     }
@@ -3241,15 +3915,20 @@ pub fn generate(
                         "[adaptive-kv] maybe_downshift error @ pos {} (post-prefill): {:?} — poisoning model",
                         m.seq_pos, e
                     );
-                    crate::dense::emit_active_attempt_error(
+                    // G4.7 fail-closed: DN already advanced — full attested
+                    // rollback (this site previously had no reset; the next
+                    // turn would prefill over drifted state). Keeps
+                    // `transient`/retryable; only `rolled_back` attested.
+                    let _ = (kv, dn, weights, config, scratch);
+                    let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                    crate::common::emit_fail_closed_error(
                         stdout,
                         Some(id),
                         &format!("adaptive KV transition failed after prefill: {e}"),
                         "transient",
                         true,
-                        false,
+                        &ep,
                     );
-                    let _ = stdout.flush();
                     return;
                 }
             }
@@ -3332,7 +4011,9 @@ pub fn generate(
         //
         // Disable with `HIPFIRE_QWEN35_GRAMMAR=0` for A/B comparison.
         let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-            hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+            hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+                .ok()
+                .as_deref(),
             &m.model_path,
         );
         let tool_schemas_qwen: Vec<saddle_core::grammar::json::ToolSchema> = if grammar_enabled {
@@ -3494,10 +4175,11 @@ pub fn generate(
         // +256 EOS below only counts in-think tokens, so a non-think ramble or a
         // re-open loop after the cap latches would run to max_tokens. Hard-EOS
         // once generation runs this many tokens past the latch.
-        let post_latch_answer_budget: usize = hipfire_config::developer_var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(768);
+        let post_latch_answer_budget: usize =
+            hipfire_config::developer_var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(768);
         let mut latch_gen_mark: Option<usize> = None;
 
         // N-gram loop detector: track 4-gram token sequences. When any
@@ -3545,21 +4227,38 @@ pub fn generate(
             if let Err(e) = qwen35::forward_scratch(
                 gpu, weights, config, next_token, m.seq_pos, kv, dn, scratch,
             ) {
-                let action = qwen_ar_forward_fail_action();
-                debug_assert!(!action.emit_failed_token);
-                if action.reset_uncommitted_state {
-                    reset_ar_uncommitted_state!();
-                }
-                if action.emit_request_error {
-                    write_error(
-                        stdout,
-                        id,
-                        &qwen_ar_forward_fail_message("forward_scratch decode", e),
-                    );
-                }
+                // G4.7 fail-closed: attested rollback + correlated error
+                // (no done, no cache store). Terminal identical except
+                // `rolled_back` is now attested.
+                let _ = (kv, dn, weights, config, scratch);
+                let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    &qwen_ar_forward_fail_message("forward_scratch decode", e),
+                    "internal",
+                    false,
+                    &ep,
+                );
                 return;
             }
             generated += 1;
+            // Test-only fault seam (G4.7, mirrors dense G4.10): fires after the
+            // first decode forward's GPU/KV mutation, before any token
+            // visibility. Same fail-closed terminal as the prefill seam.
+            if generated == 1 && crate::common::take_generation_fault_after_first_decode() {
+                let _ = (kv, dn, weights, config, scratch);
+                let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                crate::common::emit_fail_closed_error(
+                    stdout,
+                    Some(id),
+                    "injected fault after first decode",
+                    "gpu",
+                    true,
+                    &ep,
+                );
+                return;
+            }
             // Incremental UTF-8 + filter routing via producer-owned
             // commit-then-classify. Raw commit (conversation/stream/seq_pos)
             // runs inside the closure before fallible classify; decode delta
@@ -3634,15 +4333,20 @@ pub fn generate(
                             "[adaptive-kv] maybe_downshift error @ pos {} (decode): {:?} — poisoning model",
                             m.seq_pos, e
                         );
-                        crate::dense::emit_active_attempt_error(
+                        // G4.7 fail-closed: DN already advanced — full attested
+                        // rollback (this site previously had no reset; the next
+                        // turn would prefill over drifted state). Keeps
+                        // `transient`/retryable; only `rolled_back` attested.
+                        let _ = (kv, dn, weights, config, scratch);
+                        let ep = crate::common::production_fail_closed_rollback(m, gpu, None, None);
+                        crate::common::emit_fail_closed_error(
                             stdout,
                             Some(id),
                             &format!("adaptive KV transition failed during decode: {e}"),
                             "transient",
                             true,
-                            false,
+                            &ep,
                         );
-                        let _ = stdout.flush();
                         return;
                     }
                 }
@@ -4277,7 +4981,11 @@ pub fn generate(
                     cached_seq.pop();
                 }
             }
-            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
                 eprintln!(
                     "[qwen-cache store] cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
                     cached_seq.len(),
@@ -4290,12 +4998,28 @@ pub fn generate(
                         .collect::<String>(),
                 );
             }
+            // Whole-envelope store (Qwen branch only): FULL generated body
+            // verbatim plus the producer reasoning text. The shared lookup
+            // replays R...A as one span on think-envelope templates;
+            // no-reasoning turns keep the primer-prepended single-slot path.
+            let tok = m.tokenizer.as_ref().unwrap();
             let _ = qwen_ar_apply_cache_action(
                 |fp, seq| {
+                    let reasoning = hipfire_runtime::prompt_frame::cached_producer_reasoning_text(
+                        tok,
+                        &seq,
+                        started_in_think,
+                    )
+                    .map(|text| {
+                        hipfire_runtime::prompt_frame::CachedAssistantBody {
+                            token_ids: Vec::new(),
+                            text,
+                        }
+                    });
                     m.asst_turn_cache.insert(
                         fp,
                         hipfire_runtime::prompt_frame::CachedAssistantTurn {
-                            reasoning: None,
+                            reasoning,
                             tools: Vec::new(),
                             content: Some(hipfire_runtime::prompt_frame::CachedAssistantBody {
                                 token_ids: seq,
@@ -4309,7 +5033,7 @@ pub fn generate(
             );
         }
 
-        emit_staged_terminal_done(stdout, &pending_done);
+        emit_active_route_done(stdout, id, &pending_done);
     } else {
         // LLaMA path -- multi-turn aware
         let has_eviction = m.eviction.is_some();
@@ -4335,7 +5059,7 @@ pub fn generate(
             new_tokens.len(),
         );
         let (mut next_token, sampled_rng) = if batched_prefill {
-            llama::forward_prefill_batch(
+            if let Err(e) = llama::forward_prefill_batch(
                 gpu,
                 weights,
                 config,
@@ -4344,10 +5068,21 @@ pub fn generate(
                 kv,
                 scratch,
                 None,
-            )
-            .unwrap();
+            ) {
+                // Prefill wrote partial KV rows: full fail-closed rollback +
+                // one correlated error (no `done`, no cache store).
+                let _ = (config, weights, scratch, kv);
+                crate::dense::dense_fail_closed_error(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("llama prefill (forward_prefill_batch) failed: {e:?}"),
+                );
+                return;
+            }
             let sample_seed = llama_prefill_sample_seed(rng_state, new_tokens.len(), temp);
-            gpu.sample_top_p(
+            match gpu.sample_top_p(
                 &scratch.logits,
                 &scratch.sample_buf,
                 &scratch.repeat_buf,
@@ -4357,21 +5092,57 @@ pub fn generate(
                 sample_seed,
                 0,
                 1.0,
-            )
-            .unwrap()
+            ) {
+                Ok(sampled) => sampled,
+                Err(e) => {
+                    let _ = (config, weights, scratch, kv);
+                    crate::dense::dense_fail_closed_error(
+                        m,
+                        gpu,
+                        stdout,
+                        id,
+                        &format!("llama prefill (sample_top_p) failed: {e:?}"),
+                    );
+                    return;
+                }
+            }
         } else {
             for (i, &tok) in new_tokens.iter().enumerate() {
                 let pos = m.seq_pos + i;
-                let (_, rng) = llama::forward_scratch(
+                match llama::forward_scratch(
                     gpu, weights, config, tok, pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
-                )
-                .unwrap();
-                rng_state = rng;
+                ) {
+                    Ok((_, rng)) => {
+                        rng_state = rng;
+                    }
+                    Err(e) => {
+                        let _ = (config, weights, scratch, kv);
+                        crate::dense::dense_fail_closed_error(
+                            m,
+                            gpu,
+                            stdout,
+                            id,
+                            &format!("llama prefill (forward_scratch) failed: {e:?}"),
+                        );
+                        return;
+                    }
+                }
             }
             let mut out_bytes = [0u8; 8];
-            gpu.hip
+            if let Err(e) = gpu
+                .hip
                 .memcpy_dtoh(&mut out_bytes, &scratch.sample_buf.buf)
-                .unwrap();
+            {
+                let _ = (config, weights, scratch, kv);
+                crate::dense::dense_fail_closed_error(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("llama prefill (sample download) failed: {e:?}"),
+                );
+                return;
+            }
             (
                 u32::from_ne_bytes([out_bytes[0], out_bytes[1], out_bytes[2], out_bytes[3]]),
                 u32::from_ne_bytes([out_bytes[4], out_bytes[5], out_bytes[6], out_bytes[7]]),
@@ -4382,6 +5153,14 @@ pub fn generate(
         m.seq_pos += new_tokens.len();
         m.conversation_tokens.extend_from_slice(&new_tokens);
         let ngram_scope_start_llama = m.conversation_tokens.len() - this_turn_prompt_len_llama;
+        // Test-only fault seam (G4.10): fires after prefill GPU/KV mutation,
+        // before any token visibility. Same production fail-closed terminal
+        // as the dense family loops.
+        if take_generation_fault_after_prefill() {
+            let _ = (config, weights, scratch, kv);
+            crate::dense::dense_fail_closed_error(m, gpu, stdout, id, "injected fault after prefill");
+            return;
+        }
         // Prefill ends here: prompt is processed AND first token is ready (D2H
         // sync is the user-observable "time to first token" boundary). Decode
         // below measures the pure forward+sample steady-state.
@@ -4398,6 +5177,15 @@ pub fn generate(
         let mut filter = EosFilter::new(EosFilterConfig::default());
 
         for _ in 0..max_tokens {
+            // Decode-side abort check (mirrors the Qwen AR loop): a client
+            // cancel bails at the next iteration with an attested
+            // aborted+done pair instead of burning max_tokens of decode.
+            if check_abort(id) {
+                let _ = (config, weights, scratch, kv);
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
+                return;
+            }
             generated += 1;
             m.conversation_tokens.push(next_token);
             streamed_tokens.push(next_token);
@@ -4430,16 +5218,27 @@ pub fn generate(
                 ngram_scope_start_llama.max(m.conversation_tokens.len().saturating_sub(rw));
             let hist_slice = &m.conversation_tokens[scope_start..];
             let hist_bytes: Vec<u8> = hist_slice.iter().flat_map(|t| t.to_ne_bytes()).collect();
-            gpu.hip
+            if let Err(e) = gpu
+                .hip
                 .memcpy_htod(&scratch.repeat_buf.buf, &hist_bytes)
-                .unwrap();
+            {
+                let _ = (config, weights, scratch, kv);
+                crate::dense::dense_fail_closed_error(
+                    m,
+                    gpu,
+                    stdout,
+                    id,
+                    &format!("llama decode (repeat upload) failed: {e:?}"),
+                );
+                return;
+            }
 
             // Write K/V for this token FIRST so the next turn's context is
             // always fully populated. The sampled next_token from this call
             // is discarded when we break on im_end/eos — wasteful by one
             // launch but avoids a KV cache gap at the terminator.
             let pos = m.seq_pos + generated - 1;
-            let (tok, rng) = llama::forward_scratch(
+            let (tok, rng) = match llama::forward_scratch(
                 gpu,
                 weights,
                 config,
@@ -4452,8 +5251,20 @@ pub fn generate(
                 rng_state,
                 hist_slice.len(),
                 repeat_penalty,
-            )
-            .unwrap();
+            ) {
+                Ok(sampled) => sampled,
+                Err(e) => {
+                    let _ = (config, weights, scratch, kv);
+                    crate::dense::dense_fail_closed_error(
+                        m,
+                        gpu,
+                        stdout,
+                        id,
+                        &format!("llama decode (forward_scratch) failed: {e:?}"),
+                    );
+                    return;
+                }
+            };
 
             if next_token == config.eos_token {
                 break;
@@ -4465,6 +5276,13 @@ pub fn generate(
                 break;
             }
 
+            // Test-only fault seam (G4.10): fires after the first decode
+            // step's GPU/KV mutation. Same production fail-closed terminal.
+            if generated == 1 && take_generation_fault_after_first_decode() {
+                let _ = (config, weights, scratch, kv);
+                crate::dense::dense_fail_closed_error(m, gpu, stdout, id, "injected fault after first decode");
+                return;
+            }
             next_token = tok;
             rng_state = rng;
         }
@@ -4473,11 +5291,24 @@ pub fn generate(
         // ChatML \n boundary — run through forward to keep KV cache in sync
         if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
             for &t in &nl {
-                let (_, rng2) = llama::forward_scratch(
+                match llama::forward_scratch(
                     gpu, weights, config, t, m.seq_pos, kv, scratch, temp, top_p, rng_state, 0, 1.0,
-                )
-                .unwrap();
-                rng_state = rng2;
+                ) {
+                    Ok((_, rng)) => {
+                        rng_state = rng;
+                    }
+                    Err(e) => {
+                        let _ = (config, weights, scratch, kv);
+                        crate::dense::dense_fail_closed_error(
+                            m,
+                            gpu,
+                            stdout,
+                            id,
+                            &format!("llama trailer (forward_scratch) failed: {e:?}"),
+                        );
+                        return;
+                    }
+                }
                 m.seq_pos += 1;
                 m.conversation_tokens.push(t);
             }
@@ -4527,10 +5358,14 @@ pub fn generate(
             }
         }
         match await_client_terminal_commit(stdout, id, &pending_done) {
-            ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+            ClientTerminalDecision::Commit => emit_active_route_done(stdout, id, &pending_done),
             ClientTerminalDecision::Abort => {
-                // Bring-up AR path has no full production rollback attestation;
-                // suppress success done on cancel/disconnect (fail-closed).
+                // Abort after commit: full fail-closed rollback first, then
+                // the attested aborted+done pair (or a single unattested
+                // error when rollback cannot be attested).
+                let _ = (config, weights, scratch, kv);
+                let ep = production_fail_closed_rollback(m, gpu, None, None);
+                emit_spec_cancel_after_rollback(stdout, id, generated, &ep);
             }
         }
     }
@@ -4598,7 +5433,7 @@ pub fn emit_qwen_ar_done(
         cached_tokens,
         pflash_fragment_json,
     );
-    emit_staged_terminal_done(stdout, &envelope);
+    emit_active_route_done(stdout, id, &envelope);
 }
 
 pub fn model_retry_reset_eligible(arch_id: u32) -> bool {
@@ -4619,5 +5454,481 @@ pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
         13 => "gemma4",
         14 => "muse_glimmer",
         _ => "unknown",
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn generation_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| std::sync::Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod route_scope_tests {
+    use super::*;
+    use hipfire_engine::terminal::{
+        activate_terminal_control, clear_terminal_control, set_active_attempt_id,
+    };
+    fn route_lock() -> std::sync::MutexGuard<'static, ()> {
+        super::generation_test_lock()
+    }
+    fn parse_events(sink: &[u8]) -> Vec<serde_json::Value> {
+        std::str::from_utf8(sink)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn vision_route_scope_restores_route_and_releases_same_key_start() {
+        let _guard = route_lock();
+        let id = "vision-route-scope";
+        let attempt = 91_001;
+        let mut sink = Vec::new();
+        set_active_attempt_id(attempt);
+
+        // A route owned by an outer producer must survive an inner vision
+        // request that fails after its start event.
+        set_generation_route(GenerationRoute::LfmAr);
+        activate_terminal_control(id, attempt);
+        {
+            let _scope = GenerationRouteScope::enter(GenerationRoute::QwenAr, id);
+            emit_generation_start(GenerationRoute::QwenAr, &mut sink, id, false);
+            emit_active_route_error(
+                &mut sink,
+                Some(id),
+                "vision failed after start",
+                "gpu",
+                true,
+                false,
+            );
+        }
+        assert_eq!(active_generation_route(), Some(GenerationRoute::LfmAr));
+
+        // Reusing the same wire key for a different vision route must emit a
+        // fresh start and advertise that route's own (legacy) contract.
+        activate_terminal_control(id, attempt);
+        {
+            let _scope = GenerationRouteScope::enter(GenerationRoute::DotsOcr, id);
+            emit_generation_start(GenerationRoute::DotsOcr, &mut sink, id, false);
+        }
+        assert_eq!(active_generation_route(), Some(GenerationRoute::LfmAr));
+
+        // A second same-key scope must also be able to claim a fresh start;
+        // the first scope's Drop released only its exact (id, attempt) latch.
+        activate_terminal_control(id, attempt);
+        {
+            let _scope = GenerationRouteScope::enter(GenerationRoute::DotsOcr, id);
+            emit_generation_start(GenerationRoute::DotsOcr, &mut sink, id, false);
+            emit_generation_cancel(GenerationRoute::DotsOcr, &mut sink, id, 0);
+        }
+
+        let events: Vec<serde_json::Value> = std::str::from_utf8(&sink)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let starts: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["type"] == "gen_start")
+            .collect();
+        assert_eq!(starts.len(), 3);
+        assert_eq!(starts[0]["contract_version"], 2);
+        assert!(starts[1].get("contract_version").is_none());
+        assert!(starts[2].get("contract_version").is_none());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            1
+        );
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn standalone_dots_ocr_starts_before_error_and_deduplicates_nested_scope() {
+        let _guard = route_lock();
+        let id = "dots-ocr-standalone";
+        let attempt = 91_101;
+        let mut sink = Vec::new();
+
+        clear_terminal_control();
+        clear_generation_route();
+        set_active_attempt_id(attempt);
+        activate_terminal_control(id, attempt);
+        {
+            let _outer = GenerationRouteScope::enter(GenerationRoute::DotsOcr, id);
+            {
+                let _inner = GenerationRouteScope::enter(GenerationRoute::DotsOcr, id);
+                emit_generation_start(GenerationRoute::DotsOcr, &mut sink, id, false);
+            }
+            emit_active_route_error(
+                &mut sink,
+                Some(id),
+                "tokenizer not loaded",
+                "validation",
+                false,
+                false,
+            );
+        }
+
+        let first = parse_events(&sink);
+        assert_eq!(first.len(), 2);
+        assert_eq!(first[0]["type"], "gen_start");
+        assert_eq!(first[1]["type"], "error");
+        assert_eq!(
+            first
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            1
+        );
+        assert_eq!(first[1]["attempt_id"], attempt);
+
+        // A later request reusing the same wire key must get a fresh start;
+        // dropping the nested/outer scopes released only the old latch.
+        clear_terminal_control();
+        activate_terminal_control(id, attempt);
+        {
+            let _scope = GenerationRouteScope::enter(GenerationRoute::DotsOcr, id);
+            emit_generation_start(GenerationRoute::DotsOcr, &mut sink, id, false);
+        }
+        let reused = parse_events(&sink);
+        assert_eq!(
+            reused
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            2
+        );
+        assert_eq!(reused[2]["type"], "gen_start");
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn lfm_vl_early_error_follows_generation_start() {
+        let _guard = route_lock();
+        let id = "lfm-vl-early-error";
+        let attempt = 91_102;
+        let mut sink = Vec::new();
+
+        clear_terminal_control();
+        clear_generation_route();
+        set_active_attempt_id(attempt);
+        activate_terminal_control(id, attempt);
+        {
+            let _scope = GenerationRouteScope::enter(GenerationRoute::LfmAr, id);
+            emit_generation_start(GenerationRoute::LfmAr, &mut sink, id, false);
+            emit_active_route_error(
+                &mut sink,
+                Some(id),
+                "tokenizer not loaded",
+                "validation",
+                false,
+                false,
+            );
+        }
+
+        let events = parse_events(&sink);
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["type"], "gen_start");
+        assert_eq!(events[1]["type"], "error");
+        assert_eq!(events[1]["attempt_id"], attempt);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            1
+        );
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn qwen_ar_same_key_reuse_after_error_reopens_latch() {
+        let _guard = route_lock();
+        let id = "qwen-ar-reuse";
+        let attempt = 91_201;
+        let mut sink = Vec::new();
+
+        clear_generation_route();
+        set_active_attempt_id(attempt);
+        for n in 0..2 {
+            clear_terminal_control();
+            activate_terminal_control(id, attempt);
+            let _scope = GenerationRouteScope::enter(GenerationRoute::QwenAr, id);
+            emit_generation_start(GenerationRoute::QwenAr, &mut sink, id, false);
+            emit_generation_error(
+                GenerationRoute::QwenAr,
+                &mut sink,
+                Some(id),
+                &format!("qwen ar failure {n}"),
+                "validation",
+                false,
+                false,
+            );
+        }
+
+        let events = parse_events(&sink);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            2
+        );
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn speculative_routes_same_key_reuse_after_error_reopens_latch() {
+        let _guard = route_lock();
+        let attempt = 91_202;
+        let mut sink = Vec::new();
+
+        clear_generation_route();
+        set_active_attempt_id(attempt);
+        for (route, id) in [
+            (GenerationRoute::QwenDflash, "qwen-dflash-reuse"),
+            (GenerationRoute::Qwen2Spec, "qwen-spec-reuse"),
+        ] {
+            for n in 0..2 {
+                clear_terminal_control();
+                activate_terminal_control(id, attempt);
+                let _scope = GenerationRouteScope::enter(route, id);
+                emit_generation_start(route, &mut sink, id, false);
+                emit_generation_error(
+                    route,
+                    &mut sink,
+                    Some(id),
+                    &format!("{} failure {n}", route.name()),
+                    "validation",
+                    false,
+                    false,
+                );
+            }
+        }
+
+        let events = parse_events(&sink);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            4
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            4
+        );
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn expert_parallel_error_and_cancel_reuse_same_key() {
+        let _guard = route_lock();
+        let attempt = 91_203;
+        let mut sink = Vec::new();
+
+        clear_generation_route();
+        set_active_attempt_id(attempt);
+        for (route, id) in [
+            (GenerationRoute::Deepseek4Ep, "ds4-ep-reuse"),
+            (GenerationRoute::MiniMaxEp, "minimax-ep-reuse"),
+        ] {
+            clear_terminal_control();
+            activate_terminal_control(id, attempt);
+            {
+                let _scope = GenerationRouteScope::enter(route, id);
+                emit_generation_start(route, &mut sink, id, false);
+                emit_generation_error(
+                    route,
+                    &mut sink,
+                    Some(id),
+                    "EP failure",
+                    "validation",
+                    false,
+                    false,
+                );
+            }
+            clear_terminal_control();
+            activate_terminal_control(id, attempt);
+            let _scope = GenerationRouteScope::enter(route, id);
+            emit_generation_start(route, &mut sink, id, false);
+            emit_generation_cancel(route, &mut sink, id, 0);
+        }
+
+        let events = parse_events(&sink);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            4
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "error")
+                .count(),
+            2
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "aborted")
+                .count(),
+            2
+        );
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+    #[test]
+    fn pipeline_parallel_start_precedes_token_and_done() {
+        let _guard = route_lock();
+        let id = "pipeline-order";
+        let attempt = 91_301;
+        let mut sink = Vec::new();
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(attempt);
+        activate_terminal_control(id, attempt);
+        {
+            let _scope = GenerationRouteScope::enter(GenerationRoute::PipelineParallel, id);
+            emit_generation_start(GenerationRoute::PipelineParallel, &mut sink, id, true);
+            sink.extend_from_slice(
+                serde_json::json!({
+                    "type": "token",
+                    "id": id,
+                    "text": "answer",
+                    "attempt_id": attempt,
+                })
+                .to_string()
+                .as_bytes(),
+            );
+            sink.push(b'\n');
+            let pending_done = serde_json::json!({
+                "type": "done",
+                "id": id,
+                "tokens": 1,
+                "finish_reason": "stop",
+                "attempt_id": attempt,
+            });
+            emit_generation_done_value(GenerationRoute::PipelineParallel, &mut sink, &pending_done);
+        }
+
+        let events = parse_events(&sink);
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["type"], "gen_start");
+        assert_eq!(events[0]["contract_version"], 2);
+        assert_eq!(events[0]["started_in_think"], true);
+        assert_eq!(events[1]["type"], "token");
+        assert_eq!(events[2]["type"], "done");
+        assert_eq!(events[2]["finish_reason"], "stop");
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+
+    #[test]
+    fn pipeline_parallel_prefill_decode_terminals_release_same_key() {
+        let _guard = route_lock();
+        let id = "pipeline-reuse";
+        let attempt = 91_302;
+        let mut sink = Vec::new();
+
+        clear_generation_route();
+        set_active_attempt_id(attempt);
+        for message in [
+            "forward_prefill_batch_multi: injected",
+            "forward_scratch_multi decode: injected",
+        ] {
+            clear_terminal_control();
+            activate_terminal_control(id, attempt);
+            let _scope = GenerationRouteScope::enter(GenerationRoute::PipelineParallel, id);
+            emit_generation_start(GenerationRoute::PipelineParallel, &mut sink, id, false);
+            emit_generation_error(
+                GenerationRoute::PipelineParallel,
+                &mut sink,
+                Some(id),
+                message,
+                "validation",
+                false,
+                false,
+            );
+        }
+
+        clear_terminal_control();
+        activate_terminal_control(id, attempt);
+        let _scope = GenerationRouteScope::enter(GenerationRoute::PipelineParallel, id);
+        emit_generation_start(GenerationRoute::PipelineParallel, &mut sink, id, false);
+        emit_generation_cancel(GenerationRoute::PipelineParallel, &mut sink, id, 2);
+
+        let events = parse_events(&sink);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "gen_start")
+                .count(),
+            3
+        );
+        let errors: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["type"] == "error")
+            .collect();
+        assert_eq!(errors.len(), 2);
+        assert!(errors
+            .iter()
+            .all(|event| event["class"] == "validation" && event["retryable"] == false));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["type"] == "aborted")
+                .count(),
+            1
+        );
+        let aborted_done: Vec<&serde_json::Value> = events
+            .iter()
+            .filter(|event| event["type"] == "done")
+            .collect();
+        assert_eq!(aborted_done.len(), 1);
+        assert_eq!(aborted_done[0]["finish_reason"], "aborted");
+
+        clear_generation_route();
+        clear_terminal_control();
+        set_active_attempt_id(0);
     }
 }

@@ -9,7 +9,7 @@ use crate::hfq::HfqFile;
 use crate::kv_backend::KvBackend;
 use crate::safetensors_source::SafetensorsSource;
 use rdna_compute::Gpu;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// A model on disk, before we know its arch. Carries either a parsed
 /// HFQ header or a directory (safetensors/ParoQuant — probed later).
@@ -68,7 +68,20 @@ pub struct LoadCtx<'a> {
     /// checkpoint value; other carriers must ignore it.
     pub deepseek4_experts_per_token: Option<usize>,
     pub draft_path: Option<&'a str>,
+    /// Shared Qwen3.5-VL vision-tower sidecar (`qwen3.8-27b-vision.hfq`,
+    /// `params.vision` / `HIPFIRE_VISION_SIDECAR`). Read by `Qwen35Carrier`
+    /// only, and only when the trunk itself carries no tower tensor: the
+    /// sidecar opens as a separate `HfqFile` (never an overlay) and its tower
+    /// loads against the trunk's `vision_config_from_hfq`. `None` = trunk-only
+    /// (or text-only when the trunk has no tower either).
+    pub vision_path: Option<PathBuf>,
     pub kv_mode_override: Option<&'a str>,
+    // NOTE: head overlays (`--head`) deliberately have NO LoadCtx field. They
+    // validate and attach in `admit_source` before teardown, so the admitted
+    // source the carrier consumes is already effective — threading a second
+    // path here would reopen the file and reintroduce the pre-teardown
+    // validation gap. The offline coherence example uses
+    // `load_maple_from_hfq_with_head` directly.
     pub kv_backend: KvBackend,
     pub kv_adaptive_override: Option<&'a str>,
     pub state_quant_override: Option<&'a str>,
@@ -132,6 +145,11 @@ pub struct SpecLoadCfg {
     pub mtp: Option<bool>,
     /// MTP draft window K. `None` = runtime default (`HIPFIRE_MTP_K`).
     pub mtp_k: Option<usize>,
+    /// Qwen DFlash draft enable, lowered from `dflash_mode`: `Some(true)` =
+    /// `on` (fail the load when the draft is missing or unloadable),
+    /// `Some(false)` = `off` (skip), `None` = `auto` (load when present,
+    /// log-and-AR fallback otherwise).
+    pub dflash: Option<bool>,
 }
 
 /// CASK/TriAttention params forwarded by the CLI at load time.

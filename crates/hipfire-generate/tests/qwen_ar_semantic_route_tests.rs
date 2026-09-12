@@ -20,6 +20,27 @@ use hipfire_generate::common::*;
     
     use hipfire_generate::{common::emit_spec_cancel_after_rollback, qwen::qwen_client_commit_effects, qwen::QwenClientCommitEffects};
     use std::collections::HashMap;
+struct TerminalTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for TerminalTestGuard {
+    fn drop(&mut self) {
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+}
+
+fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
+    static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    let lock = LOCK.lock().expect("terminal test lock");
+    clear_terminal_control();
+    set_active_attempt_id(0);
+    activate_terminal_control(id, attempt_id);
+    TerminalTestGuard { _lock: lock }
+}
+
 
     /// Drive the real shared producer (same object production uses).
     /// Each chunk is raw-committed as a synthetic token before classify.
@@ -35,6 +56,7 @@ use hipfire_generate::common::*;
         Vec<u32>,
         Vec<usize>,
     ) {
+        let _guard = begin_terminal_test("t1", 7);
         set_active_attempt_id(7);
         let mut producer = QwenArSemanticProducer::new("t1", started_in_think);
         let mut sink = Vec::new();
@@ -491,6 +513,7 @@ use hipfire_generate::common::*;
 
     #[test]
     fn cancellation_transcript_carries_attempt_id() {
+        let _guard = begin_terminal_test("req-1", 42);
         set_active_attempt_id(42);
         let mut sink = Vec::new();
         emit_qwen_ar_cancelled(&mut sink, "req-1", 3);
@@ -847,8 +870,9 @@ use hipfire_generate::common::*;
     #[test]
     fn real_writers_hostile_request_ids() {
         // Finding 5: shared serde writers + hostile IDs.
-        set_active_attempt_id(99);
         let hostile = r#"req"}\n{"type":"pwned"#;
+        let _guard = begin_terminal_test(hostile, 99);
+        set_active_attempt_id(99);
         let mut sink = Vec::new();
         emit_gen_start(&mut sink, hostile, false, Some(2));
         emit_visible_token(&mut sink, hostile, "ok");
@@ -881,6 +905,7 @@ use hipfire_generate::common::*;
     #[test]
     fn cancellation_json_through_semantic_fold_contract() {
         // Finding 6: cancel JSON transcript is valid contract-v2 fold input.
+        let _guard = begin_terminal_test("c1", 42);
         set_active_attempt_id(42);
         let mut sink = Vec::new();
         emit_gen_start(
@@ -1065,6 +1090,7 @@ use hipfire_generate::common::*;
         // Fix round 4 #1: open-think → exactly one correlated non-retryable
         // validation error, no done, no unread stale event after terminal.
         // GPU-less: attest epilogue.rolled_back=false (same writer as production).
+        let _guard = begin_terminal_test("ot1", 7);
         set_active_attempt_id(7);
         let mut sink = Vec::new();
         let ep = hipfire_generate::common::RollbackEpilogue {
@@ -1184,6 +1210,7 @@ use hipfire_generate::common::*;
     #[test]
     fn wire_helpers_used_by_gen_start_and_cancel_writers() {
         // Fix round 4 #3: production writers use shared semantic wire helpers.
+        let _guard = begin_terminal_test("c1", 42);
         set_active_attempt_id(42);
         let mut sink = Vec::new();
         emit_gen_start(
@@ -1244,6 +1271,7 @@ use hipfire_generate::common::*;
 
     #[test]
     fn finish_defers_tool_calls_until_commit_effects() {
+        let _guard = begin_terminal_test("t-commit", 11);
         set_active_attempt_id(11);
         let mut producer = QwenArSemanticProducer::new("t-commit", false);
         let mut sink = Vec::new();
@@ -1327,6 +1355,7 @@ use hipfire_generate::common::*;
 
     #[test]
     fn abort_effects_suppress_calls_cache_and_normal_done() {
+        let _guard = begin_terminal_test("t-abort", 12);
         set_active_attempt_id(12);
         let mut producer = QwenArSemanticProducer::new("t-abort", false);
         let mut sink = Vec::new();

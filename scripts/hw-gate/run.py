@@ -531,11 +531,11 @@ def _run_harness_mode(repo, fixture, env_base, logs_dir, device, mode, harness_c
     # than no route.
     #
     # `dflash_draft` may be a list, because the two lanes hold different
-    # drafts: hiptrx has qwen36-27b-dflash-mq4.hfq and no qwen38, hipx has
-    # qwen38-27b-dflash-mq4.hfq and no qwen36. The lane speculates with the
-    # first candidate it actually has; a lane holding none records `skip`, so
-    # the evidence says "not covered here" rather than inventing a pass or a
-    # failure on evidence the host never had.
+    # drafts (one lane may only have a legacy dense draft, the other only the
+    # 3.8 ladder draft). The lane speculates with the first candidate it
+    # actually has; a lane holding none records `skip`, so the evidence says
+    # "not covered here" rather than inventing a pass or a failure on evidence
+    # the host never had.
     draft_path: Path | None = None
     if mode.endswith("-dflash"):
         declared = fixture.get("dflash_draft")
@@ -586,6 +586,13 @@ def _run_harness_mode(repo, fixture, env_base, logs_dir, device, mode, harness_c
     serve_log_path = logs_dir_p / f"{safe_tag}-{mode}.serve.log"
     out_combined_path = logs_dir_p / f"{safe_tag}-{mode}.out"
     argv = _build_harness_argv(gate_root, model_path, mode, max_tokens, battery_prompts_path, per_home, out_path, serve_log_path, draft_path)
+    # Optional per-fixture extra argv: list applies to every mode; dict is mode→argv
+    # (exact gate mode key, e.g. "battery" / "battery-dflash"). Appended after built-ins.
+    extra = fixture.get("harness_args")
+    if isinstance(extra, dict):
+        extra = extra.get(mode) or []
+    if isinstance(extra, list) and extra:
+        argv = list(argv) + [str(a) for a in extra]
     start = time.time()
     exit_code = 1
     stdout = ""

@@ -39,12 +39,29 @@ earned).
 ## Quick start (bring-up only)
 
 ```bash
+# Fast smoke (small model — speed only, not acceptance):
 hipfire diag
-hipfire pull qwen3.5:4b          # tag from registry/models.json; other tags OK if VRAM fits
+hipfire pull qwen3.5:4b          # tag from registry/models.json; other small tags OK if VRAM fits
 hipfire run qwen3.5:4b "Explain WMMA in one paragraph."
 ```
 
+**Acceptance / validation fixture** (dense claims, DFlash, promotion-shaped
+reports): registry tag `qwen3.8:27b-mq4-xt` → on-disk
+`~/.hipfire/models/qwen3.8-27b.mq4-xt`, with measured draft
+`~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq` (see
+[`AGENTS.md`](../../../AGENTS.md) §5 pin). Do not treat a small-model smoke
+pass as acceptance evidence.
+
+```bash
+hipfire pull qwen3.8:27b-mq4-xt
+# optional measured-draft override:
+# export HIPFIRE_DFLASH_DRAFT=~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq
+hipfire config set dflash_mode auto   # pull ≠ enable
+hipfire run qwen3.8:27b-mq4-xt "Explain WMMA in one paragraph."
+```
+
 If `diag` or first run fails, chain to `hipfire-diag` / `hipfire-autoheal`.
+
 
 ## Claim → harness (summary)
 

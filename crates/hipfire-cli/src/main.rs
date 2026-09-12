@@ -126,6 +126,8 @@ pub(crate) enum Commands {
     SidecarGen(SidecarArgs),
     /// Generate text through a fresh native daemon process.
     Run(RunArgs),
+    /// Generate an image (txt2img) through a fresh native daemon process.
+    Img(ImgArgs),
     /// Start an interactive conversation through the native HTTP service.
     Chat(ChatArgs),
     /// Start the native OpenAI-compatible HTTP service.
@@ -356,7 +358,7 @@ struct TuiArgs {
     arguments: Vec<String>,
 }
 
-#[derive(Args, Debug)]
+#[derive(Args, Debug, Clone)]
 struct RunArgs {
     /// Registry tag, local alias, filename, or model path.
     model: String,
@@ -378,6 +380,11 @@ struct RunArgs {
     #[arg(long)]
     /// One-shot KV format override for this model load.
     kv_mode: Option<String>,
+    #[arg(long)]
+    /// Select a published lm_head variant (see the registry's `heads`), e.g.
+    /// `--head q4k`. The overlay shadows the model's own head at load time;
+    /// omitting this uses the head baked into the model file.
+    head: Option<String>,
     #[arg(long, value_parser = ["contiguous", "vmm"])]
     /// One-shot KV storage backend override for this model load.
     kv_backend: Option<String>,
@@ -387,6 +394,10 @@ struct RunArgs {
     /// Explicit DFlash draft model.
     #[arg(long, alias = "md")]
     model_draft: Option<PathBuf>,
+    /// Explicit vision-tower sidecar (overrides the registry `vision` slot
+    /// and `HIPFIRE_VISION_SIDECAR`; skipped while `vision_mode=off`).
+    #[arg(long)]
+    vision: Option<PathBuf>,
     /// Override the active MTP/n-gram draft window.
     #[arg(long, alias = "draft")]
     draft_max: Option<u64>,
@@ -405,6 +416,51 @@ struct RunArgs {
     #[arg(long)]
     /// Buffer visible output instead of streaming it.
     no_stream: bool,
+}
+
+#[derive(Args, Debug)]
+#[command(after_help = "NOTE: --image must be given before the prompt words \
+    (e.g. `hipfire img --image a.png --image b.png my-flux2-klein-pipe edit this photo`); \
+    the prompt is a greedy trailing positional and swallows anything after it.")]
+struct ImgArgs {
+    /// Model tag, alias, filename, or path to an HFQ trunk pack
+    /// (`<base>-transformer.hfq`, with its sidecar packs next to it).
+    model: String,
+    /// Prompt words. Quote the prompt to preserve exact whitespace.
+    #[arg(num_args = 0..)]
+    prompt: Vec<String>,
+    /// Reference image for FLUX.2 Klein edit (repeatable, up to 4). Requires
+    /// an arch-45 pipe; a FLUX.1 pipe refuses reference images.
+    #[arg(long = "image", value_name = "PATH")]
+    image: Vec<PathBuf>,
+    /// Output PNG path (default: hipfire-<seed>.png in the working directory).
+    #[arg(short = 'o', long)]
+    out: Option<PathBuf>,
+    /// Pixel width (must be divisible by the VAE compression factor). Defaults
+    /// to 1024 when no `--image` is given; with `--image`, defaults to the
+    /// reference image's own size.
+    #[arg(long)]
+    width: Option<u64>,
+    /// Pixel height (must be divisible by the VAE compression factor).
+    /// Defaults to 1024 when no `--image` is given; with `--image`, defaults
+    /// to the reference image's own size.
+    #[arg(long)]
+    height: Option<u64>,
+    /// Denoise steps; defaults to the model's architecture default (4 for
+    /// step-distilled schnell, 28 for guidance-distilled dev).
+    #[arg(long)]
+    steps: Option<u64>,
+    /// Noise seed; same seed → byte-identical PNG.
+    #[arg(long, default_value_t = 0)]
+    seed: u64,
+    /// Execution backend for the transformer forward: `gpu` (the HIP MMDiT
+    /// forward) or `cpu` (the f32 reference oracle). Defaults to `gpu` when
+    /// a GPU is available, else `cpu`.
+    #[arg(long)]
+    backend: Option<String>,
+    /// Emit one JSON result object instead of the progress lines.
+    #[arg(short = 'j', long)]
+    json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -489,6 +545,10 @@ pub(crate) struct BenchArgs {
     /// Prompt words for the standard benchmark.
     #[arg(num_args = 0..)]
     prompt: Vec<String>,
+    /// Read the standard-benchmark prompt verbatim from a file (raw bytes,
+    /// no trimming). Mutually exclusive with positional PROMPT words.
+    #[arg(long, conflicts_with = "prompt")]
+    prompt_file: Option<PathBuf>,
 }
 
 #[derive(Args, Debug)]
@@ -572,6 +632,11 @@ pub(crate) struct ServeArgs {
     /// KV storage backend for models loaded by this service.
     #[arg(long, value_parser = ["contiguous", "vmm"])]
     kv_backend: Option<String>,
+    /// Vision-tower sidecar wired into every model load (`params["vision"]`);
+    /// overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`;
+    /// skipped while `vision_mode=off`.
+    #[arg(long)]
+    vision: Option<PathBuf>,
     /// Idle model-unload timeout in seconds; zero disables eviction.
     #[arg(long, value_parser = clap::value_parser!(u64).range(0..=86400))]
     idle_timeout: Option<u64>,
@@ -654,6 +719,7 @@ fn run() -> Result<()> {
         Some(Commands::Quantize(args)) => quantize_command(&paths, args),
         Some(Commands::SidecarGen(args)) => sidecar_command(&paths, args),
         Some(Commands::Run(args)) => run_command(&paths, args),
+        Some(Commands::Img(args)) => img_command(&paths, args),
         Some(Commands::Chat(args)) => chat_command(&paths, args),
         Some(Commands::Serve(args)) => crate::serve::serve_command(&paths, args),
         Some(Commands::Stop(args)) => crate::serve::stop_command(&paths, args),
@@ -693,19 +759,21 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 let mut values = fields()
                     .iter()
                     .map(|field| {
-                        let resolved = resolved.get(field.key).expect("schema key resolved");
-                        (
+                        let item = resolved.get(field.key).ok_or_else(|| {
+                            anyhow!("configuration key '{}' is not set", field.key)
+                        })?;
+                        Ok::<_, anyhow::Error>((
                             field.key.to_owned(),
                             serde_json::json!({
                                 "legacy_key": field.legacy_key,
-                                "value": resolved.value,
+                                "value": item.value,
                                 "default": format_default(field),
-                                "source": resolved.source,
+                                "source": item.source,
                                 "overridden": loaded.layer.get(field.key).is_some(),
                             }),
-                        )
+                        ))
                     })
-                    .collect::<serde_json::Map<_, _>>();
+                    .collect::<Result<serde_json::Map<_, _>>>()?;
                 for (key, item) in resolved
                     .values
                     .iter()
@@ -739,7 +807,9 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 }
                 println!();
                 for schema in fields() {
-                    let item = resolved.get(schema.key).expect("schema key resolved");
+                    let item = resolved
+                        .get(schema.key)
+                        .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
                     let marker = if loaded.layer.get(schema.key).is_some() {
                         "override"
                     } else {
@@ -804,8 +874,12 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             let mut loaded = load_global(&paths.config)?;
             loaded.layer.set_cli(&key, &value)?;
             write_global_toml(&paths.config, &loaded.layer)?;
-            let canonical = canonical_config_key(&key).expect("set_cli accepted key");
-            let value = loaded.layer.get(&canonical).expect("set value");
+            let canonical = canonical_config_key(&key)
+                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let value = loaded
+                .layer
+                .get(&canonical)
+                .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
             println!("{canonical} = {value}");
             if loaded.format == ConfigFormat::LegacyJson {
                 println!(
@@ -842,8 +916,9 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 .get(&canonical)
                 .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
             if is_developer_key(&canonical) {
-                let env_compat =
-                    developer_env_for_key(&canonical).expect("validated developer key");
+                let env_compat = developer_env_for_key(&canonical).ok_or_else(|| {
+                    anyhow!("developer key '{canonical}' has no legacy env spelling")
+                })?;
                 if output.json {
                     println!(
                         "{}",
@@ -888,7 +963,8 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 }
                 return Ok(());
             }
-            let schema = field(&canonical).expect("stable configuration key");
+            let schema = field(&canonical)
+                .ok_or_else(|| anyhow!("unknown configuration key '{canonical}'"))?;
             if output.json {
                 println!(
                     "{}",
@@ -1097,8 +1173,10 @@ fn model_config_command(
                 let values = fields()
                     .iter()
                     .map(|schema| {
-                        let item = resolved.get(schema.key).expect("schema key resolved");
-                        (
+                        let item = resolved.get(schema.key).ok_or_else(|| {
+                            anyhow!("configuration key '{}' is not set", schema.key)
+                        })?;
+                        Ok::<_, anyhow::Error>((
                             schema.key.to_owned(),
                             serde_json::json!({
                                 "legacy_key": schema.legacy_key,
@@ -1106,9 +1184,9 @@ fn model_config_command(
                                 "source": item.source,
                                 "overridden": overrides.get(schema.key).is_some(),
                             }),
-                        )
+                        ))
                     })
-                    .collect::<serde_json::Map<_, _>>();
+                    .collect::<Result<serde_json::Map<_, _>>>()?;
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
@@ -1129,7 +1207,9 @@ fn model_config_command(
                     catalog.format
                 );
                 for schema in fields() {
-                    let item = resolved.get(schema.key).expect("schema key resolved");
+                    let item = resolved
+                        .get(schema.key)
+                        .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
                     let marker = if overrides.get(schema.key).is_some() {
                         "override"
                     } else {
@@ -1155,7 +1235,9 @@ fn model_config_command(
             }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
             let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
-            let value = resolved.get(schema.key).expect("schema key resolved");
+            let value = resolved
+                .get(schema.key)
+                .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
             if output.json {
                 println!(
                     "{}",
@@ -1183,7 +1265,7 @@ fn model_config_command(
                 .map(str::to_owned)
                 .unwrap_or_else(|| tag.clone().unwrap_or_else(|| model_name.to_owned()));
             let local_path = find_model_path(paths, &registry, model_name);
-            let saved = {
+            let (canonical, saved) = {
                 let record = loaded.catalog.models.entry(id.clone()).or_default();
                 if record.path.is_none() {
                     record.path = local_path;
@@ -1192,12 +1274,17 @@ fn model_config_command(
                     record.registry_tag = tag.clone();
                 }
                 record.overrides.set_cli(&key, &value)?;
-                let schema = field(&key).expect("set_cli accepted key");
-                record.overrides.get(schema.key).unwrap().clone()
+                let schema =
+                    field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let saved = record
+                    .overrides
+                    .get(schema.key)
+                    .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?
+                    .clone();
+                (schema.key, saved)
             };
             write_catalog_toml(&paths.config, &loaded.catalog)?;
-            let schema = field(&key).expect("set_cli accepted key");
-            println!("{id} {} = {saved}", schema.key);
+            println!("{id} {canonical} = {saved}");
             if loaded.format == CatalogFormat::LegacyJson {
                 println!(
                     "migrated model catalog to {}; preserved legacy JSON as rollback copies",
@@ -1215,11 +1302,9 @@ fn model_config_command(
                 println!("{model_name} has no per-model overrides");
                 return Ok(());
             };
-            let record = loaded
-                .catalog
-                .models
-                .get_mut(&id)
-                .expect("resolved model id");
+            let record = loaded.catalog.models.get_mut(&id).ok_or_else(|| {
+                anyhow!("model '{model_name}' has no catalog entry for id '{id}'")
+            })?;
             if let Some(key) = key {
                 let schema =
                     field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
@@ -1242,7 +1327,9 @@ fn model_config_command(
             }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
             let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
-            let value = resolved.get(schema.key).expect("schema key resolved");
+            let value = resolved
+                .get(schema.key)
+                .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
             if output.json {
                 println!(
                     "{}",
@@ -1601,9 +1688,20 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     fs::create_dir_all(&paths.models)
         .with_context(|| format!("failed to create {}", paths.models.display()))?;
     let destination = paths.models.join(&entry.file);
-    if destination.exists() && !args.force {
-        eprintln!("Already downloaded: {}", destination.display());
+    let needs_base = if args.force {
+        true
+    } else if destination.exists() {
+        if existing_artifact_valid(&destination, entry.sha256.as_deref(), entry.size_bytes) {
+            eprintln!("Already downloaded: {}", destination.display());
+            false
+        } else {
+            eprintln!("Refreshing stale artifact: {}", destination.display());
+            true
+        }
     } else {
+        true
+    };
+    if needs_base {
         let url = artifact_url(entry, &entry.file);
         eprintln!("Pulling {tag} ({:.2} GB)...", entry.size_gb);
         download_verified(
@@ -1618,14 +1716,26 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         ("TriAttention", entry.triattn.as_ref()),
         ("MTP", entry.mtp.as_ref()),
         ("DSpark", entry.dspark.as_ref()),
+        ("DFlash", entry.dflash.as_ref()),
+        ("Vision", entry.vision.as_ref()),
+        ("T5", entry.t5.as_ref()),
+        ("CLIP", entry.clip.as_ref()),
+        ("Qwen3", entry.qwen3.as_ref()),
+        ("VAE", entry.vae.as_ref()),
     ] {
         let Some(sidecar) = sidecar else {
             continue;
         };
         let destination = paths.models.join(&sidecar.file);
-        if destination.exists() {
-            eprintln!("  {label} sidecar already present: {}", sidecar.file);
-            continue;
+        if destination.exists() && !args.force {
+            if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes)
+            {
+                eprintln!("  {label} sidecar already present: {}", sidecar.file);
+                continue;
+            }
+            eprintln!("  {label} sidecar stale, refreshing: {}", sidecar.file);
+        } else if destination.exists() && args.force {
+            // force always refreshes
         }
         eprintln!("  Fetching {label} sidecar: {}", sidecar.file);
         let url = artifact_url(entry, &sidecar.file);
@@ -1638,6 +1748,25 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         ) {
             eprintln!("  warning: {label} sidecar unavailable: {error:#}");
         }
+    }
+    for (name, sidecar) in &entry.heads {
+        let destination = paths.models.join(&sidecar.file);
+        if destination.exists() && !args.force {
+            if existing_artifact_valid(&destination, sidecar.sha256.as_deref(), sidecar.size_bytes)
+            {
+                eprintln!("  head {name} already present: {}", sidecar.file);
+                continue;
+            }
+            eprintln!("  head {name} stale, refreshing: {}", sidecar.file);
+        }
+        eprintln!("  Fetching head {name}: {}", sidecar.file);
+        download_verified(
+            &artifact_url(entry, &sidecar.file),
+            &destination,
+            sidecar.sha256.as_deref(),
+            sidecar.size_bytes,
+            true,
+        )?;
     }
     println!("{}", paths.models.join(&entry.file).display());
     Ok(())
@@ -1768,20 +1897,128 @@ fn report_progress(downloaded: u64, total: Option<u64>, elapsed: Duration) {
     let _ = std::io::stderr().flush();
 }
 
+pub(crate) fn existing_artifact_valid(
+    path: &Path,
+    expected_sha256: Option<&str>,
+    expected_size: Option<u64>,
+) -> bool {
+    let Ok(metadata) = fs::metadata(path) else {
+        return false;
+    };
+    if let Some(expected) = expected_size {
+        if metadata.len() != expected {
+            return false;
+        }
+    }
+    if let Some(expected) = expected_sha256 {
+        let Ok(digest) = sha256_path(path) else {
+            return false;
+        };
+        if !digest.eq_ignore_ascii_case(expected) {
+            return false;
+        }
+    }
+    true
+}
+
 fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
     let loaded = load_registry(&paths.registry);
-    let resolved = loaded.registry.model(&args.model);
-    let path = find_model_path(paths, &loaded.registry, &args.model)
+    rm_with_registry(paths, &loaded.registry, args)
+}
+
+/// Remove one model and its sidecars. A declared DFlash draft sidecar is
+/// shared: several registry entries can name the same `dflash.file` (e.g.
+/// `qwen3.8:27b`, `qwen3.8:27b-mq4-pro`, and `qwen3.8:27b-mq4-xt` all declare
+/// `qwen38-27b-dflash-mq4.hfq`). Deleting it while a sibling declarer is
+/// still on disk leaves those siblings running AR under `dflash_mode=auto`
+/// or refusing to load under `on`, so the sidecar is kept — with one stderr
+/// line — whenever any OTHER entry declaring the same file still has its own
+/// target file present in the models dir. The `vision` tower sidecar follows
+/// the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one
+/// `qwen3.8-27b-vision.hfq`).
+fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Result<()> {
+    let resolved = registry_entry_for_path(paths, registry, &args.model);
+    let path = find_model_path(paths, registry, &args.model)
         .unwrap_or_else(|| paths.models.join(&args.model));
     if !path.is_file() {
         bail!("model not found: {}", path.display());
     }
     let mut targets = BTreeSet::from([path.clone()]);
-    if let Some((_, entry)) = resolved {
+    // A shared DFlash sidecar that must survive this removal: (file, keepers).
+    let mut kept_sidecar: Option<(String, String)> = None;
+    // A shared vision-tower sidecar under the same rule: every `qwen3.8:27b*`
+    // tier declares `qwen3.8-27b-vision.hfq`, so the keeper check is copied
+    // from DFlash exactly.
+    let mut kept_vision: Option<(String, String)> = None;
+    if let Some((tag, entry)) = resolved {
         targets.extend(
-            [&entry.triattn, &entry.mtp, &entry.dspark]
-                .into_iter()
-                .flatten()
+            [
+                &entry.triattn,
+                &entry.mtp,
+                &entry.dspark,
+                &entry.t5,
+                &entry.clip,
+                &entry.vae,
+            ]
+            .into_iter()
+            .flatten()
+            .map(|sidecar| paths.models.join(&sidecar.file))
+            .filter(|path| path.is_file()),
+        );
+        if let Some(sidecar) = entry.dflash.as_ref() {
+            let sidecar_path = paths.models.join(&sidecar.file);
+            if sidecar_path.is_file() {
+                // `models` is a BTreeMap, so keepers list in sorted tag order.
+                let keepers: Vec<&str> = registry
+                    .models
+                    .iter()
+                    .filter(|(other_tag, other)| {
+                        other_tag.as_str() != tag
+                            && other.file != entry.file
+                            && other
+                                .dflash
+                                .as_ref()
+                                .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
+                            && paths.models.join(&other.file).is_file()
+                    })
+                    .map(|(other_tag, _)| other_tag.as_str())
+                    .collect();
+                if keepers.is_empty() {
+                    targets.insert(sidecar_path);
+                } else {
+                    kept_sidecar = Some((sidecar.file.clone(), keepers.join(", ")));
+                }
+            }
+        }
+        if let Some(sidecar) = entry.vision.as_ref() {
+            let sidecar_path = paths.models.join(&sidecar.file);
+            if sidecar_path.is_file() {
+                // `models` is a BTreeMap, so keepers list in sorted tag order.
+                let keepers: Vec<&str> = registry
+                    .models
+                    .iter()
+                    .filter(|(other_tag, other)| {
+                        other_tag.as_str() != tag
+                            && other.file != entry.file
+                            && other
+                                .vision
+                                .as_ref()
+                                .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
+                            && paths.models.join(&other.file).is_file()
+                    })
+                    .map(|(other_tag, _)| other_tag.as_str())
+                    .collect();
+                if keepers.is_empty() {
+                    targets.insert(sidecar_path);
+                } else {
+                    kept_vision = Some((sidecar.file.clone(), keepers.join(", ")));
+                }
+            }
+        }
+        targets.extend(
+            entry
+                .heads
+                .values()
                 .map(|sidecar| paths.models.join(&sidecar.file))
                 .filter(|path| path.is_file()),
         );
@@ -1828,14 +2065,19 @@ fn rm_command(paths: &Paths, args: RmArgs) -> Result<()> {
             .with_context(|| format!("failed to remove {}", target.display()))?;
         println!("removed {}", target.display());
     }
+    if let Some((file, keepers)) = kept_sidecar {
+        eprintln!("keeping DFlash sidecar {file}: still declared by {keepers}");
+    }
+    if let Some((file, keepers)) = kept_vision {
+        eprintln!("keeping Vision sidecar {file}: still declared by {keepers}");
+    }
     Ok(())
 }
 
 fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let loaded_registry = load_registry(&paths.registry);
     let registry = &loaded_registry.registry;
-    let (canonical, entry) = registry
-        .model(&args.model)
+    let (canonical, entry) = registry_entry_for_path(paths, registry, &args.model)
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
         .unwrap_or((None, None));
     let mut model_path = find_model_path(paths, registry, &args.model);
@@ -1864,6 +2106,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     if let Some(draft) = &args.model_draft {
         if !draft.is_file() {
             bail!("DFlash draft not found: {}", draft.display());
+        }
+    }
+    if let Some(vision) = &args.vision {
+        if !vision.is_file() {
+            bail!("vision sidecar not found: {}", vision.display());
         }
     }
     if args
@@ -1908,14 +2155,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     };
     let host = config_string(&resolved, "serve.host")?;
     let port = config_u64(&resolved, "serve.port")? as u16;
-    let force_local = process_truthy("HIPFIRE_LOCAL")
-        || args.image.is_some()
-        || args.kv_mode.is_some()
-        || args.kv_backend.is_some()
-        || args.speculation.is_some()
-        || args.model_draft.is_some()
-        || args.draft_max.is_some()
-        || args.dspark_conf_threshold.is_some();
+    let force_local = run_should_force_local(&args);
     if !force_local && service_ready(&host, port, Duration::from_millis(150)) {
         return run_via_http(
             &host,
@@ -1944,10 +2184,14 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let mut params = load_params(
         &resolved,
         entry,
+        &paths.models,
         &model_path,
         max_tokens,
         args.kv_mode.as_deref(),
         args.kv_backend.as_deref(),
+        canonical.as_deref(),
+        args.model_draft.is_some(),
+        args.head.as_deref(),
     )?;
     let selector = args
         .speculation
@@ -1962,6 +2206,21 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         if args.speculation.is_none() {
             apply_speculation_selector(&mut params, "dflash")?;
         }
+    }
+    // Registry sidecar for a final auto/on selector the config-time
+    // load_params could not see (config-off + `run --spec dflash`); a
+    // no-op when load_params already resolved or an explicit draft won.
+    resolve_dflash_sidecar(
+        &mut params,
+        entry,
+        &paths.models,
+        &model_path,
+        canonical.as_deref(),
+    )?;
+    if let Some(vision) = &args.vision {
+        // Forwarded in every mode; the daemon's `vision_mode=off` gate decides
+        // and can then name the sidecar it declined on an image request.
+        params["vision"] = serde_json::json!(vision.display().to_string());
     }
     if let Some(window) = args.draft_max {
         if !(1..=32).contains(&window) {
@@ -2088,6 +2347,203 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Default `hipfire img --backend`: `"gpu"` when a GPU is available
+/// (`rdna_compute::Gpu::init()` succeeds), else `"cpu"`. Probed once per
+/// process and cached — never re-probes the GPU per invocation. An explicit
+/// `--backend` always overrides this default. A failed probe prints one
+/// stderr line with the underlying HIP error so a fixable driver problem
+/// isn't silently mistaken for "no GPU present".
+fn default_img_backend() -> &'static str {
+    static GPU_AVAILABLE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *GPU_AVAILABLE.get_or_init(|| match rdna_compute::Gpu::init() {
+        Ok(_) => true,
+        Err(e) => {
+            eprintln!(
+                "hipfire: no GPU detected ({} [code {}]); defaulting --backend to cpu \
+                 (run `hipfire diag` for a full environment report if a GPU should be present)",
+                e.message, e.code
+            );
+            false
+        }
+    }) {
+        "gpu"
+    } else {
+        "cpu"
+    }
+}
+
+/// `hipfire img <model> <prompt…>`: one-shot txt2img through a fresh native
+/// daemon process. Mirrors `run`'s model resolution and
+/// local-spawn posture; prints per-step progress to stderr, writes the PNG,
+/// prints its path (or the JSON result object with `--json`).
+fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
+    if args.steps.is_some_and(|s| s == 0 || s > 128) {
+        bail!("--steps must be between 1 and 128 (omit for the model default)");
+    }
+    let backend = args
+        .backend
+        .clone()
+        .unwrap_or_else(|| default_img_backend().to_owned());
+    if backend != "cpu" && backend != "gpu" {
+        bail!("--backend must be \"cpu\" or \"gpu\", got {:?}", backend);
+    }
+    for (name, v) in [("--width", args.width), ("--height", args.height)] {
+        if let Some(v) = v {
+            if v == 0 || v > 8192 {
+                bail!("{name} must be between 1 and 8192");
+            }
+        }
+    }
+    if args.image.len() > 4 {
+        bail!("at most 4 --image references (got {})", args.image.len());
+    }
+    // Width/height default to 1024 only for plain txt2img (no reference
+    // images); a reference edit leaves them unset so the daemon defaults to
+    // the reference image's own size.
+    let (width, height) = if args.image.is_empty() {
+        (
+            Some(args.width.unwrap_or(1024)),
+            Some(args.height.unwrap_or(1024)),
+        )
+    } else {
+        (args.width, args.height)
+    };
+    // The CLI reads the reference files itself and ships their bytes; the
+    // daemon never opens a client-named path.
+    let images = args
+        .image
+        .iter()
+        .map(|p| {
+            use base64::Engine as _;
+            let bytes = std::fs::read(p)
+                .with_context(|| format!("--image {}: cannot read file", p.display()))?;
+            Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+        })
+        .collect::<Result<Vec<String>>>()?;
+    let prompt = if args.prompt.is_empty() {
+        "a tiny cat sitting on a tiny table".to_owned()
+    } else {
+        args.prompt.join(" ")
+    };
+    let loaded_registry = load_registry(&paths.registry);
+    let registry = &loaded_registry.registry;
+    let (canonical, entry) = registry
+        .model(&args.model)
+        .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
+        .unwrap_or((None, None));
+    let mut model_path = find_model_path(paths, registry, &args.model);
+    if model_path.is_none() {
+        if let Some(entry) = entry {
+            eprintln!(
+                "Model not found locally. Pulling {}...",
+                canonical.as_deref().unwrap_or(&args.model)
+            );
+            pull_command(
+                paths,
+                PullArgs {
+                    model: args.model.clone(),
+                    force: false,
+                },
+            )?;
+            model_path = Some(paths.models.join(&entry.file));
+        }
+    }
+    let model_path = model_path.ok_or_else(|| {
+        if std::path::Path::new(&args.model).is_dir() {
+            anyhow!(
+                "model not found: {0} is a directory; a diffusers pipe is not a model — pack it \
+                 with `hipfire-quantize --flux-pipe {0} --output <base>.hfq` and pass \
+                 `<base>-transformer.hfq`",
+                args.model
+            )
+        } else {
+            anyhow!("model not found: {}", args.model)
+        }
+    })?;
+    let resolved = resolved_for_model(paths, &args.model, canonical.as_deref(), entry)?;
+    let daemon = find_daemon(paths).ok_or_else(|| {
+        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
+    })?;
+    let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+    let engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
+    engine.ping()?;
+    let _loaded = engine.load(&model_path, serde_json::json!({}))?;
+    let mut request = serde_json::json!({
+        "type": "img_generate",
+        "id": "img",
+        "prompt": prompt,
+        "seed": args.seed,
+        "backend": backend,
+    });
+    // Absent means the architecture default; the daemon refuses an explicit 0.
+    if let Some(s) = args.steps {
+        request["steps"] = serde_json::json!(s);
+    }
+    if let Some(w) = width {
+        request["width"] = serde_json::json!(w);
+    }
+    if let Some(h) = height {
+        request["height"] = serde_json::json!(h);
+    }
+    if !images.is_empty() {
+        request["images"] = serde_json::json!(images);
+    }
+    let mut progress = 0u64;
+    let done = engine.img_generate(&request, |event| {
+        if event.get("type").and_then(serde_json::Value::as_str) == Some("img_progress") {
+            let step = event
+                .get("step")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            let total = event
+                .get("total")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            if !args.json && step > progress {
+                eprintln!("[img] step {step}/{total}");
+                progress = step;
+            }
+        }
+        Ok(())
+    })?;
+    let _ = engine.unload();
+    let png_b64 = done
+        .get("png_b64")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| anyhow!("daemon img_done missing png_b64"))?;
+    let png = {
+        use base64::Engine as _;
+        base64::engine::general_purpose::STANDARD
+            .decode(png_b64)
+            .context("daemon returned invalid base64 PNG")?
+    };
+    let out_path = args.out.clone().unwrap_or_else(|| {
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(format!("hipfire-{}.png", args.seed))
+    });
+    std::fs::write(&out_path, &png)
+        .with_context(|| format!("failed to write {}", out_path.display()))?;
+    if args.json {
+        println!(
+            "{}",
+            serde_json::to_string(&serde_json::json!({
+                "path": out_path,
+                "bytes": png.len(),
+                "width": done.get("width").and_then(serde_json::Value::as_u64),
+                "height": done.get("height").and_then(serde_json::Value::as_u64),
+                "steps": done.get("steps").and_then(serde_json::Value::as_u64),
+                "seed": done.get("seed").and_then(serde_json::Value::as_u64),
+                "ms": done.get("ms").and_then(serde_json::Value::as_u64),
+                "model": done.get("model"),
+            }))?
+        );
+    } else {
+        println!("{}", out_path.display());
+    }
+    Ok(())
+}
+
 fn process_truthy(name: &str) -> bool {
     hipfire_config::process_value(name).is_some_and(|value| {
         !matches!(
@@ -2095,6 +2551,19 @@ fn process_truthy(name: &str) -> bool {
             "" | "0" | "false" | "off" | "no"
         )
     })
+}
+
+pub(crate) fn run_should_force_local(args: &RunArgs) -> bool {
+    process_truthy("HIPFIRE_LOCAL")
+        || args.image.is_some()
+        || args.kv_mode.is_some()
+        || args.kv_backend.is_some()
+        || args.head.is_some()
+        || args.speculation.is_some()
+        || args.model_draft.is_some()
+        || args.vision.is_some()
+        || args.draft_max.is_some()
+        || args.dspark_conf_threshold.is_some()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2210,6 +2679,7 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             no_prewarm: true,
             kv_mode: None,
             kv_backend: None,
+            vision: None,
             idle_timeout: None,
             tp: None,
             continuous_batch_size: None,
@@ -2395,6 +2865,36 @@ fn scan_local_models(local: &[PathBuf], search: &str, mode: MatchMode) -> Vec<Pa
         .cloned()
         .collect()
 }
+
+/// Resolve a user-supplied model input to its registry entry, if it has one.
+///
+/// A path-form input receives registry identity (sidecars, kv/max_seq policy,
+/// rm targets) only when it IS the installed artifact: `canonicalize(input)`
+/// must equal `canonicalize(models_dir.join(entry.file))` for some entry.
+/// Both sides are canonicalized so a symlink inside the models directory
+/// (e.g. `qwen3.8-27b.mq4-xt` pointing out at `~/qcal`) still matches by
+/// target. A path that merely shares a basename with an entry file gets no
+/// entry and loads as (or removes as) a bare artifact.
+///
+/// Non-path inputs (tags, aliases, bare file names with no on-disk doppelganger
+/// in the current directory) go through [`RegistryV1::model`], which keeps
+/// tag/alias/`qwen3.5:` normalization and the bare `entry.file` match.
+pub(crate) fn registry_entry_for_path<'registry>(
+    paths: &Paths,
+    registry: &'registry RegistryV1,
+    input: &str,
+) -> Option<(&'registry str, &'registry ModelEntry)> {
+    let candidate = Path::new(input);
+    if input.contains('/') || input.contains('\\') || candidate.is_file() {
+        let canonical_input = fs::canonicalize(candidate).ok()?;
+        return registry.models.iter().find_map(|(tag, entry)| {
+            let canonical_installed = fs::canonicalize(paths.models.join(&entry.file)).ok()?;
+            (canonical_installed == canonical_input).then(|| (tag.as_str(), entry))
+        });
+    }
+    registry.model(input)
+}
+
 pub(crate) fn find_model_path(
     paths: &Paths,
     registry: &RegistryV1,
@@ -2488,20 +2988,24 @@ pub(crate) fn find_model_path(
 pub(crate) fn load_params(
     resolved: &hipfire_config::ResolvedConfig,
     entry: Option<&ModelEntry>,
+    models_dir: &Path,
     model_path: &Path,
     max_tokens: u64,
     kv_override: Option<&str>,
     kv_backend_override: Option<&str>,
+    tag: Option<&str>,
+    explicit_draft: bool,
+    head_override: Option<&str>,
 ) -> Result<serde_json::Value> {
     let configured_max_seq = config_u64(resolved, "memory.max_seq")?;
     let max_seq = configured_max_seq.max(max_tokens.saturating_add(1024));
     let configured_kv = config_string(resolved, "memory.kv_cache")?;
     let kv_mode = kv_override
         .map(str::to_owned)
-        .or_else(|| (configured_kv != "auto").then_some(configured_kv))
-        .or_else(|| entry.and_then(|entry| entry.default_kv_mode.clone()))
-        .unwrap_or_else(|| "q8".into());
-    // Validate a one-shot override through the shared schema.
+        .filter(|value| !value.is_empty())
+        .unwrap_or(configured_kv);
+    // Validate through the shared schema. `auto` is preserved so architecture
+    // (maple vs qwen) can select BF16 vs Q8; do not substitute q8 here.
     field("memory.kv_cache")
         .expect("schema field")
         .parse_cli(&kv_mode)?;
@@ -2526,6 +3030,45 @@ pub(crate) fn load_params(
             }
         }
     }
+    // Resolve --head <name> against the registry's `heads` map. The overlay
+    // lives beside the model file, exactly like the triattn sidecar. Refuse
+    // rather than fall back: a silent fall-back would serve the base's head
+    // and answer a different question than the operator asked.
+    let head_file = match head_override.filter(|s| !s.is_empty()) {
+        None => String::new(),
+        // A direct path is accepted as well as a registry name: loading a
+        // model BY PATH has no registry entry, so names cannot resolve there
+        // and only a path can work.
+        Some(name) if Path::new(name).is_file() => name.to_string(),
+        Some(name) => {
+            let heads = entry.map(|e| &e.heads);
+            let sidecar = heads.and_then(|h| h.get(name)).ok_or_else(|| {
+                let known: Vec<&str> = heads
+                    .map(|h| h.keys().map(String::as_str).collect())
+                    .unwrap_or_default();
+                anyhow!(
+                    "--head {name}: not a file, and this model has no such head variant{}",
+                    if known.is_empty() {
+                        " (it publishes none)".to_string()
+                    } else {
+                        format!(" (available: {})", known.join(", "))
+                    }
+                )
+            })?;
+            let candidate = model_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(&sidecar.file);
+            if !candidate.is_file() {
+                bail!(
+                    "--head {name}: overlay {} not found — fetch it with \
+                     `hipfire pull` or place it beside the model",
+                    candidate.display()
+                );
+            }
+            candidate.display().to_string()
+        }
+    };
     let mut params = serde_json::json!({
         "max_seq": max_seq,
         "deepseek4_compute_placement": config_string(
@@ -2536,6 +3079,7 @@ pub(crate) fn load_params(
         "kv_backend": kv_backend,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
+        "vision_mode": config_string(resolved, "vision.mode")?,
         "dflash_adaptive_b": config_bool(resolved, "speculation.dflash_adaptive_b")?,
         "mtp_mode": config_string(resolved, "speculation.mtp")?,
         "mtp_k": config_u64(resolved, "speculation.mtp_k")?,
@@ -2545,6 +3089,7 @@ pub(crate) fn load_params(
         "ddtree_budget": config_u64(resolved, "speculation.ddtree_budget")?,
         "ddtree_topk": config_u64(resolved, "speculation.ddtree_topk")?,
         "cask_sidecar": cask_sidecar,
+        "head": head_file,
         "cask": config_bool(resolved, "memory.cask.enabled")?,
         "cask_budget": config_u64(resolved, "memory.cask.budget")?,
         "cask_beta": config_u64(resolved, "memory.cask.beta")?,
@@ -2573,7 +3118,158 @@ pub(crate) fn load_params(
     let selector = config_string(resolved, "speculation.mode")?;
     apply_speculation_selector(&mut params, &selector)?;
     project_dflash_draft(&mut params, developer_dflash_draft(resolved));
+    if !explicit_draft {
+        // A CLI `--model-draft` (projected by the caller after this returns)
+        // always wins, so skip sidecar resolution — and its `on` fail-closed
+        // bail — when one was given.
+        resolve_dflash_sidecar(&mut params, entry, models_dir, model_path, tag)?;
+    }
+    resolve_vision_sidecar(&mut params, entry, models_dir, model_path, tag)?;
     Ok(params)
+}
+
+/// Resolve a registry-declared DFlash sidecar into `params["draft"]`.
+///
+/// Call only once the final `dflash_mode` is known. When the mode is `auto`
+/// or `on`, no explicit draft is set (`params["draft"]`, e.g. from
+/// `developer.dflash_draft`), and `entry.dflash` names a pulled file, wire
+/// it: `on` without the file fails closed, `auto` logs one line and runs AR.
+/// With no entry at all the artifact is not registry-managed (e.g. a path
+/// that merely shares a basename with an entry file): `auto` runs AR as a
+/// bare artifact, but `on` fails closed instead of silently running AR.
+/// The sidecar is looked up in `models_dir` first — `find_model_path`
+/// canonicalizes, so a symlinked target's parent is wherever the artifact
+/// really lives, not the models directory the draft was pulled into — then
+/// next to the target. An explicit draft always wins; a final `off` never
+/// carries a draft (`project_dflash_draft` strips it) and returns early.
+fn resolve_dflash_sidecar(
+    params: &mut serde_json::Value,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    tag: Option<&str>,
+) -> Result<()> {
+    if !matches!(params["dflash_mode"].as_str(), Some("auto" | "on")) {
+        return Ok(());
+    }
+    if params
+        .get("draft")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|draft| !draft.is_empty())
+    {
+        return Ok(());
+    }
+    let Some(sidecar) = entry.and_then(|entry| entry.dflash.as_ref()) else {
+        if params["dflash_mode"].as_str() == Some("on") && model_path.is_file() {
+            bail!(
+                "DFlash draft required (dflash_mode=on) but {} is not a registry-managed artifact; pass developer.dflash_draft or use the registry tag",
+                model_path.display()
+            );
+        }
+        return Ok(());
+    };
+    let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let candidate = [models_dir, beside_target]
+        .into_iter()
+        .map(|dir| dir.join(&sidecar.file))
+        .find(|candidate| candidate.is_file());
+    if let Some(candidate) = candidate {
+        params["draft"] = serde_json::json!(candidate.display().to_string());
+        return Ok(());
+    }
+    let tag = tag.unwrap_or("<model>");
+    if params["dflash_mode"].as_str() == Some("on") {
+        bail!(
+            "DFlash draft {} is not pulled; run `hipfire pull {tag}` or set developer.dflash_draft",
+            sidecar.file
+        );
+    }
+    eprintln!(
+        "[hipfire] DFlash draft {} not pulled; running AR — `hipfire pull {tag}`",
+        sidecar.file
+    );
+    Ok(())
+}
+
+/// Resolve a registry-declared vision-tower sidecar into `params["vision"]`.
+///
+/// Call only once the final `vision_mode` is known (`load_params` projects it
+/// from `vision.mode`). `off` is a hard override mirroring the daemon's
+/// `dflash_mode=off` guard: never carry a tower, even an explicitly projected
+/// one. `auto` uses the registry/sibling sidecar when present and runs
+/// silently text-only when absent. `on` requires the declared sidecar and
+/// fails the load closed when it cannot be resolved (same shape as the
+/// DFlash `on` refusal). A trunk with an embedded tower declares no sidecar
+/// and is unaffected by this key under every mode.
+///
+/// Priority under `auto`/`on`: an already-projected `params["vision"]`
+/// (e.g. `run --vision`) always wins; then `HIPFIRE_VISION_SIDECAR` (empty
+/// string opts out, the same semantics as `HIPFIRE_DFLASH_DRAFT`); then
+/// `entry.vision`, looked up in `models_dir` first — `find_model_path`
+/// canonicalizes, so a symlinked target's parent is wherever the artifact
+/// really lives, not the models directory the sidecar was pulled into —
+/// then next to the target, then as the `<trunk-stem>-vision.hfq` sibling
+/// convention beside any trunk.
+fn resolve_vision_sidecar(
+    params: &mut serde_json::Value,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    tag: Option<&str>,
+) -> Result<()> {
+    // Resolve in every mode. The daemon's `vision_mode=off` gate is the hard
+    // override and the only place that decides; leaving the resolved path in
+    // the params lets it tell an image request which sidecar it declined.
+    let mode = params["vision_mode"].as_str().unwrap_or("off");
+    if !matches!(mode, "off" | "auto" | "on") {
+        return Ok(());
+    }
+    if let Some(projected) = params.get("vision").and_then(serde_json::Value::as_str) {
+        if projected.is_empty() {
+            if let Some(obj) = params.as_object_mut() {
+                obj.remove("vision");
+            }
+            return Ok(());
+        }
+        return Ok(());
+    }
+    if let Ok(env) = hipfire_config::developer_var("HIPFIRE_VISION_SIDECAR") {
+        if env.is_empty() {
+            if let Some(obj) = params.as_object_mut() {
+                obj.remove("vision");
+            }
+            return Ok(());
+        }
+        params["vision"] = serde_json::json!(env);
+        return Ok(());
+    }
+    let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut candidates = Vec::new();
+    if let Some(sidecar) = entry.and_then(|entry| entry.vision.as_ref()) {
+        candidates.push(models_dir.join(&sidecar.file));
+        candidates.push(beside_target.join(&sidecar.file));
+    }
+    if let Some(stem) = model_path
+        .file_name()
+        .and_then(|file| file.to_str())
+        .map(|file| file.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(file))
+    {
+        candidates.push(beside_target.join(format!("{stem}-vision.hfq")));
+    }
+    if let Some(hit) = candidates.into_iter().find(|candidate| candidate.is_file()) {
+        params["vision"] = serde_json::json!(hit.display().to_string());
+        return Ok(());
+    }
+    if mode == "on" {
+        if let Some(sidecar) = entry.and_then(|entry| entry.vision.as_ref()) {
+            let tag = tag.unwrap_or("<model>");
+            bail!(
+                "Vision tower {} is not pulled; run `hipfire pull {tag}` or pass --vision",
+                sidecar.file
+            );
+        }
+    }
+    Ok(())
 }
 
 /// Project snapshotted `developer.dflash_draft` after the effective speculation selector.
@@ -3615,6 +4311,69 @@ fn sample_stats(values: &[f64]) -> Option<SampleStats> {
     })
 }
 
+/// Default standard-bench prompt. Historical numbers depend on its exact
+/// bytes; do not change it.
+const BENCH_DEFAULT_PROMPT: &str = "Explain the theory of general relativity in simple terms.";
+
+/// Below this tokenized prompt length the measured `prefill_tok_s` is launch
+/// overhead, not prefill throughput (363 tok/s at ~24 tokens vs 886 at 4.4k
+/// on a 7900 XTX with the same binary).
+const BENCH_PREFILL_EVIDENCE_TOKENS: u64 = 256;
+
+/// Resolve the standard-benchmark prompt: `--prompt-file` reads the file
+/// verbatim (raw bytes, no trimming — one newline can move τ by 17%), else
+/// the positional words joined with spaces, else the historical default.
+/// The clap `conflicts_with` on `--prompt-file` covers CLI parsing; the
+/// explicit check here covers programmatically built args.
+fn resolve_bench_prompt(args: &BenchArgs) -> Result<String> {
+    if let Some(path) = args.prompt_file.as_deref() {
+        if !args.prompt.is_empty() {
+            bail!("--prompt-file cannot be combined with a positional prompt");
+        }
+        let bytes = fs::read(path)
+            .with_context(|| format!("failed to read --prompt-file {}", path.display()))?;
+        return String::from_utf8(bytes)
+            .with_context(|| format!("--prompt-file {} is not valid UTF-8", path.display()));
+    }
+    Ok(if args.prompt.is_empty() {
+        BENCH_DEFAULT_PROMPT.to_owned()
+    } else {
+        args.prompt.join(" ")
+    })
+}
+
+/// Hex md5 of the exact prompt bytes sent, so two bench numbers are only
+/// compared when their prompts are byte-identical.
+fn bench_prompt_md5(prompt: &str) -> String {
+    format!("{:x}", md5::compute(prompt.as_bytes()))
+}
+
+/// Short-prompt caveat: below 256 prompt tokens `prefill_tok_s` measures
+/// launch overhead, not prefill throughput.
+fn bench_prompt_warning(prompt_tokens: u64) -> Option<String> {
+    (prompt_tokens < BENCH_PREFILL_EVIDENCE_TOKENS).then(|| {
+        format!(
+            "prompt is {prompt_tokens} tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+        )
+    })
+}
+
+/// Prompt length as the daemon reports it on the `done` event:
+/// `prefill_tokens` (rows actually prefilled) plus `cached_tokens` (prefix
+/// served from the prompt cache). `None` when the event carries neither.
+fn bench_prompt_tokens_from_done(done: &serde_json::Value) -> Option<u64> {
+    let prefill = done
+        .get("prefill_tokens")
+        .and_then(serde_json::Value::as_u64);
+    let cached = done
+        .get("cached_tokens")
+        .and_then(serde_json::Value::as_u64);
+    match (prefill, cached) {
+        (None, None) => None,
+        (p, c) => Some(p.unwrap_or(0) + c.unwrap_or(0)),
+    }
+}
+
 fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.runs == 0 {
         bail!("--runs must be positive");
@@ -3665,11 +4424,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         return bench_experimental(paths, &args);
     }
     let (mut engine, loaded, pre_diag, post_diag) = open_bench_engine(paths, &args, None)?;
-    let prompt = if args.prompt.is_empty() {
-        "Explain the theory of general relativity in simple terms.".to_owned()
-    } else {
-        args.prompt.join(" ")
-    };
+    let prompt = resolve_bench_prompt(&args)?;
+    let prompt_md5 = bench_prompt_md5(&prompt);
+    let prompt_chars = prompt.chars().count() as u64;
     eprintln!("hipfire bench");
     eprintln!("  model:  {}", args.model);
     eprintln!(
@@ -3688,6 +4445,8 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     );
     eprintln!("  runs:   {}", args.runs);
     eprintln!("  max_tokens: {}", args.max_tokens);
+    eprintln!("  prompt_md5: {prompt_md5}");
+    eprintln!("  prompt_chars: {prompt_chars}");
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
     } else {
@@ -3700,6 +4459,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         let mut prefill = Vec::new();
         let mut wall = Vec::new();
         let mut ttft = Vec::new();
+        let mut prompt_tokens: Option<u64> = None;
         for _ in 0..args.runs {
             let done = bench_generate_with_reasoning(
                 &mut engine,
@@ -3707,6 +4467,14 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 args.max_tokens as u64,
                 args.reasoning_on,
             )?;
+            // Every run uses the same prompt, so the daemon's tokenized
+            // prompt length is run-invariant; keep the first report. The
+            // done event reports the prompt as `prefill_tokens` (rows the
+            // engine actually prefilled) plus `cached_tokens` (prefix served
+            // from the prompt cache); the prompt is their sum.
+            if prompt_tokens.is_none() {
+                prompt_tokens = bench_prompt_tokens_from_done(&done);
+            }
             if let Some(value) = done.get("decode_tok_s").and_then(serde_json::Value::as_f64) {
                 decode.push(value);
             }
@@ -3726,6 +4494,19 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             std::io::stderr().flush()?;
         }
         eprintln!();
+        // Below 256 prompt tokens prefill_tok_s is launch overhead, not
+        // prefill throughput — say so in the report instead of leaving a
+        // bare number that invites a wrong comparison.
+        let warnings: Vec<String> = prompt_tokens
+            .and_then(bench_prompt_warning)
+            .into_iter()
+            .collect();
+        if let Some(tokens) = prompt_tokens {
+            eprintln!("  prompt_tokens: {tokens}");
+        }
+        for warning in &warnings {
+            eprintln!("  warning: {warning}");
+        }
         let report = serde_json::json!({
             "protocol": "native-generate-v1",
             "model": args.model,
@@ -3735,6 +4516,10 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             "max_tokens": args.max_tokens,
             "runs": args.runs,
             "batch": 1,
+            "prompt_tokens": prompt_tokens,
+            "prompt_md5": prompt_md5,
+            "prompt_chars": prompt_chars,
+            "warnings": warnings,
             "decode_tok_s": sample_stats(&decode),
             "prefill_tok_s": sample_stats(&prefill),
             "wall_tok_s": sample_stats(&wall),
@@ -3877,7 +4662,17 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
 /// a leaked first model would show up: if the slots engine did not actually
 /// release its weights, `MemAvailable` is still depressed here and this stops
 /// the sweep instead of taking the box down.
+///
+/// `memory.oom_guard` (default `auto`) opts out or forces the check on: this
+/// process never initializes a GPU, so `auto` falls back to host swap state —
+/// with swap an overcommit degrades rather than kills and the check stands
+/// down; without swap it stays up. A discrete-GPU box that wants the check
+/// anyway pins `memory.oom_guard=true`.
 fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
+    if !hipfire_config::oom_guard_effective(None) {
+        eprintln!("memory headroom guard inactive (memory.oom_guard); continuing sweep");
+        return Ok(());
+    }
     let registry = load_registry(&paths.registry).registry;
     let Some(path) = find_model_path(paths, &registry, model) else {
         return Ok(());
@@ -3940,8 +4735,7 @@ fn open_bench_engine(
     serde_json::Value,
 )> {
     let registry = load_registry(&paths.registry).registry;
-    let (tag, entry) = registry
-        .model(&args.model)
+    let (tag, entry) = registry_entry_for_path(paths, &registry, &args.model)
         .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry.clone())))
         .unwrap_or((None, None));
     let mut path = find_model_path(paths, &registry, &args.model);
@@ -3991,20 +4785,34 @@ fn open_bench_engine(
     let mut params = load_params(
         &resolved,
         entry.as_ref(),
+        &paths.models,
         &path,
         max_tokens,
         args.kv_mode.as_deref(),
         args.kv_backend.as_deref(),
+        tag.as_deref(),
+        false,
+        // No --head on this path yet; the model's own head is used.
+        None,
     )?;
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
     }
+    // Registry sidecar for a final auto/on selector the config-time
+    // load_params could not see (config-off + `bench --spec dflash`).
+    resolve_dflash_sidecar(
+        &mut params,
+        entry.as_ref(),
+        &paths.models,
+        &path,
+        tag.as_deref(),
+    )?;
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
         let configured = params["max_seq"].as_u64().unwrap_or(0);
         params["max_seq"] = serde_json::json!(configured.max(requested));
     }
-    if let Ok(n) = std::env::var("HIPFIRE_BENCH_CONTINUOUS_BATCH") {
+    if let Ok(n) = hipfire_config::developer_var("HIPFIRE_BENCH_CONTINUOUS_BATCH") {
         if let Ok(n) = n.parse::<u64>() {
             params["continuous_batch_size"] = serde_json::json!(n);
         }
@@ -4225,11 +5033,7 @@ fn bench_experimental(paths: &Paths, args: &BenchArgs) -> Result<()> {
             bail!("--exp requires RDNA2 (gfx1030/gfx1031), detected {arch}");
         }
         let _ = bench_generate(&mut engine, "Hello", 16)?;
-        let prompt = if args.prompt.is_empty() {
-            "Explain the theory of general relativity in simple terms.".to_owned()
-        } else {
-            args.prompt.join(" ")
-        };
+        let prompt = resolve_bench_prompt(args)?;
         let mut samples = Vec::new();
         for _ in 0..args.runs {
             let done = bench_generate(&mut engine, &prompt, 128)?;
@@ -4285,6 +5089,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             backend: "both".to_owned(),
             workload: "both".to_owned(),
             prompt: Vec::new(),
+            prompt_file: None,
         };
         let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None)?;
         let _ = bench_generate(&mut engine, "Hello", 1)?;
@@ -4389,7 +5194,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
                     .unwrap_or("unknown"),
             );
         }
-        println!("\nFor phase-aware ISA fit evidence, run hipfire-atlas.");
+        println!("\nFor phase-aware ISA fit evidence, run python3 scripts/kernel_atlas.py render-fit --row <atlas-row.json>.");
     }
     Ok(())
 }
@@ -6254,7 +7059,19 @@ mod tests {
         fs::write(&sidecar_path, b"sidecar").unwrap();
 
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let params = load_params(&defaults, Some(entry), &model_path, 64, None, None).unwrap();
+        let params = load_params(
+            &defaults,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_handoff_tokens"], 0);
         assert_eq!(params["cask_sidecar"], "");
@@ -6269,7 +7086,19 @@ mod tests {
             layer: explicit,
         }])
         .unwrap();
-        let params = load_params(&enabled, Some(entry), &model_path, 64, None, None).unwrap();
+        let params = load_params(
+            &enabled,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(params["cask"], false);
         assert_eq!(params["cask_sidecar"], sidecar_path.display().to_string());
         assert_eq!(params["prefill_compression"], "off");
@@ -6280,8 +7109,19 @@ mod tests {
     pub(crate) fn load_params_forwards_explicit_vmm_backend() {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
-        let params =
-            load_params(&defaults, None, &model_path, 64, Some("q8"), Some("vmm")).unwrap();
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            Some("vmm"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(params["kv_backend"], "vmm");
     }
 
@@ -6289,7 +7129,19 @@ mod tests {
     pub(crate) fn load_params_defaults_to_schema_contiguous_backend() {
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
-        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(params["kv_backend"], "contiguous");
         assert_eq!(params["max_seq"], 32768);
     }
@@ -6300,7 +7152,7 @@ mod tests {
         fs::create_dir_all(&paths.root).unwrap();
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{
                 "qwen3.5:4b":{"repo":"x","file":"qwen3.5-4b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"},
                 "qwen3.6:35b-a3b":{"repo":"x","file":"qwen3.6-35b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
@@ -6380,7 +7232,7 @@ mod tests {
         fs::create_dir_all(&paths.root).unwrap();
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{
                 "muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
                 "muse-glimmer:fast":{"repo":"x","file":"muse-glimmer-30b.mq4r","size_gb":1,"min_vram_gb":1,"desc":"x"},
@@ -6532,7 +7384,7 @@ mod tests {
         fs::create_dir_all(&paths.root).unwrap();
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
@@ -6587,23 +7439,38 @@ mod tests {
         let params = load_params(
             &resolved,
             Some(entry),
+            &model_path.parent().unwrap(),
             &model_path,
             64,
             Some("q8"),
             Some("contiguous"),
+            None,
+            false,
+            None,
         )
         .unwrap();
         assert_eq!(params["kv_backend"], "contiguous");
         // Without explicit override, load_params uses the resolved vmm.
-        let params2 =
-            load_params(&resolved, Some(entry), &model_path, 64, Some("q8"), None).unwrap();
+        let params2 = load_params(
+            &resolved,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(params2["kv_backend"], "vmm");
         assert_eq!(params2["max_seq"], 262144);
 
         // Glimmer target likewise overridable (backend + max_seq).
         let raw2 = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
@@ -6647,7 +7514,7 @@ mod tests {
         // DeepSeek target override wins over 1M/384Ki policy.
         let raw3 = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"deepseek-v4-flash":{"repo":"x","file":"ds4.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
@@ -6695,7 +7562,19 @@ mod tests {
     pub(crate) fn load_params_only_forwards_explicit_deepseek4_expert_fanout() {
         let model_path = PathBuf::from("/tmp/test-model.mq2r");
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let params = load_params(&defaults, None, &model_path, 64, Some("q8"), None).unwrap();
+        let params = load_params(
+            &defaults,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(params["deepseek4_compute_placement"], "single");
         assert!(params.get("deepseek4_experts_per_token").is_none());
 
@@ -6710,7 +7589,19 @@ mod tests {
             layer: explicit,
         }])
         .unwrap();
-        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(params["deepseek4_experts_per_token"], 4);
     }
 
@@ -6731,9 +7622,13 @@ mod tests {
         let params = load_params(
             &resolved,
             None,
+            Path::new("/tmp/test-model.mq2r").parent().unwrap(),
             Path::new("/tmp/test-model.mq2r"),
             64,
             Some("q8"),
+            None,
+            None,
+            false,
             None,
         )
         .unwrap();
@@ -6756,8 +7651,1017 @@ mod tests {
         .unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
 
-        let params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(params["draft"], draft);
+    }
+
+    fn dflash_sidecar_entry(draft_file: &str) -> ModelEntry {
+        ModelEntry {
+            repo: "hipfire-models/qwen3.5-9b".into(),
+            file: "qwen3.5-9b.mq4".into(),
+            size_gb: 5.31,
+            min_vram_gb: 6.8,
+            desc: "test target".into(),
+            dflash: Some(hipfire_registry::Sidecar {
+                file: draft_file.into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn vision_sidecar_entry(vision_file: &str) -> ModelEntry {
+        ModelEntry {
+            repo: "hipfire-models/qwen3.8-27b".into(),
+            file: "qwen3.8-27b.mq4".into(),
+            size_gb: 15.66,
+            min_vram_gb: 17.0,
+            desc: "test target".into(),
+            vision: Some(hipfire_registry::Sidecar {
+                file: vision_file.into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn resolved_with_dflash_mode(
+        mode: &str,
+        draft: Option<&str>,
+    ) -> hipfire_config::ResolvedConfig {
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("speculation.dflash", mode).unwrap();
+        if let Some(draft) = draft {
+            explicit.set_cli("developer.dflash_draft", draft).unwrap();
+        }
+        resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("speculation.dflash={mode}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap()
+    }
+
+    fn resolved_with_vision_mode(mode: &str) -> hipfire_config::ResolvedConfig {
+        let mut explicit = ConfigLayer::default();
+        explicit.set_cli("vision.mode", mode).unwrap();
+        resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("vision.mode={mode}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap()
+    }
+
+    #[test]
+    pub(crate) fn load_params_resolves_registry_dflash_sidecar_when_present() {
+        // (b) auto + pulled draft file → params["draft"] points at it.
+        let paths = test_paths("dflash-sidecar-present");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let draft_path = paths.models.join("qwen35-9b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let resolved = resolved_with_dflash_mode("auto", None);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["dflash_mode"], "auto");
+        assert_eq!(params["draft"], draft_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    pub(crate) fn load_params_finds_sidecar_in_models_dir_for_symlinked_target() {
+        // find_model_path canonicalizes, so a target symlinked out of the
+        // models dir has a parent with no draft in it. The sidecar must be
+        // looked up in the models dir, not beside the canonical file.
+        // Measured 2026-09-03: serve --speculation dflash ran AR (tau=None)
+        // on a symlinked qwen3.8-27b.mq5 while the tag form resolved.
+        let paths = test_paths("dflash-sidecar-symlink");
+        fs::create_dir_all(&paths.models).unwrap();
+        let elsewhere = paths.root.join("artifacts");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let real_model = elsewhere.join("qwen3.5-9b.mq4v2.base.hfq");
+        fs::write(&real_model, b"model").unwrap();
+        std::os::unix::fs::symlink(&real_model, paths.models.join("qwen3.5-9b.mq4")).unwrap();
+        let draft_path = paths.models.join("qwen35-9b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let resolved = resolved_with_dflash_mode("on", None);
+        // What serve/run actually pass: the canonicalized path.
+        let canonical = fs::canonicalize(paths.models.join("qwen3.5-9b.mq4")).unwrap();
+        assert_eq!(
+            canonical.parent().unwrap(),
+            elsewhere.canonicalize().unwrap()
+        );
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &paths.models,
+            &canonical,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["draft"], draft_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_dflash_on_fails_closed_when_sidecar_missing() {
+        // (c) on + missing file errors with a pull hint naming the tag.
+        let paths = test_paths("dflash-sidecar-on-missing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let resolved = resolved_with_dflash_mode("on", None);
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .expect_err("on without a pulled draft must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("qwen35-9b-dflash-mq4.hfq"), "{message}");
+        assert!(message.contains("hipfire pull qwen3.5:9b"), "{message}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_dflash_auto_runs_ar_when_sidecar_missing() {
+        // (d) auto + missing file yields no draft and no error.
+        let paths = test_paths("dflash-sidecar-auto-missing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let resolved = resolved_with_dflash_mode("auto", None);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["dflash_mode"], "auto");
+        assert!(
+            params.get("draft").is_none(),
+            "auto without a pulled draft runs AR"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_explicit_draft_wins_over_dflash_sidecar() {
+        // (e) developer.dflash_draft beats the sidecar even when pulled.
+        let paths = test_paths("dflash-sidecar-explicit-wins");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let draft_path = paths.models.join("qwen35-9b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let explicit = "/tmp/custom-draft.hfq";
+        let resolved = resolved_with_dflash_mode("auto", Some(explicit));
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["draft"], explicit);
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_final_off_drops_dflash_sidecar() {
+        // (f) off never carries the sidecar, and a final off selector drops
+        // a previously resolved one.
+        let paths = test_paths("dflash-sidecar-off-drops");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let draft_path = paths.models.join("qwen35-9b-dflash-mq4.hfq");
+        fs::write(&draft_path, b"draft").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let resolved = resolved_with_dflash_mode("off", None);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(
+            params.get("draft").is_none(),
+            "off must not resolve the sidecar"
+        );
+
+        // Resolve under auto, then a final off selector drops it.
+        let resolved = resolved_with_dflash_mode("auto", None);
+        let mut params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["draft"], draft_path.display().to_string());
+        apply_speculation_selector(&mut params, "off").unwrap();
+        project_dflash_draft(&mut params, developer_dflash_draft(&resolved));
+        assert_eq!(params["dflash_mode"], "off");
+        assert!(
+            params.get("draft").is_none(),
+            "final off must drop the sidecar draft"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_skips_sidecar_for_explicit_cli_draft() {
+        // `run --model-draft` (projected by the caller after load_params)
+        // always wins: even `on` must not fail closed on a missing sidecar.
+        let paths = test_paths("dflash-sidecar-cli-explicit");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.5-9b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = dflash_sidecar_entry("qwen35-9b-dflash-mq4.hfq");
+        let resolved = resolved_with_dflash_mode("on", None);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.5:9b"),
+            true,
+            None,
+        )
+        .unwrap();
+        assert!(params.get("draft").is_none());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_resolves_registry_vision_sidecar_when_present() {
+        // `auto` + pulled registry `vision.file` wires `params["vision"]`
+        // for the daemon load.
+        let paths = test_paths("vision-sidecar-present");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let vision_path = paths.models.join("qwen3.8-27b-vision.hfq");
+        fs::write(&vision_path, b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("auto");
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["vision"], vision_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_skips_vision_sidecar_when_unpulled() {
+        // `auto` + declared but unpulled sidecar is silently skipped: vision
+        // never gates a text-only load.
+        let paths = test_paths("vision-sidecar-absent");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("auto");
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(params.get("vision").is_none());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_discovers_stem_vision_sibling_beside_trunk() {
+        // `auto` with no registry identity at all: `<trunk-stem>-vision.hfq`
+        // beside the trunk is still discovered.
+        let paths = test_paths("vision-stem-sibling");
+        let elsewhere = paths.root.join("artifacts");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let model_path = elsewhere.join("qwen3.8-27b.mq5");
+        fs::write(&model_path, b"model").unwrap();
+        let vision_path = elsewhere.join("qwen3.8-27b-vision.hfq");
+        fs::write(&vision_path, b"vision").unwrap();
+        let resolved = resolved_with_vision_mode("auto");
+        let params = load_params(
+            &resolved,
+            None,
+            &paths.models,
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["vision"], vision_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn projected_vision_path_wins_over_registry_sidecar() {
+        // `run --vision` (projected by the caller after load_params returns)
+        // always wins: a preset `params["vision"]` is never re-resolved.
+        let paths = test_paths("vision-projected-wins");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        fs::write(paths.models.join("qwen3.8-27b-vision.hfq"), b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let mut params = serde_json::json!({"vision_mode": "auto"});
+        resolve_vision_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("qwen3.8:27b"),
+        )
+        .unwrap();
+        assert_eq!(
+            params["vision"],
+            paths
+                .models
+                .join("qwen3.8-27b-vision.hfq")
+                .display()
+                .to_string()
+        );
+        // An explicit override survives a second resolution pass.
+        params["vision"] = serde_json::json!("/custom/tower.hfq");
+        resolve_vision_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("qwen3.8:27b"),
+        )
+        .unwrap();
+        assert_eq!(params["vision"], "/custom/tower.hfq");
+        // Empty string opts out: the key is dropped, never re-resolved.
+        params["vision"] = serde_json::json!("");
+        resolve_vision_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("qwen3.8:27b"),
+        )
+        .unwrap();
+        assert!(params.get("vision").is_none());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_vision_off_still_forwards_sidecar_for_daemon_gate() {
+        // `off` is a hard override: a pulled sidecar is never wired, and an
+        // explicitly projected path is stripped, mirroring `dflash_mode=off`.
+        let paths = test_paths("vision-mode-off");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        fs::write(paths.models.join("qwen3.8-27b-vision.hfq"), b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("off");
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["vision_mode"], "off");
+        // `off` still resolves the sidecar into the params: the daemon's gate
+        // is the hard override and needs the path to name what it declined.
+        assert_eq!(
+            params["vision"],
+            paths
+                .models
+                .join("qwen3.8-27b-vision.hfq")
+                .display()
+                .to_string()
+        );
+        // An explicitly projected path is forwarded untouched under `off`.
+        let mut params = serde_json::json!({"vision_mode": "off", "vision": "/custom/tower.hfq"});
+        resolve_vision_sidecar(
+            &mut params,
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("qwen3.8:27b"),
+        )
+        .unwrap();
+        assert_eq!(params["vision"], "/custom/tower.hfq");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_vision_on_wires_sidecar_when_present() {
+        // `on` + pulled sidecar wires it like `auto`.
+        let paths = test_paths("vision-mode-on-present");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let vision_path = paths.models.join("qwen3.8-27b-vision.hfq");
+        fs::write(&vision_path, b"vision").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("on");
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["vision_mode"], "on");
+        assert_eq!(params["vision"], vision_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_vision_on_fails_closed_when_sidecar_missing() {
+        // `on` + declared but unpulled sidecar fails closed with a pull hint
+        // naming the tag — same shape as the DFlash `on` refusal.
+        let paths = test_paths("vision-mode-on-missing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = vision_sidecar_entry("qwen3.8-27b-vision.hfq");
+        let resolved = resolved_with_vision_mode("on");
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .expect_err("on without a pulled tower must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("qwen3.8-27b-vision.hfq"), "{message}");
+        assert!(message.contains("hipfire pull qwen3.8:27b"), "{message}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_vision_on_leaves_bare_trunk_alone() {
+        // `on` with no declared sidecar never fails: a trunk with an embedded
+        // tower is unaffected by this key, so the load proceeds without one.
+        let paths = test_paths("vision-mode-on-bare");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let resolved = resolved_with_vision_mode("on");
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(params.get("vision").is_none());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    /// Minimal in-memory registry for rm tests: (tag, target file, dflash file).
+    fn rm_test_registry(entries: &[(&str, &str, Option<&str>)]) -> RegistryV1 {
+        let mut models = BTreeMap::new();
+        for (tag, file, dflash) in entries {
+            models.insert(
+                (*tag).to_owned(),
+                ModelEntry {
+                    repo: "test/repo".into(),
+                    file: (*file).to_owned(),
+                    size_gb: 1.0,
+                    min_vram_gb: 1.0,
+                    desc: "rm test".into(),
+                    dflash: dflash.map(|draft| hipfire_registry::Sidecar {
+                        file: draft.into(),
+                        sha256: None,
+                        size_bytes: None,
+                    }),
+                    ..Default::default()
+                },
+            );
+        }
+        RegistryV1 {
+            schema_version: hipfire_registry::REGISTRY_SCHEMA_VERSION,
+            generated_at: "test".into(),
+            _comment: None,
+            models,
+            aliases: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn rm_keeps_shared_dflash_sidecar_while_sibling_target_present() {
+        // The hw-gate regression on PR #686: `qwen3.8:27b`, `qwen3.8:27b-mq4-pro`,
+        // and `qwen3.8:27b-mq4-xt` all declare `qwen38-27b-dflash-mq4.hfq`.
+        // Removing one target must keep the sidecar while a sibling declarer's
+        // target file is still on disk.
+        let paths = test_paths("rm-shared-sidecar-kept");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in [
+            "qwen3.8-27b.mq4",
+            "qwen3.8-27b.mq4-pro",
+            "qwen38-27b-dflash-mq4.hfq",
+        ] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let registry = rm_test_registry(&[
+            (
+                "qwen3.8:27b",
+                "qwen3.8-27b.mq4",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+            (
+                "qwen3.8:27b-mq4-pro",
+                "qwen3.8-27b.mq4-pro",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+            (
+                "qwen3.8:27b-mq4-xt",
+                "qwen3.8-27b.mq4-xt",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+        ]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b-mq4-pro".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4-pro").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            paths.models.join("qwen3.8-27b.mq4").exists(),
+            "sibling target stays"
+        );
+        assert!(
+            paths.models.join("qwen38-27b-dflash-mq4.hfq").exists(),
+            "shared sidecar is kept while a sibling declarer is on disk"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_dflash_sidecar_with_last_declaring_target() {
+        // `qwen3.8:27b` still declares the sidecar in the registry, but its
+        // target file was never downloaded — a registry row alone must not pin
+        // the sidecar once the last on-disk declarer is removed.
+        let paths = test_paths("rm-shared-sidecar-last");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.8-27b.mq4-pro", "qwen38-27b-dflash-mq4.hfq"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let registry = rm_test_registry(&[
+            (
+                "qwen3.8:27b",
+                "qwen3.8-27b.mq4",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+            (
+                "qwen3.8:27b-mq4-pro",
+                "qwen3.8-27b.mq4-pro",
+                Some("qwen38-27b-dflash-mq4.hfq"),
+            ),
+        ]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b-mq4-pro".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4-pro").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            !paths.models.join("qwen38-27b-dflash-mq4.hfq").exists(),
+            "sidecar goes with the last on-disk declarer"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_keeps_shared_vision_sidecar_while_sibling_target_present() {
+        // Every `qwen3.8:27b*` tier declares `qwen3.8-27b-vision.hfq`.
+        // Removing one target must keep the sidecar while a sibling declarer's
+        // target file is still on disk (same shared-keeper rule as DFlash).
+        let paths = test_paths("rm-shared-vision-kept");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in [
+            "qwen3.8-27b.mq4",
+            "qwen3.8-27b.mq4-pro",
+            "qwen3.8-27b-vision.hfq",
+        ] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let mut registry = rm_test_registry(&[
+            ("qwen3.8:27b", "qwen3.8-27b.mq4", None),
+            ("qwen3.8:27b-mq4-pro", "qwen3.8-27b.mq4-pro", None),
+        ]);
+        for entry in registry.models.values_mut() {
+            entry.vision = Some(hipfire_registry::Sidecar {
+                file: "qwen3.8-27b-vision.hfq".into(),
+                sha256: None,
+                size_bytes: None,
+            });
+        }
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b-mq4-pro".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4-pro").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            paths.models.join("qwen3.8-27b.mq4").exists(),
+            "sibling target stays"
+        );
+        assert!(
+            paths.models.join("qwen3.8-27b-vision.hfq").exists(),
+            "shared vision sidecar is kept while a sibling declarer is on disk"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_vision_sidecar_with_last_declaring_target() {
+        // A registry row alone must not pin the sidecar once the last
+        // on-disk declarer is removed.
+        let paths = test_paths("rm-shared-vision-last");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.8-27b.mq4-pro", "qwen3.8-27b-vision.hfq"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let mut registry = rm_test_registry(&[
+            ("qwen3.8:27b", "qwen3.8-27b.mq4", None),
+            ("qwen3.8:27b-mq4-pro", "qwen3.8-27b.mq4-pro", None),
+        ]);
+        for entry in registry.models.values_mut() {
+            entry.vision = Some(hipfire_registry::Sidecar {
+                file: "qwen3.8-27b-vision.hfq".into(),
+                sha256: None,
+                size_bytes: None,
+            });
+        }
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b-mq4-pro".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4-pro").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            !paths.models.join("qwen3.8-27b-vision.hfq").exists(),
+            "vision sidecar goes with the last on-disk declarer"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_without_dflash_declaration_leaves_draft_file_alone() {
+        // A tag with no dflash declaration keeps master behaviour: its target
+        // goes, and a draft file it never declared is not an rm target.
+        let paths = test_paths("rm-no-dflash");
+        fs::create_dir_all(&paths.models).unwrap();
+        fs::write(paths.models.join("qwen3.8-27b.mq4"), b"fixture").unwrap();
+        fs::write(paths.models.join("qwen38-27b-dflash-mq4.hfq"), b"draft").unwrap();
+        let registry = rm_test_registry(&[("qwen3.8:27b", "qwen3.8-27b.mq4", None)]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: "qwen3.8:27b".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.8-27b.mq4").exists(),
+            "removed target is gone"
+        );
+        assert!(
+            paths.models.join("qwen38-27b-dflash-mq4.hfq").exists(),
+            "an undeclared draft file is never an rm target"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_foreign_same_basename_path_removes_only_that_file() {
+        // PR #686 hw-gate regression: `hipfire rm /elsewhere/qwen3.6-27b.mq4`
+        // basename-matched the `qwen3.6:27b` entry and deleted the installed
+        // target plus its sidecars while the installed target stayed. A path
+        // that merely shares a basename gets no registry identity: only that
+        // file goes.
+        let paths = test_paths("rm-foreign-basename");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.6-27b.mq4", "qwen36-27b-dflash-mq4.hfq"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let elsewhere = paths.root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let foreign = elsewhere.join("qwen3.6-27b.mq4");
+        fs::write(&foreign, b"lookalike").unwrap();
+        let registry = rm_test_registry(&[(
+            "qwen3.6:27b",
+            "qwen3.6-27b.mq4",
+            Some("qwen36-27b-dflash-mq4.hfq"),
+        )]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: foreign.display().to_string(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!foreign.exists(), "the named foreign file is removed");
+        assert!(
+            paths.models.join("qwen3.6-27b.mq4").exists(),
+            "installed target stays"
+        );
+        assert!(
+            paths.models.join("qwen36-27b-dflash-mq4.hfq").exists(),
+            "installed sidecars stay"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_installed_path_removes_target_and_sidecars() {
+        // The same removal by installed path keeps master behaviour: target
+        // plus declared sidecars go.
+        let paths = test_paths("rm-installed-path");
+        fs::create_dir_all(&paths.models).unwrap();
+        for file in ["qwen3.6-27b.mq4", "qwen36-27b-dflash-mq4.hfq"] {
+            fs::write(paths.models.join(file), b"fixture").unwrap();
+        }
+        let registry = rm_test_registry(&[(
+            "qwen3.6:27b",
+            "qwen3.6-27b.mq4",
+            Some("qwen36-27b-dflash-mq4.hfq"),
+        )]);
+        rm_with_registry(
+            &paths,
+            &registry,
+            RmArgs {
+                model: paths.models.join("qwen3.6-27b.mq4").display().to_string(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(
+            !paths.models.join("qwen3.6-27b.mq4").exists(),
+            "installed target is gone"
+        );
+        assert!(
+            !paths.models.join("qwen36-27b-dflash-mq4.hfq").exists(),
+            "declared sidecar goes with its target"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registry_entry_for_path_matches_symlinked_artifact() {
+        // `qwen3.8-27b.mq4-xt` is a symlink out of the models dir: the input
+        // and the installed entry file canonicalize to the same target, so
+        // the entry (and its sidecar) still resolve. A same-basename file
+        // elsewhere canonicalizes elsewhere and gets no entry.
+        let paths = test_paths("registry-entry-symlink");
+        fs::create_dir_all(&paths.models).unwrap();
+        let elsewhere = paths.root.join("qcal");
+        fs::create_dir_all(&elsewhere).unwrap();
+        let real = elsewhere.join("qwen3.8-27b-weights.mq4");
+        fs::write(&real, b"weights").unwrap();
+        std::os::unix::fs::symlink(&real, paths.models.join("qwen3.8-27b.mq4-xt")).unwrap();
+        let foreign_dir = paths.root.join("foreign");
+        fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign = foreign_dir.join("qwen3.8-27b.mq4-xt");
+        fs::write(&foreign, b"lookalike").unwrap();
+        let registry = rm_test_registry(&[("qwen3.8:27b-mq4-xt", "qwen3.8-27b.mq4-xt", None)]);
+        let installed = paths
+            .models
+            .join("qwen3.8-27b.mq4-xt")
+            .display()
+            .to_string();
+        let (tag, _) = registry_entry_for_path(&paths, &registry, &installed)
+            .expect("symlinked installed artifact must match by canonical target");
+        assert_eq!(tag, "qwen3.8:27b-mq4-xt");
+        assert!(
+            registry_entry_for_path(&paths, &registry, &foreign.display().to_string()).is_none(),
+            "same-basename foreign file gets no registry entry"
+        );
+        assert!(
+            registry_entry_for_path(&paths, &registry, "qwen3.8:27b-mq4-xt").is_some(),
+            "tag form still resolves"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn load_params_dflash_on_fails_closed_for_non_registry_artifact() {
+        // `on` + a path with no registry entry + no explicit draft fails
+        // closed with the not-managed message instead of silently running AR
+        // (Fable's earlier note on unregistered basenames). `auto` on the
+        // same file still runs AR as a bare artifact.
+        let paths = test_paths("dflash-on-foreign-path");
+        fs::create_dir_all(&paths.models).unwrap();
+        let foreign_dir = paths.root.join("elsewhere");
+        fs::create_dir_all(&foreign_dir).unwrap();
+        let foreign = foreign_dir.join("qwen3.6-27b.mq4");
+        fs::write(&foreign, b"lookalike").unwrap();
+        assert!(
+            registry_entry_for_path(
+                &paths,
+                &rm_test_registry(&[("qwen3.6:27b", "qwen3.6-27b.mq4", None)]),
+                &foreign.display().to_string()
+            )
+            .is_none(),
+            "precondition: foreign path has no entry"
+        );
+        let resolved = resolved_with_dflash_mode("on", None);
+        let error = load_params(
+            &resolved,
+            None,
+            &paths.models,
+            &foreign,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .expect_err("on without registry identity must fail closed");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("not a registry-managed artifact"),
+            "{message}"
+        );
+        assert!(message.contains("developer.dflash_draft"), "{message}");
+        let resolved = resolved_with_dflash_mode("auto", None);
+        let params = load_params(
+            &resolved,
+            None,
+            &paths.models,
+            &foreign,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["dflash_mode"], "auto");
+        assert!(
+            params.get("draft").is_none(),
+            "auto on a bare artifact runs AR"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 
     #[test]
@@ -6780,7 +8684,19 @@ mod tests {
         let model_path = PathBuf::from("/tmp/test-model.mq4");
 
         // load_params alone must not carry the draft while config mode is off.
-        let mut params = load_params(&resolved, None, &model_path, 64, Some("q8"), None).unwrap();
+        let mut params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
         assert_eq!(params["dflash_mode"], "off");
         assert!(
             params.get("draft").is_none(),
@@ -8178,6 +10094,7 @@ mod tests {
                     cache_capable: false,
                     kv_override: None,
                     kv_backend_override: None,
+                    vision_override: None,
                     tp: None,
                     continuous_batch_size: 1,
                     multi_slot_enabled: false,
@@ -9044,6 +10961,121 @@ mod tests {
         assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(128));
     }
 
+    fn bench_args_for_test(prompt: Vec<String>, prompt_file: Option<PathBuf>) -> BenchArgs {
+        BenchArgs {
+            model: "qwen:test".to_owned(),
+            runs: 1,
+            json: true,
+            exp: false,
+            matrix: false,
+            pp: vec![128],
+            ctx: vec![128],
+            tg: 128,
+            max_tokens: 128,
+            sustained_tg: None,
+            sustained_ctx: vec![128],
+            warmups: 1,
+            kv_mode: None,
+            kv_backend: None,
+            redline: false,
+            speculation: None,
+            reasoning_on: false,
+            concurrency: None,
+            backend: "both".to_owned(),
+            workload: "both".to_owned(),
+            prompt,
+            prompt_file,
+        }
+    }
+
+    #[test]
+    fn bench_prompt_file_conflicts_with_positional_prompt() {
+        let err = Cli::try_parse_from([
+            "hipfire",
+            "bench",
+            "qwen:test",
+            "--prompt-file",
+            "prompt.txt",
+            "hello",
+        ])
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("--prompt-file"),
+            "conflict error should name the flag: {err}"
+        );
+    }
+
+    #[test]
+    fn bench_resolve_prompt_keeps_historical_default() {
+        let args = bench_args_for_test(Vec::new(), None);
+        assert_eq!(
+            resolve_bench_prompt(&args).unwrap(),
+            "Explain the theory of general relativity in simple terms."
+        );
+    }
+
+    #[test]
+    fn bench_resolve_prompt_joins_positional_words() {
+        let args = bench_args_for_test(vec!["hello".to_owned(), "world".to_owned()], None);
+        assert_eq!(resolve_bench_prompt(&args).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn bench_resolve_prompt_file_is_verbatim() {
+        let path = std::env::temp_dir().join("hipfire-bench-prompt-verbatim.txt");
+        // Trailing newline included: the file is read as raw bytes, never trimmed.
+        std::fs::write(&path, "repeat after me\n").unwrap();
+        let args = bench_args_for_test(Vec::new(), Some(path.clone()));
+        let prompt = resolve_bench_prompt(&args).unwrap();
+        std::fs::remove_file(&path).ok();
+        assert_eq!(prompt, "repeat after me\n");
+        assert_eq!(
+            bench_prompt_md5(&prompt),
+            format!("{:x}", md5::compute(b"repeat after me\n"))
+        );
+    }
+
+    #[test]
+    fn bench_resolve_prompt_rejects_file_and_positional() {
+        let args = bench_args_for_test(vec!["hello".to_owned()], Some(PathBuf::from("prompt.txt")));
+        assert!(resolve_bench_prompt(&args).is_err());
+    }
+
+    #[test]
+    fn bench_prompt_warning_threshold() {
+        // The default short prompt must warn; 256+ tokens must not.
+        let short = bench_prompt_warning(24).expect("24 tokens must warn");
+        assert!(
+            short.contains("launch overhead"),
+            "unexpected text: {short}"
+        );
+        assert!(
+            short.contains("24"),
+            "warning should name the count: {short}"
+        );
+        assert!(bench_prompt_warning(255).is_some());
+        assert!(bench_prompt_warning(256).is_none());
+        assert!(bench_prompt_warning(4400).is_none());
+    }
+
+    #[test]
+    fn bench_prompt_tokens_come_from_prefill_plus_cached() {
+        // The daemon's done event names the prompt as prefill_tokens (+ any
+        // prompt-cache hit in cached_tokens); there is no prompt_tokens key.
+        let done = serde_json::json!({"prefill_tokens": 4400, "cached_tokens": 8});
+        assert_eq!(bench_prompt_tokens_from_done(&done), Some(4408));
+        let no_cache = serde_json::json!({"prefill_tokens": 24});
+        assert_eq!(bench_prompt_tokens_from_done(&no_cache), Some(24));
+        let neither = serde_json::json!({"tokens": 128, "prompt_tokens": 99});
+        assert_eq!(bench_prompt_tokens_from_done(&neither), None);
+    }
+
+    #[test]
+    fn bench_prompt_md5_is_hex_of_prompt_bytes() {
+        // md5("abc") is a fixed vector; guards against swapping in sha256.
+        assert_eq!(bench_prompt_md5("abc"), "900150983cd24fb0d6963f7d28e17f72");
+    }
+
     #[test]
     fn http_reasoning_nested_max_tokens_alias_resolves_cap_source() {
         let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
@@ -9688,5 +11720,438 @@ mod tests {
         )
         .unwrap_err();
         assert!(format!("{err}").contains("must be between 0 and 393216"));
+    }
+
+    #[test]
+    fn head_forces_local_even_when_service_would_be_ready() {
+        let with_head = RunArgs {
+            model: "maple-preview".into(),
+            prompt: vec![],
+            temp: None,
+            top_p: None,
+            repeat_penalty: None,
+            max_tokens: None,
+            kv_mode: None,
+            head: Some("q4k".into()),
+            kv_backend: None,
+            speculation: None,
+            model_draft: None,
+            vision: None,
+            draft_max: None,
+            dspark_conf_threshold: None,
+            system: None,
+            image: None,
+            json: false,
+            no_stream: false,
+        };
+        let without_head = RunArgs {
+            head: None,
+            ..with_head.clone()
+        };
+        // --head must force local; without head should not force local by itself
+        assert!(
+            run_should_force_local(&with_head),
+            "--head must force local load path"
+        );
+        assert!(
+            !run_should_force_local(&without_head),
+            "without head and no other flags should not force local"
+        );
+    }
+
+    #[test]
+    fn existing_artifact_valid_detects_fresh_and_stale() {
+        use sha2::{Digest, Sha256};
+        let dir = env::temp_dir().join(format!(
+            "hipfire-artifact-valid-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("model.mq4");
+        let content = b"fresh content";
+        fs::write(&path, content).unwrap();
+        let mut hasher = Sha256::new();
+        hasher.update(content);
+        let sha = format!("{:x}", hasher.finalize());
+        let size = content.len() as u64;
+        assert!(existing_artifact_valid(&path, Some(&sha), Some(size)));
+        assert!(!existing_artifact_valid(&path, Some(&sha), Some(size + 1)));
+        assert!(!existing_artifact_valid(
+            &path,
+            Some("deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef"),
+            Some(size)
+        ));
+        // No expectations means existence alone is valid
+        assert!(existing_artifact_valid(&path, None, None));
+        // Missing file is invalid
+        assert!(!existing_artifact_valid(
+            &dir.join("missing"),
+            Some(&sha),
+            Some(size)
+        ));
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn load_params_preserves_auto_for_direct_path_and_registry() {
+        // Direct-path load: no registry entry, config is auto -> must stay auto.
+        let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
+        assert_eq!(config_string(&defaults, "memory.kv_cache").unwrap(), "auto");
+        let direct_path = PathBuf::from("/tmp/direct-model.mq4");
+        let params = load_params(
+            &defaults,
+            None,
+            &direct_path.parent().unwrap(),
+            &direct_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            params["kv_mode"], "auto",
+            "direct-path auto must survive to architecture"
+        );
+        // Registry path with default_kv_mode=bf16 must also preserve auto when
+        // no explicit --kv-mode is given; architecture picks BF16.
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{
+                "maple-preview":{"repo":"x","file":"maple-preview.mq2lloydu","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"bf16"}
+            },
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (_, entry) = registry.model("maple-preview").unwrap();
+        let params2 = load_params(
+            &defaults,
+            Some(entry),
+            &direct_path.parent().unwrap(),
+            &direct_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            params2["kv_mode"], "auto",
+            "registry auto must survive even when entry has bf16 default"
+        );
+        // Explicit override still wins
+        let params3 = load_params(
+            &defaults,
+            Some(entry),
+            &direct_path.parent().unwrap(),
+            &direct_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params3["kv_mode"], "q8");
+    }
+
+    fn write_test_registry_cache(paths: &Paths, raw: &str) {
+        let registry = RegistryV1::parse(raw, "test-cache").unwrap();
+        let url = env::var("HIPFIRE_REGISTRY_URL")
+            .unwrap_or_else(|_| "https://example.com/test.json".into());
+        let cache = serde_json::json!({
+            "fetched_at": unix_timestamp() * 1000,
+            "url": url,
+            "registry": registry
+        });
+        fs::create_dir_all(paths.registry.cache.parent().unwrap()).unwrap();
+        fs::write(
+            &paths.registry.cache,
+            serde_json::to_string(&cache).unwrap(),
+        )
+        .unwrap();
+    }
+
+    fn tiny_http_server(
+        files: std::collections::HashMap<String, Vec<u8>>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let base = format!("http://127.0.0.1:{}", addr.port());
+        let expected = files.len();
+        let handle = std::thread::spawn(move || {
+            let mut served = 0usize;
+            listener.set_nonblocking(false).unwrap();
+            for stream in listener.incoming() {
+                let mut stream = match stream {
+                    Ok(s) => s,
+                    Err(_) => break,
+                };
+                let mut buf = [0u8; 4096];
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]);
+                // Extract file name from request path: /{repo}/resolve/main/{file}
+                let mut body: Option<Vec<u8>> = None;
+                for (name, data) in &files {
+                    if req.contains(name) {
+                        body = Some(data.clone());
+                        break;
+                    }
+                }
+                if let Some(data) = body {
+                    let header = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        data.len()
+                    );
+                    let _ = stream.write_all(header.as_bytes());
+                    let _ = stream.write_all(&data);
+                } else {
+                    let header =
+                        "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                    let _ = stream.write_all(header.as_bytes());
+                }
+                let _ = stream.flush();
+                served += 1;
+                if served >= expected {
+                    break;
+                }
+            }
+        });
+        // small pause to let listener start
+        std::thread::sleep(Duration::from_millis(50));
+        (base, handle)
+    }
+
+    #[test]
+    fn pull_fresh_downloads_heads_with_hash_verification() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("pull-fresh-heads");
+        // Build tiny artifacts
+        let base_content = b"base-model-content";
+        let head_q4k_content = b"head-q4k-content";
+        let head_bf16_content = b"head-bf16-content";
+        use sha2::{Digest, Sha256};
+        let sha = |data: &[u8]| {
+            let mut h = Sha256::new();
+            h.update(data);
+            format!("{:x}", h.finalize())
+        };
+        let raw = format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "test-model":{{
+                    "repo":"test/repo",
+                    "file":"test-model.mq4",
+                    "size_gb":0.001,
+                    "min_vram_gb":1,
+                    "desc":"x",
+                    "default_kv_mode":"bf16",
+                    "heads":{{
+                        "q4k":{{"file":"test-model-head-q4k.hfq","sha256":"{}","size_bytes":{}}},
+                        "bf16":{{"file":"test-model-head-bf16.hfq","sha256":"{}","size_bytes":{}}}
+                    }},
+                    "sha256":"{}",
+                    "size_bytes":{}
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            sha(head_q4k_content),
+            head_q4k_content.len(),
+            sha(head_bf16_content),
+            head_bf16_content.len(),
+            sha(base_content),
+            base_content.len()
+        );
+        write_test_registry_cache(&paths, &raw);
+        let mut files = std::collections::HashMap::new();
+        files.insert("test-model.mq4".to_string(), base_content.to_vec());
+        files.insert(
+            "test-model-head-q4k.hfq".to_string(),
+            head_q4k_content.to_vec(),
+        );
+        files.insert(
+            "test-model-head-bf16.hfq".to_string(),
+            head_bf16_content.to_vec(),
+        );
+        let (base, handle) = tiny_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        // Pull should download base + both heads
+        pull_command(
+            &paths,
+            PullArgs {
+                model: "test-model".into(),
+                force: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(paths.models.join("test-model.mq4")).unwrap(),
+            base_content
+        );
+        assert_eq!(
+            fs::read(paths.models.join("test-model-head-q4k.hfq")).unwrap(),
+            head_q4k_content
+        );
+        assert_eq!(
+            fs::read(paths.models.join("test-model-head-bf16.hfq")).unwrap(),
+            head_bf16_content
+        );
+        let _ = handle.join();
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn pull_stale_same_name_artifact_refreshes_atomically() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("pull-stale-refresh");
+        let fresh = b"fresh-content";
+        let stale = b"stale-old-content";
+        use sha2::{Digest, Sha256};
+        let sha = |data: &[u8]| {
+            let mut h = Sha256::new();
+            h.update(data);
+            format!("{:x}", h.finalize())
+        };
+        let raw = format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "test-model":{{
+                    "repo":"test/repo",
+                    "file":"test-model.mq4",
+                    "size_gb":0.001,
+                    "min_vram_gb":1,
+                    "desc":"x",
+                    "sha256":"{}",
+                    "size_bytes":{}
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            sha(fresh),
+            fresh.len()
+        );
+        write_test_registry_cache(&paths, &raw);
+        fs::create_dir_all(&paths.models).unwrap();
+        // Place stale artifact with same name but wrong hash/size
+        fs::write(paths.models.join("test-model.mq4"), stale).unwrap();
+        assert!(!existing_artifact_valid(
+            &paths.models.join("test-model.mq4"),
+            Some(&sha(fresh)),
+            Some(fresh.len() as u64)
+        ));
+        let mut files = std::collections::HashMap::new();
+        files.insert("test-model.mq4".to_string(), fresh.to_vec());
+        let (base, handle) = tiny_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        // Without --force, stale should still be detected and refreshed
+        pull_command(
+            &paths,
+            PullArgs {
+                model: "test-model".into(),
+                force: false,
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(paths.models.join("test-model.mq4")).unwrap(),
+            fresh
+        );
+        let _ = handle.join();
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_heads_alongside_base() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("rm-heads");
+        let valid_sha = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+        let raw = format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "test-model":{{
+                    "repo":"test/repo",
+                    "file":"test-model.mq4",
+                    "size_gb":0.001,
+                    "min_vram_gb":1,
+                    "desc":"x",
+                    "heads":{{
+                        "q4k":{{"file":"test-model-head-q4k.hfq","sha256":"{sha}","size_bytes":3}},
+                        "bf16":{{"file":"test-model-head-bf16.hfq","sha256":"{sha}","size_bytes":3}}
+                    }},
+                    "sha256":"{sha}",
+                    "size_bytes":3
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            sha = valid_sha
+        );
+        write_test_registry_cache(&paths, &raw);
+        fs::create_dir_all(&paths.models).unwrap();
+        fs::write(paths.models.join("test-model.mq4"), b"base").unwrap();
+        fs::write(paths.models.join("test-model-head-q4k.hfq"), b"q4k").unwrap();
+        fs::write(paths.models.join("test-model-head-bf16.hfq"), b"bf16").unwrap();
+        assert!(paths.models.join("test-model-head-q4k.hfq").is_file());
+        rm_command(
+            &paths,
+            RmArgs {
+                model: "test-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("test-model.mq4").exists());
+        assert!(!paths.models.join("test-model-head-q4k.hfq").exists());
+        assert!(!paths.models.join("test-model-head-bf16.hfq").exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvGuard {
+        key: String,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl EnvGuard {
+        fn set(key: &str, val: &str) -> Self {
+            let prev = env::var_os(key);
+            env::set_var(key, val);
+            Self {
+                key: key.to_string(),
+                prev,
+            }
+        }
+    }
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            if let Some(v) = &self.prev {
+                env::set_var(&self.key, v);
+            } else {
+                env::remove_var(&self.key);
+            }
+        }
     }
 }

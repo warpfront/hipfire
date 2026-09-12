@@ -177,6 +177,10 @@ fn decode_step_body(
         let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
             hipfire_dispatch::families::kv_tier::KvTierInputs {
                 pos: seq_len - 1,
+                // Only read on the Q8 arm. Under `--kv-mode bf16` the cache
+                // reports `quant_bf16` through `tier_inputs()`, `classify`
+                // resolves to KTier::Bf16 first, and that arm is windowed
+                // unconditionally — so this flag goes inert, not contradicted.
                 q8_windowed: true,
                 window,
                 ..state.kv.tier_inputs()
@@ -608,13 +612,16 @@ enum DownMode {
 
 fn down_mode() -> DownMode {
     static M: std::sync::OnceLock<DownMode> = std::sync::OnceLock::new();
-    *M.get_or_init(
-        || match hipfire_config::developer_var("HIPFIRE_MAPLE_DOWN").ok().as_deref() {
+    *M.get_or_init(|| {
+        match hipfire_config::developer_var("HIPFIRE_MAPLE_DOWN")
+            .ok()
+            .as_deref()
+        {
             Some("atomic") => DownMode::Atomic,
             Some("expanded-nocombine") => DownMode::ExpandedNoCombine,
             _ => DownMode::Expanded,
-        },
-    )
+        }
+    })
 }
 
 // ───────────────────────── Batched prefill ─────────────────────────
@@ -1234,6 +1241,8 @@ fn batched_attend(
     let plan = hipfire_dispatch::families::kv_tier::KvTierPlan::derive(
         hipfire_dispatch::families::kv_tier::KvTierInputs {
             pos: start_pos + b - 1,
+            // Inert under `--kv-mode bf16` — see the decode-side note; the
+            // Bf16 arm is windowed unconditionally in both shapes.
             q8_windowed: true,
             window,
             batch_size: b,

@@ -1,0 +1,9 @@
+HIPFIRE_KV_MODE=q8 HIP_VISIBLE_DEVICES=0 python3 target/g4_batch_corrected.py
+
+Cache staging before this run:
+cp /tmp/hipfire-g4-home-g46-batch-corrected/.hipfire_kernels/gfx1151/kv_slot_desc.h /tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_slot_desc.h
+cp /tmp/hipfire-g4-home-g46-batch-corrected/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hsaco /tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hsaco
+cp /tmp/hipfire-g4-home-g46-batch-corrected/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hash /tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hash
+
+The HSACO was compiled from the cached source with the exact failed-run device compile flags:
+/nix/store/38am99f653hccgj56jg545w6pn5vf3w2-hipClang/bin/clang++ --offload-arch=gfx1151 --cuda-device-only -O3 --no-offload-compress --rocm-path=/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3 --hip-path=/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3 -I/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3/include --rocm-device-lib-path=/nix/store/bb0c3xjc5cn4f8hgbbgwcp03wa9d4gxw-rocm-device-libs-22.0.0-rocm/amdgcn/bitcode -o <cache>/kv_cache_write_q8_0_independent.ae4df8f416708260.hsaco -x hip <cache>/kv_cache_write_q8_0_independent.ae4df8f416708260.hip

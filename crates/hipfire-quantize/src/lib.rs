@@ -6,6 +6,7 @@ pub mod hessian_io;
 pub mod hfhs_diag;
 pub mod hfqm;
 pub mod safetensors_file;
+pub mod vision_sidecar;
 
 use std::sync::OnceLock;
 

@@ -12,7 +12,7 @@ old CLIs that read {models, aliases} keep working unchanged; new fields are
 purely additive:
   top-level : schema_version, generated_at
   per-entry : sha256 (HF LFS oid), size_bytes, arch_id, quant
-  sidecars  : triattn/mtp gain sha256/size_bytes next to their `file`
+  sidecars  : triattn/mtp/dflash gain sha256/size_bytes next to their `file`
 
 Fail-closed: ANY problem — repo unreachable, file missing from the repo
 tree, file not LFS (no sha256), size_bytes disagreeing with curated
@@ -90,6 +90,10 @@ KNOWN_KV_MODES = {
     "auto",
     "f32",
     "f16",
+    # maple (arch 15) only: a flat 2-byte BF16 KV tier. Per-site acceptance
+    # lives in hipfire_runtime::kv_mode's policies; this list is only the
+    # schema allow-list, and must stay in sync with hipfire-config's KV_MODES.
+    "bf16",
     "q8",
     "asym4",
     "asym3",
@@ -276,6 +280,10 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 15
     if family == "vibethinker":
         return 7   # Qwen2 dense (WeiboAI/VibeThinker-3B base)
+    # FLUX.1 MMDiT trunk packs (per-component HFQ, arch 40; sidecar ids
+    # 41/42/43 live in the packs' own headers, not the registry entry).
+    if family in ("flux", "flux.schnell", "flux.dev"):
+        return 40
     return None
 
 
@@ -360,7 +368,7 @@ def is_strict_superset(old: object, new: object, path: str, errors: list[str]) -
 def annotate_sidecar(
     sidecar: dict, tree: dict[str, dict], tag: str, kind: str, errors: list[str]
 ) -> dict:
-    """triattn/mtp sub-object: require existence, add sha256/size_bytes if LFS."""
+    """triattn/mtp/dflash/vision sub-object: require existence, add sha256/size_bytes if LFS."""
     out = dict(sidecar)
     fname = sidecar.get("file", "")
     item = tree.get(fname)
@@ -393,12 +401,23 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
 
     # One tree fetch per unique repo.
     repos = sorted({e["repo"] for e in models.values() if e.get("repo")})
+    # Image-component (diffusion) repos publish AFTER their packs exist, so a
+    # missing repo is expected until the first upload: sizes/digests stay TBD
+    # on those entries. Fail-closed stays for text-model repos, where a probe
+    # failure means a typo or a broken upload.
+    image_repos = {e["repo"] for e in models.values() if e.get("arch_id") == 40}
     trees: dict[str, dict[str, dict]] = {}
     for repo in repos:
         try:
             trees[repo] = repo_tree(repo, token)
             log(f"probed {repo}: {len(trees[repo])} files")
         except Exception as e:  # noqa: BLE001 — collected, run fails closed
+            if repo in image_repos:
+                log(
+                    f"repo {repo}: image-component repo not published yet ({e}); "
+                    f"sizes/digests stay TBD"
+                )
+                continue
             errors.append(f"repo {repo}: tree probe failed: {e}")
 
     out_models: dict = {}
@@ -482,9 +501,18 @@ def build_registry(curated: dict, token: str | None) -> tuple[dict | None, list[
                                 f"HF {size_bytes / 1e9:.2f} GB ({drift:.0%} drift); "
                                 f"update registry/models.json"
                             )
-            for kind in ("triattn", "mtp"):
+            for kind in ("triattn", "mtp", "dflash", "vision", "t5", "clip", "qwen3", "vae"):
                 if isinstance(entry.get(kind), dict):
                     new_entry[kind] = annotate_sidecar(entry[kind], tree, tag, kind, errors)
+            # `heads` is a MAP of sidecars (alternative lm_head overlays), not a
+            # single one — same annotation, once per entry, so a head that is
+            # missing from the repo fails the run like any other sidecar.
+            if isinstance(entry.get("heads"), dict):
+                new_entry["heads"] = {
+                    name: annotate_sidecar(sc, tree, tag, f"heads.{name}", errors)
+                    for name, sc in entry["heads"].items()
+                    if isinstance(sc, dict)
+                }
         # repo probe already failed → error recorded above; entry still gets
         # arch_id/quant so the error list is the only blocker.
 

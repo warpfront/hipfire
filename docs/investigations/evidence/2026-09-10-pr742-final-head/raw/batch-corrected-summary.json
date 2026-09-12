@@ -1,0 +1,308 @@
+{
+  "binary": "/tmp/hipfire-g4-e786-target/release/daemon",
+  "binary_sha256": "82c45928b85318d1760855d4c0f40f20508618c586c9cf910edbee9f03f1b9b7",
+  "cache_home": "/tmp/hipfire-g4-home-g46-batch",
+  "cache_arch": "gfx1151",
+  "staged_header": "/tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_slot_desc.h",
+  "staged_kernel": "/tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hsaco",
+  "staged_kernel_hash": "ae4df8f416708260",
+  "phases": {
+    "load": {
+      "event": {
+        "type": "loaded",
+        "arch": "qwen3_5",
+        "dim": 5120,
+        "layers": 64,
+        "vocab": 248320,
+        "vl": false,
+        "reasoning_contract": "qwen_jinja",
+        "reasoning_effort_native": false,
+        "reasoning_efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "cache_capable": true,
+        "retry_reset_eligible": true,
+        "continuous_batch_capable": true
+      }
+    },
+    "two_lane_commit_done": {
+      "requests": [
+        {
+          "type": "generate",
+          "id": "lane-commit-a",
+          "attempt_id": 601,
+          "prompt": "Write one short sentence about Rust ownership.",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Write one short sentence about Rust ownership."
+            }
+          ],
+          "temperature": 0.0,
+          "max_tokens": 32,
+          "thinking_enabled": false,
+          "serve_continuous_batch": true,
+          "params": {
+            "serve_continuous_batch": true
+          }
+        },
+        {
+          "type": "generate",
+          "id": "lane-commit-b",
+          "attempt_id": 602,
+          "prompt": "Write one short sentence about Rust borrowing.",
+          "messages": [
+            {
+              "role": "user",
+              "content": "Write one short sentence about Rust borrowing."
+            }
+          ],
+          "temperature": 0.0,
+          "max_tokens": 32,
+          "thinking_enabled": false,
+          "serve_continuous_batch": true,
+          "params": {
+            "serve_continuous_batch": true
+          }
+        }
+      ],
+      "event_types": [
+        "gen_start",
+        "token",
+        "gen_start",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "commit_ready",
+        "done",
+        "token",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "RustR ownershipust ensures borrowing memory allows safety multiple by immutable enforcing references that or each a value single has mutable exactly reference one to owner a, value which to is exist responsible simultaneously for, freeing ensuring the memory memory safety when without it garbage goes collection out. of scope.",
+      "terminal_events": {
+        "lane-commit-a": [
+          {
+            "type": "done",
+            "id": "lane-commit-a",
+            "tokens": 31,
+            "tok_s": 5.3,
+            "prefill_tokens": 20,
+            "prefill_ms": 185.1,
+            "prefill_tok_s": 108.1,
+            "decode_tok_s": 6.2,
+            "ttft_ms": 778.0,
+            "cached_tokens": 0,
+            "finish_reason": "stop",
+            "attempt_id": 601,
+            "latency_ms": 5805.5,
+            "execution_mode": "continuous_batch_independent",
+            "continuous_batch": {
+              "executed": true,
+              "slots": 2,
+              "lane": 0,
+              "lane_capacity": 4096,
+              "max_active_lanes": 2,
+              "refill": "continuous"
+            }
+          }
+        ],
+        "lane-commit-b": [
+          {
+            "type": "done",
+            "id": "lane-commit-b",
+            "tokens": 27,
+            "tok_s": 9.8,
+            "prefill_tokens": 20,
+            "prefill_ms": 218.3,
+            "prefill_tok_s": 91.6,
+            "decode_tok_s": 10.6,
+            "ttft_ms": 220.8,
+            "cached_tokens": 0,
+            "finish_reason": "stop",
+            "attempt_id": 602,
+            "latency_ms": 2758.8,
+            "execution_mode": "continuous_batch_independent",
+            "continuous_batch": {
+              "executed": true,
+              "slots": 2,
+              "lane": 1,
+              "lane_capacity": 4096,
+              "max_active_lanes": 2,
+              "refill": "continuous"
+            }
+          }
+        ]
+      },
+      "terminal_count": 2,
+      "assertions": {
+        "both_started": true,
+        "both_commit_ready": true,
+        "both_commit_sent": true,
+        "one_done_each": true,
+        "finish_reason_not_aborted": true,
+        "attempt_correlation": true
+      }
+    },
+    "same_key_reuse": {
+      "request": {
+        "type": "generate",
+        "id": "lane-commit-a",
+        "attempt_id": 601,
+        "prompt": "Now answer with exactly REUSED.",
+        "messages": [
+          {
+            "role": "user",
+            "content": "Now answer with exactly REUSED."
+          }
+        ],
+        "temperature": 0.0,
+        "max_tokens": 32,
+        "thinking_enabled": false,
+        "serve_continuous_batch": true,
+        "params": {
+          "serve_continuous_batch": true
+        }
+      },
+      "stale_abort_sent_before_generate": true,
+      "event_types": [
+        "gen_start",
+        "token",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "REUSED",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "lane-commit-a",
+          "tokens": 3,
+          "tok_s": 6.6,
+          "prefill_tokens": 19,
+          "prefill_ms": 256.8,
+          "prefill_tok_s": 74.0,
+          "decode_tok_s": 15.3,
+          "ttft_ms": 258.7,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 601,
+          "latency_ms": 454.1,
+          "execution_mode": "continuous_batch_independent",
+          "continuous_batch": {
+            "executed": true,
+            "slots": 2,
+            "lane": 0,
+            "lane_capacity": 4096,
+            "max_active_lanes": 1,
+            "refill": "continuous"
+          }
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "commit_sent": true,
+        "one_done": true,
+        "finish_reason_not_aborted": true,
+        "attempt_correlation": true
+      }
+    },
+    "snapshot": {
+      "event": {
+        "type": "test_state_snapshot",
+        "schema_version": 1,
+        "arch": "qwen35",
+        "eligible_routes": [
+          "qwen_ar",
+          "qwen_dflash"
+        ],
+        "state_epoch": 0,
+        "seq_pos": 0,
+        "conversation_len": 0,
+        "kv_hash": "ef63c0f140b9a325",
+        "kv_bytes": 67133440,
+        "recurrent_hash": "6a67742d55922325",
+        "recurrent_bytes": 120324096,
+        "graph_clean": true,
+        "replay_clean": true,
+        "drafter_reset": true,
+        "checkpoint_empty": true,
+        "adaptive_clean": true,
+        "asst_cache_empty": true,
+        "prefix_cache_clean": true
+      }
+    },
+    "reset": {
+      "event": {
+        "type": "reset",
+        "rolled_back": true,
+        "state_epoch": 1,
+        "seq_pos": 0,
+        "conversation_len": 0,
+        "attempt_id": 603,
+        "retry_reset_eligible": true
+      }
+    },
+    "unload": {
+      "event": {
+        "type": "unloaded"
+      }
+    }
+  },
+  "completed_at_utc": "2026-09-10T17:47:24Z"
+}

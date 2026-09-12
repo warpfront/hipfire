@@ -178,6 +178,165 @@ fn main() {
         ok = false;
     }
 
+    // ── HD512 prefill/decode consistency (batched vs single-query) ──
+    // Regression for the HD512 Q-preload/dot grouping in
+    // `attention_flash_q8_0_tile_batched`: the batched kernel must preload Q
+    // and group the Q·K dot as four 128-dim halves × four dims/thread —
+    // exactly the single-query `attention_flash_q8_0_tile` association. The
+    // contiguous 16-dim/thread grouping differs in FP association, so a
+    // batched prefill row diverges from a single-query decode of the SAME
+    // cache/query/position. One multirow batch covers BOS, a two-token
+    // prefix, the 124-token reproducer length, a tile-boundary pair, and the
+    // tail; each row is compared against `attention_flash_q8_0` (full
+    // causal, window 0) on the same cache and query at the same position.
+    {
+        const NH5: usize = 4;
+        const NKV5: usize = 2;
+        const HD5: usize = 512;
+        const BLK5: usize = 34; // Q8_0 block: fp16 scale + 32 i8 codes
+                                // Derive — never guess: the batched launcher tiles by
+                                // `Gpu::attn_tile_size`; the single-query path tiles by
+                                // `attention::q8_flash_tile_size`.
+        let tile_b = gpu.attn_tile_size();
+        let s5: usize = (tile_b + 64).max(160);
+        let tile_s = rdna_compute::attention::q8_flash_tile_size(&gpu.arch, NH5, NKV5, HD5, s5);
+        // BOS, two-token prefix, 124-token reproducer length, tile-boundary
+        // pair, tail.
+        let pos5: [i32; 7] = [
+            0,
+            1,
+            2,
+            123,
+            (tile_b - 1) as i32,
+            tile_b as i32,
+            (s5 - 1) as i32,
+        ];
+        let b5 = pos5.len();
+
+        // Deterministic Q8_0 K/V cache: fp16 scale 1.0, varied small codes.
+        let blocks5 = HD5 / 32;
+        let bytes_per_pos5 = NKV5 * blocks5 * BLK5;
+        let mut kv5 = vec![0u8; s5 * bytes_per_pos5];
+        for pos in 0..s5 {
+            for blk_i in 0..(NKV5 * blocks5) {
+                let off = pos * bytes_per_pos5 + blk_i * BLK5;
+                kv5[off] = 0x00;
+                kv5[off + 1] = 0x3C; // fp16 scale 1.0
+                for j in 0..32 {
+                    kv5[off + 2 + j] =
+                        (((pos * 31 + blk_i * 7 + j * 3) % 13) as i32 - 6) as i8 as u8;
+                }
+            }
+        }
+
+        // Deterministic, finite, nondegenerate Q, varied by row, head, dim.
+        let q5_data: Vec<f32> = (0..b5 * NH5 * HD5)
+            .map(|i| {
+                let r = i / (NH5 * HD5);
+                let h = (i / HD5) % NH5;
+                let d = i % HD5;
+                (((r * 7919 + h * 104729 + d * 1299709 + 12345) % 2001) as f32) / 1000.0 - 1.0
+            })
+            .collect();
+
+        // Candidate: one multirow full-causal batch.
+        let q5 = gpu.upload_f32(&q5_data, &[b5 * NH5 * HD5]).expect("q5");
+        let pos5_bytes =
+            unsafe { std::slice::from_raw_parts(pos5.as_ptr() as *const u8, pos5.len() * 4) };
+        let positions5 = gpu.upload_raw(pos5_bytes, &[b5]).expect("pos5");
+        let k5 = gpu.upload_raw(&kv5, &[kv5.len()]).expect("k5");
+        let v5 = gpu.upload_raw(&kv5, &[kv5.len()]).expect("v5");
+        let max_tiles_b = s5.div_ceil(tile_b);
+        let partials5 = gpu
+            .zeros(&[b5 * NH5 * max_tiles_b * (2 + HD5)], DType::F32)
+            .expect("partials5");
+        let out5 = gpu.zeros(&[b5 * NH5 * HD5], DType::F32).expect("out5");
+        gpu.attention_flash_q8_0_batched_masked(
+            &q5,
+            &k5,
+            &v5,
+            &out5,
+            &positions5,
+            NH5,
+            NKV5,
+            HD5,
+            s5,
+            s5,
+            b5,
+            &partials5,
+            None,
+            0,
+            0,
+        )
+        .expect("hd512 batched attn launch");
+        let got5 = gpu.download_f32(&out5).expect("download5");
+
+        // Reference: single-query decode per row on the SAME cache/query/position.
+        let max_tiles_s = s5.div_ceil(tile_s);
+        println!("hd512: batch={b5} heads={NH5} kv={NKV5} dim={HD5} seq={s5} tile_b={tile_b} tile_s={tile_s}");
+        for (r, &p) in pos5.iter().enumerate() {
+            let row_q = &q5_data[r * NH5 * HD5..(r + 1) * NH5 * HD5];
+            let qr = gpu.upload_f32(row_q, &[NH5 * HD5]).expect("q5 row");
+            let pd = [p];
+            let pdb = unsafe { std::slice::from_raw_parts(pd.as_ptr() as *const u8, 4) };
+            let post = gpu.upload_raw(pdb, &[1]).expect("pos row");
+            let outr = gpu.zeros(&[NH5 * HD5], DType::F32).expect("out row");
+            let partr = gpu
+                .zeros(&[NH5 * max_tiles_s * (2 + HD5)], DType::F32)
+                .expect("partials row");
+            gpu.attention_flash_q8_0(
+                &qr,
+                &k5,
+                &v5,
+                &outr,
+                &post.buf,
+                (p + 1) as usize,
+                NH5,
+                NKV5,
+                HD5,
+                s5,
+                &partr,
+            )
+            .expect("hd512 single attn launch");
+            let want = gpu.download_f32(&outr).expect("download row");
+            let got_row = &got5[r * NH5 * HD5..(r + 1) * NH5 * HD5];
+            for (i, (&g, &w)) in got_row.iter().zip(want.iter()).enumerate() {
+                if !g.is_finite() || !w.is_finite() {
+                    eprintln!(
+                        "FAIL hd512: row {r} pos {p} dim {i} non-finite (batched={g} single={w})"
+                    );
+                    ok = false;
+                }
+            }
+            let d = max_abs_diff(got_row, &want);
+            // Rows inside the first tile of BOTH paths are tiling-independent
+            // (single tile → identical reduction math), so they always demand
+            // exact numerical equality (d == 0; signed zero accepts). Later
+            // rows demand it too when both resolvers agree (the lab default);
+            // where the two tile sizes disagree the tiling itself rounds
+            // differently, so those rows use a tight tolerance instead.
+            let single_tile_row = (p + 1) as usize <= tile_b.min(tile_s);
+            if single_tile_row || tile_b == tile_s {
+                println!("hd512: row {r} pos {p} |batched - single| = {d:.6e} (want exactly 0)");
+                if d != 0.0 {
+                    eprintln!(
+                        "FAIL hd512: row {r} pos {p} prefill/decode mismatch: batched vs single-query differ by {d:.6e}"
+                    );
+                    ok = false;
+                }
+            } else {
+                println!("hd512: row {r} pos {p} |batched - single| = {d:.6e} (tiles differ; want < 1e-5)");
+                if !(d <= 1e-5) {
+                    eprintln!(
+                        "FAIL hd512: row {r} pos {p} differs from single-query decode by {d:.6e}"
+                    );
+                    ok = false;
+                }
+            }
+        }
+        println!("hd512: prefill/decode consistency checked ({b5} rows)");
+    }
+
     if ok {
         println!("PASS: sliding-window masking correct (prefill + decode)");
     } else {

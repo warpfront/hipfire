@@ -330,35 +330,18 @@ fn preprocess(img: image::DynamicImage, cfg: &VisionConfig) -> Result<Prepared, 
 /// decompression-bomb image is rejected before allocation — same contract
 /// as [`load_and_preprocess_from_bytes`].
 pub fn load_and_preprocess(path: &Path, cfg: &VisionConfig) -> Result<Prepared, String> {
-    let reader = image::ImageReader::open(path)
-        .map_err(|e| format!("failed to open image {}: {e}", path.display()))?
-        .with_guessed_format()
-        .map_err(|e| format!("failed to read image {}: {e}", path.display()))?;
-    let (ow, oh) = reader.into_dimensions().map_err(map_image_err)?;
+    let (ow, oh) = hipfire_runtime::imagedec::probe_dimensions_path(path)?;
     reject_if_too_large(ow, oh)?;
-    let img =
-        image::open(path).map_err(|e| format!("failed to open image {}: {e}", path.display()))?;
+    let img = hipfire_runtime::imagedec::decode_dynamic_path(path)?;
     preprocess(img, cfg)
 }
 
 /// Load + preprocess raw PNG/JPEG bytes.
 pub fn load_and_preprocess_from_bytes(data: &[u8], cfg: &VisionConfig) -> Result<Prepared, String> {
-    let reader = image::ImageReader::new(std::io::Cursor::new(data))
-        .with_guessed_format()
-        .map_err(|e| format!("failed to read image: {e}"))?;
-    let (ow, oh) = reader.into_dimensions().map_err(map_image_err)?;
+    let (ow, oh) = hipfire_runtime::imagedec::probe_dimensions(data)?;
     reject_if_too_large(ow, oh)?;
-    let img = image::load_from_memory(data).map_err(map_image_err)?;
+    let img = hipfire_runtime::imagedec::decode_dynamic(data)?;
     preprocess(img, cfg)
-}
-
-fn map_image_err(e: image::ImageError) -> String {
-    match e {
-        image::ImageError::Unsupported(_) => {
-            "unsupported image format — supported: png, jpeg".to_string()
-        }
-        other => format!("failed to decode image: {other}"),
-    }
 }
 
 #[cfg(test)]

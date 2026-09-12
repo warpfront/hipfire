@@ -6525,29 +6525,34 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gemv_hfq6g256", kernels::GEMV_HFQ6G256_SRC, "gemv_hfq6g256")?;
-        let func = &self.functions["gemv_hfq6g256"];
-        let mut a_ptr = a_raw.buf.as_ptr();
-        let mut x_ptr = x.buf.as_ptr();
-        let mut y_ptr = y.buf.as_ptr();
-        let mut m_val = m as i32;
-        let mut k_val = k as i32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut a_ptr as *mut _ as *mut c_void,
-            &mut x_ptr as *mut _ as *mut c_void,
-            &mut y_ptr as *mut _ as *mut c_void,
-            &mut m_val as *mut _ as *mut c_void,
-            &mut k_val as *mut _ as *mut c_void,
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
         ];
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gemv_hfq6g256",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            },
+        )
     }
     /// HFQ5-G256 GEMV. K must be multiple of 256.
     pub fn gemv_hfq5g256(
@@ -6875,7 +6880,8 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false);
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol =
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -7718,7 +7724,8 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false);
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol =
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -7925,7 +7932,8 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false);
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol =
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -8075,7 +8083,8 @@ impl Gpu {
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false)
         };
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol = {
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -8238,7 +8247,8 @@ impl Gpu {
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false)
         };
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol = {
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -8632,7 +8642,8 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false);
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol =
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -8775,7 +8786,8 @@ impl Gpu {
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_ALL_BUFFER", false)
         };
-        let gfx1151_lm_head_cpol_owned = hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
+        let gfx1151_lm_head_cpol_owned =
+            hipfire_config::developer_var("HIPFIRE_GFX1151_LM_HEAD_CPOL").ok();
         let gfx1151_lm_head_cpol = {
             if self.arch_caps.is_gfx1151() && rows == 2 && m == 248_320 && k == 2_048 {
                 gfx1151_lm_head_cpol_owned.as_deref()
@@ -10285,6 +10297,7 @@ impl Gpu {
             let fixed_k2048 = self.arch_caps.is_gfx1100()
                 && self.flags.rdna3_hfq4_moe_gate_up_k2048
                 && k == 2_048;
+            let fixed_k2816 = k == 2_816;
             let gfx1151_k2048 = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_GATE_UP_K2048", false);
@@ -10303,13 +10316,19 @@ impl Gpu {
             let gfx1151_k2048_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && (hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_LOADS", false)
-                    || hipfire_config::developer_bool("HIPFIRE_GFX1151_WEIGHT_BUFFER_GATE_UP", false));
+                    || hipfire_config::developer_bool(
+                        "HIPFIRE_GFX1151_WEIGHT_BUFFER_GATE_UP",
+                        false,
+                    ));
             let gfx1151_all_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_GATE_UP_ALL_BUFFER", false);
             let gfx1151_route_all_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
-                && hipfire_config::developer_bool("HIPFIRE_GFX1151_GATE_UP_ROUTE_ALL_BUFFER", false);
+                && hipfire_config::developer_bool(
+                    "HIPFIRE_GFX1151_GATE_UP_ROUTE_ALL_BUFFER",
+                    false,
+                );
             let gfx1151_pair_all_buffer = self.arch_caps.is_gfx1151()
                 && k == 2_048
                 && hipfire_config::developer_bool("HIPFIRE_GFX1151_GATE_UP_PAIR_ALL_BUFFER", false);
@@ -10463,18 +10482,33 @@ impl Gpu {
                     },
                 )
             } else if matches!(cpol, "glc" | "slc" | "dlc") {
-                let (module, source, func) = match cpol {
-                    "glc" => (
+                let (module, source, func) = match (k, cpol) {
+                    (2_816, "glc") => (
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_GLC_GFX1100_SRC,
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_glc",
+                    ),
+                    (2_816, "slc") => (
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_SLC_GFX1100_SRC,
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_slc",
+                    ),
+                    (2_816, "dlc") => (
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc",
+                        kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_CPOL_DLC_GFX1100_SRC,
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816_cpol_dlc",
+                    ),
+                    (_, "glc") => (
                         "gemv_hfq4g256_moe_gate_up_indexed_cpol_glc",
                         kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_GLC_GFX1100_SRC,
                         "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_glc",
                     ),
-                    "slc" => (
+                    (_, "slc") => (
                         "gemv_hfq4g256_moe_gate_up_indexed_cpol_slc",
                         kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_SLC_GFX1100_SRC,
                         "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_slc",
                     ),
-                    "dlc" => (
+                    (_, "dlc") => (
                         "gemv_hfq4g256_moe_gate_up_indexed_cpol_dlc",
                         kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_CPOL_DLC_GFX1100_SRC,
                         "gemv_hfq4g256_moe_gate_up_k8_indexed_cpol_dlc",
@@ -10540,6 +10574,21 @@ impl Gpu {
                     "gemv_hfq4g256_moe_gate_up_k8_indexed_rowtile",
                     [32u32, 1, 1],
                     ((m as u32) + 1) / 2,
+                )
+            } else if fixed_k2816 {
+                self.ensure_kernel(
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816",
+                    kernels::GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC,
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816",
+                )?;
+                (
+                    "gemv_hfq4g256_moe_gate_up_k8_indexed_k2816",
+                    [32u32, 1, 1],
+                    if tight_grid {
+                        (m as u32) >> 1
+                    } else {
+                        m as u32
+                    },
                 )
             } else if fixed_k2048 {
                 self.ensure_kernel(
@@ -12349,7 +12398,8 @@ impl Gpu {
             bytes,
         );
         let grid_x = if self.arch_caps.is_gfx1100()
-            && hipfire_config::developer_bool("HIPFIRE_MOE_DOWN_TIGHT_GRID", false) {
+            && hipfire_config::developer_bool("HIPFIRE_MOE_DOWN_TIGHT_GRID", false)
+        {
             (m as u32).div_ceil(4)
         } else {
             m as u32

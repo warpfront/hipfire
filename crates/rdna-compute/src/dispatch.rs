@@ -51,6 +51,11 @@ pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
 /// bump — see [`Gpu::is_uma`], the only consumer.
 const HIP_DEVICE_ATTRIBUTE_INTEGRATED: i32 = 16;
 
+/// Process-wide host→device upload counter, read through [`Gpu::htod_uploads`].
+/// Diagnostics only: a per-call constant upload in a hot loop is invisible in a
+/// kernel budget but shows up here.
+static HTOD_UPLOADS: AtomicUsize = AtomicUsize::new(0);
+
 // ── MQ*-GL ("global Lloyd") format constants ────────────────────────────
 //
 // GL = one codebook shared by the whole tensor plus a per-block fp16 scale,
@@ -1061,8 +1066,7 @@ impl Gpu {
     /// Poll interval for [`Self::sync_with_deadline`]: 2 ms. Coarse enough
     /// never to spin a core, fine-grained enough for a deadline measured in
     /// seconds.
-    pub(crate) const SYNC_POLL_INTERVAL: std::time::Duration =
-        std::time::Duration::from_millis(2);
+    pub(crate) const SYNC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
 
     /// Bounded stream sync: record a completion event on this `Gpu`'s stream
     /// (or the null stream) and poll `hipEventQuery` until it completes or
@@ -1218,6 +1222,12 @@ impl Gpu {
         // `gfx10-1-generic` (covers Navi 10/12/14) without per-arch JIT
         // cache fragmentation. Empty / unset preserves prior behavior.
         let detected_arch = hip.get_arch(id).unwrap_or_else(|_| "gfx1010".to_string());
+        // Record the DETECTED (not compile-target-overridden) arch for
+        // config-time policy that runs without a Gpu handle in hand — the
+        // kv_slots memory preflight resolves its auto mode (unified-memory
+        // APU vs discrete GPU) from physical topology, which a
+        // HIPFIRE_TARGET_ARCH override does not change.
+        crate::arch_caps::note_process_gpu_arch(&detected_arch);
         let arch = hipfire_config::developer_var("HIPFIRE_TARGET_ARCH")
             .ok()
             .filter(|s| !s.is_empty())
@@ -2340,7 +2350,10 @@ impl Gpu {
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         let record = self.replay.is_recording();
-        let result: HipResult<()> = if record || self.graphs.capture_mode || self.flags.force_blob_path {
+        let result: HipResult<()> = if record
+            || self.graphs.capture_mode
+            || self.flags.force_blob_path
+        {
             let mut blob = blob_builder();
             blob.pad_to(16);
             if record {
@@ -3052,6 +3065,17 @@ impl Gpu {
             .checked_mul(dtype.size())
             .ok_or_else(|| HipError::new(0, "VMM tensor byte size overflowed"))?;
         let mut arena = VmmArena::reserve(&self.hip, self.device_id, byte_size)?;
+        // WINDOWS FIX (2026-09-09): hipMemCreate/hipMemMap on Windows/ROCm 7.2
+        // (gfx1100) maps a second, later segment onto the SAME physical pages as
+        // the first (vmm_arena_smoke boundary-growth assert fails; every
+        // subsequent KV growth corrupts all prior KV -> token soup). Single
+        // segment maps are proven correct. So on Windows, map the FULL
+        // reservation in one map_next up front instead of growing in small
+        // segments; grow_vmm_tensor then becomes a no-op (already fully
+        // mapped). Costs up-front VRAM for the whole reservation; correctness
+        // over on-demand commit on the platform whose driver breaks growth.
+        #[cfg(windows)]
+        let initial_mapped_bytes = arena.reserved_bytes();
         if initial_mapped_bytes > 0 {
             if let Err(err) = arena.map_next(&self.hip, initial_mapped_bytes, access_devices) {
                 return Err(self.retain_failed_vmm_arena(arena, err));
@@ -3247,11 +3271,65 @@ impl Gpu {
         }
     }
 
+    /// Allocate a pool tensor then run `init`. On init failure the owner is
+    /// returned to the pool and the original error is preserved — constructors
+    /// that allocate then memset/htod must not strand the buffer when init fails
+    /// (`GpuTensor` has no freeing `Drop`).
+    fn alloc_then_init(
+        &mut self,
+        shape: &[usize],
+        dtype: DType,
+        init: impl FnOnce(&HipRuntime, Option<&hip_bridge::Stream>, &GpuTensor) -> HipResult<()>,
+    ) -> HipResult<GpuTensor> {
+        let tensor = self.alloc_tensor(shape, dtype)?;
+        let init_result = {
+            let stream = self.active_stream.as_ref();
+            init(&self.hip, stream, &tensor)
+        };
+        if let Err(err) = init_result {
+            let _ = self.free_tensor(tensor);
+            return Err(err);
+        }
+        Ok(tensor)
+    }
+
     pub fn upload_f32(&mut self, data: &[f32], shape: &[usize]) -> HipResult<GpuTensor> {
+        HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         self.bind_thread()?;
-        let tensor = self.alloc_tensor(shape, DType::F32)?;
+        self.alloc_then_init(shape, DType::F32, |hip, _stream, tensor| {
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+            hip.memcpy_htod(&tensor.buf, bytes)
+        })
+    }
+
+    /// Upload host-side **f16 bit patterns** straight into an `F16` tensor.
+    ///
+    /// The counterpart to [`Self::upload_f32`] for callers that already hold
+    /// half-precision words — notably the diffusion weight streamer, which
+    /// converts a checkpoint's BF16 bytes to f16 one tensor at a time and must
+    /// never materialise a whole-model f32 host table. Uploading f32 and
+    /// casting on the device costs 2× the PCIe/fabric traffic plus a transient
+    /// f32 device allocation the size of the tensor; this path costs neither.
+    ///
+    /// `data` is little-endian f16 words, exactly `shape.iter().product()` of
+    /// them.
+    pub fn upload_f16_bits(&mut self, data: &[u16], shape: &[usize]) -> HipResult<GpuTensor> {
+        HTOD_UPLOADS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.bind_thread()?;
+        let tensor = self.alloc_tensor(shape, DType::F16)?;
+        let want = tensor.numel();
+        if data.len() != want {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "upload_f16_bits: {} words for a {want}-element {shape:?} tensor",
+                    data.len()
+                ),
+            ));
+        }
         let bytes =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 2) };
         self.hip.memcpy_htod(&tensor.buf, bytes)?;
         Ok(tensor)
     }
@@ -3263,12 +3341,12 @@ impl Gpu {
     /// softmax weight).
     pub fn full_f32(&mut self, shape: &[usize], value: f32) -> HipResult<GpuTensor> {
         self.bind_thread()?;
-        let tensor = self.alloc_tensor(shape, DType::F32)?;
-        let data = vec![value; tensor.numel()];
-        let bytes =
-            unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
-        self.hip.memcpy_htod(&tensor.buf, bytes)?;
-        Ok(tensor)
+        self.alloc_then_init(shape, DType::F32, |hip, _stream, tensor| {
+            let data = vec![value; tensor.numel()];
+            let bytes =
+                unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
+            hip.memcpy_htod(&tensor.buf, bytes)
+        })
     }
 
     /// In-place constant fill of an existing F32 tensor (sync htod).
@@ -3279,6 +3357,26 @@ impl Gpu {
             unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, data.len() * 4) };
         self.hip.memcpy_htod(&tensor.buf, bytes)?;
         Ok(())
+    }
+
+    /// Read an `F16` tensor back as raw half words — no widening, so a
+    /// caller can compare device bytes bit-for-bit (the streaming weight
+    /// upload's parity harness does exactly that against the f32-upload +
+    /// device-cast path it replaced).
+    pub fn download_f16_bits(&self, tensor: &GpuTensor) -> HipResult<Vec<u16>> {
+        self.bind_thread()?;
+        if tensor.dtype != DType::F16 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("download_f16_bits: tensor is {:?}, not F16", tensor.dtype),
+            ));
+        }
+        let numel = tensor.numel();
+        let mut data = vec![0u16; numel];
+        let bytes =
+            unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, numel * 2) };
+        self.hip.memcpy_dtoh(bytes, &tensor.buf)?;
+        Ok(data)
     }
 
     pub fn download_f32(&self, tensor: &GpuTensor) -> HipResult<Vec<f32>> {
@@ -3293,21 +3391,40 @@ impl Gpu {
 
     pub fn zeros(&mut self, shape: &[usize], dtype: DType) -> HipResult<GpuTensor> {
         self.bind_thread()?;
-        let tensor = self.alloc_tensor(shape, dtype)?;
-        match self.active_stream.as_ref() {
-            Some(stream) => self
-                .hip
-                .memset_async(&tensor.buf, 0, tensor.byte_size(), stream)?,
-            None => self.hip.memset(&tensor.buf, 0, tensor.byte_size())?,
-        }
-        Ok(tensor)
+        self.alloc_then_init(shape, dtype, |hip, stream, tensor| match stream {
+            Some(stream) => hip.memset_async(&tensor.buf, 0, tensor.byte_size(), stream),
+            None => hip.memset(&tensor.buf, 0, tensor.byte_size()),
+        })
     }
 
     /// Upload raw bytes to GPU (for quantized weights).
+    ///
+    /// Allocation is a direct `hip.malloc` (not the GpuPool). On host→device
+    /// copy failure the buffer is released with `hip.free` — never
+    /// [`Self::free_tensor`], which would park a never-pooled allocation on
+    /// the free list. Successful owners are still typically torn down via
+    /// `free_tensor`, which *does* return them into the pool; later
+    /// `upload_raw` calls still malloc fresh and never reclaim those slots
+    /// (the pool-backed twin lives in hipfire-runtime weight fulfillment).
     pub fn upload_raw(&self, data: &[u8], shape: &[usize]) -> HipResult<GpuTensor> {
+        self.upload_raw_with_copy(data, shape, HipRuntime::memcpy_htod)
+    }
+
+    /// [`Self::upload_raw`] with an injectable copy step so regressions can
+    /// force malloc-success / copy-failure without a production knob.
+    fn upload_raw_with_copy(
+        &self,
+        data: &[u8],
+        shape: &[usize],
+        copy: impl FnOnce(&HipRuntime, &DeviceBuffer, &[u8]) -> HipResult<()>,
+    ) -> HipResult<GpuTensor> {
         self.bind_thread()?;
         let buf = self.hip.malloc(data.len())?;
-        self.hip.memcpy_htod(&buf, data)?;
+        if let Err(err) = copy(&self.hip, &buf, data) {
+            // hip.malloc owner — hip.free only. free_tensor would pool it.
+            let _ = self.hip.free(buf);
+            return Err(err);
+        }
         Ok(GpuTensor {
             buf,
             shape: shape.to_vec(),
@@ -3660,6 +3777,25 @@ impl Gpu {
         self.hip.free(tensor.buf)
     }
 
+    /// Host→device `upload_f32` calls since process start. A hot loop that
+    /// re-uploads a constant vector every call shows up here; a loop that
+    /// uploads once and caches does not.
+    pub fn htod_uploads() -> usize {
+        HTOD_UPLOADS.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Allocation counters for the buffer pool: `(new, reused, bytes_new)`.
+    /// `new` counts real `hipMalloc` calls, `reused` counts free-list hits.
+    /// A hot loop that frees what it allocates keeps `new` flat and grows
+    /// `reused`; a loop that leaks grows `new` on every iteration.
+    pub fn pool_stats(&self) -> (usize, usize, usize) {
+        (
+            self.pool.total_new,
+            self.pool.total_reused,
+            self.pool.total_allocated,
+        )
+    }
+
     /// Drain the GPU memory pool. Actually calls hipFree on all pooled buffers.
     /// Call after model unload to return VRAM to the system.
     pub fn drain_pool(&mut self) {
@@ -3816,6 +3952,166 @@ impl Gpu {
             &mut params,
             blob_builder,
         )
+    }
+
+    /// 2D strided F32 row copy, one launch for `n_rows` rows:
+    ///
+    /// ```text
+    /// dst[r * dst_row_stride + dst_col_offset + c] = src[r * src_row_stride + c]
+    /// ```
+    ///
+    /// for `r` in `0..n_rows`, `c` in `0..len`. This is the single-launch
+    /// replacement for a per-row `copy_d2d` loop — the FLUX.1 MMDiT single
+    /// block's `linear2` input assemble issued 2 × 4608 = 9216 tiny D2D
+    /// memcpys per block, which is launch-latency bound, not bandwidth bound.
+    ///
+    /// A `float4` fast path is taken automatically when `len`, both row
+    /// strides and `dst_col_offset` are multiples of 4 and both device
+    /// pointers are 16-byte aligned; every other shape falls back to the
+    /// scalar path, so correctness does not depend on the alignment.
+    ///
+    /// Both tensors must be F32. The full accessed range of each buffer is
+    /// bounds-checked here rather than left to the kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn copy_rows_strided_f32(
+        &mut self,
+        src: &GpuTensor,
+        dst: &GpuTensor,
+        n_rows: usize,
+        len: usize,
+        src_row_stride: usize,
+        dst_row_stride: usize,
+        dst_col_offset: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if src.dtype != DType::F32 || dst.dtype != DType::F32 {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "copy_rows_strided_f32: both tensors must be F32 (src {:?}, dst {:?})",
+                    src.dtype, dst.dtype
+                ),
+            ));
+        }
+        if n_rows == 0 || len == 0 {
+            return Ok(());
+        }
+        if len > src_row_stride {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "copy_rows_strided_f32: len {len} exceeds src_row_stride {src_row_stride}"
+                ),
+            ));
+        }
+        if dst_col_offset + len > dst_row_stride {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "copy_rows_strided_f32: dst_col_offset {dst_col_offset} + len {len} exceeds dst_row_stride {dst_row_stride}"
+                ),
+            ));
+        }
+        let f32_sz = DType::F32.size();
+        // Last element touched, +1, in each buffer.
+        let src_need = (n_rows - 1)
+            .checked_mul(src_row_stride)
+            .and_then(|v| v.checked_add(len))
+            .and_then(|v| v.checked_mul(f32_sz))
+            .ok_or_else(|| HipError::new(0, "copy_rows_strided_f32: src size overflow"))?;
+        let dst_need = (n_rows - 1)
+            .checked_mul(dst_row_stride)
+            .and_then(|v| v.checked_add(dst_col_offset))
+            .and_then(|v| v.checked_add(len))
+            .and_then(|v| v.checked_mul(f32_sz))
+            .ok_or_else(|| HipError::new(0, "copy_rows_strided_f32: dst size overflow"))?;
+        if src.buf.size() < src_need {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "copy_rows_strided_f32: src buffer too small (have {}, need {src_need} for {n_rows}×{len} stride {src_row_stride})",
+                    src.buf.size()
+                ),
+            ));
+        }
+        if dst.buf.size() < dst_need {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "copy_rows_strided_f32: dst buffer too small (have {}, need {dst_need} for {n_rows}×{len} @ col {dst_col_offset} stride {dst_row_stride})",
+                    dst.buf.size()
+                ),
+            ));
+        }
+
+        const KERNEL: &str = "copy_rows_strided_f32";
+        self.ensure_kernel(KERNEL, crate::kernels::COPY_ROWS_STRIDED_F32_SRC, KERNEL)?;
+
+        let sp = src.buf.as_ptr();
+        let dp = dst.buf.as_ptr();
+        // float4 needs 16-byte alignment on both the base pointer and every
+        // row/column offset it derives from it.
+        let aligned = len % 4 == 0
+            && src_row_stride % 4 == 0
+            && dst_row_stride % 4 == 0
+            && dst_col_offset % 4 == 0
+            && (sp as usize) % 16 == 0
+            && (dp as usize) % 16 == 0;
+
+        let n_rows_i = i32::try_from(n_rows)
+            .map_err(|_| HipError::new(0, "copy_rows_strided_f32: n_rows exceeds i32"))?;
+        let len_i = i32::try_from(len)
+            .map_err(|_| HipError::new(0, "copy_rows_strided_f32: len exceeds i32"))?;
+        let ss_i = i32::try_from(src_row_stride)
+            .map_err(|_| HipError::new(0, "copy_rows_strided_f32: src_row_stride exceeds i32"))?;
+        let ds_i = i32::try_from(dst_row_stride)
+            .map_err(|_| HipError::new(0, "copy_rows_strided_f32: dst_row_stride exceeds i32"))?;
+        let dco_i = i32::try_from(dst_col_offset)
+            .map_err(|_| HipError::new(0, "copy_rows_strided_f32: dst_col_offset exceeds i32"))?;
+        let vec4_i = i32::from(aligned);
+
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &dp as *const _ as *mut c_void,
+            &n_rows_i as *const _ as *mut c_void,
+            &len_i as *const _ as *mut c_void,
+            &ss_i as *const _ as *mut c_void,
+            &ds_i as *const _ as *mut c_void,
+            &dco_i as *const _ as *mut c_void,
+            &vec4_i as *const _ as *mut c_void,
+        ];
+
+        const BLOCK: u32 = 256;
+        let cols = if aligned { len / 4 } else { len };
+        let grid_x = (cols as u32).div_ceil(BLOCK);
+        // Grid-stride on y in the kernel, so capping at the conservative
+        // 65535 launch limit stays correct for any row count.
+        let grid_y = (n_rows as u32).min(65535);
+        let bytes = n_rows * len * f32_sz * 2; // read + write
+        let timer = crate::profile::begin_timer(&self.hip, KERNEL, KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [grid_x, grid_y, 1],
+            [BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(sp);
+                blob.push_ptr(dp);
+                blob.push_i32(n_rows_i);
+                blob.push_i32(len_i);
+                blob.push_i32(ss_i);
+                blob.push_i32(ds_i);
+                blob.push_i32(dco_i);
+                blob.push_i32(vec4_i);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// Drop captured graph state and retained Redline replay after a live KV
@@ -4835,12 +5131,12 @@ impl Drop for Gpu {
 mod tests {
     use super::gen_fwht_signs;
     use super::DType;
+    use super::Gpu;
     use super::HessianCapture;
     use super::MQ2G256V2_GROUP_BYTES;
     use super::MQ3G256V2_GROUP_BYTES;
     use super::MQ5G256V2_GROUP_BYTES;
     use super::MQ6G256V2_GROUP_BYTES;
-    use super::Gpu;
 
     #[test]
     fn q8hfq_row_stride_matches_legacy_formula() {
@@ -5056,10 +5352,197 @@ mod tests {
             .expect_err("load cleanup must refuse a still-owned VMM arena");
         assert!(err.to_string().contains("live VMM"), "{err}");
         assert_eq!(gpu.vmm_allocation_count(), 1);
+        #[cfg(not(windows))]
         assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(0));
+        #[cfg(windows)]
+        {
+            // Single-segment workaround: the full reservation is mapped up front,
+            // so a 4096-byte reserve already reports a granularity-aligned prefix.
+            let mapped = gpu
+                .vmm_mapped_bytes(&tensor)
+                .expect("windows full-map must report mapped bytes");
+            let gran = gpu
+                .vmm_granularity(&tensor)
+                .expect("registered VMM tensor must expose granularity");
+            assert_eq!(mapped % gran, 0, "mapped must be granularity-aligned");
+            assert!(
+                mapped >= 4096,
+                "full-map must cover the 4096-byte reservation, got {mapped}"
+            );
+        }
 
         gpu.free_tensor(tensor).expect("free live owner");
         assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+
+    #[test]
+    fn vmm_fullmap_covers_unaligned_reservation() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        hip_bridge::clear_vmm_faults();
+        let access = [gpu.device_id];
+        // 4097 is a multiple of no real VMM granularity: the pre-fix Windows
+        // path (map_next with the raw byte size) rejected it even though the
+        // reservation itself was valid.
+        const UNALIGNED: usize = 4097;
+        let mut tensor =
+            match unsafe { gpu.alloc_vmm_tensor(&[UNALIGNED], super::DType::Raw, 0, &access) } {
+                Ok(tensor) => tensor,
+                Err(_) => {
+                    eprintln!("skip: VMM unavailable");
+                    return;
+                }
+            };
+        assert_eq!(gpu.vmm_allocation_count(), 1);
+        #[cfg(not(windows))]
+        {
+            // Growth path: nothing is mapped up front, so grow an aligned
+            // cover for the unaligned reservation.
+            assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(0));
+            let gran = gpu
+                .vmm_granularity(&tensor)
+                .expect("registered VMM tensor must expose granularity");
+            let cover = UNALIGNED.div_ceil(gran) * gran;
+            gpu.grow_vmm_tensor(&mut tensor, cover, &access)
+                .expect("grow to cover unaligned reservation");
+            assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(cover));
+        }
+        #[cfg(windows)]
+        {
+            // Single-segment path: the whole reservation is mapped up front,
+            // so any further growth must fail without disturbing the mapping.
+            let mapped = gpu
+                .vmm_mapped_bytes(&tensor)
+                .expect("windows full-map must report mapped bytes");
+            let gran = gpu
+                .vmm_granularity(&tensor)
+                .expect("registered VMM tensor must expose granularity");
+            assert_eq!(mapped % gran, 0, "mapped must be granularity-aligned");
+            assert!(
+                mapped >= UNALIGNED,
+                "full-map must cover the {UNALIGNED}-byte reservation, got {mapped}"
+            );
+            let over_err = gpu
+                .grow_vmm_tensor(&mut tensor, gran, &access)
+                .expect_err("windows full-map must already cover the reservation");
+            assert!(
+                over_err.to_string().contains("exceed reserve"),
+                "unexpected full-map growth error: {over_err}"
+            );
+            assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(mapped));
+        }
+        // The observable logical prefix is usable on both paths.
+        let expect: Vec<u8> = (0..UNALIGNED).map(|i| (i % 251) as u8).collect();
+        gpu.hip
+            .memcpy_htod(&tensor.buf, &expect)
+            .expect("htod unaligned prefix");
+        let mut actual = vec![0u8; UNALIGNED];
+        gpu.hip
+            .memcpy_dtoh(&mut actual, &tensor.buf)
+            .expect("dtoh unaligned prefix");
+        assert_eq!(actual, expect);
+        gpu.free_tensor(tensor).expect("free");
+        assert_eq!(gpu.vmm_allocation_count(), 0);
+    }
+
+    /// Alloc→init failure must return the owner to the pool. Baseline is taken
+    /// after a successful public warm so first-touch `total_new` sits outside the
+    /// measured window; a leaked owner still forces a fresh malloc on retry.
+    #[test]
+    fn alloc_then_init_failure_returns_pool_owner() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let warm = gpu.zeros(&[64], DType::F32).expect("warm public zeros");
+        let warm_host = gpu.download_f32(&warm).expect("download warm");
+        assert_eq!(warm_host.len(), 64);
+        assert!(
+            warm_host.iter().all(|&x| x == 0.0),
+            "public zeros must clear the buffer"
+        );
+        gpu.free_tensor(warm).expect("free warm");
+        let fresh_allocations = gpu.pool_stats().0;
+
+        // Real allocation, injected init only — not a pre-alloc inject.
+        let err = match gpu.alloc_then_init(&[64], DType::F32, |_hip, _stream, _tensor| {
+            Err(hip_bridge::HipError::new(2, "injected init failure"))
+        }) {
+            Err(error) => error,
+            Ok(tensor) => {
+                let _ = gpu.free_tensor(tensor);
+                panic!("injected init failure must surface");
+            }
+        };
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+
+        // Immediate public retry reuses the returned slot; content still correct.
+        let ok = gpu.zeros(&[64], DType::F32).expect("zeros retry");
+        let host = gpu.download_f32(&ok).expect("download retry");
+        assert_eq!(host, vec![0.0f32; 64]);
+        gpu.free_tensor(ok).expect("free retry");
+        assert_eq!(
+            gpu.pool_stats().0,
+            fresh_allocations,
+            "failed init leaked its pool allocation instead of rolling it back",
+        );
+    }
+
+    /// malloc-success / copy-failure must `hip.free` the raw owner (not
+    /// `free_tensor`/pool). Soft-skip without GPU like the other leaf tests.
+    #[test]
+    fn upload_raw_copy_failure_hip_frees_owner() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        // Public success path still works and is free_tensor-teardown'd
+        // (pooled free domain — see upload_raw docs). Not an allocator change.
+        let warm = gpu
+            .upload_raw(&[7u8; 64], &[64])
+            .expect("warm public upload_raw");
+        assert_eq!(warm.buf.size(), 64);
+        assert!(warm.buf.is_hip_allocation());
+        gpu.free_tensor(warm).expect("free warm into pool");
+
+        let (free_before, total) = gpu.hip.get_vram_info().expect("vram before");
+        let pool_before = gpu.pool_stats();
+
+        let err = match gpu.upload_raw_with_copy(&[7u8; 64], &[64], |_hip, _buf, _data| {
+            Err(hip_bridge::HipError::new(2, "injected raw H2D failure"))
+        }) {
+            Err(error) => error,
+            Ok(tensor) => {
+                let _ = gpu.free_tensor(tensor);
+                panic!("injected raw copy failure must surface");
+            }
+        };
+        assert!(
+            err.to_string().contains("injected"),
+            "unexpected error: {err}"
+        );
+
+        let (free_after, _) = gpu.hip.get_vram_info().expect("vram after");
+        assert_eq!(
+            free_after, free_before,
+            "copy-fail must hip.free the malloc owner (free VRAM {free_before} → {free_after}, total={total})"
+        );
+        // hip.free path must not touch pool counters (would if free_tensor'd).
+        assert_eq!(
+            gpu.pool_stats(),
+            pool_before,
+            "copy-fail must not route the raw malloc through the pool"
+        );
+
+        // Public success still works after the failure seam.
+        let ok = gpu.upload_raw(&[9u8; 64], &[64]).expect("upload_raw retry");
+        assert!(ok.buf.is_hip_allocation());
+        gpu.free_tensor(ok).expect("free retry");
     }
 
     #[test]
@@ -5326,10 +5809,7 @@ mod tests {
     fn deadline_error_names_last_kernel() {
         // Constructor-level pin; the timeout path itself is driven below
         // through `poll_until_ready` with a stubbed query.
-        let e = Gpu::deadline_exceeded(
-            Some("gemv_hfq4g256"),
-            std::time::Duration::from_secs(5),
-        );
+        let e = Gpu::deadline_exceeded(Some("gemv_hfq4g256"), std::time::Duration::from_secs(5));
         let s = e.to_string();
         assert!(s.contains("gemv_hfq4g256"), "names the kernel: {s}");
         assert!(s.contains("5s"), "names the deadline: {s}");
@@ -5377,11 +5857,9 @@ mod tests {
     #[test]
     fn poll_propagates_query_errors() {
         // A real query failure (bad handle, lost device) is not "not ready".
-        let err = Gpu::poll_until_ready(
-            std::time::Duration::from_secs(5),
-            Some("k"),
-            || Err(hip_bridge::HipError::new(999, "boom")),
-        )
+        let err = Gpu::poll_until_ready(std::time::Duration::from_secs(5), Some("k"), || {
+            Err(hip_bridge::HipError::new(999, "boom"))
+        })
         .expect_err("query errors must propagate");
         assert!(err.to_string().contains("boom"), "{err}");
     }

@@ -62,7 +62,10 @@ pub fn batch_render_prompt_tokens(
     enable_thinking: bool,
     reasoning_effort: Option<&str>,
 ) -> Result<(Vec<u32>, bool), String> {
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0");
     let try_jinja = jinja_enabled && chat_template.is_some();
     let q_tokens = tokenizer.encode(prompt);
     let system_prompt = system;

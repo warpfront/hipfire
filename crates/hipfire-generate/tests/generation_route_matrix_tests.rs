@@ -410,9 +410,9 @@ fn precedence_ep_before_arch_short_circuit() {
         ..base()
     };
     assert_eq!(select_generation_route(&i), GenerationRoute::MiniMaxEp);
-    // EP on unregistered arch → Unknown (still EP-first).
+    // EP on an unregistered arch → Unknown (still EP-first).
     let i = GenerationRouteInputs {
-        arch_id: 5,
+        arch_id: 99,
         ep: true,
         has_speculator: true,
         ..base()
@@ -421,22 +421,36 @@ fn precedence_ep_before_arch_short_circuit() {
 }
 
 #[test]
-fn qwen_ep_batch_semantic_route_clears_ep_for_qwen_ar() {
-    // Global selector: arch 6 + EP topology → Unknown (EP short-circuit).
-    let with_ep = GenerationRouteInputs {
-        arch_id: 6,
-        ep: true,
-        ..base()
-    };
-    assert_eq!(select_generation_route(&with_ep), GenerationRoute::Unknown);
-    // Batch eligibility clears EP after independent topology gates so the
-    // non-spec Qwen AR ladder remains reachable (exact callsite invariant).
-    let cleared = GenerationRouteInputs {
-        arch_id: 6,
+fn qwen_ep_dense_tp_selects_qwen_ar_semantic_contract() {
+    for arch_id in [5, 6] {
+        let with_ep = GenerationRouteInputs {
+            arch_id,
+            ep: true,
+            ..base()
+        };
+        let route = select_generation_route(&with_ep);
+        assert_eq!(route, GenerationRoute::QwenAr);
+
+        let id = format!("qwen-ep-{arch_id}");
+        let mut sink = Vec::new();
+        generation_route_adapter(route)
+            .expect("every selected route has an adapter")
+            .emit_start(&mut sink, &id);
+        let start: serde_json::Value = serde_json::from_slice(&sink).unwrap();
+        assert_eq!(start["type"], "gen_start");
+        assert_eq!(start["contract_version"], 2);
+    }
+
+    // The same Qwen route remains the ordinary AR route without EP.
+    let without_ep = GenerationRouteInputs {
+        arch_id: 5,
         ep: false,
         ..base()
     };
-    assert_eq!(select_generation_route(&cleared), GenerationRoute::QwenAr);
+    assert_eq!(
+        select_generation_route(&without_ep),
+        GenerationRoute::QwenAr
+    );
 }
 
 #[test]
@@ -841,10 +855,114 @@ fn pure_gate_tools_absent_always_allowed() {
     }
 }
 
+/// `Write` probe that observes whether a start adapter flushes the real
+/// writer after the `gen_start` bytes were delivered to it.
+struct FlushObservingWriter {
+    bytes: Vec<u8>,
+    /// Bytes present at the most recent `flush()`; trails `bytes.len()` when
+    /// writes after the last flush were never flushed.
+    flushed_through: usize,
+    flush_count: usize,
+}
+
+impl std::io::Write for FlushObservingWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.flushed_through = self.bytes.len();
+        self.flush_count += 1;
+        Ok(())
+    }
+}
+
 #[test]
-fn all_variant_count_is_twenty_two() {
-    // Pin count so accidental ALL edits surface here too.
-    // 22 since MapleAr (arch 15) joined; was 21.
-    assert_eq!(GenerationRoute::ALL.len(), 22);
-    assert_eq!(capability_rows().len(), 22);
+fn all_route_starts_flush_gen_start_to_real_writer() {
+    // Behavioral pin for the `gen_start` flush guarantee: every production
+    // start adapter must deliver `gen_start` bytes to the real writer *and*
+    // flush it, so piped daemon stdout shows `gen_start` throughout prefill
+    // (canonical behavior in `hipfire_engine::emit::emit_gen_start`). A
+    // `Vec`-only cardinality assertion cannot observe this; a `Write` that
+    // records `flush()` can. New `GenerationRoute::ALL` variants are covered
+    // automatically by iterating `ALL`.
+    for &route in GenerationRoute::ALL {
+        let mut writer = FlushObservingWriter {
+            bytes: Vec::new(),
+            flushed_through: 0,
+            flush_count: 0,
+        };
+        // Unique id per route: the production adapter holds a per-request
+        // start latch, so a shared id would suppress every start after the
+        // first and the test would observe nothing.
+        let id = format!("route-start-flush-{route:?}");
+        generation_route_adapter(route)
+            .unwrap_or_else(|| panic!("missing production adapter for {}", route.name()))
+            .emit_start_with(&mut writer, &id, false);
+        assert!(
+            !writer.bytes.is_empty(),
+            "{route:?} wrote no gen_start bytes"
+        );
+        let event: serde_json::Value = serde_json::from_str(
+            std::str::from_utf8(&writer.bytes)
+                .unwrap_or_else(|_| panic!("{route:?} gen_start is not UTF-8"))
+                .trim(),
+        )
+        .unwrap_or_else(|_| panic!("{route:?} gen_start is not one JSON envelope"));
+        assert_eq!(event["type"], "gen_start", "{route:?} start envelope");
+        assert!(
+            writer.flush_count >= 1,
+            "{route:?} never flushed the real writer"
+        );
+        assert_eq!(
+            writer.flushed_through,
+            writer.bytes.len(),
+            "{route:?} flushed before all gen_start bytes were written"
+        );
+    }
+}
+
+#[test]
+fn route_cancel_releases_start_latch_and_claims_once() {
+    let id = "route-cancel-lifecycle";
+    let attempt = 7001;
+    activate_terminal_control(id, attempt);
+    set_active_attempt_id(attempt);
+    let mut sink = Vec::new();
+    emit_generation_start(GenerationRoute::GlimmerAr, &mut sink, id, false);
+    emit_generation_cancel(GenerationRoute::GlimmerAr, &mut sink, id, 3);
+    let first: Vec<_> = std::str::from_utf8(&sink)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect();
+    assert_eq!(first.len(), 3);
+    assert_eq!(first[0]["type"], "gen_start");
+    assert_eq!(first[1]["type"], "aborted");
+    assert_eq!(first[2]["finish_reason"], "aborted");
+
+    // The terminal claim remains one-shot, but the route-start latch is
+    // released by the cancel wrapper, so a same-key fallback start is visible.
+    emit_generation_start(GenerationRoute::GlimmerAr, &mut sink, id, false);
+    emit_generation_cancel(GenerationRoute::GlimmerAr, &mut sink, id, 4);
+    let all: Vec<_> = std::str::from_utf8(&sink)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect();
+    assert_eq!(
+        all.iter()
+            .filter(|event| event["type"] == "gen_start")
+            .count(),
+        2
+    );
+    assert_eq!(
+        all.iter()
+            .filter(|event| event["type"] == "aborted")
+            .count(),
+        1
+    );
+    clear_terminal_control();
+    set_active_attempt_id(0);
 }

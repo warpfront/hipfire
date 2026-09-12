@@ -47,6 +47,14 @@ pub fn populate(registry: &mut KernelRegistry) {
         tile: TileImpl::None,
     });
     registry.register(KernelVariant {
+        key: KernelKey::GemmQ8_0BatchedF32Chunked,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
         key: KernelKey::GemmQ8_0Wmma,
         arch_required: ArchPredicate::HasWmma,
         shape_gate: None,

@@ -357,6 +357,71 @@ pub enum LayerWeights {
     DeltaNetMoe(DeltaNetMoeLayerWeights),
     FullAttnMoe(FullAttnMoeLayerWeights),
 }
+impl LayerWeights {
+    /// Return every GPU allocation owned by one layer to `gpu`.
+    ///
+    /// This is the single layer-level teardown used by both normal unload and
+    /// whole-model load rollback. In particular, it preserves the packed,
+    /// paged, EP, and Paro ownership branches in `free_moe_ffn`.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        match self {
+            LayerWeights::DeltaNet(l) => {
+                let _ = gpu.free_tensor(l.attn_norm);
+                l.wqkv.free_all(gpu);
+                l.wz.free_all(gpu);
+                l.w_alpha.free_all(gpu);
+                l.w_beta.free_all(gpu);
+                let _ = gpu.free_tensor(l.a_log);
+                let _ = gpu.free_tensor(l.dt_bias);
+                let _ = gpu.free_tensor(l.conv_weight);
+                let _ = gpu.free_tensor(l.norm_weight);
+                l.wo.free_all(gpu);
+                let _ = gpu.free_tensor(l.ffn_norm);
+                l.w_gate.free_all(gpu);
+                l.w_up.free_all(gpu);
+                l.w_down.free_all(gpu);
+            }
+            LayerWeights::FullAttn(l) => {
+                let _ = gpu.free_tensor(l.attn_norm);
+                l.wq.free_all(gpu);
+                l.wk.free_all(gpu);
+                l.wv.free_all(gpu);
+                l.wo.free_all(gpu);
+                let _ = gpu.free_tensor(l.q_norm);
+                let _ = gpu.free_tensor(l.k_norm);
+                let _ = gpu.free_tensor(l.ffn_norm);
+                l.w_gate.free_all(gpu);
+                l.w_up.free_all(gpu);
+                l.w_down.free_all(gpu);
+            }
+            LayerWeights::DeltaNetMoe(l) => {
+                let _ = gpu.free_tensor(l.attn_norm);
+                l.wqkv.free_all(gpu);
+                l.wz.free_all(gpu);
+                l.w_alpha.free_all(gpu);
+                l.w_beta.free_all(gpu);
+                let _ = gpu.free_tensor(l.a_log);
+                let _ = gpu.free_tensor(l.dt_bias);
+                let _ = gpu.free_tensor(l.conv_weight);
+                let _ = gpu.free_tensor(l.norm_weight);
+                l.wo.free_all(gpu);
+                let _ = gpu.free_tensor(l.ffn_norm);
+                free_moe_ffn(gpu, l.ffn);
+            }
+            LayerWeights::FullAttnMoe(l) => {
+                let _ = gpu.free_tensor(l.attn_norm);
+                l.wq.free_all(gpu);
+                l.wk.free_all(gpu);
+                l.wv.free_all(gpu);
+                l.wo.free_all(gpu);
+                let _ = gpu.free_tensor(l.q_norm);
+                let _ = gpu.free_tensor(l.k_norm);
+                let _ = gpu.free_tensor(l.ffn_norm);
+                free_moe_ffn(gpu, l.ffn);
+            }
+        }
+    }
+}
 /// Immutable source identity captured before any EP GPU allocation.
 /// Exact equality over canonical path, platform file identity (dev, ino),
 /// length, mtime, arch_id, exact metadata_json, ordered tensor manifest
@@ -1339,67 +1404,109 @@ impl MmqScreenable for Qwen35Weights {
     }
 }
 
-fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
-    ffn.router.free_all(gpu);
-    ffn.shared_expert_gate.free_all(gpu);
-    ffn.shared_expert.gate.free_all(gpu);
-    ffn.shared_expert.up.free_all(gpu);
-    ffn.shared_expert.down.free_all(gpu);
-    let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
-    let _ = gpu.free_tensor(ffn.expert_down_ptrs);
+/// Free a [`WeightTensor`] through a caller-supplied GPU-tensor cleanup seam.
+/// The callback receives every owned sidecar and the weight buffer exactly once.
+pub(crate) fn free_weight_with<F>(weight: WeightTensor, free: &mut F)
+where
+    F: FnMut(GpuTensor),
+{
+    if let Some(paro) = weight.paro {
+        if !paro.is_alias {
+            free(paro.pairs);
+            free(paro.theta);
+            free(paro.channel_scales);
+        }
+    }
+    if let Some(awq) = weight.awq_scale {
+        free(awq);
+    }
+    free(weight.buf);
+}
+
+/// Free a [`WeightTensor`]'s owning sidecars without freeing its weight buffer.
+/// Used only for non-owning views into [`PackedExpertOwners`].
+fn free_weight_metadata_with<F>(weight: WeightTensor, free: &mut F)
+where
+    F: FnMut(GpuTensor),
+{
+    if let Some(paro) = weight.paro {
+        if !paro.is_alias {
+            free(paro.pairs);
+            free(paro.theta);
+            free(paro.channel_scales);
+        }
+    }
+    if let Some(awq) = weight.awq_scale {
+        free(awq);
+    }
+}
+
+/// Free a staged MoE owner through a caller-supplied GPU-tensor cleanup seam.
+///
+/// The ownership branches here are authoritative for all current routed-expert
+/// layouts: ordinary per-expert weights, packed uniform-MQ4 owners, ParoQuant
+/// shared sidecars, EP dummy buffers, and paged-mode's empty expert vector.
+/// Each callback invocation consumes one actual owning buffer exactly once.
+pub(crate) fn free_moe_ffn_with(ffn: MoeFfnWeights, free: &mut impl FnMut(GpuTensor)) {
+    free_weight_with(ffn.router, free);
+    free_weight_with(ffn.shared_expert_gate, free);
+    free_weight_with(ffn.shared_expert.gate, free);
+    free_weight_with(ffn.shared_expert.up, free);
+    free_weight_with(ffn.shared_expert.down, free);
+    free(ffn.expert_gate_up_ptrs);
+    free(ffn.expert_down_ptrs);
     // Non-owning pointer table — free the buffer only; the per-expert scales it
     // points into are owned by `experts[i].down.awq_scale` and freed below via
-    // `e.down.free_all`.
+    // `free_weight_with`.
     if let Some(t) = ffn.expert_down_awq_ptrs {
-        let _ = gpu.free_tensor(t);
+        free(t);
     }
     // Owned device buffer (built from per-expert gpu_dtype). Free it.
     if let Some(t) = ffn.expert_dtype_tags {
-        let _ = gpu.free_tensor(t);
+        free(t);
     }
     if let Some(owners) = ffn.packed_expert_owners {
         // Packed expert WeightTensors are non-owning views. Free only metadata
         // that remains individually owned, then return each layer blob once.
         for e in ffn.experts {
-            free_weight_metadata_only(gpu, e.gate_up);
-            free_weight_metadata_only(gpu, e.down);
+            free_weight_metadata_with(e.gate_up, free);
+            free_weight_metadata_with(e.down, free);
         }
-        let _ = gpu.free_tensor(owners.gate_up);
-        let _ = gpu.free_tensor(owners.down);
+        free(owners.gate_up);
+        free(owners.down);
     } else {
         for e in ffn.experts {
-            e.gate_up.free_all(gpu);
-            e.down.free_all(gpu);
+            free_weight_with(e.gate_up, free);
+            free_weight_with(e.down, free);
         }
     }
     // ParoQuant MoE: free the owning shared sidecars (per-expert `paro` fields
     // alias these and must NOT be freed separately — they're non-owning views).
     if let Some(s) = ffn.paro_shared {
-        let _ = gpu.free_tensor(s.gate_up_pairs);
-        let _ = gpu.free_tensor(s.gate_up_theta);
-        let _ = gpu.free_tensor(s.gate_up_channel_scales);
-        let _ = gpu.free_tensor(s.down_pairs);
-        let _ = gpu.free_tensor(s.down_theta);
-        let _ = gpu.free_tensor(s.down_channel_scales);
+        free(s.gate_up_pairs);
+        free(s.gate_up_theta);
+        free(s.gate_up_channel_scales);
+        free(s.down_pairs);
+        free(s.down_theta);
+        free(s.down_channel_scales);
     }
     for d in ffn.ep_dummy_buffers {
-        let _ = gpu.free_tensor(d);
+        free(d);
     }
 }
 
-/// Free a [`WeightTensor`]'s owning sidecars without freeing its weight buffer.
-/// Used only for non-owning views into [`PackedExpertOwners`].
+fn free_moe_ffn(gpu: &mut Gpu, ffn: MoeFfnWeights) {
+    let mut free = |tensor| {
+        let _ = gpu.free_tensor(tensor);
+    };
+    free_moe_ffn_with(ffn, &mut free);
+}
+
 fn free_weight_metadata_only(gpu: &mut Gpu, weight: WeightTensor) {
-    if let Some(paro) = weight.paro {
-        if !paro.is_alias {
-            let _ = gpu.free_tensor(paro.pairs);
-            let _ = gpu.free_tensor(paro.theta);
-            let _ = gpu.free_tensor(paro.channel_scales);
-        }
-    }
-    if let Some(awq) = weight.awq_scale {
-        let _ = gpu.free_tensor(awq);
-    }
+    let mut free = |tensor| {
+        let _ = gpu.free_tensor(tensor);
+    };
+    free_weight_metadata_with(weight, &mut free);
 }
 
 // ─── State ──────────────────────────────────────────────────────────────
@@ -1540,8 +1647,8 @@ impl DeltaNetState {
         // unique_ratio 0.625 vs 0.555, max_freq 0.055 vs 0.078. Also makes the DN
         // state DETERMINISTIC (no stochastic dither). Opt OUT with
         // HIPFIRE_DN_STATE_EF=0. Q8-only (FP32 has no requant; Q4 EF is future
-        // work; the multi-GPU band split is still stochastic — new_with_quant_multi
-        // leaves s_ef_residual empty). Residual is f16 per-element.
+        // work). The multi-GPU band split (`new_with_quant_multi` below) uses
+        // the same rule and geometry. Residual is f16 per-element.
         let ef_enabled = quant == StateQuant::Q8
             && hipfire_config::developer_var("HIPFIRE_DN_STATE_EF")
                 .map(|v| v != "0")
@@ -1641,37 +1748,44 @@ impl DeltaNetState {
     /// Returns `Err` on the first HIP memset/memset_async failure so production
     /// rollback can attest `rolled_back:false`.
     pub fn reset(&mut self, gpu: &mut Gpu) -> HipResult<()> {
-        match gpu.active_stream.as_ref() {
-            Some(stream) => {
-                for s in &self.s_matrices {
-                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
+        // Sticky-fault poison: a 700/719 here means the context is dead (the
+        // gate saw the same 719 repeat across requests on memsets alone), so
+        // latch process-wide and let the daemon fail fast instead of burning
+        // doomed prefills. All other errors pass through unlatched.
+        let result: HipResult<()> = (|| {
+            match gpu.active_stream.as_ref() {
+                Some(stream) => {
+                    for s in &self.s_matrices {
+                        gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
+                    }
+                    for s in &self.s_scales {
+                        gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
+                    }
+                    for s in &self.conv_states {
+                        gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
+                    }
+                    for s in &self.s_ef_residual {
+                        gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
+                    }
                 }
-                for s in &self.s_scales {
-                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
-                }
-                for s in &self.conv_states {
-                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
-                }
-                for s in &self.s_ef_residual {
-                    gpu.hip.memset_async(&s.buf, 0, s.buf.size(), stream)?;
+                None => {
+                    for s in &self.s_matrices {
+                        gpu.hip.memset(&s.buf, 0, s.buf.size())?;
+                    }
+                    for s in &self.s_scales {
+                        gpu.hip.memset(&s.buf, 0, s.buf.size())?;
+                    }
+                    for s in &self.conv_states {
+                        gpu.hip.memset(&s.buf, 0, s.buf.size())?;
+                    }
+                    for s in &self.s_ef_residual {
+                        gpu.hip.memset(&s.buf, 0, s.buf.size())?;
+                    }
                 }
             }
-            None => {
-                for s in &self.s_matrices {
-                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
-                }
-                for s in &self.s_scales {
-                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
-                }
-                for s in &self.conv_states {
-                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
-                }
-                for s in &self.s_ef_residual {
-                    gpu.hip.memset(&s.buf, 0, s.buf.size())?;
-                }
-            }
-        }
-        Ok(())
+            Ok(())
+        })();
+        hipfire_runtime::reset_core::note_hip_result(result, "qwen35::DeltaNetState::reset")
     }
 
     /// Multi-GPU companion to `new_with_quant`. Each LA-layer's state is
@@ -1692,9 +1806,23 @@ impl DeltaNetState {
             + config.linear_num_value_heads * config.linear_value_head_dim;
         let conv_state_size = conv_channels * (config.conv_kernel_dim - 1);
 
+        // Same EF sigma-delta rule as the single path (`new_batched_with_quant`):
+        // Q8 + `HIPFIRE_DN_STATE_EF` default-ON. Each residual is f16 per state
+        // element, allocated on the LA-layer's owning device so `ef_residual()`
+        // returns `Some` and the DeltaNet kernel takes the deterministic
+        // sigma-delta branch instead of stochastic dither. No further plumbing
+        // is needed: `forward_scratch_layers_multi` already runs each layer on
+        // `gpus.devices[device_for_layer]` and passes
+        // `ef_residual(delta_layer_idx)` alongside the same-device S/scales.
+        let ef_enabled = quant == StateQuant::Q8
+            && hipfire_config::developer_var("HIPFIRE_DN_STATE_EF")
+                .map(|v| v != "0")
+                .unwrap_or(true);
+
         let mut s_matrices = Vec::new();
         let mut s_scales = Vec::new();
         let mut conv_states = Vec::new();
+        let mut s_ef_residual = Vec::new();
         let mut la_to_device: Vec<u8> = Vec::new();
 
         for (orig_layer_idx, lt) in config.layer_types.iter().enumerate() {
@@ -1715,7 +1843,10 @@ impl DeltaNetState {
                 }
                 StateQuant::Q8 => {
                     let buf = g.hip.malloc(s_size)?;
-                    g.hip.memset(&buf, 0, s_size)?;
+                    if let Err(e) = g.hip.memset(&buf, 0, s_size) {
+                        let _ = g.hip.free(buf);
+                        return Err(e);
+                    }
                     s_matrices.push(GpuTensor {
                         buf,
                         shape: vec![s_size],
@@ -1725,7 +1856,10 @@ impl DeltaNetState {
                 }
                 StateQuant::Q4 => {
                     let buf = g.hip.malloc(s_size / 2)?;
-                    g.hip.memset(&buf, 0, s_size / 2)?;
+                    if let Err(e) = g.hip.memset(&buf, 0, s_size / 2) {
+                        let _ = g.hip.free(buf);
+                        return Err(e);
+                    }
                     s_matrices.push(GpuTensor {
                         buf,
                         shape: vec![s_size / 2],
@@ -1734,6 +1868,9 @@ impl DeltaNetState {
                     s_scales.push(g.zeros(&[n_heads * s_dim], DType::F32)?);
                 }
             }
+            if ef_enabled {
+                s_ef_residual.push(g.zeros(&[s_size], DType::F16)?);
+            }
             conv_states.push(g.zeros(&[conv_state_size], DType::F32)?);
         }
         Ok((
@@ -1741,10 +1878,10 @@ impl DeltaNetState {
                 s_matrices,
                 s_scales,
                 conv_states,
-                // EF residual not wired for the multi-GPU band split (would need
-                // per-device residual alloc routed by device_for_layer); empty ⇒
-                // ef_residual() returns None ⇒ kernel uses the stochastic path.
-                s_ef_residual: Vec::new(),
+                // Per-device EF residuals (Q8 + HIPFIRE_DN_STATE_EF default-ON);
+                // empty only when EF is off (FP32/Q4/HIPFIRE_DN_STATE_EF=0) ⇒
+                // ef_residual() returns None ⇒ kernel uses stochastic requant.
+                s_ef_residual,
                 quant,
             },
             la_to_device,
@@ -1763,7 +1900,7 @@ impl DeltaNetState {
         for (i, t) in self.conv_states.into_iter().enumerate() {
             let _ = gpus.devices[la_to_device[i] as usize].free_tensor(t);
         }
-        // Empty today (multi-GPU EF not wired); free if/when residuals land.
+        // Per-device EF residuals ride along when EF is on (Q8 default-ON).
         for (i, t) in self.s_ef_residual.into_iter().enumerate() {
             let _ = gpus.devices[la_to_device[i] as usize].free_tensor(t);
         }

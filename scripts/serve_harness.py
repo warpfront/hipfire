@@ -24,7 +24,7 @@ Modes:
   session — an existing N-turn session file (recall + attractor), e.g. the 8-turn
             session_coding.json the coherence gate uses.
 """
-import argparse, atexit, errno, hashlib, json, os, re, shutil, signal, subprocess, sys, tempfile, time, urllib.request
+import argparse, atexit, base64, errno, hashlib, json, math, os, re, shutil, signal, struct, subprocess, sys, tempfile, time, urllib.error, urllib.request, zlib
 from pathlib import Path
 
 # Mirror of the Rust configuration schema's reasoning budgets (resolved here so the pre-flight shows the
@@ -513,7 +513,9 @@ def show_config(cfg):
     _note = ('no think block emitted' if _thinking_off
              else 'uncapped think budget' if _cap == 0
              else f'> think cap {_cap} — model can answer' if cfg['max_tokens'] > _cap
-             else f'<= think cap {_cap} — INVALID (think-only); run will hard-fail')
+             else ('n/a for --mode images (diffusion pipe, no chat completion)'
+                   if cfg['mode'] == 'images'
+                   else f'<= think cap {_cap} — INVALID (think-only); run will hard-fail'))
     print(f"  max_tokens     : {cfg['max_tokens']}"
           f" [{cfg.get('max_tokens_source', 'unknown')}]  ({_note})")
     print("  sampling (what IS set):")
@@ -1948,10 +1950,15 @@ def spawn_serve(cfg, home, log):
         except OSError:
             pass
     _write_native_config(cfg, home)
+    # The requested config is written to <home>/.hipfire/config.toml, but
+    # ConfigPaths::discover prefers HIPFIRE_HOME over HOME/.hipfire — an inherited
+    # HIPFIRE_HOME would make the daemon read a stale parent/gate config instead
+    # (dflash off, wrong max_seq, MTP auto). Point the child's HIPFIRE_HOME at the
+    # harness-written root; the parent environment is untouched.
     # Honor a caller-provided per-GPU daemon binary (a renamed copy → distinct
     # process comm → the CLI's reapOrphans `pkill -x <name>` stays scoped to THIS
     # instance). HIPFIRE_DAEMON_NAME/ID pass through from os.environ untouched.
-    env = dict(os.environ, HOME=home, HIP_VISIBLE_DEVICES=os.environ.get("HIP_VISIBLE_DEVICES","0"),
+    env = dict(os.environ, HOME=home, HIPFIRE_HOME=os.path.join(home, ".hipfire"), HIP_VISIBLE_DEVICES=os.environ.get("HIP_VISIBLE_DEVICES","0"),
                HIPFIRE_DAEMON_BIN=os.environ.get(
                    "HIPFIRE_DAEMON_BIN",
                    os.path.join(REPO, "target", "release", "daemon" + (".exe" if os.name == "nt" else ""))),
@@ -1984,6 +1991,10 @@ def spawn_serve(cfg, home, log):
     cli = _native_cli()
     serve_cmd = [cli, "serve", "127.0.0.1", str(cfg["port"]),
                  "--kv-backend", cfg.get("kv_backend", "contiguous")]
+    if cfg.get("mode") == "images":
+        # Pre-warm the diffusion pipe at serve start and pin it (no idle
+        # eviction) so the images battery is deterministic start to finish.
+        serve_cmd.extend(["--model", cfg["model"], "--idle-timeout", "0"])
     if cfg.get("tp"):
         serve_cmd.extend(["--tp", str(cfg["tp"])])
     atexit.register(_kill_serve)
@@ -2075,6 +2086,165 @@ def _self_test_attractor_channels():
     # ...but a genuinely degenerate short window still trips once it can repeat.
     assert _response_has_attractor("", " ".join(["the"] * ATTRACTOR_MIN_WINDOW))
     print("serve_harness: attractor-channel self-test OK", flush=True)
+
+
+def _g45_sse_bytes(payloads):
+    """Encode canned choice payloads (or raw lines) as SSE ``data:`` bytes."""
+    lines = []
+    for p in payloads:
+        if isinstance(p, bytes):
+            lines.append(p)
+        elif isinstance(p, str):
+            lines.append(p.encode("utf-8"))
+        else:
+            lines.append(("data: " + json.dumps(p)).encode("utf-8"))
+    lines.append(b"data: [DONE]")
+    return lines
+
+
+def _g45_chunk(delta=None, finish=None, cid="chatcmpl-g45"):
+    choice = {"index": 0, "delta": delta or {}}
+    if finish is not None:
+        choice["finish_reason"] = finish
+    return {"id": cid, "choices": [choice]}
+
+
+def _self_test_g45_terminal_accounting():
+    """GPU-free: the SSE fold counts exactly one terminal and any late bytes."""
+    t0 = time.time()
+    # Clean stop: prose, one terminal, usage, DONE.
+    clean = _fold_chat_sse_chunks(_g45_sse_bytes([
+        _g45_chunk({"content": "hi"}),
+        _g45_chunk({}, finish="stop"),
+        {"usage": {"prompt_tokens": 5, "completion_tokens": 2}},
+    ]), t0)
+    assert clean["finish"] == "stop", clean
+    assert clean["terminal_count"] == 1, clean
+    assert clean["terminal_reasons"] == ["stop"], clean
+    assert clean["post_terminal_bytes"] == 0, clean
+    assert "".join(clean["ans"]) == "hi", clean
+    # Duplicate terminal: two finish chunks both counted.
+    dup = _fold_chat_sse_chunks(_g45_sse_bytes([
+        _g45_chunk({"content": "hi"}),
+        _g45_chunk({}, finish="stop"),
+        _g45_chunk({"content": "late"}, finish="stop"),
+    ]), t0)
+    assert dup["terminal_count"] == 2, dup
+    assert dup["post_terminal_bytes"] == len("late".encode("utf-8")), dup
+    # Late tool delta after the terminal counts as late bytes too.
+    late_tool = _fold_chat_sse_chunks(_g45_sse_bytes([
+        _g45_chunk({}, finish="length"),
+        _g45_chunk({"tool_calls": [{"index": 0, "id": "call_0"}]}),
+    ]), t0)
+    assert late_tool["terminal_count"] == 1, late_tool
+    assert late_tool["post_terminal_bytes"] > 0, late_tool
+    # Missing terminal: count 0, finish None — the row assertion must reject.
+    missing = _fold_chat_sse_chunks(_g45_sse_bytes([_g45_chunk({"content": "hi"})]), t0)
+    assert missing["terminal_count"] == 0 and missing["finish"] is None, missing
+    # Non-data lines and broken JSON never disturb the fold.
+    noisy = _fold_chat_sse_chunks([b": keep-alive", b"data: {broken",
+                                   *_g45_sse_bytes([_g45_chunk({}, finish="error")])], t0)
+    assert noisy["terminal_count"] == 1 and noisy["finish"] == "error", noisy
+    print("serve_harness: g45-terminal-accounting self-test OK", flush=True)
+
+
+def _self_test_g45_fail_closed_assertions():
+    """GPU-free: the fail-closed row gate passes good terminals, rejects all
+    four violation classes (wrong finish, duplicate terminal, late bytes,
+    tool release)."""
+    good = {"finish": "error", "terminal_count": 1, "terminal_reasons": ["error"],
+            "post_terminal_bytes": 0, "tool_calls": []}
+    assert _assert_g45_fail_closed_row(dict(good), "malformed_tool", ["error", "length"]) is True
+    length_ok = dict(good, finish="length", terminal_reasons=["length"])
+    assert _assert_g45_fail_closed_row(length_ok, "length_cap", ["length"]) is True
+    cases = [
+        ("wrong finish", dict(good, finish="stop"), ["error", "length"]),
+        ("missing terminal", dict(good, finish=None, terminal_count=0), ["error", "length"]),
+        ("duplicate terminal", dict(good, terminal_count=2,
+                                    terminal_reasons=["error", "error"]), ["error", "length"]),
+        ("late bytes", dict(good, post_terminal_bytes=7), ["error", "length"]),
+        ("tool release", dict(good, tool_calls=[{"id": "call_0"}]), ["error", "length"]),
+    ]
+    for label, row, allowed in cases:
+        try:
+            _assert_g45_fail_closed_row(row, "probe", allowed)
+        except AssertionError:
+            continue
+        raise AssertionError(f"g45 gate accepted a {label} row: {row!r}")
+    # A completed call fails explicitly (tuning signal), even when the
+    # allowed list names tool_calls (defense in depth against typos).
+    for completed in (dict(good, finish="tool_calls"),
+                      dict(good, tool_calls=[{"id": "call_0"}])):
+        try:
+            _assert_g45_fail_closed_row(completed, "probe", ["tool_calls"])
+        except AssertionError as e:
+            assert "call completed; lower max_tokens" in str(e), str(e)
+        else:
+            raise AssertionError(f"g45 gate accepted a completed call: {completed!r}")
+    print("serve_harness: g45-fail-closed-assertions self-test OK", flush=True)
+
+
+def _self_test_g45_cache_store_log_check():
+    """GPU-free: ``[qwen-cache store]`` line counting for both AR and DFlash
+    spellings, ignoring lookups/HITs."""
+    assert _count_qwen_cache_stores("") == 0
+    assert _count_qwen_cache_stores(None) == 0
+    text = (
+        "[qwen-cache store] cached_seq=41 emit_text.len=120 tool_calls=0 preview='hi'\n"
+        "[qwen-cache store dflash] fp=0x0000000000000001 cached_seq=9 span=False\n"
+        "[qwen-cache jinja lookup dflash] fp=0x0000000000000001 role=Role(Assistant) primer=0 hit=True\n"
+        "[qwen-cache HIT dflash] reuse prefix=10 suffix=3 (no reset)\n"
+    )
+    assert _count_qwen_cache_stores(text) == 2, text
+    assert _count_qwen_cache_stores("malformed tool protocol\n") == 0
+    print("serve_harness: g45-cache-store-log-check self-test OK", flush=True)
+
+def _self_test_g45_torn_stream_and_error_mapping():
+    """GPU-free: torn streams never raise and never synthesize a terminal;
+    the serve-log envelope maps them to exactly one error terminal."""
+    import http.client
+    t0 = time.time()
+    # Clean EOF with no DONE and no terminal: honest wire state, no synthesis.
+    torn = _fold_chat_sse_chunks([b"data: " + json.dumps(_g45_chunk({"content": "part"})).encode("utf-8")], t0)
+    assert torn["saw_done"] is False and torn["stream_error"] is None, torn
+    assert torn["terminal_count"] == 0 and torn["finish"] is None, torn
+    assert "".join(torn["ans"]) == "part", torn
+    # Abrupt close mid-stream: exception recorded, partial bytes still folded.
+    partial = b"data: " + json.dumps(_g45_chunk({"content": "late-part"})).encode("utf-8") + b"\n"
+    def raising():
+        yield b"data: " + json.dumps(_g45_chunk({"content": "early"})).encode("utf-8") + b"\n"
+        raise http.client.IncompleteRead(partial=partial, expected=128)
+    cut = _fold_chat_sse_chunks(raising(), t0)
+    assert cut["stream_error"] is not None and "IncompleteRead" in cut["stream_error"], cut
+    assert "".join(cut["ans"]) == "earlylate-part", cut
+    assert cut["terminal_count"] == 0 and cut["saw_done"] is False, cut
+    # Daemon error envelope maps a terminal-less row to exactly one terminal.
+    log_slice = (
+        "[qwen-cache GEN-ENTRY] conv_tok=156 seq_pos=156\n"
+        "[hipfire] streaming completion failed: daemon error: "
+        "[validation retryable=false rolled_back=true attempt=2] "
+        "open think span at end of generation (validation)\n"
+    )
+    row = {"finish": None, "terminal_count": 0, "terminal_reasons": [],
+           "post_terminal_bytes": 0, "tool_calls": [], "saw_done": False,
+           "stream_error": None}
+    assert _apply_daemon_error_terminal(row, log_slice) is True, row
+    assert row["finish"] == "error" and row["terminal_count"] == 1, row
+    assert row["terminal_reasons"] == ["error"], row
+    assert row["rolled_back"] is True and row["retryable"] is False, row
+    assert row["attempt"] == 2 and row["error_class"] == "validation", row
+    assert "open think span" in row["daemon_error"], row
+    # Never overrides a terminal already seen on the wire.
+    wired = {"finish": "length", "terminal_count": 1, "terminal_reasons": ["length"],
+             "post_terminal_bytes": 0, "tool_calls": []}
+    assert _apply_daemon_error_terminal(wired, log_slice) is False, wired
+    assert wired["finish"] == "length" and "daemon_error" not in wired, wired
+    # No envelope, no mapping.
+    bare = {"finish": None, "terminal_count": 0, "terminal_reasons": [],
+            "post_terminal_bytes": 0, "tool_calls": []}
+    assert _apply_daemon_error_terminal(bare, "unrelated log noise\n") is False, bare
+    assert bare["finish"] is None and bare["terminal_count"] == 0, bare
+    print("serve_harness: g45-torn-stream-error-mapping self-test OK", flush=True)
 
 def _project_mtp_ngram_timings(timings):
     """Project MTP/ngram timing fields from a daemon timings object for report rows.
@@ -2287,8 +2457,10 @@ def _assert_transcript_equal(rows_a, rows_b):
 
 
 def _load_structured_session(path):
-    """Load a structured Glimmer session if schema==glimmer-cache-tool-roundtrip-v1, else None.
+    """Load a structured session for a known schema, else None.
 
+    Accepted: ``glimmer-cache-tool-roundtrip-v1`` (Glimmer tool round-trip)
+    and ``g45-fail-closed-v1`` (G4.5 parser-finalization fail-closed steps).
     Preserves prompt bytes exactly (read_bytes().decode) and records prompt_md5.
     """
     try:
@@ -2297,10 +2469,10 @@ def _load_structured_session(path):
         return None
     if not isinstance(data, dict):
         return None
-    if data.get("schema") != "glimmer-cache-tool-roundtrip-v1":
+    if data.get("schema") not in ("glimmer-cache-tool-roundtrip-v1", "g45-fail-closed-v1"):
         return None
     # Resolve any content_file references
-    for turn in data.get("turns") or []:
+    for turn in (data.get("turns") or []) + (data.get("steps") or []):
         if "content_file" in turn and "content" not in turn:
             p = turn["content_file"]
             fp = p if os.path.isabs(p) else os.path.join(REPO, p)
@@ -2437,18 +2609,198 @@ def _run_glimmer_cache_tool_session(cfg, args, scenario):
     return rows
 
 
+_QWEN_CACHE_STORE_RE = re.compile(r"\[qwen-cache store[ \]]")
 
-def _request_body(cfg, messages, tools=None):
+
+def _count_qwen_cache_stores(text):
+    """Count ``[qwen-cache store]`` / ``[qwen-cache store dflash]`` lines.
+
+    The daemon emits one such line (under ``HIPFIRE_QWEN_CACHE_TRACE=1``)
+    exactly when a turn is published to ``asst_turn_cache``. Fail-closed
+    turns (malformed / open-think / length) never store, so a log slice
+    covering only such a request must contain zero new lines.
+    """
+    return len(_QWEN_CACHE_STORE_RE.findall(text or ""))
+
+
+_DAEMON_ERROR_RE = re.compile(
+    r"streaming completion failed: daemon error: "
+    r"\[(\w+) retryable=(\w+) rolled_back=(\w+) attempt=(\d+)\] (.*)"
+)
+
+
+def _apply_daemon_error_terminal(row, log_slice):
+    """Map a torn stream onto the daemon error terminal in the serve log.
+
+    A daemon error terminal (malformed protocol, open think) tears the SSE
+    stream down with no terminal frame, so the row legitimately shows
+    ``terminal_count == 0`` / ``finish is None``. When the step's serve-log
+    slice contains exactly the matching ``streaming completion failed:
+    daemon error:`` envelope, attribute the torn stream to it: set
+    ``finish="error"``, count the one terminal, and keep the envelope's
+    message, class, retryable/rolled_back flags, and attempt on the row.
+    Never overrides a terminal already seen on the wire. Returns True when
+    applied, False when there is nothing to map (wire terminal present or
+    no envelope in the slice).
+    """
+    if row.get("terminal_count"):
+        return False
+    match = None
+    for match in _DAEMON_ERROR_RE.finditer(log_slice or ""):
+        pass
+    if match is None:
+        return False
+    row["finish"] = "error"
+    row["terminal_count"] = 1
+    row["terminal_reasons"] = ["error"]
+    row["error_class"] = match.group(1)
+    row["retryable"] = (match.group(2) == "true")
+    row["rolled_back"] = (match.group(3) == "true")
+    row["attempt"] = int(match.group(4))
+    row["daemon_error"] = match.group(5).strip()
+    return True
+
+
+def _assert_g45_fail_closed_row(row, step, allowed):
+    """Assert one fail-closed parser terminal: exactly one terminal, no tool
+    release, a non-storing finish class, and no late bytes after it.
+
+    ``allowed`` is the step's fail-closed finish set (``error`` and/or
+    ``length`` — the terminals ``qwen_ar_finish_route`` never stores or
+    releases calls for). Raises :class:`AssertionError` naming the step and
+    the offending observation; the G4.5 runner lets it propagate like the
+    Glimmer tool-roundtrip assertions.
+    """
+    finish = row.get("finish")
+    if finish == "tool_calls" or row.get("tool_calls"):
+        raise AssertionError(
+            f"g45 {step}: call completed; lower max_tokens so the cap "
+            f"truncates inside the tool-call body "
+            f"(finish={finish!r} tool_calls={row.get('tool_calls')!r})"
+        )
+    if finish not in allowed:
+        raise AssertionError(
+            f"g45 {step}: expected fail-closed finish in {sorted(allowed)}, "
+            f"got {finish!r} row={row!r}"
+        )
+    if row.get("terminal_count") != 1:
+        raise AssertionError(
+            f"g45 {step}: expected exactly one terminal, got "
+            f"count={row.get('terminal_count')} reasons={row.get('terminal_reasons')} "
+            f"finish={finish!r}"
+        )
+    if row.get("post_terminal_bytes"):
+        raise AssertionError(
+            f"g45 {step}: {row.get('post_terminal_bytes')} late payload bytes "
+            f"after the terminal (finish={finish!r})"
+        )
+    return True
+
+
+def _run_g45_fail_closed_session(cfg, args, scenario):
+    """Execute a ``g45-fail-closed-v1`` parser-finalization session.
+
+    Each step is one independent single-turn request against the same serve
+    (no history carried: a fail-closed turn must neither poison nor require
+    follow-up context). ``kind: fail_closed`` steps assert the G4.5 terminal
+    boundary via :func:`_assert_g45_fail_closed_row`; ``kind: positive``
+    steps assert a storing-capable terminal with the same cardinality shape.
+    A daemon error terminal tears the SSE stream down with no terminal
+    frame, so a terminal-less fail-closed row is attributed through its
+    serve-log slice (:func:`_apply_daemon_error_terminal`) — a torn stream
+    with no matching envelope fails instead of passing silently. With
+    ``HIPFIRE_QWEN_CACHE_TRACE=1`` and a spawned serve, each step's slice
+    must additionally add zero ``[qwen-cache store]`` lines for fail-closed
+    steps; the seed positive control makes absence meaningful (a zero-store
+    seed prints a vacuous-control warning instead of passing silently).
+    """
+    steps = scenario.get("steps") or []
+    if not steps:
+        raise AssertionError("g45-fail-closed-v1 scenario has no steps")
+    log_path = getattr(args, "serve_log", None) or "/tmp/serve_harness.serve.log"
+    no_spawn = bool(getattr(args, "no_spawn", False))
+    trace_on = os.environ.get("HIPFIRE_QWEN_CACHE_TRACE") == "1"
+    want_slice = not no_spawn and os.path.exists(log_path)
+    want_log = want_slice and trace_on
+    if trace_on and not want_log:
+        print("g45: HIPFIRE_QWEN_CACHE_TRACE=1 but no spawned serve log at "
+              f"{log_path} — cache-publication check SKIPPED", flush=True)
+    rows = []
+    seed_stores = None
+    for idx, step in enumerate(steps):
+        name = step.get("name") or f"step{idx}"
+        kind = step.get("kind") or "fail_closed"
+        prompt = step.get("content") or ""
+        tools = step.get("tools")
+        allowed = step.get("expect_finish") or (["stop"] if kind == "positive" else ["error", "length"])
+        log_offset = _serve_log_offset(log_path) if want_slice else 0
+        r = send(cfg, [{"role": "user", "content": prompt}],
+                 tools=tools,
+                 max_tokens=step.get("max_tokens"),
+                 max_think_tokens=step.get("max_think_tokens"))
+        r["prompt_md5"] = step.get("prompt_md5") or hashlib.md5(prompt.encode("utf-8")).hexdigest()
+        r["step"] = name
+        r["g45_kind"] = kind
+        log_slice = _serve_log_text(log_path, log_offset) if want_slice else ""
+        if kind == "positive":
+            if r.get("finish") not in allowed:
+                raise AssertionError(
+                    f"g45 {name}: positive step expected finish in {sorted(allowed)}, "
+                    f"got {r.get('finish')!r} row={r!r}"
+                )
+            if r.get("terminal_count") != 1 or r.get("post_terminal_bytes"):
+                raise AssertionError(
+                    f"g45 {name}: positive step terminal shape violated: "
+                    f"count={r.get('terminal_count')} "
+                    f"reasons={r.get('terminal_reasons')} "
+                    f"late_bytes={r.get('post_terminal_bytes')}"
+                )
+        else:
+            if not r.get("terminal_count"):
+                if not want_slice or not _apply_daemon_error_terminal(r, log_slice):
+                    raise AssertionError(
+                        f"g45 {name}: torn stream with no daemon error terminal "
+                        f"in the serve log (saw_done={r.get('saw_done')} "
+                        f"stream_error={r.get('stream_error')!r})"
+                    )
+            _assert_g45_fail_closed_row(r, name, allowed)
+        if want_log:
+            stores = _count_qwen_cache_stores(log_slice)
+            r["qwen_cache_stores"] = stores
+            if kind == "positive" and seed_stores is None and idx == 0:
+                seed_stores = stores
+            if kind != "positive" and stores != 0:
+                raise AssertionError(
+                    f"g45 {name}: fail-closed turn published {stores} "
+                    f"asst_turn_cache store(s); expected 0"
+                )
+        rows.append(r)
+        print(turn_line(idx + 1, r), flush=True)
+    for r in rows:
+        print(f"  prompt_md5={r.get('prompt_md5')} request_md5={r.get('request_md5')} step={r.get('step')}", flush=True)
+    bmd5, bpath = _daemon_binary_md5()
+    if bmd5:
+        print(f"  daemon_binary_md5={bmd5} path={bpath}", flush=True)
+    if want_log and seed_stores == 0:
+        print("g45: WARNING seed stored 0 turns — no-store absence is a vacuous "
+              "control on this route; rerun on the Qwen AR path with "
+              "HIPFIRE_QWEN_CACHE_TRACE=1 for a meaningful control", flush=True)
+    print(f"g45_fail_closed=PASS steps={len(rows)}", flush=True)
+    return rows
+
+
+def _request_body(cfg, messages, tools=None, max_tokens=None, max_think_tokens=None):
     body = {
         "model": cfg["model"],
         "messages": messages,
-        "max_tokens": cfg["max_tokens"],
+        "max_tokens": cfg["max_tokens"] if max_tokens is None else max_tokens,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
     body.update(cfg["sampling"])
-    if cfg.get("request_max_think_tokens") is not None:
-        body["max_think_tokens"] = cfg["request_max_think_tokens"]
+    think_cap = cfg.get("request_max_think_tokens") if max_think_tokens is None else max_think_tokens
+    if think_cap is not None:
+        body["max_think_tokens"] = think_cap
     if cfg.get("seed") is not None:
         body["seed"] = cfg["seed"]
     if tools is not None:
@@ -2456,22 +2808,55 @@ def _request_body(cfg, messages, tools=None):
     return body
 
 
-def send(cfg, messages, tools=None):
-    body = _request_body(cfg, messages, tools)
-    # Exact bytes sent for md5 (AGENTS.md discipline: byte-identical prompts + request identity)
-    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    request_md5 = hashlib.md5(body_bytes).hexdigest()
-    t0 = time.time(); ttft = None; think = []; ans = []
+def _fold_chat_sse_chunks(line_iter, t0):
+    """Fold OpenAI chat-completions SSE lines into stream observations.
+
+    Pure fold over the ``data:`` payloads (no I/O): identical content
+    accounting to the historical inline loop in :func:`send`, plus terminal
+    cardinality for the G4.5 fail-closed gates — ``terminal_count`` (SSE
+    chunks carrying a non-null ``finish_reason``), ``terminal_reasons``
+    (distinct values in arrival order), and ``post_terminal_bytes``
+    (content / reasoning / tool-delta payload bytes arriving after the first
+    terminal chunk). Accepts ``bytes`` or ``str`` lines; stops at ``[DONE]``.
+
+    A daemon error terminal tears the stream down with no terminal frame
+    (``ResponseChunk::fail`` — no success/error frame is appended), so the
+    iterator may end cleanly without ``[DONE]`` or raise mid-stream
+    (``IncompleteRead`` carries the torn bytes in ``partial``). Both are
+    folded, never raised: ``saw_done`` reports a clean ``[DONE]`` end and
+    ``stream_error`` carries the iterator exception, if any. Attributing a
+    torn stream to the daemon error terminal is the runner's job
+    (:func:`_apply_daemon_error_terminal`, via the serve log) — the fold
+    itself never synthesizes a terminal.
+    """
+    ttft = None; think = []; ans = []
     tool_acc = {}
     usage = {}; timings = {}; finish = None; completion_id = None
-    req = urllib.request.Request(f"http://127.0.0.1:{cfg['port']}/v1/chat/completions",
-                                 data=body_bytes,
-                                 headers={"Content-Type": "application/json"}, method="POST")
-    for raw in urllib.request.urlopen(req, timeout=1800):
-        line = raw.decode("utf-8", "ignore").strip()
+    terminal_count = 0; terminal_reasons = []; post_terminal_bytes = 0
+    seen_terminal = False; saw_done = False; stream_error = None
+    pending = []
+    it = iter(line_iter)
+    while True:
+        if pending:
+            raw = pending.pop(0)
+        else:
+            try:
+                raw = next(it)
+            except StopIteration:
+                break
+            except Exception as e:
+                stream_error = f"{type(e).__name__}: {e}"
+                partial = getattr(e, "partial", None)
+                if partial:
+                    pending.extend(partial.splitlines(keepends=True))
+                    continue
+                break
+        line = raw.decode("utf-8", "ignore").strip() if isinstance(raw, bytes) else raw.strip()
         if not line.startswith("data:"): continue
         p = line[5:].strip()
-        if p == "[DONE]": break
+        if p == "[DONE]":
+            saw_done = True
+            break
         try: ck = json.loads(p)
         except Exception: continue
         if isinstance(ck.get("id"), str):
@@ -2479,8 +2864,23 @@ def send(cfg, messages, tools=None):
         if ck.get("usage"): usage = ck["usage"]
         if ck.get("timings"): timings = ck["timings"]
         ch = (ck.get("choices") or [{}])[0]
-        if ch.get("finish_reason"): finish = ch["finish_reason"]
+        reason = ch.get("finish_reason")
+        if reason is not None:
+            terminal_count += 1
+            if reason not in terminal_reasons:
+                terminal_reasons.append(reason)
+            seen_terminal = True
+        if reason:
+            finish = reason
         d = ch.get("delta") or {}
+        if seen_terminal:
+            for key in ("content", "reasoning_content"):
+                val = d.get(key)
+                if isinstance(val, str):
+                    post_terminal_bytes += len(val.encode("utf-8"))
+            deltas = d.get("tool_calls")
+            if deltas:
+                post_terminal_bytes += len(json.dumps(deltas).encode("utf-8"))
         if isinstance(d.get("reasoning_content"), str):
             if ttft is None and d["reasoning_content"]: ttft = time.time() - t0
             think.append(d["reasoning_content"])
@@ -2489,6 +2889,35 @@ def send(cfg, messages, tools=None):
             ans.append(d["content"])
         if d.get("tool_calls"):
             _merge_tool_call_deltas(tool_acc, d["tool_calls"])
+    return {
+        "ttft": ttft, "think": think, "ans": ans, "tool_acc": tool_acc,
+        "usage": usage, "timings": timings, "finish": finish,
+        "completion_id": completion_id, "terminal_count": terminal_count,
+        "terminal_reasons": terminal_reasons,
+        "post_terminal_bytes": post_terminal_bytes,
+        "saw_done": saw_done, "stream_error": stream_error,
+    }
+
+
+def send(cfg, messages, tools=None, max_tokens=None, max_think_tokens=None):
+    body = _request_body(cfg, messages, tools, max_tokens, max_think_tokens)
+    # Exact bytes sent for md5 (AGENTS.md discipline: byte-identical prompts + request identity)
+    body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    request_md5 = hashlib.md5(body_bytes).hexdigest()
+    t0 = time.time()
+    req = urllib.request.Request(f"http://127.0.0.1:{cfg['port']}/v1/chat/completions",
+                                 data=body_bytes,
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    folded = _fold_chat_sse_chunks(urllib.request.urlopen(req, timeout=1800), t0)
+    ttft = folded["ttft"]; think = folded["think"]; ans = folded["ans"]
+    tool_acc = folded["tool_acc"]
+    usage = folded["usage"]; timings = folded["timings"]; finish = folded["finish"]
+    completion_id = folded["completion_id"]
+    terminal_count = folded["terminal_count"]
+    terminal_reasons = folded["terminal_reasons"]
+    post_terminal_bytes = folded["post_terminal_bytes"]
+    saw_done = folded["saw_done"]
+    stream_error = folded["stream_error"]
     wall = time.time() - t0
     dtoks = usage.get("completion_tokens", 0)
     decode_ts = timings.get("decode_tok_s")
@@ -2532,6 +2961,11 @@ def send(cfg, messages, tools=None):
         "tool_calls": tool_calls,
         "request_md5": request_md5,
         "atem_leak": atem_leak,
+        "terminal_count": terminal_count,
+        "terminal_reasons": terminal_reasons,
+        "post_terminal_bytes": post_terminal_bytes,
+        "saw_done": saw_done,
+        "stream_error": stream_error,
     }
 
 
@@ -2564,11 +2998,248 @@ def turn_line(i, r, recall=""):
             f"{recall}{fl} | {r['ans_preview']!r}")
 
 
+def _decode_png(data):
+    """Minimal dependency-free PNG decoder: 8-bit, non-interlaced, color
+    types 2 (RGB) / 6 (RGBA), all filter types. Returns (w, h, RGB bytes)."""
+    pos = 8
+    w = h = 0
+    color = 2
+    idat = bytearray()
+    while pos + 12 <= len(data):
+        length = struct.unpack(">I", data[pos:pos + 4])[0]
+        ctype = data[pos + 4:pos + 8]
+        body = data[pos + 8:pos + 8 + length]
+        if ctype == b"IHDR":
+            w, h, depth, color, _, _, interlace = struct.unpack(">IIBBBBB", body)
+            if depth != 8 or interlace != 0 or color not in (2, 6):
+                raise ValueError(
+                    f"unsupported PNG for images battery: depth={depth} "
+                    f"color={color} interlace={interlace}"
+                )
+        elif ctype == b"IDAT":
+            idat += body
+        pos += 12 + length
+    raw = zlib.decompress(bytes(idat))
+    ch = 3 if color == 2 else 4
+    stride = w * ch
+    out = bytearray(w * h * 3)
+    prev = bytearray(stride)
+    row_len = stride + 1
+    for y in range(h):
+        f = raw[y * row_len]
+        cur = bytearray(raw[y * row_len + 1:(y + 1) * row_len])
+        if f == 1:  # Sub
+            for i in range(ch, stride):
+                cur[i] = (cur[i] + cur[i - ch]) & 0xFF
+        elif f == 2:  # Up
+            for i in range(stride):
+                cur[i] = (cur[i] + prev[i]) & 0xFF
+        elif f == 3:  # Average
+            for i in range(stride):
+                a = cur[i - ch] if i >= ch else 0
+                cur[i] = (cur[i] + ((a + prev[i]) >> 1)) & 0xFF
+        elif f == 4:  # Paeth
+            for i in range(stride):
+                a = cur[i - ch] if i >= ch else 0
+                b = prev[i]
+                c = prev[i - ch] if i >= ch else 0
+                p = a + b - c
+                pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                cur[i] = (cur[i] + pr) & 0xFF
+        for x in range(w):
+            base = (y * w + x) * 3
+            src = x * ch
+            out[base] = cur[src]
+            out[base + 1] = cur[src + 1]
+            out[base + 2] = cur[src + 2]
+        prev = cur
+    return w, h, out
+
+
+def _img_psnr_ssim(a, b):
+    """PSNR in dB (inf for identical) and global SSIM over equal-length RGB
+    byte arrays. The 1e-3 relative tolerance is enforced at the
+    call site as ssim >= 0.999; byte-identical images score inf / 1.0."""
+    n = len(a)
+    mse = 0.0
+    for x, y in zip(a, b):
+        d = x - y
+        mse += d * d
+    mse /= n
+    psnr = float("inf") if mse == 0.0 else 10.0 * math.log10(255.0 * 255.0 / mse)
+    ma = sum(a) / n
+    mb = sum(b) / n
+    va = sum((x - ma) ** 2 for x in a) / n
+    vb = sum((x - mb) ** 2 for x in b) / n
+    cov = sum((x - ma) * (y - mb) for x, y in zip(a, b)) / n
+    c1 = (0.01 * 255.0) ** 2
+    c2 = (0.03 * 255.0) ** 2
+    ssim = ((2 * ma * mb + c1) * (2 * cov + c2)) / (
+        (ma * ma + mb * mb + c1) * (va + vb + c2)
+    )
+    return psnr, ssim
+
+
+def _image_request(cfg, prompt, seed, width, height, steps, extra=None):
+    """One POST to /v1/images/generations; returns status + decoded payload.
+
+    On 200: png bytes/md5, size echo, hipfire metadata. On HTTP error: status
+    and the OpenAI error message. Request bytes are md5-stamped per AGENTS.md
+    discipline so a run is byte-identified."""
+    body = {"model": "ignored", "prompt": prompt, "n": 1,
+            "size": f"{width}x{height}", "steps": steps, "seed": seed}
+    if extra:
+        body.update(extra)
+    body_bytes = json.dumps(body, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{cfg['port']}/v1/images/generations",
+        data=body_bytes, headers={"Content-Type": "application/json"}, method="POST")
+    t0 = time.time()
+    request_md5 = hashlib.md5(body_bytes).hexdigest()
+    try:
+        with urllib.request.urlopen(req, timeout=900) as raw:
+            resp = json.load(raw)
+    except urllib.error.HTTPError as err:
+        text = err.read().decode("utf-8", "ignore")
+        try:
+            payload = json.loads(text)
+        except Exception:
+            payload = {"error": {"message": text[:200]}}
+        return {"http_status": err.code,
+                "error_message": payload.get("error", {}).get("message", ""),
+                "request_md5": request_md5}
+    png = base64.b64decode(resp["data"][0]["b64_json"])
+    return {"http_status": 200, "png": png,
+            "png_md5": hashlib.md5(png).hexdigest(), "png_bytes": len(png),
+            "size_echo": resp["data"][0].get("size"),
+            "request_md5": request_md5,
+            "hipfire": resp.get("hipfire", {}) or {},
+            "model_echo": resp.get("model"), "ms": time.time() - t0}
+
+
+def _run_images_battery(cfg, args):
+    """Image battery: deterministic seeded txt2img over the
+    live serve path.
+
+    Gates: (1) every valid request is 200 and echoes the requested size;
+    (2) same seed repeats byte-identically within one process (self PSNR =
+    inf, SSIM = 1.0, asserted >= 60 dB / >= 0.999); (3) refuse cases fail
+    closed with 400 + message; (4) same seed across a second fresh serve
+    process is byte-identical (cross-process determinism).
+
+    PSNR/SSIM against the committed diffusers golden are recorded as eyeball
+    metrics only: the golden was generated with torch noise and hipfire's
+    seeded noise is its own xorshift64*/Box-Muller generator, so
+    golden-identity is not a pass criterion and must never be asserted."""
+    prompt = args.img_prompt
+    width, height, steps = args.img_width, args.img_height, args.img_steps
+    seeds = [int(s) for s in re.split(r"[,\s]+", args.img_seeds) if s.strip()]
+    if not seeds:
+        sys.exit("serve_harness: --img-seeds must contain at least one seed")
+    gold = {}
+    rows = []
+    refuse = [
+        ("bad-size", {"size": "31x32"}),
+        ("n2", {"n": 2}),
+        ("missing-prompt", {"prompt": ""}),
+        ("bad-format", {"response_format": "png"}),
+        ("bad-steps", {"steps": 0}),
+        ("negative-prompt", {"negative_prompt": "ugly"}),
+        ("bad-sampler", {"sampler": "dpmpp"}),
+        # Reference images never ride the JSON generations body (and never as
+        # server paths): they are multipart file parts on /v1/images/edits.
+        ("images-on-generations", {"images": ["/etc/hostname"]}),
+    ]
+    for seed in seeds:
+        r1 = _image_request(cfg, prompt, seed, width, height, steps)
+        r2 = _image_request(cfg, prompt, seed, width, height, steps)
+        if r1["http_status"] != 200 or r2["http_status"] != 200:
+            sys.exit(f"serve_harness: images battery seed {seed} failed: "
+                     f"{r1.get('error_message') or r2.get('error_message')}")
+        parity = r1["png"] == r2["png"]
+        psnr, ssim = _img_psnr_ssim(r1["png"], r2["png"])
+        if not parity or psnr < 60.0 or ssim < 0.999:
+            sys.exit(
+                f"serve_harness: images battery seed {seed} within-process "
+                f"determinism FAILED (parity={parity} psnr={psnr:.1f}dB ssim={ssim:.4f})"
+            )
+        gold[seed] = r1["png"]
+        # Keep the actual pixels for a human eyeball: one PNG per seed beside
+        # the serve log (append-only log dir; the artifact is a new file).
+        img_artifact = f"{args.serve_log}.img-seed-{seed}.png"
+        try:
+            with open(img_artifact, "wb") as fh:
+                fh.write(r1["png"])
+            print(f"  [img artifact] {img_artifact}", flush=True)
+        except OSError as err:
+            print(f"  [img artifact] could not write {img_artifact}: {err}", flush=True)
+        rows.append({
+            "mode": "images", "seed": seed, "width": width, "height": height,
+            "steps": steps, "png_md5": r1["png_md5"], "png_bytes": r1["png_bytes"],
+            "within_parity": parity, "self_psnr_db": psnr, "self_ssim": ssim,
+            "ms": r1["ms"], "request_md5": r1["request_md5"],
+            "size_echo": r1["size_echo"], "model_echo": r1["model_echo"],
+            "runaway": False, "empty": False, "attractor": False,
+        })
+        print(f"  [img seed={seed}] 200 in {r1['ms'] * 1000:.0f}ms "
+              f"{r1['png_bytes']}B md5={r1['png_md5'][:12]} "
+              f"within-parity={parity} self-psnr={psnr:.1f}dB self-ssim={ssim:.4f}",
+              flush=True)
+    for name, extra in refuse:
+        r = _image_request(cfg, prompt, seeds[0], width, height, steps, extra)
+        ok = r["http_status"] == 400 and bool(r.get("error_message"))
+        rows.append({"mode": "images-refusal", "case": name,
+                     "http_status": r["http_status"],
+                     "error_message": r.get("error_message", ""), "ok": ok})
+        print(f"  [img refuse {name}] {r['http_status']} ok={ok} :: "
+              f"{r.get('error_message', '')[:70]}", flush=True)
+    if not all(r["ok"] for r in rows if r.get("mode") == "images-refusal"):
+        sys.exit("serve_harness: images battery fail-closed refusal gate failed")
+    golden_path = os.path.abspath(args.img_golden)
+    if os.path.isfile(golden_path):
+        gw, gh, gpx = _decode_png(open(golden_path, "rb").read())
+        for seed, png in gold.items():
+            w, h, px = _decode_png(png)
+            if (w, h) != (gw, gh):
+                print(f"  [img golden seed={seed}] size {w}x{h} vs golden "
+                      f"{gw}x{gh}; eyeball metrics skipped", flush=True)
+                continue
+            psnr, ssim = _img_psnr_ssim(px, gpx)
+            print(f"  [img golden seed={seed}] golden-vs-seeded psnr={psnr:.1f}dB "
+                  f"ssim={ssim:.4f} (different noise sources; report-only, "
+                  f"not a gate)", flush=True)
+    else:
+        print(f"  [img golden] fixture not found at {golden_path}; "
+              f"eyeball metrics skipped", flush=True)
+    # Cross-process determinism: same seed, second fresh serve process.
+    second = spawn_serve(cfg, args.home, args.serve_log)
+    if second is None:
+        sys.exit("serve_harness: images battery second serve span failed to warm")
+    cross = None
+    try:
+        r = _image_request(cfg, prompt, seeds[0], width, height, steps)
+        cross = r["http_status"] == 200 and r["png"] == gold[seeds[0]]
+        rows.append({"mode": "images-cross-process", "seed": seeds[0],
+                     "cross_parity": cross, "png_md5": r.get("png_md5", ""),
+                     "http_status": r.get("http_status")})
+        print(f"  [img cross-process seed={seeds[0]}] http={r['http_status']} "
+              f"byte-parity={cross}", flush=True)
+    finally:
+        _kill_serve()
+    if not cross:
+        sys.exit("serve_harness: images battery cross-process byte parity "
+                 "FAILED (same seed across processes must be byte-identical)")
+    return rows
+
+
 def run(cfg, args):
     label = f"{os.path.basename(cfg['model'])}|{cfg['mtp']}|{cfg['mode']}"
     print(f"### RUN {label}  kv={cfg['kv']} sampling={cfg['sampling']} seed={cfg.get('seed')} ###", flush=True)
     rows = []
     feedback_shape = getattr(args, "feedback_shape", None) or "rich"
+    if cfg["mode"] == "images":
+        return _run_images_battery(cfg, args)
     battery = load_prompt_battery(
         cfg.get("prompts_file"), cfg.get("prompt_file"), cfg.get("niah_file")
     )
@@ -2595,13 +3266,15 @@ def run(cfg, args):
             recall = f" recall={len(expected) - len(missing)}/{len(expected)}" if expected else ""
             rows.append(r); print(f"  [{genre}]" + turn_line(len(rows), r, recall)[2:], flush=True)
     elif cfg["mode"] == "session":
-        # Structured Glimmer session takes precedence when schema matches
+        # Structured sessions take precedence when the schema matches
         structured = None
         try:
             structured = _load_structured_session(args.session)
         except Exception:
             structured = None
-        if structured is not None:
+        if structured is not None and structured.get("schema") == "g45-fail-closed-v1":
+            rows = _run_g45_fail_closed_session(cfg, args, structured)
+        elif structured is not None:
             rows = _run_glimmer_cache_tool_session(cfg, args, structured)
         else:
             turns = json.load(open(args.session))
@@ -2867,13 +3540,35 @@ def main():
                     help="context length; omitted resolves canonical-tag policy then 32768")
     ap.add_argument("--sampling", default="registry",
                     help="registry | registry:general|coding|instruct | greedy | recipe:general|coding|nothink | json:{...}")
-    ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session"])
+    ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session", "images"])
     ap.add_argument(
         "--session",
         default=os.path.join(REPO, "benchmarks", "prompts", "session_coding.json"),
         help="Multi-turn session fixture (default: the committed 8-turn coding chain).",
     )
     ap.add_argument("--port", type=int, default=11520)
+    # --mode images battery knobs.
+    ap.add_argument(
+        "--img-prompt",
+        default="a tiny cat sitting on a tiny table",
+        help="Prompt for --mode images (tiny diffusion pipe fixture).",
+    )
+    ap.add_argument(
+        "--img-golden",
+        default=os.path.join(
+            REPO, "crates", "hipfire-arch-diffusion", "tests", "fixtures",
+            "tiny-pipeline", "golden.png",
+        ),
+        help="Committed diffusers golden PNG for eyeball PSNR/SSIM metrics "
+             "(report-only; the golden is torch noise, not hipfire's seeded noise).",
+    )
+    ap.add_argument("--img-width", type=int, default=32,
+                    help="Pixel width for --mode images (must be divisible by the VAE upscale).")
+    ap.add_argument("--img-height", type=int, default=32)
+    ap.add_argument("--img-steps", type=int, default=2,
+                    help="Denoise steps for --mode images (1..128).")
+    ap.add_argument("--img-seeds", default="0,7",
+                    help="Comma/space separated seeds exercised in --mode images.")
     ap.add_argument("--home", default=os.path.expanduser("~/.cache/serve_harness_home"))
     ap.add_argument("--serve-log", default="/tmp/serve_harness.serve.log")
     ap.add_argument(
@@ -2948,6 +3643,10 @@ def main():
         _self_test_glimmer_tool_delta_merge()
         _self_test_glimmer_transcript_and_trace()
         _self_test_attractor_channels()
+        _self_test_g45_terminal_accounting()
+        _self_test_g45_fail_closed_assertions()
+        _self_test_g45_cache_store_log_check()
+        _self_test_g45_torn_stream_and_error_mapping()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")
@@ -2958,7 +3657,7 @@ def main():
         return
     # `off` resolves to the sentinel cap 1, which is not a real think budget — no
     # think block is emitted at all, so the think-only-output guard does not apply.
-    if (cfg['thinking_cap_tokens'] != 1
+    if args.mode != "images" and (cfg['thinking_cap_tokens'] != 1
             and cfg['thinking_cap_tokens']
             and cfg['max_tokens'] <= cfg['thinking_cap_tokens']):
         sys.exit(

@@ -383,11 +383,6 @@ impl GemmFamily {
                 w.dtype, key
             )));
         }
-        macro_rules! hip {
-            ($e:expr) => {
-                $e.map_err(|e| DispatchError::Hip(e.to_string()))
-            };
-        }
 
         use KernelKey as K;
         match key {
@@ -398,6 +393,9 @@ impl GemmFamily {
             K::GemmQ8_0Wmma => hip!(gpu.gemm_q8_0_wmma(w.buf, x, y, m, k, batch_size)),
             K::GemmQ8_0BatchedChunked => {
                 hip!(gpu.gemm_q8_0_batched_chunked(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmQ8_0BatchedF32Chunked => {
+                hip!(gpu.gemm_q8_0_batched_f32_chunked(w.buf, x, y, m, k, batch_size))
             }
             K::GemmHfq4G256Wmma => hip!(gpu.gemm_hfq4g256_wmma(w.buf, x, y, m, k, batch_size)),
             K::GemmTQ2G128Prefill => {

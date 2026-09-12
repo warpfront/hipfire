@@ -69,6 +69,18 @@ pub trait ModelSource {
     fn chat_template(&self) -> Option<String> {
         None
     }
+
+    /// Hint that one tensor's bytes will not be read again, so the source may
+    /// drop whatever it is holding for them.
+    ///
+    /// Advisory and best-effort by contract: a caller that streams a 24 GB
+    /// checkpoint tensor-by-tensor uses it to keep resident set size flat
+    /// (see [`SafetensorsSource`](crate::safetensors_source::SafetensorsSource),
+    /// which issues `MADV_DONTNEED` over the tensor's mmap range). A source
+    /// with nothing to release — or one whose release fails — is not an
+    /// error, and a later `tensor_data` for the same name must still return
+    /// the same bytes.
+    fn release_tensor_pages(&self, _name: &str) {}
 }
 
 /// Open a model from a path, auto-detecting the format.

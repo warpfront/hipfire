@@ -36,6 +36,8 @@ use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::ParoRotation;
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::model_load::load_weights as rt_load_weights;
+use hipfire_runtime::model_load::load_weights_with_fault as rt_load_weights_with_fault;
+pub use hipfire_runtime::model_load::StagedLoadFault;
 use hipfire_runtime::model_load::LoadedWeights;
 use hipfire_runtime::model_load::WeightSource;
 use hipfire_runtime::model_source::ModelSource;
@@ -2428,10 +2430,40 @@ pub use hipfire_runtime::model_load::Layout;
 /// Drive a qwen35 `WeightSource` over the device slice (runtime orchestrator),
 /// then assemble `Qwen35Weights`. `pager` is always `None` here; paged-experts
 /// wiring is unchanged and set by the caller post-load.
+///
+/// The production route always runs fault-free; [`load_weights_with_fault`]
+/// is the test-only seam.
 pub fn load_weights(
     source: &mut (impl WeightSource<Layer = LayerWeights>),
     devices: &mut [Gpu],
     layout: &Layout,
+) -> HipResult<Qwen35Weights> {
+    load_weights_inner(source, devices, layout, None)
+}
+
+/// Deterministic fault-injection seam over the production direct-Qwen35 load.
+///
+/// The production route always calls [`load_weights`] (fault `None`), so a
+/// fault is unreachable without this seam. Mirrors
+/// `DeepseekV4::load_dspark_with_fault`: typed, never environment-controlled.
+/// Each [`StagedLoadFault`] fires after the named owner is published to the
+/// runtime staged transaction, so a failing run proves the transaction's
+/// reverse-order rollback reclaims every staged GPU owner.
+#[doc(hidden)]
+pub fn load_weights_with_fault(
+    source: &mut (impl WeightSource<Layer = LayerWeights>),
+    devices: &mut [Gpu],
+    layout: &Layout,
+    fault: StagedLoadFault,
+) -> HipResult<Qwen35Weights> {
+    load_weights_inner(source, devices, layout, Some(fault))
+}
+
+fn load_weights_inner(
+    source: &mut (impl WeightSource<Layer = LayerWeights>),
+    devices: &mut [Gpu],
+    layout: &Layout,
+    fault: Option<StagedLoadFault>,
 ) -> HipResult<Qwen35Weights> {
     use std::sync::atomic::Ordering;
     use std::time::Instant;
@@ -2443,7 +2475,10 @@ pub fn load_weights(
         output,
         layers,
         lm_head_aliases_embd,
-    } = rt_load_weights(source, devices, layout)?;
+    } = match fault {
+        None => rt_load_weights(source, devices, layout)?,
+        Some(fault) => rt_load_weights_with_fault(source, devices, layout, fault)?,
+    };
     eprintln!(
         "  weight sweep: {} ms (packed-expert host-read {} ms, H2D {} ms)",
         t_sweep.elapsed().as_millis(),
@@ -2514,7 +2549,7 @@ impl WeightSource for HfqSource<'_> {
             );
         }
         let (embd_meta, embd_data) = qwen35_tensor_data_cow(self.hfq, "embed_tokens.weight")
-            .expect("embed_tokens not found");
+            .ok_or_else(|| HipError::new(0, "embed_tokens not found"))?;
         let out = load_embedding(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)?;
         drop(embd_data);
         Ok(out)
@@ -2546,13 +2581,13 @@ impl WeightSource for HfqSource<'_> {
             c.vocab_size,
             c.dim,
             |gpu| {
-                let (lm_info, lm_data) =
-                    qwen35_tensor_data_cow(hfq, "lm_head.weight").expect("lm_head present");
+                let (lm_info, lm_data) = qwen35_tensor_data_cow(hfq, "lm_head.weight")
+                    .ok_or_else(|| HipError::new(0, "lm_head present"))?;
                 load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)
             },
             |gpu| {
                 let (embd_meta, embd_data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
-                    .expect("embed_tokens not found");
+                    .ok_or_else(|| HipError::new(0, "embed_tokens not found"))?;
                 dequant_weight_raw(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)
             },
         )?;
@@ -2576,6 +2611,9 @@ impl WeightSource for HfqSource<'_> {
             self.hfq.drop_pages_range(start, end - start);
         }
         Ok(lw)
+    }
+    fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
+        layer.free_gpu(gpu);
     }
 }
 
@@ -2689,6 +2727,9 @@ impl WeightSource for ParoSource<'_> {
             )
         };
         crate::layer_driver::load_layer(&mut b, c, layer_idx, moe)
+    }
+    fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
+        layer.free_gpu(gpu);
     }
 }
 
@@ -4049,7 +4090,20 @@ fn e8_soa_experts() -> bool {
     })
 }
 
-const MQ4_G256_QUANT_TYPE: u8 = 13;
+/// Quant types that share the 136 B/group stride and can be packed into
+/// layer-level blobs via `try_load_packed_mq4_experts`. All three have
+/// identical byte layout for concatenation purposes — only the 8-byte group
+/// header interpretation differs, which is handled by kernel dispatch on
+/// `gpu_dtype`. qt=30 (MQ4G256Lloyd, 160 B/group) and qt=47 (MQ6G256V2,
+/// 200 B/group) are excluded because their strides differ.
+fn packable_mq4_dtype(qt: u8) -> Option<DType> {
+    match qt {
+        13 => Some(DType::MQ4G256),
+        44 => Some(DType::MQ4G256V2),
+        45 => Some(DType::MQ4CG256),
+        _ => None,
+    }
+}
 
 struct PackedMq4ExpertSpec {
     gate_up_name: String,
@@ -4128,6 +4182,7 @@ fn try_load_packed_mq4_experts(
     let mut specs = Vec::with_capacity(expert_ids.len());
     let mut gate_up_stride = None;
     let mut down_stride = None;
+    let mut expert_dtype: Option<DType> = None;
     for &expert_id in expert_ids {
         let gate_up_bare = format!("{p}.mlp.experts.{expert_id}.gate_up_proj.weight");
         let down_bare = format!("{p}.mlp.experts.{expert_id}.down_proj.weight");
@@ -4150,8 +4205,19 @@ fn try_load_packed_mq4_experts(
         else {
             return Ok(None);
         };
-        if gate_up_qt != MQ4_G256_QUANT_TYPE || down_qt != MQ4_G256_QUANT_TYPE {
+        let Some(gu_dt) = packable_mq4_dtype(gate_up_qt) else {
             return Ok(None);
+        };
+        let Some(dn_dt) = packable_mq4_dtype(down_qt) else {
+            return Ok(None);
+        };
+        if gu_dt != dn_dt {
+            return Ok(None);
+        }
+        match expert_dtype {
+            None => expert_dtype = Some(gu_dt),
+            Some(dt) if dt == gu_dt => {}
+            Some(_) => return Ok(None),
         }
         match gate_up_stride {
             None => gate_up_stride = Some(gate_up_bytes),
@@ -4291,11 +4357,12 @@ fn try_load_packed_mq4_experts(
         );
     }
 
+    let expert_dtype = expert_dtype.expect("non-empty packed MQ4 expert list");
     let mut experts = Vec::with_capacity(specs.len());
     for (slot, spec) in specs.iter().enumerate() {
         let mut gate_up = WeightTensor {
             buf: gate_up_owner.sub_offset(slot * gate_up_stride, gate_up_stride),
-            gpu_dtype: DType::MQ4G256,
+            gpu_dtype: expert_dtype,
             m: 2 * mi,
             k: dim,
             row_stride: 0,
@@ -4305,7 +4372,7 @@ fn try_load_packed_mq4_experts(
         gate_up.awq_scale = load_awq_scale_for(hfq, gpu, &spec.gate_up_name, dim);
         let mut down = WeightTensor {
             buf: down_owner.sub_offset(slot * down_stride, down_stride),
-            gpu_dtype: DType::MQ4G256,
+            gpu_dtype: expert_dtype,
             m: dim,
             k: mi,
             row_stride: 0,
@@ -4903,4 +4970,365 @@ pub(crate) fn load_moe_ffn(
         global_expert_dtypes: None,
         ep_dummy_buffers,
     })
+}
+
+/// Direct-Qwen35 load fault-boundary evidence (G4.3 final-head).
+///
+/// Mirrors the DSpark seam tests (`dspark_after_*` in hipfire-arch-deepseek4):
+/// each ignored test fails the production staged transaction after one
+/// publication boundary, proves free VRAM returns to the warmed baseline,
+/// retries through the production (seam-free) route, and proves the reloaded
+/// weights forward finite one-token logits with the retained carrier/store
+/// route unchanged.
+#[cfg(test)]
+mod direct_load_fault_tests {
+    use super::{HfqSource, Layout, StagedLoadFault, load_weights, load_weights_with_fault};
+    use crate::Qwen35;
+    use crate::qwen35::{
+        DeltaNetState, LayerWeights, Qwen35Config, Qwen35HfqSourceIdentity, config_from_hfq,
+        forward,
+    };
+    use hip_bridge::HipResult;
+    use hipfire_runtime::arch::Architecture;
+    use hipfire_runtime::hfq::HfqFile;
+    use hipfire_runtime::llama::{EmbeddingFormat, KvCache, WeightTensor};
+    use hipfire_runtime::model_load::WeightSource;
+    use rdna_compute::{Gpu, GpuTensor};
+
+    /// Env var naming the real dense-Qwen35 fixture for the fault-seam tests
+    /// below (e.g. `~/.hipfire/models/qwen3.8-27b.mq4-xt` — the dense Qwen35
+    /// family artifact). Unset (or no GPU) skips with a message; a set but
+    /// unreadable fixture is a setup error and fails loudly. Nothing is
+    /// fabricated.
+    const QWEN35_FIXTURE_ENV: &str = "HIPFIRE_QWEN35_FIXTURE";
+
+    /// HIP free-byte slack for the rollback VRAM assertions. `free_tensor`
+    /// parks buffers in the `Gpu` reuse pool, so each test drains the pool
+    /// before comparing HIP-visible free bytes; the residual delta is driver
+    /// rounding plus neighbor-process noise. 64 MiB sits far below one
+    /// resident Qwen35 layer, so any leaked staged owner still fails loudly.
+    const QWEN35_VRAM_SLACK_BYTES: usize = 64 << 20;
+
+    /// Serializes the five fault tests below. Each drives multi-GiB loads and
+    /// asserts device-global HIP free bytes, so concurrent execution on one
+    /// GPU measures its siblings' live loads as its own "leak". Same
+    /// `static TEST_LOCK: Mutex<()>` pattern as
+    /// `hipfire-runtime/src/llama.rs` (`RNG_TEST_LOCK`).
+    static QWEN35_VRAM_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    /// Warm-up upload that pays the ROCm first-device-allocation reservation
+    /// before any VRAM baseline is taken. The first `hipMalloc` in a HIP
+    /// process permanently reserves a fixed driver-side VM/setup block that no
+    /// process-tracked owner can free: measured 153,092,096 bytes (146.00 MiB)
+    /// on gfx1201/R9700, reproduced in isolation with a lone 1 MiB
+    /// `upload_raw` + `free_tensor` + `drain_pool` (process `hipMalloc` /
+    /// `hipFree` ledger balances exactly, a second identical load adds zero
+    /// bytes, and the shortfall is identical for 1.9 GiB and 5.9 GiB peaks).
+    /// Warming here keeps the rollback assertions strict: a genuinely leaked
+    /// Qwen35 layer still fails loudly against the 64 MiB slack. This is an
+    /// explicitly named warm-up, not slack.
+    const QWEN35_ROCM_FIRST_ALLOC_WARMUP_BYTES: usize = 1 << 20;
+
+    /// Parse the fixture config CPU-only (no GPU), or `None` (with a skip
+    /// message) when the env var is unset. Used by the last-layer test to
+    /// name its fault before the GPU run starts.
+    fn qwen35_fixture_config() -> Option<Qwen35Config> {
+        let path = match std::env::var(QWEN35_FIXTURE_ENV) {
+            Ok(path) => path,
+            Err(_) => {
+                eprintln!("skip: {QWEN35_FIXTURE_ENV} unset (need a real dense Qwen35 HFQ)");
+                return None;
+            }
+        };
+        let hfq = HfqFile::open(std::path::Path::new(&path))
+            .unwrap_or_else(|e| panic!("open {QWEN35_FIXTURE_ENV}={path}: {e:?}"));
+        Some(config_from_hfq(&hfq).expect("Qwen35 fixture model config"))
+    }
+
+    /// Open the fixture + config and init the GPU, or `None` (with a skip
+    /// message) when the env var is unset or no GPU is present. A set but
+    /// unreadable fixture is a setup error and fails loudly.
+    fn qwen35_fixture_gpu() -> Option<(HfqFile, Qwen35Config, Gpu)> {
+        let path = match std::env::var(QWEN35_FIXTURE_ENV) {
+            Ok(path) => path,
+            Err(_) => {
+                eprintln!("skip: {QWEN35_FIXTURE_ENV} unset (need a real dense Qwen35 HFQ)");
+                return None;
+            }
+        };
+        let Some(mut gpu) = Gpu::init().ok() else {
+            eprintln!("skip: no GPU");
+            return None;
+        };
+        // Pay the one-time ROCm first-allocation reservation up front so the
+        // per-test `free_before` baselines below measure only what the load
+        // under test owns. Idempotent within a process: post-warm-up uploads
+        // add no further reservation.
+        let warm = gpu
+            .upload_raw(
+                &vec![0u8; QWEN35_ROCM_FIRST_ALLOC_WARMUP_BYTES],
+                &[QWEN35_ROCM_FIRST_ALLOC_WARMUP_BYTES],
+            )
+            .expect("Qwen35 first-alloc warm-up upload");
+        gpu.free_tensor(warm)
+            .expect("Qwen35 first-alloc warm-up free");
+        gpu.drain_pool();
+        let hfq = HfqFile::open(std::path::Path::new(&path))
+            .unwrap_or_else(|e| panic!("open {QWEN35_FIXTURE_ENV}={path}: {e:?}"));
+        let cfg = config_from_hfq(&hfq).expect("Qwen35 fixture model config");
+        Some((hfq, cfg, gpu))
+    }
+
+    fn qwen35_free_vram_bytes(gpu: &Gpu) -> usize {
+        gpu.hip.get_vram_info().expect("Qwen35 test VRAM query").0
+    }
+
+    /// Fault-seam round trip for one [`StagedLoadFault`]: fail the production
+    /// [`load_weights_with_fault`] load through the real `HfqSource` route,
+    /// prove HIP free VRAM returns to its warmed baseline, retry the identical
+    /// load through the seam-free production [`load_weights`] route, prove the
+    /// retained carrier/store route is unchanged, and prove the reloaded
+    /// weights forward finite vocab-length logits for one token.
+    fn exercise_qwen35_fault_via_seam(fault: StagedLoadFault) {
+        // Serialize the five VRAM-accounting tests (see
+        // QWEN35_VRAM_TEST_LOCK): device-global free-byte assertions cannot
+        // run concurrently on one GPU.
+        let _vram_guard = QWEN35_VRAM_TEST_LOCK.lock().unwrap();
+        let Some((mut hfq, cfg, mut gpu)) = qwen35_fixture_gpu() else {
+            return;
+        };
+        // Retained carrier/store route identity BEFORE any load: the exact
+        // source file the direct-HFQ route resolves, plus the mmap/evict route
+        // bit the carrier hands `HfqSource::prepare`. Both must be identical
+        // after the fault and the retry.
+        let source_id_before = Qwen35HfqSourceIdentity::capture(&hfq);
+        let evict_before = hfq.evicts_page_cache();
+        assert_eq!(Qwen35::name(), "qwen35");
+        assert_eq!(Qwen35::arch_id(), 5);
+        let free_before = qwen35_free_vram_bytes(&gpu);
+        let layout = Layout::single(cfg.n_layers);
+
+        // Fail AFTER the named publication through the production `HfqSource`
+        // route — the same construction `Qwen35::load_weights` uses.
+        let err = {
+            let mut source = HfqSource::new(&mut hfq, &cfg);
+            match load_weights_with_fault(
+                &mut source,
+                std::slice::from_mut(&mut gpu),
+                &layout,
+                fault,
+            ) {
+                Ok(_) => panic!("fault-injected Qwen35 load must fail for {fault:?}"),
+                Err(err) => err,
+            }
+        };
+        assert!(
+            err.message.contains("injected staged-load failure"),
+            "{fault:?} error bypassed the fault seam: {err:?}"
+        );
+        gpu.drain_pool();
+        let free_after_fail = qwen35_free_vram_bytes(&gpu);
+        assert!(
+            free_after_fail + QWEN35_VRAM_SLACK_BYTES >= free_before,
+            "{fault:?} leaked VRAM across rollback: free {free_before} -> {free_after_fail}"
+        );
+
+        // Immediate retry through the PRODUCTION route (no seam): proves the
+        // retained carrier/store route still serves after the fault.
+        let weights = {
+            let mut source = HfqSource::new(&mut hfq, &cfg);
+            load_weights(&mut source, std::slice::from_mut(&mut gpu), &layout)
+                .expect("Qwen35 retry load")
+        };
+        assert_eq!(weights.layers.len(), cfg.n_layers, "retry dropped layers");
+        assert!(
+            weights.pager.is_none(),
+            "retry left the direct fully-resident route"
+        );
+        assert!(
+            weights.ep_shard().is_none(),
+            "retry left the ordinary single-GPU route"
+        );
+        // Retained route unchanged: same store identity, same carrier evict
+        // bit, same embedding/output route observables.
+        assert_eq!(
+            Qwen35HfqSourceIdentity::capture(&hfq),
+            source_id_before,
+            "fault changed the store route"
+        );
+        assert_eq!(
+            hfq.evicts_page_cache(),
+            evict_before,
+            "fault changed the carrier evict route"
+        );
+        eprintln!(
+            "qwen35: direct HFQ source route identity: arch=qwen35/5 \
+             embd_format={:?} lm_head_aliases_embd={} pager=false ep_shard=false \
+             source={}",
+            weights.embd_format,
+            weights.lm_head_aliases_embd,
+            source_id_before.canonical_path.display(),
+        );
+
+        // One-token forward through the reloaded weights: real embedding
+        // lookup + full layer stack + lm_head via the production decode entry.
+        let mut kv = KvCache::new_gpu_q8(
+            &mut gpu,
+            cfg.n_layers,
+            cfg.n_kv_heads,
+            cfg.head_dim,
+            1,
+        )
+        .expect("retry KV alloc");
+        let mut dn = DeltaNetState::new(&mut gpu, &cfg).expect("retry DeltaNet state");
+        let logits = forward(&mut gpu, &weights, &cfg, 1, 0, &mut kv, &mut dn)
+            .expect("retry one-token forward");
+        assert_eq!(logits.len(), cfg.vocab_size, "retry logits length != vocab");
+        assert!(
+            logits.iter().all(|v| v.is_finite()),
+            "retry produced non-finite logits"
+        );
+        let (mut min, mut max) = (f32::INFINITY, f32::NEG_INFINITY);
+        for &v in &logits {
+            min = min.min(v);
+            max = max.max(v);
+        }
+        assert!(max > min, "retry produced degenerate constant logits");
+
+        kv.free_gpu(&mut gpu).expect("retry KV free");
+        dn.free_gpu(&mut gpu);
+        weights.free_gpu(&mut gpu);
+        gpu.drain_pool();
+        let free_final = qwen35_free_vram_bytes(&gpu);
+        assert!(
+            free_final + QWEN35_VRAM_SLACK_BYTES >= free_before,
+            "{fault:?} leaked VRAM across retry unload: free {free_before} -> {free_final}"
+        );
+    }
+
+    /// Requires a real HIP GPU and `HIPFIRE_QWEN35_FIXTURE` pointing at a real
+    /// dense Qwen35 HFQ. Early-owner fault: fails after the embedding upload
+    /// is published to the staged transaction.
+    #[test]
+    #[ignore = "requires real HIP GPU + HIPFIRE_QWEN35_FIXTURE (real dense Qwen35 HFQ)"]
+    fn qwen35_after_embed_fault_rolls_back_and_retries() {
+        exercise_qwen35_fault_via_seam(StagedLoadFault::AfterEmbed);
+    }
+
+    /// Requires a real HIP GPU and `HIPFIRE_QWEN35_FIXTURE` pointing at a real
+    /// dense Qwen35 HFQ. Early-layer fault: fails after layer 0 is published;
+    /// rollback must reclaim the layer plus output, norm, and embedding.
+    #[test]
+    #[ignore = "requires real HIP GPU + HIPFIRE_QWEN35_FIXTURE (real dense Qwen35 HFQ)"]
+    fn qwen35_after_layer0_fault_rolls_back_and_retries() {
+        exercise_qwen35_fault_via_seam(StagedLoadFault::AfterLayer(0));
+    }
+
+    /// Requires a real HIP GPU and `HIPFIRE_QWEN35_FIXTURE` pointing at a real
+    /// dense Qwen35 HFQ. Mid-load fault: fails after the final norm is
+    /// published, before the output/lm_head upload.
+    #[test]
+    #[ignore = "requires real HIP GPU + HIPFIRE_QWEN35_FIXTURE (real dense Qwen35 HFQ)"]
+    fn qwen35_after_final_norm_fault_rolls_back_and_retries() {
+        exercise_qwen35_fault_via_seam(StagedLoadFault::AfterFinalNorm);
+    }
+
+    /// Requires a real HIP GPU and `HIPFIRE_QWEN35_FIXTURE` pointing at a real
+    /// dense Qwen35 HFQ. Late fault: fails after the output/lm_head is
+    /// published, before the first layer upload.
+    #[test]
+    #[ignore = "requires real HIP GPU + HIPFIRE_QWEN35_FIXTURE (real dense Qwen35 HFQ)"]
+    fn qwen35_after_output_fault_rolls_back_and_retries() {
+        exercise_qwen35_fault_via_seam(StagedLoadFault::AfterOutput);
+    }
+
+    /// Requires a real HIP GPU and `HIPFIRE_QWEN35_FIXTURE` pointing at a real
+    /// dense Qwen35 HFQ. Final-publish fault: fails after the last layer is
+    /// published, just before commit; rollback must reclaim the whole model.
+    #[test]
+    #[ignore = "requires real HIP GPU + HIPFIRE_QWEN35_FIXTURE (real dense Qwen35 HFQ)"]
+    fn qwen35_after_last_layer_fault_rolls_back_and_retries() {
+        let Some(cfg) = qwen35_fixture_config() else {
+            return;
+        };
+        let last = cfg
+            .n_layers
+            .checked_sub(1)
+            .expect("Qwen35 fixture has layers");
+        exercise_qwen35_fault_via_seam(StagedLoadFault::AfterLayer(last));
+    }
+
+    /// No-GPU proof that the seam preserves admission validation: with an
+    /// empty device slice both entries reject before any source work or fault
+    /// logic runs, so the fault hook is unreachable without devices — and the
+    /// production entry (which takes no fault argument at all) rejects
+    /// identically.
+    #[test]
+    fn seam_preserves_admission_validation_without_gpu() {
+        /// `WeightSource` whose every method panics: reaching any of them
+        /// without devices is a test failure.
+        struct NoGpuSource {
+            n_layers: usize,
+        }
+        impl WeightSource for NoGpuSource {
+            type Layer = LayerWeights;
+            fn n_layers(&self) -> usize {
+                self.n_layers
+            }
+            fn prepare(&mut self, _n_devices: usize) -> HipResult<()> {
+                unreachable!("source must not run without devices")
+            }
+            fn read_embed(&mut self, _gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)> {
+                unreachable!("source must not run without devices")
+            }
+            fn read_final_norm(&mut self, _gpu: &mut Gpu) -> HipResult<GpuTensor> {
+                unreachable!("source must not run without devices")
+            }
+            fn read_output(
+                &mut self,
+                _gpu: &mut Gpu,
+                _embd: &GpuTensor,
+                _embd_fmt: EmbeddingFormat,
+                _can_alias: bool,
+            ) -> HipResult<(WeightTensor, bool)> {
+                unreachable!("source must not run without devices")
+            }
+            fn read_layer(&mut self, _gpu: &mut Gpu, _layer_idx: usize) -> HipResult<Self::Layer> {
+                unreachable!("source must not run without devices")
+            }
+            fn free_layer(&mut self, _gpu: &mut Gpu, _layer: Self::Layer) {
+                unreachable!("source must not run without devices")
+            }
+        }
+
+        let layout = Layout::single(2);
+        let mut devices: Vec<Gpu> = Vec::new();
+        let mut source = NoGpuSource { n_layers: 2 };
+        for fault in [
+            StagedLoadFault::AfterEmbed,
+            StagedLoadFault::AfterOutput,
+            StagedLoadFault::AfterLayer(0),
+        ] {
+            let err = match load_weights_with_fault(&mut source, &mut devices, &layout, fault) {
+                Ok(_) => panic!("empty devices must reject before the fault hook"),
+                Err(err) => err,
+            };
+            assert!(
+                format!("{err:?}").contains("at least one device"),
+                "seam bypassed admission validation: {err:?}"
+            );
+            assert!(
+                !format!("{err:?}").contains("injected"),
+                "fault hook reachable without devices: {err:?}"
+            );
+        }
+        let err = match load_weights(&mut source, &mut devices, &layout) {
+            Ok(_) => panic!("empty devices must reject on the production route"),
+            Err(err) => err,
+        };
+        assert!(
+            format!("{err:?}").contains("at least one device"),
+            "production route changed validation: {err:?}"
+        );
+    }
 }

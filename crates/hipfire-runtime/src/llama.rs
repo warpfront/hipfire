@@ -539,6 +539,25 @@ impl WeightTensor {
         let _ = gpu.free_tensor(self.buf);
     }
 }
+impl WeightTensor {
+    /// Free owning metadata while retaining the weight buffer.
+    ///
+    /// Tied output heads are non-owning views of the embedding buffer. Their
+    /// metadata still belongs to the output descriptor, but freeing the buffer
+    /// here would double-release the embedding allocation.
+    pub fn free_metadata_only(self, gpu: &mut Gpu) {
+        if let Some(paro) = self.paro {
+            if !paro.is_alias {
+                let _ = gpu.free_tensor(paro.pairs);
+                let _ = gpu.free_tensor(paro.theta);
+                let _ = gpu.free_tensor(paro.channel_scales);
+            }
+        }
+        if let Some(awq) = self.awq_scale {
+            let _ = gpu.free_tensor(awq);
+        }
+    }
+}
 
 impl WeightTensor {
     /// Logic-free adapter to the dispatch-layer WeightRef. Wires Givens +
@@ -677,31 +696,47 @@ pub struct LayerWeights {
     pub w_up: WeightTensor,
     pub w_down: WeightTensor,
 }
+impl LayerWeights {
+    /// Return every GPU buffer owned by one layer to the pool.
+    ///
+    /// Whole-model loaders use this during rollback as well as normal unload,
+    /// so a partially completed sweep has the same ownership semantics as a
+    /// successfully published model.
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        let _ = gpu.free_tensor(self.attn_norm);
+        self.wq.free_all(gpu);
+        self.wk.free_all(gpu);
+        self.wv.free_all(gpu);
+        self.wo.free_all(gpu);
+        if let Some(t) = self.q_norm {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.k_norm {
+            let _ = gpu.free_tensor(t);
+        }
+        let _ = gpu.free_tensor(self.ffn_norm);
+        self.w_gate.free_all(gpu);
+        self.w_up.free_all(gpu);
+        self.w_down.free_all(gpu);
+    }
+}
 
 impl LlamaWeights {
     /// Return all GPU buffers to the pool (drained on unload). Consumes self.
+    /// Each weight goes through `WeightTensor::free_all` so the PARO rotation
+    /// and AWQ scale sidecars are released with their buffers.
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.free_tensor(self.token_embd);
         let _ = gpu.free_tensor(self.output_norm);
         if !self.lm_head_aliases_embd {
-            let _ = gpu.free_tensor(self.output.buf);
+            // free_all (not .buf) so the AWQ / PARO sidecars are released too.
+            // The tied-lm_head alias carries no sidecars by construction
+            // (`tied_lm_head_alias` sets paro/awq_scale to None), so skipping
+            // the whole output weight when aliased still frees exactly once.
+            self.output.free_all(gpu);
         }
-        for l in self.layers {
-            let _ = gpu.free_tensor(l.attn_norm);
-            let _ = gpu.free_tensor(l.wq.buf);
-            let _ = gpu.free_tensor(l.wk.buf);
-            let _ = gpu.free_tensor(l.wv.buf);
-            let _ = gpu.free_tensor(l.wo.buf);
-            if let Some(t) = l.q_norm {
-                let _ = gpu.free_tensor(t);
-            }
-            if let Some(t) = l.k_norm {
-                let _ = gpu.free_tensor(t);
-            }
-            let _ = gpu.free_tensor(l.ffn_norm);
-            let _ = gpu.free_tensor(l.w_gate.buf);
-            let _ = gpu.free_tensor(l.w_up.buf);
-            let _ = gpu.free_tensor(l.w_down.buf);
+        for layer in self.layers {
+            layer.free_gpu(gpu);
         }
     }
 }
@@ -1138,6 +1173,41 @@ pub fn rotate_x_mq_batched_for(
     }
 }
 
+/// S3-f16-projection-inputs: AWQ-aware batched RMSNorm+FWHT rotation writing
+/// exact FP16 directly into `x_rot_f16`.
+///
+/// Mirrors [`fused_rmsnorm_rotate_mq_batched_for`], but the producer stores
+/// `(_Float16)` (bit-identical to the F32 producer followed by
+/// `convert_f32_to_f16`) and the caller feeds the result to the
+/// `*_wmma_f16` GEMM entries, which validate `DType::F16` and never run
+/// `ensure_fp16_x`. AWQ routing is identical: `next_linear` is the FIRST
+/// linear after the rotation (e.g. `layer.wqkv`, `layer.w_gate`, `layer.wq`);
+/// gate/up and Q/K/V share the same input tensor hence the same scale.
+pub fn fused_rmsnorm_rotate_mq_f16_batched_for(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    norm_weight: &GpuTensor,
+    next_linear: &WeightTensor,
+    x_rot_f16: &GpuTensor,
+    k: usize,
+    eps: f32,
+    batch_size: usize,
+) -> HipResult<()> {
+    if let Some(awq) = next_linear.awq_scale.as_ref() {
+        gpu.fused_rmsnorm_rotate_mq_awq_f16_batched(
+            x,
+            norm_weight,
+            awq,
+            x_rot_f16,
+            k,
+            eps,
+            batch_size,
+        )
+    } else {
+        gpu.fused_rmsnorm_rotate_mq_f16_batched(x, norm_weight, x_rot_f16, k, eps, batch_size)
+    }
+}
+
 /// Phase A Stage A — F2: standalone AWQ-aware variant of
 /// `fused_silu_mul_rotate_mq`. The `down_proj_weight` is the downstream
 /// linear consuming x_rot (e.g. `w_down` / `down_proj`). When its
@@ -1176,6 +1246,28 @@ pub fn fused_silu_mul_rotate_mq_batched_for(
         gpu.fused_silu_mul_rotate_mq_awq_batched(gate, up, awq, x_rot, k, batch_size)
     } else {
         gpu.fused_silu_mul_rotate_mq_batched(gate, up, x_rot, k, batch_size)
+    }
+}
+
+/// S4-f16-residual-inputs: batched AWQ-aware `fused_silu_mul_rotate_mq`
+/// writing the frozen F16 sidecar directly (no F32 `x_rot`, no convert).
+/// The `down_proj_weight` selects the plain vs AWQ kernel exactly like
+/// [`fused_silu_mul_rotate_mq_batched_for`]; `x_rot_f16` must be DType::F16.
+///
+/// Byte-identical to the F32 producer followed by `convert_f32_to_f16`.
+pub fn fused_silu_mul_rotate_mq_f16_batched_for(
+    gpu: &mut Gpu,
+    down_proj_weight: &WeightTensor,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    x_rot_f16: &GpuTensor,
+    k: usize,
+    batch_size: usize,
+) -> HipResult<()> {
+    if let Some(awq) = down_proj_weight.awq_scale.as_ref() {
+        gpu.fused_silu_mul_rotate_mq_awq_f16_batched(gate, up, awq, x_rot_f16, k, batch_size)
+    } else {
+        gpu.fused_silu_mul_rotate_mq_f16_batched(gate, up, x_rot_f16, k, batch_size)
     }
 }
 
@@ -1838,10 +1930,50 @@ pub fn prefill_forward(
 /// largest physical_cap any consumer sets up.
 pub const PREFILL_MAX_BATCH: usize = 256;
 
+/// Kill-switch for the MQ-V2 (qt44 + neutral qt47-50) gfx11 WMMA prefill path:
+/// gfx12 (`gfx1200`/`gfx1201`) is always admitted, gfx11
+/// (`gfx1100`/`gfx1101`/`gfx1102`/`gfx1150`/`gfx1151`) is admitted unless
+/// `HIPFIRE_MQV2_GFX11_WMMA=0`, anything else is rejected. Defined here as
+/// the shared home for the qwen35 caller (`qwen35::is_batchable_la`);
+/// `llama::is_batchable_la` does NOT delegate to it (see below).
+/// `value` is the raw env var (None = unset → default ON); only `Some("0")`
+/// disables the gfx11 path. Gfx12 is unaffected by the env var.
+pub fn mqv2_gfx11_wmma_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
+    let gfx11_enabled = value != Some("0");
+    if matches!(arch, "gfx1200" | "gfx1201") {
+        true
+    } else if matches!(
+        arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
+    ) {
+        gfx11_enabled
+    } else {
+        false
+    }
+}
+
+/// Admit rule for the MQ-V2 family (`MQ4G256V2` + neutral `MQ6/5/3/2G256V2`)
+/// in batched WMMA prefill: dtype set × arch set × the
+/// `HIPFIRE_MQV2_GFX11_WMMA` kill-switch in one function. Only
+/// `qwen35::is_batchable_la` delegates here — qwen35's
+/// `forward_prefill_chunk` has V2 dispatch arms, while the llama chunk path
+/// does not (see `llama::is_batchable_la`).
+/// `MQ4CG256` (qt45) stays gfx12-only in its caller and is intentionally
+/// NOT part of this rule.
+pub fn mqv2_wmma_batchable(dt: DType, mqv2_gfx11_wmma: Option<&str>, arch: &str) -> bool {
+    matches!(
+        dt,
+        DType::MQ4G256V2
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
+    ) && mqv2_gfx11_wmma_enabled_from_env(mqv2_gfx11_wmma, arch)
+}
+
 /// Is this dtype/arch combination eligible for the batched WMMA prefill
-/// kernels? Matches `qwen35::is_batchable_la` exactly so plain Qwen3 and
-/// hybrid Qwen3.5 share one rule and stay in lockstep when new dtypes or
-/// arches gain WMMA support.
+/// kernels? NOTE: unlike `qwen35::is_batchable_la`, this does NOT admit the
+/// MQ-V2 family — see the `never_v2` refusal below.
 pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
     let always_ok = matches!(
         dt,
@@ -1874,21 +2006,30 @@ pub fn is_batchable_la(dt: DType, arch: &str) -> bool {
             arch,
             "gfx1010" | "gfx1011" | "gfx1012" | "gfx1013" | "gfx1030" | "gfx1031" | "gfx1032"
         );
-    // MQ4G256V2 / MQ4CG256 batched prefill + batched lm_head GEMM exist only
-    // on gfx12 (gfx1200/gfx1201). Outside gfx12, fall back to per-token decode
-    // rather than dispatching a gfx12 WMMA kernel. Lockstep with
-    // qwen35::is_batchable_la (qt44/qt45).
-    // Extended to neutral V2 family qt47-50.
-    let mq4_v2_gfx12 = matches!(
+    // MQ-V2 family (`MQ4G256V2` + neutral `MQ6/5/3/2G256V2`, qt44/qt47-50)
+    // plus `MQ4CG256` (qt45): REFUSED on every arch. `forward_prefill_chunk`
+    // has no V2 arms — its per-layer dtype matchers (`qkv_is_mq` ~:2570,
+    // `wo_is_mq` ~:3025, `ffn_is_mq` ~:3117, `w_down_is_mq` ~:3248) list only
+    // `MQ4G256|MQ6G256|MQ3G256|MFP4G32`, so an admitted V2 model would skip
+    // the FWHT rotate and run the V1 `hfq4g256` launchers
+    // (`gemm_qkv_hfq4g256`, `gemm_hfq4g256_residual`, `gemm_gate_up_hfq4g256`)
+    // on V2 blobs — silently incoherent prefill. Per-token decode is the
+    // only correct llama path for V2 until those arms exist. qwen35's chunk
+    // path DOES have the V2 arms, so `qwen35::is_batchable_la` keeps
+    // admitting V2 via the shared `mqv2_wmma_batchable` rule above.
+    let never_v2 = matches!(
         dt,
         DType::MQ4G256V2
-            | DType::MQ4CG256
             | DType::MQ6G256V2
             | DType::MQ5G256V2
             | DType::MQ3G256V2
             | DType::MQ2G256V2
-    ) && matches!(arch, "gfx1200" | "gfx1201");
-    wmma_only || mq3_gfx10_scalar || mq4_v2_gfx12
+            | DType::MQ4CG256
+    );
+    if never_v2 {
+        return false;
+    }
+    wmma_only || mq3_gfx10_scalar
 }
 
 /// Per-call scratch for `forward_prefill_batch`. Holds [N × ...] working
@@ -3758,8 +3899,12 @@ fn llama_forward_lowered_enabled() -> bool {
     })
 }
 
+/// Numeric attention flash policy for `HIPFIRE_ATTN_FLASH` (`config.attention_flash_mode`):
+/// `0` never, `1` auto (flash at long context), `2` always. `auto` resolves to
+/// `2` on graph-capable archs (gfx11/gfx12) so direct and captured forwards run
+/// the same kernel, and to `1` elsewhere.
 #[inline]
-fn llama_attention_flash_mode_for(mode: &str, gpu_arch: &str) -> usize {
+pub fn attention_flash_mode_for(mode: &str, gpu_arch: &str) -> usize {
     match mode {
         "never" | "0" | "off" => 0,
         "always" | "2" | "force" => 2,
@@ -3768,9 +3913,10 @@ fn llama_attention_flash_mode_for(mode: &str, gpu_arch: &str) -> usize {
     }
 }
 
+/// [`attention_flash_mode_for`] against the process configuration.
 #[inline]
-fn llama_attention_flash_mode(gpu_arch: &str) -> usize {
-    llama_attention_flash_mode_for(crate::config::get().attention_flash_mode.as_str(), gpu_arch)
+pub fn attention_flash_mode(gpu_arch: &str) -> usize {
+    attention_flash_mode_for(crate::config::get().attention_flash_mode.as_str(), gpu_arch)
 }
 
 #[inline]
@@ -3810,7 +3956,7 @@ fn llama_kv_write_attend(
         let ctx = DispatchCtx::new(gpu);
         let plan = KvTierPlan::derive(KvTierInputs {
             pos,
-            flash_mode: llama_attention_flash_mode(&gpu.arch),
+            flash_mode: attention_flash_mode(&gpu.arch),
             ..kv_cache.tier_inputs()
         })
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
@@ -4064,7 +4210,7 @@ fn forward_scratch_layers_lowered(
         config,
         scratch,
         kv_cache: &*kv_cache,
-        flash_mode: llama_attention_flash_mode(&gpu.arch),
+        flash_mode: attention_flash_mode(&gpu.arch),
         knobs,
         pos,
     };
@@ -5869,6 +6015,7 @@ impl KvCacheExt for KvCache {
             self.quant_int8,
             is_hfq8,
             self.quant_fwht,
+            self.quant_bf16,
         )
     }
 
@@ -5884,6 +6031,7 @@ impl KvCacheExt for KvCache {
             quant_q4,
             quant_int8: self.quant_int8,
             quant_hfq8: self.is_hfq8_kv(),
+            quant_bf16: self.quant_bf16,
             f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: self.v_mode.bits() as i32,
             pos: 0,
@@ -6008,6 +6156,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6048,6 +6197,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6107,6 +6257,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6147,6 +6298,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6187,6 +6339,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6232,6 +6385,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6277,6 +6431,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6343,6 +6498,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6409,6 +6565,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: true,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6475,6 +6632,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: true,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6549,6 +6707,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6616,6 +6775,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: true,
             quant_asym2: false,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6682,6 +6842,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: true,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6727,6 +6888,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6776,6 +6938,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6825,6 +6988,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: true,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6874,6 +7038,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: true,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6923,6 +7088,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -6972,6 +7138,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: true,
             quant_asym2: false,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -7021,6 +7188,7 @@ impl KvCacheExt for KvCache {
             quant_asym3: false,
             quant_asym2: true,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -7901,11 +8069,11 @@ mod tests {
 
     #[test]
     fn qwen3_flash_mode_policy_matches_rdna_generation() {
-        assert_eq!(llama_attention_flash_mode_for("auto", "gfx1100"), 2);
-        assert_eq!(llama_attention_flash_mode_for("auto", "gfx1201"), 2);
-        assert_eq!(llama_attention_flash_mode_for("auto", "gfx1030"), 1);
-        assert_eq!(llama_attention_flash_mode_for("never", "gfx1100"), 0);
-        assert_eq!(llama_attention_flash_mode_for("always", "gfx1030"), 2);
+        assert_eq!(attention_flash_mode_for("auto", "gfx1100"), 2);
+        assert_eq!(attention_flash_mode_for("auto", "gfx1201"), 2);
+        assert_eq!(attention_flash_mode_for("auto", "gfx1030"), 1);
+        assert_eq!(attention_flash_mode_for("never", "gfx1100"), 0);
+        assert_eq!(attention_flash_mode_for("always", "gfx1030"), 2);
     }
 
     #[test]
@@ -7913,7 +8081,7 @@ mod tests {
         let max_seq = 32_768;
         let expected_tile =
             rdna_compute::attention::q8_flash_tile_size("gfx1100", 16, 8, 128, max_seq);
-        assert_eq!(expected_tile, 32);
+        assert_eq!(expected_tile, 128);
         assert_eq!(
             llama_flash_partials_len("gfx1100", 16, 8, 128, max_seq),
             16 * max_seq.div_ceil(expected_tile) * 130
@@ -8247,20 +8415,18 @@ mod tests {
     }
 
     #[test]
-    fn is_batchable_la_mq4_v2_gfx12_only() {
-        // MQ4G256V2 / MQ4CG256 batched prefill is gfx12-only; other arches
-        // fall back to per-token decode.
-        for arch in ["gfx1200", "gfx1201"] {
-            assert!(
-                is_batchable_la(DType::MQ4G256V2, arch),
-                "MQ4G256V2 should batch on {arch}"
-            );
-            assert!(
-                is_batchable_la(DType::MQ4CG256, arch),
-                "MQ4CG256 should batch on {arch}"
-            );
-        }
-        for arch in ["gfx1010", "gfx1100", "gfx942"] {
+    fn is_batchable_la_mq4_v2_refused_everywhere() {
+        // `forward_prefill_chunk` has no V2 arms (its `qkv_is_mq` ~:2570,
+        // `wo_is_mq` ~:3025, `ffn_is_mq` ~:3117, `w_down_is_mq` ~:3248
+        // matchers list only V1 dtypes), so llama must refuse MQ4G256V2 and
+        // MQ4CG256 on EVERY arch — including gfx11/gfx12 — and stay on
+        // per-token decode. qwen35's chunk path has the arms and keeps the
+        // shared `mqv2_wmma_batchable` rule; see
+        // `qwen35_is_batchable_la_mq4_v2_gfx11_and_gfx12` for the admit side.
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201", "gfx1010",
+            "gfx1030", "gfx942",
+        ] {
             assert!(
                 !is_batchable_la(DType::MQ4G256V2, arch),
                 "MQ4G256V2 must fall back on {arch}"
@@ -8273,18 +8439,31 @@ mod tests {
     }
 
     #[test]
-    fn is_batchable_la_v2_family_gfx12_only() {
-        for arch in ["gfx1200", "gfx1201"] {
-            assert!(is_batchable_la(DType::MQ6G256V2, arch), "MQ6V2 gfx12");
-            assert!(is_batchable_la(DType::MQ5G256V2, arch), "MQ5V2 gfx12");
-            assert!(is_batchable_la(DType::MQ3G256V2, arch), "MQ3V2 gfx12");
-            assert!(is_batchable_la(DType::MQ2G256V2, arch), "MQ2V2 gfx12");
-        }
-        for arch in ["gfx1010", "gfx1100", "gfx942"] {
-            assert!(!is_batchable_la(DType::MQ6G256V2, arch), "MQ6V2 fallback");
-            assert!(!is_batchable_la(DType::MQ5G256V2, arch), "MQ5V2 fallback");
-            assert!(!is_batchable_la(DType::MQ3G256V2, arch), "MQ3V2 fallback");
-            assert!(!is_batchable_la(DType::MQ2G256V2, arch), "MQ2V2 fallback");
+    fn is_batchable_la_v2_family_refused_everywhere() {
+        // Neutral V2 family (qt47-50): same refusal as MQ4G256V2 — no V2 arms
+        // in the llama chunk path, so refuse on every arch (including
+        // gfx11/gfx12). Mirrors `qwen35_is_batchable_la_v2_family_gfx11_and_gfx12`
+        // on the admit side.
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201", "gfx1010",
+            "gfx1030", "gfx942",
+        ] {
+            assert!(
+                !is_batchable_la(DType::MQ6G256V2, arch),
+                "MQ6V2 fallback on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ5G256V2, arch),
+                "MQ5V2 fallback on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ3G256V2, arch),
+                "MQ3V2 fallback on {arch}"
+            );
+            assert!(
+                !is_batchable_la(DType::MQ2G256V2, arch),
+                "MQ2V2 fallback on {arch}"
+            );
         }
         assert_ne!(DType::MQ6G256, DType::MQ6G256V2);
         assert_ne!(DType::MQ3G256, DType::MQ3G256V2);
@@ -8485,6 +8664,7 @@ mod tests {
             quant_q4: false,
             quant_int8: false,
             quant_hfq8: false,
+            quant_bf16: false,
             f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv.v_mode_bits(),
             pos: 100,
@@ -8531,6 +8711,7 @@ mod tests {
             quant_q4: false,
             quant_int8: false,
             quant_hfq8: false,
+            quant_bf16: false,
             f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv.v_mode_bits(),
             pos: 100,
@@ -8607,6 +8788,7 @@ mod tests {
             quant_q4: false,
             quant_int8: false,
             quant_hfq8: false,
+            quant_bf16: false,
             f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv.v_mode_bits(),
             pos: 100,
@@ -8652,6 +8834,7 @@ mod tests {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -8696,6 +8879,7 @@ mod tests {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,

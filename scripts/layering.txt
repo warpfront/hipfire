@@ -26,6 +26,7 @@
  1 hipfire-registry
  1 hsa-bridge
  1 redline-rocr
+ 1 va-bridge
  2 hipfire-tui
  2 redline-dispatch
  3 rdna-compute
@@ -33,6 +34,7 @@
  4 saddle-core
  5 hipfire-runtime
  6 hipfire-arch-cohere2moe
+ 6 hipfire-arch-diffusion
  6 hipfire-arch-gemma4
  6 hipfire-arch-llama
  6 hipfire-arch-maple

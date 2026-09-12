@@ -378,13 +378,39 @@ fn main() {
     //    production prefill is itself token-by-token.) ──────
     if n == 1 && !batched_prefill {
         eprintln!("\n=== tp=1 anchor: production forward_scratch (unsharded rank 0) ===");
-        let mut kv_ref = KvCache::new_gpu_q8(
-            &mut gpus.devices[0],
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            kv_seq,
-        )
+        // The reference MUST sit on the same KV tier as the EP side, or the
+        // anchor compares two tiers and reports a false ANCHOR FAIL on any
+        // non-q8 run (it did, on fwht3, before this was tier-aware).
+        let mut kv_ref = match kv_mode.as_str() {
+            "asym3" => KvCache::new_gpu_asym3(
+                &mut gpus.devices[0],
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            ),
+            "fwht3" => {
+                let is_kv: Vec<bool> = config
+                    .layer_types
+                    .iter()
+                    .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
+                    .collect();
+                KvCache::new_gpu_fwht3_filtered(
+                    &mut gpus.devices[0],
+                    &is_kv,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    kv_seq,
+                )
+            }
+            _ => KvCache::new_gpu_q8(
+                &mut gpus.devices[0],
+                config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            ),
+        }
         .expect("kv ref");
         let mut dn_ref = DeltaNetState::new(&mut gpus.devices[0], &config).expect("dn ref");
         let scratch_ref =

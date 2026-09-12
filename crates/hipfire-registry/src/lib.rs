@@ -187,6 +187,39 @@ pub struct ModelEntry {
     pub mtp: Option<Sidecar>,
     #[serde(default)]
     pub dspark: Option<Sidecar>,
+    // Image-generation component sidecars (arch 40+ trunks, see
+    // docs/architecture-ids.md — ids provisional until the HFQM pack ships).
+    // `t5` is the T5-XXL text-encoder component (sidecar arch 41), `clip` the
+    // CLIP-L pooled-text encoder (arch 42), `vae` the VAE decoder (arch 43).
+    // Shared across FLUX.1 entries; a FLUX.2 Klein entry uses `qwen3` (its
+    // Qwen3 text encoder, arch 45) plus the shared `vae` instead of
+    // `t5`/`clip`.
+    #[serde(default)]
+    pub t5: Option<Sidecar>,
+    #[serde(default)]
+    pub clip: Option<Sidecar>,
+    #[serde(default)]
+    pub qwen3: Option<Sidecar>,
+    #[serde(default)]
+    pub vae: Option<Sidecar>,
+    #[serde(default)]
+    pub dflash: Option<Sidecar>,
+    /// Shared Qwen3.8-27B vision-tower sidecar (`qwen3.8-27b-vision.hfq`,
+    /// llm.cpp mmproj-style). Every `qwen3.8:27b*` tier declares the same
+    /// file so each text quant tier serves images without requantizing the
+    /// trunk; sha256/size_bytes stay absent until the pack ships.
+    #[serde(default)]
+    pub vision: Option<Sidecar>,
+    /// Alternative `lm_head` carriers, keyed by short name (`q4k`, `bf16`).
+    ///
+    /// Each is a single-tensor `.hfq` from `hipfire-quantize --head-only` that
+    /// shadows the base's `lm_head.weight` at load time. The BASE ships the
+    /// recommended head and runs standalone; these only exist so a different
+    /// carrier costs a 188-635 MB download instead of a near-identical 6.5 GB
+    /// model. Three full variants would be 19.63 GB; base plus two overlays is
+    /// 7.30 GB.
+    #[serde(default)]
+    pub heads: std::collections::BTreeMap<String, Sidecar>,
     #[serde(default)]
     pub default_tool_format: Option<String>,
     #[serde(default)]
@@ -346,9 +379,7 @@ impl RegistryV1 {
                 self.schema_version
             )));
         }
-        if self.generated_at.trim().is_empty() {
-            return Err(fail("generated_at is empty".into()));
-        }
+        validate_generated_at(&self.generated_at).map_err(fail)?;
         if self.models.is_empty() {
             return Err(fail("model catalog is empty".into()));
         }
@@ -364,9 +395,20 @@ impl RegistryV1 {
                 return Err(fail(format!("model '{tag}' has invalid size metadata")));
             }
             validate_digest(entry.sha256.as_deref(), tag).map_err(fail)?;
-            for sidecar in [&entry.triattn, &entry.mtp, &entry.dspark]
-                .into_iter()
-                .flatten()
+            for sidecar in [
+                &entry.triattn,
+                &entry.mtp,
+                &entry.dspark,
+                &entry.dflash,
+                &entry.vision,
+                &entry.t5,
+                &entry.clip,
+                &entry.qwen3,
+                &entry.vae,
+            ]
+            .into_iter()
+            .flatten()
+            .chain(entry.heads.values())
             {
                 if sidecar.file.trim().is_empty() {
                     return Err(fail(format!("model '{tag}' has an empty sidecar file")));
@@ -422,12 +464,29 @@ impl RegistryV1 {
         if self.models.contains_key(&qwen) {
             return qwen;
         }
+        // A bare file name matches its entry. A path never does: matching on
+        // `file_name()` let a lookalike file outside the models directory
+        // inherit the installed artifact's identity (sidecars, kv/max_seq
+        // policy, rm targets). Callers that know the models directory resolve
+        // paths with canonical comparison instead (`registry_entry_for_path`
+        // in hipfire-cli); a bare file name carries no directory to confuse.
         self.models
             .iter()
             .find_map(|(tag, entry)| {
                 (entry.file == normalized || entry.file == input).then(|| tag.clone())
             })
             .unwrap_or(normalized)
+    }
+
+    /// Exact `entry.file` match for callers that already established the input
+    /// is the installed artifact (e.g. via canonical path comparison against
+    /// the models directory). Unlike [`RegistryV1::model`], this never applies
+    /// tag/alias normalization: `file_name` must be the bare file as stored.
+    pub fn entry_for_file(&self, file_name: &str) -> Option<(&str, &ModelEntry)> {
+        self.models
+            .iter()
+            .find(|(_, entry)| entry.file == file_name)
+            .map(|(tag, entry)| (tag.as_str(), entry))
     }
 
     pub fn model(&self, input: &str) -> Option<(&str, &ModelEntry)> {
@@ -445,6 +504,86 @@ fn validate_digest(digest: Option<&str>, label: &str) -> std::result::Result<(),
         }
     }
     Ok(())
+}
+
+fn validate_generated_at(ts: &str) -> std::result::Result<(), String> {
+    // Strict normalized RFC3339 UTC: YYYY-MM-DDTHH:MM:SSZ (20 bytes).
+    // Lexical order equals chronological order only in this normalized form,
+    // which is what `prefer_bundled_if_newer` relies on. Reject any
+    // non-normalized representation (offsets, fractional seconds, whitespace,
+    // lowercase, etc.) and validate calendar ranges so malformed strings
+    // cannot invert precedence via lexical comparison.
+    if ts.len() != 20 {
+        return Err(format!(
+            "generated_at '{}' is not strict RFC3339 UTC (expected YYYY-MM-DDTHH:MM:SSZ)",
+            ts
+        ));
+    }
+    let b = ts.as_bytes();
+    if b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return Err(format!(
+            "generated_at '{}' is not strict RFC3339 UTC (expected YYYY-MM-DDTHH:MM:SSZ)",
+            ts
+        ));
+    }
+    for i in [0, 1, 2, 3, 5, 6, 8, 9, 11, 12, 14, 15, 17, 18] {
+        if !b[i].is_ascii_digit() {
+            return Err(format!(
+                "generated_at '{}' is not strict RFC3339 UTC (expected YYYY-MM-DDTHH:MM:SSZ)",
+                ts
+            ));
+        }
+    }
+    let year = (b[0] - b'0') as u16 * 1000
+        + (b[1] - b'0') as u16 * 100
+        + (b[2] - b'0') as u16 * 10
+        + (b[3] - b'0') as u16;
+    let month = (b[5] - b'0') * 10 + (b[6] - b'0');
+    let day = (b[8] - b'0') * 10 + (b[9] - b'0');
+    let hour = (b[11] - b'0') * 10 + (b[12] - b'0');
+    let minute = (b[14] - b'0') * 10 + (b[15] - b'0');
+    let second = (b[17] - b'0') * 10 + (b[18] - b'0');
+    if month == 0 || month > 12 {
+        return Err(format!("generated_at '{}' has invalid month", ts));
+    }
+    if day == 0 || day > days_in_month(year, month) {
+        return Err(format!("generated_at '{}' has invalid day", ts));
+    }
+    if hour > 23 {
+        return Err(format!("generated_at '{}' has invalid hour", ts));
+    }
+    if minute > 59 {
+        return Err(format!("generated_at '{}' has invalid minute", ts));
+    }
+    if second > 59 {
+        return Err(format!("generated_at '{}' has invalid second", ts));
+    }
+    Ok(())
+}
+
+fn days_in_month(year: u16, month: u8) -> u8 {
+    match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if is_leap_year(year) {
+                29
+            } else {
+                28
+            }
+        }
+        _ => 0,
+    }
+}
+
+fn is_leap_year(year: u16) -> bool {
+    year % 4 == 0 && (year % 100 != 0 || year % 400 == 0)
 }
 
 fn is_effort_native_tag(tag: &str) -> bool {
@@ -564,6 +703,43 @@ pub fn bundled() -> Result<RegistryV1> {
     RegistryV1::parse(BUNDLED_REGISTRY, "bundled registry/v1.json")
 }
 
+/// Prefer the BUNDLED registry when it is newer than whatever was fetched.
+///
+/// `registry/v1.json` is compiled into the binary, so on a branch the bundled
+/// copy IS that branch's registry — while the fetch targets master. Without
+/// this, editing the registry on a branch changes nothing for a locally built
+/// binary: the 24h cache or a master fetch silently wins, and nothing says so.
+/// That cost a real debugging detour (a branch's `heads` map read as empty).
+///
+/// `generated_at` is the existing signal and needs no new configuration:
+/// `scripts/registry_gen.py` stamps it on every regeneration, and its
+/// `%Y-%m-%dT%H:%M:%SZ` form compares correctly as a plain string.
+///
+/// This does NOT break distribution. A released binary's bundled registry is
+/// older than master's by construction, so the fetch keeps winning there and
+/// users still get new models without upgrading. Only a freshly regenerated
+/// local registry — i.e. someone editing it — takes precedence.
+fn prefer_bundled_if_newer(
+    loaded: LoadedRegistry,
+    bundled: RegistryV1,
+    warnings: &mut Vec<String>,
+) -> LoadedRegistry {
+    if loaded.source == RegistrySource::Bundled
+        || bundled.generated_at <= loaded.registry.generated_at
+    {
+        return loaded;
+    }
+    warnings.push(format!(
+        "using the bundled registry ({}), which is newer than the fetched one ({})",
+        bundled.generated_at, loaded.registry.generated_at
+    ));
+    LoadedRegistry {
+        registry: bundled,
+        source: RegistrySource::Bundled,
+        warnings: std::mem::take(warnings),
+    }
+}
+
 pub fn load(paths: &RegistryPaths) -> LoadedRegistry {
     let mut warnings = Vec::new();
     let bundled = bundled().expect("checked-in registry/v1.json must validate");
@@ -582,14 +758,15 @@ pub fn load(paths: &RegistryPaths) -> LoadedRegistry {
         .as_ref()
         .is_some_and(|cache| cache_is_fresh(cache, now, REGISTRY_CACHE_TTL))
     {
-        return LoadedRegistry {
+        let loaded = LoadedRegistry {
             registry: cache.expect("checked above").registry,
             source: RegistrySource::Cache,
-            warnings,
+            warnings: std::mem::take(&mut warnings),
         };
+        return prefer_bundled_if_newer(loaded, bundled, &mut warnings);
     }
 
-    match fetch_registry(&url) {
+    let loaded = match fetch_registry(&url) {
         Ok(registry) => {
             let cache_file = RegistryCache {
                 fetched_at: now,
@@ -602,7 +779,7 @@ pub fn load(paths: &RegistryPaths) -> LoadedRegistry {
             LoadedRegistry {
                 registry,
                 source: RegistrySource::Network,
-                warnings,
+                warnings: std::mem::take(&mut warnings),
             }
         }
         Err(error) => {
@@ -611,17 +788,18 @@ pub fn load(paths: &RegistryPaths) -> LoadedRegistry {
                 LoadedRegistry {
                     registry: cache.registry,
                     source: RegistrySource::StaleCache,
-                    warnings,
+                    warnings: std::mem::take(&mut warnings),
                 }
             } else {
                 LoadedRegistry {
-                    registry: bundled,
+                    registry: bundled.clone(),
                     source: RegistrySource::Bundled,
-                    warnings,
+                    warnings: std::mem::take(&mut warnings),
                 }
             }
         }
-    }
+    };
+    prefer_bundled_if_newer(loaded, bundled, &mut warnings)
 }
 
 fn read_cache(path: &Path, url: &str, warnings: &mut Vec<String>) -> Option<RegistryCache> {
@@ -714,6 +892,104 @@ fn epoch_millis() -> u64 {
 mod tests {
     use super::*;
 
+    /// The `heads` map must be VALIDATED, not merely parsed.
+    ///
+    /// Adding a field to the struct makes it round-trip; it does not make the
+    /// validator look at it. This asserts the negative directly: a head with a
+    /// malformed digest is REJECTED. Without the `.chain(entry.heads.values())`
+    /// in `validate`, this test fails and the bundled-registry check would
+    /// happily ship an unverifiable head overlay.
+    #[test]
+    fn heads_sidecars_are_digest_validated() {
+        let with_bad_head = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{"m":{"repo":"r","file":"f.hfq","size_gb":1,"min_vram_gb":1,"desc":"d",
+              "heads":{"q4k":{"file":"h.hfq","sha256":"not-a-sha"}}}},
+            "aliases":{}
+        }"#;
+        let err = RegistryV1::parse(with_bad_head, "test")
+            .expect_err("a malformed head digest must be rejected");
+        assert!(
+            format!("{err}").contains("invalid SHA-256"),
+            "expected a digest complaint, got: {err}"
+        );
+
+        // Control: the SAME registry with a well-formed digest parses, so the
+        // rejection above is about the digest and not about `heads` being
+        // unparseable.
+        let good = with_bad_head.replace("not-a-sha", &"a".repeat(64));
+        let reg = RegistryV1::parse(&good, "test").expect("valid head must parse");
+        let (_, entry) = reg.model("m").unwrap();
+        assert_eq!(entry.heads.len(), 1);
+        assert_eq!(entry.heads["q4k"].file, "h.hfq");
+    }
+
+    fn reg_at(stamp: &str) -> RegistryV1 {
+        RegistryV1::parse(
+            &format!(
+                r#"{{"schema_version":1,"generated_at":"{stamp}",
+                   "models":{{"m":{{"repo":"r","file":"f","size_gb":1,"min_vram_gb":1,"desc":"d"}}}},
+                   "aliases":{{}}}}"#
+            ),
+            "test",
+        )
+        .unwrap()
+    }
+
+    /// A NEWER bundled registry wins — this is what makes a branch's registry
+    /// edits visible to a locally built binary instead of being silently
+    /// overridden by the 24h cache or a master fetch.
+    #[test]
+    fn newer_bundled_registry_beats_a_stale_fetch() {
+        let mut w = Vec::new();
+        let fetched = LoadedRegistry {
+            registry: reg_at("2026-08-31T05:32:38Z"),
+            source: RegistrySource::Cache,
+            warnings: Vec::new(),
+        };
+        let out = prefer_bundled_if_newer(fetched, reg_at("2026-09-01T13:14:39Z"), &mut w);
+        assert_eq!(out.source, RegistrySource::Bundled);
+        assert_eq!(out.registry.generated_at, "2026-09-01T13:14:39Z");
+        assert!(
+            out.warnings.iter().any(|x| x.contains("newer")),
+            "the override must be reported, not silent: {:?}",
+            out.warnings
+        );
+    }
+
+    /// The other direction is what keeps DISTRIBUTION working: a released
+    /// binary's bundled registry is older than master's, so the fetch must
+    /// still win and users get new models without upgrading. Without this the
+    /// change above would freeze every client at its build-time registry.
+    #[test]
+    fn older_bundled_registry_defers_to_the_fetch() {
+        let mut w = Vec::new();
+        let fetched = LoadedRegistry {
+            registry: reg_at("2026-09-01T13:14:39Z"),
+            source: RegistrySource::Network,
+            warnings: Vec::new(),
+        };
+        let out = prefer_bundled_if_newer(fetched, reg_at("2026-08-28T08:31:54Z"), &mut w);
+        assert_eq!(out.source, RegistrySource::Network);
+        assert_eq!(out.registry.generated_at, "2026-09-01T13:14:39Z");
+        assert!(out.warnings.is_empty(), "no override, so nothing to report");
+    }
+
+    /// Equal stamps must not flap between sources.
+    #[test]
+    fn equal_timestamps_keep_the_fetched_registry() {
+        let mut w = Vec::new();
+        let same = "2026-09-01T13:14:39Z";
+        let fetched = LoadedRegistry {
+            registry: reg_at(same),
+            source: RegistrySource::Cache,
+            warnings: Vec::new(),
+        };
+        let out = prefer_bundled_if_newer(fetched, reg_at(same), &mut w);
+        assert_eq!(out.source, RegistrySource::Cache);
+    }
+
     #[test]
     fn bundled_registry_is_strictly_valid() {
         let registry = bundled().unwrap();
@@ -728,6 +1004,16 @@ mod tests {
 
         let (tag, model) = registry.model("ornith-1.5:35b-a3b-mq4r").unwrap();
         assert_eq!(tag, "ornith-1.5:35b-a3b-mq4r");
+        for alias in ["ornith-1.5:fast", "ornith-1.5:35b-a3b-fast"] {
+            let (resolved, fast) = registry
+                .model(alias)
+                .unwrap_or_else(|| panic!("{alias} must resolve"));
+            assert_eq!(
+                resolved, "ornith-1.5:35b-a3b-mq4r",
+                "{alias} is the MQ4R speed SKU"
+            );
+            assert_eq!(fast.file, "ornith-1.5-35b-a3b.mq4r");
+        }
         assert_eq!(model.file, "ornith-1.5-35b-a3b.mq4r");
         assert_eq!(model.quant.as_deref(), Some("mq4r"));
         assert_eq!(model.size_bytes, Some(18_700_570_368));
@@ -947,7 +1233,7 @@ mod tests {
         // Original Qwen3 family (without .5/.6/.8) receives no automatic policy.
         let qwen3_raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"qwen3:8b":{"repo":"x","file":"qwen3-8b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"q8"}},
             "aliases":{}
         }"#;
@@ -1028,6 +1314,61 @@ mod tests {
             "effort-native: absence means uncapped"
         );
     }
+    #[test]
+    fn bundled_dflash_sidecars_name_pullable_files() {
+        // Every `dflash.file` must name a file that some registry entry's
+        // `file` also names, so `hipfire pull <target>` fetching the sidecar
+        // always lands a file that `hipfire pull <tag>-draft` could fetch too.
+        let registry = bundled().unwrap();
+        let files: std::collections::BTreeSet<&str> = registry
+            .models
+            .values()
+            .map(|entry| entry.file.as_str())
+            .collect();
+        let mut paired = 0;
+        for (tag, entry) in &registry.models {
+            if let Some(sidecar) = entry.dflash.as_ref() {
+                assert!(
+                    files.contains(sidecar.file.as_str()),
+                    "model '{tag}' declares dflash sidecar '{}' with no matching entry file",
+                    sidecar.file
+                );
+                paired += 1;
+            }
+        }
+        assert!(
+            paired > 0,
+            "bundled registry should pair at least one dflash sidecar"
+        );
+    }
+
+    #[test]
+    fn bundled_vision_sidecar_is_shared_across_qwen38_tiers() {
+        // Every `qwen3.8:27b*` tier declares the same vision-tower sidecar
+        // (`qwen3.8-27b-vision.hfq`) so each text quant tier serves images
+        // without requantizing the trunk. Unlike dflash, the vision file is
+        // standalone: no registry entry's `file` names it.
+        let registry = bundled().unwrap();
+        let mut declared = 0;
+        for (tag, entry) in &registry.models {
+            if !tag.starts_with("qwen3.8:27b") {
+                continue;
+            }
+            let sidecar = entry
+                .vision
+                .as_ref()
+                .unwrap_or_else(|| panic!("model '{tag}' must declare the shared vision sidecar"));
+            assert_eq!(
+                sidecar.file, "qwen3.8-27b-vision.hfq",
+                "model '{tag}' must share qwen3.8-27b-vision.hfq"
+            );
+            declared += 1;
+        }
+        assert!(
+            declared > 0,
+            "bundled registry should declare a vision sidecar"
+        );
+    }
 
     #[test]
     fn aliases_and_filenames_resolve_to_canonical_tags() {
@@ -1043,6 +1384,23 @@ mod tests {
             "qwen3.8:27b-mq4-xt"
         );
         assert_eq!(registry.resolve_tag("qwen3.8:fast"), "qwen3.8:27b-mq4-xt");
+        // A path is not a tag: even a path into the models directory resolves
+        // to itself here. Callers that know the models directory establish
+        // identity with canonical path comparison (`registry_entry_for_path`
+        // in hipfire-cli), so `serve --model ~/.hipfire/models/<file>` still
+        // sees the entry's sidecars without letting a same-basename lookalike
+        // elsewhere inherit them (PR #686 hw-gate regression).
+        assert_eq!(
+            registry.resolve_tag("/home/u/.hipfire/models/qwen3.8-27b.mq5"),
+            "/home/u/.hipfire/models/qwen3.8-27b.mq5"
+        );
+        assert_eq!(
+            registry.resolve_tag("/home/u/.hipfire/models/qwen3.8-27b.mq4"),
+            "/home/u/.hipfire/models/qwen3.8-27b.mq4"
+        );
+        assert!(registry
+            .model("/home/u/.hipfire/models/qwen3.8-27b.mq4")
+            .is_none());
 
         assert_eq!(registry.resolve_tag("deepseek4"), "deepseek-v4-flash");
         assert_eq!(registry.resolve_tag("deepseek4:0731"), "deepseek-v4-flash");
@@ -1102,6 +1460,49 @@ mod tests {
     }
 
     #[test]
+    fn path_inputs_never_resolve_to_registry_tags() {
+        // PR #686 hw-gate regression: `hipfire rm /elsewhere/qwen3.6-27b.mq4`
+        // basename-matched the `qwen3.6:27b` entry and deleted the installed
+        // sidecars. A path — anywhere, including the models directory itself —
+        // is not a tag and resolves to itself.
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-10T00:00:00Z",
+            "models":{"qwen3.6:27b":{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        assert_eq!(
+            registry.resolve_tag("/elsewhere/qwen3.6-27b.mq4"),
+            "/elsewhere/qwen3.6-27b.mq4"
+        );
+        assert!(registry.model("/elsewhere/qwen3.6-27b.mq4").is_none());
+        // The bare file name still resolves: it carries no directory to confuse
+        // with the installed artifact.
+        assert_eq!(registry.resolve_tag("qwen3.6-27b.mq4"), "qwen3.6:27b");
+        assert!(registry.model("qwen3.6-27b.mq4").is_some());
+    }
+
+    #[test]
+    fn entry_for_file_matches_exact_bare_names_only() {
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-10T00:00:00Z",
+            "models":{"qwen3.6:27b":{"repo":"x","file":"qwen3.6-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
+            "aliases":{"qwen36":"qwen3.6:27b"}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+        let (tag, _) = registry.entry_for_file("qwen3.6-27b.mq4").unwrap();
+        assert_eq!(tag, "qwen3.6:27b");
+        assert!(registry
+            .entry_for_file("/elsewhere/qwen3.6-27b.mq4")
+            .is_none());
+        assert!(registry.entry_for_file("qwen3.6:27b").is_none());
+        assert!(registry.entry_for_file("qwen36").is_none());
+        assert!(registry.entry_for_file("other.mq4").is_none());
+    }
+
+    #[test]
     fn recommended_settings_lower_the_full_sampling_contract_to_config() {
         let settings = RecommendedSettings {
             temperature: Some(1.0),
@@ -1157,7 +1558,7 @@ mod tests {
     fn malformed_entry_rejects_the_whole_registry() {
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"bad":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_mode":"magic4"}},
             "aliases":{}
         }"#;
@@ -1168,7 +1569,7 @@ mod tests {
     fn tag_policy_pins_qwen_deepseek_and_glimmer_targets() {
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{
                 "qwen3.5:4b":{"repo":"x","file":"qwen3.5-4b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
                 "qwen3.6:35b-a3b":{"repo":"x","file":"qwen3.6-35b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"},
@@ -1338,7 +1739,7 @@ mod tests {
         // Old v1 JSON without the invented fields must still parse (deny_unknown_fields).
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"ok":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
@@ -1355,7 +1756,7 @@ mod tests {
         // Invented wire fields must be rejected (no schema expansion).
         let bad = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"bad":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","default_kv_backend":"vmm"}},
             "aliases":{}
         }"#;
@@ -1365,14 +1766,14 @@ mod tests {
         );
         let bad2 = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"bad":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","default_max_seq":262144}},
             "aliases":{}
         }"#;
         assert!(RegistryV1::parse(bad2, "test").is_err());
         let bad3 = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"bad":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","default_max_tokens":81920}},
             "aliases":{}
         }"#;
@@ -1384,7 +1785,7 @@ mod tests {
         // Registry tag policy is a low-precedence layer; global/model/one-shot user config wins.
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"qwen3.8:27b":{"repo":"x","file":"qwen3.8-27b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
@@ -1446,7 +1847,7 @@ mod tests {
         // Glimmer target override likewise wins (backend + max_seq).
         let raw2 = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"muse-glimmer":{"repo":"x","file":"muse-glimmer-30b.mq4","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
@@ -1502,7 +1903,7 @@ mod tests {
         // DeepSeek target override wins over 1M/384Ki policy.
         let raw3 = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"deepseek-v4-flash":{"repo":"x","file":"ds4.mq2r","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{}
         }"#;
@@ -1556,7 +1957,7 @@ mod tests {
     fn dangling_aliases_are_dropped() {
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"ok":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x"}},
             "aliases":{"good":"ok","bad":"missing"}
         }"#;
@@ -1579,7 +1980,7 @@ mod tests {
     fn sampling_profiles_resolve_per_mode_with_general_fallback() {
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"m":{
                 "repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x",
                 "recommended_settings":{"temperature":1.0,"presence_penalty":1.5},
@@ -1609,7 +2010,7 @@ mod tests {
     fn out_of_range_sampling_profile_rejects_the_whole_registry() {
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{"m":{
                 "repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x",
                 "sampling_profiles":{"coding":{"temperature":9.0}}
@@ -1695,23 +2096,23 @@ mod tests {
         // bundled (network) or discards the cache entry (fresh/stale).
         let cases = [
             // Qwen3.8 product SKUs
-            r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"high"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"high"}}},"aliases":{}}"#,
             // DeepSeek V4 Flash (also covers :mq2lloyd via family)
-            r#"{"schema_version":1,"generated_at":"now","models":{"deepseek-v4-flash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"low","thinking_budget":"uncapped"}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"deepseek-v4-flash-preview":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"high","thinking_budget":"med"}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"deepseek-v4-flash:mq2lloyd":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"low"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"deepseek-v4-flash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"low","thinking_budget":"uncapped"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"deepseek-v4-flash-preview":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"high","thinking_budget":"med"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"deepseek-v4-flash:mq2lloyd":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"low"}}},"aliases":{}}"#,
             // Muse Glimmer product SKUs
-            r#"{"schema_version":1,"generated_at":"now","models":{"muse-glimmer":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"xhigh"}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"muse-glimmer:fast":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"max"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"muse-glimmer":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"xhigh"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"muse-glimmer:fast":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"max"}}},"aliases":{}}"#,
             // Ornith 1.5 product + legacy family spellings
-            r#"{"schema_version":1,"generated_at":"now","models":{"ornith-1.5:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"high"}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"ornith1.5:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"uncapped"}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"ornith:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"med"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"ornith-1.5:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"xhigh","thinking_budget":"high"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"ornith1.5:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"uncapped"}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"ornith:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"med"}}},"aliases":{}}"#,
             // Effort-native sampling_profiles also rejected
-            r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"coding":{"reasoning_effort":"xhigh","thinking_budget":"high"}}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"deepseek-v4-flash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"low"}}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"muse-glimmer":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"uncapped"}}}},"aliases":{}}"#,
-            r#"{"schema_version":1,"generated_at":"now","models":{"ornith-1.5:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"high"}}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"coding":{"reasoning_effort":"xhigh","thinking_budget":"high"}}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"deepseek-v4-flash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"low"}}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"muse-glimmer":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"uncapped"}}}},"aliases":{}}"#,
+            r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"ornith-1.5:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"high"}}}},"aliases":{}}"#,
         ];
         for raw in cases {
             let err = RegistryV1::parse(raw, "network/cache")
@@ -1724,7 +2125,7 @@ mod tests {
         }
         // A cache entry that violates the invariant is also rejected via
         // validate(), causing read_cache to return None and load() to fall back.
-        let stale_raw = r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"high"}}},"aliases":{}}"#;
+        let stale_raw = r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"qwen3.8:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"high"}}},"aliases":{}}"#;
         let stale: RegistryV1 = serde_json::from_str(stale_raw).unwrap();
         assert!(
             stale.validate("registry cache").is_err(),
@@ -1737,23 +2138,23 @@ mod tests {
         // Mirrors hipfire-config/registry_gen enum allowlists: recognizable
         // invalid values are rejected with a clear error; malformed types
         // already fail via surrounding validation and are not re-tested here.
-        let invalid_effort = r#"{"schema_version":1,"generated_at":"now","models":{"m":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"turbo"}}},"aliases":{}}"#;
+        let invalid_effort = r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"m":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"turbo"}}},"aliases":{}}"#;
         let err = RegistryV1::parse(invalid_effort, "test")
             .expect_err("invalid reasoning_effort must be rejected");
         assert!(err.to_string().contains("reasoning_effort"));
 
-        let invalid_effort_profile = r#"{"schema_version":1,"generated_at":"now","models":{"m":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"coding":{"reasoning_effort":"ultra"}}}},"aliases":{}}"#;
+        let invalid_effort_profile = r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"m":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"coding":{"reasoning_effort":"ultra"}}}},"aliases":{}}"#;
         let err = RegistryV1::parse(invalid_effort_profile, "test")
             .expect_err("invalid profile effort must be rejected");
         assert!(err.to_string().contains("reasoning_effort"));
 
         // thinking_budget invalid on legacy (non-effort-native) model
-        let invalid_budget = r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.5:9b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"yolo"}}},"aliases":{}}"#;
+        let invalid_budget = r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"qwen3.5:9b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"yolo"}}},"aliases":{}}"#;
         let err = RegistryV1::parse(invalid_budget, "test")
             .expect_err("invalid thinking_budget must be rejected");
         assert!(err.to_string().contains("thinking_budget"));
 
-        let invalid_budget_profile = r#"{"schema_version":1,"generated_at":"now","models":{"qwen3.6:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"superhigh"}}}},"aliases":{}}"#;
+        let invalid_budget_profile = r#"{"schema_version":1,"generated_at":"2026-09-01T00:00:00Z","models":{"qwen3.6:35b-a3b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"superhigh"}}}},"aliases":{}}"#;
         let err = RegistryV1::parse(invalid_budget_profile, "test")
             .expect_err("invalid profile budget must be rejected");
         assert!(err.to_string().contains("thinking_budget"));
@@ -1765,7 +2166,7 @@ mod tests {
         // remain valid and pass validation for both top-level and profiles.
         let raw = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{
                 "qwen3.5:9b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"reasoning_effort":"high","thinking_budget":"high"}},
                 "qwen3.5:27b":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","sampling_profiles":{"general":{"thinking_budget":"med"},"coding":{"reasoning_effort":"max","thinking_budget":"max"}}},
@@ -1780,7 +2181,7 @@ mod tests {
         // also accept thinking_budget even when family would otherwise be native.
         let sidecars = r#"{
             "schema_version":1,
-            "generated_at":"now",
+            "generated_at":"2026-09-01T00:00:00Z",
             "models":{
                 "qwen3.8:27b-draft":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"high"}},
                 "qwen3.8:27b-dflash":{"repo":"x","file":"x","size_gb":1,"min_vram_gb":1,"desc":"x","recommended_settings":{"thinking_budget":"low"}},

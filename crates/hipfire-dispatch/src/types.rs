@@ -76,6 +76,7 @@ pub enum TileImpl {
     DflashV5Gfx12,
     DflashN128,
     // Vision/dflash F32-K/V rungs
+    DflashN64,
     DflashM32,
     DflashWmmaF32,
     // Causal (F16-K/V rungs)
@@ -331,6 +332,7 @@ pub enum KernelKey {
     GemmMq3G256V2BatchedLmhead,
     GemmMq2G256V2BatchedLmhead,
     GemmQ8_0BatchedChunked,
+    GemmQ8_0BatchedF32Chunked,
     GemmQ8_0Wmma,
     GemmQ8_0Wmma4W,
     GemmHfq4G256Wmma,
@@ -465,7 +467,12 @@ pub enum KernelKey {
     AttnFlashAsym2Fwht,
     AttnFlashQ8_0,
     AttnFlashQ8_0Windowed, // Q8_0 flash with sliding-window mask (cohere2moe)
-    AttnQ8_0Kv,            // non-flash short-context Q8_0 decode (ship 3.1 B0)
+    /// BF16 flash with sliding-window mask (maple). There is deliberately no
+    /// non-windowed BF16 attend key: `window == 0` already means full causal,
+    /// so one kernel covers both of Maple's layer types and there is no
+    /// second path that could drop the window.
+    AttnFlashBf16Windowed,
+    AttnQ8_0Kv, // non-flash short-context Q8_0 decode (ship 3.1 B0)
     AttnGqaFused,
     // F32 GQA-flash decode family (qwen2). Selected by F32AttnPolicy::Gqa.
     AttnGqaWarp,  // GQA, head_dim==128, long-ctx warp-reduce
@@ -487,6 +494,7 @@ pub enum KernelKey {
     AttnFlashAsym2FwhtBatched,       // no _masked — 2-bit tree-verify gap
     AttnQ8_0KvBatchedMasked,         // P-1 no-LDS-cap tiled kernel
     AttnQ8_0KvBatchedMaskedWindowed, // sliding-window batched Q8 (cohere2moe prefill)
+    AttnBf16KvBatchedMaskedWindowed, // sliding-window batched BF16 (maple prefill)
     // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
     // Full attention (no KV cache — vision / dflash cross-attention)
     AttnFullF16,       // F16 K/V, non-causal
@@ -501,6 +509,7 @@ pub enum KernelKey {
     KvWriteAsym2,
     KvWriteAsym2Fwht,
     KvWriteQ8_0,
+    KvWriteBf16,  // flat 2-byte BF16 KV write (maple)
     KvWriteHfq4,  // HFQ4-quantized KV write (llama legacy)
     KvWriteQ4,    // Q4-quantized KV write (llama legacy)
     KvWriteInt8c, // INT8-per-column KV write (llama)
@@ -514,6 +523,7 @@ pub enum KernelKey {
     KvWriteAsym2Batched,
     KvWriteAsym2FwhtBatched,
     KvWriteQ8_0Batched,
+    KvWriteBf16Batched,
 }
 
 // ── Shape context for predicate evaluation ───────────

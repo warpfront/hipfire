@@ -12,6 +12,237 @@ use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
 use std::sync::OnceLock;
 
+/// One instantiation of the parameterised LDS-staged WMMA GEMM
+/// (`kernels/src/gemm_f16_x_f16_wmma_lds256.hip`).
+///
+/// The four axes are independent and control different things:
+///
+/// * `bm × bn` — block macro-tile. DRAM intensity `bm·bn/(bm+bn)` FLOP/byte,
+///   and, more importantly on the measured archs, `bn` sets how many times A is
+///   streamed: with `grid.x` along M the resident blocks share an X slab, so
+///   real traffic is roughly `|A|·(B/bn) + |X|`.
+/// * `wm × wn` — wave register tile. LDS intensity `wm·wn/(2(wm+wn))`
+///   FLOP/byte, and `wm·wn/32` accumulator VGPRs per lane.
+/// * `ks` — K elements staged per barrier pair. Sets the LDS footprint
+///   `(bm+bn)·ks·2` bytes; a `bn` past 256 only fits at `ks = 32`.
+/// * `swap` — put B on `grid.x` instead of M, reversing which operand the
+///   concurrently-resident blocks share.
+///
+/// Only the combinations in [`Gpu::LDS_TILE_VARIANTS`] have a compiled entry
+/// point; [`LdsTile::entry`] names it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LdsTile {
+    pub bm: usize,
+    pub bn: usize,
+    pub wm: usize,
+    pub wn: usize,
+    pub ks: usize,
+    pub swap: bool,
+    /// Software-pipelined main loop: stage `k0 + ks`'s global loads are issued
+    /// before stage `k0`'s WMMA, so their DRAM latency runs under the math
+    /// instead of stalling the wave at the top of every stage. Same barriers,
+    /// same K summation order, bit-exact against `pipe = false` — see the
+    /// SOFTWARE PIPELINING note in the kernel source. Only the tiles in
+    /// [`Gpu::LDS_EPI_TILES`] have a pipelined entry point (`_p`), and
+    /// 128×128 / 64×64 k64 deliberately does not: it spills.
+    pub pipe: bool,
+}
+
+impl LdsTile {
+    pub const fn new(bm: usize, bn: usize, wm: usize, wn: usize, ks: usize, swap: bool) -> Self {
+        Self {
+            bm,
+            bn,
+            wm,
+            wn,
+            ks,
+            swap,
+            pipe: false,
+        }
+    }
+
+    /// The same tile with the software-pipelined main loop.
+    pub const fn pipelined(self) -> Self {
+        Self { pipe: true, ..self }
+    }
+
+    /// The same tile with the plain load → barrier → WMMA → barrier main loop.
+    /// This is what `HIPFIRE_FLUX_GEMM_PIPE=0` selects.
+    pub const fn unpipelined(self) -> Self {
+        Self {
+            pipe: false,
+            ..self
+        }
+    }
+
+    /// Kernel entry-point name, matching the `WLDS_KERNEL` naming in the .hip.
+    pub fn entry(&self) -> String {
+        format!(
+            "gemm_wmma_lds_{}_{}_{}_{}_k{}{}{}",
+            self.bm,
+            self.bn,
+            self.wm,
+            self.wn,
+            self.ks,
+            if self.swap { "_sw" } else { "" },
+            if self.pipe { "_p" } else { "" }
+        )
+    }
+
+    /// Short table label: `bm×bn/wm×wn k<ks>[sw][p]`.
+    pub fn label(&self) -> String {
+        format!(
+            "{}x{}/{}x{}k{}{}{}",
+            self.bm,
+            self.bn,
+            self.wm,
+            self.wn,
+            self.ks,
+            if self.swap { "sw" } else { "" },
+            if self.pipe { "p" } else { "" }
+        )
+    }
+
+    /// Entry-point name of the fused-epilogue instantiation with `suffix`
+    /// (`_o16`, `_o16g`, `_gr`, `_gra`, `_a`) — the `EPI = 0` name plus the
+    /// suffix, matching `WLDS_EPI_SET` in the .hip.
+    pub fn entry_epi(&self, suffix: &str) -> String {
+        format!("{}{}", self.entry(), suffix)
+    }
+}
+
+/// Fused epilogue for [`Gpu::gemm_f16_x_f16_wmma_lds_epi`].
+///
+/// Every FLUX MMDiT GEMM is followed by a fixed elementwise pass — a cast to
+/// F16 for the next GEMM's activation, a GELU, a gated residual accumulation,
+/// or the sum of the two halves of a split `linear2`. Each of those is a
+/// separate kernel that re-reads and re-writes the whole `B × M` matrix (226 MB
+/// each way at B = 4608, M = 12288, on a part with 90 GB/s of DRAM). Selecting
+/// them here folds them into the GEMM's store instead.
+///
+/// The evaluation order is fixed by the kernel and reproduced by the parity
+/// gate:
+///
+/// ```text
+/// v  = acc                        (the WMMA F32 accumulator)
+/// v += addin[b, m]                if `addin`
+/// v += bias[m]                    if `bias` (same expression as EPI = 0)
+/// v  = gelu_tanh(v)               if `gelu`
+/// v  = fma(gate[m], v, residual[b, m])   if `gate`/`residual`
+/// y[b, m] = v                     (RNE to F16 if `out_f16`)
+/// ```
+///
+/// `residual` (and `addin`) MAY alias `y`: element `(b, m)` is read and written
+/// by the same thread at the same flat index, so the in-place gated update
+/// Task 5 needs is race-free. See the ALIASING note in the kernel source.
+///
+/// Only the five combinations in [`GemmEpilogue::SUPPORTED`] are compiled;
+/// anything else is a launcher error naming the entry that would be needed.
+#[derive(Default, Clone, Copy)]
+pub struct GemmEpilogue<'a> {
+    /// Store `_Float16` (round-to-nearest-even) instead of F32. `y.dtype` must
+    /// match.
+    pub out_f16: bool,
+    /// Apply GELU-tanh to `acc + bias`, bit-identically to `gelu_tanh_f32`.
+    pub gelu: bool,
+    /// F32 `[B, M]` matrix added into the accumulator before the bias.
+    pub addin: Option<&'a GpuTensor>,
+    /// F32 `[M]` per-output-row gate. Requires `residual`.
+    pub gate: Option<&'a GpuTensor>,
+    /// F32 `[B, M]` residual the gated product is added to. Requires `gate`.
+    /// May alias `y`.
+    pub residual: Option<&'a GpuTensor>,
+}
+
+/// `GpuTensor` has no `Debug`, so print what actually identifies an epilogue:
+/// its mask and the suffix that mask maps to.
+impl std::fmt::Debug for GemmEpilogue<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let mask = self.mask();
+        write!(
+            f,
+            "GemmEpilogue({mask:#06b} {})",
+            Self::entry_suffix(mask).unwrap_or("<not instantiated>")
+        )
+    }
+}
+
+impl<'a> GemmEpilogue<'a> {
+    /// Bit 0 — store F16 instead of F32.
+    pub const OUT_F16: u32 = 1;
+    /// Bit 1 — GELU-tanh on `acc + bias`.
+    pub const GELU: u32 = 2;
+    /// Bit 2 — `acc += addin[b, m]`.
+    pub const ADDIN: u32 = 4;
+    /// Bit 3 — `y = residual + gate[m] · value`.
+    pub const GATED: u32 = 8;
+
+    /// The compiled combinations, mask → entry-name suffix. These are the ones
+    /// the FLUX single/double blocks use; the full 16-mask cross product is
+    /// deliberately not instantiated (each entry is a kernel in a single
+    /// translation unit that the JIT compiles as a whole).
+    pub const SUPPORTED: &'static [(u32, &'static str)] = &[
+        (Self::OUT_F16, "_o16"),
+        (Self::OUT_F16 | Self::GELU, "_o16g"),
+        (Self::GATED, "_gr"),
+        (Self::GATED | Self::ADDIN, "_gra"),
+        (Self::ADDIN, "_a"),
+    ];
+
+    /// The `EPI` bitmask this configuration selects. `0` is the plain
+    /// F32 + bias store, i.e. exactly [`Gpu::gemm_f16_x_f16_wmma_lds_tiled`].
+    pub fn mask(&self) -> u32 {
+        let mut mask = 0;
+        if self.out_f16 {
+            mask |= Self::OUT_F16;
+        }
+        if self.gelu {
+            mask |= Self::GELU;
+        }
+        if self.addin.is_some() {
+            mask |= Self::ADDIN;
+        }
+        // Validated as both-or-neither by the launcher before this is read.
+        if self.gate.is_some() || self.residual.is_some() {
+            mask |= Self::GATED;
+        }
+        mask
+    }
+
+    /// Entry-name suffix for `mask`, or `None` when nothing is instantiated.
+    pub fn entry_suffix(mask: u32) -> Option<&'static str> {
+        Self::SUPPORTED
+            .iter()
+            .find(|&&(m, _)| m == mask)
+            .map(|&(_, suffix)| suffix)
+    }
+
+    /// The suffix an arbitrary mask *would* carry, for error messages. Built in
+    /// the same order `WLDS_EPI_SET` names its entries — output dtype, then
+    /// GELU, then gated, then add-in — so a supported mask reproduces its real
+    /// suffix (`GATED | ADDIN` → `_gra`, not `_a_gr`) and an unsupported one
+    /// names a plausible entry rather than a permutation of one.
+    fn describe(mask: u32) -> String {
+        let mut out = String::new();
+        for (bit, tag) in [
+            (Self::OUT_F16, "_o16"),
+            (Self::GELU, "g"),
+            (Self::GATED, "_gr"),
+            (Self::ADDIN, "a"),
+        ] {
+            if mask & bit != 0 {
+                // The first fragment carries the leading underscore; a bare
+                // GELU or ADDIN still needs one.
+                if out.is_empty() && !tag.starts_with('_') {
+                    out.push('_');
+                }
+                out.push_str(tag);
+            }
+        }
+        out
+    }
+}
+
 /// Batch ceilings for the LDS-staged HFQ4-G256 GEMMs (`HIPFIRE_HFQ4G256_LDSSTAGE=1`).
 /// The staged kernels win while the grid is small and lose once the added LDS
 /// traffic plus the `__launch_bounds__(256,4)` occupancy cap outweigh the
@@ -80,6 +311,21 @@ enum Mq4v2QkvzaVariant {
 enum Mq4v2QkvVariant {
     Generic,
     K2048XBufferGfx1100,
+}
+
+/// Exact-gfx1100 MQ4V2 residual verify-tier pick (N<=16 DFlash tier).
+///
+/// Shared by the F32 entry below and the F16 entry in
+/// `mq_f16_residual_producers.rs` so both precisions route identically: the
+/// `residual_ksplit_off` kill switch dominates BOTH optimized tiers and
+/// restores the base kernel; otherwise the `residual_ldsstage` default-on
+/// exact-gfx1100 tier wins wherever `K % 512 == 0`, else the frozen split-K
+/// table, else base. Pure so CPU tests can pin the precedence without a GPU.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResidualVerifyTier {
+    LdsStage,
+    Ksplit { kw: usize },
+    Base,
 }
 
 fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
@@ -3099,8 +3345,8 @@ impl Gpu {
         let gfx1151_wave64_share_x = self.arch_caps.is_gfx1151()
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_QKVZA_WAVE64_SHARE_X", false);
-        let rdna3_k2048_r2 = rdna3_k2048
-            && hipfire_config::developer_bool("HIPFIRE_RDNA3_QKVZA_R2", false);
+        let rdna3_k2048_r2 =
+            rdna3_k2048 && hipfire_config::developer_bool("HIPFIRE_RDNA3_QKVZA_R2", false);
         let rdna3_k2048_cpol_slc = rdna3_k2048
             && hipfire_config::developer_var("HIPFIRE_QKVZA_CPOL").as_deref() == Ok("slc");
         let cdna_wave64 = self.arch_caps.is_wave64_native()
@@ -22038,6 +22284,11 @@ impl Gpu {
     /// the WMMA Q8 GEMM (`gemm_q8_0_wmma`, or its gfx12 sibling) which is
     /// much faster than the scalar `gemm_q8_0_batched` per output. Opt out
     /// via HIPFIRE_Q8_BATCHED_LEGACY=1.
+    ///
+    /// Callers that need explicit F32 input/dequant precision (no F16 rounding
+    /// of activations or dequant weights) should use
+    /// [`Self::gemm_q8_0_batched_f32_chunked`] instead of relying on the
+    /// automatic WMMA selector here.
     pub fn gemm_q8_0_batched_chunked(
         &mut self,
         a_raw: &GpuTensor,
@@ -22063,6 +22314,26 @@ impl Gpu {
             return self.gemm_q8_0_wmma(a_raw, x, y, m, k, n);
         }
 
+        self.gemm_q8_0_batched_f32_chunked(a_raw, x, y, m, k, n)
+    }
+
+    /// Explicit F32-precision Q8_0 batched GEMM: sub-batches at MAX_BATCH=64 and
+    /// always runs the scalar `gemm_q8_0_batched` path (F32 activations and F32
+    /// dequant of Q8 weights). Separate from [`Self::gemm_q8_0_batched_chunked`],
+    /// whose automatic WMMA selector rounds both F32 inputs and dequant weights
+    /// to F16 on gfx12 — that loss breaks Gemma prefill/decode continuation.
+    /// Keeps the same portable Always contract as the generic F32 kernels; no
+    /// arch gate. Y[n, m] = X[n, k] @ A_q8[m, k]^T.
+    pub fn gemm_q8_0_batched_f32_chunked(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
         const MAX_BATCH: usize = 64;
         let mut off = 0;
         while off < n {
@@ -24745,6 +25016,13 @@ impl Gpu {
             )
         }
     }
+    /// F16 weight × F16 input → F32 batched GEMM, arch-routed.
+    ///
+    /// gfx11 takes the wave32 `gemm_f16_x_f16_wmma` kernel; gfx12 (RDNA4)
+    /// takes the `gemm_f16_x_f16_wmma_gfx12` sister (half8 operands,
+    /// `_w32_gfx12` builtin, contiguous-per-half C mapping) because the gfx11
+    /// `_w32` builtin does not compile for gfx1201. Same operand contract,
+    /// same grid/block, same `[B, M]` F32 result — purely an ISA-level swap.
     pub fn gemm_f16_x_f16_wmma(
         &mut self,
         a_f16: &GpuTensor,
@@ -24755,11 +25033,20 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "gemm_f16_x_f16_wmma",
-            kernels::GEMM_F16_X_F16_WMMA_SRC,
-            "gemm_f16_x_f16_wmma",
-        )?;
+        let (module, source, symbol) = if self.arch_caps.has_wmma_w32_gfx12() {
+            (
+                "gemm_f16_x_f16_wmma_gfx12",
+                kernels::GEMM_F16_X_F16_WMMA_GFX12_SRC,
+                "gemm_f16_x_f16_wmma_gfx12",
+            )
+        } else {
+            (
+                "gemm_f16_x_f16_wmma",
+                kernels::GEMM_F16_X_F16_WMMA_SRC,
+                "gemm_f16_x_f16_wmma",
+            )
+        };
+        self.ensure_kernel(module, source, symbol)?;
         let ap = a_f16.buf.as_ptr();
         let xp = x_f16.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
@@ -24777,7 +25064,7 @@ impl Gpu {
         let grid_m = ((m + 15) / 16) as u32;
         let grid_b = ((batch_size + 15) / 16) as u32;
         self.launch_maybe_blob(
-            "gemm_f16_x_f16_wmma",
+            module,
             [grid_m, grid_b, 1],
             [32, 1, 1],
             0,
@@ -24794,6 +25081,874 @@ impl Gpu {
             },
         )
     }
+
+    /// LDS-staged 128×128 macro-tile GEMM: `Y[b, m] = bias[m] + Σ_k A[m,k]·X[b,k]`.
+    ///
+    /// Same operand contract as [`Gpu::gemm_f16_x_f16_wmma`], with the bias
+    /// fused into the epilogue so callers can drop the separate `bias_add_f32`
+    /// pass. Pass `bias = None` to skip it.
+    ///
+    /// Requires `K % 64 == 0` (the K-stage depth). Callers with a ragged K must
+    /// route to `gemm_f16_x_f16_wmma`.
+    pub fn gemm_f16_x_f16_wmma_lds(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y_f32: &GpuTensor,
+        bias_f32: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            k % 64 == 0,
+            "gemm_f16_x_f16_wmma_lds: K must be a multiple of 64 (got {k})"
+        );
+        if let Some(b) = bias_f32 {
+            assert_eq!(
+                b.dtype,
+                DType::F32,
+                "gemm_f16_x_f16_wmma_lds: `bias_f32` must be F32"
+            );
+        }
+        self.ensure_kernel(
+            "gemm_f16_x_f16_wmma_lds",
+            kernels::GEMM_F16_X_F16_WMMA_LDS_SRC,
+            "gemm_f16_x_f16_wmma_lds",
+        )?;
+        let ap = a_f16.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let bp = bias_f32.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut hb = i32::from(bias_f32.is_some());
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut hb as *mut _ as *mut c_void,
+        ];
+        let grid_m = m.div_ceil(128) as u32;
+        let grid_b = batch_size.div_ceil(128) as u32;
+        self.launch_maybe_blob(
+            "gemm_f16_x_f16_wmma_lds",
+            [grid_m, grid_b, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(xp);
+                b.push_ptr(yp);
+                b.push_ptr(bp);
+                b.push_i32(mi);
+                b.push_i32(ki);
+                b.push_i32(bi);
+                b.push_i32(hb);
+                b
+            },
+        )
+    }
+
+    /// Two-level-blocked sibling of [`Gpu::gemm_f16_x_f16_wmma_lds`].
+    ///
+    /// Identical operand contract and identical K-accumulation order (ascending
+    /// 16-element WMMA substeps), so results are bit-exact against it and
+    /// against `gemm_f16_x_f16_wmma` + `bias_add_f32`. What varies is the two
+    /// blocking levels, which set two independent arithmetic intensities:
+    ///
+    /// * block macro-tile `bm × bn` → DRAM intensity `bm·bn/(bm+bn)` FLOP/byte
+    /// * wave register tile `wm × wn` → LDS intensity `wm·wn/(2·(wm+wn))`
+    ///   FLOP/byte, since a wave issues `(wm/16)·(wn/16)` WMMA per k-substep
+    ///   after `(wm+wn)/16` fragment loads of 1024 B each.
+    ///
+    /// Measurement on gfx1150 showed the shipped 128×128 / 32×64 kernel is
+    /// bound by the second, not the first: widening only the block tile moved
+    /// wall time by 4 % while the implied DRAM rate fell from 90 to 49 GB/s.
+    /// Both levels are therefore exposed rather than fixed.
+    ///
+    /// `tile` must be one of [`Gpu::LDS_TILE_VARIANTS`]. Requires `K % 64 == 0`.
+    ///
+    /// Rows of `A` and `X` are packed at pitch `k`. Use
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_tiled_ld`] to give them a wider pitch —
+    /// which is worth 1.25-1.65× on the FLUX census, see the ROW PITCH note
+    /// in the kernel source.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_x_f16_wmma_lds_tiled(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y_f32: &GpuTensor,
+        bias_f32: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        tile: LdsTile,
+    ) -> HipResult<()> {
+        self.gemm_f16_x_f16_wmma_lds_tiled_ld(
+            a_f16, x_f16, y_f32, bias_f32, m, k, batch_size, tile, k, k,
+        )
+    }
+
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_tiled`] with an explicit row pitch for
+    /// each input operand: `A` is `[M, lda]` and `X` is `[B, ldx]`, of which
+    /// only the first `k` elements of every row are read.
+    ///
+    /// `lda == ldx == k` is the packed contract and is bit-identical to
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_tiled`]. A wider pitch changes nothing
+    /// numerically — the same `k` elements are summed in the same order — it
+    /// only moves where those elements sit in DRAM. That matters a great deal:
+    /// a pitch that is a multiple of 1024 bytes camps the concurrent staging
+    /// reads of a block's `bm + bn` rows onto a small set of channels, and
+    /// every FLUX.1-dev `K` (3072, 12288, 15360) is such a pitch. See the ROW
+    /// PITCH note in the kernel source for the measurement.
+    ///
+    /// # Panics
+    ///
+    /// Each pitch must be `>= k`, **a multiple of 16 elements** (the staging
+    /// `half16` loads are 32-byte vector loads and only stay aligned if the
+    /// pitch is), and backed by an operand long enough for it —
+    /// `(rows - 1)·ld + k` elements. All three are asserted, because the kernel
+    /// cannot detect any of them: it would read the wrong memory and return
+    /// plausible wrong numbers.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_x_f16_wmma_lds_tiled_ld(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y_f32: &GpuTensor,
+        bias_f32: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        tile: LdsTile,
+        lda: usize,
+        ldx: usize,
+    ) -> HipResult<()> {
+        // `pipe` selects a different entry point, not a different launch
+        // geometry, so it is folded into `entry()` and nothing here reads it.
+        let LdsTile {
+            bm,
+            bn,
+            wm,
+            wn,
+            ks,
+            swap,
+            pipe: _,
+        } = tile;
+        assert!(
+            Self::LDS_TILE_VARIANTS.contains(&tile),
+            "gemm_f16_x_f16_wmma_lds_tiled: no kernel for {}",
+            tile.entry()
+        );
+        // K > 0, not just K % 64 == 0: the pipelined entries prefetch stage 0
+        // before the loop is entered, so a zero-length K would read a buffer
+        // that has no stage 0 to read.
+        assert!(
+            k > 0 && k % 64 == 0,
+            "gemm_f16_x_f16_wmma_lds_tiled: K must be a positive multiple of 64 (got {k})"
+        );
+        if let Some(b) = bias_f32 {
+            assert_eq!(
+                b.dtype,
+                DType::F32,
+                "gemm_f16_x_f16_wmma_lds_tiled_ld: `bias_f32` must be F32"
+            );
+        }
+        Self::check_lds_pitch(
+            "gemm_f16_x_f16_wmma_lds_tiled_ld",
+            a_f16,
+            x_f16,
+            m,
+            k,
+            batch_size,
+            lda,
+            ldx,
+        );
+        let _ = ks;
+        let entry = tile.entry();
+        // One wave per wm×wn output patch, 32 threads each.
+        let threads = ((bm / wm) * (bn / wn) * 32) as u32;
+        self.bind_thread()?;
+        self.ensure_kernel(
+            Self::LDS256_MODULE,
+            kernels::GEMM_F16_X_F16_WMMA_LDS256_SRC,
+            &entry,
+        )?;
+        let ap = a_f16.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let yp = y_f32.buf.as_ptr();
+        let bp = bias_f32.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut hb = i32::from(bias_f32.is_some());
+        let mut lai = lda as i32;
+        let mut lxi = ldx as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut hb as *mut _ as *mut c_void,
+            &mut lai as *mut _ as *mut c_void,
+            &mut lxi as *mut _ as *mut c_void,
+        ];
+        let grid_m = m.div_ceil(bm) as u32;
+        let grid_b = batch_size.div_ceil(bn) as u32;
+        // `swap` puts B on grid.x, which is the fastest-varying dispatch axis.
+        let grid = if swap {
+            [grid_b, grid_m, 1]
+        } else {
+            [grid_m, grid_b, 1]
+        };
+        self.launch_maybe_blob(&entry, grid, [threads, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_ptr(bp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(bi);
+            b.push_i32(hb);
+            b.push_i32(lai);
+            b.push_i32(lxi);
+            b
+        })
+    }
+
+    /// Module name shared by every entry point in
+    /// `GEMM_F16_X_F16_WMMA_LDS256_SRC` — the 15 `EPI = 0` tiles and the 25
+    /// fused-epilogue instantiations all come out of one translation unit.
+    ///
+    /// `compile_and_load_kernel` caches the compiled object per MODULE name and
+    /// then resolves each entry out of the loaded module, so naming the module
+    /// once turns what used to be one full hipcc run per entry (~29 s each on
+    /// this source, gfx1150) into a single run for all 40. It also registers
+    /// each entry as an alias of that artifact for the retained-PM4 capture,
+    /// exactly as the other multi-entry sources in this crate do.
+    const LDS256_MODULE: &'static str = "gemm_wmma_lds256";
+
+    /// A/B knob for the coalesced (LDS-staged) epilogue: `HIPFIRE_LDS_EPI_DIRECT=1`
+    /// compiles the same source with `WLDS_STAGE_EPILOGUE 0`, i.e. the direct
+    /// store that writes along B at a stride of `4·M`. Both arms are
+    /// bit-identical (the parity gate runs green either way); only the access
+    /// pattern differs, so this measures the pattern and nothing else.
+    ///
+    /// The patched arm gets its own module name — the entry names are the same,
+    /// and `functions` is keyed by entry name, so one process must load exactly
+    /// one arm. That is the intended use: fresh process per arm, interleaved,
+    /// with the unfused chain in `bench_gemm_epilogue` as the drift control.
+    fn lds256_source(&self) -> (&'static str, std::borrow::Cow<'static, str>) {
+        if hipfire_config::developer_var("HIPFIRE_LDS_EPI_DIRECT").as_deref() == Ok("1") {
+            static DIRECT: OnceLock<String> = OnceLock::new();
+            let src = DIRECT.get_or_init(|| {
+                const FROM: &str = "#define WLDS_STAGE_EPILOGUE 1";
+                // A patch that matched nothing would silently compile the
+                // default arm and be written up as a null A/B result.
+                let base = kernels::GEMM_F16_X_F16_WMMA_LDS256_SRC;
+                assert!(
+                    base.contains(FROM),
+                    "lds256_source: no `{FROM}` in the kernel"
+                );
+                base.replace(FROM, "#define WLDS_STAGE_EPILOGUE 0")
+            });
+            (
+                "gemm_wmma_lds256_direct",
+                std::borrow::Cow::Borrowed(src.as_str()),
+            )
+        } else {
+            (
+                Self::LDS256_MODULE,
+                std::borrow::Cow::Borrowed(kernels::GEMM_F16_X_F16_WMMA_LDS256_SRC),
+            )
+        }
+    }
+
+    /// The row-pitch preconditions shared by
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_tiled_ld`] and
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_epi_ld`]. All three are conditions the
+    /// kernel cannot detect, so violating any of them reads the wrong memory
+    /// and returns plausible wrong numbers rather than failing.
+    ///
+    /// 1. `ld >= k` — a narrower pitch would fold the next row's data into the
+    ///    dot product.
+    /// 2. `ld % 16 == 0` — `wlds_src` issues a `half16_t` (32-byte) vector load
+    ///    at `base + row·ld + k0 + kt·16` elements. The allocation base is
+    ///    256-byte aligned and every other term is a multiple of 16, so the
+    ///    load is 32-byte aligned exactly when the pitch is. `k` is already a
+    ///    multiple of 64, so only a pad that is not a multiple of 16 can break
+    ///    it. See the PITCH PRECONDITION note in the kernel source.
+    /// 3. the operands are long enough for the pitch actually being launched:
+    ///    the last row read starts at `(rows - 1)·ld` and is `k` long. Without
+    ///    this, adding a pad without growing the allocation reads past the end
+    ///    of the buffer on every row past the first.
+    #[allow(clippy::too_many_arguments)]
+    fn check_lds_pitch(
+        who: &str,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        lda: usize,
+        ldx: usize,
+    ) {
+        assert!(
+            lda >= k && ldx >= k,
+            "{who}: row pitch must be >= K (got lda = {lda}, ldx = {ldx}, K = {k})"
+        );
+        assert!(
+            lda % 16 == 0 && ldx % 16 == 0,
+            "{who}: row pitch must be a multiple of 16 elements, so the staging \
+             half16 loads stay 32-byte aligned (got lda = {lda}, ldx = {ldx})"
+        );
+        let need_a = m.saturating_sub(1) * lda + k;
+        let need_x = batch_size.saturating_sub(1) * ldx + k;
+        assert!(
+            a_f16.numel() >= need_a,
+            "{who}: A holds {} elements but M = {m} rows at lda = {lda} need {need_a}",
+            a_f16.numel()
+        );
+        assert!(
+            x_f16.numel() >= need_x,
+            "{who}: X holds {} elements but B = {batch_size} rows at ldx = {ldx} need {need_x}",
+            x_f16.numel()
+        );
+    }
+
+    /// Every tile compiled into `GEMM_F16_X_F16_WMMA_LDS256_SRC`, in the order
+    /// the bench walks them. Two wave tiles (32×64 and 64×64) across four block
+    /// tiles at K stage 64, then the shallow-stage tiles that a `bn` past 256
+    /// requires, then the swapped-grid controls.
+    ///
+    /// Rejected and not instantiated: wave tile 96×64 / 64×96 (LDS intensity
+    /// 19.2) and block 256×512 at 1024 threads — all three spill. See the
+    /// kernel source.
+    pub const LDS_TILE_VARIANTS: &'static [LdsTile] = &[
+        LdsTile::new(128, 128, 32, 64, 64, false),
+        LdsTile::new(256, 128, 32, 64, 64, false),
+        LdsTile::new(128, 256, 32, 64, 64, false),
+        LdsTile::new(256, 256, 32, 64, 64, false),
+        LdsTile::new(128, 128, 64, 64, 64, false),
+        LdsTile::new(256, 128, 64, 64, 64, false),
+        LdsTile::new(128, 256, 64, 64, 64, false),
+        LdsTile::new(256, 256, 64, 64, 64, false),
+        LdsTile::new(128, 256, 64, 64, 32, false),
+        LdsTile::new(64, 512, 64, 64, 32, false),
+        LdsTile::new(128, 512, 64, 64, 32, false),
+        LdsTile::new(128, 512, 32, 64, 32, false),
+        LdsTile::new(128, 256, 64, 64, 64, true),
+        LdsTile::new(256, 128, 64, 64, 64, true),
+        LdsTile::new(128, 512, 64, 64, 32, true),
+        // Software-pipelined twins of the selectable tiles. 128×128 / 64×64 k64
+        // is absent on purpose — it is the one tile whose pipelined form
+        // spills (16 VGPRs on gfx1150). See the kernel source.
+        LdsTile::new(128, 256, 32, 64, 64, false).pipelined(),
+        LdsTile::new(128, 128, 32, 64, 64, false).pipelined(),
+        LdsTile::new(256, 256, 64, 64, 64, false).pipelined(),
+        LdsTile::new(128, 256, 64, 64, 32, false).pipelined(),
+    ];
+
+    /// Pick a tile and dispatch it.
+    ///
+    /// The tile is chosen per arch from measurement, not from a model — see
+    /// [`Gpu::lds_tile_for`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_x_f16_wmma_lds_auto(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y_f32: &GpuTensor,
+        bias_f32: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let cu = self.cu_count_or_default();
+        let arch = self.arch.clone();
+        let tile = Self::lds_pipe_gate(&arch, Self::lds_tile_for(&arch, m, batch_size, cu));
+        self.gemm_f16_x_f16_wmma_lds_tiled(a_f16, x_f16, y_f32, bias_f32, m, k, batch_size, tile)
+    }
+
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_auto`] with an explicit row pitch per
+    /// input operand — the pitch-aware entry a caller that stores its weights
+    /// padded uses instead. `lda == ldx == k` is the packed contract and is
+    /// bit-identical to [`Gpu::gemm_f16_x_f16_wmma_lds_auto`].
+    ///
+    /// # Panics
+    ///
+    /// Same pitch preconditions as
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_tiled_ld`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_x_f16_wmma_lds_auto_ld(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y_f32: &GpuTensor,
+        bias_f32: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        lda: usize,
+        ldx: usize,
+    ) -> HipResult<()> {
+        let cu = self.cu_count_or_default();
+        let arch = self.arch.clone();
+        let tile = Self::lds_pipe_gate(&arch, Self::lds_tile_for(&arch, m, batch_size, cu));
+        self.gemm_f16_x_f16_wmma_lds_tiled_ld(
+            a_f16, x_f16, y_f32, bias_f32, m, k, batch_size, tile, lda, ldx,
+        )
+    }
+
+    /// Decide the main-loop form for a selected tile: the per-arch default from
+    /// [`Gpu::lds_pipe_default`], overridden by `HIPFIRE_FLUX_GEMM_PIPE` (`0`
+    /// forces the plain loop, `1` forces the pipelined one). A tile with no
+    /// compiled `_p` twin always gets the plain loop, so `=1` can never name an
+    /// entry that was not instantiated.
+    ///
+    /// The knob is on the *dispatch*, not on the tile table: both arms are
+    /// compiled into the same module, so an A/B is one env var against one
+    /// binary with no JIT difference between the arms. The two are bit-exact,
+    /// so it only ever measures the main loop — which is what makes it the
+    /// right tool for the controller to settle gfx1151 and gfx1100 without a
+    /// rebuild.
+    pub fn lds_pipe_gate(arch: &str, tile: LdsTile) -> LdsTile {
+        // One env read per process, like every other developer_var in this
+        // file: the gate is on the hot dispatch path of every _auto GEMM.
+        static OVERRIDE: OnceLock<Option<bool>> = OnceLock::new();
+        let want = match *OVERRIDE.get_or_init(|| {
+            match hipfire_config::developer_var("HIPFIRE_FLUX_GEMM_PIPE").as_deref() {
+                Ok("0") => Some(false),
+                Ok("1") => Some(true),
+                _ => None,
+            }
+        }) {
+            Some(forced) => forced,
+            None => Self::lds_pipe_default(arch),
+        };
+        let piped = tile.pipelined();
+        if want && Self::LDS_TILE_VARIANTS.contains(&piped) {
+            piped
+        } else {
+            tile.unpipelined()
+        }
+    }
+
+    /// Arch prefixes whose default is the software-pipelined main loop, in the
+    /// same table-not-predicate shape as [`Gpu::lds_tile_preference`]: flipping
+    /// an arch is a one-line edit here. Prefix matching, so `gfx1151:xnack-`
+    /// and friends match.
+    ///
+    /// **MEASURED, one row per arch, and only measurement puts an arch here.**
+    ///
+    /// | arch | measurement | provenance | verdict |
+    /// |---|---|---|---|
+    /// | gfx1151 | **1.07×** end-to-end: 3.950 / 3.921 s/step with the pipelining on vs 4.202 s/step off (t_double 76.2 vs 78.3 ms, t_single 65.1–65.8 vs 71.4 ms) | controller, `gpu_flux_real_throughput`, real FLUX.1-dev checkpoint, f32 activation path, `HIPFIRE_FLUX_GEMM_PIPE=1` vs `=0` | **ON** |
+    /// | gfx1100 | +2.6 % on its selected tile: 89.7 vs 87.4 TFLOP/s | controller, `bench_gemm_wide_lds`, 128×256 / 64×64 k32 | OFF — inside the ±3 % band |
+    /// | gfx1150 | +2–3 % at the median on both its tiles (128×256 / 32×64 k64 1.03×, 128×128 / 32×64 k64 1.02×) | this box, `bench_gemm_wide_lds`, `REPS=5 WARM=1`, lock held, five runs | OFF — inside the ±3 % band |
+    ///
+    /// gfx1151 is the arch the prefetch was written for: it selects
+    /// 256×256 / 64×64 k64, whose 64 KB of LDS pins it to a single workgroup
+    /// per CU, so nothing else can cover the global-load latency. On gfx1150
+    /// that same tile measures 1.15× (five runs, 1.13–1.19×) — but gfx1150 does
+    /// not select it, and the tiles it does select are inside the noise band.
+    /// gfx1100 already runs 2+ workgroups per CU, so the latency is covered
+    /// without a prefetch, and the pipelined form of its first choice costs it
+    /// real occupancy (190 VGPR / 8 waves per SIMD → 206 / 7).
+    ///
+    /// Unlisted archs are off; `HIPFIRE_FLUX_GEMM_PIPE=1` turns any of them on
+    /// for a measurement without a rebuild.
+    const LDS_PIPE_ON: &'static [&'static str] = &["gfx1151"];
+
+    /// Whether the software-pipelined main loop is on by default for `arch`.
+    /// See [`Gpu::LDS_PIPE_ON`] for the measurements behind the table.
+    pub fn lds_pipe_default(arch: &str) -> bool {
+        Self::LDS_PIPE_ON.iter().any(|p| arch.starts_with(p))
+    }
+
+    /// The tiles that have fused-epilogue instantiations: exactly the set
+    /// [`Gpu::lds_tile_for`] can return (every per-arch preference chain plus
+    /// [`Gpu::LDS_TILE_FALLBACK`]), so `gemm_f16_x_f16_wmma_lds_auto_epi` can
+    /// never pick a tile without a kernel. `epi_tiles_cover_selector` asserts
+    /// the two stay in sync; `WLDS_EPI_SET` in the .hip is the third copy.
+    ///
+    /// Widening this list is not free: five kernels per tile land in a single
+    /// translation unit that the JIT compiles as a whole.
+    pub const LDS_EPI_TILES: &'static [LdsTile] = &[
+        LdsTile::new(128, 256, 32, 64, 64, false),
+        LdsTile::new(128, 128, 32, 64, 64, false),
+        LdsTile::new(256, 256, 64, 64, 64, false),
+        LdsTile::new(128, 256, 64, 64, 32, false),
+        LdsTile::new(128, 128, 64, 64, 64, false),
+        LdsTile::new(128, 256, 32, 64, 64, false).pipelined(),
+        LdsTile::new(128, 128, 32, 64, 64, false).pipelined(),
+        LdsTile::new(256, 256, 64, 64, 64, false).pipelined(),
+        LdsTile::new(128, 256, 64, 64, 32, false).pipelined(),
+    ];
+
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_tiled`] with a fused epilogue.
+    ///
+    /// Identical GEMM — same tiles, same K order, same `acc + bias` expression
+    /// — with the following elementwise pass folded into the store. See
+    /// [`GemmEpilogue`] for the operand contract and the evaluation order; an
+    /// all-false/all-`None` `epi` is dispatched to the `EPI = 0` entry and is
+    /// bit-identical to calling `gemm_f16_x_f16_wmma_lds_tiled` directly.
+    ///
+    /// Errors (rather than asserts) on an epilogue combination or a tile that
+    /// has no compiled entry, naming the entry that would be needed. Panics if
+    /// `y.dtype` disagrees with `epi.out_f16`, or if an operand is misshapen.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_x_f16_wmma_lds_epi(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        bias_f32: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        tile: LdsTile,
+        epi: &GemmEpilogue<'_>,
+    ) -> HipResult<()> {
+        self.gemm_f16_x_f16_wmma_lds_epi_ld(
+            a_f16, x_f16, y, bias_f32, m, k, batch_size, tile, epi, k, k,
+        )
+    }
+
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_epi`] with an explicit row pitch for each
+    /// input operand — see [`Gpu::gemm_f16_x_f16_wmma_lds_tiled_ld`] for what
+    /// the pitch is for.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_x_f16_wmma_lds_epi_ld(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        bias_f32: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        tile: LdsTile,
+        epi: &GemmEpilogue<'_>,
+        lda: usize,
+        ldx: usize,
+    ) -> HipResult<()> {
+        let want_dtype = if epi.out_f16 { DType::F16 } else { DType::F32 };
+        assert_eq!(
+            y.dtype, want_dtype,
+            "gemm_f16_x_f16_wmma_lds_epi: out_f16 = {} needs a {want_dtype:?} y, got {:?}",
+            epi.out_f16, y.dtype
+        );
+        if let Some(b) = bias_f32 {
+            assert_eq!(
+                b.dtype,
+                DType::F32,
+                "gemm_f16_x_f16_wmma_lds_epi: `bias_f32` must be F32"
+            );
+        }
+        if epi.gate.is_some() != epi.residual.is_some() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_f16_x_f16_wmma_lds_epi: the gated epilogue needs both `gate` ([M]) and \
+                 `residual` ([B, M]); one was None",
+            ));
+        }
+        for (name, t) in [("addin", epi.addin), ("residual", epi.residual)] {
+            if let Some(t) = t {
+                assert_eq!(
+                    t.numel(),
+                    batch_size * m,
+                    "gemm_f16_x_f16_wmma_lds_epi: `{name}` must be [B, M] = [{batch_size}, {m}]"
+                );
+                assert_eq!(
+                    t.dtype,
+                    DType::F32,
+                    "gemm_f16_x_f16_wmma_lds_epi: `{name}` must be F32"
+                );
+            }
+        }
+        if let Some(g) = epi.gate {
+            assert_eq!(
+                g.numel(),
+                m,
+                "gemm_f16_x_f16_wmma_lds_epi: `gate` must be [M] = [{m}]"
+            );
+            assert_eq!(
+                g.dtype,
+                DType::F32,
+                "gemm_f16_x_f16_wmma_lds_epi: `gate` must be F32"
+            );
+        }
+
+        let mask = epi.mask();
+        if mask == 0 {
+            // No epilogue selected: the EPI = 0 entry already is this kernel.
+            return self.gemm_f16_x_f16_wmma_lds_tiled_ld(
+                a_f16, x_f16, y, bias_f32, m, k, batch_size, tile, lda, ldx,
+            );
+        }
+        let Some(suffix) = GemmEpilogue::entry_suffix(mask) else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_f16_x_f16_wmma_lds_epi: no kernel {}{} (epilogue mask {mask:#06b} is \
+                     not instantiated); compiled suffixes: {}",
+                    tile.entry(),
+                    GemmEpilogue::describe(mask),
+                    GemmEpilogue::SUPPORTED
+                        .iter()
+                        .map(|&(_, s)| s)
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                ),
+            ));
+        };
+        if !Self::LDS_EPI_TILES.contains(&tile) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_f16_x_f16_wmma_lds_epi: no kernel {} (tile {} has no fused-epilogue \
+                     instantiation; see Gpu::LDS_EPI_TILES)",
+                    tile.entry_epi(suffix),
+                    tile.label()
+                ),
+            ));
+        }
+        // K > 0 for the same reason as in `gemm_f16_x_f16_wmma_lds_tiled`.
+        assert!(
+            k > 0 && k % 64 == 0,
+            "gemm_f16_x_f16_wmma_lds_epi: K must be a positive multiple of 64 (got {k})"
+        );
+        Self::check_lds_pitch(
+            "gemm_f16_x_f16_wmma_lds_epi_ld",
+            a_f16,
+            x_f16,
+            m,
+            k,
+            batch_size,
+            lda,
+            ldx,
+        );
+
+        let entry = tile.entry_epi(suffix);
+        // One wave per wm×wn output patch, 32 threads each.
+        let threads = ((tile.bm / tile.wm) * (tile.bn / tile.wn) * 32) as u32;
+        self.bind_thread()?;
+        let (module, source) = self.lds256_source();
+        self.ensure_kernel(module, &source, &entry)?;
+        let ap = a_f16.buf.as_ptr();
+        let xp = x_f16.buf.as_ptr();
+        let yp = y.buf.as_ptr();
+        let bp = bias_f32.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let cp = epi.addin.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let rp = epi
+            .residual
+            .map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let gp = epi.gate.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let mut mi = m as i32;
+        let mut ki = k as i32;
+        let mut bi = batch_size as i32;
+        let mut hb = i32::from(bias_f32.is_some());
+        let mut lai = lda as i32;
+        let mut lxi = ldx as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ap as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &yp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &mut mi as *mut _ as *mut c_void,
+            &mut ki as *mut _ as *mut c_void,
+            &mut bi as *mut _ as *mut c_void,
+            &mut hb as *mut _ as *mut c_void,
+            &cp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &mut lai as *mut _ as *mut c_void,
+            &mut lxi as *mut _ as *mut c_void,
+        ];
+        let grid_m = m.div_ceil(tile.bm) as u32;
+        let grid_b = batch_size.div_ceil(tile.bn) as u32;
+        let grid = if tile.swap {
+            [grid_b, grid_m, 1]
+        } else {
+            [grid_m, grid_b, 1]
+        };
+        self.launch_maybe_blob(&entry, grid, [threads, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(ap);
+            b.push_ptr(xp);
+            b.push_ptr(yp);
+            b.push_ptr(bp);
+            b.push_i32(mi);
+            b.push_i32(ki);
+            b.push_i32(bi);
+            b.push_i32(hb);
+            b.push_ptr(cp);
+            b.push_ptr(rp);
+            b.push_ptr(gp);
+            b.push_i32(lai);
+            b.push_i32(lxi);
+            b
+        })
+    }
+
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_epi`] with the tile picked exactly as
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_auto`] picks it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_x_f16_wmma_lds_auto_epi(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        bias_f32: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        epi: &GemmEpilogue<'_>,
+    ) -> HipResult<()> {
+        let cu = self.cu_count_or_default();
+        let arch = self.arch.clone();
+        let tile = Self::lds_pipe_gate(&arch, Self::lds_tile_for(&arch, m, batch_size, cu));
+        self.gemm_f16_x_f16_wmma_lds_epi(a_f16, x_f16, y, bias_f32, m, k, batch_size, tile, epi)
+    }
+
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_auto_epi`] with an explicit row pitch per
+    /// input operand. `lda == ldx == k` is the packed contract and is
+    /// bit-identical to [`Gpu::gemm_f16_x_f16_wmma_lds_auto_epi`].
+    ///
+    /// # Panics
+    ///
+    /// Same pitch preconditions as
+    /// [`Gpu::gemm_f16_x_f16_wmma_lds_tiled_ld`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_f16_x_f16_wmma_lds_auto_epi_ld(
+        &mut self,
+        a_f16: &GpuTensor,
+        x_f16: &GpuTensor,
+        y: &GpuTensor,
+        bias_f32: Option<&GpuTensor>,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        epi: &GemmEpilogue<'_>,
+        lda: usize,
+        ldx: usize,
+    ) -> HipResult<()> {
+        let cu = self.cu_count_or_default();
+        let arch = self.arch.clone();
+        let tile = Self::lds_pipe_gate(&arch, Self::lds_tile_for(&arch, m, batch_size, cu));
+        self.gemm_f16_x_f16_wmma_lds_epi_ld(
+            a_f16, x_f16, y, bias_f32, m, k, batch_size, tile, epi, lda, ldx,
+        )
+    }
+
+    /// Tile choice for [`Gpu::gemm_f16_x_f16_wmma_lds_auto`], factored out so it
+    /// is unit-testable without a GPU.
+    ///
+    /// The preference order is **measured per arch**, because the winner is not
+    /// the same on all three (`bench_gemm_wide_lds`, median of 5, fresh
+    /// process, lock held, summed over the four FLUX.1-dev census shapes at
+    /// their real per-step call counts, against the shipped 128×128 / 32×64
+    /// tiling):
+    ///
+    /// | tile                | gfx1150 | gfx1151 | gfx1100 |
+    /// |---------------------|---------|---------|---------|
+    /// | 128×256 / 32×64 k64 | **1.19**|  1.23   |  1.11   |
+    /// | 256×256 / 64×64 k64 |  1.06   | **1.29**|  1.59   |
+    /// | 128×256 / 64×64 k32 |  0.86   |  0.66   | **1.75**|
+    ///
+    /// gfx1100's winner is a 43 % loss on gfx1151, so a single portable choice
+    /// would give up most of the win — this is the same "winner on one arch is
+    /// the loser on another" pattern the attention work already recorded. Every
+    /// listed tile is a win on the arch it is listed for; unknown archs get the
+    /// one that is positive on all three.
+    ///
+    /// This picks the *tile*. Whether that tile's main loop is
+    /// software-pipelined is a separate, orthogonal decision made afterwards by
+    /// [`Gpu::lds_pipe_gate`] — the chains here name plain tiles only.
+    ///
+    /// A tile is skipped when it is wider than the operand it tiles, or when
+    /// its grid would not produce at least `cu_count / 2` workgroups — past
+    /// that point the launch tail costs more than the tile wins.
+    pub fn lds_tile_for(arch: &str, m: usize, batch_size: usize, cu_count: usize) -> LdsTile {
+        let min_blocks = (cu_count / 2).max(1);
+        for &t in Self::lds_tile_preference(arch) {
+            let fits = m >= t.bm && batch_size >= t.bn;
+            let blocks = m.div_ceil(t.bm) * batch_size.div_ceil(t.bn);
+            if fits && blocks >= min_blocks {
+                return t;
+            }
+        }
+        Self::LDS_TILE_FALLBACK
+    }
+
+    /// Measured descending preference per arch. See [`Gpu::lds_tile_for`].
+    fn lds_tile_preference(arch: &str) -> &'static [LdsTile] {
+        // Plain tiles only: the main-loop form is orthogonal to the tile and is
+        // decided afterwards by `lds_pipe_gate`, so it stays one env var away
+        // from an A/B on any arch.
+        const GFX1150: &[LdsTile] = &[
+            LdsTile::new(128, 256, 32, 64, 64, false),
+            LdsTile::new(128, 128, 32, 64, 64, false),
+        ];
+        const GFX1151: &[LdsTile] = &[
+            LdsTile::new(256, 256, 64, 64, 64, false),
+            LdsTile::new(128, 256, 32, 64, 64, false),
+            LdsTile::new(128, 128, 32, 64, 64, false),
+        ];
+        const GFX1100: &[LdsTile] = &[
+            LdsTile::new(128, 256, 64, 64, 32, false),
+            // The only selectable tile with no pipelined twin at all: its
+            // pipelined form spills. See the kernel source.
+            LdsTile::new(128, 128, 64, 64, 64, false),
+        ];
+        // Unmeasured archs (gfx1101/1102/1103, gfx12xx): the tile that is a win
+        // on all three measured parts, at 48 KB of LDS rather than 64.
+        const PORTABLE: &[LdsTile] = &[
+            LdsTile::new(128, 256, 32, 64, 64, false),
+            LdsTile::new(128, 128, 32, 64, 64, false),
+        ];
+        match arch {
+            a if a.starts_with("gfx1150") => GFX1150,
+            a if a.starts_with("gfx1151") => GFX1151,
+            a if a.starts_with("gfx1100") => GFX1100,
+            _ => PORTABLE,
+        }
+    }
+
+    /// Used when no preferred tile fits the shape. Reproduces the shipped
+    /// `gemm_f16_x_f16_wmma_lds` tiling exactly.
+    const LDS_TILE_FALLBACK: LdsTile = LdsTile::new(128, 128, 32, 64, 64, false);
+
+    /// CU count for tile selection. Falls back to 16 (the smallest RDNA3 iGPU
+    /// config) when the device property is unavailable, which biases the
+    /// selector toward the wide tile rather than toward the narrow one.
+    fn cu_count_or_default(&self) -> usize {
+        self.hip
+            .get_device_attribute(
+                crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                self.device_id,
+            )
+            .ok()
+            .filter(|&v| v > 0)
+            .map(|v| crate::profiler::hip_mp_count_to_cu_count(&self.arch, v as u32) as usize)
+            .filter(|&v| (4..=256).contains(&v))
+            .unwrap_or(16)
+    }
+
     pub fn gemm_f32_register_tiled(
         &mut self,
         a: &GpuTensor,
@@ -25919,6 +27074,21 @@ impl Gpu {
                 [64u32, 1, 1],
                 ((m as u32) + 1) / 2,
             )
+        } else if k == 2_816 {
+            // Gemma4 lowered MQ4 (K=2816, eleven groups): compile-time tail
+            // specialization mirroring the HFQ4 K2816 route. The generic
+            // kernel below hard-codes tail = 0 (valid for K=2048), which
+            // would silently drop the final three groups here.
+            self.ensure_kernel(
+                "gemv_mq4g256_moe_gate_up_k8_indexed_k2816",
+                crate::kernels::GEMV_MQ4G256_MOE_GATE_UP_INDEXED_K2816_SRC,
+                "gemv_mq4g256_moe_gate_up_k8_indexed_k2816",
+            )?;
+            (
+                "gemv_mq4g256_moe_gate_up_k8_indexed_k2816",
+                [32u32, 1, 1],
+                m as u32,
+            )
         } else {
             self.ensure_kernel(
                 "gemv_hfq4g256_moe_gate_up_indexed",
@@ -26089,7 +27259,7 @@ impl Gpu {
         result
     }
 
-    #[allow(unused_variables)]
+    #[allow(clippy::too_many_arguments)]
     pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,
@@ -26101,10 +27271,43 @@ impl Gpu {
         m: usize,
         k: usize,
     ) -> HipResult<()> {
-        Err(hip_bridge::HipError::new(
-            0,
-            "MoE kernel not yet ported (Phase 4)",
-        ))
+        const KERNEL: &str = "gemv_hfq4g128_moe_down_residual_scaled_k8_indexed";
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_hfq4g128_moe_down_residual_scaled_k8_indexed",
+            kernels::GEMV_HFQ4G128_MOE_DOWN_RESIDUAL_SCALED_K8_INDEXED_SRC,
+            KERNEL,
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let sp = per_expert_scale.buf.as_ptr();
+        let hp = hidden_batch.buf.as_ptr();
+        let rp = x_residual.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &hp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(KERNEL, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pp);
+            b.push_ptr(ip);
+            b.push_ptr(wp);
+            b.push_ptr(sp);
+            b.push_ptr(hp);
+            b.push_ptr(rp);
+            b.push_i32(m_val);
+            b.push_i32(k_val);
+            b
+        })
     }
     #[allow(unused_variables)]
     pub fn gemv_hfq4g128_moe_down_residual_scaled_k8_indexed_batched(
@@ -27337,7 +28540,9 @@ impl Gpu {
     /// WMMA contracts (half16, w32, interleaved C). Distinct source/symbol/module
     /// so admitting gfx11 cannot alter the certified gfx12 code object.
     /// Exact gfx1100/gfx1151 production batch-tiles come from
-    /// `mqv2_prefill_batch_tile` outside replay/capture.
+    /// `mqv2_prefill_batch_tile` outside replay/capture. Small-N eager HIP on
+    /// exact gfx1100 defaults to the RAW-slab ldsstage (HIPFIRE_GATEUP_LDSSTAGE
+    /// default-on; `=0` restores historical base); capture/replay keep base.
     pub fn gemm_gate_up_mq4g256v2_wmma(
         &mut self,
         a_gate: &GpuTensor,
@@ -27405,8 +28610,30 @@ impl Gpu {
             }
         }
         self.bind_thread()?;
-        let kname = "gemm_gate_up_mq4g256v2_wmma";
-        let ksrc = kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_SRC;
+        // Small-N eager HIP: exact-gfx1100 RAW-slab ldsstage default-on via
+        // flags.gate_up_ldsstage (HIPFIRE_GATEUP_LDSSTAGE; =0 → historical base),
+        // 1<=N<=16, K%512==0. Capture/replay and other shapes keep base block32.
+        let (kname, ksrc, block_x) = if !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && self.arch_caps.is_gfx1100()
+            && self.arch == "gfx1100"
+            && (1..=16).contains(&batch_size)
+            && k > 0
+            && k % 512 == 0
+            && self.flags.gate_up_ldsstage
+        {
+            (
+                "gemm_gate_up_mq4g256v2_wmma_gfx1100_ldsstage",
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX1100_LDSSTAGE_SRC,
+                256u32,
+            )
+        } else {
+            (
+                "gemm_gate_up_mq4g256v2_wmma",
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_SRC,
+                32u32,
+            )
+        };
         self.ensure_kernel(kname, ksrc, kname)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
         let mut ag = a_gate.buf.as_ptr();
@@ -27441,7 +28668,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
-            [32, 1, 1],
+            [block_x, 1, 1],
             0,
             &mut params,
             || {
@@ -27945,6 +29172,44 @@ impl Gpu {
             self.gemm_mq4g256v2_mmq_add_prequant(a_raw, xq, y, m, k, batch_size)?;
             return Ok(());
         }
+        // Exact gfx1100 DFlash verify tier: split-K LDS for N<=16, where the
+        // base kernel (one wave32 per 16x16 tile) launches too few waves to
+        // cover 96 CUs. Capture-SAFE (unlike the mw_lds tier below): the
+        // kernel is deterministic (fixed wave-order LDS reduction, no
+        // atomics), launches via launch_maybe_blob (blob ABI recorded under
+        // capture), and its symbols carry the replay.rs kernarg contract, so
+        // verify-graph capture bakes ks4_lds and every replayed cycle keeps
+        // the win. Only Redline tape recording keeps the base contract.
+        // Kill switch: HIPFIRE_RESIDUAL_KSPLIT_OFF=1 disables BOTH the ksplit
+        // and ldsstage kernels (flags.residual_ksplit_off) and restores the
+        // base oracle. The ldsstage kernel (gfx1100 port of the gfx12
+        // ldsstage design) is default-on for exact gfx1100
+        // (flags.residual_ldsstage) wherever K % 512 == 0; set
+        // HIPFIRE_RESIDUAL_LDSSTAGE=0 to restore the split-K table path.
+        if !self.replay.is_recording()
+            && !self.flags.residual_ksplit_off
+            && self.arch_caps.is_gfx1100()
+            && self.arch == "gfx1100"
+            && batch_size <= 16
+        {
+            match Self::residual_verify_tier(
+                self.flags.residual_ksplit_off,
+                self.flags.residual_ldsstage,
+                k,
+            ) {
+                ResidualVerifyTier::LdsStage => {
+                    return self.gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
+                        a_raw, x, y, m, k, batch_size,
+                    );
+                }
+                ResidualVerifyTier::Ksplit { kw } => {
+                    return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                        a_raw, x, y, m, k, batch_size, kw,
+                    );
+                }
+                ResidualVerifyTier::Base => {}
+            }
+        }
         // Exact gfx1100 production multi-wave policy: MW4 for N 416..463
         // and MW8 for N>=464. Smaller measured ranges retain BT4/6/8.
         // Capture/replay keep the fixed historical base launch contract.
@@ -28215,6 +29480,248 @@ impl Gpu {
         }
         result
     }
+    /// Split-K width for the exact-gfx1100 DFlash verify tier (N<=16).
+    ///
+    /// Returns None when split-K cannot run (K not a multiple of 256 or no
+    /// KW in {2,4,8} divides G = K/256 with G >= KW); the caller then falls
+    /// through to the base kernel. Initial table from the verify-shape bench
+    /// (verify-shapes-v2-run2.txt): kw=4 for K<=8192, kw=8 for K>8192, each
+    /// relaxed to the next smaller dividing KW. Re-tune from the ksplit
+    /// parity example's timing sweep; update this table, not the call sites.
+    fn residual_ksplit_kw(k: usize) -> Option<usize> {
+        if k % 256 != 0 || k == 0 {
+            return None;
+        }
+        let g = k / 256;
+        let want = if k <= 8192 { 4 } else { 8 };
+        [want, 4, 2]
+            .into_iter()
+            .filter(|&kw| kw <= want)
+            .find(|&kw| g >= kw && g % kw == 0)
+    }
+
+    /// Shared verify-tier pick for the exact-gfx1100 residual entries (see
+    /// `ResidualVerifyTier`): kill switch dominates both tiers, default-on
+    /// ldsstage next, split-K table next, base fallback. Both the F32 entry
+    /// above and the F16 entry route through here.
+    #[inline]
+    pub(crate) fn residual_verify_tier(
+        ksplit_off: bool,
+        ldsstage: bool,
+        k: usize,
+    ) -> ResidualVerifyTier {
+        if !ksplit_off && ldsstage && k > 0 && k % 512 == 0 {
+            return ResidualVerifyTier::LdsStage;
+        }
+        if !ksplit_off {
+            if let Some(kw) = Self::residual_ksplit_kw(k) {
+                return ResidualVerifyTier::Ksplit { kw };
+            }
+        }
+        ResidualVerifyTier::Base
+    }
+
+    /// MQ4V2 gfx1100 split-K LDS residual (KS2/KS4/KS8) — DFlash verify tier.
+    ///
+    /// One 16x16 output tile per block, `kw` waves splitting K, fp32 accs
+    /// reduced through LDS in fixed wave order by wave 0 with a single Y +=.
+    /// Exact gfx1100 only. Grid: ceil(M/16) x ceil(N/16); block 32*kw; FP16 X
+    /// once; blob-safe ABI + profile timer. Preserves fused `Y += W@X`.
+    /// `kw` accepts only 2/4/8 with (K/256) % kw == 0; otherwise Err.
+    pub fn gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        kw: usize,
+    ) -> HipResult<()> {
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        if k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds: K must be divisible by 256 (got {k})"
+                ),
+            ));
+        }
+        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds: exact gfx1100 required (got {})",
+                    self.arch
+                ),
+            ));
+        }
+        let func_name = match kw {
+            2 => "gemm_mq4g256v2_residual_wmma_gfx1100_ks2_lds",
+            4 => "gemm_mq4g256v2_residual_wmma_gfx1100_ks4_lds",
+            8 => "gemm_mq4g256v2_residual_wmma_gfx1100_ks8_lds",
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds: kw must be 2, 4, or 8",
+                ));
+            }
+        };
+        if (k / 256) % kw != 0 || k / 256 < kw {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds: K/256 must be >= kw and divisible by kw (got K={k}, kw={kw})"
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_KSPLIT_LDS_SRC,
+            func_name,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [(32 * kw) as u32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// MQ4V2 gfx1100 LDS-staged residual — DFlash verify tier (N<=16).
+    ///
+    /// gfx1100 port of the gfx12 ldsstage design: one 16x16 output tile per
+    /// 8-wave block, cooperative 16-row x 512-K RAW slab staging, per-wave
+    /// 64-wide K slices consumed from LDS as gfx11 WMMA fragments, wave-0
+    /// fixed-order reduce with a single Y +=. Exact gfx1100 only. Grid:
+    /// ceil(M/16) x ceil(N/16); block 256; FP16 X once; blob-safe ABI +
+    /// profile timer. Preserves fused `Y += W@X`. Requires K % 512 == 0;
+    /// otherwise falls back to ks4 (or the ks table / base when ks4 cannot
+    /// run), so direct callers never observe an Err for odd-K shapes.
+    pub fn gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        if k % 512 != 0 {
+            let g = k / 256;
+            if k % 256 == 0 && g >= 4 && g % 4 == 0 {
+                return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                    a_raw, x, y, m, k, batch_size, 4,
+                );
+            }
+            if let Some(kw) = Self::residual_ksplit_kw(k) {
+                return self.gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds(
+                    a_raw, x, y, m, k, batch_size, kw,
+                );
+            }
+            return self.gemm_mq4g256v2_residual_wmma(a_raw, x, y, m, k, batch_size);
+        }
+        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage: exact gfx1100 required (got {})",
+                    self.arch
+                ),
+            ));
+        }
+        self.bind_thread()?;
+        const MODULE: &str = "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage";
+        const FUNC: &str = "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX1100_LDSSTAGE_SRC,
+            FUNC,
+        )?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", FUNC, bytes);
+        let result = self.launch_maybe_blob(
+            FUNC,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// MQ4V2 gfx1151 residual batch-tile (BT4/6/8) — default-off.
     ///
     /// Direct harness entry for exact gfx1151. Reuses the same portable gfx11
@@ -35991,5 +37498,225 @@ impl Gpu {
             "qt=45 gemm_mq4cg256_batched_lmhead: scalar fallback has no mq4c source \
              (GEMM_MQ4CG256_SRC missing) — would mis-decode MQ4C fp16-header groups as v1 f32 header",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn residual_kill_switch_dominates_ldsstage_and_ksplit() {
+        // K = 2048 admits both optimized tiers (K % 512 == 0, ks table -> kw=4).
+        // Kill switch restores base even with the ldsstage enabled (the F16 bug).
+        assert_eq!(
+            ResidualVerifyTier::Base,
+            Gpu::residual_verify_tier(true, true, 2048)
+        );
+        assert_eq!(
+            ResidualVerifyTier::Base,
+            Gpu::residual_verify_tier(true, false, 2048)
+        );
+        // Preserved enabled/disabled routing with the kill switch off.
+        assert_eq!(
+            ResidualVerifyTier::LdsStage,
+            Gpu::residual_verify_tier(false, true, 2048)
+        );
+        assert_eq!(
+            ResidualVerifyTier::Ksplit { kw: 4 },
+            Gpu::residual_verify_tier(false, false, 2048)
+        );
+        // Large-K split widths still route through the table (kw=8).
+        assert_eq!(
+            ResidualVerifyTier::Ksplit { kw: 8 },
+            Gpu::residual_verify_tier(false, false, 12288)
+        );
+        assert_eq!(
+            ResidualVerifyTier::LdsStage,
+            Gpu::residual_verify_tier(false, true, 12288)
+        );
+        // Unsupported K (K/256 odd, no kw divides it) restores base.
+        assert_eq!(
+            ResidualVerifyTier::Base,
+            Gpu::residual_verify_tier(false, true, 768)
+        );
+        assert_eq!(
+            ResidualVerifyTier::Base,
+            Gpu::residual_verify_tier(false, false, 1000)
+        );
+        assert_eq!(
+            ResidualVerifyTier::Base,
+            Gpu::residual_verify_tier(false, true, 0)
+        );
+    }
+}
+
+#[cfg(test)]
+mod lds_epi_tests {
+    use super::*;
+
+    /// Every tile `lds_tile_for` can return must have fused-epilogue entries,
+    /// or `gemm_f16_x_f16_wmma_lds_auto_epi` fails at runtime on that arch.
+    /// Adding a tile to a preference chain without a `WLDS_EPI_SET` line in
+    /// `kernels/src/gemm_f16_x_f16_wmma_lds256.hip` fails here instead.
+    ///
+    /// Reachability runs over both main-loop forms: `HIPFIRE_FLUX_GEMM_PIPE`
+    /// can turn any selected tile into its `_p` twin (or back), on any arch, so
+    /// every chain tile that has a pipelined entry needs the fused-epilogue set
+    /// for both forms.
+    #[test]
+    fn epi_tiles_cover_selector() {
+        for arch in ["gfx1150", "gfx1151", "gfx1100", "gfx1201", "gfx1030"] {
+            for &tile in Gpu::lds_tile_preference(arch) {
+                let mut forms = vec![tile.unpipelined()];
+                // A tile with no `_p` entry is never pipelined by the gate.
+                if Gpu::LDS_TILE_VARIANTS.contains(&tile.pipelined()) {
+                    forms.push(tile.pipelined());
+                }
+                for t in forms {
+                    assert!(
+                        Gpu::LDS_EPI_TILES.contains(&t),
+                        "{arch} can select {} but it has no fused-epilogue instantiation",
+                        t.label()
+                    );
+                }
+            }
+        }
+        // The fallback is reachable on every arch, so both of its main-loop
+        // forms must be instantiated — including under HIPFIRE_FLUX_GEMM_PIPE=1
+        // on an arch whose default is off.
+        assert!(Gpu::LDS_EPI_TILES.contains(&Gpu::LDS_TILE_FALLBACK));
+        assert!(Gpu::LDS_EPI_TILES.contains(&Gpu::LDS_TILE_FALLBACK.pipelined()));
+        assert!(Gpu::LDS_TILE_VARIANTS.contains(&Gpu::LDS_TILE_FALLBACK.pipelined()));
+        // And nothing is instantiated that the selector cannot reach — every
+        // extra tile is five more kernels of JIT time for no caller.
+        for &tile in Gpu::LDS_EPI_TILES {
+            let reachable = ["gfx1150", "gfx1151", "gfx1100", "gfx1201"]
+                .iter()
+                .any(|a| Gpu::lds_tile_preference(a).contains(&tile.unpipelined()))
+                || tile.unpipelined() == Gpu::LDS_TILE_FALLBACK;
+            assert!(
+                reachable,
+                "{} is instantiated but unreachable",
+                tile.label()
+            );
+            assert!(Gpu::LDS_TILE_VARIANTS.contains(&tile));
+        }
+    }
+
+    /// The gate must be a pure (arch, tile) → tile map that only ever changes
+    /// the main-loop form, and must never name an entry that was not compiled.
+    #[test]
+    fn pipe_gate_only_changes_the_main_loop() {
+        for arch in ["gfx1150", "gfx1151", "gfx1100", "gfx1201", "gfx1030"] {
+            for &tile in Gpu::lds_tile_preference(arch) {
+                // The env var is not set under test, so this is the default.
+                let got = Gpu::lds_pipe_gate(arch, tile);
+                assert_eq!(got.unpipelined(), tile.unpipelined(), "{arch} changed tile");
+                assert!(Gpu::LDS_TILE_VARIANTS.contains(&got));
+                assert!(Gpu::LDS_EPI_TILES.contains(&got));
+                assert_eq!(
+                    got.pipe,
+                    Gpu::lds_pipe_default(arch)
+                        && Gpu::LDS_TILE_VARIANTS.contains(&tile.pipelined())
+                );
+            }
+        }
+        // gfx1100's fallback has no `_p` entry, so the gate must leave it plain
+        // even where the arch default is on.
+        let no_twin = LdsTile::new(128, 128, 64, 64, 64, false);
+        assert!(!Gpu::LDS_TILE_VARIANTS.contains(&no_twin.pipelined()));
+        assert!(!Gpu::lds_pipe_gate("gfx1151", no_twin).pipe);
+    }
+
+    /// The kill switch has to be a pure tile→tile map, or the `_p` and non-`_p`
+    /// arms of an A/B are not the same GEMM.
+    #[test]
+    fn pipe_kill_switch_only_drops_the_pipelining() {
+        for &tile in Gpu::LDS_TILE_VARIANTS {
+            let off = tile.unpipelined();
+            assert!(!off.pipe, "{} still pipelined after the gate", off.label());
+            assert_eq!(off.pipelined().unpipelined(), off);
+            // Every pipelined variant's plain twin must exist too, so the
+            // kill switch can never name an entry that was not compiled.
+            if tile.pipe {
+                assert!(Gpu::LDS_TILE_VARIANTS.contains(&off));
+                assert!(tile.entry().ends_with("_p"));
+                assert_eq!(tile.entry(), format!("{}_p", off.entry()));
+            }
+        }
+    }
+
+    #[test]
+    fn epi_masks_match_the_instantiated_suffixes() {
+        // Metadata-only: `mask()` never touches the buffer.
+        let one = GpuTensor::null_for_test();
+        assert_eq!(GemmEpilogue::default().mask(), 0);
+        assert_eq!(
+            GemmEpilogue {
+                out_f16: true,
+                ..Default::default()
+            }
+            .mask(),
+            GemmEpilogue::OUT_F16
+        );
+        assert_eq!(
+            GemmEpilogue {
+                out_f16: true,
+                gelu: true,
+                ..Default::default()
+            }
+            .mask(),
+            GemmEpilogue::OUT_F16 | GemmEpilogue::GELU
+        );
+        assert_eq!(
+            GemmEpilogue {
+                gate: Some(&one),
+                residual: Some(&one),
+                addin: Some(&one),
+                ..Default::default()
+            }
+            .mask(),
+            GemmEpilogue::GATED | GemmEpilogue::ADDIN
+        );
+        for &(mask, suffix) in GemmEpilogue::SUPPORTED {
+            assert_eq!(GemmEpilogue::entry_suffix(mask), Some(suffix));
+        }
+        // GELU alone, and F16 output combined with a gate, are not
+        // instantiated — the launcher must reject them, not launch something.
+        assert_eq!(GemmEpilogue::entry_suffix(GemmEpilogue::GELU), None);
+        assert_eq!(
+            GemmEpilogue::entry_suffix(GemmEpilogue::GATED | GemmEpilogue::OUT_F16),
+            None
+        );
+        // For an instantiated mask, describe() must reproduce the real suffix —
+        // an error message that names a permutation of an existing entry sends
+        // the reader looking for a kernel that was never meant to exist.
+        for &(mask, suffix) in GemmEpilogue::SUPPORTED {
+            assert_eq!(GemmEpilogue::describe(mask), suffix);
+        }
+        assert_eq!(GemmEpilogue::describe(GemmEpilogue::GELU), "_g");
+        assert_eq!(
+            GemmEpilogue::describe(GemmEpilogue::OUT_F16 | GemmEpilogue::GATED),
+            "_o16_gr"
+        );
+    }
+
+    #[test]
+    fn epi_entry_names_match_the_kernel_source() {
+        let src = kernels::GEMM_F16_X_F16_WMMA_LDS256_SRC;
+        for &tile in Gpu::LDS_EPI_TILES {
+            assert!(
+                src.contains(&format!("WLDS_EPI_SET({},", tile.entry())),
+                "kernel source has no WLDS_EPI_SET for {}",
+                tile.entry()
+            );
+        }
+        for &(_, suffix) in GemmEpilogue::SUPPORTED {
+            assert!(
+                src.contains(&format!("BASE##{suffix},")),
+                "kernel source does not emit the {suffix} entry"
+            );
+        }
     }
 }

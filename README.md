@@ -11,8 +11,8 @@
 
 <p align="center">
   <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.2.1" src="https://img.shields.io/badge/stable-v0.2.1-24292f?style=flat-square" /></a>
-  <a href="CHANGELOG.md"><img alt="Next release v0.3.0 beta" src="https://img.shields.io/badge/next-v0.3.0%20beta-f04b24?style=flat-square" /></a>
-  <a href="docs/MODELS.md"><img alt="61 curated model entries" src="https://img.shields.io/badge/registry-61%20curated%20models-ff8a1f?style=flat-square" /></a>
+  <a href="CHANGELOG.md"><img alt="Next release v0.3.1 candidate" src="https://img.shields.io/badge/next-v0.3.1%20candidate-f04b24?style=flat-square" /></a>
+  <a href="docs/MODELS.md"><img alt="80 curated model entries" src="https://img.shields.io/badge/registry-80%20curated%20models-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
 
@@ -36,11 +36,19 @@ One-shot inference uses the same model registry and serving stack:
 hipfire run qwen3.5:4b "What is the capital of France?"
 ```
 
+Image generation (first release; RDNA3/3.5 measured):
+
+```bash
+hipfire pull flux.schnell:1
+hipfire img flux.schnell:1 "a red cube on a wooden table" --out x.png
+```
+
 The daemon exposes an OpenAI-compatible API on `0.0.0.0:11435`.
 
-Current stable release: **v0.2.1**. The next release is **v0.3.0**,
-headlined by MQ4R and Redline across RDNA, and adding Qwen 3.8 27B and
-Muse Glimmer 30B. See [CHANGELOG.md](CHANGELOG.md).
+Current stable release: **v0.2.1**. The next release is **v0.3.1**
+(promotion candidate), headlined by DFlash prompt-cache repair, registry
+draft sidecars, Ornith 1.5, and first-release image generation (FLUX).
+See [CHANGELOG.md](CHANGELOG.md).
 
 Curated weights are published through
 [huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
@@ -117,7 +125,7 @@ OpenAI-compatible client.
 
 ## Curated model registry
 
-The registry currently contains 77 pullable model entries. Run
+The registry currently contains 80 curated model entries. Run
 `hipfire list -r` to see the authoritative live list.
 
 | Registry family | Pull tags and variants |
@@ -128,6 +136,7 @@ The registry currently contains 77 pullable model entries. Run
 | Qwen 3.6 35B-A3B | `qwen3.6:35b-a3b` (MQ4P default), `qwen3.6:35b-a3b-mq2`, `qwen3.6:35b-a3b-mq3p`, `qwen3.6:35b-a3b-mq4p`, `qwen3.6:35b-a3b-mfp4`, `qwen3.6:35b-a3b-mq4r`, `qwen3.6:35b-a3b-mq5`, `qwen3.6:35b-a3b-mq6` |
 | Qwen 3.8 dense | MQ V2 ladder: `qwen3.8:27b-mq3-xt`, `qwen3.8:27b-mq3`, `qwen3.8:27b-mq3-pro`; `qwen3.8:27b-mq4-xt`, `qwen3.8:27b` (MQ4V2 default), `qwen3.8:27b-mq4-pro`; corresponding MQ5 and MQ6 `-xt` / base / `-pro` tags; drafts `qwen3.8:27b-draft-mq3` through `-mq6` (MQ4 recommended) |
 | Muse Glimmer | `muse-glimmer` (MQ4 quality trunk), `muse-glimmer:fast` (MQ4R speed SKU), `muse-glimmer:draft` |
+| Ornith 1.5 | `ornith-1.5:35b-a3b` (MQ4 default), `ornith-1.5:35b-a3b-mq4r` / `ornith-1.5:fast` (MQ4R) |
 | DeepSeek V4 Flash | `deepseek-v4-flash` |
 | MiniMax-M2.7 | `minimax-m2.7` |
 | North-Mini-Code-1.0 | `north-mini-code` |
@@ -139,7 +148,7 @@ The registry currently contains 77 pullable model entries. Run
 | VibeThinker-3B | `vibethinker:3b`, `vibethinker:3b-mq6` |
 
 Common aliases include `qwen3.5`, `qwen3.6`, `qwen3.8`, `qwen3`, `carnice`,
-`qwopus`, `deepseek4`, `deepseek-v4`, `muse-glimmer`, and `vibethinker`.
+`qwopus`, `deepseek4`, `deepseek-v4`, `muse-glimmer`, `ornith`, `ornith-1.5`, `ornith-1.5:fast`, and `vibethinker`.
 
 Carnice uses the Hermes tool-call format. Plain Qwen 3.5 and 3.6 use
 their native Qwen XML tool-call format.
@@ -348,6 +357,7 @@ the prefill MMQ redesign log is at
 | [QUANTIZE.md](docs/QUANTIZE.md) | `hipfire quantize` for HF / safetensors / GGUF |
 | [CONFIG.md](docs/CONFIG.md) | Every config key, CASK sidecar / KV eviction policies, env overrides |
 | [SERVE.md](docs/SERVE.md) | OpenAI-compatible HTTP API |
+| [IMAGEGEN.md](docs/IMAGEGEN.md) | FLUX.1 / FLUX.2 Klein image generation — local test guide |
 | [BENCHMARKS.md](docs/BENCHMARKS.md) | Measured perf per arch, vs ollama |
 | [ARCHITECTURE.md](docs/ARCHITECTURE.md) | Engine layout, dispatch, two model paths |
 | [QUANTIZATION.md](docs/QUANTIZATION.md) | MQ4 / HF4 design, asym KV cache, FWHT math |

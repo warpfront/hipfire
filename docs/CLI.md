@@ -10,9 +10,9 @@ Bare interactive `hipfire` launches the terminal UI when `hipfire-tui` is instal
 
 | Command | Purpose |
 |---|---|
-| `hipfire pull <tag>` | Download a registry model (and published sidecars when listed) into `~/.hipfire/models/`. |
+| `hipfire pull <tag>` | Download a registry model into `~/.hipfire/models/`. When the entry declares a DFlash draft (`dflash.file`), the pull also fetches that sidecar. Pull does **not** enable speculation: `dflash_mode` defaults to **`off`**. With `auto`, the loader uses the sidecar when present (otherwise AR); with `on`, load fails closed if the sidecar is missing. Override the path with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` (or `run --model-draft`). When the entry declares a vision tower (`vision.file`, e.g. every `qwen3.8:27b*` tier → `qwen3.8-27b-vision.hfq`), the pull also fetches that sidecar; override with `run --vision` / `serve --vision` / `HIPFIRE_VISION_SIDECAR`. |
 | `hipfire list [-r\|--remote] [-j\|--json]` | Local models; `-r` also lists pullable registry tags; user aliases from `quantize --register` appear separately. |
-| `hipfire rm <tag\|path> [-y\|--yes]` | Delete the weight file and sibling sidecars (`.triattn*.bin`, `*.mtp`). Confirms unless `-y`. |
+| `hipfire rm <tag\|path> [-y\|--yes]` | Delete the weight file and sibling sidecars (`.triattn*.bin`, `*.mtp`, matching DSpark). A declared DFlash draft is **shared**: several tags can name the same `dflash.file` (e.g. `qwen3.8:27b` / `qwen3.8:27b-mq4-pro` / `qwen3.8:27b-mq4-xt` → one `qwen38-27b-dflash-mq4.hfq`). If any *other* registry entry that declares the same draft still has its own target file on disk, `rm` **keeps** the sidecar and prints one stderr line; otherwise the draft is removed with the target. The `vision` tower sidecar follows the same shared-keeper rule (every `qwen3.8:27b*` tier declares the one `qwen3.8-27b-vision.hfq`). Confirms unless `-y`. |
 | `hipfire ps [-j\|--json]` | Running daemon / quantize / upload processes and whether the configured serve port is busy (process scan is Linux-oriented). |
 
 Tags resolve through the dynamic registry + aliases. Authoritative live list:
@@ -27,6 +27,7 @@ payloads fall back to cache then the embedded registry. Pin the bundle with
 | Command | Purpose |
 |---|---|
 | `hipfire run <model> [flags] [prompt...]` | One-shot generate. Model = registry tag, alias, or path. Uses a healthy `serve` over HTTP when present; otherwise spawns a one-shot daemon. Forces local spawn when `HIPFIRE_LOCAL=1` or a load-time override such as `--kv-mode`/`--image` cannot safely reuse the resident model. Recognized missing registry tags auto-pull. |
+| `hipfire img <model> [flags] <prompt...>` | One-shot txt2img on a diffusion checkpoint (arch 40 FLUX.1, arch 45 FLUX.2 Klein). Model = an HFQ trunk pack (`<base>-transformer.hfq`, sidecars next to it) or a registry tag that resolves to one (`flux.schnell:1`); build packs with `hipfire-quantize --flux-pipe` below. Writes `<model>-<WxH>-<seed>.png`. |
 | `hipfire chat <model> [--no-color]` | Interactive multi-turn TUI. See [CHAT.md](CHAT.md). |
 | `hipfire serve [model] [host] [port] [flags]` | OpenAI-compatible HTTP server. See [SERVE.md](SERVE.md). |
 | `hipfire restart [serve flags...]` | `stop --force` semantics then start with the same flags. |
@@ -49,6 +50,7 @@ Flags may appear before or after the model. CLI help and the native typed schema
 | `--dspark-conf-threshold <f>` | DSpark confidence cutoff in `[0,1]` (qwen3 + deepseek4). |
 | `--system <text>` | System prompt. |
 | `--image <path>` | Vision input (when the model supports it). |
+| `--vision <path>` | Vision-tower sidecar for this load; wins over the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`. Skipped while `vision_mode=off` (default); required when `on`. Also on `serve`. |
 | `-j, --json` | Machine-readable output. |
 | `--no-stream` | Buffer full response. |
 
@@ -62,7 +64,7 @@ hipfire run qwen3.5:27b -md ~/.hipfire/models/qwen35-27b-dflash-mq4.hfq "..."
 HIPFIRE_LOCAL=1 hipfire run qwen3.5:4b "..."   # skip HTTP; always local spawn
 ```
 
-Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL=1`, `--kv-mode`, or `--image`. JSON and non-streaming responses are supported by the native HTTP service and do not by themselves force a local daemon.
+Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL` truthy, `--image`, `--kv-mode`, `--kv-backend`, `--spec`/`--speculation`, `--model-draft`, `--vision`, `--draft-max`, or `--dspark-conf-threshold` (exact list: `force_local` in `crates/hipfire-cli/src/main.rs`). JSON and non-streaming responses are supported by the native HTTP service and do not by themselves force a local daemon.
 
 ### `hipfire serve` flags
 
@@ -74,6 +76,28 @@ Local-forcing (skip a healthy serve): `HIPFIRE_LOCAL=1`, `--kv-mode`, or `--imag
 | `--idle-timeout <s>` | Unload after idle seconds (`0` = never; max `86400`). |
 | `--no-prewarm` | Lazy-load on first request. |
 | `--tp N` | Expert-parallel across N GPUs (supported MoE paths only; `1..64`). |
+| `--vision <path>` | Vision-tower sidecar wired into every model load of this process. Skipped while `vision_mode=off` (default). |
+
+### `hipfire img` flags
+
+Run in a fresh daemon process; the prompt is the positional text. `--steps`
+defaults to the model's own default (4 for step-distilled `flux.schnell:1`,
+28 for guidance-distilled `flux.dev:1`).
+
+| Flag | Purpose |
+|---|---|
+| `--width` / `--height` | Latent grid size. Defaults match the reference (1024×1024 unless `--image` is given). |
+| `--steps <n>` | Denoise steps; omit for the architecture default. |
+| `--seed <n>` | Same model + seed → byte-identical PNG. |
+| `--backend <cpu\|gpu>` | Transformer backend; defaults to GPU when available. |
+| `--image <path>` | Reference image (FLUX.2 Klein edit only, arch 45). The CLI reads the file and sends its bytes; the daemon never opens a client-named path. |
+| `--sampler <name>` | `euler` / `flow-match` only. |
+| `--json` | Print the JSON result object instead of just the PNG path. |
+
+Model resolution accepts an HFQ **component pack** (trunk file) — the
+`t5`/`clip`/`vae` sidecar packs are discovered next to it by sibling name
+(`<stem>-t5.hfq` etc., or shared `t5-xxl.hfq` / `clip-l.hfq` / `vae.hfq`).
+`hipfire pull flux.schnell:1` fetches the trunk + all three sidecars at once.
 
 ## Configuration
 
@@ -91,6 +115,7 @@ Do not inventory every key here — [CONFIG.md](CONFIG.md) owns defaults and ran
 | Command | Purpose |
 |---|---|
 | `hipfire quantize <hf-id\|dir\|file.gguf> [flags]` | CPU quantize via `hipfire-quantize`. |
+| `hipfire-quantize --flux-pipe <pipe_dir> -o <base.hfq>` | Pack a FLUX.1 or FLUX.2 Klein diffusers pipe into per-component HFQ files (`<base>-transformer.hfq` plus `-t5.hfq`, `-clip.hfq`, `-vae.hfq` for FLUX.1, or `-qwen3.hfq`, `-vae.hfq` for Klein; arch ids 40–46). `--flux-component` packs one. The packs are the only form the daemon loads. |
 | `hipfire sidecar-gen <model> [flags]` | Build a `.triattn.bin` next to the model (does not pull). |
 
 ### `quantize` (summary)
@@ -121,7 +146,7 @@ Supported CLI formats include `mq4`, `mq6`, `q8`/`q8f16`, `hf4`/`hf6` and hfq al
 
 | Command | Purpose |
 |---|---|
-| `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep). |
+| `hipfire bench <model> [opts] [prompt]` | Prefill/decode timing. `--runs N` (default 5), `--json`, `--exp` (RDNA2 variant sweep). `--prompt-file PATH` reads the prompt verbatim; JSON records `prompt_tokens`/`prompt_md5`/`prompt_chars`/`warnings` (short prompts warn that `prefill_tok_s` is launch overhead). |
 | `hipfire bench <model> --matrix ...` | Synthetic PP/context/TG matrix (`--pp`, `--ctx`, `--tg`, `--sustained-tg`, `--sustained-ctx`, `--warmups`, `--kv-mode`, `--redline`). |
 | `hipfire profile [model] [--kernel substr] [--json]` | Live daemon roofline and compiled-kernel VGPR/SGPR/LDS/occupancy report. Use `hipfire-atlas` for measured ISA-fit and workload analysis. |
 | `hipfire diag` | Static device/runtime checks plus a live HIP arch, version, and VRAM probe when the daemon is available. |
@@ -170,6 +195,8 @@ Single-invocation knobs (non-exhaustive; full list in [env-vars.md](env-vars.md)
 | `HIPFIRE_KV_MODE=...` | Override KV layout. |
 | `HIPFIRE_SPECULATION=...` | Top of speculation ladder. |
 | `HIPFIRE_DFLASH_DRAFT=...` | Explicit draft path. |
+| `HIPFIRE_VISION_SIDECAR=...` | Explicit vision-tower sidecar path; empty opts out. Skipped while `vision_mode=off`. |
+| `HIPFIRE_VISION_MODE=...` | Tower sidecar gate: `off` (default) / `auto` / `on`. |
 | `HIPFIRE_DFLASH_MODE=...` | Daemon-side mode (CLI default config is still `off`). |
 | `HIPFIRE_NO_REGISTRY_FETCH=1` | Pin bundled registry. |
 | `HIPFIRE_REGISTRY_URL=...` | Alternate registry URL. |

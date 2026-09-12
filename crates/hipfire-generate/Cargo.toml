@@ -23,11 +23,12 @@ description = "Per-architecture generation bodies, lifted out of the daemon bina
 # generation code stays where it can actually see the architectures.
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
-hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
-hipfire-dispatch = { path = "../hipfire-dispatch" }
 hipfire-runtime = { path = "../hipfire-runtime" }
+# Re-added: S4 (#719) introduced hipfire_config readers in this crate after the
+# machete pass that removed it, so the "unused" finding is no longer true.
+hipfire-config = { path = "../hipfire-config" }
 hipfire-loader = { path = "../hipfire-loader" }
 hipfire-engine = { path = "../hipfire-engine" }
 hipfire-pflash = { path = "../hipfire-pflash" }
@@ -36,6 +37,7 @@ hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
+hipfire-arch-diffusion = { path = "../hipfire-arch-diffusion" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-lfm2-vl = { path = "../hipfire-arch-lfm2-vl" }
@@ -45,9 +47,12 @@ hipfire-arch-maple = { path = "../hipfire-arch-maple" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
 base64 = "0.22"
-serde = { version = "1", features = ["derive"] }
-serde_json = { version = "1", features = ["preserve_order"] }
+serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = "0.1"
 
 [features]
 serve-fault-inject = ["hipfire-runtime/serve-fault-inject"]
+# VCN JPEG decode for VL images (`image.decode = vcn|auto`): pooled libva
+# decode straight to device patches, skipping CPU decode and upload.
+# Default off; the CPU path below is unchanged when disabled.
+vcn-jpeg = ["hipfire-arch-qwen35-vl/vcn-jpeg"]

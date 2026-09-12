@@ -213,11 +213,10 @@ fn kv_mode_from_ctx(ctx: &LoadCtx) -> String {
 fn resolve_kv_mode(
     ctx: &LoadCtx,
     policy: &hipfire_runtime::kv_mode::KvModePolicy,
-    head_dim: usize,
 ) -> hipfire_runtime::kv_mode::KvMode {
     let kv_mode = kv_mode_from_ctx(ctx);
     let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
-        hipfire_runtime::kv_mode::resolve(&kv_mode, policy, head_dim);
+        hipfire_runtime::kv_mode::resolve(&kv_mode, policy);
     if let Some(w) = warning {
         eprintln!("  KV cache: {w} (site {})", policy.site);
     }
@@ -276,7 +275,7 @@ fn load_qwen35_pp(
     // fadvise(DONTNEED)-per-tensor forces a full disk re-read on every load.
     // UMA keeps eviction (default) to avoid OOM vs hipMalloc staging.
     hfq_file.set_evict_page_cache(
-        std::env::var("HIPFIRE_PAGE_EVICTION")
+        hipfire_config::developer_var("HIPFIRE_PAGE_EVICTION")
             .ok()
             .map(|v| v != "0")
             .unwrap_or_else(|| gpus.devices.iter().any(|g| g.is_uma())),
@@ -292,11 +291,7 @@ fn load_qwen35_pp(
         .iter()
         .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
         .collect();
-    let mode = resolve_kv_mode(
-        ctx,
-        &hipfire_runtime::kv_mode::QWEN35_PP_POLICY,
-        config.head_dim,
-    );
+    let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PP_POLICY);
     let dims = hipfire_runtime::llama::KvDims {
         layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
         n_kv_heads: config.n_kv_heads,
@@ -383,6 +378,20 @@ impl Carrier for Qwen35Carrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         // 5 = dense (+VL), 6 = MoE — same ids in both namespaces.
         matches!(arch_id, 5 | 6)
+    }
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        // Qwen3.5 is the only carrier with a pp>1 path (load_qwen35_pp), HFQ
+        // only. Dir + pp>1 is refused; VMM + pp>1 is refused globally upstream.
+        if pp > 1 && is_dir {
+            return Err("qwen35: safetensors + pp>1 unsupported".into());
+        }
+        Ok(())
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
@@ -510,7 +519,7 @@ impl Carrier for Qwen35Carrier {
                 // re-read on every load. UMA keeps eviction (default) to
                 // avoid OOM vs hipMalloc staging.
                 hfq_file.set_evict_page_cache(
-                    std::env::var("HIPFIRE_PAGE_EVICTION")
+                    hipfire_config::developer_var("HIPFIRE_PAGE_EVICTION")
                         .ok()
                         .map(|v| v != "0")
                         .unwrap_or_else(|| ctx.gpu.is_uma()),
@@ -520,26 +529,63 @@ impl Carrier for Qwen35Carrier {
                 // ── pp=1 path (single-GPU) ────────────────────
                 let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
 
-                // VL detection — loads weights from hfq_file in-place
+                // VL detection — tower loads from the trunk in-place, or from
+                // the shared sidecar when the trunk is tower-less. The sidecar
+                // opens as a SEPARATE HfqFile (never attach_overlay: REAP
+                // rejects additive tensor names); the tower always sizes from
+                // the trunk's vision_config_from_hfq, falling back to the
+                // sidecar's metadata (text-only trunks predate the embedded
+                // blob). Admission already refused tower-less / wrong-arch
+                // sidecars, so a sidecar failure here fails the load closed —
+                // an explicitly requested tower must never silently serve text.
                 let (vision_config, vision_weights) = {
                     use hipfire_arch_qwen35_vl::Qwen35Vl;
                     use hipfire_runtime::arch::Architecture;
                     let has_vision = hfq_file
                         .tensor_data("model.visual.patch_embed.proj.weight")
                         .is_some();
-                    let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();
-                    match vc {
-                        Some(vc) if has_vision => {
-                            let vw = Qwen35Vl::load_weights(&mut hfq_file, &vc, ctx.gpu)
-                                .map_err(|e| eprintln!("  VL weight load failed: {e}"))
-                                .ok();
-                            eprintln!(
-                                "  VL model: vision encoder (hidden={}, layers={})",
-                                vc.hidden_size, vc.num_layers
-                            );
-                            (Some(vc), vw)
+                    if has_vision {
+                        let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();
+                        match vc {
+                            Some(vc) => {
+                                let vw = Qwen35Vl::load_weights(&mut hfq_file, &vc, ctx.gpu)
+                                    .map_err(|e| eprintln!("  VL weight load failed: {e}"))
+                                    .ok();
+                                eprintln!(
+                                    "  VL model: vision encoder (hidden={}, layers={})",
+                                    vc.hidden_size, vc.num_layers
+                                );
+                                (Some(vc), vw)
+                            }
+                            _ => (None, None),
                         }
-                        _ => (None, None),
+                    } else if let Some(p) = ctx.vision_path.as_ref() {
+                        let mut sidecar =
+                            hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(p)).map_err(
+                                |e| format!("vision sidecar '{}': open failed: {e}", p.display()),
+                            )?;
+                        let vc = Qwen35Vl::config_from_hfq(&hfq_file)
+                            .ok()
+                            .or_else(|| Qwen35Vl::config_from_hfq(&sidecar).ok())
+                            .ok_or_else(|| {
+                                "qwen35-vl: vision tower requested but no vision_config in \
+                                 trunk or sidecar metadata — requantize the trunk or pack \
+                                 the sidecar with --include-vision"
+                                    .to_string()
+                            })?;
+                        let vw =
+                            Qwen35Vl::load_weights(&mut sidecar, &vc, ctx.gpu).map_err(|e| {
+                                format!("vision sidecar '{}': tower load failed: {e}", p.display())
+                            })?;
+                        eprintln!(
+                            "  VL model (sidecar {}): vision encoder (hidden={}, layers={})",
+                            p.display(),
+                            vc.hidden_size,
+                            vc.num_layers
+                        );
+                        (Some(vc), Some(vw))
+                    } else {
+                        (None, None)
                     }
                 };
 
@@ -607,11 +653,7 @@ impl Carrier for Qwen35Carrier {
                     .iter()
                     .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                     .collect();
-                let mode = resolve_kv_mode(
-                    ctx,
-                    &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY,
-                    config.head_dim,
-                );
+                let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY);
                 let dims = hipfire_runtime::llama::KvDims {
                     layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
                     n_kv_heads: config.n_kv_heads,
@@ -1467,7 +1509,12 @@ impl Carrier for Lfm2MoeCarrier {
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
-            supports_continuous_batch: true,
+            // Continuous batching is NOT servable: the generate-side eligibility
+            // (`is_batch_request_eligible`) returns false unconditionally for
+            // LFM, so staging a batch state only spends VRAM on state that is
+            // never driven. Declare false so the route never admits it and the
+            // state is never allocated. Single-stream LFM is unaffected.
+            supports_continuous_batch: false,
             supports_ep_batch: false,
             dflash: None,
             supports_mtp: false,
@@ -1637,6 +1684,18 @@ impl Carrier for Cohere2MoeCarrier {
         // 12 = Cohere2-MoE in both the HFQ and safetensors-Dir namespaces.
         arch_id == 12
     }
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        _is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        if pp > 1 {
+            return Err("cohere2moe: pp>1 unsupported via registry".into());
+        }
+        Ok(())
+    }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: false,
@@ -1746,6 +1805,18 @@ impl Carrier for MapleCarrier {
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 15
+    }
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        _is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        if pp > 1 {
+            return Err("maple: pp>1 unsupported via registry".into());
+        }
+        Ok(())
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
@@ -1877,6 +1948,18 @@ impl Carrier for Gemma4Carrier {
         // would still need a target model, so it naturally fails later in generate routing.
         matches!(arch_id, 13 | 22)
     }
+    fn admit_topology(
+        &self,
+        _arch_id: u32,
+        _is_dir: bool,
+        pp: usize,
+        _kv_backend: KvBackend,
+    ) -> Result<(), String> {
+        if pp > 1 {
+            return Err("gemma4: pp>1 unsupported".into());
+        }
+        Ok(())
+    }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: false,
@@ -1899,22 +1982,112 @@ impl Carrier for Gemma4Carrier {
         gpu: &mut rdna_compute::Gpu,
         synthetic: &[u32],
         _n: usize,
-        _prefill_err: &mut Option<String>,
+        prefill_err: &mut Option<String>,
     ) -> Option<bool> {
-        let bundle = m.gemma4_mut().unwrap();
-        let config = &bundle.config;
-        let weights = &bundle.weights;
-        let state = &mut bundle.state;
-        let mut ok = true;
-        for (i, &tok) in synthetic.iter().enumerate() {
-            if hipfire_arch_gemma4::forward::decode_step(config, weights, state, gpu, tok, i as u32)
-                .is_err()
-            {
-                ok = false;
-                break;
+        if let Some(bundle) = m.gemma4_mut() {
+            for (i, &tok) in synthetic.iter().enumerate() {
+                if let Err(error) = hipfire_arch_gemma4::forward::decode_step(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    tok,
+                    i as u32,
+                ) {
+                    *prefill_err = Some(format!("gemma4 eager bench prefill failed: {error:?}"));
+                    return Some(false);
+                }
             }
+            return Some(true);
         }
-        Some(ok)
+
+        if let Some(bundle) = m.gemma4_lowered_mut() {
+            for (i, &tok) in synthetic.iter().enumerate() {
+                if let Err(error) = hipfire_arch_gemma4::lowered::forward_scratch(
+                    gpu,
+                    &bundle.weights,
+                    &bundle.config,
+                    tok,
+                    i,
+                    &mut bundle.kv_sliding,
+                    &mut bundle.kv_full,
+                    &bundle.scratch,
+                ) {
+                    *prefill_err = Some(format!("gemma4 lowered bench prefill failed: {error:?}"));
+                    return Some(false);
+                }
+            }
+            return Some(true);
+        }
+
+        *prefill_err = Some("gemma4 bench prefill missing eager/lowered state".into());
+        Some(false)
+    }
+    fn bench_decode_prime(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        let mut error = None;
+        match self.bench_prefill(m, gpu, synthetic, synthetic.len(), &mut error) {
+            Some(true) => Some(None),
+            Some(false) => {
+                Some(Some(error.unwrap_or_else(|| {
+                    "gemma4 bench decode prime failed".into()
+                })))
+            }
+            None => None,
+        }
+    }
+    fn bench_decode_run(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        context: usize,
+        iterations: usize,
+        decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        if let Some(bundle) = m.gemma4_mut() {
+            for i in 0..iterations {
+                let token = 101 + (i as u32 % 1000);
+                if let Err(error) = hipfire_arch_gemma4::forward::decode_step(
+                    &bundle.config,
+                    &bundle.weights,
+                    &mut bundle.state,
+                    gpu,
+                    token,
+                    (context + i) as u32,
+                ) {
+                    *decode_err = Some(format!("gemma4 eager bench decode failed: {error:?}"));
+                    return Some(false);
+                }
+            }
+            return Some(true);
+        }
+
+        if let Some(bundle) = m.gemma4_lowered_mut() {
+            for i in 0..iterations {
+                let token = 101 + (i as u32 % 1000);
+                if let Err(error) = hipfire_arch_gemma4::lowered::forward_scratch(
+                    gpu,
+                    &bundle.weights,
+                    &bundle.config,
+                    token,
+                    context + i,
+                    &mut bundle.kv_sliding,
+                    &mut bundle.kv_full,
+                    &bundle.scratch,
+                ) {
+                    *decode_err = Some(format!("gemma4 lowered bench decode failed: {error:?}"));
+                    return Some(false);
+                }
+            }
+            return Some(true);
+        }
+
+        *decode_err = Some("gemma4 bench decode missing eager/lowered state".into());
+        Some(false)
     }
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.pp > 1 {
@@ -2354,13 +2527,15 @@ impl Carrier for MuseGlimmerCarrier {
                         // Freeze HIPFIRE_GLIMMER_CTX_CAP once at load (daemon/load default
                         // 256). Same value sizes drafter scratch and device hidden log.
                         let ctx_cap = {
-                            let requested = std::env::var("HIPFIRE_GLIMMER_CTX_CAP")
-                                .ok()
-                                .and_then(|v| v.trim().parse::<usize>().ok())
-                                .filter(|v| *v > 0)
-                                .unwrap_or(
-                                    hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_CTX_CAP_DEFAULT,
-                                );
+                            let requested = hipfire_config::developer_var(
+                                "HIPFIRE_GLIMMER_CTX_CAP",
+                            )
+                            .ok()
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .filter(|v| *v > 0)
+                            .unwrap_or(
+                                hipfire_arch_muse_glimmer::drafter::GLIMMER_DRAFTER_CTX_CAP_DEFAULT,
+                            );
                             requested.clamp(1, ctx.max_seq)
                         };
                         let dscratch =
@@ -2487,6 +2662,180 @@ impl Carrier for MuseGlimmerCarrier {
                     "muse_glimmer: safetensors Dir load not yet wired — use HFQ (quantize with --arch-id 14) or add config_from_source to hipfire-arch-muse-glimmer".into()
                 );
             }
+        }
+    }
+}
+
+// ─── FluxDiffusionCarrier (arch 40 FLUX.1 / arch 45 FLUX.2 Klein) ──────
+//
+// Image-generation COMPONENT carrier: loads the HFQ component packs that
+// `hipfire-quantize --flux-pipe` writes (the trunk plus its sidecars, found
+// next to it by name) into a `FluxPipeModel`. A diffusers pipe directory is
+// the packer's input, not a model — it is refused by name. The daemon must
+// never text-generate on the result; `img_route` in lib.rs is the
+// fail-closed gate in both directions.
+
+pub struct FluxDiffusionCarrier;
+impl Carrier for FluxDiffusionCarrier {
+    fn name(&self) -> &'static str {
+        "flux"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 40 || arch_id == 45
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        use hipfire_arch_diffusion::pipeline::HfqSidecars;
+
+        let hfq = match &src {
+            ModelSource::Hfq(hfq) => hfq,
+            ModelSource::Dir(source) => {
+                return Err(format!(
+                    "flux (arch 40/45): {} is a diffusers pipe directory, which is not \
+                     loadable; pack it with `hipfire-quantize --flux-pipe <pipe_dir> \
+                     --output <base>.hfq` and load `<base>-transformer.hfq`",
+                    source.path().display()
+                ));
+            }
+        };
+        // The trunk pack (arch 40 or 45) plus the sidecar packs the packer
+        // wrote next to it: `<base>-t5.hfq` / `<base>-clip.hfq` / `<base>-vae.hfq`
+        // for FLUX.1, `<base>-qwen3.hfq` / `<base>-vae.hfq` for FLUX.2 Klein,
+        // when the trunk is `<base>-transformer.hfq`. The shared names the
+        // registry sidecar slots land under (`t5-xxl.hfq` / `clip-l.hfq` /
+        // `qwen3.hfq` / `vae.hfq`) are accepted too, so one T5 and one VAE
+        // serve both schnell and dev.
+        let arch_id = hfq.arch_id;
+        let trunk_path = hfq.path().to_path_buf();
+        let reopen = |p: &std::path::Path| -> Result<hipfire_runtime::hfq::HfqFile, String> {
+            hipfire_runtime::hfq::HfqFile::open(p)
+                .map_err(|e| format!("flux (HFQ): reopen {}: {e}", p.display()))
+        };
+        let file = trunk_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("");
+        let stem = trunk_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or(file);
+        let base = stem.strip_suffix("-transformer").unwrap_or(stem);
+        let find = |candidates: &[String]| -> Option<std::path::PathBuf> {
+            candidates
+                .iter()
+                .map(|n| trunk_path.with_file_name(n))
+                .find(|p| p.is_file())
+        };
+        let vae_names = [format!("{base}-vae.hfq"), "vae.hfq".into()];
+        let Some(vae_path) = find(&vae_names) else {
+            return Err(format!(
+                "flux (HFQ): {file} needs the vae sidecar pack next to it \
+                 (tried {base}-vae.hfq and the shared vae.hfq)"
+            ));
+        };
+        let sidecars = match arch_id {
+            40 => {
+                let t5_names = [
+                    format!("{base}-t5.hfq"),
+                    "t5-xxl.hfq".into(),
+                    "t5.hfq".into(),
+                ];
+                let clip_names = [
+                    format!("{base}-clip.hfq"),
+                    "clip-l.hfq".into(),
+                    "clip.hfq".into(),
+                ];
+                let (Some(t5_path), Some(clip_path)) = (find(&t5_names), find(&clip_names)) else {
+                    return Err(format!(
+                        "flux (HFQ): {file} needs the t5 and clip sidecar packs next to it \
+                         (tried {base}-t5.hfq, {base}-clip.hfq and the shared t5-xxl.hfq / \
+                         clip-l.hfq)"
+                    ));
+                };
+                HfqSidecars::Flux1 {
+                    t5: reopen(&t5_path)?,
+                    clip: reopen(&clip_path)?,
+                    vae: reopen(&vae_path)?,
+                }
+            }
+            45 => {
+                let qwen3_names = [format!("{base}-qwen3.hfq"), "qwen3.hfq".into()];
+                let Some(qwen3_path) = find(&qwen3_names) else {
+                    return Err(format!(
+                        "flux (HFQ): {file} needs the qwen3 sidecar pack next to it \
+                         (tried {base}-qwen3.hfq and the shared qwen3.hfq)"
+                    ));
+                };
+                HfqSidecars::Flux2 {
+                    qwen3: reopen(&qwen3_path)?,
+                    vae: reopen(&vae_path)?,
+                }
+            }
+            other => {
+                return Err(format!(
+                "flux (HFQ): arch {other} is not a FLUX trunk pack (40 FLUX.1 / 45 FLUX.2 Klein)"
+            ))
+            }
+        };
+        // Reopen the trunk fresh: the loader's copy may have been prepared
+        // (mmap dropped) for a UMA device, and the streaming load needs the
+        // mapping alive for its whole run.
+        let bundle =
+            hipfire_arch_diffusion::pipeline::load_pipe_hfq(reopen(&trunk_path)?, sidecars)?;
+        // Skeleton tokenizer for the `LoadedModel` contract. The img path
+        // never encodes through it (the bundle's own tokenizers do the
+        // conditioning; text `generate` refuses arch 40/45), so any parseable
+        // vocab satisfies the field: the embedded CLIP `vocab.json` (FLUX.1)
+        // or the embedded Qwen3 `tokenizer.json` (Klein), else a minimal
+        // one-token vocab. No panic: fail closed as an error.
+        let skeleton_tokenizer = {
+            let meta: serde_json::Value =
+                serde_json::from_str(hfq.metadata_json()).unwrap_or(serde_json::Value::Null);
+            let tok = meta.get("tokenizer");
+            tok.and_then(|t| t.get("clip_vocab"))
+                .and_then(|vocab| {
+                    let blob = serde_json::json!({ "model": { "vocab": vocab } });
+                    hipfire_runtime::tokenizer::Tokenizer::from_hf_json(&blob.to_string()).ok()
+                })
+                .or_else(|| {
+                    tok.and_then(|t| t.get("qwen"))
+                        .and_then(|q| q.as_str())
+                        .and_then(|q| hipfire_runtime::tokenizer::Tokenizer::from_hf_json(q).ok())
+                })
+                .or_else(|| {
+                    hipfire_runtime::tokenizer::Tokenizer::from_hf_json(
+                        r#"{"model":{"vocab":{"<pad>":0}}}"#,
+                    )
+                    .ok()
+                })
+                .ok_or("flux (HFQ): cannot build a skeleton tokenizer from the trunk metadata")?
+        };
+        Ok(LoadedModel {
+            arch_id,
+            state: Some(Box::new(
+                hipfire_arch_diffusion::arch_model::FluxPipeModel { bundle },
+            )),
+            ..LoadedModel::skeleton(
+                arch_id,
+                skeleton_tokenizer,
+                4096,
+                4096,
+                ctx.path.to_string(),
+                None,
+            )
+        })
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        // Component only: no chat capabilities of any kind.
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
 }

@@ -34,9 +34,14 @@ use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
     about = "Quantize Hugging Face safetensors or GGUF weights into Hipfire HFQ"
 )]
 pub(crate) struct QuantizeArgs {
-    /// Hugging Face model directory, model ID, or GGUF file.
-    #[arg(long, value_name = "PATH_OR_MODEL_ID")]
-    pub input: String,
+    /// Hugging Face model directory, model ID, or GGUF file. Not used by
+    /// `--flux-pipe`, which names its own input.
+    #[arg(
+        long,
+        value_name = "PATH_OR_MODEL_ID",
+        required_unless_present = "flux_pipe"
+    )]
+    pub input: Option<String>,
 
     /// Destination HFQ file.
     #[arg(long, value_name = "PATH")]
@@ -62,9 +67,33 @@ pub(crate) struct QuantizeArgs {
     /// Does NOT touch `word_embeddings` (same shape, but only ONE ROW is read
     /// per token — a RAM question, not a bandwidth one), the ternary expert
     /// path, or the router.
-    #[arg(long, value_name = "MODE", default_value = "bf16",
-          value_parser = ["bf16", "q8", "mq4"])]
+    /// Default is q8, not bf16. Measured on gfx1151 against a bf16 reference
+    /// (2048 teacher-forced tokens): q8 and bf16 heads give the IDENTICAL mean
+    /// KL of 0.0511, but q8 decodes 23% faster (144.6 vs 117.6 tok/s). A bf16
+    /// head is therefore strictly dominated -- it costs throughput and buys
+    /// exactly zero accuracy. mq4 (qt=30 Lloyd, 5.0 bpw) is +10.4% decode over
+    /// q8 but +51% mean KL and -2.7pp top-1, which is a poor trade on this
+    /// stack; note the vendor DOES ship a Q4_K head, because on their CPU path
+    /// the same swap buys 49% rather than 10%.
+    ///
+    /// `mq4` (qt=30) is DEPRECATED and no longer selectable: mq4v2 (qt=44)
+    /// beats it on every axis -- lower KL (0.0744 vs 0.0772), faster (165.8 vs
+    /// 161.8 tok/s) and 15% smaller (4.25 vs 5.0 bpw). Existing .hfq files with
+    /// a qt=30 head still LOAD; only producing new ones is removed.
+    #[arg(long, value_name = "MODE", default_value = "q8",
+          value_parser = ["bf16", "q8", "mq4v2", "q4k"])]
     pub head_quant: String,
+
+    /// `--format maple` only: emit a HEAD-ONLY `.hfq` containing just
+    /// `lm_head.weight` at `--head-quant`, instead of a full model.
+    ///
+    /// The result is a load-time overlay for a full build: same arch_id, same
+    /// logical shape, differing only in the head's quant tier. Shipping heads
+    /// this way avoids duplicating the identical 6.17 GB body per carrier —
+    /// three head variants cost 7.30 GB rather than 19.63 GB, and switching
+    /// heads is a 175 MB download instead of 6.5 GB.
+    #[arg(long, default_value_t = false)]
+    pub head_only: bool,
 
     /// Override the architecture ID stamped into the HFQ header.
     #[arg(long, value_name = "ID")]
@@ -73,6 +102,22 @@ pub(crate) struct QuantizeArgs {
     /// Allow an architecture override to move Qwen3 off its pillar IDs.
     #[arg(long)]
     pub force_arch_id: bool,
+
+    /// Pack a FLUX.1 or FLUX.2 Klein diffusers pipe into per-component HFQ files instead of
+    /// running the quantize pipeline (`--format` is ignored on this path).
+    /// The pipe is a dir root holding `transformer/`, `vae/`, `scheduler/`, the
+    /// text encoder dirs and `tokenizer*/`. The packs are the only form the
+    /// daemon loads; see docs/QUANTIZE.md.
+    #[arg(long, value_name = "PIPE_DIR")]
+    pub flux_pipe: Option<String>,
+
+    /// `--flux-pipe` only: one component to pack, or `all` (default) to write
+    /// every component derived from `--output`: `<stem>-transformer.hfq`,
+    /// `<stem>-t5.hfq`, `<stem>-clip.hfq`, `<stem>-vae.hfq` for FLUX.1;
+    /// `<stem>-transformer.hfq`, `<stem>-qwen3.hfq`, `<stem>-vae.hfq` for
+    /// FLUX.2 Klein. A single component writes exactly to `--output`.
+    #[arg(long, value_name = "COMPONENT", default_value = "all")]
+    pub flux_component: String,
 
     /// Reuse the source checkpoint's AWQ sidecars as an imatrix for the
     /// low-bit packers' column weighting. Value is the alpha the source was
@@ -195,6 +240,12 @@ pub(crate) struct QuantizeArgs {
     /// Ingest only tensors whose names start with this prefix.
     #[arg(long, value_name = "PREFIX")]
     pub include_prefix: Option<String>,
+
+    /// Vision-tower-only sidecar shorthand: `--include-vision` plus
+    /// `--include-prefix model.visual.` (an explicit `--include-prefix`
+    /// still wins). Emits the shared `qwen3.8-27b-vision.hfq` sidecar.
+    #[arg(long)]
+    pub vision_only: bool,
 
     /// Product tier for Qwen3.8 ladder: xt keeps lm_head at base codec, base lifts lm_head, pro also lifts ssm_out (linear_attn.out_proj).
     /// embed_tokens and linear_attn.conv1d.weight remain Q8 at every rung; structural tensors remain F16.

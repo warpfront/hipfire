@@ -145,14 +145,21 @@ def main():
     dtype = getattr(torch, args.dtype)
     print(f"loading {args.model} on {args.device} ({args.dtype})...")
     processor = Qwen2VLImageProcessor.from_pretrained(args.model)
+    # Materialize the skeleton in bf16 regardless of the requested dtype: the
+    # checkpoint is stored bf16 (upcasting the tower afterwards is lossless),
+    # and an f32 skeleton of a 27B LM we never run is ~110 GB on the host.
     model = AutoModelForImageTextToText.from_pretrained(
         args.model,
-        dtype=dtype,
+        dtype=torch.bfloat16,
         device_map=args.device,
     )
     model.eval()
+    # Only the vision tower is exercised; free the LM before upcasting.
+    model.model.language_model = None
+    model.lm_head = None
+    model.model.visual.to(dtype)
     print(f"loaded. visual: {type(model.model.visual).__name__}, "
-          f"n_blocks={len(model.model.visual.blocks)}")
+          f"n_blocks={len(model.model.visual.blocks)} dtype={args.dtype}")
 
     out_root = Path(args.out)
     for img_path in args.images:

@@ -42,6 +42,9 @@ fn fadvise_dontneed(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
 #[cfg(not(unix))]
 fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
 
+/// The only tensor a head overlay may carry.
+const HEAD_TENSOR_NAME: &str = "lm_head.weight";
+
 impl HfqFile {
     /// Start a background parallel cache warmer: N worker threads pread the
     /// data region chunk-sequentially into the page cache while the loader
@@ -388,6 +391,58 @@ impl HfqFile {
         Ok(f)
     }
 
+    /// Attach a HEAD overlay: a single-tensor `.hfq` (built by
+    /// `hipfire-quantize --head-only`) whose `lm_head.weight` shadows the
+    /// base's, so one body can serve several head carriers.
+    ///
+    /// Same guards as [`Self::attach_overlay`] — matching arch_id, the name
+    /// must already exist in the base, and the logical shape must match; only
+    /// the quant tier may differ. Failure is an ERROR, not a warning: unlike
+    /// the REAP path (where proceeding unpruned is a safe default for an
+    /// unrelated model that merely shares an env var), a head overlay is
+    /// requested explicitly, so silently serving the base's head would hand
+    /// back a model the operator did not ask for.
+    pub fn attach_head_overlay(&mut self, head_path: &Path) -> Result<(), String> {
+        let ov = Self::open_at_offset(head_path, 0)
+            .map_err(|e| format!("head overlay {head_path:?}: {e}"))?;
+        self.attach_opened_head(ov, head_path)
+    }
+
+    /// Attach an already-open, range-validated head overlay file. Same entry
+    /// guards as [`Self::attach_head_overlay`]; the open step lives with the
+    /// caller so admission can validate and retain the effective base+head
+    /// source before any teardown, and loading consumes it without reopening.
+    pub fn attach_opened_head(&mut self, ov: HfqFile, head_path: &Path) -> Result<(), String> {
+        // A head overlay must contain ONLY head tensors. Without this, passing
+        // a full model to --head "succeeds": every name exists in the base with
+        // a matching shape, so attach_overlay's guards all pass and the entire
+        // model silently shadows itself. Caught by a negative control that
+        // passed the base as its own overlay.
+        let foreign: Vec<&str> = ov
+            .tensors
+            .iter()
+            .map(|t| t.name.as_str())
+            .filter(|n| *n != HEAD_TENSOR_NAME)
+            .collect();
+        if !foreign.is_empty() {
+            return Err(format!(
+                "head overlay {head_path:?}: expected only `{HEAD_TENSOR_NAME}`, found {} \
+                 tensor(s) including `{}` — this looks like a full model, not a \
+                 `hipfire-quantize --head-only` build",
+                ov.tensors.len(),
+                foreign[0],
+            ));
+        }
+        if ov.tensors.is_empty() {
+            return Err(format!("head overlay {head_path:?}: contains no tensors"));
+        }
+        let n = ov.tensors.len();
+        self.attach_overlay(ov)
+            .map_err(|e| format!("head overlay {head_path:?}: {e}"))?;
+        eprintln!("  head overlay: {n} tensor(s) from {head_path:?} shadow the base");
+        Ok(())
+    }
+
     /// Attach an overlay whose tensors shadow this file's by name. Used by the
     /// REAP load-time splice (SP3). Errors if arch_id differs (wrong model).
     pub fn attach_overlay(&mut self, overlay: HfqFile) -> Result<(), String> {
@@ -430,6 +485,19 @@ impl HfqFile {
     /// True when an overlay is attached (its tensors shadow the base).
     pub fn has_overlay(&self) -> bool {
         self.overlay.is_some()
+    }
+
+    /// Whether this source carries any AWQ scale sidecar. The carrier uses
+    /// this classification before allocation so supported sidecars stay on the
+    /// legacy loader until the manifest resolver can represent them.
+    pub fn has_awq_sidecars(&self) -> bool {
+        self.tensors
+            .iter()
+            .any(|tensor| tensor.name.ends_with(".awq_scale.weight"))
+            || self
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.has_awq_sidecars())
     }
 
     /// Open an HFQM container that lives inside a larger file, starting at
@@ -610,6 +678,26 @@ impl HfqFile {
             let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
             pos += 8;
 
+            // Every indexed payload range must lie within the file: a
+            // truncated container (valid header/index, short payload) must
+            // refuse here, not attach and serve corrupted logits later.
+            // Extents pack contiguously from data_offset, so each tensor's
+            // end is checked as it is indexed.
+            let end = cumulative_offset.checked_add(data_size).ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("HfqFile: tensor '{name}' payload size overflows usize"),
+                )
+            })?;
+            if end > file_len {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    format!(
+                        "HfqFile: tensor '{name}' payload [{cumulative_offset}, {end}) \
+                         extends past the {file_len}-byte file (truncated container)"
+                    ),
+                ));
+            }
             tensor_map.insert(name.clone(), i);
             tensors.push(HfqTensorInfo {
                 name,
@@ -619,7 +707,7 @@ impl HfqFile {
                 data_offset: cumulative_offset,
                 data_size,
             });
-            cumulative_offset += data_size;
+            cumulative_offset = end;
         }
         let me = Self {
             _file: file,
@@ -965,6 +1053,13 @@ impl HfqFile {
                 }
                 total_read += n as usize;
             }
+            // A short read means the file shrank after a successful open
+            // (open validates every indexed range up front). Return None so
+            // the caller refuses — never hand back a zero-filled tail as if
+            // it were weights.
+            if total_read < info.data_size {
+                return None;
+            }
             // Evict these pages from cache — works because pread doesn't hold a
             // mapping. Skipped when the loader disabled eviction (discrete-GPU
             // loads want the page cache warm for repeat loads).
@@ -1028,6 +1123,13 @@ impl HfqFile {
                     break;
                 }
                 total_read += n as usize;
+            }
+            // A short read means the file shrank after a successful open
+            // (open validates every indexed range up front). Return None so
+            // the caller refuses — never hand back a zero-filled tail as if
+            // it were weights.
+            if total_read < info.data_size {
+                return None;
             }
             if self.evict_page_cache {
                 fadvise_dontneed(fd, info.data_offset, info.data_size);
@@ -1183,6 +1285,11 @@ impl HfqFile {
     pub fn load_identity_arc(&self) -> HipResult<std::sync::Arc<HfqSourceIdentity>> {
         self.load_identity().map(std::sync::Arc::new)
     }
+
+    /// Full tensor index of this HFQ file, in on-disk order.
+    pub fn tensor_infos(&self) -> &[HfqTensorInfo] {
+        &self.tensors
+    }
 }
 
 // ─── ModelSource impl for HfqFile ───────────────────────────────────────────
@@ -1241,6 +1348,101 @@ impl crate::model_source::ModelSource for HfqFile {
     fn chat_template(&self) -> Option<String> {
         // Delegate to HfqFile's own chat_template method
         HfqFile::chat_template(self)
+    }
+}
+
+// ─── HfqModelSource: owned HFQ → ModelSource bridge ─────────────────────────
+//
+// HfqFile's plain ModelSource impl cannot serve `tensor_data` (the trait wants
+// `&TensorInfo` that outlives the call, and HfqFile stores `HfqTensorInfo`), so
+// this adapter materializes the tensor index ONCE and serves stable references
+// to it, with bytes backed by the HfqFile's mmap.
+//
+// Consumers: arch loaders that read weights through `&dyn ModelSource`. A pack
+// written by `hipfire-quantize` (F16 weights / F32 bias+scale) loads through
+// here unchanged, with no loader-side knowledge of the HFQ container.
+//
+// The caller must keep the underlying HfqFile's mmap alive for the life of the
+// adapter (do not call `prepare()`/`drop_mmap`): returned byte slices back the
+// mmap. Overlay (REAP) shadowing is not consulted for `tensor_info`; the
+// adapter serves the on-disk index only.
+
+/// Map a packed HFQ `quant_type` byte to the dtype string the arch loaders
+/// dispatch on (F16/F32/BF16). Unknown values map to a marker string the
+/// loaders reject by name.
+fn quant_type_to_dtype(quant_type: u8) -> &'static str {
+    match quant_type {
+        1 => "F16",
+        2 => "F32",
+        16 => "BF16",
+        _ => "?",
+    }
+}
+
+/// An owned [`HfqFile`] served through [`ModelSource`](crate::model_source::ModelSource)
+/// with a materialized [`TensorInfo`](crate::model_source::TensorInfo) index.
+pub struct HfqModelSource {
+    hfq: HfqFile,
+    infos: Vec<crate::model_source::TensorInfo>,
+    index: std::collections::HashMap<String, usize>,
+}
+
+impl HfqModelSource {
+    /// Wrap an owned [`HfqFile`] (the caller reopens the pack). Owning the
+    /// file rather than borrowing it keeps the adapter `Send` (`&HfqFile` is
+    /// not, because of the pread `RefCell`), so a boxed adapter can be held
+    /// by a model type that must itself be `Send`.
+    pub fn from_hfq(hfq: HfqFile) -> Self {
+        let mut index = std::collections::HashMap::with_capacity(hfq.tensor_infos().len());
+        let infos = hfq
+            .tensor_infos()
+            .iter()
+            .enumerate()
+            .map(|(i, t)| {
+                index.insert(t.name.clone(), i);
+                crate::model_source::TensorInfo {
+                    name: t.name.clone(),
+                    dtype: quant_type_to_dtype(t.quant_type).to_string(),
+                    shape: t.shape.iter().map(|&s| s as usize).collect(),
+                    quant_type: t.quant_type,
+                    data_offset: t.data_offset,
+                    data_size: t.data_size,
+                }
+            })
+            .collect();
+        Self { hfq, infos, index }
+    }
+}
+
+impl crate::model_source::ModelSource for HfqModelSource {
+    fn metadata_json(&self) -> &str {
+        &self.hfq.metadata_json
+    }
+
+    fn arch_id(&self) -> u32 {
+        self.hfq.arch_id
+    }
+
+    fn quant_config(&self) -> Option<&crate::model_source::QuantConfig> {
+        None // HFQ files encode quant_type per-tensor
+    }
+
+    fn tensor_data(&self, name: &str) -> Option<(&crate::model_source::TensorInfo, &[u8])> {
+        let idx = *self.index.get(name)?;
+        let (_info, bytes) = self.hfq.tensor_data(name)?;
+        Some((&self.infos[idx], bytes))
+    }
+
+    fn tensor_info(&self, name: &str) -> Option<&crate::model_source::TensorInfo> {
+        self.index.get(name).map(|&i| &self.infos[i])
+    }
+
+    fn tensor_names(&self) -> Vec<&str> {
+        self.hfq.tensor_names()
+    }
+
+    fn path(&self) -> &std::path::Path {
+        self.hfq.path()
     }
 }
 
@@ -1381,15 +1583,18 @@ fn load_f16_tensor(
     gpu.upload_f32(&f32_data, shape)
 }
 
-/// Load an AWQ scale sidecar tensor from an HFQ file onto GPU.
+/// Resolve a validated AWQ scale sidecar payload as little-endian F32 bytes.
 ///
 /// Phase A Stage A — AWQ sidecar lookup. The quantizer emits per-tensor
 /// sidecars named `<weight_name>.awq_scale.weight` (1D F16, length K)
-/// alongside MQ4-quantized weights. The forward path uses these to apply
-/// `x /= awq_scale` before the rotation kernel, completing the AWQ
-/// math `(W·s) · (x/s) = W·x`. Backward-compatible: when no sidecar
-/// exists (the common case for pre-Stage-A .hfq files), this returns
-/// None and the runtime behaves identically to before.
+/// alongside MQ4-quantized weights. Returns `None` when no sidecar exists
+/// or it fails validation (callers keep `awq_scale` as `None`, matching
+/// pre-Stage-A behavior).
+///
+/// This is the single parse core for both the legacy direct uploader below
+/// and pool-aware constructor paths (e.g. DFlash): the naming convention,
+/// validation, and F16 → F32 conversion live here exactly once so the two
+/// upload paths cannot drift into parallel parsers.
 ///
 /// Naming convention: replace trailing `.weight` with `.awq_scale.weight`.
 /// Matches hipfire-quantize's emit pattern.
@@ -1398,7 +1603,7 @@ fn load_f16_tensor(
 /// + fadvise_dontneed (avoids page cache buildup on unified-memory APUs)
 /// and on non-Unix falls back to mmap. Sidecars are small (K ≤ ~12288
 /// elements, ~48 KB peak), so the owned-Vec copy is negligible.
-pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> Option<GpuTensor> {
+pub(crate) fn awq_scale_f32_bytes(hfq: &HfqFile, weight_name: &str, k: usize) -> Option<Vec<u8>> {
     let sidecar_name = match weight_name.strip_suffix(".weight") {
         Some(stem) => format!("{stem}.awq_scale.weight"),
         None => format!("{weight_name}.awq_scale.weight"),
@@ -1427,7 +1632,17 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
         .chunks_exact(2)
         .map(|c| crate::llama::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
-    let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
+    Some(f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect())
+}
+
+/// Load an AWQ scale sidecar tensor from an HFQ file onto GPU.
+///
+/// The forward path uses these to apply `x /= awq_scale` before the rotation
+/// kernel, completing the AWQ math `(W·s) · (x/s) = W·x`. Backward-compatible:
+/// when no sidecar exists (the common case for pre-Stage-A .hfq files), this
+/// returns None and the runtime behaves identically to before.
+pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> Option<GpuTensor> {
+    let f32_bytes = awq_scale_f32_bytes(hfq, weight_name, k)?;
     gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
 }
 
@@ -1602,7 +1817,10 @@ impl WeightSource for LlamaHfqSource<'_> {
                 )
             },
             |gpu| {
-                let data = hfq.tensor_data("model.embed_tokens.weight").unwrap().1;
+                let data = hfq
+                    .tensor_data("model.embed_tokens.weight")
+                    .ok_or_else(|| HipError::new(0, "embed_tokens not found"))?
+                    .1;
                 reupload_f16_as_f32(gpu, &data, cfg.vocab_size, cfg.dim)
             },
         )
@@ -1623,6 +1841,9 @@ impl WeightSource for LlamaHfqSource<'_> {
         };
         load_layer(&mut b, cfg, q_out_dim, kv_dim, i)
     }
+    fn free_layer(&mut self, gpu: &mut Gpu, layer: Self::Layer) {
+        layer.free_gpu(gpu);
+    }
 }
 
 /// Load llama-family `model.embed_tokens.weight` and classify its embedding
@@ -1635,9 +1856,10 @@ fn load_embedding_llama(
     eprintln!("  loading token_embd...");
     let (info, data) = hfq
         .tensor_data("model.embed_tokens.weight")
-        .expect("embed_tokens not found");
+        .ok_or_else(|| HipError::new(0, "embed_tokens not found"))?;
     // Q4K embeddings are llama-family-only (GGUF-derived). qwen2/qwen35 have no
     // Q4K embedding-lookup kernel — that is why the shared `load_embedding` /
+
     // `embed_classify` deliberately rejects qt 4 (rejecting at load gives a clean
     // error instead of an "unsupported embedding format" panic deep in the qwen
     // forward pass). So Q4K stays an explicit llama-only branch here; everything
@@ -1651,28 +1873,13 @@ fn load_embedding_llama(
     load_embedding(gpu, info.quant_type, data, config.vocab_size, config.dim)
 }
 
-/// Load LLaMA weights from an HFQ file onto GPU.
-pub fn load_weights_hfq(
-    hfq: &HfqFile,
-    config: &LlamaConfig,
-    gpu: &mut Gpu,
-) -> HipResult<LlamaWeights> {
-    // R2 guard: the LLaMA-family loader does NOT read Q/K/V proj bias —
-    // `LayerWeights` has no `wq_bias` / `wk_bias` / `wv_bias` fields and
-    // the per-layer load below only names `*.q_proj.weight`. Qwen2
-    // requires those biases (`attention_bias=true` is the modeling
-    // default). The quantiser used to auto-tag every Qwen2 model as
-    // `arch_id=1`, which the daemon dispatches to this loader; the
-    // result was silently-wrong outputs with no warning. As of the
-    // `--arch-id` flag (see `hipfire-quantize`), Qwen2 models should be
-    // tagged `arch_id=7` and dispatched to `hipfire-arch-qwen2`.
-    //
-    // If we see `q_proj.bias` while loading as the LLaMA family, the
-    // input is a mis-tagged Qwen2 HFQ. Refuse hard with a pointer at
-    // the correct path. (Detection by manifest is robust to either the
-    // model_type tag or the model family — both LLaMA and Qwen3 lack
-    // these bias tensors, so any HFQ with `model.layers.0.self_attn.q_proj.bias`
-    // is by definition a Qwen2-family input.)
+/// Reject a mis-tagged Qwen2 HFQ before any model allocation.
+///
+/// The LLaMA-family `LayerWeights` type has no attention-bias tensors. A
+/// Qwen2 file carrying `q_proj.bias` would therefore load and produce
+/// silently-wrong output unless this admission check runs before every loader
+/// route, including the manifest pilot.
+pub fn validate_llama_hfq_admission(hfq: &HfqFile) -> HipResult<()> {
     if hfq
         .find_tensor_info("model.layers.0.self_attn.q_proj.bias")
         .is_some()
@@ -1696,6 +1903,16 @@ pub fn load_weights_hfq(
             ),
         ));
     }
+    Ok(())
+}
+
+/// Load LLaMA weights from an HFQ file onto GPU.
+pub fn load_weights_hfq(
+    hfq: &HfqFile,
+    config: &LlamaConfig,
+    gpu: &mut Gpu,
+) -> HipResult<LlamaWeights> {
+    validate_llama_hfq_admission(hfq)?;
 
     let mut source = LlamaHfqSource { hfq, cfg: config };
     let layout = crate::model_load::Layout::single(config.n_layers);
@@ -1717,6 +1934,64 @@ pub fn load_weights_hfq(
     })
 }
 
+struct PendingLlamaLayer {
+    attn_norm: Option<GpuTensor>,
+    wq: Option<WeightTensor>,
+    wk: Option<WeightTensor>,
+    wv: Option<WeightTensor>,
+    wo: Option<WeightTensor>,
+    q_norm: Option<GpuTensor>,
+    k_norm: Option<GpuTensor>,
+    ffn_norm: Option<GpuTensor>,
+    w_gate: Option<WeightTensor>,
+    w_up: Option<WeightTensor>,
+    w_down: Option<WeightTensor>,
+}
+
+impl PendingLlamaLayer {
+    fn cleanup<B: WeightBackend>(&mut self, b: &mut B) {
+        fn free_weight<B: WeightBackend>(b: &mut B, weight: WeightTensor) {
+            if let Some(paro) = weight.paro {
+                if !paro.is_alias {
+                    b.free_tensor(paro.pairs);
+                    b.free_tensor(paro.theta);
+                    b.free_tensor(paro.channel_scales);
+                }
+            }
+            if let Some(awq) = weight.awq_scale {
+                b.free_tensor(awq);
+            }
+            b.free_tensor(weight.buf);
+        }
+
+        for weight in [
+            self.w_down.take(),
+            self.w_up.take(),
+            self.w_gate.take(),
+            self.wo.take(),
+            self.wv.take(),
+            self.wk.take(),
+            self.wq.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            free_weight(b, weight);
+        }
+        for tensor in [
+            self.ffn_norm.take(),
+            self.k_norm.take(),
+            self.q_norm.take(),
+            self.attn_norm.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            b.free_tensor(tensor);
+        }
+    }
+}
+
 /// Single llama per-layer walk over a `WeightBackend`. Dense-only (no MoE,
 /// no DeltaNet). `q_out_dim`/`kv_dim` are passed in so the caller reuses the
 /// exact dims it already computes.
@@ -1728,26 +2003,80 @@ pub fn load_layer<B: WeightBackend>(
     i: usize,
 ) -> HipResult<LayerWeights> {
     b.set_layer(i);
+    let mut pending = PendingLlamaLayer {
+        attn_norm: None,
+        wq: None,
+        wk: None,
+        wv: None,
+        wo: None,
+        q_norm: None,
+        k_norm: None,
+        ffn_norm: None,
+        w_gate: None,
+        w_up: None,
+        w_down: None,
+    };
+    macro_rules! stage {
+        ($slot:ident, $load:expr) => {
+            match $load {
+                Ok(owner) => pending.$slot = Some(owner),
+                Err(err) => {
+                    pending.cleanup(b);
+                    return Err(err);
+                }
+            }
+        };
+    }
+    macro_rules! take {
+        ($slot:ident) => {
+            pending.$slot.take().expect(concat!(
+                "load_layer: missing staged owner ",
+                stringify!($slot)
+            ))
+        };
+    }
+
+    stage!(attn_norm, b.norm("input_layernorm.weight", &[config.dim]));
+    stage!(wq, b.proj("self_attn.q_proj", q_out_dim, config.dim));
+    stage!(wk, b.proj("self_attn.k_proj", kv_dim, config.dim));
+    stage!(wv, b.proj("self_attn.v_proj", kv_dim, config.dim));
+    stage!(wo, b.proj("self_attn.o_proj", config.dim, q_out_dim));
+    if config.has_qk_norm {
+        stage!(
+            q_norm,
+            b.norm("self_attn.q_norm.weight", &[config.head_dim])
+        );
+        stage!(
+            k_norm,
+            b.norm("self_attn.k_norm.weight", &[config.head_dim])
+        );
+    }
+    stage!(
+        ffn_norm,
+        b.norm("post_attention_layernorm.weight", &[config.dim])
+    );
+    stage!(
+        w_gate,
+        b.proj("mlp.gate_proj", config.hidden_dim, config.dim)
+    );
+    stage!(w_up, b.proj("mlp.up_proj", config.hidden_dim, config.dim));
+    stage!(
+        w_down,
+        b.proj("mlp.down_proj", config.dim, config.hidden_dim)
+    );
+
     Ok(LayerWeights {
-        attn_norm: b.norm("input_layernorm.weight", &[config.dim])?,
-        wq: b.proj("self_attn.q_proj", q_out_dim, config.dim)?,
-        wk: b.proj("self_attn.k_proj", kv_dim, config.dim)?,
-        wv: b.proj("self_attn.v_proj", kv_dim, config.dim)?,
-        wo: b.proj("self_attn.o_proj", config.dim, q_out_dim)?,
-        q_norm: if config.has_qk_norm {
-            Some(b.norm("self_attn.q_norm.weight", &[config.head_dim])?)
-        } else {
-            None
-        },
-        k_norm: if config.has_qk_norm {
-            Some(b.norm("self_attn.k_norm.weight", &[config.head_dim])?)
-        } else {
-            None
-        },
-        ffn_norm: b.norm("post_attention_layernorm.weight", &[config.dim])?,
-        w_gate: b.proj("mlp.gate_proj", config.hidden_dim, config.dim)?,
-        w_up: b.proj("mlp.up_proj", config.hidden_dim, config.dim)?,
-        w_down: b.proj("mlp.down_proj", config.dim, config.hidden_dim)?,
+        attn_norm: take!(attn_norm),
+        wq: take!(wq),
+        wk: take!(wk),
+        wv: take!(wv),
+        wo: take!(wo),
+        q_norm: pending.q_norm.take(),
+        k_norm: pending.k_norm.take(),
+        ffn_norm: take!(ffn_norm),
+        w_gate: take!(w_gate),
+        w_up: take!(w_up),
+        w_down: take!(w_down),
     })
 }
 
@@ -1770,75 +2099,27 @@ pub fn config_from_safetensors_llama(
 }
 
 /// Load a ParoQuant-quantized weight tensor from a safetensors source.
-/// Repacks AWQ INT4 data to HFQ4G128 and uploads ParoQuant rotation metadata.
+/// The shared Paro loader owns every upload until all rotation metadata has
+/// succeeded, so a missing sidecar or failed upload cannot leak a partial
+/// output head.
 fn load_paroquant_weight_from_source(
     source: &dyn crate::model_source::ModelSource,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     tensor_prefix: &str, // e.g. "model.layers.0.mlp.gate_proj"
     out_dim: usize,      // M
     in_dim: usize,       // K
     group_size: u32,
     krot: u8,
 ) -> HipResult<WeightTensor> {
-    use crate::llama::ParoRotation;
-
-    let qw_name = format!("{tensor_prefix}.qweight");
-    let qz_name = format!("{tensor_prefix}.qzeros");
-    let sc_name = format!("{tensor_prefix}.scales");
-    let pairs_name = format!("{tensor_prefix}.pairs");
-    let theta_name = format!("{tensor_prefix}.theta");
-    let cs_name = format!("{tensor_prefix}.channel_scales");
-
-    let (_, qw_data) = source
-        .tensor_data(&qw_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qw_name}")))?;
-    let (_, qz_data) = source
-        .tensor_data(&qz_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qz_name}")))?;
-    let (_, sc_data) = source
-        .tensor_data(&sc_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {sc_name}")))?;
-
-    let hfq_data = crate::paro::repack_awq_to_hfq4g128(
-        qw_data,
-        qz_data,
-        sc_data,
+    crate::paro::load_paro_weight(
+        source,
+        gpu,
+        tensor_prefix,
         out_dim,
         in_dim,
-        group_size as usize,
-    );
-    let buf = gpu.upload_raw(&hfq_data, &[hfq_data.len()])?;
-
-    let (_, pairs_data) = source
-        .tensor_data(&pairs_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {pairs_name}")))?;
-    let (_, theta_data) = source
-        .tensor_data(&theta_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {theta_name}")))?;
-    let (_, cs_data) = source
-        .tensor_data(&cs_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {cs_name}")))?;
-
-    let pairs = gpu.upload_raw(pairs_data, &[pairs_data.len()])?;
-    let theta = gpu.upload_raw(theta_data, &[theta_data.len()])?;
-    let channel_scales = gpu.upload_raw(cs_data, &[cs_data.len()])?;
-
-    Ok(WeightTensor {
-        buf,
-        gpu_dtype: DType::ParoQ4G128,
-        m: out_dim,
-        k: in_dim,
-        row_stride: 0,
-        paro: Some(ParoRotation {
-            pairs,
-            theta,
-            channel_scales,
-            krot: krot as u32,
-            group_size,
-            is_alias: false,
-        }),
-        awq_scale: None,
-    })
+        group_size,
+        krot,
+    )
 }
 
 /// Load an FP16 weight tensor from safetensors as F32 on GPU.
@@ -2312,13 +2593,15 @@ mod llama_config_tests {
     }
 }
 
-// ─── Overlay resolution tests (SP3) ─────────────────────────────────────────
-
+/// Shared minimal-HFQ fixture writer for constructor regression tests.
+///
+/// Home for the writer previously private to `overlay_tests` so DFlash
+/// leaf-upload tests can build tiny containers (weight + AWQ sidecar)
+/// without duplicating the container layout.
 #[cfg(test)]
-mod overlay_tests {
-    use super::*;
-    use crate::model_source::ModelSource; // for `tensor_names`
+pub(crate) mod hfq_test_fixture {
     use std::io::Write;
+    use std::path::Path;
 
     /// Minimal HFQ writer mirroring `hipfire-quantize`'s `write_hfq`
     /// (`crates/hipfire-quantize/src/main.rs:3398`) byte-for-byte for the
@@ -2332,7 +2615,7 @@ mod overlay_tests {
     ///   - zero padding so the data region starts 4096-aligned.
     ///   - tensor data, concatenated in index order (offsets are derived at
     ///     read time cumulatively from `data_offset`).
-    fn write_min_hfq(path: &Path, arch_id: u32, tensors: &[(&str, u8, &[u32], &[u8])]) {
+    pub(crate) fn write_min_hfq(path: &Path, arch_id: u32, tensors: &[(&str, u8, &[u32], &[u8])]) {
         let metadata = b"{}"; // balanced JSON; brace-scan parser stops at the close brace
         let header_size: u64 = 32;
         let metadata_offset = header_size;
@@ -2372,6 +2655,15 @@ mod overlay_tests {
         }
         f.flush().unwrap();
     }
+}
+
+// ─── Overlay resolution tests (SP3) ─────────────────────────────────────────
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::hfq_test_fixture::write_min_hfq;
+    use super::*;
+    use crate::model_source::ModelSource; // for `tensor_names`
 
     #[test]
     fn truncated_container_errors_instead_of_panicking() {
@@ -2494,5 +2786,119 @@ mod overlay_tests {
         let mut f = HfqFile::open(&base).unwrap();
         let err = f.attach_overlay(HfqFile::open(&ov).unwrap()).unwrap_err();
         assert!(err.contains("'Z' not present in base"), "got: {err}");
+    }
+
+    fn write_head_pair(
+        dir: &std::path::Path,
+        byte: u8,
+    ) -> (std::path::PathBuf, std::path::PathBuf) {
+        let base = dir.join("base.hfq");
+        let head = dir.join("head.hfq");
+        write_min_hfq(
+            &base,
+            15,
+            &[
+                ("model.embed_tokens.weight", 1, &[4, 4], &vec![0u8; 32]),
+                ("lm_head.weight", 3, &[2, 4], &vec![1u8; 32]),
+            ],
+        );
+        write_min_hfq(
+            &head,
+            15,
+            &[("lm_head.weight", 13, &[2, 4], &vec![byte; 32])],
+        );
+        (base, head)
+    }
+
+    #[test]
+    fn truncated_payload_open_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, head) = write_head_pair(dir.path(), 7);
+        let len = std::fs::metadata(&head).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&head)
+            .unwrap()
+            .set_len(len - 10)
+            .unwrap();
+        let err = match HfqFile::open_at_offset(&head, 0) {
+            Ok(_) => panic!("truncated open must refuse"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("truncated"), "got: {err}");
+    }
+
+    #[test]
+    fn short_read_vec_returns_none_not_zero_fill() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, head) = write_head_pair(dir.path(), 7);
+        let f = HfqFile::open(&head).unwrap();
+        assert!(f.tensor_data_vec("lm_head.weight").is_some());
+        // Shrink the file after a successful open: the indexed range no
+        // longer reads fully, so the call must refuse, not zero-fill.
+        let len = std::fs::metadata(&head).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&head)
+            .unwrap()
+            .set_len(len - 10)
+            .unwrap();
+        assert!(
+            f.tensor_data_vec("lm_head.weight").is_none(),
+            "short pread must refuse, not return zero-filled weights"
+        );
+    }
+
+    #[test]
+    fn short_read_pread_returns_none_not_zero_fill() {
+        let dir = tempfile::tempdir().unwrap();
+        let (_, head) = write_head_pair(dir.path(), 7);
+        let f = HfqFile::open(&head).unwrap();
+        assert!(f.tensor_data_pread("lm_head.weight").is_some());
+        let len = std::fs::metadata(&head).unwrap().len();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&head)
+            .unwrap()
+            .set_len(len - 10)
+            .unwrap();
+        assert!(
+            f.tensor_data_pread("lm_head.weight").is_none(),
+            "short pread must refuse, not return zero-filled weights"
+        );
+    }
+
+    #[test]
+    fn opened_head_attaches_and_shadows() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, head) = write_head_pair(dir.path(), 7);
+        let mut f = HfqFile::open(&base).unwrap();
+        let ov = HfqFile::open(&head).unwrap();
+        f.attach_opened_head(ov, &head)
+            .expect("valid head attaches");
+        let (_, data) = f.tensor_data("lm_head.weight").expect("head served");
+        assert_eq!(data, &vec![7u8; 32], "overlay shadows the base head");
+    }
+
+    #[test]
+    fn opened_head_full_model_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, _) = write_head_pair(dir.path(), 7);
+        let mut f = HfqFile::open(&base).unwrap();
+        let ov = HfqFile::open(&base).unwrap();
+        let err = f.attach_opened_head(ov, &base).unwrap_err();
+        assert!(err.contains("expected only"), "got: {err}");
+    }
+
+    #[test]
+    fn opened_head_empty_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let (base, _) = write_head_pair(dir.path(), 7);
+        let empty = dir.path().join("empty.hfq");
+        write_min_hfq(&empty, 15, &[]);
+        let mut f = HfqFile::open(&base).unwrap();
+        let ov = HfqFile::open(&empty).unwrap();
+        let err = f.attach_opened_head(ov, &empty).unwrap_err();
+        assert!(err.contains("no tensors"), "got: {err}");
     }
 }

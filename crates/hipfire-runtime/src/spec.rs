@@ -112,6 +112,18 @@ impl SpecStep {
     }
 }
 
+/// Tokens that must be re-forwarded after restoring a speculative window's
+/// pre-verify snapshot. The final consumed token remains pending and is
+/// committed by the caller's ordinary terminal flush.
+pub fn terminal_prefix_replay(window_seed: u32, consumed: &[u32]) -> SmallVec<[u32; 8]> {
+    let mut replay = SmallVec::with_capacity(consumed.len());
+    if !consumed.is_empty() {
+        replay.push(window_seed);
+        replay.extend_from_slice(&consumed[..consumed.len() - 1]);
+    }
+    replay
+}
+
 /// Outcome of the shared greedy accept-prefix rule ([`accept_greedy_prefix`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GreedyAccept {
@@ -763,6 +775,25 @@ pub trait Speculator {
         Ok(false)
     }
 
+    /// Repair a terminal that consumed only a strict prefix of the most recent
+    /// speculative window. Implementations with a retained pre-window snapshot
+    /// restore it and replay only the state-committable prefix, leaving the last
+    /// consumed token pending for the caller's normal terminal flush.
+    ///
+    /// Returns `true` when the resident target and drafter caches are repaired.
+    /// The default is unsupported; callers retain the conservative reset path.
+    fn repair_terminal_prefix(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        window_start: usize,
+        window_seed: u32,
+        consumed: &[u32],
+    ) -> Result<bool, String> {
+        let _ = (gpu, target, window_start, window_seed, consumed);
+        Ok(false)
+    }
+
     /// Rewind drafter-LOCAL state for a fresh conversation. The target's KV /
     /// recurrent state is the daemon's concern (it owns the bundle); this clears
     /// only the drafter's own scratch + checkpoint ring.
@@ -1392,10 +1423,14 @@ pub struct SpecEmitCtx<'a> {
     pub eos: u32,
     /// Secondary terminator (e.g. `<|im_end|>`), if the arch uses one.
     pub im_end: Option<u32>,
-    /// Raw tool definitions from the request (OpenAI-shape JSON). Each carrier
-    /// extracts its own grammar `ToolSchema` from these; `None`/empty ⇒ no
-    /// tool-call grammar.
+    /// Raw tool definitions from the request (OpenAI-shape JSON). `Some` enables
+    /// the tool-call *parser* (XML or JSON) even when constrained grammar is off.
+    /// `None` ⇒ tool-looking text is ordinary assistant content.
     pub tools: Option<&'a [serde_json::Value]>,
+    /// Constrained tool-call grammar. Independent of [`Self::tools`]: Qwen3.5/3.8
+    /// XML-native cards keep this false (default `qwen35_grammar_on`) so the
+    /// matcher does not force Hermes-JSON, but still parse `<tool_call>` XML.
+    pub enable_grammar: bool,
     /// User stop sequences matched against the decoded suffix.
     pub stop: Vec<String>,
     /// `max_think_tokens` budget (0 ⇒ no think force-close).

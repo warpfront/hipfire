@@ -127,8 +127,43 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
 
         // Weight MEMORY phase: sequential along row0 then row1 (8 headers).
         float sc0a, zp0a, sc1a, zp1a, sc2a, zp2a, sc3a, zp3a;
+        unsigned int pk0a, pk1a, pk2a, pk3a;
         float sc0b, zp0b, sc1b, zp1b, sc2b, zp2b, sc3b, zp3b;
-        unsigned int pk0a, pk1a, pk2a, pk3a, pk0b, pk1b, pk2b, pk3b;
+        unsigned int pk0b, pk1b, pk2b, pk3b;
+
+#if defined(__gfx1100__)
+        LOAD_W(row_ptr0 + g * 136, row_weight_offset0 + g * 136, sc0a, zp0a, pk0a);
+        LOAD_W(row_ptr0 + (g + 1) * 136, row_weight_offset0 + (g + 1) * 136, sc1a, zp1a, pk1a);
+        LOAD_W(row_ptr0 + (g + 2) * 136, row_weight_offset0 + (g + 2) * 136, sc2a, zp2a, pk2a);
+        LOAD_W(row_ptr0 + (g + 3) * 136, row_weight_offset0 + (g + 3) * 136, sc3a, zp3a, pk3a);
+
+        // Finish row0 before making row1's headers live. The empty exact-gfx1100
+        // dependency barrier prevents LLVM from hoisting the second row's loads
+        // back across this point; it emits no ISA instruction.
+        DOG_X8(sc0a, zp0a, pk0a, acc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        DOG_X8(sc1a, zp1a, pk1a, acc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        DOG_X8(sc2a, zp2a, pk2a, acc2,
+               xv2a.x, xv2a.y, xv2a.z, xv2a.w, xv2b.x, xv2b.y, xv2b.z, xv2b.w);
+        DOG_X8(sc3a, zp3a, pk3a, acc3,
+               xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
+
+        asm volatile("" : "+v"(acc0), "+v"(acc1), "+v"(acc2), "+v"(acc3) :: "memory");
+
+        LOAD_W(row_ptr1 + g * 136, row_weight_offset1 + g * 136, sc0b, zp0b, pk0b);
+        LOAD_W(row_ptr1 + (g + 1) * 136, row_weight_offset1 + (g + 1) * 136, sc1b, zp1b, pk1b);
+        LOAD_W(row_ptr1 + (g + 2) * 136, row_weight_offset1 + (g + 2) * 136, sc2b, zp2b, pk2b);
+        LOAD_W(row_ptr1 + (g + 3) * 136, row_weight_offset1 + (g + 3) * 136, sc3b, zp3b, pk3b);
+        DOG_X8(sc0b, zp0b, pk0b, bcc0,
+               xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+        DOG_X8(sc1b, zp1b, pk1b, bcc1,
+               xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+        DOG_X8(sc2b, zp2b, pk2b, bcc2,
+               xv2a.x, xv2a.y, xv2a.z, xv2a.w, xv2b.x, xv2b.y, xv2b.z, xv2b.w);
+        DOG_X8(sc3b, zp3b, pk3b, bcc3,
+               xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
+#else
         LOAD_W(row_ptr0 + g * 136, row_weight_offset0 + g * 136, sc0a, zp0a, pk0a);
         LOAD_W(row_ptr0 + (g + 1) * 136, row_weight_offset0 + (g + 1) * 136, sc1a, zp1a, pk1a);
         LOAD_W(row_ptr0 + (g + 2) * 136, row_weight_offset0 + (g + 2) * 136, sc2a, zp2a, pk2a);
@@ -138,26 +173,23 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
         LOAD_W(row_ptr1 + (g + 2) * 136, row_weight_offset1 + (g + 2) * 136, sc2b, zp2b, pk2b);
         LOAD_W(row_ptr1 + (g + 3) * 136, row_weight_offset1 + (g + 3) * 136, sc3b, zp3b, pk3b);
 
-        // Pure FMA phase: same dual-row DOG order and acc slots as baseline.
         DOG_X8(sc0a, zp0a, pk0a, acc0,
                xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
         DOG_X8(sc0b, zp0b, pk0b, bcc0,
                xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-
         DOG_X8(sc1a, zp1a, pk1a, acc1,
                xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
         DOG_X8(sc1b, zp1b, pk1b, bcc1,
                xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
-
         DOG_X8(sc2a, zp2a, pk2a, acc2,
                xv2a.x, xv2a.y, xv2a.z, xv2a.w, xv2b.x, xv2b.y, xv2b.z, xv2b.w);
         DOG_X8(sc2b, zp2b, pk2b, bcc2,
                xv2a.x, xv2a.y, xv2a.z, xv2a.w, xv2b.x, xv2b.y, xv2b.z, xv2b.w);
-
         DOG_X8(sc3a, zp3a, pk3a, acc3,
                xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
         DOG_X8(sc3b, zp3b, pk3b, bcc3,
                xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
+#endif
     }
 
     if (tail >= 1) {

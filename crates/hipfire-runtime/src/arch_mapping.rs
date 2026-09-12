@@ -85,6 +85,17 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     ("gemma4_unified_assistant", 22),
     // arch 23 — muse_glimmer DFlash drafter
     ("muse_glimmer_assistant", 23),
+    // arch 40 — flux MMDiT diffusion trunk (image-gen component block 40–47;
+    // high by design so the sequential primary range 16–19 stays free for
+    // future text arches; never a chat-serve trunk — see
+    // docs/architecture-ids.md § Image-generation component ids)
+    ("flux", 40),
+    // arch 45 — flux2 MMDiT diffusion trunk (FLUX.2 Klein; 44 is intentionally
+    // spare). The diffusers `_class_name` strings route through the same two
+    // keys: `derive_arch_id` matches the table as substrings with the longest
+    // key winning, so `Flux2Transformer2DModel` resolves to 45 via "flux2" and
+    // `FluxTransformer2DModel` to 40 via "flux".
+    ("flux2", 45),
 ];
 
 /// Look up an `arch_id` for a `model_type` / GGUF `general.architecture` string.

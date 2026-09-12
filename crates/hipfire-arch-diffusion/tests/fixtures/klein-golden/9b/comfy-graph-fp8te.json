@@ -1,0 +1,99 @@
+{
+  "1": {
+    "class_type": "UNETLoader",
+    "inputs": { "unet_name": "flux-2-klein-9b.safetensors", "weight_dtype": "default" }
+  },
+  "2": {
+    "class_type": "CLIPLoader",
+    "inputs": { "clip_name": "qwen_3_8b_fp8mixed.safetensors", "type": "flux2" }
+  },
+  "3": {
+    "class_type": "VAELoader",
+    "inputs": { "vae_name": "flux2-vae.safetensors" }
+  },
+  "4": {
+    "class_type": "CLIPTextEncode",
+    "inputs": {
+      "text": "a red bicycle leaning on a brick wall, golden hour",
+      "clip": ["2", 0]
+    }
+  },
+  "5": {
+    "class_type": "EmptyFlux2LatentImage",
+    "inputs": { "width": 1024, "height": 1024, "batch_size": 1 }
+  },
+  "6": {
+    "class_type": "KSamplerSelect",
+    "inputs": { "sampler_name": "euler" }
+  },
+  "7": {
+    "class_type": "RandomNoise",
+    "inputs": { "noise_seed": 7 }
+  },
+  "8": {
+    "class_type": "BasicGuider",
+    "inputs": { "model": ["1", 0], "conditioning": ["4", 0] }
+  },
+  "9": {
+    "class_type": "ManualSigmas",
+    "inputs": { "sigmas": "0.5" }
+  },
+  "10": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": ["7", 0],
+      "guider": ["8", 0],
+      "sampler": ["6", 0],
+      "sigmas": ["9", 0],
+      "latent_image": ["5", 0]
+    }
+  },
+  "11": {
+    "class_type": "SaveLatent",
+    "inputs": { "samples": ["10", 0], "filename_prefix": "latents/klein9b_init" }
+  },
+  "12": {
+    "class_type": "Flux2Scheduler",
+    "inputs": { "steps": 4, "width": 1024, "height": 1024 }
+  },
+  "13": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": ["7", 0],
+      "guider": ["8", 0],
+      "sampler": ["6", 0],
+      "sigmas": ["12", 0],
+      "latent_image": ["5", 0]
+    }
+  },
+  "14": {
+    "class_type": "SaveLatent",
+    "inputs": { "samples": ["13", 0], "filename_prefix": "latents/klein9b_golden" }
+  },
+  "15": {
+    "class_type": "VAEDecode",
+    "inputs": { "samples": ["13", 0], "vae": ["3", 0] }
+  },
+  "16": {
+    "class_type": "SaveImage",
+    "inputs": { "images": ["15", 0], "filename_prefix": "klein9b_golden" }
+  },
+  "20": {
+    "class_type": "SplitSigmas",
+    "inputs": { "sigmas": ["12", 0], "step": 1 }
+  },
+  "21": {
+    "class_type": "SamplerCustomAdvanced",
+    "inputs": {
+      "noise": ["7", 0],
+      "guider": ["8", 0],
+      "sampler": ["6", 0],
+      "sigmas": ["20", 0],
+      "latent_image": ["5", 0]
+    }
+  },
+  "22": {
+    "class_type": "SaveLatent",
+    "inputs": { "samples": ["21", 0], "filename_prefix": "latents/klein9b_step1" }
+  }
+}

@@ -43,6 +43,11 @@ pub fn populate(registry: &mut KernelRegistry) {
             Some(ShapePredicate::BatchEq(1)),
         ),
         (
+            KernelKey::KvWriteBf16,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
             KernelKey::KvWriteF32,
             ArchPredicate::Always,
             Some(ShapePredicate::BatchEq(1)),
@@ -117,6 +122,11 @@ pub fn populate(registry: &mut KernelRegistry) {
             ArchPredicate::Always,
             Some(ShapePredicate::BatchGt(1)),
         ),
+        (
+            KernelKey::KvWriteBf16Batched,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
     ];
     for (key, arch, shape) in kv_write_batched {
         registry.register(KernelVariant {
@@ -168,6 +178,11 @@ pub fn populate(registry: &mut KernelRegistry) {
         ),
         (
             KernelKey::AttnFlashQ8_0Windowed,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashBf16Windowed,
             ArchPredicate::Always,
             Some(ShapePredicate::BatchEq(1)),
         ),
@@ -319,6 +334,11 @@ pub fn populate(registry: &mut KernelRegistry) {
             ArchPredicate::Always,
             Some(ShapePredicate::BatchGt(1)),
         ),
+        (
+            KernelKey::AttnBf16KvBatchedMaskedWindowed,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
     ];
     for (key, arch, shape) in attn_batched {
         registry.register(KernelVariant {
@@ -386,7 +406,17 @@ pub fn populate(registry: &mut KernelRegistry) {
     });
     // No scalar floor for F16 — fall to AttnFullF32 at caller level.
 
-    // AttnFullF32: non-causal, F32 K/V
+    registry.register(KernelVariant {
+        key: KernelKey::AttnFullF32,
+        arch_required: ArchPredicate::HasWmmaW32,
+        shape_gate: Some(ShapePredicate::And(&[
+            ShapePredicate::BatchEq(16),
+            ShapePredicate::HeadDimEq(128),
+        ])),
+        steps: &[PipelineOp::Attend],
+        has_awq: false,
+        tile: TileImpl::DflashN64,
+    });
     registry.register(KernelVariant {
         key: KernelKey::AttnFullF32,
         arch_required: ArchPredicate::HasWmma,

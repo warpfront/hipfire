@@ -109,6 +109,7 @@ Stable/default-on and safety controls:
 | `kernel.rocblas_off` | `false` | Disable rocBLAS dispatch. |
 | `fusions.force_unfused` | `false` | Force supported projection paths unfused. |
 | `speculation.dflash_tree` | `false` | Enable DDTree tree-SWOR verification. |
+| `memory.oom_guard` | `auto` | Memory preflight OOM guard — see [Memory](#memory). Gates only the host `MemAvailable` headroom check; the R9700 deployment-target VRAM-budget check always runs. Env: `HIPFIRE_OOM_GUARD`. |
 
 The following default-off keys are experimental kernel-route overrides. They
 are typed booleans, process-scoped, and visible in `hipfire config list` with
@@ -303,7 +304,8 @@ Legacy one-shot alias: `HIPFIRE_KV_MODE` (see [`env-vars.md`](env-vars.md)).
 | `flash_mode` | `"auto"` | `auto` \| `always` \| `never` |
 
 Lowered directly into the daemon snapshot. `HIPFIRE_ATTN_FLASH` remains a
-legacy one-shot alias.
+legacy one-shot alias. The Qwen3.5 MTP head inherits the trunk
+`flash_mode` / `attention_flash_mode` (it does not pin a separate non-flash path).
 
 ---
 
@@ -326,6 +328,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | Key | Default | Values / range | Notes |
 |---|---|---|---|
 | `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. |
+| `vision_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** Tower sidecar gate — see [Vision tower](#vision-tower). |
 | `dflash_adaptive_b` | `true` | bool | Adaptive draft block size. |
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
 | `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when weights present (DeepSeek path primary). Separate Qwen35 MTP env gate may apply — see env doc. |
@@ -340,6 +343,25 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 Legacy compatibility input still wins at the top of the startup ladder for
 the corresponding knobs, but the engine receives only the resolved immutable
 snapshot. Full aliases: [`env-vars.md`](env-vars.md).
+
+---
+## Vision tower
+
+| Key | Default | Values / range |
+|---|---|---|
+| `vision_mode` | `"off"` | `off` \| `auto` \| `on` |
+
+- **`off`** (default) — never load a tower sidecar. The registry/sibling file is not wired, and even an explicit `run --vision` / `serve --vision` / `HIPFIRE_VISION_SIDECAR` path is skipped with one stderr line. The daemon enforces the same hard override for non-CLI clients, mirroring `dflash_mode=off`. Text loads pay no tower VRAM (~1 GB).
+- **`auto`** — use the registry `vision` slot (or the `<trunk-stem>-vision.hfq` sibling beside the trunk) when present; silently text-only when absent.
+- **`on`** — require the declared sidecar: the load fails closed with a pull hint when it cannot be resolved. A trunk with an embedded tower declares no sidecar and is unaffected by this key.
+
+```bash
+hipfire config set vision_mode auto
+hipfire config qwen3.8:27b set vision_mode auto   # per-model overlay
+HIPFIRE_VISION_MODE=auto hipfire run qwen3.8:27b  # one-shot
+```
+
+Loading detail: [`MODELS.md`](MODELS.md). Env inventory: [`env-vars.md`](env-vars.md).
 
 ---
 
@@ -428,11 +450,65 @@ runtime PFlash module — not restated here.
 | `serve_max_queue` | `64` | int 0–100000 (`0` = uncapped depth) |
 | `serve_queue_timeout_ms` | `30000` | int 0–3600000 (`0` = no wait timeout) |
 | `experimental_budget_alert` | `false` | bool |
+| `serve.multi_slot` | `false` | Serve concurrent requests on the multi-slot engine instead of one at a time. |
+| `serve.multi_slot_slots` | `4` | int 1–64 concurrent slots. |
+| `serve.multi_slot_ctx` | `8192` | int 512–1048576 per-slot context capacity (tokens). |
+| `serve.multi_slot_prefill_chunk` | `1024` | int 1–1048576. Prefill tokens taken from one slot per multi-slot step; batch scratch is sized `n_slots ×` this. Env: `HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK`. |
 
 Serve HTTP surface: [`SERVE.md`](SERVE.md). The corresponding `HIPFIRE_MODEL`,
 `HIPFIRE_IDLE_TIMEOUT`, `HIPFIRE_MAX_REQUEST_BYTES`,
-`HIPFIRE_SERVE_MAX_QUEUE`, and `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` names are
-legacy one-shot aliases.
+`HIPFIRE_SERVE_MAX_QUEUE`, `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS`, and
+`HIPFIRE_SERVE_MULTI_SLOT*` names are legacy one-shot aliases.
+
+---
+
+## Memory
+
+### `memory.oom_guard`
+
+| Key | Default | Values |
+|---|---|---|
+| `memory.oom_guard` | `auto` | `auto` \| `true`/`on`/`1` \| `false`/`off`/`0` |
+
+Compat env: `HIPFIRE_OOM_GUARD`. Used by `kv_slots::preflight_alloc`, the
+`SlotPool` arena check, and the CLI bench-sweep headroom path.
+
+Two checks exist; only one is gated:
+
+- **Host `MemAvailable` headroom** — gated by `memory.oom_guard`. Default
+  `auto` turns it **on** for unified-memory APU arches (`gfx1035` / `gfx1036` /
+  `gfx1103` / `gfx1150`–`gfx1152`: GPU allocations come from system RAM, so an
+  overshoot is a desktop-killing OOM), **off** for discrete GPUs (overshoot is
+  a failed `hipMalloc`), and for GPU-less processes by host swap state (no
+  swap → on). Explicit `true`/`false` force either way; `auto` logs its
+  decision once.
+- **R9700 deployment-target VRAM budget** (32 GiB class ceiling in
+  `preflight_alloc`) — **always runs**, on every arch, whether the host
+  headroom guard is active or not. A configuration that does not fit the
+  deployment target is refused regardless of this box's RAM.
+
+`scripts/run-bounded.sh` (`HIPFIRE_MEM_CAP`) remains the hard cgroup backstop.
+
+### Prompt / assistant-turn cache
+
+| Key | Default | Values |
+|---|---|---|
+| `memory.prompt_cache_capacity` | `32` | int ≥0; maximum cached assistant-turn tokenizations (`0` keeps none). Env: `HIPFIRE_PROMPT_CACHE_CAP`. |
+| `memory.prompt_cache_unbounded` | `false` | Remove the capacity bound. Env: `HIPFIRE_PROMPT_CACHE_UNBOUNDED`. |
+
+Qwen AR and DFlash multi-turn reuse store each completed assistant turn as the
+**verbatim generated token span** (whole envelope: full body tokens, plus
+producer reasoning text when the turn thought). On the next turn, Jinja history
+replay splices that span through the model's trained template framing so the
+LCP prefix matches the prior bake. Unedited rich `reasoning_content` history
+hits; edited or mismatched history falls back to a plain retokenized render
+(cold or checkpoint path) instead of replaying stale tokens.
+
+Multi-turn DFlash and the prefix cache: when a DFlash turn ends on EOS (or the
+think cap) mid-window, **RepairForTerminal** restores the pre-window recurrent
+state and replays only the consumed prefix so the prompt/prefix cache stays
+warm. The next turn prefills only the new suffix instead of a full cold
+prefill (the previous fail-closed path reset and invalidated the cache).
 
 ---
 
@@ -496,6 +572,7 @@ uses ambient variables in engine hot paths.
 | `prompt_heat_json` | `diagnostic.prompt_heat_json` | `HIPFIRE_PROMPT_HEAT_JSON` | off unless `1` |
 | `prompt_heat_limit` | `diagnostic.prompt_heat_limit` | `HIPFIRE_PROMPT_HEAT_LIMIT` | 64 |
 | `dflash_mode` | `speculation.dflash` | `HIPFIRE_DFLASH_MODE` | `"off"` |
+| `vision_mode` | `vision.mode` | `HIPFIRE_VISION_MODE` | `"off"` |
 | `draft_f16` | `speculation.draft_f16` | `HIPFIRE_DRAFT_F16` | true unless `0` |
 | `draft_gemm_dump` | `diagnostic.draft_gemm_dump` | `HIPFIRE_DRAFT_GEMM_DUMP` | off unless `1` |
 | `draft_subphase` | `diagnostic.draft_subphase` | `HIPFIRE_DRAFT_SUBPHASE` | off unless `1` |

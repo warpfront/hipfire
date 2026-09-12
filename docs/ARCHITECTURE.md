@@ -53,7 +53,7 @@ operator runtime.
 |---|---|---|
 | Operator | `hipfire-cli`, `hipfire-config`, `hipfire-registry`, `hipfire-client`, `hipfire-tui` | Tag resolve, typed config, pull, HTTP service/client, one-shot daemon spawn |
 | Product binary | `hipfire-daemon` | `[[bin]] name = "daemon"`. Message dispatch and process lifetime only |
-| Generation | `hipfire-generate` | The generate bodies: `ar`, `qwen`, `dense`, `vision`, `batch`, plus the Redline fixtures |
+| Generation | `hipfire-generate` | The generate bodies: `ar`, `qwen`, `dense`, `vision`, `batch`, `img`, plus the Redline fixtures |
 | Serve engine | `hipfire-engine` | Scheduler, terminal control, emit, prompt. **Zero arch dependencies** |
 | Composition root | `hipfire-loader` | Carrier registry, single `load_model` dispatch, `LoadedModel`, continuous-batch staging |
 | Arch forward | `hipfire-arch-*` | Config / weights / state / static-dispatch forward (LLaMA exception: canonical forward remains in runtime) |
@@ -104,7 +104,11 @@ hipfire run <tag-or-path> "…"
 Native CLI (`crates/hipfire-cli`)
   resolve registry tag → model path under ~/.hipfire/models/ (or local path)
   if serve up AND not forced local → HTTP POST /v1/chat/completions
-    forced local when HIPFIRE_LOCAL=1, --kv-mode, --json, or --no-stream
+    forced local when `HIPFIRE_LOCAL` is truthy or any of `--image`,
+    `--kv-mode`, `--kv-backend`, `--spec`/`--speculation`, `--model-draft`,
+    `--draft-max`, `--dspark-conf-threshold` is passed (`force_local` in
+    `crates/hipfire-cli/src/main.rs`; `--json`/`--no-stream` ride the HTTP
+    route and do not force local)
     if HTTP fails while serve still live → abort (no local spawn; would collide)
   else → spawn one-shot daemon binary
         │
@@ -118,6 +122,7 @@ hipfire-loader
   Carrier registry probe on arch_id (+ is_dir namespace)
   carrier.load → LoadedModel { arch_id, state: ModelState::…, tokenizer, … }
   optional: draft/speculator, VL weights, EP/PP scaffolding
+  Qwen3.5-VL tower sidecar: `params.vision` / `HIPFIRE_VISION_SIDECAR` → separate `qwen3.8-27b-vision.hfq` validated at admission, tower sized by the trunk's `vision_config`
         │
         ▼
 generate(…) ladder (daemon.rs)
@@ -213,10 +218,29 @@ the facade/re-export plus bring-up/carrier surface. Other runtime-owned pieces
 | `hipfire-arch-minimax` | MiniMax-M2 MoE |
 | `hipfire-arch-lfm2moe` | LFM2.5 dense + LFM2.5-MoE hybrid short-conv / GQA |
 | `hipfire-arch-cohere2moe` | Cohere2-MoE / North-Mini-Code |
+| `hipfire-arch-diffusion` | Latent image diffusion: FLUX.1 MMDiT (40) and FLUX.2 Klein (45) — components, not chat trunks |
 | `hipfire-arch-toy` | Template only (`arch_id = 0xFF`); daemon must not dispatch |
 
 Bring-up contract: implement `hipfire_runtime::arch::Architecture` (see
 `hipfire-arch-toy` and production `hipfire-arch-qwen35/src/arch.rs`).
+
+### Image generation (ids 40–47)
+
+Diffusion trunks are **components**: they load through `FluxDiffusionCarrier`
+and are refused by text `generate`, so they implement `ArchModel` + `Carrier`
+and deliberately not `Architecture` (a latent-step optimizer has no token
+stream). `arch_id` 40 is FLUX.1 MMDiT; **45 is FLUX.2 Klein** (4B/9B), keyed on
+`_class_name: "Flux2Transformer2DModel"` or `model_type: "flux2"`, daemon name
+`flux2_mmdit`. FLUX.2 is a separate forward body in the same crate — bias-free
+linears, one shared modulation vector, SwiGLU MLPs, 4-axis id-table RoPE, Qwen3
+conditioning instead of T5+CLIP, and a 32-channel VAE whose latent statistics
+live in an internal BatchNorm. The request wire is the daemon's
+`img_generate`/`img_progress`/`img_done` and HTTP `/v1/images/generations`;
+arch 45 adds an **`images`** field (up to four reference image paths, also
+`hipfire img --image`) whose VAE-encoded tokens condition every denoise step
+without being denoised, which is what makes reference editing a request option
+rather than a separate route. Component ids and their detection rules:
+[`architecture-ids.md`](architecture-ids.md) § Image-generation component ids.
 
 ### Forward shape (typical dense/hybrid layer)
 

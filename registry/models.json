@@ -102,6 +102,9 @@
           "presence_penalty": 1.5,
           "repeat_penalty": 1.0
         }
+      },
+      "dflash": {
+        "file": "qwen35-9b-dflash-mq4.hfq"
       }
     },
     "qwen3.5:27b": {
@@ -144,6 +147,9 @@
           "presence_penalty": 1.5,
           "repeat_penalty": 1.0
         }
+      },
+      "dflash": {
+        "file": "qwen35-27b-dflash-mq4.hfq"
       }
     },
     "qwen3.5:35b-a3b": {
@@ -313,10 +319,23 @@
       "size_gb": 6.5,
       "min_vram_gb": 12,
       "sampling": {
-        "temperature": 0.6,
+        "temperature": 1.0,
         "top_p": 0.95
       },
-      "desc": "Deepgrove Maple-Preview 20B-A1B (arch_id=15). NATIVELY TERNARY: every linear weight ships as {-s,0,+s} with one bf16 scale per output row, so MQ2G256LloydU (qt=51, 2.250 bpw) carries the body VALUE-EXACTLY \u2014 a packing, not a quantization; max|err| vs the bf16 master is 0. lm_head is Q8: measured +23.9% decode for +0.00005 nats of mean KL, with top-1 agreement and PPL both slightly BETTER than bf16 (MQ4 head was rejected \u2014 2.6x the KL, concentrated on the model's most-confident positions). 24 layers, 256 experts top-8 on every layer, 3:1 sliding(512)/global-NoPE attention, QK-norm before partial RoPE, clamped SwiGLU. Reasoning model (<think>), Qwen tokenizer, ChatML + <tool_call> tools. ~1530 tok/s prefill, ~158 tok/s decode on gfx1151. NOTE: wikitext PPL ~57 (a peer scores ~7.7) \u2014 that is the MODEL, not the packing: KL vs a bf16 reference is 0.084 and the vendor's own ternary GGUF scores within 0.2%. Upstream calls it a preview with minimal agentic post-training."
+      "desc": "Deepgrove Maple-Preview 20B-A1B (arch_id=15). NATIVELY TERNARY: every linear weight ships as {-s,0,+s} with one bf16 scale per output row, so MQ2G256LloydU (qt=51, 2.250 bpw) carries the body VALUE-EXACTLY — a packing, not a quantization; max|err| vs the bf16 master is 0. lm_head is Q8: measured +23.9% decode for +0.00005 nats of mean KL, with top-1 agreement and PPL both slightly BETTER than bf16 (MQ4 head was rejected — 2.6x the KL, concentrated on the model's most-confident positions). 24 layers, 256 experts top-8 on every layer, 3:1 sliding(512)/global-NoPE attention, QK-norm before partial RoPE, clamped SwiGLU. Reasoning model (<think>), Qwen tokenizer, ChatML + <tool_call> tools. ~1530 tok/s prefill, ~158 tok/s decode on gfx1151. NOTE: wikitext PPL ~57 (a peer scores ~7.7) — that is the MODEL, not the packing: KL vs a bf16 reference is 0.084 and the vendor's own ternary GGUF scores within 0.2%. Upstream calls it a preview with minimal agentic post-training.",
+      "default_kv_mode": "bf16",
+      "heads": {
+        "q4k": {
+          "file": "maple-head-q4k.hfq",
+          "sha256": "deff26e9dfaddfc521f10037e00deae40fb4011fb14db3b10eb166928d7ec795",
+          "size_bytes": 188137472
+        },
+        "bf16": {
+          "file": "maple-head-bf16.hfq",
+          "sha256": "94cde3ad60d380a753f1223882682662643e49faed217df5b4db03e0a17f3e8b",
+          "size_bytes": 635437056
+        }
+      }
     },
     "north-mini-code": {
       "repo": "nwoolmer/hipfire-north-mini-code",
@@ -697,6 +716,9 @@
       "desc": "44 tok/s AR / 185 tok/s w/ draft on code",
       "triattn": {
         "file": "qwen3.6-27b.mq4.triattn.blended_v3.bin"
+      },
+      "dflash": {
+        "file": "qwen36-27b-dflash-mq4.hfq"
       }
     },
     "qwen3.8:27b-mq3-xt": {
@@ -725,6 +747,14 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq3.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq3": {
@@ -753,6 +783,14 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq3.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq3-pro": {
@@ -781,6 +819,14 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq3.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq4-xt": {
@@ -809,6 +855,14 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b": {
@@ -837,6 +891,14 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq4-pro": {
@@ -865,6 +927,14 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq5-xt": {
@@ -893,6 +963,11 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq5": {
@@ -921,6 +996,11 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq5-pro": {
@@ -949,6 +1029,11 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq6-xt": {
@@ -977,6 +1062,11 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq6": {
@@ -1005,6 +1095,11 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.8:27b-mq6-pro": {
@@ -1033,6 +1128,11 @@
           "repeat_penalty": 1.0,
           "reasoning_effort": "xhigh"
         }
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
       }
     },
     "qwen3.5:0.8b-mq6": {
@@ -1060,7 +1160,10 @@
       "min_vram_gb": 8.8,
       "desc": "MQ6, higher quality",
       "default_kv_mode": "q8",
-      "quant_recipe": "v3-awq-f1"
+      "quant_recipe": "v3-awq-f1",
+      "dflash": {
+        "file": "qwen35-9b-dflash-mq4.hfq"
+      }
     },
     "qwen3.5:27b-mq6": {
       "repo": "hipfire-models/qwen3.5-27b",
@@ -1076,14 +1179,20 @@
       "min_vram_gb": 6.1,
       "desc": "MQ3 alpha (3.25 bpw, gfx11/gfx12). Smaller than MQ4, comparable decode. Quality eval pending — see issue #113. Sub-9B MQ3 not shipped — see #114.",
       "default_kv_mode": "q8",
-      "quant_recipe": "v3-awq-f1"
+      "quant_recipe": "v3-awq-f1",
+      "dflash": {
+        "file": "qwen35-9b-dflash-mq4.hfq"
+      }
     },
     "qwen3.5:27b-mq3": {
       "repo": "hipfire-models/qwen3.5-27b",
       "file": "qwen3.5-27b.mq3",
       "size_gb": 10.7,
       "min_vram_gb": 12,
-      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB (MQ4 OOMs at ~98K). gfx11/gfx12 only."
+      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB (MQ4 OOMs at ~98K). gfx11/gfx12 only.",
+      "dflash": {
+        "file": "qwen35-27b-dflash-mq3.hfq"
+      }
     },
     "qwen3.6:27b-mq3": {
       "recommended_settings": {
@@ -1096,7 +1205,10 @@
       "file": "qwen3.6-27b.mq3",
       "size_gb": 10.7,
       "min_vram_gb": 12,
-      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s τ=7.0)."
+      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s τ=7.0).",
+      "dflash": {
+        "file": "qwen36-27b-dflash-mq3.hfq"
+      }
     },
     "qwen3.5:27b-draft-mq3": {
       "repo": "hipfire-models/qwen3.5-27b",
@@ -1152,28 +1264,48 @@
       "file": "qwen38-27b-dflash-mq3.hfq",
       "size_gb": 0.98,
       "min_vram_gb": 16,
-      "desc": "MQ3 DFlash draft for qwen3.8:27b (arch 20). Same-bit alternative; MQ4 draft is the recommended controller."
+      "desc": "MQ3 DFlash draft for qwen3.8:27b (arch 20). Same-bit alternative; MQ4 draft is the recommended controller.",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      }
     },
     "qwen3.8:27b-draft-mq4": {
       "repo": "hipfire-models/qwen3.8-27b",
       "file": "qwen38-27b-dflash-mq4.hfq",
       "size_gb": 1.21,
       "min_vram_gb": 16,
-      "desc": "MQ4 DFlash draft for qwen3.8:27b (arch 20). Recommended controller draft across the MQ3–MQ6 V2 ladder; same-bit mq3/mq5/mq6 alternatives available."
+      "desc": "MQ4 DFlash draft for qwen3.8:27b (arch 20). Recommended controller draft across the MQ3–MQ6 V2 ladder; same-bit mq3/mq5/mq6 alternatives available.",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      }
     },
     "qwen3.8:27b-draft-mq5": {
       "repo": "hipfire-models/qwen3.8-27b",
       "file": "qwen38-27b-dflash-mq5.hfq",
       "size_gb": 1.43,
       "min_vram_gb": 16,
-      "desc": "MQ5 DFlash draft for qwen3.8:27b (arch 20). Same-bit alternative; MQ4 draft is the recommended controller."
+      "desc": "MQ5 DFlash draft for qwen3.8:27b (arch 20). Same-bit alternative; MQ4 draft is the recommended controller.",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      }
     },
     "qwen3.8:27b-draft-mq6": {
       "repo": "hipfire-models/qwen3.8-27b",
       "file": "qwen38-27b-dflash-mq6.hfq",
       "size_gb": 1.66,
       "min_vram_gb": 16,
-      "desc": "MQ6 DFlash draft for qwen3.8:27b (arch 20). Same-bit alternative; MQ4 draft is the recommended controller."
+      "desc": "MQ6 DFlash draft for qwen3.8:27b (arch 20). Same-bit alternative; MQ4 draft is the recommended controller.",
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      }
     },
     "qwen3.5:9b-draft": {
       "repo": "hipfire-models/qwen3.5-9b",
@@ -1564,6 +1696,40 @@
         }
       },
       "desc": "Official Ornith 1.5 35B-A3B uniform MQ4G256V2 Redline SKU, quantized from ornith-ai/Ornith-1.5-35B-A3B@10fbf86f with --format mq4 --no-q8-router --uniform. Census: 20,871 MQ4G256V2 (qt44), 31 Q8F16, 191 F16, zero qt13 and zero qt15. Parent-card sampling is temperature 0.6, top_p 0.95, top_k 20, no presence penalty. The optional .mtp is the separately published replacement head documented by the model card. Low/medium/xhigh effort steering defaults to xhigh and has no implicit think-token cap."
+    },
+    "flux.schnell:1": {
+      "repo": "elphil/flux",
+      "file": "flux-schnell-transformer.hfq",
+      "t5": {
+        "file": "flux-schnell-t5.hfq"
+      },
+      "clip": {
+        "file": "flux-schnell-clip.hfq"
+      },
+      "vae": {
+        "file": "flux-schnell-vae.hfq"
+      },
+      "size_gb": 23.8,
+      "min_vram_gb": 24,
+      "arch_id": 40,
+      "desc": "FLUX.1-schnell MMDiT trunk as per-component HFQ packs (arch 40; sidecars arch 41 T5-XXL / 42 CLIP-L / 43 VAE). Built with `hipfire-quantize --flux-pipe`; served via `hipfire img flux.schnell:1`. Step-distilled: 4 default steps (guidance_embed_dim 0). T5/CLIP/VAE sidecars are shared with flux.dev:1 - pull once. Published on the Hub as elphil/flux (public, Apache-2.0)."
+    },
+    "flux.dev:1": {
+      "repo": "hipfire-models/flux",
+      "file": "flux-dev-transformer.hfq",
+      "t5": {
+        "file": "flux-dev-t5.hfq"
+      },
+      "clip": {
+        "file": "flux-dev-clip.hfq"
+      },
+      "vae": {
+        "file": "flux-dev-vae.hfq"
+      },
+      "size_gb": 23.8,
+      "min_vram_gb": 24,
+      "arch_id": 40,
+      "desc": "FLUX.1-dev MMDiT trunk as per-component HFQ packs (arch 40; sidecars arch 41 T5-XXL / 42 CLIP-L / 43 VAE). Guidance-distilled: 28 default steps (guidance_embed_dim 128). LOCAL-ONLY PLACEHOLDER: FLUX.1-dev is NCL and cannot be redistributed; dev packs are never uploaded to the Hub, so digest fields stay TBD."
     }
   },
   "aliases": {
@@ -1572,6 +1738,8 @@
     "ornith-1.5": "ornith-1.5:35b-a3b",
     "ornith1.5": "ornith-1.5:35b-a3b",
     "ornith1.5:35b-a3b": "ornith-1.5:35b-a3b",
+    "ornith-1.5:fast": "ornith-1.5:35b-a3b-mq4r",
+    "ornith-1.5:35b-a3b-fast": "ornith-1.5:35b-a3b-mq4r",
     "qwen3.5": "qwen3.5:4b",
     "qwen3.5:latest": "qwen3.5:9b",
     "qwen3.5:small": "qwen3.5:0.8b",

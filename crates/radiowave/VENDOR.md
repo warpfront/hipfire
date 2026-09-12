@@ -36,7 +36,7 @@ pins them explicitly:
 | `license` | Apache-2.0 | Apache-2.0 | hipfire workspace is MIT — must not inherit |
 | `rust-version` | 1.85 | 1.85 | not defined in hipfire workspace |
 | `authors` / `repository` / `homepage` | redline | redline | not defined in hipfire workspace |
-| `version` | 0.1.0 (redline) | 0.1.0 | keeps upstream version visible; hipfire is 0.3.0 |
+| `version` | 0.1.0 (redline) | 0.1.0 | keeps upstream version visible; hipfire is 0.3.1 |
 
 Everything under `src/`, `include/` and `tests/` is byte-identical to upstream
 at the pinned commit. If you change a file here, record it in this table or the

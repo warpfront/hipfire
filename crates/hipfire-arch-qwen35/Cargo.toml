@@ -21,8 +21,8 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 hipfire-reap = { path = "../hipfire-reap", default-features = false }
 saddle-core = { path = "../saddle-core" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
 [[example]]
 name = "test_qwen35_load_multi"
 path = "examples/test_qwen35_load_multi.rs"
@@ -41,4 +41,39 @@ required-features = ["deltanet"]
 [[example]]
 name = "qwen_dense_tp2_parity"
 path = "examples/qwen_dense_tp2_parity.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_gdn_pre_gfx1100"
+path = "examples/test_dflash_gdn_pre_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_draft_collapse_gfx1100"
+path = "examples/test_dflash_draft_collapse_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_hidden_scatter_gfx1100"
+path = "examples/test_dflash_hidden_scatter_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_dflash_snapshot_bulk_gfx1100"
+path = "examples/test_dflash_snapshot_bulk_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_mq_f16_projection_producers_gfx1100"
+path = "examples/test_mq_f16_projection_producers_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_mq_f16_residual_producers_gfx1100"
+path = "examples/test_mq_f16_residual_producers_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "test_qwen35_fa_batch_fusion_gfx1100"
+path = "examples/test_qwen35_fa_batch_fusion_gfx1100.rs"
 required-features = ["deltanet"]

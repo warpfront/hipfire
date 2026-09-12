@@ -29,14 +29,15 @@ use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
 
 use hipfire_arch_qwen35::spec_emit::Qwen35Emit;
-use hipfire_engine::emit::{
-    emit_gen_start, emit_qwen_ar_cancelled, emit_reasoning_token, emit_visible_token,
-    QWEN_AR_SEMANTIC_CONTRACT_VERSION,
-};
+use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token};
 use hipfire_engine::terminal::{
-    batch_bind_active, batch_check_abort, batch_clear_terminal, batch_mark_ready_with_pending,
-    batch_transition_to_queued, batch_wait_decision, BatchAttemptScope, LaneTicket,
-    CLIENT_TERMINAL_COMMIT_TIMEOUT,
+    batch_bind_active, batch_check_abort, batch_clear_terminal_at_generation,
+    batch_mark_ready_with_pending, batch_transition_to_queued, batch_wait_decision,
+    BatchAttemptScope, BatchGeneration, LaneTicket, CLIENT_TERMINAL_COMMIT_TIMEOUT,
+};
+use hipfire_generate::ar::{
+    emit_active_route_cancel, emit_active_route_done, emit_generation_start, GenerationRoute,
+    GenerationRouteScope,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::prompt_frame::{
@@ -45,6 +46,25 @@ use hipfire_runtime::prompt_frame::{
 use hipfire_runtime::serve::{Continuation, DoneReason, Event, SubmitRequest};
 use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx};
 use hipfire_runtime::tokenizer::Tokenizer;
+
+fn emit_qwen_ar_slot_error<W: std::io::Write>(
+    stdout: &mut W,
+    id: &str,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    hipfire_generate::ar::emit_generation_error(
+        GenerationRoute::QwenAr,
+        stdout,
+        Some(id),
+        message,
+        class,
+        retryable,
+        rolled_back,
+    );
+}
 
 /// Daemon-owned slot backend. Owns one weight copy via SlotEngine.
 pub struct SlotBackend {
@@ -162,9 +182,11 @@ impl SlotBackend {
         stdout: &mut W,
         id: &str,
         attempt_id: u64,
+        admission: BatchGeneration,
     ) -> Result<(), String> {
         // Guard active count and ensure keyed entry cleared on every exit.
         let Some(_guard) = self.acquire_guard() else {
+            let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
             hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -174,27 +196,29 @@ impl SlotBackend {
                 false,
             );
             let _ = stdout.flush();
-            batch_clear_terminal(id, attempt_id);
+            batch_clear_terminal_at_generation(id, attempt_id, admission);
             return Ok(());
         };
         // Ensure keyed registry entry cleared on exit (including error paths).
         struct ClearOnExit<'a> {
             id: String,
             attempt_id: u64,
+            admission: BatchGeneration,
             _marker: std::marker::PhantomData<&'a ()>,
         }
         impl Drop for ClearOnExit<'_> {
             fn drop(&mut self) {
-                batch_clear_terminal(&self.id, self.attempt_id);
+                batch_clear_terminal_at_generation(&self.id, self.attempt_id, self.admission);
             }
         }
         let _clear = ClearOnExit {
             id: id.to_string(),
             attempt_id,
+            admission,
             _marker: std::marker::PhantomData,
         };
         hipfire_engine::terminal::set_active_attempt_id(attempt_id);
-        let _scope = BatchAttemptScope::enter(attempt_id);
+        let _scope = BatchAttemptScope::enter_for_generation(id, attempt_id, admission);
 
         // Require experimental marker.
         if !is_experimental_generate(msg) {
@@ -562,20 +586,18 @@ impl SlotBackend {
             Continuation::Cold
         };
 
-        // Emit gen_start before blocking on engine. Must agree with enable_thinking.
-        emit_gen_start(
-            stdout,
-            id,
-            started_in_think,
-            Some(QWEN_AR_SEMANTIC_CONTRACT_VERSION),
-        );
-        if batch_check_abort(id, attempt_id) {
-            batch_clear_terminal(id, attempt_id);
-            emit_qwen_ar_cancelled(stdout, id, 0);
+        // Own the route and its exact `(id, attempt)` start latch for the
+        // complete post-start lifecycle. Pre-start validation above remains
+        // intentionally on the uncorrelated direct error path.
+        let _route_scope = GenerationRouteScope::enter(GenerationRoute::QwenAr, id);
+        emit_generation_start(GenerationRoute::QwenAr, stdout, id, started_in_think);
+        if batch_check_abort(id, attempt_id, admission) {
+            emit_active_route_cancel(stdout, id, 0);
+            batch_clear_terminal_at_generation(id, attempt_id, admission);
             return Ok(());
         }
         // Transition queued (stdin reader announced). Bind will happen after Accepted.
-        let _ = batch_transition_to_queued(id, attempt_id);
+        let _ = batch_transition_to_queued(id, attempt_id, admission);
 
         let (tx, rx) = mpsc::channel::<Event>();
         let req = SubmitRequest {
@@ -590,9 +612,9 @@ impl SlotBackend {
             reply: tx,
         };
         if let Err(e) = self.engine.submit(req) {
-            hipfire_engine::emit::emit_active_attempt_error(
+            emit_qwen_ar_slot_error(
                 stdout,
-                Some(id),
+                id,
                 &format!("multi_slot submit: {e}"),
                 "internal",
                 false,
@@ -621,9 +643,9 @@ impl SlotBackend {
             ThinkMode::NonThink
         };
         if think_mode != expected_think_mode {
-            hipfire_engine::emit::emit_active_attempt_error(
+            emit_qwen_ar_slot_error(
                 stdout,
-                Some(id),
+                id,
                 "think_mode mismatch with enable_thinking",
                 "internal",
                 false,
@@ -640,6 +662,7 @@ impl SlotBackend {
             eos: self.tokenizer.eos_id,
             im_end: self.tokenizer.special_token_id("<|im_end|>"),
             tools: None,
+            enable_grammar: false,
             stop: Vec::new(),
             max_think: 0,
             max_tokens,
@@ -669,12 +692,12 @@ impl SlotBackend {
         let mut rejected: Option<String> = None;
 
         loop {
-            if batch_check_abort(id, attempt_id) {
+            if batch_check_abort(id, attempt_id, admission) {
                 drop(rx);
                 if let Some(sess) = accepted_session.take() {
                     let _ = self.engine.close(sess);
                 }
-                emit_qwen_ar_cancelled(stdout, id, produced);
+                emit_active_route_cancel(stdout, id, produced);
                 return Ok(());
             }
             match rx.recv_timeout(Duration::from_millis(100)) {
@@ -689,10 +712,11 @@ impl SlotBackend {
                         prefill_tokens = prefill;
                         let ticket = LaneTicket {
                             lane: (session % 1024) as usize,
-                            generation: attempt_id,
+                            generation: session,
+                            admission,
                         };
                         accepted_ticket = Some(ticket);
-                        let _ = batch_bind_active(id, attempt_id, ticket);
+                        let _ = batch_bind_active(id, attempt_id, admission, ticket);
                     }
                     Event::Token { id: tok_id } => {
                         let outcome = if first_token {
@@ -726,9 +750,9 @@ impl SlotBackend {
             if let Some(sess) = accepted_session.take() {
                 let _ = self.engine.close(sess);
             }
-            hipfire_engine::emit::emit_active_attempt_error(
+            emit_qwen_ar_slot_error(
                 stdout,
-                Some(id),
+                id,
                 &format!("multi_slot rejected: {reason}"),
                 "internal",
                 false,
@@ -742,14 +766,7 @@ impl SlotBackend {
             if let Some(sess) = accepted_session.take() {
                 let _ = self.engine.close(sess);
             }
-            hipfire_engine::emit::emit_active_attempt_error(
-                stdout,
-                Some(id),
-                &reason,
-                "internal",
-                false,
-                false,
-            );
+            emit_qwen_ar_slot_error(stdout, id, &reason, "internal", false, false);
             let _ = stdout.flush();
             return Ok(());
         }
@@ -759,7 +776,7 @@ impl SlotBackend {
             if let Some(sess) = accepted_session.take() {
                 let _ = self.engine.close(sess);
             }
-            emit_qwen_ar_cancelled(stdout, id, produced);
+            emit_active_route_cancel(stdout, id, produced);
             return Ok(());
         }
 
@@ -789,14 +806,27 @@ impl SlotBackend {
         // Mark ready with exact pending done, publish commit_ready, poll keyed Commit/Abort with normal timeout
         let ticket = accepted_ticket.unwrap_or(LaneTicket {
             lane: 0,
-            generation: attempt_id,
+            generation: 0,
+            admission,
         });
         // If no session accepted, we still need to handle terminal: directly emit cancelled? But we have pending_done
         if accepted_session.is_some() {
-            let _ = batch_mark_ready_with_pending(id, attempt_id, ticket, pending_done.clone());
+            let _ = batch_mark_ready_with_pending(
+                id,
+                attempt_id,
+                admission,
+                ticket,
+                pending_done.clone(),
+            );
         } else {
             // No session: treat as ready with dummy ticket to allow commit wait? Just emit done directly
-            let _ = batch_mark_ready_with_pending(id, attempt_id, ticket, pending_done.clone());
+            let _ = batch_mark_ready_with_pending(
+                id,
+                attempt_id,
+                admission,
+                ticket,
+                pending_done.clone(),
+            );
         }
         let mut commit_ready = pending_done.clone();
         if let Some(map) = commit_ready.as_object_mut() {
@@ -808,18 +838,19 @@ impl SlotBackend {
         let _ = writeln!(stdout, "{}", commit_ready);
         let _ = stdout.flush();
 
-        let decision = batch_wait_decision(id, attempt_id, CLIENT_TERMINAL_COMMIT_TIMEOUT);
+        let decision =
+            batch_wait_decision(id, attempt_id, admission, CLIENT_TERMINAL_COMMIT_TIMEOUT);
         match decision {
             hipfire_engine::terminal::ClientTerminalDecision::Commit => {
-                // Emit byte-identical done
-                let _ = writeln!(stdout, "{}", pending_done);
-                let _ = stdout.flush();
+                // Emit byte-identical done through the route adapter so the
+                // keyed claim and route-start latch are retired together.
+                emit_active_route_done(stdout, id, &pending_done);
             }
             hipfire_engine::terminal::ClientTerminalDecision::Abort => {
                 if let Some(sess) = accepted_session.take() {
                     let _ = self.engine.close(sess);
                 }
-                emit_qwen_ar_cancelled(stdout, id, produced);
+                emit_active_route_cancel(stdout, id, produced);
             }
         }
         Ok(())
@@ -1283,6 +1314,7 @@ pub fn build_convo_from_messages(messages: &[Message]) -> Vec<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use hipfire_engine::terminal::{batch_clear_all_terminals, batch_terminal_generation};
     use hipfire_runtime::prompt_frame::Role;
     use serde_json::json;
 
@@ -1522,5 +1554,134 @@ mod tests {
             },
         ]);
         assert_ne!(c1, c2);
+    }
+    #[test]
+    fn qwen_ar_slot_post_start_errors_release_route_and_reuse_generation() {
+        let _lock = crate::TERMINAL_TEST_LOCK.lock().unwrap();
+        let cases = [
+            (
+                "submit",
+                "multi_slot submit: engine unavailable",
+                "internal",
+            ),
+            (
+                "think",
+                "think_mode mismatch with enable_thinking",
+                "internal",
+            ),
+            (
+                "rejected",
+                "multi_slot rejected: engine rejected result",
+                "internal",
+            ),
+            (
+                "summary",
+                "model emitted tool calls on a tool-disabled multi-slot request",
+                "internal",
+            ),
+        ];
+
+        for (offset, (name, message, class)) in cases.into_iter().enumerate() {
+            let id = format!("slot-{name}-reuse");
+            let attempt_id = 92_000 + offset as u64;
+            batch_clear_all_terminals();
+            hipfire_engine::terminal::set_active_attempt_id(attempt_id);
+            assert_eq!(hipfire_generate::ar::active_generation_route(), None);
+
+            let admission_a = hipfire_engine::terminal::batch_announce_terminal(&id, attempt_id)
+                .expect("slot admission A");
+            let mut output = Vec::new();
+            {
+                let _batch_scope =
+                    BatchAttemptScope::enter_for_generation(&id, attempt_id, admission_a);
+                let _route_scope = GenerationRouteScope::enter(GenerationRoute::QwenAr, &id);
+                emit_generation_start(GenerationRoute::QwenAr, &mut output, &id, false);
+                emit_qwen_ar_slot_error(&mut output, &id, message, class, false, false);
+            }
+
+            let events: Vec<serde_json::Value> = std::str::from_utf8(&output)
+                .expect("slot error UTF-8")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("slot error JSON"))
+                .collect();
+            assert_eq!(events.len(), 2, "{name} terminal envelope count");
+            assert_eq!(events[0]["type"], "gen_start", "{name} start event");
+            assert_eq!(events[0]["id"], id, "{name} start id");
+            assert_eq!(events[0]["attempt_id"], attempt_id, "{name} start attempt");
+            assert_eq!(events[1]["type"], "error", "{name} error event");
+            assert_eq!(events[1]["id"], id, "{name} error id");
+            assert_eq!(events[1]["attempt_id"], attempt_id, "{name} error attempt");
+            assert_eq!(
+                hipfire_generate::ar::active_generation_route(),
+                None,
+                "{name} route cleanup"
+            );
+            assert_eq!(events[1]["class"], class, "{name} error class");
+            assert_eq!(events[1]["retryable"], false, "{name} retryability");
+            assert_eq!(events[1]["rolled_back"], false, "{name} rollback");
+            assert_eq!(
+                batch_terminal_generation(&id, attempt_id),
+                Some(admission_a),
+                "{name} admission remains until ClearOnExit"
+            );
+
+            // ClearOnExit owns A's opaque token. A stale second drop must
+            // never remove a same-key B admission.
+            assert!(batch_clear_terminal_at_generation(
+                &id,
+                attempt_id,
+                admission_a
+            ));
+            let admission_b = hipfire_engine::terminal::batch_announce_terminal(&id, attempt_id)
+                .expect("slot admission B");
+            assert_ne!(admission_a, admission_b, "{name} fresh admission");
+            assert!(
+                !batch_clear_terminal_at_generation(&id, attempt_id, admission_a),
+                "{name} stale ClearOnExit"
+            );
+            assert_eq!(
+                batch_terminal_generation(&id, attempt_id),
+                Some(admission_b),
+                "{name} B survived stale cleanup"
+            );
+
+            {
+                let _batch_scope =
+                    BatchAttemptScope::enter_for_generation(&id, attempt_id, admission_b);
+                let _route_scope = GenerationRouteScope::enter(GenerationRoute::QwenAr, &id);
+                emit_generation_start(GenerationRoute::QwenAr, &mut output, &id, false);
+                emit_qwen_ar_slot_error(&mut output, &id, message, class, false, false);
+            }
+            let events: Vec<serde_json::Value> = std::str::from_utf8(&output)
+                .expect("reused slot UTF-8")
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("reused slot JSON"))
+                .collect();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "gen_start")
+                    .count(),
+                2,
+                "{name} fresh start after error"
+            );
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| event["type"] == "error")
+                    .count(),
+                2,
+                "{name} one error per generation"
+            );
+            assert_eq!(events[2]["attempt_id"], attempt_id, "{name} reuse attempt");
+            assert_eq!(events[3]["class"], class, "{name} reuse error class");
+            assert!(batch_clear_terminal_at_generation(
+                &id,
+                attempt_id,
+                admission_b
+            ));
+        }
+        batch_clear_all_terminals();
+        hipfire_engine::terminal::set_active_attempt_id(0);
     }
 }

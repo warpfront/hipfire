@@ -7,6 +7,7 @@
 
 use super::batch::BatchSemantics;
 use super::batch::PrefillBatchScratch;
+use super::config::DflashFusionCtx;
 use super::config::LayerType;
 use super::config::MropeCtx;
 use super::config::Qwen35Config;
@@ -1149,19 +1150,7 @@ impl Qwen35Scratch {
             // Honors HIPFIRE_ATTN_FLASH=never|0|off as an explicit override
             // for users who prefer the non-flash kernel and don't intend
             // to use graph capture.
-            flash_mode: match hipfire_runtime::config::get().attention_flash_mode.as_str() {
-                "never" | "0" | "off" => 0,
-                "always" | "2" | "force" => 2,
-                _ => {
-                    let graph_capable_arch =
-                        gpu.arch.starts_with("gfx12") || gpu.arch.starts_with("gfx11");
-                    if graph_capable_arch {
-                        2
-                    } else {
-                        1
-                    }
-                }
-            },
+            flash_mode: hipfire_runtime::llama::attention_flash_mode(&gpu.arch) as u8,
 
             moe_router_logits: None,
             moe_scalar_buf: None,
@@ -4308,7 +4297,10 @@ pub fn forward_prefill_dense_tp(
             _ => return Err(HipError::new(0, "dense TP received a MoE/mismatched layer")),
         }
     }
-    let cap = crate::qwen35::prefill::prefill_max_batch(&gpus.devices[0]);
+    // Size the scratch to the call, not to the arch ceiling: an 8-token verify
+    // would otherwise allocate and free a 512-row PBS per rank on every cycle.
+    let cap =
+        crate::qwen35::prefill::prefill_max_batch_tp(&gpus.devices[0], tp).min(tokens.len().max(1));
     if cap == 0 {
         return Err(HipError::new(0, "prefill_max_batch is zero"));
     }
@@ -4454,6 +4446,7 @@ pub fn forward_prefill_dense_tp(
                                 q8_flags[rank],
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(&partials[rank]),
+                                DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -4484,6 +4477,7 @@ pub fn forward_prefill_dense_tp(
                                 q8_flags[rank],
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(&partials[rank]),
+                                DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -4514,6 +4508,7 @@ pub fn forward_prefill_dense_tp(
                             let ctx = DispatchCtx::new(&gpus.devices[rank]);
                             if let Err(e) = crate::qwen35::prefill::batch_chunk_full_attn_attn(
                                 &mut gpus.devices[rank],
+                                false,
                                 layer,
                                 &configs[rank],
                                 &pbs_vec[rank],
@@ -4531,6 +4526,7 @@ pub fn forward_prefill_dense_tp(
                                 kv_layer_idx,
                                 layer_idx,
                                 BatchEpilogue::Partial(&partials[rank]),
+                                DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -4561,6 +4557,7 @@ pub fn forward_prefill_dense_tp(
                                 q8_flags[rank],
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(&partials[rank]),
+                                DflashFusionCtx::Off,
                             ) {
                                 process_res = Err(e);
                                 break;

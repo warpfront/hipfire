@@ -113,7 +113,9 @@ MQ2V2 is not registered. Explicit `qwen3.8:27b-mq4` aliases to `qwen3.8:27b`. Le
 | `qwen3.8:27b-draft-mq6` | `qwen38-27b-dflash-mq6.hfq` | 1.66 | 16 | `qwen3.8:27b*` (same-bit alt) |
 | `muse-glimmer:draft` | `muse-glimmer-30b-dflash.mq4` | 1.36 | 26 | `muse-glimmer` / `muse-glimmer:fast` |
 
-Draft **loading** is controlled by `dflash_mode` / `speculation` / `HIPFIRE_DFLASH_DRAFT` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)). Default `dflash_mode` is **off**. Filename auto-match may wire a sibling draft when present; that is discovery, not an admission that DFlash wins on every prompt.
+Draft **loading** is registry-driven: `hipfire pull <tag>` fetches the draft sidecar alongside the target, and `dflash_mode` / `speculation` ([`CONFIG.md`](CONFIG.md), [`env-vars.md`](env-vars.md)) decides what happens next — default `dflash_mode` is **`off`** (pull ≠ enable); `auto` uses the sidecar when present (AR otherwise); `on` requires it and fails the load without it. Override the sidecar with `developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` or `run --model-draft`. Watch for `DFlash draft loaded:` in load output. Several tags may share one `dflash.file`; `hipfire rm` keeps that file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
+
+Vision-tower **loading** is registry-driven the same way: every `qwen3.8:27b*` tier declares the shared `vision.file` (`qwen3.8-27b-vision.hfq`, llama.cpp mmproj-style), so `hipfire pull <tag>` fetches the tower once and every text quant tier serves images without requantizing the trunk. The loader opens the sidecar as a separate pack and applies it with the trunk's vision config. `vision_mode` ([`CONFIG.md`](CONFIG.md#vision-tower), [`env-vars.md`](env-vars.md)) decides what happens next — default **`off`** never loads the tower (even an explicit `--vision` is skipped, the daemon's `dflash_mode=off`-style hard override, so text loads pay no tower VRAM); `auto` uses the registry/sibling sidecar when present and stays silently text-only when absent; `on` requires the declared sidecar and fails the load closed without it. A trunk with an embedded tower declares no sidecar and is unaffected by this key. Override per load with `run --vision` / `serve --vision` or `HIPFIRE_VISION_SIDECAR` (empty opts out); a `<trunk-stem>-vision.hfq` file beside the trunk is also discovered. `hipfire rm` keeps the shared file while another installed declarer still needs it ([`CLI.md`](CLI.md)).
 
 ### Qwen3 (non-3.5) dense HF4
 
@@ -139,7 +141,7 @@ Draft **loading** is controlled by `dflash_mode` / `speculation` / `HIPFIRE_DFLA
 | `qwopus3.6:27b-coder` | `qwopus3.6-27b-coder.mq4` | 15.0 | 16 | q8 default KV; agentic coder finetune |
 | `nex-n2:mini` | `nex-n2-mini.mq4p` | 19.82 | 22 | q8 default KV; Qwen3.5-35B-A3B agentic MoE finetune |
 | `ornith-1.5:35b-a3b` | `ornith-1.5-35b-a3b.mq4` | 19.02 | 22 | q8 default KV; MQ4G256V2 quality trunk with selective MQ6/Q8 protection; semantic `low`/`medium`/`xhigh` effort (default `xhigh`), uncapped unless an explicit integer cap is set |
-| `ornith-1.5:35b-a3b-mq4r` | `ornith-1.5-35b-a3b.mq4r` | 18.70 | 22 | q8 default KV; uniform MQ4G256V2 Redline SKU, 20,871 qt44 and zero qt13/qt15; same effort contract as the quality trunk |
+| `ornith-1.5:35b-a3b-mq4r` | `ornith-1.5-35b-a3b.mq4r` | 18.70 | 22 | q8 default KV; uniform MQ4G256V2 Redline SKU, 20,871 qt44 and zero qt13/qt15; same effort contract as the quality trunk. Speed SKU aliases: `ornith-1.5:fast` / `ornith-1.5:35b-a3b-fast` → this tag (Muse/Qwen3.8 `:fast` pattern) |
 
 ### Other families (registry)
 
@@ -258,6 +260,7 @@ downloads). **Partial table** — for the complete surface read that file or run
 | `qwen3.5:large` | `qwen3.5:27b` |
 | `qwen3.6` / `qwen3.6:a3b` | `qwen3.6:35b-a3b` |
 | `ornith` / `ornith-1.5` / `ornith1.5` / `ornith1.5:35b-a3b` | `ornith-1.5:35b-a3b` |
+| `ornith-1.5:fast` / `ornith-1.5:35b-a3b-fast` | `ornith-1.5:35b-a3b-mq4r` |
 | `qwen3.8` / `qwen3.8:latest` | `qwen3.8:27b` |
 | `qwen3.8:fast` / `qwen3.8:27b-fast` | `qwen3.8:27b-mq4-xt` |
 | `qwen3.8:27b-mq4` | `qwen3.8:27b` |

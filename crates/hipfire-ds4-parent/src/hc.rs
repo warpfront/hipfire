@@ -80,10 +80,7 @@ pub struct ParentHcParams<'a> {
 #[inline]
 fn require_f32(t: &GpuTensor, name: &str) -> Result<(), String> {
     if t.dtype != DType::F32 {
-        return Err(err(format!(
-            "{name} must be F32 (got {:?})",
-            t.dtype
-        )));
+        return Err(err(format!("{name} must be F32 (got {:?})", t.dtype)));
     }
     Ok(())
 }
@@ -112,7 +109,7 @@ fn sigmoid_f32(x: f32) -> f32 {
 fn hc_post_scale() -> f32 {
     use std::sync::LazyLock;
     static SCALE: LazyLock<f32> = LazyLock::new(|| {
-        let v = std::env::var("HIPFIRE_DEEPSEEK4_PARENT_POST_SCALE")
+        let v = hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_PARENT_POST_SCALE")
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(2.0);
@@ -126,7 +123,6 @@ fn hc_post_scale() -> f32 {
     });
     *SCALE
 }
-
 
 /// Host-side `hc_split_sinkhorn` control split (pre/post + comb logits),
 /// matching `kernel.py:391-396` **before** the sinkhorn iterations.
@@ -145,10 +141,7 @@ fn split_pre_post_comb_logits(
         return Err(err(format!("hc_scale len {} < 3", scale.len())));
     }
     if base.len() < mix_hc {
-        return Err(err(format!(
-            "hc_base len {} < mix_hc {mix_hc}",
-            base.len()
-        )));
+        return Err(err(format!("hc_base len {} < mix_hc {mix_hc}", base.len())));
     }
     if mixes.len() < rows * mix_hc {
         return Err(err(format!(
@@ -167,19 +160,17 @@ fn split_pre_post_comb_logits(
         let mbase = r * mix_hc;
         for j in 0..hc_mult {
             // pre = sigmoid(mixes * scale[0] + base) + eps
-            pre[r * hc_mult + j] =
-                sigmoid_f32(mixes[mbase + j] * s0 + base[j]) + hc_eps;
+            pre[r * hc_mult + j] = sigmoid_f32(mixes[mbase + j] * s0 + base[j]) + hc_eps;
             // post = post_scale * sigmoid(mixes * scale[1] + base)
             // Reference hardcodes post_scale=2.0 (kernel.py:394).
-            post[r * hc_mult + j] = hc_post_scale()
-                * sigmoid_f32(mixes[mbase + j + hc_mult] * s1 + base[j + hc_mult]);
+            post[r * hc_mult + j] =
+                hc_post_scale() * sigmoid_f32(mixes[mbase + j + hc_mult] * s1 + base[j + hc_mult]);
         }
         let cbase = r * hc_mult * hc_mult;
         for j in 0..hc_mult {
             for k in 0..hc_mult {
                 let idx = j * hc_mult + k + hc_mult * 2;
-                comb[cbase + j * hc_mult + k] =
-                    mixes[mbase + idx] * s2 + base[idx];
+                comb[cbase + j * hc_mult + k] = mixes[mbase + idx] * s2 + base[idx];
             }
         }
     }
@@ -334,23 +325,14 @@ pub fn parent_hc_pre(
 
     // 3. Upload post (finished) and comb logits; run GPU sinkhorn in-place.
     gpu.hip
-        .memcpy_htod(
-            &post.buf,
-            unsafe {
-                std::slice::from_raw_parts(post_h.as_ptr() as *const u8, post_h.len() * 4)
-            },
-        )
+        .memcpy_htod(&post.buf, unsafe {
+            std::slice::from_raw_parts(post_h.as_ptr() as *const u8, post_h.len() * 4)
+        })
         .map_err(|e| err(format!("hc_pre upload post: {e:?}")))?;
     gpu.hip
-        .memcpy_htod(
-            &comb.buf,
-            unsafe {
-                std::slice::from_raw_parts(
-                    comb_logits.as_ptr() as *const u8,
-                    comb_logits.len() * 4,
-                )
-            },
-        )
+        .memcpy_htod(&comb.buf, unsafe {
+            std::slice::from_raw_parts(comb_logits.as_ptr() as *const u8, comb_logits.len() * 4)
+        })
         .map_err(|e| err(format!("hc_pre upload comb: {e:?}")))?;
     gpu.hc_sinkhorn_4x4_batched(comb, hc_eps, sinkhorn_iters, rows as i32)
         .map_err(|e| err(format!("hc_sinkhorn_4x4_batched: {e:?}")))?;
@@ -451,15 +433,7 @@ pub fn parent_hc_post(
         .upload_f32(&ct, &[rows, hc_mult, hc_mult])
         .map_err(|e| err(format!("hc_post upload comb^T: {e:?}")))?;
 
-    let mix = gpu.hc_mix_4stream_batched(
-        residual,
-        &comb_t,
-        post,
-        x,
-        out,
-        dim as i32,
-        rows as i32,
-    );
+    let mix = gpu.hc_mix_4stream_batched(residual, &comb_t, post, x, out, dim as i32, rows as i32);
     free_scratch(gpu, comb_t);
     mix.map_err(|e| err(format!("hc_mix_4stream_batched: {e:?}")))
 }

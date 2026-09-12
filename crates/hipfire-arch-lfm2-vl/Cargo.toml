@@ -16,7 +16,9 @@ deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 hipfire-runtime = { path = "../hipfire-runtime" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+serde_json.workspace = true
+# PNG decode/resize only — JPEG goes through
+# `hipfire_runtime::imagedec` (libjpeg-turbo-rs), so the `jpeg`
+# feature stays off and zune-jpeg stays out of the lock.
+image.workspace = true
 libm = "0.2"

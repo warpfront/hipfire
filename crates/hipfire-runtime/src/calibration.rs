@@ -42,7 +42,7 @@ enum HessianStorage {
 }
 
 fn hessian_storage_from_env() -> HessianStorage {
-    match std::env::var("HIPFIRE_CALIB_HESSIAN_STORAGE")
+    match hipfire_config::developer_var("HIPFIRE_CALIB_HESSIAN_STORAGE")
         .ok()
         .as_deref()
         .map(str::to_ascii_lowercase)
@@ -130,7 +130,10 @@ pub struct CalibCollector {
 
 /// `HIPFIRE_CALIB_F64_AUDIT=1` → run the CPU f64 reference accumulation.
 fn f64_audit_enabled() -> bool {
-    std::env::var("HIPFIRE_CALIB_F64_AUDIT").ok().as_deref() == Some("1")
+    hipfire_config::developer_var("HIPFIRE_CALIB_F64_AUDIT")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 impl CalibCollector {

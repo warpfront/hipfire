@@ -3,31 +3,36 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
+use crate::calibration::awq_eligible;
+use crate::dequant::{dequantize_e2m1_ue8m0_to_f32, e2m1_to_f32};
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
-use crate::reap_overlay;
-use crate::quant_mq::*;
-use crate::quant_hfp4::*;
-use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
-use crate::dequant::{dequantize_e2m1_ue8m0_to_f32, e2m1_to_f32};
-use crate::calibration::awq_eligible;
-use crate::quant_e8::*;
 use crate::hfq::*;
+use crate::quant_e8::*;
+use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
+use crate::quant_hfp4::*;
+use crate::quant_mq::*;
+use crate::reap_overlay;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 mod gptq_damping_probe {
     //! Offline GPTQ-Lloyd damping sweep. Runs the GPTQ-Lloyd quant pipeline
@@ -2021,9 +2026,9 @@ mod hfq_block_diag {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hfq::{kmap_resolve, kmap_resolve_mode, QuantLevel};
     use crate::model_filter::{is_q8_tensor, q8_class_of, should_quantize};
     use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
-    use crate::hfq::{kmap_resolve, kmap_resolve_mode, QuantLevel};
 
     /// The MQ*-G256-GL codebooks are NOT stored in the `.hfq` file: the encoder
     /// bakes them in via `gl_encode_block(&GL_CB2 | &GL_CB3, ..)` and the runtime
@@ -2572,10 +2577,21 @@ mod tests {
         // via q8_class_of:is_q8_tensor (56xx). should_quantize keeps it quantizable
         // (contains "weight", not norm/bias, not vision).
         let name = "lm_head.weight";
-        assert!(should_quantize(name), "lm_head must be quantizable (should_quantize:53xx)");
-        assert_eq!(q8_class_of(name), Some("lm_head"), "q8_class_of:55xx lm_head");
+        assert!(
+            should_quantize(name),
+            "lm_head must be quantizable (should_quantize:53xx)"
+        );
+        assert_eq!(
+            q8_class_of(name),
+            Some("lm_head"),
+            "q8_class_of:55xx lm_head"
+        );
         assert!(is_q8_tensor(name), "is_q8_tensor:59xx must be Q8");
-        assert_eq!(kmap_resolve(name, 52, false), QuantLevel::Q8, "kmap Rule2 Q8");
+        assert_eq!(
+            kmap_resolve(name, 52, false),
+            QuantLevel::Q8,
+            "kmap Rule2 Q8"
+        );
         assert_eq!(kmap_resolve_mode(name, 52, false, 0), QuantLevel::Q8);
         assert_eq!(kmap_resolve_mode(name, 52, false, 3), QuantLevel::Q8);
     }
@@ -2594,7 +2610,7 @@ mod tests {
         // time. Only a check that pins the CLASS SELECTION catches that gap.
         //
         // SAFETY: single-threaded test; env is restored before returning.
-        let prev = std::env::var("HIPFIRE_Q8_CLASSES").ok();
+        let prev = hipfire_config::developer_var("HIPFIRE_Q8_CLASSES").ok();
         unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", "lm_head,embed") };
 
         assert!(is_q8_tensor("lm_head.weight"), "lm_head must be Q8");
@@ -2604,8 +2620,14 @@ mod tests {
         );
         let attn_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.q_proj.weight");
         let gate_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.gate_proj.weight");
-        assert!(!attn_q8, "attention must NOT be pulled into Q8 by the glimmer default");
-        assert!(!gate_q8, "the Glimmer attention gate is a projection and must follow --format");
+        assert!(
+            !attn_q8,
+            "attention must NOT be pulled into Q8 by the glimmer default"
+        );
+        assert!(
+            !gate_q8,
+            "the Glimmer attention gate is a projection and must follow --format"
+        );
 
         match prev {
             Some(v) => unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", v) },
@@ -2632,10 +2654,21 @@ mod tests {
         let mlp_gate = "model.language_model.layers.0.mlp.gate_proj.weight";
         // q8_class_of:55xx — self_attn substring => "attn"; mlp gate has no
         // self_attn/attn_q/class and is not a router, so None.
-        assert_eq!(q8_class_of(attn_gate), Some("attn"), "self_attn.gate_proj => attn (q8_class_of)");
-        assert_eq!(q8_class_of(mlp_gate), None, "mlp.gate_proj must not be attn/router");
+        assert_eq!(
+            q8_class_of(attn_gate),
+            Some("attn"),
+            "self_attn.gate_proj => attn (q8_class_of)"
+        );
+        assert_eq!(
+            q8_class_of(mlp_gate),
+            None,
+            "mlp.gate_proj must not be attn/router"
+        );
         assert!(is_q8_tensor(attn_gate), "attn gate must be fixed-tier Q8");
-        assert!(!is_q8_tensor(mlp_gate), "mlp gate is not fixed-tier (unless --q8-router on MoE)");
+        assert!(
+            !is_q8_tensor(mlp_gate),
+            "mlp gate is not fixed-tier (unless --q8-router on MoE)"
+        );
         // should_quantize:53xx — both are weights, not norms/bias/vision => true
         assert!(should_quantize(attn_gate));
         assert!(should_quantize(mlp_gate));
@@ -2646,7 +2679,10 @@ mod tests {
         // the gate's input channels and is divided at inference before the gate;
         // the gate's output then scales attn_out via sigmoid. Input-side AWQ is
         // mathematically valid regardless of where the gate's output is applied.
-        assert!(awq_eligible(attn_gate), "attn gate must be AWQ-eligible (input-side)");
+        assert!(
+            awq_eligible(attn_gate),
+            "attn gate must be AWQ-eligible (input-side)"
+        );
         assert!(awq_eligible(mlp_gate), "mlp gate must be AWQ-eligible");
         // kmap: dense edge-layer rule promotes FFN only, not attn — so even in
         // edge layer 0, the attn gate stays Base (not Promote6). This matches the
@@ -2656,7 +2692,10 @@ mod tests {
         // mis-fire even if is_moe were true: attn gate is not mlp.gate.weight.
         // For MoE edge-layer (0 is edge), full promotion returns Promote6 for every
         // tensor including attn — that is the expected MoE policy, not a router.
-        assert_eq!(kmap_resolve_mode("model.layers.0.self_attn.gate_proj.weight", 52, true, 0), QuantLevel::Promote6);
+        assert_eq!(
+            kmap_resolve_mode("model.layers.0.self_attn.gate_proj.weight", 52, true, 0),
+            QuantLevel::Promote6
+        );
     }
 
     #[test]
@@ -2673,12 +2712,23 @@ mod tests {
             "model.language_model.norm.weight",
         ];
         for name in norms {
-            assert!(!should_quantize(name), "norm {name} must not be quantizable");
-            assert_eq!(kmap_resolve(name, 52, false), QuantLevel::F16, "kmap F16 for {name}");
+            assert!(
+                !should_quantize(name),
+                "norm {name} must not be quantizable"
+            );
+            assert_eq!(
+                kmap_resolve(name, 52, false),
+                QuantLevel::F16,
+                "kmap F16 for {name}"
+            );
             assert_eq!(kmap_resolve_mode(name, 52, false, 1), QuantLevel::F16);
             assert_eq!(kmap_resolve_mode(name, 52, false, 2), QuantLevel::F16);
             assert_eq!(kmap_resolve_mode(name, 52, false, 3), QuantLevel::F16);
-            assert_eq!(kmap_resolve(name, 52, true), QuantLevel::F16, "even MoE must be F16");
+            assert_eq!(
+                kmap_resolve(name, 52, true),
+                QuantLevel::F16,
+                "even MoE must be F16"
+            );
             // q8_class_of is unrelated to norms — must be None / not Q8
             assert!(!is_q8_tensor(name));
         }
@@ -2699,18 +2749,35 @@ mod tests {
             "model.vision_projection.weight",
         ];
         for name in vision {
-            assert!(!should_quantize(name), "vision {name} must stay F16 (should_quantize)");
-            assert_eq!(kmap_resolve(name, 52, false), QuantLevel::F16, "kmap vision F16 for {name}");
+            assert!(
+                !should_quantize(name),
+                "vision {name} must stay F16 (should_quantize)"
+            );
+            assert_eq!(
+                kmap_resolve(name, 52, false),
+                QuantLevel::F16,
+                "kmap vision F16 for {name}"
+            );
             assert_eq!(kmap_resolve_mode(name, 52, false, 0), QuantLevel::F16);
             assert_eq!(kmap_resolve_mode(name, 52, true, 1), QuantLevel::F16);
             // parse_layer_idx must NOT extract vision_tower.layers.N as text layer
-            assert_eq!(parse_layer_idx(name), None, "vision {name} must not parse as layer idx");
+            assert_eq!(
+                parse_layer_idx(name),
+                None,
+                "vision {name} must not parse as layer idx"
+            );
             // The old unanchored find("layers.") would have returned Some(0/49)
             // and edge-layer Promote6 could have fired — locked to None now.
         }
         // Plain vision_tower. prefix (dots.ocr style) must still be F16
-        assert_eq!(kmap_resolve("vision_tower.layers.0.attn.q_proj.weight", 52, false), QuantLevel::F16);
-        assert_eq!(parse_layer_idx("vision_tower.layers.0.attn.q_proj.weight"), None);
+        assert_eq!(
+            kmap_resolve("vision_tower.layers.0.attn.q_proj.weight", 52, false),
+            QuantLevel::F16
+        );
+        assert_eq!(
+            parse_layer_idx("vision_tower.layers.0.attn.q_proj.weight"),
+            None
+        );
         // model.visual.* (Qwen3.5-VL) unchanged
         assert!(!should_quantize("model.visual.patch_embed.weight"));
         assert_eq!(parse_layer_idx("model.visual.layers.0.weight"), None);
@@ -2719,9 +2786,18 @@ mod tests {
     #[test]
     pub(crate) fn glimmer_text_layers_still_parse() {
         // Sanity: text layers must still parse correctly (no regression for non-vision).
-        assert_eq!(parse_layer_idx("model.language_model.layers.0.self_attn.q_proj.weight"), Some(0));
-        assert_eq!(parse_layer_idx("model.language_model.layers.51.mlp.down_proj.weight"), Some(51));
-        assert_eq!(parse_layer_idx("model.layers.3.self_attn.gate_proj.weight"), Some(3));
+        assert_eq!(
+            parse_layer_idx("model.language_model.layers.0.self_attn.q_proj.weight"),
+            Some(0)
+        );
+        assert_eq!(
+            parse_layer_idx("model.language_model.layers.51.mlp.down_proj.weight"),
+            Some(51)
+        );
+        assert_eq!(
+            parse_layer_idx("model.layers.3.self_attn.gate_proj.weight"),
+            Some(3)
+        );
     }
 
     #[test]

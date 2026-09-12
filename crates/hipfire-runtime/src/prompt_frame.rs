@@ -37,6 +37,7 @@
 //! against a base model where any `<|im_start|>` token would be
 //! out-of-distribution.
 
+use crate::emit_text::{ThinkOutputRouter, ThinkRouteEvent};
 use crate::tokenizer::Tokenizer;
 
 /// Chooses what goes after the assistant role-and-newline opener.
@@ -969,6 +970,44 @@ pub struct CachedAssistantTurn {
     pub content: Option<CachedAssistantBody>,
 }
 
+/// Producer-authoritative reasoning TEXT for one generated assistant body.
+///
+/// Re-drives [`ThinkOutputRouter`] — the same classifier that produced the SSE
+/// `reasoning` channel the client echoes back as `reasoning_content` — over
+/// `tokenizer.decode(generated_body)`, never by re-parsing markers by hand.
+/// `started_in_think` must be the prompt-side primer state the turn generated
+/// under (assistant opener ended on an open `<think>`).
+///
+/// Text-only on purpose: the generated body's boundary bytes can sit inside
+/// merged BPE units while templates re-emit that framing as their own tokens,
+/// so no token sub-span of the body is a safe reasoning slot. Callers store the
+/// FULL body verbatim in the content slot and pair it with this text; the
+/// splice replays the whole assistant envelope in one span while the
+/// unconditional `reasoning.text == reasoning_content` check in
+/// [`build_cached_history_jinja`] keeps edited history from hitting.
+/// Returns `None` when there is no reasoning text (plain turn).
+pub fn cached_producer_reasoning_text(
+    tokenizer: &Tokenizer,
+    generated_body: &[u32],
+    started_in_think: bool,
+) -> Option<String> {
+    let text = tokenizer.decode(generated_body);
+    let mut router = ThinkOutputRouter::new(started_in_think);
+    let mut events = Vec::new();
+    router.push_into(&text, &mut events);
+    router.finish_into(&mut events);
+    let mut reasoning = String::new();
+    for ev in events {
+        if let ThinkRouteEvent::Reasoning(t) = ev {
+            reasoning.push_str(&t);
+        }
+    }
+    if reasoning.is_empty() {
+        return None;
+    }
+    Some(reasoning)
+}
+
 /// JSON formatter matching HuggingFace's `json.dumps(..., ensure_ascii=False)`
 /// default separators — `", "` between elements and `": "` after keys — the
 /// exact form the model's chat_template was trained on. minijinja's builtin
@@ -1020,6 +1059,7 @@ pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
             format!("tojson: {e}"),
         )
     })?;
+
     String::from_utf8(buf).map_err(|e| {
         minijinja::Error::new(
             minijinja::ErrorKind::InvalidOperation,
@@ -1495,6 +1535,82 @@ fn pick_splice_sentinels(tok: &Tokenizer, n: usize) -> Option<Vec<(String, u32)>
     Some(deduped)
 }
 
+/// Does this template already emit `primer` at the head of a HISTORY
+/// assistant turn?
+///
+/// The generation primer is whatever the cold render leaves after
+/// `<|im_start|>assistant\n` on the live turn (for Qwen with thinking off,
+/// `<think>\n\n</think>\n\n`). The cached assistant body is stored
+/// post-primer, so the jinja splice must re-supply the primer exactly once.
+/// Qwen3.5's template renders history assistant turns bare
+/// (`assistant\n{content}`), so the caller prepends it; Qwen3.8's template
+/// re-emits the empty-think block on history turns too, so prepending
+/// doubles it and the LCP dies at the first assistant turn of every session
+/// (measured 2026-09-03: `lcp=26` against `prior_len=118`, the dumped
+/// render carrying `<think>\n\n</think>\n\n` twice back to back).
+///
+/// Decide from the template itself: render a one-exchange history whose
+/// assistant content is a sentinel word and check whether the primer tokens
+/// sit between the assistant opener and the sentinel. Any render failure
+/// or an unfound opener answers `false` (prepend, the historical behaviour).
+pub fn template_emits_history_primer(frame: &JinjaChatFrame, primer: &[u32]) -> bool {
+    if primer.is_empty() {
+        return false;
+    }
+    let tok = frame.tokenizer;
+    let sentinel = "zqxjkv";
+    let probe = vec![
+        Message {
+            role: Role::User,
+            content: "probe".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        },
+        Message {
+            role: Role::Assistant,
+            content: sentinel.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        },
+        Message {
+            role: Role::User,
+            content: "again".to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        },
+    ];
+    let Ok(rendered) = frame.render_messages(&probe, None, None) else {
+        return false;
+    };
+    let tokens = tok.encode(&rendered);
+    let opener = tok.encode("<|im_start|>assistant\n");
+    let sentinel_ids = tok.encode(sentinel);
+    if opener.is_empty() || sentinel_ids.is_empty() {
+        return false;
+    }
+    // First assistant opener in the render is the history turn.
+    let Some(start) = tokens
+        .windows(opener.len())
+        .position(|w| w == opener.as_slice())
+        .map(|p| p + opener.len())
+    else {
+        return false;
+    };
+    tokens[start..].starts_with(primer) && tokens[start + primer.len()..].starts_with(&sentinel_ids)
+}
+
 /// Jinja-native analogue of [`build_cached_history`]: render the conversation
 /// through the model's **trained** `chat_template` but splice each cached
 /// channel body verbatim. The resulting token stream byte-exactly reproduces
@@ -1507,9 +1623,14 @@ fn pick_splice_sentinels(tok: &Tokenizer, n: usize) -> Option<Vec<(String, u32)>
 /// envelope, and final content are separate slots. Tools and content are
 /// MUTUALLY EXCLUSIVE (`[reasoning?] ++ (tools | content)`). Sentinels are
 /// distinct WITHIN a turn and RECYCLED ACROSS turns (`k = 1 + max_tool_slots + 1`).
-/// The render is committed only when the observed sentinel-id SEQUENCE equals the
-/// expected sequence exactly; any inequality (missing, duplicate, reorder) returns
-/// the plain render.
+/// The render is committed only when the observed sentinel-id SEQUENCE matches the
+/// expected sequence; any inequality (duplicate, reorder, missing content/tool
+/// slot, trailing sentinels) returns the plain render. One exception: a template
+/// branch that never interpolates `reasoning_content` (Qwen bare-history turns)
+/// drops the reasoning sentinel — that structural absence is tolerated and the
+/// remaining slots splice. The `reasoning` text equality below still authorized
+/// the turn, and the dropped slot contributes no output bytes, so edited
+/// reasoning still misses while unedited rich history hits.
 ///
 /// Body boundaries exclude template-owned header/terminator tokens (`<|start|>`,
 /// `assistant to=…`, `<|message|>`, `<|eom|>`, `<|eot|>`); the template re-emits
@@ -1547,6 +1668,17 @@ pub fn build_cached_history_jinja(
         if turn.tools.is_empty() && turn.content.is_none() {
             // Must have at least one slot (reasoning alone without content is invalid per spec)
             return Ok(plain_tokens);
+        }
+        // Whole-envelope marker shape: text-only `reasoning` (empty token ids)
+        // is only meaningful beside a verbatim full-body content slot with no
+        // tools. Any other turn wearing empty reasoning ids is structural
+        // doubt → plain render (no silent re-interpretation of slot bodies).
+        if let Some(rb) = &turn.reasoning {
+            if rb.token_ids.is_empty()
+                && (!turn.tools.is_empty() || turn.content.is_none() || rb.text.is_empty())
+            {
+                return Ok(plain_tokens);
+            }
         }
         // Validate tool count and recipients, and reasoning provenance.
         if turn.tools.is_empty() {
@@ -1632,26 +1764,8 @@ pub fn build_cached_history_jinja(
     let r_id = sentinel_ids[0];
     let a_text = sentinel_texts[k - 1].clone();
     let a_id = sentinel_ids[k - 1];
-    // Build expected sequence, slot bodies and slot texts in document order
-    let mut expected_ids: Vec<u32> = Vec::with_capacity(total_slots);
-    let mut slot_bodies: Vec<Vec<u32>> = Vec::with_capacity(total_slots);
-    for (_, turn) in &cached_hits {
-        if let Some(rb) = &turn.reasoning {
-            expected_ids.push(r_id);
-            slot_bodies.push(rb.token_ids.clone());
-        }
-        if !turn.tools.is_empty() {
-            for (i, tb) in turn.tools.iter().enumerate() {
-                let tid = sentinel_ids[1 + i];
-                expected_ids.push(tid);
-                slot_bodies.push(tb.token_ids.clone());
-            }
-        } else if let Some(cb) = &turn.content {
-            expected_ids.push(a_id);
-            slot_bodies.push(cb.token_ids.clone());
-        }
-    }
-    // 4. Clone messages and substitute sentinels per slot
+    // Substitute sentinels per slot. This borrows the hits; slot bodies move
+    // out below, so substitution runs first.
     let mut subbed: Vec<Message> = messages.to_vec();
     for (msg_idx, turn) in &cached_hits {
         let m = &mut subbed[*msg_idx];
@@ -1667,39 +1781,136 @@ pub fn build_cached_history_jinja(
             m.content = a_text.clone();
         }
     }
+    // Build the expected sentinel sequence, MOVING each slot body out of the
+    // hits — cached bodies can be whole generated turns, so the splice must
+    // never clone them on the cache fast path. `slot_span_open` marks the R of
+    // a whole-envelope turn (text-only `reasoning` + verbatim full-body
+    // content, validated above): its R...A pair splices as ONE span below,
+    // swallowing the template-owned mid framing whose bytes already live
+    // inside the stored body.
+    let mut expected_ids: Vec<u32> = Vec::with_capacity(total_slots);
+    let mut slot_bodies: Vec<Vec<u32>> = Vec::with_capacity(total_slots);
+    let mut slot_is_reasoning: Vec<bool> = Vec::with_capacity(total_slots);
+    let mut slot_span_open: Vec<bool> = Vec::with_capacity(total_slots);
+    let mut slot_span_close: Vec<bool> = Vec::with_capacity(total_slots);
+    for (_, mut turn) in cached_hits {
+        let span = matches!(&turn.reasoning, Some(rb) if rb.token_ids.is_empty())
+            && turn.tools.is_empty()
+            && turn.content.is_some();
+        if let Some(rb) = turn.reasoning.take() {
+            expected_ids.push(r_id);
+            slot_is_reasoning.push(true);
+            slot_span_open.push(span);
+            slot_span_close.push(false);
+            slot_bodies.push(if span { Vec::new() } else { rb.token_ids });
+        }
+        if !turn.tools.is_empty() {
+            for (i, tb) in turn.tools.into_iter().enumerate() {
+                let tid = sentinel_ids[1 + i];
+                expected_ids.push(tid);
+                slot_is_reasoning.push(false);
+                slot_span_open.push(false);
+                slot_span_close.push(false);
+                slot_bodies.push(tb.token_ids);
+            }
+        } else if let Some(cb) = turn.content.take() {
+            expected_ids.push(a_id);
+            slot_is_reasoning.push(false);
+            slot_span_open.push(false);
+            slot_span_close.push(span);
+            slot_bodies.push(cb.token_ids);
+        }
+    }
     // 5. Render substituted, tokenize. Error -> plain.
     let sub_rendered = match frame.render_messages(&subbed, tools, None) {
         Ok(s) => s,
         Err(_) => return Ok(plain_tokens),
     };
     let sub_tokens = tok.encode(&sub_rendered);
-    // 6. Extract observed sentinel subsequence and require exact equality
+    // 6. Extract observed sentinel subsequence. Templates that never interpolate
+    // a slot (Qwen bare-history branches drop `reasoning_content`) omit its
+    // sentinel: tolerate a missing REASONING sentinel only, and only for
+    // per-slot turns. A whole-envelope R delimits its span, so its absence is
+    // structural doubt. The semantic text equality above already authorized
+    // every kept turn, and a dropped slot contributes no bytes to the output,
+    // so no stale reasoning can leak in. Every other deviation
+    // (missing/duplicated/reordered content or tool slot, trailing sentinels)
+    // is structural doubt → plain render.
     let mut observed_ids: Vec<u32> = Vec::new();
     for &t in &sub_tokens {
         if sentinel_ids.contains(&t) {
             observed_ids.push(t);
         }
     }
-    if observed_ids != expected_ids {
-        return Ok(plain_tokens);
-    }
-    // 7. Splice in one non-recursive pass
-    let total_body_len: usize = slot_bodies.iter().map(|b| b.len()).sum();
-    let mut out: Vec<u32> =
-        Vec::with_capacity(sub_tokens.len() - expected_ids.len() + total_body_len);
-    let mut bi: usize = 0;
-    for &t in &sub_tokens {
-        if sentinel_ids.contains(&t) {
-            if bi >= expected_ids.len() || t != expected_ids[bi] {
+    let mut kept_expected: Vec<u32> = Vec::with_capacity(expected_ids.len());
+    let mut kept_idx: Vec<usize> = Vec::with_capacity(slot_bodies.len());
+    {
+        let mut oi = 0usize;
+        for (i, &eid) in expected_ids.iter().enumerate() {
+            if slot_is_reasoning[i]
+                && !slot_span_open[i]
+                && (oi >= observed_ids.len() || observed_ids[oi] != eid)
+            {
+                // Template dropped the reasoning slot: skip it (no bytes).
+                continue;
+            }
+            if oi >= observed_ids.len() || observed_ids[oi] != eid {
                 return Ok(plain_tokens);
             }
-            out.extend_from_slice(&slot_bodies[bi]);
-            bi += 1;
-        } else {
-            out.push(t);
+            kept_expected.push(eid);
+            kept_idx.push(i);
+            oi += 1;
+        }
+        if oi != observed_ids.len() {
+            return Ok(plain_tokens);
         }
     }
-    debug_assert_eq!(bi, slot_bodies.len());
+    // 7. Splice in one pass. A whole-envelope R swallows everything through its
+    // paired A (template-owned mid framing included — those bytes already live
+    // inside the stored body) and emits the verbatim body ONCE. The opener and
+    // primer before R and the closer after A pass through untouched, so each is
+    // consumed exactly once. Any sentinel surprise is structural doubt.
+    let total_body_len: usize = kept_idx.iter().map(|&i| slot_bodies[i].len()).sum();
+    let mut out: Vec<u32> =
+        Vec::with_capacity(sub_tokens.len() - kept_expected.len() + total_body_len);
+    let mut bi: usize = 0;
+    let mut si: usize = 0;
+    while si < sub_tokens.len() {
+        let t = sub_tokens[si];
+        if !sentinel_ids.contains(&t) {
+            out.push(t);
+            si += 1;
+            continue;
+        }
+        if bi >= kept_expected.len() || t != kept_expected[bi] {
+            return Ok(plain_tokens);
+        }
+        let ki = kept_idx[bi];
+        if slot_span_open[ki] {
+            // Pair check against the kept sequence, then swallow the span.
+            if bi + 1 >= kept_expected.len()
+                || kept_expected[bi + 1] != a_id
+                || !slot_span_close[kept_idx[bi + 1]]
+            {
+                return Ok(plain_tokens);
+            }
+            let mut sj = si + 1;
+            while sj < sub_tokens.len() && !sentinel_ids.contains(&sub_tokens[sj]) {
+                sj += 1;
+            }
+            if sj >= sub_tokens.len() || sub_tokens[sj] != a_id {
+                return Ok(plain_tokens);
+            }
+            out.extend_from_slice(&slot_bodies[kept_idx[bi + 1]]);
+            bi += 2;
+            si = sj + 1;
+        } else {
+            out.extend_from_slice(&slot_bodies[ki]);
+            bi += 1;
+            si += 1;
+        }
+    }
+    debug_assert_eq!(bi, kept_idx.len());
     Ok(out)
 }
 
@@ -2114,6 +2325,51 @@ mod tests {
         assert_eq!(m.role, Role::Tool);
         assert_eq!(m.content, "72F");
         assert_eq!(m.tool_call_id.as_deref(), Some("call_42"));
+    }
+
+    #[test]
+    fn history_primer_probe_distinguishes_qwen35_and_qwen38_templates() {
+        // Thinking off: the live turn's cold render primes
+        // `<think>\n\n</think>\n\n` after the assistant opener. Qwen3.5-style
+        // templates render HISTORY assistant turns bare; Qwen3.8-style
+        // templates re-emit the empty-think block on them. The cached body is
+        // stored post-primer, so the splice must prepend the primer for the
+        // former and must NOT for the latter (measured 2026-09-03: the double
+        // primer put `lcp=26` against `prior_len=118` on every turn).
+        let t = make_tokenizer();
+        let bare = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if not enable_thinking %}<think>\n\n</think>\n\n{% endif %}{% endif %}";
+        let reemit = "{% for m in messages %}<|im_start|>{{ m.role }}\n{% if m.role == 'assistant' and not enable_thinking %}<think>\n\n</think>\n\n{% endif %}{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n{% if not enable_thinking %}<think>\n\n</think>\n\n{% endif %}{% endif %}";
+        let primer = t.encode("<think>\n\n</think>\n\n");
+        assert!(!primer.is_empty());
+        for (template, expect) in [(bare, false), (reemit, true)] {
+            let frame = JinjaChatFrame {
+                tokenizer: &t,
+                template,
+                system: None,
+                user: "",
+                enable_thinking: false,
+                bos_token: Some(""),
+                reasoning_strength: None,
+                reasoning_effort: None,
+            };
+            assert_eq!(
+                template_emits_history_primer(&frame, &primer),
+                expect,
+                "template {template:?}"
+            );
+        }
+        // Empty primer (thinking on with no opener text): never claim re-emit.
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: reemit,
+            system: None,
+            user: "",
+            enable_thinking: false,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        assert!(!template_emits_history_primer(&frame, &[]));
     }
 
     #[test]
@@ -3975,5 +4231,363 @@ SYS:{{ build_system_message(system_message) }}:END
                 &cold[cold.len().saturating_sub(suffix.len() + 32)..]
             );
         }
+    }
+    // ── rich assistant-history prefix-cache reuse (Qwen DFlash) ───
+    //
+    // The generate path stores whole-envelope turns (FULL generated body verbatim
+    // + producer reasoning text via `cached_producer_reasoning_text`) and the
+    // splice replays the R...A envelope as ONE span. These tests prove the splice
+    // contract on a fixture-shaped Qwen3.8 template (history assistants ALWAYS
+    // replay `reasoning_content` through `<think>`, matching the qwen3.8-27b
+    // embedded template's assistant branch): unedited rich history extends the
+    // prior conversation byte-exactly; edited reasoning falls back to the plain
+    // render (safe miss); absent reasoning still hits via the recovery path.
+    // Trailing-space content discriminates verbatim replay from retokenize luck:
+    // the template trims `reasoning_content` on a plain render but the replayed
+    // span preserves the baked bytes.
+    //
+    // Fixture assistant branch, exact (qwen3.8-27b.mq4-xt embedded template):
+    // `<|im_start|>assistant\n<think>\n{reasoning|trim}\n</think>\n\n{content}`.
+    const QWEN38_HISTORY_THINK: &str = "{% for m in messages %}{% if m.role == 'assistant' %}{% set reasoning_content = '' %}{% if m.reasoning_content is string %}{% set reasoning_content = m.reasoning_content %}{% endif %}{% set reasoning_content = reasoning_content|trim %}<|im_start|>assistant\n<think>\n{{ reasoning_content }}\n</think>\n\n{{ m.content }}<|im_end|>\n{% else %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endif %}{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n{% endif %}";
+    fn qwen_fixture_frame(t: &Tokenizer) -> JinjaChatFrame<'_> {
+        JinjaChatFrame {
+            tokenizer: t,
+            template: QWEN38_HISTORY_THINK,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        }
+    }
+
+    fn qmsg(role: Role, content: &str, reasoning: Option<&str>) -> Message {
+        Message {
+            role,
+            content: content.to_string(),
+            reasoning_content: reasoning.map(|s| s.to_string()),
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }
+    }
+
+    #[test]
+    fn qwen_fixture_think_history_splice_extends_prior_conversation() {
+        let t = make_tokenizer();
+        let frame = qwen_fixture_frame(&t);
+        let u1 = qmsg(Role::User, "hi", None);
+        let r1 = t.encode(
+            &frame
+                .render_messages(std::slice::from_ref(&u1), None, None)
+                .unwrap(),
+        );
+        // Generation after the primed `<think>\n`, baked verbatim. Trailing
+        // space in the answer discriminates splice from retokenize luck.
+        let generated = t.encode("plan A\n</think>\n\nanswer B ");
+        let mut conv_after_t1 = r1.clone();
+        conv_after_t1.extend_from_slice(&generated);
+        // Production-shaped whole-envelope store: FULL generated body verbatim
+        // plus the router-derived producer reasoning text (no token partition).
+        let reasoning_text =
+            cached_producer_reasoning_text(&t, &generated, true).expect("reasoning");
+        assert_eq!(reasoning_text, "plan A\n", "router-derived reasoning text");
+        let stored = CachedAssistantTurn {
+            reasoning: Some(CachedAssistantBody {
+                token_ids: Vec::new(),
+                text: reasoning_text,
+            }),
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: generated,
+                text: String::new(),
+            }),
+        };
+        // Rich history echoes the SSE channels verbatim; the lookup forwards the
+        // envelope turn verbatim (template re-emits every marker): mirror that.
+        let messages = vec![
+            u1,
+            qmsg(Role::Assistant, "answer B ", Some("plan A\n")),
+            qmsg(Role::User, "again", None),
+        ];
+        let rendered = build_cached_history_jinja(&frame, &messages, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(stored.clone())
+            } else {
+                None
+            }
+        })
+        .expect("cached render");
+        for sid in [9u32, 10, 11, 12, 13] {
+            assert!(!rendered.contains(&sid), "sentinel must be fully replaced");
+        }
+        assert!(rendered.len() > conv_after_t1.len());
+        // Real invariant: the strict-prefix holds only through the lookup's
+        // verbatim splice — the plain fallback trims the trailing-space content
+        // and cannot satisfy it. No incidental splice-vs-plain difference is
+        // required: on cooperative tokenizations both coincide.
+        assert_eq!(
+            &rendered[..conv_after_t1.len()],
+            conv_after_t1.as_slice(),
+            "rich history must extend the baked conversation as a strict prefix"
+        );
+    }
+
+    #[test]
+    fn qwen_edited_reasoning_falls_back_to_plain() {
+        let t = make_tokenizer();
+        let frame = qwen_fixture_frame(&t);
+        let u1 = qmsg(Role::User, "hi", None);
+        let generated = t.encode("plan A\n</think>\n\nanswer B ");
+        let stored = CachedAssistantTurn {
+            reasoning: Some(CachedAssistantBody {
+                token_ids: Vec::new(),
+                text: "plan A\n".to_string(),
+            }),
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: generated,
+                text: String::new(),
+            }),
+        };
+        // Edited reasoning: unconditional text equality fails even though the
+        // slot would splice — no stale tokens, plain fallback.
+        let messages = vec![
+            u1,
+            qmsg(Role::Assistant, "answer B ", Some("plan A EDITED\n")),
+            qmsg(Role::User, "again", None),
+        ];
+        let rendered = build_cached_history_jinja(&frame, &messages, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(stored.clone())
+            } else {
+                None
+            }
+        })
+        .expect("cached render");
+        let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
+        assert_eq!(rendered, plain, "edited reasoning must miss");
+    }
+
+    #[test]
+    fn qwen_absent_reasoning_still_splices() {
+        // Plain-feedback clients send no `reasoning_content`; the stored producer
+        // turn still splices (recovery path) without selecting a reasoning mode.
+        let t = make_tokenizer();
+        let frame = qwen_fixture_frame(&t);
+        let u1 = qmsg(Role::User, "hi", None);
+        let r1 = t.encode(
+            &frame
+                .render_messages(std::slice::from_ref(&u1), None, None)
+                .unwrap(),
+        );
+        let generated = t.encode("plan A\n</think>\n\nanswer B ");
+        let mut conv_after_t1 = r1.clone();
+        conv_after_t1.extend_from_slice(&generated);
+        let stored = CachedAssistantTurn {
+            reasoning: Some(CachedAssistantBody {
+                token_ids: Vec::new(),
+                text: "plan A\n".to_string(),
+            }),
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: generated,
+                text: String::new(),
+            }),
+        };
+        let messages = vec![
+            u1,
+            qmsg(Role::Assistant, "answer B ", None),
+            qmsg(Role::User, "again", None),
+        ];
+        let rendered = build_cached_history_jinja(&frame, &messages, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(stored.clone())
+            } else {
+                None
+            }
+        })
+        .expect("cached render");
+        assert_eq!(
+            &rendered[..conv_after_t1.len()],
+            conv_after_t1.as_slice(),
+            "absent reasoning must still extend the baked conversation"
+        );
+    }
+
+    #[test]
+    fn qwen_tool_turn_without_tool_bodies_falls_back() {
+        let t = make_tokenizer();
+        let frame = qwen_fixture_frame(&t);
+        let u1 = qmsg(Role::User, "weather in Paris?", None);
+        let mut a1 = qmsg(Role::Assistant, "", None);
+        a1.tool_calls = vec![ToolCall {
+            id: Some("call_0".to_string()),
+            name: "get_weather".to_string(),
+            arguments: serde_json::json!({ "city": "Paris" }),
+            rendered_body: None,
+        }];
+        let messages = vec![u1, a1, qmsg(Role::User, "and tomorrow?", None)];
+        let stored = CachedAssistantTurn {
+            reasoning: None,
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: vec![101, 102],
+                text: String::new(),
+            }),
+        };
+        let rendered = build_cached_history_jinja(&frame, &messages, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(stored.clone())
+            } else {
+                None
+            }
+        })
+        .expect("cached render");
+        let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
+        assert_eq!(rendered, plain, "tool turn without tool bodies must miss");
+    }
+
+    #[test]
+    fn producer_reasoning_text_matches_sse_channel() {
+        let t = make_tokenizer();
+        let body = t.encode("plan A\n</think>\n\nanswer B");
+        assert_eq!(
+            cached_producer_reasoning_text(&t, &body, true).as_deref(),
+            Some("plan A\n"),
+            "SSE-identical reasoning text",
+        );
+    }
+
+    #[test]
+    fn producer_reasoning_text_absent_only_when_unprimed() {
+        let t = make_tokenizer();
+        assert!(cached_producer_reasoning_text(&t, &t.encode("just answer"), false).is_none());
+        // Primed-open reasoning yields text even with no close marker: the
+        // router was already inside `<think>` when generation started.
+        assert_eq!(
+            cached_producer_reasoning_text(&t, &t.encode("plan A"), true).as_deref(),
+            Some("plan A"),
+        );
+    }
+
+    #[test]
+    fn producer_reasoning_text_needs_no_atomic_close() {
+        // Text derivation never slices token spans, so a non-atomic `</think>`
+        // still yields the SSE-identical text.
+        let t = test_tokenizer_no_think();
+        assert_eq!(
+            cached_producer_reasoning_text(&t, &t.encode("plan A\n</think>\n\nanswer B"), true)
+                .as_deref(),
+            Some("plan A\n"),
+        );
+    }
+
+    #[test]
+    fn whole_envelope_body_replays_verbatim() {
+        // The property the runtime needs: the stored content body IS the baked
+        // stream, token-for-token — no partition, so merged BPE units at the
+        // `\n</think>\n\n` boundary cannot be mis-split.
+        let t = make_tokenizer();
+        let generated = t.encode("plan A\n</think>\n\nanswer B ");
+        let stored = CachedAssistantTurn {
+            reasoning: Some(CachedAssistantBody {
+                token_ids: Vec::new(),
+                text: "plan A\n".to_string(),
+            }),
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: generated.clone(),
+                text: String::new(),
+            }),
+        };
+        assert_eq!(
+            stored.content.expect("content").token_ids,
+            generated,
+            "whole-envelope store keeps every generated token",
+        );
+    }
+
+    #[test]
+    fn malformed_span_marker_falls_back_to_plain() {
+        // A turn wearing empty reasoning ids with an EMPTY guard text is
+        // structural doubt even though no reasoning text is claimed: plain
+        // render, never a partial envelope replay.
+        let t = make_tokenizer();
+        let frame = qwen_fixture_frame(&t);
+        let messages = vec![
+            qmsg(Role::User, "hi", None),
+            qmsg(Role::Assistant, "answer B ", None),
+            qmsg(Role::User, "again", None),
+        ];
+        let stored = CachedAssistantTurn {
+            reasoning: Some(CachedAssistantBody {
+                token_ids: Vec::new(),
+                text: String::new(),
+            }),
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: vec![1, 2, 3],
+                text: String::new(),
+            }),
+        };
+        let rendered = build_cached_history_jinja(&frame, &messages, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(stored.clone())
+            } else {
+                None
+            }
+        })
+        .expect("cached render");
+        let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
+        assert_eq!(rendered, plain, "empty-text span marker must miss");
+    }
+
+    #[test]
+    fn span_without_reasoning_slot_falls_back_to_plain() {
+        // Bare-history template drops the reasoning slot: no R delimiter, so a
+        // whole-envelope turn cannot replay — plain fallback, never partial.
+        let t = make_tokenizer();
+        let bare = "{% for m in messages %}<|im_start|>{{ m.role }}\n{{ m.content }}<|im_end|>\n{% endfor %}{% if add_generation_prompt %}<|im_start|>assistant\n<think>\n{% endif %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template: bare,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let generated = t.encode("plan A\n</think>\n\nanswer B ");
+        let stored = CachedAssistantTurn {
+            reasoning: Some(CachedAssistantBody {
+                token_ids: Vec::new(),
+                text: "plan A\n".to_string(),
+            }),
+            tools: Vec::new(),
+            content: Some(CachedAssistantBody {
+                token_ids: generated,
+                text: String::new(),
+            }),
+        };
+        let messages = vec![
+            qmsg(Role::User, "hi", None),
+            qmsg(Role::Assistant, "answer B ", Some("plan A\n")),
+            qmsg(Role::User, "again", None),
+        ];
+        let rendered = build_cached_history_jinja(&frame, &messages, None, |m| {
+            if matches!(m.role, Role::Assistant) {
+                Some(stored.clone())
+            } else {
+                None
+            }
+        })
+        .expect("cached render");
+        let plain = t.encode(&frame.render_messages(&messages, None, None).unwrap());
+        assert_eq!(rendered, plain, "undelimitable span must miss");
     }
 }

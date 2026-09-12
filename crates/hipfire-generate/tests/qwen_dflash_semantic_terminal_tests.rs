@@ -23,6 +23,39 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     };
     use hipfire_runtime::tokenizer::Tokenizer;
     use std::collections::HashSet;
+/// Serialize tests that exercise the process-wide terminal singleton.
+///
+/// The production path owns one active request at a time, while Cargo may run
+/// these integration tests concurrently. Each terminal writer claims its active
+/// key exactly once, so keep each test's synthetic claim isolated.
+struct TerminalTestGuard {
+    _lock: std::sync::MutexGuard<'static, ()>,
+}
+
+impl Drop for TerminalTestGuard {
+    fn drop(&mut self) {
+        clear_terminal_control();
+        set_active_attempt_id(0);
+    }
+}
+
+impl TerminalTestGuard {
+    fn activate(&self, id: &str, attempt_id: u64) {
+        clear_terminal_control();
+        set_active_attempt_id(attempt_id);
+        activate_terminal_control(id, attempt_id);
+    }
+}
+fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
+    static LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+    let lock = LOCK.lock().expect("terminal test lock");
+    clear_terminal_control();
+    set_active_attempt_id(0);
+    activate_terminal_control(id, attempt_id);
+    TerminalTestGuard { _lock: lock }
+}
+
 
     fn summary_tool_calls(calls: Vec<ToolCall>) -> FinishSummary {
         let n = calls.len();
@@ -140,6 +173,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
             eos: 9,
             im_end: Some(1),
             tools: Some(&[]),
+            enable_grammar: true,
             stop: Vec::new(),
             max_think: 0,
             max_tokens: 256,
@@ -436,6 +470,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         assert!(!hipfire_generate::qwen::qwen_dflash_cache_action(&term).store);
         assert!(!matches!(term, hipfire_generate::qwen::QwenDflashWireTerminal::Done { .. }));
         // Production Malformed writer: error XOR done (GPU-less attested epilogue).
+        let _guard = begin_terminal_test("req-ot", 21);
         set_active_attempt_id(21);
         let mut sink = Vec::new();
         if let hipfire_generate::qwen::QwenDflashWireTerminal::Malformed {
@@ -621,10 +656,46 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     }
 
     #[test]
-    fn terminal_marker_mid_window_strict_prefix_realigns() {
+    fn terminal_strict_prefix_uses_window_repair() {
+        use hipfire_generate::qwen::{
+            spec_strict_prefix_action, SpecStrictPrefixAction,
+        };
+
+        assert_eq!(
+            spec_strict_prefix_action(9, 11, true),
+            SpecStrictPrefixAction::RepairForTerminal
+        );
+
+        use hipfire_runtime::spec::terminal_prefix_replay;
+        assert_eq!(
+            terminal_prefix_replay(7, &[]).as_slice(),
+            &[] as &[u32]
+        );
+        assert_eq!(terminal_prefix_replay(7, &[8]).as_slice(), &[7]);
+        assert_eq!(
+            terminal_prefix_replay(7, &[8, 9, 10]).as_slice(),
+            &[7, 8, 9]
+        );
+        assert_eq!(
+            spec_strict_prefix_action(9, 11, false),
+            SpecStrictPrefixAction::Realign
+        );
+        assert_eq!(
+            spec_strict_prefix_action(11, 11, true),
+            SpecStrictPrefixAction::None
+        );
+        assert_eq!(
+            spec_strict_prefix_action(12, 11, false),
+            SpecStrictPrefixAction::None
+        );
+    }
+
+    #[test]
+    fn terminal_marker_mid_window_tracks_exact_host_prefix() {
         // Spec window emits body + im_end + unobserved tail. Semantic loop
-        // consumes only through the terminal marker; host + realign plan must
-        // land exactly on that prefix (no unobserved tail in conversation or KV).
+        // consumes only through the terminal marker; host bookkeeping must
+        // exclude the unobserved tail; window-local repair replays this exact
+        // prefix while leaving the terminal token for the ordinary flush.
         let tok = test_tokenizer();
         let prompt = vec![4u32, 5];
         let first_token = tok.encode("hi")[0];
@@ -820,6 +891,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
             eos: 9,
             im_end: Some(1),
             tools: None,
+            enable_grammar: false,
             stop: Vec::new(),
             max_think: 1,
             max_tokens: 256,
@@ -972,11 +1044,13 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     #[test]
     fn step_and_forced_advance_error_helpers_are_xor_done() {
         // Production fail-closed writer with GPU-less attested epilogue.
+        let _guard = begin_terminal_test("req-step", 42);
         set_active_attempt_id(42);
         for (what, id, needle) in [
             ("spec_step", "req-step", "spec_step:"),
             ("forced", "req-fa", "forced-token"),
         ] {
+            _guard.activate(id, 42);
             let mut sink = Vec::new();
             let ep = attest_epilogue(true);
             hipfire_generate::qwen::emit_spec_failure_terminal(&mut sink, id, what, "boom", &ep);
@@ -992,6 +1066,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
             assert!(!text.contains(r#""type":"tool_calls""#));
         }
         // rolled_back=false + context path (sync could not be attested).
+        _guard.activate("req-ctx", 42);
         let mut sink = Vec::new();
         let ep = attest_epilogue_with_context("device_synchronize failed: test");
         hipfire_generate::qwen::emit_spec_failure_terminal(&mut sink, "req-ctx", "spec_step", "boom", &ep);
@@ -1010,6 +1085,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
 
     #[test]
     fn forced_advance_error_is_xor_done_no_calls() {
+        let _guard = begin_terminal_test("req-fa", 43);
         set_active_attempt_id(43);
         let mut sink = Vec::new();
         let ep = attest_epilogue(true);
@@ -1096,6 +1172,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     #[test]
     fn cancel_is_fold_compatible_no_cache_helper() {
         // Production cancel writer (same path as hipfire_generate::qwen::generate_spec abort sites).
+        let _guard = begin_terminal_test("c", 11);
         set_active_attempt_id(11);
         let mut sink = Vec::new();
         emit_qwen_ar_cancelled(&mut sink, "c", 3);
@@ -1114,8 +1191,9 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
 
     #[test]
     fn serde_done_v2_hostile_id_roundtrip() {
-        set_active_attempt_id(5);
         let id = "id\"quote\"\n";
+        let _guard = begin_terminal_test(id, 5);
+        set_active_attempt_id(5);
         let mut sink = Vec::new();
         emit_qwen_dflash_done_terminal(
             &mut sink, id, 2, 1.0, 1, 1.0, 1.0, 1.0, 1.0, 1.0, 1, 0, "stop", None,
@@ -1132,6 +1210,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
 
     #[test]
     fn grammar_lifecycle_error_only_serialized() {
+        let _guard = begin_terminal_test("g1", 7);
         set_active_attempt_id(7);
         let fin = summary_tool_calls(vec![ToolCall {
             id: None,
@@ -1208,6 +1287,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     #[test]
     fn cancel_wire_helpers_carry_attempt_id() {
         // Production cancel writer carries attempt_id on aborted + done.
+        let _guard = begin_terminal_test("c1", 3);
         set_active_attempt_id(3);
         let mut sink = Vec::new();
         emit_qwen_ar_cancelled(&mut sink, "c1", 5);
@@ -1379,6 +1459,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         // Cancelled path must use aborted+done wire, never bake the forced token.
         // ErrorOnly is reserved for eviction failures (XOR below).
         assert_ne!(hipfire_generate::qwen::SpecFailClosedWire::Cancelled, hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly);
+        let _guard = begin_terminal_test("c-force", 55);
         set_active_attempt_id(55);
         let mut sink = Vec::new();
         match hipfire_generate::qwen::classify_forced_gpu_advance(true) {
@@ -1404,6 +1485,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     fn eviction_error_terminal_exclusivity() {
         // maybe_evict / on_evict Err → ErrorOnly: one fail-closed error, no done.
         assert_eq!(hipfire_generate::qwen::classify_evict_failure_wire(), hipfire_generate::qwen::SpecFailClosedWire::ErrorOnly);
+        let _guard = begin_terminal_test("ev1", 66);
         set_active_attempt_id(66);
         let mut sink = Vec::new();
         let ep = attest_epilogue(true);
@@ -1489,6 +1571,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         );
 
         // Capacity reject wires as exclusive error terminal (no done).
+        let _guard = begin_terminal_test("realign", 71);
         set_active_attempt_id(71);
         let mut sink = Vec::new();
         let ep = attest_epilogue(true);
@@ -1515,6 +1598,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         // hipfire_generate::dense::emit_active_attempt_error(class=validation, retryable=false,
         // rolled_back=false, message="DFlash jinja render: …") then handled=true.
         // Plain is not a silent fallback when a template is configured.
+        let _guard = begin_terminal_test("j1", 88);
         set_active_attempt_id(88);
         let mut sink = Vec::new();
         let render_err = "undefined variable `messages`";
@@ -1573,6 +1657,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         // No injectable mock GPU; production surface is hipfire_generate::common::RollbackEpilogue from
         // hipfire_generate::common::fail_closed_device_sync on Err → rolled_back=false + context.
         // hipfire_generate::common::emit_fail_closed_error must append context and claim rolled_back=false.
+        let _guard = begin_terminal_test("rb1", 17);
         set_active_attempt_id(17);
         let mut sink = Vec::new();
         let ep = attest_epilogue_with_context("device_synchronize failed: hipErrorUnknown");
@@ -1602,6 +1687,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         assert!(!out.contains(r#""type":"done""#));
 
         // Attested success path still reports rolled_back=true without context suffix.
+        _guard.activate("rb2", 17);
         let mut sink_ok = Vec::new();
         let ep_ok = attest_epilogue(true);
         hipfire_generate::common::emit_fail_closed_error(
@@ -1678,6 +1764,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     /// Wire: one correlated validation error, rolled_back=false, no done/aborted.
     #[test]
     fn zero_budget_max_tokens_preflight_error_only_no_done() {
+        let _guard = begin_terminal_test("zb0", 101);
         set_active_attempt_id(101);
         let mut sink = Vec::new();
         // Mirrors hipfire_generate::qwen::generate_spec entry gate (max_tokens == 0 → emit + return None).
@@ -1715,6 +1802,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     #[test]
     fn cancel_after_rollback_attested_vs_unattested_wire() {
         // Attested rollback keeps fold-compatible aborted + done pair.
+        let _guard = begin_terminal_test("c-ok", 202);
         set_active_attempt_id(202);
         let mut sink_ok = Vec::new();
         let ep_ok = attest_epilogue(true);
@@ -1738,7 +1826,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         assert!(!out_ok.contains(r#""type":"tool_calls""#));
 
         // Unattested rollback: one fail-closed error, no aborted/done.
-        set_active_attempt_id(203);
+        _guard.activate("c-bad", 203);
         let mut sink_bad = Vec::new();
         let ep_bad = attest_epilogue_with_context("device_synchronize failed: hipErrorUnknown");
         assert!(!ep_bad.rolled_back);
@@ -1879,6 +1967,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         assert!(ctx.contains("device_synchronize failed"), "{ctx}");
 
         // Qwen AR prefill abort terminal exclusivity (attested vs unattested).
+        let _guard = begin_terminal_test("ar-prefill", 501);
         set_active_attempt_id(501);
         let mut sink = Vec::new();
         hipfire_generate::common::emit_spec_cancel_after_rollback(&mut sink, "ar-prefill", 0, &attest_epilogue(true));
@@ -1890,7 +1979,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         assert_eq!(lines[1]["completion_tokens"], 0);
         assert!(lines.iter().all(|e| e["attempt_id"] == 501));
 
-        set_active_attempt_id(502);
+        _guard.activate("ar-prefill-bad", 502);
         let mut sink = Vec::new();
         hipfire_generate::common::emit_spec_cancel_after_rollback(
             &mut sink,
@@ -1908,7 +1997,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         assert!(!out.contains(r#""type":"tool_calls""#));
 
         // Qwen AR mid-decode abort terminal exclusivity.
-        set_active_attempt_id(503);
+        _guard.activate("ar-decode", 503);
         let mut sink = Vec::new();
         hipfire_generate::common::emit_spec_cancel_after_rollback(&mut sink, "ar-decode", 5, &attest_epilogue(true));
         let lines = parse_jsonl(&String::from_utf8(sink).unwrap());
@@ -1917,7 +2006,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         assert_eq!(lines[1]["finish_reason"], "aborted");
         assert_eq!(lines[1]["completion_tokens"], 5);
 
-        set_active_attempt_id(504);
+        _guard.activate("ar-decode-bad", 504);
         let mut sink = Vec::new();
         hipfire_generate::common::emit_spec_cancel_after_rollback(
             &mut sink,
@@ -1953,11 +2042,12 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
             "missing KV hook must never classify as Cancelled"
         );
 
+        let _guard = begin_terminal_test("kv-pp", 301);
         for (attempt, id, message) in [
             (301u64, "kv-pp", "kv_cache_mut missing (post-prefill)"),
             (302u64, "kv-pc", "kv_cache_mut missing (per-cycle)"),
         ] {
-            set_active_attempt_id(attempt);
+            _guard.activate(id, attempt);
             let mut sink = Vec::new();
             // Production seam: classify first, then fail-closed writer (same as
             // hipfire_generate::qwen::generate_spec match slot.kv_cache_mut() { None => ... }).
@@ -1990,7 +2080,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
 
         // Unattested rollback on the same missing-hook path: rolled_back=false
         // + context appended; still error-only (no panic surface).
-        set_active_attempt_id(303);
+        _guard.activate("kv-ua", 303);
         let mut sink = Vec::new();
         let ep = attest_epilogue_with_context("device_synchronize failed: test");
         hipfire_generate::common::emit_fail_closed_error(
@@ -2019,6 +2109,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     /// inner hipfire_generate::qwen::generate_spec defense; wrapper must not fall through to AR.
     #[test]
     fn generate_dflash_zero_budget_preflight_handled_error_only() {
+        let _guard = begin_terminal_test("df-zb0", 401);
         set_active_attempt_id(401);
         let mut sink = Vec::new();
         // Mirrors hipfire_generate::qwen::generate_dflash entry (max_tokens == 0 → emit + return true).
@@ -2055,6 +2146,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
     /// (unit fn) before DSML render / decode-cache teardown / set_sampling.
     #[test]
     fn generate_deepseek4_spec_zero_budget_preflight_error_only() {
+        let _guard = begin_terminal_test("ds4-zb0", 402);
         set_active_attempt_id(402);
         let mut sink = Vec::new();
         // Mirrors hipfire_generate::dense::generate_deepseek4_spec entry (max_tokens == 0 → emit + return).
@@ -2136,6 +2228,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
             (false, false, "length", "fail-closed speculative decode"),
         ];
 
+        let _guard = begin_terminal_test("leg-fc", 500);
         for (i, (grammar, open_think, reason, expected_msg)) in cases.iter().enumerate() {
             assert_eq!(
                 legacy_fail_closed_message(*grammar, *open_think, reason),
@@ -2147,7 +2240,8 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
             let take_error_only = fail_closed_present || *grammar;
             assert!(take_error_only, "case {i} must take error-only path");
 
-            set_active_attempt_id(500 + i as u64);
+            let attempt = 500 + i as u64;
+            _guard.activate("leg-fc", attempt);
             let mut sink = Vec::new();
             let ep = attest_epilogue(true);
             hipfire_generate::common::emit_fail_closed_error(
@@ -2219,6 +2313,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         assert_eq!(seq_pos, 0);
         assert!(conversation_tokens.is_empty());
 
+        let _guard = begin_terminal_test("rw-err", 601);
         set_active_attempt_id(601);
         let mut sink = Vec::new();
         let ep = attest_epilogue(true);
@@ -2244,7 +2339,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
         assert!(!qwen_dflash_epilogue_after_spec_run(false));
 
         // Unattested sync path still error-only with context suffix.
-        set_active_attempt_id(602);
+        _guard.activate("rw-ua", 602);
         let mut sink_ua = Vec::new();
         let ep_ua = attest_epilogue_with_context("device_synchronize failed: hipErrorUnknown");
         hipfire_generate::common::emit_fail_closed_error(
@@ -2418,6 +2513,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
             eos: 9,
             im_end: Some(1),
             tools: None,
+            enable_grammar: false,
             stop: vec![first_text.clone()],
             max_think: 0,
             max_tokens: 256,
@@ -2519,6 +2615,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
             eos: 9,
             im_end: Some(1),
             tools: None,
+            enable_grammar: false,
             stop: vec![stop_text.clone()],
             max_think: 0,
             max_tokens: 256,
@@ -2699,6 +2796,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
             eos: 9,
             im_end: Some(1),
             tools: None,
+            enable_grammar: false,
             stop: vec![first_text.clone()],
             max_think: 0,
             max_tokens: 1,
@@ -3131,6 +3229,7 @@ use hipfire_runtime::emit_text::extract_tool_calls_from_text;
 
     #[test]
     fn dflash_client_abort_suppresses_release_store_done() {
+        let _guard = begin_terminal_test("df-abort", 33);
         set_active_attempt_id(33);
         let tc = ToolCall {
             id: None,

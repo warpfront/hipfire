@@ -1,0 +1,653 @@
+{"ts": 1789061158.4417186, "phase": "lifecycle-load", "line": "2026-09-10T17:25:58.441669Z  INFO daemon starting pid=2360821"}
+{"ts": 1789061158.4725683, "phase": "lifecycle-load", "line": "GPU dev 0: gfx1151 (131.1 GB VRAM, HIP 7.2)"}
+{"ts": 1789061158.840346, "phase": "lifecycle-load", "line": "  DeltaNet state: Q8"}
+{"ts": 1789061158.840747, "phase": "lifecycle-load", "line": "  loading token_embd..."}
+{"ts": 1789061158.8407874, "phase": "lifecycle-load", "line": "  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]"}
+{"ts": 1789061159.5419977, "phase": "lifecycle-load", "line": "  loading output_norm..."}
+{"ts": 1789061159.5425193, "phase": "lifecycle-load", "line": "  loading output (separate lm_head)..."}
+{"ts": 1789061159.8139365, "phase": "lifecycle-load", "line": "  lm_head AWQ sidecar: absent (no-op)"}
+{"ts": 1789061159.8140223, "phase": "lifecycle-load", "line": "  loading layer 0/64 (LinearAttention)..."}
+{"ts": 1789061159.9142926, "phase": "lifecycle-load", "line": "  loading layer 1/64 (LinearAttention)..."}
+{"ts": 1789061159.963147, "phase": "lifecycle-load", "line": "  loading layer 2/64 (LinearAttention)..."}
+{"ts": 1789061159.9910707, "phase": "lifecycle-load", "line": "  loading layer 3/64 (FullAttention)..."}
+{"ts": 1789061160.018222, "phase": "lifecycle-load", "line": "  loading layer 4/64 (LinearAttention)..."}
+{"ts": 1789061160.0450997, "phase": "lifecycle-load", "line": "  loading layer 5/64 (LinearAttention)..."}
+{"ts": 1789061160.073537, "phase": "lifecycle-load", "line": "  loading layer 6/64 (LinearAttention)..."}
+{"ts": 1789061160.0992734, "phase": "lifecycle-load", "line": "  loading layer 7/64 (FullAttention)..."}
+{"ts": 1789061160.1241558, "phase": "lifecycle-load", "line": "  loading layer 8/64 (LinearAttention)..."}
+{"ts": 1789061160.1498804, "phase": "lifecycle-load", "line": "  loading layer 9/64 (LinearAttention)..."}
+{"ts": 1789061160.1745934, "phase": "lifecycle-load", "line": "  loading layer 10/64 (LinearAttention)..."}
+{"ts": 1789061160.1995134, "phase": "lifecycle-load", "line": "  loading layer 11/64 (FullAttention)..."}
+{"ts": 1789061160.223506, "phase": "lifecycle-load", "line": "  loading layer 12/64 (LinearAttention)..."}
+{"ts": 1789061160.248331, "phase": "lifecycle-load", "line": "  loading layer 13/64 (LinearAttention)..."}
+{"ts": 1789061160.2820342, "phase": "lifecycle-load", "line": "  loading layer 14/64 (LinearAttention)..."}
+{"ts": 1789061160.369717, "phase": "lifecycle-load", "line": "  loading layer 15/64 (FullAttention)..."}
+{"ts": 1789061160.5866652, "phase": "lifecycle-load", "line": "  loading layer 16/64 (LinearAttention)..."}
+{"ts": 1789061160.6751478, "phase": "lifecycle-load", "line": "  loading layer 17/64 (LinearAttention)..."}
+{"ts": 1789061160.8260307, "phase": "lifecycle-load", "line": "  loading layer 18/64 (LinearAttention)..."}
+{"ts": 1789061161.0432746, "phase": "lifecycle-load", "line": "  loading layer 19/64 (FullAttention)..."}
+{"ts": 1789061161.1801064, "phase": "lifecycle-load", "line": "  loading layer 20/64 (LinearAttention)..."}
+{"ts": 1789061161.2979105, "phase": "lifecycle-load", "line": "  loading layer 21/64 (LinearAttention)..."}
+{"ts": 1789061161.4124794, "phase": "lifecycle-load", "line": "  loading layer 22/64 (LinearAttention)..."}
+{"ts": 1789061161.5003238, "phase": "lifecycle-load", "line": "  loading layer 23/64 (FullAttention)..."}
+{"ts": 1789061161.5795705, "phase": "lifecycle-load", "line": "  loading layer 24/64 (LinearAttention)..."}
+{"ts": 1789061161.645709, "phase": "lifecycle-load", "line": "  loading layer 25/64 (LinearAttention)..."}
+{"ts": 1789061161.7229493, "phase": "lifecycle-load", "line": "  loading layer 26/64 (LinearAttention)..."}
+{"ts": 1789061162.0610738, "phase": "lifecycle-load", "line": "  loading layer 27/64 (FullAttention)..."}
+{"ts": 1789061163.0412912, "phase": "lifecycle-load", "line": "  loading layer 28/64 (LinearAttention)..."}
+{"ts": 1789061163.8953838, "phase": "lifecycle-load", "line": "  loading layer 29/64 (LinearAttention)..."}
+{"ts": 1789061164.2034771, "phase": "lifecycle-load", "line": "  loading layer 30/64 (LinearAttention)..."}
+{"ts": 1789061164.361605, "phase": "lifecycle-load", "line": "  loading layer 31/64 (FullAttention)..."}
+{"ts": 1789061164.538166, "phase": "lifecycle-load", "line": "  loading layer 32/64 (LinearAttention)..."}
+{"ts": 1789061164.6663172, "phase": "lifecycle-load", "line": "  loading layer 33/64 (LinearAttention)..."}
+{"ts": 1789061164.7757633, "phase": "lifecycle-load", "line": "  loading layer 34/64 (LinearAttention)..."}
+{"ts": 1789061164.8443449, "phase": "lifecycle-load", "line": "  loading layer 35/64 (FullAttention)..."}
+{"ts": 1789061164.9166815, "phase": "lifecycle-load", "line": "  loading layer 36/64 (LinearAttention)..."}
+{"ts": 1789061164.9937398, "phase": "lifecycle-load", "line": "  loading layer 37/64 (LinearAttention)..."}
+{"ts": 1789061165.0921361, "phase": "lifecycle-load", "line": "  loading layer 38/64 (LinearAttention)..."}
+{"ts": 1789061165.16945, "phase": "lifecycle-load", "line": "  loading layer 39/64 (FullAttention)..."}
+{"ts": 1789061165.2478387, "phase": "lifecycle-load", "line": "  loading layer 40/64 (LinearAttention)..."}
+{"ts": 1789061165.3929586, "phase": "lifecycle-load", "line": "  loading layer 41/64 (LinearAttention)..."}
+{"ts": 1789061165.5042443, "phase": "lifecycle-load", "line": "  loading layer 42/64 (LinearAttention)..."}
+{"ts": 1789061165.645222, "phase": "lifecycle-load", "line": "  loading layer 43/64 (FullAttention)..."}
+{"ts": 1789061165.7673903, "phase": "lifecycle-load", "line": "  loading layer 44/64 (LinearAttention)..."}
+{"ts": 1789061165.8869042, "phase": "lifecycle-load", "line": "  loading layer 45/64 (LinearAttention)..."}
+{"ts": 1789061165.9807005, "phase": "lifecycle-load", "line": "  loading layer 46/64 (LinearAttention)..."}
+{"ts": 1789061166.0643072, "phase": "lifecycle-load", "line": "  loading layer 47/64 (FullAttention)..."}
+{"ts": 1789061166.1410403, "phase": "lifecycle-load", "line": "  loading layer 48/64 (LinearAttention)..."}
+{"ts": 1789061166.2162628, "phase": "lifecycle-load", "line": "  loading layer 49/64 (LinearAttention)..."}
+{"ts": 1789061166.2919953, "phase": "lifecycle-load", "line": "  loading layer 50/64 (LinearAttention)..."}
+{"ts": 1789061166.5875926, "phase": "lifecycle-load", "line": "  loading layer 51/64 (FullAttention)..."}
+{"ts": 1789061166.878907, "phase": "lifecycle-load", "line": "  loading layer 52/64 (LinearAttention)..."}
+{"ts": 1789061166.988614, "phase": "lifecycle-load", "line": "  loading layer 53/64 (LinearAttention)..."}
+{"ts": 1789061167.0663142, "phase": "lifecycle-load", "line": "  loading layer 54/64 (LinearAttention)..."}
+{"ts": 1789061167.1344402, "phase": "lifecycle-load", "line": "  loading layer 55/64 (FullAttention)..."}
+{"ts": 1789061167.2208672, "phase": "lifecycle-load", "line": "  loading layer 56/64 (LinearAttention)..."}
+{"ts": 1789061167.291661, "phase": "lifecycle-load", "line": "  loading layer 57/64 (LinearAttention)..."}
+{"ts": 1789061167.359394, "phase": "lifecycle-load", "line": "  loading layer 58/64 (LinearAttention)..."}
+{"ts": 1789061167.4251337, "phase": "lifecycle-load", "line": "  loading layer 59/64 (FullAttention)..."}
+{"ts": 1789061167.5042067, "phase": "lifecycle-load", "line": "  loading layer 60/64 (LinearAttention)..."}
+{"ts": 1789061167.6009922, "phase": "lifecycle-load", "line": "  loading layer 61/64 (LinearAttention)..."}
+{"ts": 1789061167.6839385, "phase": "lifecycle-load", "line": "  loading layer 62/64 (LinearAttention)..."}
+{"ts": 1789061167.7560942, "phase": "lifecycle-load", "line": "  loading layer 63/64 (FullAttention)..."}
+{"ts": 1789061167.8383217, "phase": "lifecycle-load", "line": "  weight sweep: 8997 ms (packed-expert host-read 0 ms, H2D 0 ms)"}
+{"ts": 1789061167.8427262, "phase": "lifecycle-load", "line": "KV cache: Q8 vmm (16/64 layers carry KV; K 272B/head + V Q8 272B/head; mapped_prefix=1927 / physical_cap=4096 / max_seq=4096)"}
+{"ts": 1789061185.7944236, "phase": "life-normal-commit", "line": "2026-09-10T17:26:25.794360Z  INFO daemon control command received request_id=\"life-normal\" attempt_id=101 command=\"commit\""}
+{"ts": 1789061185.7945743, "phase": "life-normal-commit", "line": "[daemon-control] received commit for id=life-normal attempt_id=101"}
+{"ts": 1789061187.8158555, "phase": "life-reuse-1-commit", "line": "2026-09-10T17:26:27.815814Z  INFO daemon control command received request_id=\"life-reuse-1\" attempt_id=103 command=\"commit\""}
+{"ts": 1789061187.8159971, "phase": "life-reuse-1-commit", "line": "[daemon-control] received commit for id=life-reuse-1 attempt_id=103"}
+{"ts": 1789061189.210849, "phase": "life-reuse-2-commit", "line": "2026-09-10T17:26:29.210763Z  INFO daemon control command received request_id=\"life-reuse-2\" attempt_id=104 command=\"commit\""}
+{"ts": 1789061189.211106, "phase": "lifecycle-snapshot-after-reuse", "line": "[daemon-control] received commit for id=life-reuse-2 attempt_id=104"}
+{"ts": 1789061189.9101372, "phase": "lifecycle-reload", "line": "  DeltaNet state: Q8"}
+{"ts": 1789061189.9105124, "phase": "lifecycle-reload", "line": "  loading token_embd..."}
+{"ts": 1789061189.910553, "phase": "lifecycle-reload", "line": "  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]"}
+{"ts": 1789061190.6233857, "phase": "lifecycle-reload", "line": "  loading output_norm..."}
+{"ts": 1789061190.626694, "phase": "lifecycle-reload", "line": "  loading output (separate lm_head)..."}
+{"ts": 1789061190.8872592, "phase": "lifecycle-reload", "line": "  lm_head AWQ sidecar: absent (no-op)"}
+{"ts": 1789061190.8873143, "phase": "lifecycle-reload", "line": "  loading layer 0/64 (LinearAttention)..."}
+{"ts": 1789061190.9591763, "phase": "lifecycle-reload", "line": "  loading layer 1/64 (LinearAttention)..."}
+{"ts": 1789061191.0251963, "phase": "lifecycle-reload", "line": "  loading layer 2/64 (LinearAttention)..."}
+{"ts": 1789061191.1139991, "phase": "lifecycle-reload", "line": "  loading layer 3/64 (FullAttention)..."}
+{"ts": 1789061191.2454135, "phase": "lifecycle-reload", "line": "  loading layer 4/64 (LinearAttention)..."}
+{"ts": 1789061191.3119264, "phase": "lifecycle-reload", "line": "  loading layer 5/64 (LinearAttention)..."}
+{"ts": 1789061191.4356344, "phase": "lifecycle-reload", "line": "  loading layer 6/64 (LinearAttention)..."}
+{"ts": 1789061191.5056741, "phase": "lifecycle-reload", "line": "  loading layer 7/64 (FullAttention)..."}
+{"ts": 1789061192.1918395, "phase": "lifecycle-reload", "line": "  loading layer 8/64 (LinearAttention)..."}
+{"ts": 1789061193.3567374, "phase": "lifecycle-reload", "line": "  loading layer 9/64 (LinearAttention)..."}
+{"ts": 1789061193.9475424, "phase": "lifecycle-reload", "line": "  loading layer 10/64 (LinearAttention)..."}
+{"ts": 1789061194.1731956, "phase": "lifecycle-reload", "line": "  loading layer 11/64 (FullAttention)..."}
+{"ts": 1789061194.4634306, "phase": "lifecycle-reload", "line": "  loading layer 12/64 (LinearAttention)..."}
+{"ts": 1789061194.6832857, "phase": "lifecycle-reload", "line": "  loading layer 13/64 (LinearAttention)..."}
+{"ts": 1789061194.9091122, "phase": "lifecycle-reload", "line": "  loading layer 14/64 (LinearAttention)..."}
+{"ts": 1789061195.1255944, "phase": "lifecycle-reload", "line": "  loading layer 15/64 (FullAttention)..."}
+{"ts": 1789061195.679004, "phase": "lifecycle-reload", "line": "  loading layer 16/64 (LinearAttention)..."}
+{"ts": 1789061196.0308053, "phase": "lifecycle-reload", "line": "  loading layer 17/64 (LinearAttention)..."}
+{"ts": 1789061196.5628417, "phase": "lifecycle-reload", "line": "  loading layer 18/64 (LinearAttention)..."}
+{"ts": 1789061197.2158775, "phase": "lifecycle-reload", "line": "  loading layer 19/64 (FullAttention)..."}
+{"ts": 1789061197.629571, "phase": "lifecycle-reload", "line": "  loading layer 20/64 (LinearAttention)..."}
+{"ts": 1789061198.0656435, "phase": "lifecycle-reload", "line": "  loading layer 21/64 (LinearAttention)..."}
+{"ts": 1789061198.5258515, "phase": "lifecycle-reload", "line": "  loading layer 22/64 (LinearAttention)..."}
+{"ts": 1789061198.9201221, "phase": "lifecycle-reload", "line": "  loading layer 23/64 (FullAttention)..."}
+{"ts": 1789061199.2567754, "phase": "lifecycle-reload", "line": "  loading layer 24/64 (LinearAttention)..."}
+{"ts": 1789061199.5183551, "phase": "lifecycle-reload", "line": "  loading layer 25/64 (LinearAttention)..."}
+{"ts": 1789061199.8315382, "phase": "lifecycle-reload", "line": "  loading layer 26/64 (LinearAttention)..."}
+{"ts": 1789061200.3100848, "phase": "lifecycle-reload", "line": "  loading layer 27/64 (FullAttention)..."}
+{"ts": 1789061201.4621236, "phase": "lifecycle-reload", "line": "  loading layer 28/64 (LinearAttention)..."}
+{"ts": 1789061202.445413, "phase": "lifecycle-reload", "line": "  loading layer 29/64 (LinearAttention)..."}
+{"ts": 1789061202.903785, "phase": "lifecycle-reload", "line": "  loading layer 30/64 (LinearAttention)..."}
+{"ts": 1789061203.4413815, "phase": "lifecycle-reload", "line": "  loading layer 31/64 (FullAttention)..."}
+{"ts": 1789061203.988832, "phase": "lifecycle-reload", "line": "  loading layer 32/64 (LinearAttention)..."}
+{"ts": 1789061204.4069173, "phase": "lifecycle-reload", "line": "  loading layer 33/64 (LinearAttention)..."}
+{"ts": 1789061204.69297, "phase": "lifecycle-reload", "line": "  loading layer 34/64 (LinearAttention)..."}
+{"ts": 1789061204.986162, "phase": "lifecycle-reload", "line": "  loading layer 35/64 (FullAttention)..."}
+{"ts": 1789061205.2859054, "phase": "lifecycle-reload", "line": "  loading layer 36/64 (LinearAttention)..."}
+{"ts": 1789061205.5607932, "phase": "lifecycle-reload", "line": "  loading layer 37/64 (LinearAttention)..."}
+{"ts": 1789061205.8686924, "phase": "lifecycle-reload", "line": "  loading layer 38/64 (LinearAttention)..."}
+{"ts": 1789061206.1648965, "phase": "lifecycle-reload", "line": "  loading layer 39/64 (FullAttention)..."}
+{"ts": 1789061206.4713864, "phase": "lifecycle-reload", "line": "  loading layer 40/64 (LinearAttention)..."}
+{"ts": 1789061206.7600589, "phase": "lifecycle-reload", "line": "  loading layer 41/64 (LinearAttention)..."}
+{"ts": 1789061207.099296, "phase": "lifecycle-reload", "line": "  loading layer 42/64 (LinearAttention)..."}
+{"ts": 1789061207.421014, "phase": "lifecycle-reload", "line": "  loading layer 43/64 (FullAttention)..."}
+{"ts": 1789061207.8301451, "phase": "lifecycle-reload", "line": "  loading layer 44/64 (LinearAttention)..."}
+{"ts": 1789061208.1985943, "phase": "lifecycle-reload", "line": "  loading layer 45/64 (LinearAttention)..."}
+{"ts": 1789061208.4536686, "phase": "lifecycle-reload", "line": "  loading layer 46/64 (LinearAttention)..."}
+{"ts": 1789061208.655355, "phase": "lifecycle-reload", "line": "  loading layer 47/64 (FullAttention)..."}
+{"ts": 1789061208.9024916, "phase": "lifecycle-reload", "line": "  loading layer 48/64 (LinearAttention)..."}
+{"ts": 1789061209.1166012, "phase": "lifecycle-reload", "line": "  loading layer 49/64 (LinearAttention)..."}
+{"ts": 1789061209.3375618, "phase": "lifecycle-reload", "line": "  loading layer 50/64 (LinearAttention)..."}
+{"ts": 1789061209.6659715, "phase": "lifecycle-reload", "line": "  loading layer 51/64 (FullAttention)..."}
+{"ts": 1789061209.9863045, "phase": "lifecycle-reload", "line": "  loading layer 52/64 (LinearAttention)..."}
+{"ts": 1789061210.2058342, "phase": "lifecycle-reload", "line": "  loading layer 53/64 (LinearAttention)..."}
+{"ts": 1789061210.4094841, "phase": "lifecycle-reload", "line": "  loading layer 54/64 (LinearAttention)..."}
+{"ts": 1789061210.6127038, "phase": "lifecycle-reload", "line": "  loading layer 55/64 (FullAttention)..."}
+{"ts": 1789061210.900365, "phase": "lifecycle-reload", "line": "  loading layer 56/64 (LinearAttention)..."}
+{"ts": 1789061211.1608942, "phase": "lifecycle-reload", "line": "  loading layer 57/64 (LinearAttention)..."}
+{"ts": 1789061211.3799276, "phase": "lifecycle-reload", "line": "  loading layer 58/64 (LinearAttention)..."}
+{"ts": 1789061211.5963776, "phase": "lifecycle-reload", "line": "  loading layer 59/64 (FullAttention)..."}
+{"ts": 1789061211.8329432, "phase": "lifecycle-reload", "line": "  loading layer 60/64 (LinearAttention)..."}
+{"ts": 1789061212.1570737, "phase": "lifecycle-reload", "line": "  loading layer 61/64 (LinearAttention)..."}
+{"ts": 1789061212.4150007, "phase": "lifecycle-reload", "line": "  loading layer 62/64 (LinearAttention)..."}
+{"ts": 1789061212.6242478, "phase": "lifecycle-reload", "line": "  loading layer 63/64 (FullAttention)..."}
+{"ts": 1789061212.882098, "phase": "lifecycle-reload", "line": "  weight sweep: 22971 ms (packed-expert host-read 0 ms, H2D 0 ms)"}
+{"ts": 1789061212.8856168, "phase": "lifecycle-reload", "line": "KV cache: Q8 vmm (16/64 layers carry KV; K 272B/head + V Q8 272B/head; mapped_prefix=1927 / physical_cap=4096 / max_seq=4096)"}
+{"ts": 1789061213.2129521, "phase": "life-reload-commit", "line": "2026-09-10T17:26:53.212872Z  INFO daemon control command received request_id=\"life-reload-generate\" attempt_id=105 command=\"commit\""}
+{"ts": 1789061213.2132628, "phase": "life-reload-commit", "line": "[daemon-control] received commit for id=life-reload-generate attempt_id=105"}
+{"ts": 1789061213.47065, "phase": "g46-load", "line": "2026-09-10T17:26:53.470599Z  INFO daemon starting pid=2363112"}
+{"ts": 1789061213.5935876, "phase": "g46-load", "line": "GPU dev 0: gfx1151 (131.1 GB VRAM, HIP 7.2)"}
+{"ts": 1789061213.999206, "phase": "g46-load", "line": "  DeltaNet state: Q8"}
+{"ts": 1789061213.9996083, "phase": "g46-load", "line": "  loading token_embd..."}
+{"ts": 1789061213.9996498, "phase": "g46-load", "line": "  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]"}
+{"ts": 1789061215.395361, "phase": "g46-load", "line": "  loading output_norm..."}
+{"ts": 1789061215.4122396, "phase": "g46-load", "line": "  loading output (separate lm_head)..."}
+{"ts": 1789061215.883383, "phase": "g46-load", "line": "  lm_head AWQ sidecar: absent (no-op)"}
+{"ts": 1789061215.8836021, "phase": "g46-load", "line": "  loading layer 0/64 (LinearAttention)..."}
+{"ts": 1789061216.0408723, "phase": "g46-load", "line": "  loading layer 1/64 (LinearAttention)..."}
+{"ts": 1789061216.15914, "phase": "g46-load", "line": "  loading layer 2/64 (LinearAttention)..."}
+{"ts": 1789061216.3581674, "phase": "g46-load", "line": "  loading layer 3/64 (FullAttention)..."}
+{"ts": 1789061216.5765986, "phase": "g46-load", "line": "  loading layer 4/64 (LinearAttention)..."}
+{"ts": 1789061216.745933, "phase": "g46-load", "line": "  loading layer 5/64 (LinearAttention)..."}
+{"ts": 1789061217.015726, "phase": "g46-load", "line": "  loading layer 6/64 (LinearAttention)..."}
+{"ts": 1789061217.1621106, "phase": "g46-load", "line": "  loading layer 7/64 (FullAttention)..."}
+{"ts": 1789061217.985512, "phase": "g46-load", "line": "  loading layer 8/64 (LinearAttention)..."}
+{"ts": 1789061218.668663, "phase": "g46-load", "line": "  loading layer 9/64 (LinearAttention)..."}
+{"ts": 1789061219.0009038, "phase": "g46-load", "line": "  loading layer 10/64 (LinearAttention)..."}
+{"ts": 1789061219.149905, "phase": "g46-load", "line": "  loading layer 11/64 (FullAttention)..."}
+{"ts": 1789061219.3172045, "phase": "g46-load", "line": "  loading layer 12/64 (LinearAttention)..."}
+{"ts": 1789061219.449842, "phase": "g46-load", "line": "  loading layer 13/64 (LinearAttention)..."}
+{"ts": 1789061219.5877385, "phase": "g46-load", "line": "  loading layer 14/64 (LinearAttention)..."}
+{"ts": 1789061219.7312381, "phase": "g46-load", "line": "  loading layer 15/64 (FullAttention)..."}
+{"ts": 1789061220.151048, "phase": "g46-load", "line": "  loading layer 16/64 (LinearAttention)..."}
+{"ts": 1789061220.3578932, "phase": "g46-load", "line": "  loading layer 17/64 (LinearAttention)..."}
+{"ts": 1789061220.7516952, "phase": "g46-load", "line": "  loading layer 18/64 (LinearAttention)..."}
+{"ts": 1789061221.2628016, "phase": "g46-load", "line": "  loading layer 19/64 (FullAttention)..."}
+{"ts": 1789061221.5310354, "phase": "g46-load", "line": "  loading layer 20/64 (LinearAttention)..."}
+{"ts": 1789061221.7849755, "phase": "g46-load", "line": "  loading layer 21/64 (LinearAttention)..."}
+{"ts": 1789061222.0299134, "phase": "g46-load", "line": "  loading layer 22/64 (LinearAttention)..."}
+{"ts": 1789061222.25448, "phase": "g46-load", "line": "  loading layer 23/64 (FullAttention)..."}
+{"ts": 1789061222.4501016, "phase": "g46-load", "line": "  loading layer 24/64 (LinearAttention)..."}
+{"ts": 1789061222.6218655, "phase": "g46-load", "line": "  loading layer 25/64 (LinearAttention)..."}
+{"ts": 1789061222.7985895, "phase": "g46-load", "line": "  loading layer 26/64 (LinearAttention)..."}
+{"ts": 1789061223.0446882, "phase": "g46-load", "line": "  loading layer 27/64 (FullAttention)..."}
+{"ts": 1789061223.30633, "phase": "g46-load", "line": "  loading layer 28/64 (LinearAttention)..."}
+{"ts": 1789061223.5839105, "phase": "g46-load", "line": "  loading layer 29/64 (LinearAttention)..."}
+{"ts": 1789061223.886507, "phase": "g46-load", "line": "  loading layer 30/64 (LinearAttention)..."}
+{"ts": 1789061224.4635038, "phase": "g46-load", "line": "  loading layer 31/64 (FullAttention)..."}
+{"ts": 1789061224.9936016, "phase": "g46-load", "line": "  loading layer 32/64 (LinearAttention)..."}
+{"ts": 1789061225.3956003, "phase": "g46-load", "line": "  loading layer 33/64 (LinearAttention)..."}
+{"ts": 1789061225.699945, "phase": "g46-load", "line": "  loading layer 34/64 (LinearAttention)..."}
+{"ts": 1789061225.9088404, "phase": "g46-load", "line": "  loading layer 35/64 (FullAttention)..."}
+{"ts": 1789061226.1876566, "phase": "g46-load", "line": "  loading layer 36/64 (LinearAttention)..."}
+{"ts": 1789061226.3761137, "phase": "g46-load", "line": "  loading layer 37/64 (LinearAttention)..."}
+{"ts": 1789061226.7019157, "phase": "g46-load", "line": "  loading layer 38/64 (LinearAttention)..."}
+{"ts": 1789061226.9097116, "phase": "g46-load", "line": "  loading layer 39/64 (FullAttention)..."}
+{"ts": 1789061227.1914828, "phase": "g46-load", "line": "  loading layer 40/64 (LinearAttention)..."}
+{"ts": 1789061227.670334, "phase": "g46-load", "line": "  loading layer 41/64 (LinearAttention)..."}
+{"ts": 1789061228.0632792, "phase": "g46-load", "line": "  loading layer 42/64 (LinearAttention)..."}
+{"ts": 1789061228.545763, "phase": "g46-load", "line": "  loading layer 43/64 (FullAttention)..."}
+{"ts": 1789061229.0509336, "phase": "g46-load", "line": "  loading layer 44/64 (LinearAttention)..."}
+{"ts": 1789061229.5026507, "phase": "g46-load", "line": "  loading layer 45/64 (LinearAttention)..."}
+{"ts": 1789061229.861989, "phase": "g46-load", "line": "  loading layer 46/64 (LinearAttention)..."}
+{"ts": 1789061230.0726173, "phase": "g46-load", "line": "  loading layer 47/64 (FullAttention)..."}
+{"ts": 1789061230.3315551, "phase": "g46-load", "line": "  loading layer 48/64 (LinearAttention)..."}
+{"ts": 1789061230.6666172, "phase": "g46-load", "line": "  loading layer 49/64 (LinearAttention)..."}
+{"ts": 1789061231.0183702, "phase": "g46-load", "line": "  loading layer 50/64 (LinearAttention)..."}
+{"ts": 1789061231.6514692, "phase": "g46-load", "line": "  loading layer 51/64 (FullAttention)..."}
+{"ts": 1789061232.3925974, "phase": "g46-load", "line": "  loading layer 52/64 (LinearAttention)..."}
+{"ts": 1789061232.674184, "phase": "g46-load", "line": "  loading layer 53/64 (LinearAttention)..."}
+{"ts": 1789061232.9027958, "phase": "g46-load", "line": "  loading layer 54/64 (LinearAttention)..."}
+{"ts": 1789061233.0661798, "phase": "g46-load", "line": "  loading layer 55/64 (FullAttention)..."}
+{"ts": 1789061233.4365933, "phase": "g46-load", "line": "  loading layer 56/64 (LinearAttention)..."}
+{"ts": 1789061233.8618226, "phase": "g46-load", "line": "  loading layer 57/64 (LinearAttention)..."}
+{"ts": 1789061234.2191947, "phase": "g46-load", "line": "  loading layer 58/64 (LinearAttention)..."}
+{"ts": 1789061234.5006883, "phase": "g46-load", "line": "  loading layer 59/64 (FullAttention)..."}
+{"ts": 1789061234.7593458, "phase": "g46-load", "line": "  loading layer 60/64 (LinearAttention)..."}
+{"ts": 1789061235.1744213, "phase": "g46-load", "line": "  loading layer 61/64 (LinearAttention)..."}
+{"ts": 1789061235.5562825, "phase": "g46-load", "line": "  loading layer 62/64 (LinearAttention)..."}
+{"ts": 1789061235.8963575, "phase": "g46-load", "line": "  loading layer 63/64 (FullAttention)..."}
+{"ts": 1789061236.2237456, "phase": "g46-load", "line": "  weight sweep: 22224 ms (packed-expert host-read 0 ms, H2D 0 ms)"}
+{"ts": 1789061236.2275357, "phase": "g46-load", "line": "KV cache: Q8 vmm (16/64 layers carry KV; K 272B/head + V Q8 272B/head; mapped_prefix=1927 / physical_cap=4096 / max_seq=4096)"}
+{"ts": 1789061256.5641055, "phase": "g46-exact-commit", "line": "2026-09-10T17:27:36.563985Z  INFO daemon control command received request_id=\"g46-exact\" attempt_id=201 command=\"commit\""}
+{"ts": 1789061256.5644808, "phase": "g46_early_commit", "line": "[daemon-control] received commit for id=g46-exact attempt_id=201"}
+{"ts": 1789061256.6321309, "phase": "g46-early-early-commit", "line": "2026-09-10T17:27:36.632088Z  INFO daemon control command received request_id=\"g46-early\" attempt_id=202 command=\"commit\""}
+{"ts": 1789061256.6321766, "phase": "g46-early-early-commit", "line": "[daemon-control] received commit for id=g46-early attempt_id=202"}
+{"ts": 1789061257.4975257, "phase": "g46-early-legal-commit", "line": "2026-09-10T17:27:37.497451Z  INFO daemon control command received request_id=\"g46-early\" attempt_id=202 command=\"commit\""}
+{"ts": 1789061257.4976392, "phase": "g46-early-legal-commit", "line": "[daemon-control] received commit for id=g46-early attempt_id=202"}
+{"ts": 1789061257.5649111, "phase": "wrong_attempt_commit-wrong-control", "line": "2026-09-10T17:27:37.564874Z  INFO daemon control command received request_id=\"wrong_attempt_commit\" attempt_id=999 command=\"commit\""}
+{"ts": 1789061257.5649595, "phase": "wrong_attempt_commit-wrong-control", "line": "[daemon-control] received commit for id=wrong_attempt_commit attempt_id=999"}
+{"ts": 1789061257.8719308, "phase": "wrong_attempt_commit-legal-commit", "line": "2026-09-10T17:27:37.871890Z  INFO daemon control command received request_id=\"wrong_attempt_commit\" attempt_id=203 command=\"commit\""}
+{"ts": 1789061257.8720527, "phase": "wrong_attempt_commit-legal-commit", "line": "[daemon-control] received commit for id=wrong_attempt_commit attempt_id=203"}
+{"ts": 1789061257.9395287, "phase": "stale_wrong_id-wrong-control", "line": "2026-09-10T17:27:37.939479Z  INFO daemon control command received request_id=\"other-id\" attempt_id=204 command=\"commit\""}
+{"ts": 1789061257.9395745, "phase": "stale_wrong_id-wrong-control", "line": "[daemon-control] received commit for id=other-id attempt_id=204"}
+{"ts": 1789061258.2463, "phase": "stale_wrong_id-legal-commit", "line": "2026-09-10T17:27:38.246254Z  INFO daemon control command received request_id=\"stale_wrong_id\" attempt_id=204 command=\"commit\""}
+{"ts": 1789061258.246361, "phase": "stale_wrong_id-legal-commit", "line": "[daemon-control] received commit for id=stale_wrong_id attempt_id=204"}
+{"ts": 1789061258.5519207, "phase": "g46-late-commit", "line": "2026-09-10T17:27:38.551868Z  INFO daemon control command received request_id=\"g46-late\" attempt_id=205 command=\"commit\""}
+{"ts": 1789061258.5520017, "phase": "g46-late-commit", "line": "[daemon-control] received commit for id=g46-late attempt_id=205"}
+{"ts": 1789061258.5522006, "phase": "g46-late-ping", "line": "2026-09-10T17:27:38.552175Z  INFO daemon control command received request_id=\"g46-late\" attempt_id=205 command=\"commit\""}
+{"ts": 1789061258.5522492, "phase": "g46-late-ping", "line": "[daemon-control] received commit for id=g46-late attempt_id=205"}
+{"ts": 1789061258.619591, "phase": "g46-duplicate-second-generate", "line": "[batch] duplicate generate dropped id=g46-duplicate attempt_id=206; preserving live registry"}
+{"ts": 1789061258.860132, "phase": "g46-duplicate-commit", "line": "2026-09-10T17:27:38.860059Z  INFO daemon control command received request_id=\"g46-duplicate\" attempt_id=206 command=\"commit\""}
+{"ts": 1789061258.860246, "phase": "g46-duplicate-commit", "line": "[daemon-control] received commit for id=g46-duplicate attempt_id=206"}
+{"ts": 1789061259.2288682, "phase": "g46-reuse-commit", "line": "2026-09-10T17:27:39.228831Z  INFO daemon control command received request_id=\"g46-reuse\" attempt_id=207 command=\"commit\""}
+{"ts": 1789061259.228946, "phase": "g46-reuse-commit", "line": "[daemon-control] received commit for id=g46-reuse attempt_id=207"}
+{"ts": 1789061259.229156, "phase": "g46_same_key_second", "line": "2026-09-10T17:27:39.229132Z  INFO daemon control command received request_id=\"g46-reuse\" attempt_id=207 command=\"abort\""}
+{"ts": 1789061259.229198, "phase": "g46_same_key_second", "line": "[daemon-control] received abort for id=g46-reuse attempt_id=207"}
+{"ts": 1789061259.600516, "phase": "g46-reuse-commit", "line": "2026-09-10T17:27:39.600473Z  INFO daemon control command received request_id=\"g46-reuse\" attempt_id=207 command=\"commit\""}
+{"ts": 1789061259.6005878, "phase": "g46-reuse-commit", "line": "[daemon-control] received commit for id=g46-reuse attempt_id=207"}
+{"ts": 1789061290.9995313, "phase": "g46_abort_before_prefill", "line": "2026-09-10T17:28:10.999435Z  INFO daemon control command received request_id=\"g46-abort-prefill\" attempt_id=210 command=\"abort\""}
+{"ts": 1789061290.9997318, "phase": "g46_abort_before_prefill", "line": "[daemon-control] received abort for id=g46-abort-prefill attempt_id=210"}
+{"ts": 1789061325.7061849, "phase": "g46-abort-during-decode-control", "line": "2026-09-10T17:28:45.706111Z  INFO daemon control command received request_id=\"g46-abort-decode\" attempt_id=212 command=\"abort\""}
+{"ts": 1789061325.7062933, "phase": "g46-abort-during-decode-control", "line": "[daemon-control] received abort for id=g46-abort-decode attempt_id=212"}
+{"ts": 1789061326.5549572, "phase": "g46-reload-after-fault", "line": "  DeltaNet state: Q8"}
+{"ts": 1789061326.5554037, "phase": "g46-reload-after-fault", "line": "  loading token_embd..."}
+{"ts": 1789061326.5554447, "phase": "g46-reload-after-fault", "line": "  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]"}
+{"ts": 1789061327.2102184, "phase": "g46-reload-after-fault", "line": "  loading output_norm..."}
+{"ts": 1789061327.213693, "phase": "g46-reload-after-fault", "line": "  loading output (separate lm_head)..."}
+{"ts": 1789061327.4770672, "phase": "g46-reload-after-fault", "line": "  lm_head AWQ sidecar: absent (no-op)"}
+{"ts": 1789061327.4771643, "phase": "g46-reload-after-fault", "line": "  loading layer 0/64 (LinearAttention)..."}
+{"ts": 1789061327.5488873, "phase": "g46-reload-after-fault", "line": "  loading layer 1/64 (LinearAttention)..."}
+{"ts": 1789061327.615954, "phase": "g46-reload-after-fault", "line": "  loading layer 2/64 (LinearAttention)..."}
+{"ts": 1789061327.7073588, "phase": "g46-reload-after-fault", "line": "  loading layer 3/64 (FullAttention)..."}
+{"ts": 1789061327.8483973, "phase": "g46-reload-after-fault", "line": "  loading layer 4/64 (LinearAttention)..."}
+{"ts": 1789061327.9171028, "phase": "g46-reload-after-fault", "line": "  loading layer 5/64 (LinearAttention)..."}
+{"ts": 1789061328.0386922, "phase": "g46-reload-after-fault", "line": "  loading layer 6/64 (LinearAttention)..."}
+{"ts": 1789061328.1089544, "phase": "g46-reload-after-fault", "line": "  loading layer 7/64 (FullAttention)..."}
+{"ts": 1789061328.7081585, "phase": "g46-reload-after-fault", "line": "  loading layer 8/64 (LinearAttention)..."}
+{"ts": 1789061329.2159066, "phase": "g46-reload-after-fault", "line": "  loading layer 9/64 (LinearAttention)..."}
+{"ts": 1789061329.4806626, "phase": "g46-reload-after-fault", "line": "  loading layer 10/64 (LinearAttention)..."}
+{"ts": 1789061329.582357, "phase": "g46-reload-after-fault", "line": "  loading layer 11/64 (FullAttention)..."}
+{"ts": 1789061329.6621933, "phase": "g46-reload-after-fault", "line": "  loading layer 12/64 (LinearAttention)..."}
+{"ts": 1789061329.7284944, "phase": "g46-reload-after-fault", "line": "  loading layer 13/64 (LinearAttention)..."}
+{"ts": 1789061329.7958446, "phase": "g46-reload-after-fault", "line": "  loading layer 14/64 (LinearAttention)..."}
+{"ts": 1789061329.8653476, "phase": "g46-reload-after-fault", "line": "  loading layer 15/64 (FullAttention)..."}
+{"ts": 1789061330.117543, "phase": "g46-reload-after-fault", "line": "  loading layer 16/64 (LinearAttention)..."}
+{"ts": 1789061330.2044098, "phase": "g46-reload-after-fault", "line": "  loading layer 17/64 (LinearAttention)..."}
+{"ts": 1789061330.3332598, "phase": "g46-reload-after-fault", "line": "  loading layer 18/64 (LinearAttention)..."}
+{"ts": 1789061330.5598264, "phase": "g46-reload-after-fault", "line": "  loading layer 19/64 (FullAttention)..."}
+{"ts": 1789061330.7182019, "phase": "g46-reload-after-fault", "line": "  loading layer 20/64 (LinearAttention)..."}
+{"ts": 1789061330.818366, "phase": "g46-reload-after-fault", "line": "  loading layer 21/64 (LinearAttention)..."}
+{"ts": 1789061330.928816, "phase": "g46-reload-after-fault", "line": "  loading layer 22/64 (LinearAttention)..."}
+{"ts": 1789061331.0136566, "phase": "g46-reload-after-fault", "line": "  loading layer 23/64 (FullAttention)..."}
+{"ts": 1789061331.089866, "phase": "g46-reload-after-fault", "line": "  loading layer 24/64 (LinearAttention)..."}
+{"ts": 1789061331.1564426, "phase": "g46-reload-after-fault", "line": "  loading layer 25/64 (LinearAttention)..."}
+{"ts": 1789061331.2289119, "phase": "g46-reload-after-fault", "line": "  loading layer 26/64 (LinearAttention)..."}
+{"ts": 1789061331.3106875, "phase": "g46-reload-after-fault", "line": "  loading layer 27/64 (FullAttention)..."}
+{"ts": 1789061331.3869624, "phase": "g46-reload-after-fault", "line": "  loading layer 28/64 (LinearAttention)..."}
+{"ts": 1789061331.454202, "phase": "g46-reload-after-fault", "line": "  loading layer 29/64 (LinearAttention)..."}
+{"ts": 1789061331.519589, "phase": "g46-reload-after-fault", "line": "  loading layer 30/64 (LinearAttention)..."}
+{"ts": 1789061331.7046309, "phase": "g46-reload-after-fault", "line": "  loading layer 31/64 (FullAttention)..."}
+{"ts": 1789061331.8607152, "phase": "g46-reload-after-fault", "line": "  loading layer 32/64 (LinearAttention)..."}
+{"ts": 1789061331.9667714, "phase": "g46-reload-after-fault", "line": "  loading layer 33/64 (LinearAttention)..."}
+{"ts": 1789061332.0344787, "phase": "g46-reload-after-fault", "line": "  loading layer 34/64 (LinearAttention)..."}
+{"ts": 1789061332.1003177, "phase": "g46-reload-after-fault", "line": "  loading layer 35/64 (FullAttention)..."}
+{"ts": 1789061332.1705666, "phase": "g46-reload-after-fault", "line": "  loading layer 36/64 (LinearAttention)..."}
+{"ts": 1789061332.2411606, "phase": "g46-reload-after-fault", "line": "  loading layer 37/64 (LinearAttention)..."}
+{"ts": 1789061332.3175898, "phase": "g46-reload-after-fault", "line": "  loading layer 38/64 (LinearAttention)..."}
+{"ts": 1789061332.383066, "phase": "g46-reload-after-fault", "line": "  loading layer 39/64 (FullAttention)..."}
+{"ts": 1789061332.5302417, "phase": "g46-reload-after-fault", "line": "  loading layer 40/64 (LinearAttention)..."}
+{"ts": 1789061332.7085855, "phase": "g46-reload-after-fault", "line": "  loading layer 41/64 (LinearAttention)..."}
+{"ts": 1789061332.942581, "phase": "g46-reload-after-fault", "line": "  loading layer 42/64 (LinearAttention)..."}
+{"ts": 1789061333.2031505, "phase": "g46-reload-after-fault", "line": "  loading layer 43/64 (FullAttention)..."}
+{"ts": 1789061333.515747, "phase": "g46-reload-after-fault", "line": "  loading layer 44/64 (LinearAttention)..."}
+{"ts": 1789061333.7759545, "phase": "g46-reload-after-fault", "line": "  loading layer 45/64 (LinearAttention)..."}
+{"ts": 1789061334.010262, "phase": "g46-reload-after-fault", "line": "  loading layer 46/64 (LinearAttention)..."}
+{"ts": 1789061334.2241082, "phase": "g46-reload-after-fault", "line": "  loading layer 47/64 (FullAttention)..."}
+{"ts": 1789061334.4744065, "phase": "g46-reload-after-fault", "line": "  loading layer 48/64 (LinearAttention)..."}
+{"ts": 1789061334.6974835, "phase": "g46-reload-after-fault", "line": "  loading layer 49/64 (LinearAttention)..."}
+{"ts": 1789061334.946687, "phase": "g46-reload-after-fault", "line": "  loading layer 50/64 (LinearAttention)..."}
+{"ts": 1789061335.3625453, "phase": "g46-reload-after-fault", "line": "  loading layer 51/64 (FullAttention)..."}
+{"ts": 1789061335.819915, "phase": "g46-reload-after-fault", "line": "  loading layer 52/64 (LinearAttention)..."}
+{"ts": 1789061336.1289968, "phase": "g46-reload-after-fault", "line": "  loading layer 53/64 (LinearAttention)..."}
+{"ts": 1789061336.4088342, "phase": "g46-reload-after-fault", "line": "  loading layer 54/64 (LinearAttention)..."}
+{"ts": 1789061336.6885161, "phase": "g46-reload-after-fault", "line": "  loading layer 55/64 (FullAttention)..."}
+{"ts": 1789061336.9720418, "phase": "g46-reload-after-fault", "line": "  loading layer 56/64 (LinearAttention)..."}
+{"ts": 1789061337.2311845, "phase": "g46-reload-after-fault", "line": "  loading layer 57/64 (LinearAttention)..."}
+{"ts": 1789061337.4809422, "phase": "g46-reload-after-fault", "line": "  loading layer 58/64 (LinearAttention)..."}
+{"ts": 1789061337.7260873, "phase": "g46-reload-after-fault", "line": "  loading layer 59/64 (FullAttention)..."}
+{"ts": 1789061337.992808, "phase": "g46-reload-after-fault", "line": "  loading layer 60/64 (LinearAttention)..."}
+{"ts": 1789061338.2688816, "phase": "g46-reload-after-fault", "line": "  loading layer 61/64 (LinearAttention)..."}
+{"ts": 1789061338.5609076, "phase": "g46-reload-after-fault", "line": "  loading layer 62/64 (LinearAttention)..."}
+{"ts": 1789061338.7728214, "phase": "g46-reload-after-fault", "line": "  loading layer 63/64 (FullAttention)..."}
+{"ts": 1789061339.0197947, "phase": "g46-reload-after-fault", "line": "  weight sweep: 12464 ms (packed-expert host-read 0 ms, H2D 0 ms)"}
+{"ts": 1789061339.0238597, "phase": "g46-reload-after-fault", "line": "KV cache: Q8 vmm (16/64 layers carry KV; K 272B/head + V Q8 272B/head; mapped_prefix=1927 / physical_cap=4096 / max_seq=4096)"}
+{"ts": 1789061339.2888849, "phase": "g46-after-reload-commit", "line": "2026-09-10T17:28:59.288809Z  INFO daemon control command received request_id=\"g46-after-reload\" attempt_id=215 command=\"commit\""}
+{"ts": 1789061339.288996, "phase": "g46-after-reload-commit", "line": "[daemon-control] received commit for id=g46-after-reload attempt_id=215"}
+{"ts": 1789061339.5227478, "phase": "batch-load", "line": "2026-09-10T17:28:59.522707Z  INFO daemon starting pid=2366969"}
+{"ts": 1789061339.568891, "phase": "batch-load", "line": "GPU dev 0: gfx1151 (131.1 GB VRAM, HIP 7.2)"}
+{"ts": 1789061339.9352376, "phase": "batch-load", "line": "  DeltaNet state: Q8"}
+{"ts": 1789061339.9356084, "phase": "batch-load", "line": "  loading token_embd..."}
+{"ts": 1789061339.9356484, "phase": "batch-load", "line": "  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]"}
+{"ts": 1789061341.3361986, "phase": "batch-load", "line": "  loading output_norm..."}
+{"ts": 1789061341.3492658, "phase": "batch-load", "line": "  loading output (separate lm_head)..."}
+{"ts": 1789061341.8503292, "phase": "batch-load", "line": "  lm_head AWQ sidecar: absent (no-op)"}
+{"ts": 1789061341.85053, "phase": "batch-load", "line": "  loading layer 0/64 (LinearAttention)..."}
+{"ts": 1789061342.004294, "phase": "batch-load", "line": "  loading layer 1/64 (LinearAttention)..."}
+{"ts": 1789061342.1433046, "phase": "batch-load", "line": "  loading layer 2/64 (LinearAttention)..."}
+{"ts": 1789061342.3073442, "phase": "batch-load", "line": "  loading layer 3/64 (FullAttention)..."}
+{"ts": 1789061342.5103514, "phase": "batch-load", "line": "  loading layer 4/64 (LinearAttention)..."}
+{"ts": 1789061342.6480653, "phase": "batch-load", "line": "  loading layer 5/64 (LinearAttention)..."}
+{"ts": 1789061342.8472798, "phase": "batch-load", "line": "  loading layer 6/64 (LinearAttention)..."}
+{"ts": 1789061342.9730926, "phase": "batch-load", "line": "  loading layer 7/64 (FullAttention)..."}
+{"ts": 1789061343.6938174, "phase": "batch-load", "line": "  loading layer 8/64 (LinearAttention)..."}
+{"ts": 1789061343.99892, "phase": "batch-load", "line": "  loading layer 9/64 (LinearAttention)..."}
+{"ts": 1789061344.1474173, "phase": "batch-load", "line": "  loading layer 10/64 (LinearAttention)..."}
+{"ts": 1789061344.2929604, "phase": "batch-load", "line": "  loading layer 11/64 (FullAttention)..."}
+{"ts": 1789061344.5036356, "phase": "batch-load", "line": "  loading layer 12/64 (LinearAttention)..."}
+{"ts": 1789061344.6600275, "phase": "batch-load", "line": "  loading layer 13/64 (LinearAttention)..."}
+{"ts": 1789061344.817726, "phase": "batch-load", "line": "  loading layer 14/64 (LinearAttention)..."}
+{"ts": 1789061344.964593, "phase": "batch-load", "line": "  loading layer 15/64 (FullAttention)..."}
+{"ts": 1789061345.3346002, "phase": "batch-load", "line": "  loading layer 16/64 (LinearAttention)..."}
+{"ts": 1789061345.474386, "phase": "batch-load", "line": "  loading layer 17/64 (LinearAttention)..."}
+{"ts": 1789061345.6126347, "phase": "batch-load", "line": "  loading layer 18/64 (LinearAttention)..."}
+{"ts": 1789061345.757322, "phase": "batch-load", "line": "  loading layer 19/64 (FullAttention)..."}
+{"ts": 1789061345.9302685, "phase": "batch-load", "line": "  loading layer 20/64 (LinearAttention)..."}
+{"ts": 1789061346.1514904, "phase": "batch-load", "line": "  loading layer 21/64 (LinearAttention)..."}
+{"ts": 1789061346.3394613, "phase": "batch-load", "line": "  loading layer 22/64 (LinearAttention)..."}
+{"ts": 1789061346.5759628, "phase": "batch-load", "line": "  loading layer 23/64 (FullAttention)..."}
+{"ts": 1789061346.856868, "phase": "batch-load", "line": "  loading layer 24/64 (LinearAttention)..."}
+{"ts": 1789061347.0133529, "phase": "batch-load", "line": "  loading layer 25/64 (LinearAttention)..."}
+{"ts": 1789061347.1913216, "phase": "batch-load", "line": "  loading layer 26/64 (LinearAttention)..."}
+{"ts": 1789061347.4342785, "phase": "batch-load", "line": "  loading layer 27/64 (FullAttention)..."}
+{"ts": 1789061347.6049576, "phase": "batch-load", "line": "  loading layer 28/64 (LinearAttention)..."}
+{"ts": 1789061347.727738, "phase": "batch-load", "line": "  loading layer 29/64 (LinearAttention)..."}
+{"ts": 1789061347.932464, "phase": "batch-load", "line": "  loading layer 30/64 (LinearAttention)..."}
+{"ts": 1789061348.3995633, "phase": "batch-load", "line": "  loading layer 31/64 (FullAttention)..."}
+{"ts": 1789061348.9005218, "phase": "batch-load", "line": "  loading layer 32/64 (LinearAttention)..."}
+{"ts": 1789061349.1579463, "phase": "batch-load", "line": "  loading layer 33/64 (LinearAttention)..."}
+{"ts": 1789061349.295479, "phase": "batch-load", "line": "  loading layer 34/64 (LinearAttention)..."}
+{"ts": 1789061349.4361255, "phase": "batch-load", "line": "  loading layer 35/64 (FullAttention)..."}
+{"ts": 1789061349.611554, "phase": "batch-load", "line": "  loading layer 36/64 (LinearAttention)..."}
+{"ts": 1789061349.7643054, "phase": "batch-load", "line": "  loading layer 37/64 (LinearAttention)..."}
+{"ts": 1789061350.006621, "phase": "batch-load", "line": "  loading layer 38/64 (LinearAttention)..."}
+{"ts": 1789061350.1807375, "phase": "batch-load", "line": "  loading layer 39/64 (FullAttention)..."}
+{"ts": 1789061350.339411, "phase": "batch-load", "line": "  loading layer 40/64 (LinearAttention)..."}
+{"ts": 1789061350.6010737, "phase": "batch-load", "line": "  loading layer 41/64 (LinearAttention)..."}
+{"ts": 1789061350.872662, "phase": "batch-load", "line": "  loading layer 42/64 (LinearAttention)..."}
+{"ts": 1789061351.2336292, "phase": "batch-load", "line": "  loading layer 43/64 (FullAttention)..."}
+{"ts": 1789061351.586355, "phase": "batch-load", "line": "  loading layer 44/64 (LinearAttention)..."}
+{"ts": 1789061351.8906722, "phase": "batch-load", "line": "  loading layer 45/64 (LinearAttention)..."}
+{"ts": 1789061352.1096275, "phase": "batch-load", "line": "  loading layer 46/64 (LinearAttention)..."}
+{"ts": 1789061352.2593894, "phase": "batch-load", "line": "  loading layer 47/64 (FullAttention)..."}
+{"ts": 1789061352.4658272, "phase": "batch-load", "line": "  loading layer 48/64 (LinearAttention)..."}
+{"ts": 1789061352.6988065, "phase": "batch-load", "line": "  loading layer 49/64 (LinearAttention)..."}
+{"ts": 1789061352.9189951, "phase": "batch-load", "line": "  loading layer 50/64 (LinearAttention)..."}
+{"ts": 1789061353.3413277, "phase": "batch-load", "line": "  loading layer 51/64 (FullAttention)..."}
+{"ts": 1789061353.7593818, "phase": "batch-load", "line": "  loading layer 52/64 (LinearAttention)..."}
+{"ts": 1789061353.971821, "phase": "batch-load", "line": "  loading layer 53/64 (LinearAttention)..."}
+{"ts": 1789061354.1387634, "phase": "batch-load", "line": "  loading layer 54/64 (LinearAttention)..."}
+{"ts": 1789061354.3006816, "phase": "batch-load", "line": "  loading layer 55/64 (FullAttention)..."}
+{"ts": 1789061354.516484, "phase": "batch-load", "line": "  loading layer 56/64 (LinearAttention)..."}
+{"ts": 1789061354.6764328, "phase": "batch-load", "line": "  loading layer 57/64 (LinearAttention)..."}
+{"ts": 1789061354.8425047, "phase": "batch-load", "line": "  loading layer 58/64 (LinearAttention)..."}
+{"ts": 1789061355.0061815, "phase": "batch-load", "line": "  loading layer 59/64 (FullAttention)..."}
+{"ts": 1789061355.184939, "phase": "batch-load", "line": "  loading layer 60/64 (LinearAttention)..."}
+{"ts": 1789061355.4175549, "phase": "batch-load", "line": "  loading layer 61/64 (LinearAttention)..."}
+{"ts": 1789061355.6349251, "phase": "batch-load", "line": "  loading layer 62/64 (LinearAttention)..."}
+{"ts": 1789061355.7893038, "phase": "batch-load", "line": "  loading layer 63/64 (FullAttention)..."}
+{"ts": 1789061355.97783, "phase": "batch-load", "line": "  weight sweep: 16042 ms (packed-expert host-read 0 ms, H2D 0 ms)"}
+{"ts": 1789061355.9821882, "phase": "batch-load", "line": "KV cache: Q8 vmm (16/64 layers carry KV; K 272B/head + V Q8 272B/head; mapped_prefix=1927 / physical_cap=4096 / max_seq=4096)"}
+{"ts": 1789061356.0114467, "phase": "batch-load", "line": "KV cache: q8 (16/64 layers carry KV, others placeholder)"}
+{"ts": 1789061356.0258627, "phase": "batch-load", "line": "[daemon] continuous batch staged: slots=2 lane_cap=4096 repeat_cap=2048"}
+{"ts": 1789061369.0565267, "phase": "batch-lane-commit", "line": "[batch] drive failed (attested): forward_decode_batch: HipError(0): hipcc compilation failed for kv_cache_write_q8_0_independent:"}
+{"ts": 1789061369.05727, "phase": "batch-lane-commit", "line": "/tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hip:6:10: fatal error: 'kv_slot_desc.h' file not found"}
+{"ts": 1789061369.057333, "phase": "batch-lane-commit", "line": "    6 | #include \"kv_slot_desc.h\""}
+{"ts": 1789061369.0573547, "phase": "batch-lane-commit", "line": "      |          ^~~~~~~~~~~~~~~~"}
+{"ts": 1789061369.0573711, "phase": "batch-lane-commit", "line": "1 error generated when compiling for gfx1151."}
+{"ts": 1789061369.057396, "phase": "batch-lane-commit", "line": "failed to execute:/nix/store/38am99f653hccgj56jg545w6pn5vf3w2-hipClang/bin/clang++  --offload-arch=gfx1151  --cuda-device-only -O3 --no-offload-compress --rocm-path=/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3 --hip-path=/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3 -I/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3/include --rocm-device-lib-path=/nix/store/bb0c3xjc5cn4f8hgbbgwcp03wa9d4gxw-rocm-device-libs-22.0.0-rocm/amdgcn/bitcode -o \"/tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/.kv_cache_write_q8_0_independent.ae4df8f416708260.2366969_50_1789061368733169615.hsaco.tmp\" -x hip /tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hip"}
+{"ts": 1789061369.0574226, "phase": "batch-lane-commit", "line": " (hipError=0)"}
+{"ts": 1789061369.5751548, "phase": "batch-lane-commit", "line": "[batch] drive failed (attested): forward_decode_batch: HipError(0): hipcc compilation failed for kv_cache_write_q8_0_independent:"}
+{"ts": 1789061369.5758193, "phase": "batch-snapshot-after-terminals", "line": "/tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hip:6:10: fatal error: 'kv_slot_desc.h' file not found"}
+{"ts": 1789061369.5758848, "phase": "batch-snapshot-after-terminals", "line": "    6 | #include \"kv_slot_desc.h\""}
+{"ts": 1789061369.575903, "phase": "batch-snapshot-after-terminals", "line": "      |          ^~~~~~~~~~~~~~~~"}
+{"ts": 1789061369.5759282, "phase": "batch-snapshot-after-terminals", "line": "1 error generated when compiling for gfx1151."}
+{"ts": 1789061369.575943, "phase": "batch-snapshot-after-terminals", "line": "failed to execute:/nix/store/38am99f653hccgj56jg545w6pn5vf3w2-hipClang/bin/clang++  --offload-arch=gfx1151  --cuda-device-only -O3 --no-offload-compress --rocm-path=/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3 --hip-path=/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3 -I/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3/include --rocm-device-lib-path=/nix/store/bb0c3xjc5cn4f8hgbbgwcp03wa9d4gxw-rocm-device-libs-22.0.0-rocm/amdgcn/bitcode -o \"/tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/.kv_cache_write_q8_0_independent.ae4df8f416708260.2366969_51_1789061369224252955.hsaco.tmp\" -x hip /tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hip"}
+{"ts": 1789061369.575959, "phase": "batch-snapshot-after-terminals", "line": " (hipError=0)"}
+{"ts": 1789061370.2002096, "phase": "batch-reload", "line": "  DeltaNet state: Q8"}
+{"ts": 1789061370.200591, "phase": "batch-reload", "line": "  loading token_embd..."}
+{"ts": 1789061370.2006254, "phase": "batch-reload", "line": "  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]"}
+{"ts": 1789061371.794296, "phase": "batch-reload", "line": "  loading output_norm..."}
+{"ts": 1789061371.7945242, "phase": "batch-reload", "line": "  loading output (separate lm_head)..."}
+{"ts": 1789061372.477402, "phase": "batch-reload", "line": "  lm_head AWQ sidecar: absent (no-op)"}
+{"ts": 1789061372.47759, "phase": "batch-reload", "line": "  loading layer 0/64 (LinearAttention)..."}
+{"ts": 1789061372.6694498, "phase": "batch-reload", "line": "  loading layer 1/64 (LinearAttention)..."}
+{"ts": 1789061372.8883007, "phase": "batch-reload", "line": "  loading layer 2/64 (LinearAttention)..."}
+{"ts": 1789061373.1147525, "phase": "batch-reload", "line": "  loading layer 3/64 (FullAttention)..."}
+{"ts": 1789061373.3776886, "phase": "batch-reload", "line": "  loading layer 4/64 (LinearAttention)..."}
+{"ts": 1789061373.5794823, "phase": "batch-reload", "line": "  loading layer 5/64 (LinearAttention)..."}
+{"ts": 1789061373.851833, "phase": "batch-reload", "line": "  loading layer 6/64 (LinearAttention)..."}
+{"ts": 1789061374.0584166, "phase": "batch-reload", "line": "  loading layer 7/64 (FullAttention)..."}
+{"ts": 1789061374.8193822, "phase": "batch-reload", "line": "  loading layer 8/64 (LinearAttention)..."}
+{"ts": 1789061375.213599, "phase": "batch-reload", "line": "  loading layer 9/64 (LinearAttention)..."}
+{"ts": 1789061375.4171176, "phase": "batch-reload", "line": "  loading layer 10/64 (LinearAttention)..."}
+{"ts": 1789061375.5850058, "phase": "batch-reload", "line": "  loading layer 11/64 (FullAttention)..."}
+{"ts": 1789061375.8066273, "phase": "batch-reload", "line": "  loading layer 12/64 (LinearAttention)..."}
+{"ts": 1789061376.035912, "phase": "batch-reload", "line": "  loading layer 13/64 (LinearAttention)..."}
+{"ts": 1789061376.2205927, "phase": "batch-reload", "line": "  loading layer 14/64 (LinearAttention)..."}
+{"ts": 1789061376.318556, "phase": "batch-reload", "line": "  loading layer 15/64 (FullAttention)..."}
+{"ts": 1789061376.6963758, "phase": "batch-reload", "line": "  loading layer 16/64 (LinearAttention)..."}
+{"ts": 1789061376.7781243, "phase": "batch-reload", "line": "  loading layer 17/64 (LinearAttention)..."}
+{"ts": 1789061376.8583364, "phase": "batch-reload", "line": "  loading layer 18/64 (LinearAttention)..."}
+{"ts": 1789061376.9319675, "phase": "batch-reload", "line": "  loading layer 19/64 (FullAttention)..."}
+{"ts": 1789061377.013595, "phase": "batch-reload", "line": "  loading layer 20/64 (LinearAttention)..."}
+{"ts": 1789061377.1443079, "phase": "batch-reload", "line": "  loading layer 21/64 (LinearAttention)..."}
+{"ts": 1789061377.2609346, "phase": "batch-reload", "line": "  loading layer 22/64 (LinearAttention)..."}
+{"ts": 1789061377.361332, "phase": "batch-reload", "line": "  loading layer 23/64 (FullAttention)..."}
+{"ts": 1789061377.4476042, "phase": "batch-reload", "line": "  loading layer 24/64 (LinearAttention)..."}
+{"ts": 1789061377.5138717, "phase": "batch-reload", "line": "  loading layer 25/64 (LinearAttention)..."}
+{"ts": 1789061377.595999, "phase": "batch-reload", "line": "  loading layer 26/64 (LinearAttention)..."}
+{"ts": 1789061377.6820555, "phase": "batch-reload", "line": "  loading layer 27/64 (FullAttention)..."}
+{"ts": 1789061377.7593656, "phase": "batch-reload", "line": "  loading layer 28/64 (LinearAttention)..."}
+{"ts": 1789061377.8252435, "phase": "batch-reload", "line": "  loading layer 29/64 (LinearAttention)..."}
+{"ts": 1789061377.8938565, "phase": "batch-reload", "line": "  loading layer 30/64 (LinearAttention)..."}
+{"ts": 1789061378.1031294, "phase": "batch-reload", "line": "  loading layer 31/64 (FullAttention)..."}
+{"ts": 1789061378.3890183, "phase": "batch-reload", "line": "  loading layer 32/64 (LinearAttention)..."}
+{"ts": 1789061378.5266583, "phase": "batch-reload", "line": "  loading layer 33/64 (LinearAttention)..."}
+{"ts": 1789061378.5963047, "phase": "batch-reload", "line": "  loading layer 34/64 (LinearAttention)..."}
+{"ts": 1789061378.6621153, "phase": "batch-reload", "line": "  loading layer 35/64 (FullAttention)..."}
+{"ts": 1789061378.7342985, "phase": "batch-reload", "line": "  loading layer 36/64 (LinearAttention)..."}
+{"ts": 1789061378.806314, "phase": "batch-reload", "line": "  loading layer 37/64 (LinearAttention)..."}
+{"ts": 1789061378.8845115, "phase": "batch-reload", "line": "  loading layer 38/64 (LinearAttention)..."}
+{"ts": 1789061378.9492688, "phase": "batch-reload", "line": "  loading layer 39/64 (FullAttention)..."}
+{"ts": 1789061379.020902, "phase": "batch-reload", "line": "  loading layer 40/64 (LinearAttention)..."}
+{"ts": 1789061379.1780581, "phase": "batch-reload", "line": "  loading layer 41/64 (LinearAttention)..."}
+{"ts": 1789061379.2855382, "phase": "batch-reload", "line": "  loading layer 42/64 (LinearAttention)..."}
+{"ts": 1789061379.3983588, "phase": "batch-reload", "line": "  loading layer 43/64 (FullAttention)..."}
+{"ts": 1789061379.5161233, "phase": "batch-reload", "line": "  loading layer 44/64 (LinearAttention)..."}
+{"ts": 1789061379.6122591, "phase": "batch-reload", "line": "  loading layer 45/64 (LinearAttention)..."}
+{"ts": 1789061379.6915386, "phase": "batch-reload", "line": "  loading layer 46/64 (LinearAttention)..."}
+{"ts": 1789061379.7589695, "phase": "batch-reload", "line": "  loading layer 47/64 (FullAttention)..."}
+{"ts": 1789061379.833649, "phase": "batch-reload", "line": "  loading layer 48/64 (LinearAttention)..."}
+{"ts": 1789061379.9062405, "phase": "batch-reload", "line": "  loading layer 49/64 (LinearAttention)..."}
+{"ts": 1789061379.9790285, "phase": "batch-reload", "line": "  loading layer 50/64 (LinearAttention)..."}
+{"ts": 1789061380.231818, "phase": "batch-reload", "line": "  loading layer 51/64 (FullAttention)..."}
+{"ts": 1789061380.469208, "phase": "batch-reload", "line": "  loading layer 52/64 (LinearAttention)..."}
+{"ts": 1789061380.5893013, "phase": "batch-reload", "line": "  loading layer 53/64 (LinearAttention)..."}
+{"ts": 1789061380.6570387, "phase": "batch-reload", "line": "  loading layer 54/64 (LinearAttention)..."}
+{"ts": 1789061380.723926, "phase": "batch-reload", "line": "  loading layer 55/64 (FullAttention)..."}
+{"ts": 1789061380.802979, "phase": "batch-reload", "line": "  loading layer 56/64 (LinearAttention)..."}
+{"ts": 1789061380.870068, "phase": "batch-reload", "line": "  loading layer 57/64 (LinearAttention)..."}
+{"ts": 1789061380.94193, "phase": "batch-reload", "line": "  loading layer 58/64 (LinearAttention)..."}
+{"ts": 1789061381.006279, "phase": "batch-reload", "line": "  loading layer 59/64 (FullAttention)..."}
+{"ts": 1789061381.0878267, "phase": "batch-reload", "line": "  loading layer 60/64 (LinearAttention)..."}
+{"ts": 1789061381.18651, "phase": "batch-reload", "line": "  loading layer 61/64 (LinearAttention)..."}
+{"ts": 1789061381.2704983, "phase": "batch-reload", "line": "  loading layer 62/64 (LinearAttention)..."}
+{"ts": 1789061381.3480647, "phase": "batch-reload", "line": "  loading layer 63/64 (FullAttention)..."}
+{"ts": 1789061381.4230783, "phase": "batch-reload", "line": "  weight sweep: 11222 ms (packed-expert host-read 0 ms, H2D 0 ms)"}
+{"ts": 1789061381.4268873, "phase": "batch-reload", "line": "KV cache: Q8 vmm (16/64 layers carry KV; K 272B/head + V Q8 272B/head; mapped_prefix=1927 / physical_cap=4096 / max_seq=4096)"}
+{"ts": 1789061387.201284, "phase": "batch-after-reload-commit", "line": "2026-09-10T17:29:47.201180Z  INFO daemon control command received request_id=\"batch-after-reload\" attempt_id=304 command=\"commit\""}
+{"ts": 1789061387.2015352, "phase": "batch-final-unload", "line": "[daemon-control] received commit for id=batch-after-reload attempt_id=304"}
+{"ts": 1789061545.6764681, "phase": "g45-load", "line": "2026-09-10T17:32:25.676406Z  INFO daemon starting pid=2372600"}
+{"ts": 1789061545.708038, "phase": "g45-load", "line": "GPU dev 0: gfx1151 (131.1 GB VRAM, HIP 7.2)"}
+{"ts": 1789061546.0537324, "phase": "g45-load", "line": "  DeltaNet state: Q8"}
+{"ts": 1789061546.0540955, "phase": "g45-load", "line": "  loading token_embd..."}
+{"ts": 1789061546.0541246, "phase": "g45-load", "line": "  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]"}
+{"ts": 1789061546.7177901, "phase": "g45-load", "line": "  loading output_norm..."}
+{"ts": 1789061546.7193038, "phase": "g45-load", "line": "  loading output (separate lm_head)..."}
+{"ts": 1789061546.9563544, "phase": "g45-load", "line": "  lm_head AWQ sidecar: absent (no-op)"}
+{"ts": 1789061546.9565213, "phase": "g45-load", "line": "  loading layer 0/64 (LinearAttention)..."}
+{"ts": 1789061546.9938586, "phase": "g45-load", "line": "  loading layer 1/64 (LinearAttention)..."}
+{"ts": 1789061547.019954, "phase": "g45-load", "line": "  loading layer 2/64 (LinearAttention)..."}
+{"ts": 1789061547.0505602, "phase": "g45-load", "line": "  loading layer 3/64 (FullAttention)..."}
+{"ts": 1789061547.0793648, "phase": "g45-load", "line": "  loading layer 4/64 (LinearAttention)..."}
+{"ts": 1789061547.1072774, "phase": "g45-load", "line": "  loading layer 5/64 (LinearAttention)..."}
+{"ts": 1789061547.1683962, "phase": "g45-load", "line": "  loading layer 6/64 (LinearAttention)..."}
+{"ts": 1789061547.2103148, "phase": "g45-load", "line": "  loading layer 7/64 (FullAttention)..."}
+{"ts": 1789061547.2685204, "phase": "g45-load", "line": "  loading layer 8/64 (LinearAttention)..."}
+{"ts": 1789061547.299591, "phase": "g45-load", "line": "  loading layer 9/64 (LinearAttention)..."}
+{"ts": 1789061547.3365664, "phase": "g45-load", "line": "  loading layer 10/64 (LinearAttention)..."}
+{"ts": 1789061547.3698635, "phase": "g45-load", "line": "  loading layer 11/64 (FullAttention)..."}
+{"ts": 1789061547.3934875, "phase": "g45-load", "line": "  loading layer 12/64 (LinearAttention)..."}
+{"ts": 1789061547.4224494, "phase": "g45-load", "line": "  loading layer 13/64 (LinearAttention)..."}
+{"ts": 1789061547.4517841, "phase": "g45-load", "line": "  loading layer 14/64 (LinearAttention)..."}
+{"ts": 1789061547.4756584, "phase": "g45-load", "line": "  loading layer 15/64 (FullAttention)..."}
+{"ts": 1789061547.5163717, "phase": "g45-load", "line": "  loading layer 16/64 (LinearAttention)..."}
+{"ts": 1789061547.5395467, "phase": "g45-load", "line": "  loading layer 17/64 (LinearAttention)..."}
+{"ts": 1789061547.5632913, "phase": "g45-load", "line": "  loading layer 18/64 (LinearAttention)..."}
+{"ts": 1789061547.5876677, "phase": "g45-load", "line": "  loading layer 19/64 (FullAttention)..."}
+{"ts": 1789061547.6126556, "phase": "g45-load", "line": "  loading layer 20/64 (LinearAttention)..."}
+{"ts": 1789061547.6358361, "phase": "g45-load", "line": "  loading layer 21/64 (LinearAttention)..."}
+{"ts": 1789061547.6753347, "phase": "g45-load", "line": "  loading layer 22/64 (LinearAttention)..."}
+{"ts": 1789061547.7069793, "phase": "g45-load", "line": "  loading layer 23/64 (FullAttention)..."}
+{"ts": 1789061547.7301047, "phase": "g45-load", "line": "  loading layer 24/64 (LinearAttention)..."}
+{"ts": 1789061547.7572923, "phase": "g45-load", "line": "  loading layer 25/64 (LinearAttention)..."}
+{"ts": 1789061547.7902603, "phase": "g45-load", "line": "  loading layer 26/64 (LinearAttention)..."}
+{"ts": 1789061547.814825, "phase": "g45-load", "line": "  loading layer 27/64 (FullAttention)..."}
+{"ts": 1789061547.8397799, "phase": "g45-load", "line": "  loading layer 28/64 (LinearAttention)..."}
+{"ts": 1789061547.863584, "phase": "g45-load", "line": "  loading layer 29/64 (LinearAttention)..."}
+{"ts": 1789061547.893845, "phase": "g45-load", "line": "  loading layer 30/64 (LinearAttention)..."}
+{"ts": 1789061547.946625, "phase": "g45-load", "line": "  loading layer 31/64 (FullAttention)..."}
+{"ts": 1789061547.969442, "phase": "g45-load", "line": "  loading layer 32/64 (LinearAttention)..."}
+{"ts": 1789061547.9986546, "phase": "g45-load", "line": "  loading layer 33/64 (LinearAttention)..."}
+{"ts": 1789061548.0293384, "phase": "g45-load", "line": "  loading layer 34/64 (LinearAttention)..."}
+{"ts": 1789061548.0531552, "phase": "g45-load", "line": "  loading layer 35/64 (FullAttention)..."}
+{"ts": 1789061548.076601, "phase": "g45-load", "line": "  loading layer 36/64 (LinearAttention)..."}
+{"ts": 1789061548.1003582, "phase": "g45-load", "line": "  loading layer 37/64 (LinearAttention)..."}
+{"ts": 1789061548.1232376, "phase": "g45-load", "line": "  loading layer 38/64 (LinearAttention)..."}
+{"ts": 1789061548.1465979, "phase": "g45-load", "line": "  loading layer 39/64 (FullAttention)..."}
+{"ts": 1789061548.1740665, "phase": "g45-load", "line": "  loading layer 40/64 (LinearAttention)..."}
+{"ts": 1789061548.2079778, "phase": "g45-load", "line": "  loading layer 41/64 (LinearAttention)..."}
+{"ts": 1789061548.2483091, "phase": "g45-load", "line": "  loading layer 42/64 (LinearAttention)..."}
+{"ts": 1789061548.2807379, "phase": "g45-load", "line": "  loading layer 43/64 (FullAttention)..."}
+{"ts": 1789061548.3107672, "phase": "g45-load", "line": "  loading layer 44/64 (LinearAttention)..."}
+{"ts": 1789061548.3416593, "phase": "g45-load", "line": "  loading layer 45/64 (LinearAttention)..."}
+{"ts": 1789061548.3708942, "phase": "g45-load", "line": "  loading layer 46/64 (LinearAttention)..."}
+{"ts": 1789061548.3939664, "phase": "g45-load", "line": "  loading layer 47/64 (FullAttention)..."}
+{"ts": 1789061548.416586, "phase": "g45-load", "line": "  loading layer 48/64 (LinearAttention)..."}
+{"ts": 1789061548.4395168, "phase": "g45-load", "line": "  loading layer 49/64 (LinearAttention)..."}
+{"ts": 1789061548.4637752, "phase": "g45-load", "line": "  loading layer 50/64 (LinearAttention)..."}
+{"ts": 1789061548.5009353, "phase": "g45-load", "line": "  loading layer 51/64 (FullAttention)..."}
+{"ts": 1789061548.5570564, "phase": "g45-load", "line": "  loading layer 52/64 (LinearAttention)..."}
+{"ts": 1789061548.5877566, "phase": "g45-load", "line": "  loading layer 53/64 (LinearAttention)..."}
+{"ts": 1789061548.6110992, "phase": "g45-load", "line": "  loading layer 54/64 (LinearAttention)..."}
+{"ts": 1789061548.637331, "phase": "g45-load", "line": "  loading layer 55/64 (FullAttention)..."}
+{"ts": 1789061548.66064, "phase": "g45-load", "line": "  loading layer 56/64 (LinearAttention)..."}
+{"ts": 1789061548.683729, "phase": "g45-load", "line": "  loading layer 57/64 (LinearAttention)..."}
+{"ts": 1789061548.70751, "phase": "g45-load", "line": "  loading layer 58/64 (LinearAttention)..."}
+{"ts": 1789061548.747809, "phase": "g45-load", "line": "  loading layer 59/64 (FullAttention)..."}
+{"ts": 1789061548.7867749, "phase": "g45-load", "line": "  loading layer 60/64 (LinearAttention)..."}
+{"ts": 1789061548.8426085, "phase": "g45-load", "line": "  loading layer 61/64 (LinearAttention)..."}
+{"ts": 1789061548.9113321, "phase": "g45-load", "line": "  loading layer 62/64 (LinearAttention)..."}
+{"ts": 1789061548.965674, "phase": "g45-load", "line": "  loading layer 63/64 (FullAttention)..."}
+{"ts": 1789061548.9959304, "phase": "g45-load", "line": "  weight sweep: 2942 ms (packed-expert host-read 0 ms, H2D 0 ms)"}
+{"ts": 1789061548.999716, "phase": "g45-load", "line": "KV cache: Q8 vmm (16/64 layers carry KV; K 272B/head + V Q8 272B/head; mapped_prefix=1927 / physical_cap=4096 / max_seq=4096)"}
+{"ts": 1789061566.848418, "phase": "g45-ordinary-stop-control", "line": "2026-09-10T17:32:46.848355Z  INFO daemon control command received request_id=\"g45-stop\" attempt_id=401 command=\"commit\""}
+{"ts": 1789061566.8485022, "phase": "g45-ordinary-stop-control", "line": "[daemon-control] received commit for id=g45-stop attempt_id=401"}
+{"ts": 1789061567.148463, "phase": "g45-max-tokens-length-control", "line": "2026-09-10T17:32:47.148422Z  INFO daemon control command received request_id=\"g45-length\" attempt_id=402 command=\"commit\""}
+{"ts": 1789061567.148553, "phase": "g45-max-tokens-length-control", "line": "[daemon-control] received commit for id=g45-length attempt_id=402"}
+{"ts": 1789061568.9787562, "phase": "g45-next-turn-reuse-control", "line": "2026-09-10T17:32:48.978695Z  INFO daemon control command received request_id=\"g45-reuse\" attempt_id=405 command=\"commit\""}
+{"ts": 1789061568.9789193, "phase": "g45-next-turn-reuse-control", "line": "[daemon-control] received commit for id=g45-reuse attempt_id=405"}
+{"ts": 1789061569.3929286, "phase": "g46-controlled-load", "line": "2026-09-10T17:32:49.392880Z  INFO daemon starting pid=2374205"}
+{"ts": 1789061569.4266942, "phase": "g46-controlled-load", "line": "GPU dev 0: gfx1151 (131.1 GB VRAM, HIP 7.2)"}
+{"ts": 1789061569.7688591, "phase": "g46-controlled-load", "line": "  DeltaNet state: Q8"}
+{"ts": 1789061569.7692587, "phase": "g46-controlled-load", "line": "  loading token_embd..."}
+{"ts": 1789061569.7692988, "phase": "g46-controlled-load", "line": "  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]"}
+{"ts": 1789061570.6553192, "phase": "g46-controlled-load", "line": "  loading output_norm..."}
+{"ts": 1789061570.6587667, "phase": "g46-controlled-load", "line": "  loading output (separate lm_head)..."}
+{"ts": 1789061570.920404, "phase": "g46-controlled-load", "line": "  lm_head AWQ sidecar: absent (no-op)"}
+{"ts": 1789061570.9206052, "phase": "g46-controlled-load", "line": "  loading layer 0/64 (LinearAttention)..."}
+{"ts": 1789061571.0086207, "phase": "g46-controlled-load", "line": "  loading layer 1/64 (LinearAttention)..."}
+{"ts": 1789061571.0750208, "phase": "g46-controlled-load", "line": "  loading layer 2/64 (LinearAttention)..."}
+{"ts": 1789061571.1627917, "phase": "g46-controlled-load", "line": "  loading layer 3/64 (FullAttention)..."}
+{"ts": 1789061571.2928457, "phase": "g46-controlled-load", "line": "  loading layer 4/64 (LinearAttention)..."}
+{"ts": 1789061571.3674545, "phase": "g46-controlled-load", "line": "  loading layer 5/64 (LinearAttention)..."}
+{"ts": 1789061571.5145504, "phase": "g46-controlled-load", "line": "  loading layer 6/64 (LinearAttention)..."}
+{"ts": 1789061571.5889316, "phase": "g46-controlled-load", "line": "  loading layer 7/64 (FullAttention)..."}
+{"ts": 1789061572.195072, "phase": "g46-controlled-load", "line": "  loading layer 8/64 (LinearAttention)..."}
+{"ts": 1789061572.4628477, "phase": "g46-controlled-load", "line": "  loading layer 9/64 (LinearAttention)..."}
+{"ts": 1789061572.5319338, "phase": "g46-controlled-load", "line": "  loading layer 10/64 (LinearAttention)..."}
+{"ts": 1789061572.5987678, "phase": "g46-controlled-load", "line": "  loading layer 11/64 (FullAttention)..."}
+{"ts": 1789061572.6805818, "phase": "g46-controlled-load", "line": "  loading layer 12/64 (LinearAttention)..."}
+{"ts": 1789061572.746534, "phase": "g46-controlled-load", "line": "  loading layer 13/64 (LinearAttention)..."}
+{"ts": 1789061572.8137932, "phase": "g46-controlled-load", "line": "  loading layer 14/64 (LinearAttention)..."}
+{"ts": 1789061572.8832614, "phase": "g46-controlled-load", "line": "  loading layer 15/64 (FullAttention)..."}
+{"ts": 1789061573.1410384, "phase": "g46-controlled-load", "line": "  loading layer 16/64 (LinearAttention)..."}
+{"ts": 1789061573.2167182, "phase": "g46-controlled-load", "line": "  loading layer 17/64 (LinearAttention)..."}
+{"ts": 1789061573.2846353, "phase": "g46-controlled-load", "line": "  loading layer 18/64 (LinearAttention)..."}
+{"ts": 1789061573.350453, "phase": "g46-controlled-load", "line": "  loading layer 19/64 (FullAttention)..."}
+{"ts": 1789061573.460263, "phase": "g46-controlled-load", "line": "  loading layer 20/64 (LinearAttention)..."}
+{"ts": 1789061573.585723, "phase": "g46-controlled-load", "line": "  loading layer 21/64 (LinearAttention)..."}
+{"ts": 1789061573.7061708, "phase": "g46-controlled-load", "line": "  loading layer 22/64 (LinearAttention)..."}
+{"ts": 1789061573.8041131, "phase": "g46-controlled-load", "line": "  loading layer 23/64 (FullAttention)..."}
+{"ts": 1789061573.8814368, "phase": "g46-controlled-load", "line": "  loading layer 24/64 (LinearAttention)..."}
+{"ts": 1789061573.947562, "phase": "g46-controlled-load", "line": "  loading layer 25/64 (LinearAttention)..."}
+{"ts": 1789061574.0197356, "phase": "g46-controlled-load", "line": "  loading layer 26/64 (LinearAttention)..."}
+{"ts": 1789061574.092011, "phase": "g46-controlled-load", "line": "  loading layer 27/64 (FullAttention)..."}
+{"ts": 1789061574.1678495, "phase": "g46-controlled-load", "line": "  loading layer 28/64 (LinearAttention)..."}
+{"ts": 1789061574.2339802, "phase": "g46-controlled-load", "line": "  loading layer 29/64 (LinearAttention)..."}
+{"ts": 1789061574.30027, "phase": "g46-controlled-load", "line": "  loading layer 30/64 (LinearAttention)..."}
+{"ts": 1789061574.4440076, "phase": "g46-controlled-load", "line": "  loading layer 31/64 (FullAttention)..."}
+{"ts": 1789061574.543951, "phase": "g46-controlled-load", "line": "  loading layer 32/64 (LinearAttention)..."}
+{"ts": 1789061574.631497, "phase": "g46-controlled-load", "line": "  loading layer 33/64 (LinearAttention)..."}
+{"ts": 1789061574.6995287, "phase": "g46-controlled-load", "line": "  loading layer 34/64 (LinearAttention)..."}
+{"ts": 1789061574.7641742, "phase": "g46-controlled-load", "line": "  loading layer 35/64 (FullAttention)..."}
+{"ts": 1789061574.8382916, "phase": "g46-controlled-load", "line": "  loading layer 36/64 (LinearAttention)..."}
+{"ts": 1789061574.9117026, "phase": "g46-controlled-load", "line": "  loading layer 37/64 (LinearAttention)..."}
+{"ts": 1789061574.995768, "phase": "g46-controlled-load", "line": "  loading layer 38/64 (LinearAttention)..."}
+{"ts": 1789061575.063433, "phase": "g46-controlled-load", "line": "  loading layer 39/64 (FullAttention)..."}
+{"ts": 1789061575.1350687, "phase": "g46-controlled-load", "line": "  loading layer 40/64 (LinearAttention)..."}
+{"ts": 1789061575.245157, "phase": "g46-controlled-load", "line": "  loading layer 41/64 (LinearAttention)..."}
+{"ts": 1789061575.3496003, "phase": "g46-controlled-load", "line": "  loading layer 42/64 (LinearAttention)..."}
+{"ts": 1789061575.4581969, "phase": "g46-controlled-load", "line": "  loading layer 43/64 (FullAttention)..."}
+{"ts": 1789061575.571718, "phase": "g46-controlled-load", "line": "  loading layer 44/64 (LinearAttention)..."}
+{"ts": 1789061575.6980624, "phase": "g46-controlled-load", "line": "  loading layer 45/64 (LinearAttention)..."}
+{"ts": 1789061575.778382, "phase": "g46-controlled-load", "line": "  loading layer 46/64 (LinearAttention)..."}
+{"ts": 1789061575.8449063, "phase": "g46-controlled-load", "line": "  loading layer 47/64 (FullAttention)..."}
+{"ts": 1789061575.9242706, "phase": "g46-controlled-load", "line": "  loading layer 48/64 (LinearAttention)..."}
+{"ts": 1789061576.0011103, "phase": "g46-controlled-load", "line": "  loading layer 49/64 (LinearAttention)..."}
+{"ts": 1789061576.0803225, "phase": "g46-controlled-load", "line": "  loading layer 50/64 (LinearAttention)..."}
+{"ts": 1789061576.2637765, "phase": "g46-controlled-load", "line": "  loading layer 51/64 (FullAttention)..."}
+{"ts": 1789061576.463267, "phase": "g46-controlled-load", "line": "  loading layer 52/64 (LinearAttention)..."}
+{"ts": 1789061576.572133, "phase": "g46-controlled-load", "line": "  loading layer 53/64 (LinearAttention)..."}
+{"ts": 1789061576.6677983, "phase": "g46-controlled-load", "line": "  loading layer 54/64 (LinearAttention)..."}
+{"ts": 1789061576.7405891, "phase": "g46-controlled-load", "line": "  loading layer 55/64 (FullAttention)..."}
+{"ts": 1789061576.812118, "phase": "g46-controlled-load", "line": "  loading layer 56/64 (LinearAttention)..."}
+{"ts": 1789061576.8805146, "phase": "g46-controlled-load", "line": "  loading layer 57/64 (LinearAttention)..."}
+{"ts": 1789061576.9515538, "phase": "g46-controlled-load", "line": "  loading layer 58/64 (LinearAttention)..."}
+{"ts": 1789061577.0164514, "phase": "g46-controlled-load", "line": "  loading layer 59/64 (FullAttention)..."}
+{"ts": 1789061577.0929813, "phase": "g46-controlled-load", "line": "  loading layer 60/64 (LinearAttention)..."}
+{"ts": 1789061577.1799526, "phase": "g46-controlled-load", "line": "  loading layer 61/64 (LinearAttention)..."}
+{"ts": 1789061577.280604, "phase": "g46-controlled-load", "line": "  loading layer 62/64 (LinearAttention)..."}
+{"ts": 1789061577.3731, "phase": "g46-controlled-load", "line": "  loading layer 63/64 (FullAttention)..."}
+{"ts": 1789061577.472319, "phase": "g46-controlled-load", "line": "  weight sweep: 7703 ms (packed-expert host-read 0 ms, H2D 0 ms)"}
+{"ts": 1789061577.4762506, "phase": "g46-controlled-load", "line": "KV cache: Q8 vmm (16/64 layers carry KV; K 272B/head + V Q8 272B/head; mapped_prefix=1927 / physical_cap=4096 / max_seq=4096)"}
+{"ts": 1789061577.4937057, "phase": "g46-controlled-abort-prefill-control", "line": "2026-09-10T17:32:57.493199Z  INFO daemon control command received request_id=\"g46-abort-prefill-controlled\" attempt_id=501 command=\"abort\""}
+{"ts": 1789061577.4937613, "phase": "g46-controlled-abort-prefill-control", "line": "[daemon-control] received abort for id=g46-abort-prefill-controlled attempt_id=501"}

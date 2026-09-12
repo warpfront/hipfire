@@ -5,10 +5,10 @@ Domain prose lives in the linked owners; this file does not duplicate it.
 
 | Field | Value |
 |---|---|
-| Inventory date | 2026-07-22 |
+| Inventory date | 2026-09-07 |
 | Working branch | `beta` |
-| Audited source ref | `202282de8759dfa6963ea5184ad2bf2b9259cef6` |
-| Comparison base | `origin/beta` @ `202282de8759dfa6963ea5184ad2bf2b9259cef6` |
+| Audited source ref | `20ba9ee3e33bddfa443ef1e5ba0c989de629fedb` |
+| Comparison base | `origin/beta` @ `20ba9ee3e33bddfa443ef1e5ba0c989de629fedb` |
 | Integrated commit / tree / source hashes | Supplied externally by Git/CI after cutover. Never self-referenced here. |
 
 ## Truth states
@@ -79,6 +79,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Architecture id table | [`docs/architecture-ids.md`](architecture-ids.md) | shipped / ref-pinned | |
 | Quantization formats and math | [`docs/QUANTIZATION.md`](QUANTIZATION.md) | shipped / ref-pinned | |
 | `hipfire quantize` operator guide | [`docs/QUANTIZE.md`](QUANTIZE.md) | shipped / ref-pinned | |
+| Image generation (FLUX) | [`docs/IMAGEGEN.md`](IMAGEGEN.md) | shipped / ref-pinned | First release; RDNA3/3.5 measured. CLI `hipfire img`, HTTP `/v1/images/generations` + `/edits`. |
 | Multi-GPU operator guide | [`docs/multi-gpu.md`](multi-gpu.md) | shipped / ref-pinned | |
 | Container install / run | [`docs/CONTAINER.md`](CONTAINER.md) | shipped / ref-pinned | |
 | NixOS notes | [`docs/NIXOS.md`](NIXOS.md) | shipped / ref-pinned | |
@@ -134,6 +135,7 @@ Every current top-level page, exactly once.
 | [`architecture-ids.md`](architecture-ids.md) | shipped / ref-pinned | Arch id table. |
 | [`QUANTIZATION.md`](QUANTIZATION.md) | shipped / ref-pinned | Quant design. |
 | [`QUANTIZE.md`](QUANTIZE.md) | shipped / ref-pinned | Quantize tool. |
+| [`IMAGEGEN.md`](IMAGEGEN.md) | shipped / ref-pinned | Image generation (FLUX); first release RDNA3/3.5. |
 | [`multi-gpu.md`](multi-gpu.md) | shipped / ref-pinned | Multi-GPU ops. |
 | [`CONTAINER.md`](CONTAINER.md) | shipped / ref-pinned | Containers. |
 | [`NIXOS.md`](NIXOS.md) | shipped / ref-pinned | NixOS. |
@@ -169,8 +171,8 @@ Every current top-level collection, exactly once. Directory policy applies to me
 
 ## Audit scope
 
-- **Audited ref** (`202282de8759dfa6963ea5184ad2bf2b9259cef6`): beta behavior pin used for this inventory refresh.
-- **Comparison base** (`origin/beta` @ `202282de8759dfa6963ea5184ad2bf2b9259cef6`): use when separating branch-only work from current beta facts.
+- **Audited ref** (`20ba9ee3e33bddfa443ef1e5ba0c989de629fedb`): beta behavior pin used for this inventory refresh.
+- **Comparison base** (`origin/beta` @ `20ba9ee3e33bddfa443ef1e5ba0c989de629fedb`): use when separating branch-only work from current beta facts.
 - Branch-implemented surfaces must not be phrased as beta product facts.
 - Historical, legal, and measured checkpoint bodies are not rewritten by this index.
 

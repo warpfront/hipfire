@@ -7,24 +7,24 @@
 //! types. `hipfire-runtime::llama` re-exports these for backward
 //! compatibility; new code should import from `saddle_core::kv`.
 
-use hip_bridge::{HipError, HipResult};
+use hip_bridge::HipResult;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-/// The resolved, validated KV-cache mode (plus one resolver-internal sentinel).
+/// The resolved, validated KV-cache mode.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KvMode {
     Q8,
+    /// Flat 2-byte BF16 K/V. NOT part of the quantized ladder: no rotation, no
+    /// per-block scale, and no VMM / adaptive / compaction support. Only a
+    /// site whose `accepted` list names it can ever resolve to it — today that
+    /// is maple alone, so every other site's behaviour is unchanged.
+    Bf16,
     Asym2,
     Asym3,
     Asym4,
     Fwht2,
     Fwht3,
     Fwht4,
-    /// SENTINEL — not an allocatable mode. Emitted only by site 3's
-    /// `normalize_dir` for its `auto`-set (`"" | "auto" | "turbo" | "turbo3"`).
-    /// `resolve` collapses it to `Asym3` (head_dim == 256) or `Q8` (else)
-    /// *before returning*, so `KvCache::from_mode` never sees it.
-    Asym3Auto,
 }
 
 /// KV storage backend selection.
@@ -311,6 +311,11 @@ pub struct KvCache {
     /// True when the rotation primitive is signed-FWHT (matches Fwht{2,3,4}
     /// KvMode values). False when Givens (matches Asym{2,3,4}).
     pub quant_fwht: bool,
+    /// True when K and V are stored as flat 2-byte BF16 (no scales, no
+    /// blocks) instead of a quantized block layout. Mutually exclusive with
+    /// every `quant_*` tier flag above; `quantized` is also set so the legacy
+    /// llama/qwen35 `!quantized` branches never mistake it for plain F32.
+    pub quant_bf16: bool,
     /// V-cache quantization mode (independent of the K mode). Defaults to Q8.
     pub v_mode: VMode,
     /// Per-layer flag: true = this layer uses Q8 (boundary layer)
@@ -424,6 +429,13 @@ impl KvCache {
                 }
                 Self::checked_vmm_product("q8 K head stride", &[head_dim / 32, 34])
             }
+            // BF16 is contiguous-only. It has no growable-arena constructor, so
+            // refuse here rather than compute a stride for a layout the VMM
+            // path cannot actually allocate.
+            KvMode::Bf16 => Err(hip_bridge::HipError::new(
+                0,
+                "VMM does not support bf16 KV (contiguous backend only)",
+            )),
             KvMode::Asym2 | KvMode::Fwht2 => head_dim
                 .checked_div(4)
                 .and_then(|n| n.checked_add(4))
@@ -437,10 +449,6 @@ impl KvCache {
                 .checked_div(2)
                 .and_then(|n| n.checked_add(4))
                 .ok_or_else(|| hip_bridge::HipError::new(0, "VMM 4-bit K head stride overflowed")),
-            KvMode::Asym3Auto => Err(hip_bridge::HipError::new(
-                0,
-                "KV mode Asym3Auto must be resolved before VMM layout",
-            )),
         }
     }
 
@@ -504,6 +512,14 @@ impl KvCache {
                     ));
                 }
             }
+            // Fail closed: bf16 has no VMM constructor. Callers that want bf16
+            // must use the contiguous backend.
+            KvMode::Bf16 => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "VMM does not support bf16 KV (contiguous backend only)",
+                ));
+            }
             KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => {
                 let ok_hd = match mode {
                     KvMode::Asym3 => head_dim == 256,
@@ -562,12 +578,6 @@ impl KvCache {
                     }
                 }
             },
-            KvMode::Asym3Auto => {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    "KV mode Asym3Auto must be resolved before VMM layout",
-                ));
-            }
         }
         Ok(())
     }
@@ -597,6 +607,10 @@ impl KvCache {
             Self::checked_vmm_product("V reserve", &[physical_cap, v_bytes_per_token])?;
         let rotation_table_len = match mode {
             KvMode::Q8 => 0,
+            // Unrotated, like Q8. Unreachable in practice — the validate above
+            // rejects bf16 for VMM before this runs — but 0 is the honest
+            // answer for a tier with no rotation table.
+            KvMode::Bf16 => 0,
             KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => head_dim / 2,
             KvMode::Fwht3 => 256,
             KvMode::Fwht2 | KvMode::Fwht4 => {
@@ -608,7 +622,6 @@ impl KvCache {
                     256
                 }
             }
-            KvMode::Asym3Auto => 0,
         };
         let uses_fwht_signs = matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4);
         Ok(VmmKvLayout {
@@ -764,7 +777,15 @@ impl KvCache {
             KvMode::Fwht2 => (false, false, false, true, true),
             KvMode::Fwht3 => (false, false, true, false, true),
             KvMode::Fwht4 => (false, true, false, false, true),
-            KvMode::Asym3Auto => (false, false, false, false, false),
+            // Bf16 is NOT representable in this 5-flag VMM bundle — all-false
+            // here would decode as KTier::F32 and hand a bf16 buffer to the
+            // F32 kernels, which read it at twice the stride. It can never
+            // legitimately arrive: `validate_vmm_mode` rejects bf16 before any
+            // VMM constructor runs. Panic loudly rather than return a lie.
+            KvMode::Bf16 => panic!(
+                "vmm_mode_flags: bf16 has no VMM layout — it is contiguous-only \
+                 and should have been rejected by validate_mode_with_backend"
+            ),
         }
     }
 
@@ -775,12 +796,6 @@ impl KvCache {
         single_gpu: bool,
         dims: &KvDims,
     ) -> HipResult<()> {
-        if mode == KvMode::Asym3Auto {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "KV mode Asym3Auto must be resolved before allocation",
-            ));
-        }
         if matches!(mode, KvMode::Asym4 | KvMode::Asym3) && dims.head_dim != 256 {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -972,6 +987,7 @@ impl KvCache {
             givens_cos: None,
             givens_sin: None,
             quant_fwht: false,
+            quant_bf16: false,
             v_mode: VMode::Q8,
             layer_is_boundary: self.layer_is_boundary.clone(),
             compact_offset: 0,
@@ -1063,10 +1079,18 @@ impl KvCache {
         let ms = dims.max_seq;
         match (mode, &dims.layers, dims.physical_cap) {
             // Mask + Some(cap): _capped_filtered (only q8/asym3/fwht2/fwht3 have it).
-            (KvMode::Q8, Mask(m), Some(cap)) => Self::new_gpu_q8_capped_filtered(gpu, m, nh, hd, ms, cap),
-            (KvMode::Asym3, Mask(m), Some(cap)) => Self::new_gpu_asym3_capped_filtered(gpu, m, nh, hd, ms, cap),
-            (KvMode::Fwht2, Mask(m), Some(cap)) => Self::new_gpu_fwht2_capped_filtered(gpu, m, nh, hd, ms, cap),
-            (KvMode::Fwht3, Mask(m), Some(cap)) => Self::new_gpu_fwht3_capped_filtered(gpu, m, nh, hd, ms, cap),
+            (KvMode::Q8, Mask(m), Some(cap)) => {
+                Self::new_gpu_q8_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            (KvMode::Asym3, Mask(m), Some(cap)) => {
+                Self::new_gpu_asym3_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            (KvMode::Fwht2, Mask(m), Some(cap)) => {
+                Self::new_gpu_fwht2_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            (KvMode::Fwht3, Mask(m), Some(cap)) => {
+                Self::new_gpu_fwht3_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
             // Mask + cap-but-no-capped-variant: cap DROPPED, use _filtered (faithful).
             (KvMode::Asym2, Mask(m), _) => Self::new_gpu_asym2_filtered(gpu, m, nh, hd, ms),
             (KvMode::Asym4, Mask(m), _) => Self::new_gpu_asym4_filtered(gpu, m, nh, hd, ms),
@@ -1078,12 +1102,24 @@ impl KvCache {
             (KvMode::Fwht3, Mask(m), None) => Self::new_gpu_fwht3_filtered(gpu, m, nh, hd, ms),
             // Flat + Some(cap): _capped (only q8/asym3/asym4).
             (KvMode::Q8, Flat(n), Some(cap)) => Self::new_gpu_q8_capped(gpu, *n, nh, hd, ms, cap),
-            (KvMode::Asym3, Flat(n), Some(cap)) => Self::new_gpu_asym3_capped(gpu, *n, nh, hd, ms, cap),
-            (KvMode::Asym4, Flat(n), Some(cap)) => Self::new_gpu_asym4_capped(gpu, *n, nh, hd, ms, cap),
+            (KvMode::Asym3, Flat(n), Some(cap)) => {
+                Self::new_gpu_asym3_capped(gpu, *n, nh, hd, ms, cap)
+            }
+            (KvMode::Asym4, Flat(n), Some(cap)) => {
+                Self::new_gpu_asym4_capped(gpu, *n, nh, hd, ms, cap)
+            }
             // Flat + None: plain (only q8/asym3/asym4).
             (KvMode::Q8, Flat(n), None) => Self::new_gpu_q8(gpu, *n, nh, hd, ms),
             (KvMode::Asym3, Flat(n), None) => Self::new_gpu_asym3(gpu, *n, nh, hd, ms),
             (KvMode::Asym4, Flat(n), None) => Self::new_gpu_asym4(gpu, *n, nh, hd, ms),
+            // Bf16 is Flat-only: there is no _filtered constructor because no
+            // hybrid arch (the reason _filtered exists) uses this tier. A
+            // Mask request therefore falls through to the error below rather
+            // than silently allocating every layer.
+            (KvMode::Bf16, Flat(n), Some(cap)) => {
+                Self::new_gpu_bf16_capped(gpu, *n, nh, hd, ms, cap)
+            }
+            (KvMode::Bf16, Flat(n), None) => Self::new_gpu_bf16(gpu, *n, nh, hd, ms),
             // No constructor exists for this combination.
             (m, l, c) => Err(hip_bridge::HipError::new(
                 0,
@@ -1098,7 +1134,6 @@ impl KvCache {
             )),
         }
     }
-
 }
 
 impl KvCache {
@@ -1135,6 +1170,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -1183,6 +1219,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -1221,6 +1258,30 @@ impl KvCache {
         max_seq_len: usize,
         physical_cap: usize,
     ) -> HipResult<Self> {
+        Self::new_gpu_q8_capped_with_alloc(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            Gpu::zeros,
+        )
+    }
+
+    /// [`new_gpu_q8_capped`] with an injectable K/V allocator: the production
+    /// door passes [`Gpu::zeros`]; rollback tests fail the Nth call to prove a
+    /// mid-loop failure frees every already-owned buffer before the original
+    /// error propagates.
+    fn new_gpu_q8_capped_with_alloc(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        mut alloc_zero: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
+    ) -> HipResult<Self> {
         assert!(
             physical_cap > 0 && physical_cap <= max_seq_len,
             "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
@@ -1232,9 +1293,23 @@ impl KvCache {
         let cache_elems = (cache_bytes + 3) / 4;
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[cache_elems], DType::F32)?);
+        // Same cleanup-closure shape as `alloc_k_v_filtered`: on any mid-loop
+        // failure free every tensor already pushed so a partial build never
+        // leaks device memory (GpuTensor has no freeing Drop). The K push
+        // precedes its V, so a V failure leaves the current K unmatched but
+        // still owned in `k_gpu` — the drain below covers it.
+        let result = (|| -> HipResult<()> {
+            for _ in 0..n_layers {
+                k_gpu.push(alloc_zero(gpu, &[cache_elems], DType::F32)?);
+                v_gpu.push(alloc_zero(gpu, &[cache_elems], DType::F32)?);
+            }
+            Ok(())
+        })();
+        if let Err(err) = result {
+            for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                let _ = gpu.free_tensor(tensor);
+            }
+            return Err(err);
         }
         Ok(Self {
             k_gpu,
@@ -1254,11 +1329,103 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
             layer_is_boundary: vec![],
             compact_offset: 0,
+            v_mode: VMode::Q8,
+        })
+    }
+
+    /// Create a flat BF16 KV cache. 2 bytes per element — 1.88x the Q8_0
+    /// layout (34 B per 32 elements). Values are **rounded F32→BF16** (same 8
+    /// exponent bits, truncated mantissa); that is not lossless, but it is the
+    /// near-reference tier Maple compares Q8 against and **the default Maple
+    /// KV mode** today.
+    ///
+    /// Layout is deliberately the simplest thing that can work: element
+    /// `(t, kv_h, d)` lives at `t * kv_dim + kv_h * head_dim + d`, one bf16
+    /// each. No blocks, no scales, no padding. That is what lets the tile
+    /// kernel drop the entire Q8 block-index computation.
+    ///
+    /// Sized by `physical_cap` like `new_gpu_q8_capped`, so eviction-bounded
+    /// callers get the buffer they asked for.
+    pub fn new_gpu_bf16(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_bf16_capped(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Same as [`KvCache::new_gpu_bf16`] with an explicit physical_cap.
+    pub fn new_gpu_bf16_capped(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        // 2 bytes per element, rounded up to whole F32 elements because the
+        // allocator is typed F32 everywhere else in this file. kv_dim is even
+        // for every real model so the round-up is a no-op, but the ceil keeps
+        // a hypothetical odd kv_dim from under-allocating.
+        let cache_bytes = physical_cap * kv_dim * 2;
+        let cache_elems = cache_bytes.div_ceil(4);
+        // All layers carry KV (no hybrid mask). Route through
+        // `alloc_k_v_filtered` so a mid-loop `zeros` failure frees every
+        // already-pushed owner — GpuTensor has no freeing Drop.
+        let is_kv_layer = vec![true; n_layers];
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, &is_kv_layer)?;
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            // `quantized` is TRUE even though bf16 is not a quantized tier:
+            // the legacy llama/qwen35 paths branch on `!quantized` to mean
+            // "plain F32 layout", and a bf16 buffer read as F32 is garbage.
+            // Setting this keeps those paths out of their F32 arm. Only Maple
+            // can allocate this cache today.
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: true,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            // V is bf16 too. `VMode::Q8` is the struct's default and is never
+            // read on this path — the tier decode reaches `KTier::Bf16` before
+            // any v_mode branch.
             v_mode: VMode::Q8,
         })
     }
@@ -1639,6 +1806,10 @@ impl KvCache {
         // invariant (the legacy qwen35 literals hardcoded quant_q4 = false).
         // Release classify() output is unchanged either way (asym is matched
         // before q4), so this is a true no-op for kernel selection.
+        // BF16 is a distinct flat tier (maple): it is `quantized:true` with
+        // empty `k_scales` and no other quant flag, so without `!quant_bf16`
+        // it would ALSO report quant_q4, giving two true tier flags and
+        // tripping the same debug_assert on every Maple BF16 dispatch.
         self.quantized
             && !self.quant_hfq4
             && !self.quant_q8
@@ -1646,6 +1817,7 @@ impl KvCache {
             && !self.quant_asym4
             && !self.quant_asym3
             && !self.quant_asym2
+            && !self.quant_bf16
             && self.k_scales.is_empty()
     }
 
@@ -2354,6 +2526,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -2449,6 +2622,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2565,6 +2739,7 @@ impl KvCache {
             quant_asym3,
             quant_asym2,
             quant_fwht,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos,
             givens_sin,
@@ -2659,6 +2834,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2705,6 +2881,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2753,6 +2930,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2803,6 +2981,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2901,6 +3080,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -2972,6 +3152,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3044,6 +3225,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3143,6 +3325,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: false,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3269,6 +3452,7 @@ impl KvCache {
             quant_asym3: true,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3451,6 +3635,7 @@ impl KvCache {
             quant_asym3: true,
             quant_asym2: false,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3478,7 +3663,12 @@ impl KvCache {
             "asym3 currently requires head_dim=256 (Qwen 3.5)"
         );
         Self::new_gpu_asym3_capped_inner(
-            gpu, n_layers, n_kv_heads, head_dim, max_seq_len, physical_cap,
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
         )
     }
 
@@ -3498,7 +3688,12 @@ impl KvCache {
             "asym3 (gemma4) requires head_dim=256 or 512 (got {head_dim})"
         );
         Self::new_gpu_asym3_capped_inner(
-            gpu, n_layers, n_kv_heads, head_dim, max_seq_len, physical_cap,
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
         )
     }
 
@@ -3509,6 +3704,38 @@ impl KvCache {
         head_dim: usize,
         max_seq_len: usize,
         physical_cap: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_asym3_capped_inner_with_alloc(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+            Gpu::zeros,
+            Gpu::alloc_tensor,
+            |gpu: &mut Gpu, tensor: &GpuTensor, bytes: &[u8]| {
+                gpu.hip.memcpy_htod(&tensor.buf, bytes)
+            },
+        )
+    }
+
+    /// [`new_gpu_asym3_capped_inner`] with injectable allocation/copy seams:
+    /// the production door passes [`Gpu::zeros`], [`Gpu::alloc_tensor`], and
+    /// a host-to-device copy; rollback tests fail the Nth seam call to prove
+    /// a mid-build failure frees every already-owned buffer — the current
+    /// unmatched K, all prior K/V layers, and any owned givens table — before
+    /// the original error propagates.
+    fn new_gpu_asym3_capped_inner_with_alloc(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        mut alloc_zero: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
+        mut alloc: impl FnMut(&mut Gpu, &[usize], DType) -> HipResult<GpuTensor>,
+        mut copy_htod: impl FnMut(&mut Gpu, &GpuTensor, &[u8]) -> HipResult<()>,
     ) -> HipResult<Self> {
         assert!(head_dim % 32 == 0);
         assert!(
@@ -3524,21 +3751,67 @@ impl KvCache {
 
         let mut k_gpu = Vec::with_capacity(n_layers);
         let mut v_gpu = Vec::with_capacity(n_layers);
-        for _ in 0..n_layers {
-            k_gpu.push(gpu.zeros(&[k_elems], DType::F32)?);
-            v_gpu.push(gpu.zeros(&[v_elems], DType::F32)?);
+        // Same cleanup-closure shape as `alloc_k_v_filtered`: on any mid-loop
+        // failure free every tensor already pushed (GpuTensor has no freeing
+        // Drop). The K push precedes its V, so a V failure leaves the current
+        // K unmatched but still owned in `k_gpu` — the drain below covers it.
+        let kv_result = (|| -> HipResult<()> {
+            for _ in 0..n_layers {
+                k_gpu.push(alloc_zero(gpu, &[k_elems], DType::F32)?);
+                v_gpu.push(alloc_zero(gpu, &[v_elems], DType::F32)?);
+            }
+            Ok(())
+        })();
+        if let Err(err) = kv_result {
+            for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                let _ = gpu.free_tensor(tensor);
+            }
+            return Err(err);
         }
         let n_blocks = head_dim / 2;
         let (cos_vals, sin_vals) = Self::gen_givens_angles(42, n_blocks);
         let cb: Vec<u8> = cos_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
         let sb: Vec<u8> = sin_vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
-        let ct = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        let st = gpu.alloc_tensor(&[n_blocks], DType::F32)?;
-        gpu.hip.memcpy_htod(&ct.buf, &cb)?;
-        gpu.hip.memcpy_htod(&st.buf, &sb)?;
+        // Givens tables follow the filtered-VMM rotation-table pattern: a
+        // partial pair never escapes — a second-alloc or copy failure frees
+        // the already-owned table — and a table failure rolls back every K/V
+        // owner above so the caller can retry on the same `gpu`.
+        let tables = (|| -> HipResult<(GpuTensor, GpuTensor)> {
+            let ct = alloc(gpu, &[n_blocks], DType::F32)?;
+            let st = match alloc(gpu, &[n_blocks], DType::F32) {
+                Ok(st) => st,
+                Err(err) => {
+                    let _ = gpu.free_tensor(ct);
+                    return Err(err);
+                }
+            };
+            if let Err(err) = copy_htod(gpu, &ct, &cb) {
+                let _ = gpu.free_tensor(ct);
+                let _ = gpu.free_tensor(st);
+                return Err(err);
+            }
+            if let Err(err) = copy_htod(gpu, &st, &sb) {
+                let _ = gpu.free_tensor(ct);
+                let _ = gpu.free_tensor(st);
+                return Err(err);
+            }
+            Ok((ct, st))
+        })();
+        let (ct, st) = match tables {
+            Ok(pair) => pair,
+            Err(err) => {
+                for tensor in k_gpu.drain(..).chain(v_gpu.drain(..)) {
+                    let _ = gpu.free_tensor(tensor);
+                }
+                return Err(err);
+            }
+        };
         let v_bph = v_bpp / n_kv_heads;
-        eprintln!("KV cache: asym3 (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
-            k_bph + v_bph, (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64);
+        eprintln!(
+            "KV cache: asym3 (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
+            k_bph + v_bph,
+            (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
+        );
         Ok(Self {
             k_gpu,
             v_gpu,
@@ -3557,6 +3830,7 @@ impl KvCache {
             quant_asym3: true,
             quant_asym2: false,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3640,6 +3914,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: true,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3729,6 +4004,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: true,
             quant_fwht: true,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3801,6 +4077,7 @@ impl KvCache {
             quant_asym3: false,
             quant_asym2: true,
             quant_fwht: false,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3906,7 +4183,6 @@ impl KvCache {
     // The KvCache.givens_cos / .givens_sin fields stay `None` in multi mode
     // — Stage 6 forward dispatch reads from the per-device replicas in
     // `Gpus` instead.
-
 }
 
 /// KV VMM-layout and adaptive-reset contract tests.
@@ -3927,7 +4203,7 @@ mod vmm_layout_tests {
             KvMode::Asym2 | KvMode::Fwht2 => 4 + head_dim / 4,
             KvMode::Asym3 | KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
             KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
-            KvMode::Asym3Auto => panic!("Asym3Auto is not a layout mode"),
+            KvMode::Bf16 => panic!("bf16 is not a VMM layout mode"),
         }
     }
 
@@ -3960,6 +4236,7 @@ mod vmm_layout_tests {
             quant_asym3: a3,
             quant_asym2: a2,
             quant_fwht: fwht,
+            quant_bf16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -3983,7 +4260,6 @@ mod vmm_layout_tests {
             physical_cap: Some(physical_cap),
         }
     }
-
 
     #[test]
     fn fwht3_vmm_layout_matches_asym3_byte_geometry() {
@@ -4053,7 +4329,7 @@ mod vmm_layout_tests {
     }
 
     #[test]
-    fn validate_mode_rejects_multi_gpu_flat_and_asym3auto_vmm() {
+    fn validate_mode_rejects_multi_gpu_and_flat_vmm() {
         let mask = vmm_mask_dims(4, 256, 4096, 1024);
         let err = KvCache::validate_mode_with_backend(KvMode::Fwht3, KvBackend::Vmm, false, &mask)
             .unwrap_err()
@@ -4071,12 +4347,6 @@ mod vmm_layout_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("filtered"), "{err}");
-
-        let err =
-            KvCache::validate_mode_with_backend(KvMode::Asym3Auto, KvBackend::Vmm, true, &mask)
-                .unwrap_err()
-                .to_string();
-        assert!(err.contains("Asym3Auto"), "{err}");
     }
 
     #[test]
@@ -4302,5 +4572,352 @@ mod vmm_layout_tests {
                 );
             }
         }
+    }
+}
+
+/// BF16 tier projection / plan regression (debug-build).
+///
+/// Maple's BF16 cache sets `quantized=true` with empty `k_scales` and
+/// `quant_bf16=true` — the exact shape that the legacy Q4 residual
+/// `quantized && !tier && k_scales.is_empty()` would also match.
+/// Without the `!quant_bf16` exclusion the cache reports TWO true tier flags
+/// (`bf16` + `q4`), which trips `hipfire-dispatch::families::kv_tier::classify`'s
+/// `debug_assert!(count <= 1)` on every Maple BF16 attention dispatch.
+/// These tests mirror that assertion without taking a dispatch dependency, so
+/// a future regression is caught here even in GPU-free CI.
+#[cfg(test)]
+mod bf16_tier_projection_tests {
+    use super::*;
+
+    fn stub(
+        quantized: bool,
+        quant_q8: bool,
+        quant_hfq4: bool,
+        quant_int8: bool,
+        quant_asym4: bool,
+        quant_asym3: bool,
+        quant_asym2: bool,
+        quant_fwht: bool,
+        quant_bf16: bool,
+        k_scales_empty: bool,
+    ) -> KvCache {
+        KvCache {
+            k_gpu: Vec::new(),
+            v_gpu: Vec::new(),
+            k_scales: if k_scales_empty {
+                Vec::new()
+            } else {
+                // non-empty sentinel: one dummy 1-element tensor avoids needing Gpu
+                vec![GpuTensor {
+                    buf: unsafe { hip_bridge::DeviceBuffer::from_raw(std::ptr::null_mut(), 0) },
+                    shape: vec![1],
+                    dtype: DType::F32,
+                }]
+            },
+            v_scales: Vec::new(),
+            kv_dim: 0,
+            max_seq: 0,
+            physical_cap: 0,
+            n_kv_heads: 0,
+            head_dim: 0,
+            quantized,
+            quant_q8,
+            quant_int8,
+            quant_hfq4,
+            quant_asym4,
+            quant_asym3,
+            quant_asym2,
+            quant_fwht,
+            quant_bf16,
+            v_mode: VMode::Q8,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: Vec::new(),
+            compact_offset: 0,
+        }
+    }
+
+    /// Mirrors `hipfire_dispatch::families::kv_tier::classify`'s at-most-one check,
+    /// using the two derived predicates exactly as `KvCacheExt::{k_tier,tier_inputs}`
+    /// do: `quant_q4 = quant_q4_residual()`, `quant_hfq8 = is_hfq8_kv()`.
+    fn tier_count(cache: &KvCache) -> usize {
+        let flags = [
+            cache.quant_asym4,
+            cache.quant_asym3,
+            cache.quant_asym2,
+            cache.quant_q8,
+            cache.quant_hfq4,
+            cache.quant_q4_residual(),
+            cache.quant_int8,
+            cache.is_hfq8_kv(),
+            cache.quant_bf16,
+        ];
+        flags.iter().filter(|&&b| b).count()
+    }
+
+    #[test]
+    fn bf16_projection_is_exclusive_q4_false_bf16_true() {
+        // Maple BF16: quantized true, empty scales, bf16 true, no other tier.
+        let bf16 = stub(
+            true, false, false, false, false, false, false, false, true, true,
+        );
+        assert!(
+            !bf16.quant_q4_residual(),
+            "BF16 must NOT report legacy Q4 residual"
+        );
+        assert!(bf16.quant_bf16, "BF16 flag must be true");
+        assert!(!bf16.is_hfq8_kv(), "BF16 must not report HFQ8");
+        assert_eq!(
+            tier_count(&bf16),
+            1,
+            "BF16 must classify as exactly one tier (bf16)"
+        );
+        // The dispatch crate's `classify` debug_assert would trip if count > 1.
+        // Mirror that guard so GPU-free CI catches the same regression.
+        debug_assert!(
+            tier_count(&bf16) <= 1,
+            "at most one KV storage tier flag should be set (BF16)"
+        );
+    }
+
+    #[test]
+    fn q4_residual_still_reports_q4_only() {
+        // LLaMA legacy Q4: quantized true, empty scales, no named tier, no bf16.
+        let q4 = stub(
+            true, false, false, false, false, false, false, false, false, true,
+        );
+        assert!(q4.quant_q4_residual(), "legacy Q4 must report q4 residual");
+        assert!(!q4.quant_bf16);
+        assert!(!q4.is_hfq8_kv());
+        assert_eq!(
+            tier_count(&q4),
+            1,
+            "Q4 must classify as exactly one tier (q4)"
+        );
+        debug_assert!(tier_count(&q4) <= 1, "at most one tier (Q4)");
+    }
+
+    #[test]
+    fn q8_projection_is_exclusive_q4_false() {
+        // Q8: quantized true, q8 true, empty scales, no bf16. Must not also be Q4.
+        let q8 = stub(
+            true, true, false, false, false, false, false, false, false, true,
+        );
+        assert!(
+            !q8.quant_q4_residual(),
+            "Q8 must NOT report legacy Q4 residual"
+        );
+        assert!(!q8.quant_bf16);
+        assert!(!q8.is_hfq8_kv());
+        assert!(q8.quant_q8);
+        assert_eq!(
+            tier_count(&q8),
+            1,
+            "Q8 must classify as exactly one tier (q8)"
+        );
+        debug_assert!(tier_count(&q8) <= 1, "at most one tier (Q8)");
+    }
+
+    #[test]
+    fn asym_and_hfq_variants_remain_exclusive() {
+        // Asym3 (qwen35 default) was the original motivator for the asym exclusion;
+        // ensure the new bf16 exclusion didn't reintroduce overlap.
+        let asym3 = stub(
+            true, false, false, false, false, true, false, false, false, true,
+        );
+        assert!(
+            !asym3.quant_q4_residual(),
+            "asym3 must NOT report Q4 residual"
+        );
+        assert_eq!(tier_count(&asym3), 1);
+
+        // HFQ8 has non-empty k_scales and is its own tier.
+        let hfq8 = stub(
+            true, false, false, false, false, false, false, false, false, false,
+        );
+        assert!(hfq8.is_hfq8_kv(), "hfq8 with scales must report hfq8");
+        assert!(
+            !hfq8.quant_q4_residual(),
+            "hfq8 must NOT report Q4 (scales non-empty)"
+        );
+        assert_eq!(tier_count(&hfq8), 1);
+
+        // F32: quantized false => no tier at all (KTier::F32).
+        let f32_cache = stub(
+            false, false, false, false, false, false, false, false, false, true,
+        );
+        assert!(!f32_cache.quant_q4_residual());
+        assert!(!f32_cache.is_hfq8_kv());
+        assert_eq!(tier_count(&f32_cache), 0, "F32 must classify as zero tiers");
+    }
+}
+
+/// Partial-construction rollback for the two flat Gemma doors.
+///
+/// No mock-GPU seam exists in this crate (`Gpu` needs real HIP), so these
+/// tests follow the workspace's `*_with_alloc` convention (qwen35 batch
+/// scratch, dflash weights): the private `..._with_alloc` helpers take over
+/// each allocation/copy seam, the test fails the Nth seam call, and a
+/// successful retry on the same `gpu` must reuse the rolled-back pool blocks
+/// — any retained (leaked) owner would force fresh `hipMalloc`s and move
+/// `pool_stats().0`. GPU-gated like the qwen35/dflash rollback tests.
+#[cfg(test)]
+mod kv_capped_rollback_tests {
+    use super::*;
+    use hip_bridge::HipError;
+    use std::cell::Cell;
+
+    const ROLLBACK_LAYERS: usize = 4;
+    const ROLLBACK_HEADS: usize = 2;
+    const ROLLBACK_SEQ: usize = 16;
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises Q8 partial-construction rollback and retry"]
+    fn q8_capped_partial_alloc_failure_frees_owners_and_retries() {
+        let mut gpu = Gpu::init().expect("GPU required for allocation rollback");
+        // Warm the pool so the retry legs below reuse pooled blocks.
+        let warm = KvCache::new_gpu_q8_capped(
+            &mut gpu,
+            ROLLBACK_LAYERS,
+            ROLLBACK_HEADS,
+            128,
+            ROLLBACK_SEQ,
+            ROLLBACK_SEQ,
+        )
+        .expect("warm q8 cache");
+        warm.free_gpu(&mut gpu).expect("release warm q8 cache");
+        let fresh = gpu.pool_stats().0;
+
+        // Fail at every K/V seam call. Odd calls fail a K (all prior layers
+        // owned); even calls fail a V, leaving the current K unmatched but
+        // already pushed — the drain must cover it too.
+        for fail_at in 1..=ROLLBACK_LAYERS * 2 {
+            let calls = Cell::new(0usize);
+            let err = KvCache::new_gpu_q8_capped_with_alloc(
+                &mut gpu,
+                ROLLBACK_LAYERS,
+                ROLLBACK_HEADS,
+                128,
+                ROLLBACK_SEQ,
+                ROLLBACK_SEQ,
+                |gpu, shape, dtype| {
+                    calls.set(calls.get() + 1);
+                    if calls.get() == fail_at {
+                        Err(HipError::new(2, "injected q8 K/V allocation failure"))
+                    } else {
+                        gpu.zeros(shape, dtype)
+                    }
+                },
+            )
+            .err()
+            .expect(&format!(
+                "q8 allocation fault at call {fail_at} did not trigger"
+            ));
+            assert!(
+                err.to_string()
+                    .contains("injected q8 K/V allocation failure"),
+                "q8 fault at call {fail_at} surfaced the wrong error: {err}"
+            );
+            // Successful retry on the same gpu must reuse the rolled-back pool
+            // blocks: a leak would force fresh hipMallocs and move `total_new`.
+            let retry = KvCache::new_gpu_q8_capped(
+                &mut gpu,
+                ROLLBACK_LAYERS,
+                ROLLBACK_HEADS,
+                128,
+                ROLLBACK_SEQ,
+                ROLLBACK_SEQ,
+            )
+            .expect("immediate retry after q8 allocation failure");
+            retry.free_gpu(&mut gpu).expect("release retried q8 cache");
+            assert_eq!(
+                gpu.pool_stats().0,
+                fresh,
+                "failed q8 construction at call {fail_at} leaked owners instead of rolling them back",
+            );
+        }
+        gpu.drain_pool();
+    }
+
+    #[test]
+    #[ignore = "requires an AMD GPU; exercises asym3 partial-construction rollback and retry"]
+    fn asym3_capped_partial_failure_frees_layers_givens_and_retries() {
+        let mut gpu = Gpu::init().expect("GPU required for allocation rollback");
+        // Warm the pool so the retry legs below reuse pooled blocks.
+        let warm = KvCache::new_gpu_asym3_capped_gemma4(
+            &mut gpu,
+            ROLLBACK_LAYERS,
+            ROLLBACK_HEADS,
+            256,
+            ROLLBACK_SEQ,
+            ROLLBACK_SEQ,
+        )
+        .expect("warm asym3 cache");
+        warm.free_gpu(&mut gpu).expect("release warm asym3 cache");
+        let fresh = gpu.pool_stats().0;
+
+        // Seam order per attempt: 2 K/V calls per layer, then cos alloc, sin
+        // alloc, cos copy, sin copy. Failing at each index covers partial
+        // layers (incl. the unmatched-K case), each partial-givens shape, and
+        // both copy failures.
+        let total_seams = ROLLBACK_LAYERS * 2 + 4;
+        for fail_at in 1..=total_seams {
+            let calls = Cell::new(0usize);
+            let fault = |calls: &Cell<usize>, label: &str| -> HipResult<()> {
+                calls.set(calls.get() + 1);
+                if calls.get() == fail_at {
+                    Err(HipError::new(2, &format!("injected asym3 {label} failure")))
+                } else {
+                    Ok(())
+                }
+            };
+            let err = KvCache::new_gpu_asym3_capped_inner_with_alloc(
+                &mut gpu,
+                ROLLBACK_LAYERS,
+                ROLLBACK_HEADS,
+                256,
+                ROLLBACK_SEQ,
+                ROLLBACK_SEQ,
+                |gpu, shape, dtype| {
+                    fault(&calls, "K/V allocation")?;
+                    gpu.zeros(shape, dtype)
+                },
+                |gpu, shape, dtype| {
+                    fault(&calls, "givens allocation")?;
+                    gpu.alloc_tensor(shape, dtype)
+                },
+                |gpu, tensor, bytes| {
+                    fault(&calls, "givens copy")?;
+                    gpu.hip.memcpy_htod(&tensor.buf, bytes)
+                },
+            )
+            .err()
+            .expect(&format!("asym3 fault at seam {fail_at} did not trigger"));
+            assert!(
+                err.to_string().contains("injected asym3"),
+                "asym3 fault at seam {fail_at} surfaced the wrong error: {err}"
+            );
+            // Successful retry through the Gemma door on the same gpu must
+            // reuse the rolled-back pool blocks.
+            let retry = KvCache::new_gpu_asym3_capped_gemma4(
+                &mut gpu,
+                ROLLBACK_LAYERS,
+                ROLLBACK_HEADS,
+                256,
+                ROLLBACK_SEQ,
+                ROLLBACK_SEQ,
+            )
+            .expect("immediate retry after asym3 failure");
+            retry
+                .free_gpu(&mut gpu)
+                .expect("release retried asym3 cache");
+            assert_eq!(
+                gpu.pool_stats().0,
+                fresh,
+                "failed asym3 construction at seam {fail_at} leaked owners instead of rolling them back",
+            );
+        }
+        gpu.drain_pool();
     }
 }

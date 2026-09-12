@@ -11,6 +11,9 @@
 //! - unload/recreate (free then alloc) works
 //! - a deterministic map failure leaves no leaked tracked allocation and is
 //!   followed by a successful allocation
+//! On Windows the reservation is mapped in one full segment up front
+//! (ROCm-Windows growth workaround); segment-growth coverage below is
+//! non-Windows, while mapping/readback assertions hold on both.
 //!
 //! Device selection (parent GPU-2 route):
 //!   HIPFIRE_VMM_SMOKE_DEVICE=2 cargo run -p rdna-compute --example vmm_tensor_smoke
@@ -43,28 +46,61 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert_eq!(gpu.device_id, device);
     assert_eq!(gpu.vmm_allocation_count(), 0);
 
-    // --- alloc + boundary growth preserves prior bytes ---
+    // --- alloc + full-prefix readback (segment growth on non-Windows, ---
+    // --- full reservation mapped up front on Windows) ---
     let mut tensor = unsafe { gpu.alloc_vmm_tensor(&[chunk * 2], DType::Raw, chunk, &access)? };
     assert_eq!(gpu.vmm_allocation_count(), 1);
-    assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(chunk));
-    assert_eq!(tensor.buf.size(), chunk);
-    assert!(tensor.buf.is_vmm_owner());
+    #[cfg(not(windows))]
+    let readback = {
+        assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(chunk));
+        assert_eq!(tensor.buf.size(), chunk);
+        assert!(tensor.buf.is_vmm_owner());
 
-    let first = pattern(chunk, 1, 0);
-    gpu.hip.memcpy_htod(&tensor.buf, &first)?;
+        let first = pattern(chunk, 1, 0);
+        gpu.hip.memcpy_htod(&tensor.buf, &first)?;
 
-    let mapped = gpu.grow_vmm_tensor(&mut tensor, chunk, &access)?;
-    assert_eq!(mapped, chunk * 2);
-    assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(chunk * 2));
-    assert_eq!(tensor.buf.size(), chunk * 2);
-    let second = pattern(chunk, 17, 3);
-    gpu.hip.memcpy_htod_offset(&tensor.buf, chunk, &second)?;
+        let mapped = gpu.grow_vmm_tensor(&mut tensor, chunk, &access)?;
+        assert_eq!(mapped, chunk * 2);
+        assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(chunk * 2));
+        assert_eq!(tensor.buf.size(), chunk * 2);
+        let second = pattern(chunk, 17, 3);
+        gpu.hip.memcpy_htod_offset(&tensor.buf, chunk, &second)?;
 
-    let mut readback = vec![0u8; chunk * 2];
-    gpu.hip.memcpy_dtoh(&mut readback, &tensor.buf)?;
-    assert_eq!(&readback[..chunk], first.as_slice());
-    assert_eq!(&readback[chunk..], second.as_slice());
-    println!("vmm_tensor_smoke: BOUNDARY_GROWTH PASS (mapped={mapped})");
+        let mut readback = vec![0u8; chunk * 2];
+        gpu.hip.memcpy_dtoh(&mut readback, &tensor.buf)?;
+        assert_eq!(&readback[..chunk], first.as_slice());
+        assert_eq!(&readback[chunk..], second.as_slice());
+        println!("vmm_tensor_smoke: BOUNDARY_GROWTH PASS (mapped={mapped})");
+        readback
+    };
+    #[cfg(windows)]
+    let readback = {
+        // Single-segment workaround: the full reservation is already mapped,
+        // so any further growth must fail and the whole prefix reads back.
+        assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(chunk * 2));
+        assert_eq!(tensor.buf.size(), chunk * 2);
+        assert!(tensor.buf.is_vmm_owner());
+        let over_err = gpu
+            .grow_vmm_tensor(&mut tensor, chunk, &access)
+            .expect_err("windows full-map must already cover the reservation");
+        assert!(
+            over_err.to_string().contains("exceed reserve"),
+            "unexpected full-map growth error: {over_err}"
+        );
+        assert_eq!(gpu.vmm_mapped_bytes(&tensor), Some(chunk * 2));
+
+        let first = pattern(chunk, 1, 0);
+        gpu.hip.memcpy_htod(&tensor.buf, &first)?;
+        let second = pattern(chunk, 17, 3);
+        gpu.hip.memcpy_htod_offset(&tensor.buf, chunk, &second)?;
+
+        let mut readback = vec![0u8; chunk * 2];
+        gpu.hip.memcpy_dtoh(&mut readback, &tensor.buf)?;
+        assert_eq!(&readback[..chunk], first.as_slice());
+        assert_eq!(&readback[chunk..], second.as_slice());
+        println!("vmm_tensor_smoke: FULLMAP_PREFIX PASS (mapped={})", chunk * 2);
+        readback
+    };
 
     // --- grow past reservation fails; prior mapping + tracking intact ---
     let gran = gpu
@@ -109,8 +145,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("vmm_tensor_smoke: UNLOAD_RELOAD PASS");
 
     // --- deterministic allocation/map failure: no leaked tracking; next alloc ok ---
+    #[cfg(windows)]
+    let fail_err = {
+        // The requested initial size is shadowed by the full reservation, so a
+        // non-granular initial still succeeds with the whole reservation mapped.
+        let bad_initial = gran.saturating_sub(1).max(1);
+        let absorbed =
+            unsafe { gpu.alloc_vmm_tensor(&[chunk], DType::Raw, bad_initial, &access) }
+                .expect("windows full-map absorbs non-granular initial");
+        assert_eq!(gpu.vmm_mapped_bytes(&absorbed), Some(chunk));
+        assert_eq!(absorbed.buf.size(), chunk);
+        gpu.free_tensor(absorbed).expect("free absorbed tensor");
+        // Genuine alloc failure on this path: a zero-byte reserve is rejected
+        // before any arena exists, so nothing may leak.
+        match unsafe { gpu.alloc_vmm_tensor(&[0], DType::Raw, 0, &access) } {
+            Ok(_) => panic!("zero-byte reserve must fail"),
+            Err(err) => err,
+        }
+    };
     // Non-granular initial map size is rejected before the arena is registered.
     // Fall back to mapping more than the reserved logical size when granularity == 1.
+    #[cfg(not(windows))]
     let fail_err = if gran > 1 {
         let bad_initial = gran.saturating_sub(1).max(1);
         match unsafe { gpu.alloc_vmm_tensor(&[chunk], DType::Raw, bad_initial, &access) } {
@@ -127,7 +182,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     assert!(
         fail_err.to_string().contains("multiple of granularity")
             || fail_err.to_string().contains("exceed reserve")
-            || fail_err.to_string().contains("VMM map"),
+            || fail_err.to_string().contains("VMM map")
+            || fail_err.to_string().contains("greater than zero"),
         "unexpected deterministic failure: {fail_err}"
     );
     // Successful cleanup path must not leave a tracked/orphan arena behind.

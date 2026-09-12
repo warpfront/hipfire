@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.3.1 — DFlash cache repair, admission hardening, image gen
+
+- Source-aware admission and refusal-before-teardown (#682, #687).
+- Registry-declared DFlash draft sidecars: `pull` fetches them, `auto`/`on` semantics, shared-sidecar-aware `rm` (#686).
+- DFlash prompt-cache repair on terminal overshoot (`RepairForTerminal`) (#695).
+- Template-aware primer splice (#692).
+- Qwen AR/DFlash: rich assistant reasoning history preserves the verbatim generated token span across template framing (whole-envelope store + Jinja splice); edited history falls back safely to plain retokenize.
+- Transactional DFlash constructors with emitter rollback (#691).
+- Qwen35 prefill/decode scratch and per-layer weight construction retain actual owners until publication, reclaiming every staged allocation on failure so immediate retries reuse the pool.
+- MQ-V2 prefill admit rule (#690).
+- gfx1100 DFlash launch fusion and split-K residual tiers (#702 body, S1–S8).
+- Dense-TP prefill chunking equals arch batch × tp (#725).
+- MTP head inherits trunk flash policy; tile-sized partials (#726).
+- XML tool calls parsed with grammar off (#729).
+- `HIPFIRE_RCCL_LIB` for non-standard ROCm layouts (#728).
+- `memory.oom_guard` (default `auto`; env `HIPFIRE_OOM_GUARD`) (#697).
+- `ornith-1.5:fast` alias → `ornith-1.5:35b-a3b-mq4r` (#680).
+- `moe_topk_renorm_k8` barrier (partial #670, nwoolmer).
+- Image generation: FLUX.1 schnell / FLUX.2 Klein via `hipfire img`, `POST /v1/images/generations` + `/edits`, `hipfire-quantize --flux-pipe` (philhug; first release; RDNA3/3.5 measured).
+- Qwen3.8-27B vision as a shared sidecar: `qwen3.8-27b-vision.hfq` (F16 tower, mmproj-style) pairs with every text quant tier — `hipfire pull` fetches it, `run`/`serve` accept `--vision`, `hipfire-quantize --vision-only` packs it. No trunk requantization. Loading is gated by `vision_mode` (`vision.mode`, env `HIPFIRE_VISION_MODE`; default **`off`** = text-only, no tower VRAM): `hipfire config set vision_mode auto` loads the tower when present, `on` fails the load closed without it. Validated on the committed 6-image desc/OCR battery; tower parity vs HF is decoder-bounded (zune-jpeg vs libjpeg chroma), see `benchmarks/vision/`.
+- Gate overhaul: `change_gate` / agentic-review retired (#700); hw-gate pins Qwen3.8 MQ4-XT and drops qwen3.6 as current fixture.
+- S1+S2 dependency hygiene and panic-free config CLI (#701).
+- All production `HIPFIRE_*` reads are config-owned.
+- Opt-in VCN JPEG preprocessing for existing VL serving: `image.decode` stays `cpu` by default; `vcn`/`auto` attempt shared VCN decode with guarded JPEG dimensions and validated VA plane layout/ownership, falling back to CPU on unsupported inputs, unavailable platforms, or recoverable decode failure. A failed terminal GPU completion fails closed (quarantine + request error + nonzero daemon exit; restart required) instead of unsafe same-device CPU fallback. This is a JPEG prepass only — not a replacement vision tokenizer or learned tower.
+- Manifest-route weight uploads go through the GPU buffer pool (`weight_store` pooled fulfillment + pool-return rollback) instead of raw `hip.malloc` paired with pooled frees, so repeated load/unload cycles on one context hold post-warmup free VRAM flat instead of retaining ~one model's weights per cycle. Single plain-manifest transactional load only — the legacy loader path is unchanged. Provenance: per-cycle upload journal count, decode parity, and pool-hit counters in the pinned-fixture cycle test; pooled manifest vs legacy forwards bit-identical. AWQ numerics now rest on a post-`output_norm` quantized-lm_head oracle (uniform 2.0-vs-4.0 sidecars forward at an exact 2:1 logit ratio, alternating sidecar proves per-channel application); the pre-norm o_proj pair only records sidecar attachment since RMSNorm erases global scales.
+- DFlash weight and scratch constructors now roll back late failures for immediate retry, including pool-aware F32 leaf uploads and AWQ sidecar attachment.
+- Preserve all eleven weight groups in K=2816 HFQ4/MQ4 MoE gate/up kernels while retaining the K=2048 path (#734 prerequisite; it did not itself enable Gemma serving — the lowered route arrives via #667 below).
+- Maple head overlays and BF16 KV tier (#670, nwoolmer): `hipfire run maple-preview --head q4k|bf16` loads single-tensor head overlays that validate and attach during source admission before teardown (non-Maple, EP, and REAP combinations are refused there); truncated payloads refuse at open and short reads refuse instead of zero-filling. Flat BF16 KV tier with windowed attention kernels, selectable via `--kv-mode`; the batch-router GEMM selects a gfx12 WMMA sister kernel on RDNA4. No quality or performance claims are made here.
+- Gemma 4 26B-A4B lowered route (#667): admission serves MoE/batched lowered loads end to end (`generate_gemma4_lowered`) instead of refusing them; `max_seq` is the logical authority (scratch flash partials and the full asym3 cache are sized from it) while the sliding Q8 ring's physical allocation is capped at `min(sliding_window, max_seq)`. The separate batched-prefill API shares single-token indexed MoE semantics (`moe_token_indexed`) with Q8 projections on an explicit F32 batched path (no automatic F16-staged WMMA); HD512 Q preload/lane alignment plus four-term dot association in the batched Q8 attention tile. Exact numerical parity across four prompt sizes (15/124/370/1108 tokens: byte-identical 262144 logits + 24 continuation tokens) on gfx1201 — that parity rig used a full-Q8 test cache, while serving/replay exercise the production mixed sliding-Q8/full-asym3 tiers; ordinary tokenwise-prefill chat serving: battery and chain each 5/5 coherent (no empty/attractor/runaway); stable 2-token prefill and 124-token-context decode captures with PM4 vs HIP/blob exact logits/KV/state across 3 successive positions. No broad quality or performance claims. Fixture: `gemma-4-26b-a4b-it.hfq4g128-maintainer.hf4` (15,343,188,028 bytes, sha256 `11cf46cba97f5e279d351f9d31cf4bdd78cb1fbc7c16da2433e6141ae7e07d53`), a maintainer-generated fixture distinct from the missing author artifact.
+- Gemma lowered loads reject `max_seq < 128` before replacing the resident model. Partial weight, scratch and KV construction now reclaims owned GPU allocations for retry, including AWQ sidecars and position buffers; lowered weight uploads reuse the unload pool. The diagnostic oracle follows the production mixed-Q8/asym3 cache geometry for short contexts and sliding-ring rollover.
+
+### Validation
+
+Fixture: `qwen3.8-27b.mq4-xt` (sha256 `9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7`) with paired draft sha256 `d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc`. Routes run: battery / chain / session AR+DFlash, ornith `.mq4r` PM4 route proof, tp=2, MTP@8192.
+
 ## v0.3.0 — MQ V2 wire schema, Bonsai, Redline across RDNA
 
 ### Quant wire schema (Bonsai + Magnum V2)

@@ -265,6 +265,7 @@ pub enum ConfigCategory {
     Memory,
     Attention,
     Speculation,
+    Vision,
     Replay,
     Fusions,
     Prompt,
@@ -477,11 +478,18 @@ fn expand_tilde(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+// The union of every KV-mode name any SITE accepts. This is the config
+// schema's allow-list only — it is NOT a promise that a given model supports a
+// mode. Per-site acceptance lives in `hipfire_runtime::kv_mode`'s policies,
+// which warn and fall back for anything they cannot allocate. `bf16` is
+// currently maple-only (arch 15).
 const KV_MODES: &[&str] = &[
-    "auto", "f32", "f16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2", "turbo",
-    "turbo4", "turbo3", "turbo2",
+    "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
+    "turbo", "turbo4", "turbo3", "turbo2",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
+/// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
+const IMAGE_DECODE_MODES: &[&str] = &["cpu", "vcn", "auto"];
 // `off` disables thinking outright. It resolves to a cap of 1, the engine's
 // established "no thinking" sentinel (the daemon reads
 // `enable_thinking: max_think_tokens != 1`) and the same value the OpenAI
@@ -632,6 +640,17 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_KV_ADAPTIVE"),
         "Runtime VRAM-fit KV precision policy."
+    ),
+    // Process-scoped: the preflight guards snapshot this once at startup, and
+    // a mid-serve flip would make the refusal policy depend on which load ran
+    // last — dishonest for a long-lived daemon.
+    process_auto_bool_field!(
+        "memory.oom_guard",
+        "oom_guard",
+        Memory,
+        false,
+        "HIPFIRE_OOM_GUARD",
+        "Memory preflight OOM guard. Default auto: on for unified-memory APU architectures (GPU allocations come out of system RAM, so an overshoot can globally OOM the desktop), off for discrete GPUs, and for GPU-less processes decided by host swap state. Set true to force on, false to force off (HIPFIRE_OOM_GUARD)."
     ),
     field!(
         "model.deepseek4_experts_per_token",
@@ -1091,6 +1110,30 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         Some("HIPFIRE_DFLASH_MODE"),
         "DFlash eligibility policy."
+    ),
+    field!(
+        "vision.mode",
+        "vision_mode",
+        Vision,
+        ModelLoad,
+        DefaultValue::String("off"),
+        ValueRule::Enum(AUTO_ON_OFF),
+        true,
+        false,
+        Some("HIPFIRE_VISION_MODE"),
+        "Vision-tower sidecar policy."
+    ),
+    field!(
+        "image.decode",
+        "image_decode",
+        Vision,
+        ModelLoad,
+        DefaultValue::String("cpu"),
+        ValueRule::Enum(IMAGE_DECODE_MODES),
+        true,
+        false,
+        Some("HIPFIRE_IMAGE_DECODE"),
+        "VL image JPEG decode path: cpu (default), vcn, or auto (VCN when probed, else cpu)."
     ),
     field!(
         "speculation.dflash_ngram_block",
@@ -3081,7 +3124,9 @@ impl ProcessConfig {
             if is_developer_key(key) {
                 continue;
             }
-            let schema = field(key).expect("ConfigLayer::validate accepted stable key");
+            let Some(schema) = field(key) else {
+                return Err(ConfigError::UnknownKey(key.clone()));
+            };
             if schema.env_compat.is_none() {
                 return Err(ConfigError::InvalidValue {
                     key: key.clone(),
@@ -3242,6 +3287,146 @@ pub fn active_or_local_process_config() -> &'static ProcessConfig {
 /// parsers; this function never reads or mutates the ambient environment.
 pub fn process_value(name: &str) -> Option<String> {
     active_or_local_process_config().legacy_value(name)
+}
+
+/// Resolve the memory preflight OOM guard (`memory.oom_guard`, compat
+/// `HIPFIRE_OOM_GUARD`). The guard exists because on unified-memory APUs
+/// (Strix Halo) GPU allocations come out of system RAM with no swap, so a
+/// bad admission takes the desktop down with a global OOM rather than
+/// failing one request; on a discrete GPU an overshoot is a plain failed
+/// `hipMalloc`. Default `auto` resolves per deployment class — see
+/// [`oom_guard_effective`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum OomGuardMode {
+    /// Decide by deployment class (unified-memory APU vs discrete GPU).
+    Auto,
+    /// Always refuse oversized allocations before they are made.
+    On,
+    /// Never refuse (the operator's informed trade).
+    Off,
+}
+
+/// Read the configured mode: `auto` (also unset or unparseable — validated
+/// layers should not produce anything else), or an on/off spelling.
+fn oom_guard_mode_for(value: Option<&str>) -> OomGuardMode {
+    match value.map(|v| v.trim().to_ascii_lowercase()) {
+        Some(v) if v == "0" || v == "false" || v == "off" || v == "no" => OomGuardMode::Off,
+        Some(v) if v == "1" || v == "true" || v == "on" || v == "yes" => OomGuardMode::On,
+        _ => OomGuardMode::Auto,
+    }
+}
+
+/// The configured mode of the memory preflight OOM guard.
+pub fn oom_guard_mode() -> OomGuardMode {
+    oom_guard_mode_for(process_value("HIPFIRE_OOM_GUARD").as_deref())
+}
+
+/// GPU architectures whose allocations land in system RAM: the GPU has no
+/// private VRAM (or only a small carve-out), so model weights and KV eat the
+/// same physical memory as the desktop. An overshoot here is a global OOM,
+/// not a failed hipMalloc.
+pub const UNIFIED_MEMORY_ARCHS: &[&str] = &[
+    "gfx1035", "gfx1036", // RDNA2 APU (Van Gogh / Steam Deck class)
+    "gfx1103", // RDNA3 APU (Phoenix orphan)
+    "gfx1150", "gfx1151", "gfx1152", // RDNA3.5 APU (Strix Point / Strix Halo)
+];
+
+/// GPU architectures with private VRAM: allocations that exceed it fail
+/// that one allocation instead of the machine.
+pub const DISCRETE_MEMORY_ARCHS: &[&str] = &[
+    "gfx906", "gfx908", "gfx940", "gfx941", "gfx942", // CDNA (HBM)
+    "gfx1010", "gfx1011", "gfx1012", // RDNA1
+    "gfx1030", "gfx1031", "gfx1032", // RDNA2 dGPU
+    "gfx1100", "gfx1101", "gfx1102", // RDNA3 dGPU
+    "gfx1200", "gfx1201", // RDNA4
+];
+
+/// Whether `arch` is a unified-memory APU (GPU memory is system RAM).
+pub fn is_unified_memory_arch(arch: &str) -> bool {
+    UNIFIED_MEMORY_ARCHS
+        .iter()
+        .any(|known| arch.eq_ignore_ascii_case(known))
+}
+
+/// Whether `arch` is a recognized discrete-VRAM GPU.
+fn is_discrete_memory_arch(arch: &str) -> bool {
+    DISCRETE_MEMORY_ARCHS
+        .iter()
+        .any(|known| arch.eq_ignore_ascii_case(known))
+}
+
+/// `SwapTotal` (kB) from a /proc/meminfo body; `None` when absent/unreadable.
+fn swap_total_kb_from_meminfo(meminfo: &str) -> Option<u64> {
+    for line in meminfo.lines() {
+        if let Some(rest) = line.strip_prefix("SwapTotal:") {
+            return rest.split_whitespace().next()?.parse().ok();
+        }
+    }
+    None
+}
+
+/// Host swap size in kB; `None` when /proc/meminfo cannot be read.
+fn host_has_swap() -> Option<bool> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    Some(swap_total_kb_from_meminfo(&meminfo)? > 0)
+}
+
+/// Pure auto decision, testable without pinning host state. With a known GPU
+/// arch the deployment class decides (unified-memory APU → on, discrete →
+/// off, unrecognized → on, failing safe). Without one (no GPU has been
+/// initialized in this process) the host's own lethality decides: with swap
+/// an overcommit degrades instead of killing, so the guard stands down;
+/// without (or with unreadable) swap, it stays up.
+fn oom_guard_auto_for(arch: Option<&str>, has_swap: Option<bool>) -> bool {
+    match arch {
+        Some(arch) if is_unified_memory_arch(arch) => true,
+        Some(arch) if is_discrete_memory_arch(arch) => false,
+        Some(_) => true,
+        None => !matches!(has_swap, Some(true)),
+    }
+}
+
+/// Resolve whether the memory preflight guard should refuse allocations in
+/// this process.
+///
+/// `arch` is the GPU arch this process initialized (see
+/// `rdna_compute::arch_caps::process_gpu_arch`), or `None` when no GPU is
+/// (yet) known — e.g. a CLI process that only supervises the daemon. The
+/// `auto` decision is logged once to stderr with its reason so a refusal (or
+/// a skipped refusal) in a daemon log explains itself.
+pub fn oom_guard_effective(arch: Option<&str>) -> bool {
+    match oom_guard_mode() {
+        OomGuardMode::On => true,
+        OomGuardMode::Off => false,
+        OomGuardMode::Auto => {
+            static DECISION_NOTE: std::sync::Once = std::sync::Once::new();
+            let has_swap = host_has_swap();
+            let enabled = oom_guard_auto_for(arch, has_swap);
+            DECISION_NOTE.call_once(|| {
+                let why = match (arch, has_swap) {
+                    (Some(a), _) if is_unified_memory_arch(a) => {
+                        format!("{a}: unified-memory APU; GPU allocations come from system RAM")
+                    }
+                    (Some(a), _) if is_discrete_memory_arch(a) => {
+                        format!("{a}: discrete GPU; an overshoot is a failed hipMalloc, not an OOM")
+                    }
+                    (Some(a), _) => format!("{a}: unrecognized arch; failing safe"),
+                    (None, Some(true)) => {
+                        "no GPU arch known; host has swap, so an overcommit degrades rather than kills"
+                            .to_string()
+                    }
+                    (None, _) => {
+                        "no GPU arch known; host has no readable swap; failing safe".to_string()
+                    }
+                };
+                eprintln!(
+                    "[oom_guard] auto: {why} → guard {}",
+                    if enabled { "on" } else { "off" }
+                );
+            });
+            enabled
+        }
+    }
 }
 
 /// Compatibility-shaped access for experimental code while its public policy
@@ -3736,7 +3921,9 @@ fn validate_model_layer(layer: &ConfigLayer) -> Result<()> {
                     .into(),
             });
         }
-        let schema = field(key).expect("validated configuration field");
+        let Some(schema) = field(key) else {
+            return Err(ConfigError::UnknownKey(key.clone()));
+        };
         if matches!(schema.scope, ConfigScope::Process | ConfigScope::Diagnostic) {
             return Err(ConfigError::InvalidValue {
                 key: key.clone(),
@@ -4513,6 +4700,98 @@ mod tests {
     }
 
     #[test]
+    fn oom_guard_mode_parses_auto_on_off() {
+        // Unset, "auto", and unparseable values all land on Auto — a garbage
+        // value must not silently disable a safety guard, nor force it past
+        // the deployment-class decision.
+        assert_eq!(oom_guard_mode_for(None), OomGuardMode::Auto);
+        assert_eq!(oom_guard_mode_for(Some("auto")), OomGuardMode::Auto);
+        assert_eq!(oom_guard_mode_for(Some("AUTO")), OomGuardMode::Auto);
+        assert_eq!(oom_guard_mode_for(Some("banana")), OomGuardMode::Auto);
+        assert_eq!(oom_guard_mode_for(Some("1")), OomGuardMode::On);
+        assert_eq!(oom_guard_mode_for(Some("true")), OomGuardMode::On);
+        assert_eq!(oom_guard_mode_for(Some("ON")), OomGuardMode::On);
+        // The typed bool renders "0"; raw compat spellings also count.
+        assert_eq!(oom_guard_mode_for(Some("0")), OomGuardMode::Off);
+        assert_eq!(oom_guard_mode_for(Some("false")), OomGuardMode::Off);
+        assert_eq!(oom_guard_mode_for(Some("OFF")), OomGuardMode::Off);
+        assert_eq!(oom_guard_mode_for(Some("no")), OomGuardMode::Off);
+    }
+
+    #[test]
+    fn unified_and_discrete_arch_classes_are_disjoint_and_complete() {
+        // Every APU arch must resolve to unified, every dGPU/CDNA arch to
+        // not-unified, and the two tables must never overlap.
+        for arch in UNIFIED_MEMORY_ARCHS {
+            assert!(is_unified_memory_arch(arch));
+            assert!(
+                !DISCRETE_MEMORY_ARCHS.contains(arch),
+                "{arch} in both tables"
+            );
+            // Case-insensitive: arch strings arrive from the HIP runtime.
+            assert!(is_unified_memory_arch(&arch.to_uppercase()));
+        }
+        for arch in DISCRETE_MEMORY_ARCHS {
+            assert!(!is_unified_memory_arch(arch));
+            assert!(is_discrete_memory_arch(arch));
+        }
+        assert!(is_unified_memory_arch("gfx1151"));
+        assert!(!is_unified_memory_arch("gfx1100"));
+    }
+
+    #[test]
+    fn oom_guard_auto_decision_matrix() {
+        // Known unified-memory APU: guard on regardless of host swap — GPU
+        // allocations land in RAM either way.
+        assert!(oom_guard_auto_for(Some("gfx1151"), Some(true)));
+        assert!(oom_guard_auto_for(Some("gfx1151"), Some(false)));
+        assert!(oom_guard_auto_for(Some("gfx1103"), None));
+        // Known discrete GPU: overshoot is a failed hipMalloc; stand down.
+        assert!(!oom_guard_auto_for(Some("gfx1100"), Some(true)));
+        assert!(!oom_guard_auto_for(Some("gfx942"), None));
+        assert!(!oom_guard_auto_for(Some("gfx1201"), Some(false)));
+        // Unrecognized arch: fail safe.
+        assert!(oom_guard_auto_for(Some("gfx9999"), Some(true)));
+        // No GPU arch in this process: the host's own lethality decides.
+        assert!(!oom_guard_auto_for(None, Some(true)));
+        assert!(oom_guard_auto_for(None, Some(false)));
+        // Unreadable /proc/meminfo: fail safe.
+        assert!(oom_guard_auto_for(None, None));
+    }
+
+    #[test]
+    fn swap_total_parses_from_meminfo() {
+        let with_swap = "MemTotal:       130000000 kB\nSwapTotal:       2000000 kB\nSwapFree:        2000000 kB\n";
+        assert_eq!(swap_total_kb_from_meminfo(with_swap), Some(2_000_000));
+        let no_swap = "MemTotal:       130000000 kB\nSwapTotal:             0 kB\n";
+        assert_eq!(swap_total_kb_from_meminfo(no_swap), Some(0));
+        assert_eq!(swap_total_kb_from_meminfo("MemTotal: 100 kB\n"), None);
+    }
+
+    #[test]
+    fn oom_guard_schema_field_is_process_scoped_with_env_compat() {
+        let field = field("memory.oom_guard").expect("oom_guard schema field");
+        assert_eq!(field.env_compat, Some("HIPFIRE_OOM_GUARD"));
+        // Default is the string "auto": the deployment-class decision, not a
+        // blanket on/off.
+        assert!(matches!(
+            field.default.to_value(),
+            ConfigValue::String(v) if v == "auto"
+        ));
+        assert!(matches!(field.rule, ValueRule::AutoBool));
+        assert!(!field.include_builtin_in_process_config);
+        // The AutoBool rule must accept all three spellings end to end.
+        assert!(field.validate(&ConfigValue::Bool(false)).is_ok());
+        assert!(field.validate(&ConfigValue::Bool(true)).is_ok());
+        assert!(field
+            .validate(&ConfigValue::String("auto".to_string()))
+            .is_ok());
+        assert!(field
+            .validate(&ConfigValue::String("sometimes".to_string()))
+            .is_err());
+    }
+
+    #[test]
     fn schema_has_unique_keys_and_legacy_keys() {
         let mut canonical = std::collections::BTreeSet::new();
         let mut legacy = std::collections::BTreeSet::new();
@@ -4579,6 +4858,34 @@ mod tests {
         assert_eq!(field.parse_cli("4").unwrap(), ConfigValue::Integer(4));
         assert!(field.parse_cli("0").is_err());
         assert!(field.parse_cli("7").is_err());
+    }
+    #[test]
+    fn vision_mode_defaults_off_with_auto_on_off_values() {
+        let field = field("vision.mode").expect("vision.mode schema field");
+        assert_eq!(field.legacy_key, "vision_mode");
+        assert_eq!(field.env_compat, Some("HIPFIRE_VISION_MODE"));
+        assert_eq!(field.default.to_value(), ConfigValue::String("off".into()));
+        for mode in ["off", "auto", "on"] {
+            assert_eq!(
+                field.parse_cli(mode).unwrap(),
+                ConfigValue::String(mode.into())
+            );
+        }
+        assert!(field.parse_cli("sometimes").is_err());
+    }
+    #[test]
+    fn image_decode_defaults_cpu_with_cpu_vcn_auto_values() {
+        let field = field("image.decode").expect("image.decode schema field");
+        assert_eq!(field.legacy_key, "image_decode");
+        assert_eq!(field.env_compat, Some("HIPFIRE_IMAGE_DECODE"));
+        assert_eq!(field.default.to_value(), ConfigValue::String("cpu".into()));
+        for mode in ["cpu", "vcn", "auto"] {
+            assert_eq!(
+                field.parse_cli(mode).unwrap(),
+                ConfigValue::String(mode.into())
+            );
+        }
+        assert!(field.parse_cli("sometimes").is_err());
     }
 
     #[test]

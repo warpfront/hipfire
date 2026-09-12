@@ -26,7 +26,7 @@ def spawn(daemon):
     return p, errs
 
 
-def load(p, model):
+def load(p, model, errs):
     t0 = time.perf_counter()
     p.stdin.write(json.dumps(
         {"type": "load", "model": model, "params": {"max_seq": 2048}}) + "\n")
@@ -52,15 +52,15 @@ def main():
 
     p, errs = spawn(daemon)
     try:
-        print(f"swap1  A={a.split('/')[-1]}: {load(p, a)*1000:.0f} ms")
-        print(f"swap2  A again (warm):   {load(p, a)*1000:.0f} ms")
-        print(f"swap3  B first-in-proc:  {load(p, b)*1000:.0f} ms")
+        print(f"swap1  A={a.split('/')[-1]}: {load(p, a, errs)*1000:.0f} ms")
+        print(f"swap2  A again (warm):   {load(p, a, errs)*1000:.0f} ms")
+        print(f"swap3  B first-in-proc:  {load(p, b, errs)*1000:.0f} ms")
     finally:
         p.terminate()
     # fresh-process control for B
-    p2, _ = spawn(daemon)
+    p2, errs2 = spawn(daemon)
     try:
-        print(f"fresh  B new-process:    {load(p2, b)*1000:.0f} ms")
+        print(f"fresh  B new-process:    {load(p2, b, errs2)*1000:.0f} ms")
     finally:
         p2.terminate()
 

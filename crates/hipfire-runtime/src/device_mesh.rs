@@ -52,6 +52,10 @@ pub struct Axis {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum CollectiveHint {
     /// Reduce values across the named axis group.
+    ///
+    /// Restored for the G3 manifest planner, which schedules one ordered
+    /// per-operation reduction hint per row- or expert-sharded declaration
+    /// (removed in 90b2cc7aa as unreferenced while no producer existed).
     AllReduce { kind: DimKind },
     /// Transfer the residual from one pipeline stage to the next.
     ///

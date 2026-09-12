@@ -76,7 +76,7 @@ def test_harness_argv_construction(tmp_path, monkeypatch):
     logs_dir.mkdir()
     home = tmp_path / "home"
     home.mkdir()
-    fixture = {"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": "abc", "size_bytes": 123}
+    fixture = {"tag": "qwen3.8:27b-mq4-xt", "file": "qwen3.8-27b.mq4-xt", "sha256": "abc", "size_bytes": 123}
     harness_cfg = {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 256}
     # create prompt file for repo/battery_prompts
     prompt_path = repo / "benchmarks" / "prompts" / "hw-gate" / "serve-battery.json"
@@ -130,7 +130,7 @@ def test_harness_argv_construction(tmp_path, monkeypatch):
     home_idx = argv.index("--home")
     per_home = Path(argv[home_idx+1])
     assert str(per_home).startswith(str(home))
-    assert "qwen3.6-27b" in str(per_home) or "qwen3" in str(per_home)
+    assert "qwen3.8-27b-mq4-xt" in str(per_home) or "qwen3" in str(per_home)
     # also check chain mode has no --prompts-file
     captured.clear()
     res2 = run_mod._run_harness_mode(str(repo), fixture, env_base, str(logs_dir), "3", "chain", harness_cfg, str(models_dir))
@@ -139,8 +139,8 @@ def test_harness_argv_construction(tmp_path, monkeypatch):
     # ensure argv contains thinking flags for chain as well
     assert "--thinking" in argv2
     # verify logs .out captured
-    assert (logs_dir / "qwen3.6-27b-battery.out").is_file()
-    content_out = (logs_dir / "qwen3.6-27b-battery.out").read_text()
+    assert (logs_dir / "qwen3.8-27b-mq4-xt-battery.out").is_file()
+    content_out = (logs_dir / "qwen3.8-27b-mq4-xt-battery.out").read_text()
     assert "harness stdout" in content_out
 
 
@@ -203,7 +203,7 @@ def test_mode_union():
         "buckets": {
             "load": {"modes": ["battery"]},
             "serve": {"modes": ["battery", "chain"]},
-            "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}},
+            "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.8:27b-mq4-xt", "harness_args": []}},
         }
     }
     assert run_mod._modes_for_buckets(["load"], manifest) == ["battery"]
@@ -226,7 +226,7 @@ def test_render_md_turn_tables_and_details(tmp_path):
         "binaries": {"daemon_md5": "d1", "hipfire_md5": "h1", "build_seconds": 42.5},
         "fixtures": [
             {
-                "tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": "abc", "sha256_ok": True, "size_ok": True,
+                "tag": "qwen3.8:27b-mq4-xt", "file": "qwen3.8-27b.mq4-xt", "sha256": "abc", "sha256_ok": True, "size_ok": True,
                 "modes": {
                     "battery": {"exit": 0, "seconds": 19.2, "rows": [row0], "status": "pass", "reason": ""},
                     "chain": {"exit": 1, "seconds": 30.0, "rows": [row1], "status": "fail", "reason": "attractor"},
@@ -251,8 +251,8 @@ def test_render_md_turn_tables_and_details(tmp_path):
     assert "runaway" in md.lower()
     assert "recall" in md.lower()
     # details blocks verbatim
-    assert "<details><summary>qwen3.6:27b battery turn 0" in md
-    assert "<details><summary>qwen3.6:27b chain turn 0" in md
+    assert "<details><summary>qwen3.8:27b-mq4-xt battery turn 0" in md
+    assert "<details><summary>qwen3.8:27b-mq4-xt chain turn 0" in md
     # verbatim assistant_content inside fence
     fence = run_mod._fence(assistant)
     assert f"{fence}\n{assistant}\n{fence}" in md
@@ -303,12 +303,12 @@ def test_main_exit_2_missing_fixture_no_build(tmp_path, monkeypatch):
         "models_dir": str(models_dir),
         "harness": {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 256},
         "fixtures": [
-            {"tag": "qwen3.6:27b", "file": "missing.mq4", "sha256": "a"*64, "size_bytes": 123, "arch_id": 5, "why": "x"}
+            {"tag": "qwen3.8:27b-mq4-xt", "file": "missing.mq4", "sha256": "a"*64, "size_bytes": 123, "arch_id": 5, "why": "x"}
         ],
         "buckets": {
             "load": {"modes": ["battery"]},
             "serve": {"modes": ["battery", "chain"]},
-            "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": ["--pm4"]}}
+            "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.8:27b-mq4-xt", "harness_args": ["--pm4"]}}
         }
     }
     fixtures_path = tmp_path / "scripts" / "hw-gate" / "fixtures.json"
@@ -348,7 +348,7 @@ def test_main_harness_success_and_failure(tmp_path, monkeypatch):
     content = b"modeldata"
     sha = hashlib.sha256(content).hexdigest()
     size = len(content)
-    fpath = models_dir / "qwen3.6-27b.mq4"
+    fpath = models_dir / "qwen3.8-27b.mq4-xt"
     fpath.write_bytes(content)
     home = tmp_path / "home"
     home.mkdir()
@@ -363,12 +363,12 @@ def test_main_harness_success_and_failure(tmp_path, monkeypatch):
         "models_dir": str(models_dir),
         "harness": {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 256},
         "fixtures": [
-            {"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha, "size_bytes": size, "arch_id": 5, "why": "x"}
+            {"tag": "qwen3.8:27b-mq4-xt", "file": "qwen3.8-27b.mq4-xt", "sha256": sha, "size_bytes": size, "arch_id": 5, "why": "x"}
         ],
         "buckets": {
             "load": {"modes": ["battery"]},
             "serve": {"modes": ["battery", "chain"]},
-            "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}
+            "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.8:27b-mq4-xt", "harness_args": []}}
         }
     }
     fixtures_path = tmp_path / "scripts" / "hw-gate" / "fixtures.json"
@@ -459,11 +459,11 @@ def test_kernel_redline_config_source(tmp_path, monkeypatch):
     models_dir.mkdir()
     content = b"data"
     sha = hashlib.sha256(content).hexdigest()
-    (models_dir / "qwen3.6-27b.mq4").write_bytes(content)
+    (models_dir / "qwen3.8-27b.mq4-xt").write_bytes(content)
     repo = _make_repo_with_harness(tmp_path)
-    kernel_cfg = {"model_tag": "qwen3.6:27b", "harness_args": ["--pm4", "--capture-repeats", "2"]}
+    kernel_cfg = {"model_tag": "qwen3.8:27b-mq4-xt", "harness_args": ["--pm4", "--capture-repeats", "2"]}
     # manifest with fixtures list
-    manifest = {"fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha, "size_bytes": len(content)}], "buckets": {"kernel": {"modes": ["battery"], "redline": kernel_cfg}}}
+    manifest = {"fixtures": [{"tag": "qwen3.8:27b-mq4-xt", "file": "qwen3.8-27b.mq4-xt", "sha256": sha, "size_bytes": len(content)}], "buckets": {"kernel": {"modes": ["battery"], "redline": kernel_cfg}}}
     captured = {}
     def fake_run(argv, **kwargs):
         captured["argv"] = argv
@@ -479,17 +479,17 @@ def test_kernel_redline_config_source(tmp_path, monkeypatch):
 
 def test_routes_union_and_mode_selection():
     routes = [
-        {"mode": "battery", "tag": "qwen3.6:27b", "source": "bucket", "why": "x"},
-        {"mode": "chain", "tag": "qwen3.6:27b", "source": "sol", "why": "y"},
-        {"mode": "battery", "tag": "qwen3.6:27b", "source": "author", "why": "z"},
+        {"mode": "battery", "tag": "qwen3.8:27b-mq4-xt", "source": "bucket", "why": "x"},
+        {"mode": "chain", "tag": "qwen3.8:27b-mq4-xt", "source": "sol", "why": "y"},
+        {"mode": "battery", "tag": "qwen3.8:27b-mq4-xt", "source": "author", "why": "z"},
         {"mode": "battery", "tag": "ornith-1.5:35b-a3b-mq4r", "source": "author", "why": "a"},
     ]
     order, per_modes, per_source = run_mod._build_routes_map(routes)
-    assert order == ["qwen3.6:27b", "ornith-1.5:35b-a3b-mq4r"]
-    assert per_modes["qwen3.6:27b"] == ["battery", "chain"]
+    assert order == ["qwen3.8:27b-mq4-xt", "ornith-1.5:35b-a3b-mq4r"]
+    assert per_modes["qwen3.8:27b-mq4-xt"] == ["battery", "chain"]
     assert per_modes["ornith-1.5:35b-a3b-mq4r"] == ["battery"]
     # bucket priority over author/sol
-    assert per_source["qwen3.6:27b"] == "bucket"
+    assert per_source["qwen3.8:27b-mq4-xt"] == "bucket"
     assert per_source["ornith-1.5:35b-a3b-mq4r"] == "author"
 
 
@@ -520,7 +520,7 @@ def test_routes_unknown_tag_unavailable(tmp_path, monkeypatch):
     models_dir.mkdir()
     content = b"modeldata"
     sha = hashlib.sha256(content).hexdigest()
-    (models_dir / "qwen3.6-27b.mq4").write_bytes(content)
+    (models_dir / "qwen3.8-27b.mq4-xt").write_bytes(content)
     home = tmp_path / "home"
     home.mkdir()
     repo = _make_repo_with_harness(tmp_path)
@@ -530,8 +530,8 @@ def test_routes_unknown_tag_unavailable(tmp_path, monkeypatch):
     fixtures_data = {
         "schema": "hipfire.hw-gate.fixtures", "version": 2, "models_dir": str(models_dir),
         "harness": {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 256},
-        "fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha, "size_bytes": len(content), "arch_id": 5}],
-        "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}}
+        "fixtures": [{"tag": "qwen3.8:27b-mq4-xt", "file": "qwen3.8-27b.mq4-xt", "sha256": sha, "size_bytes": len(content), "arch_id": 5}],
+        "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.8:27b-mq4-xt", "harness_args": []}}}
     }
     fixtures_path = tmp_path / "scripts" / "hw-gate" / "fixtures.json"
     fixtures_path.parent.mkdir(parents=True, exist_ok=True)
@@ -543,7 +543,7 @@ def test_routes_unknown_tag_unavailable(tmp_path, monkeypatch):
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(json.dumps(registry_data))
     routes = [
-        {"mode": "battery", "tag": "qwen3.6:27b", "source": "bucket", "why": "mandatory"},
+        {"mode": "battery", "tag": "qwen3.8:27b-mq4-xt", "source": "bucket", "why": "mandatory"},
         {"mode": "battery", "tag": "unknown:tag", "source": "sol", "why": "sol request"},
     ]
     routes_path = tmp_path / "routes.json"
@@ -576,7 +576,7 @@ def test_routes_unknown_tag_unavailable(tmp_path, monkeypatch):
     assert unknown["reason"] == "unknown tag"
     assert unknown["modes"] == {}
     # mandatory should be pass
-    mandatory = next(f for f in data["fixtures"] if f["tag"] == "qwen3.6:27b")
+    mandatory = next(f for f in data["fixtures"] if f["tag"] == "qwen3.8:27b-mq4-xt")
     assert mandatory["status"] == "pass"
     assert mandatory["source"] == "bucket"
     assert unknown["source"] == "sol"
@@ -587,7 +587,7 @@ def test_routes_absent_file_unavailable_still_pass(tmp_path, monkeypatch):
     models_dir.mkdir()
     content = b"presentdata"
     sha_present = hashlib.sha256(content).hexdigest()
-    (models_dir / "qwen3.6-27b.mq4").write_bytes(content)
+    (models_dir / "qwen3.8-27b.mq4-xt").write_bytes(content)
     home = tmp_path / "home"
     home.mkdir()
     repo = _make_repo_with_harness(tmp_path)
@@ -597,8 +597,8 @@ def test_routes_absent_file_unavailable_still_pass(tmp_path, monkeypatch):
     fixtures_data = {
         "schema": "hipfire.hw-gate.fixtures", "version": 2, "models_dir": str(models_dir),
         "harness": {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 256},
-        "fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha_present, "size_bytes": len(content), "arch_id": 5}],
-        "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}}
+        "fixtures": [{"tag": "qwen3.8:27b-mq4-xt", "file": "qwen3.8-27b.mq4-xt", "sha256": sha_present, "size_bytes": len(content), "arch_id": 5}],
+        "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.8:27b-mq4-xt", "harness_args": []}}}
     }
     fixtures_path = tmp_path / "scripts" / "hw-gate" / "fixtures.json"
     fixtures_path.parent.mkdir(parents=True, exist_ok=True)
@@ -618,7 +618,7 @@ def test_routes_absent_file_unavailable_still_pass(tmp_path, monkeypatch):
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(json.dumps(registry_data))
     routes = [
-        {"mode": "battery", "tag": "qwen3.6:27b", "source": "bucket", "why": "mandatory"},
+        {"mode": "battery", "tag": "qwen3.8:27b-mq4-xt", "source": "bucket", "why": "mandatory"},
         {"mode": "chain", "tag": "qwen3.8:27b", "source": "author", "why": "author request"},
     ]
     routes_path = tmp_path / "routes.json"
@@ -668,7 +668,7 @@ def test_routes_mismatched_mandatory_still_exit2(tmp_path, monkeypatch):
     content = b"gooddata"
     bad_content = b"baddata12345"
     # write bad file content but fixtures expects good sha
-    (models_dir / "qwen3.6-27b.mq4").write_bytes(bad_content)
+    (models_dir / "qwen3.8-27b.mq4-xt").write_bytes(bad_content)
     sha_good = hashlib.sha256(content).hexdigest()
     home = tmp_path / "home"
     home.mkdir()
@@ -679,8 +679,8 @@ def test_routes_mismatched_mandatory_still_exit2(tmp_path, monkeypatch):
     fixtures_data = {
         "schema": "hipfire.hw-gate.fixtures", "version": 2, "models_dir": str(models_dir),
         "harness": {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 256},
-        "fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha_good, "size_bytes": len(content), "arch_id": 5}],
-        "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}}
+        "fixtures": [{"tag": "qwen3.8:27b-mq4-xt", "file": "qwen3.8-27b.mq4-xt", "sha256": sha_good, "size_bytes": len(content), "arch_id": 5}],
+        "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.8:27b-mq4-xt", "harness_args": []}}}
     }
     fixtures_path = tmp_path / "scripts" / "hw-gate" / "fixtures.json"
     fixtures_path.parent.mkdir(parents=True, exist_ok=True)
@@ -690,7 +690,7 @@ def test_routes_mismatched_mandatory_still_exit2(tmp_path, monkeypatch):
     fixtures_path.write_text(json.dumps(fixtures_data))
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(json.dumps({"models": {}, "aliases": {}}))
-    routes = [{"mode": "battery", "tag": "qwen3.6:27b", "source": "bucket", "why": "mandatory"}]
+    routes = [{"mode": "battery", "tag": "qwen3.8:27b-mq4-xt", "source": "bucket", "why": "mandatory"}]
     routes_path = tmp_path / "routes.json"
     routes_path.write_text(json.dumps(routes))
     out = tmp_path / "hw-gate.json"
@@ -711,7 +711,7 @@ def test_render_md_unavailable_rows(tmp_path):
         "host": {"gfx": "gfx1201", "rocm": "6.2", "device": "3", "runner": "hiptrx"},
         "binaries": {"daemon_md5": "d1", "hipfire_md5": "h1", "build_seconds": 42.5},
         "fixtures": [
-            {"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": "abc", "sha256_ok": True, "size_ok": True, "source": "bucket", "modes": {"battery": {"exit": 0, "seconds": 1.0, "rows": [{"genre": "x", "finish": "stop", "ctx": 10, "cached": 0, "gen": 10, "ans_words": 1, "prefill_tok_s": 1.0, "decode_tok_s": 1.0, "attractor": False, "empty": False, "runaway": False, "recall_ok": True, "expected_substrings": [], "assistant_content": "ok", "prompt_md5": ""}], "status": "pass", "reason": ""}}, "status": "pass", "reason": ""},
+            {"tag": "qwen3.8:27b-mq4-xt", "file": "qwen3.8-27b.mq4-xt", "sha256": "abc", "sha256_ok": True, "size_ok": True, "source": "bucket", "modes": {"battery": {"exit": 0, "seconds": 1.0, "rows": [{"genre": "x", "finish": "stop", "ctx": 10, "cached": 0, "gen": 10, "ans_words": 1, "prefill_tok_s": 1.0, "decode_tok_s": 1.0, "attractor": False, "empty": False, "runaway": False, "recall_ok": True, "expected_substrings": [], "assistant_content": "ok", "prompt_md5": ""}], "status": "pass", "reason": ""}}, "status": "pass", "reason": ""},
             {"tag": "qwen3.8:27b", "file": "qwen3.8-27b.mq4", "sha256": "def", "sha256_ok": False, "size_ok": False, "source": "author", "modes": {}, "status": "unavailable", "reason": "fixture not present on runner: qwen3.8-27b.mq4"},
             {"tag": "unknown:tag", "file": "", "sha256": "", "sha256_ok": False, "size_ok": False, "source": "sol", "modes": {}, "status": "unavailable", "reason": "unknown tag"},
         ],
@@ -739,7 +739,7 @@ def test_routes_modes_per_fixture(tmp_path, monkeypatch):
     c2 = b"data2!!"
     sha1 = hashlib.sha256(c1).hexdigest()
     sha2 = hashlib.sha256(c2).hexdigest()
-    (models_dir / "qwen3.6-27b.mq4").write_bytes(c1)
+    (models_dir / "qwen3.8-27b.mq4-xt").write_bytes(c1)
     (models_dir / "qwen3.8-27b.mq4").write_bytes(c2)
     home = tmp_path / "home"
     home.mkdir()
@@ -750,8 +750,8 @@ def test_routes_modes_per_fixture(tmp_path, monkeypatch):
     fixtures_data = {
         "schema": "hipfire.hw-gate.fixtures", "version": 2, "models_dir": str(models_dir),
         "harness": {"battery_prompts": "benchmarks/prompts/hw-gate/serve-battery.json", "max_tokens": 256},
-        "fixtures": [{"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": sha1, "size_bytes": len(c1), "arch_id": 5}],
-        "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.6:27b", "harness_args": []}}}
+        "fixtures": [{"tag": "qwen3.8:27b-mq4-xt", "file": "qwen3.8-27b.mq4-xt", "sha256": sha1, "size_bytes": len(c1), "arch_id": 5}],
+        "buckets": {"load": {"modes": ["battery"]}, "serve": {"modes": ["battery", "chain"]}, "kernel": {"modes": ["battery"], "redline": {"model_tag": "qwen3.8:27b-mq4-xt", "harness_args": []}}}
     }
     fixtures_path = tmp_path / "scripts" / "hw-gate" / "fixtures.json"
     fixtures_path.parent.mkdir(parents=True, exist_ok=True)
@@ -763,7 +763,7 @@ def test_routes_modes_per_fixture(tmp_path, monkeypatch):
     registry_path = tmp_path / "registry.json"
     registry_path.write_text(json.dumps(registry_data))
     routes = [
-        {"mode": "battery", "tag": "qwen3.6:27b", "source": "bucket", "why": "mandatory"},
+        {"mode": "battery", "tag": "qwen3.8:27b-mq4-xt", "source": "bucket", "why": "mandatory"},
         {"mode": "battery", "tag": "qwen3.8:27b", "source": "author", "why": "x"},
         {"mode": "chain", "tag": "qwen3.8:27b", "source": "author", "why": "x"},
     ]
@@ -782,9 +782,9 @@ def test_routes_modes_per_fixture(tmp_path, monkeypatch):
             model_idx = argv.index("--model")
             model_path = argv[model_idx+1]
             tag = "unknown"
-            if "qwen3.6" in model_path:
-                tag = "qwen3.6:27b"
-            elif "qwen3.8" in model_path:
+            if "qwen3.8-27b.mq4-xt" in model_path:
+                tag = "qwen3.8:27b-mq4-xt"
+            elif "qwen3.8-27b.mq4" in model_path:
                 tag = "qwen3.8:27b"
             mode_idx = argv.index("--mode")
             mode = argv[mode_idx+1]
@@ -802,14 +802,14 @@ def test_routes_modes_per_fixture(tmp_path, monkeypatch):
     rc = run_mod.main(["--repo", str(repo), "--fixtures", str(fixtures_path), "--base", "a", "--head", "b", "--buckets", "load", "--device", "3", "--out", str(out), "--md", str(md), "--routes", str(routes_path), "--registry", str(registry_path), "--skip-build"])
     assert rc == 0
     data = json.loads(out.read_text())
-    # qwen3.6 should have only battery
-    q1 = next(f for f in data["fixtures"] if f["tag"] == "qwen3.6:27b")
+    # qwen3.8 should have only battery
+    q1 = next(f for f in data["fixtures"] if f["tag"] == "qwen3.8:27b-mq4-xt")
     assert set(q1["modes"].keys()) == {"battery"}
     # qwen3.8 should have battery and chain
     q2 = next(f for f in data["fixtures"] if f["tag"] == "qwen3.8:27b")
     assert set(q2["modes"].keys()) == {"battery", "chain"}
     # ensure harness called with correct modes
-    assert "battery" in captured_modes["qwen3.6:27b"] and "chain" not in captured_modes["qwen3.6:27b"]
+    assert "battery" in captured_modes["qwen3.8:27b-mq4-xt"] and "chain" not in captured_modes["qwen3.8:27b-mq4-xt"]
     assert set(captured_modes["qwen3.8:27b"]) == {"battery", "chain"}
 
 
@@ -914,7 +914,7 @@ def _dflash_env(tmp_path, monkeypatch, fixture, mode, drafts_on_disk):
 
 
 FIX = {"tag": "qwen3.8:27b-mq4-xt", "file": "x.mq4",
-       "dflash_draft": ["qwen38-27b-dflash-mq4.hfq", "qwen36-27b-dflash-mq4.hfq"]}
+       "dflash_draft": ["qwen38-27b-dflash-mq4.hfq", "legacy-dense-dflash-mq4.hfq"]}
 
 
 def test_dflash_mode_forces_speculation_on_with_an_explicit_draft(tmp_path, monkeypatch):
@@ -935,9 +935,9 @@ def test_plain_battery_never_gets_a_draft(tmp_path, monkeypatch):
 
 
 def test_lane_uses_the_draft_it_actually_holds(tmp_path, monkeypatch):
-    """hiptrx holds qwen36 and no qwen38; hipx holds qwen38 and no qwen36."""
-    argv, _ = _dflash_env(tmp_path, monkeypatch, FIX, "battery-dflash", ["qwen36-27b-dflash-mq4.hfq"])
-    assert argv[argv.index("--draft") + 1].endswith("qwen36-27b-dflash-mq4.hfq")
+    """Lane holds only the second candidate; first is missing → uses second."""
+    argv, _ = _dflash_env(tmp_path, monkeypatch, FIX, "battery-dflash", ["legacy-dense-dflash-mq4.hfq"])
+    assert argv[argv.index("--draft") + 1].endswith("legacy-dense-dflash-mq4.hfq")
 
 
 def test_lane_without_any_declared_draft_skips_rather_than_fails(tmp_path, monkeypatch):

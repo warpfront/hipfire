@@ -253,6 +253,11 @@ hipfire pull qwen3.5:9b-draft
 hipfire config set dflash_mode auto    # or on / per-model
 ```
 
+`auto` uses a pulled draft when present; `on` fails the load without it.
+`developer.dflash_draft` / `HIPFIRE_DFLASH_DRAFT` override the registry sidecar.
+Several tags can share one draft file — `hipfire rm` keeps that sidecar while
+another installed target still declares it (see [CLI.md](CLI.md)).
+
 ## Long context (optional)
 
 CASK/TriAttention eviction is experimental and disabled by default. It is

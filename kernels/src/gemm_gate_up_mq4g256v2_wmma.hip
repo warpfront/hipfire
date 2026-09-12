@@ -27,6 +27,47 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
+// gfx1100 packed-half2 A dequant — exact muse_rm_pk idiom (bit-identical path).
+// Pair shifts (0,4)/(8,12)/(16,20)/(24,28); q via packed RTZ convert; sc/zp
+// broadcast with __half2half2; fused __hfma2; eight __half2 bitcast to half16.
+#if defined(__gfx1100__)
+// Exact nibble integers 0..15: RTZ == RN bit-for-bit (exact in f16 and f32).
+__device__ __forceinline__ __half2 pkrtz_nibble2(float a, float b) {
+    const auto v = __builtin_amdgcn_cvt_pkrtz(a, b);
+    static_assert(sizeof(v) == sizeof(__half2), "pkrtz size");
+    __half2 h2;
+    __builtin_memcpy(&h2, &v, sizeof(__half2));
+    return h2;
+}
+
+#define DEQUANT_PK_H2(pk, sc_h, zp_h, h01, h23, h45, h67)                                         \
+    do {                                                                                          \
+        const __half2 sc2 = __half2half2(sc_h);                                                   \
+        const __half2 zp2 = __half2half2(zp_h);                                                   \
+        const __half2 q01 = pkrtz_nibble2((float)(((pk) >> 0) & 0xFu),                            \
+                                          (float)(((pk) >> 4) & 0xFu));                           \
+        const __half2 q23 = pkrtz_nibble2((float)(((pk) >> 8) & 0xFu),                            \
+                                          (float)(((pk) >> 12) & 0xFu));                          \
+        const __half2 q45 = pkrtz_nibble2((float)(((pk) >> 16) & 0xFu),                           \
+                                          (float)(((pk) >> 20) & 0xFu));                          \
+        const __half2 q67 = pkrtz_nibble2((float)(((pk) >> 24) & 0xFu),                           \
+                                          (float)(((pk) >> 28) & 0xFu));                          \
+        (h01) = __hfma2(q01, sc2, zp2);                                                           \
+        (h23) = __hfma2(q23, sc2, zp2);                                                           \
+        (h45) = __hfma2(q45, sc2, zp2);                                                           \
+        (h67) = __hfma2(q67, sc2, zp2);                                                           \
+    } while (0)
+
+#define DEQUANT_A_FRAG_PK(pk0, pk1, sc_h, zp_h, frag)                                             \
+    do {                                                                                          \
+        __half2 _h[8];                                                                            \
+        DEQUANT_PK_H2((pk0), (sc_h), (zp_h), _h[0], _h[1], _h[2], _h[3]);                        \
+        DEQUANT_PK_H2((pk1), (sc_h), (zp_h), _h[4], _h[5], _h[6], _h[7]);                        \
+        static_assert(sizeof(_h) == sizeof(frag), "DEQUANT_A_FRAG_PK size mismatch");             \
+        __builtin_memcpy(&(frag), _h, sizeof(frag));                                              \
+    } while (0)
+#endif
+
 #if defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
 __launch_bounds__(32, 8)
 #else
@@ -107,21 +148,29 @@ extern "C" __global__ void gemm_gate_up_mq4g256v2_wmma(
 
             // Dequant tile A
             half16_t a_reg;
+#if defined(__gfx1100__)
+            DEQUANT_A_FRAG_PK(pk0a, pk1a, (__half)sc_h, (__half)zp_h, a_reg);
+#else
             #define DQ(i, pk, sh) a_reg[i] = sc_h * (_Float16)(float)(((pk) >> (sh)) & 0xFu) + zp_h
             DQ(0,  pk0a,  0); DQ(1,  pk0a,  4); DQ(2,  pk0a,  8); DQ(3,  pk0a, 12);
             DQ(4,  pk0a, 16); DQ(5,  pk0a, 20); DQ(6,  pk0a, 24); DQ(7,  pk0a, 28);
             DQ(8,  pk1a,  0); DQ(9,  pk1a,  4); DQ(10, pk1a,  8); DQ(11, pk1a, 12);
             DQ(12, pk1a, 16); DQ(13, pk1a, 20); DQ(14, pk1a, 24); DQ(15, pk1a, 28);
+#endif
 
             // WMMA A — b_b load may still be in flight
             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_a, acc);
 
             // Dequant tile B (reuse a_reg register)
+#if defined(__gfx1100__)
+            DEQUANT_A_FRAG_PK(pk0b, pk1b, (__half)sc_h, (__half)zp_h, a_reg);
+#else
             DQ(0,  pk0b,  0); DQ(1,  pk0b,  4); DQ(2,  pk0b,  8); DQ(3,  pk0b, 12);
             DQ(4,  pk0b, 16); DQ(5,  pk0b, 20); DQ(6,  pk0b, 24); DQ(7,  pk0b, 28);
             DQ(8,  pk1b,  0); DQ(9,  pk1b,  4); DQ(10, pk1b,  8); DQ(11, pk1b, 12);
             DQ(12, pk1b, 16); DQ(13, pk1b, 20); DQ(14, pk1b, 24); DQ(15, pk1b, 28);
             #undef DQ
+#endif
 
             // WMMA B
             acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_b, acc);
@@ -152,3 +201,8 @@ extern "C" __global__ void gemm_gate_up_mq4g256v2_wmma(
         }
     }
 }
+
+#if defined(__gfx1100__)
+#undef DEQUANT_PK_H2
+#undef DEQUANT_A_FRAG_PK
+#endif

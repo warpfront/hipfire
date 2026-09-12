@@ -163,6 +163,44 @@ through to per-model / registry / daemon defaults when omitted):
 | `reasoning.max_tokens` / `max_think_tokens` | Explicit **integer** think-span cap on Qwen Jinja contracts. `0` or omitted = uncapped. DeepSeek, Gemma, Glimmer, and unsupported contracts drop it with a warning. Independent of effort. |
 | `thinking_budget` / `reasoning.budget` | Legacy **named** cap preset only on non-effort-native Qwen templates that still accept it. Dropped+warned elsewhere. |
 
+### `POST /v1/images/generations`
+
+OpenAI-shaped image generation on a loaded diffusion checkpoint (arch 40
+FLUX.1, arch 45 FLUX.2 Klein). Body fields: `model` (must already be loaded on
+this server), `prompt`, optional `width` /
+`height` (or OpenAI `size: "WxH"`), `steps` (defaults to the architecture
+default: 4 for `flux.schnell`, 28 for `flux.dev`), `seed`, `n` (must be 1),
+`response_format` (must be `b64_json`). References the same denoise path as the
+`img_generate` daemon message (`hipfire img`).
+
+```json
+{"model": "flux.schnell:1", "prompt": "a tiny lighthouse on a rock, sunset", "size": "512x512", "response_format": "b64_json"}
+```
+
+Response: `{ "data": [ { "b64_json": "…", "width": 512, "height": 512, "seed": 0, "steps": 4 } ], "model": "…", "hipfire": { "ms": 1234 } }`.
+
+This body takes no image input. A request with an `images` field is refused
+with a 400 that points at `/v1/images/edits`.
+
+### `POST /v1/images/edits`
+
+OpenAI-shaped reference edit (FLUX.2 Klein, arch 45 only): `multipart/form-data`
+with one to four `image` file parts (PNG or JPEG, at most 32 MB each after
+upload) plus the text fields of `/v1/images/generations` (`prompt` required;
+`size`, `steps`, `seed`, `n`, `response_format`). The image bytes travel in
+the request; the server never reads a file the client names. Each reference
+is area-capped at 1 MP and floored to a multiple of 16, and conditions every
+denoise step without being denoised. Without `size` the output takes the
+first reference's size. The whole body counts against `serve.max_request_bytes`.
+
+```bash
+curl -s -X POST http://127.0.0.1:11580/v1/images/edits \
+  -F image=.png -F prompt="make the bicycle blue" -F steps=4 -F seed=0 \
+  | jq -r .data[0].b64_json | base64 -d > bike-blue.png
+```
+
+Response: the same shape as `/v1/images/generations`.
+
 ### Reasoning request contract
 
 Mode, effort, and cap are three independent axes — full key table and budget

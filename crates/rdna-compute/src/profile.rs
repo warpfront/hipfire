@@ -17,7 +17,7 @@
 //! accurately but loses any async pipelining the runtime would have done.
 //! For bandwidth attribution this is exactly what we want.
 
-use hip_bridge::{Event, HipResult, HipRuntime};
+use hip_bridge::{Event, HipResult, HipRuntime, Stream};
 use std::cell::RefCell;
 
 #[derive(Debug, Clone)]
@@ -133,6 +133,87 @@ pub fn end_timer(hip: &HipRuntime, timer: Option<Timer>) -> HipResult<()> {
     Ok(())
 }
 
+// ─── Deferred (non-synchronizing) timer pairs ──────────────────────────────
+//
+// `Timer::finish` above synchronizes the stop event immediately — exactly
+// right for isolated per-kernel bandwidth attribution (see the module doc).
+// It is wrong for a caller wrapping hundreds of launches in one step (e.g.
+// one FLUX denoise step, ~1,000 kernel launches): syncing the host thread
+// after every single one serializes launches that would otherwise pipeline
+// back-to-back on the GPU, inflating the summed per-family time far past the
+// step's real wall clock.
+//
+// `PendingTimer` only ever enqueues `hipEventRecord` calls (never
+// `hipEventSynchronize`). A caller collects many of them across a step and
+// resolves the whole batch at once with `resolve_deferred`, which
+// synchronizes exactly ONCE.
+//
+// Deliberately independent of `start`/`is_active`/`record`: routing this
+// through the shared `is_active()` gate would also switch on every other
+// `Timer`-based call site reachable from the same code path (several already
+// exist, e.g. `attention_flux`, `layernorm_modulate`, `qk_rmsnorm_rope_flux`)
+// and reintroduce exactly the per-launch synchronization this type exists to
+// avoid. Callers manage their own on/off switch and only call
+// `begin_deferred` when profiling is active.
+
+/// One start/stop `hipEvent` pair, recorded non-synchronously. See the
+/// section doc above for why this is separate from [`Timer`].
+pub struct PendingTimer {
+    start: Event,
+    stop: Event,
+}
+
+/// Record the start event on `stream` (`None` = null/legacy stream).
+/// Non-blocking. Pair with [`PendingTimer::mark_stop`], then batch-resolve
+/// with [`resolve_deferred`].
+pub fn begin_deferred(hip: &HipRuntime, stream: Option<&Stream>) -> HipResult<PendingTimer> {
+    let start = hip.event_create()?;
+    let stop = hip.event_create()?;
+    hip.event_record(&start, stream)?;
+    Ok(PendingTimer { start, stop })
+}
+
+impl PendingTimer {
+    /// Record the stop event on `stream`. Non-blocking.
+    pub fn mark_stop(&self, hip: &HipRuntime, stream: Option<&Stream>) -> HipResult<()> {
+        hip.event_record(&self.stop, stream)
+    }
+}
+
+/// Resolve a batch of [`PendingTimer`]s collected across one step, each
+/// tagged with a caller-chosen label. Synchronizes exactly ONCE — on
+/// `stream` if given, else on the last timer's stop event — then reads every
+/// pair's elapsed time and destroys the events.
+///
+/// Safe without a per-pair wait: HIP stream completion is FIFO, so once the
+/// sync call returns, every event recorded earlier on the same stream (every
+/// entry but the last, and the last itself) has also completed.
+pub fn resolve_deferred<L>(
+    hip: &HipRuntime,
+    stream: Option<&Stream>,
+    timers: Vec<(L, PendingTimer)>,
+) -> Vec<(L, f64)> {
+    if timers.is_empty() {
+        return Vec::new();
+    }
+    match stream {
+        Some(s) => {
+            let _ = hip.stream_synchronize(s);
+        }
+        None => {
+            let _ = hip.event_synchronize(&timers.last().expect("checked non-empty above").1.stop);
+        }
+    }
+    let mut out = Vec::with_capacity(timers.len());
+    for (label, t) in timers {
+        let ms = hip.event_elapsed_ms(&t.start, &t.stop).unwrap_or(0.0);
+        out.push((label, ms as f64 * 1000.0));
+        let _ = hip.event_destroy(t.start);
+        let _ = hip.event_destroy(t.stop);
+    }
+    out
+}
+
 // ─── Byte count formulas for common kernel shapes ──────────────────────────
 //
 // Each helper takes kernel dimensions and returns the number of bytes the
@@ -154,7 +235,7 @@ pub fn gemv_hfq4g256_bytes(m: usize, k: usize) -> usize {
 /// HFQ4-G128 weight footprint: 72 B per 128-element group (4 B scale +
 /// 4 B zero + 64 B packed 4-bit weights).
 pub fn hfq4g128_weight_bytes(m: usize, k: usize) -> usize {
-    let groups = k / 128;
+    let groups = k.div_ceil(128);
     m * groups * 72
 }
 

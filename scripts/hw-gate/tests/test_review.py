@@ -53,7 +53,7 @@ def _base_evidence(verdict="pass", with_attractor=False):
     ev = {"verdict": verdict, "fixtures": [], "kernel": None}
     if with_attractor:
         ev["fixtures"] = [{
-            "tag": "qwen3.6:27b",
+            "tag": "qwen3.8:27b-mq4-xt",
             "modes": {
                 "battery": {
                     "rows": [{"attractor": True, "empty": False}]
@@ -156,7 +156,7 @@ def _fixtures_content(tmp_models: Path | None = None):
         "version": 2,
         "models_dir": str(tmp_models) if tmp_models else "~/.hipfire/models",
         "fixtures": [
-            {"tag": "qwen3.6:27b", "file": "qwen3.6-27b.mq4", "sha256": "abc", "size_bytes": 100, "arch_id": 5, "why": "test"},
+            {"tag": "qwen3.8:27b-mq4-xt", "file": "qwen3.8-27b.mq4-xt", "sha256": "abc", "size_bytes": 100, "arch_id": 5, "why": "test"},
             {"tag": "ornith-1.5:35b-a3b-mq4r", "file": "ornith.mq4r", "sha256": "def", "size_bytes": 100, "arch_id": 6, "why": "test"},
         ],
         "buckets": {
@@ -175,7 +175,7 @@ def test_prelim_routes_bucket_union_and_sol():
     models_dir = tmp / "models"
     models_dir.mkdir(parents=True)
     # create both fixture files present
-    (models_dir / "qwen3.6-27b.mq4").write_text("dummy")
+    (models_dir / "qwen3.8-27b.mq4-xt").write_text("dummy")
     (models_dir / "ornith.mq4r").write_text("dummy")
     checkout, base, head = _make_repo(tmp / "repo1")
     select = {
@@ -185,7 +185,7 @@ def test_prelim_routes_bucket_union_and_sol():
         "buckets": ["load"],
         "policy_paths": [],
         "surfaces": {"load": ["crates/hipfire-loader/foo.rs"], "serve": [], "kernel": [], "policy": [], "other": []},
-        "request": {"routes": [{"mode": "battery", "tag": "qwen3.6:27b"}], "claim": "test claim"},
+        "request": {"routes": [{"mode": "battery", "tag": "qwen3.8:27b-mq4-xt"}], "claim": "test claim"},
         "request_error": None,
     }
     select_path = tmp / "select.json"
@@ -201,7 +201,7 @@ def test_prelim_routes_bucket_union_and_sol():
         "run_hardware": True,
         "run_hardware_reasons": ["safe"],
         "routes": [
-            {"mode": "battery", "tag": "qwen3.6:27b", "source": "sol", "why": "sol why"},
+            {"mode": "battery", "tag": "qwen3.8:27b-mq4-xt", "source": "sol", "why": "sol why"},
             {"mode": "battery", "tag": "unknown:tag", "source": "sol", "why": "unknown should be dropped"},
         ],
         "unavailable_routes": [],
@@ -253,7 +253,7 @@ def test_prelim_routes_bucket_union_and_sol():
     # routes.json bucket (2 fixtures *1 mode=2) union sol (known tag duplicate => still 2)
     routes = json.loads(routes_path.read_text())
     tags = [r["tag"] for r in routes]
-    assert "qwen3.6:27b" in tags
+    assert "qwen3.8:27b-mq4-xt" in tags
     assert "ornith-1.5:35b-a3b-mq4r" in tags
     # unknown dropped
     assert "unknown:tag" not in tags
@@ -275,7 +275,7 @@ def test_prelim_unavailable_listed():
     tmp = Path(tempfile.mkdtemp())
     models_dir = tmp / "models"
     models_dir.mkdir(parents=True)
-    (models_dir / "qwen3.6-27b.mq4").write_text("dummy")
+    (models_dir / "qwen3.8-27b.mq4-xt").write_text("dummy")
     # ornith missing => unavailable
     checkout, base, head = _make_repo(tmp / "repo2")
     select = {

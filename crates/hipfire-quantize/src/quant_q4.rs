@@ -3,24 +3,29 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 
-
-#![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
+#![allow(
+    dead_code,
+    unused_imports,
+    unused_variables,
+    non_snake_case,
+    clippy::all
+)]
 
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::OnceLock;
 
-use clap::Parser;
-use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
-use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
-use hipfire_quantize::hessian_io;
 use crate::e8;
 use crate::e8_gptq;
 use crate::gguf_input;
 use crate::reap_overlay;
+use clap::Parser;
+use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
+use hipfire_quantize::hessian_io;
+use hipfire_quantize::safetensors_file::{SafetensorsFile, TensorMeta};
 
 // ─── Q4_F16_G64 Quantization ────────────────────────────────────────────────
 
@@ -74,6 +79,108 @@ pub(crate) fn quantize_q4f16_g64(f32_data: &[f32]) -> Vec<u8> {
 /// Quantize F32 weights to Q4_K format (144 bytes per 256 elements, 0.5625 B/w).
 /// GGML-compatible block layout: f16 d + f16 dmin + 12B packed scales + 128B nibbles.
 /// This produces blocks that work with the existing gemv_q4k kernel.
+
+/// Port of llama.cpp's `make_qkx2_quants` (ggml-quants.c:799).
+///
+/// Returns `(scale, the_min)` for one sub-block, where dequantization is
+/// `w = scale * q - the_min` — the same convention `dequantize_row_q4_K` uses
+/// (`y = d1*q - m1`).
+///
+/// WHY THIS RATHER THAN MIN/MAX. Plain min/max picks the scale that makes the
+/// extremes representable, which is not the scale that minimises error: one
+/// outlier stretches the grid and every other weight pays for it. This searches
+/// `nstep` candidate scales around the min/max one and, for each, solves the
+/// weighted least-squares fit for (scale, min) given the resulting integer
+/// levels, keeping whichever candidate actually has the lowest error.
+///
+/// Measured on Maple's lm_head: min/max gives relative L2 0.0799, this gives
+/// 0.0731 — the same 0.0731 DeepGrove's published Q4_K head achieves. The
+/// layout was already GGML-compatible; only the encoder was weaker.
+///
+/// `weights` are llama.cpp's importance weights `sqrt(mean(x^2)) + |x|`, which
+/// bias the fit toward larger-magnitude entries.
+#[allow(clippy::too_many_arguments)]
+fn make_qkx2_quants(
+    x: &[f32],
+    weights: &[f32],
+    nmax: i32,
+    rmin: f32,
+    rdelta: f32,
+    nstep: i32,
+) -> (f32, f32) {
+    let n = x.len();
+    let mut min = x[0];
+    let mut max = x[0];
+    let mut sum_w = weights[0];
+    let mut sum_x = sum_w * x[0];
+    for i in 1..n {
+        if x[i] < min {
+            min = x[i];
+        }
+        if x[i] > max {
+            max = x[i];
+        }
+        let w = weights[i];
+        sum_w += w;
+        sum_x += w * x[i];
+    }
+    // The grid is anchored at or below zero, so an all-positive block still
+    // encodes zero exactly.
+    if min > 0.0 {
+        min = 0.0;
+    }
+    if max == min {
+        return (0.0, -min);
+    }
+
+    let mut iscale = nmax as f32 / (max - min);
+    let mut scale = 1.0 / iscale;
+    let mut laux = vec![0i32; n];
+    let mut best_error = 0.0f32;
+    for i in 0..n {
+        let l = (iscale * (x[i] - min)).round() as i32;
+        let l = l.clamp(0, nmax);
+        let diff = scale * l as f32 + min - x[i];
+        best_error += weights[i] * diff * diff;
+    }
+    if nstep < 1 {
+        return (scale, -min);
+    }
+
+    for is in 0..=nstep {
+        iscale = (rmin + rdelta * is as f32 + nmax as f32) / (max - min);
+        let (mut sum_l, mut sum_l2, mut sum_xl) = (0.0f32, 0.0f32, 0.0f32);
+        for i in 0..n {
+            let l = ((iscale * (x[i] - min)).round() as i32).clamp(0, nmax);
+            laux[i] = l;
+            let w = weights[i];
+            sum_l += w * l as f32;
+            sum_l2 += w * (l * l) as f32;
+            sum_xl += w * l as f32 * x[i];
+        }
+        let d = sum_w * sum_l2 - sum_l * sum_l;
+        if d > 0.0 {
+            let mut this_scale = (sum_w * sum_xl - sum_x * sum_l) / d;
+            let mut this_min = (sum_l2 * sum_x - sum_l * sum_xl) / d;
+            if this_min > 0.0 {
+                this_min = 0.0;
+                this_scale = sum_xl / sum_l2;
+            }
+            let mut cur_error = 0.0f32;
+            for i in 0..n {
+                let diff = this_scale * laux[i] as f32 + this_min - x[i];
+                cur_error += weights[i] * diff * diff;
+            }
+            if cur_error < best_error {
+                best_error = cur_error;
+                scale = this_scale;
+                min = this_min;
+            }
+        }
+    }
+    (scale, -min)
+}
+
 pub(crate) fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
     let super_block_size = 256;
     let block_bytes = 144;
@@ -98,11 +205,17 @@ pub(crate) fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
             }
             let group = &f32_data[start..end];
 
-            let min_val = group.iter().cloned().fold(f32::INFINITY, f32::min);
-            let max_val = group.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let range = max_val - min_val;
-            sub_scales[sb] = if range > 0.0 { range / 15.0 } else { 0.0 };
-            sub_mins[sb] = min_val;
+            // llama.cpp's importance weights: sqrt(mean(x^2)) + |x|.
+            let sum_x2: f32 = group.iter().map(|v| v * v).sum();
+            let av_x = (sum_x2 / group.len() as f32).sqrt();
+            let w: Vec<f32> = group.iter().map(|v| av_x + v.abs()).collect();
+            // Same parameters Q4_K uses at ggml-quants.c:1476
+            // (nmax=15, rmin=-1.0, rdelta=0.1, nstep=20, use_mad=false).
+            let (scale, the_min) = make_qkx2_quants(group, &w, 15, -1.0, 0.1, 20);
+            sub_scales[sb] = scale;
+            // The rest of this function stores the SIGNED min and negates it
+            // when packing, so convert back from llama.cpp's positive the_min.
+            sub_mins[sb] = -the_min;
         }
 
         // Find super-block d and dmin that best represent the sub-block scales/mins
@@ -128,9 +241,16 @@ pub(crate) fn quantize_q4k(f32_data: &[f32]) -> Vec<u8> {
             min_ints[sb] = ((-sub_mins[sb]) * inv_dmin + 0.5).min(63.0) as u8;
         }
 
-        // Write super-block header
-        output[out_off..out_off + 2].copy_from_slice(&f32_to_f16(d).to_le_bytes());
-        output[out_off + 2..out_off + 4].copy_from_slice(&f32_to_f16(dmin).to_le_bytes());
+        // Write super-block header. Final nibbles must use the F16 values that
+        // are actually stored — dequant only sees those — matching llama.cpp
+        // quantize_row_q4_K_ref (ggml-quants.c): FP32_TO_FP16 then FP16_TO_FP32
+        // before (x + dm) / d. Scale/min *ints* stay on the pre-store F32 path.
+        let d_bits = f32_to_f16(d);
+        let dmin_bits = f32_to_f16(dmin);
+        output[out_off..out_off + 2].copy_from_slice(&d_bits.to_le_bytes());
+        output[out_off + 2..out_off + 4].copy_from_slice(&dmin_bits.to_le_bytes());
+        let d = f16_to_f32(d_bits);
+        let dmin = f16_to_f32(dmin_bits);
 
         // Pack 6-bit scales/mins into 12 bytes (GGML encoding)
         let sc = &mut output[out_off + 4..out_off + 16];
@@ -290,4 +410,103 @@ pub(crate) fn quantize_q8hfq(f32_data: &[f32], m: usize, k: usize) -> (Vec<u8>, 
     }
 
     (output, row_stride)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Q4_K final nibbles must be chosen from the *stored* F16 `d`/`dmin`, not
+    /// the pre-store F32 values. Fixture: sub-block 0 is constant 0.09 (tiny
+    /// scale_int=1) while sub-block 1 is ±4.05 (sets max_scale so `d = max/63`
+    /// is not F16-exact). With the pre-store F32 `d`, element 0 sits just under
+    /// the half-integer (`10.999… → nibble 10`); after F16 truncate+re-widen it
+    /// crosses (`11.004… → nibble 11`). GGML's quantize_row_q4_K_ref does the
+    /// same re-widen before packing qs.
+    #[test]
+    fn q4k_nibbles_follow_stored_f16_d_at_half_integer_boundary() {
+        let mut vals = vec![0.0f32; 256];
+        for i in 0..32 {
+            vals[i] = 0.09;
+        }
+        for i in 32..64 {
+            vals[i] = if i % 2 == 0 { 4.05 } else { -4.05 };
+        }
+
+        let packed = quantize_q4k(&vals);
+        assert_eq!(packed.len(), 144, "one Q4_K super-block");
+
+        let d_bits = u16::from_le_bytes([packed[0], packed[1]]);
+        let dmin_bits = u16::from_le_bytes([packed[2], packed[3]]);
+        let d = f16_to_f32(d_bits);
+        let dmin = f16_to_f32(dmin_bits);
+
+        // Unpack 6-bit scales/mins (same layout as dequant_q4_k / GGML).
+        let sc = &packed[4..16];
+        let mut scales = [0u8; 8];
+        let mut mins = [0u8; 8];
+        for i in 0..4 {
+            scales[i] = sc[i] & 63;
+            mins[i] = sc[4 + i] & 63;
+        }
+        for i in 0..4 {
+            scales[4 + i] = (sc[8 + i] & 0xF) | ((sc[i] >> 6) << 4);
+            mins[4 + i] = (sc[8 + i] >> 4) | ((sc[4 + i] >> 6) << 4);
+        }
+
+        // Precondition: this fixture's super-scale is not F16-exact, so the
+        // re-widen path is load-bearing (next F16 step flips the boundary nibble).
+        assert_eq!(scales[0], 1, "fixture expects scale_int[0]=1");
+        assert_eq!(mins[0], 0, "fixture expects min_int[0]=0");
+        let d_next = f16_to_f32(d_bits.wrapping_add(1));
+        let q_stored = {
+            let inv = 1.0 / (d * scales[0] as f32);
+            ((vals[0] * inv) + 0.5).max(0.0).min(15.0) as u8
+        };
+        let q_next = {
+            let inv = 1.0 / (d_next * scales[0] as f32);
+            ((vals[0] * inv) + 0.5).max(0.0).min(15.0) as u8
+        };
+        assert_ne!(
+            q_stored, q_next,
+            "fixture must sit on an F16 rounding boundary (stored d nibble {q_stored} vs next {q_next})"
+        );
+
+        // Every packed nibble must match reconstruction from the stored F16 scales.
+        let qs = &packed[16..144];
+        for group in 0..4 {
+            let sb_e = group * 2;
+            let sb_o = group * 2 + 1;
+            let eff_e = d * scales[sb_e] as f32;
+            let eff_o = d * scales[sb_o] as f32;
+            let min_e = dmin * mins[sb_e] as f32;
+            let min_o = dmin * mins[sb_o] as f32;
+            let inv_e = if eff_e > 0.0 { 1.0 / eff_e } else { 0.0 };
+            let inv_o = if eff_o > 0.0 { 1.0 / eff_o } else { 0.0 };
+            for l in 0..32 {
+                let idx_e = group * 64 + l;
+                let idx_o = idx_e + 32;
+                let expect_e = ((vals[idx_e] + min_e) * inv_e + 0.5).max(0.0).min(15.0) as u8;
+                let expect_o = ((vals[idx_o] + min_o) * inv_o + 0.5).max(0.0).min(15.0) as u8;
+                let byte = qs[group * 32 + l];
+                assert_eq!(
+                    byte & 0x0F,
+                    expect_e,
+                    "low nibble mismatch at elem {idx_e} (stored-F16 reconstruction)"
+                );
+                assert_eq!(
+                    byte >> 4,
+                    expect_o,
+                    "high nibble mismatch at elem {idx_o} (stored-F16 reconstruction)"
+                );
+            }
+        }
+
+        // Pin the boundary element itself: must be the stored-scale choice.
+        assert_eq!(
+            qs[0] & 0x0F,
+            q_stored,
+            "elem 0 must use re-widened stored d (nibble {q_stored})"
+        );
+    }
 }

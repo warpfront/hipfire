@@ -10,10 +10,11 @@
 use std::time::Instant;
 
 use crate::terminal::{
-    batch_announce_terminal, batch_apply_terminal_control, batch_bind_active, batch_check_abort,
-    batch_clear_terminal, batch_mark_ready_with_pending, batch_poll_decision,
-    batch_terminal_control, batch_transition_to_queued, AttemptKey, BatchRegistryState,
-    ClientTerminalDecision, LaneTicket, CLIENT_TERMINAL_COMMIT_TIMEOUT,
+    batch_active_owner_matches, batch_bind_active, batch_check_abort,
+    batch_clear_terminal_at_generation, batch_is_current, batch_mark_ready_with_pending,
+    batch_poll_decision, batch_ready_owner_matches, batch_transition_to_queued, AttemptKey,
+    BatchGeneration, ClientTerminalDecision, LaneTicket, SingletonTransfer,
+    CLIENT_TERMINAL_COMMIT_TIMEOUT,
 };
 
 // ── Batch sampling controls and cohort key ───────────────────────────────
@@ -147,6 +148,12 @@ pub struct ContinuousBatchScheduler {
 #[derive(Debug, Clone)]
 pub struct BatchPendingRequest {
     pub key: AttemptKey,
+    /// Opaque terminal-registry admission owner. This is independent of the
+    /// scheduler's lane reuse generation.
+    pub admission: BatchGeneration,
+    /// Exact wire request retained for a singleton handoff. Batch barriers
+    /// must not reconstruct a reduced generate payload.
+    pub original_msg: serde_json::Value,
     pub prompt: String,
     pub prompt_tokens: Vec<u32>,
     pub started_in_think: bool,
@@ -217,7 +224,10 @@ impl ContinuousBatchScheduler {
 
     pub fn enqueue(&mut self, req: BatchPendingRequest) -> bool {
         let key = req.key.clone();
-        if self.pending.contains_key(&key) || self.inbox.contains(&key) {
+        if !batch_is_current(&key.id, key.attempt_id, req.admission)
+            || self.pending.contains_key(&key)
+            || self.inbox.contains(&key)
+        {
             return false;
         }
         let sampling = req.sampling.clone();
@@ -242,12 +252,30 @@ impl ContinuousBatchScheduler {
         }
         let key = self.inbox.pop_front()?;
         let req = self.pending.get(&key)?.clone();
-        let gen = self.next_generation;
+        if !batch_is_current(&key.id, key.attempt_id, req.admission) {
+            self.pending.remove(&key);
+            self.pending_sampling.remove(&key);
+            self.maybe_clear_cohort();
+            return None;
+        }
+        let lane_generation = self.next_generation;
         self.next_generation += 1;
         let ticket = LaneTicket {
             lane: lane_idx,
-            generation: gen,
+            generation: lane_generation,
+            admission: req.admission,
         };
+        // The reader may already have promoted the key to Queued. The
+        // idempotent transition keeps direct inbox and daemon enqueue paths
+        // on one generation-checked producer API.
+        if !batch_transition_to_queued(&key.id, key.attempt_id, req.admission)
+            || !batch_bind_active(&key.id, key.attempt_id, req.admission, ticket)
+        {
+            self.pending.remove(&key);
+            self.pending_sampling.remove(&key);
+            self.maybe_clear_cohort();
+            return None;
+        }
         let lane = QwenBatchLane {
             key: key.clone(),
             ticket,
@@ -268,16 +296,6 @@ impl ContinuousBatchScheduler {
         if self.cohort_key.is_none() {
             self.cohort_key = Some(req_sampling_key);
         }
-        if batch_terminal_control()
-            .mu
-            .lock()
-            .unwrap()
-            .entries
-            .contains_key(&key)
-        {
-            batch_transition_to_queued(&key.id, key.attempt_id);
-            batch_bind_active(&key.id, key.attempt_id, ticket);
-        }
         Some((key, ticket))
     }
 
@@ -291,6 +309,16 @@ impl ContinuousBatchScheduler {
             BatchLane::Running(q) => {
                 let key = q.key.clone();
                 let ticket = q.ticket;
+                if !batch_mark_ready_with_pending(
+                    &key.id,
+                    key.attempt_id,
+                    ticket.admission,
+                    ticket,
+                    pending_done.clone(),
+                ) {
+                    self.lanes[lane] = BatchLane::Running(q);
+                    return false;
+                }
                 let sampling = q.sampling.clone();
                 let prompt_len = q.prompt_len;
                 let seq_pos = q.seq_pos;
@@ -301,11 +329,10 @@ impl ContinuousBatchScheduler {
                     sampling,
                     prompt_len,
                     seq_pos,
-                    pending_done: pending_done.clone(),
+                    pending_done,
                     deadline,
                 };
                 self.lanes[lane] = BatchLane::AwaitingClient(term);
-                batch_mark_ready_with_pending(&key.id, key.attempt_id, ticket, pending_done);
                 true
             }
             other => {
@@ -315,103 +342,180 @@ impl ContinuousBatchScheduler {
         }
     }
 
-    pub fn commit_lane(&mut self, lane: usize, expected: &AttemptKey) -> bool {
+    pub fn commit_lane(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+    ) -> bool {
+        self.commit_lane_inner(lane, expected, admission, true)
+    }
+
+    /// Commit a ready lane while retaining its keyed terminal registry entry.
+    ///
+    /// Continuous-batch callers use this when a staged `done` still needs to
+    /// claim the request-owned terminal slot. They must clear the entry after
+    /// the terminal writer has claimed and emitted the envelope.
+    pub fn commit_lane_retain_terminal(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+    ) -> bool {
+        self.commit_lane_inner(lane, expected, admission, false)
+    }
+
+    fn commit_lane_inner(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+        clear_terminal: bool,
+    ) -> bool {
         if lane >= self.lanes.len() {
             return false;
         }
-        let is_awaiting =
-            matches!(&self.lanes[lane], BatchLane::AwaitingClient(t) if &t.key == expected);
-        if !is_awaiting {
+        let (ticket, lane_generation) =
+            match &self.lanes[lane] {
+                BatchLane::AwaitingClient(t) if &t.key == expected => (t.ticket, t.ticket.generation),
+                _ => return false,
+            };
+        if ticket.admission != admission {
             return false;
         }
-        match batch_poll_decision(&expected.id, expected.attempt_id) {
-            Some(ClientTerminalDecision::Commit) => {}
-            _ => return false,
+        if !matches!(
+            batch_poll_decision(&expected.id, expected.attempt_id, admission),
+            Some(ClientTerminalDecision::Commit)
+        ) || !batch_ready_owner_matches(
+            &expected.id,
+            expected.attempt_id,
+            admission,
+            ticket,
+        ) {
+            return false;
         }
-        {
-            let g = batch_terminal_control().mu.lock().unwrap();
-            if let Some(e) = g.entries.get(expected) {
-                if let BatchRegistryState::Ready { owner } = e.state {
-                    let lane_gen = self.lanes[lane].generation();
-                    if owner.generation != lane_gen {
-                        return false;
-                    }
-                } else {
-                    return false;
-                }
-            } else {
-                return false;
-            }
-        }
-        let gen = self.lanes[lane].generation();
         self.lanes[lane] = BatchLane::Empty {
-            generation: gen + 1,
+            generation: lane_generation + 1,
         };
         self.pending.remove(expected);
         self.pending_sampling.remove(expected);
-        batch_clear_terminal(&expected.id, expected.attempt_id);
+        if clear_terminal {
+            batch_clear_terminal_at_generation(&expected.id, expected.attempt_id, admission);
+        }
         self.maybe_clear_cohort();
         true
     }
 
-    pub fn abort_lane(&mut self, lane: usize, expected: &AttemptKey) -> bool {
+    pub fn abort_lane(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+    ) -> bool {
         if lane >= self.lanes.len() {
             return false;
         }
-        let lane_key = self.lanes[lane].key().cloned();
-        if lane_key.as_ref() != Some(expected) {
+        let (ticket, lane_generation) = match &self.lanes[lane] {
+            BatchLane::Seeding(q) | BatchLane::Running(q) if &q.key == expected => {
+                (q.ticket, q.ticket.generation)
+            }
+            BatchLane::AwaitingClient(t) if &t.key == expected => {
+                (t.ticket, t.ticket.generation)
+            }
+            _ => return false,
+        };
+        if ticket.admission != admission
+            || (!batch_active_owner_matches(
+                &expected.id,
+                expected.attempt_id,
+                admission,
+                ticket,
+            ) && !batch_ready_owner_matches(
+                &expected.id,
+                expected.attempt_id,
+                admission,
+                ticket,
+            ))
+        {
             return false;
         }
-        {
-            let g = batch_terminal_control().mu.lock().unwrap();
-            if let Some(e) = g.entries.get(expected) {
-                match e.state {
-                    BatchRegistryState::Active { owner } | BatchRegistryState::Ready { owner } => {
-                        if owner.generation != self.lanes[lane].generation() {
-                            return false;
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let gen = self.lanes[lane].generation();
         self.lanes[lane] = BatchLane::Empty {
-            generation: gen + 1,
+            generation: lane_generation + 1,
         };
         self.pending.remove(expected);
         self.pending_sampling.remove(expected);
         self.inbox.retain(|k| k != expected);
-        batch_clear_terminal(&expected.id, expected.attempt_id);
+        batch_clear_terminal_at_generation(&expected.id, expected.attempt_id, admission);
         self.maybe_clear_cohort();
         true
     }
 
-    pub fn abort_queued(&mut self, key: &AttemptKey) -> bool {
+    /// Retire a lane after a successful GPU reset while keeping the exact
+    /// batch terminal owner live for an immediate singleton handoff.
+    ///
+    /// Unlike [`Self::abort_lane`], this deliberately does not clear the
+    /// keyed terminal registry. The caller must consume that owner with
+    /// `batch_handoff_to_singleton_and_clear`; clearing it first would make a
+    /// reset failure or stale requeue unclaimable.
+    pub fn retire_lane_for_singleton(
+        &mut self,
+        lane: usize,
+        expected: &AttemptKey,
+        admission: BatchGeneration,
+    ) -> bool {
+        if lane >= self.lanes.len() {
+            return false;
+        }
+        let (ticket, lane_generation) = match &self.lanes[lane] {
+            BatchLane::Seeding(q) | BatchLane::Running(q) if &q.key == expected => {
+                (q.ticket, q.ticket.generation)
+            }
+            BatchLane::AwaitingClient(t) if &t.key == expected => {
+                (t.ticket, t.ticket.generation)
+            }
+            _ => return false,
+        };
+        if ticket.admission != admission
+            || !batch_active_owner_matches(
+                &expected.id,
+                expected.attempt_id,
+                admission,
+                ticket,
+            )
+        {
+            return false;
+        }
+        self.lanes[lane] = BatchLane::Empty {
+            generation: lane_generation + 1,
+        };
+        self.pending.remove(expected);
+        self.pending_sampling.remove(expected);
+        self.inbox.retain(|k| k != expected);
+        self.maybe_clear_cohort();
+        true
+    }
+
+    pub fn abort_queued(&mut self, key: &AttemptKey, admission: BatchGeneration) -> bool {
         if !self.inbox.contains(key) {
             return false;
         }
-        let state_ok = {
-            let g = batch_terminal_control().mu.lock().unwrap();
-            if let Some(e) = g.entries.get(key) {
-                matches!(
-                    e.state,
-                    BatchRegistryState::Announced | BatchRegistryState::Queued
-                )
-            } else {
-                false
-            }
-        };
-        if !state_ok {
+        if self
+            .pending
+            .get(key)
+            .is_none_or(|request| request.admission != admission)
+        {
             return false;
         }
-        if !batch_check_abort(&key.id, key.attempt_id) {
+        if !batch_is_current(&key.id, key.attempt_id, admission)
+            || !batch_check_abort(&key.id, key.attempt_id, admission)
+        {
             return false;
         }
         self.inbox.retain(|k| k != key);
         self.pending.remove(key);
         self.pending_sampling.remove(key);
-        batch_clear_terminal(&key.id, key.attempt_id);
+        batch_clear_terminal_at_generation(&key.id, key.attempt_id, admission);
+        self.maybe_clear_cohort();
         true
     }
 
@@ -427,32 +531,38 @@ impl ContinuousBatchScheduler {
 
     pub fn fail_all_active(&mut self) -> Vec<AttemptKey> {
         let mut failed = Vec::new();
+        let mut owned = Vec::new();
         for lane in &mut self.lanes {
             match lane {
                 BatchLane::Running(q) | BatchLane::Seeding(q) => {
                     failed.push(q.key.clone());
+                    owned.push((q.key.clone(), q.ticket.admission));
                 }
                 BatchLane::AwaitingClient(t) => {
                     failed.push(t.key.clone());
+                    owned.push((t.key.clone(), t.ticket.admission));
                 }
                 BatchLane::Empty { .. } => {}
             }
             if !matches!(lane, BatchLane::Empty { .. }) {
-                let gen = lane.generation();
+                let generation = lane.generation();
                 *lane = BatchLane::Empty {
-                    generation: gen + 1,
+                    generation: generation + 1,
                 };
             }
         }
-        for k in failed.iter() {
-            self.pending.remove(k);
-            self.pending_sampling.remove(k);
-            batch_clear_terminal(&k.id, k.attempt_id);
+        for (key, admission) in owned {
+            self.pending.remove(&key);
+            self.pending_sampling.remove(&key);
+            batch_clear_terminal_at_generation(&key.id, key.attempt_id, admission);
         }
-        for k in self.inbox.drain(..) {
-            self.pending.remove(&k);
-            self.pending_sampling.remove(&k);
-            batch_clear_terminal(&k.id, k.attempt_id);
+        for key in self.inbox.drain(..) {
+            let admission = self.pending.get(&key).map(|request| request.admission);
+            self.pending.remove(&key);
+            self.pending_sampling.remove(&key);
+            if let Some(admission) = admission {
+                batch_clear_terminal_at_generation(&key.id, key.attempt_id, admission);
+            }
         }
         self.cohort_key = None;
         failed
@@ -784,7 +894,15 @@ pub fn lfm_fast_path_candidate_len(sched: &ContinuousBatchScheduler) -> usize {
     {
         return 0;
     }
-    if crate::terminal::batch_check_abort(&front_key.id, front_key.attempt_id) {
+    if !crate::terminal::batch_is_current(
+        &front_key.id,
+        front_key.attempt_id,
+        front_req.admission,
+    ) || crate::terminal::batch_check_abort(
+        &front_key.id,
+        front_key.attempt_id,
+        front_req.admission,
+    ) {
         return 0;
     }
     let first_len = front_req.prompt_tokens.len();
@@ -820,7 +938,9 @@ pub fn lfm_fast_path_candidate_len(sched: &ContinuousBatchScheduler) -> usize {
         {
             break;
         }
-        if crate::terminal::batch_check_abort(&key.id, key.attempt_id) {
+        if !crate::terminal::batch_is_current(&key.id, key.attempt_id, req.admission)
+            || crate::terminal::batch_check_abort(&key.id, key.attempt_id, req.admission)
+        {
             break;
         }
         let cohort = match sched.pending_sampling.get(key) {
@@ -913,7 +1033,38 @@ impl DaemonInbox {
 #[derive(Debug, Clone)]
 pub enum DaemonMsg {
     Regular(serde_json::Value),
+    /// A generate request with the admission token minted by the stdin reader.
+    ///
+    /// The token is carried out-of-band: it is an internal ownership
+    /// capability and must never be recovered by looking up the request key
+    /// after the message has been admitted.
+    RegularWithAdmission(serde_json::Value, BatchGeneration),
+    /// A batch think-barrier handoff that already owns the singleton
+    /// terminal transaction. Main must adopt the snapshot; it must not
+    /// re-announce or rediscover the retired batch admission.
+    SingletonWithAdmission(serde_json::Value, SingletonTransfer),
     ParseError(String),
+}
+
+/// Preserve an explicit singleton owner while a batch driver parks a full
+/// request as a sequential barrier.
+pub fn daemon_singleton_with_admission(
+    value: serde_json::Value,
+    transfer: SingletonTransfer,
+) -> DaemonMsg {
+    DaemonMsg::SingletonWithAdmission(value, transfer)
+}
+
+/// Preserve an admission token while a batch driver parks a message as a
+/// sequential barrier.
+pub fn daemon_regular_with_admission(
+    value: serde_json::Value,
+    admission: Option<BatchGeneration>,
+) -> DaemonMsg {
+    match admission {
+        Some(admission) => DaemonMsg::RegularWithAdmission(value, admission),
+        None => DaemonMsg::Regular(value),
+    }
 }
 
 pub type CaskConfig = hipfire_runtime::loader_api::CaskConfig;

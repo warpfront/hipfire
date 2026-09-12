@@ -1,0 +1,2048 @@
+{
+  "binary": "/tmp/hipfire-g4-e786-target/release/daemon",
+  "binary_sha256": "82c45928b85318d1760855d4c0f40f20508618c586c9cf910edbee9f03f1b9b7",
+  "target": "/home/bjoern/.hipfire/models/qwen3.5-27b.mq4",
+  "target_sha256": "ea615949ddf6a180eee03ff6fde39f7e51148f153b1b05f82258b9953088576e",
+  "target_size": 14984158208,
+  "draft": "/home/bjoern/.hipfire/models/qwen35-27b-dflash-mq4.hfq",
+  "draft_sha256": "3d428b97c1911a9ad815cc52fbee080306852c1dafad6b1b17bb70bd68010301",
+  "draft_size": 919401472,
+  "phases": {
+    "lifecycle_load": {
+      "event": {
+        "type": "loaded",
+        "arch": "qwen3_5",
+        "dim": 5120,
+        "layers": 64,
+        "vocab": 248320,
+        "vl": false,
+        "reasoning_contract": "qwen_jinja",
+        "reasoning_effort_native": false,
+        "reasoning_efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "cache_capable": true,
+        "retry_reset_eligible": true,
+        "continuous_batch_capable": false
+      }
+    },
+    "lifecycle_snapshot_fresh": {
+      "event": {
+        "type": "test_state_snapshot",
+        "schema_version": 1,
+        "arch": "qwen35",
+        "eligible_routes": [
+          "qwen_ar",
+          "qwen_dflash"
+        ],
+        "state_epoch": 0,
+        "seq_pos": 0,
+        "conversation_len": 0,
+        "kv_hash": "ef63c0f140b9a325",
+        "kv_bytes": 67133440,
+        "recurrent_hash": "6a67742d55922325",
+        "recurrent_bytes": 120324096,
+        "graph_clean": true,
+        "replay_clean": true,
+        "drafter_reset": true,
+        "checkpoint_empty": true,
+        "adaptive_clean": true,
+        "asst_cache_empty": true,
+        "prefix_cache_clean": true
+      }
+    },
+    "life_normal": {
+      "request": {
+        "type": "generate",
+        "id": "life-normal",
+        "attempt_id": 101,
+        "prompt": "Reply with exactly one short line containing the word OK.",
+        "temperature": 0.0,
+        "max_tokens": 32,
+        "thinking_enabled": false,
+        "stop": [
+          "\\n"
+        ]
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "OK",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "life-normal",
+          "tokens": 2,
+          "tok_s": 0.1,
+          "prefill_tokens": 23,
+          "prefill_ms": 12094.2,
+          "prefill_tok_s": 1.9,
+          "decode_tok_s": 0.4,
+          "ttft_ms": 12094.2,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 101
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true,
+        "finish_reason_stop": true,
+        "commit_payload_matches_done": true
+      }
+    },
+    "lifecycle_snapshot_after_normal": {
+      "event": {
+        "type": "test_state_snapshot",
+        "schema_version": 1,
+        "arch": "qwen35",
+        "eligible_routes": [
+          "qwen_ar",
+          "qwen_dflash"
+        ],
+        "state_epoch": 0,
+        "seq_pos": 26,
+        "conversation_len": 26,
+        "kv_hash": "ee0a15d1427fb849",
+        "kv_bytes": 67133440,
+        "recurrent_hash": "f975f0a6d666b30c",
+        "recurrent_bytes": 120324096,
+        "graph_clean": false,
+        "replay_clean": true,
+        "drafter_reset": true,
+        "checkpoint_empty": false,
+        "adaptive_clean": true,
+        "asst_cache_empty": false,
+        "prefix_cache_clean": false
+      }
+    },
+    "lifecycle_reset": {
+      "event": {
+        "type": "reset",
+        "rolled_back": true,
+        "state_epoch": 1,
+        "seq_pos": 0,
+        "conversation_len": 0,
+        "attempt_id": 102,
+        "retry_reset_eligible": true
+      },
+      "assertions": {
+        "ack_zero": true
+      }
+    },
+    "lifecycle_snapshot_after_reset": {
+      "event": {
+        "type": "test_state_snapshot",
+        "schema_version": 1,
+        "arch": "qwen35",
+        "eligible_routes": [
+          "qwen_ar",
+          "qwen_dflash"
+        ],
+        "state_epoch": 1,
+        "seq_pos": 0,
+        "conversation_len": 0,
+        "kv_hash": "ee0a15d1427fb849",
+        "kv_bytes": 67133440,
+        "recurrent_hash": "6a67742d55922325",
+        "recurrent_bytes": 120324096,
+        "graph_clean": true,
+        "replay_clean": true,
+        "drafter_reset": true,
+        "checkpoint_empty": true,
+        "adaptive_clean": true,
+        "asst_cache_empty": true,
+        "prefix_cache_clean": true
+      }
+    },
+    "life-reuse-1": {
+      "request": {
+        "type": "generate",
+        "id": "life-reuse-1",
+        "attempt_id": 103,
+        "prompt": "After reset, answer with one short sentence about Rust.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "Rust is a systems programming language that emphasizes safety, speed, and concurrency without a garbage collector.",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "life-reuse-1",
+          "tokens": 20,
+          "tok_s": 13.1,
+          "prefill_tokens": 23,
+          "prefill_ms": 167.8,
+          "prefill_tok_s": 137.1,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 167.8,
+          "cached_tokens": 0,
+          "finish_reason": "length",
+          "attempt_id": 103
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true,
+        "commit_payload_matches_done": true
+      }
+    },
+    "life-reuse-2": {
+      "request": {
+        "type": "generate",
+        "id": "life-reuse-2",
+        "attempt_id": 104,
+        "prompt": "Continue this same session with one short sentence about ownership.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "True ownership means taking full responsibility for both the successes and the failures of your actions.",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "life-reuse-2",
+          "tokens": 18,
+          "tok_s": 12.9,
+          "prefill_tokens": 23,
+          "prefill_ms": 169.1,
+          "prefill_tok_s": 136.0,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 169.1,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 104
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true,
+        "commit_payload_matches_done": true
+      }
+    },
+    "lifecycle_snapshot_after_reuse": {
+      "event": {
+        "type": "test_state_snapshot",
+        "schema_version": 1,
+        "arch": "qwen35",
+        "eligible_routes": [
+          "qwen_ar",
+          "qwen_dflash"
+        ],
+        "state_epoch": 1,
+        "seq_pos": 42,
+        "conversation_len": 42,
+        "kv_hash": "77e81ba179a10e06",
+        "kv_bytes": 67133440,
+        "recurrent_hash": "b0e6756baabaa4e3",
+        "recurrent_bytes": 120324096,
+        "graph_clean": false,
+        "replay_clean": true,
+        "drafter_reset": true,
+        "checkpoint_empty": false,
+        "adaptive_clean": true,
+        "asst_cache_empty": false,
+        "prefix_cache_clean": false
+      }
+    },
+    "lifecycle_unload": {
+      "event": {
+        "type": "unloaded"
+      }
+    },
+    "lifecycle_reload": {
+      "event": {
+        "type": "loaded",
+        "arch": "qwen3_5",
+        "dim": 5120,
+        "layers": 64,
+        "vocab": 248320,
+        "vl": false,
+        "reasoning_contract": "qwen_jinja",
+        "reasoning_effort_native": false,
+        "reasoning_efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "cache_capable": true,
+        "retry_reset_eligible": true,
+        "continuous_batch_capable": false
+      }
+    },
+    "life_reload_generate": {
+      "request": {
+        "type": "generate",
+        "id": "life-reload-generate",
+        "attempt_id": 105,
+        "prompt": "Give one word: ready.",
+        "temperature": 0.0,
+        "max_tokens": 12,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "ready",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "life-reload-generate",
+          "tokens": 2,
+          "tok_s": 6.5,
+          "prefill_tokens": 18,
+          "prefill_ms": 169.4,
+          "prefill_tok_s": 106.2,
+          "decode_tok_s": 14.5,
+          "ttft_ms": 169.4,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 105
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true,
+        "commit_payload_matches_done": true
+      }
+    },
+    "lifecycle_final_unload": {
+      "event": {
+        "type": "unloaded"
+      }
+    },
+    "g46_load": {
+      "event": {
+        "type": "loaded",
+        "arch": "qwen3_5",
+        "dim": 5120,
+        "layers": 64,
+        "vocab": 248320,
+        "vl": false,
+        "reasoning_contract": "qwen_jinja",
+        "reasoning_effort_native": false,
+        "reasoning_efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "cache_capable": true,
+        "retry_reset_eligible": true,
+        "continuous_batch_capable": false
+      }
+    },
+    "g46_exact_commit": {
+      "request": {
+        "type": "generate",
+        "id": "g46-exact",
+        "attempt_id": 201,
+        "prompt": "Answer exactly OK.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "OK",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "g46-exact",
+          "tokens": 2,
+          "tok_s": 0.1,
+          "prefill_tokens": 16,
+          "prefill_ms": 14559.8,
+          "prefill_tok_s": 1.1,
+          "decode_tok_s": 0.3,
+          "ttft_ms": 14559.8,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 201
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true
+      }
+    },
+    "g46_early_commit": {
+      "request": {
+        "type": "generate",
+        "id": "g46-early",
+        "attempt_id": 202,
+        "prompt": "Write two short words.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "Hello world",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "g46-early",
+          "tokens": 3,
+          "tok_s": 3.5,
+          "prefill_tokens": 17,
+          "prefill_ms": 661.0,
+          "prefill_tok_s": 25.7,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 661.0,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 202
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true,
+        "early_commit_did_not_terminalize": true
+      },
+      "_all_events": [
+        {
+          "type": "gen_start",
+          "id": "g46-early",
+          "started_in_think": false,
+          "attempt_id": 202,
+          "contract_version": 2
+        },
+        {
+          "type": "token",
+          "id": "g46-early",
+          "text": "Hello",
+          "attempt_id": 202
+        },
+        {
+          "type": "token",
+          "id": "g46-early",
+          "text": " world",
+          "attempt_id": 202
+        },
+        {
+          "type": "commit_ready",
+          "id": "g46-early",
+          "tokens": 3,
+          "tok_s": 3.5,
+          "prefill_tokens": 17,
+          "prefill_ms": 661.0,
+          "prefill_tok_s": 25.7,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 661.0,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 202
+        },
+        {
+          "type": "done",
+          "id": "g46-early",
+          "tokens": 3,
+          "tok_s": 3.5,
+          "prefill_tokens": 17,
+          "prefill_ms": 661.0,
+          "prefill_tok_s": 25.7,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 661.0,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 202
+        }
+      ],
+      "_commit_ready_payload": {
+        "type": "commit_ready",
+        "id": "g46-early",
+        "tokens": 3,
+        "tok_s": 3.5,
+        "prefill_tokens": 17,
+        "prefill_ms": 661.0,
+        "prefill_tok_s": 25.7,
+        "decode_tok_s": 14.7,
+        "ttft_ms": 661.0,
+        "cached_tokens": 0,
+        "finish_reason": "stop",
+        "attempt_id": 202
+      },
+      "_done": {
+        "type": "done",
+        "id": "g46-early",
+        "tokens": 3,
+        "tok_s": 3.5,
+        "prefill_tokens": 17,
+        "prefill_ms": 661.0,
+        "prefill_tok_s": 25.7,
+        "decode_tok_s": 14.7,
+        "ttft_ms": 661.0,
+        "cached_tokens": 0,
+        "finish_reason": "stop",
+        "attempt_id": 202
+      }
+    },
+    "g46_wrong_attempt_commit": {
+      "request": {
+        "type": "generate",
+        "id": "wrong_attempt_commit",
+        "attempt_id": 203,
+        "prompt": "One short answer.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "Yes.",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "wrong_attempt_commit",
+          "tokens": 3,
+          "tok_s": 9.8,
+          "prefill_tokens": 16,
+          "prefill_ms": 103.4,
+          "prefill_tok_s": 154.7,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 103.4,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 203
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true,
+        "wrong_control_ignored": true
+      },
+      "_all_events": [
+        {
+          "type": "gen_start",
+          "id": "wrong_attempt_commit",
+          "started_in_think": false,
+          "attempt_id": 203,
+          "contract_version": 2
+        },
+        {
+          "type": "token",
+          "id": "wrong_attempt_commit",
+          "text": "Yes",
+          "attempt_id": 203
+        },
+        {
+          "type": "token",
+          "id": "wrong_attempt_commit",
+          "text": ".",
+          "attempt_id": 203
+        },
+        {
+          "type": "commit_ready",
+          "id": "wrong_attempt_commit",
+          "tokens": 3,
+          "tok_s": 9.8,
+          "prefill_tokens": 16,
+          "prefill_ms": 103.4,
+          "prefill_tok_s": 154.7,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 103.4,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 203
+        },
+        {
+          "type": "done",
+          "id": "wrong_attempt_commit",
+          "tokens": 3,
+          "tok_s": 9.8,
+          "prefill_tokens": 16,
+          "prefill_ms": 103.4,
+          "prefill_tok_s": 154.7,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 103.4,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 203
+        }
+      ],
+      "_commit_ready_payload": {
+        "type": "commit_ready",
+        "id": "wrong_attempt_commit",
+        "tokens": 3,
+        "tok_s": 9.8,
+        "prefill_tokens": 16,
+        "prefill_ms": 103.4,
+        "prefill_tok_s": 154.7,
+        "decode_tok_s": 14.7,
+        "ttft_ms": 103.4,
+        "cached_tokens": 0,
+        "finish_reason": "stop",
+        "attempt_id": 203
+      },
+      "_done": {
+        "type": "done",
+        "id": "wrong_attempt_commit",
+        "tokens": 3,
+        "tok_s": 9.8,
+        "prefill_tokens": 16,
+        "prefill_ms": 103.4,
+        "prefill_tok_s": 154.7,
+        "decode_tok_s": 14.7,
+        "ttft_ms": 103.4,
+        "cached_tokens": 0,
+        "finish_reason": "stop",
+        "attempt_id": 203
+      }
+    },
+    "g46_stale_wrong_id": {
+      "request": {
+        "type": "generate",
+        "id": "stale_wrong_id",
+        "attempt_id": 204,
+        "prompt": "One short answer.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "Yes.",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "stale_wrong_id",
+          "tokens": 3,
+          "tok_s": 9.8,
+          "prefill_tokens": 16,
+          "prefill_ms": 103.1,
+          "prefill_tok_s": 155.2,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 103.1,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 204
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true,
+        "wrong_control_ignored": true
+      },
+      "_all_events": [
+        {
+          "type": "gen_start",
+          "id": "stale_wrong_id",
+          "started_in_think": false,
+          "attempt_id": 204,
+          "contract_version": 2
+        },
+        {
+          "type": "token",
+          "id": "stale_wrong_id",
+          "text": "Yes",
+          "attempt_id": 204
+        },
+        {
+          "type": "token",
+          "id": "stale_wrong_id",
+          "text": ".",
+          "attempt_id": 204
+        },
+        {
+          "type": "commit_ready",
+          "id": "stale_wrong_id",
+          "tokens": 3,
+          "tok_s": 9.8,
+          "prefill_tokens": 16,
+          "prefill_ms": 103.1,
+          "prefill_tok_s": 155.2,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 103.1,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 204
+        },
+        {
+          "type": "done",
+          "id": "stale_wrong_id",
+          "tokens": 3,
+          "tok_s": 9.8,
+          "prefill_tokens": 16,
+          "prefill_ms": 103.1,
+          "prefill_tok_s": 155.2,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 103.1,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 204
+        }
+      ],
+      "_commit_ready_payload": {
+        "type": "commit_ready",
+        "id": "stale_wrong_id",
+        "tokens": 3,
+        "tok_s": 9.8,
+        "prefill_tokens": 16,
+        "prefill_ms": 103.1,
+        "prefill_tok_s": 155.2,
+        "decode_tok_s": 14.7,
+        "ttft_ms": 103.1,
+        "cached_tokens": 0,
+        "finish_reason": "stop",
+        "attempt_id": 204
+      },
+      "_done": {
+        "type": "done",
+        "id": "stale_wrong_id",
+        "tokens": 3,
+        "tok_s": 9.8,
+        "prefill_tokens": 16,
+        "prefill_ms": 103.1,
+        "prefill_tok_s": 155.2,
+        "decode_tok_s": 14.7,
+        "ttft_ms": 103.1,
+        "cached_tokens": 0,
+        "finish_reason": "stop",
+        "attempt_id": 204
+      }
+    },
+    "g46_late_commit": {
+      "request": {
+        "type": "generate",
+        "id": "g46-late",
+        "attempt_id": 205,
+        "prompt": "Reply OK.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "OK",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "g46-late",
+          "tokens": 2,
+          "tok_s": 8.4,
+          "prefill_tokens": 15,
+          "prefill_ms": 102.2,
+          "prefill_tok_s": 146.8,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 102.2,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 205
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true,
+        "late_control_no_new_terminal": true
+      }
+    },
+    "g46_duplicate_generate": {
+      "request": {
+        "type": "generate",
+        "id": "g46-duplicate",
+        "attempt_id": 206,
+        "prompt": "Reply one word.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "Okay",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "g46-duplicate",
+          "tokens": 2,
+          "tok_s": 8.3,
+          "prefill_tokens": 16,
+          "prefill_ms": 103.0,
+          "prefill_tok_s": 155.3,
+          "decode_tok_s": 14.6,
+          "ttft_ms": 103.0,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 206
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true,
+        "single_start": true,
+        "single_terminal": true
+      }
+    },
+    "g46_same_key_first": {
+      "request": {
+        "type": "generate",
+        "id": "g46-reuse",
+        "attempt_id": 207,
+        "prompt": "First answer one word.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "Yes",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "g46-reuse",
+          "tokens": 2,
+          "tok_s": 6.6,
+          "prefill_tokens": 17,
+          "prefill_ms": 165.8,
+          "prefill_tok_s": 102.6,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 165.8,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 207
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true
+      },
+      "_all_events": [
+        {
+          "type": "gen_start",
+          "id": "g46-reuse",
+          "started_in_think": false,
+          "attempt_id": 207,
+          "contract_version": 2
+        },
+        {
+          "type": "token",
+          "id": "g46-reuse",
+          "text": "Yes",
+          "attempt_id": 207
+        },
+        {
+          "type": "commit_ready",
+          "id": "g46-reuse",
+          "tokens": 2,
+          "tok_s": 6.6,
+          "prefill_tokens": 17,
+          "prefill_ms": 165.8,
+          "prefill_tok_s": 102.6,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 165.8,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 207
+        },
+        {
+          "type": "done",
+          "id": "g46-reuse",
+          "tokens": 2,
+          "tok_s": 6.6,
+          "prefill_tokens": 17,
+          "prefill_ms": 165.8,
+          "prefill_tok_s": 102.6,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 165.8,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 207
+        }
+      ],
+      "_commit_ready_payload": {
+        "type": "commit_ready",
+        "id": "g46-reuse",
+        "tokens": 2,
+        "tok_s": 6.6,
+        "prefill_tokens": 17,
+        "prefill_ms": 165.8,
+        "prefill_tok_s": 102.6,
+        "decode_tok_s": 14.7,
+        "ttft_ms": 165.8,
+        "cached_tokens": 0,
+        "finish_reason": "stop",
+        "attempt_id": 207
+      },
+      "_done": {
+        "type": "done",
+        "id": "g46-reuse",
+        "tokens": 2,
+        "tok_s": 6.6,
+        "prefill_tokens": 17,
+        "prefill_ms": 165.8,
+        "prefill_tok_s": 102.6,
+        "decode_tok_s": 14.7,
+        "ttft_ms": 165.8,
+        "cached_tokens": 0,
+        "finish_reason": "stop",
+        "attempt_id": 207
+      }
+    },
+    "g46_same_key_second": {
+      "request": {
+        "type": "generate",
+        "id": "g46-reuse",
+        "attempt_id": 207,
+        "prompt": "Second answer one word.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "Okay",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "g46-reuse",
+          "tokens": 2,
+          "tok_s": 6.6,
+          "prefill_tokens": 17,
+          "prefill_ms": 168.0,
+          "prefill_tok_s": 101.2,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 168.0,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 207
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true,
+        "same_key_reuse_committed": true
+      }
+    },
+    "g46_commit_timeout": {
+      "request": {
+        "type": "generate",
+        "id": "g46-timeout",
+        "attempt_id": 208,
+        "prompt": "Write one sentence.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "commit_ready",
+        "aborted",
+        "done"
+      ],
+      "decoded_text": "The sun dipped below the horizon, painting the sky in hues of orange and purple.",
+      "terminal_events": [
+        {
+          "type": "aborted",
+          "id": "g46-timeout",
+          "reason": "client_cancelled",
+          "attempt_id": 208
+        },
+        {
+          "type": "done",
+          "id": "g46-timeout",
+          "finish_reason": "aborted",
+          "prompt_tokens": 0,
+          "completion_tokens": 18,
+          "prefill_ms": 0,
+          "decode_ms": 0,
+          "attempt_id": 208
+        }
+      ],
+      "terminal_count": 2,
+      "assertions": {
+        "one_terminal": false,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": false,
+        "timeout_aborted": true
+      }
+    },
+    "g46_reset_after_timeout": {
+      "event": {
+        "type": "reset",
+        "rolled_back": true,
+        "state_epoch": 1,
+        "seq_pos": 0,
+        "conversation_len": 0,
+        "attempt_id": 209,
+        "retry_reset_eligible": true
+      }
+    },
+    "g46_abort_before_prefill": {
+      "request": {
+        "type": "generate",
+        "id": "g46-abort-prefill",
+        "attempt_id": 210,
+        "prompt": "Write a long detailed answer about Rust ownership.",
+        "temperature": 0.0,
+        "max_tokens": 64,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "token",
+        "commit_ready",
+        "aborted",
+        "done"
+      ],
+      "decoded_text": "# Rust Ownership: The Foundation of Memory Safety Without Garbage Collection\n\nRust's ownership system is arguably its most defining feature. It is the mechanism that allows Rust to guarantee memory safety and prevent data races at **compile time**, without the need for a garbage collector (GC) or a runtime reference counting system. This",
+      "terminal_events": [
+        {
+          "type": "aborted",
+          "id": "g46-abort-prefill",
+          "reason": "client_cancelled",
+          "attempt_id": 210
+        },
+        {
+          "type": "done",
+          "id": "g46-abort-prefill",
+          "finish_reason": "aborted",
+          "prompt_tokens": 0,
+          "completion_tokens": 64,
+          "prefill_ms": 0,
+          "decode_ms": 0,
+          "attempt_id": 210
+        }
+      ],
+      "terminal_count": 2,
+      "assertions": {
+        "one_terminal": false,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": false,
+        "abort_terminal": true
+      },
+      "_all_events": [
+        {
+          "type": "gen_start",
+          "id": "g46-abort-prefill",
+          "started_in_think": false,
+          "attempt_id": 210,
+          "contract_version": 2
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": "#",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " Rust",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " Ownership",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": ":",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " The",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " Foundation",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " of",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " Memory",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " Safety",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " Without",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " Gar",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": "bage",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " Collection",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": "\n\n",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": "R",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": "ust",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": "'s",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " ownership",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " system",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " is",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " arguably",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " its",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " most",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " defining",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " feature",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": ".",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " It",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " is",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " the",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " mechanism",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " that",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " allows",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " Rust",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " to",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " guarantee",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " memory",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " safety",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " and",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " prevent",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " data",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " races",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " at",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " **",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": "compile",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " time",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": "**,",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " without",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " the",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " need",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " for",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " a",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " garbage",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " collector",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " (",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": "GC",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": ")",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " or",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " a",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " runtime",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " reference",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " counting",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " system",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": ".",
+          "attempt_id": 210
+        },
+        {
+          "type": "token",
+          "id": "g46-abort-prefill",
+          "text": " This",
+          "attempt_id": 210
+        },
+        {
+          "type": "commit_ready",
+          "id": "g46-abort-prefill",
+          "tokens": 64,
+          "tok_s": 14.1,
+          "prefill_tokens": 21,
+          "prefill_ms": 169.3,
+          "prefill_tok_s": 124.0,
+          "decode_tok_s": 14.7,
+          "ttft_ms": 169.3,
+          "cached_tokens": 0,
+          "finish_reason": "length",
+          "attempt_id": 210
+        },
+        {
+          "type": "aborted",
+          "id": "g46-abort-prefill",
+          "reason": "client_cancelled",
+          "attempt_id": 210
+        },
+        {
+          "type": "done",
+          "id": "g46-abort-prefill",
+          "finish_reason": "aborted",
+          "prompt_tokens": 0,
+          "completion_tokens": 64,
+          "prefill_ms": 0,
+          "decode_ms": 0,
+          "attempt_id": 210
+        }
+      ],
+      "_commit_ready_payload": {
+        "type": "commit_ready",
+        "id": "g46-abort-prefill",
+        "tokens": 64,
+        "tok_s": 14.1,
+        "prefill_tokens": 21,
+        "prefill_ms": 169.3,
+        "prefill_tok_s": 124.0,
+        "decode_tok_s": 14.7,
+        "ttft_ms": 169.3,
+        "cached_tokens": 0,
+        "finish_reason": "length",
+        "attempt_id": 210
+      },
+      "_done": {
+        "type": "done",
+        "id": "g46-abort-prefill",
+        "finish_reason": "aborted",
+        "prompt_tokens": 0,
+        "completion_tokens": 64,
+        "prefill_ms": 0,
+        "decode_ms": 0,
+        "attempt_id": 210
+      }
+    },
+    "g46_reset_after_abort_prefill": {
+      "event": {
+        "type": "reset",
+        "rolled_back": true,
+        "state_epoch": 2,
+        "seq_pos": 0,
+        "conversation_len": 0,
+        "attempt_id": 211,
+        "retry_reset_eligible": true
+      }
+    },
+    "g46_abort_during_decode": {
+      "request": {
+        "type": "generate",
+        "id": "g46-abort-decode",
+        "attempt_id": 212,
+        "prompt": "Write a long detailed explanation of Rust ownership and borrowing.",
+        "temperature": 0.0,
+        "max_tokens": 128,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "aborted",
+        "done"
+      ],
+      "decoded_text": "#",
+      "terminal_events": [
+        {
+          "type": "aborted",
+          "id": "g46-abort-decode",
+          "reason": "client_cancelled",
+          "attempt_id": 212
+        },
+        {
+          "type": "done",
+          "id": "g46-abort-decode",
+          "finish_reason": "aborted",
+          "prompt_tokens": 0,
+          "completion_tokens": 1,
+          "prefill_ms": 0,
+          "decode_ms": 0,
+          "attempt_id": 212
+        }
+      ],
+      "terminal_count": 2,
+      "assertions": {
+        "abort_sent_after_token": true,
+        "abort_terminal": true
+      }
+    },
+    "g46_reset_after_abort_decode": {
+      "event": {
+        "type": "reset",
+        "rolled_back": true,
+        "state_epoch": 3,
+        "seq_pos": 0,
+        "conversation_len": 0,
+        "attempt_id": 213,
+        "retry_reset_eligible": true
+      }
+    },
+    "g46_fault_after_prefill": {
+      "request": {
+        "type": "generate",
+        "id": "g46-fault-after-prefill",
+        "attempt_id": 214,
+        "prompt": "Reply with one word.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false,
+        "test_fault_after_prefill": true
+      },
+      "event_types": [
+        "gen_start",
+        "error"
+      ],
+      "decoded_text": "",
+      "terminal_events": [
+        {
+          "type": "error",
+          "message": "injected fault after prefill",
+          "class": "gpu",
+          "retryable": true,
+          "rolled_back": true,
+          "attempt_id": 214,
+          "id": "g46-fault-after-prefill"
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": false,
+        "commit_ready_equals_done": null,
+        "typed_error_or_fail_closed": true
+      }
+    },
+    "g46_snapshot_after_fault": {
+      "event": {
+        "type": "test_state_snapshot",
+        "schema_version": 1,
+        "arch": "qwen35",
+        "eligible_routes": [
+          "qwen_ar",
+          "qwen_dflash"
+        ],
+        "state_epoch": 3,
+        "seq_pos": 0,
+        "conversation_len": 0,
+        "kv_hash": "91f41d3bffac28c9",
+        "kv_bytes": 67133440,
+        "recurrent_hash": "6a67742d55922325",
+        "recurrent_bytes": 120324096,
+        "graph_clean": true,
+        "replay_clean": true,
+        "drafter_reset": true,
+        "checkpoint_empty": true,
+        "adaptive_clean": true,
+        "asst_cache_empty": true,
+        "prefix_cache_clean": true
+      }
+    },
+    "g46_unload_after_fault": {
+      "event": {
+        "type": "unloaded"
+      }
+    },
+    "g46_reload_after_fault": {
+      "event": {
+        "type": "loaded",
+        "arch": "qwen3_5",
+        "dim": 5120,
+        "layers": 64,
+        "vocab": 248320,
+        "vl": false,
+        "reasoning_contract": "qwen_jinja",
+        "reasoning_effort_native": false,
+        "reasoning_efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "cache_capable": true,
+        "retry_reset_eligible": true,
+        "continuous_batch_capable": false
+      }
+    },
+    "g46_after_reload_generate": {
+      "request": {
+        "type": "generate",
+        "id": "g46-after-reload",
+        "attempt_id": 215,
+        "prompt": "Reply OK.",
+        "temperature": 0.0,
+        "max_tokens": 20,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "OK",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "g46-after-reload",
+          "tokens": 2,
+          "tok_s": 8.3,
+          "prefill_tokens": 15,
+          "prefill_ms": 103.5,
+          "prefill_tok_s": 144.9,
+          "decode_tok_s": 14.5,
+          "ttft_ms": 103.5,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 215
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true
+      }
+    },
+    "g46_final_unload": {
+      "event": {
+        "type": "unloaded"
+      }
+    },
+    "batch_load": {
+      "event": {
+        "type": "loaded",
+        "arch": "qwen3_5",
+        "dim": 5120,
+        "layers": 64,
+        "vocab": 248320,
+        "vl": false,
+        "reasoning_contract": "qwen_jinja",
+        "reasoning_effort_native": false,
+        "reasoning_efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "cache_capable": true,
+        "retry_reset_eligible": true,
+        "continuous_batch_capable": true
+      }
+    },
+    "batch_matrix": {
+      "request_count": 2,
+      "event_types": [
+        "gen_start",
+        "error",
+        "gen_start",
+        "error"
+      ],
+      "decoded_text": "",
+      "terminal_events": {
+        "lane-abort": [
+          {
+            "type": "error",
+            "message": "batch GPU error: forward_decode_batch: HipError(0): hipcc compilation failed for kv_cache_write_q8_0_independent:\n/tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hip:6:10: fatal error: 'kv_slot_desc.h' file not found\n    6 | #include \"kv_slot_desc.h\"\n      |          ^~~~~~~~~~~~~~~~\n1 error generated when compiling for gfx1151.\nfailed to execute:/nix/store/38am99f653hccgj56jg545w6pn5vf3w2-hipClang/bin/clang++  --offload-arch=gfx1151  --cuda-device-only -O3 --no-offload-compress --rocm-path=/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3 --hip-path=/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3 -I/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3/include --rocm-device-lib-path=/nix/store/bb0c3xjc5cn4f8hgbbgwcp03wa9d4gxw-rocm-device-libs-22.0.0-rocm/amdgcn/bitcode -o \"/tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/.kv_cache_write_q8_0_independent.ae4df8f416708260.2366969_50_1789061368733169615.hsaco.tmp\" -x hip /tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hip\n (hipError=0)",
+            "class": "gpu",
+            "retryable": true,
+            "rolled_back": true,
+            "attempt_id": 301,
+            "id": "lane-abort"
+          }
+        ],
+        "lane-commit": [
+          {
+            "type": "error",
+            "message": "batch GPU error: forward_decode_batch: HipError(0): hipcc compilation failed for kv_cache_write_q8_0_independent:\n/tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hip:6:10: fatal error: 'kv_slot_desc.h' file not found\n    6 | #include \"kv_slot_desc.h\"\n      |          ^~~~~~~~~~~~~~~~\n1 error generated when compiling for gfx1151.\nfailed to execute:/nix/store/38am99f653hccgj56jg545w6pn5vf3w2-hipClang/bin/clang++  --offload-arch=gfx1151  --cuda-device-only -O3 --no-offload-compress --rocm-path=/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3 --hip-path=/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3 -I/nix/store/lqklrnx2bc9k765jyxc0d8q6h15wlybb-clr-7.2.3/include --rocm-device-lib-path=/nix/store/bb0c3xjc5cn4f8hgbbgwcp03wa9d4gxw-rocm-device-libs-22.0.0-rocm/amdgcn/bitcode -o \"/tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/.kv_cache_write_q8_0_independent.ae4df8f416708260.2366969_51_1789061369224252955.hsaco.tmp\" -x hip /tmp/hipfire-g4-home-g46-batch/.hipfire_kernels/gfx1151/kv_cache_write_q8_0_independent.ae4df8f416708260.hip\n (hipError=0)",
+            "class": "gpu",
+            "retryable": true,
+            "rolled_back": true,
+            "attempt_id": 302,
+            "id": "lane-commit"
+          }
+        ]
+      },
+      "terminal_count": 2,
+      "assertions": {
+        "both_started": true,
+        "one_terminal_each": true,
+        "abort_lane_aborted": false,
+        "commit_lane_done": true,
+        "attempt_correlation": true,
+        "commit_ready_each": false
+      }
+    },
+    "batch_snapshot_after_terminals": {
+      "event": {
+        "type": "test_state_snapshot",
+        "schema_version": 1,
+        "arch": "qwen35",
+        "eligible_routes": [
+          "qwen_ar",
+          "qwen_dflash"
+        ],
+        "state_epoch": 0,
+        "seq_pos": 0,
+        "conversation_len": 0,
+        "kv_hash": "ef63c0f140b9a325",
+        "kv_bytes": 67133440,
+        "recurrent_hash": "6a67742d55922325",
+        "recurrent_bytes": 120324096,
+        "graph_clean": true,
+        "replay_clean": false,
+        "drafter_reset": true,
+        "checkpoint_empty": true,
+        "adaptive_clean": true,
+        "asst_cache_empty": true,
+        "prefix_cache_clean": true
+      }
+    },
+    "batch_reset": {
+      "event": {
+        "type": "reset",
+        "rolled_back": true,
+        "state_epoch": 1,
+        "seq_pos": 0,
+        "conversation_len": 0,
+        "attempt_id": 303,
+        "retry_reset_eligible": true
+      }
+    },
+    "batch_unload": {
+      "event": {
+        "type": "unloaded"
+      }
+    },
+    "batch_reload": {
+      "event": {
+        "type": "loaded",
+        "arch": "qwen3_5",
+        "dim": 5120,
+        "layers": 64,
+        "vocab": 248320,
+        "vl": false,
+        "reasoning_contract": "qwen_jinja",
+        "reasoning_effort_native": false,
+        "reasoning_efforts": [
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ],
+        "cache_capable": true,
+        "retry_reset_eligible": true,
+        "continuous_batch_capable": false
+      }
+    },
+    "batch_after_reload_generate": {
+      "request": {
+        "type": "generate",
+        "id": "batch-after-reload",
+        "attempt_id": 304,
+        "prompt": "Answer one word: ready.",
+        "temperature": 0.0,
+        "max_tokens": 16,
+        "thinking_enabled": false
+      },
+      "event_types": [
+        "gen_start",
+        "token",
+        "commit_ready",
+        "done"
+      ],
+      "decoded_text": "ready",
+      "terminal_events": [
+        {
+          "type": "done",
+          "id": "batch-after-reload",
+          "tokens": 2,
+          "tok_s": 0.3,
+          "prefill_tokens": 18,
+          "prefill_ms": 168.0,
+          "prefill_tok_s": 107.1,
+          "decode_tok_s": 0.4,
+          "ttft_ms": 168.0,
+          "cached_tokens": 0,
+          "finish_reason": "stop",
+          "attempt_id": 304
+        }
+      ],
+      "terminal_count": 1,
+      "assertions": {
+        "one_terminal": true,
+        "attempt_correlation": true,
+        "commit_ready_seen": true,
+        "commit_ready_equals_done": true
+      }
+    },
+    "batch_final_unload": {
+      "event": {
+        "type": "unloaded"
+      }
+    }
+  },
+  "completed_at_utc": "2026-09-10T17:29:47Z"
+}

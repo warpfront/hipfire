@@ -1,0 +1,7 @@
+warning: user-defined alias `fmt` is shadowing an external subcommand found at `/run/current-system/sw/bin/cargo-fmt`
+  |
+  = note: this was previously accepted but will become a hard error in the future; see <https://github.com/rust-lang/cargo/issues/10049>
+error: no such command: `use-scripts-fmt-changed-sh-instead-of-cargo-fmt`
+
+help: view all installed commands with `cargo --list`
+help: find a package to install `use-scripts-fmt-changed-sh-instead-of-cargo-fmt` with `cargo search cargo-use-scripts-fmt-changed-sh-instead-of-cargo-fmt`

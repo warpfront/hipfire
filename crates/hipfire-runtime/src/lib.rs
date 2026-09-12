@@ -23,6 +23,7 @@ pub mod bf16_loader;
 pub mod cache_plan;
 #[cfg(feature = "deltanet")]
 pub mod cask;
+pub mod chatml;
 pub mod config;
 #[cfg(feature = "deltanet")]
 pub mod cpu_router;
@@ -39,6 +40,7 @@ pub mod eval_common;
 pub mod gguf;
 pub mod hfq;
 pub mod hfq_parallel;
+pub mod imagedec;
 pub mod kv_adaptive;
 pub mod kv_backend;
 pub mod kv_mode;
@@ -63,8 +65,10 @@ pub mod swap;
 pub mod tp_shard;
 #[cfg(feature = "deltanet")]
 pub mod triattn;
+pub mod weight_manifest;
 #[cfg(feature = "deltanet")]
 pub mod weight_pager;
+pub mod weight_store;
 
 pub mod emit_text;
 pub mod eos_filter;

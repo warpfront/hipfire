@@ -3939,6 +3939,39 @@ impl Gpu {
         result
     }
 
+    /// Recorder-aware scale for kernels that are part of a retained forward.
+    /// Input staging intentionally uses [`Self::scale_f32`] outside the tape.
+    #[cfg(feature = "deltanet")]
+    pub fn scale_f32_recorded(&mut self, x: &GpuTensor, scale: f32) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("scale_f32", kernels::SCALE_F32_SRC, "scale_f32")?;
+        let n = x.numel();
+        let xp = x.buf.as_ptr();
+        let nv = n as i32;
+        let sv = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &nv as *const _ as *mut c_void,
+            &sv as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        self.launch_maybe_blob(
+            "scale_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_i32(nv);
+                b.push_f32(sv);
+                b
+            },
+        )
+    }
+
     /// Fused `y[i] += c * x[i]` with a CPU-supplied scalar. Merges the
     /// (scale_f32 + add_inplace_f32) pair used by the MoE routed-expert
     /// epilogue — one kernel launch instead of two.
@@ -4817,26 +4850,29 @@ impl Gpu {
     pub fn gelu_tanh_f32(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("gelu_tanh_f32", kernels::GELU_TANH_SRC, "gelu_tanh_f32")?;
-        let func = &self.functions["gelu_tanh_f32"];
-        let mut xp = x.buf.as_ptr();
-        let mut op = out.buf.as_ptr();
-        let mut ni = n as i32;
+        let xp = x.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let ni = n as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut xp as *mut _ as *mut c_void,
-            &mut op as *mut _ as *mut c_void,
-            &mut ni as *mut _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
         ];
         let blocks = ((n + 255) / 256) as u32;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [blocks, 1, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        self.launch_maybe_blob(
+            "gelu_tanh_f32",
+            [blocks, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(op);
+                b.push_i32(ni);
+                b
+            },
+        )
     }
 
     /// Bias-add: x[batch, n] += bias[n] (in-place, broadcast over batch dim)
@@ -6155,6 +6191,338 @@ impl Gpu {
                 blob.push_i32(kernel_size_i32);
                 blob.push_i32(groups_i32);
                 blob.push_i32(group_size_i32);
+                blob
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// FLUX.1 2D axial RoPE, in-place (seed for the MMDiT forward's image
+    /// rotation). Matches the CPU `flux::rope_2d`: `x` is a
+    /// `[n_all, heads*head_dim]` row-major buffer; only rows in
+    /// `[row_offset, row_offset + n_img)` are rotated (the BFL text-first
+    /// concat means image rows sit at the end, so `row_offset` = n_text).
+    /// Positions are `(0, row, col, 0)` with `row = t/grid_w`, `col =
+    /// t%grid_w`, unless `ids` is given (an F32 `[n_img, 4]` table of
+    /// per-image-row positions, for FLUX.2 Klein's reference-image time
+    /// axis); `head_dim` splits into the `axes_dim` axial regions `[ax0,
+    /// ax1, ax2, ax3]` (real FLUX.1: `[16, 56, 56, 0]`, summing to head_dim).
+    pub fn rope_2d_flux_f32(
+        &mut self,
+        x: &GpuTensor,
+        row_offset: usize,
+        n_img: usize,
+        heads: usize,
+        head_dim: usize,
+        grid_w: usize,
+        axes_dim: [usize; 4],
+        theta: f64,
+        ids: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if n_img == 0 || heads == 0 || head_dim == 0 || grid_w == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rope_2d_flux_f32: dims must be > 0",
+            ));
+        }
+        if x.dtype != DType::F32 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("rope_2d_flux_f32: x dtype must be F32 (got {:?})", x.dtype),
+            ));
+        }
+        let sum_ax: usize = axes_dim.iter().sum();
+        if sum_ax != head_dim {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("rope_2d_flux_f32: axes_dim {axes_dim:?} must sum to head_dim {head_dim}"),
+            ));
+        }
+        for a in axes_dim {
+            if a % 2 != 0 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("rope_2d_flux_f32: axes_dim must be even (got {a})"),
+                ));
+            }
+        }
+        if let Some(t) = ids {
+            if t.dtype != DType::F32 || t.numel() < n_img * 4 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "rope_2d_flux_f32: ids must be F32 [n_img, 4]",
+                ));
+            }
+        }
+        let f32 = DType::F32.size();
+        let n_all = row_offset + n_img;
+        let need = n_all
+            .checked_mul(heads)
+            .and_then(|v| v.checked_mul(head_dim))
+            .and_then(|v| v.checked_mul(f32))
+            .unwrap();
+        if x.buf.size() < need {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "rope_2d_flux_f32: x buffer too small (have {} need {need} for [{n_all}, {heads}*{head_dim}] F32)",
+                    x.buf.size()
+                ),
+            ));
+        }
+        // Prefer the tuned kernel: same ABI and same math, but without the
+        // per-pair f64 `pow` that made the seed kernel run ~12x slower than a
+        // plain copy of the same bytes. `HIPFIRE_FLUX_ROPE_FAST=0` forces the
+        // seed kernel, so the two can be A/B-ed in one session on the real
+        // forward rather than compared across commits.
+        let fast =
+            hipfire_config::developer_var("HIPFIRE_FLUX_ROPE_FAST").map_or(true, |v| v != "0");
+        let (kernel, src) = if fast {
+            (
+                "rope_2d_flux_f32_fast",
+                crate::kernels::ROPE_2D_FLUX_F32_FAST_SRC,
+            )
+        } else {
+            ("rope_2d_flux_f32", crate::kernels::ROPE_2D_FLUX_F32_SRC)
+        };
+        let kernel: &str = kernel;
+        self.ensure_kernel(kernel, src, kernel)?;
+        let x_ptr = x.buf.as_ptr();
+        let ids_ptr = ids.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let row_offset_i = row_offset as i32;
+        let n_img_i = n_img as i32;
+        let heads_i = heads as i32;
+        let hd_i = head_dim as i32;
+        let grid_w_i = grid_w as i32;
+        let ax0_i = axes_dim[0] as i32;
+        let ax1_i = axes_dim[1] as i32;
+        let ax2_i = axes_dim[2] as i32;
+        let ax3_i = axes_dim[3] as i32;
+        // The seed kernel runs one thread per (row, head) and loops the pairs;
+        // the fast kernel runs one thread per (row, head, pair) so that
+        // adjacent lanes touch adjacent memory.
+        let total = if fast {
+            n_img * heads * (head_dim / 2)
+        } else {
+            n_img * heads
+        };
+        let block = 256u32;
+        let grid = total.div_ceil(block as usize) as u32;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &ids_ptr as *const _ as *mut c_void,
+            &row_offset_i as *const _ as *mut c_void,
+            &n_img_i as *const _ as *mut c_void,
+            &heads_i as *const _ as *mut c_void,
+            &hd_i as *const _ as *mut c_void,
+            &grid_w_i as *const _ as *mut c_void,
+            &ax0_i as *const _ as *mut c_void,
+            &ax1_i as *const _ as *mut c_void,
+            &ax2_i as *const _ as *mut c_void,
+            &ax3_i as *const _ as *mut c_void,
+            &theta as *const _ as *mut c_void,
+        ];
+        let bytes = need;
+        let timer = crate::profile::begin_timer(&self.hip, "rope_2d_flux_f32", kernel, bytes);
+        let result =
+            self.launch_maybe_blob(kernel, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(ids_ptr);
+                blob.push_i32(row_offset_i);
+                blob.push_i32(n_img_i);
+                blob.push_i32(heads_i);
+                blob.push_i32(hd_i);
+                blob.push_i32(grid_w_i);
+                blob.push_i32(ax0_i);
+                blob.push_i32(ax1_i);
+                blob.push_i32(ax2_i);
+                blob.push_i32(ax3_i);
+                blob.push_u64(theta.to_bits()); // double is 64-bit, no push_f64
+                blob
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// FLUX adaLN-Zero modulation affine, broadcast over rows (seed for the
+    /// MMDiT forward): `out[r,i] = x[r,i]*(1 + scale[i]) + shift[i]`
+    /// with `d`-wide `shift`/`scale` row vectors shared by every row. Covers
+    /// the double-block (twice per stream), single-block, and final-head
+    /// modulations. `output` may alias `x` (in-place) but not `shift`/`scale`.
+    pub fn modulate_f32(
+        &mut self,
+        x: &GpuTensor,
+        shift: &GpuTensor,
+        scale: &GpuTensor,
+        output: &GpuTensor,
+        n_rows: usize,
+        d: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if n_rows == 0 || d == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "modulate_f32: dims must be > 0",
+            ));
+        }
+        for (name, t) in [
+            ("x", x),
+            ("shift", shift),
+            ("scale", scale),
+            ("output", output),
+        ] {
+            if t.dtype != DType::F32 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("modulate_f32: {name} dtype must be F32 (got {:?})", t.dtype),
+                ));
+            }
+        }
+        let f32 = DType::F32.size();
+        let need_rows = n_rows
+            .checked_mul(d)
+            .and_then(|v| v.checked_mul(f32))
+            .unwrap();
+        let need_d = d.checked_mul(f32).unwrap();
+        for (name, t, need) in [
+            ("x", x, need_rows),
+            ("output", output, need_rows),
+            ("shift", shift, need_d),
+            ("scale", scale, need_d),
+        ] {
+            if t.buf.size() < need {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "modulate_f32: {name} buffer too small (have {} need {need} F32)",
+                        t.buf.size()
+                    ),
+                ));
+            }
+        }
+        const KERNEL: &str = "modulate_f32";
+        self.ensure_kernel("modulate_f32", crate::kernels::MODULATE_F32_SRC, KERNEL)?;
+        let x_ptr = x.buf.as_ptr();
+        let shift_ptr = shift.buf.as_ptr();
+        let scale_ptr = scale.buf.as_ptr();
+        let out_ptr = output.buf.as_ptr();
+        let n_rows_i = n_rows as i32;
+        let d_i = d as i32;
+        let total = n_rows * d;
+        let block = 256u32;
+        let grid = total.div_ceil(block as usize) as u32;
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &shift_ptr as *const _ as *mut c_void,
+            &scale_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &n_rows_i as *const _ as *mut c_void,
+            &d_i as *const _ as *mut c_void,
+        ];
+        let bytes = need_rows;
+        let timer = crate::profile::begin_timer(&self.hip, "modulate_f32", KERNEL, bytes);
+        let result =
+            self.launch_maybe_blob(KERNEL, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(shift_ptr);
+                blob.push_ptr(scale_ptr);
+                blob.push_ptr(out_ptr);
+                blob.push_i32(n_rows_i);
+                blob.push_i32(d_i);
+                blob
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// FLUX gated residual accumulation, in-place on `acc` (seed for the
+    /// MMDiT forward): `acc[r,i] += gate[i]*x[r,i]` with a
+    /// `d`-wide `gate` row vector shared by every row. Covers the double
+    /// block's `g1` (attn-proj) and `g2` (mlp) gates and the single block's
+    /// `g1` residual gate.
+    pub fn gated_add_f32(
+        &mut self,
+        acc: &GpuTensor,
+        gate: &GpuTensor,
+        x: &GpuTensor,
+        n_rows: usize,
+        d: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if n_rows == 0 || d == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gated_add_f32: dims must be > 0",
+            ));
+        }
+        for (name, t) in [("acc", acc), ("gate", gate), ("x", x)] {
+            if t.dtype != DType::F32 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "gated_add_f32: {name} dtype must be F32 (got {:?})",
+                        t.dtype
+                    ),
+                ));
+            }
+        }
+        let f32 = DType::F32.size();
+        let need_rows = n_rows
+            .checked_mul(d)
+            .and_then(|v| v.checked_mul(f32))
+            .unwrap();
+        let need_d = d.checked_mul(f32).unwrap();
+        for (name, t, need) in [
+            ("acc", acc, need_rows),
+            ("x", x, need_rows),
+            ("gate", gate, need_d),
+        ] {
+            if t.buf.size() < need {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "gated_add_f32: {name} buffer too small (have {} need {need} F32)",
+                        t.buf.size()
+                    ),
+                ));
+            }
+        }
+        const KERNEL: &str = "gated_add_f32";
+        self.ensure_kernel("gated_add_f32", crate::kernels::GATED_ADD_F32_SRC, KERNEL)?;
+        let acc_ptr = acc.buf.as_ptr();
+        let gate_ptr = gate.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let n_rows_i = n_rows as i32;
+        let d_i = d as i32;
+        let total = n_rows * d;
+        let block = 256u32;
+        let grid = total.div_ceil(block as usize) as u32;
+        let mut params: Vec<*mut c_void> = vec![
+            &acc_ptr as *const _ as *mut c_void,
+            &gate_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &n_rows_i as *const _ as *mut c_void,
+            &d_i as *const _ as *mut c_void,
+        ];
+        let bytes = need_rows;
+        let timer = crate::profile::begin_timer(&self.hip, "gated_add_f32", KERNEL, bytes);
+        let result =
+            self.launch_maybe_blob(KERNEL, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(acc_ptr);
+                blob.push_ptr(gate_ptr);
+                blob.push_ptr(x_ptr);
+                blob.push_i32(n_rows_i);
+                blob.push_i32(d_i);
                 blob
             });
         if let Some(t) = timer {

@@ -201,7 +201,7 @@ pub fn emit_spec_cancel_after_rollback(
     epilogue: &RollbackEpilogue,
 ) {
     if epilogue.rolled_back {
-        emit_qwen_ar_cancelled(stdout, id, completion_tokens);
+        crate::ar::emit_active_route_cancel(stdout, id, completion_tokens);
         return;
     }
     emit_fail_closed_error(
@@ -297,6 +297,136 @@ pub fn production_fail_closed_rollback_live(
     epilogue
 }
 
+/// Pipeline-parallel production fail-closed rollback (G4.7).
+///
+/// Extends [`production_fail_closed_rollback`] — host cursors, asst-turn
+/// cache clear, pp-aware recurrent/DN reset via [`reset_qwen35_recurrent`]
+/// (per-LA-device `bind_thread` + memset with error accumulation), llama KV
+/// arm, checkpoint rings, spec reset, single-`gpu` graph invalidate + sync —
+/// to the full PP device set: captured graphs are invalidated and the device
+/// is synchronized on `gpu` AND every `m.pp_gpus` device, each under its own
+/// `bind_thread`, with every failure accumulated via [`push_reset_err`].
+/// `rolled_back` is true only when every reset and every per-device sync
+/// succeeds.
+///
+/// `gpu` is the daemon's single handle (bound to the same physical device as
+/// `pp_gpus.devices[0]`); the shared HIP heap does not imply shared graph
+/// handles or drained streams, so per-device invalidate + sync is required
+/// (precedent: `ep_reset_after_abort` in qwen.rs).
+///
+/// A missing `pp_gpus` with `pp > 1` is recorded as an attestation error
+/// (fail-closed); with `pp <= 1` this degrades to the single-device rollback.
+pub fn production_pp_fail_closed_rollback(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> RollbackEpilogue {
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    let single = fail_closed_reset_target_and_spec(m, gpu, None, None);
+    let mut first_err: Option<String> = single.context;
+    if m.pp > 1 {
+        match m.pp_gpus.as_mut() {
+            Some(gpus) => {
+                for (rank, dev) in gpus.devices.iter_mut().enumerate() {
+                    if let Err(e) = dev.bind_thread() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("pp rank{rank} graph bind_thread"),
+                            e,
+                        );
+                    }
+                    dev.invalidate_graph_state();
+                }
+                for (rank, dev) in gpus.devices.iter_mut().enumerate() {
+                    if let Err(e) = dev.bind_thread() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("pp rank{rank} sync bind_thread"),
+                            e,
+                        );
+                    }
+                    if let Err(e) = dev.hip.device_synchronize() {
+                        push_reset_err(
+                            &mut first_err,
+                            &format!("pp rank{rank} device_synchronize"),
+                            e,
+                        );
+                    }
+                }
+            }
+            None => push_reset_err(&mut first_err, "pp_gpus", "pp>1 with no pp_gpus"),
+        }
+    }
+    match first_err {
+        None => RollbackEpilogue {
+            rolled_back: true,
+            context: None,
+        },
+        Some(e) => {
+            // Unattested: no replay observation may survive a dirty turn.
+            gpu.replay.invalidate_replay_observation_window();
+            RollbackEpilogue {
+                rolled_back: false,
+                context: Some(e),
+            }
+        }
+    }
+}
+/// Reset one mesh-backed request through the route's complete lifecycle owner.
+///
+/// PP owns a daemon `Gpu` handle in addition to its per-rank `Gpus`, so callers
+/// pass `Some(gpu)` and this dispatches to the all-device PP epilogue. Dense TP
+/// EP owns all device handles inside `LoadedModel::ep`, so it passes `None` and
+/// reuses the EP all-rank reset. A missing handle is itself an unattested
+/// failure; no caller may continue toward a normal terminal on that path.
+pub fn reset_mesh_request_state(
+    m: &mut LoadedModel,
+    gpu: Option<&mut rdna_compute::Gpu>,
+) -> RollbackEpilogue {
+    if m.pp > 1 {
+        return match gpu {
+            Some(gpu) => production_pp_fail_closed_rollback(m, gpu),
+            None => {
+                m.seq_pos = 0;
+                m.conversation_tokens.clear();
+                RollbackEpilogue {
+                    rolled_back: false,
+                    context: Some("PP reset missing daemon GPU handle".to_string()),
+                }
+            }
+        };
+    }
+    if m.ep.is_some() {
+        return crate::qwen::ep_reset_after_abort(m);
+    }
+    match gpu {
+        Some(gpu) => production_fail_closed_rollback(m, gpu, None, None),
+        None => {
+            m.seq_pos = 0;
+            m.conversation_tokens.clear();
+            RollbackEpilogue {
+                rolled_back: false,
+                context: Some("mesh reset has no EP or daemon GPU handle".to_string()),
+            }
+        }
+    }
+}
+
+fn emit_active_error_route_aware(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) {
+    if crate::ar::active_generation_route().is_some() {
+        crate::ar::emit_active_route_error(stdout, id, message, class, retryable, rolled_back);
+    } else {
+        emit_active_attempt_error(stdout, id, message, class, retryable, rolled_back);
+    }
+}
+
 /// Emit one correlated fail-closed error (no done). Appends epilogue context
 /// when rollback could not be attested.
 pub fn emit_fail_closed_error(
@@ -311,7 +441,35 @@ pub fn emit_fail_closed_error(
         Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
         _ => message.to_string(),
     };
-    emit_active_attempt_error(stdout, id, &full, class, retryable, epilogue.rolled_back);
+    emit_active_error_route_aware(stdout, id, &full, class, retryable, epilogue.rolled_back);
+    let _ = stdout.flush();
+}
+
+/// Emit a fail-closed error through an explicitly selected producer route.
+/// Batch drivers use this variant so one lane cannot clear the global route
+/// before another lane releases its own `(id, attempt_id)` start latch.
+pub fn emit_fail_closed_error_for_route(
+    route: crate::ar::GenerationRoute,
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    epilogue: &RollbackEpilogue,
+) {
+    let full = match &epilogue.context {
+        Some(ctx) if !epilogue.rolled_back => format!("{message} ({ctx})"),
+        _ => message.to_string(),
+    };
+    crate::ar::emit_generation_error(
+        route,
+        stdout,
+        id,
+        &full,
+        class,
+        retryable,
+        epilogue.rolled_back,
+    );
     let _ = stdout.flush();
 }
 
@@ -572,6 +730,26 @@ pub fn qwen_dflash_hit_length_cap(
     generated >= max_tokens && !decoded_eot && !semantic_stop
 }
 
+/// Shared ctx-capacity margin for the spec entry guard (`generate_dflash`
+/// AR fallback) and the in-loop guard (`generate_spec` hard error). A
+/// request fits only when prompt + budget + one full draft block fits the
+/// draft's context-indexed structures; the `+ block_size` margin is what the
+/// mid-loop `position + block_size >= ctx_capacity` break enforces per
+/// cycle. Both sites must use this so any request `generate_spec` would
+/// refuse falls back to AR at entry instead of erroring after `gen_start`
+/// (audit-DFlash Broken 5).
+pub fn spec_ctx_request_fits(
+    prompt_len: usize,
+    max_tokens: usize,
+    block_size: usize,
+    ctx_capacity: usize,
+) -> bool {
+    prompt_len
+        .saturating_add(max_tokens)
+        .saturating_add(block_size)
+        <= ctx_capacity
+}
+
 /// Extract held ToolCalls from a FinishSummary (generate_spec holds them).
 pub fn finish_summary_held_tool_calls(
     finish: &FinishSummary,
@@ -596,7 +774,7 @@ pub fn emit_ds4_malformed_action(
     debug_assert!(!action.store_cache);
     debug_assert!(!action.expose_tool_calls);
     debug_assert!(!action.retryable);
-    emit_active_attempt_error(
+    emit_active_error_route_aware(
         stdout,
         Some(id),
         &action.message,
@@ -660,8 +838,12 @@ pub fn emit_committed_event(
     t_ms: u64,
 ) {
     use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1"));
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_EMIT_TOKEN_IDS")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
     if !*ENABLED {
         return;
     }
@@ -1253,8 +1435,11 @@ pub fn fail_closed_epilogue_after_sync(
 /// + the slot's eos + the tokenizer and calls `carrier.make_spec_emitter`.
 pub struct SpecEmitRequest {
     pub im_end: Option<u32>,
-    /// Raw tool definitions (OpenAI-shape JSON); `None`/empty ⇒ no tool grammar.
+    /// Raw tool definitions (OpenAI-shape JSON); `None` ⇒ no tool-call parser.
     pub tools: Option<Vec<serde_json::Value>>,
+    /// Constrained tool grammar. False on XML-native Qwen3.5/3.8 (parser still
+    /// runs when `tools` is `Some`).
+    pub enable_grammar: bool,
     pub stop: Vec<String>,
     pub max_think: usize,
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
@@ -1289,6 +1474,11 @@ pub struct SpecRun {
     /// `finish.decoded_eot` — wrappers OR both so stop-at-max_tokens wins over
     /// length. GrammarViolation is fail-closed, not carried here.
     pub semantic_stop: Option<StopReason>,
+    /// The mid-loop `position + block_size >= ctx_capacity` break fired: the
+    /// draft cannot host another full block. Wrappers OR this into the
+    /// length-cap decision so the turn reports `finish_reason=length` with
+    /// no cache store instead of a natural `stop`.
+    pub ctx_exhausted: bool,
     /// Truthful rollback attestation when this turn ended fail-closed
     /// (grammar / open-think / malformed). `None` on safe Done paths.
     pub fail_closed_rollback: Option<RollbackEpilogue>,
@@ -1377,6 +1567,185 @@ pub fn maybe_inject_fault_after_prefill_dflash(
         &ep,
     );
     true
+}
+
+/// Fire one-shot after-first-decode fault on qwen DFlash (live slot/spec path).
+///
+/// Sits with the prefill seam above, not after the first `spec.step`: the
+/// prefill already ran the first target decode (KV/recurrent/drafter advanced,
+/// `first_token` sampled), and the emitter's `begin` below makes that token
+/// wire-visible — firing later would leak a `token` before the fail-closed
+/// terminal the AR loop attests at `ar.rs:4249`. Consumes the same
+/// `test_fault_after_first_decode` arm (`take_generation_fault_after_first_decode`,
+/// armed by `RequestFaultGuard`; no new mechanism, no new wire field) and
+/// produces the same single correlated `error` terminal. Returns true when
+/// the fault was taken (caller must return immediately).
+#[cfg(feature = "serve-fault-inject")]
+pub fn maybe_inject_fault_after_first_decode_dflash(
+    arch_id: u32,
+    seq_pos: &mut usize,
+    conversation_tokens: &mut Vec<u32>,
+    prefill_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    dflash_checkpoints: &mut Vec<(usize, speculative::DeltaNetSnapshot)>,
+    asst_turn_cache: &mut hipfire_loader::AsstTurnCache,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    slot: &mut dyn SpecTarget,
+    spec: &mut dyn Speculator,
+) -> bool {
+    if !take_generation_fault_after_first_decode() {
+        return false;
+    }
+    if !matches!(arch_id, 5 | 6) {
+        return false;
+    }
+    let ep = crate::common::production_fail_closed_rollback_live(
+        seq_pos,
+        conversation_tokens,
+        prefill_checkpoints,
+        dflash_checkpoints,
+        asst_turn_cache,
+        gpu,
+        slot,
+        spec,
+    );
+    crate::common::emit_fail_closed_error(
+        stdout,
+        Some(id),
+        "injected fault after first decode",
+        "gpu",
+        true,
+        &ep,
+    );
+    true
+}
+
+// ── G4.10 generation-fault hooks (test-only) ──
+
+// Test-only fault points for the dense/AR generation loops.
+//
+// Always compiled (unlike the `serve-fault-inject` wire hook) so ignored GPU
+// tests can arm faults without feature flags. Production never arms these;
+// an unarmed `take_*` is one thread-local load with no behavior change.
+// Both points are one-shot: taking an armed fault disarms it.
+std::thread_local! {
+    static GENERATION_FAULT_AFTER_PREFILL: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+    static GENERATION_FAULT_AFTER_FIRST_DECODE: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+// Test-only fault points for the vision (Qwen35-VL / dots.ocr) generation
+// paths (G4.8 lifecycle evidence). Same contract as the dense points above:
+// always compiled, never armed in production, one thread-local load when
+// unarmed. Unlike the dense points these carry a *site* ("prefill",
+// "decode", "argmax", "spec") because the vision matrix injects at several
+// seams. Unlike the one-shot dense points these are STICKY: several
+// generate entries share prefill helpers, so a consuming read at one entry
+// would hide the site from the loop that owns it (dots.ocr's spec loop).
+// The test clears them with `arm_*(None)` after each turn, exactly as it
+// used to unset the env. Previously these were `HIPFIRE_*_FAULT`
+// env reads, which violated the config-owned rule and could not be observed
+// through the process snapshot once the test toggled them mid-run.
+std::thread_local! {
+    static VISION_FAULT: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+    static DOTS_FAULT: std::cell::RefCell<Option<&'static str>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Arm (or clear with `None`) the Qwen35-VL fault at `site`.
+#[doc(hidden)]
+pub fn arm_vision_fault(site: Option<&'static str>) {
+    VISION_FAULT.with(|c| *c.borrow_mut() = site);
+}
+
+/// Read the armed Qwen35-VL fault site without disarming it.
+#[doc(hidden)]
+pub fn peek_vision_fault() -> Option<&'static str> {
+    VISION_FAULT.with(|c| *c.borrow())
+}
+
+/// Arm (or clear with `None`) the dots.ocr fault at `site`.
+#[doc(hidden)]
+pub fn arm_dots_fault(site: Option<&'static str>) {
+    DOTS_FAULT.with(|c| *c.borrow_mut() = site);
+}
+
+/// Read the armed dots.ocr fault site without disarming it.
+#[doc(hidden)]
+pub fn peek_dots_fault() -> Option<&'static str> {
+    DOTS_FAULT.with(|c| *c.borrow())
+}
+
+/// Arm (or disarm) the after-prefill fault.
+#[doc(hidden)]
+pub fn arm_generation_fault_after_prefill(armed: bool) {
+    GENERATION_FAULT_AFTER_PREFILL.with(|c| c.set(armed));
+}
+
+/// Take the armed after-prefill fault, disarming it.
+#[doc(hidden)]
+pub fn take_generation_fault_after_prefill() -> bool {
+    GENERATION_FAULT_AFTER_PREFILL.with(|c| c.replace(false))
+}
+
+/// Arm (or disarm) the after-first-decode fault.
+#[doc(hidden)]
+pub fn arm_generation_fault_after_first_decode(armed: bool) {
+    GENERATION_FAULT_AFTER_FIRST_DECODE.with(|c| c.set(armed));
+}
+
+/// Take the armed after-first-decode fault, disarming it.
+#[doc(hidden)]
+pub fn take_generation_fault_after_first_decode() -> bool {
+    GENERATION_FAULT_AFTER_FIRST_DECODE.with(|c| c.replace(false))
+}
+
+/// Arm the generation fault hooks from a daemon `generate` request carrying
+/// `test_fault_after_prefill` / `test_fault_after_first_decode` booleans.
+/// Missing or non-boolean fields disarm. Test-only wiring; the hooks are
+/// default-off and one-shot.
+#[doc(hidden)]
+pub fn arm_generation_faults_from_request(msg: &serde_json::Value) {
+    let flag = |k: &str| msg.get(k).and_then(|v| v.as_bool()).unwrap_or(false);
+    arm_generation_fault_after_prefill(flag("test_fault_after_prefill"));
+    arm_generation_fault_after_first_decode(flag("test_fault_after_first_decode"));
+}
+
+/// Disarm every generation fault hook on this thread.
+#[doc(hidden)]
+pub fn disarm_generation_faults() {
+    arm_generation_fault_after_prefill(false);
+    arm_generation_fault_after_first_decode(false);
+}
+
+/// Test-only per-request fault arming for the daemon (`serve-fault-inject`):
+/// arms the AR after-prefill hook and the generation hooks from the request's
+/// `test_fault_*` booleans, and disarms all of them on drop so an unconsumed
+/// arm cannot leak into the next request on this thread.
+#[cfg(feature = "serve-fault-inject")]
+#[doc(hidden)]
+pub struct RequestFaultGuard;
+#[cfg(feature = "serve-fault-inject")]
+impl RequestFaultGuard {
+    pub fn arm_from_request(msg: &serde_json::Value) -> Self {
+        let want = msg
+            .get("test_fault_after_prefill")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        crate::ar::arm_fault_after_prefill(want);
+        arm_generation_faults_from_request(msg);
+        Self
+    }
+}
+#[cfg(feature = "serve-fault-inject")]
+impl Drop for RequestFaultGuard {
+    fn drop(&mut self) {
+        crate::ar::arm_fault_after_prefill(false);
+        disarm_generation_faults();
+    }
 }
 
 // ── test-support helpers, moved with the daemon test modules ──
@@ -1537,7 +1906,7 @@ pub fn token_logprob_fields(
 
 #[cfg(test)]
 mod tests {
-    use super::latch_request_think_cap;
+    use super::{latch_request_think_cap, spec_ctx_request_fits};
 
     #[test]
     fn numeric_think_cap_latches_once_and_keeps_first_position() {
@@ -1565,5 +1934,30 @@ mod tests {
         ));
         assert!(latched);
         assert_eq!(mark, Some(4096));
+    }
+
+    #[test]
+    fn spec_ctx_request_fits_holds_one_block_margin() {
+        // Sum is prompt + max_tokens + block_size vs ctx_capacity: exactly
+        // at cap fits, cap+1 refuses, and a bare prompt+max_tokens == cap
+        // still refuses once the block margin is added (the band the entry
+        // guard used to admit and the loop guard then rejected).
+        assert!(spec_ctx_request_fits(100, 900, 24, 1024));
+        assert!(spec_ctx_request_fits(100, 899, 24, 1023));
+        assert!(!spec_ctx_request_fits(100, 900, 24, 1023));
+        assert!(!spec_ctx_request_fits(1000, 24, 24, 1024));
+        assert!(!spec_ctx_request_fits(900, 100, 24, 1023));
+        // Zero block degrades to the legacy prompt+max_tokens check.
+        assert!(spec_ctx_request_fits(100, 900, 0, 1000));
+        assert!(!spec_ctx_request_fits(100, 901, 0, 1000));
+        // Saturating arithmetic: huge budgets clamp instead of panicking
+        // (debug) or wrapping (release) into a false fit.
+        assert!(spec_ctx_request_fits(usize::MAX, 1, 1, usize::MAX));
+        assert!(!spec_ctx_request_fits(
+            usize::MAX - 10,
+            20,
+            0,
+            usize::MAX - 1
+        ));
     }
 }

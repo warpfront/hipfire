@@ -12,7 +12,8 @@
 //! 2. each rank computes ONLY its owned experts (+ the shared expert on rank 0)
 //!    into its partial via [`ForwardBindings::run_moe_ep`] (non-owned experts
 //!    read load-time zero-dummy weights → contribute 0),
-//! 3. `all_reduce_sum_f32` the partials across ranks (RCCL),
+//! 3. `all_reduce_sum_f32` the partials across ranks (canonical deterministic
+//!    rooted peer reduce; RCCL/legacy-unrooted only via explicit opt-in),
 //! 4. each rank adds the reduced partial into its residual stream via
 //!    [`ForwardBindings::ep_add_into_residual`].
 //!
@@ -56,19 +57,59 @@ pub fn ensure_rank_streams(gpus: &mut Gpus) -> Result<(), DispatchError> {
     Ok(())
 }
 
+/// Decode all-reduce selection. The DEFAULT is the canonical deterministic
+/// rooted peer reduce ([`crate::multi_gpu::Gpus::all_reduce_sum_f32_peer_rooted`]:
+/// every rank observes the exact same left-associated sum `((p0+p1)+p2)+...`
+/// over ranks in index order, regardless of N). Both non-canonical transports
+/// stay reachable via explicit opt-in only:
+/// - `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1` → legacy unrooted peer diagnostic,
+/// - `HIPFIRE_EP_PEER_ALLREDUCE_DECODE=0` → RCCL.
+/// Without peer access the canonical path cannot run, so it falls back to
+/// RCCL (and the selection log line says so).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DecodeArMode {
+    Canonical,
+    LegacyPeer,
+    Rccl,
+}
+
+static DECODE_AR_MODE: std::sync::LazyLock<DecodeArMode> = std::sync::LazyLock::new(|| {
+    match hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() {
+        Ok("1") => DecodeArMode::LegacyPeer,
+        Ok("0") => DecodeArMode::Rccl,
+        _ => DecodeArMode::Canonical,
+    }
+});
+
 fn all_reduce_sum_f32_decode(
     gpus: &mut Gpus,
     refs: &[&DeviceBuffer],
     count: usize,
 ) -> Result<(), DispatchError> {
-    // Decode stays on RCCL: its tiny per-token reduce is already fast. The
-    // peer-direct diagnostic remains available for both MoE and attention TP.
-    static PEER_DECODE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let use_peer = *PEER_DECODE.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_EP_PEER_ALLREDUCE_DECODE").as_deref() == Ok("1")
+    let mode = *DECODE_AR_MODE;
+    let use_rooted = mode == DecodeArMode::Canonical && gpus.peer_access_enabled;
+    // Selection log line: names the active path (once per process).
+    static LOGGED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    LOGGED.get_or_init(|| {
+        let path = match mode {
+            DecodeArMode::Canonical if gpus.peer_access_enabled => {
+                "canonical rooted-peer (fixed left fold over ranks; \
+                 HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1 selects legacy unrooted peer, \
+                 =0 selects RCCL)"
+            }
+            DecodeArMode::Canonical => {
+                "RCCL (canonical rooted-peer unavailable: peer access disabled)"
+            }
+            DecodeArMode::LegacyPeer => "legacy unrooted peer (HIPFIRE_EP_PEER_ALLREDUCE_DECODE=1)",
+            DecodeArMode::Rccl => "RCCL (HIPFIRE_EP_PEER_ALLREDUCE_DECODE=0)",
+        };
+        eprintln!("EP decode all-reduce: {path}");
     });
-    if use_peer {
+    if mode == DecodeArMode::LegacyPeer {
         gpus.all_reduce_sum_f32_peer(refs, count).map_err(hip_err)
+    } else if use_rooted {
+        gpus.all_reduce_sum_f32_peer_rooted(refs, count)
+            .map_err(hip_err)
     } else {
         gpus.all_reduce_sum_f32(refs, count).map_err(hip_err)
     }

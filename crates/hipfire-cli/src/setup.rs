@@ -415,9 +415,7 @@ fn resolve_rocm_root(explicit: Option<&Path>, yes: bool) -> Result<PathBuf> {
     // Env-based wrapper for call sites that do not have explicit hipcc/strict.
     // The live installer passes them explicitly via resolve_rocm_root_with to
     // avoid global mutation in tests (see rocm.rs:723-746 pattern).
-    let hipcc = std::env::var_os("HIPFIRE_HIPCC")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
+    let hipcc = hipfire_config::rocm::configured_compiler().map(|(_, path)| path);
     let strict = hipfire_config::rocm::is_strict_rocm();
     resolve_rocm_root_with(explicit, hipcc.as_deref(), strict, yes)
 }
@@ -507,9 +505,7 @@ fn canonicalize_or_keep(path: &Path) -> PathBuf {
 /// (e.g. `/opt/rocm/core`, `core-7`, `core-7.14` → one root). Canonicalization
 /// failure keeps the original path rather than discarding a usable candidate.
 fn usable_rocm_roots(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
-    let hipcc = std::env::var_os("HIPFIRE_HIPCC")
-        .filter(|v| !v.is_empty())
-        .map(PathBuf::from);
+    let hipcc = hipfire_config::rocm::configured_compiler().map(|(_, path)| path);
     let strict = hipfire_config::rocm::is_strict_rocm();
     usable_rocm_roots_with(roots, hipcc.as_deref(), strict)
 }

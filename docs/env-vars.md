@@ -105,7 +105,8 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | Variable | Default / sense | Notes |
 |---|---|---|
 | `HIPFIRE_SPECULATION` | `off`/`auto`/`ngram`/`dflash`/`mtp`/`dspark` | Canonical selector |
-| `HIPFIRE_DFLASH_DRAFT` | retired engine read | Still appears in legacy gate scripts; product draft discovery uses typed speculation/load policy and registry/filename matching. |
+| `HIPFIRE_DFLASH_DRAFT` | explicit draft path (overrides the registry sidecar); empty opts out | Legacy `developer.dflash_draft` read; still appears in legacy gate scripts. |
+| `HIPFIRE_VISION_SIDECAR` | explicit vision-tower sidecar path (overrides `params.vision`); empty opts out | Daemon load; validated at admission (arch 5\|6 + tower tensor), loaded by the Qwen35 carrier |
 | `HIPFIRE_DFLASH_CTX_CAP` | **8192**; `0` restores uncapped legacy behavior | Caps draft-side context storage; over-cap requests fall back to AR |
 | `HIPFIRE_DFLASH_WINDOW` | **0 / unset** (legacy), unless declared by draft metadata | Enables bounded draft SWA; refused with CASK eviction |
 | `HIPFIRE_DFLASH_MODE` | RuntimeConfig default **`off`** | Distinct from config `dflash_mode` apply path — product CLI also uses load params |
@@ -125,6 +126,14 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` / `HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD` | per-arch conf | |
 | `HIPFIRE_DDTREE_BUDGET` / `HIPFIRE_DDTREE_TOPK` | tree draft | Runtime defaults 256/8 if env-only; CLI config defaults 0/4 |
 | `HIPFIRE_DDTREE_*` | research/diag family | See inventory; not product defaults |
+
+### Vision tower sidecar
+
+| Variable | Default / sense | Notes |
+|---|---|---|
+| `HIPFIRE_VISION_SIDECAR` | explicit vision-tower path (overrides the registry sidecar); empty opts out | Read via `developer_var` (env beats `developer.vision_sidecar`); wired into the daemon load as `params["vision"]`. Skipped while `vision_mode=off`. |
+| `HIPFIRE_VISION_MODE` | tower sidecar gate: `off` (default) / `auto` / `on` | Env-compat for config `vision.mode`; projected into load params as `vision_mode` and enforced daemon-side. |
+| `HIPFIRE_IMAGE_DECODE` | VL image JPEG decode path: `cpu` (default) / `vcn` / `auto` | Env-compat for config `image.decode`; read via process snapshot in `hipfire-arch-qwen35-vl`. The standard daemon build compiles the `vcn-jpeg` path in (default feature). Runtime default remains `cpu`, which never enters the VCN prepass. `vcn` and `auto` attempt shared VCN JPEG decode and fall back to CPU for unsupported inputs, platforms where VCN is unavailable, or recoverable decode failure. A failed terminal GPU completion fails closed by quarantining the shared VA session, emitting a request error, and exiting the daemon nonzero (restart required) instead of unsafe same-device CPU fallback. When VCN runs, pooled decode surfaces stay leased until GPU preprocessing completes; the learned vision tower is unchanged. |
 
 ### Graph / MMQ / prefill
 
@@ -169,6 +178,8 @@ diagnostic and developer harness exports pending their cleanup.
 | `HIPFIRE_MAX_REQUEST_BYTES` | Body cap |
 | `HIPFIRE_SERVE_MAX_QUEUE` / `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` | Admission queue |
 | `HIPFIRE_EXPERIMENTAL_BUDGET_ALERT` | Research budget nudge |
+| `HIPFIRE_FA_PERTOKEN_MIN_CTX` | Context length past which an exact-gfx1100 Q8 small-batch (n = 4..32, head_dim 128/256, sequential non-tree, graph capture off) attend step leaves the batched flash kernel for the multi-row tile; default `4096`, `0` disables the route. Other arches, KV modes, shapes, and semantics retain the batched route. |
+| `HIPFIRE_RCCL_LIB` | Explicit `librccl.so` path, tried before the ROCm root. For distributions whose ROCm prefix does not carry RCCL (nixpkgs: `rocmtoolkit-merged` has HIP/HSA, `librccl` is a separate store path). |
 | `HIPFIRE_DEVICES` / `HIPFIRE_TP` / `HIPFIRE_TP_USE_RCCL` | Multi-GPU / TP. `HIPFIRE_DEVICES` is the compatibility alias for `hardware.devices`; startup lowers its physical list to ROCr selectors plus matching HIP logical selectors. |
 | `HIPFIRE_ALLOW_MIXED_ARCH=1` | Mixed arch pairs |
 | `HIPFIRE_PP_LAYERS` / `HIPFIRE_PP_PFLASH` | Pipeline parallel |
@@ -286,7 +297,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 **Do not hand-edit rows below** except by re-running the source scan.
 **Generation method:** token scan over visible `*.rs`, `*.py`, and `*.sh`, excluding ignored/generated files.
 **Columns:** variable; up to two lexical source paths.
-**Count:** 715
+**Count:** 738
 
 | Variable | Example source path(s) |
 |---|---|
@@ -517,6 +528,16 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_FLASH_PREFILL_FIXED_HD` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_FLASH_PARTIALS_BATCH` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/src/config.rs |
+| `HIPFIRE_FLUX_ATTN` | crates/hipfire-arch-diffusion/src/flux_gpu.rs, crates/rdna-compute/src/attention.rs |
+| `HIPFIRE_FLUX_ATTN_GRID` | crates/rdna-compute/src/attention.rs |
+| `HIPFIRE_FLUX_F16_ACT` | crates/hipfire-arch-diffusion/src/flux_gpu.rs |
+| `HIPFIRE_FLUX_GEMM_LDS` | crates/hipfire-arch-diffusion/src/flux_gpu.rs |
+| `HIPFIRE_FLUX_GEMM_PIPE` | crates/rdna-compute/src/gemm.rs |
+| `HIPFIRE_FLUX_GEMM_WIDE` | crates/hipfire-arch-diffusion/src/flux_gpu.rs |
+| `HIPFIRE_FLUX_GUIDANCE` | crates/hipfire-arch-diffusion/src/pipeline.rs |
+| `HIPFIRE_FLUX_MOD_GEMV` | crates/hipfire-arch-diffusion/src/flux_gpu.rs |
+| `HIPFIRE_FLUX_ROPE_FAST` | crates/rdna-compute/src/norm.rs |
+| `HIPFIRE_FLUX_WPAD` | crates/hipfire-arch-diffusion/src/flux_gpu.rs |
 | `HIPFIRE_FORCE_ANSWER_SECS` | scripts/test-qwen35-think-cap.sh |
 | `HIPFIRE_FORCE_REBUILD` | crates/hipfire-cli/src/main.rs, scripts/install.sh |
 | `HIPFIRE_FORCE_SPEC_GATE` | scripts/coherence-gate-dflash.sh |
@@ -684,6 +705,9 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_HOST_TIMING` | crates/hipfire-runtime/examples/dflash_spec_demo.rs, scripts/ddtree_verify_profile.sh |
 | `HIPFIRE_IDLE_TIMEOUT` | crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_IMAGE` | scripts/container-gate.sh |
+| `HIPFIRE_IMAGE_DECODE` | crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_IMG_COND_CACHE` | crates/hipfire-arch-diffusion/src/pipeline.rs |
+| `HIPFIRE_IMG_PROFILE` | crates/hipfire-arch-diffusion/src/pipeline.rs |
 | `HIPFIRE_JINJA_CHAT` | crates/hipfire-daemon/src/main.rs, crates/hipfire-runtime/src/prompt_frame.rs |
 | `HIPFIRE_JINJA_TOOLS_DRAFTER` | scripts/agentic-gate-jinja-tools.sh |
 | `HIPFIRE_JINJA_TOOLS_MODEL` | scripts/agentic-gate-jinja-tools.sh |
@@ -895,6 +919,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_QWEN_MOE_FINAL_NORM_RAW` | scripts/test_pr228_spiral_check.sh |
 | `HIPFIRE_QWEN_MTP` | crates/hipfire-daemon/src/main.rs, scripts/serve_harness.py |
 | `HIPFIRE_QWEN_PROMPT_CACHE` | crates/hipfire-daemon/src/main.rs |
+| `HIPFIRE_RCCL_LIB` | crates/hip-bridge/src/rccl.rs |
 | `HIPFIRE_RDNA2_VARIANT` | crates/hipfire-cli/src/main.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_RDNA3_HFQ4_LM_HEAD_K2048` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_RDNA3_HFQ4_MOE_GATE_UP_K2048` | crates/rdna-compute/src/feature_flags.rs |
@@ -996,6 +1021,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_SWEEP_OUT` | scripts/mq3-mq2-sweep.sh, scripts/spec_decode_genre_sweep.sh |
 | `HIPFIRE_SWEEP_PROMPTS_DIR` | scripts/mq3-mq2-sweep.sh |
 | `HIPFIRE_SWEEP_RUNS` | scripts/ddtree_budget_sweep.sh |
+| `HIPFIRE_T5_GPU` | crates/hipfire-arch-diffusion/src/pipeline.rs |
 | `HIPFIRE_TARGET_ARCH` | crates/rdna-compute/src/dispatch.rs, scripts/kernel_atlas.py |
 | `HIPFIRE_TEST_MODEL` | scripts/test-qwen35-abort-resume.sh, scripts/test-qwen35-think-cap.sh |
 | `HIPFIRE_THINK_CONTINUATION` | crates/hipfire-arch-qwen35/src/spec_emit.rs, crates/hipfire-daemon/src/main.rs |
@@ -1008,10 +1034,21 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_TUI_BIN` | crates/hipfire-cli/src/main.rs |
 | `HIPFIRE_UNIFORM_GATE_UP` | crates/hipfire-runtime/examples/hfq_splice_attn.rs |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
+| `HIPFIRE_VAE_CONFIG_ONLY` | crates/hipfire-arch-diffusion/src/pipeline.rs |
+| `HIPFIRE_VAE_CONV` | crates/hipfire-arch-diffusion/src/vae_gpu.rs |
+| `HIPFIRE_VAE_FUSE_NORM` | crates/hipfire-arch-diffusion/src/vae_gpu.rs |
+| `HIPFIRE_VAE_GPU` | crates/hipfire-arch-diffusion/src/pipeline.rs |
+| `HIPFIRE_VAE_IM2COL_MAP` | crates/rdna-compute/src/vae.rs |
+| `HIPFIRE_VAE_IM2COL_MB` | crates/hipfire-arch-diffusion/src/vae_gpu.rs |
+| `HIPFIRE_VAE_IM2COL_TILE` | crates/rdna-compute/src/vae.rs |
+| `HIPFIRE_VAE_PROFILE` | crates/hipfire-arch-diffusion/src/vae_gpu.rs |
+| `HIPFIRE_VAE_TRANSPOSE` | crates/rdna-compute/src/vae.rs |
 | `HIPFIRE_VERIFY_GRAPH` | crates/hipfire-arch-qwen35/src/mtp_probe.rs, crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_VERIFY_GRAPH_TIMING` | crates/hipfire-arch-qwen35/src/speculative.rs |
 | `HIPFIRE_VERIFY_GRAPH_TREE` | crates/hipfire-arch-qwen35/src/speculative.rs, scripts/tree_graph_bench.sh |
 | `HIPFIRE_VERSION` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/build_kld_ref_native.rs |
+| `HIPFIRE_VISION_MODE` | crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_VISION_SIDECAR` | crates/hipfire-cli/src/main.rs, crates/hipfire-cli/src/serve/mod.rs |
 | `HIPFIRE_VL_DUMP_DIR` | crates/hipfire-runtime/examples/infer.rs |
 | `HIPFIRE_WEIGHT_BUFFER_LOADS_FLAT_GEMV_OPT_IN` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_WEIGHT_BUFFER_LOADS_OPT_IN` | crates/rdna-compute/src/kernels.rs |
@@ -1052,4 +1089,5 @@ When adding a user-facing knob:
 |---|---|---|
 | `HIPFIRE_ATTN_TILE_SIZE` | `128` | Tile size for the batched attention tile+reduce path. Must be a positive multiple of 32; anything else falls back to 128. Resolved once via `Gpu::attn_tile_size()`. **Raising it is safe; lowering it increases `max_tiles` and therefore the `partials` bytes per query row, which can exceed buffers sized elsewhere against the 128 default.** |
 | `HIPFIRE_VRAM_BUDGET_BYTES` | 32 GiB | Deployment-target VRAM ceiling used by the SP1 benchmark harnesses' preflight. Read by `examples/`, not by production code. |
+| `HIPFIRE_OOM_GUARD` | `auto` | Typed key `memory.oom_guard`. Gates **only** the host `MemAvailable` headroom half of `kv_slots::preflight_alloc` / `SlotPool` / CLI bench-sweep preflight. The R9700 deployment-target VRAM-budget check **always runs**. `auto`: on for unified-memory APU archs (gfx1035/1036/1103/1150/1151/1152), off for recognized discrete GPUs, and for processes with no known GPU arch by host swap state (no swap → on; unreadable → on). `1`/`true`/`0`/`false` force either way. The auto decision is logged once to stderr with its reason. `scripts/run-bounded.sh` remains the hard backstop. Full write-up: [`CONFIG.md`](CONFIG.md#memoryoom_guard). |
 | `HIPFIRE_MEM_CAP` | `24G` | Read by `scripts/run-bounded.sh`, not by the binaries: cgroup `MemoryMax` for a gated run. Exit 137 means the cap fired — shrink the configuration rather than raising it. |

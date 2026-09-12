@@ -47,6 +47,9 @@ pub mod qwen;
 /// MiniMax-M2, Cohere2-MoE, Gemma4, Muse Glimmer, Qwen2, LLaMA.
 pub mod dense;
 
+/// Image generation: the `img_generate` wire body (FLUX.1/FLUX.2),
+/// including reference-image decode and the GPU/CPU denoise split.
+pub mod img;
 /// Vision and OCR: Qwen3.5-VL and dots.ocr, including the text-only
 /// dots.ocr path.
 pub mod vision;

@@ -663,6 +663,78 @@ impl Engine {
         Ok(response)
     }
 
+    /// Image generation request: send `img_generate`, surface every
+    /// `img_progress` event through `event`, and return the terminal
+    /// `img_done` value. Mirrors the control-channel discipline of
+    /// [`Engine::load`] — one persistent channel for the whole transaction,
+    /// so progress lines emitted between receives are never dropped.
+    pub fn img_generate(
+        &self,
+        request: &Value,
+        mut event: impl FnMut(&Value) -> Result<()>,
+    ) -> Result<Value> {
+        let request_id = request
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ClientError::Protocol("img_generate request missing id".into()))?
+            .to_owned();
+        let (tx, rx) = mpsc::channel();
+        // Two routing classes share this one channel:
+        // - `img_progress` / `img_done` are non-lifecycle and the reader
+        //   delivers them on the control slot, so register `tx` there.
+        // - the daemon's img_generate refusals are `error` lifecycle events
+        //   carrying (id, attempt_id=0); the reader routes those into the
+        //   `pending` map, and without a registration here they would be
+        //   quarantined and this transaction would hang forever.
+        let key = (request_id.clone(), 0u64);
+        {
+            let mut map = self.inner.dispatch.pending.lock().unwrap();
+            if map.contains_key(&key) {
+                return Err(ClientError::Protocol(format!(
+                    "duplicate live img_generate id={request_id} attempt_id=0"
+                )));
+            }
+            map.insert(key.clone(), tx.clone());
+        }
+        *self.inner.dispatch.control.lock().unwrap() = Some(tx);
+        let send_res = self.send(request);
+        if let Err(e) = send_res {
+            *self.inner.dispatch.control.lock().unwrap() = None;
+            self.inner.dispatch.pending.lock().unwrap().remove(&key);
+            return Err(e);
+        }
+        loop {
+            let response = match self.recv_control(&rx) {
+                Ok(v) => v,
+                Err(e) => {
+                    *self.inner.dispatch.control.lock().unwrap() = None;
+                    self.inner.dispatch.pending.lock().unwrap().remove(&key);
+                    return Err(e);
+                }
+            };
+            match response.get("type").and_then(Value::as_str) {
+                Some("img_done") => {
+                    *self.inner.dispatch.control.lock().unwrap() = None;
+                    self.inner.dispatch.pending.lock().unwrap().remove(&key);
+                    return Ok(response);
+                }
+                Some("error") => {
+                    *self.inner.dispatch.control.lock().unwrap() = None;
+                    self.inner.dispatch.pending.lock().unwrap().remove(&key);
+                    return Err(daemon_error_from_value(&response));
+                }
+                _ => {
+                    if let Err(e) = event(&response) {
+                        *self.inner.dispatch.control.lock().unwrap() = None;
+                        self.inner.dispatch.pending.lock().unwrap().remove(&key);
+                        return Err(e);
+                    }
+                }
+            }
+        }
+    }
+
     pub fn generate(
         &self,
         request: &Value,
@@ -1957,6 +2029,23 @@ mod tests {
         assert_eq!(
             route_lifecycle_event("error", &err),
             LifecycleRoute::Pending(("req-g".into(), 7))
+        );
+    }
+
+    #[test]
+    fn route_lifecycle_keyed_zero_error_stays_on_exact_pending_channel() {
+        let err = serde_json::json!({
+            "type": "error",
+            "id": "req-zero",
+            "message": "generate attempt_id must be nonzero",
+            "class": error_class::VALIDATION,
+            "retryable": false,
+            "rolled_back": false,
+            "attempt_id": 0,
+        });
+        assert_eq!(
+            route_lifecycle_event("error", &err),
+            LifecycleRoute::Pending(("req-zero".into(), 0))
         );
     }
 
@@ -3332,6 +3421,56 @@ done
         assert_eq!(typed.attempt_id, 5);
         // Control plane remains healthy after a keyed generation error.
         engine.ping().expect("control not poisoned by keyed error");
+        drop(engine);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn generate_zero_error_reaches_exact_waiter() {
+        let root = env::temp_dir().join(format!(
+            "hipfire-client-zero-attempt-{}-{}",
+            std::process::id(),
+            "waiter"
+        ));
+        let daemon = write_fake_daemon(
+            &root,
+            r#"#!/bin/sh
+while IFS= read -r line; do
+  case "$line" in
+    *'"generate"'*)
+      # A raw daemon rejection remains routeable by its exact (id,
+      # attempt_id) key; the daemon never activates generation ownership.
+      echo '{"type":"error","id":"req-zero","message":"generate attempt_id must be nonzero","class":"validation","retryable":false,"rolled_back":false,"attempt_id":0}'
+      ;;
+    *'"ping"'*) echo '{"type":"pong"}' ;;
+    *'"unload"'*) echo '{"type":"unloaded"}'; exit 0 ;;
+  esac
+done
+"#,
+        );
+        let engine = spawn_fake_engine(&daemon);
+        let err = engine
+            .generate(
+                &serde_json::json!({"type":"generate","id":"req-zero","attempt_id":0}),
+                |_| Ok(()),
+            )
+            .unwrap_err();
+        let typed = err
+            .typed_daemon()
+            .expect("reserved-attempt validation error");
+        assert_eq!(typed.id.as_deref(), Some("req-zero"));
+        assert_eq!(typed.attempt_id, 0);
+        assert_eq!(typed.class, error_class::VALIDATION);
+        assert_eq!(typed.message, "generate attempt_id must be nonzero");
+        assert_eq!(
+            engine.active_attempt_id(),
+            None,
+            "zero-attempt rejection must not retain active client state"
+        );
+        engine
+            .ping()
+            .expect("control plane remains healthy after zero rejection");
         drop(engine);
         let _ = fs::remove_dir_all(root);
     }

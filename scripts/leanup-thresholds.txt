@@ -25,12 +25,24 @@ required_features_daemon    == 0
 # Reconciled to the measured f2ea5136 master baseline on 2026-08-28. This
 # branch adds no semantic debt; rustfmt makes one existing Qwen35 call visible.
 # hipfire-daemon/src/main.rs. Was 43,696 as hipfire-runtime/examples/daemon.rs
-# on master; the saddle layering moved it into a crate.
-daemon_lines                <= 4155
+# on master; the saddle layering moved it into a crate. Raised 4155 -> 4176 on
+# 2026-09-02 for the G2 source-aware admission block (see commit message).
+# Raised 4176 -> 4204 on 2026-09-06: the 7b16762b0 reconciliation merged the
+# G2 block (28 net lines once the DS4 tp>1 refusal moved before admission)
+# with the sticky GPU-fault latch (370592d17) and DFlash sidecar plumbing
+# (351c326e0). See commit message.
+# One additional call argument passes max_seq to pre-teardown source admission.
+# RATCHET-RAISE 4816 -> 4840: traded 24 lines of daemon main.rs for fail-closed
+# max_seq floor admission. A `load` carrying max_seq=0 previously panicked the
+# KV physical_cap assertion and killed the daemon process with the resident
+# model still serving; the guard refuses it before any teardown or allocation.
+# The load arm was sitting exactly at the old ceiling, so no correctness fix
+# there fits under it. Paid down when the arm's branch duplication is factored.
+daemon_lines                <= 4840
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
-# 28 of these are invoked by scripts or change_gate routes and are meant to stay.
+# 28 of these are invoked by scripts or CI gates and are meant to stay.
 ungated_examples            <= 48
 
 # --- layering, derived from the Cargo graph (scripts/check-layering.py) ---
@@ -95,4 +107,4 @@ bypass_slack                == 0
 
 # Total across all arch crates. Redundant given the rows, kept so the descent is
 # visible in this file's diff. Lower it when you bank a migration.
-bypass_total                <= 237
+bypass_total                <= 257

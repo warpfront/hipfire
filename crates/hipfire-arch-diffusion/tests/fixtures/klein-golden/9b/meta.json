@@ -1,0 +1,40 @@
+{
+  "prompt_file": "prompt.txt",
+  "prompt_md5": "f3998d154ce21b15df261b0b4a2d1d60",
+  "prompt_bytes": 50,
+  "seed": 7,
+  "steps": 4,
+  "width": 1024,
+  "height": 1024,
+  "cfg": 1.0,
+  "sampler": "euler",
+  "scheduler": "Flux2Scheduler (empirical mu, exponential shift)",
+  "source": "ComfyUI 0.31.0 (frontend 1.48.7) on inferno02 gfx1151; UNETLoader flux-2-klein-9b.safetensors (weight_dtype default = bf16), CLIPLoader qwen_3_8b.safetensors type flux2 (bf16), VAELoader flux2-vae.safetensors",
+  "graph": "comfy-graph.json",
+  "date": "2026-09-05",
+  "hipfire_commit": "1acdf494",
+  "md5": {
+    "init.latent": "c4383f2f9110a0734b02bde2ba9c6be4",
+    "golden.latent": "e978e8863f77996cc915e70d472d376e",
+    "golden.png": "a10d95803c57abb2fa0fa5af376d0c00",
+    "step1.latent": "a5777cbbd863ab704eb22bf346f1afe1",
+    "prompt.txt": "f3998d154ce21b15df261b0b4a2d1d60"
+  },
+  "latent_shape": [1, 128, 64, 64],
+  "velocity_regression_bar": 0.10,
+  "note_velocity_regression_bar": "2x the measured value at commit e25d44cb (step-1 velocity rel_l2 4.909e-2 against the bf16 oracle); a regression tripwire, not a correctness bound. The correctness ceiling stays VELOCITY_TOL = 0.15, the ComfyUI fp8-vs-bf16 bracket, unchanged and shared with the 4B fixture. This bar is per-fixture because the measured values differ by ~4x across the three (edit 1.34e-2, 4B 3.11e-2, 9B 4.91e-2) and one shared number would be as loose as the ceiling for the tightest of them. See ../4b/meta.json note_velocity_regression_bar for the full rationale and the update rule.",
+
+  "note_scope": "This is the 9B twin of the 4B txt2img fixture. Everything about the CONVENTIONS (latent order, normalization, noise extraction, schedule, the step1 factor, why the gate asserts on the step-1 velocity rather than the final latent) is identical and is documented once, in ../4b/meta.json. Only what is 9B-SPECIFIC is written here.",
+
+  "note_model": "FLUX.2-klein-9B: transformer hidden 4096, 8 double + 24 single blocks, 32 heads, head_dim 128, mlp 12288, txt_hidden 12288 (3 taps x 4096); text encoder Qwen3-8B, hidden 4096, 36 layers, 32 q heads / 8 kv heads, intermediate 12288. Same VAE as the 4B pipe (BatchNorm(128) latent norm), so the same latent conventions and the same DECODE_TOL apply unchanged. Same 1024x1024 latent shape [1,128,64,64] as the 4B fixture, so image_seq_len 4096, mu 2.291179895 and the sigma list are BYTE-FOR-BYTE the 4B ones: the schedule is a function of (steps, width, height) only and does not see the model.",
+
+  "note_oracle_text_encoder": "THE ORACLE'S TEXT ENCODER IS THE bf16 FILE — deliberately, and it took looking. ComfyUI needs a Qwen3-8B in its own single-file format. The obvious candidate, and the one the task brief named as the only published one, is qwen_3_8b_fp8mixed.safetensors; Comfy-Org/flux2-klein-9B (which HTTP-redirects to Comfy-Org/vae-text-encorder-for-flux-klein-9b, so `curl` without -L returns the redirect text and `jq` chokes on it) in fact publishes THREE: qwen_3_8b.safetensors (bf16, 16381517176 B, sha256 f0ff9239d56269ca1d05e5f86da6a79fac111af464955681f11c7ab0ec5ef6c1, md5 25eb20e3325386017b9a04951695d453), qwen_3_8b_fp8mixed.safetensors (8664848742 B, sha256 abad16806e0cbabc54e0325d6565847443fe396d5f0be38bb3cd3fe75a1201d6, md5 12b4156a3b0db375b222cb8c291e2b34) and qwen_3_8b_fp4mixed.safetensors (6802593327 B). The bf16 file is the one that matches how the 4B fixture was captured (qwen_3_4b.safetensors is 8044982048 B = 2 bytes/param, i.e. full precision), so the 9B gate measures the same thing the 4B gate does rather than a text-encoder dtype on top of it. Both encoders were captured; the fp8-mixed run is kept as the CONTROL and its graph is comfy-graph-fp8te.json. See note_encoder_bracket.",
+
+  "note_encoder_bracket": "THE TEXT-ENCODER DTYPE BRACKET, measured ComfyUI-against-ComfyUI with the encoder as the ONLY change (same graph, same seed-7 RandomNoise, same bf16 transformer, same VAE): init.latent payloads are BYTE-IDENTICAL (rel_l2 0.0000e0 — the noise does not depend on the encoder, which is also the check that the two captures really differ in one input only), the step-1 latent moves rel_l2 4.5074e-3, and the FINAL latent moves rel_l2 4.2548e-1. Undiluted, that step-1 number is a VELOCITY bracket of about 0.122 (multiply by ||x1||/((1-sigma1)*||v||) = 0.9784/(0.032616*1.1075) = 27.1). Two things follow. (1) A text-encoder dtype change is worth almost exactly as much on the final latent as a TRANSFORMER weight-dtype change is on the 4B fixture (4.255e-1 vs 4.158e-1) — the distilled 4-step schedule integrates whatever perturbation it is given and does not care where it came from. (2) hipfire measured against the fp8-mixed oracle reads velocity 1.1667e-1 / final 3.9325e-1, i.e. INSIDE the 0.122 / 0.425 bracket that the two ComfyUI oracles show against each other; measured against the bf16 oracle it reads 4.9085e-2 / 2.1636e-1. The fp8 run is therefore not a hipfire result at all — it is the oracle moving.",
+
+  "note_block_parity_tol": "gpu_klein_block_parity is the INTRA-hipfire f32-CPU-vs-f16-GPU gate, and its 5e-3 per-part bar is calibrated on the 4B geometry. On 9B it reads 4.633e-3 (default pass) and 6.539e-3 (--refs), so the --refs pass needs TOL_L2=8e-3. 8e-3 IS ROUNDED UP FROM THE MEASURED 6.539e-3, NOT A DERIVED BRACKET; the 4B->9B ratio 2.99x is unexplained (a naive f16-accumulation scaling model, sqrt(depth*hidden) = sqrt((32*4096)/(25*3072)) = 1.31, predicts 1.30x). It is the one bar in the Klein suite that is not a measured bracket — note_gate_bars' four all are — and its confidence rests on the discrimination controls in the measurements above (the 4B control reproducing to the digit, the monotone no-step-change curve, the magnitude being a rounding number, HIPFIRE_FLUX_WPAD=0 reproducing byte-identically, and the independent ComfyUI-oracle gate passing FIRST), not on the arithmetic. A third Klein size would settle it. TOL_L2 fails closed: unparseable, or outside (0, 0.05], exits 1 before the checkpoint is opened.",
+
+  "note_gate_bars": "The 9B gate uses the SAME four bars as the 4B one, UNCHANGED — DECODE_TOL 0.05, VELOCITY_TOL 0.15, TOL 0.0935, FINAL_TOL 0.42 — and passes all four with no env override. Measured on 1acdf494 + this commit: step-1 velocity rel_l2 4.9085e-2 (rel_inf 2.4787e-1), step-1 latent 1.8130e-3, final latent 2.1636e-1, golden decode 8.8527e-3, our-decode-vs-ComfyUI-PNG 2.0207e-1 (diagnostic), growth 119.3x over 4 steps, 3489 ms/step steady state. Read against 4B (3.108e-2 / 1.159e-3 / 2.196e-1 / 8.435e-3): the 9B forward is ~1.6x the 4B on the velocity and INDISTINGUISHABLE on the final latent and the decode. The velocity ratio tracks the f16 accumulation the internal CPU/GPU block parity shows independently (4B worst 2.189e-3 vs 9B worst 6.539e-3 on --refs, same command, same deterministic inputs), which is what a deeper and wider forward in the same code is supposed to look like. The bars were NOT moved for 9B; the only tolerance that moved anywhere in this task is gpu_klein_block_parity's TOL_L2, which is an intra-hipfire f16 band and is documented at its own constant.",
+
+  "regenerate": "jq -c '{prompt: ., client_id: \"hipfire-klein-9b-bf16te\"}' comfy-graph.json > /tmp/post9b.json ; curl -s -X POST -H 'Content-Type: application/json' -d @/tmp/post9b.json http://127.0.0.1:8188/prompt ; poll GET /history/<prompt_id> ; copy /home/user/comfy-outputs/latents/klein9b_bf16te_init_*.latent -> init.latent, klein9b_bf16te_step1_*.latent -> step1.latent, klein9b_bf16te_golden_*.latent -> golden.latent, /home/user/comfy-outputs/klein9b_bf16te_golden_*.png -> golden.png, then chmod 644 (ComfyUI writes latents 0600). ONE graph produces all four and every sampler consumes the SAME RandomNoise node, so the noise the golden was made from is the noise that gets saved. Check the regenerated init.latent by its STATISTICS (the gate asserts mean ~0 / std ~1), never by its size. The fp8-mixed CONTROL is the same recipe with comfy-graph-fp8te.json and the klein9b_* prefixes."
+}

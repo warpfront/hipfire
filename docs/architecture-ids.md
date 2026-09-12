@@ -51,6 +51,36 @@ them for ordinary dispatch.
 | 0xFF | Toy / template | `hipfire-arch-toy` | Never ship; daemon must not dispatch. No current carrier claims it. Registry disjointness tests include `0xFF` and assert at most one claimer — they do **not** assert zero claimers / hard-reserved. |
 | `u32::MAX` | Unclaimed dir sentinel | `safetensors_source::UNCLAIMED_ARCH_ID` | Emitted for unrecognized `model_type`; no carrier matches → fail closed. |
 
+## Image-generation component ids (40–47)
+
+Diffusion checkpoints are **components, not chat models**: loadable for image
+generation, never text-served. The block is deliberately **high** — ids 16–19
+stay free for the next sequential primary text arches, which a component
+claim would silently collide with (the registry disjointness sweep covers
+0..=64, so 40+ is still test-enforced).
+
+The block is **grouped by family, extension-only**: FLUX.1 owns 40–43 (trunk +
+its two text encoders + the VAE it shares with FLUX.2), FLUX.2 owns 45–46 (44
+is intentionally spare, kept free for a future need), and future families
+(SD/SDXL) start at 47. New components get the next free id;
+ids are never re-numbered once a pack ships.
+
+Only the trunk ids (40, 45) are claimed by a carrier. The sidecar ids (41, 42,
+43, 46) live in the headers of the per-component HFQ packs that
+`hipfire-quantize --flux-pipe` writes, and the trunk's carrier resolves the
+sidecars next to the trunk file; no carrier claims a sidecar id on its own.
+
+| arch_id | Family | Crate | Carrier | Notes |
+|---:|---|---|---|---|
+| 40 | Flux MMDiT (checkpoint trunk) | `hipfire-arch-diffusion` | `FluxDiffusionCarrier` | `model_type flux` or `_class_name FluxTransformer2DModel` → 40. Daemon name `flux_mmdit`, served as `img_generate`/`img_progress`/`img_done`, `/v1/images/generations` and `hipfire img`. Refused by text `generate`/`bench_prefill`. |
+| 41 | T5-XXL / T5 (sidecar, FLUX.1) | `hipfire-arch-diffusion` | (sidecar) | Text-conditioning encoder for FLUX/SD3, DFlash-sidecar precedent (20/23). |
+| 42 | CLIP-L (sidecar, FLUX.1) | `hipfire-arch-diffusion` | (sidecar) | 768-d pooled-text encoder feeding the MMDiT text stream alongside the T5 token sequence. Packed as its own HFQ component (distinct forward contract from T5 — do not reuse 41). |
+| 43 | VAE (sidecar) | `hipfire-arch-diffusion` | (sidecar) | Latent encode (img2img) / decode (pixels); not a serve trunk. Shared across FLUX.1 and FLUX.2 (the FLUX.2 `ae`): one sidecar slot serves both trunks. |
+| 44 | (reserved spare) | — | — | Kept free; nothing ships on it. |
+| 45 | FLUX.2 MMDiT / Klein (checkpoint trunk) | `hipfire-arch-diffusion` | `FluxDiffusionCarrier` | `_class_name Flux2Transformer2DModel` or `model_type flux2` → 45. Qwen3 text encoder (taps 9/18/27), 32-ch FLUX.2 VAE with BatchNorm latent stats, empirical sigma shift, reference-image edit via `img_generate` `images[]`. Daemon name `flux2_mmdit`. |
+| 46 | FLUX.2 Klein Qwen3 text encoder (sidecar) | `hipfire-arch-diffusion` | (sidecar) | Standard Qwen3 causal-LM conditioner (model_type `qwen3`, Qwen3-4B geometry); distinct from arch 1 chat `qwen3` — attached only via the FLUX.2 pack, never loaded standalone. |
+| 47 | SD/SDXL UNet (checkpoint trunk) | (planned) | (none) | Reserved for `model_type sd` / `sdxl`; nothing ships on it yet. |
+
 ## Source namespaces
 
 | Namespace | Origin | Examples |

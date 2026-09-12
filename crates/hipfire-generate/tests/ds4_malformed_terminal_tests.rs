@@ -307,6 +307,7 @@ use hipfire_engine::terminal::{set_active_attempt_id, ClientTerminalDecision};
 
     #[test]
     fn emit_writes_one_validation_error_no_done_or_calls() {
+        activate_terminal_control("req-ds4", 17);
         set_active_attempt_id(17);
         let mut buf = Vec::new();
         let action =
@@ -326,6 +327,9 @@ use hipfire_engine::terminal::{set_active_attempt_id, ClientTerminalDecision};
         assert!(msg.contains("malformed") && msg.contains("unclosed"));
         assert!(!text.contains("\"type\":\"done\""));
         assert!(!text.contains("\"type\":\"tool_calls\""));
+        clear_terminal_control();
+        activate_terminal_control("req-ds4", 17);
+        set_active_attempt_id(17);
         let mut buf2 = Vec::new();
         emit_ds4_malformed_terminal(
             &mut buf2,
@@ -340,7 +344,7 @@ use hipfire_engine::terminal::{set_active_attempt_id, ClientTerminalDecision};
                 .count(),
             1
         );
-        set_active_attempt_id(0);
+        clear_terminal_control();
     }
 
     #[test]
@@ -671,6 +675,7 @@ use hipfire_engine::terminal::{set_active_attempt_id, ClientTerminalDecision};
                 eos: 7,
                 im_end: None,
                 tools: None,
+                enable_grammar: false,
                 stop: Vec::new(),
                 max_think: 0,
                 max_tokens: 16,

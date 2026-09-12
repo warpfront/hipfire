@@ -60,6 +60,12 @@ pub struct ThinkOutputRouter {
     in_think: bool,
     pending: String,
     strip_answer_newlines: bool,
+    /// Initial prompt state retained so `reset` can reuse this router for a
+    /// fresh turn without losing assistant-prefix think semantics.
+    started_in_think: bool,
+    /// Once terminal output is finalized, no later bytes may cross the
+    /// client-visible boundary until `reset` or a fresh router starts a turn.
+    finished: bool,
 }
 
 impl ThinkOutputRouter {
@@ -71,7 +77,18 @@ impl ThinkOutputRouter {
             in_think: started_in_think,
             pending: String::new(),
             strip_answer_newlines: false,
+            started_in_think,
+            finished: false,
         }
+    }
+
+    /// Reuse this router for a fresh turn, restoring the prompt-derived
+    /// initial channel and clearing all buffered/terminal state.
+    pub fn reset(&mut self) {
+        self.in_think = self.started_in_think;
+        self.pending.clear();
+        self.strip_answer_newlines = false;
+        self.finished = false;
     }
 
     /// Whether the generated stream currently has an unclosed think span.
@@ -82,7 +99,7 @@ impl ThinkOutputRouter {
     /// Route one UTF-8-safe text chunk into out without allocating an
     /// intermediate event vector. Existing entries in out are preserved.
     pub fn push_into(&mut self, text: &str, out: &mut Vec<ThinkRouteEvent>) {
-        if text.is_empty() {
+        if self.finished || text.is_empty() {
             return;
         }
         self.pending.push_str(text);
@@ -90,10 +107,14 @@ impl ThinkOutputRouter {
     }
 
     /// End-of-stream: classify a trailing partial marker as ordinary text.
-    /// The think state remains observable so callers can retain their existing
-    /// open-think fail-closed terminal policy.
+    /// The first call consumes the pending bytes; repeated calls and late
+    /// input are inert, preserving exactly-once terminal ownership.
     pub fn finish_into(&mut self, out: &mut Vec<ThinkRouteEvent>) {
+        if self.finished {
+            return;
+        }
         self.drain(true, out);
+        self.finished = true;
     }
 
     fn drain(&mut self, finish: bool, out: &mut Vec<ThinkRouteEvent>) {
@@ -820,12 +841,25 @@ fn extract_qwen_xml_tool_call_inner(
     if strict && !rest.chars().all(|c| c.is_whitespace()) {
         return None;
     }
-    // Strict: nothing after </function> either.
+    // Strict: after </function>, allow only whitespace or duplicate copies of
+    // that same closer. The duplicate is content-free and has been observed on
+    // otherwise valid greedy tool-call output; anything else still fails
+    // closed as malformed protocol.
     if strict {
         if let Some(end) = after_name.find("</function>") {
-            let after_close = &after_name[end + "</function>".len()..];
-            if !after_close.chars().all(|c| c.is_whitespace()) {
+            let mut tail = after_name[end + "</function>".len()..].trim_start();
+            let mut dropped = 0usize;
+            while let Some(rest) = tail.strip_prefix("</function>") {
+                tail = rest.trim_start();
+                dropped += 1;
+            }
+            if !tail.chars().all(|c| c.is_whitespace()) {
                 return None;
+            }
+            if dropped > 0 {
+                eprintln!(
+                    "[hipfire] tool_call: dropped {dropped} duplicated </function> closer(s)"
+                );
             }
         }
     }
@@ -1174,6 +1208,49 @@ mod tests {
             ]
         );
         assert!(!router.in_think());
+    }
+
+    #[test]
+    fn think_router_finish_is_idempotent_and_blocks_late_output() {
+        let mut router = ThinkOutputRouter::new(true);
+        let mut events = Vec::new();
+        router.push_into("reason</thi", &mut events);
+        router.finish_into(&mut events);
+        let first_len = events.len();
+        router.finish_into(&mut events);
+        router.push_into("nk>late", &mut events);
+        assert_eq!(events.len(), first_len);
+        assert!(router.in_think());
+    }
+
+    #[test]
+    fn think_router_reset_reuses_finished_router_with_initial_think_state() {
+        let mut router = ThinkOutputRouter::new(true);
+        let mut events = Vec::new();
+
+        router.push_into("first", &mut events);
+        router.finish_into(&mut events);
+        router.push_into("late", &mut events);
+        assert_eq!(
+            events,
+            vec![ThinkRouteEvent::Reasoning("first".into())],
+            "finished routers must reject late bytes before reset"
+        );
+
+        router.reset();
+        assert!(
+            router.in_think(),
+            "reset must restore started-in-think state"
+        );
+        router.push_into("second", &mut events);
+        router.finish_into(&mut events);
+        assert_eq!(
+            events,
+            vec![
+                ThinkRouteEvent::Reasoning("first".into()),
+                ThinkRouteEvent::Reasoning("second".into()),
+            ]
+        );
     }
 
     #[test]
@@ -1655,6 +1732,36 @@ mod tests {
     }
 
     #[test]
+    fn router_qwen_xml_duplicate_function_closer_is_repaired() {
+        let s = "<tool_call><function=read_file><parameter=path>src/main.rs</parameter></function>\n</function>\n</tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "read_file");
+        assert_eq!(calls[0].arguments["path"], "src/main.rs");
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_qwen_xml_multiple_duplicate_function_closers_are_repaired() {
+        let s = "<tool_call><function=read_file><parameter=path>x</parameter></function></function> </function></tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Ok);
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["path"], "x");
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
+    fn router_qwen_xml_duplicate_closer_with_trailing_content_fails_closed() {
+        let s = "<tool_call><function=read_file><parameter=path>x</parameter></function></function>extra</tool_call>";
+        let (vis, calls, term) = feed(&[s]);
+        assert_eq!(term, Terminal::Malformed);
+        assert!(calls.is_empty());
+        assert_no_protocol_leak(&vis);
+    }
+
+    #[test]
     fn router_visible_text_never_includes_call_body() {
         let full = r#"Hi.<tool_call>
 {"name": "bash", "arguments": {"cmd": "echo hi"}}
@@ -1680,7 +1787,9 @@ mod tests {
     fn disabled_router_keeps_tool_like_text_visible_and_non_executable() {
         let text = "<tool_call>\n<function=cat\n</function>\n</tool_call>";
         let mut router = ToolOutputRouter::disabled();
-        let events = router.push(text).expect("tool-free text must remain visible");
+        let events = router
+            .push(text)
+            .expect("tool-free text must remain visible");
         assert_eq!(events.len(), 1);
         match &events[0] {
             ToolRouteEvent::VisibleText(visible) => assert_eq!(visible.as_str(), text),

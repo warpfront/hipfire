@@ -6,7 +6,40 @@
 //!
 //! Relocated verbatim from `crates/hipfire-daemon/src/main.rs` (wave 3).
 
-use crate::terminal::active_attempt_id;
+use crate::terminal::{active_attempt_id, claim_wire_terminal};
+
+/// Result of a terminal emission attempt.
+///
+/// `claimed` records ownership of the lifecycle terminal slot independently
+/// from `delivered`: a writer can consume the slot and still fail to make the
+/// bytes visible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TerminalEmitOutcome {
+    claimed: bool,
+    delivered: bool,
+}
+
+impl TerminalEmitOutcome {
+    pub const fn claimed(self) -> bool {
+        self.claimed
+    }
+
+    pub const fn delivered(self) -> bool {
+        self.delivered
+    }
+
+    pub(crate) const fn new(claimed: bool, delivered: bool) -> Self {
+        Self { claimed, delivered }
+    }
+
+    /// Preserve claim ownership while replacing the delivery result.
+    pub const fn with_delivery(self, delivered: bool) -> Self {
+        Self {
+            claimed: self.claimed,
+            delivered,
+        }
+    }
+}
 
 /// Whether the authoritative Jinja generation suffix opens a reasoning span.
 /// This is deliberately tail-only: a literal `<think>` in user content must
@@ -18,7 +51,9 @@ pub fn render_tail_opens_think(rendered: &str) -> bool {
 /// Reduce the authoritative rendered-prompt state to the signal consumed by
 /// speculative emitters. Jinja owns the generation suffix, so the request's
 /// `assistant_prefix` is not authoritative once rendering succeeds.
-pub fn spec_assistant_prefix(started_in_think: bool) -> hipfire_runtime::prompt_frame::AssistantPrefix {
+pub fn spec_assistant_prefix(
+    started_in_think: bool,
+) -> hipfire_runtime::prompt_frame::AssistantPrefix {
     if started_in_think {
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
     } else {
@@ -164,7 +199,11 @@ pub fn canonical_json(v: &serde_json::Value) -> String {
     out
 }
 
-pub fn emit_error_with_id(stdout: &mut impl std::io::Write, id: &str, message: impl std::fmt::Display) {
+pub fn emit_error_with_id(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    message: impl std::fmt::Display,
+) {
     emit_active_attempt_error(
         stdout,
         Some(id),
@@ -186,16 +225,47 @@ pub fn emit_active_attempt_error(
     class: &str,
     retryable: bool,
     rolled_back: bool,
-) {
-    write_error_envelope(
-        stdout,
-        id,
-        message,
-        class,
-        retryable,
-        rolled_back,
-        active_attempt_id(),
-    );
+) -> bool {
+    emit_active_attempt_error_outcome(stdout, id, message, class, retryable, rolled_back)
+        .delivered()
+}
+
+/// Emit an active-attempt error while retaining whether its terminal claim was
+/// consumed when the writer fails.
+pub fn emit_active_attempt_error_outcome(
+    stdout: &mut impl std::io::Write,
+    id: Option<&str>,
+    message: &str,
+    class: &str,
+    retryable: bool,
+    rolled_back: bool,
+) -> TerminalEmitOutcome {
+    let attempt_id = active_attempt_id();
+    // Attempt zero is the uncorrelated pre-admission channel. It must never
+    // be emitted by an active terminal writer.
+    if attempt_id == 0 {
+        return TerminalEmitOutcome::new(false, false);
+    }
+    let claimed = if let Some(id) = id {
+        if !claim_wire_terminal(id, attempt_id) {
+            return TerminalEmitOutcome::new(false, false);
+        }
+        true
+    } else {
+        false
+    };
+    TerminalEmitOutcome::new(
+        claimed,
+        write_error_envelope(
+            stdout,
+            id,
+            message,
+            class,
+            retryable,
+            rolled_back,
+            attempt_id,
+        ),
+    )
 }
 
 pub fn emit_uncorrelated_error(
@@ -206,7 +276,7 @@ pub fn emit_uncorrelated_error(
     retryable: bool,
     rolled_back: bool,
 ) {
-    write_error_envelope(stdout, id, message, class, retryable, rolled_back, 0);
+    let _ = write_error_envelope(stdout, id, message, class, retryable, rolled_back, 0);
 }
 fn write_error_envelope(
     stdout: &mut impl std::io::Write,
@@ -216,7 +286,7 @@ fn write_error_envelope(
     retryable: bool,
     rolled_back: bool,
     attempt_id: u64,
-) {
+) -> bool {
     let mut envelope = serde_json::json!({
         "type": "error",
         "message": message,
@@ -228,8 +298,10 @@ fn write_error_envelope(
     if let Some(id) = id {
         envelope["id"] = serde_json::Value::String(id.to_owned());
     }
-    let _ = writeln!(stdout, "{}", envelope);
-    let _ = stdout.flush();
+    if writeln!(stdout, "{}", envelope).is_err() {
+        return false;
+    }
+    stdout.flush().is_ok()
 }
 
 /// Emit a single-line `{"type":"error","id":"...","message":"..."}` JSON
@@ -261,11 +333,32 @@ pub fn emit_qwen_ar_info(stdout: &mut impl std::io::Write, id: &str, message: &s
     let _ = stdout.flush();
 }
 
-pub fn emit_qwen_ar_cancelled(stdout: &mut impl std::io::Write, id: &str, completion_tokens: usize) {
+pub fn emit_qwen_ar_cancelled(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    completion_tokens: usize,
+) -> bool {
+    emit_qwen_ar_cancelled_outcome(stdout, id, completion_tokens).delivered()
+}
+
+/// Emit a cancellation while retaining whether its terminal claim was
+/// consumed when the writer fails.
+pub fn emit_qwen_ar_cancelled_outcome(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    completion_tokens: usize,
+) -> TerminalEmitOutcome {
     let attempt_id = active_attempt_id();
+    if !claim_wire_terminal(id, attempt_id) {
+        return TerminalEmitOutcome::new(false, false);
+    }
     let aborted = hipfire_runtime::semantic::wire_aborted(id, "client_cancelled", attempt_id);
-    let _ = writeln!(stdout, "{}", aborted);
+    if writeln!(stdout, "{}", aborted).is_err() {
+        return TerminalEmitOutcome::new(true, false);
+    }
     let done = hipfire_runtime::semantic::wire_aborted_done(id, completion_tokens, attempt_id);
-    let _ = writeln!(stdout, "{}", done);
-    let _ = stdout.flush();
+    if writeln!(stdout, "{}", done).is_err() {
+        return TerminalEmitOutcome::new(true, false);
+    }
+    TerminalEmitOutcome::new(true, stdout.flush().is_ok())
 }

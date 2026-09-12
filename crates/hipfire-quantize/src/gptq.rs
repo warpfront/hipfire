@@ -282,7 +282,7 @@ pub const GPTQ_DEFAULT_BLOCK_SIZE: usize = 128;
 /// Unset → 128. Parse failure → 128. This keeps the unblocked path
 /// reachable without code changes for numerical oracle comparisons.
 pub fn gptq_block_size() -> usize {
-    match std::env::var("HIPFIRE_GPTQ_BLOCK") {
+    match hipfire_config::developer_var("HIPFIRE_GPTQ_BLOCK") {
         Ok(v) => match v.trim().parse::<usize>() {
             Ok(0) | Ok(1) => 1,
             Ok(n) => n,

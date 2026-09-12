@@ -90,6 +90,11 @@ pub(crate) struct ServeRuntime {
     pub(crate) cache_capable: bool,
     pub(crate) kv_override: Option<String>,
     pub(crate) kv_backend_override: Option<String>,
+    /// Explicit vision-tower sidecar (`serve --vision`) projected as
+    /// `params["vision"]` on every model load, winning over the registry
+    /// `vision` slot and `HIPFIRE_VISION_SIDECAR`; skipped while
+    /// `vision_mode=off`.
+    pub(crate) vision_override: Option<PathBuf>,
     pub(crate) tp: Option<u64>,
     pub(crate) continuous_batch_size: u64,
     /// Experimental daemon multi-slot mode (`serve.multi_slot`). Default off.
@@ -652,9 +657,13 @@ pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
     if args.detach && !args.foreground_child {
         return detach_serve(paths, &args, &host, port);
     }
+    if let Some(vision) = args.vision.as_ref() {
+        if !vision.is_file() {
+            bail!("vision sidecar not found: {}", vision.display());
+        }
+    }
     serve_foreground(paths, &args, &host, port, resolved)
 }
-
 pub(crate) fn resolve_serve_positionals(
     paths: &Paths,
     values: &[String],
@@ -905,6 +914,7 @@ pub(crate) fn serve_foreground(
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
             kv_backend_override: args.kv_backend.clone(),
+            vision_override: args.vision.clone(),
             tp: args.tp,
             continuous_batch_size,
             multi_slot_enabled,
@@ -1107,9 +1117,7 @@ impl ServeRuntime {
         meta: &Mutex<ServeMeta>,
         minimum_max_seq: Option<u64>,
     ) -> Result<hipfire_config::ResolvedConfig> {
-        let (tag, entry) = self
-            .registry
-            .model(model)
+        let (tag, entry) = crate::registry_entry_for_path(&self.paths, &self.registry, model)
             .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
             .unwrap_or((None, None));
         let mut path = find_model_path(&self.paths, &self.registry, model);
@@ -1143,11 +1151,20 @@ impl ServeRuntime {
             let mut params = load_params(
                 &resolved,
                 entry,
+                &self.paths.models,
                 &path,
                 max_tokens,
                 self.kv_override.as_deref(),
                 self.kv_backend_override.as_deref(),
+                tag.as_deref(),
+                false,
+                // serve has no --head yet; models load their own head.
+                None,
             )?;
+            if let Some(vision) = self.vision_override.as_ref() {
+                // Forwarded in every mode; the daemon's `vision_mode=off` gate decides.
+                params["vision"] = serde_json::json!(vision.display().to_string());
+            }
             if let Some(tp) = self.tp {
                 params["tp"] = serde_json::json!(tp);
             }
@@ -1207,9 +1224,19 @@ impl ServeRuntime {
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
             self.current_max_seq = loaded_max_seq;
+            // Report the model the way it was requested. A path-form
+            // request now resolves its registry entry (for sidecars and
+            // tag policy), but clients — serve_harness's warm probe among
+            // them — compare `/health.model` against the path they asked
+            // for; a tag only stands in when the request was a tag.
+            let served_name = if Path::new(model).is_absolute() || model.contains('/') {
+                model.to_owned()
+            } else {
+                tag.unwrap_or_else(|| model.to_owned())
+            };
             meta.lock()
                 .unwrap_or_else(|error| error.into_inner())
-                .current_model = Some(tag.unwrap_or_else(|| model.to_owned()));
+                .current_model = Some(served_name);
         }
         Ok(resolved)
     }

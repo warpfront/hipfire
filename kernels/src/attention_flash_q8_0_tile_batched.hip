@@ -183,7 +183,16 @@ __global__ void attention_flash_q8_0_tile_batched(
     const bool lane_one_q8_block = head_dim % 32 == 0 && dpt <= 32
                                 && (d0 % 32) + dpt <= 32;
     float mq[16];
-    for (int i = 0; i < dpt; i++) mq[i] = q_head[d0 + i];
+    if (head_dim == 512) {
+        // Match single-token half layout: 4 halves × 4 dims/thread so Phase A
+        // can use the same four-term grouped association as decode.
+        for (int half = 0; half < 4; half++) {
+            for (int j = 0; j < 4; j++)
+                mq[half * 4 + j] = q_head[half * 128 + tid * 4 + j];
+        }
+    } else {
+        for (int i = 0; i < dpt; i++) mq[i] = q_head[d0 + i];
+    }
 
     // Phase A: Q·K (Q8_0 dequant — 8 dims, spanning bi = d0/32, bj = d0%32).
     for (int t_local = 0; t_local < tile_len; t_local++) {
@@ -216,6 +225,20 @@ __global__ void attention_flash_q8_0_tile_batched(
             for (int i = 0; i < 4; i++) {
                 const signed char quant = (signed char)(packed >> (8 * i));
                 partial += mq[i] * (ks * (float)quant);
+            }
+        } else if (head_dim == 512) {
+            // Lane grouping and four-term addition order intentionally match
+            // decode (attention_flash_q8_0_tile) for stable prefill/decode numerics.
+            for (int half = 0; half < 4; half++) {
+                const int k_bi = half * 4 + tid / 8;
+                const int k_off = (tid % 8) * 4;
+                const unsigned char* kb = k_cache + kv_offset_for_k(desc, t, per_pos_bytes)
+                                        + (kv_head_blk + k_bi) * 34;
+                const float ks = (float)*((const _Float16*)kb);
+                partial += mq[half * 4 + 0] * (ks * (float)((signed char)kb[2 + k_off + 0]))
+                         + mq[half * 4 + 1] * (ks * (float)((signed char)kb[2 + k_off + 1]))
+                         + mq[half * 4 + 2] * (ks * (float)((signed char)kb[2 + k_off + 2]))
+                         + mq[half * 4 + 3] * (ks * (float)((signed char)kb[2 + k_off + 3]));
             }
         } else {
             for (int i = 0; i < dpt; i++) {

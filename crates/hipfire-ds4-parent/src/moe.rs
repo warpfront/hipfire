@@ -37,27 +37,28 @@ pub const PARENT_ROUTE_SCALE: f32 = 1.5;
 /// diagnostic sweeps only — logged once. Do not change the default.
 pub fn effective_parent_route_scale() -> f32 {
     use std::sync::LazyLock;
-    static SCALE: LazyLock<f32> = LazyLock::new(|| {
-        match std::env::var("HIPFIRE_PARENT_ROUTE_SCALE") {
-            Ok(s) => match s.parse::<f32>() {
-                Ok(v) if v.is_finite() && v > 0.0 => {
-                    eprintln!(
-                        "deepseek4 parent: HIPFIRE_PARENT_ROUTE_SCALE={v} overrides \
+    static SCALE: LazyLock<f32> =
+        LazyLock::new(
+            || match hipfire_config::developer_var("HIPFIRE_PARENT_ROUTE_SCALE") {
+                Ok(s) => match s.parse::<f32>() {
+                    Ok(v) if v.is_finite() && v > 0.0 => {
+                        eprintln!(
+                            "deepseek4 parent: HIPFIRE_PARENT_ROUTE_SCALE={v} overrides \
                          checkpoint PARENT_ROUTE_SCALE={PARENT_ROUTE_SCALE} (diagnostic only)"
-                    );
-                    v
-                }
-                _ => {
-                    eprintln!(
-                        "deepseek4 parent: ignoring invalid HIPFIRE_PARENT_ROUTE_SCALE={s:?}; \
+                        );
+                        v
+                    }
+                    _ => {
+                        eprintln!(
+                            "deepseek4 parent: ignoring invalid HIPFIRE_PARENT_ROUTE_SCALE={s:?}; \
                          using checkpoint {PARENT_ROUTE_SCALE}"
-                    );
-                    PARENT_ROUTE_SCALE
-                }
+                        );
+                        PARENT_ROUTE_SCALE
+                    }
+                },
+                Err(_) => PARENT_ROUTE_SCALE,
             },
-            Err(_) => PARENT_ROUTE_SCALE,
-        }
-    });
+        );
     *SCALE
 }
 /// `swiglu_limit` from the parent `config.json`.
@@ -457,7 +458,9 @@ pub fn parent_route(
     let n_experts = cfg.n_routed_experts;
     let topk = cfg.num_experts_per_tok;
     if topk == 0 || n_experts == 0 {
-        return Err("deepseek4 parent: n_routed_experts and num_experts_per_tok must be > 0".to_owned());
+        return Err(
+            "deepseek4 parent: n_routed_experts and num_experts_per_tok must be > 0".to_owned(),
+        );
     }
     if x.dtype != DType::BF16 {
         return Err(format!(
@@ -601,9 +604,7 @@ pub fn parent_moe_forward(
     routing: &ParentRouting,
     out: &GpuTensor,
 ) -> Result<(), String> {
-    let _ = parent_moe_forward_counted(
-        gpu, backend, layer, cfg, scratch, x, rows, routing, out,
-    )?;
+    let _ = parent_moe_forward_counted(gpu, backend, layer, cfg, scratch, x, rows, routing, out)?;
     Ok(())
 }
 
@@ -772,12 +773,7 @@ pub fn parent_moe_forward_counted(
         let gate = download_f32_prefix(gpu, &scratch.gate_f32, n_tok * inter)?;
         let up = download_f32_prefix(gpu, &scratch.up_f32, n_tok * inter)?;
         let mut hidden = vec![0.0f32; n_tok * inter];
-        swiglu_clamp_silu_mul(
-            &gate,
-            &up,
-            &mut hidden,
-            PARENT_SWIGLU_LIMIT,
-        );
+        swiglu_clamp_silu_mul(&gate, &up, &mut hidden, PARENT_SWIGLU_LIMIT);
         // Apply routing weight INSIDE the expert, before w2 (model.py:609-610).
         for i in 0..n_tok {
             let w = route_w[i];
@@ -819,15 +815,7 @@ pub fn parent_moe_forward_counted(
     // ── Shared expert over the full batch (no routing weight) ──────────
     // Fresh x copy for each projection (destructive act-quant).
     run_shared_expert(
-        gpu,
-        backend,
-        layer,
-        scratch,
-        &x_bytes,
-        rows,
-        dim,
-        inter,
-        out,
+        gpu, backend, layer, scratch, &x_bytes, rows, dim, inter, out,
     )?;
 
     Ok(decode_calls)
@@ -918,7 +906,12 @@ pub fn swiglu_clamp_silu_mul(gate: &[f32], up: &[f32], out: &mut [f32], limit: f
 
 // ── shape / IO helpers ──────────────────────────────────────────────────────
 
-fn validate_dense_shape(name: &str, w: &ParentDenseWeight, n: usize, k: usize) -> Result<(), String> {
+fn validate_dense_shape(
+    name: &str,
+    w: &ParentDenseWeight,
+    n: usize,
+    k: usize,
+) -> Result<(), String> {
     if w.n() != n || w.k() != k {
         return Err(format!(
             "deepseek4 parent: {name} shape [{},{}] != expected [{n},{k}]",
@@ -1000,8 +993,7 @@ fn download_f32_prefix(gpu: &Gpu, t: &GpuTensor, nelems: usize) -> Result<Vec<f3
         ));
     }
     let mut data = vec![0.0f32; nelems];
-    let bytes =
-        unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
+    let bytes = unsafe { std::slice::from_raw_parts_mut(data.as_mut_ptr() as *mut u8, nbytes) };
     gpu.hip
         .memcpy_dtoh(bytes, &t.buf)
         .map_err(|e| format!("deepseek4 parent: f32 download: {e:?}"))?;
@@ -1159,7 +1151,7 @@ mod tests {
         let bias = vec![0.0f32, 0.0, 0.0, 10.0];
         let (w, idx) = score_route_topk(&scores, Some(&bias), 1, 4, 2, 1.5).unwrap();
         assert_eq!(idx[0], 3); // bias winner first
-        // second should be expert 0 (highest remaining selection score)
+                               // second should be expert 0 (highest remaining selection score)
         assert_eq!(idx[1], 0);
         // weights from raw, L1-normed, *1.5
         let sum_raw = scores[3] + scores[0];
@@ -1240,7 +1232,7 @@ mod tests {
             + max_rows * inter * 4 // hidden_f32
             + max_rows * inter * 2 // hidden_bf16
             + max_rows * dim * 4; // expert_out_f32
-        // ~16 MiB weight tile + small per-row — not 256× anything.
+                                  // ~16 MiB weight tile + small per-row — not 256× anything.
         assert!(bytes < 40 * 1024 * 1024, "scratch too large: {bytes}");
         // Independent of expert count: same for 1 or 256 experts.
         let bytes_same = bytes; // formula has no n_experts term
@@ -1278,14 +1270,7 @@ mod tests {
         let gate = vec![1.0f32; inter];
         let up = vec![2.0f32; inter];
         let w_route = 0.75f32;
-        let hid = crate::layer_ref::expert_swiglu_ref(
-            &gate,
-            &up,
-            1,
-            inter,
-            10.0,
-            Some(&[w_route]),
-        );
+        let hid = crate::layer_ref::expert_swiglu_ref(&gate, &up, 1, inter, 10.0, Some(&[w_route]));
         let mut hid_unweighted = vec![0.0f32; inter];
         swiglu_clamp_silu_mul(&gate, &up, &mut hid_unweighted, 10.0);
         for j in 0..inter {
@@ -1344,11 +1329,7 @@ mod tests {
         assert_eq!(groups[0][0], (0, 0.5));
         assert_eq!(groups[1][0], (0, 0.4));
         assert_eq!(groups[1][1], (1, 0.3));
-        let r0_w: f32 = seen
-            .iter()
-            .filter(|(r, _)| *r == 0)
-            .map(|(_, w)| *w)
-            .sum();
+        let r0_w: f32 = seen.iter().filter(|(r, _)| *r == 0).map(|(_, w)| *w).sum();
         assert!((r0_w - 0.9).abs() < 1e-6);
     }
 
@@ -1373,8 +1354,7 @@ mod tests {
         }
         let bias = vec![0.0f32; n_exp];
         let (w, _idx) =
-            score_route_topk(&scores, Some(&bias), rows, n_exp, topk, PARENT_ROUTE_SCALE)
-                .unwrap();
+            score_route_topk(&scores, Some(&bias), rows, n_exp, topk, PARENT_ROUTE_SCALE).unwrap();
         for r in 0..rows {
             let sum: f32 = w[r * topk..(r + 1) * topk].iter().sum();
             assert!(
@@ -1386,5 +1366,4 @@ mod tests {
         let r0: f32 = w[..topk].iter().sum();
         assert!((r0 - PARENT_ROUTE_SCALE).abs() < 1e-5);
     }
-
 }

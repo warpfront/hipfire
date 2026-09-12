@@ -122,9 +122,32 @@ pub fn paro_text_prefix(source: &dyn ModelSource) -> HipResult<&'static str> {
 /// The function reads `.qweight`, `.qzeros`, `.scales`, `.pairs`, `.theta`,
 /// and `.channel_scales` from `source`, repacks to HFQ4G128, and uploads all
 /// rotation sidecars to GPU.
+struct PendingParoWeight {
+    buf: Option<GpuTensor>,
+    pairs: Option<GpuTensor>,
+    theta: Option<GpuTensor>,
+    channel_scales: Option<GpuTensor>,
+}
+
+impl PendingParoWeight {
+    fn cleanup(&mut self, gpu: &mut Gpu) {
+        fn free_opt(gpu: &mut Gpu, owner: &mut Option<GpuTensor>) {
+            if let Some(tensor) = owner.take() {
+                let _ = gpu.free_tensor(tensor);
+            }
+        }
+
+        free_opt(gpu, &mut self.channel_scales);
+        free_opt(gpu, &mut self.theta);
+        free_opt(gpu, &mut self.pairs);
+        free_opt(gpu, &mut self.buf);
+    }
+}
+
+/// Load a single ParoQuant weight tensor.
 pub fn load_paro_weight(
     source: &dyn ModelSource,
-    gpu: &Gpu,
+    gpu: &mut Gpu,
     tensor_prefix: &str, // e.g. "model.language_model.layers.0.mlp.gate_proj"
     out_dim: usize,      // M
     in_dim: usize,       // K
@@ -138,58 +161,73 @@ pub fn load_paro_weight(
     let theta_name = format!("{tensor_prefix}.theta");
     let cs_name = format!("{tensor_prefix}.channel_scales");
 
-    let (_, qw_data) = source
-        .tensor_data(&qw_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qw_name}")))?;
-    let (_, qz_data) = source
-        .tensor_data(&qz_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qz_name}")))?;
-    let (_, sc_data) = source
-        .tensor_data(&sc_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {sc_name}")))?;
+    let mut pending = PendingParoWeight {
+        buf: None,
+        pairs: None,
+        theta: None,
+        channel_scales: None,
+    };
+    let result = (|| -> HipResult<WeightTensor> {
+        let (_, qw_data) = source
+            .tensor_data(&qw_name)
+            .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qw_name}")))?;
+        let (_, qz_data) = source
+            .tensor_data(&qz_name)
+            .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {qz_name}")))?;
+        let (_, sc_data) = source
+            .tensor_data(&sc_name)
+            .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {sc_name}")))?;
 
-    // Repack AWQ → HFQ4G128
-    let hfq_data = repack_awq_to_hfq4g128(
-        qw_data,
-        qz_data,
-        sc_data,
-        out_dim,
-        in_dim,
-        group_size as usize,
-    );
-    let buf = gpu.upload_raw(&hfq_data, &[hfq_data.len()])?;
+        // Repack AWQ → HFQ4G128.
+        let hfq_data = repack_awq_to_hfq4g128(
+            qw_data,
+            qz_data,
+            sc_data,
+            out_dim,
+            in_dim,
+            group_size as usize,
+        );
+        pending.buf = Some(gpu.upload_raw(&hfq_data, &[hfq_data.len()])?);
 
-    // Load rotation metadata
-    let (_, pairs_data) = source
-        .tensor_data(&pairs_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {pairs_name}")))?;
-    let (_, theta_data) = source
-        .tensor_data(&theta_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {theta_name}")))?;
-    let (_, cs_data) = source
-        .tensor_data(&cs_name)
-        .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {cs_name}")))?;
+        let (_, pairs_data) = source.tensor_data(&pairs_name).ok_or_else(|| {
+            HipError::new(0, &format!("ParoQuant tensor not found: {pairs_name}"))
+        })?;
+        let (_, theta_data) = source.tensor_data(&theta_name).ok_or_else(|| {
+            HipError::new(0, &format!("ParoQuant tensor not found: {theta_name}"))
+        })?;
+        let (_, cs_data) = source
+            .tensor_data(&cs_name)
+            .ok_or_else(|| HipError::new(0, &format!("ParoQuant tensor not found: {cs_name}")))?;
 
-    let pairs = gpu.upload_raw(pairs_data, &[pairs_data.len()])?;
-    let theta = gpu.upload_raw(theta_data, &[theta_data.len()])?;
-    let channel_scales = gpu.upload_raw(cs_data, &[cs_data.len()])?;
+        pending.pairs = Some(gpu.upload_raw(pairs_data, &[pairs_data.len()])?);
+        pending.theta = Some(gpu.upload_raw(theta_data, &[theta_data.len()])?);
+        pending.channel_scales = Some(gpu.upload_raw(cs_data, &[cs_data.len()])?);
 
-    Ok(WeightTensor {
-        buf,
-        gpu_dtype: DType::ParoQ4G128,
-        m: out_dim,
-        k: in_dim,
-        row_stride: 0,
-        paro: Some(ParoRotation {
-            pairs,
-            theta,
-            channel_scales,
-            krot: krot as u32,
-            group_size,
-            is_alias: false,
-        }),
-        awq_scale: None,
-    })
+        Ok(WeightTensor {
+            buf: pending.buf.take().expect("Paro weight buffer staged"),
+            gpu_dtype: DType::ParoQ4G128,
+            m: out_dim,
+            k: in_dim,
+            row_stride: 0,
+            paro: Some(ParoRotation {
+                pairs: pending.pairs.take().expect("Paro pairs staged"),
+                theta: pending.theta.take().expect("Paro theta staged"),
+                channel_scales: pending
+                    .channel_scales
+                    .take()
+                    .expect("Paro channel scales staged"),
+                krot: krot as u32,
+                group_size,
+                is_alias: false,
+            }),
+            awq_scale: None,
+        })
+    })();
+
+    if result.is_err() {
+        pending.cleanup(gpu);
+    }
+    result
 }
 
 /// Load a weight tensor from a ParoQuant model.

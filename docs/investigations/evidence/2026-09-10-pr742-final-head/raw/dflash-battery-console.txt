@@ -1,0 +1,27 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : /home/bjoern/.hipfire/models/qwen3.5-27b.mq4
+  registry tag  : qwen3.5:27b
+  kv_mode       : q8 [explicit(--kv)]   kv_backend: vmm [explicit(--kv-backend)]   mtp_mode: off   mode: battery
+  max_seq       : 4096 [explicit(--max-seq)]
+  dflash        : on   draft: /home/bjoern/.hipfire/models/qwen35-27b-dflash-mq4.hfq
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : (derived from --dflash/--mtp above)
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : (runtime default)
+  expert parallel: tp=1
+  seed          : None   prompt_source: benchmarks/prompts/dflash_resident_smoke.txt
+  thinking_cap  : thinking DISABLED (sentinel cap 1) [named-budget(off)]
+  reasoning_effort: auto  (parent prompt semantics; independent of cap)
+  max_tokens     : 32 [explicit(--max-tokens)]  (no think block emitted)
+  sampling (what IS set):
+      temperature       = 0.0      [explicit(greedy)]
+  sampling (NOT set, serve/daemon default applies): top_p, top_k, min_p, presence_penalty, repeat_penalty, reasoning_effort
+=======================================================================================
+  [serve warm; MTP head loaded lines=0]
+### RUN qwen3.5-27b.mq4|off|battery  kv=q8 sampling={'temperature': 0.0} seed=None ###
+  [prose]t1  finish=length ctx=26     cached=0      gen=32   (think 0/ans 29w) prefill=10820.0ms/2.4tok/s decode=2.8tok/s tau=1.82 !RUNAWAY | 'The first and most important reason for the decline of the Roman Empire is widely consider'
+[qwen3.5-27b.mq4|off|battery DONE] turns=1 runaway=1 empty=0 attractor=0 retrieval_miss=0 avg_prefill=2.4tok/s avg_decode=2.8tok/s
+  prompt_md5=085ecf774d8f35719d9c39b1867d9533 request_md5=d57350b36015a59cf00dabc94ae4047f step=
+  daemon_binary_md5=281d08a2d1975976f1bb8af8c070eb06 path=/tmp/hipfire-g4-e786-target/release/daemon
