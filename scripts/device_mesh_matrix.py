@@ -850,7 +850,9 @@ def main(argv=None):
         sub = dict(ctx, mapping=row_mapping(ctx, row, out), row_env=dict(row.get("env", {})))
         start = time.time()
         try:
-            disposition, note, detail = execute_row(sub, row, out, args.timeout)
+            # A row may declare its own per-command budget (the vision matrix
+            # legitimately runs ~15 min on gfx1201 and has an 1800 s watchdog).
+            disposition, note, detail = execute_row(sub, row, out, int(row.get("timeout", args.timeout)))
         except Exception as exc:  # never abort the matrix on one row
             disposition, note, detail = "failed", "runner exception: %s" % exc, {}
         elapsed = round(time.time() - start, 1)
