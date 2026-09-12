@@ -1918,23 +1918,46 @@
   },
   {
    "commands": {
-    "negative": [],
-    "positive": []
+    "positive": [
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_single -- --ignored --test-threads=1",
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_pp2_vs_single_oracle -- --ignored --exact --test-threads=1",
+     "HIPFIRE_QWEN35_FIXTURE=$MODELS_DIR/qwen3.8-27b.mq4-xt HIPFIRE_ORNITH_FIXTURE=$MODELS_DIR/ornith-1.5-35b-a3b.mq4r HIPFIRE_HAVE_2_GPU=1 cargo test -p hipfire-arch-qwen35 --locked --test route_oracle_mesh qwen35_tp2_vs_single_oracle -- --ignored --exact --test-threads=1"
+    ],
+    "negative": []
    },
-   "fixtures": [],
+   "fixtures": [
+    "qwen3.8:27b-mq4-xt",
+    "ornith-1.5:35b-a3b-mq4r"
+   ],
    "hosts": [
-    "gfx1100",
-    "gfx1201",
-    "gfx1151"
+    "gfx1201"
    ],
    "id": "g1-route-oracles-nonllama",
    "milestone": "G1",
-   "note": "#666 G1 requires route-specific numerical/state oracles for every retained Single/PP/TP/EP route. Only the plain-LLaMA oracle exists (g3-pinned-parity-oracle). No existing probe for Qwen35 dense/MoE, PP, TP, or EP route oracles.",
+   "predicate": {
+    "kind": "cargo",
+    "min_passed": 4
+   },
+   "probe": "thin-driver",
+   "route": "single+pp+tp/route-oracles"
+  },
+  {
+   "id": "g5-ep-route-oracles",
+   "milestone": "G5",
+   "route": "ep/route-oracles",
+   "probe": "none",
+   "commands": {
+    "positive": [],
+    "negative": []
+   },
+   "fixtures": [],
+   "hosts": [
+    "gfx1201"
+   ],
    "predicate": {
     "kind": "none"
    },
-   "probe": "none",
-   "route": "single+pp+tp+ep/route-oracles"
+   "note": "qwen35_ep2_vs_single_oracle and qwen35_ep4_vs_ep2_oracle exist on this head and are deliberately RED at 1e-3: sharded EP diverges from single by a top-k routing flip seeded by expert-parity vs slot-order f32 association (pos 17 / pos 2 on Q8 state; pos 5 on f32). Unchanged by canonical rooted reduce, EF residuals on multi, or f32 state. Pre-exists on master; daemon refuses MoE EP so no user exposure. Discharged by the G5 slot-order combine (G5-SLOT-COMBINE-PLAN.md)."
   },
   {
    "commands": {
