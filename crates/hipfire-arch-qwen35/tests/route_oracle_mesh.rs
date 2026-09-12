@@ -242,6 +242,17 @@ fn kv_mask(config: &Qwen35Config) -> Vec<bool> {
         .collect()
 }
 
+/// DeltaNet state precision for BOTH routes. `HIPFIRE_ORACLE_STATE_FP32=1`
+/// runs the comparison on f32 recurrent state — the maintainer's diagnostic
+/// for whether a divergence is carried by Q8 state requant at all.
+fn oracle_state_quant() -> StateQuant {
+    if std::env::var("HIPFIRE_ORACLE_STATE_FP32").as_deref() == Ok("1") {
+        StateQuant::FP32
+    } else {
+        StateQuant::Q8
+    }
+}
+
 fn state_quant_name(q: StateQuant) -> &'static str {
     if q == StateQuant::Q8 {
         "q8"
@@ -287,7 +298,8 @@ fn load_single(path: &str) -> Option<Single> {
         KV_MAX,
     )
     .expect("single fwht3 kv");
-    let dn = DeltaNetState::new_with_quant(&mut gpu, &config, StateQuant::Q8).expect("single dn");
+    let dn =
+        DeltaNetState::new_with_quant(&mut gpu, &config, oracle_state_quant()).expect("single dn");
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, SCRATCH_WINDOW, KV_MAX)
         .expect("single scratch");
     Some(Single {
@@ -348,7 +360,7 @@ fn log_kv(tag: &str, kv: &KvCache) {
 
 fn check_dn(tag: &str, dn: &DeltaNetState) {
     assert!(
-        dn.quant == StateQuant::Q8,
+        dn.quant == oracle_state_quant(),
         "{tag}: DeltaNet state must be Q8-pinned"
     );
     assert!(
@@ -447,7 +459,8 @@ fn qwen35_pp2_vs_single_oracle() {
     )
     .expect("pp fwht3 kv");
     let (mut dn_pp, la_to_device) =
-        DeltaNetState::new_with_quant_multi(&mut gpus, &config, StateQuant::Q8).expect("pp dn");
+        DeltaNetState::new_with_quant_multi(&mut gpus, &config, oracle_state_quant())
+            .expect("pp dn");
     let _ = gpus.enable_peer_all().expect("pp enable_peer_all");
     let dev_last = gpus.output_device;
     // Single route second (see mesh-first note above).
@@ -515,7 +528,7 @@ fn qwen35_pp2_vs_single_oracle() {
     );
     check_dn(TEST, &single.dn);
     assert!(
-        dn_pp.quant == StateQuant::Q8,
+        dn_pp.quant == oracle_state_quant(),
         "mesh DeltaNet state must be Q8-pinned"
     );
     eprintln!(
@@ -686,8 +699,12 @@ fn qwen35_tp2_vs_single_oracle() {
             .unwrap_or_else(|e| panic!("tp kv rank {rank}: {e:?}")),
         );
         dns.push(
-            DeltaNetState::new_with_quant(&mut gpus.devices[rank], &configs[rank], StateQuant::Q8)
-                .unwrap_or_else(|e| panic!("tp dn rank {rank}: {e:?}")),
+            DeltaNetState::new_with_quant(
+                &mut gpus.devices[rank],
+                &configs[rank],
+                oracle_state_quant(),
+            )
+            .unwrap_or_else(|e| panic!("tp dn rank {rank}: {e:?}")),
         );
         scratches.push(
             Qwen35Scratch::new_with_kv_max(
@@ -757,7 +774,7 @@ fn qwen35_tp2_vs_single_oracle() {
         );
         assert!(!kvs[rank].k_gpu.is_empty() && !kvs[rank].v_gpu.is_empty());
         assert!(
-            dns[rank].quant == StateQuant::Q8,
+            dns[rank].quant == oracle_state_quant(),
             "rank {rank} DN must be Q8"
         );
         assert_eq!(dns[rank].s_matrices.len(), single.dn.s_matrices.len());
@@ -1228,7 +1245,7 @@ fn load_ep_mesh(test: &str, path: &str, tp: usize) -> Option<EpMesh> {
             .unwrap_or_else(|e| panic!("ep kv rank {r}: {e:?}")),
         );
         dns.push(
-            DeltaNetState::new_with_quant(&mut gpus.devices[r], &config, StateQuant::Q8)
+            DeltaNetState::new_with_quant(&mut gpus.devices[r], &config, oracle_state_quant())
                 .unwrap_or_else(|e| panic!("ep dn rank {r}: {e:?}")),
         );
         scratches.push(
@@ -1442,7 +1459,7 @@ fn qwen35_ep2_vs_single_oracle() {
             "rank {r} layer-0 V byte extent parity"
         );
         assert!(
-            mesh.dns[r].quant == StateQuant::Q8,
+            mesh.dns[r].quant == oracle_state_quant(),
             "rank {r} DN must be Q8"
         );
         assert_eq!(mesh.dns[r].s_matrices.len(), s_dn_len);
@@ -1641,7 +1658,7 @@ fn qwen35_ep4_vs_ep2_oracle() {
             "ep4 rank {r} must carry the fwht3 tier"
         );
         assert!(
-            ep4.dns[r].quant == StateQuant::Q8,
+            ep4.dns[r].quant == oracle_state_quant(),
             "ep4 rank {r} DN must be Q8"
         );
         assert_eq!(ep4.dns[r].s_matrices.len(), r_dn_len);
