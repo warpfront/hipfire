@@ -1187,6 +1187,14 @@ fn dispatch_attend(
                 let st = io.givens_sin.unwrap();
                 let fp = io.flash_partials.unwrap();
                 if io.head_dim == 512 {
+                    if io.output_gate.is_some() {
+                        return Err(DispatchError::UnsupportedVariant {
+                            family: "attention/attend",
+                            variant: "D512 Asym3 output gate is unsupported",
+                            arch: "",
+                            quant: "asym3",
+                        });
+                    }
                     return hip!(gpu.attention_flash_asym3_hd512(
                         io.q,
                         io.k_cache,

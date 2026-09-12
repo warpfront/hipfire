@@ -2179,12 +2179,21 @@ pub const GEMMA4_FLASH_TILE: usize = 128;
 /// scale linearly with this.
 pub const GEMMA4_MAX_PREFILL_BATCH: usize = 128;
 
+#[inline]
+fn flash_partials_len_for_tile(
+    max_seq: usize,
+    n_heads: usize,
+    head_dim: usize,
+    tile_size: usize,
+) -> usize {
+    n_heads * max_seq.div_ceil(tile_size) * (2 + head_dim)
+}
+
 /// Pure geometry: single-query flash partial length for `max_seq`.
 /// `n_heads * ceil(max_seq / TILE) * (2 + head_dim)` floats.
 #[inline]
 pub fn gemma4_flash_partials_len(max_seq: usize, n_heads: usize, full_head_dim: usize) -> usize {
-    let tiles = max_seq.div_ceil(GEMMA4_FLASH_TILE);
-    n_heads * tiles * (2 + full_head_dim)
+    flash_partials_len_for_tile(max_seq, n_heads, full_head_dim, GEMMA4_FLASH_TILE)
 }
 
 /// Pure geometry: batched flash partial length for `max_seq`.
@@ -2443,13 +2452,24 @@ impl Gemma4Scratch {
         let i_sample_buf = alloc!(&[2], DType::F32);
         let i_repeat_buf = alloc!(&[1024], DType::F32);
 
-        // Flash partials sizing. Per-head × max_tiles × (2 + head_dim) floats.
-        // Sized for FULL attn (head_dim=512 stride 514, vs sliding 256 stride 258);
-        // sliding-layer dispatches use part of the buffer, full-layer dispatches
-        // use all of it. `max_seq` is the single authority shared with both KV
-        // caches — no independent `HIPFIRE_KV_SEQ` env var.
-        let flash_partials_sz =
+        // gfx1100 sliding Q8 uses a smaller tile than full Asym3 attention, so
+        // its larger tile count can outweigh the smaller per-tile stride.
+        let sliding_tile = rdna_compute::attention::q8_flash_tile_size(
+            &gpu.arch,
+            config.n_heads,
+            config.sliding_n_kv_heads,
+            config.sliding_head_dim,
+            max_seq,
+        );
+        let sliding_flash_partials_sz = flash_partials_len_for_tile(
+            max_seq,
+            config.n_heads,
+            config.sliding_head_dim,
+            sliding_tile,
+        );
+        let full_flash_partials_sz =
             gemma4_flash_partials_len(max_seq, config.n_heads, config.full_head_dim);
+        let flash_partials_sz = sliding_flash_partials_sz.max(full_flash_partials_sz);
         let i_flash_partials = alloc!(&[flash_partials_sz], DType::F32);
 
         // (Note 2026-05-19): removed the precomputed sliding/full cos+sin
@@ -2670,6 +2690,16 @@ impl Gemma4Scratch {
 #[cfg(test)]
 mod scratch_geometry_tests {
     use super::*;
+
+    #[test]
+    fn sliding_tile32_partials_can_exceed_full_tile128_partials() {
+        let max_seq = 1025;
+        let sliding = flash_partials_len_for_tile(max_seq, 16, 256, 32);
+        let full = flash_partials_len_for_tile(max_seq, 16, 512, 128);
+        assert!(sliding > full);
+        assert_eq!(sliding, 16 * 33 * 258);
+        assert_eq!(full, 16 * 9 * 514);
+    }
 
     fn dummy_cfg_31b() -> Gemma4Config {
         // Minimal config mirroring 31B/26B shapes: n_heads=32, full_head_dim=512
