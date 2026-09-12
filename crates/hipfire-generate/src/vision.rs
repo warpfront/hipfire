@@ -1222,8 +1222,11 @@ pub fn generate_vl(
     // Test-only fault hook (G4.8 lifecycle evidence): `HIPFIRE_VISION_FAULT`
     // `=prefill` fails this request through the fail-closed error epilogue
     // after prefill; `=decode` fails it on the first decode iteration.
-    // Unset (production) → one missed env lookup, no behavior change.
-    let vl_fault = std::env::var("HIPFIRE_VISION_FAULT").ok();
+    // Gated on `serve-fault-inject`: a default build has no env read at all.
+    #[cfg(feature = "serve-fault-inject")]
+    let vl_fault = hipfire_config::developer_var("HIPFIRE_VISION_FAULT").ok();
+    #[cfg(not(feature = "serve-fault-inject"))]
+    let vl_fault: Option<String> = None;
 
     // Mirror the text path: <think>/</think> as paired open/close. The
     // previous implementation queried "💭" twice (open == close) which
@@ -2225,7 +2228,10 @@ pub fn generate_vl_dots_ocr(
     // Test-only fault hook (G4.8 lifecycle evidence): `HIPFIRE_DOTS_FAULT`
     // `=prefill` fails this request through the fail-closed error epilogue
     // once prefill has committed decoder state. Unset → no behavior change.
-    let dots_fault = std::env::var("HIPFIRE_DOTS_FAULT").ok();
+    #[cfg(feature = "serve-fault-inject")]
+    let dots_fault = hipfire_config::developer_var("HIPFIRE_DOTS_FAULT").ok();
+    #[cfg(not(feature = "serve-fault-inject"))]
+    let dots_fault: Option<String> = None;
     if dots_fault.as_deref() == Some("prefill") {
         dots_ar_fail(
             state,
@@ -2578,8 +2584,13 @@ pub fn run_dots_ocr_ngram_loop(
         let max_emit = max_tokens.saturating_sub(generated);
         // Test-only fault hook (G4.8 lifecycle evidence): `HIPFIRE_DOTS_FAULT`
         // `=spec` fails through the same fail-closed path as a real verify
-        // failure. Unset → no behavior change.
-        if std::env::var("HIPFIRE_DOTS_FAULT").as_deref() == Ok("spec") {
+        // failure. Gated on `serve-fault-inject`; a default build never reads it.
+        #[cfg(feature = "serve-fault-inject")]
+        let dots_spec_fault =
+            hipfire_config::developer_var("HIPFIRE_DOTS_FAULT").as_deref() == Ok("spec");
+        #[cfg(not(feature = "serve-fault-inject"))]
+        let dots_spec_fault = false;
+        if dots_spec_fault {
             dots_spec_fail(
                 bundle,
                 spec,
