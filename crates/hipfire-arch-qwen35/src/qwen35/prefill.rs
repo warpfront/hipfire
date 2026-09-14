@@ -6066,10 +6066,11 @@ fn batch_chunk_full_attn_output_projection(
     Ok(())
 }
 
-/// Context length past which an admitted gfx1100/gfx1201 Q8 small-batch attend step
+/// Context length past which an admitted gfx1100/gfx1151/gfx1201 Q8 small-batch attend step
 /// leaves the batched masked FA kernel for the multi-row tile. Measured with
 /// the Qwen3.8-27B verify shape (`bench_flash_rows`, tile 128). The conservative
-/// 4k boundary is retained across both measured architectures.
+/// 4k boundary is retained for the gfx1151 validation candidate alongside the
+/// measured gfx1100/gfx1201 routes.
 /// `HIPFIRE_FA_PERTOKEN_MIN_CTX` overrides; `0` disables the route.
 pub(crate) fn fa_pertoken_min_ctx() -> Option<usize> {
     use std::sync::OnceLock;
@@ -6096,7 +6097,7 @@ fn q8_multirow_attn_admitted(
     capture_mode: bool,
     replay_recording: bool,
 ) -> bool {
-    matches!(arch, "gfx1100" | "gfx1201")
+    matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
         && quant_q8
         && matches!(head_dim, 128 | 256)
         && (4..=32).contains(&n)
@@ -6146,7 +6147,9 @@ fn batch_chunk_fa_attend(
     }
 
     if multirow {
-        debug_assert!(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201());
+        debug_assert!(
+            gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()
+        );
         debug_assert!(kv_cache.quant_q8);
         debug_assert!(matches!(config.head_dim, 128 | 256));
         gpu.kv_cache_write_q8_0_batched(
@@ -8999,8 +9002,8 @@ mod tests {
     use rdna_compute::DType;
 
     #[test]
-    fn q8_multirow_attn_admits_only_measured_arch_shapes() {
-        for arch in ["gfx1100", "gfx1201"] {
+    fn q8_multirow_attn_admits_only_explicit_arch_shapes() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             for head_dim in [128, 256] {
                 for n in [4, 8, 32] {
                     assert!(q8_multirow_attn_admitted(
@@ -9152,12 +9155,30 @@ mod tests {
 
     #[test]
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
-        for arch in ["gfx1100", "gfx1201"] {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                true,
             ));
         }
     }
