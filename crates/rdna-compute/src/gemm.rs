@@ -268,7 +268,7 @@ impl<'a> GemmEpilogue<'a> {
 /// kernel before the gfx11 WMMA branch, so batch >= 128 never reaches these
 /// kernels there. gfx12 has no such diversion, which is why only gfx12 shows the
 /// large-batch regression.
-const LDSSTAGE_MAX_BATCH: usize = 96;
+pub(crate) const LDSSTAGE_MAX_BATCH: usize = 96;
 
 /// gfx11 (RDNA3 / RDNA3.5), both dGPU and iGPU. Re-measured on the PINNED 3.6
 /// trunk `86a5f80f…` (the fixture rule: measure 3.6 when it exists), which

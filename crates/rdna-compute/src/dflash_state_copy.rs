@@ -3,7 +3,8 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! S1 (launch-fusion): `Gpu` launchers for the descriptor-driven DeltaNet
-//! snapshot bulk copy (`dflash_state_bulk_copy_gfx1100`, gfx1100-only).
+//! snapshot bulk copy (`dflash_state_bulk_copy_gfx1100`). The historical
+//! symbol name is retained while admission covers the measured DFlash fleet.
 //!
 //! The kernel source is self-contained here via `include_str!` so no shared
 //! registry (`kernels.rs` / `replay.rs`) changes are needed. One block per

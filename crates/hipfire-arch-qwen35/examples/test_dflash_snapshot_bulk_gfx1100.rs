@@ -131,7 +131,7 @@ fn poison_state(gpu: &mut Gpu, state: &DeltaNetState, seed: u64) {
     }
 }
 
-fn run_case(gpu: &mut Gpu, gfx1100: bool, ef_on: bool) {
+fn run_case(gpu: &mut Gpu, supported: bool, ef_on: bool) {
     let tag = if ef_on { "EF-on" } else { "EF-off" };
     let mut state = make_state(gpu, ef_on, 0x11);
     let mut snap = DeltaNetSnapshot::new_for(gpu, &state).expect("new_for");
@@ -144,16 +144,16 @@ fn run_case(gpu: &mut Gpu, gfx1100: bool, ef_on: bool) {
         };
     match snap.bulk_n_items() {
         Some(n) => {
-            assert!(gfx1100, "{tag}: tables armed off gfx1100");
+            assert!(supported, "{tag}: tables armed on unsupported arch");
             assert_eq!(n, expect_items, "{tag}: item count");
         }
         None => assert!(
-            !gfx1100,
-            "{tag}: tables disarmed on gfx1100 (n_items would be {expect_items})"
+            !supported,
+            "{tag}: tables disarmed on supported arch (n_items would be {expect_items})"
         ),
     }
     eprintln!(
-        "{tag}: bulk_n_items={:?} (expect {expect_items} on gfx1100)",
+        "{tag}: bulk_n_items={:?} (expect {expect_items} when supported)",
         snap.bulk_n_items()
     );
 
@@ -220,9 +220,9 @@ fn run_case(gpu: &mut Gpu, gfx1100: bool, ef_on: bool) {
 
 fn main() {
     let mut gpu = Gpu::init().expect("Gpu::init");
-    let gfx1100 = gpu.arch_caps.is_gfx1100();
-    eprintln!("arch={} gfx1100={gfx1100}", gpu.arch);
-    run_case(&mut gpu, gfx1100, true);
-    run_case(&mut gpu, gfx1100, false);
-    println!("S1 bulk snapshot gate: PASS (EF on/off, gfx1100={gfx1100})");
+    let supported = gpu.arch_caps.supports_dflash_copy_fusions();
+    eprintln!("arch={} dflash_copy_fusions={supported}", gpu.arch);
+    run_case(&mut gpu, supported, true);
+    run_case(&mut gpu, supported, false);
+    println!("S1 bulk snapshot gate: PASS (EF on/off, supported={supported})");
 }

@@ -1298,7 +1298,7 @@ impl DeltaNetSnapshot {
         gpu: &Gpu,
         forward: bool,
     ) -> Option<(&DeviceBuffer, u32)> {
-        if gpu.flags.dn_snapshot_bulk_off || !gpu.arch_caps.is_gfx1100() {
+        if gpu.flags.dn_snapshot_bulk_off || !gpu.arch_caps.supports_dflash_copy_fusions() {
             return None;
         }
         if self.bulk_n_items == 0 || Self::bulk_fingerprint(state) != self.bulk_fingerprint {
@@ -1351,10 +1351,10 @@ impl DeltaNetSnapshot {
             bulk_n_items: 0,
             bulk_fingerprint: Self::bulk_fingerprint(state),
         };
-        // Arm the gfx1100 bulk route: JIT + table upload happen here at
+        // Arm the fleet-validated bulk route: JIT + table upload happen here at
         // setup, never in a decode cycle. Any failure leaves the snapshot on
         // the legacy memcpy path.
-        if gpu.arch_caps.is_gfx1100() && !gpu.flags.dn_snapshot_bulk_off {
+        if gpu.arch_caps.supports_dflash_copy_fusions() && !gpu.flags.dn_snapshot_bulk_off {
             let backs = [
                 &snap.s_matrix_bufs[..],
                 &snap.s_scale_bufs[..],

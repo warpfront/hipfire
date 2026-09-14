@@ -3,7 +3,8 @@
 //! S4-f16-residual-inputs: post-attention/down producers that emit the frozen
 //! FP16 sidecars consumed by [`Gpu::gemm_mq4g256v2_residual_wmma_f16`].
 //!
-//! Three Gpu launch families (plain + AWQ each), all exact-gfx1100,
+//! Three Gpu launch families (plain + AWQ each), on the validated
+//! gfx1100/gfx1201 fleet,
 //! batched `[N x K]` row-major, `launch_maybe_blob` + `KernargBlob` only:
 //!
 //! * `gated_norm_rotate_mq_f16_batched` — LA post-GDN: gated RMSNorm + FWHT
@@ -100,10 +101,10 @@ impl Gpu {
                 "gated_norm_rotate_mq_f16_batched: K % 256 == 0 and N >= 1 required",
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "gated_norm_rotate_mq_f16_batched: exact gfx1100 required",
+                "gated_norm_rotate_mq_f16_batched: unsupported architecture",
             ));
         }
         self.bind_thread()?;
@@ -198,10 +199,10 @@ impl Gpu {
                 "gated_norm_rotate_mq_awq_f16_batched: K % 256 == 0, N >= 1, awq len >= K required",
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "gated_norm_rotate_mq_awq_f16_batched: exact gfx1100 required",
+                "gated_norm_rotate_mq_awq_f16_batched: unsupported architecture",
             ));
         }
         self.bind_thread()?;
@@ -287,10 +288,10 @@ impl Gpu {
                 "sigmoid_mul_rotate_mq_f16_batched: K % 256 == 0 and N >= 1 required",
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "sigmoid_mul_rotate_mq_f16_batched: exact gfx1100 required",
+                "sigmoid_mul_rotate_mq_f16_batched: unsupported architecture",
             ));
         }
         self.bind_thread()?;
@@ -359,10 +360,10 @@ impl Gpu {
                 "sigmoid_mul_rotate_mq_awq_f16_batched: K % 256 == 0, N >= 1, awq len >= K required",
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "sigmoid_mul_rotate_mq_awq_f16_batched: exact gfx1100 required",
+                "sigmoid_mul_rotate_mq_awq_f16_batched: unsupported architecture",
             ));
         }
         self.bind_thread()?;
@@ -435,10 +436,10 @@ impl Gpu {
                 "fused_silu_mul_rotate_mq_f16_batched: K % 256 == 0 and N >= 1 required",
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "fused_silu_mul_rotate_mq_f16_batched: exact gfx1100 required",
+                "fused_silu_mul_rotate_mq_f16_batched: unsupported architecture",
             ));
         }
         self.bind_thread()?;
@@ -507,10 +508,10 @@ impl Gpu {
                 "fused_silu_mul_rotate_mq_awq_f16_batched: K % 256 == 0, N >= 1, awq len >= K required",
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "fused_silu_mul_rotate_mq_awq_f16_batched: exact gfx1100 required",
+                "fused_silu_mul_rotate_mq_awq_f16_batched: unsupported architecture",
             ));
         }
         self.bind_thread()?;
@@ -586,10 +587,10 @@ impl Gpu {
         if m == 0 || batch_size == 0 {
             return Ok(());
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !self.arch_caps.supports_dflash_f16_residual_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "gemm_mq4g256v2_residual_wmma_f16: exact gfx1100 required",
+                "gemm_mq4g256v2_residual_wmma_f16: unsupported architecture",
             ));
         }
         if batch_size > 16 {
@@ -605,6 +606,38 @@ impl Gpu {
             ));
         }
         self.bind_thread()?;
+        if self.arch_caps.is_rdna4() {
+            let ldsstage = self.flags.hfq4g256_ldsstage_wmma
+                && k % 512 == 0
+                && batch_size <= crate::gemm::LDSSTAGE_MAX_BATCH;
+            return if ldsstage {
+                self.gemm_residual_f16_one(
+                    a_raw,
+                    x_f16,
+                    y,
+                    m,
+                    k,
+                    batch_size,
+                    "gemm_mq4g256v2_residual_wmma_gfx12_ldsstage_f16",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC,
+                    "gemm_mq4g256v2_residual_wmma_gfx12_ldsstage",
+                    [256, 1, 1],
+                )
+            } else {
+                self.gemm_residual_f16_one(
+                    a_raw,
+                    x_f16,
+                    y,
+                    m,
+                    k,
+                    batch_size,
+                    "gemm_mq4g256v2_residual_wmma_gfx12_f16",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC,
+                    "gemm_mq4g256v2_residual_wmma_gfx12",
+                    [32, 1, 1],
+                )
+            };
+        }
         // Shared verify-tier pick (same helper as the F32 entry): the kill
         // switch dominates both optimized tiers and restores base.
         match Self::residual_verify_tier(

@@ -1,0 +1,52 @@
+[
+{
+"request_id": "chatcmpl-30532-1",
+"ctx": 5489,
+"cached": 0,
+"gen": 19,
+"finish": "stop",
+"think_words": 0,
+"ans_words": 6,
+"prefill_ms": 24203.7,
+"prefill_tok_s": 226.8,
+"decode_tok_s": 1.1,
+"decode_estimated": false,
+"tau": 8.5,
+"cycles": 2,
+"dflash": true,
+"mtp": null,
+"mtp_ngram": null,
+"ngram_mod_windows": null,
+"ngram_mod_drafts": null,
+"ngram_mod_accepted": null,
+"ngram_mod_accept_rate": null,
+"mtp_windows": null,
+"ar_windows": null,
+"mtp_retired": null,
+"mtp_window_timings": null,
+"ttft_s": 24.215,
+"wall_s": 41.734,
+"attractor": false,
+"empty": false,
+"runaway": false,
+"ans_preview": "The secret pass code is mauve-velociraptor-7741.",
+"assistant_content": "The secret pass code is mauve-velociraptor-7741.",
+"content": "The secret pass code is mauve-velociraptor-7741.",
+"reasoning_content": "",
+"tool_calls": [],
+"request_md5": "3561e5aa2bfe76d352e2752ab77a71cc",
+"atem_leak": false,
+"terminal_count": 1,
+"terminal_reasons": [
+"stop"
+],
+"post_terminal_bytes": 0,
+"saw_done": true,
+"stream_error": null,
+"prompt_md5": "27a3b8ec0bf8e397ae20cd8cd346f7ac",
+"expected_substrings": [
+"mauve-velociraptor-7741"
+],
+"retrieval_missing": []
+}
+]

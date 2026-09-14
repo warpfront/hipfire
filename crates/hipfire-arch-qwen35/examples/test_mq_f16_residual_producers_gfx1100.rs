@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
 
-//! S4-f16-residual-inputs parity gate on exact gfx1100.
+//! S4-f16-residual-inputs parity gate on the validated gfx1100/gfx1201 fleet.
 //!
 //! For N in {1, 8, 16}, head layouts {32x128 (LA), 48x128 (FA)}, AWQ
 //! absent/present, and nonzero initial residuals, requires:
@@ -249,11 +249,11 @@ fn main() {
         }
     };
     let arch = gpu.arch.clone();
-    if !(gpu.arch_caps.is_gfx1100() && arch == "gfx1100") {
-        eprintln!("SKIP: arch {arch} is not exact gfx1100 — harness requires gfx1100 only");
+    if !gpu.arch_caps.supports_dflash_f16_residual_fusions() {
+        eprintln!("SKIP: arch {arch} is not in the validated S4 fleet");
         return;
     }
-    println!("[s4] arch {arch} confirmed exact gfx1100");
+    println!("[s4] arch {arch} admitted by the S4 capability");
 
     let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
     let mut fails = 0;
@@ -447,7 +447,7 @@ fn run_residual(
     let y0 = rand_vec(rng, n * m, -1.0, 1.0);
     let dy_old = gpu.upload_f32(&y0, &[n * m]).unwrap();
     let dy_new = gpu.upload_f32(&y0, &[n * m]).unwrap();
-    gpu.gemm_mq4g256v2_residual_wmma(&dw, x_f32, &dy_old, m, k, n)
+    gpu.gemm_hfq4g256_residual_mq4v2(&dw, x_f32, &dy_old, m, k, n)
         .unwrap();
     let x_view = x_f16.sub_offset(0, n * k);
     gpu.gemm_mq4g256v2_residual_wmma_f16(&dw, &x_view, &dy_new, m, k, n)

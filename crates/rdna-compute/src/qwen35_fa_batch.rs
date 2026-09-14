@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! S6-fa-prep-q8-pair launchers: batched full-attention prep and paired Q8
-//! K/V cache writes for gfx1100 DFlash verify.
+//! K/V cache writes for validated wave32 DFlash verify devices.
 //!
 //! Both kernels are bit-exact folds of the launches they replace (see the
 //! `.hip` headers); admission (gfx1100, `DflashFusionCtx::ChainVerify`,
@@ -58,10 +58,10 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.is_gfx1100() {
+        if !self.arch_caps.supports_dflash_fa_batch_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "qwen35_fa_prep_batched_gfx1100 is certified only on gfx1100",
+                "qwen35_fa_prep_batched_gfx1100 is not certified on this architecture",
             ));
         }
         if !FA_PREP_BATCHED_GEOMETRIES.contains(&(n_q_heads, n_kv_heads)) {
@@ -166,10 +166,10 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.is_gfx1100() {
+        if !self.arch_caps.supports_dflash_fa_batch_fusions() {
             return Err(hip_bridge::HipError::new(
                 1,
-                "kv_cache_write_q8_0_pair_batched is certified only on gfx1100",
+                "kv_cache_write_q8_0_pair_batched is not certified on this architecture",
             ));
         }
         if batch_size == 0 || n_kv_heads == 0 || head_dim % 32 != 0 {

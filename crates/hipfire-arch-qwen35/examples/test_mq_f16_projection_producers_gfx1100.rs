@@ -3,7 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! S3-f16-projection-inputs gate: exact-FP16 projection-input producers on
-//! gfx1100.
+//! validated gfx1100/gfx1201 fleet.
 //!
 //! For N in {1,2,8,16} x hidden K in {4096,5120} x AWQ {absent, present}:
 //!  1. F16 memcmp: `fused_rmsnorm_rotate_mq[_awq]_f16_batched` bytes vs the
@@ -16,7 +16,7 @@
 //! AWQ identically (byte-match vs the direct producer call), and a non-F16
 //! `x_f16` input is rejected with `Err` (never silently converted).
 //!
-//! On any non-gfx1100 arch the harness SKIPs cleanly (exit 0, no GPU work).
+//! On an unsupported arch the harness SKIPs cleanly (exit 0, no GPU work).
 
 use hipfire_runtime::llama::{fused_rmsnorm_rotate_mq_f16_batched_for, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -202,15 +202,15 @@ fn main() {
         }
     };
     let arch = gpu.arch.clone();
-    if !(gpu.arch_caps.is_gfx1100() && arch == "gfx1100") {
-        eprintln!("SKIP: arch {arch} is not exact gfx1100");
+    if !gpu.arch_caps.supports_dflash_f16_projection_fusions() {
+        eprintln!("SKIP: arch {arch} is not in the validated S3 fleet");
         return;
     }
     if gpu.active_capture.is_some() {
         eprintln!("SKIP: active_capture is Some");
         return;
     }
-    eprintln!("arch {arch} confirmed exact gfx1100 — running S3 F16 producer gate");
+    eprintln!("arch {arch} admitted by the S3 capability — running F16 producer parity");
 
     let mut all_ok = true;
     // Routing-sensitive but 16-aligned row counts (base kernels handle tails;
@@ -353,7 +353,7 @@ fn main() {
                     {
                         fill_f32_quiet_nan(&mut gpu, o, s);
                     }
-                    gpu.gemm_qkvza_mq4g256v2_wmma(
+                    gpu.gemm_qkvza_hfq4g256_mq4v2(
                         &w_qkv,
                         &w_z,
                         &w_b,
@@ -431,7 +431,7 @@ fn main() {
                     for o in outs_old.iter().chain(outs_new.iter()) {
                         fill_f32_quiet_nan(&mut gpu, o, 0x7fc0_0021);
                     }
-                    gpu.gemm_qkv_mq4g256v2_wmma(
+                    gpu.gemm_qkv_hfq4g256_mq4v2(
                         &w_q,
                         &w_k,
                         &w_v,
@@ -502,7 +502,7 @@ fn main() {
                     for o in outs_old.iter().chain(outs_new.iter()) {
                         fill_f32_quiet_nan(&mut gpu, o, 0x7fc0_0031);
                     }
-                    gpu.gemm_gate_up_mq4g256v2_wmma(
+                    gpu.gemm_gate_up_hfq4g256_mq4v2(
                         &w_g,
                         &w_u,
                         &d_rot_f32,

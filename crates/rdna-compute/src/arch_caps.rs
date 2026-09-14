@@ -397,6 +397,38 @@ impl ArchCaps {
     pub fn supports_ds4_f16_compressor_cache(&self) -> bool {
         self.has_wmma_w32 || self.has_wmma_w32_gfx12
     }
+    /// DFlash state-copy and hidden-ring launch fusion admission.
+    ///
+    /// These kernels are pure copies with no WMMA or architecture-specific
+    /// builtins. Keep the production gate on the measured DFlash fleet until
+    /// additional hardware is validated.
+    pub fn supports_dflash_copy_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1151 || self.is_gfx1201
+    }
+    /// DFlash exact-F16 projection producer/consumer admission.
+    ///
+    /// The producer is wave32 portable. The consumers select distinct gfx11
+    /// and gfx12 WMMA sources, so keep this on the hardware validated by the
+    /// projection parity harness.
+    pub fn supports_dflash_f16_projection_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
+    /// DFlash direct-F16 residual producer/consumer admission.
+    pub fn supports_dflash_f16_residual_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
+    /// DFlash GDN pre/tape fusion admission.
+    pub fn supports_dflash_gdn_pre_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
+    /// DFlash batched FA preparation and paired Q8 K/V-write admission.
+    ///
+    /// Both kernels use portable wave32 reductions and no generation-specific
+    /// WMMA intrinsics. Keep admission limited to architectures covered by the
+    /// end-to-end parity harness.
+    pub fn supports_dflash_fa_batch_fusions(&self) -> bool {
+        self.is_gfx1100 || self.is_gfx1201
+    }
     pub fn is_rdna4(&self) -> bool {
         self.is_rdna4
     }
@@ -535,6 +567,7 @@ mod tests {
         assert!(caps.has_wmma_w32());
         assert!(!caps.has_wmma_w32_gfx12());
         assert!(caps.supports_ds4_f16_compressor_cache());
+        assert!(caps.supports_dflash_copy_fusions());
     }
 
     #[test]
@@ -573,6 +606,79 @@ mod tests {
         assert!(!caps.has_wmma_w32());
         assert!(!caps.is_rdna3());
         assert!(caps.supports_ds4_f16_compressor_cache());
+    }
+
+    #[test]
+    fn dflash_copy_fusions_cover_measured_fleet_only() {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            assert!(make_caps(arch).supports_dflash_copy_fusions(), "{arch}");
+        }
+        for arch in ["gfx1030", "gfx1101", "gfx1150", "gfx1200", "gfx942"] {
+            assert!(!make_caps(arch).supports_dflash_copy_fusions(), "{arch}");
+        }
+    }
+
+    #[test]
+    fn dflash_f16_projection_fusions_cover_validated_fleet_only() {
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(
+                make_caps(arch).supports_dflash_f16_projection_fusions(),
+                "{arch}"
+            );
+        }
+        for arch in [
+            "gfx1030", "gfx1101", "gfx1150", "gfx1151", "gfx1200", "gfx942",
+        ] {
+            assert!(
+                !make_caps(arch).supports_dflash_f16_projection_fusions(),
+                "{arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn dflash_f16_residual_fusions_cover_validated_fleet_only() {
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(
+                make_caps(arch).supports_dflash_f16_residual_fusions(),
+                "{arch}"
+            );
+        }
+        for arch in [
+            "gfx1030", "gfx1101", "gfx1150", "gfx1151", "gfx1200", "gfx942",
+        ] {
+            assert!(
+                !make_caps(arch).supports_dflash_f16_residual_fusions(),
+                "{arch}"
+            );
+        }
+    }
+
+    #[test]
+    fn dflash_gdn_pre_fusions_cover_validated_fleet_only() {
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(make_caps(arch).supports_dflash_gdn_pre_fusions(), "{arch}");
+        }
+        for arch in [
+            "gfx1030", "gfx1101", "gfx1150", "gfx1151", "gfx1200", "gfx942",
+        ] {
+            assert!(!make_caps(arch).supports_dflash_gdn_pre_fusions(), "{arch}");
+        }
+    }
+
+    #[test]
+    fn dflash_fa_batch_fusions_cover_validated_fleet_only() {
+        for arch in ["gfx1100", "gfx1201"] {
+            assert!(make_caps(arch).supports_dflash_fa_batch_fusions(), "{arch}");
+        }
+        for arch in [
+            "gfx1030", "gfx1101", "gfx1150", "gfx1151", "gfx1200", "gfx942",
+        ] {
+            assert!(
+                !make_caps(arch).supports_dflash_fa_batch_fusions(),
+                "{arch}"
+            );
+        }
     }
 
     #[test]
