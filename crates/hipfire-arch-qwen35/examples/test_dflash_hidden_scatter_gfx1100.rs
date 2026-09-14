@@ -26,7 +26,7 @@ const MAX_POS: usize = 40;
 const MAX_BATCH: usize = 17;
 const N_EXTRACT: usize = 5;
 const LAYERS: [usize; N_EXTRACT] = [2, 7, 13, 21, 33];
-const CANARY_VAL: f32 = 3.1415927;
+const CANARY_VAL: f32 = 3.125;
 
 fn lcg(state: &mut u64) -> u64 {
     *state = state
@@ -43,7 +43,7 @@ fn pattern(ext: usize, row: usize, col: usize, hidden: usize) -> f32 {
         .wrapping_add((row * hidden + col) as u64)
         .wrapping_add(0x12345678);
     let v = (lcg(&mut s) % 2000001) as f32 / 1000.0 - 1000.0;
-    if col % 7 == 0 {
+    if col.is_multiple_of(7) {
         (ext * 100000 + row * 1000 + col) as f32
     } else {
         v
@@ -407,7 +407,7 @@ fn direct_launcher_arm(
         )
         .map_err(|e| format!("direct: scatter5 try: {e}"))?;
     assert!(launched, "direct: scatter5_try reported false after ensure");
-    speculative::scatter_hidden_block_to_interleaved(&gpu, &rb_l, &dst_l, OFF, BLK, N, MOD)
+    speculative::scatter_hidden_block_to_interleaved(gpu, &rb_l, &dst_l, OFF, BLK, N, MOD)
         .map_err(|e| format!("direct: loop scatter: {e}"))?;
     let a = gpu
         .download_f32(&dst_k)

@@ -33,12 +33,20 @@ use super::weights::StateQuant;
 use crate::speculative::HiddenStateRingBuffer;
 use hip_bridge::HipError;
 use hip_bridge::HipResult;
+use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
+
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::context::DispatchWorkload;
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::families::kv_tier::KvTierPlan;
+use hipfire_dispatch::families::moe::codebook_batched_admit_enabled;
+#[cfg(test)]
+use hipfire_dispatch::families::moe::{
+    codebook_batched_admit_enabled_from_env, mq6_batched_admit_enabled_from_env,
+};
+use hipfire_dispatch::pipeline::dump_hidden_localize;
 use hipfire_dispatch::pipeline::execute_steps;
 use hipfire_dispatch::pipeline::GemvInput;
 use hipfire_dispatch::pipeline::Step;
@@ -184,7 +192,7 @@ fn dispatch_batched_gemm_epilogue(
             } else {
                 return run_residual_gemm_key(
                     gpu,
-                    crate::forward_slots::residual_gemm_key_for(w.gpu_dtype),
+                    hipfire_dispatch::families::gemm::residual_gemm_key_for(w.gpu_dtype),
                     &w.buf,
                     w.gpu_dtype,
                     input,
@@ -278,7 +286,7 @@ fn dispatch_batched_gemm_epilogue(
                 zero_partial_for_residual(gpu, out, n, m)?;
                 return run_residual_gemm_key(
                     gpu,
-                    crate::forward_slots::residual_gemm_key_for(w.gpu_dtype),
+                    hipfire_dispatch::families::gemm::residual_gemm_key_for(w.gpu_dtype),
                     &w.buf,
                     w.gpu_dtype,
                     input,
@@ -342,6 +350,8 @@ fn dispatch_batched_gemm_epilogue(
 /// `HiddenStateRingBuffer` staging can match a safe chunk ceiling (staging
 /// smaller than a chunk will assert-fail on prompt seeding of long prompts).
 pub const PREFILL_MAX_BATCH: usize = 256;
+/// Minimum number of rows for the batched prefill kernels.
+const MIN_BATCH: usize = 2;
 
 /// gfx1100-measured default prefill chunk size (Qwen3.8 / MQ4V2 gate-up BT path).
 /// Exact `gfx1100` only — not gfx1101/1102/1151 or other gfx11 variants.
@@ -1853,16 +1863,23 @@ pub fn qwen35_layer_batch_admissible(
                 ));
             }
             // TopK gate is environment-sensitive.
-            if !moe_prefill_topk_shape_supported(config.num_experts_per_tok, config.num_experts) {
+            if !hipfire_dispatch::families::moe::moe_prefill_topk_shape_supported(
+                config.num_experts_per_tok,
+                config.num_experts,
+            ) {
                 return Err(HipError::new(0, "DeltaNetMoe topk shape unsupported"));
             }
-            let admit_mq6 = mq6_batched_admit_enabled_from_env(
+            let admit_mq6 = hipfire_dispatch::families::moe::mq6_batched_admit_enabled_from_env(
                 hipfire_config::developer_var("HIPFIRE_MOE_MQ6_ADMIT")
                     .ok()
                     .as_deref(),
                 arch,
             );
-            if !moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch) {
+            let dtypes = moe_prefill_dtypes(&l.ffn)
+                .ok_or_else(|| HipError::new(0, "DeltaNetMoe MoE dtype metadata unavailable"))?;
+            if !hipfire_dispatch::families::moe::gated_moe_prefill_admissible(
+                &dtypes, admit_mq6, arch,
+            ) {
                 return Err(HipError::new(0, "DeltaNetMoe moe_ffn not batch-admissible"));
             }
             Ok(())
@@ -1923,21 +1940,117 @@ pub fn qwen35_layer_batch_admissible(
                     "FullAttnMoe shared_expert_gate shape mismatch",
                 ));
             }
-            if !moe_prefill_topk_shape_supported(config.num_experts_per_tok, config.num_experts) {
+            if !hipfire_dispatch::families::moe::moe_prefill_topk_shape_supported(
+                config.num_experts_per_tok,
+                config.num_experts,
+            ) {
                 return Err(HipError::new(0, "FullAttnMoe topk shape unsupported"));
             }
-            let admit_mq6 = mq6_batched_admit_enabled_from_env(
+            let admit_mq6 = hipfire_dispatch::families::moe::mq6_batched_admit_enabled_from_env(
                 hipfire_config::developer_var("HIPFIRE_MOE_MQ6_ADMIT")
                     .ok()
                     .as_deref(),
                 arch,
             );
-            if !moe_ffn_batched_admissible(&l.ffn, admit_mq6, arch) {
+            let dtypes = moe_prefill_dtypes(&l.ffn)
+                .ok_or_else(|| HipError::new(0, "FullAttnMoe MoE dtype metadata unavailable"))?;
+            if !hipfire_dispatch::families::moe::gated_moe_prefill_admissible(
+                &dtypes, admit_mq6, arch,
+            ) {
                 return Err(HipError::new(0, "FullAttnMoe moe_ffn not batch-admissible"));
             }
             Ok(())
         }
     }
+}
+/// Choose the next prefill chunk without leaving an invalid singleton tail.
+///
+/// Batched kernels require at least `MIN_BATCH` rows. When a full chunk would
+/// leave one row, move one row into the tail (for example, 257 → 255 + 2).
+#[inline]
+fn next_prefill_chunk_len(remaining: usize, max_batch: usize) -> Option<usize> {
+    if remaining < MIN_BATCH || max_batch < MIN_BATCH {
+        return None;
+    }
+    if max_batch == MIN_BATCH && remaining % MIN_BATCH != 0 {
+        return None;
+    }
+
+    let chunk = remaining.min(max_batch);
+    if remaining - chunk == 1 {
+        (chunk > MIN_BATCH).then_some(chunk - 1)
+    } else {
+        Some(chunk)
+    }
+}
+
+/// Plan scratch owned by one prefill call.
+///
+/// Large prompts retain the configured chunk size, while a short prompt gets
+/// exactly one right-sized chunk. The DeltaNet S-state tape is consumed only by
+/// tree verify; ordinary prefill advances recurrent state in place.
+#[inline]
+fn owned_prefill_scratch_plan(
+    n: usize,
+    configured_max_batch: usize,
+    tree_verify: bool,
+) -> (usize, bool) {
+    debug_assert!(n > 0);
+    debug_assert!(configured_max_batch >= MIN_BATCH);
+    (configured_max_batch.min(n.max(MIN_BATCH)), tree_verify)
+}
+
+/// Whether `forward_prefill_batch_with_pbs` will take the tape-capturing
+/// batched (PBS) path for an `n`-token call.
+///
+/// This is the single source of truth for the eligibility decision shared by
+/// the forward and speculative-decode callers.
+pub fn prefill_batch_pbs_eligible(
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    // Kept for API stability and future state-aware gating.
+    _dn_state: &DeltaNetState,
+    n: usize,
+    arch: &str,
+    moe_router_logits_present: bool,
+) -> bool {
+    let decouple_env = hipfire_config::developer_var("HIPFIRE_MTP_VERIFY_DECOUPLE").ok();
+    let is_rdna3_decouple = arch.starts_with("gfx11");
+    let verify_decouple = n <= 32
+        && decouple_env.as_deref() != Some("0")
+        && (is_rdna3_decouple || decouple_env.as_deref() == Some("1"));
+    let force_fallback = !verify_decouple && !hipfire_runtime::config::get().prefill_batched;
+    let has_dn = weights
+        .layers
+        .iter()
+        .any(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_)));
+    let all_layers_ok = weights.layers.iter().all(|lw| {
+        if matches!(
+            lw,
+            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
+        ) && !moe_router_logits_present
+        {
+            return false;
+        }
+        qwen35_layer_batch_admissible(lw, config, arch).is_ok()
+    });
+    let result = !force_fallback && n >= MIN_BATCH && has_dn && all_layers_ok;
+    if hipfire_config::developer_var("HIPFIRE_DEBUG_BATCH")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
+        eprintln!(
+            "[hipfire::batch_eligible] result={result} \
+             arch={arch} n={n} n>={MIN_BATCH}={} \
+             force_fallback={force_fallback} \
+             has_dn={has_dn} \
+             moe_router_logits_present={moe_router_logits_present} \
+             all_layers_ok={all_layers_ok}",
+            n >= MIN_BATCH,
+        );
+    }
+    result
 }
 
 pub(crate) fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipResult<()> {
@@ -2019,546 +2132,49 @@ pub(crate) fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor
 /// `prefill_moe_ffn_body_batched` branch on the actual dtype, so a
 /// layer admitted here is dispatchable end-to-end.
 ///
-fn paro_batched_admit_enabled_from_env(value: Option<&str>) -> bool {
-    // Default OFF (opt-in via HIPFIRE_PARO_BATCHED=1). The PARO batched prefill
-    // path (ParoQ4G128 wqkv/wz/wo → gemm_hfq4g128 + per-weight Givens) was
-    // only validated for finite logits, not coherence. Per-token fallback
-    // (forward_scratch) is correct and avoids the echo bug. Set =1 to re-enable
-    // for eval/benchmarking, understanding that output may differ from decode.
-    value == Some("1")
-}
-
-#[derive(Debug, Clone, Copy)]
-struct MoePrefillDtypes {
-    router: DType,
-    shared_expert_scalar_gate: DType,
-    shared_expert_gate: DType,
-    shared_expert_up: DType,
-    shared_expert_down: DType,
-    expert_gate_up: DType,
-    expert_down: DType,
-    expert_gate_up_uniform: bool,
-    expert_down_uniform: bool,
-    /// Routed experts are dtype-mixed (graded) AND carry an `expert_dtype_tags`
-    /// table → served by the merged grouped-WMMA prefill kernel (per-expert
-    /// MQ6/MQ4/MQ3L/MQ2L). When true, the per-expert *uniform* requirement is
-    /// waived for the ROUTED experts; the router + shared expert still use their
-    /// own batched paths and are validated normally. Without this, a graded file
-    /// fails admission and silently drops to the per-token prefill fallback (the
-    /// merged kernel never fires — observed as ~decode-speed prefill).
-    routed_mixed_merged: bool,
-}
-
-impl MoePrefillDtypes {
-    #[cfg(test)]
-    fn uniform(dtype: DType) -> Self {
-        Self {
-            router: dtype,
-            shared_expert_scalar_gate: dtype,
-            shared_expert_gate: dtype,
-            shared_expert_up: dtype,
-            shared_expert_down: dtype,
-            expert_gate_up: dtype,
-            expert_down: dtype,
-            expert_gate_up_uniform: true,
-            expert_down_uniform: true,
-            routed_mixed_merged: false,
-        }
-    }
-
-    fn from_ffn(ffn: &MoeFfnWeights) -> Option<Self> {
-        // When the EP global table is present, derive every routed-expert
-        // decision from the full-model table — never from the compact local
-        // `ffn.experts` slice, which may appear uniform on each rank even
-        // when the global model is graded mixed.
-        if let Some(global) = ffn.global_expert_dtypes.as_ref() {
-            let first = global.first()?;
-            return Some(Self {
-                router: ffn.router.gpu_dtype,
-                shared_expert_scalar_gate: ffn.shared_expert_gate.gpu_dtype,
-                shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
-                shared_expert_up: ffn.shared_expert.up.gpu_dtype,
-                shared_expert_down: ffn.shared_expert.down.gpu_dtype,
-                expert_gate_up: first.0,
-                expert_down: first.1,
-                expert_gate_up_uniform: global.iter().all(|(g, _)| *g == first.0),
-                expert_down_uniform: global.iter().all(|(_, d)| *d == first.1),
-                routed_mixed_merged: ffn.expert_dtype_tags.is_some(),
-            });
-        }
-        let first = ffn.experts.first()?;
-        Some(Self {
+/// Assemble the shared, dtype-only prefill admission record from Qwen-owned
+/// weights. The policy itself lives in dispatch; this adapter only translates
+/// the load-time metadata, including global EP expert tiers.
+pub(crate) fn moe_prefill_dtypes(
+    ffn: &MoeFfnWeights,
+) -> Option<hipfire_dispatch::families::moe::MoePrefillDtypes> {
+    if let Some(global) = ffn.global_expert_dtypes.as_ref() {
+        let first = global.first()?;
+        return Some(hipfire_dispatch::families::moe::MoePrefillDtypes {
             router: ffn.router.gpu_dtype,
             shared_expert_scalar_gate: ffn.shared_expert_gate.gpu_dtype,
             shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
             shared_expert_up: ffn.shared_expert.up.gpu_dtype,
             shared_expert_down: ffn.shared_expert.down.gpu_dtype,
-            expert_gate_up: first.gate_up.gpu_dtype,
-            expert_down: first.down.gpu_dtype,
-            expert_gate_up_uniform: ffn
-                .experts
-                .iter()
-                .all(|e| e.gate_up.gpu_dtype == first.gate_up.gpu_dtype),
-            expert_down_uniform: ffn
-                .experts
-                .iter()
-                .all(|e| e.down.gpu_dtype == first.down.gpu_dtype),
+            expert_gate_up: first.0,
+            expert_down: first.1,
+            expert_gate_up_uniform: global.iter().all(|(g, _)| *g == first.0),
+            expert_down_uniform: global.iter().all(|(_, d)| *d == first.1),
             routed_mixed_merged: ffn.expert_dtype_tags.is_some(),
-        })
+        });
     }
+    let first = ffn.experts.first()?;
+    Some(hipfire_dispatch::families::moe::MoePrefillDtypes {
+        router: ffn.router.gpu_dtype,
+        shared_expert_scalar_gate: ffn.shared_expert_gate.gpu_dtype,
+        shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
+        shared_expert_up: ffn.shared_expert.up.gpu_dtype,
+        shared_expert_down: ffn.shared_expert.down.gpu_dtype,
+        expert_gate_up: first.gate_up.gpu_dtype,
+        expert_down: first.down.gpu_dtype,
+        expert_gate_up_uniform: ffn
+            .experts
+            .iter()
+            .all(|e| e.gate_up.gpu_dtype == first.gate_up.gpu_dtype),
+        expert_down_uniform: ffn
+            .experts
+            .iter()
+            .all(|e| e.down.gpu_dtype == first.down.gpu_dtype),
+        routed_mixed_merged: ffn.expert_dtype_tags.is_some(),
+    })
 }
 
-fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
-    k_top == 8 && num_experts <= 1024
-}
-
-/// Routed-expert dtypes the batched-prefill grouped-GEMM path (Path 2) serves
-/// natively for a UNIFORM-per-projection CODEBOOK file (`expert_dtype_tags == None`
-/// and at least one Lloyd projection). Pure MQ4/MQ4 pairs use the default arm.
-///
-/// Each has a real `dispatch_grouped_gemm` arm whose launcher covers BOTH gfx11
-/// (`_k2`) and gfx12 (`_gfx12`):
-///   MQ4G256      -> `gemm_hfq4g256_moe_grouped_wmma_k2` / `.gfx12`
-///   MQ2G256Lloyd -> `gemm_mq2g256_lloyd_moe_grouped_wmma` (arch-selecting)
-///   MQ3G256Lloyd -> `gemm_mq3g256_lloyd_moe_grouped_wmma` (arch-selecting)
-///
-/// DELIBERATELY EXCLUDED — do not add without landing the kernels first:
-///   MQ2G256GL / MQ3G256GL — GL ships FIVE kernels total, all single-token
-///     indexed decode GEMVs (`gemv_mq{2,3}g256gl_moe_{gate_up,down}_indexed`
-///     plus the sym gate_up). There is no grouped-WMMA GEMM and no batched
-///     indexed GEMV for the SoA global-codebook layout, and the merged
-///     dtype-tag kernel has no GL branch. Admitting GL would push a
-///     `[idx][scale]` SoA blob into a per-group-header decoder: OOB reads and
-///     token soup, with no error.
-///   MQ6G256 / MQ6G256V2 — handled by the `admit_mq6` arm (env/arch gated).
-///   MQ4G256V2 — handled by the default MQ4 arm + Path-2
-///     `gemm_mq4g256v2_moe_grouped_wmma_k2` / `_gfx12` (never HFQ4 V1).
-///   MQ2/3/5G256V2 — out of scope for MoE grouped prefill (dense-only V2).
-fn routed_codebook_grouped_supported(dt: DType) -> bool {
-    matches!(
-        dt,
-        DType::MQ4G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
-    )
-}
-
-/// Uniform MQ4V2 / MQ6V2 routed projections Path-2 grouped GEMM serves on
-/// gfx11 (`_k2`) and gfx12 (`_gfx12`) after dispatch. Distinct wire layouts
-/// from V1 (dual-half fp16 headers); never collapse onto HFQ4/HFQ6 launchers.
-/// Used by admission tests and documentation lockstep with
-/// `dispatch_grouped_gemm` / `gemm_mq{4,6}g256v2_moe_grouped_wmma_k2`.
-#[inline]
-fn routed_uniform_mqv2_grouped_supported(dt: DType) -> bool {
-    matches!(dt, DType::MQ4G256V2 | DType::MQ6G256V2)
-}
-
-/// True when the routed pair is a uniform codebook pair the batched grouped-GEMM
-/// path now serves AND at least one projection is a Lloyd codebook dtype (a pure
-/// MQ4/MQ4 pair is the pre-existing default arm, not this one). Used by BOTH the
-/// admission predicate and the MQ3-in-MoE refusal so the two can never disagree:
-/// an admitted-but-refused layer would hard-error a model that serves today.
-pub(crate) fn routed_codebook_pair_batched_supported(gate_up: DType, down: DType) -> bool {
-    routed_codebook_grouped_supported(gate_up)
-        && routed_codebook_grouped_supported(down)
-        && (matches!(gate_up, DType::MQ2G256Lloyd | DType::MQ3G256Lloyd)
-            || matches!(down, DType::MQ2G256Lloyd | DType::MQ3G256Lloyd))
-}
-
-/// Arch/env gate for the uniform codebook routed-expert batched prefill.
-///
-/// Requires (a) a WMMA arch — the grouped-GEMM kernels are gfx11 wave32-WMMA or
-/// gfx12 WMMA only — and (b) `HIPFIRE_MOE_GROUPED_GEMM` not forced off, because
-/// Path 2 is the ONLY implemented route for these dtypes: the Path 0/1
-/// indexed-GEMV arms in `run_moe_prefill` have no MQ2/MQ3-Lloyd branch and would
-/// return `UnsupportedVariant` (a hard error, not a fallback). Admitting while
-/// Path 2 is disabled would turn a working slow prefill into a failure.
-///
-/// `HIPFIRE_MOE_CODEBOOK_BATCHED=0` restores the per-token fallback (the bisect
-/// escape hatch); `=1` forces the admit on an unlisted arch for bring-up.
-fn codebook_batched_admit_enabled_from_env(
-    value: Option<&str>,
-    grouped_gemm_value: Option<&str>,
-    arch: &str,
-) -> bool {
-    // Mirrors FeatureFlags::moe_grouped_gemm (default on; "0"/"off" disables).
-    let grouped_gemm_on = !matches!(grouped_gemm_value, Some("0") | Some("off"));
-    match value {
-        Some("0") | Some("off") | Some("false") => false,
-        // Explicit opt-in is honored on any arch (research / bring-up), still
-        // hard-gated on Path 2 being enabled.
-        Some("1") | Some("on") | Some("true") => grouped_gemm_on,
-        // DEFAULT OFF — opt-in via HIPFIRE_MOE_CODEBOOK_BATCHED=1.
-        //
-        // Admitting the codebook pair here makes
-        // `gemm_mq2g256_lloyd_moe_grouped_wmma_gfx12` the gate_up kernel for
-        // every uniform-Lloyd a3b SKU, and promotes its MQ3 sibling from
-        // wired-but-unreachable to live. NEITHER has ever executed on
-        // hardware. Static review and a clean hipcc compile are not acceptance
-        // evidence (CLAUDE.md, "Runtime validation (mandatory)"), and the
-        // failure mode is silently-wrong prefill on exactly the SKUs this is
-        // meant to accelerate.
-        //
-        // Flip this default only after a `scripts/serve_harness.py` coherence
-        // run of the MQ2L/MQ3L pair on gfx1201 AND on a gfx11 part — the gfx11
-        // `_k2` leg is a separate translation unit and is equally unexercised.
-        _ => false,
-    }
-}
-
-fn codebook_batched_admit_enabled(arch: &str) -> bool {
-    codebook_batched_admit_enabled_from_env(
-        hipfire_config::developer_var("HIPFIRE_MOE_CODEBOOK_BATCHED")
-            .ok()
-            .as_deref(),
-        hipfire_config::developer_var("HIPFIRE_MOE_GROUPED_GEMM")
-            .ok()
-            .as_deref(),
-        arch,
-    )
-}
-
-fn moe_ffn_batched_admissible_for_dtypes(
-    dtypes: &MoePrefillDtypes,
-    admit_mq6: bool,
-    admit_paro: bool,
-    admit_e8: bool,
-    admit_codebook: bool,
-) -> bool {
-    let router_ok = matches!(
-        dtypes.router,
-        DType::MQ4G256 | DType::MQ4G256V2 | DType::Q8_0 | DType::F32
-    );
-    let shared_gate_ok = matches!(
-        dtypes.shared_expert_scalar_gate,
-        DType::MQ4G256 | DType::MQ4G256V2 | DType::Q8_0 | DType::F32
-    );
-    // Graded (mixed-dtype) routed experts are served by the merged grouped-WMMA
-    // prefill kernel, so the per-expert *uniform* requirement is waived for the
-    // routed experts; the router + shared expert still go through their own
-    // batched paths and are validated below.
-    let routed_ok =
-        dtypes.routed_mixed_merged || (dtypes.expert_gate_up_uniform && dtypes.expert_down_uniform);
-    if !(router_ok && shared_gate_ok && routed_ok) {
-        return false;
-    }
-
-    if dtypes.routed_mixed_merged {
-        // Routed experts handled by the merged kernel (per-expert MQ6/MQ4/MQ3L/
-        // MQ2L + V2 tags 7..18). Only require the SHARED expert to be batchable
-        // on its dense path: MQ4/MQ4V2 always, MQ6/MQ6V2 when this arch admits
-        // MQ6 dense kernels. Exact V2 dtypes — never V1 aliases. Fused
-        // gate+up requires exact dtype equality (MQ4 != MQ4V2, MQ6 != MQ6V2
-        // have different dual-half vs single-half headers → never collapse).
-        let shared_gu_ok = (dtypes.shared_expert_gate == dtypes.shared_expert_up
-            && matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ4G256V2))
-            || (admit_mq6
-                && matches!(
-                    dtypes.shared_expert_gate,
-                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
-                )
-                && dtypes.shared_expert_up == dtypes.shared_expert_gate);
-        let shared_dn_ok = matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ4G256V2)
-            || (admit_mq6
-                && matches!(dtypes.shared_expert_down, DType::MQ6G256 | DType::MQ6G256V2));
-        return shared_gu_ok && shared_dn_ok;
-    }
-
-    // mfp4-E8 routed experts with Q8 shared expert (original arm):
-    // gfx1151-native A3B checkpoint. Shared expert is Q8 (gate/up/down);
-    // router/scalar-gate are Q8 (validated by router_ok/shared_gate_ok above).
-    // The batched body runs a dedicated Q8 shared-expert path (two plain Q8
-    // GEMMs + silu_mul + sigmoid-scaled residual add) and routes the E8
-    // experts through `run_moe_prefill` Path 1 (indexed batched GEMV).
-    // E8-family match helper: MFP4, MFP3, MFP2 lattice types.
-    let is_e8_family =
-        |dt: DType| matches!(dt, DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8);
-
-    if admit_e8
-        && dtypes.shared_expert_gate == DType::Q8_0
-        && dtypes.shared_expert_up == DType::Q8_0
-        && dtypes.shared_expert_down == DType::Q8_0
-        && is_e8_family(dtypes.expert_gate_up)
-        && is_e8_family(dtypes.expert_down)
-    {
-        return true;
-    }
-
-    // Uniform mfp4/mfp3/mfp2-E8: BOTH shared AND routed experts are E8-family
-    // (Option B from the implementation spec). Router + shared_expert_gate
-    // (scalar) remain Q8 (validated above). The batched body dequants the shared
-    // expert E8→F16 transiently and runs `gemm_f16_wmma_mb8` against
-    // `x_rot_batch` (FWHT-rotated activations), then the routed experts go
-    // through the indexed E8 batched GEMV path. The dequant→F16 path requires
-    // has_wmma_w32 (gfx11+), which `admit_e8` already gates on arch.
-    if admit_e8
-        && is_e8_family(dtypes.expert_gate_up)
-        && is_e8_family(dtypes.expert_down)
-        // Shared expert may be per-projection MIXED — gate+up are dispatched
-        // together (one match on gate's dtype) so they must share a dtype;
-        // down is matched independently. The batched body handles Q8 (un-rotated)
-        // and E8 (dequant→f16, x_rot) per projection and keys the SwiGLU rotate
-        // on the down dtype, so any {Q8,E8-family} combination of (gate==up,down)
-        // is correct.
-        && dtypes.shared_expert_gate == dtypes.shared_expert_up
-        && matches!(dtypes.shared_expert_gate, DType::Q8_0 | DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
-        && matches!(dtypes.shared_expert_down, DType::Q8_0 | DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8)
-    {
-        return true;
-    }
-
-    // Uniform-per-projection CODEBOOK routed experts (the antirez asymmetric
-    // recipe: gate_up = MQ2-Lloyd, down = MQ3-Lloyd; also the MQ4/Lloyd mixes
-    // the per-layer tiered formats emit). `routed_ok` above already established
-    // uniformity per projection and the absence of a tag table, so
-    // `expert_gate_up` / `expert_down` describe EVERY expert. The routed block
-    // runs Path 2 grouped-WMMA (`dispatch_grouped_gemm` MQ2/MQ3-Lloyd arms), the
-    // SwiGLU+FWHT-rotate is weight-agnostic, and the shared expert + router keep
-    // their own dense batched paths — which is why the shared side is validated
-    // exactly as in the default MQ4 arm (plus MQ6/MQ6V2 when this arch admits).
-    //
-    // Structurally distinct from `routed_mixed_merged` above: that arm covers a
-    // GRADED file served by the merged dtype-tag kernel; this one covers a
-    // UNIFORM file served by the per-dtype grouped kernels, with no tag table.
-    if admit_codebook
-        && routed_codebook_pair_batched_supported(dtypes.expert_gate_up, dtypes.expert_down)
-    {
-        let shared_gu_ok = (dtypes.shared_expert_gate == dtypes.shared_expert_up
-            && matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ4G256V2))
-            || (admit_mq6
-                && matches!(
-                    dtypes.shared_expert_gate,
-                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
-                )
-                && dtypes.shared_expert_up == dtypes.shared_expert_gate);
-        let shared_dn_ok = matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ4G256V2)
-            || (admit_mq6
-                && matches!(dtypes.shared_expert_down, DType::MQ6G256 | DType::MQ6G256V2));
-        if shared_gu_ok && shared_dn_ok {
-            return true;
-        }
-    }
-
-    if admit_paro
-        && dtypes.shared_expert_gate == DType::ParoQ4G128
-        && dtypes.shared_expert_up == DType::ParoQ4G128
-        && dtypes.shared_expert_down == DType::ParoQ4G128
-        && dtypes.expert_gate_up == DType::ParoQ4G128
-        && dtypes.expert_down == DType::ParoQ4G128
-    {
-        return true;
-    }
-
-    // Uniform MQ4 / MQ4V2 / MQ6 / MQ6V2 shared+routed (Path 2 grouped after
-    // dispatch on gfx11/gfx12). MQ6* needs `admit_mq6`; MQ4V2 always admits
-    // like MQ4. MQ2/3/5V2 deliberately excluded from MoE grouped prefill.
-    if admit_mq6 {
-        let shared_gu_dt = dtypes.shared_expert_gate;
-        let shared_gu_ok = matches!(
-            shared_gu_dt,
-            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
-        ) && dtypes.shared_expert_up == shared_gu_dt;
-        let shared_dn_ok = matches!(
-            dtypes.shared_expert_down,
-            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
-        );
-        let experts_ok = matches!(
-            dtypes.expert_gate_up,
-            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
-        ) && matches!(
-            dtypes.expert_down,
-            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
-        );
-        // Lockstep: any uniform V2 projection we admit must be a Path-2
-        // grouped-supported dtype (or V1 MQ4/MQ6 which have their own arms).
-        debug_assert!(
-            !matches!(dtypes.expert_gate_up, DType::MQ4G256V2 | DType::MQ6G256V2)
-                || routed_uniform_mqv2_grouped_supported(dtypes.expert_gate_up)
-        );
-        debug_assert!(
-            !matches!(dtypes.expert_down, DType::MQ4G256V2 | DType::MQ6G256V2)
-                || routed_uniform_mqv2_grouped_supported(dtypes.expert_down)
-        );
-        shared_gu_ok && shared_dn_ok && experts_ok
-    } else {
-        // Exact gate/up dtype equality required even for MQ4-family (MQ4 !=
-        // MQ4V2 have different header layouts; fused kernel handles one layout
-        // per launch → cross-version ordering rejects).
-        dtypes.shared_expert_gate == dtypes.shared_expert_up
-            && matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ4G256V2)
-            && matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ4G256V2)
-            && matches!(dtypes.expert_gate_up, DType::MQ4G256 | DType::MQ4G256V2)
-            && matches!(dtypes.expert_down, DType::MQ4G256 | DType::MQ4G256V2)
-    }
-}
-/// Threshold below which batching overhead isn't worth the alloc + per-layer
-/// dispatch — single-token prefill must not take the batched path.
-const MIN_BATCH: usize = 2;
-
-/// Choose the next prefill chunk without leaving an invalid singleton tail.
-///
-/// Batched kernels require at least `MIN_BATCH` rows. When a full chunk would
-/// leave one row, move one row into the tail (for example, 257 → 255 + 2).
-#[inline]
-fn next_prefill_chunk_len(remaining: usize, max_batch: usize) -> Option<usize> {
-    if remaining < MIN_BATCH || max_batch < MIN_BATCH {
-        return None;
-    }
-    if max_batch == MIN_BATCH && remaining % MIN_BATCH != 0 {
-        return None;
-    }
-
-    let chunk = remaining.min(max_batch);
-    if remaining - chunk == 1 {
-        (chunk > MIN_BATCH).then_some(chunk - 1)
-    } else {
-        Some(chunk)
-    }
-}
-
-/// Plan scratch owned by one prefill call.
-///
-/// Large prompts retain the configured chunk size, while a short prompt gets
-/// exactly one right-sized chunk. The DeltaNet S-state tape is consumed only by
-/// tree verify; ordinary prefill advances recurrent state in place.
-#[inline]
-fn owned_prefill_scratch_plan(
-    n: usize,
-    configured_max_batch: usize,
-    tree_verify: bool,
-) -> (usize, bool) {
-    debug_assert!(n > 0);
-    debug_assert!(configured_max_batch >= MIN_BATCH);
-    (configured_max_batch.min(n.max(MIN_BATCH)), tree_verify)
-}
-
-/// Whether `forward_prefill_batch_with_pbs` will take the tape-capturing
-/// batched (PBS) path for an `n`-token call — equivalently, whether a `GdnTape`
-/// handed to that forward will actually be populated. When this is false the
-/// forward silently drops to a tape-less per-token loop, so spec-decode callers
-/// that later replay the GDN tape MUST gate that cheap replay on this predicate;
-/// otherwise they replay a stale/zero tape and corrupt DeltaNet state. This is
-/// the single source of truth for the eligibility decision — called by the
-/// forward itself and by those callers, so the two can never drift. (The
-/// tree-verify forward keeps its own, deliberately simpler, eligibility check.)
-pub fn prefill_batch_pbs_eligible(
-    weights: &Qwen35Weights,
-    config: &Qwen35Config,
-    // Kept for API stability and future state-aware gating. The batched path
-    // now dispatches the GDN recurrence by state quant on the non-tree route,
-    // so it no longer gates eligibility here (see the removed Q8-only check).
-    _dn_state: &DeltaNetState,
-    n: usize,
-    arch: &str,
-    moe_router_logits_present: bool,
-) -> bool {
-    // HIPFIRE_PREFILL_BATCHED=0 forces the per-token fallback — an escape hatch
-    // for the LARGE seed prefill (gfx11 24GB OOM + a batched-seed correctness bug
-    // that collapses MTP τ→1.0). But the small-B MTP verify (n = K+1, ≤ ~32) is
-    // cheap and its BATCHED path is the dominant gfx11 decode lever: per-token it
-    // costs ~K full sequential trunk forwards/cycle (the measured 92ms→16.8ms /
-    // 41→223 tok/s bottleneck, rocprofv3 2026-06-16). Decouple: let the small-B
-    // verify batch even when the flag forces the seed per-token. Opt-in
-    // (HIPFIRE_MTP_VERIFY_DECOUPLE=1) until the batched verify is validated
-    // coherent + τ-preserving per-arch (the gfx11 batched *seed* corrupts; whether
-    // the small-B *verify* also corrupts is exactly what this gate tests).
-    // DEFAULT-ON for RDNA3 (gfx11) — the small-B verify BATCHED is validated
-    // coherent + τ-preserving there (W3x 2026-06-16: byte-identical output vs
-    // per-token at 240-tok ctx; +20% mq4; the scalar→WMMA + MQ3L-LUT kernel
-    // wins lift all STRUCTURED domains >AR on both mq4/mq4p; fresh default-config
-    // re-validated mq4 code 1.26× / mq4p chat 1.07×). Opt-out
-    // HIPFIRE_MTP_VERIFY_DECOUPLE=0. Other archs opt-in (=1) until validated;
-    // gfx12 batches the whole prefill already so it is moot there. The seed
-    // stays per-token for LONG prompts (n>32 fails this gate → force_fallback
-    // when PREFILL_BATCHED=0); a short seed (n≤32) batches, fine for mq4/mq4p
-    // (E8 short-seed batched-prefill can OOM, but E8 admission is itself opt-in
-    // via HIPFIRE_E8_GFX12 so the default config never reaches it).
-    let decouple_env = hipfire_config::developer_var("HIPFIRE_MTP_VERIFY_DECOUPLE").ok();
-    let is_rdna3_decouple = arch.starts_with("gfx11");
-    let verify_decouple = n <= 32
-        && decouple_env.as_deref() != Some("0")
-        && (is_rdna3_decouple || decouple_env.as_deref() == Some("1"));
-    let force_fallback = !verify_decouple && !hipfire_runtime::config::get().prefill_batched;
-    let has_dn = weights
-        .layers
-        .iter()
-        .any(|lw| matches!(lw, LayerWeights::DeltaNet(_) | LayerWeights::DeltaNetMoe(_),));
-    let all_layers_ok = weights.layers.iter().all(|lw| {
-        if matches!(
-            lw,
-            LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_)
-        ) && !moe_router_logits_present
-        {
-            return false;
-        }
-        qwen35_layer_batch_admissible(lw, config, arch).is_ok()
-    });
-    let result = !force_fallback
-        && n >= MIN_BATCH
-        // State quant no longer gates batched prefill: forward_prefill_chunk
-        // dispatches the GDN recurrence by dn_state.quant on the non-tree path
-        // (FP32 → gated_delta_net_f32_batch_seq, Q8 → _q8_batch_seq, Q4 → _q4),
-        // so FP32/Q4 state is fully batchable here. Was hard-gated to Q8 when
-        // the batched GDN was Q8-only; that's the seed + per-cycle-commit
-        // per-token fallback that made FP32 DFlash ~4.5× slower + 10× TTFT.
-        && has_dn
-        // LA/FA/MoE projection + MoE-FFN weight dtypes must all be batchable;
-        // A3B engine policy quantizes attention as Q8 (admitted alongside MQ4).
-        && all_layers_ok;
-    // HIPFIRE_DEBUG_BATCH=1: print per-component eligibility to stderr.
-    if hipfire_config::developer_var("HIPFIRE_DEBUG_BATCH")
-        .ok()
-        .as_deref()
-        == Some("1")
-    {
-        eprintln!(
-            "[hipfire::batch_eligible] result={result} \
-             arch={arch} n={n} n>={MIN_BATCH}={} \
-             force_fallback={force_fallback} \
-             has_dn={has_dn} \
-             moe_router_logits_present={moe_router_logits_present} \
-             all_layers_ok={all_layers_ok}",
-            n >= MIN_BATCH,
-        );
-    }
-    result
-}
-
-/// Whether MQ6 MoE FFN projections can enter batched prefill. Default-on for
-/// gfx11 (RDNA3/3.5) AND gfx12 (RDNA4): the MQ6 grouped-WMMA decode is present
-/// on both (tag 0 of the merged `gemm_mixed_moe_grouped_wmma{_k2,.gfx12}` kernel,
-/// plus the standalone `gemm_hfq6g256_moe_grouped_wmma{_k2,.gfx12,_gfx1151}` ported
-/// 2026-06-11/12), and the graded shared-MQ6 expert runs the dense-GEMM batched
-/// path. Validated on gfx1100: graded T3-3L-E8 (MQ6 hot / E8 mid / MQ3L cold,
-/// MQ6 shared) batches coherently, KLD 0.038964, and gfx11 prefill is ~10× the
-/// per-token fallback (1012 vs 106 tok/s pp512). UNIFORM-MQ6 OOMs on gfx11
-/// (>24 GB) so it never reaches this gate there — only graded MQ6 models do.
-/// The original gfx12-only default predated the gfx11 MQ6 grouped port and
-/// silently forced per-token prefill on every graded-MQ6 model on gfx11.
-/// gfx1151 (RDNA3.5, Strix Halo) additionally has master's channel-tested
-/// routed grouped-WMMA MQ6 fast-path (its unrelated Q8 WMMA prefill family is
-/// gated separately by `q8_prefill_wmma_enabled`). Override per-arch with
-/// `HIPFIRE_MOE_MQ6_ADMIT=0|1`.
-// pub(crate): also used by forward_slots.rs (MoE slots port) to compute the
-// same admit_mq6 predicate before calling `moe_ffn_batched_admissible`.
-// Visibility change only — behavior and existing callers are unchanged.
-pub(crate) fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
-    match value {
-        Some("0") | Some("off") | Some("false") => false,
-        Some("1") | Some("on") | Some("true") => true,
-        // RDNA3/3.5 (gfx11xx, includes gfx1151) + RDNA4 (gfx12xx). RDNA1/2
-        // (gfx10xx, no WMMA) stay off. The gfx11 widen (8d555fc6) subsumes
-        // master's narrower gfx12||gfx1151 default; gfx1151 still picks up its
-        // channel-tested grouped-WMMA fast-path inside the kernel dispatcher.
-        _ => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
-    }
-}
-
-/// Qwen3.5 batched prefill can run Q8 projections through fused WMMA kernels
-/// or through the older chunked-Q8 substrate. gfx12 has a separate WMMA ABI;
-/// gfx11/gfx1151 use the gfx11 wave32 WMMA ABI. The low-level Q8 channel tests
-/// cover the fused, residual, and generic chunked drop-in paths, so default on
-/// for every arch that advertises wave32 WMMA while preserving the env opt-out.
-fn q8_prefill_wmma_enabled_from_env(value: Option<&str>, arch: &str, has_wmma: bool) -> bool {
-    let _ = arch;
+fn q8_prefill_wmma_enabled_from_env(value: Option<&str>, _arch: &str, has_wmma: bool) -> bool {
     if !has_wmma {
         return false;
     }
@@ -2569,9 +2185,6 @@ fn q8_prefill_wmma_enabled_from_env(value: Option<&str>, arch: &str, has_wmma: b
     }
 }
 
-// pub(crate): also used by forward_slots.rs (SP3 Task 2) to pick the same
-// Q8 WMMA fused-kernel gate the dense batched-prefill path uses. Visibility
-// change only — behavior and callers inside this file are unchanged.
 pub(crate) fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
     q8_prefill_wmma_enabled_from_env(
         hipfire_config::developer_var("HIPFIRE_Q8_PREFILL_WMMA")
@@ -2580,74 +2193,6 @@ pub(crate) fn q8_prefill_wmma_enabled(gpu: &Gpu) -> bool {
         gpu.arch.as_str(),
         gpu.arch_caps.has_wmma(),
     )
-}
-
-// pub(crate): also used by forward_slots.rs (MoE slots port) to gate entry
-// into `prefill_moe_ffn_body_batched` from the slot-aware path, mirroring
-// this file's own `prefill_batch_pbs_eligible` precondition check. Visibility
-// change only — behavior and existing callers are unchanged.
-pub(crate) fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool, arch: &str) -> bool {
-    let Some(dtypes) = MoePrefillDtypes::from_ffn(ffn) else {
-        return false;
-    };
-    // mfp4-E8 routed experts: originally gfx1151-only, now widened to all
-    // gfx11 + gfx12 arches behind the HIPFIRE_E8_GFX12 gate. The shared-expert
-    // dequant→F16 GEMM path uses `dequantize_mfp4g32_e8_to_f16` + `gemm_f16_wmma_mb8`
-    // which are available on all WMMA-capable arches. The indexed E8 GEMV kernels
-    // for the routed experts are also present on gfx11 (shipped in the MoE-AWQ
-    // branch). Gate on HIPFIRE_E8_GFX12 to allow safe opt-in rollout.
-    let admit_e8 = matches!(
-        arch,
-        "gfx1100"
-            | "gfx1101"
-            | "gfx1102"
-            | "gfx1150"
-            | "gfx1151"
-            | "gfx1152"
-            | "gfx1200"
-            | "gfx1201"
-    ) && hipfire_config::developer_var("HIPFIRE_E8_GFX12")
-        .ok()
-        .as_deref()
-        == Some("1");
-
-    // PARO admit is default-on. Set HIPFIRE_PARO_BATCHED=0 to force the old
-    // fallback path while bisecting or debugging.
-    // for shisa-Qwen3.6-A3B-PARO and similar ParoQuant checkpoints where the
-    // routed-expert + shared-expert weights are ParoQ4G128 (HFQ4G128 +
-    // per-weight Givens rotation metadata). The downstream dispatch arms for
-    // ParoQ4G128 are implemented on this branch. See roadmap at
-    // .claude/plans/magical-marinating-hippo.md.
-    static PARO_ADMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let admit_paro = *PARO_ADMIT.get_or_init(|| {
-        paro_batched_admit_enabled_from_env(
-            hipfire_config::developer_var("HIPFIRE_PARO_BATCHED")
-                .ok()
-                .as_deref(),
-        )
-    });
-
-    let admit_codebook = codebook_batched_admit_enabled(arch);
-    // One-time provenance line. A codebook-routed model that used to prefill
-    // per-token now takes grouped-WMMA batched prefill, so any timing captured
-    // across that flip must be attributable; print once per process which route
-    // the routed experts took and how to put it back.
-    if admit_codebook
-        && routed_codebook_pair_batched_supported(dtypes.expert_gate_up, dtypes.expert_down)
-        && dtypes.expert_gate_up_uniform
-        && dtypes.expert_down_uniform
-    {
-        static NOTED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
-        NOTED.get_or_init(|| {
-            eprintln!(
-                "[moe-prefill] uniform codebook routed experts (gate_up={:?} down={:?}) \
-                 admitted to grouped-WMMA batched prefill on {arch}. \
-                 HIPFIRE_MOE_CODEBOOK_BATCHED=0 restores the per-token fallback.",
-                dtypes.expert_gate_up, dtypes.expert_down
-            );
-        });
-    }
-    moe_ffn_batched_admissible_for_dtypes(&dtypes, admit_mq6, admit_paro, admit_e8, admit_codebook)
 }
 
 /// #397 Ship 5.2 slice 1: route a single PLAIN-batched prefill GEMM through
@@ -2956,76 +2501,52 @@ pub(crate) fn prefill_moe_ffn_body_batched(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn prefill_moe_ffn_body_batched_with_route(
-    gpu: &mut Gpu,
-    ffn: &MoeFfnWeights,
-    ffn_norm: &GpuTensor,
+fn build_moe_prefill_params<'a>(
+    gpu: &Gpu,
+    ffn: &'a MoeFfnWeights,
+    ffn_norm: &'a GpuTensor,
     config: &Qwen35Config,
-    pbs: &PrefillBatchScratch,
+    pbs: &'a PrefillBatchScratch,
     n: usize,
-    ctx: &DispatchCtx,
     model_has_mq6_moe: bool,
-    // EP (Ship 6 substrate-EP prefill): when `Some`, the routed combine writes
-    // into this zeroed `[n × dim]` partial instead of `pbs.x_batch` (the EP
-    // driver all-reduce-sums it across ranks and adds into x_batch). The shared
-    // expert (step 5) stays in `pbs.x_batch` — replicated per rank, not
-    // redirected. `None` = byte-identical single-GPU behavior.
-    routed_out: Option<&GpuTensor>,
-    route: PrefillRouteMode<'_>,
-) -> HipResult<()> {
-    let dim = config.dim;
+    routed_out: Option<&'a GpuTensor>,
+    route: PrefillRouteMode<'a>,
+) -> HipResult<(
+    hipfire_dispatch::pipeline::sealed_moe::BoundMoeExperts<'a>,
+    hipfire_dispatch::families::moe::MoePrefillParams<'a>,
+)> {
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
     let k_top = config.num_experts_per_tok;
     let n_exp = config.num_experts;
 
     let router_logits = pbs.moe_router_logits_batch.as_ref().expect("moe scratch");
-    let shared_scalar = pbs.moe_shared_scalar_batch.as_ref().expect("moe scratch");
-    let shared_gate = pbs.moe_shared_gate_batch.as_ref().expect("moe scratch");
-    let shared_up = pbs.moe_shared_up_batch.as_ref().expect("moe scratch");
-    let shared_rot = pbs.moe_shared_rot_batch.as_ref().expect("moe scratch");
+    let router_scores = pbs
+        .moe_router_score_views_batch
+        .as_ref()
+        .and_then(|views| n.checked_sub(1).and_then(|index| views.get(index)))
+        .ok_or_else(|| HipError::new(0, "moe router score scratch view is unavailable"))?;
     let topk_indices = pbs.moe_topk_indices_batch.as_ref().expect("moe scratch");
     let topk_weights = pbs.moe_topk_weights_batch.as_ref().expect("moe scratch");
     let gate_batch = pbs.moe_gate_batch.as_ref().expect("moe scratch");
     let up_batch = pbs.moe_up_batch.as_ref().expect("moe scratch");
     let rot_batch = pbs.moe_rot_batch.as_ref().expect("moe scratch");
     let down_expanded = pbs.moe_down_expanded_batch.as_ref().expect("moe scratch");
-    // ── 0. Preflight: bind, build params, seal, adopt — before any launch ──
-    //
-    // Actual (not static-metadata) validation BEFORE any GPU mutation. The
-    // seal checks the live binding, the preexisting PBS tensor descriptors,
-    // the zeroed routed partial, and (on non-root ranks) the root proof —
-    // all pure, launching nothing. Sealing needs only descriptors, never
-    // contents, so it may run before norm/rotate/shared/router produce any.
-    // Mode resolution is the historical seal-site rule: Single bindings
-    // ignore the band mode; compact bindings follow it, with legacy
-    // `Replicated` keeping today's fail-closed sealer error — only earlier.
-    // The root route is still produced (and its receipt attached) after the
-    // router kernels at step 6, before the experts execute; the producer
-    // proof still only exports from that actual produced+attached receipt,
-    // never fabricated. No re-sealing: the late block reuses this seal.
+    let shared_scalar = pbs.moe_shared_scalar_batch.as_ref().expect("moe scratch");
+    let shared_gate = pbs.moe_shared_gate_batch.as_ref().expect("moe scratch");
+    let shared_up = pbs.moe_shared_up_batch.as_ref().expect("moe scratch");
+    let shared_rot = pbs.moe_shared_rot_batch.as_ref().expect("moe scratch");
+
     let bound = ffn.bound_experts()?;
-    let single = bound.rank_count() == 1;
-    let produce_root = matches!(route, PrefillRouteMode::ProduceRoot { .. }) && !single;
-    let adopt_root = matches!(route, PrefillRouteMode::AdoptRoot { .. }) && !single;
-    // Non-root EP ranks skip the router GEMM + softmax/topk + produce below:
-    // their route arrays already hold the root's D2D-copied bytes. The
-    // shared-expert GEMMs still run (shared stays replicated per rank).
-    let skip_router_produce = adopt_root;
-    let down_m = ffn.experts[0].down.m;
-    let down_k = ffn.experts[0].down.k;
-    let gate_up_k = ffn.experts[0].gate_up.k;
-    let total_slots = n * k_top;
-    let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
-    // The load-time owner caches only genuinely mixed tier arrays. Borrowing
-    // these slices keeps prefill allocation-free and preserves uniform None.
     let (per_expert_gate_up, per_expert_down) = ffn.per_expert_tier_tables();
     let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
-        shared_gate: ffn.shared_expert_gate.gpu_dtype,
-        shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
-        shared_expert_up: ffn.shared_expert.up.gpu_dtype,
-        shared_expert_down: ffn.shared_expert.down.gpu_dtype,
+        shared: Some(hipfire_dispatch::families::moe::MoeSharedDtypes {
+            selector: ffn.shared_expert_gate.gpu_dtype,
+            gate: ffn.shared_expert.gate.gpu_dtype,
+            up: ffn.shared_expert.up.gpu_dtype,
+            down: ffn.shared_expert.down.gpu_dtype,
+        }),
         experts_all_gate_up_mq4: if let Some(global) = ffn.global_expert_dtypes.as_ref() {
             global
                 .iter()
@@ -3045,13 +2566,12 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route(
         } else {
             ffn.experts[0].down.gpu_dtype
         },
-        // The cached mixed-only tier slices are the source of truth for both
-        // projections; borrowing their presence avoids any per-call scan.
         routed_has_mixed_experts: per_expert_gate_up.is_some() || per_expert_down.is_some(),
         has_paro_shared: ffn.paro_shared.is_some(),
         per_expert_gate_up,
         per_expert_down,
     };
+
     let paro_gate_up =
         ffn.paro_shared
             .as_ref()
@@ -3070,22 +2590,46 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route(
                 scales: &paro.down_channel_scales,
                 krot: paro.krot as usize,
             });
-    // Route A MoE-AWQ: the per-expert indexed table (built at load) supersedes
-    // the Ship 4.2 single-scale `down_awq_scale` stub for routed experts — that
-    // stub applied experts[0]'s scale to every routed slot, which is wrong once
-    // experts actually carry per-expert AWQ. Pass `None` for the single scale;
-    // `expert_down_awq_ptrs` drives the correct per-slot path in run_moe_prefill.
-    let down_awq_scale: Option<&GpuTensor> = None;
+
+    let prelude = hipfire_dispatch::families::moe::MoePrefillPrelude {
+        normalization: hipfire_dispatch::families::moe::MoeNormalization::RmsNorm {
+            weight: ffn_norm,
+            plain_out: &pbs.x_norm_batch,
+            eps: config.norm_eps,
+        },
+        router: ffn.router.dispatch_ref(),
+        router_logits,
+        router_scores,
+        norm_topk_prob: config.norm_topk_prob,
+        route,
+        shared: Some(hipfire_dispatch::families::moe::MoeSharedPrefill {
+            weights: hipfire_dispatch::families::moe::MoeSharedWeights {
+                selector: ffn.shared_expert_gate.dispatch_ref(),
+                gate: ffn.shared_expert.gate.dispatch_ref(),
+                up: ffn.shared_expert.up.dispatch_ref(),
+                down: ffn.shared_expert.down.dispatch_ref(),
+            },
+            intermediate: smi,
+            scalar: shared_scalar,
+            gate_out: shared_gate,
+            up_out: shared_up,
+            rotated: shared_rot,
+        }),
+        q8_router_policy: hipfire_dispatch::families::moe::MoeQ8RouterPolicy::DispatcherEntry,
+    };
+
     let moe_prefill_params = hipfire_dispatch::families::moe::MoePrefillParams {
         dtypes: moe_dtypes,
+        recipe: hipfire_dispatch::families::moe::MoeRecipe::SoftmaxGatedShared,
+        prelude,
         batch_size: n,
         mi,
-        down_m,
-        down_k,
-        gate_up_k,
+        down_m: ffn.experts[0].down.m,
+        down_k: ffn.experts[0].down.k,
+        gate_up_k: ffn.experts[0].gate_up.k,
         k_top,
         n_exp,
-        m_total_max,
+        m_total_max: moe_grouped_m_total_bound(n * k_top, n_exp),
         force_mq4_grouped_fp16: model_has_mq6_moe
             && gpu.arch_caps.is_gfx1151()
             && gpu.flags.moe_grouped_i8.is_none(),
@@ -3112,34 +2656,164 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route(
         y_down_grouped: pbs.moe_y_down_grouped.as_ref().expect("moe scratch"),
         paro_gate_up,
         paro_down,
-        down_awq_scale,
+        down_awq_scale: None,
         routed_out,
     };
-    let mut sealed = if adopt_root {
-        // Non-root EP rank: seal compact, adopt the root proof (launches
-        // nothing — the receipt binds this call's own invocation over this
-        // rank's own topk buffers), attach now so a proof mismatch rejects
-        // before this rank mutates anything.
-        let proof = match route {
-            PrefillRouteMode::AdoptRoot { proof } => proof,
-            _ => unreachable!("adopt_root without AdoptRoot mode"),
-        };
-        let mut sealed =
-            hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, moe_prefill_params)
-                .map_err(HipError::from)?;
-        let receipt = hipfire_dispatch::pipeline::sealed_moe::adopt_prefill_route(&sealed, proof)
-            .map_err(HipError::from)?;
-        sealed
-            .attach_route_receipt(receipt)
-            .map_err(HipError::from)?;
-        sealed
-    } else if produce_root {
-        hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, moe_prefill_params)
-            .map_err(HipError::from)?
+    Ok((bound, moe_prefill_params))
+}
+
+/// Pure grouped-prefill EP preflight shared by the runtime mesh schedule.
+///
+/// This reuses the exact live-operand parameter builder and sealer used by the
+/// executing body. It performs no norm, routing, or expert launch; the actual
+/// root route proof is still minted only after the root produces route bytes.
+pub(crate) fn preflight_moe_ffn_batched_ep(
+    gpu: &Gpu,
+    ffn: &MoeFfnWeights,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    ctx: &DispatchCtx,
+    model_has_mq6_moe: bool,
+    routed_out: &GpuTensor,
+) -> HipResult<()> {
+    let proof_slot = std::cell::Cell::new(None);
+    let route = PrefillRouteMode::ProduceRoot { slot: &proof_slot };
+    let (bound, params) = build_moe_prefill_params(
+        gpu,
+        ffn,
+        ffn_norm,
+        config,
+        pbs,
+        n,
+        model_has_mq6_moe,
+        Some(routed_out),
+        route,
+    )?;
+    hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
+        .map(|_| ())
+        .map_err(HipError::from)
+}
+
+/// Return the rank-local expert output geometry that compact EP must gather to
+/// root before the canonical slot-order combine.
+pub(crate) fn moe_ffn_batched_ep_slot_geometry(
+    gpu: &Gpu,
+    ffn: &MoeFfnWeights,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    ctx: &DispatchCtx,
+    model_has_mq6_moe: bool,
+    routed_out: &GpuTensor,
+) -> HipResult<(usize, bool)> {
+    let proof_slot = std::cell::Cell::new(None);
+    let (bound, params) = build_moe_prefill_params(
+        gpu,
+        ffn,
+        ffn_norm,
+        config,
+        pbs,
+        n,
+        model_has_mq6_moe,
+        Some(routed_out),
+        PrefillRouteMode::ProduceRoot { slot: &proof_slot },
+    )?;
+    let resolution = hipfire_dispatch::families::moe::MoePrefillResolution::resolve(
+        &params.dtypes,
+        &ctx.arch,
+        &ctx.flags,
+    );
+    let output = if resolution.use_path2 {
+        let count = params
+            .m_total_max
+            .checked_mul(params.down_m)
+            .ok_or_else(|| HipError::new(0, "compact EP grouped output count overflow"))?;
+        (count, true)
+    } else if !resolution.down_path0 {
+        let count = params
+            .batch_size
+            .checked_mul(params.k_top)
+            .and_then(|slots| slots.checked_mul(params.down_m))
+            .ok_or_else(|| HipError::new(0, "compact EP expanded output count overflow"))?;
+        (count, false)
     } else {
-        hipfire_dispatch::pipeline::sealed_moe::seal_prefill(bound, ctx, moe_prefill_params)
-            .map_err(HipError::from)?
+        return Err(HipError::new(
+            0,
+            "compact EP prefill requires expanded expert outputs",
+        ));
     };
+    hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
+        .map_err(HipError::from)?;
+    Ok(output)
+}
+
+/// Fold root's gathered expert rows with the ordinary single-device combine.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_moe_ffn_batched_ep_slot_order(
+    gpu: &mut Gpu,
+    ffn: &MoeFfnWeights,
+    ffn_norm: &GpuTensor,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    ctx: &DispatchCtx,
+    model_has_mq6_moe: bool,
+    routed_out: &GpuTensor,
+) -> HipResult<()> {
+    let proof_slot = std::cell::Cell::new(None);
+    let (bound, params) = build_moe_prefill_params(
+        gpu,
+        ffn,
+        ffn_norm,
+        config,
+        pbs,
+        n,
+        model_has_mq6_moe,
+        Some(routed_out),
+        PrefillRouteMode::ProduceRoot { slot: &proof_slot },
+    )?;
+    let sealed = hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
+        .map_err(HipError::from)?;
+    sealed.execute_ep_slot_combine(gpu).map_err(HipError::from)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prefill_moe_ffn_body_batched_with_route<'a>(
+    gpu: &mut Gpu,
+    ffn: &'a MoeFfnWeights,
+    ffn_norm: &'a GpuTensor,
+    config: &Qwen35Config,
+    pbs: &'a PrefillBatchScratch,
+    n: usize,
+    ctx: &'a DispatchCtx,
+    model_has_mq6_moe: bool,
+    routed_out: Option<&'a GpuTensor>,
+    route: PrefillRouteMode<'a>,
+) -> HipResult<()> {
+    let (bound, params) = build_moe_prefill_params(
+        gpu,
+        ffn,
+        ffn_norm,
+        config,
+        pbs,
+        n,
+        model_has_mq6_moe,
+        routed_out,
+        route,
+    )?;
+    let compact_ep = matches!(
+        &params.prelude.route,
+        PrefillRouteMode::ProduceRoot { .. } | PrefillRouteMode::AdoptRoot { .. }
+    ) && bound.rank_count() > 1;
+    let sealed = if compact_ep {
+        hipfire_dispatch::pipeline::sealed_moe::seal_prefill_ep(bound, ctx, params)
+    } else {
+        hipfire_dispatch::pipeline::sealed_moe::seal_prefill(bound, ctx, params)
+    }
+    .map_err(HipError::from)?;
 
     #[cfg(feature = "moe-oracle")]
     crate::qwen35::oracle::prefill_before(
@@ -3151,578 +2825,12 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route(
         crate::qwen35::oracle::prefill_start().map_err(|e| hip_bridge::HipError::new(0, &e))?,
     )
     .map_err(|e| hip_bridge::HipError::new(0, &e))?;
-    // ── 1. Split rmsnorm vs FWHT rotate ──
-    //
-    // A3B (and every other MoE here) leaves router + shared_expert_gate
-    // as Q8_0 in the quantizer — these tiny tensors lose too much
-    // accuracy at 4-bit, so the engine never reduces them. Q8 weights
-    // are quantized against the un-rotated rmsnorm output, while the
-    // MQ4 siblings (shared_expert.{gate,up,down} + experts.{gate_up,down})
-    // expect FWHT(rmsnorm(x) / awq_scale). Populate both:
-    //   x_norm_batch ← rmsnorm(x_batch)
-    //   x_rot_batch  ← FWHT(x_norm_batch / awq_scale)  (only if any
-    //                  downstream MQ weight is present, which moe_ffn_batched_admissible
-    //                  guarantees — shared_expert.gate is always MQ4 here)
-    //
-    // Pick `shared_expert.gate` as the AWQ representative (instead of
-    // the previous `ffn.router`). Per the F1 imatrix scope every gate-side
-    // MQ4 sibling shares the same input basis and therefore an identical
-    // awq_scale, but the router itself is excluded from F1 (it stays Q8).
-    // Reading awq_scale from router would silently drop AWQ rotation in
-    // v3 AWQ runs — latent until this predicate widened.
-    gpu.rmsnorm_batched(
-        &pbs.x_batch,
-        ffn_norm,
-        &pbs.x_norm_batch,
-        n,
-        dim,
-        config.norm_eps,
-    )?;
-    // PARO mode (shared_expert.gate is ParoQ4G128): each weight carries its
-    // own Givens rotation table (paro.pairs / theta / channel_scales). The
-    // shared MQ4-style FWHT pre-rotation here would be wrong — skip it. The
-    // ParoQ4G128 dispatch arms below run per-weight Givens rotation in-place
-    // before each GEMM, using pbs.x_rot_batch as the rotation destination.
-    let paro_mode = matches!(ffn.shared_expert.gate.gpu_dtype, DType::ParoQ4G128);
-    if !paro_mode {
-        rotate_x_mq_batched_for(
-            gpu,
-            &ffn.shared_expert.gate,
-            &pbs.x_norm_batch,
-            &pbs.x_rot_batch,
-            dim,
-            n,
-        )?;
-    }
 
-    // ── 2. Router + shared-gate + shared.gate + shared.up (4 batched GEMMs) ──
-    //
-    // Per-dtype dispatch — Q8 reads `x_norm_batch`, MQ4 reads
-    // `x_rot_batch`. The natural 4-way fuse via `gemm_qkvza_hfq4g256`
-    // is not applicable when router/shared_expert_gate are Q8 (mixed
-    // strides). Four separate launches; +3 per MoE layer over the fused
-    // ideal, acceptable for the structural unlock.
-    // #397 Ship 5.2 PILOT: route the router GEMM through GemmFamily::run_key.
-    // Each arm uses the *dispatcher-entry* KernelKey (GemmQ8_0BatchedChunked /
-    // GemmHfq4G256 / GemmF32Batched) so run_key dispatches to the IDENTICAL
-    // gpu.gemm_* method the prior direct call used — preserving each method's
-    // own internal arch routing (RDNA4-WMMA / gfx906-dp4a / CDNA-rocBLAS / …)
-    // byte-for-byte. The x input still differs per dtype (Q8/F32 read
-    // x_norm_batch; MQ4 reads x_rot_batch), exactly as before. The three keys
-    // are registered ArchPredicate::Always, so run_key never rejects.
-    // Non-root EP ranks skip the router GEMM (and the logits dump below):
-    // their route arrays already hold the root's D2D-copied bytes. The
-    // shared-expert-gate GEMM after the dump still runs (shared stays
-    // replicated per rank).
-    if !skip_router_produce {
-        use hipfire_dispatch::families::gemm::GemmParams;
-        let ctx = DispatchCtx::new(gpu);
-        let (key, x_in): (hipfire_dispatch::types::KernelKey, &GpuTensor) =
-            match ffn.router.gpu_dtype {
-                DType::Q8_0 => (
-                    hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
-                    &pbs.x_norm_batch,
-                ),
-                DType::MQ4G256 => (
-                    hipfire_dispatch::types::KernelKey::GemmHfq4G256,
-                    &pbs.x_rot_batch,
-                ),
-                DType::MQ4G256V2 => (
-                    hipfire_dispatch::types::KernelKey::GemmMq4G256V2,
-                    &pbs.x_rot_batch,
-                ),
-                DType::F32 => (
-                    hipfire_dispatch::types::KernelKey::GemmF32Batched,
-                    &pbs.x_norm_batch,
-                ),
-                other => panic!(
-                    "prefill_moe_ffn_body_batched: unexpected router dtype {other:?} \
-                         — moe_ffn_batched_admitted admits MQ4G256, Q8_0, F32"
-                ),
-            };
-        let w = WeightRef {
-            buf: &ffn.router.buf,
-            dtype: ffn.router.gpu_dtype,
-            m: ffn.router.m,
-            k: ffn.router.k,
-            row_stride: ffn.router.k,
-            rotation: None,
-            awq_scale: None,
-        };
-        let params = GemmParams {
-            w: &w,
-            x: x_in,
-            y: router_logits,
-            batch_size: n,
-        };
-        hipfire_runtime::llama::gemm_family()
-            .run_key(key, &ctx, gpu, &params)
-            .map_err(HipError::from)?;
-        // DIAG: dump MoE router logits (batched)
-        dump_hidden_localize(gpu, router_logits, n, 0, ffn.router.m, 0, "router_b");
-    }
-    // #397 Ship 5.2 slice1: route the shared-expert-gate GEMM through
-    // GemmFamily::run_key. Same dtype-routed dispatcher-entry keys as the router
-    // match above (Q8/F32 read x_norm_batch, MQ4 reads x_rot_batch) → identical
-    // gpu.gemm_* method, byte-for-byte.
-    {
-        use hipfire_dispatch::types::KernelKey;
-        let (key, x_in): (KernelKey, &GpuTensor) = match ffn.shared_expert_gate.gpu_dtype {
-            DType::Q8_0 => (KernelKey::GemmQ8_0BatchedChunked, &pbs.x_norm_batch),
-            DType::MQ4G256 => (KernelKey::GemmHfq4G256, &pbs.x_rot_batch),
-            DType::MQ4G256V2 => (KernelKey::GemmMq4G256V2, &pbs.x_rot_batch),
-            DType::F32 => (KernelKey::GemmF32Batched, &pbs.x_norm_batch),
-            other => panic!(
-                "prefill_moe_ffn_body_batched: unexpected shared_expert_gate dtype {other:?} \
-                         — moe_ffn_batched_admissible admits MQ4G256, Q8_0, F32"
-            ),
-        };
-        run_plain_gemm_key(
-            gpu,
-            key,
-            &ffn.shared_expert_gate.buf,
-            ffn.shared_expert_gate.gpu_dtype,
-            x_in,
-            shared_scalar,
-            ffn.shared_expert_gate.m,
-            ffn.shared_expert_gate.k,
-            n,
-        )?;
-    }
-    // Fused gate+up dispatch for the shared expert — halves the kernel
-    // launch count vs back-to-back gemm_hfq*g256 (~75µs/launch × 40
-    // MoE layers = ~3ms saved on R9700 A3B prefill at bs=256).
-    // Per-projection dispatch: gate AND up share the same dtype (predicate
-    // enforces). MQ4 → HFQ4-layout fused kernel; MQ6 → HFQ6-layout.
-    match ffn.shared_expert.gate.gpu_dtype {
-        // #397 Ship 5.2 slice 2: shared-expert fused gate+up → FusedQkvFamily
-        // (batched-prefill gate+up variant). Same batched kernel, behavior-preserving.
-        // MQ4G256V2 / MQ6G256V2 select container-specific keys via fused_gate_up_key_for
-        // (never V1 aliases). MQ4G256 falls through to FusedGateUpHfq4G256.
-        DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256V2 => run_fused_gate_up_key(
-            gpu,
-            crate::forward_slots::fused_gate_up_key_for(ffn.shared_expert.gate.gpu_dtype),
-            &ffn.shared_expert.gate.buf,
-            &ffn.shared_expert.up.buf,
-            &pbs.x_rot_batch,
-            shared_gate,
-            shared_up,
-            ffn.shared_expert.gate.m,
-            ffn.shared_expert.up.m,
-            ffn.shared_expert.gate.k,
-            n,
-        )?,
-        DType::MQ6G256 => run_fused_gate_up_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::FusedGateUpHfq6G256,
-            &ffn.shared_expert.gate.buf,
-            &ffn.shared_expert.up.buf,
-            &pbs.x_rot_batch,
-            shared_gate,
-            shared_up,
-            ffn.shared_expert.gate.m,
-            ffn.shared_expert.up.m,
-            ffn.shared_expert.gate.k,
-            n,
-        )?,
-        // Phase 2: PARO shared_expert.gate + up. Each weight has its own
-        // Givens rotation table — rotate x_norm_batch into x_rot_batch using
-        // gate's tables, GEMM, then re-rotate using up's tables, GEMM. Total
-        // 4 dispatches vs the MQ4 path's 1 fused gemm_gate_up — acceptable
-        // overhead for the per-token-loop elimination win. Phase 4 could
-        // collapse this into a single fused kernel
-        // (gemm_gate_up_paro_q4g128_batched) if measurement shows it matters.
-        DType::ParoQ4G128 => {
-            let paro_gate = ffn
-                .shared_expert
-                .gate
-                .paro
-                .as_ref()
-                .expect("ParoQ4G128 shared_expert.gate missing paro metadata");
-            let paro_up = ffn
-                .shared_expert
-                .up
-                .paro
-                .as_ref()
-                .expect("ParoQ4G128 shared_expert.up missing paro metadata");
-            // Gate: rotate x_norm by gate's Givens → x_rot, then HFQ4G128 GEMM
-            gpu.givens_rotate_to(
-                &pbs.x_norm_batch,
-                &pbs.x_rot_batch,
-                &paro_gate.pairs,
-                &paro_gate.theta,
-                &paro_gate.channel_scales,
-                n,
-                dim,
-                paro_gate.krot as usize,
-            )?;
-            run_plain_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq4G128,
-                &ffn.shared_expert.gate.buf,
-                ffn.shared_expert.gate.gpu_dtype,
-                &pbs.x_rot_batch,
-                shared_gate,
-                ffn.shared_expert.gate.m,
-                ffn.shared_expert.gate.k,
-                n,
-            )?;
-            // Up: re-rotate x_norm by up's Givens → x_rot (overwrite), GEMM
-            gpu.givens_rotate_to(
-                &pbs.x_norm_batch,
-                &pbs.x_rot_batch,
-                &paro_up.pairs,
-                &paro_up.theta,
-                &paro_up.channel_scales,
-                n,
-                dim,
-                paro_up.krot as usize,
-            )?;
-            run_plain_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq4G128,
-                &ffn.shared_expert.up.buf,
-                ffn.shared_expert.up.gpu_dtype,
-                &pbs.x_rot_batch,
-                shared_up,
-                ffn.shared_expert.up.m,
-                ffn.shared_expert.up.k,
-                n,
-            )?;
-        }
-        // Q8 shared expert (A3B mfp4-E8): gate + up via two batched Q8 GEMMs
-        // reading the UN-rotated x_norm_batch (Q8 weights are quantized against
-        // un-rotated rmsnorm output). No fused Q8 gate+up kernel — two plain
-        // launches; mirrors the decode `gemv.run_auto` Q8 shared gate/up arm.
-        DType::Q8_0 => {
-            run_plain_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
-                &ffn.shared_expert.gate.buf,
-                ffn.shared_expert.gate.gpu_dtype,
-                &pbs.x_norm_batch,
-                shared_gate,
-                ffn.shared_expert.gate.m,
-                ffn.shared_expert.gate.k,
-                n,
-            )?;
-            run_plain_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
-                &ffn.shared_expert.up.buf,
-                ffn.shared_expert.up.gpu_dtype,
-                &pbs.x_norm_batch,
-                shared_up,
-                ffn.shared_expert.up.m,
-                ffn.shared_expert.up.k,
-                n,
-            )?;
-        }
-        // Uniform mfp4-E8 shared expert (Option B): shared expert gate/up are both
-        // MFP4G32E8. We dequant each to F16 transiently (E8→F16 gives W_rot in the
-        // FWHT-rotated domain), then run GemmF16WmmaMb8 against x_rot_batch (F32).
-        // Math: GEMM(W_rot, x_rot) = W·x_norm = correct forward pass.
-        // The F16 scratch tensors are allocated per call and freed after use; they
-        // are small (smi × dim × 2 bytes each) relative to VRAM.
-        DType::MFP4G32E8 => {
-            let gate_m = ffn.shared_expert.gate.m;
-            let gate_k = ffn.shared_expert.gate.k;
-            let up_m = ffn.shared_expert.up.m;
-            let up_k = ffn.shared_expert.up.k;
-            // Dequantize gate and up weights: E8 → F16 (in-rotated domain)
-            let gate_f16 = gpu.alloc_tensor(&[gate_m * gate_k], DType::F16)?;
-            gpu.dequantize_mfp4g32_e8_to_f16(
-                &ffn.shared_expert.gate.buf.buf,
-                &gate_f16.buf,
-                gate_m,
-                gate_k,
-            )?;
-            let up_f16 = gpu.alloc_tensor(&[up_m * up_k], DType::F16)?;
-            gpu.dequantize_mfp4g32_e8_to_f16(
-                &ffn.shared_expert.up.buf.buf,
-                &up_f16.buf,
-                up_m,
-                up_k,
-            )?;
-            // GemmF16WmmaMb8: W(F16) × x_rot_batch(F32) → shared_gate / shared_up (F32)
-            // x_rot_batch is F32; gemm_f16_wmma_mb8 accepts F32 activations directly.
-            run_plain_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmF16WmmaMb8,
-                &gate_f16,
-                DType::F16,
-                &pbs.x_rot_batch,
-                shared_gate,
-                gate_m,
-                gate_k,
-                n,
-            )?;
-            run_plain_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmF16WmmaMb8,
-                &up_f16,
-                DType::F16,
-                &pbs.x_rot_batch,
-                shared_up,
-                up_m,
-                up_k,
-                n,
-            )?;
-            // Free the transient F16 weight buffers
-            gpu.free_tensor(gate_f16)?;
-            gpu.free_tensor(up_f16)?;
-        }
-        other => panic!(
-            "prefill_moe_ffn_body_batched: unsupported shared_expert.gate dtype {other:?} \
-                         — admit predicate should have rejected this layer"
-        ),
-    }
+    execute_steps(gpu, ctx, &[Step::Moe(sealed)]).map_err(|e| HipError::new(0, &e.to_string()))?;
 
-    // ── 4. Shared-expert SwiGLU + FWHT, batched over N tokens ──
-    //
-    // fused_silu_mul_rotate_mq_batched expects [batch × k] gate/up with
-    // batch on grid.y and writes FWHT(silu(gate) * up) into x_rot. Here
-    // batch=N, k=smi; the shared-rot output buffer is [N × smi].
-    // F2: AWQ-aware silu_mul+rotate for the batched shared-expert down input.
-    // PARO: shared_expert.down has its own Givens rotation tables (paro.*);
-    // use the dedicated fused kernel (commit 50198daa). It takes a per-weight
-    // (pairs, theta, channel_scales, krot) tuple instead of the MQ4 FWHT
-    // convention. Same shape: gate/up [N × smi] → shared_rot [N × smi].
-    if paro_mode {
-        let paro_down = ffn
-            .shared_expert
-            .down
-            .paro
-            .as_ref()
-            .expect("ParoQ4G128 shared_expert.down missing paro metadata");
-        gpu.fused_silu_mul_givens_rotate_f32(
-            shared_gate,
-            shared_up,
-            shared_rot,
-            &paro_down.pairs,
-            &paro_down.theta,
-            &paro_down.channel_scales,
-            n,
-            smi,
-            paro_down.krot as usize,
-        )?;
-    } else if matches!(ffn.shared_expert.down.gpu_dtype, DType::Q8_0) {
-        // Q8 shared down expects the UN-rotated SwiGLU hidden (no FWHT). Plain
-        // element-wise silu_mul over the flat [N × smi] buffers (batched for
-        // free) writes the hidden into shared_rot, feeding the Q8 down GEMM.
-        gpu.silu_mul_f32(shared_gate, shared_up, shared_rot)?;
-    } else {
-        fused_silu_mul_rotate_mq_batched_for(
-            gpu,
-            &ffn.shared_expert.down,
-            shared_gate,
-            shared_up,
-            shared_rot,
-            smi,
-            n,
-        )?;
-    }
-
-    // ── 5. Shared-expert down with sigmoid-scaled residual, batched ──
-    //
-    // Reads shared_scalar[token] as the pre-sigmoid logit, applies sigmoid
-    // internally, and += sigmoid(scalar) × (W_down · rot) into
-    // pbs.x_batch[token × dim + row]. (Note: HFQ4 sister uses += not
-    // atomicAdd; each (bid, row) writes a unique cell.)
-    // Per-projection dispatch: MQ4 → HFQ4 kernel, MQ6 → HFQ6 sister
-    // (shipped via feat/hfq6-sigmoid-scaled-batched).
-    match ffn.shared_expert.down.gpu_dtype {
-        DType::MQ4G256 => gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
-            &ffn.shared_expert.down.buf,
-            shared_rot,
-            &pbs.x_batch,
-            shared_scalar,
-            ffn.shared_expert.down.m,
-            ffn.shared_expert.down.k,
-            n,
-        )?,
-        DType::MQ6G256 => gpu.gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched(
-            &ffn.shared_expert.down.buf,
-            shared_rot,
-            &pbs.x_batch,
-            shared_scalar,
-            ffn.shared_expert.down.m,
-            ffn.shared_expert.down.k,
-            n,
-        )?,
-        // MQ4G256V2 / MQ6G256V2: exact dense V2 residual GEMM into temp +
-        // sigmoid scale (no V1 HFQ4/HFQ6 residual_sigmoid alias — dual-half
-        // headers differ from V1). Mirrors the Q8_0 split below.
-        DType::MQ4G256V2 | DType::MQ6G256V2 => {
-            let down_tmp = GpuTensor {
-                buf: unsafe { down_expanded.buf.alias() },
-                shape: vec![n * dim],
-                dtype: DType::F32,
-            };
-            let bytes = n * dim * 4;
-            if let Some(stream) = gpu.active_stream.as_ref() {
-                gpu.hip.memset_async(&down_tmp.buf, 0, bytes, stream)?;
-            } else {
-                gpu.hip.memset(&down_tmp.buf, 0, bytes)?;
-            }
-            run_residual_gemm_key(
-                gpu,
-                crate::forward_slots::residual_gemm_key_for(ffn.shared_expert.down.gpu_dtype),
-                &ffn.shared_expert.down.buf,
-                ffn.shared_expert.down.gpu_dtype,
-                shared_rot,
-                &down_tmp,
-                ffn.shared_expert.down.m,
-                ffn.shared_expert.down.k,
-                n,
-            )?;
-            gpu.sigmoid_scaled_residual_add_batched_f32(
-                &pbs.x_batch,
-                &down_tmp,
-                shared_scalar,
-                n,
-                dim,
-            )?;
-        }
-        // Phase 2: HFQ4G128 batched residual+sigmoid-scaled kernel. Single
-        // launch, same semantics as the HFQ4G256 sister — reads shared_rot
-        // (already silu-mul-rotated by the PARO fused kernel above), GEMVs
-        // against W_down, applies sigmoid(shared_scalar[token]) × output,
-        // accumulates into pbs.x_batch.
-        DType::ParoQ4G128 => gpu.gemv_hfq4g128_residual_sigmoid_scaled_gpu_batched(
-            &ffn.shared_expert.down.buf,
-            shared_rot,
-            &pbs.x_batch,
-            shared_scalar,
-            ffn.shared_expert.down.m,
-            ffn.shared_expert.down.k,
-            n,
-        )?,
-        // Q8 shared down (A3B mfp4-E8, Q8-shared variant): plain batched Q8 GEMM
-        // W_down · hidden into a [N × dim] temp, then fold into the residual with
-        // the per-token sigmoid(shared_scalar) gate. The temp aliases the first N×dim
-        // of `down_expanded` (the routed down-expanded scratch), which is FREE here —
-        // the routed experts (step 6) overwrite it only after this completes, and
-        // the HIP stream is in-order so the add reads before that. Batched analog
-        // of the decode sigmoid_f32 + scaled_add_inplace shared-down arm.
-        DType::Q8_0 => {
-            let down_tmp = GpuTensor {
-                buf: unsafe { down_expanded.buf.alias() },
-                shape: vec![n * dim],
-                dtype: DType::F32,
-            };
-            run_plain_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmQ8_0BatchedChunked,
-                &ffn.shared_expert.down.buf,
-                ffn.shared_expert.down.gpu_dtype,
-                shared_rot,
-                &down_tmp,
-                ffn.shared_expert.down.m,
-                ffn.shared_expert.down.k,
-                n,
-            )?;
-            gpu.sigmoid_scaled_residual_add_batched_f32(
-                &pbs.x_batch,
-                &down_tmp,
-                shared_scalar,
-                n,
-                dim,
-            )?;
-        }
-        // Uniform mfp4-E8 shared expert down (Option B): dequant the E8 down weight
-        // to F16, run GemmF16WmmaMb8 against shared_rot (FWHT-rotated SwiGLU hidden)
-        // into a [N × dim] temp, then sigmoid-scale-add into the residual. The temp
-        // aliases the first N×dim of `down_expanded` (safe: step 6 routed experts
-        // run after this, and the stream is in-order). Mirrors the Q8_0 arm above
-        // except the GEMM is F16 weight × F32 activation = F32 output.
-        DType::MFP4G32E8 => {
-            let down_m = ffn.shared_expert.down.m;
-            let down_k = ffn.shared_expert.down.k;
-            let down_f16 = gpu.alloc_tensor(&[down_m * down_k], DType::F16)?;
-            gpu.dequantize_mfp4g32_e8_to_f16(
-                &ffn.shared_expert.down.buf.buf,
-                &down_f16.buf,
-                down_m,
-                down_k,
-            )?;
-            let down_tmp = GpuTensor {
-                buf: unsafe { down_expanded.buf.alias() },
-                shape: vec![n * dim],
-                dtype: DType::F32,
-            };
-            run_plain_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmF16WmmaMb8,
-                &down_f16,
-                DType::F16,
-                shared_rot,
-                &down_tmp,
-                down_m,
-                down_k,
-                n,
-            )?;
-            gpu.free_tensor(down_f16)?;
-            gpu.sigmoid_scaled_residual_add_batched_f32(
-                &pbs.x_batch,
-                &down_tmp,
-                shared_scalar,
-                n,
-                dim,
-            )?;
-        }
-        other => panic!(
-            "prefill_moe_ffn_body_batched: unsupported shared_expert.down dtype {other:?} \
-                         — admit predicate should have rejected this layer"
-        ),
-    }
-
-    // ── 6. Routed experts: delegated to MoeFamily::run_prefill (Ship 4.2) ──
-    //
-    // The call was sealed (and, on non-root ranks, adopted + attached) before
-    // the launches above; only the route production stays here because it
-    // must run after the router GEMM filled the score contents — still before
-    // the experts execute. No re-sealing: the preflight seal is reused.
-    if !adopt_root {
-        // The producer requires an exact [N × num_experts] score shape. Select
-        // the preallocated non-owning view for this chunk instead of constructing
-        // a shape Vec for every MoE layer.
-        let router_scores = pbs
-            .moe_router_score_views_batch
-            .as_ref()
-            .and_then(|views| n.checked_sub(1).and_then(|index| views.get(index)))
-            .ok_or_else(|| HipError::new(0, "moe router score scratch view is unavailable"))?;
-        let receipt = hipfire_dispatch::pipeline::sealed_moe::produce_prefill_route(
-            &sealed,
-            gpu,
-            router_scores,
-            config.norm_topk_prob,
-        )
-        .map_err(HipError::from)?;
-        sealed
-            .attach_route_receipt(receipt)
-            .map_err(HipError::from)?;
-        if produce_root {
-            // Publish the opaque producer proof through the band-carried slot.
-            // It is issued from this actual successful root-produced receipt
-            // (produced + attached + validated above), never fabricated.
-            let proof = sealed
-                .prefill_route_producer_proof()
-                .map_err(HipError::from)?;
-            match route {
-                PrefillRouteMode::ProduceRoot { slot } => slot.set(Some(proof)),
-                _ => unreachable!("produce_root without ProduceRoot mode"),
-            }
-        }
-    }
-    hipfire_dispatch::pipeline::execute_steps(
-        gpu,
-        ctx,
-        &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
-    )
-    .map_err(HipError::from)?;
     #[cfg(feature = "moe-oracle")]
     {
+        let router_logits = pbs.moe_router_logits_batch.as_ref().expect("moe scratch");
         let oracle_start =
             crate::qwen35::oracle::prefill_start().map_err(|e| hip_bridge::HipError::new(0, &e))?;
         crate::qwen35::oracle::prefill_after(
@@ -3731,12 +2839,12 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route(
             config,
             &pbs.x_batch,
             router_logits,
-            topk_indices,
-            topk_weights,
-            gate_batch,
-            up_batch,
-            rot_batch,
-            down_expanded,
+            pbs.moe_topk_indices_batch.as_ref().expect("moe scratch"),
+            pbs.moe_topk_weights_batch.as_ref().expect("moe scratch"),
+            pbs.moe_gate_batch.as_ref().expect("moe scratch"),
+            pbs.moe_up_batch.as_ref().expect("moe scratch"),
+            pbs.moe_rot_batch.as_ref().expect("moe scratch"),
+            pbs.moe_down_expanded_batch.as_ref().expect("moe scratch"),
             n,
             oracle_start,
         )
@@ -3773,98 +2881,6 @@ pub(crate) struct PrefillBandCtx<'a> {
     /// EP prefill route authority for single-layer MoE bands. `Replicated`
     /// everywhere else (whole-stack and multi-layer bands, decode ticks, PP).
     pub route: PrefillRouteMode<'a>,
-}
-
-/// EP prefill route authority for one single-layer MoE band execution.
-///
-/// Carried inside [`PrefillBandCtx`] so the per-layer band plumbing needs no
-/// new parameters, no heap allocation, and no signature churn for the
-/// single-GPU callers (which always use `Replicated`). All variants are
-/// `Copy` (shared borrows only).
-#[derive(Clone, Copy, Debug)]
-pub(crate) enum PrefillRouteMode<'a> {
-    /// Local/replicated routing: run router GEMM + softmax/topk + produce on
-    /// this rank. This is the historical single-GPU behavior, byte-identical.
-    Replicated,
-    /// EP root rank (rank 0): run router GEMM + produce locally, then publish
-    /// the opaque producer proof through `slot` — a caller-owned stack
-    /// [`std::cell::Cell`]. The cell gives write-through under the shared
-    /// `&PrefillBandCtx` borrow without heap allocation (the proof is
-    /// `Copy`); the driver reads it back after the call returns.
-    ProduceRoot {
-        slot: &'a std::cell::Cell<
-            Option<hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof>,
-        >,
-    },
-    /// EP non-root rank: skip router GEMM + softmax/topk + produce entirely;
-    /// the driver D2D-copies the root's first `N*k` route entries into this
-    /// rank's PBS arrays first, then this mode adopts the root's proof
-    /// (launching nothing) and executes the grouped MoE over those bytes.
-    AdoptRoot {
-        proof: &'a hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof,
-    },
-}
-
-#[allow(clippy::too_many_arguments)]
-/// Debug localization hook (no-op unless `HIPFIRE_DUMP_HIDDEN` is set to a file
-/// prefix). Appends the post-layer hidden row for the target absolute position
-/// to `{HIPFIRE_DUMP_HIDDEN}.{tag}` as `u32 layer_idx` followed by `dim`
-/// little-endian f32. The target absolute position is `HIPFIRE_DUMP_HIDDEN_POS`
-/// (default 0); `abs_pos_of_row0` is the absolute sequence position of row 0 of
-/// `x` (`start_pos` for the batched residual `pbs.x_batch`, `pos` for the
-/// single-row per-token `s.x`). Used to localize the PARO batched-prefill
-/// divergence by diffing `.batched` vs `.pertoken` per layer. Requires
-/// `HIPFIRE_GRAPH=0` (does a synchronous D2H readback, which is illegal under
-/// graph capture).
-pub(crate) fn dump_hidden_localize(
-    gpu: &Gpu,
-    x: &GpuTensor,
-    n_rows: usize,
-    abs_pos_of_row0: usize,
-    dim: usize,
-    layer_idx: usize,
-    tag: &str,
-) {
-    let prefix = match hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN") {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let target: usize = hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN_POS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
-    if target < abs_pos_of_row0 {
-        return;
-    }
-    let row = target - abs_pos_of_row0;
-    if row >= n_rows {
-        return;
-    }
-    if gpu.hip.device_synchronize().is_err() {
-        return;
-    }
-    let all = match gpu.download_f32(x) {
-        Ok(v) => v,
-        Err(_) => return,
-    };
-    let off = row * dim;
-    if off + dim > all.len() {
-        return;
-    }
-    use std::io::Write;
-    let path = format!("{prefix}.{tag}");
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-    {
-        let _ = f.write_all(&(layer_idx as u32).to_le_bytes());
-        let mut bytes = Vec::with_capacity(dim * 4);
-        for v in &all[off..off + dim] {
-            bytes.extend_from_slice(&v.to_le_bytes());
-        }
-        let _ = f.write_all(&bytes);
-    }
 }
 
 #[inline]
@@ -5373,7 +4389,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
     } else {
         run_fused_gate_up_key(
             gpu,
-            crate::forward_slots::fused_gate_up_key_for(layer.w_gate.gpu_dtype),
+            hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for(layer.w_gate.gpu_dtype),
             &layer.w_gate.buf,
             &layer.w_up.buf,
             &pbs.x_rot_batch,
@@ -6490,7 +5506,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
     } else {
         run_fused_gate_up_key(
             gpu,
-            crate::forward_slots::fused_gate_up_key_for(layer.w_gate.gpu_dtype),
+            hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for(layer.w_gate.gpu_dtype),
             &layer.w_gate.buf,
             &layer.w_up.buf,
             &pbs.x_rot_batch,
@@ -7407,7 +6423,7 @@ fn batch_chunk_delta_net_moe(
     } else {
         run_residual_gemm_key(
             gpu,
-            crate::forward_slots::residual_gemm_key_for(layer.wo.gpu_dtype),
+            hipfire_dispatch::families::gemm::residual_gemm_key_for(layer.wo.gpu_dtype),
             &layer.wo.buf,
             layer.wo.gpu_dtype,
             dn_wo_input,
@@ -7928,7 +6944,7 @@ fn batch_chunk_full_attn_moe(
     } else {
         run_residual_gemm_key(
             gpu,
-            crate::forward_slots::residual_gemm_key_for(layer.wo.gpu_dtype),
+            hipfire_dispatch::families::gemm::residual_gemm_key_for(layer.wo.gpu_dtype),
             &layer.wo.buf,
             layer.wo.gpu_dtype,
             fa_wo_input,
@@ -8673,7 +7689,7 @@ fn run_fa_layer_body(
             None => &s.tmp,
         };
         if dt_g == DType::MQ4CG256 || dt_g == DType::MQ4G256V2 {
-            let key = crate::forward_slots::fused_gate_up_key_for(dt_g);
+            let key = hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for(dt_g);
             let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                 kind: key,
@@ -8996,6 +8012,13 @@ mod tests {
     use super::super::forward::unsupported_mq3_experts_uniform_from_dtypes;
     use super::*;
     use hipfire_dispatch::context::DispatchWorkload;
+    use hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for;
+    use hipfire_dispatch::families::gemm::residual_gemm_key_for;
+    use hipfire_dispatch::families::moe::{
+        gated_moe_prefill_admissible_for_dtypes as moe_ffn_batched_admissible_for_dtypes,
+        moe_prefill_topk_shape_supported, paro_batched_admit_enabled_from_env,
+        routed_codebook_grouped_supported, routed_uniform_mqv2_grouped_supported, MoePrefillDtypes,
+    };
     use rdna_compute::DType;
 
     #[test]
@@ -9154,10 +8177,28 @@ mod tests {
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
         for arch in ["gfx1100", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                true,
             ));
         }
     }
@@ -9504,9 +8545,7 @@ mod tests {
         // Contract: every admitted V2 dtype maps 1:1 to its exact V2 kernel
         // in every dense operation (plain, residual, QKV, QKVZA, gate_up).
         // All V2 widths admit on both gfx11 and gfx12 (HasWmma); no qt47-50 falls into HFQ4/default/wildcard.
-        use crate::forward_slots::{
-            fused_gate_up_key_for, fused_qkv_key_for, fused_qkvza_key_for, residual_gemm_key_for,
-        };
+        use crate::forward_slots::{fused_qkv_key_for, fused_qkvza_key_for};
         use hipfire_dispatch::types::KernelKey;
         use rdna_compute::DType;
         let cases: &[(DType, KernelKey, KernelKey, KernelKey, KernelKey, &str)] = &[
@@ -10006,7 +9045,6 @@ mod tests {
     /// never HFQ4/HFQ6 V1 residual_sigmoid aliases.
     #[test]
     fn moe_shared_mqv2_dense_keys_never_collapse_to_v1() {
-        use crate::forward_slots::{fused_gate_up_key_for, residual_gemm_key_for};
         use hipfire_dispatch::types::KernelKey;
 
         assert_eq!(

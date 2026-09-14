@@ -953,15 +953,17 @@ fn pipeline_single_op_self_satisfies() {
 }
 
 // ── MoeResolution eligibility lattice (mirrors qwen35.rs:4598-4671) ──
-use crate::families::moe::{MoeDtypes, MoeResolution};
+use crate::families::moe::{MoeDtypes, MoeResolution, MoeSharedDtypes};
 
 fn dtypes_all_mq4() -> MoeDtypes<'static> {
     MoeDtypes {
         router: DType::MQ4G256,
-        shared_gate: DType::MQ4G256,
-        shared_expert_gate: DType::MQ4G256,
-        shared_expert_up: DType::MQ4G256,
-        shared_expert_down: DType::MQ4G256,
+        shared: Some(MoeSharedDtypes {
+            selector: DType::MQ4G256,
+            gate: DType::MQ4G256,
+            up: DType::MQ4G256,
+            down: DType::MQ4G256,
+        }),
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
@@ -1118,10 +1120,12 @@ fn moe_res_all_mq4v2_gate_quartet_is_fusable_mq4v2() {
     // never the V1 fused route. Still needs the rotated activation.
     let mut d = dtypes_all_mq4();
     d.router = DType::MQ4G256V2;
-    d.shared_gate = DType::MQ4G256V2;
-    d.shared_expert_gate = DType::MQ4G256V2;
-    d.shared_expert_up = DType::MQ4G256V2;
-    d.shared_expert_down = DType::MQ4G256V2;
+    d.shared = Some(MoeSharedDtypes {
+        selector: DType::MQ4G256V2,
+        gate: DType::MQ4G256V2,
+        up: DType::MQ4G256V2,
+        down: DType::MQ4G256V2,
+    });
     d.routed_gate_up = DType::MQ4G256V2;
     d.routed_down = DType::MQ4G256V2;
     d.experts_all_gate_up_mq4 = true;
@@ -1166,7 +1170,7 @@ fn moe_res_mixed_v1_v2_gate_quartet_is_not_fusable() {
 
     // V1 router + one V2 shared half
     let mut d = dtypes_all_mq4();
-    d.shared_expert_up = DType::MQ4G256V2;
+    d.shared.as_mut().unwrap().up = DType::MQ4G256V2;
     let r = MoeResolution::resolve(&d, 8);
     assert!(!r.gate_fusable, "single V2 shared-up disqualifies V1 fuse");
     assert!(
@@ -1191,10 +1195,12 @@ fn moe_res_shipped_ornith15_takes_the_indexed_path() {
     // the shipped model decoded through the resident CPU-fallback path.
     let mut d = dtypes_all_mq4();
     d.router = DType::Q8_0;
-    d.shared_gate = DType::Q8_0;
-    d.shared_expert_gate = DType::MQ6G256;
-    d.shared_expert_up = DType::MQ6G256;
-    d.shared_expert_down = DType::MQ6G256;
+    d.shared = Some(MoeSharedDtypes {
+        selector: DType::Q8_0,
+        gate: DType::MQ6G256,
+        up: DType::MQ6G256,
+        down: DType::MQ6G256,
+    });
     d.routed_gate_up = DType::MQ4G256V2;
     d.routed_down = DType::MQ4G256V2;
     d.experts_all_gate_up_mq4 = false;
@@ -2183,10 +2189,12 @@ use crate::families::moe::MoePrefillResolution;
 fn moe_dtypes_mq4() -> MoeDtypes<'static> {
     MoeDtypes {
         router: DType::Q8_0,
-        shared_gate: DType::Q8_0,
-        shared_expert_gate: DType::MQ4G256,
-        shared_expert_up: DType::MQ4G256,
-        shared_expert_down: DType::MQ4G256,
+        shared: Some(MoeSharedDtypes {
+            selector: DType::Q8_0,
+            gate: DType::MQ4G256,
+            up: DType::MQ4G256,
+            down: DType::MQ4G256,
+        }),
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,

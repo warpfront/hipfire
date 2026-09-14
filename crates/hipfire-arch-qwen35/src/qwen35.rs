@@ -53,9 +53,9 @@ pub use prefill::{
     qwen35_layer_batch_admissible, upload_prefill_batch_inputs, PREFILL_MAX_BATCH,
 };
 pub(crate) use prefill::{
-    moe_ffn_batched_admissible, mq6_batched_admit_enabled_from_env, prefill_moe_ffn_body_batched,
-    q8_prefill_wmma_enabled, run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key,
-    run_plain_gemm_key, run_residual_gemm_key,
+    moe_prefill_dtypes, prefill_moe_ffn_body_batched, q8_prefill_wmma_enabled,
+    run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key, run_plain_gemm_key,
+    run_residual_gemm_key,
 };
 pub use weights::{
     mixed_expert_tag, DeltaNetLayerWeights, DeltaNetMoeLayerWeights, DeltaNetState, ExpertWeights,

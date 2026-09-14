@@ -250,7 +250,16 @@ fn mtp_step_oracle_no_repair() {
         let mut found = None;
         for _ in 0..8 {
             let w = drafter_d
-                .mtp_step(&mut gpu, &mut slot_d, pos_d, seed_d, &history_d, MAX_N, eos_d, None)
+                .mtp_step(
+                    &mut gpu,
+                    &mut slot_d,
+                    pos_d,
+                    seed_d,
+                    &history_d,
+                    MAX_N,
+                    eos_d,
+                    None,
+                )
                 .expect("arm D step");
             history_d.extend_from_slice(&w.committed);
             pos_d += w.committed.len();
@@ -265,8 +274,10 @@ fn mtp_step_oracle_no_repair() {
     // Same resumed position the main test repairs to.
     let keep = wcommitted_d.len() - 1;
     let p1 = wpos_d + keep;
-    eprintln!("[oracle] window_start={wpos_d} committed={} keep={keep} p1={p1} pos_end={pos_d}",
-        wcommitted_d.len());
+    eprintln!(
+        "[oracle] window_start={wpos_d} committed={} keep={keep} p1={p1} pos_end={pos_d}",
+        wcommitted_d.len()
+    );
     let dn_d = dn_bytes(&gpu, &slot_d);
     let kv_d = kv_full_bytes(&gpu, &slot_d);
     let (prev_d, mtp_kv_d) = mtp_full_bytes(&gpu, &drafter_d);
@@ -274,15 +285,39 @@ fn mtp_step_oracle_no_repair() {
         .iter()
         .zip(dn_d.iter())
     {
-        eprintln!("[oracle D(stepped)] {n}: bytes={} fnv={:016x}", fam.len(), fnv1a(fam));
+        eprintln!(
+            "[oracle D(stepped)] {n}: bytes={} fnv={:016x}",
+            fam.len(),
+            fnv1a(fam)
+        );
     }
-    eprintln!("[oracle D(stepped)] trunk_kv_full: bytes={} fnv={:016x}", kv_d.len(), fnv1a(&kv_d));
-    eprintln!("[oracle D(stepped)] mtp_kv_full: bytes={} fnv={:016x}", mtp_kv_d.len(), fnv1a(&mtp_kv_d));
-    eprintln!("[oracle D(stepped)] mtp_prev_hidden: bytes={} fnv={:016x}", prev_d.len(), fnv1a(&prev_d));
+    eprintln!(
+        "[oracle D(stepped)] trunk_kv_full: bytes={} fnv={:016x}",
+        kv_d.len(),
+        fnv1a(&kv_d)
+    );
+    eprintln!(
+        "[oracle D(stepped)] mtp_kv_full: bytes={} fnv={:016x}",
+        mtp_kv_d.len(),
+        fnv1a(&mtp_kv_d)
+    );
+    eprintln!(
+        "[oracle D(stepped)] mtp_prev_hidden: bytes={} fnv={:016x}",
+        prev_d.len(),
+        fnv1a(&prev_d)
+    );
     let kv_pre_d = kv_prefix_bytes(&gpu, &slot_d, p1);
-    eprintln!("[oracle D(stepped)] trunk_kv_prefix_p1: bytes={} fnv={:016x}", kv_pre_d.len(), fnv1a(&kv_pre_d));
+    eprintln!(
+        "[oracle D(stepped)] trunk_kv_prefix_p1: bytes={} fnv={:016x}",
+        kv_pre_d.len(),
+        fnv1a(&kv_pre_d)
+    );
     let mtp_pre_d = mtp_prefix_bytes(&gpu, &drafter_d, p1);
-    eprintln!("[oracle D(stepped)] mtp_kv_prefix_p1: bytes={} fnv={:016x}", mtp_pre_d.len(), fnv1a(&mtp_pre_d));
+    eprintln!(
+        "[oracle D(stepped)] mtp_kv_prefix_p1: bytes={} fnv={:016x}",
+        mtp_pre_d.len(),
+        fnv1a(&mtp_pre_d)
+    );
     free_session(&mut gpu, slot_d, drafter_d);
 
     // Arm B2: cold prefill of D's exact processed stream.
@@ -303,11 +338,27 @@ fn mtp_step_oracle_no_repair() {
         .iter()
         .zip(dn_b.iter())
     {
-        eprintln!("[oracle B2(cold)] {n}: bytes={} fnv={:016x}", fam.len(), fnv1a(fam));
+        eprintln!(
+            "[oracle B2(cold)] {n}: bytes={} fnv={:016x}",
+            fam.len(),
+            fnv1a(fam)
+        );
     }
-    eprintln!("[oracle B2(cold)] trunk_kv_full: bytes={} fnv={:016x}", kv_b.len(), fnv1a(&kv_b));
-    eprintln!("[oracle B2(cold)] mtp_kv_full: bytes={} fnv={:016x}", mtp_kv_b.len(), fnv1a(&mtp_kv_b));
-    eprintln!("[oracle B2(cold)] mtp_prev_hidden: bytes={} fnv={:016x}", prev_b.len(), fnv1a(&prev_b));
+    eprintln!(
+        "[oracle B2(cold)] trunk_kv_full: bytes={} fnv={:016x}",
+        kv_b.len(),
+        fnv1a(&kv_b)
+    );
+    eprintln!(
+        "[oracle B2(cold)] mtp_kv_full: bytes={} fnv={:016x}",
+        mtp_kv_b.len(),
+        fnv1a(&mtp_kv_b)
+    );
+    eprintln!(
+        "[oracle B2(cold)] mtp_prev_hidden: bytes={} fnv={:016x}",
+        prev_b.len(),
+        fnv1a(&prev_b)
+    );
 
     // Three-way oracle report. Full-buffer compare covers every prefix;
     // first-diff rows locate divergence in token positions.
@@ -326,19 +377,27 @@ fn mtp_step_oracle_no_repair() {
         mtp_kv_d == mtp_kv_b,
         first_diff_row(&mtp_kv_d, &mtp_kv_b, mtp_row)
     );
-    eprintln!(
-        "[oracle] D-vs-B2 prev_hidden equal={}",
-        prev_d == prev_b
-    );
+    eprintln!("[oracle] D-vs-B2 prev_hidden equal={}", prev_d == prev_b);
     for (i, (d, b)) in dn_d.iter().zip(dn_b.iter()).enumerate() {
-        eprintln!("[oracle] D-vs-B2 dn_fam{i} equal={} fnv D={:016x} B2={:016x}", d == b, fnv1a(d), fnv1a(b));
+        eprintln!(
+            "[oracle] D-vs-B2 dn_fam{i} equal={} fnv D={:016x} B2={:016x}",
+            d == b,
+            fnv1a(d),
+            fnv1a(b)
+        );
     }
     free_session(&mut gpu, slot_b, drafter_b);
     eprintln!("[oracle] done");
 
     assert_eq!(kv_d, kv_b, "step-path trunk KV differs from cold prefill");
-    assert_eq!(mtp_kv_d, mtp_kv_b, "step-path MTP KV differs from cold prefill");
-    assert_eq!(prev_d, prev_b, "step-path prev_hidden differs from cold prefill");
+    assert_eq!(
+        mtp_kv_d, mtp_kv_b,
+        "step-path MTP KV differs from cold prefill"
+    );
+    assert_eq!(
+        prev_d, prev_b,
+        "step-path prev_hidden differs from cold prefill"
+    );
     for (i, (d, b)) in dn_d.iter().zip(dn_b.iter()).enumerate() {
         assert_eq!(d, b, "step-path dn family {i} differs from cold prefill");
     }

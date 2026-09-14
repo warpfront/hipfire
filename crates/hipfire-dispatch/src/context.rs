@@ -26,6 +26,7 @@ pub struct DispatchCtx {
     pub flags: Arc<FeatureFlags>,
     pub resources: ResourceManager,
     pub workload: DispatchWorkload,
+    device_id: i32,
 }
 
 impl DispatchCtx {
@@ -41,7 +42,13 @@ impl DispatchCtx {
             flags,
             resources: ResourceManager::new(gpu),
             workload: DispatchWorkload::Standard,
+            device_id: gpu.device_id,
         }
+    }
+
+    /// Device identity bound to this dispatch context.
+    pub fn device_id(&self) -> i32 {
+        self.device_id
     }
 
     /// Attach call-site semantics to this otherwise hardware-derived context.
@@ -50,10 +57,10 @@ impl DispatchCtx {
         self
     }
 
-    /// Construct a `DispatchCtx` for the given arch string without a live GPU.
-    /// Only for use in tests.
+    /// Construct a `DispatchCtx` for the given arch string and device without
+    /// a live GPU. Only for use in tests.
     #[cfg(any(test, feature = "test-utils"))]
-    pub fn for_test(arch: &str) -> Self {
+    pub fn for_test_device(arch: &str, device_id: i32) -> Self {
         use rdna_compute::feature_flags::FeatureFlags;
         let flags = Arc::new(FeatureFlags::for_test(arch));
         let arch_caps = ArchCaps::new(arch, flags.clone());
@@ -62,6 +69,13 @@ impl DispatchCtx {
             flags,
             resources: crate::resource::ResourceManager::for_test(),
             workload: DispatchWorkload::Standard,
+            device_id,
         }
+    }
+
+    /// Construct a test context bound to device zero.
+    #[cfg(any(test, feature = "test-utils"))]
+    pub fn for_test(arch: &str) -> Self {
+        Self::for_test_device(arch, 0)
     }
 }

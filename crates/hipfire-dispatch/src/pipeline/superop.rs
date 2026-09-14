@@ -284,12 +284,12 @@ pub enum EpMoeCombineMode {
     /// Rank-partial flow: per-rank zeroed partials, all-reduce-sum,
     /// residual add. The mode DeepSeek4/MiniMax always select.
     RankPartial,
-    /// Root-routed partial flow (Qwen plan-bound compact EP): the root
-    /// routes on-GPU and seals a route-producer proof, folding owned
-    /// experts plus the shared expert once into its zeroed partial; the
-    /// driver broadcasts the root IDs+weights device-to-device, non-roots
-    /// seal the routed contrib against the proof (zero dummies read 0),
-    /// then the existing all-reduce-sum plus residual add completes it.
+    /// Root-routed slot-order flow (Qwen plan-bound compact EP): the root
+    /// routes on-GPU and seals a route-producer proof; every rank writes its
+    /// owned expert outputs into the global slot layout while zero-dummy
+    /// experts write zero. The runtime gathers those rows to root, then Qwen
+    /// invokes the ordinary single-device slot-order combine once, broadcasts
+    /// the finished partial, and adds it to every residual stream.
     RootRoutedPartial,
 }
 
@@ -313,6 +313,9 @@ pub struct EpMoeRouteView<'a> {
     pub topk_ids: &'a GpuTensor,
     /// Selected expert weights (`moe_topk_weights`, `[k]` f32).
     pub topk_weights: &'a GpuTensor,
+    /// Rank-local expert outputs in global slot layout. Exactly one rank owns
+    /// each selected slot; all other ranks write zero through dummy experts.
+    pub slot_outputs: &'a GpuTensor,
 }
 
 impl EpMoeRouteView<'_> {
@@ -417,14 +420,12 @@ pub trait ForwardBindings {
         })
     }
 
-    /// Root half of the root-routed EP MoE: seal the SoftmaxTopK route on
-    /// this (root) rank, run the router + owned experts + the shared expert
-    /// once into `partial` (a **zeroed** per-rank buffer the EP executor
-    /// all-reduces across ranks), and return the sealer-issued
-    /// [`MoeRouteProducerProof`](super::sealed_moe::MoeRouteProducerProof)
-    /// only after successful enqueue. Unsupported by default; Qwen
-    /// overrides it. The driver calls this only after every rank reported
-    /// [`EpMoeCombineMode::RootRoutedPartial`].
+    /// Root half of root-routed EP MoE: seal and produce the authoritative
+    /// SoftmaxTopK route, then write owned expert rows into `slot_outputs`.
+    /// The shared expert may accumulate into the zeroed root `partial`, but
+    /// routed rows are not folded until [`ep_finish_moe_slot_order`].
+    /// Unsupported by default; Qwen overrides it. The driver calls this only
+    /// after every rank reported [`EpMoeCombineMode::RootRoutedPartial`].
     fn ep_run_moe_root(
         &mut self,
         _gpu: &mut Gpu,
@@ -512,9 +513,27 @@ pub trait ForwardBindings {
         })
     }
 
-    /// EP: add the all-reduced routed partial into this rank's residual stream
-    /// (the arch-specific buffer that holds the post-attention residual). Called
-    /// by the EP executor once, after the MoE all-reduce.
+    /// Finish root-routed MoE after all per-rank slot outputs have been
+    /// gathered into rank 0's global slot layout. The implementation must run
+    /// the architecture's ordinary single-device slot-order combine exactly
+    /// once into `partial`.
+    fn ep_finish_moe_slot_order(
+        &mut self,
+        _gpu: &mut Gpu,
+        _ctx: &DispatchCtx,
+        _op: &OpBinding,
+        _partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        Err(DispatchError::UnsupportedVariant {
+            family: "ep",
+            variant: "ep_finish_moe_slot_order-not-implemented-for-arch",
+            arch: "",
+            quant: "",
+        })
+    }
+
+    /// EP: add the root-combined, byte-copied routed partial into this rank's
+    /// residual stream. Called once after slot-order combine and broadcast.
     fn ep_add_into_residual(
         &mut self,
         _gpu: &mut Gpu,

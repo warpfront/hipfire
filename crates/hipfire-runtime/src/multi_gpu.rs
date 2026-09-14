@@ -170,6 +170,77 @@ pub struct Gpus {
 
 const DEFAULT_VRAM_TOLERANCE_GB: f64 = 2.0;
 
+/// Validate lease identity and reduction geometry without touching GPU state.
+/// The returned byte count is zero for the existing singleton lease identity
+/// case, which intentionally accepts any reduction count because no peer
+/// scratch is used.
+fn validate_peer_reduce_lease_metadata(
+    active: Option<&ActivePeerLease>,
+    lease: &PeerReduceScratchLease,
+    ranks: usize,
+    buffers: usize,
+    count: usize,
+) -> HipResult<usize> {
+    let active = active.ok_or_else(|| {
+        HipError::new(0, "all_reduce_sum_f32_peer_rooted_leased: no active lease")
+    })?;
+    if active.id != lease.id {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "leased reduce: lease id {} != active {}",
+                lease.id, active.id
+            ),
+        ));
+    }
+    if active.bytes != lease.bytes || active.rank_count != lease.rank_count {
+        return Err(HipError::new(
+            0,
+            "leased reduce: lease bytes/rank_count mismatch vs active record",
+        ));
+    }
+    if lease.rank_count != ranks {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "leased reduce: lease rank_count {} != n_devices {}",
+                lease.rank_count, ranks
+            ),
+        ));
+    }
+    if buffers != ranks {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "all_reduce_sum_f32_peer_rooted_leased: buffers.len()={} != n_devices={ranks}",
+                buffers
+            ),
+        ));
+    }
+    if ranks == 1 {
+        return Ok(0);
+    }
+    let bytes = count
+        .checked_mul(4)
+        .ok_or_else(|| HipError::new(0, "leased reduce: count overflow"))?;
+    if bytes > lease.bytes {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "leased reduce: count*4 {} > lease.bytes {}",
+                bytes, lease.bytes
+            ),
+        ));
+    }
+    if bytes > active.bytes {
+        return Err(HipError::new(
+            0,
+            "leased reduce: count*4 exceeds active lease bytes",
+        ));
+    }
+    Ok(bytes)
+}
+
 impl Gpus {
     /// Construct `n_devices` `Gpu` instances bound to logical IDs derived from
     /// synchronized `hardware.devices` visibility (or the first N visible if
@@ -2041,73 +2112,25 @@ impl Gpus {
         Ok(())
     }
 
-    /// Leased variant of the deterministic rooted peer all-reduce. Uses the
-    /// scratch allocated under `lease` and never allocates or grows. Validates
-    /// lease identity, rank count, `count*4 <= lease.bytes`, row lengths and
-    /// capacities. The rooted order is exactly `(((rank0 + rank1)+rank2)+rank3)`.
-    pub fn all_reduce_sum_f32_peer_rooted_leased(
-        &mut self,
+    /// Validate a leased reduction before any memset, peer copy, or arithmetic
+    /// is enqueued. Metadata validation is shared with the leased reducer;
+    /// this public seam additionally checks the live scratch rows/capacities.
+    pub fn validate_peer_reduce_scratch_lease(
+        &self,
         lease: &PeerReduceScratchLease,
         buffers: &[&DeviceBuffer],
         count: usize,
     ) -> HipResult<()> {
         let n = self.devices.len();
-        let active = self.active_peer_lease.as_ref().ok_or_else(|| {
-            HipError::new(0, "all_reduce_sum_f32_peer_rooted_leased: no active lease")
-        })?;
-        if active.id != lease.id {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "leased reduce: lease id {} != active {}",
-                    lease.id, active.id
-                ),
-            ));
-        }
-        if active.bytes != lease.bytes || active.rank_count != lease.rank_count {
-            return Err(HipError::new(
-                0,
-                "leased reduce: lease bytes/rank_count mismatch vs active record",
-            ));
-        }
-        if lease.rank_count != n {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "leased reduce: lease rank_count {} != n_devices {}",
-                    lease.rank_count, n
-                ),
-            ));
-        }
-        if buffers.len() != n {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "all_reduce_sum_f32_peer_rooted_leased: buffers.len()={} != n_devices={n}",
-                    buffers.len()
-                ),
-            ));
-        }
-        if n == 1 {
+        let bytes = validate_peer_reduce_lease_metadata(
+            self.active_peer_lease.as_ref(),
+            lease,
+            n,
+            buffers.len(),
+            count,
+        )?;
+        if bytes == 0 {
             return Ok(());
-        }
-        let bytes = count
-            .checked_mul(4)
-            .ok_or_else(|| HipError::new(0, "leased reduce: count overflow"))?;
-        if bytes > lease.bytes {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "leased reduce: count*4 {} > lease.bytes {}",
-                    bytes, lease.bytes
-                ),
-            ));
-        }
-        if bytes > active.bytes {
-            return Err(HipError::new(
-                0,
-                "leased reduce: count*4 exceeds active lease bytes",
-            ));
         }
         if self.peer_lease_buffers.len() != n {
             return Err(HipError::new(
@@ -2134,6 +2157,27 @@ impl Gpus {
         if self.peer_lease_quarantined {
             return Err(HipError::new(0, "leased reduce: scratch is quarantined"));
         }
+        Ok(())
+    }
+
+    /// Leased variant of the deterministic rooted peer all-reduce. Uses the
+    /// scratch allocated under `lease` and never allocates or grows. Validates
+    /// lease identity, rank count, `count*4 <= lease.bytes`, row lengths and
+    /// capacities. The rooted order is exactly `(((rank0 + rank1)+rank2)+rank3)`.
+    pub fn all_reduce_sum_f32_peer_rooted_leased(
+        &mut self,
+        lease: &PeerReduceScratchLease,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        self.validate_peer_reduce_scratch_lease(lease, buffers, count)?;
+        if n == 1 {
+            return Ok(());
+        }
+        let bytes = count
+            .checked_mul(4)
+            .ok_or_else(|| HipError::new(0, "leased reduce: count overflow"))?;
         // Gather N-1 peers into rank-0 lease scratch, never allocating.
         let mut gather_events = Vec::with_capacity(n - 1);
         for rank in 1..n {
@@ -2167,6 +2211,119 @@ impl Gpus {
             broadcast_events.push(self.boundary_copy(0, rank, buffers[0], buffers[rank], bytes)?);
         }
         for event in broadcast_events {
+            self.wait_boundary(event)?;
+        }
+        Ok(())
+    }
+
+    /// Gather rank-local expert rows into rank 0 without changing their global
+    /// slot layout. Each element has exactly one non-zero owner; adding the
+    /// remaining zero-dummy values therefore preserves the owner's bits.
+    ///
+    /// `chunk_count` bounds scratch use and is normally one hidden-width row.
+    pub fn gather_unique_f32_to_root(
+        &mut self,
+        lease: Option<&PeerReduceScratchLease>,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+        chunk_count: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if n == 0 || buffers.len() != n || chunk_count == 0 {
+            return Err(HipError::new(
+                0,
+                "gather_unique_f32_to_root: invalid mesh or chunk geometry",
+            ));
+        }
+        let bytes = count
+            .checked_mul(4)
+            .ok_or_else(|| HipError::new(0, "gather_unique_f32_to_root: count overflow"))?;
+        for (rank, buffer) in buffers.iter().enumerate() {
+            if buffer.size() < bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "gather_unique_f32_to_root: rank {rank} has {} bytes, needs {bytes}",
+                        buffer.size()
+                    ),
+                ));
+            }
+        }
+        if n == 1 || count == 0 {
+            return Ok(());
+        }
+        let scratch_count = chunk_count.min(count);
+        if let Some(lease) = lease {
+            self.validate_peer_reduce_scratch_lease(lease, buffers, scratch_count)?;
+        } else {
+            self.ensure_peer_ar_tmp(scratch_count * 4)?;
+        }
+
+        let mut offset = 0usize;
+        while offset < count {
+            let width = scratch_count.min(count - offset);
+            let root = GpuTensor {
+                buf: unsafe { buffers[0].alias() },
+                shape: vec![count],
+                dtype: DType::F32,
+            }
+            .sub_offset(offset, width);
+            for rank in 1..n {
+                let source = GpuTensor {
+                    buf: unsafe { buffers[rank].alias() },
+                    shape: vec![count],
+                    dtype: DType::F32,
+                }
+                .sub_offset(offset, width);
+                let scratch_buffer = if lease.is_some() {
+                    &self.peer_lease_buffers[0][rank - 1]
+                } else {
+                    &self.peer_ar_tmp[0][rank - 1]
+                };
+                let event = self.boundary_copy(rank, 0, &source.buf, scratch_buffer, width * 4)?;
+                self.wait_boundary(event)?;
+                let peer = GpuTensor {
+                    buf: unsafe { scratch_buffer.alias() },
+                    shape: vec![width],
+                    dtype: DType::F32,
+                };
+                self.devices[0].bind_thread()?;
+                self.devices[0].add_inplace_f32(&root, &peer)?;
+            }
+            offset += width;
+        }
+        Ok(())
+    }
+
+    /// Copy a root-combined f32 span byte-for-byte to every non-root rank.
+    pub fn broadcast_f32_from_root(
+        &mut self,
+        buffers: &[&DeviceBuffer],
+        count: usize,
+    ) -> HipResult<()> {
+        let n = self.devices.len();
+        if n == 0 || buffers.len() != n {
+            return Err(HipError::new(
+                0,
+                "broadcast_f32_from_root: buffer count disagrees with mesh",
+            ));
+        }
+        let bytes = count
+            .checked_mul(4)
+            .ok_or_else(|| HipError::new(0, "broadcast_f32_from_root: count overflow"))?;
+        for (rank, buffer) in buffers.iter().enumerate() {
+            if buffer.size() < bytes {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "broadcast_f32_from_root: rank {rank} has {} bytes, needs {bytes}",
+                        buffer.size()
+                    ),
+                ));
+            }
+        }
+        for rank in 1..n {
+            let event = self.boundary_copy(0, rank, buffers[0], buffers[rank], bytes)?;
             self.wait_boundary(event)?;
         }
         Ok(())
@@ -2587,6 +2744,94 @@ mod tests {
         assert_eq!(peer_reduce_scratch_total_bytes(4, usize::MAX), None);
         assert_eq!(peer_reduce_scratch_bytes_per_rank(usize::MAX, 2), None);
         assert_eq!(peer_reduce_scratch_total_bytes(usize::MAX, 2), None);
+    }
+
+    #[test]
+    fn peer_reduce_lease_metadata_preserves_validation_order() {
+        let active = ActivePeerLease {
+            id: 41,
+            bytes: 64,
+            rank_count: 2,
+        };
+        let lease = PeerReduceScratchLease {
+            id: 41,
+            bytes: 64,
+            rank_count: 2,
+            _private: (),
+        };
+        assert_eq!(
+            validate_peer_reduce_lease_metadata(Some(&active), &lease, 2, 2, 16)
+                .expect("matching live metadata"),
+            64
+        );
+
+        let released = validate_peer_reduce_lease_metadata(None, &lease, 2, 2, 16)
+            .expect_err("released lease must be rejected");
+        assert!(released.to_string().contains("no active lease"));
+
+        let wrong_id = PeerReduceScratchLease { id: 42, ..lease };
+        let wrong_id = validate_peer_reduce_lease_metadata(Some(&active), &wrong_id, 2, 2, 16)
+            .expect_err("wrong lease identity must be rejected");
+        assert!(wrong_id.to_string().contains("lease id 42 != active 41"));
+
+        let wrong_rank = ActivePeerLease {
+            id: 41,
+            bytes: 64,
+            rank_count: 3,
+        };
+        let wrong_rank_lease = PeerReduceScratchLease {
+            id: 41,
+            bytes: 64,
+            rank_count: 3,
+            _private: (),
+        };
+        let wrong_rank =
+            validate_peer_reduce_lease_metadata(Some(&wrong_rank), &wrong_rank_lease, 2, 2, 16)
+                .expect_err("wrong rank count must be rejected");
+        assert!(wrong_rank
+            .to_string()
+            .contains("lease rank_count 3 != n_devices 2"));
+
+        let undersized = PeerReduceScratchLease {
+            id: 41,
+            bytes: 8,
+            rank_count: 2,
+            _private: (),
+        };
+        let undersized_active = ActivePeerLease {
+            id: 41,
+            bytes: 8,
+            rank_count: 2,
+        };
+        let undersized =
+            validate_peer_reduce_lease_metadata(Some(&undersized_active), &undersized, 2, 2, 3)
+                .expect_err("reduction larger than lease must be rejected");
+        assert!(undersized
+            .to_string()
+            .contains("count*4 12 > lease.bytes 8"));
+
+        let singleton = ActivePeerLease {
+            id: 9,
+            bytes: 0,
+            rank_count: 1,
+        };
+        let singleton_lease = PeerReduceScratchLease {
+            id: 9,
+            bytes: 0,
+            rank_count: 1,
+            _private: (),
+        };
+        assert_eq!(
+            validate_peer_reduce_lease_metadata(
+                Some(&singleton),
+                &singleton_lease,
+                1,
+                1,
+                usize::MAX,
+            )
+            .expect("singleton identity bypasses scratch geometry"),
+            0
+        );
     }
 
     #[test]

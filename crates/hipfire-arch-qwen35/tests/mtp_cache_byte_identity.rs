@@ -47,7 +47,7 @@
 use hipfire_arch_qwen35::mtp_head::{self, Qwen35MtpHead};
 use hipfire_arch_qwen35::mtp_speculator::Qwen35MtpDrafter;
 use hipfire_arch_qwen35::speculative::{ModelSlot, ModelSlotConfig};
-use hipfire_runtime::spec::{MtpDrafter, SpecRequestConfig, terminal_prefix_replay};
+use hipfire_runtime::spec::{terminal_prefix_replay, MtpDrafter, SpecRequestConfig};
 use rdna_compute::Gpu;
 use std::path::{Path, PathBuf};
 
@@ -335,13 +335,26 @@ fn mtp_recurrent_state_byte_identity() {
             let mut found = None;
             for _ in 0..8 {
                 let w = drafter_a
-                    .mtp_step(&mut gpu, &mut slot_a, pos, seed, &history, MAX_N, eos_a, None)
+                    .mtp_step(
+                        &mut gpu,
+                        &mut slot_a,
+                        pos,
+                        seed,
+                        &history,
+                        MAX_N,
+                        eos_a,
+                        None,
+                    )
                     .expect("arm A step");
                 history.extend_from_slice(&w.committed);
                 pos += w.committed.len();
                 seed = *history.last().unwrap();
                 if w.committed.len() >= 2 {
-                    found = Some((pos - w.committed.len(), history[history.len() - w.committed.len() - 1], w.committed.clone()));
+                    found = Some((
+                        pos - w.committed.len(),
+                        history[history.len() - w.committed.len() - 1],
+                        w.committed.clone(),
+                    ));
                     break;
                 }
             }
@@ -368,7 +381,10 @@ fn mtp_recurrent_state_byte_identity() {
         let mut resident: Vec<u32> = history[..wpos].to_vec();
         resident.extend_from_slice(&replay);
         assert_eq!(resident.len(), p1, "resident length must equal p1");
-        assert_eq!(resident[wpos], wseed, "replay must re-commit the seed at wpos");
+        assert_eq!(
+            resident[wpos], wseed,
+            "replay must re-commit the seed at wpos"
+        );
         let pending = *consumed.last().expect("keep >= 1");
         let dn_a = dn_bytes(&gpu, &slot_a);
         let kv_a = kv_prefix_bytes(&gpu, &slot_a, p1);
@@ -377,7 +393,16 @@ fn mtp_recurrent_state_byte_identity() {
 
         // Continuation on the repaired arm (the "later cached turn").
         let wcont_a = drafter_a
-            .mtp_step(&mut gpu, &mut slot_a, p1, pending, &resident, MAX_N, eos_a, None)
+            .mtp_step(
+                &mut gpu,
+                &mut slot_a,
+                p1,
+                pending,
+                &resident,
+                MAX_N,
+                eos_a,
+                None,
+            )
             .expect("arm A continuation step");
         let cont_text_a = tokenizer.decode(&wcont_a.committed);
         eprintln!("[byte-id repair] A continuation: {cont_text_a:?}");
@@ -387,7 +412,15 @@ fn mtp_recurrent_state_byte_identity() {
         let (mut slot_b, head_b) = load_session(&mut gpu, &model, &head_p, CTX_PATH1);
         let mut drafter_b = greedy_drafter(head_b, CTX_PATH1);
         let seed_b = drafter_b
-            .mtp_prefill(&mut gpu, &mut slot_b, &resident, &resident, 0, false, &no_abort)
+            .mtp_prefill(
+                &mut gpu,
+                &mut slot_b,
+                &resident,
+                &resident,
+                0,
+                false,
+                &no_abort,
+            )
             .expect("arm B cold prefill");
         assert_eq!(
             seed_b, pending,
@@ -425,10 +458,7 @@ fn mtp_recurrent_state_byte_identity() {
 
         for (i, (a, b)) in dn_a.iter().zip(dn_b.iter()).enumerate() {
             assert_eq!(a.len(), b.len(), "repair dn family {i} length");
-            assert_eq!(
-                a, b,
-                "repair dn family {i} bytes differ (cold vs repaired)"
-            );
+            assert_eq!(a, b, "repair dn family {i} bytes differ (cold vs repaired)");
         }
         assert_eq!(kv_a, kv_b, "repair trunk-KV retained-prefix bytes differ");
         assert_eq!(
@@ -438,7 +468,16 @@ fn mtp_recurrent_state_byte_identity() {
         assert_eq!(prev_a, prev_b, "repair MTP prev_hidden bytes differ");
 
         let wcont_b = drafter_b
-            .mtp_step(&mut gpu, &mut slot_b, p1, pending, &resident, MAX_N, eos_a, None)
+            .mtp_step(
+                &mut gpu,
+                &mut slot_b,
+                p1,
+                pending,
+                &resident,
+                MAX_N,
+                eos_a,
+                None,
+            )
             .expect("arm B continuation step");
         assert_eq!(
             wcont_a.committed, wcont_b.committed,
@@ -530,7 +569,15 @@ fn mtp_recurrent_state_byte_identity() {
         let (mut slot_c, head_c) = load_session(&mut gpu, &model, &head_p, CTX_PATH2);
         let mut drafter_c = greedy_drafter(head_c, CTX_PATH2);
         drafter_c
-            .mtp_prefill(&mut gpu, &mut slot_c, &long[..p], &long[..p], 0, false, &no_abort)
+            .mtp_prefill(
+                &mut gpu,
+                &mut slot_c,
+                &long[..p],
+                &long[..p],
+                0,
+                false,
+                &no_abort,
+            )
             .expect("arm C cold prefix prefill");
         let dn_c = dn_bytes(&gpu, &slot_c);
         let kv_c = kv_prefix_bytes(&gpu, &slot_c, p);
@@ -538,18 +585,12 @@ fn mtp_recurrent_state_byte_identity() {
 
         for (i, (a, c)) in dn_rw.iter().zip(dn_c.iter()).enumerate() {
             assert_eq!(a.len(), c.len(), "rewind dn family {i} length");
-            assert_eq!(
-                a, c,
-                "rewind dn family {i} bytes differ (restored vs cold)"
-            );
+            assert_eq!(a, c, "rewind dn family {i} bytes differ (restored vs cold)");
         }
         assert_eq!(kv_rw, kv_c, "rewind trunk-KV retained-prefix bytes differ");
         for (i, (a, b)) in dn_a.iter().zip(dn_b.iter()).enumerate() {
             assert_eq!(a.len(), b.len(), "resumed dn family {i} length");
-            assert_eq!(
-                a, b,
-                "resumed dn family {i} bytes differ (resumed vs cold)"
-            );
+            assert_eq!(a, b, "resumed dn family {i} bytes differ (resumed vs cold)");
         }
         assert_eq!(kv_a, kv_b, "resumed trunk-KV bytes differ");
         assert_eq!(mtp_kv_a, mtp_kv_b, "resumed MTP-KV bytes differ");

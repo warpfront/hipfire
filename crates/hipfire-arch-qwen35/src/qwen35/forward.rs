@@ -11,8 +11,6 @@ use super::config::DflashFusionCtx;
 use super::config::LayerType;
 use super::config::MropeCtx;
 use super::config::Qwen35Config;
-use super::prefill::dump_hidden_localize;
-use super::prefill::routed_codebook_pair_batched_supported;
 use super::prefill::trace_finite_if_enabled;
 use super::prefill::BatchEpilogue;
 use super::prefill::PREFILL_MAX_BATCH;
@@ -31,7 +29,8 @@ use hipfire_dispatch::families::gemv::GivensRef;
 use hipfire_dispatch::families::gemv::WeightRef;
 use hipfire_dispatch::families::kv_tier::KvTierInputs;
 use hipfire_dispatch::families::kv_tier::KvTierPlan;
-use hipfire_dispatch::families::moe::MoeEpMode;
+use hipfire_dispatch::families::moe::{routed_codebook_pair_batched_supported, MoeEpMode};
+use hipfire_dispatch::pipeline::dump_hidden_localize;
 use hipfire_dispatch::pipeline::execute_steps;
 use hipfire_dispatch::pipeline::sealed_moe::MoeRouteProducerProof;
 use hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall;
@@ -141,90 +140,6 @@ impl<'a> MoeScratchRef<'a> {
     }
 }
 
-/// Heap-allocating wrapper for callers without pre-allocated scratch (the
-/// debug `forward()` path). Allocates 11 tensors, runs moe_ffn_decode_impl,
-/// frees. NOT hipGraph-compatible. For hot-path decode, callers should go
-/// through moe_ffn_decode_with_scratch which reuses pre-allocated buffers.
-fn moe_ffn_decode(
-    gpu: &mut Gpu,
-    ffn: &MoeFfnWeights,
-    x_norm: &GpuTensor,
-    x_residual: &GpuTensor,
-    config: &Qwen35Config,
-) -> HipResult<()> {
-    let hidden = config.dim;
-    let mi = config.moe_intermediate_size;
-    let smi = config.shared_expert_intermediate_size;
-    let k = config.num_experts_per_tok;
-    let n_exp = config.num_experts;
-    let max_inter = mi.max(smi);
-
-    let router_logits = gpu.alloc_tensor(&[n_exp], DType::F32)?;
-    let scalar_buf = gpu.alloc_tensor(&[1], DType::F32)?;
-    let x_rot_local = gpu.alloc_tensor(&[hidden], DType::F32)?;
-    let gate_up_buf = gpu.alloc_tensor(&[2 * max_inter], DType::F32)?;
-    let gate_buf = gpu.alloc_tensor(&[max_inter], DType::F32)?;
-    let up_buf = gpu.alloc_tensor(&[max_inter], DType::F32)?;
-    let ffn_hidden = gpu.alloc_tensor(&[max_inter], DType::F32)?;
-    let ffn_out = gpu.alloc_tensor(&[hidden], DType::F32)?;
-    let gate_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
-    let up_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
-    let rot_batch = gpu.alloc_tensor(&[k * mi], DType::F32)?;
-    let topk_indices = gpu.alloc_tensor(&[k], DType::F32)?;
-    let topk_weights = gpu.alloc_tensor(&[k], DType::F32)?;
-    let down_expanded = gpu.zeros(&[k * hidden + hidden.div_ceil(4)], DType::F32)?;
-
-    let refs = MoeScratchRef {
-        router_logits: &router_logits,
-        scalar_buf: &scalar_buf,
-        x_rot_local: &x_rot_local,
-        gate_up_buf: &gate_up_buf,
-        gate_buf: &gate_buf,
-        up_buf: &up_buf,
-        ffn_hidden: &ffn_hidden,
-        ffn_out: &ffn_out,
-        gate_batch: &gate_batch,
-        up_batch: &up_batch,
-        rot_batch: &rot_batch,
-        topk_indices: &topk_indices,
-        topk_weights: &topk_weights,
-        down_expanded: &down_expanded,
-    };
-    let result = moe_ffn_decode_impl(
-        gpu,
-        ffn,
-        x_norm,
-        x_residual,
-        config,
-        &refs,
-        false,
-        None,
-        false,
-        false,
-        MoeEpMode::None,
-    );
-
-    for t in [
-        router_logits,
-        scalar_buf,
-        x_rot_local,
-        gate_up_buf,
-        gate_buf,
-        up_buf,
-        ffn_hidden,
-        ffn_out,
-        gate_batch,
-        up_batch,
-        rot_batch,
-        topk_indices,
-        topk_weights,
-        down_expanded,
-    ] {
-        gpu.free_tensor(t)?;
-    }
-    result
-}
-
 /// All gate-side + routed MoE weights are MQ4G256 — the precondition for
 /// the prerotated fast path where the caller can fuse rmsnorm+FWHT via
 /// `fused_rmsnorm_rotate_mq` and call `moe_ffn_decode_with_scratch_prerotated`.
@@ -244,64 +159,12 @@ pub(crate) fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
 /// fused route, generic `run_auto` receives the raw residual in its `x_norm`
 /// slot and silently rotates an unnormalized activation.
 pub(crate) fn ffn_gate_side_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
-    gate_side_mq4_uniform_from_dtypes([
+    hipfire_dispatch::families::moe::softmax_shared_gate_uniform_mq4(
         ffn.router.gpu_dtype,
         ffn.shared_expert_gate.gpu_dtype,
         ffn.shared_expert.gate.gpu_dtype,
         ffn.shared_expert.up.gpu_dtype,
-    ])
-}
-
-/// Pure core of [`ffn_gate_side_mq4_for_moe`] for unit tests (no live weights).
-pub(crate) fn gate_side_mq4_uniform_from_dtypes(
-    [router, shared_expert_gate, shared_gate, shared_up]: [DType; 4],
-) -> bool {
-    [router, shared_expert_gate, shared_gate, shared_up]
-        .into_iter()
-        .all(|dt| dt == DType::MQ4G256)
-}
-
-/// Exact Ornith MQ4G256V2 gate quartet admitted by the fused prerotated
-/// dispatch route. Shapes and missing AWQ sidecars are part of the contract:
-/// widening any one here without the matching `MoeResolution::gate_fusable`
-/// arm would feed unnormalized residuals to the generic fallback.
-fn ffn_gate_side_mq4v2_prerotated_for_moe(ffn: &MoeFfnWeights) -> bool {
-    gate_side_mq4v2_prerotated_from_layouts([
-        (
-            ffn.router.gpu_dtype,
-            ffn.router.m,
-            ffn.router.k,
-            ffn.router.awq_scale.is_some(),
-        ),
-        (
-            ffn.shared_expert_gate.gpu_dtype,
-            ffn.shared_expert_gate.m,
-            ffn.shared_expert_gate.k,
-            ffn.shared_expert_gate.awq_scale.is_some(),
-        ),
-        (
-            ffn.shared_expert.gate.gpu_dtype,
-            ffn.shared_expert.gate.m,
-            ffn.shared_expert.gate.k,
-            ffn.shared_expert.gate.awq_scale.is_some(),
-        ),
-        (
-            ffn.shared_expert.up.gpu_dtype,
-            ffn.shared_expert.up.m,
-            ffn.shared_expert.up.k,
-            ffn.shared_expert.up.awq_scale.is_some(),
-        ),
-    ])
-}
-
-fn gate_side_mq4v2_prerotated_from_layouts(layouts: [(DType, usize, usize, bool); 4]) -> bool {
-    let expected = [(256, 2_048), (1, 2_048), (512, 2_048), (512, 2_048)];
-    layouts
-        .into_iter()
-        .zip(expected)
-        .all(|((dtype, m, k, has_awq), (want_m, want_k))| {
-            dtype == DType::MQ4G256V2 && m == want_m && k == want_k && !has_awq
-        })
+    )
 }
 
 /// Detect any MQ3G256 / MQ3G256Lloyd weight inside a MoE FFN block (router,
@@ -451,9 +314,8 @@ pub(crate) fn layers_have_mq6_moe(layers: &[LayerWeights]) -> bool {
     })
 }
 
-/// Zero-alloc MoE decode for the scratch path. `scratch.moe_*` fields must
-/// be populated (done automatically by `Qwen35Scratch::new` when config
-/// indicates a MoE model). Safe to call under hipGraph stream capture.
+/// Execute one token through the shared sealed MoE program using caller-owned
+/// scratch. The input is already normalized (and may already be rotated).
 pub(crate) fn moe_ffn_decode_with_scratch(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
@@ -463,8 +325,7 @@ pub(crate) fn moe_ffn_decode_with_scratch(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(
-        gpu,
+    let params = moe_params_for_decode(
         ffn,
         x_norm,
         x_residual,
@@ -475,14 +336,13 @@ pub(crate) fn moe_ffn_decode_with_scratch(
         false,
         false,
         MoeEpMode::None,
-    )
+        hipfire_dispatch::families::moe::MoeNormalization::Provided,
+    );
+    moe_ffn_decode_impl(gpu, ffn, config, &refs, params)
 }
 
-/// Same as `moe_ffn_decode_with_scratch` but expects the caller to have
-/// already populated `scratch.moe_x_rot` with FWHT-rotated post-rmsnorm x
-/// (e.g. via a fused `fused_rmsnorm_rotate_mq` launch at the call site).
-/// For all-MQ4 MoE layers this saves one launch per layer by eliding the
-/// internal `rotate_x_mq`. On non-MQ4 layers this flag is ignored.
+/// Execute one token through the shared sealed MoE program when the caller has
+/// already populated the FWHT-rotated scratch view.
 pub(crate) fn moe_ffn_decode_with_scratch_prerotated(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
@@ -492,8 +352,7 @@ pub(crate) fn moe_ffn_decode_with_scratch_prerotated(
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
     let refs = MoeScratchRef::from_scratch(scratch);
-    moe_ffn_decode_impl(
-        gpu,
+    let params = moe_params_for_decode(
         ffn,
         x_norm,
         x_residual,
@@ -504,7 +363,9 @@ pub(crate) fn moe_ffn_decode_with_scratch_prerotated(
         false,
         false,
         MoeEpMode::None,
-    )
+        hipfire_dispatch::families::moe::MoeNormalization::Provided,
+    );
+    moe_ffn_decode_impl(gpu, ffn, config, &refs, params)
 }
 
 /// The actual MoE FFN implementation. Uses the caller-provided scratch
@@ -648,9 +509,9 @@ impl hipfire_dispatch::families::moe::RoutedExpertWeights for MoeFfnWeights {
     }
 }
 
-/// Build the sealed MoE parameter record shared by the full decode and the
-/// canonical non-root experts-only path. Pure motion out of
-/// `moe_ffn_decode_impl`; the record is identical for identical inputs.
+/// Build the complete typed Qwen softmax/shared decode recipe from the
+/// caller-owned weights and scratch. `normalization` is either `Provided` for
+/// an already prepared activation or `RmsNorm` for the shared prologue.
 #[allow(clippy::too_many_arguments)]
 fn moe_params_for_decode<'a>(
     ffn: &'a MoeFfnWeights,
@@ -663,22 +524,22 @@ fn moe_params_for_decode<'a>(
     ep_skip_shared: bool,
     defer_routed_combine: bool,
     ep_mode: MoeEpMode,
+    normalization: hipfire_dispatch::families::moe::MoeNormalization<'a>,
 ) -> hipfire_dispatch::families::moe::MoeParams<'a> {
     let hidden = config.dim;
     let mi = config.moe_intermediate_size;
     let smi = config.shared_expert_intermediate_size;
     let k = config.num_experts_per_tok;
     let n_exp = config.num_experts;
-    // The load-time owner caches only genuinely mixed tier arrays. Borrowing
-    // these slices keeps decode allocation-free and preserves the uniform None
-    // fast path.
     let (per_expert_gate_up, per_expert_down) = ffn.per_expert_tier_tables();
     let moe_dtypes = hipfire_dispatch::families::moe::MoeDtypes {
         router: ffn.router.gpu_dtype,
-        shared_gate: ffn.shared_expert_gate.gpu_dtype,
-        shared_expert_gate: ffn.shared_expert.gate.gpu_dtype,
-        shared_expert_up: ffn.shared_expert.up.gpu_dtype,
-        shared_expert_down: ffn.shared_expert.down.gpu_dtype,
+        shared: Some(hipfire_dispatch::families::moe::MoeSharedDtypes {
+            selector: ffn.shared_expert_gate.gpu_dtype,
+            gate: ffn.shared_expert.gate.gpu_dtype,
+            up: ffn.shared_expert.up.gpu_dtype,
+            down: ffn.shared_expert.down.gpu_dtype,
+        }),
         experts_all_gate_up_mq4: if let Some(global) = ffn.global_expert_dtypes.as_ref() {
             global
                 .iter()
@@ -704,57 +565,46 @@ fn moe_params_for_decode<'a>(
                 .map(|e| e.down.gpu_dtype)
                 .unwrap_or(DType::F32)
         },
-        // The cached mixed-only tier slices are the source of truth for both
-        // projections; borrowing their presence avoids any per-call scan.
         routed_has_mixed_experts: per_expert_gate_up.is_some() || per_expert_down.is_some(),
         has_paro_shared: ffn.paro_shared.is_some(),
         per_expert_gate_up,
         per_expert_down,
     };
-    // Resolution is owned by the MoeFamily (Ship 4.1). The model passes only
-    // the dtype snapshot + k; the executor computes MoeResolution from MoeDtypes.
-
-    // The generic CPU-top-K fallback resolves resident expert weights through
-    // `MoeFfnWeights` directly. This keeps the decode hot path allocation-free;
-    // paged layers expose an empty resolver and are rejected before fallback.
-
+    let shared = Some(hipfire_dispatch::families::moe::MoeSharedDecode {
+        weights: hipfire_dispatch::families::moe::MoeSharedWeights {
+            selector: ffn.shared_expert_gate.dispatch_ref(),
+            gate: ffn.shared_expert.gate.dispatch_ref(),
+            up: ffn.shared_expert.up.dispatch_ref(),
+            down: ffn.shared_expert.down.dispatch_ref(),
+        },
+        intermediate: smi,
+        scalar: s.scalar_buf,
+        gate_out: s.gate_buf,
+        up_out: s.up_buf,
+    });
     hipfire_dispatch::families::moe::MoeParams {
         dtypes: moe_dtypes,
+        recipe: hipfire_dispatch::families::moe::MoeRecipe::SoftmaxGatedShared,
+        normalization,
         batch_size: 1,
         hidden,
         mi,
-        smi,
         k,
         n_exp,
         norm_topk_prob: config.norm_topk_prob,
         x_rot_prerotated,
         defer_routed_combine,
-        // Sealed decode mode, threaded from moe_ffn_decode_impl: None =
-        // Single (byte-identical); RootRoutedPartial comes from the
-        // root/contrib EP hooks via run_layer_program_ep.
         ep_mode,
         layer_idx: ffn.layer_idx,
         x_norm,
         x_residual,
-        // EP (Ship 6 substrate-EP): threaded from moe_ffn_decode_impl params.
-        // None/false (single-GPU) = byte-identical; Some(partial)/skip_shared
-        // come from moe_ffn_dispatch_ep via run_layer_program_ep.
         routed_out: ep_routed_out,
         skip_shared: ep_skip_shared,
         router: ffn.router.dispatch_ref(),
-        shared_expert_gate: ffn.shared_expert_gate.dispatch_ref(),
-        shared_gate_w: ffn.shared_expert.gate.dispatch_ref(),
-        shared_up_w: ffn.shared_expert.up.dispatch_ref(),
-        shared_down_w: ffn.shared_expert.down.dispatch_ref(),
+        shared,
         expert_gate_up_ptrs: &ffn.expert_gate_up_ptrs,
         expert_down_ptrs: &ffn.expert_down_ptrs,
-        // Route A MoE-AWQ: `Some` only on per-expert-AWQ .hfq files (the
-        // HIPFIRE_MOE_AWQ kill-switch is applied once at load in load_moe_ffn,
-        // not per-token). `None` ⇒ plain silu+rotate (byte-identical).
         expert_down_awq_ptrs: ffn.expert_down_awq_ptrs.as_ref(),
-        // Per-expert mixed-precision decode: `Some` only on graded mixed
-        // files; drives the merged dtype-tag-branched down kernel + forces
-        // the shared combine. `None` ⇒ uniform path (byte-identical).
         expert_dtype_tags: ffn.expert_dtype_tags.as_ref(),
         routed_gate_up_k: ffn.experts.first().map_or(0, |e| e.gate_up.k),
         routed_down_m: ffn.experts.first().map_or(0, |e| e.down.m),
@@ -783,11 +633,8 @@ fn moe_params_for_decode<'a>(
                 })
         }),
         router_logits: s.router_logits,
-        scalar_buf: s.scalar_buf,
         x_rot_local: s.x_rot_local,
         gate_up_buf: s.gate_up_buf,
-        gate_buf: s.gate_buf,
-        up_buf: s.up_buf,
         ffn_hidden: s.ffn_hidden,
         ffn_out: s.ffn_out,
         gate_batch: s.gate_batch,
@@ -799,48 +646,24 @@ fn moe_params_for_decode<'a>(
     }
 }
 
-fn moe_ffn_decode_impl(
+/// Execute an already-built decode recipe and retain the existing observation
+/// and expert-statistics hooks around the shared sealed Step executor.
+fn moe_ffn_decode_impl<'a>(
     gpu: &mut Gpu,
     ffn: &MoeFfnWeights,
-    x_norm: &GpuTensor,
-    x_residual: &GpuTensor,
     config: &Qwen35Config,
-    s: &MoeScratchRef<'_>,
-    x_rot_prerotated: bool,
-    // Sealed decode mode (see `MoeEpMode`). `None` = Single (classic or the
-    // deferred-combine experiment, always `ep_routed_out=None`).
-    // `RootRoutedPartial` = root-routed EP: `ep_routed_out=Some(partial)`,
-    // `defer_routed_combine=false`, root `ep_skip_shared=false`, non-root
-    // `ep_skip_shared=true`. Invalid combinations fail in the sealer
-    // before any launch.
-    ep_routed_out: Option<&GpuTensor>,
-    ep_skip_shared: bool,
-    defer_routed_combine: bool,
-    ep_mode: MoeEpMode,
+    s: &'a MoeScratchRef<'a>,
+    moe_params: hipfire_dispatch::families::moe::MoeParams<'a>,
 ) -> HipResult<()> {
-    let moe_params = moe_params_for_decode(
-        ffn,
-        x_norm,
-        x_residual,
-        config,
-        s,
-        x_rot_prerotated,
-        ep_routed_out,
-        ep_skip_shared,
-        defer_routed_combine,
-        ep_mode,
-    );
-    // Dims for the expert-stats probe below (the record builder above owns
-    // the canonical copies; these two are re-derived, not redefined).
     let hidden = config.dim;
     let k = config.num_experts_per_tok;
-    // Bind the live owner tables to the immutable per-layer contract, then
-    // execute only through the sealed Step boundary.
+    #[cfg(feature = "moe-oracle")]
+    let oracle_x_residual = moe_params.x_residual;
     #[cfg(feature = "moe-oracle")]
     {
         let oracle_pos =
             crate::qwen35::oracle::decode_position().map_err(|e| HipError::new(0, &e))?;
-        crate::qwen35::oracle::decode_before(gpu, ffn, config, x_residual, oracle_pos)
+        crate::qwen35::oracle::decode_before(gpu, ffn, config, moe_params.x_residual, oracle_pos)
             .map_err(|e| HipError::new(0, &e))?;
     }
     let ctx = hipfire_dispatch::context::DispatchCtx::new(gpu);
@@ -868,7 +691,7 @@ fn moe_ffn_decode_impl(
             s.up_batch,
             s.rot_batch,
             s.down_expanded,
-            x_residual,
+            oracle_x_residual,
             oracle_pos,
         )
         .map_err(|e| HipError::new(0, &e))?;
@@ -3219,66 +3042,7 @@ fn moe_ffn_dispatch(
     )
 }
 
-/// Pick the decode `x_norm` buffer and prerotate flag without launching.
-/// Same decision as [`moe_ffn_norm_ep`]; the non-root contrib seals against
-/// these borrows before any RMSNorm/rotation mutates GPU state (the
-/// broadcast route is already device-resident; no upload happens here).
-fn moe_ffn_norm_ep_select<'a>(
-    gpu: &Gpu,
-    ffn: &MoeFfnWeights,
-    x: &'a GpuTensor,
-    s: &'a Qwen35Scratch,
-) -> (&'a GpuTensor, bool) {
-    let exact_v2_prerotated = (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201())
-        && ffn_gate_side_mq4v2_prerotated_for_moe(ffn);
-    if ffn_gate_side_mq4_for_moe(ffn) || exact_v2_prerotated {
-        (x, true)
-    } else {
-        (&s.tmp, false)
-    }
-}
-
-/// Launch the norm/rotate chosen by [`moe_ffn_norm_ep_select`].
-fn moe_ffn_norm_ep_launch(
-    gpu: &mut Gpu,
-    x: &GpuTensor,
-    ffn_norm: &GpuTensor,
-    config: &Qwen35Config,
-    s: &Qwen35Scratch,
-    x_rot_prerotated: bool,
-) -> HipResult<()> {
-    if x_rot_prerotated {
-        gpu.fused_rmsnorm_rotate_mq(
-            x,
-            ffn_norm,
-            s.moe_x_rot.as_ref().expect("MoE scratch"),
-            config.dim,
-            config.norm_eps,
-        )
-    } else {
-        gpu.rmsnorm_f32(x, ffn_norm, &s.tmp, config.norm_eps)
-    }
-}
-
-/// Shared EP/Single norm front-end: select buffers then launch. Callers that
-/// must validate a sealed call before GPU work use select + launch split.
-/// Pure motion out of `moe_ffn_dispatch_inner`; behavior identical on every path.
-fn moe_ffn_norm_ep<'a>(
-    gpu: &mut Gpu,
-    ffn: &MoeFfnWeights,
-    x: &'a GpuTensor,
-    ffn_norm: &GpuTensor,
-    config: &Qwen35Config,
-    s: &'a Qwen35Scratch,
-) -> HipResult<(&'a GpuTensor, bool)> {
-    let (x_norm, x_rot_prerotated) = moe_ffn_norm_ep_select(gpu, ffn, x, s);
-    moe_ffn_norm_ep_launch(gpu, x, ffn_norm, config, s, x_rot_prerotated)?;
-    Ok((x_norm, x_rot_prerotated))
-}
-
-/// Shared norm/router/expert front end for Single and EP decode. The two-path
-/// norm logic (fused MQ rotate vs plain rmsnorm) is identical on every path —
-/// only the sealed mode, the routed target, and the shared/defer flags differ.
+/// Build and execute the typed Qwen decode recipe for Single or root-routed EP.
 #[allow(clippy::too_many_arguments)]
 fn moe_ffn_dispatch_inner(
     gpu: &mut Gpu,
@@ -3292,31 +3056,35 @@ fn moe_ffn_dispatch_inner(
     defer_routed_combine: bool,
     ep_mode: MoeEpMode,
 ) -> HipResult<()> {
-    let (x_norm, x_rot_prerotated) = moe_ffn_norm_ep(gpu, ffn, x, ffn_norm, config, s)?;
     let refs = MoeScratchRef::from_scratch(s);
-    moe_ffn_decode_impl(
-        gpu,
+    let params = moe_params_for_decode(
         ffn,
-        x_norm,
+        &s.tmp,
         x,
         config,
         &refs,
-        x_rot_prerotated,
+        false,
         ep_routed_out,
         ep_skip_shared,
         defer_routed_combine,
         ep_mode,
-    )?;
+        hipfire_dispatch::families::moe::MoeNormalization::RmsNorm {
+            weight: ffn_norm,
+            plain_out: &s.tmp,
+            eps: config.norm_eps,
+        },
+    );
+    moe_ffn_decode_impl(gpu, ffn, config, &refs, params)?;
     trace_finite_if_enabled(gpu, "moe_ffn", x)?;
     Ok(())
 }
 
 /// Which EP combine this rank's MoE will execute. Plan-bound compact EP
-/// bindings (an execution contract is present) run root-routed partials:
-/// the root routes once on-GPU and every rank folds its owned experts (plus
-/// the shared expert exactly once, on the root) into its zeroed partial.
+/// bindings run root-routed slot-order combination: root produces one route,
+/// every rank materializes owned expert rows in the global slot layout, and
+/// root runs the ordinary single-device combine after those rows are gathered.
 /// Anything else is not an EP binding, and `moe_ffn_dispatch_ep` on it is a
-/// fail-stop error (the single-GPU path never calls that function).
+/// fail-closed error.
 fn qwen_ep_moe_mode(ffn: &MoeFfnWeights) -> Result<EpMoeCombineMode, HipError> {
     if ffn.expert_table.execution_contract().is_none() {
         return Err(HipError::new(
@@ -3370,93 +3138,79 @@ fn moe_ffn_dispatch_ep(
     }
 }
 
-/// Pure root preparation shared by the executing root dispatch and the pure
-/// preflight hook: norm-buffer select, params build, expert bind, seal.
-/// Enqueues NOTHING and issues no GPU commands — the caller launches
-/// norm/rotate and executes the returned sealed call. An invalid
-/// binding/params fails here, before the caller mutates GPU state (the same
-/// select-then-validate order as the non-root contrib path). The returned
-/// flag is the [`moe_ffn_norm_ep_select`] choice the caller must launch.
+/// Pure root preparation shared by the executing root dispatch and the runtime
+/// preflight hook: bind the complete recipe, bind live experts, and seal.
 #[allow(clippy::too_many_arguments)]
 fn moe_sealed_root_ep<'a>(
-    gpu: &Gpu,
-    ctx: &DispatchCtx,
+    ctx: &'a DispatchCtx,
     ffn: &'a MoeFfnWeights,
     x: &'a GpuTensor,
+    ffn_norm: &'a GpuTensor,
     config: &Qwen35Config,
     s: &'a Qwen35Scratch,
     partial: &'a GpuTensor,
-) -> HipResult<(SealedMoeCall<'a>, bool)> {
-    let (x_norm, x_rot_prerotated) = moe_ffn_norm_ep_select(gpu, ffn, x, s);
+) -> HipResult<SealedMoeCall<'a>> {
     let refs = MoeScratchRef::from_scratch(s);
-    let moe_params = moe_params_for_decode(
+    let params = moe_params_for_decode(
         ffn,
-        x_norm,
+        &s.tmp,
         x,
         config,
         &refs,
-        x_rot_prerotated,
+        false,
         Some(partial),
         false,
         false,
         MoeEpMode::RootRoutedPartial,
+        hipfire_dispatch::families::moe::MoeNormalization::RmsNorm {
+            weight: ffn_norm,
+            plain_out: &s.tmp,
+            eps: config.norm_eps,
+        },
     );
     let bound = ffn.bound_experts()?;
-    let sealed = hipfire_dispatch::pipeline::sealed_moe::seal_decode(bound, ctx, moe_params)
-        .map_err(HipError::from)?;
-    Ok((sealed, x_rot_prerotated))
+    hipfire_dispatch::pipeline::sealed_moe::seal_decode(bound, ctx, params).map_err(HipError::from)
 }
 
 /// Pure non-root preparation shared by the executing contrib dispatch and the
-/// pure preflight hook: norm-buffer select, params build, expert bind,
-/// proof-bound seal. Enqueues NOTHING and issues no GPU commands — the
-/// caller launches norm/rotate and executes the returned sealed call. A
-/// proof/binding mismatch fails here, before any launch; no router ever runs
-/// on this path (the sealed call is `PrecomputedSoftmaxTopK` over the
-/// broadcast root route already resident in `s.moe_topk_*`).
+/// runtime preflight hook: bind the complete recipe and seal it against the
+/// root route proof. No GPU work occurs here.
 #[allow(clippy::too_many_arguments)]
 fn moe_sealed_contrib_ep<'a>(
-    gpu: &Gpu,
-    ctx: &DispatchCtx,
+    ctx: &'a DispatchCtx,
     ffn: &'a MoeFfnWeights,
     x: &'a GpuTensor,
+    ffn_norm: &'a GpuTensor,
     config: &Qwen35Config,
     s: &'a Qwen35Scratch,
     proof: &MoeRouteProducerProof,
     partial: &'a GpuTensor,
-) -> HipResult<(SealedMoeCall<'a>, bool)> {
-    let (x_norm, x_rot_prerotated) = moe_ffn_norm_ep_select(gpu, ffn, x, s);
+) -> HipResult<SealedMoeCall<'a>> {
     let refs = MoeScratchRef::from_scratch(s);
-    let moe_params = moe_params_for_decode(
+    let params = moe_params_for_decode(
         ffn,
-        x_norm,
+        &s.tmp,
         x,
         config,
         &refs,
-        x_rot_prerotated,
+        false,
         Some(partial),
         true,
         false,
         MoeEpMode::RootRoutedPartial,
+        hipfire_dispatch::families::moe::MoeNormalization::RmsNorm {
+            weight: ffn_norm,
+            plain_out: &s.tmp,
+            eps: config.norm_eps,
+        },
     );
     let bound = ffn.bound_experts()?;
-    let sealed = hipfire_dispatch::pipeline::sealed_moe::seal_ep_routed_contrib(
-        bound, ctx, moe_params, proof,
-    )
-    .map_err(HipError::from)?;
-    Ok((sealed, x_rot_prerotated))
+    hipfire_dispatch::pipeline::sealed_moe::seal_ep_routed_contrib(bound, ctx, params, proof)
+        .map_err(HipError::from)
 }
-
-/// Root-routed EP root dispatch: seal the SoftmaxTopK `RootRoutedPartial`
-/// call FIRST (pure select/params/bind/seal via [`moe_sealed_root_ep`] — an
-/// invalid binding/params fails before any norm/rotate launch), then
-/// norm/rotate, then execute the sealed call (routed combine + shared-down
-/// into the zeroed `partial`, `skip_shared=false` so the shared expert folds
-/// exactly once). The sealer-issued producer proof is read off the sealed
-/// call but returned only after the MoE kernels enqueue successfully — a
-/// failed submission never mints route authority. The driver's D2D broadcast
-/// then carries this rank's `moe_topk_*` (already device-resident) to every
-/// non-root rank.
+/// Root-routed EP root dispatch. The typed recipe owns normalization, routing,
+/// expert arithmetic, and the shared-expert contribution; this wrapper keeps
+/// only the route proof and existing diagnostics.
 #[allow(clippy::too_many_arguments)]
 fn moe_ffn_dispatch_root_ep(
     gpu: &mut Gpu,
@@ -3468,15 +3222,8 @@ fn moe_ffn_dispatch_root_ep(
     s: &Qwen35Scratch,
     partial: &GpuTensor,
 ) -> HipResult<MoeRouteProducerProof> {
-    // Pure preparation before any GPU mutation (matches the non-root order).
-    let (sealed, x_rot_prerotated) = moe_sealed_root_ep(gpu, ctx, ffn, x, config, s, partial)?;
-    // Pure read off the sealed call: the proof value is static load-bound
-    // metadata, but it is RETURNED only after the MoE kernels enqueue
-    // successfully below — a failed submission never mints route authority.
+    let sealed = moe_sealed_root_ep(ctx, ffn, x, ffn_norm, config, s, partial)?;
     let proof = sealed.ep_route_producer_proof().map_err(HipError::from)?;
-    let hidden = config.dim;
-    let k = config.num_experts_per_tok;
-    moe_ffn_norm_ep_launch(gpu, x, ffn_norm, config, s, x_rot_prerotated)?;
     #[cfg(feature = "moe-oracle")]
     {
         let oracle_pos =
@@ -3490,7 +3237,6 @@ fn moe_ffn_dispatch_root_ep(
         &[hipfire_dispatch::pipeline::Step::Moe(sealed)],
     )
     .map_err(HipError::from)?;
-    // Read-only probes off reborrowed scratch views (pure borrows, no work).
     let refs = MoeScratchRef::from_scratch(s);
     #[cfg(feature = "moe-oracle")]
     {
@@ -3516,8 +3262,8 @@ fn moe_ffn_dispatch_root_ep(
         capture_expert_stats(
             gpu,
             ffn.layer_idx,
-            k,
-            hidden,
+            config.num_experts_per_tok,
+            config.dim,
             refs.down_expanded,
             refs.topk_indices,
             refs.topk_weights,
@@ -3527,15 +3273,9 @@ fn moe_ffn_dispatch_root_ep(
     Ok(proof)
 }
 
-/// Root-routed EP non-root dispatch: seal the proof-bound contrib call FIRST
-/// (validation only — no GPU mutation), then norm/rotate, then execute the
-/// sealed experts call over the already device-resident broadcast route in
-/// `s.moe_topk_*`. No router runs here and nothing is uploaded from host;
-/// a proof that disagrees on contract, layer, k, or n_exp fails before any
-/// launch, so an invalid proof never mutates GPU state. `skip_shared` is
-/// always true on this path (the root folded shared once); the routed
-/// combine accumulates the owned-expert weighted contribution into the
-/// zeroed `partial` exactly once.
+/// Root-routed EP non-root dispatch. The route proof is bound before the
+/// shared typed recipe executes, so no rank-local routing or arithmetic remains
+/// in this architecture wrapper.
 #[allow(clippy::too_many_arguments)]
 fn moe_ffn_dispatch_contrib_ep(
     gpu: &mut Gpu,
@@ -3548,12 +3288,7 @@ fn moe_ffn_dispatch_contrib_ep(
     proof: &MoeRouteProducerProof,
     partial: &GpuTensor,
 ) -> HipResult<()> {
-    // Borrow the post-norm buffers and seal before any launch so a rejected
-    // proof cannot touch GPU state. Norm writes the same buffers the sealed
-    // call already holds. Shared pure preparation with the preflight hook.
-    let (sealed, x_rot_prerotated) =
-        moe_sealed_contrib_ep(gpu, ctx, ffn, x, config, s, proof, partial)?;
-    moe_ffn_norm_ep_launch(gpu, x, ffn_norm, config, s, x_rot_prerotated)?;
+    let sealed = moe_sealed_contrib_ep(ctx, ffn, x, ffn_norm, config, s, proof, partial)?;
     hipfire_dispatch::pipeline::execute_steps(
         gpu,
         ctx,
@@ -6296,10 +6031,9 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
-        // Root-routed EP dispatch: the routed combine + shared-down (gated
-        // by `skip_shared`) accumulate into `routed_out` (zeroed by the EP
-        // executor, added into `s.x` after the all-reduce). The residual
-        // `s.x` is untouched here.
+        // Legacy rank-partial dispatch retained for non-root-routed EP users:
+        // routed combine + shared-down accumulate into `routed_out`, while
+        // `s.x` remains untouched until the runtime collective completes.
         moe_ffn_dispatch_ep(gpu, ffn, &s.x, ffn_norm, config, s, routed_out, skip_shared)
             .map_err(|e| DispatchError::Hip(e.to_string()))
     }
@@ -6318,9 +6052,10 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
-        // Root only: route once on-GPU, fold owned experts + shared once
-        // into `partial`, and mint the sealer-built producer proof. Dense
-        // layers fail here (a stray EP MoE op on dense), never silently.
+        // Root only: route once on-GPU, write owned expert rows into the
+        // global slot layout, accumulate the shared expert into `partial`,
+        // and mint the sealer-built producer proof. Routed rows are folded
+        // only after every rank's slot outputs have been gathered to root.
         moe_ffn_dispatch_root_ep(gpu, ctx, ffn, &s.x, ffn_norm, config, s, partial)
             .map_err(|e| DispatchError::Hip(e.to_string()))
     }
@@ -6341,42 +6076,52 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
         // Non-root only: validate the proof before any GPU mutation, then
-        // fold owned experts over the broadcast route into `partial`. Dense
-        // layers fail here (a stray EP MoE op on dense), never silently.
+        // write owned expert rows over the broadcast route into the global
+        // slot layout. The runtime gathers these rows to root before combine.
         moe_ffn_dispatch_contrib_ep(gpu, ctx, ffn, &s.x, ffn_norm, config, s, proof, partial)
             .map_err(|e| DispatchError::Hip(e.to_string()))
     }
 
+    fn ep_finish_moe_slot_order(
+        &mut self,
+        gpu: &mut Gpu,
+        ctx: &DispatchCtx,
+        _op: &OpBinding,
+        partial: &GpuTensor,
+    ) -> Result<(), DispatchError> {
+        let s = self.s;
+        let (ffn, ffn_norm) = match self.layer {
+            LayerWeights::DeltaNetMoe(l) => (&l.ffn, &l.ffn_norm),
+            LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
+            _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
+        };
+        let sealed = moe_sealed_root_ep(ctx, ffn, &s.x, ffn_norm, self.config, s, partial)
+            .map_err(|e| DispatchError::Hip(e.to_string()))?;
+        sealed.execute_ep_slot_combine(gpu)
+    }
+
     fn ep_preflight_moe_root(
         &self,
-        gpu: &Gpu,
+        _gpu: &Gpu,
         ctx: &DispatchCtx,
         _op: &OpBinding,
         partial: &GpuTensor,
     ) -> Result<MoeRouteProducerProof, DispatchError> {
         let s = self.s;
         let config = self.config;
-        let (ffn, _) = match self.layer {
+        let (ffn, ffn_norm) = match self.layer {
             LayerWeights::DeltaNetMoe(l) => (&l.ffn, &l.ffn_norm),
             LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
-        // Pure validation only: the same select/params/bind/seal builders as
-        // the executing root path, minus the norm launch and the MoE enqueue.
-        // The proof is opaque static load-bound metadata, not a claim that
-        // device bytes were produced — the runtime still runs
-        // root-compute -> broadcast -> non-root-compute. Invalid
-        // root binding/params fail here, before any GPU mutation. Only
-        // `RootRoutedPartial` bindings seal here; Single and dense never
-        // reach this hook (trait default is `UnsupportedVariant`).
-        let (sealed, _) = moe_sealed_root_ep(gpu, ctx, ffn, &s.x, config, s, partial)
+        let sealed = moe_sealed_root_ep(ctx, ffn, &s.x, ffn_norm, config, s, partial)
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
         sealed.ep_route_producer_proof()
     }
 
     fn ep_preflight_moe_contrib(
         &self,
-        gpu: &Gpu,
+        _gpu: &Gpu,
         ctx: &DispatchCtx,
         _op: &OpBinding,
         proof: &MoeRouteProducerProof,
@@ -6384,16 +6129,12 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
     ) -> Result<(), DispatchError> {
         let s = self.s;
         let config = self.config;
-        let (ffn, _) = match self.layer {
+        let (ffn, ffn_norm) = match self.layer {
             LayerWeights::DeltaNetMoe(l) => (&l.ffn, &l.ffn_norm),
             LayerWeights::FullAttnMoe(l) => (&l.ffn, &l.ffn_norm),
             _ => return Err(DispatchError::Hip("MOE on dense layer".into())),
         };
-        // Pure validation only: the same select/params/bind/proof-bound seal
-        // builders as the executing contrib path, minus the norm launch and
-        // the MoE enqueue. A proof/binding mismatch fails here, before any
-        // GPU mutation; no router runs on this path by construction.
-        let _ = moe_sealed_contrib_ep(gpu, ctx, ffn, &s.x, config, s, proof, partial)
+        moe_sealed_contrib_ep(ctx, ffn, &s.x, ffn_norm, config, s, proof, partial)
             .map_err(|e| DispatchError::Hip(e.to_string()))?;
         Ok(())
     }
@@ -6403,8 +6144,8 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
         gpu: &mut Gpu,
         partial: &GpuTensor,
     ) -> Result<(), DispatchError> {
-        // s.x += the all-reduced routed partial (the EP MoE output summed across
-        // ranks). Mirrors the prototype's `tp_allreduce_add` residual step.
+        // s.x += the root-combined routed partial copied byte-for-byte to
+        // every rank.
         let s = self.s;
         gpu.add_inplace_f32(&s.x, partial)
             .map_err(|e| DispatchError::Hip(e.to_string()))
@@ -6447,6 +6188,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
             n_exp: self.config.num_experts,
             topk_ids: s.moe_topk_indices.as_ref()?,
             topk_weights: s.moe_topk_weights.as_ref()?,
+            slot_outputs: s.moe_down_expanded.as_ref()?,
         })
     }
 
@@ -7215,34 +6957,6 @@ mod tests {
         assert_ne!(DType::MQ6G256, DType::MQ6G256V2);
         assert_ne!(DType::MQ4G256, DType::MQ4G256V2);
         assert_ne!(DType::MQ4G256V2, DType::MQ6G256V2);
-    }
-
-    #[test]
-    fn mq4v2_gate_side_prerotation_requires_exact_ornith_layout() {
-        let v1 = DType::MQ4G256;
-        let v2 = DType::MQ4G256V2;
-        let exact = [
-            (v2, 256, 2_048, false),
-            (v2, 1, 2_048, false),
-            (v2, 512, 2_048, false),
-            (v2, 512, 2_048, false),
-        ];
-        assert!(gate_side_mq4_uniform_from_dtypes([v1, v1, v1, v1]));
-        assert!(!gate_side_mq4_uniform_from_dtypes([v2, v2, v2, v2]));
-        assert!(gate_side_mq4v2_prerotated_from_layouts(exact));
-
-        for slot in 0..4 {
-            let mut mixed = exact;
-            mixed[slot].0 = v1;
-            assert!(!gate_side_mq4v2_prerotated_from_layouts(mixed));
-
-            let mut awq = exact;
-            awq[slot].3 = true;
-            assert!(!gate_side_mq4v2_prerotated_from_layouts(awq));
-        }
-        let mut wrong_shape = exact;
-        wrong_shape[2].1 = 511;
-        assert!(!gate_side_mq4v2_prerotated_from_layouts(wrong_shape));
     }
 
     #[test]

@@ -323,8 +323,8 @@ mod tests {
                 }
             }
         }
-        assert!(m[0 * 4 + 1].is_infinite() && m[0 * 4 + 1] < 0.0);
-        assert_eq!(m[1 * 4 + 0], 0.0);
-        assert_eq!(m[3 * 4 + 3], 0.0);
+        assert!(m[1].is_infinite() && m[1] < 0.0);
+        assert_eq!(m[4], 0.0);
+        assert_eq!(m[15], 0.0);
     }
 }

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Sealed MoE calls lower to granular computation programs; Qwen root-routed EP decode and batched prefill share a checked collective schedule. Compact EP gathers expert outputs in global top-k slot layout and runs the ordinary single-device slot-order combine once on root before byte-broadcasting the finished partial, avoiding rank-grouped floating-point reassociation. Existing kernels, ownership, other-family reduction order, and diagnostic policies are retained. This does not admit new parallel axes or product replay routes; see [the design and validation boundary](docs/design/sealed-granular-moe.md).
+
 ## v0.3.1 — DFlash cache repair, admission hardening, image gen
 
 - Sealed MoE execution contracts (#755, fivetide; G5 constituent): manifest-derived expert plans bound transactionally to Qwen3.6-A3B / Ornith and Cohere MoE decode and prefill; raw MoE escape hatches removed; rank-local sealed EP with root-authoritative routes and owned reduction leases, verified on 4× R9700. EP cross-route logit equivalence is diagnostic, not an acceptance gate — G5 acceptance and PM4 admission remain open on #666.

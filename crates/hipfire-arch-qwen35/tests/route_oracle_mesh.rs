@@ -93,8 +93,9 @@
 //! ```
 
 use hipfire_arch_qwen35::qwen35::{
-    self, DeltaNetState, HfqSource, Layout, Qwen35Config, Qwen35Scratch, Qwen35ScratchSet,
-    Qwen35Weights, StateQuant,
+    self, DeltaNetState, HfqSource, Layout, Qwen35BatchLoadConfig, Qwen35Config,
+    Qwen35DecodeBatchEpState, Qwen35EpBatchReceipt, Qwen35Scratch, Qwen35ScratchSet, Qwen35Weights,
+    StateQuant,
 };
 use hipfire_runtime::ep::ensure_rank_streams;
 use hipfire_runtime::hfq::HfqFile;
@@ -103,8 +104,9 @@ use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 use rdna_compute::{DType, Gpu, GpuTensor};
+use serde::Serialize;
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 
 const KV_MAX: usize = 4096;
@@ -898,6 +900,118 @@ struct StateSnap {
     scratch: ScratchSnap,
 }
 
+/// Optional post-step EP observation sink. The files intentionally contain
+/// only comparable bytes and the separately recorded input token/position;
+/// fixture/build identities belong in the surrounding evidence directory.
+struct EpOracleDump {
+    root: PathBuf,
+}
+
+impl EpOracleDump {
+    fn from_env(topology: &str) -> Option<Self> {
+        let root = std::env::var_os("HIPFIRE_EP_ORACLE_DUMP")?;
+        if root.is_empty() {
+            return None;
+        }
+        let root = PathBuf::from(root).join(topology);
+        std::fs::create_dir_all(&root)
+            .unwrap_or_else(|e| panic!("EP oracle dump root {}: {e}", root.display()));
+        Some(Self { root })
+    }
+
+    fn write(path: PathBuf, bytes: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .unwrap_or_else(|e| panic!("EP oracle dump dir {}: {e}", parent.display()));
+        }
+        std::fs::write(&path, bytes)
+            .unwrap_or_else(|e| panic!("EP oracle dump file {}: {e}", path.display()));
+    }
+
+    fn position_root(&self, pos: usize) -> PathBuf {
+        self.root.join(format!("position-{pos}"))
+    }
+
+    fn rank_position(&self, rank: usize, pos: usize) -> PathBuf {
+        self.root
+            .join(format!("rank-{rank}"))
+            .join(format!("position-{pos}"))
+    }
+
+    fn write_f32(path: PathBuf, values: &[f32]) {
+        let mut bytes = Vec::with_capacity(values.len() * 4);
+        for value in values {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        Self::write(path, &bytes);
+    }
+
+    fn write_agreement(
+        &self,
+        rank: usize,
+        pos: usize,
+        route_indices: &[f32],
+        route_weights: &[f32],
+        residual_x: &[f32],
+    ) {
+        let dir = self.rank_position(rank, pos);
+        Self::write_f32(dir.join("route-indices.f32"), route_indices);
+        Self::write_f32(dir.join("route-weights.f32"), route_weights);
+        Self::write_f32(dir.join("residual-x.f32"), residual_x);
+    }
+
+    fn write_snapshot(&self, rank: usize, pos: usize, snap: &StateSnap) {
+        let dir = self.rank_position(rank, pos);
+        for (layer, bytes) in snap.kv_k.iter().enumerate() {
+            Self::write(dir.join(format!("kv-k-{layer}.bin")), bytes);
+        }
+        for (layer, bytes) in snap.kv_v.iter().enumerate() {
+            Self::write(dir.join(format!("kv-v-{layer}.bin")), bytes);
+        }
+        for (layer, bytes) in snap.dn_s.iter().enumerate() {
+            Self::write(dir.join(format!("dn-s-{layer}.bin")), bytes);
+        }
+        for (layer, bytes) in snap.dn_sc.iter().enumerate() {
+            Self::write(dir.join(format!("dn-scales-{layer}.bin")), bytes);
+        }
+        for (layer, bytes) in snap.dn_c.iter().enumerate() {
+            Self::write(dir.join(format!("dn-conv-{layer}.bin")), bytes);
+        }
+        for (layer, bytes) in snap.dn_ef.iter().enumerate() {
+            Self::write(dir.join(format!("dn-ef-{layer}.bin")), bytes);
+        }
+        for (field, bytes) in snap.scratch.fixed.iter().enumerate() {
+            Self::write(dir.join(format!("scratch-fixed-{field}.bin")), bytes);
+        }
+        for (field, bytes) in snap.scratch.opt.iter().enumerate() {
+            if let Some(bytes) = bytes {
+                Self::write(dir.join(format!("scratch-opt-{field}.bin")), bytes);
+            }
+        }
+        Self::write(dir.join("scratch-pos.bin"), &snap.scratch.pos_buf);
+        Self::write(dir.join("scratch-pos3.bin"), &snap.scratch.pos_buf3);
+    }
+
+    fn write_observation(&self, mesh: &mut EpMesh, token: u32, pos: usize, root_logits: &[f32]) {
+        let position = self.position_root(pos);
+        Self::write(position.join("token.u32"), &token.to_le_bytes());
+        Self::write(position.join("position.u64"), &(pos as u64).to_le_bytes());
+        Self::write_f32(
+            self.rank_position(0, pos).join("root-logits.f32"),
+            root_logits,
+        );
+        for rank in 0..mesh.gpus.devices.len() {
+            let snap = snap_state(
+                &mut mesh.gpus.devices[rank],
+                &mesh.kvs[rank],
+                &mesh.dns[rank],
+                &mesh.scratches[rank],
+            );
+            self.write_snapshot(rank, pos, &snap);
+        }
+    }
+}
+
 fn download_tensors(gpu: &mut Gpu, tensors: &[GpuTensor]) -> Vec<Vec<u8>> {
     // NOTE: `GpuTensor::byte_size` reports the nominal shape×dtype extent,
     // which over-reports for sub-byte state (Q8 DeltaNet S carries an int8
@@ -1285,6 +1399,16 @@ fn load_ep_mesh(test: &str, path: &str, tp: usize) -> Option<EpMesh> {
 impl EpMesh {
     /// One decode position; returns rank-0 logits.
     fn step(&mut self, token: u32, pos: usize) -> Vec<f32> {
+        self.step_with_lease(token, pos, None)
+    }
+
+    /// Exercise the same public EP decode with a caller-owned peer lease.
+    fn step_with_lease(
+        &mut self,
+        token: u32,
+        pos: usize,
+        peer_lease: Option<&hipfire_runtime::multi_gpu::PeerReduceScratchLease>,
+    ) -> Vec<f32> {
         qwen35::forward_ep(
             &mut self.gpus,
             &self.weights,
@@ -1295,7 +1419,7 @@ impl EpMesh {
             &self.dns,
             &self.scratches,
             &self.partials,
-            None,
+            peer_lease,
         )
         .expect("ep forward_ep");
         self.gpus.devices[0].bind_thread().expect("ep bind0");
@@ -1351,6 +1475,7 @@ fn assert_ep_rank_agreement(
     gpus: &mut Gpus,
     scratches: &[Qwen35Scratch],
     pos: usize,
+    dump: Option<&EpOracleDump>,
 ) -> Vec<String> {
     fn cmp_bits(
         tag: &str,
@@ -1411,6 +1536,9 @@ fn assert_ep_rank_agreement(
     let root_x = gpus.devices[0]
         .download_f32(&scratches[0].x)
         .expect("ep agreement root residual");
+    if let Some(dump) = dump {
+        dump.write_agreement(0, pos, &root_ids, &root_weights, &root_x);
+    }
     if root_x.iter().any(|v| !v.is_finite()) {
         failures.push(format!(
             "pos {pos}: root post-collective residual non-finite"
@@ -1436,6 +1564,9 @@ fn assert_ep_rank_agreement(
         let x = gpus.devices[r]
             .download_f32(&scratches[r].x)
             .expect("ep agreement rank residual");
+        if let Some(dump) = dump {
+            dump.write_agreement(r, pos, &ids, &weights, &x);
+        }
         cmp_bits("moe_topk_indices", pos, r, &root_ids, &ids, &mut failures);
         cmp_bits(
             "moe_topk_weights",
@@ -1573,6 +1704,7 @@ fn qwen35_ep2_vs_single_oracle() {
     let Some(mut mesh) = load_ep_mesh(TEST, &path, 2) else {
         return;
     };
+    let dump = EpOracleDump::from_env("ep2");
 
     eprintln!(
         "{TEST}: route identity — single=forward_scratch/Layout::single, mesh=forward_ep/ep=2 stride-sharded"
@@ -1661,6 +1793,9 @@ fn qwen35_ep2_vs_single_oracle() {
             }
         }
         let ep_logits = mesh.step(committed[pos], pos);
+        if let Some(dump) = dump.as_ref() {
+            dump.write_observation(&mut mesh, committed[pos], pos, &ep_logits);
+        }
         if ep_logits.len() != s_width {
             agreement_failures.push(format!(
                 "pos {pos}: logit width {} != single width {s_width}",
@@ -1675,7 +1810,12 @@ fn qwen35_ep2_vs_single_oracle() {
             let EpMesh {
                 gpus, scratches, ..
             } = &mut mesh;
-            agreement_failures.extend(assert_ep_rank_agreement(gpus, scratches, pos));
+            agreement_failures.extend(assert_ep_rank_agreement(
+                gpus,
+                scratches,
+                pos,
+                dump.as_ref(),
+            ));
         }
         let diff = max_abs_diff(&recorded[pos], &ep_logits);
         worst = worst.max(diff);
@@ -1802,6 +1942,7 @@ fn qwen35_ep4_vs_ep2_oracle() {
         eprintln!("skip: {TEST} needs 4 visible GPUs for the EP=4 side");
         return;
     };
+    let dump = EpOracleDump::from_env("ep4");
     assert_eq!(ep4.config.dim, r_dim, "route config dim");
     assert_eq!(ep4.config.num_experts, r_nexp, "route expert count");
 
@@ -1860,6 +2001,9 @@ fn qwen35_ep4_vs_ep2_oracle() {
             }
         }
         let logits4 = ep4.step(committed[pos], pos);
+        if let Some(dump) = dump.as_ref() {
+            dump.write_observation(&mut ep4, committed[pos], pos, &logits4);
+        }
         if logits4.len() != r_width {
             agreement_failures.push(format!(
                 "pos {pos}: logit width {} != ep2 width {r_width}",
@@ -1874,7 +2018,12 @@ fn qwen35_ep4_vs_ep2_oracle() {
             let EpMesh {
                 gpus, scratches, ..
             } = &mut ep4;
-            agreement_failures.extend(assert_ep_rank_agreement(gpus, scratches, pos));
+            agreement_failures.extend(assert_ep_rank_agreement(
+                gpus,
+                scratches,
+                pos,
+                dump.as_ref(),
+            ));
         }
         let diff = max_abs_diff(&recorded[pos], &logits4);
         worst = worst.max(diff);
@@ -1908,5 +2057,545 @@ fn qwen35_ep4_vs_ep2_oracle() {
     );
     eprintln!(
         "{TEST}: PASS — {total} committed positions, worst ep2-vs-ep4 logit diff {worst:.3e}"
+    );
+}
+
+#[derive(Debug, Serialize)]
+struct BatchReceiptTrace {
+    epoch: u64,
+    rank_count: u8,
+    rank_mask: u64,
+    rows: u32,
+    moe_collectives: u32,
+    reduce: String,
+    parallelism: String,
+}
+
+fn batch_receipt_trace(receipt: &Qwen35EpBatchReceipt) -> BatchReceiptTrace {
+    BatchReceiptTrace {
+        epoch: receipt.epoch(),
+        rank_count: receipt.rank_count(),
+        rank_mask: receipt.rank_mask(),
+        rows: receipt.rows(),
+        moe_collectives: receipt.moe_collectives(),
+        reduce: format!("{:?}", receipt.reduce()),
+        parallelism: format!("{:?}", receipt.parallelism()),
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct BatchTraceEvent {
+    phase: &'static str,
+    tick: usize,
+    active_mask: u64,
+    tokens: [u32; 2],
+    positions: [usize; 2],
+    sampled: [Option<u32>; 2],
+    rng_states: [Option<u32>; 2],
+    receipt: Option<BatchReceiptTrace>,
+    state_epoch: u64,
+    poison_mask: u64,
+    expected_positions: [Option<usize>; 2],
+    error: Option<String>,
+}
+
+fn batch_trace_event(
+    batch: &Qwen35DecodeBatchEpState,
+    phase: &'static str,
+    tick: usize,
+    active_mask: u64,
+    tokens: [u32; 2],
+    positions: [usize; 2],
+    sampled: [Option<u32>; 2],
+    rng_states: [Option<u32>; 2],
+    receipt: Option<&Qwen35EpBatchReceipt>,
+    expected_positions: [Option<usize>; 2],
+    error: Option<String>,
+) -> BatchTraceEvent {
+    BatchTraceEvent {
+        phase,
+        tick,
+        active_mask,
+        tokens,
+        positions,
+        sampled,
+        rng_states,
+        receipt: receipt.map(batch_receipt_trace),
+        state_epoch: batch.epoch(),
+        poison_mask: batch.poison_mask(),
+        expected_positions,
+        error,
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct BatchTraceFile {
+    kind: &'static str,
+    topology: &'static str,
+    max_batch: usize,
+    lane_capacity: usize,
+    repeat_capacity: usize,
+    prefill_chunk: usize,
+    events: Vec<BatchTraceEvent>,
+}
+
+fn write_batch_trace(load_cfg: Qwen35BatchLoadConfig, events: Vec<BatchTraceEvent>) {
+    let Some(root) = std::env::var_os("HIPFIRE_EP_ORACLE_DUMP") else {
+        return;
+    };
+    if root.is_empty() {
+        return;
+    }
+    let trace = BatchTraceFile {
+        kind: "batch-behavior-trace",
+        topology: "ep4-batch",
+        max_batch: load_cfg.max_batch,
+        lane_capacity: load_cfg.lane_capacity,
+        repeat_capacity: load_cfg.repeat_capacity,
+        prefill_chunk: load_cfg.prefill_chunk,
+        events,
+    };
+    let bytes = serde_json::to_vec_pretty(&trace).expect("serialize EP batch behavior trace");
+    EpOracleDump::write(
+        PathBuf::from(root)
+            .join("ep4-batch")
+            .join("batch-behavior-trace.json"),
+        &bytes,
+    );
+}
+
+fn seed_ep_batch(
+    batch: &mut Qwen35DecodeBatchEpState,
+    mesh: &mut EpMesh,
+    prompt: &[u32],
+) -> ([u32; 2], [u32; 2], [Qwen35EpBatchReceipt; 2]) {
+    batch.reset_all(&mut mesh.gpus).expect("EP batch reset_all");
+    let receipt0 = batch
+        .prefill_lane(&mut mesh.gpus, &mesh.weights, &mesh.config, 0, prompt)
+        .expect("EP batch prefill lane 0");
+    let receipt1 = batch
+        .prefill_lane(&mut mesh.gpus, &mesh.weights, &mesh.config, 1, prompt)
+        .expect("EP batch prefill lane 1");
+    let (token0, rng0) = batch
+        .sample_lane(&mut mesh.gpus, &mesh.config, 0, 0.0, 1.0, None, 1)
+        .expect("EP batch initial sample lane 0");
+    let (token1, rng1) = batch
+        .sample_lane(&mut mesh.gpus, &mesh.config, 1, 0.0, 1.0, None, 1)
+        .expect("EP batch initial sample lane 1");
+    ([token0, token1], [rng0, rng1], [receipt0, receipt1])
+}
+
+#[test]
+#[ignore]
+fn qwen35_ep4_batch_step_recipe_oracle() {
+    const TEST: &str = "qwen35-ep4-batch-step-recipe-oracle";
+    if !have_mesh() {
+        eprintln!("skip: {TEST} needs HIPFIRE_HAVE_2_GPU=1 and 4 GPUs");
+        return;
+    }
+    let path = moe_fixture();
+    let _sha = pin_fixture(TEST, &path, MOE_SIZE, MOE_SHA256);
+    let tokenizer = {
+        let hfq = HfqFile::open(Path::new(&path)).expect("reopen for tokenizer");
+        Tokenizer::from_hfq_metadata(&hfq.metadata_json).expect("tokenizer")
+    };
+    let prompt = chatml_prompt(&tokenizer);
+    let load_cfg = Qwen35BatchLoadConfig::new(2, 256, 128, 8);
+    assert!(
+        prompt.len() < load_cfg.lane_capacity,
+        "{TEST}: chatml prompt must leave decode capacity"
+    );
+
+    let Some(mut mesh) = load_ep_mesh(TEST, &path, 4) else {
+        return;
+    };
+    let mut physical_ids: Vec<i32> = mesh.gpus.devices.iter().map(|gpu| gpu.device_id).collect();
+    let all_gfx1201 = mesh.gpus.devices.iter().all(|gpu| gpu.arch == "gfx1201");
+    physical_ids.sort_unstable();
+    let distinct_devices = physical_ids.windows(2).all(|pair| pair[0] != pair[1]);
+    if mesh.gpus.devices.len() != 4 || !all_gfx1201 || !distinct_devices {
+        eprintln!(
+            "skip: {TEST} requires four distinct gfx1201 devices (got {:?}, archs {:?})",
+            physical_ids,
+            mesh.gpus
+                .devices
+                .iter()
+                .map(|gpu| gpu.arch.as_str())
+                .collect::<Vec<_>>()
+        );
+        mesh.free();
+        return;
+    }
+
+    let mut batch =
+        match Qwen35DecodeBatchEpState::new(&mut mesh.gpus, &mesh.weights, &mesh.config, &load_cfg)
+        {
+            Ok(batch) => batch,
+            Err(error) => {
+                mesh.free();
+                panic!("{TEST}: four-device batch admission failed: {error:?}");
+            }
+        };
+    let mut failures = Vec::new();
+    let mut events = Vec::new();
+
+    // Exercise the sequential prefill fallback through the batch owner's live
+    // lease and borrowed seed scratch, then one ordinary decode under that
+    // same lease. This is deliberately not part of the raw-state dump.
+    {
+        let (pbs, seed_partials, peer_lease) = batch.sequential_prefill_scratch_mut();
+        for (chunk_idx, chunk) in prompt.chunks(8).enumerate() {
+            qwen35::forward_prefill_batch_ep(
+                &mut mesh.gpus,
+                &mesh.weights,
+                &mesh.config,
+                chunk,
+                chunk_idx * 8,
+                &mut mesh.kvs,
+                &mut mesh.dns,
+                &mesh.scratches,
+                pbs,
+                seed_partials,
+                peer_lease,
+            )
+            .unwrap_or_else(|error| panic!("{TEST}: sequential EP prefill: {error:?}"));
+        }
+    }
+    let peer_lease = batch.peer_reduce_lease();
+    let _ = mesh.step_with_lease(
+        *prompt.last().expect("chatml prompt is non-empty"),
+        prompt.len(),
+        peer_lease,
+    );
+
+    let prompt_pos = prompt.len();
+    let (mut reference_inputs, mut reference_rng, reference_receipts) =
+        seed_ep_batch(&mut batch, &mut mesh, &prompt);
+    for lane in 0..2 {
+        events.push(batch_trace_event(
+            &batch,
+            if lane == 0 {
+                "reference-seed-lane-0"
+            } else {
+                "reference-seed-lane-1"
+            },
+            0,
+            1u64 << lane,
+            [reference_inputs[lane], 0],
+            [prompt_pos, prompt_pos],
+            [Some(reference_inputs[lane]), None],
+            [Some(reference_rng[lane]), None],
+            Some(&reference_receipts[lane]),
+            [Some(prompt_pos), Some(prompt_pos)],
+            None,
+        ));
+    }
+    let mut reference_inputs_by_tick = Vec::with_capacity(8);
+    let mut reference_samples = Vec::with_capacity(8);
+    for tick in 0..8 {
+        let inputs = reference_inputs;
+        let positions = [prompt_pos + tick, prompt_pos + tick];
+        reference_inputs_by_tick.push(inputs);
+        let receipt = batch
+            .forward_tick(
+                &mut mesh.gpus,
+                &mesh.weights,
+                &mesh.config,
+                0b11,
+                &inputs,
+                &positions,
+            )
+            .unwrap_or_else(|error| panic!("{TEST}: reference forward tick {tick}: {error:?}"));
+        let mut sampled = [0u32; 2];
+        let mut next_rng = [0u32; 2];
+        for lane in 0..2 {
+            (sampled[lane], next_rng[lane]) = batch
+                .sample_lane(
+                    &mut mesh.gpus,
+                    &mesh.config,
+                    lane,
+                    0.0,
+                    1.0,
+                    None,
+                    reference_rng[lane],
+                )
+                .unwrap_or_else(|error| {
+                    panic!("{TEST}: reference sample {tick}/{lane}: {error:?}")
+                });
+        }
+        reference_samples.push(sampled);
+        events.push(batch_trace_event(
+            &batch,
+            "reference-two-active",
+            tick,
+            0b11,
+            inputs,
+            positions,
+            [Some(sampled[0]), Some(sampled[1])],
+            [Some(next_rng[0]), Some(next_rng[1])],
+            Some(&receipt),
+            [Some(prompt_pos + tick + 1), Some(prompt_pos + tick + 1)],
+            None,
+        ));
+        reference_inputs = sampled;
+        reference_rng = next_rng;
+    }
+
+    // Refusal preflight: neither an empty mask nor a wrong active-lane
+    // position may advance epoch or poison state. A valid retry immediately
+    // follows both refusals, proving their lane positions also stayed intact.
+    let (check_inputs, check_rng, check_receipts) = seed_ep_batch(&mut batch, &mut mesh, &prompt);
+    for lane in 0..2 {
+        events.push(batch_trace_event(
+            &batch,
+            if lane == 0 {
+                "refusal-check-seed-lane-0"
+            } else {
+                "refusal-check-seed-lane-1"
+            },
+            0,
+            1u64 << lane,
+            [check_inputs[lane], 0],
+            [prompt_pos, prompt_pos],
+            [Some(check_inputs[lane]), None],
+            [Some(check_rng[lane]), None],
+            Some(&check_receipts[lane]),
+            [Some(prompt_pos), Some(prompt_pos)],
+            None,
+        ));
+    }
+    let before_empty_epoch = batch.epoch();
+    let before_empty_poison = batch.poison_mask();
+    let empty_error = batch
+        .forward_tick(
+            &mut mesh.gpus,
+            &mesh.weights,
+            &mesh.config,
+            0,
+            &check_inputs,
+            &[prompt_pos, prompt_pos],
+        )
+        .err();
+    if empty_error.is_none() {
+        failures.push("empty active mask was accepted".to_string());
+    }
+    if batch.epoch() != before_empty_epoch || batch.poison_mask() != before_empty_poison {
+        failures.push("empty active mask mutated epoch or poison state".to_string());
+    }
+    events.push(batch_trace_event(
+        &batch,
+        "empty-mask-refusal",
+        0,
+        0,
+        check_inputs,
+        [prompt_pos, prompt_pos],
+        [None, None],
+        [None, None],
+        None,
+        [Some(prompt_pos), Some(prompt_pos)],
+        empty_error.map(|error| format!("{error:?}")),
+    ));
+
+    let before_wrong_epoch = batch.epoch();
+    let before_wrong_poison = batch.poison_mask();
+    let wrong_error = batch
+        .forward_tick(
+            &mut mesh.gpus,
+            &mesh.weights,
+            &mesh.config,
+            0b11,
+            &check_inputs,
+            &[prompt_pos + 1, prompt_pos],
+        )
+        .err();
+    if wrong_error.is_none() {
+        failures.push("wrong active-lane position was accepted".to_string());
+    }
+    if batch.epoch() != before_wrong_epoch || batch.poison_mask() != before_wrong_poison {
+        failures.push("wrong position mutated epoch or poison state".to_string());
+    }
+    events.push(batch_trace_event(
+        &batch,
+        "wrong-position-refusal",
+        0,
+        0b11,
+        check_inputs,
+        [prompt_pos + 1, prompt_pos],
+        [None, None],
+        [None, None],
+        None,
+        [Some(prompt_pos), Some(prompt_pos)],
+        wrong_error.map(|error| format!("{error:?}")),
+    ));
+
+    let valid_receipt = batch
+        .forward_tick(
+            &mut mesh.gpus,
+            &mesh.weights,
+            &mesh.config,
+            0b11,
+            &check_inputs,
+            &[prompt_pos, prompt_pos],
+        )
+        .unwrap_or_else(|error| panic!("{TEST}: valid retry failed: {error:?}"));
+    let mut valid_sampled = [0u32; 2];
+    let mut valid_rng = [0u32; 2];
+    for lane in 0..2 {
+        (valid_sampled[lane], valid_rng[lane]) = batch
+            .sample_lane(
+                &mut mesh.gpus,
+                &mesh.config,
+                lane,
+                0.0,
+                1.0,
+                None,
+                check_rng[lane],
+            )
+            .unwrap_or_else(|error| panic!("{TEST}: valid retry sample {lane}: {error:?}"));
+    }
+    events.push(batch_trace_event(
+        &batch,
+        "valid-retry",
+        0,
+        0b11,
+        check_inputs,
+        [prompt_pos, prompt_pos],
+        [Some(valid_sampled[0]), Some(valid_sampled[1])],
+        [Some(valid_rng[0]), Some(valid_rng[1])],
+        Some(&valid_receipt),
+        [Some(prompt_pos + 1), Some(prompt_pos + 1)],
+        None,
+    ));
+
+    // Reseed before the inactive-lane probe. Lane one must retain the exact
+    // expected position while lane zero takes one extra successful tick.
+    let (replay_seed_inputs, replay_seed_rng, replay_seed_receipts) =
+        seed_ep_batch(&mut batch, &mut mesh, &prompt);
+    for lane in 0..2 {
+        events.push(batch_trace_event(
+            &batch,
+            if lane == 0 {
+                "inactive-probe-seed-lane-0"
+            } else {
+                "inactive-probe-seed-lane-1"
+            },
+            0,
+            1u64 << lane,
+            [replay_seed_inputs[lane], 0],
+            [prompt_pos, prompt_pos],
+            [Some(replay_seed_inputs[lane]), None],
+            [Some(replay_seed_rng[lane]), None],
+            Some(&replay_seed_receipts[lane]),
+            [Some(prompt_pos), Some(prompt_pos)],
+            None,
+        ));
+    }
+    if replay_seed_inputs[1] != reference_inputs_by_tick[0][1] {
+        failures.push("lane 1 initial sample changed after reseed".to_string());
+    }
+    let inactive_receipt = batch
+        .forward_tick(
+            &mut mesh.gpus,
+            &mesh.weights,
+            &mesh.config,
+            0b01,
+            &[replay_seed_inputs[0], 0],
+            &[prompt_pos, prompt_pos],
+        )
+        .unwrap_or_else(|error| panic!("{TEST}: lane-0 inactive probe: {error:?}"));
+    let (lane0_after_inactive, lane0_after_inactive_rng) = batch
+        .sample_lane(
+            &mut mesh.gpus,
+            &mesh.config,
+            0,
+            0.0,
+            1.0,
+            None,
+            replay_seed_rng[0],
+        )
+        .unwrap_or_else(|error| panic!("{TEST}: lane-0 inactive sample: {error:?}"));
+    events.push(batch_trace_event(
+        &batch,
+        "lane-0-only-extra-tick",
+        0,
+        0b01,
+        [replay_seed_inputs[0], 0],
+        [prompt_pos, prompt_pos],
+        [Some(lane0_after_inactive), None],
+        [Some(lane0_after_inactive_rng), None],
+        Some(&inactive_receipt),
+        [Some(prompt_pos + 1), Some(prompt_pos)],
+        None,
+    ));
+
+    let mut replay_rng = [lane0_after_inactive_rng, replay_seed_rng[1]];
+    for tick in 0..8 {
+        let inputs = reference_inputs_by_tick[tick];
+        let positions = [prompt_pos + 1 + tick, prompt_pos + tick];
+        let receipt = batch
+            .forward_tick(
+                &mut mesh.gpus,
+                &mesh.weights,
+                &mesh.config,
+                0b11,
+                &inputs,
+                &positions,
+            )
+            .unwrap_or_else(|error| panic!("{TEST}: replay forward tick {tick}: {error:?}"));
+        let mut sampled = [0u32; 2];
+        let mut next_rng = [0u32; 2];
+        for lane in 0..2 {
+            (sampled[lane], next_rng[lane]) = batch
+                .sample_lane(
+                    &mut mesh.gpus,
+                    &mesh.config,
+                    lane,
+                    0.0,
+                    1.0,
+                    None,
+                    replay_rng[lane],
+                )
+                .unwrap_or_else(|error| panic!("{TEST}: replay sample {tick}/{lane}: {error:?}"));
+        }
+        if sampled[1] != reference_samples[tick][1] {
+            failures.push(format!(
+                "lane 1 sample changed at replay tick {tick}: {} != {}",
+                sampled[1], reference_samples[tick][1]
+            ));
+        }
+        if next_rng[1] != reference_rng[1] && tick + 1 == 8 {
+            // `reference_rng` is the final reference state; only the final
+            // replay draw is compared here because lane-one token equality
+            // above is the behavior contract for every tick.
+            failures.push(format!(
+                "lane 1 final RNG changed: {} != {}",
+                next_rng[1], reference_rng[1]
+            ));
+        }
+        events.push(batch_trace_event(
+            &batch,
+            "replay-offset-lane-0",
+            tick,
+            0b11,
+            inputs,
+            positions,
+            [Some(sampled[0]), Some(sampled[1])],
+            [Some(next_rng[0]), Some(next_rng[1])],
+            Some(&receipt),
+            [Some(prompt_pos + 2 + tick), Some(prompt_pos + 1 + tick)],
+            None,
+        ));
+        replay_rng = next_rng;
+    }
+
+    if let Err(error) = batch.free_gpu(&mut mesh.gpus) {
+        failures.push(format!("free EP batch state: {error:?}"));
+    }
+    mesh.free();
+    write_batch_trace(load_cfg, events);
+    assert!(
+        failures.is_empty(),
+        "{TEST} behavior failures:\n{}",
+        failures.join("\n")
     );
 }

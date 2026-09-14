@@ -8,6 +8,7 @@ license.workspace = true
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
 rdna-compute = { path = "../rdna-compute" }
+smallvec = "1.15.2"
 
 [features]
 default = []
