@@ -325,8 +325,8 @@ static __device__ __forceinline__ void load_iu4_stage_ws4_w2_gfx1151(
     //   do_A only:  A16 + A16 + hdr2                        = 16,16,2
     //   do_Xq only: Xq16 + Xq16 + Xq4                       = 16,16,4
     // Headers (2 dwords) always ride in the last packet of a do_A phase.
-    // Fence: asm volatile("" ::: "memory") — same idiom as other gfx11 kernels;
-    // __builtin_amdgcn_sched_barrier has no memory clobber in this tree.
+    // Fence: __builtin_amdgcn_sched_barrier(0) — scheduling barrier without
+    // a memory clobber (avoids VGPR spill/wait pessimization from asm memory fences).
 
 #define IU4_WS4_A_CODE_PKT(q) do { \
         const int r_ = 64 * (b) + 2 * (q) + e; \
@@ -364,7 +364,7 @@ static __device__ __forceinline__ void load_iu4_stage_ws4_w2_gfx1151(
             x_dm_[r_ * IU4_TILE_X_K + 4 * 1 + 3] = dm; \
         } \
     } while (0)
-#define IU4_WS4_PKT_FENCE() asm volatile("" ::: "memory")
+#define IU4_WS4_PKT_FENCE() __builtin_amdgcn_sched_barrier(0)
 
     if (do_A) {
         // Packet A0: 16 A-code dwords (q 0..15).
