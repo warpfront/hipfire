@@ -440,7 +440,8 @@ fn run_position_contract(
         .unwrap_or_else(|e| panic!("echo alloc: {e:?}"));
     launch_copy_positions(gpu, &full, &d_echo, batch as i32);
     let echo = download_i32_view(gpu, &d_echo);
-    assert_eq!(echo.len(), batch);
+    assert!(echo.len() >= batch, "echo alloc smaller than batch");
+    let echo = &echo[..batch];
     for (b, &v) in echo.iter().enumerate() {
         let expect = (start + b) as i32;
         assert_eq!(v, expect, "{tag}: copy_positions[{b}]={v} != {expect}");

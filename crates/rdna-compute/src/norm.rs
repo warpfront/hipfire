@@ -3024,20 +3024,27 @@ impl Gpu {
         self.bind_thread()?;
 
         let use_fast = !dn_requant_per_token();
-        let kernel_name = if use_fast {
-            "gated_delta_net_q8_fast"
+        // G1b measurement route (exact gfx1151): DPP order-preserving tree +
+        // one-token prefetch; same ABI and bitwise-equal to q8_fast.
+        let g1b = use_fast && self.arch.as_str() == "gfx1151";
+        let (kernel_name, kernel_src, kernel_fn) = if g1b {
+            (
+                "gated_delta_net_q8_prefill_prefetch_gfx1151",
+                kernels::GATED_DELTA_NET_Q8_PREFILL_PREFETCH_GFX1151_SRC,
+                "gated_delta_net_q8_prefill_prefetch_gfx1151",
+            )
+        } else if use_fast {
+            (
+                "gated_delta_net_q8_fast",
+                kernels::GATED_DELTA_NET_Q8_FAST_SRC,
+                "gated_delta_net_q8_fast",
+            )
         } else {
-            "gated_delta_net_q8"
-        };
-        let kernel_src = if use_fast {
-            kernels::GATED_DELTA_NET_Q8_FAST_SRC
-        } else {
-            kernels::GATED_DELTA_NET_Q8_SRC
-        };
-        let kernel_fn = if use_fast {
-            "gated_delta_net_q8_fast"
-        } else {
-            "gated_delta_net_q8"
+            (
+                "gated_delta_net_q8",
+                kernels::GATED_DELTA_NET_Q8_SRC,
+                "gated_delta_net_q8",
+            )
         };
         self.ensure_kernel(kernel_name, kernel_src, kernel_fn)?;
 

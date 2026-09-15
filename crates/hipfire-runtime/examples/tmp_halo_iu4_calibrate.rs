@@ -74,7 +74,7 @@ void iu4_probe_dependent(
     const int32x2_t bv = load_op(op_b, pair);
 
     unsigned long long t0 = 0, t1 = 0;
-    if (lane == 0 && wave == 0) t0 = __builtin_amdgcn_s_memrealtime();
+    if (lane == 0 && wave == 0) t0 = wall_clock64();
 
     int32x8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
     for (int i = 0; i < loops; ++i) {
@@ -85,7 +85,7 @@ void iu4_probe_dependent(
         if ((i & 31) == 31) bound_acc(acc);
     }
 
-    if (lane == 0 && wave == 0) t1 = __builtin_amdgcn_s_memrealtime();
+    if (lane == 0 && wave == 0) t1 = wall_clock64();
 
     const int tid = (int)blockIdx.x * 256 + wave * 32 + lane;
     checksum[tid] = acc_checksum(acc);
@@ -110,7 +110,7 @@ void iu4_probe_independent(
     const int32x2_t bv = load_op(op_b, pair);
 
     unsigned long long t0 = 0, t1 = 0;
-    if (lane == 0 && wave == 0) t0 = __builtin_amdgcn_s_memrealtime();
+    if (lane == 0 && wave == 0) t0 = wall_clock64();
 
     int32x8_t acc0 = {0, 0, 0, 0, 0, 0, 0, 0};
     int32x8_t acc1 = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -126,7 +126,7 @@ void iu4_probe_independent(
         }
     }
 
-    if (lane == 0 && wave == 0) t1 = __builtin_amdgcn_s_memrealtime();
+    if (lane == 0 && wave == 0) t1 = wall_clock64();
 
     const int tid = (int)blockIdx.x * 256 + wave * 32 + lane;
     checksum[tid] = acc_checksum(acc0) + acc_checksum(acc1)
@@ -165,7 +165,7 @@ void iu4_probe_independent_lds(
     __syncthreads();
 
     unsigned long long t0 = 0, t1 = 0;
-    if (lane == 0 && wave == 0) t0 = __builtin_amdgcn_s_memrealtime();
+    if (lane == 0 && wave == 0) t0 = wall_clock64();
 
     int32x8_t acc0 = {0, 0, 0, 0, 0, 0, 0, 0};
     int32x8_t acc1 = {0, 0, 0, 0, 0, 0, 0, 0};
@@ -202,7 +202,7 @@ void iu4_probe_independent_lds(
         }
     }
 
-    if (lane == 0 && wave == 0) t1 = __builtin_amdgcn_s_memrealtime();
+    if (lane == 0 && wave == 0) t1 = wall_clock64();
 
     const int tid = (int)blockIdx.x * 256 + wave * 32 + lane;
     checksum[tid] = acc_checksum(acc0) + acc_checksum(acc1)
