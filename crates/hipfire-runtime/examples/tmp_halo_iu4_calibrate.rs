@@ -7,17 +7,31 @@
 //!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-a0 \
 //!     cargo run --release -p hipfire-runtime --example tmp_halo_iu4_calibrate
 //!
+//! Peak arm (F4a admitted + F4b wip follow-up): sweep the independent+LDS
+//! probe family over large grids at loop 4096 to find the sustained
+//! wave-WMMA issue ceiling per dtype. Halo:
+//!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
+//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-peak \
+//!     ./target/release/examples/tmp_halo_iu4_calibrate peak
+//! (build with: cargo build --release -p hipfire-runtime --features lab
+//!   --example tmp_halo_iu4_calibrate)
+//!
 //! Metadata symbols the parent must read after first JIT (radiowave /
 //! llvm-readobj notes on the cached .hsaco under HIPFIRE_KERNEL_CACHE):
 //!   iu4_probe_dependent
 //!   iu4_probe_independent
 //!   iu4_probe_independent_lds
+//!   iu4_probe_independent8_lds
+//!   iu8_probe_independent_lds
+//!   f16_probe_independent_lds
 //!   gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_a0_prod
 //!   gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_a0_noload
 //!   gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_a0_nofold
-//!
-//! Resource ceilings (plan §4): probes ≤192 VGPR, mode a/b LDS 0, mode c
-//! exactly 2048 B; twins ≤192 VGPR, dynamic LDS 30720 B; spill/scratch 0.
+ //!
+ //! Resource ceilings (plan §4): probes ≤192 VGPR, mode a/b LDS 0, mode c
+ //! exactly 2048 B; twins ≤192 VGPR, dynamic LDS 30720 B; spill/scratch 0.
+//! Peak probes: iu4 4-chain 2048 B, iu4 8-chain 2048 B, iu8 4096 B,
+//! f16 8192 B dynamic LDS; same VGPR/spill expectations.
 
 use hip_bridge::KernargBlob;
 use rdna_compute::Gpu;
@@ -37,7 +51,10 @@ const PROBE_SRC: &str = r#"
 #include <stdint.h>
 
 using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
+using int32x4_t = __attribute__((__vector_size__(4 * sizeof(int)))) int;
 using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
+typedef float __attribute__((ext_vector_type(8))) float8_t;
 
 // Nonzero nibble-valid operands: host packs identical int32x2 A/B for lanes
 // r and r+16 (address depends on lane%16 only). Four WMMAs/iter.
@@ -207,6 +224,248 @@ void iu4_probe_independent_lds(
     const int tid = (int)blockIdx.x * 256 + wave * 32 + lane;
     checksum[tid] = acc_checksum(acc0) + acc_checksum(acc1)
                   + acc_checksum(acc2) + acc_checksum(acc3);
+    if (lane == 0 && wave == 0 && blockIdx.x == 0) {
+        ticks[0] = t0;
+        ticks[1] = t1;
+    }
+}
+// iu4 8-chain twin: eight independent accumulators, two ds_read_b64 operand
+// loads per WMMA from the same per-wave 256 B region as the 4-chain probe.
+// Doubles the per-wave WMMA count to test whether the 4-chain ceiling is
+// issue-rate or occupancy-bound. Checksum sums all eight chains.
+extern "C" __global__ __launch_bounds__(256, 2)
+void iu4_probe_independent8_lds(
+    const int* __restrict__ op_a,
+    const int* __restrict__ op_b,
+    int* __restrict__ checksum,
+    unsigned long long* __restrict__ ticks,
+    int loops
+) {
+    extern __shared__ unsigned char smem[];
+    const int lane = threadIdx.x;
+    const int wave = threadIdx.y;
+    const int pair = lane & 15;
+
+    unsigned char* region = smem + wave * 256;
+    if (lane < 16) {
+        const int32x2_t av = load_op(op_a, pair);
+        const int32x2_t bv = load_op(op_b, pair);
+        *(int32x2_t*)(region + pair * 8) = av;
+        *(int32x2_t*)(region + 128 + pair * 8) = bv;
+    }
+    __syncthreads();
+
+    unsigned long long t0 = 0, t1 = 0;
+    if (lane == 0 && wave == 0) t0 = wall_clock64();
+
+    int32x8_t acc0 = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32x8_t acc1 = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32x8_t acc2 = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32x8_t acc3 = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32x8_t acc4 = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32x8_t acc5 = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32x8_t acc6 = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32x8_t acc7 = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < loops; ++i) {
+        unsigned long long a_bits = *(const unsigned long long*)(region + pair * 8);
+        unsigned long long b_bits = *(const unsigned long long*)(region + 128 + pair * 8);
+        int32x2_t av = *(const int32x2_t*)(&a_bits);
+        int32x2_t bv = *(const int32x2_t*)(&b_bits);
+        acc0 = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av, true, bv, acc0, false);
+
+        a_bits = *(const unsigned long long*)(region + pair * 8);
+        b_bits = *(const unsigned long long*)(region + 128 + pair * 8);
+        av = *(const int32x2_t*)(&a_bits);
+        bv = *(const int32x2_t*)(&b_bits);
+        acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av, true, bv, acc1, false);
+
+        a_bits = *(const unsigned long long*)(region + pair * 8);
+        b_bits = *(const unsigned long long*)(region + 128 + pair * 8);
+        av = *(const int32x2_t*)(&a_bits);
+        bv = *(const int32x2_t*)(&b_bits);
+        acc2 = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av, true, bv, acc2, false);
+
+        a_bits = *(const unsigned long long*)(region + pair * 8);
+        b_bits = *(const unsigned long long*)(region + 128 + pair * 8);
+        av = *(const int32x2_t*)(&a_bits);
+        bv = *(const int32x2_t*)(&b_bits);
+        acc3 = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av, true, bv, acc3, false);
+
+        a_bits = *(const unsigned long long*)(region + pair * 8);
+        b_bits = *(const unsigned long long*)(region + 128 + pair * 8);
+        av = *(const int32x2_t*)(&a_bits);
+        bv = *(const int32x2_t*)(&b_bits);
+        acc4 = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av, true, bv, acc4, false);
+
+        a_bits = *(const unsigned long long*)(region + pair * 8);
+        b_bits = *(const unsigned long long*)(region + 128 + pair * 8);
+        av = *(const int32x2_t*)(&a_bits);
+        bv = *(const int32x2_t*)(&b_bits);
+        acc5 = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av, true, bv, acc5, false);
+
+        a_bits = *(const unsigned long long*)(region + pair * 8);
+        b_bits = *(const unsigned long long*)(region + 128 + pair * 8);
+        av = *(const int32x2_t*)(&a_bits);
+        bv = *(const int32x2_t*)(&b_bits);
+        acc6 = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av, true, bv, acc6, false);
+
+        a_bits = *(const unsigned long long*)(region + pair * 8);
+        b_bits = *(const unsigned long long*)(region + 128 + pair * 8);
+        av = *(const int32x2_t*)(&a_bits);
+        bv = *(const int32x2_t*)(&b_bits);
+        acc7 = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av, true, bv, acc7, false);
+
+        if ((i & 31) == 31) {
+            bound_acc(acc0); bound_acc(acc1); bound_acc(acc2); bound_acc(acc3);
+            bound_acc(acc4); bound_acc(acc5); bound_acc(acc6); bound_acc(acc7);
+        }
+    }
+
+    if (lane == 0 && wave == 0) t1 = wall_clock64();
+
+    const int tid = (int)blockIdx.x * 256 + wave * 32 + lane;
+    checksum[tid] = acc_checksum(acc0) + acc_checksum(acc1)
+                  + acc_checksum(acc2) + acc_checksum(acc3)
+                  + acc_checksum(acc4) + acc_checksum(acc5)
+                  + acc_checksum(acc6) + acc_checksum(acc7);
+    if (lane == 0 && wave == 0 && blockIdx.x == 0) {
+        ticks[0] = t0;
+        ticks[1] = t1;
+    }
+}
+
+// iu8 twin: four independent chains over wmma_i32_16x16x16_iu8, signed/signed
+// like the shipping mma_i8 path. Fragments are int32x4 (16 packed i8);
+// per-wave 512 B region holds two 256 B planes, 16 slots x 16 B each,
+// indexed by (lane&15)*16. Init once, barrier once, LDS reloaded per WMMA.
+extern "C" __global__ __launch_bounds__(256, 2)
+void iu8_probe_independent_lds(
+    const int* __restrict__ op_a,
+    const int* __restrict__ op_b,
+    int* __restrict__ checksum,
+    unsigned long long* __restrict__ ticks,
+    int loops
+) {
+    extern __shared__ unsigned char smem[];
+    const int lane = threadIdx.x;
+    const int wave = threadIdx.y;
+    const int pair = lane & 15;
+
+    unsigned char* region = smem + wave * 512;
+    // A plane [0,256), B plane [256,512). Each plane: 16 slots x 16 B.
+    if (lane < 16) {
+        *(int32x4_t*)(region + pair * 16) = *(const int32x4_t*)(op_a + pair * 4);
+        *(int32x4_t*)(region + 256 + pair * 16) = *(const int32x4_t*)(op_b + pair * 4);
+    }
+    __syncthreads();
+
+    unsigned long long t0 = 0, t1 = 0;
+    if (lane == 0 && wave == 0) t0 = wall_clock64();
+
+    int32x8_t acc0 = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32x8_t acc1 = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32x8_t acc2 = {0, 0, 0, 0, 0, 0, 0, 0};
+    int32x8_t acc3 = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < loops; ++i) {
+        int32x4_t av = *(const int32x4_t*)(region + pair * 16);
+        int32x4_t bv = *(const int32x4_t*)(region + 256 + pair * 16);
+        acc0 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, av, true, bv, acc0, false);
+
+        av = *(const int32x4_t*)(region + pair * 16);
+        bv = *(const int32x4_t*)(region + 256 + pair * 16);
+        acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, av, true, bv, acc1, false);
+
+        av = *(const int32x4_t*)(region + pair * 16);
+        bv = *(const int32x4_t*)(region + 256 + pair * 16);
+        acc2 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, av, true, bv, acc2, false);
+
+        av = *(const int32x4_t*)(region + pair * 16);
+        bv = *(const int32x4_t*)(region + 256 + pair * 16);
+        acc3 = __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, av, true, bv, acc3, false);
+
+        if ((i & 31) == 31) {
+            bound_acc(acc0); bound_acc(acc1); bound_acc(acc2); bound_acc(acc3);
+        }
+    }
+
+    if (lane == 0 && wave == 0) t1 = wall_clock64();
+
+    const int tid = (int)blockIdx.x * 256 + wave * 32 + lane;
+    checksum[tid] = acc_checksum(acc0) + acc_checksum(acc1)
+                  + acc_checksum(acc2) + acc_checksum(acc3);
+    if (lane == 0 && wave == 0 && blockIdx.x == 0) {
+        ticks[0] = t0;
+        ticks[1] = t1;
+    }
+}
+
+static __device__ __forceinline__ int f32_acc_checksum(const float8_t& acc) {
+    float cs = 0.0f;
+    #pragma unroll
+    for (int j = 0; j < 8; ++j) cs += acc[j] * (float)(j + 1);
+    return (int)cs;
+}
+
+// f16 twin: four independent chains over wmma_f32_16x16x16_f16. Fragments
+// are half16 (32 B); per-wave 1024 B region holds two 512 B planes,
+// 16 slots x 32 B each, indexed by (lane&15)*32. All-1.0 operands keep
+// f32 accumulation exact (4096*4*16 = 262144 < 2^24); no bound needed.
+// Init once, barrier once, LDS reloaded per WMMA. Checksum as int bits.
+extern "C" __global__ __launch_bounds__(256, 2)
+void f16_probe_independent_lds(
+    const int* __restrict__ op_a,
+    const int* __restrict__ op_b,
+    int* __restrict__ checksum,
+    unsigned long long* __restrict__ ticks,
+    int loops
+) {
+    extern __shared__ unsigned char smem[];
+    const int lane = threadIdx.x;
+    const int wave = threadIdx.y;
+    const int pair = lane & 15;
+
+    unsigned char* region = smem + wave * 1024;
+    // A plane [0,512), B plane [512,1024). Each plane: 16 slots x 32 B.
+    if (lane < 16) {
+        const int* sa = op_a + pair * 8;
+        const int* sb = op_b + pair * 8;
+        int* da = (int*)(region + pair * 32);
+        int* db = (int*)(region + 512 + pair * 32);
+        #pragma unroll
+        for (int w = 0; w < 8; ++w) { da[w] = sa[w]; db[w] = sb[w]; }
+    }
+    __syncthreads();
+
+    unsigned long long t0 = 0, t1 = 0;
+    if (lane == 0 && wave == 0) t0 = wall_clock64();
+
+    float8_t acc0 = {0, 0, 0, 0, 0, 0, 0, 0};
+    float8_t acc1 = {0, 0, 0, 0, 0, 0, 0, 0};
+    float8_t acc2 = {0, 0, 0, 0, 0, 0, 0, 0};
+    float8_t acc3 = {0, 0, 0, 0, 0, 0, 0, 0};
+    for (int i = 0; i < loops; ++i) {
+        half16_t av = *(const half16_t*)(region + pair * 32);
+        half16_t bv = *(const half16_t*)(region + 512 + pair * 32);
+        acc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av, bv, acc0);
+
+        av = *(const half16_t*)(region + pair * 32);
+        bv = *(const half16_t*)(region + 512 + pair * 32);
+        acc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av, bv, acc1);
+
+        av = *(const half16_t*)(region + pair * 32);
+        bv = *(const half16_t*)(region + 512 + pair * 32);
+        acc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av, bv, acc2);
+
+        av = *(const half16_t*)(region + pair * 32);
+        bv = *(const half16_t*)(region + 512 + pair * 32);
+        acc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(av, bv, acc3);
+    }
+
+    if (lane == 0 && wave == 0) t1 = wall_clock64();
+
+    const int tid = (int)blockIdx.x * 256 + wave * 32 + lane;
+    checksum[tid] = f32_acc_checksum(acc0) + f32_acc_checksum(acc1)
+                  + f32_acc_checksum(acc2) + f32_acc_checksum(acc3);
     if (lane == 0 && wave == 0 && blockIdx.x == 0) {
         ticks[0] = t0;
         ticks[1] = t1;
@@ -582,6 +841,33 @@ fn pack_probe_ops() -> (Vec<i32>, Vec<i32>) {
     (a, b)
 }
 
+/// iu8 probe operands: 16 slots × int32x4 (16 B = 4 i32) per side with small
+/// nonzero signed bytes 1..7, so the signed/signed iu8 WMMA stays live.
+fn pack_probe_ops_iu8() -> (Vec<i32>, Vec<i32>) {
+    let mut ab = vec![0u8; 256];
+    let mut bb = vec![0u8; 256];
+    for slot in 0..16 {
+        for k in 0..16 {
+            ab[slot * 16 + k] = (1 + ((slot + k) % 7)) as u8;
+            bb[slot * 16 + k] = (1 + ((slot * 3 + k * 5) % 7)) as u8;
+        }
+    }
+    let to_i32 = |bs: &[u8]| {
+        bs.chunks_exact(4)
+            .map(|c| i32::from_le_bytes(c.try_into().unwrap()))
+            .collect::<Vec<i32>>()
+    };
+    (to_i32(&ab), to_i32(&bb))
+}
+
+/// f16 probe operands: 16 slots × half16 (32 B = 8 i32) per side, all 1.0.
+/// Uniform nonzero input keeps f32 accumulation exact through loop 4096.
+fn pack_probe_ops_f16() -> (Vec<i32>, Vec<i32>) {
+    let h = f16_bits(1.0) as i32;
+    let w = h | (h << 16);
+    (vec![w; 128], vec![w; 128])
+}
+
 fn median_f64(xs: &mut [f64]) -> f64 {
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let n = xs.len();
@@ -652,9 +938,13 @@ fn launch_probe(
 }
 
 fn total_wmmas(grid: u32, loops: i32) -> f64 {
-    // wave-level WMMA instructions: grid × 8 waves × loops × 4 WMMAs
+    total_wmmas_n(grid, loops, 4.0)
+}
+
+fn total_wmmas_n(grid: u32, loops: i32, chains: f64) -> f64 {
+    // wave-level WMMA instructions: grid × 8 waves × loops × chains
     // Do NOT divide by lane count.
-    (grid as f64) * (NWARPS as f64) * (loops as f64) * 4.0
+    (grid as f64) * (NWARPS as f64) * (loops as f64) * chains
 }
 
 fn ensure_probes(gpu: &mut Gpu) {
@@ -667,6 +957,21 @@ fn ensure_probes(gpu: &mut Gpu) {
         gpu.ensure_kernel_public(MOD, PROBE_SRC, sym)
             .unwrap_or_else(|e| panic!("compile {sym}: {e:?}"));
         eprintln!("A0 meta: compiled probe symbol {sym} (module {MOD})");
+    }
+}
+
+
+fn ensure_peak(gpu: &mut Gpu) {
+    const MOD: &str = "halo_iu4_a0_probes";
+    for sym in [
+        "iu4_probe_independent_lds",
+        "iu4_probe_independent8_lds",
+        "iu8_probe_independent_lds",
+        "f16_probe_independent_lds",
+    ] {
+        gpu.ensure_kernel_public(MOD, PROBE_SRC, sym)
+            .unwrap_or_else(|e| panic!("compile {sym}: {e:?}"));
+        eprintln!("PEAK meta: compiled probe symbol {sym} (module {MOD})");
     }
 }
 
@@ -876,6 +1181,154 @@ fn run_probes(gpu: &mut Gpu) {
     }
 }
 
+struct PeakRow {
+    name: &'static str,
+    grid: u32,
+    event_us: f64,
+    wmma_per_us_cu: f64,
+    tops: f64,
+    checksum_or: i32,
+}
+
+fn run_peak(gpu: &mut Gpu) {
+    const PEAK_GRIDS: [u32; 5] = [320, 640, 1280, 2560, 5120];
+    const PEAK_LOOPS: i32 = 4096;
+    const OPS_PER_WMMA: f64 = 16.0 * 16.0 * 16.0 * 2.0; // 8192 ops per wave-WMMA
+    const IU8_PEAK_LDS: u32 = 4096; // 8 waves x 512 B (two 256 B planes)
+    const F16_PEAK_LDS: u32 = 8192; // 8 waves x 1024 B (two 512 B planes)
+
+    struct PeakProbe {
+        name: &'static str,
+        lds: u32,
+        chains: f64,
+        a: Vec<i32>,
+        b: Vec<i32>,
+    }
+    let (iu4a, iu4b) = pack_probe_ops();
+    let (iu4c, iu4d) = pack_probe_ops();
+    let (iu8a, iu8b) = pack_probe_ops_iu8();
+    let (f16a, f16b) = pack_probe_ops_f16();
+    let probes = [
+        PeakProbe { name: "iu4_probe_independent_lds", lds: PROBE_LDS_BYTES, chains: 4.0, a: iu4a, b: iu4b },
+        PeakProbe { name: "iu4_probe_independent8_lds", lds: PROBE_LDS_BYTES, chains: 8.0, a: iu4c, b: iu4d },
+        PeakProbe { name: "iu8_probe_independent_lds", lds: IU8_PEAK_LDS, chains: 4.0, a: iu8a, b: iu8b },
+        PeakProbe { name: "f16_probe_independent_lds", lds: F16_PEAK_LDS, chains: 4.0, a: f16a, b: f16b },
+    ];
+
+    let max_grid = *PEAK_GRIDS.iter().max().unwrap();
+    let z = vec![0i32; (max_grid as usize) * 256];
+    let cs_bytes: Vec<u8> = z.iter().flat_map(|x| x.to_le_bytes()).collect();
+    let d_cs = gpu.upload_raw(&cs_bytes, &[cs_bytes.len()]).unwrap();
+    let tick_z = vec![0u8; 16];
+    let d_ticks = gpu.upload_raw(&tick_z, &[16]).unwrap();
+
+    // Per-probe operand buffers (dtypes differ in fragment width).
+    let mut bufs: Vec<(rdna_compute::GpuTensor, rdna_compute::GpuTensor)> = Vec::new();
+    for p in &probes {
+        let a_bytes: Vec<u8> = p.a.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let b_bytes: Vec<u8> = p.b.iter().flat_map(|x| x.to_le_bytes()).collect();
+        bufs.push((
+            gpu.upload_raw(&a_bytes, &[a_bytes.len()]).unwrap(),
+            gpu.upload_raw(&b_bytes, &[b_bytes.len()]).unwrap(),
+        ));
+    }
+
+    // Warmup each symbol once at the smallest peak grid.
+    for (i, p) in probes.iter().enumerate() {
+        let _ = launch_probe(gpu, p.name, PEAK_GRIDS[0], PEAK_LOOPS, &bufs[i].0, &bufs[i].1, &d_cs, &d_ticks, p.lds);
+    }
+
+    let mut rows: Vec<PeakRow> = Vec::new();
+    eprintln!("\n=== PEAK probe sweep (event-timed, loop 4096, block [32,8,1]) ===");
+    eprintln!("TOPS = wave-WMMA/us/CU x 40 CUs x 8192 ops (16x16x16x2 per wave-WMMA).");
+    eprintln!(
+        "{:<28} {:>5} {:>10} {:>14} {:>10} {:>10}",
+        "mode", "grid", "event_us", "WMMAs/us/CU", "TOPS", "cs_or"
+    );
+    for (i, p) in probes.iter().enumerate() {
+        for &g in &PEAK_GRIDS {
+            // 3 samples; take median event time.
+            let mut us_samples = Vec::with_capacity(3);
+            for _ in 0..3 {
+                let (us, _, _) =
+                    launch_probe(gpu, p.name, g, PEAK_LOOPS, &bufs[i].0, &bufs[i].1, &d_cs, &d_ticks, p.lds);
+                us_samples.push(us);
+            }
+            let event_us = median_f64(&mut us_samples);
+            let tw = total_wmmas_n(g, PEAK_LOOPS, p.chains);
+            let rate = tw / event_us.max(1e-9) / CU_TARGET;
+            let tops = rate * CU_TARGET * OPS_PER_WMMA / 1e6;
+            // Checksum OR over a few words so the host observes liveness.
+            let mut cs_sample = vec![0u8; 64];
+            if gpu.hip.memcpy_dtoh(&mut cs_sample, &d_cs.buf).is_err() {
+                cs_sample.fill(0);
+            }
+            let mut cs_or = 0i32;
+            for chunk in cs_sample.chunks_exact(4) {
+                cs_or |= i32::from_le_bytes(chunk.try_into().unwrap());
+            }
+            eprintln!(
+                "{:<28} {:>5} {:>10.2} {:>14.3} {:>10.2} {:>10}",
+                p.name, g, event_us, rate, tops, cs_or
+            );
+            rows.push(PeakRow { name: p.name, grid: g, event_us, wmma_per_us_cu: rate, tops, checksum_or: cs_or });
+        }
+    }
+
+    // Plateau: successive-grid delta < 3% on TOPS.
+    eprintln!("\n=== PEAK plateau check (successive-grid TOPS delta < 3%) ===");
+    for p in &probes {
+        let mut pr: Vec<&PeakRow> = rows.iter().filter(|r| r.name == p.name).collect();
+        pr.sort_by_key(|r| r.grid);
+        let mut steps = Vec::new();
+        let mut all_plateau = true;
+        for w in pr.windows(2) {
+            let d = pct_diff(w[0].tops, w[1].tops);
+            let ok = d < 3.0;
+            all_plateau &= ok;
+            steps.push(format!("{}->{} {:.2}% {}", w[0].grid, w[1].grid, d, if ok { "ok" } else { "NO" }));
+        }
+        eprintln!(
+            "{}: {}  => {}",
+            p.name,
+            steps.join("  "),
+            if all_plateau { "PLATEAU" } else { "NO-PLATEAU" }
+        );
+    }
+
+    // Final table: peak TOPS per probe + ratios vs the iu4 4-chain baseline.
+    eprintln!("\n=== PEAK table (best TOPS over grids, loop 4096) ===");
+    let peak = |mode: &str| -> Option<&PeakRow> {
+        rows.iter()
+            .filter(|r| r.name == mode)
+            .max_by(|a, b| a.tops.partial_cmp(&b.tops).unwrap())
+    };
+    let iu4 = peak("iu4_probe_independent_lds");
+    let iu48 = peak("iu4_probe_independent8_lds");
+    let iu8 = peak("iu8_probe_independent_lds");
+    let f16 = peak("f16_probe_independent_lds");
+    eprintln!(
+        "{:<28} {:>5} {:>10} {:>14} {:>10}",
+        "mode", "grid", "event_us", "WMMAs/us/CU", "TOPS"
+    );
+    for r in [iu4, iu48, iu8, f16].into_iter().flatten() {
+        eprintln!(
+            "{:<28} {:>5} {:>10.2} {:>14.3} {:>10.2}  cs_or={:#x} (nonzero => loop live)",
+            r.name, r.grid, r.event_us, r.wmma_per_us_cu, r.tops, r.checksum_or as u32
+        );
+    }
+    if let (Some(i4), Some(i8), Some(x8), Some(f)) = (iu4, iu48, iu8, f16) {
+        let den = i4.tops.max(1e-30);
+        eprintln!("iu4-8chain / iu4-4chain ratio = {:.4}", x8.tops / den);
+        eprintln!("iu8 / iu4 ratio = {:.4}", i8.tops / den);
+        eprintln!("f16 / iu4 ratio = {:.4}", f.tops / den);
+        eprintln!(
+            "peak TOPS: iu4-4chain {:.2} @grid{}  iu4-8chain {:.2} @grid{}  iu8 {:.2} @grid{}  f16 {:.2} @grid{}",
+            i4.tops, i4.grid, x8.tops, x8.grid, i8.tops, i8.grid, f.tops, f.grid
+        );
+    }
+}
+
 fn run_attribution(gpu: &mut Gpu) {
     let shapes: [(usize, usize, usize); 2] = [(17408, 5120, 512), (5120, 17408, 512)];
     let syms = [
@@ -953,6 +1406,7 @@ fn run_attribution(gpu: &mut Gpu) {
 }
 
 fn main() {
+    let peak_only = std::env::args().nth(1).as_deref() == Some("peak");
     let mut gpu = Gpu::init().expect("gpu init");
     eprintln!(
         "tmp_halo_iu4_calibrate arch={}  (A0 IU4 WMMA rate + attribution)",
@@ -969,6 +1423,17 @@ fn main() {
     // Ensure a non-null stream so event_record attaches cleanly.
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create().expect("stream"));
+    }
+
+    if peak_only {
+        ensure_peak(&mut gpu);
+        eprintln!(
+            "\nPEAK: first JIT done. Parent must read code-object metadata for the peak probe symbols listed in the file header before trusting any timing below."
+        );
+        eprintln!("HIPFIRE_KERNEL_CACHE entries live under the process cache dir (see env).");
+        run_peak(&mut gpu);
+        eprintln!("\nPEAK complete.");
+        return;
     }
 
     ensure_probes(&mut gpu);
