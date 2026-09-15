@@ -30,7 +30,9 @@
 //! Arm `ship` (argv[1]=="ship"): launch SHIPPING kernels via runtime
 //! direct launchers vs frozen prod twins (Q8: fa2_attrib_prod; fwht3:
 //! fa2_attrib_prod_fwht3 frozen from HEAD pre-qshare2). Prints bitwise_eq
-//! out (and post-Q for fwht3) + interleaved medians ship vs prod per L.
+//! out (and, for fwht3, ship-Q-unchanged vs input) + interleaved medians
+//! ship vs prod per L. F4b: the shipping launchers pre-convert internally
+//! and never mutate Q.
 //!
 //! Halo ship:
 //!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
@@ -1244,7 +1246,7 @@ fn zero_out(gpu: &Gpu, t: &rdna_compute::GpuTensor, n_f32: usize) {
 }
 
 fn run_ship(gpu: &mut Gpu) {
-    eprintln!("\n=== F4a ship arm: shipping FA2 vs frozen prod twins ===");
+    eprintln!("\n=== F4b ship arm: shipping FA2 vs frozen prod twins ===");
     eprintln!(
         "shape H{N_HEADS}/KV{N_KV}/D{HD} batch={BATCH}  L∈{L_VALUES:?}  positions at end of L"
     );
@@ -1334,7 +1336,10 @@ fn run_ship(gpu: &mut Gpu) {
         );
 
         // ---- fwht3 bit-exact: frozen prod vs shipping (out + post-Q) ----
-        // Clone Q before each launch (fwht3 rotates in place).
+        // F4b: the frozen prod twin still rotates Q in place (needs a fresh
+        // upload before every launch); the shipping launcher pre-converts
+        // internally and never mutates Q (post-Q must equal the input bytes).
+        let q_bytes_host: Vec<u8> = q_h.iter().flat_map(|x| x.to_le_bytes()).collect();
         let d_q_prod_fw = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
         let d_q_ship_fw = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
         zero_out(gpu, &d_out_prod_fw, BATCH * QO_ROW);
@@ -1376,19 +1381,25 @@ fn run_ship(gpu: &mut Gpu) {
         eprintln!(
             "  bitwise_eq L={l} fwht3 out ship_vs_prod = {eq_o}  n_diff={n_diff_o} max_abs={max_abs_o:.6e}"
         );
+        // F4b: ship Q must be bit-identical to the pre-launch input (the
+        // launcher pre-converts internally; Q immutable). Prod Q is rotated
+        // in place by the frozen twin, so it must DIFFER (sanity: rotation
+        // really happened on the prod side).
         let q_bytes = BATCH * QO_ROW * 4;
         let prod_q_post = download_bytes(gpu, &d_q_prod_fw, q_bytes);
         let ship_q_post = download_bytes(gpu, &d_q_ship_fw, q_bytes);
-        let eq_q = bitwise_eq_bytes(&prod_q_post, &ship_q_post);
+        let eq_q = bitwise_eq_bytes(&ship_q_post, &q_bytes_host);
         let mut n_diff_q = 0usize;
-        for (a, b) in prod_q_post.iter().zip(ship_q_post.iter()) {
+        for (a, b) in ship_q_post.iter().zip(q_bytes_host.iter()) {
             if a != b {
                 n_diff_q += 1;
             }
         }
         eprintln!(
-            "  bitwise_eq L={l} fwht3 postQ ship_vs_prod = {eq_q}  n_diff_bytes={n_diff_q}"
+            "  bitwise_eq L={l} fwht3 postQ ship_vs_input = {eq_q}  n_diff_bytes={n_diff_q}"
         );
+        let prod_rotated = !bitwise_eq_bytes(&prod_q_post, &q_bytes_host);
+        eprintln!("  fwht3 prod rotated in place = {prod_rotated} (expect true)");
 
         // ---- Warmup ----
         for _ in 0..ATTR_WARMUP {
@@ -1412,18 +1423,10 @@ fn run_ship(gpu: &mut Gpu) {
                 BATCH,
                 l,
             );
-            // fwht3: refresh Q outside timed path
+            // fwht3: refresh PROD Q outside timed path (in-place rotate
+            // consumes it). Ship Q is immutable under F4b — no refresh.
             gpu.hip
-                .memcpy_htod(
-                    &d_q_prod_fw.buf,
-                    &q_h.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
-                )
-                .unwrap();
-            gpu.hip
-                .memcpy_htod(
-                    &d_q_ship_fw.buf,
-                    &q_h.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
-                )
+                .memcpy_htod(&d_q_prod_fw.buf, &q_bytes_host)
                 .unwrap();
             let _ = launch_prod_fwht3(
                 gpu,
@@ -1436,12 +1439,6 @@ fn run_ship(gpu: &mut Gpu) {
                 &d_s2,
                 BATCH as i32,
             );
-            gpu.hip
-                .memcpy_htod(
-                    &d_q_ship_fw.buf,
-                    &q_h.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
-                )
-                .unwrap();
             let _ = launch_ship_fwht3(
                 gpu,
                 &d_q_ship_fw,
@@ -1456,7 +1453,6 @@ fn run_ship(gpu: &mut Gpu) {
             );
         }
 
-        let q_bytes_host: Vec<u8> = q_h.iter().flat_map(|x| x.to_le_bytes()).collect();
         let mut samp_prod_q8 = Vec::with_capacity(ATTR_ITERS);
         let mut samp_ship_q8 = Vec::with_capacity(ATTR_ITERS);
         let mut samp_prod_fw = Vec::with_capacity(ATTR_ITERS);
@@ -1485,8 +1481,9 @@ fn run_ship(gpu: &mut Gpu) {
             );
             samp_ship_q8.push(us);
 
-            // fwht3: clone/refresh Q before each launch (outside timed interval is
-            // the memcpy; event timer only wraps the kernel).
+            // fwht3: refresh PROD Q before each launch (outside timed interval
+            // is the memcpy; event timer only wraps the kernel). Ship Q is
+            // immutable under F4b — launched as-is every iteration.
             gpu.hip
                 .memcpy_htod(&d_q_prod_fw.buf, &q_bytes_host)
                 .unwrap();
@@ -1502,9 +1499,6 @@ fn run_ship(gpu: &mut Gpu) {
                 BATCH as i32,
             );
             samp_prod_fw.push(us);
-            gpu.hip
-                .memcpy_htod(&d_q_ship_fw.buf, &q_bytes_host)
-                .unwrap();
             let us = launch_ship_fwht3(
                 gpu,
                 &d_q_ship_fw,
@@ -1537,7 +1531,7 @@ fn run_ship(gpu: &mut Gpu) {
             (1.0 - r_fw) * 100.0
         );
     }
-    eprintln!("\nF4a ship arm complete.");
+    eprintln!("\nF4b ship arm complete.");
 }
 
 fn main() {
@@ -1545,7 +1539,7 @@ fn main() {
     let arm = std::env::args().nth(1).unwrap_or_default();
     let is_ship = arm == "ship";
     eprintln!(
-        "tmp_fa2_attrib arch={}  arm={}  (F3.0 attribution / F4a ship)",
+        "tmp_fa2_attrib arch={}  arm={}  (F3.0 attribution / F4b ship)",
         gpu.arch,
         if is_ship { "ship" } else { "attrib" }
     );

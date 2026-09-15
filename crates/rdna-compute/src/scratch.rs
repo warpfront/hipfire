@@ -195,6 +195,12 @@ pub struct ScratchState {
     /// in one allocation; grows-never-shrinks.
     pub sample_partials: Option<DeviceBuffer>,
     pub sample_partials_bytes: usize,
+    /// F4b: f16 Q scratch for the gfx11 FA2 pair (`attention_fa2_q_preconvert_gfx11`
+    /// writes it, the FA2 body reads it): [batch, 24, 256] f16, grows-never-shrinks.
+    /// Every valid cell is written by the pre-convert launch before the body reads
+    /// it (same-stream ordering), so no init is needed.
+    pub fa2_q16_scratch: Option<DeviceBuffer>,
+    pub fa2_q16_scratch_bytes: usize,
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
@@ -507,6 +513,25 @@ impl ScratchState {
             n_bytes,
         )?;
         Ok(self.sample_partials.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure the F4b FA2 f16 Q scratch holds at least `n_bytes`
+    /// (batch*24*256*2 for the gfx11 FA2 pair), growing (never shrinking).
+    /// Returns the device base pointer. No init needed: the pre-convert
+    /// launch writes every valid cell before the FA2 body reads it
+    /// (same-stream ordering).
+    pub fn ensure_fa2_q16_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        n_bytes: usize,
+    ) -> HipResult<*mut c_void> {
+        grow_scratch_buffer(
+            hip,
+            &mut self.fa2_q16_scratch,
+            &mut self.fa2_q16_scratch_bytes,
+            n_bytes,
+        )?;
+        Ok(self.fa2_q16_scratch.as_ref().unwrap().as_ptr())
     }
 
     /// Ensure the dedicated GEMV-residual temporary can hold at least

@@ -5676,16 +5676,21 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC: &str = concat!(
 /// half16 WMMA with the measured lane-pair mapping (lanes r and r+16
 /// supply identical rows; QK even/odd key ownership, xor-16 pair
 /// reductions, full-P reconstruction, PV even/odd dimension ownership).
-/// JIT-only via the `attention_q8_0_fa2_gqa_gfx11*` launchers; never on a
-/// default path.
+/// F4b: the body reads f16 Q from Gpu-owned scratch (one aligned 16-byte
+/// load per 8 dims, no cvt); `attention_fa2_q_preconvert_gfx11` in this
+/// same file fills the scratch from f32 Q ahead of the body. JIT-only via
+/// the `attention_q8_0_fa2_gqa_gfx11*` launchers; never on a default path.
 pub const ATTENTION_Q8_0_FA2_GQA_GFX11_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip");
 
 /// fwht3-K variant of [`ATTENTION_Q8_0_FA2_GQA_GFX11_SRC`] (`HIPFIRE_FA2_KMODE=3`):
 /// K dequantizes fwht3 records (f32 cnorm + 96 B of 3-bit codes, K stored
-/// FWHT-rotated) into the unchanged K plane, and the entry symbol
-/// `attention_q8_0_fa2_gqa_fwht3k_gfx11` rotates this WG's Q rows in place
-/// (signed FWHT-256) before the shared body. `turbo_common.h` is prepended
+/// FWHT-rotated) into the unchanged K plane. F4b: the Q-side signed-FWHT-256
+/// rotation moved out of the body into `attention_fa2_q_preconvert_gfx11`
+/// (same helper, same op order — bit-identical), so the entry symbol
+/// `attention_q8_0_fa2_gqa_fwht3k_gfx11` takes the SAME kernarg list as the
+/// Q8 entry (f16 q16 at offset 0, no signs) and never mutates Q:
+/// replay-idempotent, capture-safe. `turbo_common.h` is prepended
 /// (same pattern as the `KV_SLOT_DESC_H` sites) because the runtime compile
 /// has no `-I` to `kernels/src`. JIT-only via
 /// `attention_q8_0_fa2_gqa_fwht3k_gfx11`; never on a default path.

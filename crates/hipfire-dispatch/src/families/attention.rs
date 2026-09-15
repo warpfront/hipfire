@@ -1648,17 +1648,18 @@ fn dispatch_attend(
                     return Ok(());
                 }
                 // gfx11 FA2 prefill with fwht3 K (default on;
-                // `HIPFIRE_GFX11_FA2_PREFILL=0` opts out). Same contract and predicates
-                // as the gfx1201 arm above; arch-disjoint (gfx11 allowlist
-                // only) and an independent flag. Falls through to the
+                // `HIPFIRE_GFX11_FA2_PREFILL=0` opts out). F4b: the launcher
+                // pre-converts Q into f16 scratch (rotation fused, Q never
+                // mutated), so unlike the gfx1201 arm above this one is
+                // replay-idempotent and capture-safe — no recorder/capture
+                // gates. Otherwise same shape predicates (arch-disjoint
+                // gfx11 allowlist, independent flag). Falls through to the
                 // incumbent below otherwise.
                 if gpu.flags.gfx11_fa2_prefill
                     && matches!(
                         gpu.arch.as_str(),
                         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
                     )
-                    && !gpu.replay.is_recording()
-                    && !gpu.graphs.capture_mode
                     && io.n_heads == 24
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
