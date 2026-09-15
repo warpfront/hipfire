@@ -318,140 +318,139 @@ static __device__ __forceinline__ void load_iu4_stage_ws4_w2_gfx1151(
     const int e = threadIdx.y - 8;
     const int lane = threadIdx.x;
 
-    // 70 raw staged dwords: a_code[32] + a_header[2] + xq_words[36].
-    int a_code0, a_code1, a_code2, a_code3, a_code4, a_code5, a_code6, a_code7;
-    int a_code8, a_code9, a_code10, a_code11, a_code12, a_code13, a_code14, a_code15;
-    int a_code16, a_code17, a_code18, a_code19, a_code20, a_code21, a_code22, a_code23;
-    int a_code24, a_code25, a_code26, a_code27, a_code28, a_code29, a_code30, a_code31;
-    int a_header0, a_header1;
-    int xq0, xq1, xq2, xq3, xq4, xq5, xq6, xq7, xq8, xq9;
-    int xq10, xq11, xq12, xq13, xq14, xq15, xq16, xq17, xq18, xq19;
-    int xq20, xq21, xq22, xq23, xq24, xq25, xq26, xq27, xq28, xq29;
-    int xq30, xq31, xq32, xq33, xq34, xq35;
+    // Packetize each phase: load ≤16 dwords/lane → store to LDS, then fence so
+    // the compiler cannot hoist the next packet's loads over this store.
+    // Phases (exact LDS addresses unchanged):
+    //   do_A+do_Xq: A16 + A16 + Xq16 + Xq16 + (Xq4+hdr2)   = 16,16,16,16,6
+    //   do_A only:  A16 + A16 + hdr2                        = 16,16,2
+    //   do_Xq only: Xq16 + Xq16 + Xq4                       = 16,16,4
+    // Headers (2 dwords) always ride in the last packet of a do_A phase.
+    // Fence: asm volatile("" ::: "memory") — same idiom as other gfx11 kernels;
+    // __builtin_amdgcn_sched_barrier has no memory clobber in this tree.
+
+#define IU4_WS4_A_CODE_PKT(q) do { \
+        const int r_ = 64 * (b) + 2 * (q) + e; \
+        const char* gp_ = A + ((long long)(row0 + r_) * groups_per_row + g) * 136; \
+        Aplane[r_ * IU4_TILE_X_K + lane] = *(const int*)(gp_ + 8 + 4 * lane); \
+    } while (0)
+#define IU4_WS4_XQ_PKT(q) do { \
+        const int l_ = 64 * (q) + 32 * e + lane; \
+        Yplane[l_] = Xq_base[l_]; \
+    } while (0)
+#define IU4_WS4_HDR_PKT() do { \
+        const int r_ = 64 * (b) + 32 * e + lane; \
+        const char* gp_ = A + ((long long)(row0 + r_) * groups_per_row + g) * 136; \
+        const int h0_ = *(const int*)(gp_ + 0); \
+        const int h1_ = *(const int*)(gp_ + 4); \
+        half2* x_dm_ = (half2*)(Aplane + IU4_X_DM_OFF); \
+        { \
+            const unsigned int hs = (unsigned int)h0_; \
+            const float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu))); \
+            const float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16))); \
+            const half2 dm = make_half2((_Float16)sc, (_Float16)zp); \
+            x_dm_[r_ * IU4_TILE_X_K + 4 * 0 + 0] = dm; \
+            x_dm_[r_ * IU4_TILE_X_K + 4 * 0 + 1] = dm; \
+            x_dm_[r_ * IU4_TILE_X_K + 4 * 0 + 2] = dm; \
+            x_dm_[r_ * IU4_TILE_X_K + 4 * 0 + 3] = dm; \
+        } \
+        { \
+            const unsigned int hs = (unsigned int)h1_; \
+            const float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu))); \
+            const float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16))); \
+            const half2 dm = make_half2((_Float16)sc, (_Float16)zp); \
+            x_dm_[r_ * IU4_TILE_X_K + 4 * 1 + 0] = dm; \
+            x_dm_[r_ * IU4_TILE_X_K + 4 * 1 + 1] = dm; \
+            x_dm_[r_ * IU4_TILE_X_K + 4 * 1 + 2] = dm; \
+            x_dm_[r_ * IU4_TILE_X_K + 4 * 1 + 3] = dm; \
+        } \
+    } while (0)
+#define IU4_WS4_PKT_FENCE() asm volatile("" ::: "memory")
 
     if (do_A) {
-#define IU4_WS4_A_LOAD(q, dst) do { \
-        const int r = 64 * (b) + 2 * (q) + e; \
-        const char* gp = A + ((long long)(row0 + r) * groups_per_row + g) * 136; \
-        (dst) = *(const int*)(gp + 8 + 4 * lane); \
-    } while (0)
-        IU4_WS4_A_LOAD(0, a_code0);   IU4_WS4_A_LOAD(1, a_code1);
-        IU4_WS4_A_LOAD(2, a_code2);   IU4_WS4_A_LOAD(3, a_code3);
-        IU4_WS4_A_LOAD(4, a_code4);   IU4_WS4_A_LOAD(5, a_code5);
-        IU4_WS4_A_LOAD(6, a_code6);   IU4_WS4_A_LOAD(7, a_code7);
-        IU4_WS4_A_LOAD(8, a_code8);   IU4_WS4_A_LOAD(9, a_code9);
-        IU4_WS4_A_LOAD(10, a_code10); IU4_WS4_A_LOAD(11, a_code11);
-        IU4_WS4_A_LOAD(12, a_code12); IU4_WS4_A_LOAD(13, a_code13);
-        IU4_WS4_A_LOAD(14, a_code14); IU4_WS4_A_LOAD(15, a_code15);
-        IU4_WS4_A_LOAD(16, a_code16); IU4_WS4_A_LOAD(17, a_code17);
-        IU4_WS4_A_LOAD(18, a_code18); IU4_WS4_A_LOAD(19, a_code19);
-        IU4_WS4_A_LOAD(20, a_code20); IU4_WS4_A_LOAD(21, a_code21);
-        IU4_WS4_A_LOAD(22, a_code22); IU4_WS4_A_LOAD(23, a_code23);
-        IU4_WS4_A_LOAD(24, a_code24); IU4_WS4_A_LOAD(25, a_code25);
-        IU4_WS4_A_LOAD(26, a_code26); IU4_WS4_A_LOAD(27, a_code27);
-        IU4_WS4_A_LOAD(28, a_code28); IU4_WS4_A_LOAD(29, a_code29);
-        IU4_WS4_A_LOAD(30, a_code30); IU4_WS4_A_LOAD(31, a_code31);
-#undef IU4_WS4_A_LOAD
-        {
-            const int r = 64 * b + 32 * e + lane;
-            const char* gp = A + ((long long)(row0 + r) * groups_per_row + g) * 136;
-            a_header0 = *(const int*)(gp + 0);
-            a_header1 = *(const int*)(gp + 4);
+        // Packet A0: 16 A-code dwords (q 0..15).
+        IU4_WS4_A_CODE_PKT(0);  IU4_WS4_A_CODE_PKT(1);
+        IU4_WS4_A_CODE_PKT(2);  IU4_WS4_A_CODE_PKT(3);
+        IU4_WS4_A_CODE_PKT(4);  IU4_WS4_A_CODE_PKT(5);
+        IU4_WS4_A_CODE_PKT(6);  IU4_WS4_A_CODE_PKT(7);
+        IU4_WS4_A_CODE_PKT(8);  IU4_WS4_A_CODE_PKT(9);
+        IU4_WS4_A_CODE_PKT(10); IU4_WS4_A_CODE_PKT(11);
+        IU4_WS4_A_CODE_PKT(12); IU4_WS4_A_CODE_PKT(13);
+        IU4_WS4_A_CODE_PKT(14); IU4_WS4_A_CODE_PKT(15);
+        IU4_WS4_PKT_FENCE();
+
+        // Packet A1: 16 A-code dwords (q 16..31).
+        IU4_WS4_A_CODE_PKT(16); IU4_WS4_A_CODE_PKT(17);
+        IU4_WS4_A_CODE_PKT(18); IU4_WS4_A_CODE_PKT(19);
+        IU4_WS4_A_CODE_PKT(20); IU4_WS4_A_CODE_PKT(21);
+        IU4_WS4_A_CODE_PKT(22); IU4_WS4_A_CODE_PKT(23);
+        IU4_WS4_A_CODE_PKT(24); IU4_WS4_A_CODE_PKT(25);
+        IU4_WS4_A_CODE_PKT(26); IU4_WS4_A_CODE_PKT(27);
+        IU4_WS4_A_CODE_PKT(28); IU4_WS4_A_CODE_PKT(29);
+        IU4_WS4_A_CODE_PKT(30); IU4_WS4_A_CODE_PKT(31);
+
+        if (do_Xq) {
+            IU4_WS4_PKT_FENCE();
+            // Packet X0: 16 Xq dwords (q 0..15).
+            IU4_WS4_XQ_PKT(0);  IU4_WS4_XQ_PKT(1);
+            IU4_WS4_XQ_PKT(2);  IU4_WS4_XQ_PKT(3);
+            IU4_WS4_XQ_PKT(4);  IU4_WS4_XQ_PKT(5);
+            IU4_WS4_XQ_PKT(6);  IU4_WS4_XQ_PKT(7);
+            IU4_WS4_XQ_PKT(8);  IU4_WS4_XQ_PKT(9);
+            IU4_WS4_XQ_PKT(10); IU4_WS4_XQ_PKT(11);
+            IU4_WS4_XQ_PKT(12); IU4_WS4_XQ_PKT(13);
+            IU4_WS4_XQ_PKT(14); IU4_WS4_XQ_PKT(15);
+            IU4_WS4_PKT_FENCE();
+
+            // Packet X1: 16 Xq dwords (q 16..31).
+            IU4_WS4_XQ_PKT(16); IU4_WS4_XQ_PKT(17);
+            IU4_WS4_XQ_PKT(18); IU4_WS4_XQ_PKT(19);
+            IU4_WS4_XQ_PKT(20); IU4_WS4_XQ_PKT(21);
+            IU4_WS4_XQ_PKT(22); IU4_WS4_XQ_PKT(23);
+            IU4_WS4_XQ_PKT(24); IU4_WS4_XQ_PKT(25);
+            IU4_WS4_XQ_PKT(26); IU4_WS4_XQ_PKT(27);
+            IU4_WS4_XQ_PKT(28); IU4_WS4_XQ_PKT(29);
+            IU4_WS4_XQ_PKT(30); IU4_WS4_XQ_PKT(31);
+            IU4_WS4_PKT_FENCE();
+
+            // Last packet: Xq q32..35 (4) + headers (2) = 6 dwords.
+            IU4_WS4_XQ_PKT(32); IU4_WS4_XQ_PKT(33);
+            IU4_WS4_XQ_PKT(34); IU4_WS4_XQ_PKT(35);
+            IU4_WS4_HDR_PKT();
+        } else {
+            IU4_WS4_PKT_FENCE();
+            // Last packet: headers only (2 dwords).
+            IU4_WS4_HDR_PKT();
         }
+    } else if (do_Xq) {
+        // Xq-only phase (no A): 16 + 16 + 4.
+        IU4_WS4_XQ_PKT(0);  IU4_WS4_XQ_PKT(1);
+        IU4_WS4_XQ_PKT(2);  IU4_WS4_XQ_PKT(3);
+        IU4_WS4_XQ_PKT(4);  IU4_WS4_XQ_PKT(5);
+        IU4_WS4_XQ_PKT(6);  IU4_WS4_XQ_PKT(7);
+        IU4_WS4_XQ_PKT(8);  IU4_WS4_XQ_PKT(9);
+        IU4_WS4_XQ_PKT(10); IU4_WS4_XQ_PKT(11);
+        IU4_WS4_XQ_PKT(12); IU4_WS4_XQ_PKT(13);
+        IU4_WS4_XQ_PKT(14); IU4_WS4_XQ_PKT(15);
+        IU4_WS4_PKT_FENCE();
+
+        IU4_WS4_XQ_PKT(16); IU4_WS4_XQ_PKT(17);
+        IU4_WS4_XQ_PKT(18); IU4_WS4_XQ_PKT(19);
+        IU4_WS4_XQ_PKT(20); IU4_WS4_XQ_PKT(21);
+        IU4_WS4_XQ_PKT(22); IU4_WS4_XQ_PKT(23);
+        IU4_WS4_XQ_PKT(24); IU4_WS4_XQ_PKT(25);
+        IU4_WS4_XQ_PKT(26); IU4_WS4_XQ_PKT(27);
+        IU4_WS4_XQ_PKT(28); IU4_WS4_XQ_PKT(29);
+        IU4_WS4_XQ_PKT(30); IU4_WS4_XQ_PKT(31);
+        IU4_WS4_PKT_FENCE();
+
+        IU4_WS4_XQ_PKT(32); IU4_WS4_XQ_PKT(33);
+        IU4_WS4_XQ_PKT(34); IU4_WS4_XQ_PKT(35);
     }
 
-    if (do_Xq) {
-#define IU4_WS4_XQ_LOAD(q, dst) do { \
-        const int l = 64 * (q) + 32 * e + lane; \
-        (dst) = Xq_base[l]; \
-    } while (0)
-        IU4_WS4_XQ_LOAD(0, xq0);   IU4_WS4_XQ_LOAD(1, xq1);
-        IU4_WS4_XQ_LOAD(2, xq2);   IU4_WS4_XQ_LOAD(3, xq3);
-        IU4_WS4_XQ_LOAD(4, xq4);   IU4_WS4_XQ_LOAD(5, xq5);
-        IU4_WS4_XQ_LOAD(6, xq6);   IU4_WS4_XQ_LOAD(7, xq7);
-        IU4_WS4_XQ_LOAD(8, xq8);   IU4_WS4_XQ_LOAD(9, xq9);
-        IU4_WS4_XQ_LOAD(10, xq10); IU4_WS4_XQ_LOAD(11, xq11);
-        IU4_WS4_XQ_LOAD(12, xq12); IU4_WS4_XQ_LOAD(13, xq13);
-        IU4_WS4_XQ_LOAD(14, xq14); IU4_WS4_XQ_LOAD(15, xq15);
-        IU4_WS4_XQ_LOAD(16, xq16); IU4_WS4_XQ_LOAD(17, xq17);
-        IU4_WS4_XQ_LOAD(18, xq18); IU4_WS4_XQ_LOAD(19, xq19);
-        IU4_WS4_XQ_LOAD(20, xq20); IU4_WS4_XQ_LOAD(21, xq21);
-        IU4_WS4_XQ_LOAD(22, xq22); IU4_WS4_XQ_LOAD(23, xq23);
-        IU4_WS4_XQ_LOAD(24, xq24); IU4_WS4_XQ_LOAD(25, xq25);
-        IU4_WS4_XQ_LOAD(26, xq26); IU4_WS4_XQ_LOAD(27, xq27);
-        IU4_WS4_XQ_LOAD(28, xq28); IU4_WS4_XQ_LOAD(29, xq29);
-        IU4_WS4_XQ_LOAD(30, xq30); IU4_WS4_XQ_LOAD(31, xq31);
-        IU4_WS4_XQ_LOAD(32, xq32); IU4_WS4_XQ_LOAD(33, xq33);
-        IU4_WS4_XQ_LOAD(34, xq34); IU4_WS4_XQ_LOAD(35, xq35);
-#undef IU4_WS4_XQ_LOAD
-    }
-
-    if (do_A) {
-#define IU4_WS4_A_STORE(q, src) do { \
-        const int r = 64 * (b) + 2 * (q) + e; \
-        Aplane[r * IU4_TILE_X_K + lane] = (src); \
-    } while (0)
-        IU4_WS4_A_STORE(0, a_code0);   IU4_WS4_A_STORE(1, a_code1);
-        IU4_WS4_A_STORE(2, a_code2);   IU4_WS4_A_STORE(3, a_code3);
-        IU4_WS4_A_STORE(4, a_code4);   IU4_WS4_A_STORE(5, a_code5);
-        IU4_WS4_A_STORE(6, a_code6);   IU4_WS4_A_STORE(7, a_code7);
-        IU4_WS4_A_STORE(8, a_code8);   IU4_WS4_A_STORE(9, a_code9);
-        IU4_WS4_A_STORE(10, a_code10); IU4_WS4_A_STORE(11, a_code11);
-        IU4_WS4_A_STORE(12, a_code12); IU4_WS4_A_STORE(13, a_code13);
-        IU4_WS4_A_STORE(14, a_code14); IU4_WS4_A_STORE(15, a_code15);
-        IU4_WS4_A_STORE(16, a_code16); IU4_WS4_A_STORE(17, a_code17);
-        IU4_WS4_A_STORE(18, a_code18); IU4_WS4_A_STORE(19, a_code19);
-        IU4_WS4_A_STORE(20, a_code20); IU4_WS4_A_STORE(21, a_code21);
-        IU4_WS4_A_STORE(22, a_code22); IU4_WS4_A_STORE(23, a_code23);
-        IU4_WS4_A_STORE(24, a_code24); IU4_WS4_A_STORE(25, a_code25);
-        IU4_WS4_A_STORE(26, a_code26); IU4_WS4_A_STORE(27, a_code27);
-        IU4_WS4_A_STORE(28, a_code28); IU4_WS4_A_STORE(29, a_code29);
-        IU4_WS4_A_STORE(30, a_code30); IU4_WS4_A_STORE(31, a_code31);
-#undef IU4_WS4_A_STORE
-        {
-            const int r = 64 * b + 32 * e + lane;
-            half2* x_dm = (half2*)(Aplane + IU4_X_DM_OFF);
-#define IU4_WS4_HDR(ksc, hs_src) do { \
-                const unsigned int hs = (unsigned int)(hs_src); \
-                const float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu))); \
-                const float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16))); \
-                const half2 dm = make_half2((_Float16)sc, (_Float16)zp); \
-                x_dm[r * IU4_TILE_X_K + 4 * (ksc) + 0] = dm; \
-                x_dm[r * IU4_TILE_X_K + 4 * (ksc) + 1] = dm; \
-                x_dm[r * IU4_TILE_X_K + 4 * (ksc) + 2] = dm; \
-                x_dm[r * IU4_TILE_X_K + 4 * (ksc) + 3] = dm; \
-            } while (0)
-            IU4_WS4_HDR(0, a_header0);
-            IU4_WS4_HDR(1, a_header1);
-#undef IU4_WS4_HDR
-        }
-    }
-
-    if (do_Xq) {
-#define IU4_WS4_XQ_STORE(q, src) do { \
-        const int l = 64 * (q) + 32 * e + lane; \
-        Yplane[l] = (src); \
-    } while (0)
-        IU4_WS4_XQ_STORE(0, xq0);   IU4_WS4_XQ_STORE(1, xq1);
-        IU4_WS4_XQ_STORE(2, xq2);   IU4_WS4_XQ_STORE(3, xq3);
-        IU4_WS4_XQ_STORE(4, xq4);   IU4_WS4_XQ_STORE(5, xq5);
-        IU4_WS4_XQ_STORE(6, xq6);   IU4_WS4_XQ_STORE(7, xq7);
-        IU4_WS4_XQ_STORE(8, xq8);   IU4_WS4_XQ_STORE(9, xq9);
-        IU4_WS4_XQ_STORE(10, xq10); IU4_WS4_XQ_STORE(11, xq11);
-        IU4_WS4_XQ_STORE(12, xq12); IU4_WS4_XQ_STORE(13, xq13);
-        IU4_WS4_XQ_STORE(14, xq14); IU4_WS4_XQ_STORE(15, xq15);
-        IU4_WS4_XQ_STORE(16, xq16); IU4_WS4_XQ_STORE(17, xq17);
-        IU4_WS4_XQ_STORE(18, xq18); IU4_WS4_XQ_STORE(19, xq19);
-        IU4_WS4_XQ_STORE(20, xq20); IU4_WS4_XQ_STORE(21, xq21);
-        IU4_WS4_XQ_STORE(22, xq22); IU4_WS4_XQ_STORE(23, xq23);
-        IU4_WS4_XQ_STORE(24, xq24); IU4_WS4_XQ_STORE(25, xq25);
-        IU4_WS4_XQ_STORE(26, xq26); IU4_WS4_XQ_STORE(27, xq27);
-        IU4_WS4_XQ_STORE(28, xq28); IU4_WS4_XQ_STORE(29, xq29);
-        IU4_WS4_XQ_STORE(30, xq30); IU4_WS4_XQ_STORE(31, xq31);
-        IU4_WS4_XQ_STORE(32, xq32); IU4_WS4_XQ_STORE(33, xq33);
-        IU4_WS4_XQ_STORE(34, xq34); IU4_WS4_XQ_STORE(35, xq35);
-#undef IU4_WS4_XQ_STORE
-    }
+#undef IU4_WS4_PKT_FENCE
+#undef IU4_WS4_HDR_PKT
+#undef IU4_WS4_XQ_PKT
+#undef IU4_WS4_A_CODE_PKT
 }
 
 // Four independent int32x8 chains per jbase; shared A/B b64 fragments;
@@ -523,12 +522,16 @@ static __device__ __forceinline__ void vec_dot_i4_x128_ws4_w2_gfx1151(
 
 // dbg_mode: 0=prod, 1=noprod (waves 8..9 skip global loads/LDS stores; barriers
 // only), 2=nocomp (compute skips vec_dot/fold; barriers + epilogue store of sum).
-// Live-range across the producer branch (compute path): sum[64] is the only
-// accumulator kept live for the whole body through epilogue. The four C vectors
-// (c00..c11) and A/B fragments live only inside vec_dot_i4_x128; the u=0..7 loop
-// is #pragma nounroll — not fully unrolled, and the 8 steps' fragments are not
-// hoisted (each u reloads av0/av1/bv0/bv1). Template so dbg_mode=0 codegen matches
-// production entries bit-for-bit aside from the constexpr folds eliding nothing.
+// W2.P3: wave-uniform role split (threadIdx.y; block [32,10,1]). sum[64] and
+// C/fragment state live only on the compute branch — producers never see them.
+// Barrier pairing (same COUNT, same order on all ten waves):
+//   barrier | compute (wy < 8)                         | producer (wy >= 8)
+//   --------+------------------------------------------+---------------------------
+//   Binit   | wait (no work before first fill)         | prologue A0 both + Y0
+//   B0(g)   | h0 vec_dot(A_cur, Y0, h=0)               | A_nxt top64 if next + Y1
+//   B1(g)   | h1 vec_dot(A_cur, Y1, h=1)               | A_nxt bot64 + Y0 nxt if next
+// Template so dbg_mode=0 codegen matches production entries bit-for-bit aside
+// from the constexpr folds eliding nothing.
 template <int dbg_mode = 0>
 static __device__ __forceinline__ void gemm_iu4_body_ws4_w2_gfx1151(
     const char* __restrict__ A,
@@ -545,7 +548,6 @@ static __device__ __forceinline__ void gemm_iu4_body_ws4_w2_gfx1151(
     const int G = groups_per_row;
     const int wy = threadIdx.y;
     const int lane = threadIdx.x;
-    const bool is_compute = (wy < 8);
 
     // Dynamic LDS 61440 B: Y0, Y1, A0, A1 (§5.3).
     extern __shared__ int smem[];
@@ -554,15 +556,66 @@ static __device__ __forceinline__ void gemm_iu4_body_ws4_w2_gfx1151(
     int* A0 = Y1 + IU4_MMQ_X * IU4_TILE_Y_K;           // [18432, 39936)
     int* A1 = A0 + IU4_MMQ_Y * IU4_TILE_X_K;           // [39936, 61440)
 
-    // 64 FP32 running sums. Shipping uses sum[64] with compile-time indices in
-    // the epilogue loops; same pattern here. Four live C vectors live only
-    // inside vec_dot. No dynamically indexed scratch beyond this fixed array.
-    float sum[64];
-    #pragma unroll
-    for (int i = 0; i < 64; ++i) sum[i] = 0.0f;
+    // Wave-uniform role split: compute waves 0..7 vs producer waves 8..9.
+    // sum[64] is declared only inside the compute arm so it is not live on
+    // producer waves (parent metadata: producer path drove the 256 VGPR alloc).
+    if (wy < 8) {
+        // ── compute path ────────────────────────────────────────────────
+        float sum[64];
+        #pragma unroll
+        for (int i = 0; i < 64; ++i) sum[i] = 0.0f;
 
-    // Prologue: producers fill A0 group0 both row-halves + Y0=(0,0). Binit.
-    if (!is_compute) {
+        // Binit: producers filled A0 + Y0; compute waits.
+        __syncthreads(); // Binit
+
+        for (int g = 0; g < G; ++g) {
+            const int p = g & 1;
+            int* A_cur = (p == 0) ? A0 : A1;
+
+            // h0(g): read A[p]+Y0.
+            if constexpr (dbg_mode != 2) {
+                vec_dot_i4_x128_ws4_w2_gfx1151(A_cur, Y0, sum, 0);
+            }
+            __syncthreads(); // B0(g)
+
+            // h1(g): read A[p]+Y1.
+            if constexpr (dbg_mode != 2) {
+                vec_dot_i4_x128_ws4_w2_gfx1151(A_cur, Y1, sum, 1);
+            }
+            __syncthreads(); // B1(g)
+        }
+
+        // Epilogue: compute waves only; shipping set/add and ownership map.
+        // nocomp still stores sum (zeros) so the store path stays attributed.
+        {
+            const int w = wy;
+            const int i0 = 32 * (w / 2);
+            const int col_off = 16 * (w % 2);
+
+            #pragma unroll
+            for (int j0 = 0; j0 < IU4_MMQ_X; j0 += 32) {
+                #pragma unroll
+                for (int n = 0; n < 2; ++n) {
+                    #pragma unroll
+                    for (int l = 0; l < 8; ++l) {
+                        const int j = j0 + col_off + (lane % 16);
+                        const int i = i0 + n * 16 + 2 * l + (lane / 16);
+                        float* yp = Y + (long long)(col0 + j) * M + (row0 + i);
+                        const float v = sum[(j0 / 16 + n) * 8 + l];
+                        if (add) {
+                            *yp += v;
+                        } else {
+                            *yp = v;
+                        }
+                    }
+                }
+            }
+        }
+    } else {
+        // ── producer path ───────────────────────────────────────────────
+        // No sum / C / fragment state. Same barrier COUNT and order as compute.
+
+        // Prologue: fill A0 group0 both row-halves + Y0=(0,0).
         if constexpr (dbg_mode != 1) {
             const int* xq00 = (const int*)(Xq + (long long)0 * N + col0);
             load_iu4_stage_ws4_w2_gfx1151(
@@ -570,35 +623,22 @@ static __device__ __forceinline__ void gemm_iu4_body_ws4_w2_gfx1151(
             load_iu4_stage_ws4_w2_gfx1151(
                 A, xq00, A0, Y0, row0, 0, 1, groups_per_row, true, false);
         }
-    }
-    __syncthreads(); // Binit
+        __syncthreads(); // Binit
 
-    for (int g = 0; g < G; ++g) {
-        const int p = g & 1;
-        const bool next = (g + 1 < G);
-        int* A_cur = (p == 0) ? A0 : A1;
-        int* A_nxt = (p == 0) ? A1 : A0;
+        for (int g = 0; g < G; ++g) {
+            const int p = g & 1;
+            const bool next = (g + 1 < G);
+            int* A_nxt = (p == 0) ? A1 : A0;
 
-        // h0(g): compute reads A[p]+Y0; producers write A_nxt top64 (if next) + Y1=(g,1).
-        if (is_compute) {
-            if constexpr (dbg_mode != 2) {
-                vec_dot_i4_x128_ws4_w2_gfx1151(A_cur, Y0, sum, 0);
-            }
-        } else {
+            // h0(g): write A_nxt top64 (if next) + Y1=(g,1).
             if constexpr (dbg_mode != 1) {
                 const int* xq_g1 = (const int*)(Xq + (long long)(2 * g + 1) * N + col0);
                 load_iu4_stage_ws4_w2_gfx1151(
                     A, xq_g1, A_nxt, Y1, row0, g + 1, 0, groups_per_row, next, true);
             }
-        }
-        __syncthreads(); // B0(g)
+            __syncthreads(); // B0(g)
 
-        // h1(g): compute reads A[p]+Y1; producers write A_nxt bot64 + Y0=(g+1,0) if next.
-        if (is_compute) {
-            if constexpr (dbg_mode != 2) {
-                vec_dot_i4_x128_ws4_w2_gfx1151(A_cur, Y1, sum, 1);
-            }
-        } else {
+            // h1(g): write A_nxt bot64 + Y0=(g+1,0) if next.
             if constexpr (dbg_mode != 1) {
                 if (next) {
                     const int* xq_n0 = (const int*)(Xq + (long long)(2 * (g + 1)) * N + col0);
@@ -606,34 +646,7 @@ static __device__ __forceinline__ void gemm_iu4_body_ws4_w2_gfx1151(
                         A, xq_n0, A_nxt, Y0, row0, g + 1, 1, groups_per_row, true, true);
                 }
             }
-        }
-        __syncthreads(); // B1(g)
-    }
-
-    // Epilogue: compute waves only; shipping set/add and ownership map.
-    // nocomp still stores sum (zeros) so the store path stays attributed.
-    if (is_compute) {
-        const int w = wy;
-        const int i0 = 32 * (w / 2);
-        const int col_off = 16 * (w % 2);
-
-        #pragma unroll
-        for (int j0 = 0; j0 < IU4_MMQ_X; j0 += 32) {
-            #pragma unroll
-            for (int n = 0; n < 2; ++n) {
-                #pragma unroll
-                for (int l = 0; l < 8; ++l) {
-                    const int j = j0 + col_off + (lane % 16);
-                    const int i = i0 + n * 16 + 2 * l + (lane / 16);
-                    float* yp = Y + (long long)(col0 + j) * M + (row0 + i);
-                    const float v = sum[(j0 / 16 + n) * 8 + l];
-                    if (add) {
-                        *yp += v;
-                    } else {
-                        *yp = v;
-                    }
-                }
-            }
+            __syncthreads(); // B1(g)
         }
     }
 }
