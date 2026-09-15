@@ -136,6 +136,16 @@ Compare each against production at gate/up `(M,K,N)=(17408,5120,512)` and down `
 
 ## 7. A5 — column-adjacent full-tile grid
 
+> **STATUS 2026-09-15 — A5 REJECTED in-model.** Isolated oracle: bitwise-equal,
+> gate/up −7.3%, down −4.3% (100 interleaved samples, hot L2 from repeated
+> identical launches). In-model (profile_prefill pp512, 400 calls): IU4
+> per-call 1688 → 2272 µs, bench pp512 600 → 462. Column-adjacent order walks
+> every weight tile of a column strip before advancing; with 400 back-to-back
+> launches the weight stream (5× the X bytes) loses locality and the isolated
+> win inverts. Entries, selector and oracle removed. The 2×2 macrotile
+> alternative is not attempted: same mechanism.
+
+
 **Owners A+H under disjoint ownership; 1 h swap, at most 1 additional h for one 2×2 swizzle.**
 
 Current full-tile selection and launch are `Gpu::gemm_mq4g256v2_mmq_prequant_iu4`, `[ceil(M/128),ceil(N/128)]`, block `[32,8]` (`crates/rdna-compute/src/gemm.rs:19039-19123`). Kernel origin is x=row,y=column (`kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip:225-226`).

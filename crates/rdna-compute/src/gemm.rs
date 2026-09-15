@@ -19063,23 +19063,10 @@ impl Gpu {
         }
         self.bind_thread()?;
         let full = m % 128 == 0 && batch_size % 128 == 0;
-        // A5: exact gfx1151 + eager + full tiles only → column-adjacent
-        // entries with grid [N/128, M/128, 1]. Non-full, capture/replay, and
-        // non-gfx1151 keep baseline symbols and [M/128, N/128, 1].
-        let use_col = full
-            && self.arch.as_str() == "gfx1151"
-            && !self.replay.is_recording()
-            && !self.graphs.capture_mode;
-        let kernel_name = match (full, add, use_col) {
-            (true, true, true) => {
-                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151"
-            }
-            (true, false, true) => {
-                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151"
-            }
-            (true, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
-            (true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
-            (false, _, _) => "gemm_mq4g256v2_residual_mmq_iu4",
+        let kernel_name = match (full, add) {
+            (true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
+            (true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+            (false, _) => "gemm_mq4g256v2_residual_mmq_iu4",
         };
         const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
         self.ensure_kernel(
@@ -19116,15 +19103,9 @@ impl Gpu {
             ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
         let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let grid = if use_col {
-            // col_tile=blockIdx.x, row_tile=blockIdx.y
-            [batch_tiles as u32, row_tiles as u32, 1]
-        } else {
-            [row_tiles as u32, batch_tiles as u32, 1]
-        };
         let result = self.launch_maybe_blob(
             kernel_name,
-            grid,
+            [row_tiles as u32, batch_tiles as u32, 1],
             [32, 8, 1],
             shared_mem,
             &mut params,

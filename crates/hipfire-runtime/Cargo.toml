@@ -454,9 +454,6 @@ required-features = ["lab"]
 name = "prefill_microbench"
 required-features = ["lab"]
 
-[[example]]
-name = "tmp_halo_iu4_oracle"
-required-features = ["lab"]
 
 
 [[example]]
