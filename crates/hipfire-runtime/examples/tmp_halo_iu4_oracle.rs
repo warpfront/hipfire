@@ -1,20 +1,21 @@
-//! W2.1 bit oracle: shipping IU4 full_{set,add}_occ3 vs W2 gfx1151 entries.
+//! W2.P1 bit oracle: shipping IU4 full_{set,add}_occ3 vs WS4 W2 gfx1151 entries.
 //!
 //! Loads real qt=44 gate_proj (set) and down_proj (add, nonzero Y0) from an
 //! MQ4-XT HFQ, quantizes X via `ensure_int4_mmq_x`, and raw-launches
-//! `*_full_{set,add}_occ3` (block [32,8,1]) against `*_w2_gfx1151`
-//! (block [32,4,1]) on identical grid/LDS. Asserts bitwise-equal Y and
-//! immutable A/Xq. Phase-edge synthetic fixtures cover G=1/2/3.
+//! `*_full_{set,add}_occ3` (block [32,8,1], LDS 30720) against
+//! `*_full_{set,add}_ws4_w2_gfx1151` (block [32,10,1], LDS 61440) on identical
+//! grid. Asserts bitwise-equal Y and immutable A/Xq. Phase-edge synthetic
+//! fixtures cover G=1/2/3. TIME reports medians, TOPS, and % of 107.8 peak.
 //!
 //! Compile-only (metadata gate; no alloc/launch):
 //!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
-//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-w2 HIPFIRE_GFX11_MQ4V2_IU4=1 \
+//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-w2b HIPFIRE_GFX11_MQ4V2_IU4=1 \
 //!     cargo run --release -p hipfire-runtime --features lab \
 //!       --example tmp_halo_iu4_oracle -- --compile-only
 //!
 //! Correctness / TIME:
 //!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
-//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-w2 HIPFIRE_GFX11_MQ4V2_IU4=1 \
+//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-w2b HIPFIRE_GFX11_MQ4V2_IU4=1 \
 //!     cargo run --release -p hipfire-runtime --features lab \
 //!       --example tmp_halo_iu4_oracle -- \
 //!       /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
@@ -40,12 +41,13 @@ const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
 
 const BASE_SET: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3";
 const BASE_ADD: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3";
-const W2_SET: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_set_w2_gfx1151";
-const W2_ADD: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_add_w2_gfx1151";
+const W2_SET: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_set_ws4_w2_gfx1151";
+const W2_ADD: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_add_ws4_w2_gfx1151";
 
-const SHARED: u32 = (128 * 18 + 128 * 42) * 4; // 30720
+const SHARED_BASE: u32 = (128 * 18 + 128 * 42) * 4; // 30720
+const SHARED_W2: u32 = 2 * SHARED_BASE; // 61440 — two A planes + two Xq halves
 const BLOCK_BASE: [u32; 3] = [32, 8, 1];
-const BLOCK_W2: [u32; 3] = [32, 4, 1];
+const BLOCK_W2: [u32; 3] = [32, 10, 1];
 const N_DEFAULT: usize = 512;
 const QT_MQ4V2: u8 = 44;
 const GATE_NAME: &str = "model.language_model.layers.0.mlp.gate_proj.weight";
@@ -256,6 +258,7 @@ fn launch_once(
     func: &str,
     grid: [u32; 3],
     block: [u32; 3],
+    shared: u32,
     a: *const std::ffi::c_void,
     xq: *const std::ffi::c_void,
     y: *const std::ffi::c_void,
@@ -265,7 +268,7 @@ fn launch_once(
     add: i32,
 ) {
     let mut blob = mk_blob(a, xq, y, m, k, n, add);
-    gpu.launch_kernel_blob(func, grid, block, SHARED, &mut blob)
+    gpu.launch_kernel_blob(func, grid, block, shared, &mut blob)
         .unwrap_or_else(|e| panic!("launch {func}: {e}"));
 }
 
@@ -274,6 +277,7 @@ fn time_us(
     func: &str,
     grid: [u32; 3],
     block: [u32; 3],
+    shared: u32,
     a: *const std::ffi::c_void,
     xq: *const std::ffi::c_void,
     y: *const std::ffi::c_void,
@@ -287,12 +291,20 @@ fn time_us(
     let stop = gpu.hip.event_create().expect("event stop");
     let stream = gpu.active_stream.as_ref();
     gpu.hip.event_record(&start, stream).expect("record start");
-    gpu.launch_kernel_blob(func, grid, block, SHARED, &mut blob)
+    gpu.launch_kernel_blob(func, grid, block, shared, &mut blob)
         .unwrap_or_else(|e| panic!("timed launch {func}: {e}"));
     gpu.hip.event_record(&stop, stream).expect("record stop");
     gpu.hip.event_synchronize(&stop).expect("sync stop");
     let ms = gpu.hip.event_elapsed_ms(&start, &stop).expect("elapsed");
     ms as f64 * 1e3
+}
+
+/// Dense integer ops → TOPS from event µs: 2·M·K·N / (us · 1e6).
+fn tops_from_us(m: usize, k: usize, n: usize, us: f64) -> f64 {
+    if !(us > 0.0) {
+        return f64::NAN;
+    }
+    (2.0 * m as f64 * k as f64 * n as f64) / (us * 1.0e6)
 }
 
 fn median_f64(xs: &mut [f64]) -> f64 {
@@ -468,6 +480,7 @@ fn run_pair(
         base_sym,
         grid,
         BLOCK_BASE,
+        SHARED_BASE,
         a_ptr,
         xq_ptr,
         d_y_base.buf.as_ptr() as *const _,
@@ -481,6 +494,7 @@ fn run_pair(
         w2_sym,
         grid,
         BLOCK_W2,
+        SHARED_W2,
         a_ptr,
         xq_ptr,
         d_y_w2.buf.as_ptr() as *const _,
@@ -544,6 +558,7 @@ fn run_pair(
                 base_sym,
                 grid,
                 BLOCK_BASE,
+                SHARED_BASE,
                 a_ptr,
                 xq_ptr,
                 d_y_base.buf.as_ptr() as *const _,
@@ -557,6 +572,7 @@ fn run_pair(
                 w2_sym,
                 grid,
                 BLOCK_W2,
+                SHARED_W2,
                 a_ptr,
                 xq_ptr,
                 d_y_w2.buf.as_ptr() as *const _,
@@ -585,6 +601,7 @@ fn run_pair(
                     base_sym,
                     grid,
                     BLOCK_BASE,
+                    SHARED_BASE,
                     a_ptr,
                     xq_ptr,
                     d_y_base.buf.as_ptr() as *const _,
@@ -598,6 +615,7 @@ fn run_pair(
                     w2_sym,
                     grid,
                     BLOCK_W2,
+                    SHARED_W2,
                     a_ptr,
                     xq_ptr,
                     d_y_w2.buf.as_ptr() as *const _,
@@ -612,6 +630,7 @@ fn run_pair(
                     w2_sym,
                     grid,
                     BLOCK_W2,
+                    SHARED_W2,
                     a_ptr,
                     xq_ptr,
                     d_y_w2.buf.as_ptr() as *const _,
@@ -625,6 +644,7 @@ fn run_pair(
                     base_sym,
                     grid,
                     BLOCK_BASE,
+                    SHARED_BASE,
                     a_ptr,
                     xq_ptr,
                     d_y_base.buf.as_ptr() as *const _,
@@ -642,10 +662,20 @@ fn run_pair(
         let bmax = base_us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         let wmin = w2_us.iter().cloned().fold(f64::INFINITY, f64::min);
         let wmax = w2_us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        const PEAK_TOPS: f64 = 107.8;
+        let btops = tops_from_us(m, k, n, bmed);
+        let wtops = tops_from_us(m, k, n, wmed);
+        let bpct = 100.0 * btops / PEAK_TOPS;
+        let wpct = 100.0 * wtops / PEAK_TOPS;
         eprintln!(
             "  TIME {label}: base_med={bmed:.3} us (min={bmin:.3} max={bmax:.3})  \
              w2_med={wmed:.3} us (min={wmin:.3} max={wmax:.3})  delta={delta:+.2}%  \
              (n={SAMPLES} interleaved)"
+        );
+        eprintln!(
+            "  TOPS {label}: base={btops:.2} ({bpct:.1}% of {PEAK_TOPS})  \
+             ws4={wtops:.2} ({wpct:.1}% of {PEAK_TOPS})  ops=2*M*K*N={ops}",
+            ops = 2usize.saturating_mul(m).saturating_mul(k).saturating_mul(n)
         );
     }
 
@@ -684,7 +714,7 @@ fn main() {
     );
     if gpu.arch != "gfx1151" {
         eprintln!(
-            "WARN: W2 symbols are #if __gfx1151__; arch={} may fail JIT of _w2 entries",
+            "WARN: WS4 symbols are #if __gfx1151__; arch={} may fail JIT of _ws4_w2 entries",
             gpu.arch
         );
     }
@@ -782,7 +812,7 @@ fn main() {
 
     if ok {
         eprintln!(
-            "W2 PASS: shipping occ3 vs w2_gfx1151 bitwise-equal (gate set + down add + edges)"
+            "W2 PASS: shipping occ3 vs ws4_w2_gfx1151 bitwise-equal (gate set + down add + edges)"
         );
     } else {
         eprintln!("W2 FAIL");
