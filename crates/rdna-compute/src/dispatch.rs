@@ -1367,6 +1367,7 @@ impl Gpu {
                 q8_1_mmq_x_scratch_bytes: 0,
                 int4_mmq_x_scratch: None,
                 int4_mmq_x_scratch_bytes: 0,
+                int4_mmq_generation: 0,
                 mq4v2_fp8_x_scratch: None,
                 mq4v2_fp8_x_scratch_bytes: 0,
                 mq4v2_fp8_half_sums_scratch: None,
@@ -2854,7 +2855,6 @@ impl Gpu {
             k,
         )
     }
-
     /// Ensure prefill activations are quantized to int4 (`block_i4_128`) for
     /// the iu4-direct MMQ consumer (`HIPFIRE_GFX11_MQ4V2_IU4` path).
     /// See `scratch.rs::ensure_int4_mmq_x`.
@@ -2882,6 +2882,40 @@ impl Gpu {
             batch_size,
             k,
         )
+    }
+
+    /// Reserve `int4_mmq_x_scratch` for a producer-emitted IU4 sidecar (C2).
+    /// Does not launch the standalone quantizer.
+    pub fn reserve_int4_mmq(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int4MmqReservation> {
+        self.scratch.reserve_int4_mmq(&self.hip, k, n)
+    }
+
+    /// True when the C2 producer-sidecar route is live for this call:
+    /// IU4 + gfx1151 + kill switch not off + eager (no replay/capture) +
+    /// batch and K constraints of the iu4 MMQ consumer.
+    pub fn iu4_producer_sidecar_active(&self, batch: usize, k: usize) -> bool {
+        self.flags.iu4_producer_sidecar_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && batch >= 128
+            && batch % 128 == 0
+            && k > 0
+            && k % 256 == 0
+    }
+
+    /// Validate a prepared IU4 handle against the live scratch generation.
+    pub fn int4_mmq_prepared_ptr(
+        &self,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        k: usize,
+        n: usize,
+    ) -> HipResult<*mut c_void> {
+        let (gen, ptr) = self.scratch.int4_mmq_live();
+        prepared.checked_ptr(gen, ptr, k, n)
     }
 
     /// Returns the number of launches recorded by the `ReplayController`.

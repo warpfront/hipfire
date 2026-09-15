@@ -19,16 +19,29 @@
 //
 // awq_scale: 1D FP32 buffer length K (host-side F16 → F32 conversion
 // happens in the loader; see hfq.rs::load_awq_scale).
+//
+// HIPFIRE_IU4_SIDECAR: C2 producer path — same as the plain silu twin.
+
+#ifndef HIPFIRE_SILU_MQ_ROTATE_KERNEL
+#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq
+#endif
 
 extern "C" __launch_bounds__(32, 16)
-__global__ void fused_silu_mul_mq_rotate_awq(
+__global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     const float* __restrict__ gate,
     const float* __restrict__ up,
     const float* __restrict__ awq_scale,   // [K], FP32
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
+#ifdef HIPFIRE_IU4_SIDECAR
+    float* __restrict__ x_rot,          // nullable when emit_f32=false
+    block_i4_128* __restrict__ x_i4,    // [K/128, N]
+    int K,
+    int N
+#else
     float* __restrict__ x_rot,
     int K
+#endif
 ) {
     const int group = blockIdx.x;
     const int tid = threadIdx.x;
@@ -41,7 +54,11 @@ __global__ void fused_silu_mul_mq_rotate_awq(
     const long long batch_off = (long long)blockIdx.y * K;
     const float* gate_b  = gate  + batch_off;
     const float* up_b    = up    + batch_off;
+#ifdef HIPFIRE_IU4_SIDECAR
+          float* x_rot_b = (x_rot != nullptr) ? (x_rot + batch_off) : nullptr;
+#else
           float* x_rot_b = x_rot + batch_off;
+#endif
 
     int d0 = tid * 8;
     int base = group * 256 + d0;
@@ -106,12 +123,36 @@ __global__ void fused_silu_mul_mq_rotate_awq(
     #undef HBFLY
 
     const float s = 0.0625f;
-    x_rot_b[base    ] = v0 * s * signs2[d0    ];
-    x_rot_b[base + 1] = v1 * s * signs2[d0 + 1];
-    x_rot_b[base + 2] = v2 * s * signs2[d0 + 2];
-    x_rot_b[base + 3] = v3 * s * signs2[d0 + 3];
-    x_rot_b[base + 4] = v4 * s * signs2[d0 + 4];
-    x_rot_b[base + 5] = v5 * s * signs2[d0 + 5];
-    x_rot_b[base + 6] = v6 * s * signs2[d0 + 6];
-    x_rot_b[base + 7] = v7 * s * signs2[d0 + 7];
+    float f0 = v0 * s * signs2[d0    ];
+    float f1 = v1 * s * signs2[d0 + 1];
+    float f2 = v2 * s * signs2[d0 + 2];
+    float f3 = v3 * s * signs2[d0 + 3];
+    float f4 = v4 * s * signs2[d0 + 4];
+    float f5 = v5 * s * signs2[d0 + 5];
+    float f6 = v6 * s * signs2[d0 + 6];
+    float f7 = v7 * s * signs2[d0 + 7];
+#ifdef HIPFIRE_IU4_SIDECAR
+    if (x_rot_b != nullptr) {
+        x_rot_b[base    ] = f0;
+        x_rot_b[base + 1] = f1;
+        x_rot_b[base + 2] = f2;
+        x_rot_b[base + 3] = f3;
+        x_rot_b[base + 4] = f4;
+        x_rot_b[base + 5] = f5;
+        x_rot_b[base + 6] = f6;
+        x_rot_b[base + 7] = f7;
+    }
+    emit_iu4_sidecar_from_producer8(
+        f0, f1, f2, f3, f4, f5, f6, f7,
+        x_i4, group, (int)blockIdx.y, N, tid);
+#else
+    x_rot_b[base    ] = f0;
+    x_rot_b[base + 1] = f1;
+    x_rot_b[base + 2] = f2;
+    x_rot_b[base + 3] = f3;
+    x_rot_b[base + 4] = f4;
+    x_rot_b[base + 5] = f5;
+    x_rot_b[base + 6] = f6;
+    x_rot_b[base + 7] = f7;
+#endif
 }

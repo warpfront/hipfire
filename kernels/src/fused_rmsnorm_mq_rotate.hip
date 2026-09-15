@@ -28,7 +28,13 @@
 // Same phases, prefetch, and reduction tree as the uniform symbol; the scale
 // rides the same float4 prefetch as x/weight. Uniform builds are textually
 // unchanged.
-#ifdef HIPFIRE_RMSNORM_AWQ
+#ifdef HIPFIRE_RMSNORM_KERNEL
+/* caller (host JIT concat) already named the symbol */
+#elif defined(HIPFIRE_RMSNORM_AWQ) && defined(HIPFIRE_IU4_SIDECAR)
+#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4
+#elif defined(HIPFIRE_IU4_SIDECAR)
+#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4
+#elif defined(HIPFIRE_RMSNORM_AWQ)
 #define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq
 #else
 #define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate
@@ -43,9 +49,17 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
 #endif
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
+#ifdef HIPFIRE_IU4_SIDECAR
+    float* __restrict__ x_rot,          // nullable when emit_f32=false
+    block_i4_128* __restrict__ x_i4,    // [K/128, N] block_i4_128
+    int K,
+    float eps,
+    int N
+#else
     float* __restrict__ x_rot,
     int K,
     float eps
+#endif
 ) {
     extern __shared__ float smem[];
     float* reduce = smem;              // [256]
@@ -58,7 +72,11 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
 
     const long long batch_off = (long long)blockIdx.x * K;
     const float* x_b     = x     + batch_off;
+#ifdef HIPFIRE_IU4_SIDECAR
+          float* x_rot_b = (x_rot != nullptr) ? (x_rot + batch_off) : nullptr;
+#else
           float* x_rot_b = x_rot + batch_off;
+#endif
 
     // Phase 1a: accumulate sum-of-squares (same stride/order as baseline).
     float local_sum = 0.0f;
@@ -205,17 +223,39 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         #undef HBFLY
 
         const float s = 0.0625f;
+        float f0 = v0 * s * s20.x;
+        float f1 = v1 * s * s20.y;
+        float f2 = v2 * s * s20.z;
+        float f3 = v3 * s * s20.w;
+        float f4 = v4 * s * s21.x;
+        float f5 = v5 * s * s21.y;
+        float f6 = v6 * s * s21.z;
+        float f7 = v7 * s * s21.w;
+#ifdef HIPFIRE_IU4_SIDECAR
+        if (x_rot != nullptr) {
+            float4 out0, out1;
+            out0.x = f0; out0.y = f1; out0.z = f2; out0.w = f3;
+            out1.x = f4; out1.y = f5; out1.z = f6; out1.w = f7;
+            *reinterpret_cast<float4*>(x_rot_b + base) = out0;
+            *reinterpret_cast<float4*>(x_rot_b + base + 4) = out1;
+        }
+        // token = blockIdx.x; N is the batch extent for [K/128, N] layout.
+        emit_iu4_sidecar_from_producer8(
+            f0, f1, f2, f3, f4, f5, f6, f7,
+            x_i4, group, (int)blockIdx.x, N, lane_id);
+#else
         float4 out0;
         float4 out1;
-        out0.x = v0 * s * s20.x;
-        out0.y = v1 * s * s20.y;
-        out0.z = v2 * s * s20.z;
-        out0.w = v3 * s * s20.w;
-        out1.x = v4 * s * s21.x;
-        out1.y = v5 * s * s21.y;
-        out1.z = v6 * s * s21.z;
-        out1.w = v7 * s * s21.w;
+        out0.x = f0;
+        out0.y = f1;
+        out0.z = f2;
+        out0.w = f3;
+        out1.x = f4;
+        out1.y = f5;
+        out1.z = f6;
+        out1.w = f7;
         *reinterpret_cast<float4*>(x_rot_b + base) = out0;
         *reinterpret_cast<float4*>(x_rot_b + base + 4) = out1;
+#endif
     }
 }

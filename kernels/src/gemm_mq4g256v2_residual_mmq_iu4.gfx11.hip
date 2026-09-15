@@ -52,95 +52,9 @@
 #define IU4_X_QS_WORDS 32
 #define IU4_X_DM_OFF 32
 
-// int4 activation block: one 128-K group for one token (column).
-// qs: 64 B, even K low nibble / odd K high nibble, two's complement.
-// d: per-128 scale (MSE-clip grid argmin). s: exact int sum of the 128 x_q.
-struct block_i4_128 {
-    float d;
-    int s;
-    unsigned char qs[64];
-};
-static_assert(sizeof(block_i4_128) == 72, "bad block size");
-
-// int4 activation quantize for the iu4 MMQ path: same (X, Y, K, N) grid
-// contract as quantize_q8_1_mmq_ds4_x128 (block (256,1,1), each thread 4
-// floats, grid [(K+1023)/1024, N]), but emits block_i4_128 (72 B: f32 d,
-// i32 s, 64 B nibbles) with the W4A4 recipe — per-128 amax, 8-candidate
-// MSE-clip grid d_j=(amax/7)*0.5*(1+j/7), rintf, clamp[-8,7], strict-<
-// argmin; zero group -> d=1, q=0, s=0. One wave32 covers exactly one
-// 128-K group (lane l owns elements 4l..4l+3), so amax/MSE/sum reduce with
-// width-32 shuffles (offsets 16..1), wave64-safe like the Q8_1 preludes.
-// MSE accumulates in f32 with explicit single-rounding FMA (__fmaf_rn;
-// f64 runs at 1/16 rate on RDNA3) to match the lane-mirrored CPU-pack
-// oracle bit-exactly; s is an exact integer reduction. Arch-portable
-// (no WMMA): shared by every arch whose launcher admits the iu4 consumer.
-extern "C" __global__ void quantize_int4_mmq_ds128(
-    const float* __restrict__ X,
-    block_i4_128* __restrict__ Y,
-    int K,
-    int N
-) {
-    const int token = blockIdx.y;
-    const int t = blockIdx.x * blockDim.x + threadIdx.x;
-    const int i0 = t * 4;
-    if (token >= N || i0 >= K) return;
-    const int lane = threadIdx.x & 31;
-
-    const float4 xi = (i0 + 3 < K)
-        ? *(const float4*)(X + (long long)token * K + i0)
-        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
-    const float xv[4] = {xi.x, xi.y, xi.z, xi.w};
-
-    float amax = fmaxf(fmaxf(fabsf(xi.x), fabsf(xi.y)), fmaxf(fabsf(xi.z), fabsf(xi.w)));
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
-    }
-
-    float best_d = 1.0f;
-    if (amax != 0.0f) {
-        float best_mse = 1.0e30f;
-        for (int j = 0; j < 8; ++j) {
-            const float dj = (amax / 7.0f) * 0.5f * (1.0f + (float)j / 7.0f);
-            float mse = 0.0f;
-            #pragma unroll
-            for (int e = 0; e < 4; ++e) {
-                float q = rintf(xv[e] / dj);
-                q = fminf(fmaxf(q, -8.0f), 7.0f);
-                const float err = __fmaf_rn(-q, dj, xv[e]);
-                mse = __fmaf_rn(err, err, mse);
-            }
-            for (int offset = 16; offset > 0; offset >>= 1) {
-                mse += __shfl_xor(mse, offset, 32);
-            }
-            if (mse < best_mse) {
-                best_mse = mse;
-                best_d = dj;
-            }
-        }
-    }
-
-    int q4[4];
-    #pragma unroll
-    for (int e = 0; e < 4; ++e) {
-        float q = (amax == 0.0f) ? 0.0f : rintf(xv[e] / best_d);
-        q = fminf(fmaxf(q, -8.0f), 7.0f);
-        q4[e] = (int)q;
-    }
-    int s = q4[0] + q4[1] + q4[2] + q4[3];
-    for (int offset = 16; offset > 0; offset >>= 1) {
-        s += __shfl_xor(s, offset, 32);
-    }
-
-    const int kblock = i0 / 128;
-    block_i4_128* out = Y + (long long)kblock * N + token;
-    unsigned char* qb = out->qs;
-    qb[lane * 2 + 0] = (unsigned char)((q4[0] & 15) | ((q4[1] & 15) << 4));
-    qb[lane * 2 + 1] = (unsigned char)((q4[2] & 15) | ((q4[3] & 15) << 4));
-    if ((i0 & 127) == 0) {
-        out->d = best_d;
-        out->s = s;
-    }
-}
+// block_i4_128 + quantize_int4_mmq_ds128 live in block_i4_128_quant.hip and
+// are prepended by the host JIT (GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC). Do not
+// reintroduce a second MSE recipe copy here.
 
 #if !HIPFIRE_RDNA3
 

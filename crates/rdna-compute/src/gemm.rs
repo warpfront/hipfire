@@ -28661,6 +28661,52 @@ impl Gpu {
         result
     }
 
+
+    /// C2 prepared IU4 consumer for qkvza: never launches `quantize_int4_mmq_ds128`.
+    /// `x` is still required for beta/alpha small-tail f32 paths (emit_f32=true).
+    pub fn gemm_qkvza_mq4g256v2_wmma_iu4_prepared(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        x: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_z, xq, y_z, z_m, k, batch_size)?;
+        if beta_m < 128 {
+            self.gemm_mq4g256v2_small_tail_set_iu4(
+                a_beta, x, xq, y_beta, beta_m, k, batch_size,
+            )?;
+        } else {
+            self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+                a_beta, xq, y_beta, beta_m, k, batch_size,
+            )?;
+        }
+        if alpha_m < 128 {
+            self.gemm_mq4g256v2_small_tail_set_iu4(
+                a_alpha, x, xq, y_alpha, alpha_m, k, batch_size,
+            )?;
+        } else {
+            self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+                a_alpha, xq, y_alpha, alpha_m, k, batch_size,
+            )?;
+        }
+        Ok(())
+    }
+
     /// MQ4V2 gfx1100 qkvza batch-tile (BT4 / BT12).
     ///
     /// Direct harness entry and production selector target: reuses one
@@ -29160,6 +29206,29 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// C2 prepared IU4 consumer for qkv: never launches `quantize_int4_mmq_ds128`.
+    pub fn gemm_qkv_mq4g256v2_wmma_iu4_prepared(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_q, xq, y_q, q_m, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_k, xq, y_k, k_m, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_v, xq, y_v, v_m, k, batch_size)?;
+        Ok(())
     }
 
     /// MQ4V2 gfx1100 qkv batch-tile (BT4 / BT12).
@@ -30297,6 +30366,27 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// C2 prepared IU4 consumer for gate_up: never launches `quantize_int4_mmq_ds128`.
+    pub fn gemm_gate_up_mq4g256v2_wmma_iu4_prepared(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+            a_gate, xq, y_gate, gate_m, k, batch_size,
+        )?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
+        Ok(())
     }
 
     /// MQ4V2 gfx1100 gate_up batch-tile (BT6 / BT12).
@@ -31821,6 +31911,22 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+
+    /// C2 prepared IU4 residual consumer: never launches `quantize_int4_mmq_ds128`.
+    /// ADD semantics (`Y += W@X`); matches `gemm_mq4g256v2_residual_wmma` IU4 branch.
+    pub fn gemm_mq4g256v2_residual_wmma_iu4_prepared(
+        &mut self,
+        a_raw: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)
     }
 
     /// MQ4V2 gfx1100 residual batch-tile (BT4/6/8).
