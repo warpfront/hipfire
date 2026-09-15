@@ -27,6 +27,17 @@
 //!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-f3a \
 //!     cargo run --release -p hipfire-runtime --features lab --example tmp_fa2_attrib
 //!
+//! Arm `ship` (argv[1]=="ship"): launch SHIPPING kernels via runtime
+//! direct launchers vs frozen prod twins (Q8: fa2_attrib_prod; fwht3:
+//! fa2_attrib_prod_fwht3 frozen from HEAD pre-qshare2). Prints bitwise_eq
+//! out (and post-Q for fwht3) + interleaved medians ship vs prod per L.
+//!
+//! Halo ship:
+//!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
+//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-f4a \
+//!     cargo run --release -p hipfire-runtime --features lab \
+//!       --example tmp_fa2_attrib -- ship
+//!
 //! Metadata symbols:
 //!   fa2_attrib_prod
 //!   fa2_attrib_nofill
@@ -37,9 +48,10 @@
 //!   fa2_attrib_qshare2
 //!   fa2_attrib_qf16
 //!   fa2_attrib_qshare2_f16
+//!   fa2_attrib_prod_fwht3   (frozen pre-change fwht3 entry)
 
 use hip_bridge::KernargBlob;
-use rdna_compute::{DType, Gpu};
+use rdna_compute::{gen_fwht_signs, DType, Gpu};
 use std::time::Instant;
 
 const N_HEADS: usize = 24;
@@ -56,6 +68,19 @@ const LDS_BYTES: u32 = 32768;
 const ATTR_ITERS: usize = 100;
 const ATTR_WARMUP: usize = 5;
 const SCALE: f32 = 1.0 / 16.0;
+const FWHT3_HEAD: usize = 100;
+const FWHT3_POS: usize = N_KV * FWHT3_HEAD; // 400
+const PROD_Q8_SYM: &str = "fa2_attrib_prod";
+const PROD_FWHT3_SYM: &str = "fa2_attrib_prod_fwht3";
+const PROD_FWHT3_MOD: &str = "halo_fa2_f4a_prod_fwht3";
+
+/// Frozen pre-qshare2 fwht3 entry (HEAD kernel, renamed symbol) + turbo_common.
+const PROD_FWHT3_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 3\n",
+    "#define HIPFIRE_FA2_KT 32\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("tmp_fa2_attrib_prod_fwht3.hip"),
+);
 
 const SYMS: [&str; 9] = [
     "fa2_attrib_prod",
@@ -1062,11 +1087,467 @@ fn run_attribution(gpu: &mut Gpu) {
     }
 }
 
+
+fn fill_fwht3_k(seq_len: usize, salt: u32) -> Vec<u8> {
+    let mut buf = vec![0u8; seq_len * FWHT3_POS];
+    for g in 0..seq_len {
+        for kv in 0..N_KV {
+            let base = g * FWHT3_POS + kv * FWHT3_HEAD;
+            let cnorm = 0.05 + (prng_u32((g * 4 + kv) as u64, salt) % 200) as f32 * 0.001;
+            buf[base..base + 4].copy_from_slice(&cnorm.to_le_bytes());
+            for g3 in 0..32 {
+                let mut packed = 0u32;
+                for i in 0..8 {
+                    let code =
+                        (prng_u32((g * 256 + kv * 64 + g3 * 8 + i) as u64, salt) % 8) as u32;
+                    packed |= code << (3 * i);
+                }
+                let bytes = packed.to_le_bytes();
+                buf[base + 4 + g3 * 3..base + 4 + g3 * 3 + 3].copy_from_slice(&bytes[..3]);
+            }
+        }
+    }
+    buf
+}
+
+fn download_bytes(gpu: &Gpu, t: &rdna_compute::GpuTensor, n_bytes: usize) -> Vec<u8> {
+    let mut bytes = vec![0u8; n_bytes];
+    gpu.hip
+        .memcpy_dtoh(&mut bytes, &t.buf)
+        .unwrap_or_else(|e| panic!("download_bytes: {e:?}"));
+    bytes
+}
+
+fn bitwise_eq_bytes(a: &[u8], b: &[u8]) -> bool {
+    a == b
+}
+
+fn ensure_prod_fwht3(gpu: &mut Gpu) {
+    gpu.ensure_kernel_public(PROD_FWHT3_MOD, PROD_FWHT3_SRC, PROD_FWHT3_SYM)
+        .unwrap_or_else(|e| panic!("compile {PROD_FWHT3_SYM}: {e:?}"));
+    eprintln!("F4a meta: compiled frozen twin symbol {PROD_FWHT3_SYM} (module {PROD_FWHT3_MOD})");
+}
+
+fn launch_prod_fwht3(
+    gpu: &mut Gpu,
+    d_q: &rdna_compute::GpuTensor,
+    d_k: &rdna_compute::GpuTensor,
+    d_v: &rdna_compute::GpuTensor,
+    d_out: &rdna_compute::GpuTensor,
+    d_pos: &rdna_compute::GpuTensor,
+    d_s1: &rdna_compute::GpuTensor,
+    d_s2: &rdna_compute::GpuTensor,
+    batch: i32,
+) -> f64 {
+    let start = gpu.hip.event_create().unwrap();
+    let stop = gpu.hip.event_create().unwrap();
+    let mut args = KernargBlob::new();
+    args.push_ptr(d_q.buf.as_ptr());
+    args.push_ptr(d_k.buf.as_ptr());
+    args.push_ptr(d_v.buf.as_ptr());
+    args.push_ptr(d_out.buf.as_ptr());
+    args.push_ptr(d_pos.buf.as_ptr());
+    args.push_ptr(d_s1.buf.as_ptr());
+    args.push_ptr(d_s2.buf.as_ptr());
+    args.push_i32(N_HEADS as i32);
+    args.push_i32(N_KV as i32);
+    args.push_i32(HD as i32);
+    args.push_i32(batch);
+    args.push_f32(SCALE);
+    let grid_x = (batch as u32).div_ceil(8);
+    gpu.hip
+        .event_record(&start, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.launch_kernel_blob(
+        PROD_FWHT3_SYM,
+        [grid_x, 4, 1],
+        BLOCK,
+        LDS_BYTES,
+        args.as_mut_slice(),
+    )
+    .unwrap_or_else(|e| panic!("launch {PROD_FWHT3_SYM}: {e:?}"));
+    gpu.hip
+        .event_record(&stop, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.hip.event_synchronize(&stop).unwrap();
+    let ms = gpu.hip.event_elapsed_ms(&start, &stop).unwrap() as f64;
+    let _ = gpu.hip.event_destroy(start);
+    let _ = gpu.hip.event_destroy(stop);
+    ms * 1000.0
+}
+
+fn launch_ship_q8(
+    gpu: &mut Gpu,
+    d_q: &rdna_compute::GpuTensor,
+    d_k: &rdna_compute::GpuTensor,
+    d_v: &rdna_compute::GpuTensor,
+    d_out: &rdna_compute::GpuTensor,
+    d_pos: &rdna_compute::GpuTensor,
+    batch: usize,
+    seq_len: usize,
+) -> f64 {
+    let start = gpu.hip.event_create().unwrap();
+    let stop = gpu.hip.event_create().unwrap();
+    gpu.hip
+        .event_record(&start, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.attention_q8_0_fa2_gqa_gfx11(
+        d_q, d_k, d_v, d_out, d_pos, N_HEADS, N_KV, HD, seq_len, batch,
+    )
+    .unwrap_or_else(|e| panic!("ship q8 launch: {e:?}"));
+    gpu.hip
+        .event_record(&stop, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.hip.event_synchronize(&stop).unwrap();
+    let ms = gpu.hip.event_elapsed_ms(&start, &stop).unwrap() as f64;
+    let _ = gpu.hip.event_destroy(start);
+    let _ = gpu.hip.event_destroy(stop);
+    ms * 1000.0
+}
+
+fn launch_ship_fwht3(
+    gpu: &mut Gpu,
+    d_q: &rdna_compute::GpuTensor,
+    d_k: &rdna_compute::GpuTensor,
+    d_v: &rdna_compute::GpuTensor,
+    d_out: &rdna_compute::GpuTensor,
+    d_pos: &rdna_compute::GpuTensor,
+    d_s1: &rdna_compute::GpuTensor,
+    d_s2: &rdna_compute::GpuTensor,
+    batch: usize,
+    seq_len: usize,
+) -> f64 {
+    let start = gpu.hip.event_create().unwrap();
+    let stop = gpu.hip.event_create().unwrap();
+    gpu.hip
+        .event_record(&start, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.attention_q8_0_fa2_gqa_fwht3k_gfx11(
+        d_q, d_k, d_v, d_out, d_pos, d_s1, d_s2, N_HEADS, N_KV, HD, seq_len, batch,
+    )
+    .unwrap_or_else(|e| panic!("ship fwht3 launch: {e:?}"));
+    gpu.hip
+        .event_record(&stop, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.hip.event_synchronize(&stop).unwrap();
+    let ms = gpu.hip.event_elapsed_ms(&start, &stop).unwrap() as f64;
+    let _ = gpu.hip.event_destroy(start);
+    let _ = gpu.hip.event_destroy(stop);
+    ms * 1000.0
+}
+
+fn zero_out(gpu: &Gpu, t: &rdna_compute::GpuTensor, n_f32: usize) {
+    let z = vec![0u8; n_f32 * 4];
+    gpu.hip
+        .memcpy_htod(&t.buf, &z)
+        .unwrap_or_else(|e| panic!("zero out: {e:?}"));
+}
+
+fn run_ship(gpu: &mut Gpu) {
+    eprintln!("\n=== F4a ship arm: shipping FA2 vs frozen prod twins ===");
+    eprintln!(
+        "shape H{N_HEADS}/KV{N_KV}/D{HD} batch={BATCH}  L∈{L_VALUES:?}  positions at end of L"
+    );
+    eprintln!("Q8: ship=attention_q8_0_fa2_gqa_gfx11  prod={PROD_Q8_SYM}");
+    eprintln!(
+        "fwht3: ship=attention_q8_0_fa2_gqa_fwht3k_gfx11  prod={PROD_FWHT3_SYM} (frozen HEAD)"
+    );
+
+    // Ensure Q8 prod twin + frozen fwht3 twin.
+    gpu.ensure_kernel_public("halo_fa2_f30_attrib", TWIN_SRC, PROD_Q8_SYM)
+        .unwrap_or_else(|e| panic!("compile {PROD_Q8_SYM}: {e:?}"));
+    eprintln!("F4a meta: compiled twin symbol {PROD_Q8_SYM}");
+    ensure_prod_fwht3(gpu);
+
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+    let d_s1 = gpu.upload_f32(&signs1, &[256]).unwrap();
+    let d_s2 = gpu.upload_f32(&signs2, &[256]).unwrap();
+
+    for &l in &L_VALUES {
+        eprintln!("\n-- L={l} (positions {}..{}) --", l - BATCH, l - 1);
+        let t_pack = Instant::now();
+        let pos_h = fill_positions_end_of_l(BATCH, l);
+        let q_h = fill_q(BATCH, 0xF30A);
+        let k_q8 = fill_q8_cache(l, 0xF30B);
+        let v_h = fill_q8_cache(l, 0xF30C);
+        let k_fw = fill_fwht3_k(l, 0xF30D);
+        eprintln!(
+            "packed Q={}  Kq8={}  Kfw={}  V={}  pos={} in {:.2}s",
+            q_h.len(),
+            k_q8.len(),
+            k_fw.len(),
+            v_h.len(),
+            pos_h.len(),
+            t_pack.elapsed().as_secs_f64()
+        );
+
+        let d_k_q8 = gpu.upload_raw(&k_q8, &[k_q8.len()]).unwrap();
+        let d_k_fw = gpu.upload_raw(&k_fw, &[k_fw.len()]).unwrap();
+        let d_v = gpu.upload_raw(&v_h, &[v_h.len()]).unwrap();
+        let pos_bytes = positions_to_bytes(&pos_h);
+        let d_pos = gpu.upload_raw(&pos_bytes, &[pos_bytes.len()]).unwrap();
+
+        let d_out_prod_q8 = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+        let d_out_ship_q8 = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+        let d_out_prod_fw = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+        let d_out_ship_fw = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+
+        // ---- Q8 bit-exact: prod twin vs shipping launcher ----
+        let d_q_prod = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+        let d_q_ship = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+        zero_out(gpu, &d_out_prod_q8, BATCH * QO_ROW);
+        zero_out(gpu, &d_out_ship_q8, BATCH * QO_ROW);
+        let _ = launch_twin(
+            gpu,
+            PROD_Q8_SYM,
+            &d_q_prod,
+            &d_k_q8,
+            &d_v,
+            &d_out_prod_q8,
+            &d_pos,
+            BATCH as i32,
+        );
+        let _ = launch_ship_q8(
+            gpu,
+            &d_q_ship,
+            &d_k_q8,
+            &d_v,
+            &d_out_ship_q8,
+            &d_pos,
+            BATCH,
+            l,
+        );
+        let prod_out = download_f32(gpu, &d_out_prod_q8, BATCH * QO_ROW);
+        let ship_out = download_f32(gpu, &d_out_ship_q8, BATCH * QO_ROW);
+        let eq = bitwise_eq_f32(&prod_out, &ship_out);
+        let mut n_diff = 0usize;
+        let mut max_abs = 0.0f32;
+        for (a, b) in prod_out.iter().zip(ship_out.iter()) {
+            if a.to_bits() != b.to_bits() {
+                n_diff += 1;
+                max_abs = max_abs.max((a - b).abs());
+            }
+        }
+        eprintln!(
+            "  bitwise_eq L={l} Q8 ship_vs_prod = {eq}  n_diff={n_diff} max_abs={max_abs:.6e}"
+        );
+
+        // ---- fwht3 bit-exact: frozen prod vs shipping (out + post-Q) ----
+        // Clone Q before each launch (fwht3 rotates in place).
+        let d_q_prod_fw = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+        let d_q_ship_fw = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+        zero_out(gpu, &d_out_prod_fw, BATCH * QO_ROW);
+        zero_out(gpu, &d_out_ship_fw, BATCH * QO_ROW);
+        let _ = launch_prod_fwht3(
+            gpu,
+            &d_q_prod_fw,
+            &d_k_fw,
+            &d_v,
+            &d_out_prod_fw,
+            &d_pos,
+            &d_s1,
+            &d_s2,
+            BATCH as i32,
+        );
+        let _ = launch_ship_fwht3(
+            gpu,
+            &d_q_ship_fw,
+            &d_k_fw,
+            &d_v,
+            &d_out_ship_fw,
+            &d_pos,
+            &d_s1,
+            &d_s2,
+            BATCH,
+            l,
+        );
+        let prod_fw_out = download_f32(gpu, &d_out_prod_fw, BATCH * QO_ROW);
+        let ship_fw_out = download_f32(gpu, &d_out_ship_fw, BATCH * QO_ROW);
+        let eq_o = bitwise_eq_f32(&prod_fw_out, &ship_fw_out);
+        let mut n_diff_o = 0usize;
+        let mut max_abs_o = 0.0f32;
+        for (a, b) in prod_fw_out.iter().zip(ship_fw_out.iter()) {
+            if a.to_bits() != b.to_bits() {
+                n_diff_o += 1;
+                max_abs_o = max_abs_o.max((a - b).abs());
+            }
+        }
+        eprintln!(
+            "  bitwise_eq L={l} fwht3 out ship_vs_prod = {eq_o}  n_diff={n_diff_o} max_abs={max_abs_o:.6e}"
+        );
+        let q_bytes = BATCH * QO_ROW * 4;
+        let prod_q_post = download_bytes(gpu, &d_q_prod_fw, q_bytes);
+        let ship_q_post = download_bytes(gpu, &d_q_ship_fw, q_bytes);
+        let eq_q = bitwise_eq_bytes(&prod_q_post, &ship_q_post);
+        let mut n_diff_q = 0usize;
+        for (a, b) in prod_q_post.iter().zip(ship_q_post.iter()) {
+            if a != b {
+                n_diff_q += 1;
+            }
+        }
+        eprintln!(
+            "  bitwise_eq L={l} fwht3 postQ ship_vs_prod = {eq_q}  n_diff_bytes={n_diff_q}"
+        );
+
+        // ---- Warmup ----
+        for _ in 0..ATTR_WARMUP {
+            let _ = launch_twin(
+                gpu,
+                PROD_Q8_SYM,
+                &d_q_prod,
+                &d_k_q8,
+                &d_v,
+                &d_out_prod_q8,
+                &d_pos,
+                BATCH as i32,
+            );
+            let _ = launch_ship_q8(
+                gpu,
+                &d_q_ship,
+                &d_k_q8,
+                &d_v,
+                &d_out_ship_q8,
+                &d_pos,
+                BATCH,
+                l,
+            );
+            // fwht3: refresh Q outside timed path
+            gpu.hip
+                .memcpy_htod(
+                    &d_q_prod_fw.buf,
+                    &q_h.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
+                )
+                .unwrap();
+            gpu.hip
+                .memcpy_htod(
+                    &d_q_ship_fw.buf,
+                    &q_h.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let _ = launch_prod_fwht3(
+                gpu,
+                &d_q_prod_fw,
+                &d_k_fw,
+                &d_v,
+                &d_out_prod_fw,
+                &d_pos,
+                &d_s1,
+                &d_s2,
+                BATCH as i32,
+            );
+            gpu.hip
+                .memcpy_htod(
+                    &d_q_ship_fw.buf,
+                    &q_h.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
+                )
+                .unwrap();
+            let _ = launch_ship_fwht3(
+                gpu,
+                &d_q_ship_fw,
+                &d_k_fw,
+                &d_v,
+                &d_out_ship_fw,
+                &d_pos,
+                &d_s1,
+                &d_s2,
+                BATCH,
+                l,
+            );
+        }
+
+        let q_bytes_host: Vec<u8> = q_h.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let mut samp_prod_q8 = Vec::with_capacity(ATTR_ITERS);
+        let mut samp_ship_q8 = Vec::with_capacity(ATTR_ITERS);
+        let mut samp_prod_fw = Vec::with_capacity(ATTR_ITERS);
+        let mut samp_ship_fw = Vec::with_capacity(ATTR_ITERS);
+        for _ in 0..ATTR_ITERS {
+            let us = launch_twin(
+                gpu,
+                PROD_Q8_SYM,
+                &d_q_prod,
+                &d_k_q8,
+                &d_v,
+                &d_out_prod_q8,
+                &d_pos,
+                BATCH as i32,
+            );
+            samp_prod_q8.push(us);
+            let us = launch_ship_q8(
+                gpu,
+                &d_q_ship,
+                &d_k_q8,
+                &d_v,
+                &d_out_ship_q8,
+                &d_pos,
+                BATCH,
+                l,
+            );
+            samp_ship_q8.push(us);
+
+            // fwht3: clone/refresh Q before each launch (outside timed interval is
+            // the memcpy; event timer only wraps the kernel).
+            gpu.hip
+                .memcpy_htod(&d_q_prod_fw.buf, &q_bytes_host)
+                .unwrap();
+            let us = launch_prod_fwht3(
+                gpu,
+                &d_q_prod_fw,
+                &d_k_fw,
+                &d_v,
+                &d_out_prod_fw,
+                &d_pos,
+                &d_s1,
+                &d_s2,
+                BATCH as i32,
+            );
+            samp_prod_fw.push(us);
+            gpu.hip
+                .memcpy_htod(&d_q_ship_fw.buf, &q_bytes_host)
+                .unwrap();
+            let us = launch_ship_fwht3(
+                gpu,
+                &d_q_ship_fw,
+                &d_k_fw,
+                &d_v,
+                &d_out_ship_fw,
+                &d_pos,
+                &d_s1,
+                &d_s2,
+                BATCH,
+                l,
+            );
+            samp_ship_fw.push(us);
+        }
+
+        let med_pq = median_f64(&mut samp_prod_q8);
+        let med_sq = median_f64(&mut samp_ship_q8);
+        let med_pf = median_f64(&mut samp_prod_fw);
+        let med_sf = median_f64(&mut samp_ship_fw);
+        let r_q8 = med_sq / med_pq.max(1e-30);
+        let r_fw = med_sf / med_pf.max(1e-30);
+        eprintln!(
+            "  Q8   prod_median_us={med_pq:.2}  ship_median_us={med_sq:.2}  ship/prod={r_q8:.4}  ({:.2}% of prod)  speedup={:.2}%",
+            r_q8 * 100.0,
+            (1.0 - r_q8) * 100.0
+        );
+        eprintln!(
+            "  fwht3 prod_median_us={med_pf:.2}  ship_median_us={med_sf:.2}  ship/prod={r_fw:.4}  ({:.2}% of prod)  speedup={:.2}%",
+            r_fw * 100.0,
+            (1.0 - r_fw) * 100.0
+        );
+    }
+    eprintln!("\nF4a ship arm complete.");
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
+    let arm = std::env::args().nth(1).unwrap_or_default();
+    let is_ship = arm == "ship";
     eprintln!(
-        "tmp_fa2_attrib arch={}  (F3.0 FA2 attribution + Q candidates)",
-        gpu.arch
+        "tmp_fa2_attrib arch={}  arm={}  (F3.0 attribution / F4a ship)",
+        gpu.arch,
+        if is_ship { "ship" } else { "attrib" }
     );
     eprintln!(
         "Production Q conversion: (_Float16)float C cast → AMD v_cvt_f16_f32 (RNE)."
@@ -1080,16 +1561,21 @@ fn main() {
         eprintln!(
             "  HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \\"
         );
-        eprintln!("    HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-f3a \\");
+        eprintln!("    HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-f4a \\");
         eprintln!(
-            "    cargo run --release -p hipfire-runtime --features lab --example tmp_fa2_attrib"
+            "    cargo run --release -p hipfire-runtime --features lab --example tmp_fa2_attrib -- ship"
         );
-        eprintln!("symbols: {}", SYMS.join(", "));
+        eprintln!("symbols: {} + {PROD_FWHT3_SYM}", SYMS.join(", "));
         return;
     }
 
     if gpu.active_stream.is_none() {
         gpu.active_stream = Some(gpu.hip.stream_create().expect("stream"));
+    }
+
+    if is_ship {
+        run_ship(&mut gpu);
+        return;
     }
 
     ensure_twins(&mut gpu);

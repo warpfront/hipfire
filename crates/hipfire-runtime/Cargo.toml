@@ -670,3 +670,8 @@ name = "h2d_mmap_bench"
 required-features = ["deltanet"]
 
 
+
+[[example]]
+name = "tmp_halo_iu4_oracle"
+required-features = ["lab"]
+

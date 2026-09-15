@@ -296,4 +296,289 @@ IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3, true, 3)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3, true, 3)
 
+#if defined(__gfx1151__)
+
+// W2: four-wave half-slab register pipeline (block [32,4,1], 128 outputs/lane).
+// Pending bundle is one A128 half payload (16) + one Xq128 (18) = 34 dwords.
+// Publish only into retired half-regions; headers converted like load_iu4_tile.
+
+static __device__ __forceinline__ void prefetch_iu4_half_w2_gfx1151(
+    const char* __restrict__ A,
+    const int* __restrict__ Xq_dwords,
+    int A_pending[16],
+    int Xq_pending[18],
+    int row0,
+    int g,
+    int h,
+    int groups_per_row,
+    bool do_A,
+    bool do_Xq
+) {
+    const int w = threadIdx.y;
+    const int lane = threadIdx.x;
+
+    if (do_A) {
+        #pragma unroll
+        for (int q = 0; q < 16; ++q) {
+            const int r = 8 * q + 2 * w + (lane / 16);
+            const int payload_word = 16 * h + (lane % 16);
+            const char* gp = A + ((long long)(row0 + r) * groups_per_row + g) * 136;
+            A_pending[q] = *(const int*)(gp + 8 + payload_word * 4);
+        }
+    }
+    if (do_Xq) {
+        #pragma unroll
+        for (int q = 0; q < 18; ++q) {
+            const int l = 128 * q + 32 * w + lane;
+            Xq_pending[q] = Xq_dwords[l];
+        }
+    }
+}
+
+static __device__ __forceinline__ void publish_iu4_half_w2_gfx1151(
+    const char* __restrict__ A,
+    int* __restrict__ tile_x,
+    int* __restrict__ tile_y,
+    const int A_pending[16],
+    const int Xq_pending[18],
+    int row0,
+    int g,
+    int h,
+    int groups_per_row,
+    bool do_A,
+    bool do_Xq
+) {
+    const int w = threadIdx.y;
+    const int lane = threadIdx.x;
+
+    if (do_A) {
+        #pragma unroll
+        for (int q = 0; q < 16; ++q) {
+            const int r = 8 * q + 2 * w + (lane / 16);
+            const int payload_word = 16 * h + (lane % 16);
+            tile_x[r * IU4_TILE_X_K + payload_word] = A_pending[q];
+        }
+        // Headers after payload stores release A_pending: same f16→f32→half2 path
+        // and fourfold replication as load_iu4_tile. Pad words untouched.
+        {
+            const int r = 32 * w + lane;
+            const char* gp = A + ((long long)(row0 + r) * groups_per_row + g) * 136;
+            const unsigned int hs = *(const unsigned int*)(gp + 4 * h);
+            const float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
+            const float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+            const half2 dm = make_half2((_Float16)sc, (_Float16)zp);
+            half2* x_dm = (half2*)(tile_x + IU4_X_DM_OFF);
+            #pragma unroll
+            for (int v = 0; v < 4; ++v)
+                x_dm[r * IU4_TILE_X_K + 4 * h + v] = dm;
+        }
+    }
+    if (do_Xq) {
+        #pragma unroll
+        for (int q = 0; q < 18; ++q) {
+            const int l = 128 * q + 32 * w + lane;
+            tile_y[l] = Xq_pending[q];
+        }
+    }
+}
+
+// Two independent int32x8 chains per n-pair; shared B fragment; u=0..7 = shipping
+// (t=u/2, low_or_high=u%2). sum[((j0/32)*4+n)*8+l], 128 f32/lane.
+static __device__ __forceinline__ void vec_dot_i4_x128_w2_gfx1151(
+    const int* __restrict__ x,
+    const int* __restrict__ y,
+    float* __restrict__ sum,
+    int h
+) {
+    const int w = threadIdx.y;
+    const int lane = threadIdx.x;
+    const int lane_row = lane % 16;
+    const int i0 = 64 * (w / 2);
+    const int col_off = 16 * (w % 2);
+
+    const int* x_qs = x;
+    const int* y_qs = y + 2;
+    const int* y_ds = y;
+
+    #pragma unroll
+    for (int j0_idx = 0; j0_idx < 4; ++j0_idx) {
+        const int j0 = j0_idx * 32;
+        #pragma unroll
+        for (int pair = 0; pair < 2; ++pair) {
+            const int n0 = pair * 2;
+            const int n1 = n0 + 1;
+
+            int32x8_t acc0 = {0, 0, 0, 0, 0, 0, 0, 0};
+            int32x8_t acc1 = {0, 0, 0, 0, 0, 0, 0, 0};
+
+            #pragma nounroll
+            for (int u = 0; u < 8; ++u) {
+                const int* ap0 = x_qs + (i0 + n0 * 16 + lane_row) * IU4_TILE_X_K + h * 16 + u * 2;
+                const int* ap1 = x_qs + (i0 + n1 * 16 + lane_row) * IU4_TILE_X_K + h * 16 + u * 2;
+                const int* bp  = y_qs + (j0 + col_off + lane_row) * IU4_TILE_Y_K + u * 2;
+                const int32x2_t av0 = *(const int32x2_t*)ap0;
+                const int32x2_t av1 = *(const int32x2_t*)ap1;
+                const int32x2_t bv  = *(const int32x2_t*)bp;
+                acc0 = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av0, true, bv, acc0, false);
+                acc1 = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av1, true, bv, acc1, false);
+            }
+
+            const int j_lane = lane % 16;
+            const float d_x = *(const float*)(y_ds + (j0 + col_off + j_lane) * IU4_TILE_Y_K);
+            const int s_x = *(const int*)(y_ds + (j0 + col_off + j_lane) * IU4_TILE_Y_K + 1);
+
+            {
+                const int* acc_i = (const int*)&acc0;
+                #pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const int i = i0 + n0 * 16 + 2 * l + (lane / 16);
+                    const half2 dm = ((const half2*)(x_qs + i * IU4_TILE_X_K + IU4_X_DM_OFF))[4 * h];
+                    const float2 dmA = __half22float2(dm);
+                    sum[(j0_idx * 4 + n0) * 8 + l] +=
+                        dmA.x * d_x * (float)acc_i[l] + dmA.y * d_x * (float)s_x;
+                }
+            }
+            {
+                const int* acc_i = (const int*)&acc1;
+                #pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const int i = i0 + n1 * 16 + 2 * l + (lane / 16);
+                    const half2 dm = ((const half2*)(x_qs + i * IU4_TILE_X_K + IU4_X_DM_OFF))[4 * h];
+                    const float2 dmA = __half22float2(dm);
+                    sum[(j0_idx * 4 + n1) * 8 + l] +=
+                        dmA.x * d_x * (float)acc_i[l] + dmA.y * d_x * (float)s_x;
+                }
+            }
+        }
+    }
+}
+
+static __device__ __forceinline__ void gemm_iu4_body_w2_gfx1151(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    const int row0 = blockIdx.x * IU4_MMQ_Y;
+    const int col0 = blockIdx.y * IU4_MMQ_X;
+    const int groups_per_row = K / 256;
+    const int G = groups_per_row;
+
+    extern __shared__ int smem[];
+    int* tile_y = smem;
+    int* tile_x = tile_y + IU4_MMQ_X * IU4_TILE_Y_K;
+
+    float sum[128] = {0.0f};
+    int A_pending[16];
+    int Xq_pending[18];
+
+    // Prologue: both A halves/headers of group 0 and Xq(0,0); one publish barrier.
+    {
+        const int* xq00 = (const int*)(Xq + (long long)0 * N + col0);
+        prefetch_iu4_half_w2_gfx1151(
+            A, xq00, A_pending, Xq_pending, row0, 0, 0, groups_per_row, true, true);
+        publish_iu4_half_w2_gfx1151(
+            A, tile_x, tile_y, A_pending, Xq_pending, row0, 0, 0, groups_per_row, true, true);
+        prefetch_iu4_half_w2_gfx1151(
+            A, xq00, A_pending, Xq_pending, row0, 0, 1, groups_per_row, true, false);
+        publish_iu4_half_w2_gfx1151(
+            A, tile_x, tile_y, A_pending, Xq_pending, row0, 0, 1, groups_per_row, true, false);
+    }
+    __syncthreads(); // prologue publish; A epochs=(0,0), Y=(0,0)
+
+    for (int g = 0; g < G; ++g) {
+        const bool next = (g + 1 < G);
+
+        // Compute h0: prefetch next A half0 (if any) + Xq(g,1); dot/fold h0.
+        {
+            const int* xq_g1 = (const int*)(Xq + (long long)(2 * g + 1) * N + col0);
+            prefetch_iu4_half_w2_gfx1151(
+                A, xq_g1, A_pending, Xq_pending, row0, g + 1, 0, groups_per_row, next, true);
+        }
+        vec_dot_i4_x128_w2_gfx1151(tile_x, tile_y, sum, 0);
+
+        // Retire h0 / publish h1: R0, then A(g+1,0) if valid + Y(g,1), then P1.
+        __syncthreads(); // R0
+        publish_iu4_half_w2_gfx1151(
+            A, tile_x, tile_y, A_pending, Xq_pending, row0, g + 1, 0, groups_per_row, next, true);
+        __syncthreads(); // P1
+
+        // Compute h1: if next, prefetch A(g+1,1)+Xq(g+1,0); else neither.
+        if (next) {
+            const int* xq_n0 = (const int*)(Xq + (long long)(2 * (g + 1) + 0) * N + col0);
+            prefetch_iu4_half_w2_gfx1151(
+                A, xq_n0, A_pending, Xq_pending, row0, g + 1, 1, groups_per_row, true, true);
+        }
+        vec_dot_i4_x128_w2_gfx1151(tile_x, tile_y, sum, 1);
+
+        // Retire h1 / advance: R1; if next publish A half1 + Y(g+1,0) then P0.
+        __syncthreads(); // R1
+        if (next) {
+            publish_iu4_half_w2_gfx1151(
+                A, tile_x, tile_y, A_pending, Xq_pending, row0, g + 1, 1, groups_per_row, true, true);
+            __syncthreads(); // P0
+        }
+    }
+
+    // Epilogue: one write per owned output; same set/add expression as shipping.
+    {
+        const int w = threadIdx.y;
+        const int lane = threadIdx.x;
+        const int i0 = 64 * (w / 2);
+        const int col_off = 16 * (w % 2);
+
+        #pragma unroll
+        for (int j0_idx = 0; j0_idx < 4; ++j0_idx) {
+            const int j0 = j0_idx * 32;
+            #pragma unroll
+            for (int n = 0; n < 4; ++n) {
+                #pragma unroll
+                for (int l = 0; l < 8; ++l) {
+                    const int j = j0 + col_off + (lane % 16);
+                    const int i = i0 + n * 16 + 2 * l + (lane / 16);
+                    float* yp = Y + (long long)(col0 + j) * M + (row0 + i);
+                    const float v = sum[(j0_idx * 4 + n) * 8 + l];
+                    if (add) {
+                        *yp += v;
+                    } else {
+                        *yp = v;
+                    }
+                }
+            }
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(128, 2)
+void gemm_mq4g256v2_residual_mmq_iu4_full_set_w2_gfx1151(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    gemm_iu4_body_w2_gfx1151(A, Xq, Y, M, K, N, add);
+}
+
+extern "C" __global__ __launch_bounds__(128, 2)
+void gemm_mq4g256v2_residual_mmq_iu4_full_add_w2_gfx1151(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    gemm_iu4_body_w2_gfx1151(A, Xq, Y, M, K, N, add);
+}
+
+#endif // __gfx1151__
+
+
 #endif

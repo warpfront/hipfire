@@ -97,9 +97,9 @@ typedef int32_t __attribute__((ext_vector_type(2))) int32x2_t;
 typedef union {
     uint32_t u;
     _Float16 h[2];
-} fa2_dw_t;
+} fa2_dw_t_prod_fwht3;
 
-__device__ __forceinline__ int fa2_swiz(int c)
+__device__ __forceinline__ int fa2_swiz_prod_fwht3(int c)
 {
     // 2*bit_reverse4(c): lane starts 0,16,8,24,4,20,12,28,2,18,10,26,6,22,14,30.
     const int r = ((c & 1) << 3) | ((c & 2) << 1)
@@ -111,7 +111,7 @@ __device__ __forceinline__ int fa2_swiz(int c)
 // `kv_h` selects the KV head (blockIdx.y); `q_base` the 8-position tile
 // (blockIdx.x). Causal bounds come from positions[] (mailbox-reduced to
 // gmin/gmax); the tile loop clamps to the derived seq_len.
-__device__ __forceinline__ void fa2_gqa_body(
+__device__ __forceinline__ void fa2_gqa_body_prod_fwht3(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -146,10 +146,12 @@ __device__ __forceinline__ void fa2_gqa_body(
     uint32_t* Vdw = LDS + KT * 128;
 
     // ---- Transition 1: online state init (compute waves) ----
-    // Q is not kept across tiles (register pressure). Within a KT32 tile,
-    // each dim-chunk Q fragment is loaded/converted once and reused for
-    // both 16-key subtles' QK WMMAs (qshare2); softmax/PV still run sub0
-    // then sub1 so online order and PV accumulation stay unchanged.
+    // Q is NOT kept persistent (the tile loop cannot spare the registers).
+    // Instead each QK chunk reloads its B-fragment as four float4 loads
+    // from L1-resident Q (the per-wave Q tile is read once per tile into
+    // L1 and re-hit per subtile/chunk; L1 bandwidth makes the re-read
+    // free). Staging is one float4 at a time so only one live half16
+    // K/Q fragment pair exists per WMMA.
     typedef float __attribute__((ext_vector_type(4))) float4_t;
     float8_t Ofr[16];
     float m_old = -INFINITY;
@@ -234,7 +236,7 @@ __device__ __forceinline__ void fa2_gqa_body(
             float cnorm = 0.0f;
             if (rec != nullptr)
                 __builtin_memcpy(&cnorm, rec, 4);
-            const int rot = fa2_swiz(k & 15);
+            const int rot = fa2_swiz_prod_fwht3(k & 15);
             const int base = k * 128;
 #pragma unroll 1
             for (int m = 0; m < 4; ++m) {
@@ -246,7 +248,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                 for (int i = 0; i < 4; ++i) {
                     const int code0 = (packed >> (6 * i)) & 7;
                     const int code1 = (packed >> (6 * i + 3)) & 7;
-                    fa2_dw_t dw;
+                    fa2_dw_t_prod_fwht3 dw;
                     dw.h[0] = (_Float16)(cnorm * TURBO_C3_256[code0]);
                     dw.h[1] = (_Float16)(cnorm * TURBO_C3_256[code1]);
                     Kdw[base + ((p0 + i + rot) & 127)] = dw.u;
@@ -269,9 +271,9 @@ __device__ __forceinline__ void fa2_gqa_body(
             uint16_t su = 0;
             if (blk != nullptr)
                 su = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
-            _Float16 s = ((fa2_dw_t){.u = (uint32_t)su}).h[0];
+            _Float16 s = ((fa2_dw_t_prod_fwht3){.u = (uint32_t)su}).h[0];
             const float sf = (float)s;
-            const int rot = fa2_swiz(k & 15);
+            const int rot = fa2_swiz_prod_fwht3(k & 15);
             const int base = k * 128;
             const int pb = b * 16;
 #pragma unroll 1
@@ -285,7 +287,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                 const float c1 = (float)(int8_t)(u >> 8);
                 const float c2 = (float)(int8_t)(u >> 16);
                 const float c3 = (float)(int8_t)(u >> 24);
-                fa2_dw_t d0, d1;
+                fa2_dw_t_prod_fwht3 d0, d1;
                 d0.h[0] = (_Float16)(sf * c0);
                 d0.h[1] = (_Float16)(sf * c1);
                 d1.h[0] = (_Float16)(sf * c2);
@@ -317,8 +319,8 @@ __device__ __forceinline__ void fa2_gqa_body(
                 s0u = (uint16_t)blk0[0] | ((uint16_t)blk0[1] << 8);
             if (blk1 != nullptr)
                 s1u = (uint16_t)blk1[0] | ((uint16_t)blk1[1] << 8);
-            _Float16 s0 = ((fa2_dw_t){.u = (uint32_t)s0u}).h[0];
-            _Float16 s1 = ((fa2_dw_t){.u = (uint32_t)s1u}).h[0];
+            _Float16 s0 = ((fa2_dw_t_prod_fwht3){.u = (uint32_t)s0u}).h[0];
+            _Float16 s1 = ((fa2_dw_t_prod_fwht3){.u = (uint32_t)s1u}).h[0];
             const float sf0 = (float)s0;
             const float sf1 = (float)s1;
 #pragma unroll 1
@@ -333,10 +335,10 @@ __device__ __forceinline__ void fa2_gqa_body(
                     const int d = b * 32 + w * 4 + c;
                     const float c0 = (float)(int8_t)(u0 >> (c * 8));
                     const float c1 = (float)(int8_t)(u1 >> (c * 8));
-                    fa2_dw_t dw;
+                    fa2_dw_t_prod_fwht3 dw;
                     dw.h[0] = (_Float16)(sf0 * c0);
                     dw.h[1] = (_Float16)(sf1 * c1);
-                    Vdw[d * V_ROW + ((m + fa2_swiz(d & 15)) & V_MASK)] = dw.u;
+                    Vdw[d * V_ROW + ((m + fa2_swiz_prod_fwht3(d & 15)) & V_MASK)] = dw.u;
                 }
             }
         }
@@ -344,197 +346,6 @@ __device__ __forceinline__ void fa2_gqa_body(
 
         // ---- Transition 3: KT/16 QK/softmax/PV subtiles of 16 keys ----
         if (compute) {
-#if HIPFIRE_FA2_KT == 32
-            // qshare2 (KT32): one Q load+cvt per dim chunk feeds both
-            // subtles' QK; then softmax/PV sub0 fully, then sub1.
-            // Online-softmax order and PV accumulation order unchanged.
-            float8_t sacc0 =
-                (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-            float8_t sacc1 =
-                (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-            const int kt_sub0 = ktile;
-            const int kt_sub1 = ktile + 16;
-            const bool do0 = kt_sub0 <= gmax;
-            const bool do1 = kt_sub1 <= gmax;
-            if (do0 || do1) {
-                // QK as S^T = K*Q^T for both subtles, sharing Q fragment.
-                for (int dc = 0; dc < 16; ++dc) {
-                    half16_t qf;
-                    {
-                        const float* qd = q + qq_base + (unsigned)(dc * 16);
-#pragma unroll
-                        for (int g = 0; g < 4; ++g) {
-                            float4_t v = {0.f, 0.f, 0.f, 0.f};
-                            if (qok_ml)
-                                v = *(const float4_t*)(qd + g * 4);
-                            qf[4 * g + 0] = (_Float16)v[0];
-                            qf[4 * g + 1] = (_Float16)v[1];
-                            qf[4 * g + 2] = (_Float16)v[2];
-                            qf[4 * g + 3] = (_Float16)v[3];
-                        }
-                    }
-                    if (do0) {
-                        half16_t kf;
-                        {
-                            // sub 0: key = 0*16+ml
-                            const int key = ml;
-                            const int rot = fa2_swiz(key & 15);
-                            const int base = key * 128;
-                            // Four aligned b64 LDS loads at i={0,2,4,6}. Even
-                            // swizzle makes each start 8-byte aligned; consecutive
-                            // dwords i,i+1 never wrap (start never 127). Unpack
-                            // low then high dword into half16 order for WMMA A.
-#pragma unroll
-                            for (int i = 0; i < 8; i += 2) {
-                                const int off = base + ((dc * 8 + i + rot) & 127);
-                                const int32x2_t pair =
-                                    *(const int32x2_t*)(Kdw + off);
-                                fa2_dw_t d0, d1;
-                                d0.u = (uint32_t)pair[0];
-                                d1.u = (uint32_t)pair[1];
-                                kf[2 * i] = d0.h[0];
-                                kf[2 * i + 1] = d0.h[1];
-                                kf[2 * i + 2] = d1.h[0];
-                                kf[2 * i + 3] = d1.h[1];
-                            }
-                        }
-                        sacc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-                            kf, qf, sacc0);
-                    }
-                    if (do1) {
-                        half16_t kf;
-                        {
-                            // sub 1: key = 1*16+ml
-                            const int key = 16 + ml;
-                            const int rot = fa2_swiz(key & 15);
-                            const int base = key * 128;
-#pragma unroll
-                            for (int i = 0; i < 8; i += 2) {
-                                const int off = base + ((dc * 8 + i + rot) & 127);
-                                const int32x2_t pair =
-                                    *(const int32x2_t*)(Kdw + off);
-                                fa2_dw_t d0, d1;
-                                d0.u = (uint32_t)pair[0];
-                                d1.u = (uint32_t)pair[1];
-                                kf[2 * i] = d0.h[0];
-                                kf[2 * i + 1] = d0.h[1];
-                                kf[2 * i + 2] = d1.h[0];
-                                kf[2 * i + 3] = d1.h[1];
-                            }
-                        }
-                        sacc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-                            kf, qf, sacc1);
-                    }
-                    // Bound K/Q-load hoisting to this chunk.
-                    asm volatile("" ::: "memory");
-                }
-
-                // Softmax + PV for sub0, then sub1 (online order unchanged).
-#pragma unroll 1
-                for (int sub = 0; sub < 2; ++sub) {
-                    const bool dos = (sub == 0) ? do0 : do1;
-                    if (!dos)
-                        continue;
-                    float8_t sacc = (sub == 0) ? sacc0 : sacc1;
-                    const int kt_sub = ktile + sub * 16;
-                    const bool full = (kt_sub + 15) <= gmin;
-                    // This lane pair's softmax query is ml; its position is
-                    // loaded once per subtile (masked path only).
-                    const int pos_ml =
-                        (!full && qok_ml) ? positions[qr_ml] : 0;
-
-                    // Mask + row max. The mx chain serializes the unrolled
-                    // rows; the other key parity sits in lane ml^16 and is
-                    // combined with one shuffle, so both pair members share
-                    // the same m_new and alpha.
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        const int key_g = kt_sub + 2 * j + half;
-                        const bool ok = qok_ml && (full || key_g <= pos_ml);
-                        const float x = ok ? sacc[j] * scale_attn : -INFINITY;
-                        // NOTE: max-accumulation happens in the second pass
-                        // below; this pass only masks into sacc.
-                        sacc[j] = x;
-                    }
-                    float mx = -INFINITY;
-#pragma unroll
-                    for (int j = 0; j < 8; ++j)
-                        mx = fmaxf(mx, sacc[j]);
-                    mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
-                    const float m_new = fmaxf(m_old, mx);
-                    const float alpha =
-                        (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
-                    m_old = m_new;
-
-                    // Probabilities, then full-P reconstruction: each half
-                    // exchanges its eight parity probabilities with lane^16
-                    // and interleaves them, so both halves hold the identical
-                    // half16 P row in key order 0..15. The sum chain likewise
-                    // serializes rows before the single pair shuffle.
-                    float earr[8];
-                    float sum = 0.0f;
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        const float e = (m_new == -INFINITY)
-                            ? 0.0f
-                            : __expf(sacc[j] - m_new);
-                        earr[j] = e;
-                        sum += e;
-                    }
-                    sum += __shfl_xor(sum, 16, 32);
-                    l_val = l_val * alpha + sum;
-                    half16_t prow;
-#pragma unroll
-                    for (int j = 0; j < 8; ++j) {
-                        const float peer = __shfl_xor(earr[j], 16, 32);
-                        const float e0 = (half == 0) ? earr[j] : peer;
-                        const float e1 = (half == 0) ? peer : earr[j];
-                        prow[2 * j] = (_Float16)e0;
-                        prow[2 * j + 1] = (_Float16)e1;
-                    }
-
-                    // O rescale with the pair-local alpha: Ofr rows are the
-                    // pair's own softmax query (O[query=ml][dim]).
-#pragma unroll
-                    for (int dc = 0; dc < 16; ++dc)
-                        Ofr[dc] *= alpha;
-
-                    // PV as O^T = V^T*P^T: A = V^T full row for dim dc*16+ml
-                    // over all 16 subtile keys (partner half repeats the same
-                    // full row), B = prow. Ofr[dc][j] =
-                    // O[query=ml][dim=dc*16+2*j+half].
-#pragma unroll
-                    for (int dc = 0; dc < 16; ++dc) {
-                        const int d = dc * 16 + ml;
-                        const int rot = fa2_swiz(d & 15);
-                        const int vbase = d * V_ROW;
-                        const int ps = sub * 8;
-                        half16_t vf;
-                        // Four aligned b64 loads at i={0,2,4,6}. Within either
-                        // V-row parity the even residues cover all even b64
-                        // starts once; unpack order matches producer store order.
-#pragma unroll
-                        for (int i = 0; i < 8; i += 2) {
-                            const int off = vbase + ((ps + i + rot) & V_MASK);
-                            const int32x2_t pair =
-                                *(const int32x2_t*)(Vdw + off);
-                            fa2_dw_t d0, d1;
-                            d0.u = (uint32_t)pair[0];
-                            d1.u = (uint32_t)pair[1];
-                            vf[2 * i] = d0.h[0];
-                            vf[2 * i + 1] = d0.h[1];
-                            vf[2 * i + 2] = d1.h[0];
-                            vf[2 * i + 3] = d1.h[1];
-                        }
-                        Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-                            vf, prow, Ofr[dc]);
-                        // Bound V-load hoisting to this chunk.
-                        asm volatile("" ::: "memory");
-                    }
-                }
-            }
-#else
-            // KT64 path: original per-subtile Q reload (host pins KT32).
 #pragma unroll 1
             for (int sub = 0; sub < KT_SUBS; ++sub) {
                 const int kt_sub = ktile + sub * 16;
@@ -554,7 +365,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                     (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
                 {
                     const int key = sub * 16 + ml;
-                    const int rot = fa2_swiz(key & 15);
+                    const int rot = fa2_swiz_prod_fwht3(key & 15);
                     const int base = key * 128;
                     for (int dc = 0; dc < 16; ++dc) {
                         half16_t kf;
@@ -567,7 +378,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                             const int off = base + ((dc * 8 + i + rot) & 127);
                             const int32x2_t pair =
                                 *(const int32x2_t*)(Kdw + off);
-                            fa2_dw_t d0, d1;
+                            fa2_dw_t_prod_fwht3 d0, d1;
                             d0.u = (uint32_t)pair[0];
                             d1.u = (uint32_t)pair[1];
                             kf[2 * i] = d0.h[0];
@@ -659,7 +470,7 @@ __device__ __forceinline__ void fa2_gqa_body(
 #pragma unroll
                 for (int dc = 0; dc < 16; ++dc) {
                     const int d = dc * 16 + ml;
-                    const int rot = fa2_swiz(d & 15);
+                    const int rot = fa2_swiz_prod_fwht3(d & 15);
                     const int vbase = d * V_ROW;
                     const int ps = sub * 8;
                     half16_t vf;
@@ -671,7 +482,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                         const int off = vbase + ((ps + i + rot) & V_MASK);
                         const int32x2_t pair =
                             *(const int32x2_t*)(Vdw + off);
-                        fa2_dw_t d0, d1;
+                        fa2_dw_t_prod_fwht3 d0, d1;
                         d0.u = (uint32_t)pair[0];
                         d1.u = (uint32_t)pair[1];
                         vf[2 * i] = d0.h[0];
@@ -685,9 +496,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                     asm volatile("" ::: "memory");
                 }
             }
-#endif
         }
-
         // Tile turnover: no wave may overwrite LDS before every PV read
         // has finished.
         __syncthreads();
@@ -715,30 +524,6 @@ __device__ __forceinline__ void fa2_gqa_body(
     }
 }
 
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx11(
-    const float* __restrict__ q,
-    const unsigned char* __restrict__ k_cache,
-    const unsigned char* __restrict__ v_cache,
-    float* __restrict__ out,
-    const int* __restrict__ positions,
-    int n_heads,
-    int n_kv_heads,
-    int head_dim,
-    int batch_size,
-    float scale_attn)
-{
-    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
-        return;
-    const int kv_h = blockIdx.y;
-    if (kv_h >= 4)
-        return;
-    const int q_base = blockIdx.x * 8;
-    if (q_base >= batch_size)
-        return;
-    fa2_gqa_body(q, k_cache, v_cache, out, positions, batch_size,
-                 scale_attn, kv_h, q_base);
-}
-
 #if HIPFIRE_FA2_KMODE == 3
 // ---- KMODE=3 prologue: in-place signed-FWHT-256 of this WG's Q rows ----
 // K is stored FWHT-rotated, so Q must be rotated before QK (orthogonal
@@ -753,7 +538,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1
 // NOT replay-idempotent (a second launch would rotate twice): the launcher
 // rejects capture/replay and dispatch gates tree-verify off, so the
 // single-use prefill Q buffer is consumed exactly once.
-__device__ __forceinline__ void fa2_gqa_rotate_q_256(
+__device__ __forceinline__ void fa2_gqa_rotate_q_256_prod_fwht3(
     float* __restrict__ q,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
@@ -788,7 +573,7 @@ __device__ __forceinline__ void fa2_gqa_rotate_q_256(
     __syncthreads();
 }
 
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_gfx11(
+extern "C" __global__ __launch_bounds__(128, 1) void fa2_attrib_prod_fwht3(
     float* __restrict__ q,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -810,8 +595,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
     const int q_base = blockIdx.x * 8;
     if (q_base >= batch_size)
         return;
-    fa2_gqa_rotate_q_256(q, signs1, signs2, kv_h, q_base, batch_size);
-    fa2_gqa_body(q, k_cache, v_cache, out, positions, batch_size,
+    fa2_gqa_rotate_q_256_prod_fwht3(q, signs1, signs2, kv_h, q_base, batch_size);
+    fa2_gqa_body_prod_fwht3(q, k_cache, v_cache, out, positions, batch_size,
                  scale_attn, kv_h, q_base);
 }
 #endif
