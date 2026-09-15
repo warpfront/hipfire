@@ -4,12 +4,14 @@
 //! Derived from kernels/src/attention_q8_0_fa2_gqa.gfx11.hip (Q8 entry).
 //! Shipping shape: H24 / KV4 / D256 (not 48/8/128).
 //!
-//! Four twins of the Q8 entry, distinct symbols:
-//!   fa2_attrib_prod   — unmodified production body
-//!   fa2_attrib_nofill — after first KT tile cooperative fill, skip later
-//!                       global K/V loads + dequant + LDS stores (barriers kept)
-//!   fa2_attrib_noexp  — every __expf replaced by x*0.5f (data flow live)
-//!   fa2_attrib_nopv   — skip PV WMMAs; cheap P checksum keeps softmax live
+//! Six twins of the Q8 entry, distinct symbols:
+//!   fa2_attrib_prod    — unmodified production body
+//!   fa2_attrib_nofill  — after first KT tile cooperative fill, skip later
+//!                        global K/V loads + dequant + LDS stores (barriers kept)
+//!   fa2_attrib_noexp   — every __expf replaced by x*0.5f (data flow live)
+//!   fa2_attrib_nopv    — skip PV WMMAs; cheap P checksum keeps softmax live
+//!   fa2_attrib_noqload — no global Q load/f32→f16; synth half16 Q from lane+chunk
+//!   fa2_attrib_noqk    — keep Q load+convert; skip QK WMMA; synth scores from Q
 //!
 //! Fixture: batch 512 rows, positions at end of L ∈ {1024,8192,32768},
 //! random finite Q8 K/V + Q. 100 interleaved HIP-event samples/twin/L, warm.
@@ -25,6 +27,8 @@
 //!   fa2_attrib_nofill
 //!   fa2_attrib_noexp
 //!   fa2_attrib_nopv
+//!   fa2_attrib_noqload
+//!   fa2_attrib_noqk
 //!
 //! Twins must stay within production VGPR count ±10% or attribution is
 //! confounded — this binary prints that reminder; parent verifies metadata.
@@ -48,16 +52,18 @@ const ATTR_ITERS: usize = 100;
 const ATTR_WARMUP: usize = 5;
 const SCALE: f32 = 1.0 / 16.0; // 1/sqrt(256)
 
-const SYMS: [&str; 4] = [
+const SYMS: [&str; 6] = [
     "fa2_attrib_prod",
     "fa2_attrib_nofill",
     "fa2_attrib_noexp",
     "fa2_attrib_nopv",
+    "fa2_attrib_noqload",
+    "fa2_attrib_noqk",
 ];
 
 const TWIN_SRC: &str = r#####"
 // F3.0 FA2 attribution twins — derived from attention_q8_0_fa2_gqa.gfx11.hip
-// Diagnostic only. Modes: 0=prod 1=nofill 2=noexp 3=nopv.
+// Diagnostic only. Modes: 0=prod 1=nofill 2=noexp 3=nopv 4=noqload 5=noqk.
 #include <hip/hip_runtime.h>
 
 #define HIPFIRE_FA2_KMODE 0
@@ -281,6 +287,8 @@ __device__ __forceinline__ void fa2_gqa_body_attrib(
                     const int key = sub * 16 + ml;
                     const int rot = fa2_swiz(key & 15);
                     const int base = key * 128;
+                    // Last converted Q fragment — used by noqk score synth.
+                    half16_t qf_last = (_Float16)0;
                     for (int dc = 0; dc < 16; ++dc) {
                         half16_t kf;
 #pragma unroll
@@ -297,7 +305,18 @@ __device__ __forceinline__ void fa2_gqa_body_attrib(
                             kf[2 * i + 3] = d1.h[1];
                         }
                         half16_t qf;
-                        {
+                        if constexpr (MODE == 4) {
+                            // noqload: no global Q read / f32->f16 convert.
+                            // Synthesize half16 from lane + chunk (data-dependent).
+                            const float base_q =
+                                (float)(ml + 1) * 0.015625f
+                                + (float)dc * 0.00390625f
+                                + (float)half * 0.001f
+                                + (float)(sub & 1) * 0.0005f;
+#pragma unroll
+                            for (int g = 0; g < 16; ++g)
+                                qf[g] = (_Float16)(base_q + (float)g * 0.00025f);
+                        } else {
                             const float* qd = q + qq_base + (unsigned)(dc * 16);
 #pragma unroll
                             for (int g = 0; g < 4; ++g) {
@@ -310,9 +329,34 @@ __device__ __forceinline__ void fa2_gqa_body_attrib(
                                 qf[4 * g + 3] = (_Float16)v[3];
                             }
                         }
-                        sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-                            kf, qf, sacc);
+                        qf_last = qf;
+                        if constexpr (MODE == 5) {
+                            // noqk: keep Q load+convert; skip QK WMMA.
+                            // Fold a couple of halves into a live scalar so qf is not DCE'd.
+                            // K fragment still loaded so LDS traffic matches prod for isolation of WMMA.
+                            float keep = (float)qf[0] + (float)qf[8]
+                                       + (float)kf[0] * 0.0f;
+                            asm volatile("" : "+v"(keep) ::);
+                            (void)keep;
+                        } else {
+                            sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                                kf, qf, sacc);
+                        }
                         asm volatile("" ::: "memory");
+                    }
+                    if constexpr (MODE == 5) {
+                        // Synthesize score fragment from converted Q so softmax/PV stay live.
+                        const float s0 = (float)qf_last[0] + (float)qf_last[1];
+                        const float s1 = (float)qf_last[2] + (float)qf_last[3];
+                        const float s2 = (float)qf_last[4] + (float)qf_last[5];
+                        const float s3 = (float)qf_last[6] + (float)qf_last[7];
+                        const float s4 = (float)qf_last[8] + (float)qf_last[9];
+                        const float s5 = (float)qf_last[10] + (float)qf_last[11];
+                        const float s6 = (float)qf_last[12] + (float)qf_last[13];
+                        const float s7 = (float)qf_last[14] + (float)qf_last[15];
+                        sacc = (float8_t){
+                            s0 * 0.125f, s1 * 0.125f, s2 * 0.125f, s3 * 0.125f,
+                            s4 * 0.125f, s5 * 0.125f, s6 * 0.125f, s7 * 0.125f};
                     }
                 }
 
@@ -446,6 +490,8 @@ FA2_ATTRIB_ENTRY(fa2_attrib_prod, 0)
 FA2_ATTRIB_ENTRY(fa2_attrib_nofill, 1)
 FA2_ATTRIB_ENTRY(fa2_attrib_noexp, 2)
 FA2_ATTRIB_ENTRY(fa2_attrib_nopv, 3)
+FA2_ATTRIB_ENTRY(fa2_attrib_noqload, 4)
+FA2_ATTRIB_ENTRY(fa2_attrib_noqk, 5)
 
 "#####;
 
@@ -618,7 +664,7 @@ fn run_attribution(gpu: &mut Gpu) {
     );
     eprintln!("symbols: {}", SYMS.join(", "));
     eprintln!(
-        "WARNING: parent MUST verify all four twins stay within production VGPR ±10%; \
+        "WARNING: parent MUST verify all six twins stay within production VGPR ±10%; \
          otherwise attribution is confounded. Read hsaco metadata under HIPFIRE_KERNEL_CACHE."
     );
 
@@ -665,7 +711,7 @@ fn run_attribution(gpu: &mut Gpu) {
             }
         }
 
-        let mut samples: [Vec<f64>; 4] = [Vec::new(), Vec::new(), Vec::new(), Vec::new()];
+        let mut samples: [Vec<f64>; 6] = std::array::from_fn(|_| Vec::new());
         for _ in 0..ATTR_ITERS {
             for (si, sym) in SYMS.iter().enumerate() {
                 let us = launch_twin(
@@ -682,8 +728,8 @@ fn run_attribution(gpu: &mut Gpu) {
             }
         }
 
-        let mut med = [0.0f64; 4];
-        for i in 0..4 {
+        let mut med = [0.0f64; 6];
+        for i in 0..6 {
             med[i] = median_f64(&mut samples[i]);
             let mn = samples[i].iter().cloned().fold(f64::INFINITY, f64::min);
             let mx = samples[i]
@@ -699,17 +745,27 @@ fn run_attribution(gpu: &mut Gpu) {
         let fill = (med[0] - med[1]) / prod;
         let exp_a = (med[0] - med[2]) / prod;
         let pv = (med[0] - med[3]) / prod;
+        let qload = (med[0] - med[4]) / prod;
+        let qk = (med[0] - med[5]) / prod;
         eprintln!(
-            "  fill=(prod-nofill)/prod = {fill:.4}  ({:.2}%)",
+            "  fill =(prod-nofill)/prod  = {fill:.4}  ({:.2}%)",
             fill * 100.0
         );
         eprintln!(
-            "  exp =(prod-noexp)/prod  = {exp_a:.4}  ({:.2}%)",
+            "  exp  =(prod-noexp)/prod   = {exp_a:.4}  ({:.2}%)",
             exp_a * 100.0
         );
         eprintln!(
-            "  pv  =(prod-nopv)/prod   = {pv:.4}  ({:.2}%)",
+            "  pv   =(prod-nopv)/prod    = {pv:.4}  ({:.2}%)",
             pv * 100.0
+        );
+        eprintln!(
+            "  qload=(prod-noqload)/prod = {qload:.4}  ({:.2}%)",
+            qload * 100.0
+        );
+        eprintln!(
+            "  qk   =(prod-noqk)/prod    = {qk:.4}  ({:.2}%)",
+            qk * 100.0
         );
     }
 }
