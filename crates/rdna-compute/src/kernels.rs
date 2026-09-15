@@ -3187,15 +3187,6 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
 /// admitting RDNA3 cannot alter the certified gfx12 code object.
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma.hip");
-/// MQ4G256V2-Lloyd (qt=52) gfx11 residual WMMA base tile: `-DHIPFIRE_MQ4G256V2_LUT=1`
-/// appends 8 kernarg dwords (16 centered f16 codebook levels, staged to 32 B LDS)
-/// and decodes nibbles through them (`w = sc*C[q] + zp'`, zp' pre-folded). Distinct
-/// symbol (`gemm_mq4g256v2_residual_wmma_gfx11_lloyd`) so the module cannot alias
-/// the uniform residual base. Base tile only (no BT/MW/ldsstage twin in T0).
-pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_LUT_SRC: &str = concat!(
-    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_RESIDUAL_WMMA_KERNEL gemm_mq4g256v2_residual_wmma_gfx11_lloyd\n",
-    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma.hip")
-);
 pub const GEMM_MQ5G256V2_RESIDUAL_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq5g256v2_residual_wmma.hip");
 pub const GEMM_MQ6G256V2_RESIDUAL_WMMA_SRC: &str =

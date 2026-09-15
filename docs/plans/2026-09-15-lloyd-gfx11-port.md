@@ -7,6 +7,17 @@ All paths below are worktree-absolute; line numbers are HEAD-pinned (`:line`).
 Product decision (taken, not revisited): **xt stays uniform (+iu4) for speed on gfx11;
 base/pro tiers get Lloyd.** §3 states per-tier routes and the accepted prefill cost.
 
+> **STATUS 2026-09-15 — T0 gate FAILED; F16-LUT prefill direction abandoned.**
+> XTX (gfx1100), residual K=17408 M=5120, `tmp_lloyd_gfx11_diff --time`:
+> F16-LUT twin 2224 us vs uniform F16 base tile 1378 us at N=384 (+61%);
+> 2986 vs 2175 at N=511 (+37%); 2980 vs 1741 at N=512 where uniform routes to
+> MMQ (+71%). Abandon criterion was +10%. Correctness gate passed (rel-L2
+> 2.7e-4 vs LUT GEMV, N=511/512). T2-T6 not built; T0 code reverted; T1
+> (gfx1151 fused-decode admission) kept. On gfx11 a qt=52 artifact decodes
+> through the scalar LUT kernels; batched prefill fails closed (gemm.rs
+> `_lloyd` arms) — Lloyd tiers are gfx12-only until a prefill route that does
+> not cost gfx11 MMQ/iu4 throughput exists.
+
 ## 0. Amdahl framing (denominator first)
 
 - Decode on gfx11 is dominated by per-launch GEMV/FWHT/attention work, not by the
