@@ -42,9 +42,11 @@ pub struct WeightRef<'a> {
     pub awq_scale: Option<&'a GpuTensor>,
     /// MQ4G256V2-Lloyd (qt=52) centered codebook LUTs, copied from
     /// `WeightTensor` by `dispatch_ref`. `Some` iff the tensor was correctly
-    /// loaded; LUT-kernel arms fail closed on `None`.
+    /// loaded; LUT-kernel arms fail closed on `None`. `lloyd_lut_c16` is the
+    /// MMQ byte-code table (GEMV decode does not consume it).
     pub lloyd_lut_e4m3: Option<[u32; 4]>,
     pub lloyd_lut_f16: Option<[u32; 8]>,
+    pub lloyd_lut_c16: Option<[u32; 4]>,
 }
 
 // ── Dispatch parameters ────────────────────────────────

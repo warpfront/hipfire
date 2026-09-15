@@ -15,7 +15,8 @@
 //! * `L` (f32[16] in [0,15] units, E4M3-snapped by the constrained Lloyd fit)
 //!   arrives in the `<stem>.lloyd_levels.weight` F32 sidecar.
 //! * The loader centers `C = L − 7.5` (bit-exact in f32 for on-grid sidecars)
-//!   and builds two kernel-arg LUTs: [`lloyd_luts_from_levels`].
+//!   and builds three kernel-arg LUTs: [`lloyd_luts_from_levels`] (E4M3 + f16)
+//!   and [`lloyd_lut_c16_from_levels`] (signed MMQ byte codes).
 //! * The loader rewrites the weight headers `zp → zp'` BEFORE upload
 //!   ([`apply_lloyd_centering`]); `sc` bytes are untouched. The file keeps the
 //!   uncentered zp, so file md5 ≠ GPU bytes for qt=52 — intentional, logged.
@@ -110,6 +111,33 @@ pub fn lloyd_luts_from_levels(levels: &[f32; 16]) -> ([u32; 4], [u32; 8]) {
         h[i / 2] |= (bits as u32) << ((i % 2) * 16);
     }
     (e4, h)
+}
+
+/// Build the MMQ-LUT C16 kernel-arg from sidecar levels (f32[16], [0,15] units).
+///
+/// For each level `L`, `code = round_ties_even(16·(L − 7.5))` as a signed
+/// integer in `[-120, 120]`, packed little-endian as the u8 two's-complement
+/// bit pattern into 4 dwords (`out[i/4] |= (code as i8 as u8 as u32) <<
+/// ((i%4)*8)` — same byte-lane convention as the E4M3 arm of
+/// [`lloyd_luts_from_levels`]). U1 emits the unbiased signed codes; the MMQ
+/// twin (U2) may fold a +120 bias into the zp term if the weight-side WMMA
+/// operand must stay unsigned (Outcome B).
+pub fn lloyd_lut_c16_from_levels(levels: &[f32; 16]) -> [u32; 4] {
+    let mut out = [0u32; 4];
+    for (i, &l) in levels.iter().enumerate() {
+        let c = l - LLOYD_CENTER;
+        let code_f = (16.0 * c).round_ties_even();
+        // L ∈ [0,15] ⇒ C ∈ [-7.5,7.5] ⇒ 16C ∈ [-120,120].
+        assert!(
+            (-120.0..=120.0).contains(&code_f),
+            "C16 code {code_f} out of [-120,120] for level {l}"
+        );
+        let code_i = code_f as i32;
+        debug_assert!((-120..=120).contains(&code_i));
+        let byte = code_i as i8 as u8;
+        out[i / 4] |= (byte as u32) << ((i % 4) * 8);
+    }
+    out
 }
 
 /// Validate + parse a `lloyd_levels` sidecar: F32 (qt=2), shape [16], 64 bytes.
@@ -286,5 +314,83 @@ mod tests {
             "model.layers.0.q_proj.lloyd_levels.weight"
         );
         assert_eq!(lloyd_sidecar_name("bare"), "bare.lloyd_levels.weight");
+    }
+
+    /// Unpack one signed C16 code byte at level index `i`.
+    fn c16_code(c16: &[u32; 4], i: usize) -> i32 {
+        let byte = ((c16[i / 4] >> ((i % 4) * 8)) & 0xff) as u8;
+        byte as i8 as i32
+    }
+
+    #[test]
+    fn c16_exact_for_e4m3_on_grid_abs_ge_1() {
+        // Every finite E4M3 value with |e| ≥ 1 is an exact multiple of a
+        // negative power of two coarse enough that 16·e is an integer —
+        // round_ties_even is the identity, codes exact (plan §3.1).
+        let mut checked = 0usize;
+        for b in 0u16..=255 {
+            let b = b as u8;
+            let exp = (b >> 3) & 0xF;
+            if exp == 15 {
+                continue; // NaN/Inf lane — never produced by encode_rn
+            }
+            let e = e4m3_bias7_decode(b);
+            // Sidecar L lives in [0,15] ⇒ |e| ≤ 7.5. E4M3 also has |e|>7.5
+            // (up to 240); those are not on-grid codebook levels.
+            if e.abs() < 1.0 || e.abs() > 7.5 {
+                continue;
+            }
+            let scaled = 16.0 * e;
+            assert_eq!(
+                scaled, scaled.round_ties_even(),
+                "16·e must already be integer for |e|≥1 E4M3 e={e} b=0x{b:02x}"
+            );
+            let expected = scaled as i32;
+            let levels = [LLOYD_CENTER + e; 16];
+            let c16 = lloyd_lut_c16_from_levels(&levels);
+            for i in 0..16 {
+                assert_eq!(c16_code(&c16, i), expected, "b=0x{b:02x} level {i}");
+            }
+            checked += 1;
+        }
+        assert!(checked > 0, "expected some |e|≥1 E4M3 codes");
+    }
+
+    #[test]
+    fn c16_round_ties_even_near_center() {
+        // Near-center |e| < 1: 16·e is fractional; halves resolve ties-to-even.
+        // 16 · 0.09375 = 1.5 → 2 (even); 16 · 0.15625 = 2.5 → 2 (even);
+        // 16 · (-0.09375) = -1.5 → -2 (even magnitude via two's-complement round).
+        let mut levels = [LLOYD_CENTER; 16];
+        levels[0] = LLOYD_CENTER + 0.09375;
+        levels[1] = LLOYD_CENTER + 0.15625;
+        levels[2] = LLOYD_CENTER - 0.09375;
+        levels[3] = LLOYD_CENTER + 0.0625; // 16·0.0625 = 1.0 exact
+        let c16 = lloyd_lut_c16_from_levels(&levels);
+        assert_eq!(c16_code(&c16, 0), 2, "1.5 ties to even → 2");
+        assert_eq!(c16_code(&c16, 1), 2, "2.5 ties to even → 2");
+        assert_eq!(c16_code(&c16, 2), -2, "-1.5 ties to even → -2");
+        assert_eq!(c16_code(&c16, 3), 1, "1.0 exact");
+        // Center level → code 0.
+        assert_eq!(c16_code(&c16, 4), 0);
+        // Packing: first dword holds levels 0..3 LE.
+        let b0 = (c16[0] & 0xff) as u8 as i8;
+        let b1 = ((c16[0] >> 8) & 0xff) as u8 as i8;
+        let b2 = ((c16[0] >> 16) & 0xff) as u8 as i8;
+        let b3 = ((c16[0] >> 24) & 0xff) as u8 as i8;
+        assert_eq!([b0, b1, b2, b3], [2, 2, -2, 1]);
+    }
+
+    #[test]
+    fn c16_uniform_grid_matches_16_times_centered() {
+        let levels: [f32; 16] = core::array::from_fn(|i| i as f32);
+        let c16 = lloyd_lut_c16_from_levels(&levels);
+        for i in 0..16 {
+            let expected = (16.0 * (i as f32 - LLOYD_CENTER)).round_ties_even() as i32;
+            assert_eq!(c16_code(&c16, i), expected, "uniform level {i}");
+        }
+        // Ends: L=0 → -120; L=15 → +120.
+        assert_eq!(c16_code(&c16, 0), -120);
+        assert_eq!(c16_code(&c16, 15), 120);
     }
 }

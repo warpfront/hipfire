@@ -523,13 +523,15 @@ pub struct WeightTensor {
     /// `crate::lloyd_lut`). `lloyd_lut_e4m3` packs the 16 centered (`L−7.5`)
     /// E4M3 bytes as 4 dwords for the gfx12 FP8 prefill kernels
     /// (`HIPFIRE_FP8_LUT_ARG` mode); `lloyd_lut_f16` packs the same 16 centered
-    /// levels as f16 bits in 8 dwords for the GEMV/decode kernels. Host values
-    /// (no GPU upload). `Some` iff `gpu_dtype == DType::MQ4G256V2Lloyd` on a
-    /// correctly loaded tensor — dispatch fails closed when a Lloyd tensor
-    /// arrives with `None` here, so a missing sidecar can never silently
-    /// decode on the uniform grid.
+    /// levels as f16 bits in 8 dwords for the GEMV/decode kernels;
+    /// `lloyd_lut_c16` packs signed `round_ties_even(16·(L−7.5))` bytes as 4
+    /// dwords for the gfx11 MMQ-LUT prefill twin. Host values (no GPU upload).
+    /// `Some` iff `gpu_dtype == DType::MQ4G256V2Lloyd` on a correctly loaded
+    /// tensor — dispatch fails closed when a Lloyd tensor arrives with `None`
+    /// here, so a missing sidecar can never silently decode on the uniform grid.
     pub lloyd_lut_e4m3: Option<[u32; 4]>,
     pub lloyd_lut_f16: Option<[u32; 8]>,
+    pub lloyd_lut_c16: Option<[u32; 4]>,
 }
 
 impl WeightTensor {
@@ -591,6 +593,7 @@ impl WeightTensor {
             awq_scale: self.awq_scale.as_ref(),
             lloyd_lut_e4m3: self.lloyd_lut_e4m3,
             lloyd_lut_f16: self.lloyd_lut_f16,
+            lloyd_lut_c16: self.lloyd_lut_c16,
         }
     }
 }
@@ -796,6 +799,7 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         awq_scale: None,
         lloyd_lut_e4m3: w.lloyd_lut_e4m3,
         lloyd_lut_f16: w.lloyd_lut_f16,
+        lloyd_lut_c16: w.lloyd_lut_c16,
     };
 
     if !dtype_needs_rotation(w.gpu_dtype) {
@@ -1324,6 +1328,7 @@ pub fn weight_gemv_prerotated(
             awq_scale: None,
             lloyd_lut_e4m3: w.lloyd_lut_e4m3,
             lloyd_lut_f16: w.lloyd_lut_f16,
+            lloyd_lut_c16: w.lloyd_lut_c16,
         };
         return gemv
             .run_auto(&ctx, gpu, &wr, x, y)
@@ -1365,6 +1370,7 @@ pub fn weight_gemv_prerotated(
                 awq_scale: None,
                 lloyd_lut_e4m3: w.lloyd_lut_e4m3,
                 lloyd_lut_f16: w.lloyd_lut_f16,
+                lloyd_lut_c16: w.lloyd_lut_c16,
             };
             return gemv
                 .run(
@@ -1395,6 +1401,7 @@ pub fn weight_gemv_prerotated(
         awq_scale: None,
         lloyd_lut_e4m3: w.lloyd_lut_e4m3,
         lloyd_lut_f16: w.lloyd_lut_f16,
+        lloyd_lut_c16: w.lloyd_lut_c16,
     };
     gemv.run_auto(&ctx, gpu, &wr, x, y)
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
@@ -1434,6 +1441,7 @@ pub fn weight_gemv_residual(
         awq_scale: None,
         lloyd_lut_e4m3: w.lloyd_lut_e4m3,
         lloyd_lut_f16: w.lloyd_lut_f16,
+        lloyd_lut_c16: w.lloyd_lut_c16,
     };
 
     match w.gpu_dtype {
@@ -1534,6 +1542,7 @@ pub fn weight_gemv_swiglu_residual(
         awq_scale: None,
         lloyd_lut_e4m3: w_down.lloyd_lut_e4m3,
         lloyd_lut_f16: w_down.lloyd_lut_f16,
+        lloyd_lut_c16: w_down.lloyd_lut_c16,
     };
     match w_down.gpu_dtype {
         DType::MQ4G256
@@ -3579,6 +3588,7 @@ pub fn load_weights(
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 })
             }
             GgmlType::Q6K => {
@@ -3593,6 +3603,7 @@ pub fn load_weights(
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 })
             }
             GgmlType::Q8_0 => {
@@ -3607,6 +3618,7 @@ pub fn load_weights(
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 })
             }
             GgmlType::F32 => {
@@ -3621,6 +3633,7 @@ pub fn load_weights(
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 })
             }
             _ => {
@@ -3640,6 +3653,7 @@ pub fn load_weights(
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 })
             }
         }
@@ -3684,6 +3698,7 @@ pub fn load_weights(
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         }
     };
 

@@ -447,6 +447,7 @@ fn load_wt(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             }
         }
         // MQ4G256 (13) and its Lloyd-codebook sibling (19). The drafter's
@@ -473,6 +474,7 @@ fn load_wt(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             }
         }
         1 => {
@@ -493,6 +495,7 @@ fn load_wt(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             }
         }
         2 => {
@@ -513,6 +516,7 @@ fn load_wt(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             }
         }
         16 => {
@@ -533,6 +537,7 @@ fn load_wt(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             }
         }
         qt => {

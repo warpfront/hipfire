@@ -640,6 +640,7 @@ fn load_weight_tensor_from_source(
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -689,6 +690,7 @@ fn load_lm_head_from_source(
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         Ok((wt, true))
     } else {

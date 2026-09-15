@@ -1159,6 +1159,7 @@ fn weight_tensor_from_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         3 => {
@@ -1175,6 +1176,7 @@ fn weight_tensor_from_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         1 => {
@@ -1198,6 +1200,7 @@ fn weight_tensor_from_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         2 => {
@@ -1213,6 +1216,7 @@ fn weight_tensor_from_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         other => panic!(

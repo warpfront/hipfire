@@ -2747,6 +2747,7 @@ pub(crate) fn run_plain_gemm_key(
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let params = GemmParams {
         w: &w,
@@ -2799,6 +2800,7 @@ pub(crate) fn run_residual_gemm_key(
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     // The residual stream `y` is BOTH the residual and the output (`y += W·x`).
     let params = GemmParams {
@@ -3329,6 +3331,7 @@ pub(crate) fn prefill_moe_ffn_body_batched_with_route(
             awq_scale: None,
             lloyd_lut_e4m3: ffn.router.lloyd_lut_e4m3,
             lloyd_lut_f16: ffn.router.lloyd_lut_f16,
+            lloyd_lut_c16: ffn.router.lloyd_lut_c16,
         };
         let params = GemmParams {
             w: &w,

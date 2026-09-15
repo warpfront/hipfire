@@ -116,6 +116,7 @@ pub fn execute_pipeline(
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 };
                 gemv.run_auto(ctx, gpu, &w, params.x, params.y)?;
             }

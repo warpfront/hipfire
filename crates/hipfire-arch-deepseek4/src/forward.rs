@@ -316,6 +316,7 @@ pub(crate) fn gemv_auto(
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     // DeepSeek prepares and reuses the FWHT input in architecture-owned
     // scratch. `run_auto` treats its input as plain and rotates every typed MQ

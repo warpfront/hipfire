@@ -424,6 +424,7 @@ fn gemv_auto(
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     gemv.run_auto(&ctx, gpu, &wr, x, y)
         .map_err(|e| format!("gemv dispatch: {e}"))

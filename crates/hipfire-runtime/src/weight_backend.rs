@@ -223,6 +223,7 @@ pub fn reupload_f16_as_f32(
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -248,6 +249,7 @@ pub fn tied_lm_head_alias(
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     }
 }
 
@@ -625,6 +627,7 @@ pub(crate) fn decode_raw_codec(
         // lloyd_levels sidecar — same pattern as AWQ sidecars, never here.
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -725,6 +728,7 @@ pub fn dequant_weight_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         2 => {
@@ -739,6 +743,7 @@ pub fn dequant_weight_raw(
                 paro: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
                 awq_scale: None,
             })
         }
@@ -759,6 +764,7 @@ pub fn dequant_weight_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         other => match raw_codec(other) {

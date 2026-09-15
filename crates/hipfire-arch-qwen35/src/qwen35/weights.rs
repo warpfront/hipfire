@@ -1067,6 +1067,7 @@ pub(crate) fn alloc_ep_dummies(
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         let down = WeightTensor {
             buf: down_owner.shallow_clone(),
@@ -1078,6 +1079,7 @@ pub(crate) fn alloc_ep_dummies(
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         owners.push(gate_owner);
         owners.push(down_owner);

@@ -162,6 +162,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         7 => {
@@ -176,6 +177,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         8 => {
@@ -190,6 +192,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         11 => {
@@ -204,6 +207,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         12 => {
@@ -218,6 +222,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         13 => {
@@ -233,6 +238,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         14 => {
@@ -248,6 +254,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         15 => {
@@ -263,6 +270,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         17 => {
@@ -278,6 +286,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         18 => {
@@ -293,6 +302,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         19 => {
@@ -308,6 +318,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         20 => {
@@ -323,6 +334,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         30 => {
@@ -339,6 +351,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         31 => {
@@ -357,6 +370,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         21 => {
@@ -379,6 +393,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         24 => {
@@ -399,6 +414,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         32 => {
@@ -418,6 +434,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         33 => {
@@ -438,6 +455,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         34 => {
@@ -458,6 +476,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         36 => {
@@ -478,6 +497,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         37 => {
@@ -498,6 +518,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         44 => {
@@ -531,6 +552,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         52 => {
@@ -554,6 +576,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         45 => {
@@ -595,6 +618,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         47 => {
@@ -631,6 +655,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         48 => {
@@ -665,6 +690,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         49 => {
@@ -699,6 +725,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         50 => {
@@ -733,6 +760,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         38 => {
@@ -763,6 +791,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         39 => {
@@ -784,6 +813,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         40 => {
@@ -798,6 +828,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         41 => {
@@ -812,6 +843,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         3 => {
@@ -826,6 +858,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         1 => match f16_lm_head_mode_from_config() {
@@ -849,6 +882,7 @@ fn load_weight_tensor_raw(
                     awq_scale: None,
                     lloyd_lut_e4m3: None,
                     lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 })
             }
         },
@@ -868,6 +902,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         16 => {
@@ -885,6 +920,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         35 => {
@@ -904,6 +940,7 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
                 lloyd_lut_e4m3: None,
                 lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         _ => dequant_weight_raw(gpu, quant_type, data, m, k),
@@ -995,6 +1032,7 @@ pub(crate) fn load_weight_tensor(
                 })?;
             wt.lloyd_lut_e4m3 = Some(luts.0);
             wt.lloyd_lut_f16 = Some(luts.1);
+            wt.lloyd_lut_c16 = Some(luts.2);
         }
         return Ok(wt);
     }
@@ -1016,7 +1054,7 @@ pub(crate) fn load_weight_tensor(
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
         }
         if wt.gpu_dtype == DType::MQ4G256V2Lloyd {
-            let (e4m3, f16) = hipfire_runtime::hfq::load_lloyd_lut(hfq, &matched_name)
+            let (e4m3, f16, c16) = hipfire_runtime::hfq::load_lloyd_lut(hfq, &matched_name)
                 .or_else(|_| hipfire_runtime::hfq::load_lloyd_lut(hfq, name))
                 .map_err(|e| {
                     HipError::new(
@@ -1026,6 +1064,7 @@ pub(crate) fn load_weight_tensor(
                 })?;
             wt.lloyd_lut_e4m3 = Some(e4m3);
             wt.lloyd_lut_f16 = Some(f16);
+            wt.lloyd_lut_c16 = Some(c16);
         }
         Ok(wt)
     }
@@ -1323,6 +1362,7 @@ pub(crate) fn load_paroquant_weight(
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -1364,6 +1404,7 @@ fn load_fp16_weight_from_source(
         awq_scale: None,
         lloyd_lut_e4m3: None,
         lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -2661,7 +2702,7 @@ impl WeightSource for HfqSource<'_> {
                     break;
                 }
             }
-            let (e4m3, f16) = luts.ok_or_else(|| {
+            let (e4m3, f16, c16) = luts.ok_or_else(|| {
                 HipError::new(
                     0,
                     "MQ4G256V2Lloyd lm_head.weight has no codebook sidecar: \
@@ -2670,6 +2711,7 @@ impl WeightSource for HfqSource<'_> {
             })?;
             output.lloyd_lut_e4m3 = Some(e4m3);
             output.lloyd_lut_f16 = Some(f16);
+            output.lloyd_lut_c16 = Some(c16);
         }
         Ok((output, aliases))
     }
@@ -4592,6 +4634,7 @@ fn try_load_packed_mq4_experts(
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         gate_up.awq_scale = load_awq_scale_for(hfq, gpu, &spec.gate_up_name, dim);
         let mut down = WeightTensor {
@@ -4604,6 +4647,7 @@ fn try_load_packed_mq4_experts(
             awq_scale: None,
             lloyd_lut_e4m3: None,
             lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         down.awq_scale = load_awq_scale_for(hfq, gpu, &spec.down_name, mi);
         experts.push(ExpertWeights { gate_up, down });
