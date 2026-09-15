@@ -217,6 +217,11 @@ void iu4_probe_independent_lds(
 /// Twin source: production IU4 layout with MODE=prod|noload|nofold full_set_occ3 entries.
 /// Built from production helpers; only the three a0 diagnostic symbols are exported.
 const TWIN_SRC: &str = r#"
+#include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include <stdint.h>
+#include <math.h>
+
 // block_i4_128 (quant recipe stripped — host packs activations).
 struct block_i4_128 {
     float d;
@@ -595,6 +600,7 @@ fn pct_diff(a: f64, b: f64) -> f64 {
     ((a - b).abs() / den) * 100.0
 }
 
+#[allow(dead_code)]
 struct ProbeResult {
     name: &'static str,
     grid: u32,

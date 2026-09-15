@@ -6362,6 +6362,38 @@ pub const GATED_DELTA_NET_Q8_COMPACT2_DPP_GFX1151_SRC: &str = concat!(
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
 
+/// G1a: sequential dense-prefill Q8-EF DPP reduce on exact gfx1151.
+/// Distinct module+symbol from compact decode and baseline fast so JIT/cache
+/// cannot collide. QK_HEAD_DIV=1, TILE_ROWS=4, block32.
+pub const GATED_DELTA_NET_Q8_PREFILL_DPP_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_QK_HEAD_DIV 1\n",
+    "#define HIPFIRE_GDN_MIN_BLOCKS 8\n",
+    "#define HIPFIRE_GFX1151_GDN_DPP_REDUCE 1\n",
+    "#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_prefill_dpp_gfx1151\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+
+/// G1b: G1a + one-token Q/K/V/gate/beta prefetch (HIPFIRE_GFX1151_GDN_PREFETCH).
+pub const GATED_DELTA_NET_Q8_PREFILL_PREFETCH_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_QK_HEAD_DIV 1\n",
+    "#define HIPFIRE_GDN_MIN_BLOCKS 8\n",
+    "#define HIPFIRE_GFX1151_GDN_DPP_REDUCE 1\n",
+    "#define HIPFIRE_GFX1151_GDN_PREFETCH 1\n",
+    "#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_prefill_prefetch_gfx1151\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+
+/// G1c: R8 row tile (TILE_ROWS=8) + DPP for sequential prefill; grid y=16.
+pub const GATED_DELTA_NET_Q8_PREFILL_R8_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_QK_HEAD_DIV 1\n",
+    "#define HIPFIRE_GDN_TILE_ROWS 8\n",
+    "#define HIPFIRE_GDN_MIN_BLOCKS 8\n",
+    "#define HIPFIRE_GFX1151_GDN_DPP_REDUCE 1\n",
+    "#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_prefill_r8_gfx1151\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
+
+
 /// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
 /// to a caller-owned tape buffer, so sibling tokens read the parent's
 /// post-update state rather than the previous sibling's. Required for

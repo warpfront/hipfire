@@ -57,6 +57,32 @@ fn dn_requant_per_token() -> bool {
         .unwrap_or(false)
 }
 
+/// Closed G1 prefill variant selector (not a public ABI).
+#[cfg(feature = "deltanet")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum GdnGfx1151PrefillVariant {
+    Dpp,
+    Prefetch,
+    R8,
+}
+
+/// Resolve G1 arm for the gfx1151 prefill launcher. Default DPP; oracle may
+/// set `HIPFIRE_GDN_G1=prefetch` / `r8` / `1`/`dpp`.
+#[cfg(feature = "deltanet")]
+fn gdn_gfx1151_prefill_variant() -> GdnGfx1151PrefillVariant {
+    match hipfire_config::developer_var("HIPFIRE_GDN_G1")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("prefetch") => GdnGfx1151PrefillVariant::Prefetch,
+        Some("r8") => GdnGfx1151PrefillVariant::R8,
+        // `1` / `dpp` / unset → DPP (G1a first admitted arm).
+        _ => GdnGfx1151PrefillVariant::Dpp,
+    }
+}
+
+
 /// Use the chunked (parallel) FP32 GDN kernel on the multi-token (n>1) linear
 /// arm instead of the sequential batch_seq. DEFAULT OFF. Correctness-first
 /// PoC: each chunk is a separate host-side launch (cross-chunk is serial).
@@ -3133,6 +3159,199 @@ impl Gpu {
         }
         result
     }
+
+    /// Exact-gfx1151 sequential dense-prefill GDN (G1 candidates). Same typed
+    /// args as [`Self::gated_delta_net_q8_batch_seq`]. Private variant selector
+    /// chooses among dpp / prefetch / r8 modules; baseline batch_seq is unchanged.
+    ///
+    /// Eligibility (caller must prefer baseline when any fail): exact gfx1151,
+    /// eager/not-recording, EF present, default single-end requant, H48/D128,
+    /// tokens in 128..=512. Oracle may force a variant via `HIPFIRE_GDN_G1`
+    /// (`1`/`dpp`, `prefetch`, `r8`).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_q8_batch_seq_gfx1151_prefill(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8: &GpuTensor,
+        s_scales: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        ef_residual: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1151() || self.arch.as_str() != "gfx1151" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gated_delta_net_q8_batch_seq_gfx1151_prefill requires exact gfx1151, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gated_delta_net_q8_batch_seq_gfx1151_prefill is eager-only",
+            ));
+        }
+        if dn_requant_per_token() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gated_delta_net_q8_batch_seq_gfx1151_prefill requires default single-end requant",
+            ));
+        }
+        if ef_residual.is_none() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gated_delta_net_q8_batch_seq_gfx1151_prefill requires EF residual present",
+            ));
+        }
+        if n_heads != 48 || head_dim != 128 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gated_delta_net_q8_batch_seq_gfx1151_prefill requires H48/D128, got \
+                     H{n_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        if !(128..=512).contains(&n_tokens) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gated_delta_net_q8_batch_seq_gfx1151_prefill requires 128..=512 tokens, got {n_tokens}"
+                ),
+            ));
+        }
+        let variant = gdn_gfx1151_prefill_variant();
+        self.launch_gated_delta_net_q8_gfx1151_prefill(
+            variant,
+            q_batch,
+            k_batch,
+            v_batch,
+            gate_batch,
+            beta_batch,
+            s_q8,
+            s_scales,
+            output_batch,
+            n_tokens,
+            n_heads,
+            head_dim,
+            ef_residual,
+        )
+    }
+
+    /// Private common launcher for G1 prefill variants (closed selector).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    fn launch_gated_delta_net_q8_gfx1151_prefill(
+        &mut self,
+        variant: GdnGfx1151PrefillVariant,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8: &GpuTensor,
+        s_scales: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        ef_residual: Option<&GpuTensor>,
+    ) -> HipResult<()> {
+        let (module, src, symbol, n_tiles) = match variant {
+            GdnGfx1151PrefillVariant::Dpp => (
+                "gated_delta_net_q8_prefill_dpp_gfx1151",
+                kernels::GATED_DELTA_NET_Q8_PREFILL_DPP_GFX1151_SRC,
+                "gated_delta_net_q8_prefill_dpp_gfx1151",
+                128 / 4,
+            ),
+            GdnGfx1151PrefillVariant::Prefetch => (
+                "gated_delta_net_q8_prefill_prefetch_gfx1151",
+                kernels::GATED_DELTA_NET_Q8_PREFILL_PREFETCH_GFX1151_SRC,
+                "gated_delta_net_q8_prefill_prefetch_gfx1151",
+                128 / 4,
+            ),
+            GdnGfx1151PrefillVariant::R8 => (
+                "gated_delta_net_q8_prefill_r8_gfx1151",
+                kernels::GATED_DELTA_NET_Q8_PREFILL_R8_GFX1151_SRC,
+                "gated_delta_net_q8_prefill_r8_gfx1151",
+                128 / 8,
+            ),
+        };
+        self.ensure_kernel(module, src, symbol)?;
+
+        let mut qp = q_batch.buf.as_ptr();
+        let mut kp = k_batch.buf.as_ptr();
+        let mut vp = v_batch.buf.as_ptr();
+        let mut gp = gate_batch.buf.as_ptr();
+        let mut bp = beta_batch.buf.as_ptr();
+        let mut sp = s_q8.buf.as_ptr();
+        let mut scp = s_scales.buf.as_ptr();
+        let mut op = output_batch.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut fr = reserve_gdn_requant_frames(n_tokens as u32) as i32;
+        let mut efp: *mut c_void = ef_residual
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut scp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut fr as *mut _ as *mut c_void,
+            &mut efp as *mut _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", symbol, bytes);
+        // Static __shared__ LDS (2048 R4 / 4096 R8); dynamic group segment 0.
+        let result = self.launch_maybe_blob(
+            symbol,
+            [n_heads as u32, n_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(sp);
+                b.push_ptr(scp);
+                b.push_ptr(op);
+                b.push_i32(nt);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(fr);
+                b.push_ptr(efp);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
 
     /// One-token recurrent update for several independent sequence lanes.
     /// State tensors are lane-major; the kernel uses grid.z as the lane id.

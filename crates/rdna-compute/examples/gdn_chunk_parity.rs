@@ -27,7 +27,7 @@ fn main() {
 }
 
 #[cfg(feature = "deltanet")]
-const GDN_FAST_SRC: &str = include_str!("../../../../kernels/src/gated_delta_net_q8_fast.hip");
+const GDN_FAST_SRC: &str = include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip");
 
 /// G1a: DPP reduce tree on the batch_seq (QK_HEAD_DIV=1) entry.
 #[cfg(feature = "deltanet")]
@@ -40,7 +40,7 @@ const G1A_SRC: &str = concat!(
     "#define HIPFIRE_GDN_MIN_BLOCKS 8\n",
     "#define HIPFIRE_GFX1151_GDN_DPP_REDUCE 1\n",
     "#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_prefill_dpp_gfx1151\n",
-    include_str!("../../../../kernels/src/gated_delta_net_q8_fast.hip")
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
 
 /// G1b: G1a + one-token-ahead q/k/v/gate/beta register prefetch.
@@ -55,7 +55,7 @@ const G1B_SRC: &str = concat!(
     "#define HIPFIRE_GFX1151_GDN_DPP_REDUCE 1\n",
     "#define HIPFIRE_GFX1151_GDN_PREFETCH 1\n",
     "#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_prefill_prefetch_gfx1151\n",
-    include_str!("../../../../kernels/src/gated_delta_net_q8_fast.hip")
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
 
 /// G1c: G1a + TILE_ROWS=8 (static LDS 4096 B, block 32, grid y = 16).
@@ -70,7 +70,7 @@ const G1C_SRC: &str = concat!(
     "#define HIPFIRE_GDN_MIN_BLOCKS 8\n",
     "#define HIPFIRE_GFX1151_GDN_DPP_REDUCE 1\n",
     "#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_prefill_r8_gfx1151\n",
-    include_str!("../../../../kernels/src/gated_delta_net_q8_fast.hip")
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
 
 #[cfg(feature = "deltanet")]
