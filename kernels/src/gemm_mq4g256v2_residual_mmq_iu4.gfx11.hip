@@ -58,15 +58,19 @@
 
 #if !HIPFIRE_RDNA3
 
-extern C __global__ void gemm_mq4g256v2_residual_mmq_iu4(
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
-extern C __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add(
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
-extern C __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set(
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
-extern C __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3(
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
-extern C __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3(
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3(
+    const char*, const block_i4_128*, float*, int, int, int, int) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151(
+    const char*, const block_i4_128*, float*, int, int, int, int) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
 
 #else
@@ -220,10 +224,12 @@ static __device__ __forceinline__ void gemm_iu4_body(
     int M,
     int K,
     int N,
-    int add
+    int add,
+    int row_tile,
+    int col_tile
 ) {
-    const int row0 = blockIdx.x * IU4_MMQ_Y;
-    const int col0 = blockIdx.y * IU4_MMQ_X;
+    const int row0 = row_tile * IU4_MMQ_Y;
+    const int col0 = col_tile * IU4_MMQ_X;
     if (!FULL && (row0 >= M || col0 >= N)) return;
 
     const int groups_per_row = K / 256;
@@ -288,12 +294,17 @@ static __device__ __forceinline__ void gemm_iu4_body(
     }
 }
 
-#define IU4_ENTRY(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body<full>(A, Xq, Y, M, K, N, add); }
+#define IU4_ENTRY(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body<full>(A, Xq, Y, M, K, N, add, blockIdx.x, blockIdx.y); }
+#define IU4_ENTRY_COL(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body<full>(A, Xq, Y, M, K, N, add, blockIdx.y, blockIdx.x); }
 
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4, false, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3, true, 3)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3, true, 3)
+#if defined(__gfx1151__)
+IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151, true, 3)
+IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151, true, 3)
+#endif
 
 #endif

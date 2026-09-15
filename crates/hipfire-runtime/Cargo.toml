@@ -186,7 +186,10 @@ required-features = []
 name = "c8_sampler_validate"
 required-features = []
 
-# Gate F prereq (1): FA2 N=1024 vs two N=512 bit-identity oracle (throwaway).
+# Gate F1: FA2 N=1024 vs two N=512 bit-identity oracle (throwaway; repaired positions).
+[[example]]
+name = "tmp_fa2_n1024_oracle"
+required-features = ["lab"]
 
 [[example]]
 name = "calib_sweep"
@@ -452,6 +455,11 @@ name = "prefill_microbench"
 required-features = ["lab"]
 
 [[example]]
+name = "tmp_halo_iu4_oracle"
+required-features = ["lab"]
+
+
+[[example]]
 name = "probe_wmma"
 required-features = ["lab"]
 
@@ -642,6 +650,10 @@ required-features = ["lab"]
 [[example]]
 name = "verify_mq_kernel"
 required-features = ["lab"]
+
+[[example]]
+name = "tmp_halo_iu4_calibrate"
+required-features = []
 
 [[example]]
 name = "wmma_fa_spike"

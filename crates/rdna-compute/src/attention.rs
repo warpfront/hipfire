@@ -3886,11 +3886,19 @@ impl Gpu {
                 ),
             ));
         }
-        if batch_size == 0 || batch_size > 512 {
+        // Lab-only: exact gfx1151 allows N1024 on the direct launcher so the
+        // F1 oracle can single-launch vs two N512 halves. Production ingress
+        // (`attention_q8_0_flash_prefill_wmma`) stays capped at 512.
+        let max_fa2_batch: usize = if self.arch.as_str() == "gfx1151" {
+            1024
+        } else {
+            512
+        };
+        if batch_size == 0 || batch_size > max_fa2_batch {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_gfx11 requires 1 <= batch <= 512, got {batch_size}"
+                    "attention_q8_0_fa2_gqa_gfx11 requires 1 <= batch <= {max_fa2_batch}, got {batch_size}"
                 ),
             ));
         }
@@ -3969,17 +3977,9 @@ impl Gpu {
             32768,
             &mut params,
             || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(q_ptr);
-                b.push_ptr(k_ptr);
-                b.push_ptr(v_ptr);
-                b.push_ptr(pos_ptr);
-                b.push_i32(nh);
-                b.push_i32(nkv);
-                b.push_i32(hd);
-                b.push_i32(bs);
-                b.push_f32(sc);
-                b
+                pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
+                    q_ptr, k_ptr, v_ptr, out_ptr, pos_ptr, nh, nkv, hd, bs, sc,
+                )
             },
         );
         if let Some(t) = timer {
@@ -4051,11 +4051,18 @@ impl Gpu {
                 ),
             ));
         }
-        if batch_size == 0 || batch_size > 512 {
+        // Lab-only: exact gfx1151 N1024 on direct launcher (F1 oracle).
+        // Production ingress stays 512.
+        let max_fa2_batch: usize = if self.arch.as_str() == "gfx1151" {
+            1024
+        } else {
+            512
+        };
+        if batch_size == 0 || batch_size > max_fa2_batch {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 1 <= batch <= 512, got {batch_size}"
+                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 1 <= batch <= {max_fa2_batch}, got {batch_size}"
                 ),
             ));
         }
@@ -17128,13 +17135,104 @@ fn flux_attn_dtype_error(kernel: &str, q: DType, out: DType) -> hip_bridge::HipE
     )
 }
 
+/// Pack the FA2 gfx11 Q8 GQA kernarg blob (q,k,v,out,positions + 4×i32 + f32).
+///
+/// Shared by the capture-only blob path and the CPU ABI regression so the
+/// pointer-array layout cannot drift from the params path / HIP entry.
+/// Offsets: q0,k8,v16,out24,pos32,nh40,nkv44,hd48,bs52,scale56 (60 B payload).
+fn pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
+    q_ptr: *const c_void,
+    k_ptr: *const c_void,
+    v_ptr: *const c_void,
+    out_ptr: *const c_void,
+    pos_ptr: *const c_void,
+    nh: i32,
+    nkv: i32,
+    hd: i32,
+    bs: i32,
+    scale: f32,
+) -> hip_bridge::KernargBlob {
+    let mut b = hip_bridge::KernargBlob::new();
+    b.push_ptr(q_ptr);
+    b.push_ptr(k_ptr);
+    b.push_ptr(v_ptr);
+    b.push_ptr(out_ptr);
+    b.push_ptr(pos_ptr);
+    b.push_i32(nh);
+    b.push_i32(nkv);
+    b.push_i32(hd);
+    b.push_i32(bs);
+    b.push_f32(scale);
+    b
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::{
         flux_attn_dtype_error, flux_attn_dtype_suffix, flux_attn_route_dtypes,
-        flux_attn_route_name, q8_flash_default_tile_size, replay_stable_tile_count,
+        flux_attn_route_name, pack_attention_q8_0_fa2_gqa_gfx11_kernarg,
+        q8_flash_default_tile_size, replay_stable_tile_count,
     };
     use crate::DType;
+    use std::ffi::c_void;
+
+
+    /// C0: FA2 gfx11 blob must match the pointer-array ABI (q,k,v,out,positions,
+    /// 4×i32, f32). The old capture-only path omitted `out`, shifting every
+    /// subsequent field — keep this regression CPU-only (no GPU).
+    #[test]
+    fn pack_attention_q8_0_fa2_gqa_gfx11_kernarg_offsets_include_out() {
+        // Distinct sentinel addresses so a missing `out` slot is obvious.
+        let q = 0x1111_0001usize as *const c_void;
+        let k = 0x2222_0002usize as *const c_void;
+        let v = 0x3333_0003usize as *const c_void;
+        let out = 0x4444_0004usize as *const c_void;
+        let pos = 0x5555_0005usize as *const c_void;
+        let nh = 24i32;
+        let nkv = 4i32;
+        let hd = 256i32;
+        let bs = 512i32;
+        let scale = 1.0f32 / 16.0;
+
+        let blob = pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
+            q, k, v, out, pos, nh, nkv, hd, bs, scale,
+        );
+        let bytes = blob.as_bytes();
+        // Five 8-byte pointers + five 4-byte scalars = 60 argument bytes.
+        assert_eq!(bytes.len(), 60, "kernarg payload size");
+
+        let read_usize = |off: usize| -> usize {
+            usize::from_ne_bytes(bytes[off..off + 8].try_into().unwrap())
+        };
+        let read_i32 = |off: usize| -> i32 {
+            i32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap())
+        };
+        let read_f32 = |off: usize| -> f32 {
+            f32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap())
+        };
+
+        assert_eq!(read_usize(0), q as usize, "q @0");
+        assert_eq!(read_usize(8), k as usize, "k @8");
+        assert_eq!(read_usize(16), v as usize, "v @16");
+        assert_eq!(read_usize(24), out as usize, "out @24");
+        assert_eq!(read_usize(32), pos as usize, "pos @32");
+        assert_eq!(read_i32(40), nh, "nh @40");
+        assert_eq!(read_i32(44), nkv, "nkv @44");
+        assert_eq!(read_i32(48), hd, "hd @48");
+        assert_eq!(read_i32(52), bs, "bs @52");
+        assert_eq!(read_f32(56), scale, "scale @56");
+
+        // Explicit presence check: out must not equal any other pointer slot.
+        assert_ne!(out as usize, q as usize);
+        assert_ne!(out as usize, k as usize);
+        assert_ne!(out as usize, v as usize);
+        assert_ne!(out as usize, pos as usize);
+        assert!(
+            bytes[24..32] != bytes[32..40],
+            "out slot must not be the positions pointer (old bug)"
+        );
+    }
 
     /// The suffix table is the mapping from tensor dtypes to a kernel symbol.
     /// Get an arm wrong and the launcher asks for an entry that either does
