@@ -526,6 +526,16 @@ The conditional planning range, only after C1.0 passes, is 50–70% of the GDN b
 
 ## 11. Gate F — prefill chunk 1024, only after FA2 and GDN compatibility
 
+> **STATUS 2026-09-15 — Gate F BLOCKED at prerequisite 1.** Halo FA2 gfx11
+> N=1024 direct launch vs two disjoint N=512 launches: NOT bit-identical on
+> any of the three shapes for either K mode (max_abs 0.34 at L=1024, 1.5e-2 at
+> L=8192, 3.8e-3 at L=32768) — the kernel's >512-row path computes different
+> attention, not rounding drift. Timing for reference: 1024-row launch
+> 1819 us vs 1328 us (two 512s) at L=1024; 98.5 ms vs 106.4 ms at L=32768
+> (-7%). Chunk 1024 stays forbidden; the direct_unchecked twins and the
+> oracle were removed. Reopening F requires a kernel fix for batch>512 first.
+
+
 The existing developer override accepts values above 512 (`crates/hipfire-arch-qwen35/src/qwen35/prefill.rs:418-422`), but gfx1151's model default remains 512 (`:455-462`). The generic FA2 route admits only batch 64..512 step 16 and otherwise falls back to the incumbent (`crates/rdna-compute/src/attention.rs:3259-3286`); the direct launcher also rejects batch>512 (`:3889-3896`). Setting `HIPFIRE_PREFILL_MAX_BATCH=1024` today is therefore not evidence for a chunk win.
 
 All of the following are mandatory before timing 1024:

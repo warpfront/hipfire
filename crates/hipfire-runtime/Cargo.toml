@@ -187,9 +187,6 @@ name = "c8_sampler_validate"
 required-features = []
 
 # Gate F prereq (1): FA2 N=1024 vs two N=512 bit-identity oracle (throwaway).
-[[example]]
-name = "tmp_fa2_n1024_oracle"
-required-features = []
 
 [[example]]
 name = "calib_sweep"
