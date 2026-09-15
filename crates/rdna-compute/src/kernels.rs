@@ -3344,6 +3344,15 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str =
 // unchanged; metadata loads select the dual fp16 header per 128-weight half.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip");
+// MQ4G256V2-Lloyd (qt=52) MMQ-LUT twin: `-DHIPFIRE_MMQ_LUT=1` swaps nibble→byte
+// expand for a v_perm C16 lookup + sc/16, and emits `*_lloyd` entry symbols
+// with +4 u32 kernargs. Distinct MODULE (`gemm_mq4g256v2_residual_mmq_lloyd`)
+// so the code-object cache cannot alias the uniform module. Outcome A: signed
+// i8 codes (WMMA A_sign=true at mma_i8).
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_MMQ_LUT 1\n",
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip")
+);
 // MQ4V2 (qt44) iu4-direct MMQ sister (W4A4 prefill): weight nibbles feed
 // wmma_i32_16x16x16_iu4 directly, activations are int4 via the
 // quantize_int4_mmq_ds128 prelude in the same file. Opt-in through
