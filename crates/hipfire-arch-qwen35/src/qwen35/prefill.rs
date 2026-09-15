@@ -392,7 +392,6 @@ fn prefill_max_batch_for_arch(arch: &str, fp8_chunk512: bool) -> usize {
     }
 }
 
-
 fn explicit_prefill_max_batch() -> Option<usize> {
     hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
         .ok()
@@ -6196,6 +6195,44 @@ fn batch_chunk_fa_attend(
             config.head_dim,
             n,
         )?;
+        // Experimental gfx1201 verifier arm: retain the FA2 packed-Q8/LDS
+        // front end, split the live KV tile range to restore occupancy at
+        // small verifier batches, then combine CK-style LSE/Oacc partials.
+        // Fail closed to the exact measured shape and eager sequential route;
+        // `multirow` admission above already excludes tree, independent,
+        // graph-capture, and retained/PM4 recording paths.
+        let fa2_split_on = matches!(
+            hipfire_config::developer_var("HIPFIRE_GFX12_FA2_SPLIT_VERIFY")
+                .ok()
+                .as_deref(),
+            Some("1") | Some("on") | Some("true")
+        );
+        let fa2_splits = hipfire_config::developer_var("HIPFIRE_GFX12_FA2_SPLIT_COUNT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(8);
+        if fa2_split_on
+            && gpu.arch_caps.is_gfx1201()
+            && config.n_heads == 24
+            && config.n_kv_heads == 4
+            && config.head_dim == 256
+            && matches!(fa2_splits, 2 | 4 | 8)
+        {
+            gpu.attention_q8_0_fa2_gqa_split_gfx1201(
+                &pbs.fa_q_batch,
+                &kv_cache.k_gpu[layer_idx],
+                &kv_cache.v_gpu[layer_idx],
+                &pbs.fa_attn_out_batch,
+                &pbs.positions,
+                &s.flash_partials,
+                config.n_heads,
+                config.n_kv_heads,
+                config.head_dim,
+                n,
+                fa2_splits,
+            )?;
+            return Ok(());
+        }
         if gpu.attention_flash_q8_0_rows_masked(
             &pbs.fa_q_batch,
             &kv_cache.k_gpu[layer_idx],
@@ -9185,10 +9222,28 @@ mod tests {
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
         for arch in ["gfx1100", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                true,
             ));
         }
     }

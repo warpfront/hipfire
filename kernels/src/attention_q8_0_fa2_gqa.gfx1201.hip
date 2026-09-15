@@ -71,11 +71,12 @@ __device__ __forceinline__ int fa2_swiz(int c)
     return 8 * (c >> 2) + (c & 3);
 }
 
-// Shared workgroup body. PARTIAL=false writes normalized O to `out`;
-// PARTIAL=true writes [m, l, O_unnormalized[256]] records (stride 258) to
-// `out`. `tile0/tile1` bound the KT64 tile range (direct: whole sequence;
-// partial split: this split's disjoint range). `split` selects the record
-// plane for PARTIAL (ignored otherwise).
+// Shared workgroup body. PARTIAL=false writes normalized O to `out`.
+// PARTIAL=true follows CK split-KV's accumulator contract in one caller-owned
+// allocation: F32 LSE records first, then normalized F32 O accumulators. The
+// record index is ((query * H + head) * n_splits + split). Each split owns a
+// disjoint range of the live KT64 tiles derived from positions[], rather than
+// a max-context-sized static range.
 template <bool PARTIAL>
 __device__ __forceinline__ void fa2_gqa_body(
     const float* __restrict__ q,
@@ -87,8 +88,6 @@ __device__ __forceinline__ void fa2_gqa_body(
     float scale_attn,
     int kv_h,
     int q_base,
-    int tile0,
-    int tile1,
     int split,
     int n_splits)
 {
@@ -166,6 +165,10 @@ __device__ __forceinline__ void fa2_gqa_body(
     const int gmax = __builtin_amdgcn_readfirstlane((int)LDS[16382]);
     const int gmin = __builtin_amdgcn_readfirstlane((int)LDS[16383]);
     const int seq_len = gmax + 1;
+    const int tiles_total = (seq_len + 63) / 64;
+    const int tiles_per_split = (tiles_total + n_splits - 1) / n_splits;
+    const int tile0 = split * tiles_per_split;
+    const int tile1 = min(tile0 + tiles_per_split, tiles_total);
 
     // ---- Transitions 2-4: KT64 tiles ----
     for (int tile = tile0; tile < tile1; ++tile) {
@@ -465,35 +468,33 @@ __device__ __forceinline__ void fa2_gqa_body(
                 }
             }
         } else {
-            // Caller-owned partial records: [m, l, O_unnormalized[256]],
-            // stride 258, layout [((qr*H + h)*S + split)]. Every lane owns
-            // its query ml; lanes (ml, 0) write m/l once.
+            // CK-style split-KV contract. Keep LSE and Oacc in separate
+            // logical planes so the combine kernel has unambiguous strides:
+            //   lse[record]
+            //   oacc[record][256] (normalized partial output)
+            const unsigned records =
+                (unsigned)batch_size * 24u * (unsigned)n_splits;
+            float* lse = out;
+            float* oacc = out + records;
+            const unsigned record =
+                ((unsigned)qr_ml * 24u + (unsigned)h_ml)
+                    * (unsigned)n_splits + (unsigned)split;
+            const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
             if (kg == 0) {
                 if (qok_ml) {
-                    // 32-bit record base (partials < 64 MiB even at S=8).
-                    const unsigned rb =
-                        (((unsigned)qr_ml * 24u + (unsigned)h_ml)
-                             * (unsigned)n_splits + (unsigned)split)
-                        * 258u;
-                    float* rec = out + rb;
-                    rec[0] = m_old;
-                    rec[1] = l_val;
+                    lse[record] = l_val > 0.0f
+                        ? m_old + __logf(l_val)
+                        : -INFINITY;
                 }
             }
             if (qok_ml) {
-                const unsigned rb =
-                    (((unsigned)qr_ml * 24u + (unsigned)h_ml)
-                         * (unsigned)n_splits + (unsigned)split)
-                        * 258u;
-                float* rec = out + rb;
-                // j-outer/dc-inner, matching the direct epilogue's proven
-                // structure: j selects this lane's 8 dims per chunk.
+                float* rec = oacc + record * 256u;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    const unsigned rj = rb + 2u + (unsigned)(kg * 8 + j);
+                    const unsigned rj = (unsigned)(kg * 8 + j);
 #pragma unroll
                     for (int dc = 0; dc < 16; ++dc)
-                        rec[rj + (unsigned)(dc * 16)] = Ofr[dc][j];
+                        rec[rj + (unsigned)(dc * 16)] = Ofr[dc][j] * inv;
                 }
             }
         }
@@ -520,10 +521,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1
     const int q_base = blockIdx.x * 8;
     if (q_base >= batch_size)
         return;
-    // tiles_total is unknown without seq_len; the body derives seq_len
-    // from positions[] and clamps, so pass an unbounded range.
     fa2_gqa_body<false>(q, k_cache, v_cache, out, positions, batch_size,
-                        scale_attn, kv_h, q_base, 0, 0x3fffffff, 0, 1);
+                        scale_attn, kv_h, q_base, 0, 1);
 }
 
 #if HIPFIRE_FA2_KMODE == 3
@@ -599,7 +598,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
         return;
     fa2_gqa_rotate_q_256(q, signs1, signs2, kv_h, q_base, batch_size);
     fa2_gqa_body<false>(q, k_cache, v_cache, out, positions, batch_size,
-                        scale_attn, kv_h, q_base, 0, 0x3fffffff, 0, 1);
+                        scale_attn, kv_h, q_base, 0, 1);
 }
 #endif
 
@@ -629,17 +628,8 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_part
     const int split = blockIdx.z;
     if (split >= n_splits)
         return;
-    // Key-range partition needs seq_len, which lives in positions[] on
-    // the host side of the launcher... instead partition by tile index
-    // with an unbounded range: split s owns tiles [s*T/S,(s+1)*T/S) of
-    // the clamped range. The body cannot know T yet, so approximate with
-    // a fixed upper bound derived from the 32768 max_ctx_len gate:
-    // T_MAX = 32768/64 = 512 tiles; per = ceil(512/S).
-    const int per = (512 + n_splits - 1) / n_splits;
-    const int t0 = split * per;
-    const int t1 = t0 + per;
     fa2_gqa_body<true>(q, k_cache, v_cache, partials, positions, batch_size,
-                       scale_attn, kv_h, q_base, t0, t1, split, n_splits);
+                       scale_attn, kv_h, q_base, split, n_splits);
 }
 
 extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_gfx1201(
@@ -660,22 +650,23 @@ extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_g
     const int rec = blockIdx.x * 8 + wave;
     if (rec >= batch_size * n_heads)
         return;
+    const long long records =
+        (long long)batch_size * n_heads * n_splits;
+    const float* lse = partials;
+    const float* oacc = partials + records;
     float m = -INFINITY;
     for (int s = 0; s < n_splits; ++s) {
-        const float* pr =
-            partials + ((long long)rec * n_splits + s) * 258;
-        m = fmaxf(m, pr[0]);
+        m = fmaxf(m, lse[(long long)rec * n_splits + s]);
     }
     for (int d = lane; d < head_dim; d += 32) {
         float num = 0.0f;
         float den = 0.0f;
         for (int s = 0; s < n_splits; ++s) {
-            const float* pr =
-                partials + ((long long)rec * n_splits + s) * 258;
-            const float w =
-                (pr[1] > 0.0f) ? __expf(pr[0] - m) : 0.0f;
-            den += w * pr[1];
-            num += w * pr[2 + d];
+            const long long record = (long long)rec * n_splits + s;
+            const float split_lse = lse[record];
+            const float w = isfinite(split_lse) ? __expf(split_lse - m) : 0.0f;
+            den += w;
+            num += w * oacc[record * head_dim + d];
         }
         out[(long long)rec * head_dim + d] =
             (den > 0.0f) ? num / den : 0.0f;

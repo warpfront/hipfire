@@ -3181,10 +3181,18 @@ impl Gpu {
         // Profile bytes: f32 Q + K/V re-read over the causal prefix (ctx =
         // max_ctx_len; see `attention_q8_0_flash_prefill_bytes`) + f32 out.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer =
-            crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_flash_prefill", bytes);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_q8_0_flash_prefill",
+            bytes,
+        );
         let result = self.launch_maybe_blob(
             "attention_q8_0_flash_prefill",
             [grid_x, n_heads as u32, 1],
@@ -3254,13 +3262,33 @@ impl Gpu {
             && (64..=32768).contains(&max_ctx_len)
         {
             return self.attention_q8_0_fa2_gqa_gfx1201(
-                q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
-                max_ctx_len, batch_size,
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
+                batch_size,
             );
         }
         self.attention_q8_0_flash_prefill_wmma_slots(
-            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, max_ctx_len,
-            batch_size, None, None, None, None,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -3459,7 +3487,11 @@ impl Gpu {
         // Profile bytes: f32 Q + K/V re-read over the causal prefix (ctx =
         // max_ctx_len; see `attention_q8_0_flash_prefill_bytes`) + f32 out.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -3572,11 +3604,7 @@ impl Gpu {
         }
         const SYMBOL: &str = "attention_q8_0_fa2_gqa_gfx1201";
         if !self.functions.contains_key(SYMBOL) {
-            self.ensure_kernel(
-                SYMBOL,
-                kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
-                SYMBOL,
-            )?;
+            self.ensure_kernel(SYMBOL, kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC, SYMBOL)?;
         }
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -3606,7 +3634,11 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -3781,7 +3813,11 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -3818,17 +3854,17 @@ impl Gpu {
         result
     }
 
-    /// Benchmark-only split-KV FA2 GQA path (S partitions + stable merge).
+    /// gfx1201 split-KV FA2 GQA path (S partitions + stable merge).
     ///
     /// `partials` is caller-owned F32 scratch of at least
-    /// `n_splits * batch_size * n_heads * (head_dim + 2)` elements; this
+    /// `n_splits * batch_size * n_heads * (head_dim + 1)` elements: an
+    /// LSE plane followed by normalized-O accumulators; this
     /// method never allocates. Partial grid is `[ceil(batch/8), 4,
     /// n_splits]` (block 128, LDS 65536); merge grid is
     /// `[ceil(batch*n_heads/8), 1, 1]` (block 256, LDS 0). No profile
     /// timer: the harness times the whole call with GPU events.
-    #[doc(hidden)]
     #[allow(clippy::too_many_arguments)]
-    pub fn attention_q8_0_fa2_gqa_split_gfx1201_bench(
+    pub fn attention_q8_0_fa2_gqa_split_gfx1201(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -3847,7 +3883,7 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_split_gfx1201_bench requires gfx1201, got {}",
+                    "attention_q8_0_fa2_gqa_split_gfx1201 requires gfx1201, got {}",
                     self.arch
                 ),
             ));
@@ -3856,7 +3892,7 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_split_gfx1201_bench requires H24/KV4/D256, got \
+                    "attention_q8_0_fa2_gqa_split_gfx1201 requires H24/KV4/D256, got \
                      H{n_heads}/KV{n_kv_heads}/D{head_dim}"
                 ),
             ));
@@ -3865,7 +3901,7 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_split_gfx1201_bench requires 1 <= batch <= 384, got {batch_size}"
+                    "attention_q8_0_fa2_gqa_split_gfx1201 requires 1 <= batch <= 384, got {batch_size}"
                 ),
             ));
         }
@@ -3873,16 +3909,16 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_split_gfx1201_bench requires 1 <= n_splits <= 8, got {n_splits}"
+                    "attention_q8_0_fa2_gqa_split_gfx1201 requires 1 <= n_splits <= 8, got {n_splits}"
                 ),
             ));
         }
-        let need_partials = n_splits * batch_size * n_heads * (head_dim + 2);
+        let need_partials = n_splits * batch_size * n_heads * (head_dim + 1);
         if partials.numel() < need_partials {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_q8_0_fa2_gqa_split_gfx1201_bench scratch too small: \
+                    "attention_q8_0_fa2_gqa_split_gfx1201 scratch too small: \
                      partials={} (need>={need_partials})",
                     partials.numel()
                 ),
@@ -3898,11 +3934,7 @@ impl Gpu {
             )?;
         }
         if !self.functions.contains_key(MERGE) {
-            self.ensure_kernel(
-                MERGE,
-                kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
-                MERGE,
-            )?;
+            self.ensure_kernel(MERGE, kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC, MERGE)?;
         }
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -3968,16 +4000,23 @@ impl Gpu {
         ];
         let n_rec = batch_size * n_heads;
         let merge_grid_x = n_rec.div_ceil(8) as u32;
-        self.launch_maybe_blob(MERGE, [merge_grid_x, 1, 1], [256, 1, 1], 0, &mut mparams, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(pp_ptr);
-            b.push_ptr(o_ptr);
-            b.push_i32(mbs);
-            b.push_i32(mnh);
-            b.push_i32(mhd);
-            b.push_i32(mns);
-            b
-        })
+        self.launch_maybe_blob(
+            MERGE,
+            [merge_grid_x, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut mparams,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(mbs);
+                b.push_i32(mnh);
+                b.push_i32(mhd);
+                b.push_i32(mns);
+                b
+            },
+        )
     }
 
     /// Benchmark-only direct call to the preserved incumbent Q8 WMMA flash
@@ -3999,8 +4038,20 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.attention_q8_0_flash_prefill_wmma_slots(
-            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, max_ctx_len,
-            batch_size, None, None, None, None,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
