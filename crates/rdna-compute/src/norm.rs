@@ -2266,6 +2266,10 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        // `out` is a stable batched scratch rewritten every layer; drop any
+        // pointer-keyed F16/FP8 conversion cached from its previous contents
+        // (the Q8 residual WMMA consumer would otherwise reuse stale X).
+        self.invalidate_x_caches_for(out.buf.as_ptr());
         result
     }
 
@@ -2547,6 +2551,10 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        // `out` is a stable batched scratch rewritten every layer; drop any
+        // pointer-keyed F16/FP8 conversion cached from its previous contents
+        // (the Q8 residual WMMA consumer would otherwise reuse stale X).
+        self.invalidate_x_caches_for(out.buf.as_ptr());
         result
     }
 
