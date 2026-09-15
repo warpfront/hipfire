@@ -334,6 +334,20 @@ fn time_uniform_iu4(gpu: &mut Gpu, blob: &[u8], m: usize, k: usize, n: usize) {
     }
     gpu.hip.device_synchronize().unwrap();
     let us = t0.elapsed().as_secs_f64() * 1e6 / runs as f64;
+    // Uniform W4A4 vs f32 GEMV: the like-for-like noise floor for the twin.
+    {
+        let y = gpu.download_f32(&d_y).unwrap();
+        let cols = [0usize, 1, n / 2, n - 2, n - 1];
+        let mut want = vec![0f32; n * m];
+        let d_row = gpu.zeros(&[m], DType::F32).unwrap();
+        for &b in &cols {
+            let xr = d_x.sub_offset(b * k, k);
+            gpu.gemv_mq4g256v2(&d_a, &xr, &d_row, m, k).unwrap();
+            let r = gpu.download_f32(&d_row).unwrap();
+            want[b * m..(b + 1) * m].copy_from_slice(&r[..m]);
+        }
+        eprintln!("  uniform iu4 vs gemv_mq4g256v2 rel-L2 cols {cols:?} = {:.6e}", rel_l2_cols(&y, &want, m, &cols));
+    }
     let full = m % 128 == 0 && n % 128 == 0;
     let name = if full {
         "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3"
