@@ -13,6 +13,13 @@
 //!     cargo run --release -p hipfire-runtime --features lab \
 //!       --example tmp_halo_iu4_oracle -- --compile-only
 //!
+//! Compile-only debug (WS4 role-path metadata; HIPFIRE_WS4_DEBUG=1):
+//!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
+//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-w2b HIPFIRE_GFX11_MQ4V2_IU4=1 \
+//!     cargo run --release -p hipfire-runtime --features lab \
+//!       --example tmp_halo_iu4_oracle -- --compile-only-debug
+
+//!
 //! Correctness / TIME:
 //!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
 //!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-w2b HIPFIRE_GFX11_MQ4V2_IU4=1 \
@@ -24,6 +31,10 @@
 //! Production module/source identity matches gemm.rs:
 //!   MODULE = "gemm_mq4g256v2_residual_mmq_iu4"
 //!   SRC    = kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC (quant + IU4 HIP)
+//! Debug module (compile-only-debug):
+//!   MODULE = "gemm_mq4g256v2_residual_mmq_iu4_ws4dbg"
+//!   SRC    = "#define HIPFIRE_WS4_DEBUG 1\n" + production IU4 source
+
 
 use hip_bridge::{DeviceBuffer, KernargBlob};
 use hipfire_runtime::hfq::HfqFile;
@@ -38,6 +49,10 @@ const IU4_SRC: &str = concat!(
 );
 /// Production module name — same cache key as `Gpu::gemm_mq4g256v2_mmq_prequant_iu4`.
 const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
+/// Debug module — production IU4 source with `HIPFIRE_WS4_DEBUG` for role-path attribution.
+const MODULE_WS4DBG: &str = "gemm_mq4g256v2_residual_mmq_iu4_ws4dbg";
+const W2_SET_DBG_NOPROD: &str =
+    "gemm_mq4g256v2_residual_mmq_iu4_full_set_ws4_w2_dbg_noprod_gfx1151";
 
 const BASE_SET: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3";
 const BASE_ADD: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3";
@@ -207,16 +222,16 @@ fn cache_root() -> PathBuf {
     PathBuf::from(".hipfire_kernels")
 }
 
-fn print_module_cache(arch: &str) {
+fn print_module_cache(arch: &str, module: &str) {
     let dir = cache_root().join(arch);
-    eprintln!("MODULE={MODULE}");
+    eprintln!("MODULE={module}");
     eprintln!("CACHE_DIR={}", dir.display());
     let mut hits = Vec::new();
     if let Ok(rd) = std::fs::read_dir(&dir) {
         for ent in rd.flatten() {
             let name = ent.file_name();
             let s = name.to_string_lossy();
-            if s.starts_with(MODULE) {
+            if s.starts_with(module) {
                 hits.push(ent.path());
             }
         }
@@ -244,6 +259,7 @@ fn print_module_cache(arch: &str) {
         eprintln!("RADIOWAVE={}", rw.display());
     }
 }
+
 
 fn ensure_all(gpu: &mut Gpu) {
     for sym in [BASE_SET, BASE_ADD, W2_SET, W2_ADD] {
@@ -694,7 +710,10 @@ fn run_pair(
 fn main() {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     let compile_only = argv.iter().any(|a| a == "--compile-only");
-    argv.retain(|a| a != "--compile-only");
+    let compile_only_debug = argv.iter().any(|a| a == "--compile-only-debug");
+    argv.retain(|a| a != "--compile-only" && a != "--compile-only-debug");
+
+
     let model = argv
         .first()
         .cloned()
@@ -709,9 +728,10 @@ fn main() {
         }
     };
     eprintln!(
-        "tmp_halo_iu4_oracle on {}  model={model}  TIME={time}  compile_only={compile_only}",
+        "tmp_halo_iu4_oracle on {}  model={model}  TIME={time}  compile_only={compile_only}  compile_only_debug={compile_only_debug}",
         gpu.arch
     );
+
     if gpu.arch != "gfx1151" {
         eprintln!(
             "WARN: WS4 symbols are #if __gfx1151__; arch={} may fail JIT of _ws4_w2 entries",
@@ -719,14 +739,26 @@ fn main() {
         );
     }
 
+    if compile_only_debug {
+        // Debug module: same production IU4 source with HIPFIRE_WS4_DEBUG=1.
+        let src = format!("#define HIPFIRE_WS4_DEBUG 1\n{IU4_SRC}");
+        gpu.ensure_kernel_public(MODULE_WS4DBG, &src, W2_SET_DBG_NOPROD)
+            .unwrap_or_else(|e| panic!("JIT {W2_SET_DBG_NOPROD}: {e}"));
+        eprintln!("compiled {W2_SET_DBG_NOPROD} (module {MODULE_WS4DBG})");
+        print_module_cache(&gpu.arch, MODULE_WS4DBG);
+        eprintln!("--compile-only-debug: module ensured; returning before allocation/launch");
+        return;
+    }
+
     // Production module ensure — same MODULE + SRC as gemm.rs launcher.
     ensure_all(&mut gpu);
-    print_module_cache(&gpu.arch);
+    print_module_cache(&gpu.arch, MODULE);
 
     if compile_only {
         eprintln!("--compile-only: module ensured; returning before allocation/launch");
         return;
     }
+
 
     let t0 = Instant::now();
     let hfq = HfqFile::open(Path::new(&model)).expect("open HFQ");

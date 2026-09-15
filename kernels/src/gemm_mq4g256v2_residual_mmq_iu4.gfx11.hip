@@ -521,6 +521,15 @@ static __device__ __forceinline__ void vec_dot_i4_x128_ws4_w2_gfx1151(
     }
 }
 
+// dbg_mode: 0=prod, 1=noprod (waves 8..9 skip global loads/LDS stores; barriers
+// only), 2=nocomp (compute skips vec_dot/fold; barriers + epilogue store of sum).
+// Live-range across the producer branch (compute path): sum[64] is the only
+// accumulator kept live for the whole body through epilogue. The four C vectors
+// (c00..c11) and A/B fragments live only inside vec_dot_i4_x128; the u=0..7 loop
+// is #pragma nounroll — not fully unrolled, and the 8 steps' fragments are not
+// hoisted (each u reloads av0/av1/bv0/bv1). Template so dbg_mode=0 codegen matches
+// production entries bit-for-bit aside from the constexpr folds eliding nothing.
+template <int dbg_mode = 0>
 static __device__ __forceinline__ void gemm_iu4_body_ws4_w2_gfx1151(
     const char* __restrict__ A,
     const block_i4_128* __restrict__ Xq,
@@ -554,11 +563,13 @@ static __device__ __forceinline__ void gemm_iu4_body_ws4_w2_gfx1151(
 
     // Prologue: producers fill A0 group0 both row-halves + Y0=(0,0). Binit.
     if (!is_compute) {
-        const int* xq00 = (const int*)(Xq + (long long)0 * N + col0);
-        load_iu4_stage_ws4_w2_gfx1151(
-            A, xq00, A0, Y0, row0, 0, 0, groups_per_row, true, true);
-        load_iu4_stage_ws4_w2_gfx1151(
-            A, xq00, A0, Y0, row0, 0, 1, groups_per_row, true, false);
+        if constexpr (dbg_mode != 1) {
+            const int* xq00 = (const int*)(Xq + (long long)0 * N + col0);
+            load_iu4_stage_ws4_w2_gfx1151(
+                A, xq00, A0, Y0, row0, 0, 0, groups_per_row, true, true);
+            load_iu4_stage_ws4_w2_gfx1151(
+                A, xq00, A0, Y0, row0, 0, 1, groups_per_row, true, false);
+        }
     }
     __syncthreads(); // Binit
 
@@ -570,26 +581,37 @@ static __device__ __forceinline__ void gemm_iu4_body_ws4_w2_gfx1151(
 
         // h0(g): compute reads A[p]+Y0; producers write A_nxt top64 (if next) + Y1=(g,1).
         if (is_compute) {
-            vec_dot_i4_x128_ws4_w2_gfx1151(A_cur, Y0, sum, 0);
+            if constexpr (dbg_mode != 2) {
+                vec_dot_i4_x128_ws4_w2_gfx1151(A_cur, Y0, sum, 0);
+            }
         } else {
-            const int* xq_g1 = (const int*)(Xq + (long long)(2 * g + 1) * N + col0);
-            load_iu4_stage_ws4_w2_gfx1151(
-                A, xq_g1, A_nxt, Y1, row0, g + 1, 0, groups_per_row, next, true);
+            if constexpr (dbg_mode != 1) {
+                const int* xq_g1 = (const int*)(Xq + (long long)(2 * g + 1) * N + col0);
+                load_iu4_stage_ws4_w2_gfx1151(
+                    A, xq_g1, A_nxt, Y1, row0, g + 1, 0, groups_per_row, next, true);
+            }
         }
         __syncthreads(); // B0(g)
 
         // h1(g): compute reads A[p]+Y1; producers write A_nxt bot64 + Y0=(g+1,0) if next.
         if (is_compute) {
-            vec_dot_i4_x128_ws4_w2_gfx1151(A_cur, Y1, sum, 1);
-        } else if (next) {
-            const int* xq_n0 = (const int*)(Xq + (long long)(2 * (g + 1)) * N + col0);
-            load_iu4_stage_ws4_w2_gfx1151(
-                A, xq_n0, A_nxt, Y0, row0, g + 1, 1, groups_per_row, true, true);
+            if constexpr (dbg_mode != 2) {
+                vec_dot_i4_x128_ws4_w2_gfx1151(A_cur, Y1, sum, 1);
+            }
+        } else {
+            if constexpr (dbg_mode != 1) {
+                if (next) {
+                    const int* xq_n0 = (const int*)(Xq + (long long)(2 * (g + 1)) * N + col0);
+                    load_iu4_stage_ws4_w2_gfx1151(
+                        A, xq_n0, A_nxt, Y0, row0, g + 1, 1, groups_per_row, true, true);
+                }
+            }
         }
         __syncthreads(); // B1(g)
     }
 
     // Epilogue: compute waves only; shipping set/add and ownership map.
+    // nocomp still stores sum (zeros) so the store path stays attributed.
     if (is_compute) {
         const int w = wy;
         const int i0 = 32 * (w / 2);
@@ -616,6 +638,7 @@ static __device__ __forceinline__ void gemm_iu4_body_ws4_w2_gfx1151(
     }
 }
 
+
 extern "C" __global__ __launch_bounds__(320, 1)
 void gemm_mq4g256v2_residual_mmq_iu4_full_set_ws4_w2_gfx1151(
     const char* __restrict__ A,
@@ -626,7 +649,7 @@ void gemm_mq4g256v2_residual_mmq_iu4_full_set_ws4_w2_gfx1151(
     int N,
     int add
 ) {
-    gemm_iu4_body_ws4_w2_gfx1151(A, Xq, Y, M, K, N, add);
+    gemm_iu4_body_ws4_w2_gfx1151<0>(A, Xq, Y, M, K, N, add);
 }
 
 extern "C" __global__ __launch_bounds__(320, 1)
@@ -639,8 +662,64 @@ void gemm_mq4g256v2_residual_mmq_iu4_full_add_ws4_w2_gfx1151(
     int N,
     int add
 ) {
-    gemm_iu4_body_ws4_w2_gfx1151(A, Xq, Y, M, K, N, add);
+    gemm_iu4_body_ws4_w2_gfx1151<0>(A, Xq, Y, M, K, N, add);
 }
+
+#if defined(HIPFIRE_WS4_DEBUG)
+// Metadata-only attribution: noprod strips producer global/LDS traffic;
+// nocomp strips vec_dot/fold while keeping barriers + epilogue stores.
+extern "C" __global__ __launch_bounds__(320, 1)
+void gemm_mq4g256v2_residual_mmq_iu4_full_set_ws4_w2_dbg_noprod_gfx1151(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    gemm_iu4_body_ws4_w2_gfx1151<1>(A, Xq, Y, M, K, N, add);
+}
+
+extern "C" __global__ __launch_bounds__(320, 1)
+void gemm_mq4g256v2_residual_mmq_iu4_full_add_ws4_w2_dbg_noprod_gfx1151(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    gemm_iu4_body_ws4_w2_gfx1151<1>(A, Xq, Y, M, K, N, add);
+}
+
+extern "C" __global__ __launch_bounds__(320, 1)
+void gemm_mq4g256v2_residual_mmq_iu4_full_set_ws4_w2_dbg_nocomp_gfx1151(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    gemm_iu4_body_ws4_w2_gfx1151<2>(A, Xq, Y, M, K, N, add);
+}
+
+extern "C" __global__ __launch_bounds__(320, 1)
+void gemm_mq4g256v2_residual_mmq_iu4_full_add_ws4_w2_dbg_nocomp_gfx1151(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    gemm_iu4_body_ws4_w2_gfx1151<2>(A, Xq, Y, M, K, N, add);
+}
+#endif // HIPFIRE_WS4_DEBUG
 
 #endif // __gfx1151__
 
