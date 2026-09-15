@@ -2,6 +2,21 @@
 
 Date: 2026-09-15. Plan of record for composition, **not an admission or a measured kernel result**. Worktree: `/home/kaden/ClaudeCode/warpfront/wt-lloyd`, branch `mq4-lloyd`. This planning assignment changed only this document. No GPU program, build, formatter, linter, or project-wide test was run. CPU address/resource/epoch calculations were executed; their limited evidence is in §8. Main owns admission; an independent reviewer owns the final technical veto.
 
+> **STATUS 2026-09-15 — SHELVED by F3.0 attribution (parent-measured, gfx1151,
+> batch 512, H24/KV4/D256, 100 interleaved samples, twins within ±10% VGPR of
+> production's 200, no spill).** Fractions of shipping FA2 time at
+> L1024 / L8192 / L32768: fill 21.3 / 23.2 / 27.4 %; `__expf` 0.0 / −0.2 / −0.7 %;
+> PV 8.4 / 8.1 / 6.6 %; **Q reload (global f32 + f16 cvt per 16-key subtile)
+> 38.2 / 39.3 / 37.1 %**; QK WMMA 13.3 / 14.4 / 12.8 %.
+> The ping-pong half of this design overlaps exp with WMMA, and exp is already
+> free on RDNA3.5 — nothing to buy. The producer/consumer half has a fill
+> ceiling of 21–27 % but moves fill from four waves to two producers, so it
+> cannot approach the ≥15 % admission bar. The dominant lever is Q reload,
+> which is a loop restructure inside the shipping kernel (F4: share each Q
+> fragment across both 16-key subtiles; pre-rounded f16 Q), bit-exact and
+> portable to every gfx11. This document is retained as the audited anatomy
+> (§2) and register model (§5); its units are not dispatched.
+
 ## 1. Decision, scope, and conflicting premises
 
 **Build one exact-gfx1151 candidate: two producer waves, three consumer waves partitioned into groups of one and two, block160, 16-key stages, a depth-two f16 K/V LDS ring, and a barrier-based two-phase consumer ping-pong.** Keep the existing kernel as the shipping control and fallback. First land a serial-consumer skeleton with the same ownership, buffers, ABI, and per-row arithmetic; only then introduce overlap. This is FA3-inspired scheduling, not a port of NVIDIA TMA, WGMMA, warp-group barriers, or dynamic register repartitioning.
