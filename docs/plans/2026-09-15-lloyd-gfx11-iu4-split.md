@@ -14,6 +14,16 @@ Anything not directly observed is marked `[INFERENCE]`.
 Sibling plan (q8-x MMQ-LUT twin, the baseline this plan compares against):
 `docs/plans/2026-09-15-lloyd-gfx11-mmq-lut.md` — cited as `mmq-lut §X`.
 
+> **STATUS 2026-09-15 — K1 gate FAILED; iu4-split direction DEAD.**
+> XTX, N=512, M=17408 K=5120: uniform iu4 full_set_occ3 1061 us; split twin
+> 2813 us (2.7x) with 256 VGPR + 12-15 spills (rev1) AND 2813 us at 218 VGPR /
+> 0 spills (rev2, single accumulator + per-tile fold). Correctness passed
+> (rel-L2 6.53e-2 = the uniform kernel's own int4-activation floor). The iu4
+> kernel is MAC/issue-bound on gfx11; doubling WMMAs costs 2.7x regardless of
+> register pressure. Kernel arm reverted (history: wip commits before this).
+> The q8-x MMQ byte-LUT route (docs/plans/2026-09-15-lloyd-gfx11-mmq-lut.md)
+> is the gfx11 Lloyd prefill path: same WMMA count as uniform q8, ~1.5x iu4.
+
 ## 0. Decision, denominator, and the impossibility proof that bounds the design
 
 **Decision:** build a split twin of the iu4-direct W4A4 kernel

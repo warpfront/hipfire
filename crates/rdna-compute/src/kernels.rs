@@ -3350,15 +3350,6 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC: &str =
 // HIPFIRE_GFX11_MQ4V2_IU4 on gfx1100/gfx1151.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip");
-// MQ4V2-Lloyd (qt=52) iu4-split twin: same source under HIPFIRE_MMQ_IU4_LUT.
-// Symbols gemm_mq4g256v2_residual_mmq_iu4[_full_add|_full_set][_occ3]_lloyd;
-// MODULE must be gemm_mq4g256v2_residual_mmq_iu4_lloyd (K2) so the code-object
-// cache cannot alias the uniform module. C16 = 4 u32 kernargs; HL table
-// derived in-shader; dual accH/accL + sc'/−120·sc' fold (plan §2).
-pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_LUT_SRC: &str = concat!(
-    "#define HIPFIRE_MMQ_IU4_LUT 1\n",
-    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
-);
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =
