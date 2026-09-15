@@ -1,37 +1,42 @@
-//! F3.0 — FA2 gfx11 fill/exp/PV attribution twins (precondition for F3).
+//! F3.0 — FA2 gfx11 fill/exp/PV/Q attribution + candidate twins.
 //!
 //! Diagnostic only. Does not edit production kernels.
 //! Derived from kernels/src/attention_q8_0_fa2_gqa.gfx11.hip (Q8 entry).
 //! Shipping shape: H24 / KV4 / D256 (not 48/8/128).
 //!
-//! Six twins of the Q8 entry, distinct symbols:
-//!   fa2_attrib_prod    — unmodified production body
-//!   fa2_attrib_nofill  — after first KT tile cooperative fill, skip later
-//!                        global K/V loads + dequant + LDS stores (barriers kept)
-//!   fa2_attrib_noexp   — every __expf replaced by x*0.5f (data flow live)
-//!   fa2_attrib_nopv    — skip PV WMMAs; cheap P checksum keeps softmax live
-//!   fa2_attrib_noqload — no global Q load/f32→f16; synth half16 Q from lane+chunk
-//!   fa2_attrib_noqk    — keep Q load+convert; skip QK WMMA; synth scores from Q
+//! Twins of the Q8 entry, distinct symbols:
+//!   fa2_attrib_prod         — unmodified production body
+//!   fa2_attrib_nofill       — after first KT tile fill, skip later K/V global fill
+//!   fa2_attrib_noexp        — every __expf → x*0.5f
+//!   fa2_attrib_nopv         — skip PV WMMAs; P checksum
+//!   fa2_attrib_noqload      — synth Q fragment (no global Q load)
+//!   fa2_attrib_noqk         — keep Q load; skip QK WMMA; synth scores
+//!   fa2_attrib_qshare2      — Q load once/dim chunk for both KT32 subtles (bit-exact cand)
+//!   fa2_attrib_qf16         — host-pre-rounded f16 Q, aligned half8×2 load (bit-exact cand)
+//!   fa2_attrib_qshare2_f16  — qshare2 + qf16 (bit-exact cand)
 //!
-//! Fixture: batch 512 rows, positions at end of L ∈ {1024,8192,32768},
+//! Production Q f32→f16: C cast `(_Float16)f` (device v_cvt_f16_f32, RNE).
+//! Host f16 Q packing matches that RNE.
+//!
+//! Fixture: batch 512, positions at end of L ∈ {1024,8192,32768},
 //! random finite Q8 K/V + Q. 100 interleaved HIP-event samples/twin/L, warm.
+//! Candidates g/h/i: bitwise_eq of out vs prod printed per L.
 //!
 //! Halo (hipx device 1):
 //!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
 //!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-f3a \
 //!     cargo run --release -p hipfire-runtime --features lab --example tmp_fa2_attrib
 //!
-//! Metadata symbols the parent must read after first JIT (radiowave /
-//! llvm-readobj notes on the cached .hsaco under HIPFIRE_KERNEL_CACHE):
+//! Metadata symbols:
 //!   fa2_attrib_prod
 //!   fa2_attrib_nofill
 //!   fa2_attrib_noexp
 //!   fa2_attrib_nopv
 //!   fa2_attrib_noqload
 //!   fa2_attrib_noqk
-//!
-//! Twins must stay within production VGPR count ±10% or attribution is
-//! confounded — this binary prints that reminder; parent verifies metadata.
+//!   fa2_attrib_qshare2
+//!   fa2_attrib_qf16
+//!   fa2_attrib_qshare2_f16
 
 use hip_bridge::KernargBlob;
 use rdna_compute::{DType, Gpu};
@@ -40,30 +45,39 @@ use std::time::Instant;
 const N_HEADS: usize = 24;
 const N_KV: usize = 4;
 const HD: usize = 256;
-const BPH: usize = HD / 32; // 8
+const BPH: usize = HD / 32;
 const Q8_BLOCK: usize = 34;
-const ROW_STRIDE: usize = N_KV * BPH * Q8_BLOCK; // 1088
-const QO_ROW: usize = N_HEADS * HD; // 6144
+const ROW_STRIDE: usize = N_KV * BPH * Q8_BLOCK;
+const QO_ROW: usize = N_HEADS * HD;
 const BATCH: usize = 512;
 const L_VALUES: [usize; 3] = [1024, 8192, 32768];
 const BLOCK: [u32; 3] = [128, 1, 1];
-const LDS_BYTES: u32 = 32768; // KT32
+const LDS_BYTES: u32 = 32768;
 const ATTR_ITERS: usize = 100;
 const ATTR_WARMUP: usize = 5;
-const SCALE: f32 = 1.0 / 16.0; // 1/sqrt(256)
+const SCALE: f32 = 1.0 / 16.0;
 
-const SYMS: [&str; 6] = [
+const SYMS: [&str; 9] = [
     "fa2_attrib_prod",
     "fa2_attrib_nofill",
     "fa2_attrib_noexp",
     "fa2_attrib_nopv",
     "fa2_attrib_noqload",
     "fa2_attrib_noqk",
+    "fa2_attrib_qshare2",
+    "fa2_attrib_qf16",
+    "fa2_attrib_qshare2_f16",
 ];
 
+/// Candidates that must be bit-exact vs prod (indices into SYMS).
+const CAND_IDX: [usize; 3] = [6, 7, 8];
+
 const TWIN_SRC: &str = r#####"
+
 // F3.0 FA2 attribution twins — derived from attention_q8_0_fa2_gqa.gfx11.hip
-// Diagnostic only. Modes: 0=prod 1=nofill 2=noexp 3=nopv 4=noqload 5=noqk.
+// Modes: 0=prod 1=nofill 2=noexp 3=nopv 4=noqload 5=noqk
+//        6=qshare2 7=qf16 8=qshare2_f16
+// Q f32→f16 conversion in production is the C cast (_Float16)f  (device v_cvt_f16_f32 RNE).
 #include <hip/hip_runtime.h>
 
 #define HIPFIRE_FA2_KMODE 0
@@ -72,6 +86,7 @@ const TWIN_SRC: &str = r#####"
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
+typedef float __attribute__((ext_vector_type(4))) float4_t;
 typedef int32_t __attribute__((ext_vector_type(2))) int32x2_t;
 
 typedef union {
@@ -89,17 +104,207 @@ __device__ __forceinline__ int fa2_swiz(int c)
 template <int MODE>
 __device__ __forceinline__ float fa2_attrib_exp(float x)
 {
-    if constexpr (MODE == 2) {
-        // Cheap non-transcendental stand-in; keeps data flow live.
+    if constexpr (MODE == 2)
         return x * 0.5f;
-    } else {
+    else
         return __expf(x);
+}
+
+// MODE bits: Q_F16 if MODE==7||MODE==8; QSHARE if MODE==6||MODE==8
+template <int MODE>
+__device__ __forceinline__ constexpr bool fa2_mode_qf16()
+{
+    return MODE == 7 || MODE == 8;
+}
+template <int MODE>
+__device__ __forceinline__ constexpr bool fa2_mode_qshare()
+{
+    return MODE == 6 || MODE == 8;
+}
+
+template <int MODE>
+__device__ __forceinline__ half16_t fa2_load_q_frag(
+    const float* __restrict__ q_f32,
+    const _Float16* __restrict__ q_f16,
+    unsigned qq_base,
+    int dc,
+    int ml,
+    int half,
+    int sub,
+    bool qok_ml)
+{
+    half16_t qf;
+    if constexpr (MODE == 4) {
+        const float base_q =
+            (float)(ml + 1) * 0.015625f
+            + (float)dc * 0.00390625f
+            + (float)half * 0.001f
+            + (float)(sub & 1) * 0.0005f;
+#pragma unroll
+        for (int g = 0; g < 16; ++g)
+            qf[g] = (_Float16)(base_q + (float)g * 0.00025f);
+    } else if constexpr (fa2_mode_qf16<MODE>()) {
+        // Pre-rounded f16 Q: two aligned 16-byte half8 loads → half16 fragment.
+        const _Float16* qd = q_f16 + qq_base + (unsigned)(dc * 16);
+        if (qok_ml) {
+            const half8_t h0 = *(const half8_t*)(qd + 0);
+            const half8_t h1 = *(const half8_t*)(qd + 8);
+#pragma unroll
+            for (int i = 0; i < 8; ++i) {
+                qf[i] = h0[i];
+                qf[8 + i] = h1[i];
+            }
+        } else {
+#pragma unroll
+            for (int i = 0; i < 16; ++i)
+                qf[i] = (_Float16)0;
+        }
+    } else {
+        // Production: 4× float4 global loads + (_Float16) cast (RNE cvt).
+        const float* qd = q_f32 + qq_base + (unsigned)(dc * 16);
+#pragma unroll
+        for (int g = 0; g < 4; ++g) {
+            float4_t v = {0.f, 0.f, 0.f, 0.f};
+            if (qok_ml)
+                v = *(const float4_t*)(qd + g * 4);
+            qf[4 * g + 0] = (_Float16)v[0];
+            qf[4 * g + 1] = (_Float16)v[1];
+            qf[4 * g + 2] = (_Float16)v[2];
+            qf[4 * g + 3] = (_Float16)v[3];
+        }
+    }
+    return qf;
+}
+
+template <int MODE>
+__device__ __forceinline__ half16_t fa2_load_k_frag(
+    const uint32_t* __restrict__ Kdw,
+    int sub,
+    int ml,
+    int dc)
+{
+    half16_t kf;
+    const int key = sub * 16 + ml;
+    const int rot = fa2_swiz(key & 15);
+    const int base = key * 128;
+#pragma unroll
+    for (int i = 0; i < 8; i += 2) {
+        const int off = base + ((dc * 8 + i + rot) & 127);
+        const int32x2_t pair = *(const int32x2_t*)(Kdw + off);
+        fa2_dw_t d0, d1;
+        d0.u = (uint32_t)pair[0];
+        d1.u = (uint32_t)pair[1];
+        kf[2 * i] = d0.h[0];
+        kf[2 * i + 1] = d0.h[1];
+        kf[2 * i + 2] = d1.h[0];
+        kf[2 * i + 3] = d1.h[1];
+    }
+    return kf;
+}
+
+// Softmax + PV for one 16-key subtile (production order). Updates m_old, l_val, Ofr.
+template <int MODE>
+__device__ __forceinline__ void fa2_softmax_pv_sub(
+    float8_t sacc,
+    int kt_sub,
+    int gmin,
+    int half,
+    bool qok_ml,
+    int pos_ml,
+    float scale_attn,
+    float& m_old,
+    float& l_val,
+    float8_t Ofr[16],
+    const uint32_t* __restrict__ Vdw,
+    int V_ROW,
+    int V_MASK,
+    int sub,
+    int ml)
+{
+    const bool full = (kt_sub + 15) <= gmin;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const int key_g = kt_sub + 2 * j + half;
+        const bool ok = qok_ml && (full || key_g <= pos_ml);
+        const float x = ok ? sacc[j] * scale_attn : -INFINITY;
+        sacc[j] = x;
+    }
+    float mx = -INFINITY;
+#pragma unroll
+    for (int j = 0; j < 8; ++j)
+        mx = fmaxf(mx, sacc[j]);
+    mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+    const float m_new = fmaxf(m_old, mx);
+    const float alpha =
+        (m_old == -INFINITY) ? 0.0f : fa2_attrib_exp<MODE>(m_old - m_new);
+    m_old = m_new;
+
+    float earr[8];
+    float sum = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float e = (m_new == -INFINITY)
+            ? 0.0f
+            : fa2_attrib_exp<MODE>(sacc[j] - m_new);
+        earr[j] = e;
+        sum += e;
+    }
+    sum += __shfl_xor(sum, 16, 32);
+    l_val = l_val * alpha + sum;
+    half16_t prow;
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        const float peer = __shfl_xor(earr[j], 16, 32);
+        const float e0 = (half == 0) ? earr[j] : peer;
+        const float e1 = (half == 0) ? peer : earr[j];
+        prow[2 * j] = (_Float16)e0;
+        prow[2 * j + 1] = (_Float16)e1;
+    }
+
+#pragma unroll
+    for (int dc = 0; dc < 16; ++dc)
+        Ofr[dc] *= alpha;
+
+    if constexpr (MODE == 3) {
+        float pcs = 0.0f;
+#pragma unroll
+        for (int j = 0; j < 8; ++j)
+            pcs += earr[j] * (float)(j + 1);
+        Ofr[0][0] += pcs;
+        Ofr[0][1] += pcs * 0.5f;
+        asm volatile("" ::: "memory");
+        (void)prow;
+    } else {
+#pragma unroll
+        for (int dc = 0; dc < 16; ++dc) {
+            const int d = dc * 16 + ml;
+            const int rot = fa2_swiz(d & 15);
+            const int vbase = d * V_ROW;
+            const int ps = sub * 8;
+            half16_t vf;
+#pragma unroll
+            for (int i = 0; i < 8; i += 2) {
+                const int off = vbase + ((ps + i + rot) & V_MASK);
+                const int32x2_t pair = *(const int32x2_t*)(Vdw + off);
+                fa2_dw_t d0, d1;
+                d0.u = (uint32_t)pair[0];
+                d1.u = (uint32_t)pair[1];
+                vf[2 * i] = d0.h[0];
+                vf[2 * i + 1] = d0.h[1];
+                vf[2 * i + 2] = d1.h[0];
+                vf[2 * i + 3] = d1.h[1];
+            }
+            Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                vf, prow, Ofr[dc]);
+            asm volatile("" ::: "memory");
+        }
     }
 }
 
 template <int MODE>
 __device__ __forceinline__ void fa2_gqa_body_attrib(
-    const float* __restrict__ q,
+    const float* __restrict__ q_f32,
+    const _Float16* __restrict__ q_f16,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
     float* __restrict__ out,
@@ -124,8 +329,6 @@ __device__ __forceinline__ void fa2_gqa_body_attrib(
     const int half = lane >> 4;
     const bool compute = wave < 3;
 
-    const int q_stride = 24 * 256;
-    (void)q_stride;
     const int row_stride = 4 * (256 / 32) * 34;
     const int kv_blk = kv_h * (256 / 32);
 
@@ -133,7 +336,6 @@ __device__ __forceinline__ void fa2_gqa_body_attrib(
     uint32_t* Kdw = LDS;
     uint32_t* Vdw = LDS + KT * 128;
 
-    typedef float __attribute__((ext_vector_type(4))) float4_t;
     float8_t Ofr[16];
     float m_old = -INFINITY;
     float l_val = 0.0f;
@@ -185,11 +387,8 @@ __device__ __forceinline__ void fa2_gqa_body_attrib(
         if (ktile >= seq_len)
             break;
 
-        // nofill: first KT tile fills; later tiles skip global K/V load+dequant+LDS store
-        // but keep both barriers so sync structure matches production.
         const bool do_fill = (MODE != 1) || (tile == 0);
         if (do_fill) {
-            // K fill (Q8)
             for (int t = 0; t < KT_KITERS; ++t) {
                 const int idx = tid + t * 128;
                 const int k = idx >> 3;
@@ -225,7 +424,6 @@ __device__ __forceinline__ void fa2_gqa_body_attrib(
                     Kdw[base + ((pb + w * 2 + 1 + rot) & 127)] = d1.u;
                 }
             }
-            // V fill
             for (int t = 0; t < KT_VITERS; ++t) {
                 const int pair = tid + t * 128;
                 const int m = pair >> 3;
@@ -239,8 +437,7 @@ __device__ __forceinline__ void fa2_gqa_body_attrib(
                     ? v_cache + (unsigned long long)(k0 + 1) * (unsigned long long)row_stride
                         + (unsigned long long)(kv_blk + b) * 34ULL
                     : nullptr;
-                uint16_t s0u = 0;
-                uint16_t s1u = 0;
+                uint16_t s0u = 0, s1u = 0;
                 if (blk0 != nullptr)
                     s0u = (uint16_t)blk0[0] | ((uint16_t)blk0[1] << 8);
                 if (blk1 != nullptr)
@@ -272,68 +469,66 @@ __device__ __forceinline__ void fa2_gqa_body_attrib(
         __syncthreads();
 
         if (compute) {
-#pragma unroll 1
-            for (int sub = 0; sub < KT_SUBS; ++sub) {
-                const int kt_sub = ktile + sub * 16;
-                if (kt_sub > gmax)
-                    continue;
-                const bool full = (kt_sub + 15) <= gmin;
-                const int pos_ml =
-                    (!full && qok_ml) ? positions[qr_ml] : 0;
-
-                float8_t sacc =
+            if constexpr (fa2_mode_qshare<MODE>()) {
+                // qshare2 / qshare2_f16: one Q load per dim chunk, both subtles' QK,
+                // then softmax/PV sub0 then sub1 (online order unchanged).
+                float8_t sacc0 =
                     (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-                {
-                    const int key = sub * 16 + ml;
-                    const int rot = fa2_swiz(key & 15);
-                    const int base = key * 128;
-                    // Last converted Q fragment — used by noqk score synth.
+                float8_t sacc1 =
+                    (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                const int kt_sub0 = ktile;
+                const int kt_sub1 = ktile + 16;
+                const bool do0 = kt_sub0 <= gmax;
+                const bool do1 = kt_sub1 <= gmax;
+                if (do0 || do1) {
+                    for (int dc = 0; dc < 16; ++dc) {
+                        half16_t qf = fa2_load_q_frag<MODE>(
+                            q_f32, q_f16, qq_base, dc, ml, half, 0, qok_ml);
+                        if (do0) {
+                            half16_t kf0 = fa2_load_k_frag<MODE>(Kdw, 0, ml, dc);
+                            sacc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                                kf0, qf, sacc0);
+                        }
+                        if (do1) {
+                            half16_t kf1 = fa2_load_k_frag<MODE>(Kdw, 1, ml, dc);
+                            sacc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
+                                kf1, qf, sacc1);
+                        }
+                        asm volatile("" ::: "memory");
+                    }
+                    if (do0) {
+                        const int pos_ml =
+                            (!((kt_sub0 + 15) <= gmin) && qok_ml) ? positions[qr_ml] : 0;
+                        fa2_softmax_pv_sub<MODE>(
+                            sacc0, kt_sub0, gmin, half, qok_ml, pos_ml, scale_attn,
+                            m_old, l_val, Ofr, Vdw, V_ROW, V_MASK, 0, ml);
+                    }
+                    if (do1) {
+                        const int pos_ml =
+                            (!((kt_sub1 + 15) <= gmin) && qok_ml) ? positions[qr_ml] : 0;
+                        fa2_softmax_pv_sub<MODE>(
+                            sacc1, kt_sub1, gmin, half, qok_ml, pos_ml, scale_attn,
+                            m_old, l_val, Ofr, Vdw, V_ROW, V_MASK, 1, ml);
+                    }
+                }
+            } else {
+#pragma unroll 1
+                for (int sub = 0; sub < KT_SUBS; ++sub) {
+                    const int kt_sub = ktile + sub * 16;
+                    if (kt_sub > gmax)
+                        continue;
+                    const int pos_ml =
+                        (!((kt_sub + 15) <= gmin) && qok_ml) ? positions[qr_ml] : 0;
+
+                    float8_t sacc =
+                        (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
                     half16_t qf_last = (_Float16)0;
                     for (int dc = 0; dc < 16; ++dc) {
-                        half16_t kf;
-#pragma unroll
-                        for (int i = 0; i < 8; i += 2) {
-                            const int off = base + ((dc * 8 + i + rot) & 127);
-                            const int32x2_t pair =
-                                *(const int32x2_t*)(Kdw + off);
-                            fa2_dw_t d0, d1;
-                            d0.u = (uint32_t)pair[0];
-                            d1.u = (uint32_t)pair[1];
-                            kf[2 * i] = d0.h[0];
-                            kf[2 * i + 1] = d0.h[1];
-                            kf[2 * i + 2] = d1.h[0];
-                            kf[2 * i + 3] = d1.h[1];
-                        }
-                        half16_t qf;
-                        if constexpr (MODE == 4) {
-                            // noqload: no global Q read / f32->f16 convert.
-                            // Synthesize half16 from lane + chunk (data-dependent).
-                            const float base_q =
-                                (float)(ml + 1) * 0.015625f
-                                + (float)dc * 0.00390625f
-                                + (float)half * 0.001f
-                                + (float)(sub & 1) * 0.0005f;
-#pragma unroll
-                            for (int g = 0; g < 16; ++g)
-                                qf[g] = (_Float16)(base_q + (float)g * 0.00025f);
-                        } else {
-                            const float* qd = q + qq_base + (unsigned)(dc * 16);
-#pragma unroll
-                            for (int g = 0; g < 4; ++g) {
-                                float4_t v = {0.f, 0.f, 0.f, 0.f};
-                                if (qok_ml)
-                                    v = *(const float4_t*)(qd + g * 4);
-                                qf[4 * g + 0] = (_Float16)v[0];
-                                qf[4 * g + 1] = (_Float16)v[1];
-                                qf[4 * g + 2] = (_Float16)v[2];
-                                qf[4 * g + 3] = (_Float16)v[3];
-                            }
-                        }
+                        half16_t kf = fa2_load_k_frag<MODE>(Kdw, sub, ml, dc);
+                        half16_t qf = fa2_load_q_frag<MODE>(
+                            q_f32, q_f16, qq_base, dc, ml, half, sub, qok_ml);
                         qf_last = qf;
                         if constexpr (MODE == 5) {
-                            // noqk: keep Q load+convert; skip QK WMMA.
-                            // Fold a couple of halves into a live scalar so qf is not DCE'd.
-                            // K fragment still loaded so LDS traffic matches prod for isolation of WMMA.
                             float keep = (float)qf[0] + (float)qf[8]
                                        + (float)kf[0] * 0.0f;
                             asm volatile("" : "+v"(keep) ::);
@@ -345,7 +540,6 @@ __device__ __forceinline__ void fa2_gqa_body_attrib(
                         asm volatile("" ::: "memory");
                     }
                     if constexpr (MODE == 5) {
-                        // Synthesize score fragment from converted Q so softmax/PV stay live.
                         const float s0 = (float)qf_last[0] + (float)qf_last[1];
                         const float s1 = (float)qf_last[2] + (float)qf_last[3];
                         const float s2 = (float)qf_last[4] + (float)qf_last[5];
@@ -358,87 +552,9 @@ __device__ __forceinline__ void fa2_gqa_body_attrib(
                             s0 * 0.125f, s1 * 0.125f, s2 * 0.125f, s3 * 0.125f,
                             s4 * 0.125f, s5 * 0.125f, s6 * 0.125f, s7 * 0.125f};
                     }
-                }
-
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const int key_g = kt_sub + 2 * j + half;
-                    const bool ok = qok_ml && (full || key_g <= pos_ml);
-                    const float x = ok ? sacc[j] * scale_attn : -INFINITY;
-                    sacc[j] = x;
-                }
-                float mx = -INFINITY;
-#pragma unroll
-                for (int j = 0; j < 8; ++j)
-                    mx = fmaxf(mx, sacc[j]);
-                mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
-                const float m_new = fmaxf(m_old, mx);
-                const float alpha =
-                    (m_old == -INFINITY) ? 0.0f : fa2_attrib_exp<MODE>(m_old - m_new);
-                m_old = m_new;
-
-                float earr[8];
-                float sum = 0.0f;
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float e = (m_new == -INFINITY)
-                        ? 0.0f
-                        : fa2_attrib_exp<MODE>(sacc[j] - m_new);
-                    earr[j] = e;
-                    sum += e;
-                }
-                sum += __shfl_xor(sum, 16, 32);
-                l_val = l_val * alpha + sum;
-                half16_t prow;
-#pragma unroll
-                for (int j = 0; j < 8; ++j) {
-                    const float peer = __shfl_xor(earr[j], 16, 32);
-                    const float e0 = (half == 0) ? earr[j] : peer;
-                    const float e1 = (half == 0) ? peer : earr[j];
-                    prow[2 * j] = (_Float16)e0;
-                    prow[2 * j + 1] = (_Float16)e1;
-                }
-
-#pragma unroll
-                for (int dc = 0; dc < 16; ++dc)
-                    Ofr[dc] *= alpha;
-
-                if constexpr (MODE == 3) {
-                    // nopv: skip PV WMMAs; cheap checksum from P keeps flow live.
-                    float pcs = 0.0f;
-#pragma unroll
-                    for (int j = 0; j < 8; ++j)
-                        pcs += earr[j] * (float)(j + 1);
-                    // Fold into O so epilogue / l_val path cannot DCE the softmax work.
-                    Ofr[0][0] += pcs;
-                    Ofr[0][1] += pcs * 0.5f;
-                    asm volatile("" ::: "memory");
-                    (void)prow;
-                } else {
-#pragma unroll
-                    for (int dc = 0; dc < 16; ++dc) {
-                        const int d = dc * 16 + ml;
-                        const int rot = fa2_swiz(d & 15);
-                        const int vbase = d * V_ROW;
-                        const int ps = sub * 8;
-                        half16_t vf;
-#pragma unroll
-                        for (int i = 0; i < 8; i += 2) {
-                            const int off = vbase + ((ps + i + rot) & V_MASK);
-                            const int32x2_t pair =
-                                *(const int32x2_t*)(Vdw + off);
-                            fa2_dw_t d0, d1;
-                            d0.u = (uint32_t)pair[0];
-                            d1.u = (uint32_t)pair[1];
-                            vf[2 * i] = d0.h[0];
-                            vf[2 * i + 1] = d0.h[1];
-                            vf[2 * i + 2] = d1.h[0];
-                            vf[2 * i + 3] = d1.h[1];
-                        }
-                        Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
-                            vf, prow, Ofr[dc]);
-                        asm volatile("" ::: "memory");
-                    }
+                    fa2_softmax_pv_sub<MODE>(
+                        sacc, kt_sub, gmin, half, qok_ml, pos_ml, scale_attn,
+                        m_old, l_val, Ofr, Vdw, V_ROW, V_MASK, sub, ml);
                 }
             }
         }
@@ -461,7 +577,8 @@ __device__ __forceinline__ void fa2_gqa_body_attrib(
     }
 }
 
-#define FA2_ATTRIB_ENTRY(NAME, MODE) \
+// f32-Q entries (q_f16 unused; pass nullptr)
+#define FA2_ATTRIB_ENTRY_F32(NAME, MODE) \
 extern "C" __global__ __launch_bounds__(128, 1) void NAME( \
     const float* __restrict__ q, \
     const unsigned char* __restrict__ k_cache, \
@@ -474,24 +591,47 @@ extern "C" __global__ __launch_bounds__(128, 1) void NAME( \
     int batch_size, \
     float scale_attn) \
 { \
-    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256) \
-        return; \
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256) return; \
     const int kv_h = blockIdx.y; \
-    if (kv_h >= 4) \
-        return; \
+    if (kv_h >= 4) return; \
     const int q_base = blockIdx.x * 8; \
-    if (q_base >= batch_size) \
-        return; \
-    fa2_gqa_body_attrib<MODE>(q, k_cache, v_cache, out, positions, batch_size, \
-                 scale_attn, kv_h, q_base); \
+    if (q_base >= batch_size) return; \
+    fa2_gqa_body_attrib<MODE>(q, (_Float16*)nullptr, k_cache, v_cache, out, positions, \
+        batch_size, scale_attn, kv_h, q_base); \
 }
 
-FA2_ATTRIB_ENTRY(fa2_attrib_prod, 0)
-FA2_ATTRIB_ENTRY(fa2_attrib_nofill, 1)
-FA2_ATTRIB_ENTRY(fa2_attrib_noexp, 2)
-FA2_ATTRIB_ENTRY(fa2_attrib_nopv, 3)
-FA2_ATTRIB_ENTRY(fa2_attrib_noqload, 4)
-FA2_ATTRIB_ENTRY(fa2_attrib_noqk, 5)
+// f16-Q entries (q is half*)
+#define FA2_ATTRIB_ENTRY_F16(NAME, MODE) \
+extern "C" __global__ __launch_bounds__(128, 1) void NAME( \
+    const _Float16* __restrict__ q, \
+    const unsigned char* __restrict__ k_cache, \
+    const unsigned char* __restrict__ v_cache, \
+    float* __restrict__ out, \
+    const int* __restrict__ positions, \
+    int n_heads, \
+    int n_kv_heads, \
+    int head_dim, \
+    int batch_size, \
+    float scale_attn) \
+{ \
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256) return; \
+    const int kv_h = blockIdx.y; \
+    if (kv_h >= 4) return; \
+    const int q_base = blockIdx.x * 8; \
+    if (q_base >= batch_size) return; \
+    fa2_gqa_body_attrib<MODE>((const float*)nullptr, q, k_cache, v_cache, out, positions, \
+        batch_size, scale_attn, kv_h, q_base); \
+}
+
+FA2_ATTRIB_ENTRY_F32(fa2_attrib_prod, 0)
+FA2_ATTRIB_ENTRY_F32(fa2_attrib_nofill, 1)
+FA2_ATTRIB_ENTRY_F32(fa2_attrib_noexp, 2)
+FA2_ATTRIB_ENTRY_F32(fa2_attrib_nopv, 3)
+FA2_ATTRIB_ENTRY_F32(fa2_attrib_noqload, 4)
+FA2_ATTRIB_ENTRY_F32(fa2_attrib_noqk, 5)
+FA2_ATTRIB_ENTRY_F32(fa2_attrib_qshare2, 6)
+FA2_ATTRIB_ENTRY_F16(fa2_attrib_qf16, 7)
+FA2_ATTRIB_ENTRY_F16(fa2_attrib_qshare2_f16, 8)
 
 "#####;
 
@@ -509,32 +649,77 @@ fn prng_f32(i: u64, salt: u32) -> f32 {
     (prng_u32(i, salt) as f32 / u32::MAX as f32) * 2.0 - 1.0
 }
 
-fn f32_to_f16_bits(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let sign = ((bits >> 31) & 1) as u16;
-    let exp = ((bits >> 23) & 0xff) as i32;
-    let mant = bits & 0x7f_ffff;
-    if exp == 0 {
-        return sign << 15;
-    }
+/// IEEE754 f32→f16 round-to-nearest-even (matches AMD device `(_Float16)f` / v_cvt_f16_f32).
+fn f32_to_f16_rne(x: f32) -> u16 {
+    let b = x.to_bits();
+    let sign = ((b >> 16) & 0x8000) as u16;
+    let exp = ((b >> 23) & 0xff) as i32;
+    let mant = b & 0x7f_ffff;
+
     if exp == 0xff {
-        let m = if mant != 0 { 0x200 } else { 0 };
-        return (sign << 15) | 0x7c00 | m;
+        // Inf/NaN
+        if mant != 0 {
+            // quiet NaN with some payload bits
+            return sign | 0x7e00 | ((mant >> 13) as u16 & 0x1ff);
+        }
+        return sign | 0x7c00;
     }
-    let new_exp = exp - 127 + 15;
-    if new_exp >= 0x1f {
-        return (sign << 15) | 0x7c00;
+
+    // Rebias: f32 bias 127 → f16 bias 15
+    let half_exp = exp - 127 + 15;
+
+    if exp == 0 {
+        // f32 denormal/zero → f16 zero (underflow)
+        return sign;
     }
-    if new_exp <= 0 {
-        return sign << 15;
+
+    if half_exp >= 0x1f {
+        // overflow → inf
+        return sign | 0x7c00;
     }
-    let new_mant = (mant >> 13) as u16;
-    (sign << 15) | ((new_exp as u16) << 10) | new_mant
+
+    if half_exp <= 0 {
+        // f16 denormal or underflows to zero
+        if half_exp < -10 {
+            return sign;
+        }
+        // Implicit leading 1 of normal f32 becomes explicit for denormal f16.
+        let mant_full = mant | 0x800000;
+        // Shift so the f16 denormal exponent lands; round bit at bit (14 - half_exp) from top of 24-bit.
+        let shift = (14 - half_exp) as u32; // 14..24
+        let rounded = (mant_full >> (shift + 1)) as u32;
+        let round_bit = (mant_full >> shift) & 1;
+        let sticky = if (mant_full & ((1u32 << shift) - 1)) != 0 { 1 } else { 0 };
+        let mut out_m = rounded;
+        if round_bit == 1 && (sticky == 1 || (out_m & 1) == 1) {
+            out_m += 1;
+        }
+        return sign | (out_m as u16 & 0x3ff);
+    }
+
+    // Normal: 10-bit mantissa with RNE from 23-bit
+    let mant16 = mant >> 13;
+    let round_bit = (mant >> 12) & 1;
+    let sticky = if (mant & 0xfff) != 0 { 1 } else { 0 };
+    let mut out_m = mant16;
+    let mut out_e = half_exp as u32;
+    if round_bit == 1 && (sticky == 1 || (out_m & 1) == 1) {
+        out_m += 1;
+        if out_m == 0x400 {
+            // mantissa overflow → bump exp
+            out_m = 0;
+            out_e += 1;
+            if out_e >= 0x1f {
+                return sign | 0x7c00;
+            }
+        }
+    }
+    sign | ((out_e as u16) << 10) | (out_m as u16)
 }
 
 fn pack_q8_block(scale: f32, codes: &[i8; 32]) -> [u8; 34] {
     let mut out = [0u8; 34];
-    let s = f32_to_f16_bits(scale);
+    let s = f32_to_f16_rne(scale);
     out[0] = (s & 0xff) as u8;
     out[1] = (s >> 8) as u8;
     for w in 0..8 {
@@ -571,13 +756,20 @@ fn fill_q8_cache(seq_len: usize, salt: u32) -> Vec<u8> {
 
 fn fill_q(batch: usize, salt: u32) -> Vec<f32> {
     let n = batch * N_HEADS * HD;
-    (0..n)
-        .map(|i| prng_f32(i as u64, salt) * 0.5)
-        .collect()
+    (0..n).map(|i| prng_f32(i as u64, salt) * 0.5).collect()
+}
+
+/// Host-side f16 Q with the SAME RNE as production `(_Float16)f`.
+fn pack_q_f16_rne(q_f32: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(q_f32.len() * 2);
+    for &x in q_f32 {
+        bytes.extend_from_slice(&f32_to_f16_rne(x).to_le_bytes());
+    }
+    bytes
 }
 
 fn fill_positions_end_of_l(batch: usize, l: usize) -> Vec<i32> {
-    assert!(l >= batch, "L must cover batch positions");
+    assert!(l >= batch);
     let start = l - batch;
     (0..batch).map(|b| (start + b) as i32).collect()
 }
@@ -601,6 +793,10 @@ fn median_f64(xs: &mut [f64]) -> f64 {
     } else {
         0.5 * (xs[n / 2 - 1] + xs[n / 2])
     }
+}
+
+fn is_f16_q_sym(sym: &str) -> bool {
+    sym == "fa2_attrib_qf16" || sym == "fa2_attrib_qshare2_f16"
 }
 
 fn ensure_twins(gpu: &mut Gpu) {
@@ -639,14 +835,8 @@ fn launch_twin(
     gpu.hip
         .event_record(&start, gpu.active_stream.as_ref())
         .unwrap();
-    gpu.launch_kernel_blob(
-        name,
-        [grid_x, 4, 1],
-        BLOCK,
-        LDS_BYTES,
-        args.as_mut_slice(),
-    )
-    .unwrap_or_else(|e| panic!("launch twin {name}: {e:?}"));
+    gpu.launch_kernel_blob(name, [grid_x, 4, 1], BLOCK, LDS_BYTES, args.as_mut_slice())
+        .unwrap_or_else(|e| panic!("launch twin {name}: {e:?}"));
     gpu.hip
         .event_record(&stop, gpu.active_stream.as_ref())
         .unwrap();
@@ -654,7 +844,22 @@ fn launch_twin(
     let ms = gpu.hip.event_elapsed_ms(&start, &stop).unwrap() as f64;
     let _ = gpu.hip.event_destroy(start);
     let _ = gpu.hip.event_destroy(stop);
-    ms * 1000.0 // µs
+    ms * 1000.0
+}
+
+fn download_f32(gpu: &Gpu, t: &rdna_compute::GpuTensor, n: usize) -> Vec<f32> {
+    let mut bytes = vec![0u8; n * 4];
+    gpu.hip
+        .memcpy_dtoh(&mut bytes, &t.buf)
+        .unwrap_or_else(|e| panic!("download_f32: {e:?}"));
+    bytes
+        .chunks_exact(4)
+        .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+        .collect()
+}
+
+fn bitwise_eq_f32(a: &[f32], b: &[f32]) -> bool {
+    a.len() == b.len() && a.iter().zip(b.iter()).all(|(x, y)| x.to_bits() == y.to_bits())
 }
 
 fn run_attribution(gpu: &mut Gpu) {
@@ -664,7 +869,10 @@ fn run_attribution(gpu: &mut Gpu) {
     );
     eprintln!("symbols: {}", SYMS.join(", "));
     eprintln!(
-        "WARNING: parent MUST verify all six twins stay within production VGPR ±10%; \
+        "Production Q cvt: (_Float16)f  → device v_cvt_f16_f32 RNE; host pack_q_f16_rne matches."
+    );
+    eprintln!(
+        "WARNING: parent MUST verify all twins stay within production VGPR ±10%; \
          otherwise attribution is confounded. Read hsaco metadata under HIPFIRE_KERNEL_CACHE."
     );
 
@@ -673,11 +881,13 @@ fn run_attribution(gpu: &mut Gpu) {
         let t_pack = Instant::now();
         let pos_h = fill_positions_end_of_l(BATCH, l);
         let q_h = fill_q(BATCH, 0xF30A);
+        let q_f16 = pack_q_f16_rne(&q_h);
         let k_h = fill_q8_cache(l, 0xF30B);
         let v_h = fill_q8_cache(l, 0xF30C);
         eprintln!(
-            "packed Q={} f32  K={} B  V={} B  pos={} i32 in {:.2}s",
+            "packed Q_f32={}  Q_f16={} B  K={} B  V={} B  pos={} in {:.2}s",
             q_h.len(),
+            q_f16.len(),
             k_h.len(),
             v_h.len(),
             pos_h.len(),
@@ -687,13 +897,65 @@ fn run_attribution(gpu: &mut Gpu) {
         let d_k = gpu.upload_raw(&k_h, &[k_h.len()]).unwrap();
         let d_v = gpu.upload_raw(&v_h, &[v_h.len()]).unwrap();
         let d_q = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+        let d_q_f16 = gpu.upload_raw(&q_f16, &[q_f16.len()]).unwrap();
         let pos_bytes = positions_to_bytes(&pos_h);
         let d_pos = gpu.upload_raw(&pos_bytes, &[pos_bytes.len()]).unwrap();
 
-        // Separate outs so arms do not contend mid-interleave.
         let d_outs: Vec<_> = (0..SYMS.len())
             .map(|_| gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap())
             .collect();
+
+        let q_for = |sym: &str| -> &rdna_compute::GpuTensor {
+            if is_f16_q_sym(sym) {
+                &d_q_f16
+            } else {
+                &d_q
+            }
+        };
+
+        // --- bit-exact check for candidates vs prod (untimed) ---
+        let _ = launch_twin(
+            gpu,
+            SYMS[0],
+            q_for(SYMS[0]),
+            &d_k,
+            &d_v,
+            &d_outs[0],
+            &d_pos,
+            BATCH as i32,
+        );
+        let prod_out = download_f32(gpu, &d_outs[0], BATCH * QO_ROW);
+        for &ci in &CAND_IDX {
+            // zero out then launch
+            let z = vec![0u8; BATCH * QO_ROW * 4];
+            gpu.hip
+                .memcpy_htod(&d_outs[ci].buf, &z)
+                .unwrap_or_else(|e| panic!("zero out: {e:?}"));
+            let _ = launch_twin(
+                gpu,
+                SYMS[ci],
+                q_for(SYMS[ci]),
+                &d_k,
+                &d_v,
+                &d_outs[ci],
+                &d_pos,
+                BATCH as i32,
+            );
+            let cand_out = download_f32(gpu, &d_outs[ci], BATCH * QO_ROW);
+            let eq = bitwise_eq_f32(&prod_out, &cand_out);
+            let mut n_diff = 0usize;
+            let mut max_abs = 0.0f32;
+            for (a, b) in prod_out.iter().zip(cand_out.iter()) {
+                if a.to_bits() != b.to_bits() {
+                    n_diff += 1;
+                    max_abs = max_abs.max((a - b).abs());
+                }
+            }
+            eprintln!(
+                "  bitwise_eq L={l} {sym:<24} = {eq}  n_diff={n_diff} max_abs={max_abs:.6e}",
+                sym = SYMS[ci]
+            );
+        }
 
         // Warmup
         for _ in 0..ATTR_WARMUP {
@@ -701,7 +963,7 @@ fn run_attribution(gpu: &mut Gpu) {
                 let _ = launch_twin(
                     gpu,
                     sym,
-                    &d_q,
+                    q_for(sym),
                     &d_k,
                     &d_v,
                     &d_outs[si],
@@ -711,13 +973,13 @@ fn run_attribution(gpu: &mut Gpu) {
             }
         }
 
-        let mut samples: [Vec<f64>; 6] = std::array::from_fn(|_| Vec::new());
+        let mut samples: [Vec<f64>; 9] = std::array::from_fn(|_| Vec::new());
         for _ in 0..ATTR_ITERS {
             for (si, sym) in SYMS.iter().enumerate() {
                 let us = launch_twin(
                     gpu,
                     sym,
-                    &d_q,
+                    q_for(sym),
                     &d_k,
                     &d_v,
                     &d_outs[si],
@@ -728,8 +990,8 @@ fn run_attribution(gpu: &mut Gpu) {
             }
         }
 
-        let mut med = [0.0f64; 6];
-        for i in 0..6 {
+        let mut med = [0.0f64; 9];
+        for i in 0..9 {
             med[i] = median_f64(&mut samples[i]);
             let mn = samples[i].iter().cloned().fold(f64::INFINITY, f64::min);
             let mx = samples[i]
@@ -737,7 +999,7 @@ fn run_attribution(gpu: &mut Gpu) {
                 .cloned()
                 .fold(f64::NEG_INFINITY, f64::max);
             eprintln!(
-                "  {:<20} median_us={:.2}  min={:.2} max={:.2}",
+                "  {:<24} median_us={:.2}  min={:.2} max={:.2}",
                 SYMS[i], med[i], mn, mx
             );
         }
@@ -747,25 +1009,55 @@ fn run_attribution(gpu: &mut Gpu) {
         let pv = (med[0] - med[3]) / prod;
         let qload = (med[0] - med[4]) / prod;
         let qk = (med[0] - med[5]) / prod;
+        let r_qshare2 = med[6] / prod;
+        let r_qf16 = med[7] / prod;
+        let r_both = med[8] / prod;
         eprintln!(
-            "  fill =(prod-nofill)/prod  = {fill:.4}  ({:.2}%)",
+            "  fill =(prod-nofill)/prod   = {fill:.4}  ({:.2}%)",
             fill * 100.0
         );
         eprintln!(
-            "  exp  =(prod-noexp)/prod   = {exp_a:.4}  ({:.2}%)",
+            "  exp  =(prod-noexp)/prod    = {exp_a:.4}  ({:.2}%)",
             exp_a * 100.0
         );
         eprintln!(
-            "  pv   =(prod-nopv)/prod    = {pv:.4}  ({:.2}%)",
+            "  pv   =(prod-nopv)/prod     = {pv:.4}  ({:.2}%)",
             pv * 100.0
         );
         eprintln!(
-            "  qload=(prod-noqload)/prod = {qload:.4}  ({:.2}%)",
+            "  qload=(prod-noqload)/prod  = {qload:.4}  ({:.2}%)",
             qload * 100.0
         );
         eprintln!(
-            "  qk   =(prod-noqk)/prod    = {qk:.4}  ({:.2}%)",
+            "  qk   =(prod-noqk)/prod     = {qk:.4}  ({:.2}%)",
             qk * 100.0
+        );
+        eprintln!(
+            "  ratio qshare2/prod         = {r_qshare2:.4}  ({:.2}% of prod time)",
+            r_qshare2 * 100.0
+        );
+        eprintln!(
+            "  ratio qf16/prod            = {r_qf16:.4}  ({:.2}% of prod time)",
+            r_qf16 * 100.0
+        );
+        eprintln!(
+            "  ratio qshare2_f16/prod     = {r_both:.4}  ({:.2}% of prod time)",
+            r_both * 100.0
+        );
+        eprintln!(
+            "  speedup qshare2            = {:.4}  ({:.2}% faster)",
+            1.0 - r_qshare2,
+            (1.0 - r_qshare2) * 100.0
+        );
+        eprintln!(
+            "  speedup qf16               = {:.4}  ({:.2}% faster)",
+            1.0 - r_qf16,
+            (1.0 - r_qf16) * 100.0
+        );
+        eprintln!(
+            "  speedup qshare2_f16        = {:.4}  ({:.2}% faster)",
+            1.0 - r_both,
+            (1.0 - r_both) * 100.0
         );
     }
 }
@@ -773,8 +1065,11 @@ fn run_attribution(gpu: &mut Gpu) {
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     eprintln!(
-        "tmp_fa2_attrib arch={}  (F3.0 FA2 fill/exp/PV attribution)",
+        "tmp_fa2_attrib arch={}  (F3.0 FA2 attribution + Q candidates)",
         gpu.arch
+    );
+    eprintln!(
+        "Production Q conversion: (_Float16)float C cast → AMD v_cvt_f16_f32 (RNE)."
     );
     if !matches!(
         gpu.arch.as_str(),
