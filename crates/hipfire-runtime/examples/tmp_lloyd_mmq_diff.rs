@@ -23,9 +23,13 @@ const MMQ_X: usize = 128;
 const MMQ_Y: usize = 128;
 const MMQ_TILE_Y_K: usize = 36;
 const MMQ_TILE_X_K: usize = 76;
+/// Base tiles + 256×u16 pair table (HIPFIRE_MMQ_LUT_PAIRTAB default ON).
+const MMQ_LDS_BYTES: usize =
+    (MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * 4 + 512;
 const MODULE_LLOYD: &str = "gemm_mq4g256v2_residual_mmq_lloyd";
 const SRC_LLOYD: &str = concat!(
     "#define HIPFIRE_MMQ_LUT 1\n",
+    // PAIRTAB defaults ON inside the hip; leave unset for the LDS path.
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip")
 );
 
@@ -98,8 +102,7 @@ fn launch_lloyd_mmq(
     let kernel = lloyd_symbol(full, add, x128);
     gpu.ensure_kernel_public(MODULE_LLOYD, SRC_LLOYD, kernel)
         .unwrap_or_else(|e| panic!("ensure {kernel}: {e}"));
-    let shared =
-        ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+    let shared = MMQ_LDS_BYTES as u32;
     let grid = [m.div_ceil(MMQ_Y) as u32, n.div_ceil(MMQ_X) as u32, 1];
     let block = [32u32, 8, 1];
     let mut blob = KernargBlob::new();
