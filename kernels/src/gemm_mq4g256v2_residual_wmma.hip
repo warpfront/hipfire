@@ -42,11 +42,25 @@ __launch_bounds__(32, 8)
 #else
 __launch_bounds__(32, 2)
 #endif
-extern "C" __global__ void gemm_mq4g256v2_residual_wmma(
+extern "C" __global__ void
+#ifdef HIPFIRE_MQ4G256V2_LUT
+#ifndef HIPFIRE_MQ4G256V2_RESIDUAL_WMMA_KERNEL
+#define HIPFIRE_MQ4G256V2_RESIDUAL_WMMA_KERNEL gemm_mq4g256v2_residual_wmma_gfx11_lloyd
+#endif
+HIPFIRE_MQ4G256V2_RESIDUAL_WMMA_KERNEL(
+#else
+gemm_mq4g256v2_residual_wmma(
+#endif
     const char* __restrict__ A,
     const _Float16* __restrict__ X,
     float* __restrict__ Y,
     int M, int K, int batch_size
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    , const unsigned int LUT0, const unsigned int LUT1,
+      const unsigned int LUT2, const unsigned int LUT3,
+      const unsigned int LUT4, const unsigned int LUT5,
+      const unsigned int LUT6, const unsigned int LUT7
+#endif
 ) {
     const int row_start = blockIdx.x * 16;
     const int batch_start = blockIdx.y * 16;
@@ -63,6 +77,24 @@ extern "C" __global__ void gemm_mq4g256v2_residual_wmma(
     const _Float16* x_base = X + (long long)safe_batch * K;
 
     float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    // Centered-codebook LUT: 16 f16 levels in 8 dwords (2 per dword, LE).
+    // Staged once to 32 B of LDS (lanes 0..7 write one dword each); residual
+    // has a single source so the wave-uniform codebook select is trivial.
+    // Barrier sits outside the K loop — decode reads LUT_SMEM[q] only.
+    __shared__ unsigned short LUT_SMEM[16];
+    {
+        unsigned int d;
+        if (tid == 0) d = LUT0; else if (tid == 1) d = LUT1;
+        else if (tid == 2) d = LUT2; else if (tid == 3) d = LUT3;
+        else if (tid == 4) d = LUT4; else if (tid == 5) d = LUT5;
+        else if (tid == 6) d = LUT6; else d = LUT7;
+        if (tid < 8) ((unsigned int*)LUT_SMEM)[tid] = d;
+    }
+    __syncthreads();
+#define MQ4V2_LUT(q) (__half2float(__ushort_as_half(LUT_SMEM[(q)])))
+#endif
+
 
     for (int g = 0; g < groups_per_row; g++) {
         const char* gp = row_base + g * 136;
@@ -85,6 +117,10 @@ extern "C" __global__ void gemm_mq4g256v2_residual_wmma(
 
             half16_t a_reg;
             #define DQ(i, pk, sh) a_reg[i] = sc_h * (_Float16)(float)(((pk) >> (sh)) & 0xFu) + zp_h
+#ifdef HIPFIRE_MQ4G256V2_LUT
+            #undef DQ
+            #define DQ(i, pk, sh) a_reg[i] = sc_h * (_Float16)MQ4V2_LUT(((pk) >> (sh)) & 0xFu) + zp_h
+#endif
             DQ(0,  pk0,  0); DQ(1,  pk0,  4); DQ(2,  pk0,  8); DQ(3,  pk0, 12);
             DQ(4,  pk0, 16); DQ(5,  pk0, 20); DQ(6,  pk0, 24); DQ(7,  pk0, 28);
             DQ(8,  pk1,  0); DQ(9,  pk1,  4); DQ(10, pk1,  8); DQ(11, pk1, 12);

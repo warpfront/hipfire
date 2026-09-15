@@ -31258,6 +31258,111 @@ impl Gpu {
         result
     }
 
+    /// MQ4G256V2-Lloyd (qt=52) gfx11 residual WMMA base tile with per-tensor
+    /// centered f16 codebook. Twin of the uniform base path in
+    /// `gemm_mq4g256v2_residual_wmma` (no MMQ/BT/MW/ldsstage diversion): fail
+    /// closed unless gfx11 wave32 WMMA and `k % 256 == 0`. `lut_f16` packs the
+    /// 16 centered (`L-7.5`) f16 levels as 8 dwords (2 per dword, LE); the
+    /// kernel stages them to LDS once outside the K loop. Fused `Y += W@X`
+    /// residual add — caller pre-inits Y.
+    pub fn gemm_mq4g256v2_residual_wmma_gfx11_lloyd(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        lut_f16: [u32; 8],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.has_wmma_w32() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_mq4g256v2_residual_wmma_gfx11_lloyd: gfx11 wave32 WMMA required",
+            ));
+        }
+        if k % 256 != 0 || k == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_mq4g256v2_residual_wmma_gfx11_lloyd: K divisible by 256 required (got {k})"
+                ),
+            ));
+        }
+        if m == 0 || batch_size == 0 {
+            return Ok(());
+        }
+        let kname = "gemm_mq4g256v2_residual_wmma_gfx11_lloyd";
+        let ksrc = kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX11_LUT_SRC;
+        self.ensure_kernel(kname, ksrc, kname)?;
+        let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x_f16_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut bs_val = batch_size as i32;
+        let mut l0 = lut_f16[0];
+        let mut l1 = lut_f16[1];
+        let mut l2 = lut_f16[2];
+        let mut l3 = lut_f16[3];
+        let mut l4 = lut_f16[4];
+        let mut l5 = lut_f16[5];
+        let mut l6 = lut_f16[6];
+        let mut l7 = lut_f16[7];
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut bs_val as *mut _ as *mut c_void,
+            &mut l0 as *mut _ as *mut c_void,
+            &mut l1 as *mut _ as *mut c_void,
+            &mut l2 as *mut _ as *mut c_void,
+            &mut l3 as *mut _ as *mut c_void,
+            &mut l4 as *mut _ as *mut c_void,
+            &mut l5 as *mut _ as *mut c_void,
+            &mut l6 as *mut _ as *mut c_void,
+            &mut l7 as *mut _ as *mut c_void,
+        ];
+        let row_tiles = (m + 15) / 16;
+        let batch_tiles = (batch_size + 15) / 16;
+        let bytes =
+            crate::profile::gemv_hfq4g256_bytes(m, k) + batch_size * k * 2 + batch_size * m * 4 * 2;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let result = self.launch_maybe_blob(
+            kname,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(bs_val);
+                b.push_u32(l0);
+                b.push_u32(l1);
+                b.push_u32(l2);
+                b.push_u32(l3);
+                b.push_u32(l4);
+                b.push_u32(l5);
+                b.push_u32(l6);
+                b.push_u32(l7);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// MQ4V2 gfx1100 residual batch-tile (BT4/6/8).
     ///
     /// Direct harness entry and production selector target: reuses one
