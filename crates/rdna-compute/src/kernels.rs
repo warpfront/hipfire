@@ -3365,20 +3365,8 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_LUT_PERM_SRC: &str = concat!(
 // wmma_i32_16x16x16_iu4 directly, activations are int4 via the
 // quantize_int4_mmq_ds128 prelude in the same file. Opt-in through
 // HIPFIRE_GFX11_MQ4V2_IU4 on gfx1100/gfx1151.
-// Base = production (XSTRIDE 44, no pipeline). A2/A1 A/B hooks below.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip");
-// A2: X-tile stride 42 (bank-conflict experiment). LDS 30720 B.
-pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_STRIDE42_SRC: &str = concat!(
-    "#define HIPFIRE_IU4_XSTRIDE 42\n",
-    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
-);
-// A1: stride-42 + §6.2 software pipeline (register-only prefetch).
-pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_PIPELINE_SRC: &str = concat!(
-    "#define HIPFIRE_IU4_XSTRIDE 42\n",
-    "#define HIPFIRE_IU4_PIPELINE 1\n",
-    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
-);
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =

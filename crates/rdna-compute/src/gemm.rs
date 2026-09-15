@@ -10,7 +10,7 @@ use crate::dispatch::{
 use crate::kernels;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
-use std::sync::{LazyLock, OnceLock};
+use std::sync::OnceLock;
 
 /// One instantiation of the parameterised LDS-staged WMMA GEMM
 /// (`kernels/src/gemm_f16_x_f16_wmma_lds256.hip`).
@@ -19068,37 +19068,12 @@ impl Gpu {
             (true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
             (false, _) => "gemm_mq4g256v2_residual_mmq_iu4",
         };
-        // A2/A1 A/B hook (removed after admission). base | stride42 | pipeline.
-        // Module name is suffixed so the kernel cache never aliases variants.
-        static IU4_VARIANT: LazyLock<&'static str> = LazyLock::new(|| {
-            match hipfire_config::developer_var("HIPFIRE_IU4_VARIANT")
-                .ok()
-                .as_deref()
-                .map(str::trim)
-            {
-                Some("stride42") => "stride42",
-                Some("pipeline") => "pipeline",
-                _ => "base",
-            }
-        });
-        let (module, src, tile_x_k): (&str, &str, usize) = match *IU4_VARIANT {
-            "stride42" => (
-                "gemm_mq4g256v2_residual_mmq_iu4_stride42",
-                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_STRIDE42_SRC,
-                42,
-            ),
-            "pipeline" => (
-                "gemm_mq4g256v2_residual_mmq_iu4_pipeline",
-                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_PIPELINE_SRC,
-                42,
-            ),
-            _ => (
-                "gemm_mq4g256v2_residual_mmq_iu4",
-                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
-                44,
-            ),
-        };
-        self.ensure_kernel(module, src, kernel_name)?;
+        const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
+            kernel_name,
+        )?;
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_i4_ptr;
         let mut y_ptr = y.buf.as_ptr();
@@ -19119,14 +19094,13 @@ impl Gpu {
         const MMQ_Y: usize = 128;
         // Y tile: per-128-K block per column 64 B nibbles + (f32 d, i32 s)
         // header = 72 B = 18 ints. X tile: 32 nibble words + 8 half2 header
-        // slots + pad = IU4_TILE_X_K ints (44 base / 42 under A2).
-        // LDS = (128*18 + 128*tile_x_k)*4 → 31744 B base, 30720 B stride42.
+        // slots + 2 pad = 42 ints. LDS = (128*18 + 128*42)*4 = 30720 B.
         const MMQ_TILE_Y_K: usize = 18;
-        let mmq_tile_x_k = tile_x_k;
+        const MMQ_TILE_X_K: usize = 42;
         let row_tiles = m.div_ceil(MMQ_Y);
         let batch_tiles = batch_size.div_ceil(MMQ_X);
         let shared_mem =
-            ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * mmq_tile_x_k) * std::mem::size_of::<i32>()) as u32;
+            ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
         let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let result = self.launch_maybe_blob(
