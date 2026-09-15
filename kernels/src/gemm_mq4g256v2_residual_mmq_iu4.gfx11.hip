@@ -141,6 +141,23 @@ extern "C" __global__ void quantize_int4_mmq_ds128(
 
 #if !HIPFIRE_RDNA3
 
+#ifdef HIPFIRE_MMQ_IU4_LUT
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_lloyd(
+    const char*, const block_i4_128*, float*, int, int, int, int,
+    unsigned, unsigned, unsigned, unsigned) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_lloyd(
+    const char*, const block_i4_128*, float*, int, int, int, int,
+    unsigned, unsigned, unsigned, unsigned) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_lloyd(
+    const char*, const block_i4_128*, float*, int, int, int, int,
+    unsigned, unsigned, unsigned, unsigned) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_lloyd(
+    const char*, const block_i4_128*, float*, int, int, int, int,
+    unsigned, unsigned, unsigned, unsigned) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_lloyd(
+    const char*, const block_i4_128*, float*, int, int, int, int,
+    unsigned, unsigned, unsigned, unsigned) {}
+#else
 extern C __global__ void gemm_mq4g256v2_residual_mmq_iu4(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
 extern C __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add(
@@ -151,6 +168,7 @@ extern C __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
 extern C __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
+#endif
 
 #else
 
@@ -200,6 +218,40 @@ struct tile<I_, J_, T, DATA_LAYOUT_J_MAJOR> {
 
 using int32x2_t = __attribute__((__vector_size__(2 * sizeof(int)))) int;
 using int32x8_t = __attribute__((__vector_size__(8 * sizeof(int)))) int;
+#ifdef HIPFIRE_MMQ_IU4_LUT
+// Combined HL byte-table lookup: T[q]=(H[q]<<4)|L[q] packed as 16 LE bytes
+// across T0..T3. Selector bytes are nibble indices 0..15; bit3 picks the
+// upper half (T2/T3), low 3 bits the byte within the pair (same shape as
+// mq4_lut8 / fp8.gfx12).
+__device__ static inline unsigned iu4_lut8_hl(
+    unsigned sel,
+    unsigned T0, unsigned T1, unsigned T2, unsigned T3
+) {
+    const unsigned lo = __builtin_amdgcn_perm(T1, T0, sel & 0x07070707u);
+    const unsigned hi = __builtin_amdgcn_perm(T3, T2, sel & 0x07070707u);
+    const unsigned m = ((sel >> 3) & 0x01010101u) * 0xFFu;
+    return (hi & m) | (lo & ~m);
+}
+
+// Per-dword nibble substitution: W holds 8 codes → Hword/Lword with the
+// same even-low/odd-high nibble packing the iu4 WMMA expects.
+__device__ static inline void iu4_split_hl_dword(
+    unsigned W,
+    unsigned T0, unsigned T1, unsigned T2, unsigned T3,
+    unsigned* Hword, unsigned* Lword
+) {
+    const unsigned lo = W & 0x0F0F0F0Fu;
+    const unsigned hi = (W >> 4) & 0x0F0F0F0Fu;
+    const unsigned plo = iu4_lut8_hl(lo, T0, T1, T2, T3);
+    const unsigned phi = iu4_lut8_hl(hi, T0, T1, T2, T3);
+    const unsigned Hlo = (plo >> 4) & 0x0F0F0F0Fu;
+    const unsigned Llo = plo & 0x0F0F0F0Fu;
+    const unsigned Hhi = (phi >> 4) & 0x0F0F0F0Fu;
+    const unsigned Lhi = phi & 0x0F0F0F0Fu;
+    *Hword = Hlo | (Hhi << 4);
+    *Lword = Llo | (Lhi << 4);
+}
+#endif
 
 // Raw nibble-word copy: 32 words per 256-K row, NO expand VALU.
 // Header loop identical to the iu8 path (dual-fp16 headers, ksc select).
@@ -234,7 +286,15 @@ static __device__ __forceinline__ void load_iu4_tile(
             const unsigned int hs = *(const unsigned int*)(gp + 4 * ksc);
             const float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
             const float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+#ifdef HIPFIRE_MMQ_IU4_LUT
+            // sc' = sc·(1/16); dmA.y' = zp − 120·sc' (Outcome B bias fold).
+            // Headers on disk/GPU stay centered zp' from apply_lloyd_centering.
+            const float sc_p = sc * 0.0625f;
+            const float zp_p = zp - 120.0f * sc_p;
+            const half2 dm = make_half2((_Float16)sc_p, (_Float16)zp_p);
+#else
             const half2 dm = make_half2((_Float16)sc, (_Float16)zp);
+#endif
             #pragma unroll
             for (int l = 0; l < 4; ++l)
                 x_dm[i * IU4_TILE_X_K + 4 * ksc + l] = dm;
@@ -249,6 +309,9 @@ static __device__ __forceinline__ void vec_dot_i4_x128(
     const int* __restrict__ y,
     float* __restrict__ sum,
     int h
+#ifdef HIPFIRE_MMQ_IU4_LUT
+    , unsigned T0, unsigned T1, unsigned T2, unsigned T3
+#endif
 ) {
     using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
 
@@ -268,6 +331,47 @@ static __device__ __forceinline__ void vec_dot_i4_x128(
     for (int j0 = 0; j0 < IU4_MMQ_X; j0 += ntx * tile_C::J) {
         #pragma unroll
         for (int n = 0; n < ntx; ++n) {
+#ifdef HIPFIRE_MMQ_IU4_LUT
+            int32x8_t accH = {0, 0, 0, 0, 0, 0, 0, 0};
+            int32x8_t accL = {0, 0, 0, 0, 0, 0, 0, 0};
+            #pragma nounroll
+            for (int t = 0; t < 4; ++t) {
+                const int* ap = x_qs + (i0 + n * tile_C::I + lane_row) * IU4_TILE_X_K + h * 16 + t * 4;
+                const int* bp = y_qs + (j0 + lane_row) * IU4_TILE_Y_K + t * 4;
+                const int32x2_t av0 = *(const int32x2_t*)(ap + 0);
+                const int32x2_t av1 = *(const int32x2_t*)(ap + 2);
+                const int32x2_t bv0 = *(const int32x2_t*)(bp + 0);
+                const int32x2_t bv1 = *(const int32x2_t*)(bp + 2);
+                unsigned H0, L0, H1, L1, H2, L2, H3, L3;
+                iu4_split_hl_dword((unsigned)av0[0], T0, T1, T2, T3, &H0, &L0);
+                iu4_split_hl_dword((unsigned)av0[1], T0, T1, T2, T3, &H1, &L1);
+                iu4_split_hl_dword((unsigned)av1[0], T0, T1, T2, T3, &H2, &L2);
+                iu4_split_hl_dword((unsigned)av1[1], T0, T1, T2, T3, &H3, &L3);
+                int32x2_t hav0; hav0[0] = (int)H0; hav0[1] = (int)H1;
+                int32x2_t hav1; hav1[0] = (int)H2; hav1[1] = (int)H3;
+                int32x2_t lav0; lav0[0] = (int)L0; lav0[1] = (int)L1;
+                int32x2_t lav1; lav1[0] = (int)L2; lav1[1] = (int)L3;
+                // signA=false unsigned, signB=true signed, no-sat — same as uniform.
+                accH = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, hav0, true, bv0, accH, false);
+                accH = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, hav1, true, bv1, accH, false);
+                accL = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, lav0, true, bv0, accL, false);
+                accL = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, lav1, true, bv1, accL, false);
+            }
+            const float d_x = *(const float*)(y_ds + (j0 + j_lane) * IU4_TILE_Y_K);
+            const int s_x = *(const int*)(y_ds + (j0 + j_lane) * IU4_TILE_Y_K + 1);
+            const int* accH_i = (const int*)&accH;
+            const int* accL_i = (const int*)&accL;
+            #pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int i = i0 + n * tile_C::I + tile_C::get_i(l);
+                const half2 dm = ((const half2*)(x_qs + i * IU4_TILE_X_K + IU4_X_DM_OFF))[4 * h];
+                const float2 dmA = __half22float2(dm);
+                // C = 16·ΣH·x + ΣL·x; sc'/zp' already in dmA from load_iu4_tile.
+                const int C = 16 * accH_i[l] + accL_i[l];
+                sum[(j0 / tile_C::J + n) * tile_C::ne + l] +=
+                    dmA.x * d_x * (float)C + dmA.y * d_x * (float)s_x;
+            }
+#else
             int32x8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
             #pragma nounroll
             for (int t = 0; t < 4; ++t) {
@@ -291,6 +395,7 @@ static __device__ __forceinline__ void vec_dot_i4_x128(
                 sum[(j0 / tile_C::J + n) * tile_C::ne + l] +=
                     dmA.x * d_x * (float)acc_i[l] + dmA.y * d_x * (float)s_x;
             }
+#endif
         }
     }
 }
@@ -304,6 +409,9 @@ static __device__ __forceinline__ void gemm_iu4_body(
     int K,
     int N,
     int add
+#ifdef HIPFIRE_MMQ_IU4_LUT
+    , unsigned c16_0, unsigned c16_1, unsigned c16_2, unsigned c16_3
+#endif
 ) {
     const int row0 = blockIdx.x * IU4_MMQ_Y;
     const int col0 = blockIdx.y * IU4_MMQ_X;
@@ -311,6 +419,22 @@ static __device__ __forceinline__ void gemm_iu4_body(
 
     const int groups_per_row = K / 256;
     const int blocks128 = K / 128;
+#ifdef HIPFIRE_MMQ_IU4_LUT
+    // Prologue: C16 signed bytes S[q] → U=S+120 → T[q]=(H<<4)|L = U (byte).
+    // 16 bytes = 4 dwords in SGPRs; one lookup yields both nibbles.
+    unsigned T0 = 0u, T1 = 0u, T2 = 0u, T3 = 0u;
+    {
+        const unsigned c16[4] = {c16_0, c16_1, c16_2, c16_3};
+        unsigned T[4] = {0u, 0u, 0u, 0u};
+        #pragma unroll
+        for (int q = 0; q < 16; ++q) {
+            const int S = (int)(signed char)((c16[q / 4] >> ((q % 4) * 8)) & 0xFFu);
+            const unsigned U = (unsigned)(S + 120);
+            T[q / 4] |= (U & 0xFFu) << ((q % 4) * 8);
+        }
+        T0 = T[0]; T1 = T[1]; T2 = T[2]; T3 = T[3];
+    }
+#endif
 
     extern __shared__ int smem[];
     int* tile_y = smem;
@@ -328,7 +452,11 @@ static __device__ __forceinline__ void gemm_iu4_body(
             else tile_y[l] = 0;
         }
         __syncthreads();
+#ifdef HIPFIRE_MMQ_IU4_LUT
+        vec_dot_i4_x128(tile_x, tile_y, sum, 0, T0, T1, T2, T3);
+#else
         vec_dot_i4_x128(tile_x, tile_y, sum, 0);
+#endif
         __syncthreads();
 
         if (2 * kb + 1 < blocks128) {
@@ -339,7 +467,11 @@ static __device__ __forceinline__ void gemm_iu4_body(
                 else tile_y[l] = 0;
             }
             __syncthreads();
+#ifdef HIPFIRE_MMQ_IU4_LUT
+            vec_dot_i4_x128(tile_x, tile_y, sum, 1, T0, T1, T2, T3);
+#else
             vec_dot_i4_x128(tile_x, tile_y, sum, 1);
+#endif
             __syncthreads();
         }
     }
@@ -371,6 +503,15 @@ static __device__ __forceinline__ void gemm_iu4_body(
     }
 }
 
+#ifdef HIPFIRE_MMQ_IU4_LUT
+#define IU4_ENTRY(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add,     unsigned c16_0, unsigned c16_1, unsigned c16_2, unsigned c16_3 ) {     gemm_iu4_body<full>(A, Xq, Y, M, K, N, add, c16_0, c16_1, c16_2, c16_3); }
+
+IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_lloyd, false, 2)
+IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add_lloyd, true, 2)
+IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set_lloyd, true, 2)
+IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_lloyd, true, 3)
+IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_lloyd, true, 3)
+#else
 #define IU4_ENTRY(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body<full>(A, Xq, Y, M, K, N, add); }
 
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4, false, 2)
@@ -378,5 +519,6 @@ IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3, true, 3)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3, true, 3)
+#endif
 
 #endif

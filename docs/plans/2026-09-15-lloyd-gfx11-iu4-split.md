@@ -311,8 +311,9 @@ Delta for Liu4:
 
 Frozen cross-unit contracts: C16 = `[u32;4]` LE nibble…byte packing per
 `lloyd_lut.rs:137-138`; combined HL table `T[q]=(H[q]<<4)|L[q]` derived
-in-shader prologue; symbols `gemm_mq4g256v2_residual_mmq_iu4[_full_add|_full_set][_occ3]_lloyd`
-(or `_lloyd…` infix — K1 freezes and informs K2 before K2 starts);
+in-shader prologue; symbols (K1-frozen 2026-09-15, `_lloyd`-suffix form):
+`gemm_mq4g256v2_residual_mmq_iu4_lloyd`, `…_full_add_lloyd`, `…_full_set_lloyd`,
+`…_full_add_occ3_lloyd`, `…_full_set_occ3_lloyd`;
 MODULE `gemm_mq4g256v2_residual_mmq_iu4_lloyd` (code-object cache cannot alias
 uniform `"gemm_mq4g256v2_residual_mmq_iu4"` at `gemm.rs:18540`); launcher
 names §4; kill switches §4. NO GPU commands by planners; composers run the

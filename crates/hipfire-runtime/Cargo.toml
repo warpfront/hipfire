@@ -651,3 +651,8 @@ required-features = ["deltanet"]
 [[example]]
 name = "h2d_mmap_bench"
 required-features = ["deltanet"]
+
+[[example]]
+name = "tmp_liu4_diff"
+required-features = []
+
