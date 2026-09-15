@@ -182,10 +182,14 @@ fn dispatch_batched_gemm_epilogue(
                     n,
                 );
             } else if matches!(w.gpu_dtype, DType::MQ4G256V2Lloyd) {
-                // qt=52: FP8-LUT residual prefill. Same rotated-input contract
-                // as the uniform V2 arm; no F16 LUT variant exists so the LUT
-                // path is the ONLY Lloyd route (fail-closed inside on missing
-                // LUT / inadmissible arch or shape).
+                // qt=52: gfx11 → MMQ-LUT residual; gfx12 keeps FP8-LUT; else
+                // fail-closed inside the FP8 launcher (never uniform).
+                if lloyd_mmq_lut_route(gpu) {
+                    let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
+                    return gpu.gemm_hfq4g256_residual_mmq_lloyd(
+                        &w.buf, input, &pbs.x_batch, m, k, n, c16,
+                    );
+                }
                 let lut = lloyd_e4m3_or_fail(w, "dispatch_batched_gemm_epilogue")?;
                 return gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd(
                     &w.buf,
@@ -291,8 +295,15 @@ fn dispatch_batched_gemm_epilogue(
                     n,
                 );
             } else if matches!(w.gpu_dtype, DType::MQ4G256V2Lloyd) {
-                // qt=52 Partial: zero then FP8-LUT residual (== plain GEMM).
+                // qt=52 Partial: zero then residual (== plain GEMM). gfx11 →
+                // MMQ-LUT ADD into zeroed Y; gfx12 keeps FP8-LUT.
                 zero_partial_for_residual(gpu, out, n, m)?;
+                if lloyd_mmq_lut_route(gpu) {
+                    let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
+                    return gpu.gemm_hfq4g256_residual_mmq_lloyd(
+                        &w.buf, input, &out_n, m, k, n, c16,
+                    );
+                }
                 let lut = lloyd_e4m3_or_fail(w, "dispatch_batched_gemm_epilogue")?;
                 return gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd(
                     &w.buf, input, &out_n, m, k, n, 1, lut,
@@ -2830,6 +2841,36 @@ fn lloyd_e4m3_or_fail(w: &WeightTensor, family: &'static str) -> HipResult<[u32;
     })
 }
 
+/// qt=52 gfx11 MMQ-LUT prefill: extract the per-tensor C16 codebook or fail
+/// closed naming the prefill family. Sibling of [`lloyd_e4m3_or_fail`]; the
+/// uniform route never touches this.
+#[inline]
+fn lloyd_c16_or_fail(w: &WeightTensor, family: &'static str) -> HipResult<[u32; 4]> {
+    w.lloyd_lut_c16.ok_or_else(|| {
+        hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{family}: MQ4G256V2Lloyd weight (m={} k={}) reached prefill with lloyd_lut_c16=None — \
+                 re-quantize with a build that emits lloyd_levels (F32[16]); refusing uniform decode",
+                w.m, w.k
+            ),
+        )
+    })
+}
+
+/// gfx11 (exact gfx1100|gfx1151) MMQ-LUT route for qt=52, unless kill-switched.
+/// Same arch predicate as the uniform MQ4V2 MMQ path; `HIPFIRE_LLOYD_MMQ_OFF=1`
+/// forces fail-closed via the existing FP8-LUT arm (never uniform).
+#[inline]
+fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
+    matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
+        && hipfire_config::developer_var("HIPFIRE_LLOYD_MMQ_OFF")
+            .ok()
+            .as_deref()
+            != Some("1")
+}
+
+
 /// True when all listed projection dtypes are the Lloyd-V2 dtype.
 #[inline]
 fn all_mq4v2_lloyd(dts: &[DType]) -> bool {
@@ -4638,30 +4679,53 @@ fn batch_chunk_delta_net_input_projection(
             n,
         )?;
     } else if is_mq4v2_lloyd {
-        // qt=52: all four projections carry per-tensor codebooks → FP8-LUT
-        // launcher (uniform route untouched: this arm only fires on all-L).
-        gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
-            &layer.wqkv.buf,
-            &layer.wz.buf,
-            &layer.w_beta.buf,
-            &layer.w_alpha.buf,
-            &pbs.x_rot_batch,
-            &pbs.dn_qkv_batch,
-            &pbs.dn_z_batch,
-            &pbs.dn_beta_batch,
-            &pbs.dn_alpha_batch,
-            layer.wqkv.m,
-            layer.wz.m,
-            layer.w_beta.m,
-            layer.w_alpha.m,
-            layer.wqkv.k,
-            n,
-            1,
-            lloyd_e4m3_or_fail(&layer.wqkv, "batch_chunk_delta_net_input_projection")?,
-            lloyd_e4m3_or_fail(&layer.wz, "batch_chunk_delta_net_input_projection")?,
-            lloyd_e4m3_or_fail(&layer.w_beta, "batch_chunk_delta_net_input_projection")?,
-            lloyd_e4m3_or_fail(&layer.w_alpha, "batch_chunk_delta_net_input_projection")?,
-        )?;
+        // qt=52: all four projections Lloyd. gfx11 → MMQ-LUT; gfx12 FP8-LUT.
+        if lloyd_mmq_lut_route(gpu) {
+            gpu.gemm_qkvza_mq4g256v2_mmq_lloyd(
+                &layer.wqkv.buf,
+                &layer.wz.buf,
+                &layer.w_beta.buf,
+                &layer.w_alpha.buf,
+                &pbs.x_rot_batch,
+                &pbs.dn_qkv_batch,
+                &pbs.dn_z_batch,
+                &pbs.dn_beta_batch,
+                &pbs.dn_alpha_batch,
+                layer.wqkv.m,
+                layer.wz.m,
+                layer.w_beta.m,
+                layer.w_alpha.m,
+                layer.wqkv.k,
+                n,
+                lloyd_c16_or_fail(&layer.wqkv, "batch_chunk_delta_net_input_projection")?,
+                lloyd_c16_or_fail(&layer.wz, "batch_chunk_delta_net_input_projection")?,
+                lloyd_c16_or_fail(&layer.w_beta, "batch_chunk_delta_net_input_projection")?,
+                lloyd_c16_or_fail(&layer.w_alpha, "batch_chunk_delta_net_input_projection")?,
+            )?;
+        } else {
+            gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
+                &layer.wqkv.buf,
+                &layer.wz.buf,
+                &layer.w_beta.buf,
+                &layer.w_alpha.buf,
+                &pbs.x_rot_batch,
+                &pbs.dn_qkv_batch,
+                &pbs.dn_z_batch,
+                &pbs.dn_beta_batch,
+                &pbs.dn_alpha_batch,
+                layer.wqkv.m,
+                layer.wz.m,
+                layer.w_beta.m,
+                layer.w_alpha.m,
+                layer.wqkv.k,
+                n,
+                1,
+                lloyd_e4m3_or_fail(&layer.wqkv, "batch_chunk_delta_net_input_projection")?,
+                lloyd_e4m3_or_fail(&layer.wz, "batch_chunk_delta_net_input_projection")?,
+                lloyd_e4m3_or_fail(&layer.w_beta, "batch_chunk_delta_net_input_projection")?,
+                lloyd_e4m3_or_fail(&layer.w_alpha, "batch_chunk_delta_net_input_projection")?,
+            )?;
+        }
     } else if matches!(layer.wqkv.gpu_dtype, DType::MQ4G256V2Lloyd)
         || matches!(layer.wz.gpu_dtype, DType::MQ4G256V2Lloyd)
         || matches!(layer.w_beta.gpu_dtype, DType::MQ4G256V2Lloyd)
@@ -5508,22 +5572,37 @@ fn batch_chunk_delta_net_ffn_gate_up(
             n,
         )?;
     } else if ffn_is_mq4v2_lloyd {
-        // qt=52: gate+up both carry per-tensor codebooks → FP8-LUT launcher
-        // (uniform route untouched: this arm only fires on all-L).
-        gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            &pbs.x_rot_batch,
-            &pbs.gate_ffn_batch,
-            &pbs.up_batch,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-            n,
-            1,
-            lloyd_e4m3_or_fail(&layer.w_gate, "batch_chunk_delta_net_ffn_gate_up")?,
-            lloyd_e4m3_or_fail(&layer.w_up, "batch_chunk_delta_net_ffn_gate_up")?,
-        )?;
+        // qt=52: gate+up both Lloyd. gfx11 → MMQ-LUT; gfx12 FP8-LUT.
+        if lloyd_mmq_lut_route(gpu) {
+            gpu.gemm_gate_up_mq4g256v2_mmq_lloyd(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+                lloyd_c16_or_fail(&layer.w_gate, "batch_chunk_delta_net_ffn_gate_up")?,
+                lloyd_c16_or_fail(&layer.w_up, "batch_chunk_delta_net_ffn_gate_up")?,
+            )?;
+        } else {
+            gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+                1,
+                lloyd_e4m3_or_fail(&layer.w_gate, "batch_chunk_delta_net_ffn_gate_up")?,
+                lloyd_e4m3_or_fail(&layer.w_up, "batch_chunk_delta_net_ffn_gate_up")?,
+            )?;
+        }
     } else if matches!(layer.w_gate.gpu_dtype, DType::MQ4G256V2Lloyd)
         || matches!(layer.w_up.gpu_dtype, DType::MQ4G256V2Lloyd)
     {
@@ -5924,26 +6003,54 @@ fn batch_chunk_full_attn_input_projection(
             n,
         )?;
     } else if qkv_is_mq4v2_lloyd {
-        // qt=52: q/k/v all carry per-tensor codebooks → FP8-LUT launcher
-        // (uniform route untouched: this arm only fires on all-L).
-        gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
-            &layer.wq.buf,
-            &layer.wk.buf,
-            &layer.wv.buf,
-            &pbs.x_rot_batch,
-            &pbs.fa_q_full_batch,
-            &pbs.fa_k_batch,
-            &pbs.fa_v_batch,
-            layer.wq.m,
-            layer.wk.m,
-            layer.wv.m,
-            layer.wq.k,
-            n,
-            1,
-            lloyd_e4m3_or_fail(&layer.wq, "batch_chunk_full_attn_input_projection")?,
-            lloyd_e4m3_or_fail(&layer.wk, "batch_chunk_full_attn_input_projection")?,
-            lloyd_e4m3_or_fail(&layer.wv, "batch_chunk_full_attn_input_projection")?,
-        )?;
+        // qt=52: q/k/v all Lloyd. gfx11 → MMQ-LUT; gfx12 FP8-LUT.
+        if lloyd_mmq_lut_route(gpu) {
+            gpu.gemm_qkv_mq4g256v2_mmq_lloyd(
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_q_full_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+                n,
+                lloyd_c16_or_fail(&layer.wq, "batch_chunk_full_attn_input_projection")?,
+                lloyd_c16_or_fail(&layer.wk, "batch_chunk_full_attn_input_projection")?,
+                lloyd_c16_or_fail(&layer.wv, "batch_chunk_full_attn_input_projection")?,
+            )?;
+        } else {
+            gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                &pbs.x_rot_batch,
+                &pbs.fa_q_full_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+                n,
+                1,
+                lloyd_e4m3_or_fail(&layer.wq, "batch_chunk_full_attn_input_projection")?,
+                lloyd_e4m3_or_fail(&layer.wk, "batch_chunk_full_attn_input_projection")?,
+                lloyd_e4m3_or_fail(&layer.wv, "batch_chunk_full_attn_input_projection")?,
+            )?;
+        }
+    } else if matches!(layer.wq.gpu_dtype, DType::MQ4G256V2Lloyd)
+        || matches!(layer.wk.gpu_dtype, DType::MQ4G256V2Lloyd)
+        || matches!(layer.wv.gpu_dtype, DType::MQ4G256V2Lloyd)
+    {
+        // Mixed Lloyd/uniform FA qkv: no kernel reads mixed codebooks.
+        return Err(hip_bridge::HipError::new(
+            0,
+            "batch_chunk_full_attn_input_projection: mixed MQ4G256V2Lloyd/uniform FA qkv — refusing (quantize all three or none)",
+        ));
     } else if qkv_same_dtype {
         run_fused_qkv_key(
             gpu,
@@ -6686,22 +6793,37 @@ fn batch_chunk_full_attn_ffn_gate_up(
             n,
         )?;
     } else if fa_ffn_is_mq4v2_lloyd {
-        // qt=52: gate+up both carry per-tensor codebooks → FP8-LUT launcher
-        // (uniform route untouched: this arm only fires on all-L).
-        gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
-            &layer.w_gate.buf,
-            &layer.w_up.buf,
-            &pbs.x_rot_batch,
-            &pbs.gate_ffn_batch,
-            &pbs.up_batch,
-            layer.w_gate.m,
-            layer.w_up.m,
-            layer.w_gate.k,
-            n,
-            1,
-            lloyd_e4m3_or_fail(&layer.w_gate, "batch_chunk_full_attn_ffn_gate_up")?,
-            lloyd_e4m3_or_fail(&layer.w_up, "batch_chunk_full_attn_ffn_gate_up")?,
-        )?;
+        // qt=52: gate+up both Lloyd. gfx11 → MMQ-LUT; gfx12 FP8-LUT.
+        if lloyd_mmq_lut_route(gpu) {
+            gpu.gemm_gate_up_mq4g256v2_mmq_lloyd(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+                lloyd_c16_or_fail(&layer.w_gate, "batch_chunk_full_attn_ffn_gate_up")?,
+                lloyd_c16_or_fail(&layer.w_up, "batch_chunk_full_attn_ffn_gate_up")?,
+            )?;
+        } else {
+            gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+                1,
+                lloyd_e4m3_or_fail(&layer.w_gate, "batch_chunk_full_attn_ffn_gate_up")?,
+                lloyd_e4m3_or_fail(&layer.w_up, "batch_chunk_full_attn_ffn_gate_up")?,
+            )?;
+        }
     } else if matches!(layer.w_gate.gpu_dtype, DType::MQ4G256V2Lloyd)
         || matches!(layer.w_up.gpu_dtype, DType::MQ4G256V2Lloyd)
     {
@@ -9057,19 +9179,23 @@ fn batched_gemm_single_weight(
             )
         }
         DType::MQ4G256V2Lloyd => {
-            // qt=52 mixed-format twin of the V2 arm above: zero Y then the
-            // FP8-LUT residual launcher (== plain GEMM on zeroed Y). x is the
-            // shared FWHT-rotated activation (same rotation as qt=44).
+            // qt=52 mixed-format twin of the V2 arm: zero Y then residual
+            // (== plain GEMM). gfx11 → MMQ-LUT ADD; gfx12 keeps FP8-LUT.
             let bytes = w.m * n * 4;
             if let Some(stream) = gpu.active_stream.as_ref() {
                 gpu.hip.memset_async(&y.buf, 0, bytes, stream)?;
             } else {
                 gpu.hip.memset(&y.buf, 0, bytes)?;
             }
-            let lut = lloyd_e4m3_or_fail(w, "batched_gemm_single_weight")?;
-            gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd(
-                &w.buf, x, y, w.m, w.k, n, 1, lut,
-            )
+            if lloyd_mmq_lut_route(gpu) {
+                let c16 = lloyd_c16_or_fail(w, "batched_gemm_single_weight")?;
+                gpu.gemm_hfq4g256_residual_mmq_lloyd(&w.buf, x, y, w.m, w.k, n, c16)
+            } else {
+                let lut = lloyd_e4m3_or_fail(w, "batched_gemm_single_weight")?;
+                gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd(
+                    &w.buf, x, y, w.m, w.k, n, 1, lut,
+                )
+            }
         }
         DType::MQ4CG256 => {
             // Same residual-only contract as MQ4V2: zero Y then format-

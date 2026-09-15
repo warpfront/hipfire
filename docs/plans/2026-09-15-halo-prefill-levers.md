@@ -230,9 +230,11 @@ Producer stores (`:248-249`, `:289-291`, `:335`) rotate identically — same
 change both sides, bit-exact (pure address permutation of identical bytes).
 **Ceiling:** if LDS-issue is ~40–50% of subtile time [estimate], attention
 ×0.75–0.8: **−2 ms pp512, −30–45 ms pp2048, −6.0–7.5 s pp32768** [estimate].
-**Kill experiment:** patch swizzle + loads, run the existing 7-shape oracle
-(CHANGELOG.md:11 cites it) for bit-identity, then profile pp8192; abandon if
-<10% on the attention symbol. ≈1–2 days.
+**Kill experiment:** patch swizzle + loads, then a rebuilt throwaway oracle
+harness (the #762 7-shape oracle was host-local and is NOT in-tree — see the
+verification inventory below) driven through the deliberately-public launcher
+(`attention.rs:3847-3854`) for bit-identity vs the incumbent, then profile
+pp8192; abandon if <10% on the attention symbol. ≈1–2 days.
 **Kill-list check:** FA2 levers are untouched by the GEMM kill list; KT64
 (the adjacent knob) is already dead and this is not it.
 
@@ -247,8 +249,9 @@ If VGPRs spike when removed, the scoped alternative is
 **Ceiling:** **5–15% of attention** (0.4–1.2 ms pp512, 7–22 ms pp2048,
 1.5–4.5 s pp32768) [estimate]; multiplicative with B1, not additive.
 **Kill experiment:** delete both lines, read VGPR/scratch from the JIT log
-(gate: 0 spills, same as CHANGELOG.md:11's acceptance), 7-shape oracle,
-profile. ≈1 h. If spills appear and sched_barrier doesn't contain them, drop.
+(gate: 0 spills, same as CHANGELOG.md:11's acceptance), rebuilt throwaway
+oracle (per the inventory below — not in-tree), profile. ≈1 h. If spills
+appear and sched_barrier doesn't contain them, drop.
 **Kill-list check:** untouched area.
 
 ### B3 — Pre-convert Q to f16 once per chunk (bit-exact)
@@ -446,7 +449,17 @@ report back.
 
 - In-model per-symbol profiler: `saddle-lab/examples/profile_prefill_qwen35.rs`
   (produced the numbers this doc is sized against).
-- FA2 7-shape oracle + "0 spills" acceptance precedent: CHANGELOG.md:11.
+- FA2 oracle: the #762 "7-shape oracle PASS" (CHANGELOG.md:11) was a
+  THROWAWAY harness — PR #762 (merge `b36c79380`) committed only 6 files, no
+  test/example. Rebuild it against the public launcher
+  (`attention.rs:3854`, "call this directly only from the throwaway
+  oracle/bench harness", `:3847-3849`); envelope to re-cover: H24/KV4/D256,
+  batch 1..512, ctx 1..32768 (`attention.rs:3880-3904`). The exact 7 shapes
+  are not recorded in-tree — do not cite a shape list as if it exists.
+  Acceptance precedent to reuse: 0 spills + bit-identity vs incumbent
+  (CHANGELOG.md:11). Closest crib harnesses:
+  `crates/rdna-compute/examples/test_attention_text_gqa.rs`,
+  `q8_batched_attn_microbench.rs`.
 - Bit-identity gates for GEMM/LUT work: LUT GEMV differential precedent in
   `docs/plans/2026-09-15-lloyd-fp8-prefill-gap.md:292-302`.
 - GDN parity harnesses + numpy refs: `docs/plans/chunked-gdn.md:214-226`.
