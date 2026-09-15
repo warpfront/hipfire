@@ -27,7 +27,8 @@
 //  - Lanes r and r+16 load byte-identical fragments (address depends on
 //    lane%16 only), so duplicate-lane ownership is moot.
 //
-// LDS: (128*18 + 128*44)*4 = 31744 B (vs 57344 B baseline) -> 2 blocks/CU.
+// LDS: (128*18 + 128*IU4_TILE_X_K)*4 — 31744 B at stride 44, 30720 B at 42
+// (HIPFIRE_IU4_XSTRIDE). Two blocks/CU either way on 64 KiB LDS.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -40,12 +41,25 @@
 #define HIPFIRE_RDNA3 0
 #endif
 
+// A2/A1 experiment knobs (default = production path). Host A/B via
+// HIPFIRE_IU4_VARIANT selecting pre-#define'd source consts.
+#ifndef HIPFIRE_IU4_XSTRIDE
+#define HIPFIRE_IU4_XSTRIDE 44
+#endif
+#ifndef HIPFIRE_IU4_PIPELINE
+#define HIPFIRE_IU4_PIPELINE 0
+#endif
+
 #define IU4_MMQ_X 128
 #define IU4_MMQ_Y 128
 #define IU4_MMQ_NWARPS 8
 #define IU4_WARP_SIZE 32
 #define IU4_TILE_Y_K 18
+#if HIPFIRE_IU4_XSTRIDE == 42
+#define IU4_TILE_X_K 42
+#else
 #define IU4_TILE_X_K 44
+#endif
 #define IU4_X_QS_WORDS 32
 #define IU4_X_DM_OFF 32
 
@@ -242,6 +256,103 @@ static __device__ __forceinline__ void load_iu4_tile(
     }
 }
 
+#if HIPFIRE_IU4_PIPELINE
+// Register-only global→VGPR stage for the §6.2 software pipeline. Index and
+// clamp expressions match load_iu4_tile / the two activation loops exactly;
+// commit_* only write LDS. One pending X (16 qs + 1 hs) + one pending Y (9)
+// = 26 dwords/thread on top of the 64-float accumulator.
+
+template <bool FULL>
+static __device__ __forceinline__ void prefetch_iu4_x(
+    const char* __restrict__ A,
+    int row0,
+    int kb,
+    int M,
+    int groups_per_row,
+    int qs_reg[16],
+    unsigned int& hs_reg
+) {
+    const int txi = threadIdx.x;
+    int r = 0;
+    for (int i0 = 0; i0 < IU4_MMQ_Y; i0 += IU4_MMQ_NWARPS) {
+        const int i = i0 + threadIdx.y;
+        const int row = FULL ? row0 + i : min(row0 + i, M - 1);
+        const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
+        qs_reg[r++] = *(const int*)(gp + 8 + txi * 4);
+    }
+
+    constexpr int rows_per_warp_meta = 16;
+    for (int i0 = 0; i0 < IU4_MMQ_Y; i0 += IU4_MMQ_NWARPS * rows_per_warp_meta) {
+        const int i = i0 + threadIdx.y * rows_per_warp_meta + threadIdx.x / 2;
+        if (i < IU4_MMQ_Y) {
+            const int row = FULL ? row0 + i : min(row0 + i, M - 1);
+            const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
+            const int ksc = threadIdx.x & 1;
+            hs_reg = *(const unsigned int*)(gp + 4 * ksc);
+        }
+    }
+}
+
+static __device__ __forceinline__ void commit_iu4_x(
+    int* __restrict__ tile_x,
+    const int qs_reg[16],
+    unsigned int hs_reg
+) {
+    int* x_qs = tile_x;
+    half2* x_dm = (half2*)(x_qs + IU4_X_DM_OFF);
+    const int txi = threadIdx.x;
+
+    int r = 0;
+    for (int i0 = 0; i0 < IU4_MMQ_Y; i0 += IU4_MMQ_NWARPS) {
+        const int i = i0 + threadIdx.y;
+        x_qs[i * IU4_TILE_X_K + txi] = qs_reg[r++];
+    }
+
+    constexpr int rows_per_warp_meta = 16;
+    for (int i0 = 0; i0 < IU4_MMQ_Y; i0 += IU4_MMQ_NWARPS * rows_per_warp_meta) {
+        const int i = i0 + threadIdx.y * rows_per_warp_meta + threadIdx.x / 2;
+        if (i < IU4_MMQ_Y) {
+            const int ksc = threadIdx.x & 1;
+            const float sc = __half2float(__ushort_as_half((unsigned short)(hs_reg & 0xFFFFu)));
+            const float zp = __half2float(__ushort_as_half((unsigned short)(hs_reg >> 16)));
+            const half2 dm = make_half2((_Float16)sc, (_Float16)zp);
+            #pragma unroll
+            for (int l = 0; l < 4; ++l)
+                x_dm[i * IU4_TILE_X_K + 4 * ksc + l] = dm;
+        }
+    }
+}
+
+// Y plane: 128 cols × 18 ints = 2304 dwords; 256 threads → 9 dwords/thread.
+template <bool FULL>
+static __device__ __forceinline__ void prefetch_iu4_y(
+    const block_i4_128* __restrict__ Xq,
+    int col0,
+    int N,
+    int block128,
+    int y_reg[9]
+) {
+    const int* by = (const int*)(Xq + (long long)block128 * N + col0);
+    int r = 0;
+    for (int l0 = 0; l0 < IU4_MMQ_X * IU4_TILE_Y_K; l0 += IU4_MMQ_NWARPS * IU4_WARP_SIZE) {
+        const int l = l0 + threadIdx.y * IU4_WARP_SIZE + threadIdx.x;
+        if (FULL || col0 + l / IU4_TILE_Y_K < N) y_reg[r++] = by[l];
+        else y_reg[r++] = 0;
+    }
+}
+
+static __device__ __forceinline__ void commit_iu4_y(
+    int* __restrict__ tile_y,
+    const int y_reg[9]
+) {
+    int r = 0;
+    for (int l0 = 0; l0 < IU4_MMQ_X * IU4_TILE_Y_K; l0 += IU4_MMQ_NWARPS * IU4_WARP_SIZE) {
+        const int l = l0 + threadIdx.y * IU4_WARP_SIZE + threadIdx.x;
+        tile_y[l] = y_reg[r++];
+    }
+}
+#endif // HIPFIRE_IU4_PIPELINE
+
 // X128-structured dot over ONE 128-K half (h = 0/1): 8 iu4 WMMAs into one
 // i32 C per (j0, n), then one fold with (d_x, s_x=int sum).
 static __device__ __forceinline__ void vec_dot_i4_x128(
@@ -310,7 +421,9 @@ static __device__ __forceinline__ void gemm_iu4_body(
     if (!FULL && (row0 >= M || col0 >= N)) return;
 
     const int groups_per_row = K / 256;
+#if !HIPFIRE_IU4_PIPELINE
     const int blocks128 = K / 128;
+#endif
 
     extern __shared__ int smem[];
     int* tile_y = smem;
@@ -318,6 +431,57 @@ static __device__ __forceinline__ void gemm_iu4_body(
 
     float sum[IU4_MMQ_X * IU4_MMQ_Y / (IU4_MMQ_NWARPS * IU4_WARP_SIZE)] = {0.0f};
 
+#if HIPFIRE_IU4_PIPELINE
+    // §6.2 single-LDS software pipeline. Logical order kb0/h0, kb0/h1, …
+    // preserved. Four barriers per steady-state group; final group omits the
+    // next-group turnover pair. K % 256 == 0 so every group has both halves.
+    int x_qs_pend[16];
+    unsigned int x_hs_pend;
+    int y_pend[9];
+
+    // Prologue: prefetch X(0) + Y(0,h0), commit both, publish.
+    // Skip entirely when K==0 (groups_per_row==0) — same no-op as the
+    // serialized loop.
+    if (groups_per_row > 0) {
+        prefetch_iu4_x<FULL>(A, row0, 0, M, groups_per_row, x_qs_pend, x_hs_pend);
+        prefetch_iu4_y<FULL>(Xq, col0, N, /*block128=*/0, y_pend);
+        commit_iu4_x(tile_x, x_qs_pend, x_hs_pend);
+        commit_iu4_y(tile_y, y_pend);
+        __syncthreads();
+
+        for (int kb = 0; kb < groups_per_row; ++kb) {
+            const bool has_next = (kb + 1 < groups_per_row);
+
+            // Issue Y(kb,h1); if next group exists also issue X(kb+1).
+            prefetch_iu4_y<FULL>(Xq, col0, N, 2 * kb + 1, y_pend);
+            if (has_next) {
+                prefetch_iu4_x<FULL>(A, row0, kb + 1, M, groups_per_row, x_qs_pend, x_hs_pend);
+            }
+
+            vec_dot_i4_x128(tile_x, tile_y, sum, 0);
+
+            // h0→h1 turnover: readers done with Yh0, publish Yh1.
+            __syncthreads();
+            commit_iu4_y(tile_y, y_pend);
+            __syncthreads();
+
+            // X(next) still live; Y pending free → issue Y(kb+1,h0).
+            if (has_next) {
+                prefetch_iu4_y<FULL>(Xq, col0, N, 2 * (kb + 1), y_pend);
+            }
+
+            vec_dot_i4_x128(tile_x, tile_y, sum, 1);
+
+            // h1→next-h0 turnover (omit on final group: no later LDS writer).
+            if (has_next) {
+                __syncthreads();
+                commit_iu4_x(tile_x, x_qs_pend, x_hs_pend);
+                commit_iu4_y(tile_y, y_pend);
+                __syncthreads();
+            }
+        }
+    }
+#else
     for (int kb = 0; kb < groups_per_row; ++kb) {
         load_iu4_tile<FULL>(A, tile_x, row0, kb, M, groups_per_row);
 
@@ -343,6 +507,7 @@ static __device__ __forceinline__ void gemm_iu4_body(
             __syncthreads();
         }
     }
+#endif
 
     using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
     constexpr int rows_per_warp = 32;
