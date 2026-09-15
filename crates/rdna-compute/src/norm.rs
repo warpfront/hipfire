@@ -3095,7 +3095,7 @@ impl Gpu {
                 &mut efp as *mut _ as *mut c_void,
             ];
             self.launch_maybe_blob(
-                "gated_delta_net_q8_fast",
+                kernel_name,
                 [n_heads as u32, n_tiles, 1],
                 [32, 1, 1],
                 0,
