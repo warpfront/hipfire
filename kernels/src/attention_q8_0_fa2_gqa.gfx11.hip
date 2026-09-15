@@ -742,12 +742,29 @@ __device__ __forceinline__ void fa2_gqa_body(
 // untouched — Q is now immutable across launches (replay-idempotent).
 // signs1/signs2 may be null when do_rotate == 0.
 //
+// The entry name is KMODE-selected: the Q8 module (KMODE=0) exports
+// attention_fa2_q_preconvert_gfx11, the fwht3 module (KMODE=3) exports
+// attention_fa2_q_preconvert_fwht3_gfx11. The host function cache
+// (rdna-compute compile_and_load_kernel) is keyed by SYMBOL, not by
+// (module, symbol): one shared name across the two module builds silently
+// binds whichever build registered first. The Q8 module compiles first in
+// the ship gate, so a shared name made the fwht3 path launch the
+// rotation-free KMODE=0 build with do_rotate compiled out — a
+// deterministic near-miss on both cards (near-uniform softmax hides the
+// missing rotation to ~1e-3), not an op-order race. Distinct symbols make
+// each launcher resolve its own module's build.
+#if HIPFIRE_FA2_KMODE == 3
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht3_gfx11
+#else
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_gfx11
+#endif
+//
 // One wave32 per Q row (4 rows per 128-thread block): the row index depends
 // only on (blockIdx.x, wave), so every lane of a wave takes the same early
 // path and the ds_swizzle group inside fwht_shfl_forward_256 stays intact.
 // Rows are disjoint across waves/blocks (no LDS, no barrier); each f16 row
 // is written exactly once (one aligned 16-byte store per lane).
-extern "C" __global__ __launch_bounds__(128, 1) void attention_fa2_q_preconvert_gfx11(
+extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SYM(
     const float* __restrict__ q,
     _Float16* __restrict__ q16,
     const float* __restrict__ signs1,
@@ -817,7 +834,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1
 // transform: dot products preserved; fwht_shfl_forward_256 is normalized
 // 1/sqrt(256) = 1/16 and scale_attn applies downstream exactly as in the
 // Q8 path — no scale change). The rotation now lives in
-// attention_fa2_q_preconvert_gfx11 (same helper, same op order), so this
+// attention_fa2_q_preconvert_fwht3_gfx11 (same helper, same op order), so this
 // entry takes the SAME kernarg list as the Q8 entry above (q16 at offset 0,
 // no signs) and never mutates Q: replay-idempotent, capture-safe.
 #if HIPFIRE_FA2_KMODE == 3

@@ -40,6 +40,22 @@
 //!     cargo run --release -p hipfire-runtime --features lab \
 //!       --example tmp_fa2_attrib -- ship
 //!
+//! Arm `rotcheck` (argv[1]=="rotcheck"): fwht3 Q-rotation isolation (L=1024
+//! fixture). Runs the frozen prod twin once and downloads the rotated f32 Q;
+//! runs the shipping pre-convert entry raw (do_rotate=1) on a fresh ORIGINAL
+//! Q into f16 scratch; runs the example-local debug entry
+//! `attention_fa2_q_preconvert_f32_debug_gfx11` (production pre-convert copy
+//! storing the rotated f32 BEFORE the cast). Prints the first 8 differing
+//! f32 elements (row, head, dim, prod bits, new bits), the count, and whether
+//! casting prod's rotated f32 with the same RNE cast reproduces the f16
+//! scratch (isolates rotation vs cast).
+//!
+//! Halo rotcheck:
+//!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
+//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-f4a \
+//!     cargo run --release -p hipfire-runtime --features lab \
+//!       --example tmp_fa2_attrib -- rotcheck
+//!
 //! Metadata symbols:
 //!   fa2_attrib_prod
 //!   fa2_attrib_nofill
@@ -83,6 +99,68 @@ const PROD_FWHT3_SRC: &str = concat!(
     include_str!("../../../kernels/src/turbo_common.h"),
     include_str!("tmp_fa2_attrib_prod_fwht3.hip"),
 );
+/// F4b rotcheck: example-local f32 debug entry. Mirrors the production
+/// pre-convert exactly (same loads, same `fwht_shfl_forward_256` call, same
+/// lane mapping) but stores the rotated f32 BEFORE the cast, so the rotation
+/// can be compared bit-for-bit against the frozen prod twin's in-place Q.
+const PRECONVERT_F32_DEBUG_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 3\n",
+    "#define HIPFIRE_FA2_KT 32\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    r#####"
+#include <hip/hip_runtime.h>
+
+extern "C" __global__ __launch_bounds__(128, 1) void attention_fa2_q_preconvert_f32_debug_gfx11(
+    const float* __restrict__ q,
+    float* __restrict__ q32,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int batch_size,
+    int do_rotate)
+{
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int r = (int)blockIdx.x * 4 + wave;
+    if (r >= batch_size * 24)
+        return;
+    const int qr = r / 24;
+    const int h = r % 24;
+    const float* rp = q + (unsigned)qr * 6144u + (unsigned)h * 256u;
+    float* wp = q32 + (unsigned)qr * 6144u + (unsigned)h * 256u;
+    float v0 = rp[lane * 8 + 0], v1 = rp[lane * 8 + 1];
+    float v2 = rp[lane * 8 + 2], v3 = rp[lane * 8 + 3];
+    float v4 = rp[lane * 8 + 4], v5 = rp[lane * 8 + 5];
+    float v6 = rp[lane * 8 + 6], v7 = rp[lane * 8 + 7];
+    if (do_rotate)
+        fwht_shfl_forward_256(v0, v1, v2, v3, v4, v5, v6, v7,
+                              signs1, signs2, lane);
+    wp[lane * 8 + 0] = v0; wp[lane * 8 + 1] = v1;
+    wp[lane * 8 + 2] = v2; wp[lane * 8 + 3] = v3;
+    wp[lane * 8 + 4] = v4; wp[lane * 8 + 5] = v5;
+    wp[lane * 8 + 6] = v6; wp[lane * 8 + 7] = v7;
+}
+"#####,
+);
+const DEBUG_F32_SYM: &str = "attention_fa2_q_preconvert_f32_debug_gfx11";
+/// F4b rotcheck: shipping module sources with the byte-identical recipe the
+/// rdna-compute launchers use (attention.rs). Q8 = KT32 + raw kernel file
+/// (KMODE defaults to 0, rotation compiled out); fwht3 = KT32 + KMODE=3 +
+/// turbo_common + kernel file. rotcheck ensures the Q8 module FIRST to mirror
+/// the ship arm's Q8-first order.
+const SHIP_Q8_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KT 32\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip"),
+);
+const SHIP_FWHT3_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KT 32\n",
+    "#define HIPFIRE_FA2_KMODE 3\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip"),
+);
+const SHIP_Q8_PRECONVERT_SYM: &str = "attention_fa2_q_preconvert_gfx11";
+const SHIP_FWHT3_PRECONVERT_SYM: &str = "attention_fa2_q_preconvert_fwht3_gfx11";
+const SHIP_FWHT3_BODY_SYM: &str = "attention_q8_0_fa2_gqa_fwht3k_gfx11";
 
 const SYMS: [&str; 9] = [
     "fa2_attrib_prod",
@@ -1534,14 +1612,193 @@ fn run_ship(gpu: &mut Gpu) {
     eprintln!("\nF4b ship arm complete.");
 }
 
+fn launch_preconvert_raw(
+    gpu: &mut Gpu,
+    sym: &str,
+    d_q: &rdna_compute::GpuTensor,
+    d_dst: &rdna_compute::GpuTensor,
+    d_s1: &rdna_compute::GpuTensor,
+    d_s2: &rdna_compute::GpuTensor,
+    batch: usize,
+    do_rotate: i32,
+) {
+    // Kernargs mirror the production pre-convert ABI: q@0, dst@8, s1@16,
+    // s2@24, batch@32, do_rotate@36. Grid covers batch*24 rows, 4/block.
+    let mut args = KernargBlob::new();
+    args.push_ptr(d_q.buf.as_ptr());
+    args.push_ptr(d_dst.buf.as_ptr());
+    args.push_ptr(d_s1.buf.as_ptr());
+    args.push_ptr(d_s2.buf.as_ptr());
+    args.push_i32(batch as i32);
+    args.push_i32(do_rotate);
+    let grid_x = (batch * N_HEADS).div_ceil(4) as u32;
+    gpu.launch_kernel_blob(sym, [grid_x, 1, 1], BLOCK, 0, args.as_mut_slice())
+        .unwrap_or_else(|e| panic!("launch preconvert {sym}: {e:?}"));
+    // Explicit same-stream sync: a stale dst must never masquerade as output.
+    let ev = gpu.hip.event_create().unwrap();
+    gpu.hip
+        .event_record(&ev, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.hip.event_synchronize(&ev).unwrap();
+    let _ = gpu.hip.event_destroy(ev);
+}
+
+fn run_rotcheck(gpu: &mut Gpu) {
+    // F4b rotcheck: fwht3 Q-rotation isolation on the L=1024 fixture (same
+    // salts as the ship arm so results are comparable). Ground truth is the
+    // frozen prod twin's in-place rotated f32 Q.
+    let l = 1024usize;
+    eprintln!("\n=== F4b rotcheck: fwht3 Q-rotation isolation (L={l} fixture) ===");
+    ensure_prod_fwht3(gpu);
+    gpu.ensure_kernel_public(
+        "halo_fa2_f4b_rotcheck_dbg",
+        PRECONVERT_F32_DEBUG_SRC,
+        DEBUG_F32_SYM,
+    )
+    .unwrap_or_else(|e| panic!("compile {DEBUG_F32_SYM}: {e:?}"));
+    // Shipping modules in ship-arm order: Q8 first, then fwht3.
+    gpu.ensure_kernel_public(
+        "halo_fa2_f4b_rotcheck_q8",
+        SHIP_Q8_SRC,
+        SHIP_Q8_PRECONVERT_SYM,
+    )
+    .unwrap_or_else(|e| panic!("compile {SHIP_Q8_PRECONVERT_SYM}: {e:?}"));
+    gpu.ensure_kernel_public(
+        "halo_fa2_f4b_rotcheck_fw3",
+        SHIP_FWHT3_SRC,
+        SHIP_FWHT3_BODY_SYM,
+    )
+    .unwrap_or_else(|e| panic!("compile {SHIP_FWHT3_BODY_SYM}: {e:?}"));
+    // The fwht3 pre-convert symbol only exists once the kernel exports a
+    // KMODE-selected name; without it the ship-f16 check is skipped.
+    let have_fwht3_preconvert = gpu
+        .ensure_kernel_public(
+            "halo_fa2_f4b_rotcheck_fw3",
+            SHIP_FWHT3_SRC,
+            SHIP_FWHT3_PRECONVERT_SYM,
+        )
+        .map(|_| true)
+        .unwrap_or_else(|e| {
+            eprintln!("  note: {SHIP_FWHT3_PRECONVERT_SYM} absent ({e:?}); skipping ship-f16 check");
+            false
+        });
+
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+    let d_s1 = gpu.upload_f32(&signs1, &[256]).unwrap();
+    let d_s2 = gpu.upload_f32(&signs2, &[256]).unwrap();
+    let q_h = fill_q(BATCH, 0xF30A);
+    let pos_h = fill_positions_end_of_l(BATCH, l);
+    let pos_bytes = positions_to_bytes(&pos_h);
+    let d_pos = gpu.upload_raw(&pos_bytes, &[pos_bytes.len()]).unwrap();
+    let k_fw = fill_fwht3_k(l, 0xF30D);
+    let v_h = fill_q8_cache(l, 0xF30C);
+    let d_k_fw = gpu.upload_raw(&k_fw, &[k_fw.len()]).unwrap();
+    let d_v = gpu.upload_raw(&v_h, &[v_h.len()]).unwrap();
+    let d_out = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+
+    // (a) Frozen prod twin once: rotates Q in place; download rotated f32.
+    let d_q_prod = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+    let _ = launch_prod_fwht3(
+        gpu, &d_q_prod, &d_k_fw, &d_v, &d_out, &d_pos, &d_s1, &d_s2,
+        BATCH as i32,
+    );
+    let rot_h = download_f32(gpu, &d_q_prod, BATCH * QO_ROW);
+
+    // (b) Debug f32 entry on a fresh ORIGINAL Q (do_rotate=1).
+    let d_q_dbg = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+    let d_q32 = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+    launch_preconvert_raw(gpu, DEBUG_F32_SYM, &d_q_dbg, &d_q32, &d_s1, &d_s2, BATCH, 1);
+    let dbg_h = download_f32(gpu, &d_q32, BATCH * QO_ROW);
+
+    // (c) prod-rotated vs debug f32: first 8 diffs (row, head, dim, bits).
+    let mut n_diff = 0usize;
+    let mut first: Vec<(usize, u32, u32)> = Vec::new();
+    for (i, (a, b)) in rot_h.iter().zip(dbg_h.iter()).enumerate() {
+        if a.to_bits() != b.to_bits() {
+            if first.len() < 8 {
+                first.push((i, a.to_bits(), b.to_bits()));
+            }
+            n_diff += 1;
+        }
+    }
+    eprintln!("  prod_rot32 vs debug_f32: n_diff={n_diff} / {}", rot_h.len());
+    for (i, pb, nb) in &first {
+        let qr = i / (N_HEADS * HD);
+        let h = (i / HD) % N_HEADS;
+        let d = i % HD;
+        eprintln!("    row={qr} head={h} dim={d} prod_bits=0x{pb:08x} new_bits=0x{nb:08x}");
+    }
+
+    // Host RNE cast of prod-rotated f32 (same cast the device applies).
+    let rot16: Vec<u8> = rot_h
+        .iter()
+        .flat_map(|x| f32_to_f16_rne(*x).to_le_bytes())
+        .collect();
+
+    // (d) Shipping fwht3 pre-convert raw (do_rotate=1) on fresh ORIGINAL Q.
+    if have_fwht3_preconvert {
+        let d_q_ship = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+        let d_q16 = gpu.zeros(&[BATCH * QO_ROW], DType::F16).unwrap();
+        launch_preconvert_raw(
+            gpu, SHIP_FWHT3_PRECONVERT_SYM, &d_q_ship, &d_q16, &d_s1, &d_s2, BATCH, 1,
+        );
+        let ship16 = download_bytes(gpu, &d_q16, BATCH * QO_ROW * 2);
+        let mut n16 = 0usize;
+        for (a, b) in rot16.iter().zip(ship16.iter()) {
+            if a != b {
+                n16 += 1;
+            }
+        }
+        eprintln!(
+            "  cast(prod_rot32)==ship_f16: {} (n_diff_bytes={n16} / {})",
+            n16 == 0,
+            rot16.len()
+        );
+    }
+
+    // (e) Legacy probe: the Q8-registered build with do_rotate=1. Its KMODE=0
+    // compile has no rotation, so it must equal the plain cast of ORIGINAL Q
+    // (this is the build the fwht3 path accidentally launched pre-fix).
+    let d_q_leg = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+    let d_q16leg = gpu.zeros(&[BATCH * QO_ROW], DType::F16).unwrap();
+    launch_preconvert_raw(
+        gpu, SHIP_Q8_PRECONVERT_SYM, &d_q_leg, &d_q16leg, &d_s1, &d_s2, BATCH, 1,
+    );
+    let leg16 = download_bytes(gpu, &d_q16leg, BATCH * QO_ROW * 2);
+    let orig16: Vec<u8> = q_h
+        .iter()
+        .flat_map(|x| f32_to_f16_rne(*x).to_le_bytes())
+        .collect();
+    let mut nleg = 0usize;
+    for (a, b) in orig16.iter().zip(leg16.iter()) {
+        if a != b {
+            nleg += 1;
+        }
+    }
+    eprintln!(
+        "  legacy(q8-build,do_rotate=1)==cast(orig_q): {} (n_diff_bytes={nleg} / {})",
+        nleg == 0,
+        orig16.len()
+    );
+    eprintln!("\nF4b rotcheck complete.");
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     let arm = std::env::args().nth(1).unwrap_or_default();
     let is_ship = arm == "ship";
+    let is_rotcheck = arm == "rotcheck";
     eprintln!(
-        "tmp_fa2_attrib arch={}  arm={}  (F3.0 attribution / F4b ship)",
+        "tmp_fa2_attrib arch={}  arm={}  (F3.0 attribution / F4b ship+rotcheck)",
         gpu.arch,
-        if is_ship { "ship" } else { "attrib" }
+        if is_ship {
+            "ship"
+        } else if is_rotcheck {
+            "rotcheck"
+        } else {
+            "attrib"
+        }
     );
     eprintln!(
         "Production Q conversion: (_Float16)float C cast → AMD v_cvt_f16_f32 (RNE)."
@@ -1569,6 +1826,10 @@ fn main() {
 
     if is_ship {
         run_ship(&mut gpu);
+        return;
+    }
+    if is_rotcheck {
+        run_rotcheck(&mut gpu);
         return;
     }
 

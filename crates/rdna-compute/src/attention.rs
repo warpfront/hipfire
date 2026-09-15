@@ -3841,6 +3841,13 @@ impl Gpu {
     }
     /// F4b on-device Q pre-convert shared by the gfx11 FA2 pair.
     ///
+    /// `symbol` selects the KMODE build: `attention_fa2_q_preconvert_gfx11`
+    /// (Q8 module) or `attention_fa2_q_preconvert_fwht3_gfx11` (fwht3
+    /// module). The two modules export DIFFERENT symbols on purpose — the
+    /// function cache is keyed by symbol, so a shared name would silently
+    /// bind whichever module build registered first (and the KMODE=0 build
+    /// compiles the rotation out, ignoring `do_rotate`).
+    ///
     /// Reads f32 Q ([batch, 24, 256] — the exact layout/stride the FA2 body
     /// used to read) and writes f16 scratch at `q16_ptr` (batch*24*256 f16,
     /// same row-major layout) with the identical `(_Float16)` cast the body
@@ -3855,6 +3862,7 @@ impl Gpu {
     #[allow(clippy::too_many_arguments)]
     fn launch_fa2_q_preconvert_gfx11(
         &mut self,
+        symbol: &str,
         q_ptr: *const c_void,
         q16_ptr: *mut c_void,
         s1_ptr: *const c_void,
@@ -3862,7 +3870,6 @@ impl Gpu {
         batch_size: usize,
         do_rotate: i32,
     ) -> HipResult<()> {
-        const SYMBOL: &str = "attention_fa2_q_preconvert_gfx11";
         let grid_x = (batch_size * 24).div_ceil(4) as u32;
         let mut qp = q_ptr as *mut c_void;
         let mut q16p = q16_ptr;
@@ -3879,7 +3886,7 @@ impl Gpu {
             &mut rot as *mut _ as *mut c_void,
         ];
         // Kernargs: q0, q16@8, s1@16, s2@24, batch@32, do_rotate@36 (40 B).
-        self.launch_maybe_blob(SYMBOL, [grid_x, 1, 1], [128, 1, 1], 0, &mut params, || {
+        self.launch_maybe_blob(symbol, [grid_x, 1, 1], [128, 1, 1], 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(q_ptr);
             b.push_ptr(q16_ptr);
@@ -4040,6 +4047,7 @@ impl Gpu {
         // capture stays valid. The blob ABI below is unchanged (q16 reuses
         // the old f32 Q slot: same offset 0, same size).
         self.launch_fa2_q_preconvert_gfx11(
+            PRECONVERT,
             q.buf.as_ptr(),
             q16_ptr,
             std::ptr::null(),
@@ -4172,8 +4180,11 @@ impl Gpu {
         // KT32 pinned (see the Q8 launcher): KT64 path removed.
         // F4b: the body takes pre-rotated + pre-converted f16 Q (same kernarg
         // list as the Q8 entry — no signs); the rotation moved to the
-        // pre-convert symbol, resolved out of this module's (KMODE=3) source.
-        const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx11";
+        // fwht3 pre-convert symbol, resolved out of this module's (KMODE=3)
+        // source. The symbol MUST differ from the Q8 pre-convert symbol: the
+        // function cache is keyed by symbol, and the Q8 module's KMODE=0
+        // build compiles the rotation out.
+        const PRECONVERT: &str = "attention_fa2_q_preconvert_fwht3_gfx11";
         if !self.functions.contains_key(module) || !self.functions.contains_key(PRECONVERT) {
             let src = format!(
                 "#define HIPFIRE_FA2_KT 32\n{}",
@@ -4227,6 +4238,7 @@ impl Gpu {
         // is the shared Q8 pack (q16 reuses the old f32 Q slot: offset 0,
         // same size); the signs travel only to the pre-convert launch.
         self.launch_fa2_q_preconvert_gfx11(
+            PRECONVERT,
             q.buf.as_ptr(),
             q16_ptr,
             signs1.buf.as_ptr(),

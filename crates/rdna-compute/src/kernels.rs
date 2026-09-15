@@ -5686,8 +5686,10 @@ pub const ATTENTION_Q8_0_FA2_GQA_GFX11_SRC: &str =
 /// fwht3-K variant of [`ATTENTION_Q8_0_FA2_GQA_GFX11_SRC`] (`HIPFIRE_FA2_KMODE=3`):
 /// K dequantizes fwht3 records (f32 cnorm + 96 B of 3-bit codes, K stored
 /// FWHT-rotated) into the unchanged K plane. F4b: the Q-side signed-FWHT-256
-/// rotation moved out of the body into `attention_fa2_q_preconvert_gfx11`
-/// (same helper, same op order — bit-identical), so the entry symbol
+/// rotation moved out of the body into `attention_fa2_q_preconvert_fwht3_gfx11`
+/// (same helper, same op order — bit-identical; KMODE-selected symbol,
+/// distinct from the Q8 module's `attention_fa2_q_preconvert_gfx11` because
+/// the host function cache is keyed by symbol), so the entry symbol
 /// `attention_q8_0_fa2_gqa_fwht3k_gfx11` takes the SAME kernarg list as the
 /// Q8 entry (f16 q16 at offset 0, no signs) and never mutates Q:
 /// replay-idempotent, capture-safe. `turbo_common.h` is prepended
