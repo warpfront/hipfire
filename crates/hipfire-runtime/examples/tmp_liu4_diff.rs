@@ -111,6 +111,7 @@ fn launch_iu4_lloyd(
     blob.push_u32(c16[0]);
     blob.push_u32(c16[1]);
     blob.push_u32(c16[2]);
+    blob.push_u32(c16[3]);
     let mut bytes = blob.into_vec();
     gpu.launch_kernel_blob(
         kernel,
