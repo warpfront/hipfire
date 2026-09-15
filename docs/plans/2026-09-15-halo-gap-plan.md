@@ -6,6 +6,18 @@ Source base: `/home/kaden/ClaudeCode/warpfront/wt-lloyd`, `cadd315a1`; the paren
 
 **Planning evidence only:** no GPU program, build, formatter, linter, or project-wide test was run; no source was edited. CPU address enumeration and chunk-partition calculations below were run. All future speed ranges are **unmeasured estimates**, not promises or results. The supplied 600/582/395 t/s baseline is the campaign input.
 
+> **STATUS 2026-09-15 (parent) — row targets and admissions.** Row targets
+> are halogen-server on the same Halo: pp512 620, pp2048 710, **pp32768 730**
+> (corrected from 566). Admitted this session, all bit-exact (eval md5
+> `cc7f5a26…` unchanged): **G1b** GDN batched prefill (DPP tree + one-token
+> prefetch, universal; gfx1151 1260→991 µs/call); **F4a** FA2 Q fragment
+> shared across both 16-key subtiles (gfx1151 −24…−27 %, gfx1100 −19…−24 %,
+> VGPR 200→230). Halo after both: pp512 608–621, pp2048 594–602, pp8192 554–558,
+> pp32768 437–438, tg 14.66. FA2 attribution (F3.0) drove F4a and shelved F3;
+> next: F4b (f16 Q pre-convert, −41 % combined in the twin), W2 (IU4, spec
+> written, candidate compiled), F5 (i8-KV FA2 via iu8 WMMA, spec in progress),
+> F2, fill (21–27 % ceiling).
+
 ## 1. Order and immutable contract
 
 Execute: **C0 latent FA2 blob fix → A0 calibration → A5 grid order → F1 repaired oracle and F2 1024 host/cadence envelope → B6 fill issue structure → G1 sequential GDN constants → T0 tails → S1 co-scheduling screen → W2-versus-S1 Sol-spec decision.** This is the max brainstorm's first-week order, with the mandatory correctness fix in front and the host half of F made explicit (`docs/plans/2026-09-15-halo-gap-levers-max.md:592-604`). F2 has its own early kill; a failed chunk-size experiment must not block B6/G1/T0 at N512.
