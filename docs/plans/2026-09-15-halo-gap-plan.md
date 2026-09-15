@@ -14,9 +14,14 @@ Source base: `/home/kaden/ClaudeCode/warpfront/wt-lloyd`, `cadd315a1`; the paren
 > shared across both 16-key subtiles (gfx1151 −24…−27 %, gfx1100 −19…−24 %,
 > VGPR 200→230). Halo after both: pp512 608–621, pp2048 594–602, pp8192 554–558,
 > pp32768 437–438, tg 14.66. FA2 attribution (F3.0) drove F4a and shelved F3;
-> next: F4b (f16 Q pre-convert, −41 % combined in the twin), W2 (IU4, spec
-> written, candidate compiled), F5 (i8-KV FA2 via iu8 WMMA, spec in progress),
-> F2, fill (21–27 % ceiling).
+> **F4b** admitted: on-device f16 Q pre-convert (+fwht3 rotation; Q immutable,
+> replay-idempotent; distinct symbol per K mode because the host function cache
+> is symbol-keyed) — FA2 −33…−38 % Halo / −27…−34 % XTX vs session start,
+> VGPR 193; Halo pp512 623, pp2048 615, pp8192 578, pp32768 ≈452 (pre-fix run).
+> **Peak probe (plateaued):** iu4 107.8 TOPS, iu8 54.6, f16 55.3 — the shipping
+> IU4 GEMM (53.7 TOPS) is at 50 % of peak; A0's 63.6 was occupancy-limited.
+> iu8 = f16 rate ⇒ F5's i8 WMMA has no MAC-rate lever (fill/bytes only).
+> Next: W2 re-targeted at ≥70 % of iu4 peak (spec revision), then F2/fill.
 
 ## 1. Order and immutable contract
 
