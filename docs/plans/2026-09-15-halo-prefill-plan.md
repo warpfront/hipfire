@@ -428,6 +428,16 @@ Planning estimate, not a ceiling: 10–30 ms pp512, 40–120 ms pp2048, 0.64–1
 
 ## 10. Unit C1 — Q8-EF GDN with transient F32 chunk carry
 
+> **STATUS 2026-09-15 — C1 REJECTED at C1.0.** Halo, 48 heads, HD 128, T=512,
+> warm median-of-21: shipping `gated_delta_net_q8_fast` 1260 us; existing F32
+> chunked algebra (sum of per-chunk launches) CS16 15663 us, CS32 13247 us —
+> ratio 10.5x, gate was ≤0.60. Parity held on all seven T/CS pairs (<2.3e-7).
+> The F32 chunk kernel is one WG per head with host-serialized launches; it is
+> a correctness oracle, not a speed vehicle. No Q8 bridge was written. A
+> future C1 needs a new chunked kernel design (multi-WG per head, on-device
+> chunk loop), which is outside this plan's four-day box.
+
+
 ### 10.1 Source audit correction
 
 The profiled timer name is `gated_delta_net_q8_batch_seq`, but the default selector chooses `gated_delta_net_q8_fast` when per-token requant is disabled (`crates/rdna-compute/src/norm.rs:3000-3016`). That launch is `[n_heads,32,1]`, block 32 (`:3018,3041-3068`). The actual fast kernel dequantizes each four-row tile once, walks all tokens serially in FP32 LDS, and requantizes **once outside the token loop** (`kernels/src/gated_delta_net_q8_fast.hip:5-7,122-145,258-317`).
