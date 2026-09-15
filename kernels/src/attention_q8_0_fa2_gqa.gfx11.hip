@@ -48,11 +48,15 @@
 //     exact interleaved dimension out[query,head,dc*16+2*j+half], so every
 //     output element has exactly one writer and no row shuffle is needed.
 //
-// LDS swizzle (f16 pairs as dwords, S(c) = 8*(c>>2) + (c&3)):
-//   K store/read: dword pair p for key k at K[k][(p + S(k&15)) & 127].
-//   V store/read: key-pair p for dim d at V_T[d][(p + S(d&15)) & (KT/2-1)].
-// Loads are explicit uint32_t reads unpacked to half16; the circular row
-// wrap is intentional.
+// LDS swizzle (f16 pairs as dwords):
+//   default S(c) = 8*(c>>2)+(c&3);
+//   HIPFIRE_FA2_GFX11_SWIZZLE_EVEN: S(c) = 2*bit_reverse4(c) so every
+//   fragment start is 8-byte aligned and the 16 unique ml rows cover all
+//   even/odd bank pairs once (broadcast on lanes ml and ml+16).
+// K store/read: dword pair p for key k at K[k][(p + S(k&15)) & 127].
+// V store/read: key-pair p for dim d at V_T[d][(p + S(d&15)) & (KT/2-1)].
+// Even-swizzle path loads four aligned b64s per half16; default path keeps
+// eight scalar dword reads. Unpack order into half16 is identical either way.
 //
 // Q f16 rounding matches the incumbent (Q/K/V/P operands f16,
 // accumulators/state/O f32). No slots, no windows, no FP8, no other arch.
@@ -87,9 +91,26 @@
 #error "HIPFIRE_FA2_KT must be 32 or 64"
 #endif
 
+// B1/B2 gate defines (JIT-prepended). Default off retains the incumbent path.
+#ifndef HIPFIRE_FA2_GFX11_SWIZZLE_EVEN
+#define HIPFIRE_FA2_GFX11_SWIZZLE_EVEN 0
+#endif
+#ifndef HIPFIRE_FA2_GFX11_NO_CLOBBER
+#define HIPFIRE_FA2_GFX11_NO_CLOBBER 0
+#endif
+// Entry-symbol rename so variant modules cannot alias the functions cache.
+#ifndef HIPFIRE_FA2_GFX11_KERNEL
+#define HIPFIRE_FA2_GFX11_KERNEL attention_q8_0_fa2_gqa_gfx11
+#endif
+#ifndef HIPFIRE_FA2_GFX11_FWHT3K_KERNEL
+#define HIPFIRE_FA2_GFX11_FWHT3K_KERNEL attention_q8_0_fa2_gqa_fwht3k_gfx11
+#endif
+
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
+typedef int32_t __attribute__((ext_vector_type(2))) int32x2_t;
+
 
 typedef union {
     uint32_t u;
@@ -98,7 +119,14 @@ typedef union {
 
 __device__ __forceinline__ int fa2_swiz(int c)
 {
+#if HIPFIRE_FA2_GFX11_SWIZZLE_EVEN
+    // 2*bit_reverse4(c): lane starts 0,16,8,24,4,20,12,28,2,18,10,26,6,22,14,30.
+    const int r = ((c & 1) << 3) | ((c & 2) << 1)
+                | ((c & 4) >> 1) | ((c & 8) >> 3);
+    return 2 * r;
+#else
     return 8 * (c >> 2) + (c & 3);
+#endif
 }
 
 // Shared workgroup body (direct only: writes normalized O to `out`).
@@ -363,6 +391,27 @@ __device__ __forceinline__ void fa2_gqa_body(
                     const int base = key * 128;
                     for (int dc = 0; dc < 16; ++dc) {
                         half16_t kf;
+#if HIPFIRE_FA2_GFX11_SWIZZLE_EVEN
+                        // Four aligned b64 LDS loads at i={0,2,4,6}. Even
+                        // swizzle makes each start 8-byte aligned; consecutive
+                        // dwords i,i+1 never wrap (start never 127). Unpack
+                        // low then high dword into the same half16 order as
+                        // the eight scalar loads below — f16 element order
+                        // and WMMA A operands are unchanged.
+#pragma unroll
+                        for (int i = 0; i < 8; i += 2) {
+                            const int off = base + ((dc * 8 + i + rot) & 127);
+                            const int32x2_t pair =
+                                *(const int32x2_t*)(Kdw + off);
+                            fa2_dw_t d0, d1;
+                            d0.u = (uint32_t)pair[0];
+                            d1.u = (uint32_t)pair[1];
+                            kf[2 * i] = d0.h[0];
+                            kf[2 * i + 1] = d0.h[1];
+                            kf[2 * i + 2] = d1.h[0];
+                            kf[2 * i + 3] = d1.h[1];
+                        }
+#else
 #pragma unroll
                         for (int i = 0; i < 8; ++i) {
                             fa2_dw_t dw;
@@ -370,6 +419,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                             kf[2 * i] = dw.h[0];
                             kf[2 * i + 1] = dw.h[1];
                         }
+#endif
                         half16_t qf;
                         {
                             const float* qd = q + qq_base + (unsigned)(dc * 16);
@@ -386,8 +436,10 @@ __device__ __forceinline__ void fa2_gqa_body(
                         }
                         sacc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
                             kf, qf, sacc);
+#if !HIPFIRE_FA2_GFX11_NO_CLOBBER
                         // Bound K/Q-load hoisting to this chunk.
                         asm volatile("" ::: "memory");
+#endif
                     }
                 }
 
@@ -458,6 +510,24 @@ __device__ __forceinline__ void fa2_gqa_body(
                     const int vbase = d * V_ROW;
                     const int ps = sub * 8;
                     half16_t vf;
+#if HIPFIRE_FA2_GFX11_SWIZZLE_EVEN
+                    // Four aligned b64 loads at i={0,2,4,6}. Within either
+                    // V-row parity the even residues cover all even b64
+                    // starts once; unpack order matches the scalar path.
+#pragma unroll
+                    for (int i = 0; i < 8; i += 2) {
+                        const int off = vbase + ((ps + i + rot) & V_MASK);
+                        const int32x2_t pair =
+                            *(const int32x2_t*)(Vdw + off);
+                        fa2_dw_t d0, d1;
+                        d0.u = (uint32_t)pair[0];
+                        d1.u = (uint32_t)pair[1];
+                        vf[2 * i] = d0.h[0];
+                        vf[2 * i + 1] = d0.h[1];
+                        vf[2 * i + 2] = d1.h[0];
+                        vf[2 * i + 3] = d1.h[1];
+                    }
+#else
 #pragma unroll
                     for (int i = 0; i < 8; ++i) {
                         fa2_dw_t dw;
@@ -465,10 +535,13 @@ __device__ __forceinline__ void fa2_gqa_body(
                         vf[2 * i] = dw.h[0];
                         vf[2 * i + 1] = dw.h[1];
                     }
+#endif
                     Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(
                         vf, prow, Ofr[dc]);
+#if !HIPFIRE_FA2_GFX11_NO_CLOBBER
                     // Bound V-load hoisting to this chunk.
                     asm volatile("" ::: "memory");
+#endif
                 }
             }
         }
@@ -499,7 +572,7 @@ __device__ __forceinline__ void fa2_gqa_body(
     }
 }
 
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx11(
+extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_GFX11_KERNEL(
     const float* __restrict__ q,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -572,7 +645,7 @@ __device__ __forceinline__ void fa2_gqa_rotate_q_256(
     __syncthreads();
 }
 
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_gfx11(
+extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_GFX11_FWHT3K_KERNEL(
     float* __restrict__ q,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,

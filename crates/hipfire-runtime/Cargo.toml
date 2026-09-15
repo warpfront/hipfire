@@ -147,6 +147,10 @@ name = "tmp_lloyd_mmq_diff"
 required-features = []
 
 [[example]]
+name = "tmp_fa2_gfx11_oracle"
+required-features = []
+
+[[example]]
 name = "bench_qwen35_mq4"
 required-features = []
 
