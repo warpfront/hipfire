@@ -332,8 +332,12 @@ static __device__ __forceinline__ void vec_dot_i4_x128(
         #pragma unroll
         for (int n = 0; n < ntx; ++n) {
 #ifdef HIPFIRE_MMQ_IU4_LUT
-            int32x8_t accH = {0, 0, 0, 0, 0, 0, 0, 0};
-            int32x8_t accL = {0, 0, 0, 0, 0, 0, 0, 0};
+            // ONE accumulator (same live set as uniform). Temp H tile (8 i32)
+            // reused every WMMA step: t=wmma(H,x,0); acc=wmma(L,x,acc);
+            // acc[i]+=t[i]<<4. Avoids a second accH set (was vgpr=256+spills).
+            int32x8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
+            int32x8_t th;
+            const int32x8_t zero8 = {0, 0, 0, 0, 0, 0, 0, 0};
             #pragma nounroll
             for (int t = 0; t < 4; ++t) {
                 const int* ap = x_qs + (i0 + n * tile_C::I + lane_row) * IU4_TILE_X_K + h * 16 + t * 4;
@@ -352,24 +356,26 @@ static __device__ __forceinline__ void vec_dot_i4_x128(
                 int32x2_t lav0; lav0[0] = (int)L0; lav0[1] = (int)L1;
                 int32x2_t lav1; lav1[0] = (int)L2; lav1[1] = (int)L3;
                 // signA=false unsigned, signB=true signed, no-sat — same as uniform.
-                accH = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, hav0, true, bv0, accH, false);
-                accH = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, hav1, true, bv1, accH, false);
-                accL = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, lav0, true, bv0, accL, false);
-                accL = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, lav1, true, bv1, accL, false);
+                th = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, hav0, true, bv0, zero8, false);
+                acc = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, lav0, true, bv0, acc, false);
+                #pragma unroll
+                for (int l = 0; l < 8; ++l) acc[l] += th[l] << 4;
+                th = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, hav1, true, bv1, zero8, false);
+                acc = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, lav1, true, bv1, acc, false);
+                #pragma unroll
+                for (int l = 0; l < 8; ++l) acc[l] += th[l] << 4;
             }
             const float d_x = *(const float*)(y_ds + (j0 + j_lane) * IU4_TILE_Y_K);
             const int s_x = *(const int*)(y_ds + (j0 + j_lane) * IU4_TILE_Y_K + 1);
-            const int* accH_i = (const int*)&accH;
-            const int* accL_i = (const int*)&accL;
+            const int* acc_i = (const int*)&acc;
             #pragma unroll
             for (int l = 0; l < tile_C::ne; ++l) {
                 const int i = i0 + n * tile_C::I + tile_C::get_i(l);
                 const half2 dm = ((const half2*)(x_qs + i * IU4_TILE_X_K + IU4_X_DM_OFF))[4 * h];
                 const float2 dmA = __half22float2(dm);
-                // C = 16·ΣH·x + ΣL·x; sc'/zp' already in dmA from load_iu4_tile.
-                const int C = 16 * accH_i[l] + accL_i[l];
+                // acc already holds Σ(16·H+L)·x; sc'/zp' in dmA from load_iu4_tile.
                 sum[(j0 / tile_C::J + n) * tile_C::ne + l] +=
-                    dmA.x * d_x * (float)C + dmA.y * d_x * (float)s_x;
+                    dmA.x * d_x * (float)acc_i[l] + dmA.y * d_x * (float)s_x;
             }
 #else
             int32x8_t acc = {0, 0, 0, 0, 0, 0, 0, 0};
