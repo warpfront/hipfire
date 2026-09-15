@@ -7926,7 +7926,11 @@ impl Gpu {
         // No multirow LUT variant exists (fail-open to uniform multirow would
         // decode on the wrong grid); rows pinned to 1 unconditionally.
         let func_name = "gemv_mq4g256v2_residual_lloyd";
-        self.ensure_kernel(func_name, kernels::GEMV_MQ4G256V2_RESIDUAL_LUT_SRC, func_name)?;
+        self.ensure_kernel(
+            func_name,
+            kernels::GEMV_MQ4G256V2_RESIDUAL_LUT_SRC,
+            func_name,
+        )?;
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut x_ptr = x.buf.as_ptr();
         let mut y_ptr = y.buf.as_ptr();

@@ -120,10 +120,10 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
     match dtype {
         // MQ2G256GL / MQ3G256GL are encoded against FWHT-256-rotated
         // blocks exactly like the other MQ*-G256 dtypes.
-        MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2 | MQ4CG256
-        | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd
-        | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA
-        | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
+        MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2
+        | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ2G256Lloyd | MQ3G256Lloyd
+        | MQ4G256Lloyd | MQ2G256GL | MQ3G256GL | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
+        | MFP4G32E8SOA | MFP3G32E8 | MFP2G32E8 => RotationPlan::FwhtG256,
         // MQ4G128 and MQ8G256 carry their OWN plans and MUST NOT reach the `_` arm:
         // falling through to RotationPlan::None leaves x unrotated against weights
         // that were encoded post-rotation, which is silent garbage, not an error.
@@ -151,11 +151,10 @@ pub fn dtype_post_rotation_variant(dtype: DType) -> GemvVariant {
         ParoQ4G128 => GemvVariant::Plain,
         // GL formats are MoE-indexed-only and intentionally have no dense
         // prerotated GEMV route.
-        MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2 | MQ4CG256
-        | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd | MQ3G256Lloyd
-        | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8 | MFP4G32E8SOA | MQ4G128 => {
-            GemvVariant::Prerotated
-        }
+        MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ5G256V2 | MQ6G256V2 | MQ3G256V2 | MQ2G256V2
+        | MQ4CG256 | MQ3G256 | MQ2G256 | MQ5G256 | MQ6G256 | MQ8G256 | MQ2G256Lloyd
+        | MQ3G256Lloyd | MQ4G256Lloyd | MFP4G32 | MFP4G32Lloyd | MFP4G32P | MFP4G32E8
+        | MFP4G32E8SOA | MQ4G128 => GemvVariant::Prerotated,
         _ => GemvVariant::Plain,
     }
 }
@@ -171,10 +170,22 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
     use KernelKey::*;
     match key {
         // 3-way Fused QKV (incl. Q4K, Q8_0/HFQ3/HFP4 prefill, and the Paro 4G128T QKV synthesis)
-        FusedQkvHfq4G256 | FusedQkvMq4G256V2 | FusedQkvMq4G256V2Lloyd | FusedQkvMq6G256V2 | FusedQkvMq5G256V2
-        | FusedQkvMq3G256V2 | FusedQkvMq2G256V2 | FusedQkvMq4CG256 | FusedQkvMq3G256Lloyd
-        | FusedQkvMq4G256Lloyd | FusedQkvHfq6G256 | FusedQkvQ4K | FusedQkvQ8_0
-        | FusedQkvHfq3G256 | FusedQkvHfp4G32 | FusedQkvParo4G128T => Some(FusedQkvVariant::Qkv),
+        FusedQkvHfq4G256
+        | FusedQkvMq4G256V2
+        | FusedQkvMq4G256V2Lloyd
+        | FusedQkvMq6G256V2
+        | FusedQkvMq5G256V2
+        | FusedQkvMq3G256V2
+        | FusedQkvMq2G256V2
+        | FusedQkvMq4CG256
+        | FusedQkvMq3G256Lloyd
+        | FusedQkvMq4G256Lloyd
+        | FusedQkvHfq6G256
+        | FusedQkvQ4K
+        | FusedQkvQ8_0
+        | FusedQkvHfq3G256
+        | FusedQkvHfp4G32
+        | FusedQkvParo4G128T => Some(FusedQkvVariant::Qkv),
         // 4-way Fused QKVZA (DeltaNet linear attention, incl. Q8_0/HFQ3/HFP4 prefill and Paro 4G128T)
         FusedQkvzaHfq4G256
         | FusedQkvzaMq4G256V2
@@ -929,8 +940,9 @@ impl KernelKey {
             Prerotated => &[PipelineOp::Gemv],
             WithResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2
-                    | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => &[
+                    MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ2G256V2 | MQ3G256V2 | MQ5G256V2
+                    | MQ6G256V2 | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd
+                    | MQ4G256Lloyd => &[
                         PipelineOp::RotateFwht,
                         PipelineOp::Gemv,
                         PipelineOp::ResidualAdd,
@@ -941,10 +953,9 @@ impl KernelKey {
             }
             WithSwiGLUResidual => {
                 let steps: &[PipelineOp] = match dtype {
-                    MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2
-                    | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd | MQ4G256Lloyd => {
-                        &[PipelineOp::SiluMulRotate, PipelineOp::GemvResidual]
-                    }
+                    MQ4G256 | MQ4G256V2 | MQ4G256V2Lloyd | MQ2G256V2 | MQ3G256V2 | MQ5G256V2
+                    | MQ6G256V2 | MQ4CG256 | MQ3G256 | MQ5G256 | MQ6G256 | MQ3G256Lloyd
+                    | MQ4G256Lloyd => &[PipelineOp::SiluMulRotate, PipelineOp::GemvResidual],
                     _ => &[
                         PipelineOp::SiluMul,
                         PipelineOp::Gemv,
@@ -1032,10 +1043,9 @@ mod tests {
             KernelKey::GemvMq4G256V2SwiGLUResidual
         );
         assert!(dtype_needs_rotation(DType::MQ4G256V2Lloyd));
-        assert!(KernelKey::gemv_steps(
-            DType::MQ4G256V2Lloyd,
-            GemvVariant::WithResidual
-        )
-        .contains(&PipelineOp::RotateFwht));
+        assert!(
+            KernelKey::gemv_steps(DType::MQ4G256V2Lloyd, GemvVariant::WithResidual)
+                .contains(&PipelineOp::RotateFwht)
+        );
     }
 }

@@ -5258,18 +5258,12 @@ fn handle_main_quant(
                                     awq_sidecar_scales = Some(scales.clone());
                                     let mut scaled = f32_data.clone();
                                     awq_pre_scale_weights(&mut scaled, m, k_dim, &scales);
-                                    quantize_mq4g256v2_lloyd(
-                                        &scaled, m, k_dim, &signs1, &signs2,
-                                    )
+                                    quantize_mq4g256v2_lloyd(&scaled, m, k_dim, &signs1, &signs2)
                                 } else {
-                                    quantize_mq4g256v2_lloyd(
-                                        &f32_data, m, k_dim, &signs1, &signs2,
-                                    )
+                                    quantize_mq4g256v2_lloyd(&f32_data, m, k_dim, &signs1, &signs2)
                                 }
                             } else {
-                                quantize_mq4g256v2_lloyd(
-                                    &f32_data, m, k_dim, &signs1, &signs2,
-                                )
+                                quantize_mq4g256v2_lloyd(&f32_data, m, k_dim, &signs1, &signs2)
                             };
                             lloyd_v2_stats_record(name, &r);
                             lloyd_sidecar_levels = Some(r.levels);
@@ -5740,8 +5734,7 @@ fn handle_main_quant(
                                     (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                                 }
                                 "mq4v2-lloyd" | "mq4l" | "mq4v2l" => {
-                                    let r =
-                                        quantize_mq4g256v2_lloyd(&f32_data, m, k, &s1, &s2);
+                                    let r = quantize_mq4g256v2_lloyd(&f32_data, m, k, &s1, &s2);
                                     lloyd_v2_stats_record(name, &r);
                                     lloyd_sidecar_levels = Some(r.levels);
                                     (r.data, QuantType::MQ4G256V2L, 256u32, "MQ4G256V2L")
@@ -5926,9 +5919,7 @@ fn handle_main_quant(
                                 awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
                                 quantize_mq4g256v2_lloyd(&scaled, m_dim, k_dim, &signs1, &signs2)
                             } else {
-                                quantize_mq4g256v2_lloyd(
-                                    &f32_data, m_dim, k_dim, &signs1, &signs2,
-                                )
+                                quantize_mq4g256v2_lloyd(&f32_data, m_dim, k_dim, &signs1, &signs2)
                             }
                         } else {
                             quantize_mq4g256v2_lloyd(&f32_data, m_dim, k_dim, &signs1, &signs2)

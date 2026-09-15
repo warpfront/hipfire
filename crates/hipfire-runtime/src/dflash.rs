@@ -494,8 +494,8 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-                    lloyd_lut_e4m3: None,
-                    lloyd_lut_f16: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         13 => {
@@ -510,8 +510,8 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-                    lloyd_lut_e4m3: None,
-                    lloyd_lut_f16: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         15 => {
@@ -526,8 +526,8 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-                    lloyd_lut_e4m3: None,
-                    lloyd_lut_f16: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         17 => {
@@ -543,8 +543,8 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-                    lloyd_lut_e4m3: None,
-                    lloyd_lut_f16: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         44 => {
@@ -571,8 +571,8 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-                    lloyd_lut_e4m3: None,
-                    lloyd_lut_f16: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         47 => {
@@ -597,8 +597,8 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-                    lloyd_lut_e4m3: None,
-                    lloyd_lut_f16: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         48 => {
@@ -623,8 +623,8 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-                    lloyd_lut_e4m3: None,
-                    lloyd_lut_f16: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         49 => {
@@ -649,8 +649,8 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-                    lloyd_lut_e4m3: None,
-                    lloyd_lut_f16: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         50 => {
@@ -675,8 +675,8 @@ fn hfq_weight(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
-                    lloyd_lut_e4m3: None,
-                    lloyd_lut_f16: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         q => panic!("dflash: unsupported matrix quant_type {q} for {name}"),

@@ -7798,7 +7798,8 @@ mod dispatch_tests {
     #[test]
     fn awq_rmsnorm_rotate_is_derived_from_the_uniform_source() {
         assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC.starts_with("#define HIPFIRE_RMSNORM_AWQ 1\n"));
-        assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC.contains("HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq"));
+        assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC
+            .contains("HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq"));
         assert!(!FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC.contains("x_shared"));
         assert!(!FUSED_RMSNORM_MQ_ROTATE_SRC.contains("#define HIPFIRE_RMSNORM_AWQ 1"));
     }

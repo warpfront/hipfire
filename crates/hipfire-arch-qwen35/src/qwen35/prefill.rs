@@ -188,7 +188,14 @@ fn dispatch_batched_gemm_epilogue(
                 // LUT / inadmissible arch or shape).
                 let lut = lloyd_e4m3_or_fail(w, "dispatch_batched_gemm_epilogue")?;
                 return gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd(
-                    &w.buf, input, &pbs.x_batch, m, k, n, 1, lut,
+                    &w.buf,
+                    input,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                    1,
+                    lut,
                 );
             } else {
                 return run_residual_gemm_key(
@@ -407,7 +414,6 @@ fn prefill_max_batch_for_arch(arch: &str, fp8_chunk512: bool) -> usize {
         PREFILL_MAX_BATCH
     }
 }
-
 
 fn explicit_prefill_max_batch() -> Option<usize> {
     hipfire_config::developer_var("HIPFIRE_PREFILL_MAX_BATCH")
@@ -4653,10 +4659,8 @@ fn batch_chunk_delta_net_input_projection(
             lloyd_e4m3_or_fail(&layer.w_beta, "batch_chunk_delta_net_input_projection")?,
             lloyd_e4m3_or_fail(&layer.w_alpha, "batch_chunk_delta_net_input_projection")?,
         )?;
-    } else if matches!(
-        layer.wqkv.gpu_dtype,
-        DType::MQ4G256V2Lloyd
-    ) || matches!(layer.wz.gpu_dtype, DType::MQ4G256V2Lloyd)
+    } else if matches!(layer.wqkv.gpu_dtype, DType::MQ4G256V2Lloyd)
+        || matches!(layer.wz.gpu_dtype, DType::MQ4G256V2Lloyd)
         || matches!(layer.w_beta.gpu_dtype, DType::MQ4G256V2Lloyd)
         || matches!(layer.w_alpha.gpu_dtype, DType::MQ4G256V2Lloyd)
     {
@@ -6554,8 +6558,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
     // stride and produce fluent-but-wrong tokens.
     let fa_ffn_is_lowbit = matches!(layer.w_gate.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     // qt=52 re-arm anchor: gate+up both Lloyd → FP8-LUT launcher.
-    let fa_ffn_is_mq4v2_lloyd =
-        all_mq4v2_lloyd(&[layer.w_gate.gpu_dtype, layer.w_up.gpu_dtype]);
+    let fa_ffn_is_mq4v2_lloyd = all_mq4v2_lloyd(&[layer.w_gate.gpu_dtype, layer.w_up.gpu_dtype]);
     if fa_ffn_is_mq {
         // AWQ-aware: next linear is w_gate (FA-FFN, gate/up share input).
         fused_rmsnorm_rotate_mq_batched_for(
@@ -9406,10 +9409,28 @@ mod tests {
     fn q8_multirow_attn_rejects_replay_recording_on_supported_arches() {
         for arch in ["gfx1100", "gfx1201"] {
             assert!(q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, false,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                false,
             ));
             assert!(!q8_multirow_attn_admitted(
-                arch, true, 256, 8, 8192, Some(4096), false, false, false, true,
+                arch,
+                true,
+                256,
+                8,
+                8192,
+                Some(4096),
+                false,
+                false,
+                false,
+                true,
             ));
         }
     }

@@ -48,8 +48,7 @@ struct FamilyAccum {
     sse_lloyd: f64,
 }
 
-static FAMILY_STATS: Mutex<Option<BTreeMap<&'static str, FamilyAccum>>> =
-    Mutex::new(None);
+static FAMILY_STATS: Mutex<Option<BTreeMap<&'static str, FamilyAccum>>> = Mutex::new(None);
 
 /// Reset family stats (call once at start of a quantize run).
 pub(crate) fn lloyd_v2_stats_reset() {
@@ -323,11 +322,7 @@ fn snap_levels_to_r(levels: &mut [f64; 16], r: &[f64]) {
 ///
 /// Returns `(levels, per-iter MSE)` where `mse_hist[0]` is the uniform-grid MSE
 /// (iteration 0 assignment, before any centroid move).
-pub(crate) fn lloyd_max_fit(
-    vals: &[f64],
-    w: &[f64],
-    max_iters: usize,
-) -> ([f64; 16], Vec<f64>) {
+pub(crate) fn lloyd_max_fit(vals: &[f64], w: &[f64], max_iters: usize) -> ([f64; 16], Vec<f64>) {
     debug_assert_eq!(vals.len(), w.len());
     let mut levels = [0.0f64; 16];
     for i in 0..16 {
@@ -867,10 +862,7 @@ mod tests {
         for i in 0..16 {
             lf[i] = levels[i] as f32;
         }
-        assert!(
-            levels_in_e4m3_r(&lf),
-            "levels not in R: {levels:?}"
-        );
+        assert!(levels_in_e4m3_r(&lf), "levels not in R: {levels:?}");
         // MSE of successive snapped codebooks is non-increasing (we stop if it
         // would rise, so the recorded hist is monotone).
         for w in hist.windows(2) {
@@ -889,7 +881,11 @@ mod tests {
         let s2 = gen_fwht_signs(1042, 256);
         let w = synthetic_weights(16, 512, 99);
         let r = quantize_mq4g256v2_lloyd(&w, 16, 512, &s1, &s2);
-        assert!(levels_in_e4m3_r(&r.levels), "stored levels not in R: {:?}", r.levels);
+        assert!(
+            levels_in_e4m3_r(&r.levels),
+            "stored levels not in R: {:?}",
+            r.levels
+        );
         assert!(
             r.mse_lloyd <= r.mse_uniform + 1e-12,
             "constrained {} > unif {}",
@@ -912,10 +908,7 @@ mod tests {
         let r = quantize_mq4g256v2_lloyd(&w, 4, 256, &s1, &s2);
         assert_eq!(r.data.len(), 4 * MQ4V2_GROUP_BYTES);
 
-        let dir = std::env::temp_dir().join(format!(
-            "mq4v2l_meta_rt_{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("mq4v2l_meta_rt_{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("t.hfq");

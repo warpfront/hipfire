@@ -1,7 +1,7 @@
 # Changelog
 
 ## Unreleased
-- MQ4-Lloyd (qt=52 `MQ4G256V2L` / `DType::MQ4G256V2Lloyd`): same 136 B V2 group container as qt=44 plus per-tensor F32[16] `lloyd_levels` sidecar; product tiers `mq4-lxt` / `mq4l` / `mq4-lpro`. WT2 KLD vs AWQ'd uniform tiers (24-chunk, gfx1201, prefill scoring, q8 KV): xt 0.0482→0.0408, base 0.0405→0.0346, pro 0.0335→0.0284.
+- MQ4-Lloyd (qt=52 `MQ4G256V2L` / `DType::MQ4G256V2Lloyd`): same 136 B V2 group container as qt=44 plus per-tensor F32[16] `lloyd_levels` sidecar; product tiers `mq4l-xt` / `mq4l` / `mq4l-pro`. WT2 KLD vs AWQ'd uniform tiers (24-chunk, gfx1201, prefill scoring, q8 KV): xt 0.0482→0.0408, base 0.0405→0.0346, pro 0.0335→0.0284.
 - mq4-pro batched-prefill fix: invalidate the F16 x-cache after `gated_norm_f32_batched` / `sigmoid_mul_f32` so Q8 `out_proj` does not read stale activations under the default gfx1201 FP8 prefill path (1-chunk WT2 KLD 6.42→0.019).
 - AWQ rmsnorm-rotate rewrite: `fused_rmsnorm_mq_rotate_awq` is derived from `fused_rmsnorm_mq_rotate.hip` via `-DHIPFIRE_RMSNORM_AWQ` (retired the LDS-staged fork and the gfx1100-only `_direct` variant / `HIPFIRE_GFX1100_AWQ_NORM_DIRECT`); +2.5% decode on AWQ'd MQ4V2 artifacts on gfx1201.
 

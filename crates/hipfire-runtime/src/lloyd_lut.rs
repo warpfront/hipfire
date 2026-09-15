@@ -47,7 +47,11 @@ pub fn e4m3_bias7_decode(b: u8) -> f32 {
     } else {
         2.0f32.powi(e - 7) * (1.0 + m / 8.0)
     };
-    if b & 0x80 == 0 { mag } else { -mag }
+    if b & 0x80 == 0 {
+        mag
+    } else {
+        -mag
+    }
 }
 
 /// Encode f32 to E4M3 (bias-7) with round-to-nearest. Exhaustive 256-code
@@ -155,9 +159,7 @@ pub fn lloyd_sidecar_name(weight_name: &str) -> String {
 /// `[6..8)` zp1, `[8..136)` nibbles.
 pub fn apply_lloyd_centering(data: &mut [u8], m: usize, k: usize) -> Result<(), String> {
     if k % 256 != 0 {
-        return Err(format!(
-            "MQ4G256V2Lloyd has K={k} but requires K%256==0"
-        ));
+        return Err(format!("MQ4G256V2Lloyd has K={k} but requires K%256==0"));
     }
     let expected = m * (k / 256) * 136;
     if data.len() != expected {
@@ -171,7 +173,8 @@ pub fn apply_lloyd_centering(data: &mut [u8], m: usize, k: usize) -> Result<(), 
         for half in 0..2 {
             let o = half * 4;
             let sc = half::f16::from_bits(u16::from_le_bytes([group[o], group[o + 1]])).to_f32();
-            let zp = half::f16::from_bits(u16::from_le_bytes([group[o + 2], group[o + 3]])).to_f32();
+            let zp =
+                half::f16::from_bits(u16::from_le_bytes([group[o + 2], group[o + 3]])).to_f32();
             let zp_prime = zp + LLOYD_CENTER * sc;
             let bits = half::f16::from_f32(zp_prime).to_bits().to_le_bytes();
             group[o + 2] = bits[0];
@@ -187,8 +190,8 @@ mod tests {
 
     /// The kernel's hardcoded C0..C3 nibble table, byte per integer level.
     const KERNEL_TABLE: [u8; 16] = [
-        0x00, 0x38, 0x40, 0x44, 0x48, 0x4A, 0x4C, 0x4E, 0x50, 0x51, 0x52, 0x53,
-        0x54, 0x55, 0x56, 0x57,
+        0x00, 0x38, 0x40, 0x44, 0x48, 0x4A, 0x4C, 0x4E, 0x50, 0x51, 0x52, 0x53, 0x54, 0x55, 0x56,
+        0x57,
     ];
 
     #[test]
@@ -222,8 +225,8 @@ mod tests {
         // E4M3-representable centered, so encode∘decode is the identity and
         // the f16 LUT agrees with the E4M3 LUT bit-for-bit in f32.
         let levels: [f32; 16] = [
-            0.0, 1.5, 2.5, 3.5, 4.5, 5.5, 6.25, 7.09375, 7.90625, 8.75, 9.5,
-            10.25, 11.25, 12.5, 13.5, 15.0,
+            0.0, 1.5, 2.5, 3.5, 4.5, 5.5, 6.25, 7.09375, 7.90625, 8.75, 9.5, 10.25, 11.25, 12.5,
+            13.5, 15.0,
         ];
         let (e4, h) = lloyd_luts_from_levels(&levels);
         for i in 0..16 {
@@ -282,9 +285,6 @@ mod tests {
             lloyd_sidecar_name("model.layers.0.q_proj.weight"),
             "model.layers.0.q_proj.lloyd_levels.weight"
         );
-        assert_eq!(
-            lloyd_sidecar_name("bare"),
-            "bare.lloyd_levels.weight"
-        );
+        assert_eq!(lloyd_sidecar_name("bare"), "bare.lloyd_levels.weight");
     }
 }

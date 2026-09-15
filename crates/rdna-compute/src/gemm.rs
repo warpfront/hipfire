@@ -9397,7 +9397,8 @@ impl Gpu {
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols (see gate_up launcher).
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
@@ -9471,9 +9472,15 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let row_tiles = if slabs2 { (total_m + 31) / 32 } else { (total_m + 15) / 16 };
+        let row_tiles = if slabs2 {
+            (total_m + 31) / 32
+        } else {
+            (total_m + 15) / 16
+        };
         let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
-        let bytes = crate::profile::gemv_hfq4g256_bytes(total_m, k) + batch_size * k + batch_size * total_m * 4;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(total_m, k)
+            + batch_size * k
+            + batch_size * total_m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
         let result = self.launch_maybe_blob(
             func_name,
@@ -9546,7 +9553,8 @@ impl Gpu {
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols (see gate_up launcher).
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
@@ -9614,9 +9622,15 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
         let total_m = q_m + k_m + v_m;
-        let row_tiles = if slabs2 { (total_m + 31) / 32 } else { (total_m + 15) / 16 };
+        let row_tiles = if slabs2 {
+            (total_m + 31) / 32
+        } else {
+            (total_m + 15) / 16
+        };
         let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
-        let bytes = crate::profile::gemv_hfq4g256_bytes(total_m, k) + batch_size * k + batch_size * total_m * 4;
+        let bytes = crate::profile::gemv_hfq4g256_bytes(total_m, k)
+            + batch_size * k
+            + batch_size * total_m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
         let result = self.launch_maybe_blob(
             func_name,
@@ -27975,14 +27989,18 @@ impl Gpu {
                         a_beta, x, xq, y_beta, beta_m, k, batch_size,
                     )?;
                 } else {
-                    self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_beta, xq, y_beta, beta_m, k, batch_size)?;
+                    self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+                        a_beta, xq, y_beta, beta_m, k, batch_size,
+                    )?;
                 }
                 if alpha_m < 128 {
                     self.gemm_mq4g256v2_small_tail_set_iu4(
                         a_alpha, x, xq, y_alpha, alpha_m, k, batch_size,
                     )?;
                 } else {
-                    self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_alpha, xq, y_alpha, alpha_m, k, batch_size)?;
+                    self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+                        a_alpha, xq, y_alpha, alpha_m, k, batch_size,
+                    )?;
                 }
                 return Ok(());
             }
@@ -27993,9 +28011,7 @@ impl Gpu {
             // ~2/3 of its 128-row tile (283 us at N=512); route to the
             // measured-best small-M tail kernel (SET semantics).
             if beta_m < 128 {
-                self.gemm_mq4g256v2_small_tail_set(
-                    a_beta, x, xq, y_beta, beta_m, k, batch_size,
-                )?;
+                self.gemm_mq4g256v2_small_tail_set(a_beta, x, xq, y_beta, beta_m, k, batch_size)?;
             } else {
                 self.gemm_mq4g256v2_mmq_set_prequant(a_beta, xq, y_beta, beta_m, k, batch_size)?;
             }
@@ -29194,7 +29210,8 @@ impl Gpu {
         // Two-slab S2BT8 form by default (`HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols): each wave covers 32 rows, halving
         // the row grid. One env read per call.
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256. A masked BT12 tail beats the exact-divisor BT8/BT4 there
@@ -29260,7 +29277,11 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
         let total_m = gate_m + up_m;
-        let row_tiles = if slabs2 { (total_m + 31) / 32 } else { (total_m + 15) / 16 };
+        let row_tiles = if slabs2 {
+            (total_m + 31) / 32
+        } else {
+            (total_m + 15) / 16
+        };
         let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k)
@@ -29412,7 +29433,8 @@ impl Gpu {
                 "mq4v2-lloyd gate/up FP8 prefill: prepared (n,k) mismatch",
             ));
         }
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
             && batch_size % 128 == 0;
         let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
             (
@@ -29487,7 +29509,11 @@ impl Gpu {
             &mut u3 as *mut _ as *mut c_void,
         ];
         let total_m = gate_m + up_m;
-        let row_tiles = if slabs2 { (total_m + 31) / 32 } else { (total_m + 15) / 16 };
+        let row_tiles = if slabs2 {
+            (total_m + 31) / 32
+        } else {
+            (total_m + 15) / 16
+        };
         let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
         let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
             + crate::profile::gemv_hfq4g256_bytes(up_m, k)
@@ -29554,8 +29580,8 @@ impl Gpu {
         if batch_size % 64 == 0 {
             let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
             return self.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared_lloyd(
-                a_gate, a_up, &prepared, y_gate, y_up, gate_m, up_m, k, batch_size,
-                gate_lut, up_lut,
+                a_gate, a_up, &prepared, y_gate, y_up, gate_m, up_m, k, batch_size, gate_lut,
+                up_lut,
             );
         }
         let (x_padded, n_padded) = self.pad_f32_batch_to_64(x, batch_size, k)?;
@@ -29563,20 +29589,13 @@ impl Gpu {
         let mut yg_tmp = self.alloc_tensor(&[n_padded, gate_m], DType::F32)?;
         let mut yu_tmp = self.alloc_tensor(&[n_padded, up_m], DType::F32)?;
         let r = self.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared_lloyd(
-            a_gate, a_up, &prepared, &yg_tmp, &yu_tmp, gate_m, up_m, k, n_padded,
-            gate_lut, up_lut,
+            a_gate, a_up, &prepared, &yg_tmp, &yu_tmp, gate_m, up_m, k, n_padded, gate_lut, up_lut,
         );
         if r.is_ok() {
-            self.hip.memcpy_dtod(
-                &y_gate.buf,
-                &yg_tmp.buf,
-                batch_size * gate_m * 4,
-            )?;
-            self.hip.memcpy_dtod(
-                &y_up.buf,
-                &yu_tmp.buf,
-                batch_size * up_m * 4,
-            )?;
+            self.hip
+                .memcpy_dtod(&y_gate.buf, &yg_tmp.buf, batch_size * gate_m * 4)?;
+            self.hip
+                .memcpy_dtod(&y_up.buf, &yu_tmp.buf, batch_size * up_m * 4)?;
         }
         let _ = self.free_tensor(yg_tmp);
         let _ = self.free_tensor(yu_tmp);
@@ -29613,7 +29632,9 @@ impl Gpu {
             // iu4-direct MMQ (W4A4 prefill) opt-in; flag off is unchanged.
             if self.flags.gfx11_mmq_iu4_enabled() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
-                self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_gate, xq, y_gate, gate_m, k, batch_size)?;
+                self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+                    a_gate, xq, y_gate, gate_m, k, batch_size,
+                )?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
                 return Ok(());
             }
@@ -30140,7 +30161,8 @@ impl Gpu {
                 "mq4v2-lloyd residual FP8 prefill: prepared (n,k) mismatch",
             ));
         }
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
             && batch_size % 128 == 0;
         let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
             (
@@ -30259,10 +30281,12 @@ impl Gpu {
         // first N rows (pad rows zeroed) or the tail chunk drops the residual
         // stream — every odd-sized prefill chunk went incoherent this way.
         let (x_pad, tmps, n_pad) = self.pad_prefill_batch(x, &[m], batch_size, k)?;
-        self.hip.memcpy_dtod(&tmps[0].buf, &y.buf, batch_size * m * 4)?;
+        self.hip
+            .memcpy_dtod(&tmps[0].buf, &y.buf, batch_size * m * 4)?;
         if n_pad > batch_size {
             let tail = tmps[0].sub_offset(batch_size * m, (n_pad - batch_size) * m);
-            self.hip.memset(&tail.buf, 0, (n_pad - batch_size) * m * 4)?;
+            self.hip
+                .memset(&tail.buf, 0, (n_pad - batch_size) * m * 4)?;
         }
         let prepared = self.prepare_mq4v2_fp8_x(&x_pad, n_pad, k, scale_mode)?;
         let r = self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared_lloyd(
@@ -30353,7 +30377,8 @@ impl Gpu {
                 ),
             ));
         }
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
             && batch_size % 128 == 0;
         let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
             (
@@ -30456,7 +30481,11 @@ impl Gpu {
             &mut a3 as *mut _ as *mut c_void,
         ];
         let total_m = qkv_m + z_m + beta_m + alpha_m;
-        let row_tiles = if slabs2 { (total_m + 31) / 32 } else { (total_m + 15) / 16 };
+        let row_tiles = if slabs2 {
+            (total_m + 31) / 32
+        } else {
+            (total_m + 15) / 16
+        };
         let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
         let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
             + crate::profile::gemv_hfq4g256_bytes(z_m, k)
@@ -30544,16 +30573,16 @@ impl Gpu {
         if batch_size % 64 == 0 {
             let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
             return self.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd(
-                a_qkv, a_z, a_beta, a_alpha, &prepared, y_qkv, y_z, y_beta, y_alpha,
-                qkv_m, z_m, beta_m, alpha_m, k, batch_size, lqkv, lz, lbeta, lalpha,
+                a_qkv, a_z, a_beta, a_alpha, &prepared, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m,
+                beta_m, alpha_m, k, batch_size, lqkv, lz, lbeta, lalpha,
             );
         }
         let (x_pad, tmps, n_pad) =
             self.pad_prefill_batch(x, &[qkv_m, z_m, beta_m, alpha_m], batch_size, k)?;
         let prepared = self.prepare_mq4v2_fp8_x(&x_pad, n_pad, k, scale_mode)?;
         let r = self.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd(
-            a_qkv, a_z, a_beta, a_alpha, &prepared, &tmps[0], &tmps[1], &tmps[2], &tmps[3],
-            qkv_m, z_m, beta_m, alpha_m, k, n_pad, lqkv, lz, lbeta, lalpha,
+            a_qkv, a_z, a_beta, a_alpha, &prepared, &tmps[0], &tmps[1], &tmps[2], &tmps[3], qkv_m,
+            z_m, beta_m, alpha_m, k, n_pad, lqkv, lz, lbeta, lalpha,
         );
         if r.is_ok() {
             self.unpad_prefill_ys(
@@ -30641,7 +30670,8 @@ impl Gpu {
                 "mq4v2-lloyd qkv FP8 prefill: prepared (n,k) mismatch",
             ));
         }
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
             && batch_size % 128 == 0;
         let (func_name, ksrc, bv): (&str, &str, usize) = if slabs2 {
             (
@@ -30730,7 +30760,11 @@ impl Gpu {
             &mut v3 as *mut _ as *mut c_void,
         ];
         let total_m = q_m + k_m + v_m;
-        let row_tiles = if slabs2 { (total_m + 31) / 32 } else { (total_m + 15) / 16 };
+        let row_tiles = if slabs2 {
+            (total_m + 31) / 32
+        } else {
+            (total_m + 15) / 16
+        };
         let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
         let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
             + crate::profile::gemv_hfq4g256_bytes(k_m, k)
@@ -30806,16 +30840,14 @@ impl Gpu {
         if batch_size % 64 == 0 {
             let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
             return self.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd(
-                a_q, a_k, a_v, &prepared, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size,
-                lq, lk, lv,
+                a_q, a_k, a_v, &prepared, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size, lq, lk, lv,
             );
         }
-        let (x_pad, tmps, n_pad) =
-            self.pad_prefill_batch(x, &[q_m, k_m, v_m], batch_size, k)?;
+        let (x_pad, tmps, n_pad) = self.pad_prefill_batch(x, &[q_m, k_m, v_m], batch_size, k)?;
         let prepared = self.prepare_mq4v2_fp8_x(&x_pad, n_pad, k, scale_mode)?;
         let r = self.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd(
-            a_q, a_k, a_v, &prepared, &tmps[0], &tmps[1], &tmps[2], q_m, k_m, v_m, k,
-            n_pad, lq, lk, lv,
+            a_q, a_k, a_v, &prepared, &tmps[0], &tmps[1], &tmps[2], q_m, k_m, v_m, k, n_pad, lq,
+            lk, lv,
         );
         if r.is_ok() {
             self.unpad_prefill_ys(&[y_q, y_k, y_v], &[q_m, k_m, v_m], tmps, x_pad, batch_size)?;
@@ -30848,7 +30880,8 @@ impl Gpu {
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols (see gate_up launcher).
-        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref() != Ok("1")
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
@@ -31005,7 +31038,8 @@ impl Gpu {
             && batch_size >= 64
             && batch_size % 64 == 0
         {
-            return self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8(a_raw, x, y, m, k, batch_size, 1);
+            return self
+                .gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8(a_raw, x, y, m, k, batch_size, 1);
         }
         let bt_b: usize = if hipfire_config::developer_var("HIPFIRE_GATE_UP_BT")
             .map(|v| v != "0" && !v.is_empty())
@@ -32295,7 +32329,11 @@ impl Gpu {
             ));
         }
         let func_name = "fused_gate_up_mq4g256v2_lloyd";
-        self.ensure_kernel(func_name, kernels::FUSED_GATE_UP_MQ4G256V2_LUT_SRC, func_name)?;
+        self.ensure_kernel(
+            func_name,
+            kernels::FUSED_GATE_UP_MQ4G256V2_LUT_SRC,
+            func_name,
+        )?;
         let ag = a_gate.buf.as_ptr();
         let au = a_up.buf.as_ptr();
         let xp = x.buf.as_ptr();
@@ -32509,8 +32547,13 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(k_m, k)
             + crate::profile::gemv_hfq4g256_bytes(v_m, k);
         let timer = crate::profile::begin_timer(&self.hip, "fused", func_name, bytes);
-        let result =
-            self.launch_maybe_blob(func_name, [grid_x, 1, 1], [32, 1, 1], 0, &mut params, || {
+        let result = self.launch_maybe_blob(
+            func_name,
+            [grid_x, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(aq);
                 b.push_ptr(ak);
@@ -32527,7 +32570,8 @@ impl Gpu {
                     b.push_u32(*d);
                 }
                 b
-            });
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

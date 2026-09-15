@@ -1652,11 +1652,8 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
 /// units — see `crate::lloyd_lut`) and returns the centered kernel-arg LUTs.
 /// Hard-fails when the sidecar is absent or malformed: a Lloyd tensor without
 /// its codebook must fail the load, never silently decode on the uniform grid.
-pub fn load_lloyd_lut(
-    hfq: &HfqFile,
-    weight_name: &str,
-) -> Result<([u32; 4], [u32; 8]), HipError> {
-    use crate::lloyd_lut::{lloyd_luts_from_levels, lloyd_levels_from_sidecar, lloyd_sidecar_name};
+pub fn load_lloyd_lut(hfq: &HfqFile, weight_name: &str) -> Result<([u32; 4], [u32; 8]), HipError> {
+    use crate::lloyd_lut::{lloyd_levels_from_sidecar, lloyd_luts_from_levels, lloyd_sidecar_name};
     let sidecar = lloyd_sidecar_name(weight_name);
     let (info, data) = hfq.tensor_data_vec(&sidecar).ok_or_else(|| {
         HipError::new(
@@ -1722,9 +1719,8 @@ pub(crate) fn load_weight_tensor(
                 // Centered headers: zp → zp' BEFORE upload. `data` borrows the
                 // mmap, so center an owned copy (one memcpy per Lloyd tensor).
                 let mut centered = data.to_vec();
-                crate::lloyd_lut::apply_lloyd_centering(&mut centered, m, k).map_err(|e| {
-                    HipError::new(0, &format!("weight {st_name}: {e}"))
-                })?;
+                crate::lloyd_lut::apply_lloyd_centering(&mut centered, m, k)
+                    .map_err(|e| HipError::new(0, &format!("weight {st_name}: {e}")))?;
                 decode_raw_codec(gpu, c, &centered, m, k, &st_name)
             }
             None => Err(HipError::new(0, "qt=52 codec missing (stale RAW_CODECS)")),
@@ -1805,9 +1801,8 @@ pub fn load_weight_tensor_pread(
             Some(c) => {
                 // Owned Vec: center headers in place, then upload.
                 let mut centered = data;
-                crate::lloyd_lut::apply_lloyd_centering(&mut centered, m, k).map_err(|e| {
-                    HipError::new(0, &format!("weight {st_name}: {e}"))
-                })?;
+                crate::lloyd_lut::apply_lloyd_centering(&mut centered, m, k)
+                    .map_err(|e| HipError::new(0, &format!("weight {st_name}: {e}")))?;
                 decode_raw_codec(gpu, c, &centered, m, k, &st_name)
             }
             None => Err(HipError::new(0, "qt=52 codec missing (stale RAW_CODECS)")),

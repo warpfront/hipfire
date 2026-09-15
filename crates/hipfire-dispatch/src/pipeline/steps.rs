@@ -1134,7 +1134,12 @@ fn launch_fused(
             let (wz, z) = gemv_weight_out(&steps[2]);
             let (wb, beta) = gemv_weight_out(&steps[3]);
             let (wa, alpha) = gemv_weight_out(&steps[4]);
-            let luts = [lloyd_lut(wqkv)?, lloyd_lut(wz)?, lloyd_lut(wb)?, lloyd_lut(wa)?];
+            let luts = [
+                lloyd_lut(wqkv)?,
+                lloyd_lut(wz)?,
+                lloyd_lut(wb)?,
+                lloyd_lut(wa)?,
+            ];
             gpu.fused_qkvza_mq4g256v2_lloyd(
                 wqkv.buf, wz.buf, wb.buf, wa.buf, activated, qkv, z, beta, alpha, wqkv.m, wz.m,
                 wb.m, wa.m, wqkv.k, luts,
@@ -1666,7 +1671,11 @@ mod tests {
 
     // ── MQ4G256V2 / Lloyd scalar-fusion arch admission (T1 gfx1151) ──
 
-    fn weight_ref_v2<'a>(dummy: &'a GpuTensor, dtype: DType, lut: Option<[u32; 8]>) -> WeightRef<'a> {
+    fn weight_ref_v2<'a>(
+        dummy: &'a GpuTensor,
+        dtype: DType,
+        lut: Option<[u32; 8]>,
+    ) -> WeightRef<'a> {
         WeightRef {
             buf: dummy,
             dtype,
@@ -1680,10 +1689,7 @@ mod tests {
         }
     }
 
-    fn make_qkv3_window<'a>(
-        dummy: &'a GpuTensor,
-        wr: &'a WeightRef<'a>,
-    ) -> [Step<'a>; 4] {
+    fn make_qkv3_window<'a>(dummy: &'a GpuTensor, wr: &'a WeightRef<'a>) -> [Step<'a>; 4] {
         [
             Step::RmsnormAutomatic {
                 x: dummy,
@@ -1713,10 +1719,7 @@ mod tests {
         ]
     }
 
-    fn make_gate_up_window<'a>(
-        dummy: &'a GpuTensor,
-        wr: &'a WeightRef<'a>,
-    ) -> [Step<'a>; 3] {
+    fn make_gate_up_window<'a>(dummy: &'a GpuTensor, wr: &'a WeightRef<'a>) -> [Step<'a>; 3] {
         [
             Step::RmsnormAutomatic {
                 x: dummy,
@@ -1741,10 +1744,7 @@ mod tests {
         ]
     }
 
-    fn make_qkvza_window<'a>(
-        dummy: &'a GpuTensor,
-        wr: &'a WeightRef<'a>,
-    ) -> [Step<'a>; 5] {
+    fn make_qkvza_window<'a>(dummy: &'a GpuTensor, wr: &'a WeightRef<'a>) -> [Step<'a>; 5] {
         [
             Step::RmsnormAutomatic {
                 x: dummy,
@@ -1913,5 +1913,4 @@ mod tests {
             "force_unfused must still win on gfx1151"
         );
     }
-
 }

@@ -563,9 +563,9 @@ activation path divides by the scale before FWHT; the weight path remains
 
 | Tier name | Role |
 |---|---|
-| `mq4-lxt` | Lloyd XT (light / bandwidth) |
+| `mq4l-xt` | Lloyd XT (light / bandwidth) |
 | `mq4l` / `mq4-l` | Lloyd base |
-| `mq4-lpro` | Lloyd pro (heavier cal / AWQ stack) |
+| `mq4l-pro` | Lloyd pro (heavier cal / AWQ stack) |
 
 Wire id is always qt=52; tier labels are ladder/product names, not separate
 codecs. See [`QUANTIZATION.md`](../QUANTIZATION.md) inventory and

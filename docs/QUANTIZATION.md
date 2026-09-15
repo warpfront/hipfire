@@ -58,7 +58,7 @@ and adds a per-tensor F32[16] `lloyd_levels` sidecar (see
 | `mq5v2` | **48** | `MQ5G256V2` | 168 | Dense product candidate (ladder) |
 | `mq3v2` | **49** | `MQ3G256V2` | 104 | Dense product candidate (ladder) |
 | `mq2v2` | **50** | `MQ2G256V2` | 72 | **Wire + runtime supported; product quality-rejected** |
-| `mq4v2lloyd` / tiers `mq4-lxt` · `mq4l` · `mq4-lpro` | **52** | `MQ4G256V2Lloyd` | 136 + `lloyd_levels` | V2 wire + per-tensor 16-level Lloyd codebook; product tiers vs AWQ'd uniform |
+| `mq4v2lloyd` / tiers `mq4l-xt` · `mq4l` · `mq4l-pro` | **52** | `MQ4G256V2Lloyd` | 136 + `lloyd_levels` | V2 wire + per-tensor 16-level Lloyd codebook; product tiers vs AWQ'd uniform |
 
 **Wire implementation ≠ product admission.** MQ2V2 loads, decodes, and passes
 parity, but measured Qwen3.8 ladder KLD is catastrophic (~12–14 nats WT2/v6sel).
@@ -299,7 +299,7 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 | 49 | MQ3G256V2 | Magnum 3-bit V2 — 104 B |
 | 50 | MQ2G256V2 | Magnum 2-bit V2 — 72 B; **wire OK, product rejected** |
 | 51 | MQ2G256LloydU | Maple Lloyd-U passthrough (register) |
-| 52 | MQ4G256V2L | **MQ4 V2 + per-tensor Lloyd codebook** — 136 B group + `lloyd_levels` F32[16] sidecar; product tiers `mq4-lxt` / `mq4l` / `mq4-lpro` |
+| 52 | MQ4G256V2L | **MQ4 V2 + per-tensor Lloyd codebook** — 136 B group + `lloyd_levels` F32[16] sidecar; product tiers `mq4l-xt` / `mq4l` / `mq4l-pro` |
 
 **Current reserved wire IDs:** 23 and 25–27 only. IDs **22, 29, and 30 were
 reassigned** (TidI32, PARO4G128T, MQ4G256Lloyd). qt **42–43 and 46** are not
