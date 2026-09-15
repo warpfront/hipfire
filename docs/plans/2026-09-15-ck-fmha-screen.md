@@ -58,7 +58,7 @@ traits of interest for product-like run:
   nlogits, nbias, mask (causal), nlse, ndropout, nskip, nqscale, ntrload, nsink
 ```
 
-GQA is a **host stride / nhead_q vs nhead_k** concern, not a separate tile family: set `-h=48 -h_k=8`.
+GQA is a **host stride / nhead_q vs nhead_k** concern, not a separate tile family: set `-h=24 -h_k=4`.
 
 **Mask choice for fair causal chunk vs long K cache:**  
 When `seqlen_q=512` and `seqlen_k=8192`, **top-left** causal (`-mask=t`) makes query `i` see only keys `0..i` (far too little work vs hipfire positions near the end of context). Use **bottom-right** causal (`-mask=b` or `-mask=2`) so local query `i` attends through key index roughly `s_k - s_q + i` (last queries see the full prefix). That matches "512 new rows at the end of an 8192/32768 cache" better than top-left. Record both if curious; **kill decision uses `-mask=b`**.
@@ -171,13 +171,13 @@ run_one () {
 }
 
 # Primary kill shapes (bottom-right causal; see §1.2)
-run_one "q512_k8192_br"  -b=1 -h=48 -h_k=8 -s=512 -s_k=8192  -d=128 -mask=b
-run_one "q512_k32768_br" -b=1 -h=48 -h_k=8 -s=512 -s_k=32768 -d=128 -mask=b
+run_one "q512_k8192_br"  -b=1 -h=24 -h_k=4 -s=512 -s_k=8192  -d=256 -mask=b
+run_one "q512_k32768_br" -b=1 -h=24 -h_k=4 -s=512 -s_k=32768 -d=256 -mask=b
 
 # Diagnostics (do not use for kill alone)
-run_one "q512_k8192_tl"   -b=1 -h=48 -h_k=8 -s=512 -s_k=8192  -d=128 -mask=t
-run_one "q512_k4352_br"   -b=1 -h=48 -h_k=8 -s=512 -s_k=4352  -d=128 -mask=b
-run_one "q8192_k8192_tl"  -b=1 -h=48 -h_k=8 -s=8192 -s_k=8192 -d=128 -mask=t
+run_one "q512_k8192_tl"   -b=1 -h=24 -h_k=4 -s=512 -s_k=8192  -d=256 -mask=t
+run_one "q512_k4352_br"   -b=1 -h=24 -h_k=4 -s=512 -s_k=4352  -d=256 -mask=b
+run_one "q8192_k8192_tl"  -b=1 -h=24 -h_k=4 -s=8192 -s_k=8192 -d=256 -mask=t
 
 echo
 echo "=== parse ms (ave_time field printed as ', X.XXX ms,') ==="
@@ -220,7 +220,7 @@ The runner prints average kernel time after warmup/repeat as:
 - Official one-liner from README:  
   `../script/cmake-ck-dev.sh .. gfx1151 -G Ninja && ninja tile_example_fmha_fwd`  
   then  
-  `./bin/tile_example_fmha_fwd -b=1 -h=48 -h_k=8 -s=512 -s_k=8192 -d=128 -mask=b -v=0 -warmup=10 -repeat=50 -kname=1`
+  `./bin/tile_example_fmha_fwd -b=1 -h=24 -h_k=4 -s=512 -s_k=8192 -d=256 -mask=b -v=0 -warmup=10 -repeat=50 -kname=1`
 
 ## 4. Published / known gfx11 FMHA throughput numbers
 
