@@ -246,7 +246,13 @@ fn dispatch_batched_gemm_epilogue(
                 if lloyd_mmq_lut_route(gpu) {
                     let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
                     return gpu.gemm_hfq4g256_residual_mmq_lloyd(
-                        &w.buf, input, &pbs.x_batch, m, k, n, c16,
+                        &w.buf,
+                        input,
+                        &pbs.x_batch,
+                        m,
+                        k,
+                        n,
+                        c16,
                     );
                 }
                 let lut = lloyd_e4m3_or_fail(w, "dispatch_batched_gemm_epilogue")?;
@@ -359,9 +365,8 @@ fn dispatch_batched_gemm_epilogue(
                 zero_partial_for_residual(gpu, out, n, m)?;
                 if lloyd_mmq_lut_route(gpu) {
                     let c16 = lloyd_c16_or_fail(w, "dispatch_batched_gemm_epilogue")?;
-                    return gpu.gemm_hfq4g256_residual_mmq_lloyd(
-                        &w.buf, input, &out_n, m, k, n, c16,
-                    );
+                    return gpu
+                        .gemm_hfq4g256_residual_mmq_lloyd(&w.buf, input, &out_n, m, k, n, c16);
                 }
                 let lut = lloyd_e4m3_or_fail(w, "dispatch_batched_gemm_epilogue")?;
                 return gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd(
@@ -2928,7 +2933,6 @@ fn lloyd_mmq_lut_route(gpu: &Gpu) -> bool {
             .as_deref()
             != Some("1")
 }
-
 
 /// True when all listed projection dtypes are the Lloyd-V2 dtype.
 #[inline]

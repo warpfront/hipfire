@@ -1762,6 +1762,8 @@ mod tests {
             // qt=44/45: 136 B/group pad layouts (PR599). MQ4C is NOT 132.
             (44, DType::MQ4G256V2),
             (45, DType::MQ4CG256),
+            // qt=52: MQ4V2 container + per-tensor Lloyd codebook sidecar (136 B/G256).
+            (52, DType::MQ4G256V2Lloyd),
             // Neutral-size Magnum V2 family (qt47-50): preserve qtype distinction;
             // do not alias to legacy MQ2/3/5/6. Each maps one-to-one to its V2 DType.
             (47, DType::MQ6G256V2), // 200 B/G256 6.25bpw

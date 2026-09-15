@@ -142,9 +142,6 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 name = "coherence_probe"
 required-features = []
 
-[[example]]
-name = "tmp_lloyd_mmq_diff"
-required-features = []
 
 [[example]]
 name = "bench_qwen35_mq4"
