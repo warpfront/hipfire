@@ -2,6 +2,19 @@
 
 Date: 2026-09-15, revision after the plateaued peak probe. Worktree: `/home/kaden/ClaudeCode/warpfront/wt-lloyd`, branch `mq4-lloyd`. **Plan of record for a new candidate, not admission or a measured kernel result.** This revision changes only this document. No source edits, builds, GPU runs, formatters, linters, or project suites were performed by the planning agent. Main owns compilation and every Halo gate; an independent reviewer owns the final veto.
 
+> **STATUS 2026-09-15 (parent) — WS4 REJECTED after both bounded iterations.**
+> Metadata: first object 256 VGPR / 391 spills (the ≤300 ceiling was above the
+> 256 architectural cap); WS4 revision 256 / 124; after producer role-split +
+> packetization 256 / 27; after pinning the fold before the barrier (ISA showed
+> SelectionDAG sinking all four jbase folds past B0, 16 chains live) 216 / 0.
+> Paired oracle on gfx1151 (100 interleaved): gate set −6.2 %, down add −7.8 %
+> vs shipping — far from the ≥30 % (70 % of the 107.8 TOPS peak) gate — and
+> 1-ulp f32 fold drift everywhere (the pin changed FMA contraction), so not
+> bit-exact either. Producer waves at one WG/CU do not reproduce the probe's
+> issue rate. Removed. Successor: W3 — independent chains inside the shipping
+> 8-wave / 2-WG structure, ≤192 VGPR, fold macro untouched (local hipcc
+> resource-usage workflow).
+
 ## 1. Decision and immutable constraints
 
 **Select WS4: eight compute waves with four independent output chains/wave, plus two loader waves; one320-thread WG/CU; two A planes and two Xq-half planes,61,440 bytes LDS.** Keep `sum[64]`, the128×128 output tile, original row/column tile walk, K256 group/fold boundaries and seven-argument ABI. Loader waves stream into planes not read by the compute waves; there is no pending global-load array in compute waves. Balance each steady-state loader phase as64 **whole weight rows** of the next group plus one128-column Xq half:17,920 logical bytes. Each group uses two producer/consumer rendezvous barriers, rather than four serialized fill/compute barriers.
