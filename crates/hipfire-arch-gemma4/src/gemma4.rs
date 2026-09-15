@@ -114,6 +114,8 @@ fn load_wt(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
         });
     }
     let dtype = match info.quant_type {
@@ -129,6 +131,8 @@ fn load_wt(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             });
         }
         3 => DType::Q8_0,
@@ -161,6 +165,8 @@ fn load_wt(
         row_stride: 0,
         paro: None,
         awq_scale,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
     })
 }
 
@@ -354,6 +360,8 @@ impl Gemma4Weights {
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             }
         };
 

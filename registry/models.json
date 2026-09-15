@@ -937,6 +937,114 @@
         "size_bytes": 927611840
       }
     },
+    "qwen3.8:27b-mq4-lxt": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq4v2l.xt",
+      "size_gb": 15.0,
+      "min_vram_gb": 16,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ4V2-Lloyd XT tier (qt=52). Same wire as MQ4V2 + per-tensor 16-level Lloyd codebook sidecars. Native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      }
+    },
+    "qwen3.8:27b-mq4l": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq4v2l.base",
+      "size_gb": 15.7,
+      "min_vram_gb": 17,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ4V2-Lloyd base tier (qt=52). Same wire as MQ4V2 + per-tensor 16-level Lloyd codebook sidecars. Native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      }
+    },
+    "qwen3.8:27b-mq4-lpro": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq4v2l.pro",
+      "size_gb": 16.5,
+      "min_vram_gb": 18,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ4V2-Lloyd Pro tier (qt=52). Same wire as MQ4V2 + per-tensor 16-level Lloyd codebook sidecars. Native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      }
+    },
     "qwen3.8:27b-mq5-xt": {
       "repo": "hipfire-models/qwen3.8-27b",
       "file": "qwen3.8-27b.mq5-xt",

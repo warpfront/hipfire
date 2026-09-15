@@ -22,10 +22,25 @@
 // identical: still ((x*w)*rms)*s1 then FWHT then *s2/16. Only load
 // issue time moves earlier.
 
+// -DHIPFIRE_RMSNORM_AWQ=1 builds the AWQ twin `fused_rmsnorm_mq_rotate_awq`:
+// one extra `awq_scale[K]` argument, divided in AFTER the rms multiply and
+// BEFORE the sign/FWHT (`(((x*w)*rms)/s)*sign`), completing `(W·s)·(x/s)`.
+// Same phases, prefetch, and reduction tree as the uniform symbol; the scale
+// rides the same float4 prefetch as x/weight. Uniform builds are textually
+// unchanged.
+#ifdef HIPFIRE_RMSNORM_AWQ
+#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq
+#else
+#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate
+#endif
+
 __launch_bounds__(256, 1)
-extern "C" __global__ void fused_rmsnorm_mq_rotate(
+extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     const float* __restrict__ x,
     const float* __restrict__ weight,
+#ifdef HIPFIRE_RMSNORM_AWQ
+    const float* __restrict__ awq_scale,
+#endif
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     float* __restrict__ x_rot,
@@ -61,6 +76,9 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
     const int d0 = lane_id * 8;
 
     float4 pref_x0, pref_x1, pref_w0, pref_w1;
+#ifdef HIPFIRE_RMSNORM_AWQ
+    float4 pref_a0, pref_a1;
+#endif
     float4 s10, s11, s20, s21;
     const int pref_group = warp_group_start;
     const bool have_pref = (groups_per_warp > 0 && pref_group < groups_total);
@@ -70,6 +88,10 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
         pref_x1 = *reinterpret_cast<const float4*>(x_b + base + 4);
         pref_w0 = *reinterpret_cast<const float4*>(weight + base);
         pref_w1 = *reinterpret_cast<const float4*>(weight + base + 4);
+#ifdef HIPFIRE_RMSNORM_AWQ
+        pref_a0 = *reinterpret_cast<const float4*>(awq_scale + base);
+        pref_a1 = *reinterpret_cast<const float4*>(awq_scale + base + 4);
+#endif
     }
     // signs1/2 are indexed only by lane (not group) — load once for the warp.
     s10 = *reinterpret_cast<const float4*>(signs1 + d0);
@@ -106,16 +128,38 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
         const int base = group * 256 + d0;
 
         float4 x0, x1, w0, w1;
+#ifdef HIPFIRE_RMSNORM_AWQ
+        float4 a0, a1;
+#endif
         if (gi == 0 && have_pref) {
             x0 = pref_x0; x1 = pref_x1;
             w0 = pref_w0; w1 = pref_w1;
+#ifdef HIPFIRE_RMSNORM_AWQ
+            a0 = pref_a0; a1 = pref_a1;
+#endif
         } else {
             x0 = *reinterpret_cast<const float4*>(x_b + base);
             x1 = *reinterpret_cast<const float4*>(x_b + base + 4);
             w0 = *reinterpret_cast<const float4*>(weight + base);
             w1 = *reinterpret_cast<const float4*>(weight + base + 4);
+#ifdef HIPFIRE_RMSNORM_AWQ
+            a0 = *reinterpret_cast<const float4*>(awq_scale + base);
+            a1 = *reinterpret_cast<const float4*>(awq_scale + base + 4);
+#endif
         }
 
+#ifdef HIPFIRE_RMSNORM_AWQ
+        // Exact order of the retired LDS-staged AWQ kernel:
+        // (((x * weight) * rms) / awq_scale) * sign.
+        float v0 = (x0.x * w0.x * rms / a0.x) * s10.x;
+        float v1 = (x0.y * w0.y * rms / a0.y) * s10.y;
+        float v2 = (x0.z * w0.z * rms / a0.z) * s10.z;
+        float v3 = (x0.w * w0.w * rms / a0.w) * s10.w;
+        float v4 = (x1.x * w1.x * rms / a1.x) * s11.x;
+        float v5 = (x1.y * w1.y * rms / a1.y) * s11.y;
+        float v6 = (x1.z * w1.z * rms / a1.z) * s11.z;
+        float v7 = (x1.w * w1.w * rms / a1.w) * s11.w;
+#else
         // Exact multiply order: ((x * weight) * rms) * sign.
         float v0 = x0.x * w0.x * rms * s10.x;
         float v1 = x0.y * w0.y * rms * s10.y;
@@ -125,6 +169,7 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
         float v5 = x1.y * w1.y * rms * s11.y;
         float v6 = x1.z * w1.z * rms * s11.z;
         float v7 = x1.w * w1.w * rms * s11.w;
+#endif
 
         // Local butterfly: strides 1, 2, 4.
         float t;

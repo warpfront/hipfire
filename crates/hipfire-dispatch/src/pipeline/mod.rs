@@ -114,6 +114,8 @@ pub fn execute_pipeline(
                     row_stride: params.k,
                     rotation: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
                 };
                 gemv.run_auto(ctx, gpu, &w, params.x, params.y)?;
             }
@@ -513,6 +515,12 @@ pub fn run_uniform_moe_gate_up(
                 k,
             ))
         }
+        // qt=52 has NO indexed-LUT MoE kernel: fail closed naming the family.
+        // Lloyd routed experts take the generic per-expert fallback (per-expert
+        // LUT GEMVs through GemvFamily), never this indexed path.
+        DType::MQ4G256V2Lloyd => Err(DispatchError::Hip(format!(
+            "moe indexed gate/up: MQ4G256V2Lloyd has no indexed LUT kernel; refusing uniform decode"
+        ))),
         other => Err(DispatchError::Hip(format!(
             "uniform indexed gate/up unsupported dtype {other:?}"
         ))),
@@ -578,6 +586,10 @@ pub fn run_uniform_moe_down_expanded(
             k_top,
             batch_size,
         )),
+        // qt=52 has NO indexed-LUT MoE kernel: fail closed naming the family.
+        DType::MQ4G256V2Lloyd => Err(DispatchError::Hip(format!(
+            "moe indexed down: MQ4G256V2Lloyd has no indexed LUT kernel; refusing uniform decode"
+        ))),
         other => Err(DispatchError::Hip(format!(
             "uniform expanded down unsupported dtype {other:?}"
         ))),
@@ -1050,7 +1062,13 @@ pub(super) fn run_moe_decode(
                 p.shared_down_w.m,
                 p.shared_down_w.k,
             ))?;
-        } else if matches!(p.shared_down_w.dtype, DType::MQ4G256V2 | DType::MQ6G256V2) {
+        // qt=52 rides this exact-V2 arm (NOT the V1 sigmoid_scaled launcher):
+        // silu+FWHT, then the GemvFamily prerotated LUT kernel + scalar add.
+        // The k512 fused launcher below stays exact-qt44-only.
+        } else if matches!(
+            p.shared_down_w.dtype,
+            DType::MQ4G256V2 | DType::MQ6G256V2 | DType::MQ4G256V2Lloyd
+        ) {
             // Exact dense V2 shared-down. qt44/qt47 dual-half headers MUST NOT
             // ride the V1 HFQ4 residual_sigmoid kernel (silent fluent corruption).
             // Sequence mirrors MQ4: silu+FWHT → prerotated dense V2 GEMV →
@@ -1998,7 +2016,13 @@ fn run_moe_decode_cpu_fallback(
             p.shared_down_w.m,
             p.shared_down_w.k,
         ))?;
-    } else if matches!(p.shared_down_w.dtype, DType::MQ4G256V2 | DType::MQ6G256V2) {
+    // qt=52 rides this exact-V2 arm (NOT the V1 sigmoid_scaled launcher):
+    // silu+FWHT, then the GemvFamily prerotated LUT kernel + scalar add.
+    // The k512 fused launcher below stays exact-qt44-only.
+    } else if matches!(
+        p.shared_down_w.dtype,
+        DType::MQ4G256V2 | DType::MQ6G256V2 | DType::MQ4G256V2Lloyd
+    ) {
         // Exact dense V2 — never residual_sigmoid_scaled HFQ4 (V1 header).
         hip!(gpu.ensure_mq_signs())?;
         let x_rot_alias = unsafe {

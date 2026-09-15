@@ -75,6 +75,20 @@ fn guard_fused_qkv_dtype_key(weights: &[&GpuTensor], key: KernelKey) -> Result<(
     let is_v2 = is_fused_v2_key(key);
     let is_mq4c = is_fused_mq4cg256_key(key);
     let is_mq4v2 = is_fused_mq4v2_key(key);
+    // qt=52 (Lloyd-V2): NO fused decode/prefill kernel exists (fused kernels
+    // decode the uniform grid; the LUT live in per-tensor kernel args the
+    // fused ABIs don't carry). Any Lloyd weight arriving here — with ANY key —
+    // is a missing re-arm at the callsite: refuse, never silent-uniform.
+    for (idx, w) in weights.iter().enumerate() {
+        if w.dtype == DType::MQ4G256V2Lloyd {
+            return Err(DispatchError::Hip(format!(
+                "fused_qkv family: qt=52 (MQ4G256V2Lloyd) weight[{idx}] (dtype {:?}) routed to fused kernel key {key:?}: \
+                 no fused LUT kernel exists — decode must use per-projection LUT GEMVs \
+                 (gemv_mq4g256v2_lloyd / residual_lloyd) and prefill the FP8-LUT launchers (*_fp8_lloyd).",
+                w.dtype
+            )));
+        }
+    }
     for (idx, w) in weights.iter().enumerate() {
         let w_is_v2 = is_v2_dtype(w.dtype);
         let w_is_mq4v2 = w.dtype == DType::MQ4G256V2;

@@ -19,13 +19,12 @@
 //   stride sum-of-squares, first-group float4 prefetch under the reduction,
 //   warp-shuffle reduction tree, rsqrt, `((x*w)*rms)*s1`, local +
 //   ds_swizzle butterflies, `(v*s)*s2` stores.
-// - `fused_rmsnorm_mq_rotate_awq_f16` clones the gfx1100 AWQ path op order
-//   shared bit-exactly by `fused_rmsnorm_mq_rotate_awq` and
-//   `fused_rmsnorm_mq_rotate_awq_direct_gfx1100`: scalar stride
-//   sum-of-squares, descending-offset LDS reduction tree, rsqrt,
-//   `((x*w)*rms/awq)*s1`, identical butterflies, `(v*scale)*s2` stores.
-//   (The two AWQ baselines differ only in LDS staging, never in value
-//   operation order, so one F16 clone matches whichever baseline runs.)
+// - `fused_rmsnorm_mq_rotate_awq_f16` clones the retired LDS-staged AWQ
+//   kernel's op order: scalar stride sum-of-squares, descending-offset LDS
+//   reduction tree, rsqrt, `((x*w)*rms/awq)*s1`, identical butterflies,
+//   `(v*scale)*s2` stores. The F32 AWQ symbol is now derived from
+//   `fused_rmsnorm_mq_rotate.hip` (shuffle reduction tree, same value op
+//   order); the two can differ in the last ulp of `rms` only.
 //
 // Grid: [batch_size, 1, 1]. Block: [256]. The plain kernel takes the same
 // oversized `(K+256)*4` dynamic-shared reservation as its baseline launcher
@@ -188,8 +187,9 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate_f16(
 
 // AWQ exact-FP16 producer. Clones the gfx1100 AWQ value operation order
 // (scalar stride sum, descending-offset LDS reduction tree, IEEE divide
-// before the FWHT, float4 group loop) shared bit-exactly by
-// fused_rmsnorm_mq_rotate_awq and fused_rmsnorm_mq_rotate_awq_direct_gfx1100.
+// before the FWHT, float4 group loop) of the retired LDS-staged
+// fused_rmsnorm_mq_rotate_awq; the live F32 symbol shares the value op order
+// but reduces with the uniform kernel's shuffle tree.
 //
 // Grid: [batch]. Block: [256]. LDS: 256 floats for the exact RMS tree.
 __launch_bounds__(256, 1)

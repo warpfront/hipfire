@@ -308,6 +308,15 @@ pub enum DType {
     /// Little-endian, low 16 scale / high 16 zero per dword, half-wave uniform,
     /// lane-invariant scalar loads. `K % 256 == 0`, 4.25 bpw.
     MQ4G256V2,
+    /// MQ4-G256 v2 Lloyd (qt=52): FWHT-rotated, 136 B/group, wire layout
+    /// BYTE-IDENTICAL to MQ4G256V2 (dual fp16 half-grids + 128 B nibbles).
+    /// Nibble q decodes through a PER-TENSOR 16-level centered codebook
+    /// `w = sc·(C[q]) + zp'` with `C[q] = L[q]−7.5` (sidecar `lloyd_levels`,
+    /// f32[16] in [0,15] units, E4M3-snapped) and rewritten headers
+    /// `zp' = fp16(zp+7.5·sc)` per half (loader-applied; the file keeps the
+    /// uncentered zp). `K % 256 == 0`, 4.25 bpw. NEVER decoded by a uniform
+    /// kernel: every dispatch arm must check the LUT variant / fail closed.
+    MQ4G256V2Lloyd,
     /// MQ4-G256-C (qt=45): FWHT-rotated, 136 B/group, 4.25 bpw, pad layout:
     /// per group 136 B: `[0..4)` fp16 header (low scale, high zero), `[4..8)` zero padding,
     /// `[8..136)` 128 B nibbles at same offset as v1 (MQ4G256). ONE affine grid per 256
@@ -419,6 +428,7 @@ impl DType {
             | DType::HFQ6G256
             | DType::MQ4G256
             | DType::MQ4G256V2
+            | DType::MQ4G256V2Lloyd
             | DType::MQ4CG256
             | DType::MQ6G256V2
             | DType::MQ5G256V2
@@ -517,6 +527,10 @@ impl DType {
                 // That is the May 2026 regression this predicate was centralised to
                 // prevent; qt=44's artifact carries 496 sidecars.
                 | DType::MQ4G256V2
+                // qt=52 shares qt=44's AWQ contract exactly (same pipeline,
+                // same rotate-step x/s division). Omitting it silently drops
+                // the sidecar → (W·s)·x scale error on every projection.
+                | DType::MQ4G256V2Lloyd
                 // qt=45 shares qt=13/qt=44's AWQ contract exactly — same failure mode
                 // if omitted: silent sidecar drop → (W·s)·x. Include it.
                 | DType::MQ4CG256
@@ -557,6 +571,7 @@ impl DType {
                 | DType::MQ2G256GL
                 | DType::MQ3G256GL
                 | DType::MQ4G256V2
+                | DType::MQ4G256V2Lloyd
                 | DType::MQ4CG256
                 | DType::MQ6G256V2
                 | DType::MQ5G256V2

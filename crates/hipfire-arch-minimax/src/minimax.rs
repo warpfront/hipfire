@@ -379,6 +379,8 @@ fn wt_from_raw(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
     })
 }
 
@@ -1187,6 +1189,8 @@ fn load_wt_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
     })
 }
 
@@ -1342,6 +1346,8 @@ pub fn load_weights_from_safetensors(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             }
         };
         let mut down = {
@@ -1356,6 +1362,8 @@ pub fn load_weights_from_safetensors(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             }
         };
         drop(gu_combined);

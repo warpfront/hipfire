@@ -1646,6 +1646,36 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
     gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
 }
 
+/// Load an MQ4G256V2-Lloyd (qt=52) codebook sidecar and build kernel LUTs.
+///
+/// Reads `<weight>.lloyd_levels.weight` (F32, shape [16], levels in [0,15]
+/// units — see `crate::lloyd_lut`) and returns the centered kernel-arg LUTs.
+/// Hard-fails when the sidecar is absent or malformed: a Lloyd tensor without
+/// its codebook must fail the load, never silently decode on the uniform grid.
+pub fn load_lloyd_lut(
+    hfq: &HfqFile,
+    weight_name: &str,
+) -> Result<([u32; 4], [u32; 8]), HipError> {
+    use crate::lloyd_lut::{lloyd_luts_from_levels, lloyd_levels_from_sidecar, lloyd_sidecar_name};
+    let sidecar = lloyd_sidecar_name(weight_name);
+    let (info, data) = hfq.tensor_data_vec(&sidecar).ok_or_else(|| {
+        HipError::new(
+            0,
+            &format!(
+                "MQ4G256V2Lloyd weight {weight_name} has no codebook sidecar {sidecar}: \
+                 re-quantize with a build that emits lloyd_levels (F32 [16])"
+            ),
+        )
+    })?;
+    let levels = lloyd_levels_from_sidecar(info.quant_type, &info.shape, &data).map_err(|e| {
+        HipError::new(
+            0,
+            &format!("MQ4G256V2Lloyd weight {weight_name} sidecar {sidecar} invalid: {e}"),
+        )
+    })?;
+    Ok(lloyd_luts_from_levels(&levels))
+}
+
 /// Load a weight tensor (quantized or F16) onto GPU.
 pub(crate) fn load_weight_tensor(
     hfq: &HfqFile,
@@ -1683,8 +1713,22 @@ pub(crate) fn load_weight_tensor(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
+        52 => match raw_codec(52) {
+            Some(c) => {
+                // Centered headers: zp → zp' BEFORE upload. `data` borrows the
+                // mmap, so center an owned copy (one memcpy per Lloyd tensor).
+                let mut centered = data.to_vec();
+                crate::lloyd_lut::apply_lloyd_centering(&mut centered, m, k).map_err(|e| {
+                    HipError::new(0, &format!("weight {st_name}: {e}"))
+                })?;
+                decode_raw_codec(gpu, c, &centered, m, k, &st_name)
+            }
+            None => Err(HipError::new(0, "qt=52 codec missing (stale RAW_CODECS)")),
+        },
         other => match raw_codec(other) {
             Some(c) => decode_raw_codec(gpu, c, data, m, k, &st_name),
             None => Err(HipError::new(
@@ -1702,6 +1746,14 @@ pub(crate) fn load_weight_tensor(
     // per-loader hunt. See dispatch.rs for the allow-list rationale.
     if wt.gpu_dtype.supports_awq_sidecar() {
         wt.awq_scale = load_awq_scale(hfq, gpu, &st_name, k);
+    }
+    // Lloyd codebook attachment: fail CLOSED when a qt=52 tensor has no
+    // valid sidecar (load_lloyd_lut errors). `lloyd_lut_*` stay None for
+    // every other dtype; dispatch refuses Lloyd tensors with None LUTs.
+    if wt.gpu_dtype == DType::MQ4G256V2Lloyd {
+        let (e4m3, f16) = load_lloyd_lut(hfq, &st_name)?;
+        wt.lloyd_lut_e4m3 = Some(e4m3);
+        wt.lloyd_lut_f16 = Some(f16);
     }
     Ok(wt)
 }
@@ -1745,8 +1797,21 @@ pub fn load_weight_tensor_pread(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
+        52 => match raw_codec(52) {
+            Some(c) => {
+                // Owned Vec: center headers in place, then upload.
+                let mut centered = data;
+                crate::lloyd_lut::apply_lloyd_centering(&mut centered, m, k).map_err(|e| {
+                    HipError::new(0, &format!("weight {st_name}: {e}"))
+                })?;
+                decode_raw_codec(gpu, c, &centered, m, k, &st_name)
+            }
+            None => Err(HipError::new(0, "qt=52 codec missing (stale RAW_CODECS)")),
+        },
         other => match raw_codec(other) {
             Some(c) => decode_raw_codec(gpu, c, &data, m, k, &st_name),
             None => Err(HipError::new(
@@ -1757,6 +1822,11 @@ pub fn load_weight_tensor_pread(
     }?;
     if wt.gpu_dtype.supports_awq_sidecar() {
         wt.awq_scale = load_awq_scale(hfq, gpu, &st_name, k);
+    }
+    if wt.gpu_dtype == DType::MQ4G256V2Lloyd {
+        let (e4m3, f16) = load_lloyd_lut(hfq, &st_name)?;
+        wt.lloyd_lut_e4m3 = Some(e4m3);
+        wt.lloyd_lut_f16 = Some(f16);
     }
     Ok(wt)
 }
@@ -2146,6 +2216,8 @@ fn load_fp16_weight_tensor_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
     })
 }
 
@@ -2256,6 +2328,8 @@ pub fn load_weights_paroquant_llama(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         },
     )?;

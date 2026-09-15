@@ -1157,6 +1157,8 @@ fn weight_tensor_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         3 => {
@@ -1171,6 +1173,8 @@ fn weight_tensor_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         1 => {
@@ -1192,6 +1196,8 @@ fn weight_tensor_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         2 => {
@@ -1205,6 +1211,8 @@ fn weight_tensor_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         other => panic!(
@@ -2209,6 +2217,16 @@ fn weight_gemm_batched(
                 n,
             )
         }
+        // qt=52: no batched-LUT kernel exists — per-row LUT GEMV via
+        // weight_gemv (rotates internally). Slow but correct.
+        DType::MQ4G256V2Lloyd => {
+            for i in 0..n {
+                let x_row = x_batched.sub_offset(i * w.k, w.k);
+                let y_row = y_batched.sub_offset(i * w.m, w.m);
+                weight_gemv(gpu, w, &x_row, &y_row)?;
+            }
+            Ok(())
+        }
         DType::MQ6G256V2 => {
             let rot = rotated_x_scratch.expect("MQ6V2 batched gemm requires rotated_x_scratch");
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
@@ -2247,6 +2265,8 @@ fn weight_gemm_batched_supported(dtype: DType) -> bool {
             | DType::HFQ4G256
             | DType::MQ4G256
             | DType::MQ4G256V2
+            // qt=52 served by the per-row LUT-GEMV arm (slow but correct).
+            | DType::MQ4G256V2Lloyd
             | DType::MQ6G256V2
             | DType::F32
     )

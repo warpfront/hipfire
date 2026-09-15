@@ -80,6 +80,20 @@ __device__ static inline unsigned int mq4_spread4(unsigned int x16) {
 
 // Table lookup of 8 nibbles: byte i of out[0] = E4M3(nibble i), byte i of
 // out[1] = E4M3(nibble i+4). Same operand order as the scalar reference.
+#ifdef HIPFIRE_FP8_LUT_ARG
+// LUT-arg form (MQ4G256V2-Lloyd, qt=52): the 16 table bytes arrive as four
+// kernel-arg dwords (centered codebook E4M3(L-7.5), 4 bytes packed LE per
+// dword) instead of the uniform immediates below. Uniform builds are
+// textually unchanged.
+__device__ static inline unsigned int mq4_lut8(unsigned int sel,
+    unsigned int C0, unsigned int C1, unsigned int C2, unsigned int C3) {
+    // v_perm_b32(hi, lo, s): result byte i = {lo,hi} byte s_i for s_i in 0..7.
+    const unsigned int lo = __builtin_amdgcn_perm(C1, C0, sel & 0x07070707u);
+    const unsigned int hi = __builtin_amdgcn_perm(C3, C2, sel & 0x07070707u);
+    const unsigned int m = ((sel >> 3) & 0x01010101u) * 0xFFu;
+    return (hi & m) | (lo & ~m);
+}
+#else
 __device__ static inline unsigned int mq4_lut8(unsigned int sel) {
     // q 0..3:   00 38 40 44. q 4..7:   48 4A 4C 4E.
     // q 8..11:  50 51 52 53. q 12..15: 54 55 56 57.
@@ -93,13 +107,36 @@ __device__ static inline unsigned int mq4_lut8(unsigned int sel) {
     const unsigned int m = ((sel >> 3) & 0x01010101u) * 0xFFu;
     return (hi & m) | (lo & ~m);
 }
+#endif
 
+#ifdef HIPFIRE_FP8_LUT_ARG
+__device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk,
+    unsigned int C0, unsigned int C1, unsigned int C2, unsigned int C3) {
+    v2i_t out;
+    out[0] = (int)mq4_lut8(mq4_spread4(pk & 0xFFFFu), C0, C1, C2, C3);
+    out[1] = (int)mq4_lut8(mq4_spread4(pk >> 16), C0, C1, C2, C3);
+    return out;
+}
+#else
 __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
     v2i_t out;
     out[0] = (int)mq4_lut8(mq4_spread4(pk & 0xFFFFu));
     out[1] = (int)mq4_lut8(mq4_spread4(pk >> 16));
     return out;
 }
+#endif
+#ifdef HIPFIRE_FP8_LUT_ARG
+// Candidate select among per-tensor decoded dwords by loop-invariant side.
+// Every kernel-arg LUT dword is consumed directly at these call sites (SGPR
+// sources into v_perm_b32); the per-lane decision collapses to VALU selects,
+// so no divergent LUT copy ever occupies VGPRs across the K loop.
+__device__ static inline unsigned int mq4_pick2(unsigned int a, unsigned int b, int s) {
+    return s ? b : a;
+}
+__device__ static inline unsigned int mq4_pick3(unsigned int a, unsigned int b, unsigned int c, int s) {
+    return (s == 0) ? a : ((s == 1) ? b : c);
+}
+#endif
 
 // Batch-tile width (chains per wave). Host selects the symbol by N:
 // N%192==0 -> BV=12, N%128==0 -> BV=8, N%64==0 -> BV=4.
@@ -162,7 +199,14 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     int beta_m,
     int alpha_m,
     int K,
-    int N) {
+    int N
+#ifdef HIPFIRE_FP8_LUT_ARG
+    , unsigned int LQ0, unsigned int LQ1, unsigned int LQ2, unsigned int LQ3,
+    unsigned int LZ0, unsigned int LZ1, unsigned int LZ2, unsigned int LZ3,
+    unsigned int LB0, unsigned int LB1, unsigned int LB2, unsigned int LB3,
+    unsigned int LA0, unsigned int LA1, unsigned int LA2, unsigned int LA3
+#endif
+) {
     const int tm = qkv_m + z_m + beta_m + alpha_m;
 #elif HIPFIRE_FP8_RESIDUAL
 void HIPFIRE_FP8_GATEUP_KERNEL(
@@ -173,7 +217,11 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     float* Y_res,
     int res_m,
     int K,
-    int N) {
+    int N
+#ifdef HIPFIRE_FP8_LUT_ARG
+    , unsigned int LC0, unsigned int LC1, unsigned int LC2, unsigned int LC3
+#endif
+) {
     const int tm = res_m;
 #elif HIPFIRE_FP8_QKV
 void HIPFIRE_FP8_GATEUP_KERNEL(
@@ -190,7 +238,13 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     int k_m,
     int v_m,
     int K,
-    int N) {
+    int N
+#ifdef HIPFIRE_FP8_LUT_ARG
+    , unsigned int LQ0, unsigned int LQ1, unsigned int LQ2, unsigned int LQ3,
+    unsigned int LK0, unsigned int LK1, unsigned int LK2, unsigned int LK3,
+    unsigned int LV0, unsigned int LV1, unsigned int LV2, unsigned int LV3
+#endif
+) {
     const int tm = q_m + k_m + v_m;
 #else
 void HIPFIRE_FP8_GATEUP_KERNEL(
@@ -204,7 +258,12 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     int gate_m,
     int up_m,
     int K,
-    int N) {
+    int N
+#ifdef HIPFIRE_FP8_LUT_ARG
+    , unsigned int LG0, unsigned int LG1, unsigned int LG2, unsigned int LG3,
+    unsigned int LU0, unsigned int LU1, unsigned int LU2, unsigned int LU3
+#endif
+) {
     const int tm = gate_m + up_m;
 #endif
     // SLABS=2 waves own two 16-row slabs; SLABS=1 keeps the current grid.
@@ -246,6 +305,47 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         if (srs < gate_m) { Ax[s] = A_gate; lrx[s] = srs; } else { Ax[s] = A_up; lrx[s] = srs - gate_m; }
 #endif
     }
+#ifdef HIPFIRE_FP8_LUT_ARG
+    // Per-slab source-tensor index, loop-invariant (same row routing as
+    // Ax/lrx above). The LUT dwords stay SGPR (kernel args); the K-loop
+    // decodes every candidate and selects per slab, so no divergent LUT
+    // copy ever occupies VGPRs. Residual keeps the single-LUT SLC arrays
+    // (uniform copies, already SGPR-clean).
+#if HIPFIRE_FP8_RESIDUAL
+    unsigned int SLC0[2], SLC1[2], SLC2[2], SLC3[2];
+    #pragma unroll
+    for (int s = 0; s < 2; s++) {
+        SLC0[s]=LC0; SLC1[s]=LC1; SLC2[s]=LC2; SLC3[s]=LC3;
+    }
+#elif HIPFIRE_FP8_QKVZA
+    // Four-tensor fan-out: candidate evaluation costs more VGPRs than a
+    // copy, so QKVZA selects one LUT per slab. The select keys on the SLAB
+    // START ROW (wave-uniform, from blockIdx), not the lane row, so the four
+    // dwords resolve to SGPRs and never occupy VGPRs across the K loop. Host
+    // contract: qkv_m, z_m, beta_m, alpha_m are all multiples of 16, so no
+    // 16-row slab straddles two sources (the launcher refuses otherwise).
+    unsigned int SLC0[2], SLC1[2], SLC2[2], SLC3[2];
+    #pragma unroll
+    for (int s = 0; s < 2; s++) {
+        const int srs = rs + 16 * s;
+        if (srs < qkv_m) { SLC0[s]=LQ0; SLC1[s]=LQ1; SLC2[s]=LQ2; SLC3[s]=LQ3; }
+        else if (srs < qkv_m + z_m) { SLC0[s]=LZ0; SLC1[s]=LZ1; SLC2[s]=LZ2; SLC3[s]=LZ3; }
+        else if (srs < qkv_m + z_m + beta_m) { SLC0[s]=LB0; SLC1[s]=LB1; SLC2[s]=LB2; SLC3[s]=LB3; }
+        else { SLC0[s]=LA0; SLC1[s]=LA1; SLC2[s]=LA2; SLC3[s]=LA3; }
+    }
+#else
+    int lut_side[2];
+    #pragma unroll
+    for (int s = 0; s < 2; s++) {
+        const int srs = srx[s];
+#if HIPFIRE_FP8_QKV
+        lut_side[s] = (srs < q_m) ? 0 : (srs < q_m + k_m) ? 1 : 2;
+#else
+        lut_side[s] = (srs < gate_m) ? 0 : 1;
+#endif
+    }
+#endif
+#endif
 #else
     // Route this lane's A-row (own header source).
     const int mr = rs + ml;
@@ -270,6 +370,30 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     const char* A;
     int lr;
     if (sr < gate_m) { A = A_gate; lr = sr; } else { A = A_up; lr = sr - gate_m; }
+#endif
+#ifdef HIPFIRE_FP8_LUT_ARG
+    // Lane-row source-tensor index, loop-invariant (row routing above). The
+    // LUT dwords stay SGPR (kernel args); decode evaluates every candidate
+    // and selects, so no divergent LUT copy ever occupies VGPRs.
+    // Residual uses the single LC* args directly at the decode sites.
+#if HIPFIRE_FP8_RESIDUAL
+    // Single LC* args used directly at the decode sites (no copy).
+#elif HIPFIRE_FP8_QKVZA
+    // Four-tensor fan-out: one LUT per 16-row tile, keyed on the TILE START
+    // ROW (wave-uniform) so the dwords stay SGPR. Host contract: all four m
+    // are multiples of 16 (no tile straddles two sources); see SLABS=2 twin.
+    unsigned int LC0, LC1, LC2, LC3;
+    if (rs < qkv_m) { LC0=LQ0; LC1=LQ1; LC2=LQ2; LC3=LQ3; }
+    else if (rs < qkv_m + z_m) { LC0=LZ0; LC1=LZ1; LC2=LZ2; LC3=LZ3; }
+    else if (rs < qkv_m + z_m + beta_m) { LC0=LB0; LC1=LB1; LC2=LB2; LC3=LB3; }
+    else { LC0=LA0; LC1=LA1; LC2=LA2; LC3=LA3; }
+#else
+#if HIPFIRE_FP8_QKV
+    const int lut_side = (sr < q_m) ? 0 : (sr < q_m + k_m) ? 1 : 2;
+#else
+    const int lut_side = (sr < gate_m) ? 0 : 1;
+#endif
+#endif
 #endif
 #endif
 
@@ -394,10 +518,50 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
             for (int u = 0; u < 4; u++) {
                 const uint2 pk0 = *(const uint2*)(payx[0] + h * 64 + u * 16 + kg * 8);
                 const uint2 pk1 = *(const uint2*)(payx[1] + h * 64 + u * 16 + kg * 8);
+#ifdef HIPFIRE_FP8_LUT_ARG
+#if HIPFIRE_FP8_RESIDUAL || HIPFIRE_FP8_QKVZA
+                v2i_t q0a = mq4_qpk_to_e4m3(pk0.x, SLC0[0], SLC1[0], SLC2[0], SLC3[0]);
+                v2i_t q0b = mq4_qpk_to_e4m3(pk0.y, SLC0[0], SLC1[0], SLC2[0], SLC3[0]);
+                v2i_t q1a = mq4_qpk_to_e4m3(pk1.x, SLC0[1], SLC1[1], SLC2[1], SLC3[1]);
+                v2i_t q1b = mq4_qpk_to_e4m3(pk1.y, SLC0[1], SLC1[1], SLC2[1], SLC3[1]);
+#else
+                // Selectors depend only on the nibble packs, so both slabs
+                // share them; each slab picks its side's candidate below.
+                const unsigned int s0a = mq4_spread4(pk0.x & 0xFFFFu);
+                const unsigned int s0aH = mq4_spread4(pk0.x >> 16);
+                const unsigned int s0b = mq4_spread4(pk0.y & 0xFFFFu);
+                const unsigned int s0bH = mq4_spread4(pk0.y >> 16);
+                const unsigned int s1a = mq4_spread4(pk1.x & 0xFFFFu);
+                const unsigned int s1aH = mq4_spread4(pk1.x >> 16);
+                const unsigned int s1b = mq4_spread4(pk1.y & 0xFFFFu);
+                const unsigned int s1bH = mq4_spread4(pk1.y >> 16);
+                v2i_t q0a, q0b, q1a, q1b;
+#if HIPFIRE_FP8_QKV
+                q0a[0] = mq4_pick3(mq4_lut8(s0a, LQ0, LQ1, LQ2, LQ3), mq4_lut8(s0a, LK0, LK1, LK2, LK3), mq4_lut8(s0a, LV0, LV1, LV2, LV3), lut_side[0]);
+                q0a[1] = mq4_pick3(mq4_lut8(s0aH, LQ0, LQ1, LQ2, LQ3), mq4_lut8(s0aH, LK0, LK1, LK2, LK3), mq4_lut8(s0aH, LV0, LV1, LV2, LV3), lut_side[0]);
+                q0b[0] = mq4_pick3(mq4_lut8(s0b, LQ0, LQ1, LQ2, LQ3), mq4_lut8(s0b, LK0, LK1, LK2, LK3), mq4_lut8(s0b, LV0, LV1, LV2, LV3), lut_side[0]);
+                q0b[1] = mq4_pick3(mq4_lut8(s0bH, LQ0, LQ1, LQ2, LQ3), mq4_lut8(s0bH, LK0, LK1, LK2, LK3), mq4_lut8(s0bH, LV0, LV1, LV2, LV3), lut_side[0]);
+                q1a[0] = mq4_pick3(mq4_lut8(s1a, LQ0, LQ1, LQ2, LQ3), mq4_lut8(s1a, LK0, LK1, LK2, LK3), mq4_lut8(s1a, LV0, LV1, LV2, LV3), lut_side[1]);
+                q1a[1] = mq4_pick3(mq4_lut8(s1aH, LQ0, LQ1, LQ2, LQ3), mq4_lut8(s1aH, LK0, LK1, LK2, LK3), mq4_lut8(s1aH, LV0, LV1, LV2, LV3), lut_side[1]);
+                q1b[0] = mq4_pick3(mq4_lut8(s1b, LQ0, LQ1, LQ2, LQ3), mq4_lut8(s1b, LK0, LK1, LK2, LK3), mq4_lut8(s1b, LV0, LV1, LV2, LV3), lut_side[1]);
+                q1b[1] = mq4_pick3(mq4_lut8(s1bH, LQ0, LQ1, LQ2, LQ3), mq4_lut8(s1bH, LK0, LK1, LK2, LK3), mq4_lut8(s1bH, LV0, LV1, LV2, LV3), lut_side[1]);
+#else
+                q0a[0] = mq4_pick2(mq4_lut8(s0a, LG0, LG1, LG2, LG3), mq4_lut8(s0a, LU0, LU1, LU2, LU3), lut_side[0]);
+                q0a[1] = mq4_pick2(mq4_lut8(s0aH, LG0, LG1, LG2, LG3), mq4_lut8(s0aH, LU0, LU1, LU2, LU3), lut_side[0]);
+                q0b[0] = mq4_pick2(mq4_lut8(s0b, LG0, LG1, LG2, LG3), mq4_lut8(s0b, LU0, LU1, LU2, LU3), lut_side[0]);
+                q0b[1] = mq4_pick2(mq4_lut8(s0bH, LG0, LG1, LG2, LG3), mq4_lut8(s0bH, LU0, LU1, LU2, LU3), lut_side[0]);
+                q1a[0] = mq4_pick2(mq4_lut8(s1a, LG0, LG1, LG2, LG3), mq4_lut8(s1a, LU0, LU1, LU2, LU3), lut_side[1]);
+                q1a[1] = mq4_pick2(mq4_lut8(s1aH, LG0, LG1, LG2, LG3), mq4_lut8(s1aH, LU0, LU1, LU2, LU3), lut_side[1]);
+                q1b[0] = mq4_pick2(mq4_lut8(s1b, LG0, LG1, LG2, LG3), mq4_lut8(s1b, LU0, LU1, LU2, LU3), lut_side[1]);
+                q1b[1] = mq4_pick2(mq4_lut8(s1bH, LG0, LG1, LG2, LG3), mq4_lut8(s1bH, LU0, LU1, LU2, LU3), lut_side[1]);
+#endif
+#endif
+#else
                 v2i_t q0a = mq4_qpk_to_e4m3(pk0.x);
                 v2i_t q0b = mq4_qpk_to_e4m3(pk0.y);
                 v2i_t q1a = mq4_qpk_to_e4m3(pk1.x);
                 v2i_t q1b = mq4_qpk_to_e4m3(pk1.y);
+#endif
                 if (!livex[0]) { q0a[0] = 0; q0a[1] = 0; q0b[0] = 0; q0b[1] = 0; }
                 if (!livex[1]) { q1a[0] = 0; q1a[1] = 0; q1b[0] = 0; q1b[1] = 0; }
                 const unsigned int x_off = (unsigned int)g * 256u + (unsigned int)h * 128u + (unsigned int)u * 32u + (unsigned int)kg * 16u;
@@ -464,8 +628,34 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
             #pragma unroll
             for (int u = 0; u < 4; u++) {
                 const uint2 pk2 = *(const uint2*)(half_base + u * 16 + kg * 8);
+#ifdef HIPFIRE_FP8_LUT_ARG
+#if HIPFIRE_FP8_RESIDUAL || HIPFIRE_FP8_QKVZA
+                v2i_t q8a = mq4_qpk_to_e4m3(pk2.x, LC0, LC1, LC2, LC3);
+                v2i_t q8b = mq4_qpk_to_e4m3(pk2.y, LC0, LC1, LC2, LC3);
+#else
+                // Selectors depend only on the nibble packs (shared); the lane
+                // picks its side's candidate (LUT dwords stay SGPR).
+                const unsigned int sxa = mq4_spread4(pk2.x & 0xFFFFu);
+                const unsigned int sxaH = mq4_spread4(pk2.x >> 16);
+                const unsigned int sxb = mq4_spread4(pk2.y & 0xFFFFu);
+                const unsigned int sxbH = mq4_spread4(pk2.y >> 16);
+                v2i_t q8a, q8b;
+#if HIPFIRE_FP8_QKV
+                q8a[0] = mq4_pick3(mq4_lut8(sxa, LQ0, LQ1, LQ2, LQ3), mq4_lut8(sxa, LK0, LK1, LK2, LK3), mq4_lut8(sxa, LV0, LV1, LV2, LV3), lut_side);
+                q8a[1] = mq4_pick3(mq4_lut8(sxaH, LQ0, LQ1, LQ2, LQ3), mq4_lut8(sxaH, LK0, LK1, LK2, LK3), mq4_lut8(sxaH, LV0, LV1, LV2, LV3), lut_side);
+                q8b[0] = mq4_pick3(mq4_lut8(sxb, LQ0, LQ1, LQ2, LQ3), mq4_lut8(sxb, LK0, LK1, LK2, LK3), mq4_lut8(sxb, LV0, LV1, LV2, LV3), lut_side);
+                q8b[1] = mq4_pick3(mq4_lut8(sxbH, LQ0, LQ1, LQ2, LQ3), mq4_lut8(sxbH, LK0, LK1, LK2, LK3), mq4_lut8(sxbH, LV0, LV1, LV2, LV3), lut_side);
+#else
+                q8a[0] = mq4_pick2(mq4_lut8(sxa, LG0, LG1, LG2, LG3), mq4_lut8(sxa, LU0, LU1, LU2, LU3), lut_side);
+                q8a[1] = mq4_pick2(mq4_lut8(sxaH, LG0, LG1, LG2, LG3), mq4_lut8(sxaH, LU0, LU1, LU2, LU3), lut_side);
+                q8b[0] = mq4_pick2(mq4_lut8(sxb, LG0, LG1, LG2, LG3), mq4_lut8(sxb, LU0, LU1, LU2, LU3), lut_side);
+                q8b[1] = mq4_pick2(mq4_lut8(sxbH, LG0, LG1, LG2, LG3), mq4_lut8(sxbH, LU0, LU1, LU2, LU3), lut_side);
+#endif
+#endif
+#else
                 v2i_t q8a = mq4_qpk_to_e4m3(pk2.x);
                 v2i_t q8b = mq4_qpk_to_e4m3(pk2.y);
+#endif
                 if (!live_self) { q8a[0] = 0; q8a[1] = 0; q8b[0] = 0; q8b[1] = 0; }
                 const unsigned int x_off = (unsigned int)g * 256u + (unsigned int)h * 128u + (unsigned int)u * 32u + (unsigned int)kg * 16u;
                 #pragma unroll

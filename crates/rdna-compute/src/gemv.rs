@@ -72,36 +72,12 @@ fn e8_ldsx_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_E8_LDSX", false)
 }
 
-fn gfx1100_awq_norm_direct_enabled(gpu: &Gpu, k: usize) -> bool {
-    if !gpu.arch_caps.is_gfx1100() {
-        return false;
-    }
-    // Keep one symbol implementation for the process lifetime: ensure_kernel
-    // caches functions by symbol, while prefill and decode share this route.
-    // Qwen3.6-27B K=5120 measured +2.44% over a 512-token A/B/B/A; rocprof
-    // measured 14.859 -> 9.116 us/launch, and a 1025-token replay was exact.
-    // NOTE (S4 flags): the env half used to be OnceLock-cached together with
-    // the first call's `k`, so a process that ever passed K=5120 kept the
-    // direct kernel for all later shapes. The snapshot read below evaluates
-    // `k` per call instead; single-model processes (constant K) are
-    // unaffected, and mixed-K processes now pick the kernel their K selects.
-    k == 5_120 && hipfire_config::developer_bool("HIPFIRE_GFX1100_AWQ_NORM_DIRECT", true)
-}
-
-fn awq_norm_kernel(gpu: &Gpu, k: usize) -> (&'static str, &'static str, u32) {
-    if gfx1100_awq_norm_direct_enabled(gpu, k) {
-        (
-            "fused_rmsnorm_mq_rotate_awq_direct_gfx1100",
-            kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC,
-            (256 * 4) as u32,
-        )
-    } else {
-        (
-            "fused_rmsnorm_mq_rotate_awq",
-            kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC,
-            ((k + 256) * 4) as u32,
-        )
-    }
+fn awq_norm_kernel() -> (&'static str, &'static str, u32) {
+    (
+        "fused_rmsnorm_mq_rotate_awq",
+        kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC,
+        (256 * 4) as u32,
+    )
 }
 
 /// HIPFIRE_E8_DGPU_TWIN: on RDNA3 dGPU (gfx1100/1101/1102), route E8 MoE
@@ -2549,7 +2525,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        let (module, source, shared_mem) = awq_norm_kernel(self, k);
+        let (module, source, shared_mem) = awq_norm_kernel();
         self.ensure_kernel(module, source, "fused_rmsnorm_mq_rotate_awq")?;
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
@@ -2624,7 +2600,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_mq_signs()?;
-        let (module, source, shared_mem) = awq_norm_kernel(self, k);
+        let (module, source, shared_mem) = awq_norm_kernel();
         self.ensure_kernel(module, source, "fused_rmsnorm_mq_rotate_awq")?;
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
@@ -7832,6 +7808,179 @@ impl Gpu {
                 blob_builder,
             )
         };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// MQ4G256V2-Lloyd (qt=52) plain GEMV with per-tensor centered codebook.
+    /// Always single-row: the LUT GEMV has no multirow variant, so qt=52
+    /// tensors pin rows=1 here regardless of `HIPFIRE_GEMV_ROWS` (no env var
+    /// needed; decode works out of the box on gfx1201). Measured cost of
+    /// rows=1 vs rows=2 decode on a qt44 artifact (hipfire bench --matrix
+    /// --pp 512 --ctx 128 --tg 1 --runs 3): tg1@128 161.53 vs 160.97 tok/s
+    /// (+0.35%, noise). `lut_f16` packs the 16 centered (`L-7.5`) f16 levels
+    /// as 8 dwords (2 per dword, LE); the kernel stages them to LDS once.
+    pub fn gemv_mq4g256v2_lloyd(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        lut_f16: [u32; 8],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("gemv_mq4g256v2_lloyd: K divisible by 256 required (got {k})"),
+            ));
+        }
+        // No multirow LUT variant exists; routing a Lloyd tensor to a uniform
+        // multirow kernel would silently decode on the wrong grid, so this
+        // always launches the single-row kernel (rows pinned to 1).
+        let func_name = "gemv_mq4g256v2_lloyd";
+        self.ensure_kernel(func_name, kernels::GEMV_MQ4G256V2_LUT_SRC, func_name)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut l0 = lut_f16[0];
+        let mut l1 = lut_f16[1];
+        let mut l2 = lut_f16[2];
+        let mut l3 = lut_f16[3];
+        let mut l4 = lut_f16[4];
+        let mut l5 = lut_f16[5];
+        let mut l6 = lut_f16[6];
+        let mut l7 = lut_f16[7];
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut l0 as *mut _ as *mut c_void,
+            &mut l1 as *mut _ as *mut c_void,
+            &mut l2 as *mut _ as *mut c_void,
+            &mut l3 as *mut _ as *mut c_void,
+            &mut l4 as *mut _ as *mut c_void,
+            &mut l5 as *mut _ as *mut c_void,
+            &mut l6 as *mut _ as *mut c_void,
+            &mut l7 as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_u32(l0);
+                b.push_u32(l1);
+                b.push_u32(l2);
+                b.push_u32(l3);
+                b.push_u32(l4);
+                b.push_u32(l5);
+                b.push_u32(l6);
+                b.push_u32(l7);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// MQ4G256V2-Lloyd (qt=52) residual GEMV (`y +=`): LUT twin of
+    /// `gemv_mq4g256v2_lloyd` over `GEMV_MQ4G256V2_RESIDUAL_LUT_SRC`. Same
+    /// unconditional single-row scope (see above for the rows-1 rationale).
+    pub fn gemv_hfq4g256_residual_mq4v2_lloyd(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        lut_f16: [u32; 8],
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemv_hfq4g256_residual_mq4v2_lloyd: K divisible by 256 required (got {k})"
+                ),
+            ));
+        }
+        // No multirow LUT variant exists (fail-open to uniform multirow would
+        // decode on the wrong grid); rows pinned to 1 unconditionally.
+        let func_name = "gemv_mq4g256v2_residual_lloyd";
+        self.ensure_kernel(func_name, kernels::GEMV_MQ4G256V2_RESIDUAL_LUT_SRC, func_name)?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut x_ptr = x.buf.as_ptr();
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut l0 = lut_f16[0];
+        let mut l1 = lut_f16[1];
+        let mut l2 = lut_f16[2];
+        let mut l3 = lut_f16[3];
+        let mut l4 = lut_f16[4];
+        let mut l5 = lut_f16[5];
+        let mut l6 = lut_f16[6];
+        let mut l7 = lut_f16[7];
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut x_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut l0 as *mut _ as *mut c_void,
+            &mut l1 as *mut _ as *mut c_void,
+            &mut l2 as *mut _ as *mut c_void,
+            &mut l3 as *mut _ as *mut c_void,
+            &mut l4 as *mut _ as *mut c_void,
+            &mut l5 as *mut _ as *mut c_void,
+            &mut l6 as *mut _ as *mut c_void,
+            &mut l7 as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_u32(l0);
+                b.push_u32(l1);
+                b.push_u32(l2);
+                b.push_u32(l3);
+                b.push_u32(l4);
+                b.push_u32(l5);
+                b.push_u32(l6);
+                b.push_u32(l7);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

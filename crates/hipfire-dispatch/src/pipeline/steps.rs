@@ -164,6 +164,37 @@ fn mq4g256v2_scalar_fusion_ok(ctx: &DispatchCtx) -> bool {
     !ctx.flags.force_unfused && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
 }
 
+/// True if all Gemv steps in the window (indices 1..) are MQ4G256V2-Lloyd
+/// (qt=52) with a decode LUT attached, Prerotated input, and no AWQ on the
+/// weight ref (AWQ is applied in the RmsnormAutomatic step). A Lloyd tensor
+/// without its LUT must never fuse onto the uniform decode grid.
+fn gemv_steps_uniform_mq4g256v2_lloyd(steps: &[Step]) -> bool {
+    steps[1..].iter().all(|s| match s {
+        Step::Gemv {
+            w,
+            input: GemvInput::Prerotated(_),
+            ..
+        } => w.dtype == DType::MQ4G256V2Lloyd && w.awq_scale.is_none() && w.lloyd_lut_f16.is_some(),
+        _ => false,
+    })
+}
+
+/// MQ4G256V2-Lloyd (qt=52) QKV decode fusion: same arch set as the uniform
+/// V2 guard; the family arm passes the three per-tensor codebooks.
+pub(crate) fn guard_qkv_mq4g256v2_lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    mq4g256v2_scalar_fusion_ok(ctx) && steps.len() == 4 && gemv_steps_uniform_mq4g256v2_lloyd(steps)
+}
+
+/// MQ4G256V2-Lloyd (qt=52) QKVZA decode fusion (four codebooks).
+pub(crate) fn guard_qkvza_mq4g256v2_lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    mq4g256v2_scalar_fusion_ok(ctx) && steps.len() == 5 && gemv_steps_uniform_mq4g256v2_lloyd(steps)
+}
+
+/// MQ4G256V2-Lloyd (qt=52) gate+up decode fusion (two codebooks).
+pub(crate) fn guard_gate_up_mq4g256v2_lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    mq4g256v2_scalar_fusion_ok(ctx) && steps.len() == 3 && gemv_steps_uniform_mq4g256v2_lloyd(steps)
+}
+
 /// Exact MQ4G256V2 (qt44) QKV decode fusion. Official Ornith is all-qt44;
 /// never admit mixed V1/V2 or AWQ windows onto the V2 fused kernel.
 /// Unsupported arches fall through to exact per-projection V2 GEMVs.
@@ -531,6 +562,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
     },
     FusedPattern {
         ops: QKV3,
+        key: KernelKey::FusedQkvMq4G256V2Lloyd,
+        guard: guard_qkv_mq4g256v2_lloyd,
+    },
+    FusedPattern {
+        ops: QKV3,
         key: KernelKey::FusedQkvHfq4G256,
         guard: guard_qkv_hfq4g256,
     },
@@ -555,6 +591,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
         ops: QKVZA4,
         key: KernelKey::FusedQkvzaMq4G256V2,
         guard: guard_qkvza_mq4g256v2,
+    },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaMq4G256V2Lloyd,
+        guard: guard_qkvza_mq4g256v2_lloyd,
     },
     FusedPattern {
         ops: QKVZA4,
@@ -588,6 +629,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
         ops: GATE_UP2,
         key: KernelKey::FusedGateUpMq4G256V2,
         guard: guard_gate_up_mq4g256v2,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpMq4G256V2Lloyd,
+        guard: guard_gate_up_mq4g256v2_lloyd,
     },
     FusedPattern {
         ops: GATE_UP2,
@@ -1039,6 +1085,14 @@ fn gemv_weight_out<'a>(step: &'a Step<'a>) -> (&'a WeightRef<'a>, &'a rdna_compu
     }
 }
 
+/// The decode f16 codebook of a qt=52 weight ref; the fused-Lloyd guards
+/// already required it, so a miss here is a programming error, not a route.
+fn lloyd_lut(w: &WeightRef<'_>) -> Result<[u32; 8], DispatchError> {
+    w.lloyd_lut_f16.ok_or_else(|| {
+        DispatchError::Hip("MQ4G256V2Lloyd fused decode: weight ref has no lloyd_lut_f16".into())
+    })
+}
+
 fn launch_fused(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
@@ -1051,6 +1105,41 @@ fn launch_fused(
     let fused_qkv = FUSED_QKV.get_or_init(FusedQkvFamily::new);
 
     match key {
+        // ── MQ4G256V2-Lloyd (qt=52) decode fusions ──
+        // Launched here rather than through `FusedQkvFamily`: the LUT lives on
+        // the `WeightRef`s (the guard proved every one is `Some`), and these
+        // keys are decode-only (batched prefill takes the FP8-LUT GEMMs).
+        KernelKey::FusedQkvMq4G256V2Lloyd => {
+            let (wq, q) = gemv_weight_out(&steps[1]);
+            let (wk, k) = gemv_weight_out(&steps[2]);
+            let (wv, v) = gemv_weight_out(&steps[3]);
+            let luts = [lloyd_lut(wq)?, lloyd_lut(wk)?, lloyd_lut(wv)?];
+            gpu.fused_qkv_mq4g256v2_lloyd(
+                wq.buf, wk.buf, wv.buf, activated, q, k, v, wq.m, wk.m, wv.m, wq.k, luts,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+        KernelKey::FusedGateUpMq4G256V2Lloyd => {
+            let (wg, gate) = gemv_weight_out(&steps[1]);
+            let (wu, up) = gemv_weight_out(&steps[2]);
+            let (lg, lu) = (lloyd_lut(wg)?, lloyd_lut(wu)?);
+            gpu.fused_gate_up_mq4g256v2_lloyd(
+                wg.buf, wu.buf, activated, gate, up, wg.m, wu.m, wg.k, lg, lu,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+        KernelKey::FusedQkvzaMq4G256V2Lloyd => {
+            let (wqkv, qkv) = gemv_weight_out(&steps[1]);
+            let (wz, z) = gemv_weight_out(&steps[2]);
+            let (wb, beta) = gemv_weight_out(&steps[3]);
+            let (wa, alpha) = gemv_weight_out(&steps[4]);
+            let luts = [lloyd_lut(wqkv)?, lloyd_lut(wz)?, lloyd_lut(wb)?, lloyd_lut(wa)?];
+            gpu.fused_qkvza_mq4g256v2_lloyd(
+                wqkv.buf, wz.buf, wb.buf, wa.buf, activated, qkv, z, beta, alpha, wqkv.m, wz.m,
+                wb.m, wa.m, wqkv.k, luts,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
         KernelKey::FusedQkvMq4G256Lloyd
         | KernelKey::FusedQkvMq4G256V2
         | KernelKey::FusedQkvMq3G256Lloyd

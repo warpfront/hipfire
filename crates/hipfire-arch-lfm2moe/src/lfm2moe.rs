@@ -199,6 +199,8 @@ fn wt_from_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             });
         }
         if data.len() % 2 != 0 {
@@ -222,6 +224,8 @@ fn wt_from_raw(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
         });
     }
     let dtype = match qt {
@@ -250,6 +254,8 @@ fn wt_from_raw(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
     })
 }
 
@@ -1031,6 +1037,8 @@ fn wt_from_source_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             });
         }
         if data.len() % 2 != 0 {
@@ -1054,6 +1062,8 @@ fn wt_from_source_raw(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
         });
     }
     let dtype = match qt {
@@ -1082,6 +1092,8 @@ fn wt_from_source_raw(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
     })
 }
 

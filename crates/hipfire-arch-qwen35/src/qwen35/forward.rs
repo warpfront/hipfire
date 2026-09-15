@@ -2819,6 +2819,8 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: wqkv.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wqkv.lloyd_lut_e4m3,
+            lloyd_lut_f16: wqkv.lloyd_lut_f16,
         };
         let wr_z = WeightRef {
             buf: &wz.buf,
@@ -2828,6 +2830,8 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: wz.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wz.lloyd_lut_e4m3,
+            lloyd_lut_f16: wz.lloyd_lut_f16,
         };
         let wr_beta = WeightRef {
             buf: &w_beta.buf,
@@ -2837,6 +2841,8 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: w_beta.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: w_beta.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_beta.lloyd_lut_f16,
         };
         let wr_alpha = WeightRef {
             buf: &w_alpha.buf,
@@ -2846,6 +2852,8 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: w_alpha.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: w_alpha.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_alpha.lloyd_lut_f16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -2892,6 +2900,8 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wqkv.lloyd_lut_e4m3,
+            lloyd_lut_f16: wqkv.lloyd_lut_f16,
         };
         let wr_z = WeightRef {
             buf: &wz.buf,
@@ -2901,6 +2911,8 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wz.lloyd_lut_e4m3,
+            lloyd_lut_f16: wz.lloyd_lut_f16,
         };
         let wr_beta = WeightRef {
             buf: &w_beta.buf,
@@ -2910,6 +2922,8 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w_beta.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_beta.lloyd_lut_f16,
         };
         let wr_alpha = WeightRef {
             buf: &w_alpha.buf,
@@ -2919,6 +2933,8 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w_alpha.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_alpha.lloyd_lut_f16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -2986,6 +3002,8 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wq.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wq.lloyd_lut_e4m3,
+            lloyd_lut_f16: wq.lloyd_lut_f16,
         };
         let wrk = WeightRef {
             buf: &wk.buf,
@@ -2995,6 +3013,8 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wk.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wk.lloyd_lut_e4m3,
+            lloyd_lut_f16: wk.lloyd_lut_f16,
         };
         let wrv = WeightRef {
             buf: &wv.buf,
@@ -3004,6 +3024,8 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wv.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wv.lloyd_lut_e4m3,
+            lloyd_lut_f16: wv.lloyd_lut_f16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3042,6 +3064,8 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wq.lloyd_lut_e4m3,
+            lloyd_lut_f16: wq.lloyd_lut_f16,
         };
         let wrk = WeightRef {
             buf: &wk.buf,
@@ -3051,6 +3075,8 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wk.lloyd_lut_e4m3,
+            lloyd_lut_f16: wk.lloyd_lut_f16,
         };
         let wrv = WeightRef {
             buf: &wv.buf,
@@ -3060,6 +3086,8 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wv.lloyd_lut_e4m3,
+            lloyd_lut_f16: wv.lloyd_lut_f16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3118,6 +3146,8 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: w_gate.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: w_gate.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_gate.lloyd_lut_f16,
         };
         let wru = WeightRef {
             buf: &w_up.buf,
@@ -3127,6 +3157,8 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: w_up.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: w_up.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_up.lloyd_lut_f16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3160,6 +3192,8 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w_gate.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_gate.lloyd_lut_f16,
         };
         let wru = WeightRef {
             buf: &w_up.buf,
@@ -3169,6 +3203,8 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w_up.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_up.lloyd_lut_f16,
         };
         let steps = [
             Step::RmsnormAutomatic {

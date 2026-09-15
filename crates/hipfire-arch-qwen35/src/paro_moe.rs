@@ -504,6 +504,8 @@ pub(crate) fn paro_load_moe_ffn(
                     shared.group_size,
                 )),
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             }
         };
         let down = {
@@ -522,6 +524,8 @@ pub(crate) fn paro_load_moe_ffn(
                     shared.group_size,
                 )),
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             }
         };
         pending.experts.push(ExpertWeights { gate_up, down });

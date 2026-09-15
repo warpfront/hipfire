@@ -834,6 +834,14 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     ) {
         return Some(vec![read(0), read(8), write(16)]);
     }
+    // MQ4G256V2-Lloyd LUT GEMVs (qt52): same 3-pointer ABI as the uniform V2
+    // pair (a_raw, x read; y write/RMW) plus 8 by-value LUT dwords and 2 i32.
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2_lloyd" | "gemv_mq4g256v2_residual_lloyd"
+    ) {
+        return Some(vec![read(0), read(8), write(16)]);
+    }
     // Dense shared-expert V2 residual WMMA GEMM (prefill/batched). 3 pointers + 3 i32
     // (M,K,batch). Y is write (output) via residual path; distinct symbols per arch tile.
     if matches!(
@@ -1485,6 +1493,13 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mq6g256v2_multirow_r8"
     ) {
         return Some(32);
+    }
+    // LUT GEMVs: 3 ptrs (24 B) + 2 i32 (8 B) + 8 LUT dwords (32 B) = 64 B.
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2_lloyd" | "gemv_mq4g256v2_residual_lloyd"
+    ) {
+        return Some(64);
     }
     if matches!(
         kernel,

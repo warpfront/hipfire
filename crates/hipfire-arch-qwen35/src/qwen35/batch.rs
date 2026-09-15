@@ -1524,6 +1524,17 @@ pub(crate) fn lm_head_batched(
                 batch_size,
             )
         }
+        // qt=52: no batched-LUT lm_head kernel exists — per-row LUT GEMV
+        // (weight_gemv rotates internally). Slow but correct; mirrors the
+        // DFlash-verify fallback in mtp_spec.rs.
+        DType::MQ4G256V2Lloyd => {
+            for i in 0..batch_size {
+                let row = hidden.sub_offset(i * output.k, output.k);
+                let logits_row = logits.sub_offset(i * output.m, output.m);
+                llama::weight_gemv(gpu, output, &row, &logits_row)?;
+            }
+            Ok(())
+        }
         DType::MQ4CG256 => {
             llama::rotate_x_mq_batched_for(gpu, output, hidden, rot, output.k, batch_size)?;
             run_plain_gemm_key(

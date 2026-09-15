@@ -221,6 +221,8 @@ pub fn reupload_f16_as_f32(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
     })
 }
 
@@ -244,6 +246,8 @@ pub fn tied_lm_head_alias(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
     }
 }
 
@@ -439,6 +443,15 @@ pub(crate) const RAW_CODECS: &[RawCodec] = &[
         quant_type: 44,
         dtype: DType::MQ4G256V2,
     },
+    // qt=52: MQ4V2-Lloyd. Wire layout byte-identical to qt=44 (136 B/group),
+    // so the same verbatim upload carries it; the per-tensor codebook LUTs
+    // ride the WeightTensor (built by the caller from the lloyd_levels
+    // sidecar) and the headers are centered at load. Length check rejects the
+    // stale +32B-prefix prototype layout — re-quantize to pure 136 B/group.
+    RawCodec {
+        quant_type: 52,
+        dtype: DType::MQ4G256V2Lloyd,
+    },
     RawCodec {
         quant_type: 45,
         dtype: DType::MQ4CG256,
@@ -514,6 +527,19 @@ pub(crate) fn decode_raw_codec(
                 0,
                 &format!(
                     "MQ4G256V2 blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name})",
+                    data.len()
+                ),
+            ));
+        }
+    }
+    if codec.dtype == DType::MQ4G256V2Lloyd {
+        let gpr = k / 256;
+        let expected = m * gpr * 136;
+        if data.len() != expected {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "MQ4G256V2Lloyd blob length mismatch: expected {expected}, got {} (M={m} K={k} caller: {name}; stale +32B-prefix artifacts are rejected)",
                     data.len()
                 ),
             ));
@@ -595,6 +621,10 @@ pub(crate) fn decode_raw_codec(
         row_stride: codec.dtype.row_stride(k),
         paro: None,
         awq_scale: None,
+        // Lloyd LUTs are attached by the caller (hfq / arch loader) from the
+        // lloyd_levels sidecar — same pattern as AWQ sidecars, never here.
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
     })
 }
 
@@ -693,6 +723,8 @@ pub fn dequant_weight_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         2 => {
@@ -705,6 +737,8 @@ pub fn dequant_weight_raw(
                 k,
                 row_stride: 0,
                 paro: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
                 awq_scale: None,
             })
         }
@@ -723,6 +757,8 @@ pub fn dequant_weight_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
             })
         }
         other => match raw_codec(other) {

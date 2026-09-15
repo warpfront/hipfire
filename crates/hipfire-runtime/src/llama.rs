@@ -518,6 +518,18 @@ pub struct WeightTensor {
     /// `None` for tensors that weren't AWQ-pre-scaled — backward-compatible
     /// with all existing .hfq files.
     pub awq_scale: Option<GpuTensor>,
+    /// MQ4G256V2-Lloyd (qt=52) per-tensor centered codebook LUTs, built by the
+    /// loader from the `<weight>.lloyd_levels.weight` F32 sidecar (see
+    /// `crate::lloyd_lut`). `lloyd_lut_e4m3` packs the 16 centered (`L−7.5`)
+    /// E4M3 bytes as 4 dwords for the gfx12 FP8 prefill kernels
+    /// (`HIPFIRE_FP8_LUT_ARG` mode); `lloyd_lut_f16` packs the same 16 centered
+    /// levels as f16 bits in 8 dwords for the GEMV/decode kernels. Host values
+    /// (no GPU upload). `Some` iff `gpu_dtype == DType::MQ4G256V2Lloyd` on a
+    /// correctly loaded tensor — dispatch fails closed when a Lloyd tensor
+    /// arrives with `None` here, so a missing sidecar can never silently
+    /// decode on the uniform grid.
+    pub lloyd_lut_e4m3: Option<[u32; 4]>,
+    pub lloyd_lut_f16: Option<[u32; 8]>,
 }
 
 impl WeightTensor {
@@ -577,6 +589,8 @@ impl WeightTensor {
                 krot: p.krot as usize,
             }),
             awq_scale: self.awq_scale.as_ref(),
+            lloyd_lut_e4m3: self.lloyd_lut_e4m3,
+            lloyd_lut_f16: self.lloyd_lut_f16,
         }
     }
 }
@@ -780,6 +794,8 @@ pub fn weight_gemv(gpu: &mut Gpu, w: &WeightTensor, x: &GpuTensor, y: &GpuTensor
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+        lloyd_lut_f16: w.lloyd_lut_f16,
     };
 
     if !dtype_needs_rotation(w.gpu_dtype) {
@@ -1306,6 +1322,8 @@ pub fn weight_gemv_prerotated(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+            lloyd_lut_f16: w.lloyd_lut_f16,
         };
         return gemv
             .run_auto(&ctx, gpu, &wr, x, y)
@@ -1345,6 +1363,8 @@ pub fn weight_gemv_prerotated(
                 row_stride: 0,
                 rotation: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+                lloyd_lut_f16: w.lloyd_lut_f16,
             };
             return gemv
                 .run(
@@ -1373,6 +1393,8 @@ pub fn weight_gemv_prerotated(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+        lloyd_lut_f16: w.lloyd_lut_f16,
     };
     gemv.run_auto(&ctx, gpu, &wr, x, y)
         .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))
@@ -1410,6 +1432,8 @@ pub fn weight_gemv_residual(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: w.lloyd_lut_e4m3,
+        lloyd_lut_f16: w.lloyd_lut_f16,
     };
 
     match w.gpu_dtype {
@@ -1432,6 +1456,9 @@ pub fn weight_gemv_residual(
         | DType::MQ6G256V2
         | DType::MQ5G256V2
         | DType::MQ4G256
+        // qt=52 rides the exact-V2 residual path: FWHT-rotate, then the
+        // GemvFamily WithResidual LUT kernel (fail-closed on missing LUT).
+        | DType::MQ4G256V2Lloyd
         | DType::MQ4G256V2
         | DType::MQ4CG256
         | DType::MQ3G256
@@ -1505,10 +1532,15 @@ pub fn weight_gemv_swiglu_residual(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: w_down.lloyd_lut_e4m3,
+        lloyd_lut_f16: w_down.lloyd_lut_f16,
     };
     match w_down.gpu_dtype {
         DType::MQ4G256
         | DType::MQ4G256V2
+        // qt=52: same FWHT input contract as qt=44; the residual GEMV is the
+        // LUT twin (family branches on dtype).
+        | DType::MQ4G256V2Lloyd
         | DType::MQ4CG256
         | DType::MQ6G256
         | DType::MQ6G256V2
@@ -1961,9 +1993,14 @@ pub fn mqv2_gfx11_wmma_enabled_from_env(value: Option<&str>, arch: &str) -> bool
 /// `MQ4CG256` (qt45) stays gfx12-only in its caller and is intentionally
 /// NOT part of this rule.
 pub fn mqv2_wmma_batchable(dt: DType, mqv2_gfx11_wmma: Option<&str>, arch: &str) -> bool {
+    // MQ4G256V2Lloyd (qt52) shares the V2 wire layout and dispatches through
+    // the LUT variants of the same WMMA/FP8 prefill families (gfx12) — admit
+    // it exactly like qt44; the dispatch layer fails closed on any family
+    // without a LUT variant.
     matches!(
         dt,
         DType::MQ4G256V2
+            | DType::MQ4G256V2Lloyd
             | DType::MQ6G256V2
             | DType::MQ5G256V2
             | DType::MQ3G256V2
@@ -3540,6 +3577,8 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
                 })
             }
             GgmlType::Q6K => {
@@ -3552,6 +3591,8 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
                 })
             }
             GgmlType::Q8_0 => {
@@ -3564,6 +3605,8 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
                 })
             }
             GgmlType::F32 => {
@@ -3576,6 +3619,8 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
                 })
             }
             _ => {
@@ -3593,6 +3638,8 @@ pub fn load_weights(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
                 })
             }
         }
@@ -3635,6 +3682,8 @@ pub fn load_weights(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
         }
     };
 

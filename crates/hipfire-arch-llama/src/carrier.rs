@@ -395,6 +395,8 @@ fn resident_weight(
         row_stride: dtype.row_stride(k),
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
     }
 }
 
