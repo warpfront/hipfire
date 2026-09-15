@@ -136,14 +136,20 @@ Compare each against production at gate/up `(M,K,N)=(17408,5120,512)` and down `
 
 ## 7. A5 — column-adjacent full-tile grid
 
-> **STATUS 2026-09-15 — A5 REJECTED in-model.** Isolated oracle: bitwise-equal,
-> gate/up −7.3%, down −4.3% (100 interleaved samples, hot L2 from repeated
-> identical launches). In-model (profile_prefill pp512, 400 calls): IU4
-> per-call 1688 → 2272 µs, bench pp512 600 → 462. Column-adjacent order walks
-> every weight tile of a column strip before advancing; with 400 back-to-back
-> launches the weight stream (5× the X bytes) loses locality and the isolated
-> win inverts. Entries, selector and oracle removed. The 2×2 macrotile
-> alternative is not attempted: same mechanism.
+> **STATUS 2026-09-15 — A5 REJECTED in-model (amended).** Isolated oracle:
+> bitwise-equal, gate/up −7.3%, down −4.3% (100 interleaved samples). In-model
+> (profile_prefill pp512, 400 calls) the `_col` entries were *slower*: 2272 µs
+> vs 2188 µs for the baseline symbol measured under the same conditions
+> (≈ +4%). Both in-model figures were taken while a CPU build shared the APU
+> power budget (baseline unthrottled is 1688 µs), so only the direction is
+> evidence; the mechanism is weight-stream locality across back-to-back
+> launches (column-adjacent order walks every weight tile of a column strip).
+> Entries, selector and oracle removed. The 2×2 macrotile alternative is not
+> attempted: same mechanism.
+>
+> **Measurement rule learned here:** the Halo is an APU — never run a CPU
+> build (CK, cargo of another tree) on hipx while taking Halo numbers; pause
+> it (`SIGSTOP`) or the GPU throttles ~30% on IU4.
 
 
 **Owners A+H under disjoint ownership; 1 h swap, at most 1 additional h for one 2×2 swizzle.**
