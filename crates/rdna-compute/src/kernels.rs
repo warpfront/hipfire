@@ -5695,43 +5695,6 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC: &str = concat!(
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
 );
 
-/// B1 candidate: even swizzle + aligned LDS b64 fragment loads
-/// (`HIPFIRE_FA2_GFX11_SWIZZLE_EVEN=1`). Distinct entry symbol
-/// `attention_q8_0_fa2_gqa_gfx11_b1` so the functions/module cache cannot
-/// alias the incumbent. Temporary admission arm; remove after B-lane gate.
-pub const ATTENTION_Q8_0_FA2_GQA_GFX11_B1_SRC: &str = concat!(
-    "#define HIPFIRE_FA2_GFX11_SWIZZLE_EVEN 1\n",
-    "#define HIPFIRE_FA2_GFX11_KERNEL attention_q8_0_fa2_gqa_gfx11_b1\n",
-    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
-);
-
-/// B1+B2 candidate: B1 plus compiler-clobber removal
-/// (`HIPFIRE_FA2_GFX11_NO_CLOBBER=1`). Symbol `…_b1b2`. Temporary admission arm.
-pub const ATTENTION_Q8_0_FA2_GQA_GFX11_B1B2_SRC: &str = concat!(
-    "#define HIPFIRE_FA2_GFX11_SWIZZLE_EVEN 1\n",
-    "#define HIPFIRE_FA2_GFX11_NO_CLOBBER 1\n",
-    "#define HIPFIRE_FA2_GFX11_KERNEL attention_q8_0_fa2_gqa_gfx11_b1b2\n",
-    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
-);
-
-/// fwht3-K B1 candidate (see [`ATTENTION_Q8_0_FA2_GQA_GFX11_B1_SRC`]).
-pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_B1_SRC: &str = concat!(
-    "#define HIPFIRE_FA2_KMODE 3\n",
-    "#define HIPFIRE_FA2_GFX11_SWIZZLE_EVEN 1\n",
-    "#define HIPFIRE_FA2_GFX11_FWHT3K_KERNEL attention_q8_0_fa2_gqa_fwht3k_gfx11_b1\n",
-    include_str!("../../../kernels/src/turbo_common.h"),
-    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
-);
-
-/// fwht3-K B1+B2 candidate (see [`ATTENTION_Q8_0_FA2_GQA_GFX11_B1B2_SRC`]).
-pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_B1B2_SRC: &str = concat!(
-    "#define HIPFIRE_FA2_KMODE 3\n",
-    "#define HIPFIRE_FA2_GFX11_SWIZZLE_EVEN 1\n",
-    "#define HIPFIRE_FA2_GFX11_NO_CLOBBER 1\n",
-    "#define HIPFIRE_FA2_GFX11_FWHT3K_KERNEL attention_q8_0_fa2_gqa_fwht3k_gfx11_b1b2\n",
-    include_str!("../../../kernels/src/turbo_common.h"),
-    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
-);
 
 /// Benchmark-only gfx1201 LongSpec partition WMMA flash: same arithmetic as
 /// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC` but writes retained online-

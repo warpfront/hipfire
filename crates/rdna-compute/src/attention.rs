@@ -3915,29 +3915,15 @@ impl Gpu {
                 ),
             ));
         }
-        // Temporary B1/B2 admission hook: HIPFIRE_FA2_GFX11_VARIANT=base|b1|b1b2
-        // (default base). Module/symbol suffixed so the kernel cache cannot alias.
-        // Remove after admission.
-        let variant = std::env::var("HIPFIRE_FA2_GFX11_VARIANT").unwrap_or_else(|_| "base".into());
-        let (module, body) = match variant.as_str() {
-            "b1" => (
-                "attention_q8_0_fa2_gqa_gfx11_b1",
-                kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_B1_SRC,
-            ),
-            "b1b2" => (
-                "attention_q8_0_fa2_gqa_gfx11_b1b2",
-                kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_B1B2_SRC,
-            ),
-            _ => (
-                "attention_q8_0_fa2_gqa_gfx11",
-                kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC,
-            ),
-        };
+        let module = "attention_q8_0_fa2_gqa_gfx11";
         // KT32 pinned: the KT64/KT32 ABBA experiment selected KT32
         // (32,768 B dynamic LDS, two resident WGs/CU) on both measured
         // archs for both K modes; the KT64 path was removed.
         if !self.functions.contains_key(module) {
-            let src = format!("#define HIPFIRE_FA2_KT 32\n{body}");
+            let src = format!(
+                "#define HIPFIRE_FA2_KT 32\n{}",
+                kernels::ATTENTION_Q8_0_FA2_GQA_GFX11_SRC
+            );
             self.ensure_kernel(module, &src, module)?;
         }
         let grid_x = batch_size.div_ceil(8) as u32;
@@ -4105,25 +4091,13 @@ impl Gpu {
                 ),
             ));
         }
-        // Temporary B1/B2 admission hook (see Q8 launcher). Remove after admission.
-        let variant = std::env::var("HIPFIRE_FA2_GFX11_VARIANT").unwrap_or_else(|_| "base".into());
-        let (module, body) = match variant.as_str() {
-            "b1" => (
-                "attention_q8_0_fa2_gqa_fwht3k_gfx11_b1",
-                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_B1_SRC,
-            ),
-            "b1b2" => (
-                "attention_q8_0_fa2_gqa_fwht3k_gfx11_b1b2",
-                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_B1B2_SRC,
-            ),
-            _ => (
-                "attention_q8_0_fa2_gqa_fwht3k_gfx11",
-                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC,
-            ),
-        };
+        let module = "attention_q8_0_fa2_gqa_fwht3k_gfx11";
         // KT32 pinned (see the Q8 launcher): KT64 path removed.
         if !self.functions.contains_key(module) {
-            let src = format!("#define HIPFIRE_FA2_KT 32\n{body}");
+            let src = format!(
+                "#define HIPFIRE_FA2_KT 32\n{}",
+                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC
+            );
             self.ensure_kernel(module, &src, module)?;
         }
         let grid_x = batch_size.div_ceil(8) as u32;

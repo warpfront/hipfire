@@ -2895,8 +2895,8 @@ impl Gpu {
     }
 
     /// True when the C2 producer-sidecar route is live for this call:
-    /// IU4 + gfx1151 + kill switch not off + eager (no replay/capture) +
-    /// batch and K constraints of the iu4 MMQ consumer.
+    /// IU4 + gfx1151 + eager (no replay/capture) + batch and K constraints
+    /// of the iu4 MMQ consumer.
     pub fn iu4_producer_sidecar_active(&self, batch: usize, k: usize) -> bool {
         self.flags.iu4_producer_sidecar_enabled()
             && !self.replay.is_recording()

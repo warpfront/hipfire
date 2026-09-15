@@ -44,11 +44,6 @@ pub struct FeatureFlags {
     /// off everywhere); unset/`=0` keeps the incumbent Q8_1 MMQ route.
     /// Expected quality cost ~+0.014 WT2 KLD for the MQ4-XT speed rung.
     pub gfx11_mmq_iu4: Option<bool>,
-    /// C2 producer-emitted IU4 sidecars (`HIPFIRE_IU4_PRODUCER_SIDECAR`).
-    /// Default ON when unset so IU4 consumers skip the standalone
-    /// quantizer for RMSNorm/FWHT and SwiGLU/FWHT inputs. `=0` restores
-    /// the standalone-quantizer path. Requires IU4 + exact gfx1151.
-    pub iu4_producer_sidecar: Option<bool>,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -468,7 +463,6 @@ impl FeatureFlags {
             gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             gfx11_mmq_iu4: parse_bool("HIPFIRE_GFX11_MQ4V2_IU4"),
-            iu4_producer_sidecar: parse_bool("HIPFIRE_IU4_PRODUCER_SIDECAR"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -741,13 +735,12 @@ impl FeatureFlags {
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
     }
 
-    /// C2 producer-emitted IU4 sidecar route. Default ON when the env is
-    /// unset; `HIPFIRE_IU4_PRODUCER_SIDECAR=0` restores standalone
-    /// quantize_int4_mmq_ds128. Exact gfx1151 + IU4 opt-in only (plan §9.4).
+    /// C2 producer-emitted IU4 sidecar route: exact gfx1151 + IU4 opt-in.
+    /// When live (and eager + batch/K admission), RMSNorm/FWHT and
+    /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
+    /// keep standalone `quantize_int4_mmq_ds128`.
     pub fn iu4_producer_sidecar_enabled(&self) -> bool {
-        self.iu4_producer_sidecar.unwrap_or(true)
-            && self.gfx11_mmq_iu4.unwrap_or(false)
-            && self.arch == "gfx1151"
+        self.gfx11_mmq_iu4.unwrap_or(false) && self.arch == "gfx1151"
     }
 
     pub fn hfq3_mmq_layer_gate_pass(&self) -> bool {
@@ -811,7 +804,6 @@ impl FeatureFlags {
             gfx1151_e8_buffer: None,
             gfx11_mmq_x128: None,
             gfx11_mmq_iu4: None,
-            iu4_producer_sidecar: None,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,
