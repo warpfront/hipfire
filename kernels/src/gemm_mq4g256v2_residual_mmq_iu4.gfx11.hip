@@ -508,6 +508,13 @@ static __device__ __forceinline__ void vec_dot_i4_x128_ws4_w2_gfx1151(
                 const float2 dmA = __half22float2(dm); \
                 sum[((j / 16) + (n_idx)) * 8 + l] += \
                     dmA.x * d_x * (float)acc_i[l] + dmA.y * d_x * (float)s_x; \
+                /* Chained identity: pins this lane's fold ALU ahead of the */ \
+                /* next jbase block's LDS loads and the B0/B1 barriers. */ \
+                /* Without it the backend sinks all four blocks' folds below */ \
+                /* B0, keeping 16 int32x8 chains + sum[64] live at once (256 */ \
+                /* VGPR, spill). Values and order are unchanged (empty, */ \
+                /* register-only, per-lane after its own update). */ \
+                asm volatile("" : "+v"(sum[((j / 16) + (n_idx)) * 8 + l])); \
             } \
         } while (0)
 
