@@ -191,6 +191,11 @@ required-features = []
 name = "tmp_fa2_n1024_oracle"
 required-features = ["lab"]
 
+# Gate F3.0: FA2 fill/exp/PV attribution twins (throwaway; H24/KV4/D256).
+[[example]]
+name = "tmp_fa2_attrib"
+required-features = ["lab"]
+
 [[example]]
 name = "calib_sweep"
 required-features = ["lab"]
