@@ -29343,9 +29343,10 @@ impl Gpu {
     /// of `gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared`: identical
     /// grid/block/geometry selection (S2BT8/BT12/BT8/BT4) over the
     /// `*_LUT_SRC` sources, plus 8 kernel-arg LUT dwords (gate LUT + up LUT;
-    /// the kernel selects per row-source). `batch_size` MUST satisfy the FP8
-    /// contract (N%64==0 — the `_lloyd` wrapper pads); F16 fallbacks have no
-    /// LUT variant, so inadmissible shapes fail closed here, never uniform.
+    /// the kernel selects per 16-row slab from the wave-uniform slab start row;
+    /// all m must be multiples of 16 (fail-closed)). `batch_size` MUST satisfy
+    /// the FP8 contract (N%64==0 — the `_lloyd` wrapper pads); F16 fallbacks
+    /// have no LUT variant, so inadmissible shapes fail closed here, never uniform.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared_lloyd(
         &mut self,
@@ -29390,6 +29391,19 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 "mq4v2-lloyd gate/up FP8 prefill: batch divisible by 64 required (pad upstream)",
+            ));
+        }
+        // The LUT kernels key the per-slab codebook on the slab start row
+        // (wave-uniform -> SGPR), which requires every 16-row slab to lie in one
+        // source: gate_m and up_m must both be multiples of 16 (hence tm too, so the
+        // clamped tail lane in the kernel cannot straddle). Any other shape fails
+        // closed here, never a straddled tile decoding on the wrong codebook.
+        if gate_m % 16 != 0 || up_m % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_gate_up mq4v2 fp8 lloyd: every projection m must be a multiple of 16 (gate={gate_m} up={up_m})"
+                ),
             ));
         }
         if prepared.n != batch_size || prepared.k != k {
@@ -30555,7 +30569,9 @@ impl Gpu {
 
     /// MQ4G256V2-Lloyd (qt=52) 3-way QKV FP8 prefill, prepared-X form. LUT twin
     /// of `gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8` over the `*_QKV_*_LUT_SRC`
-    /// sources, plus 12 kernel-arg LUT dwords (q/k/v LUTs).
+    /// sources, plus 12 kernel-arg LUT dwords (q/k/v LUTs; the kernel selects
+    /// per 16-row slab from the wave-uniform slab start row; all m must be
+    /// multiples of 16 (fail-closed)).
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd(
         &mut self,
@@ -30604,6 +30620,19 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 "mq4v2-lloyd qkv FP8 prefill: batch divisible by 64 required (pad upstream)",
+            ));
+        }
+        // The LUT kernels key the per-slab codebook on the slab start row
+        // (wave-uniform -> SGPR), which requires every 16-row slab to lie in one
+        // source: q_m, k_m, and v_m must all be multiples of 16 (hence tm too, so the
+        // clamped tail lane in the kernel cannot straddle). Any other shape fails
+        // closed here, never a straddled tile decoding on the wrong codebook.
+        if q_m % 16 != 0 || k_m % 16 != 0 || v_m % 16 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "gemm_qkv mq4v2 fp8 lloyd: every projection m must be a multiple of 16 (q={q_m} k={k_m} v={v_m})"
+                ),
             ));
         }
         if prepared.n != batch_size || prepared.k != k {

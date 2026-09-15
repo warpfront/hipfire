@@ -23,13 +23,15 @@
 //   kernel's op order: scalar stride sum-of-squares, descending-offset LDS
 //   reduction tree, rsqrt, `((x*w)*rms/awq)*s1`, identical butterflies,
 //   `(v*scale)*s2` stores. The F32 AWQ symbol is now derived from
-//   `fused_rmsnorm_mq_rotate.hip` (shuffle reduction tree, same value op
-//   order); the two can differ in the last ulp of `rms` only.
+//   `fused_rmsnorm_mq_rotate.hip` via `-DHIPFIRE_RMSNORM_AWQ` (shuffle
+//   reduction tree, same value op order; the retired gfx1100-only
+//   `*_awq_direct` fork / `HIPFIRE_GFX1100_AWQ_NORM_DIRECT` are gone); the
+//   two can differ in the last ulp of `rms` only.
 //
 // Grid: [batch_size, 1, 1]. Block: [256]. The plain kernel takes the same
 // oversized `(K+256)*4` dynamic-shared reservation as its baseline launcher
 // (the R29c1 kernel only needs `reduce[256]`); the AWQ kernel takes
-// `256*4` exactly like the direct baseline launcher.
+// `256*4` exactly like the current F32 AWQ launcher.
 
 #include <hip/hip_runtime.h>
 

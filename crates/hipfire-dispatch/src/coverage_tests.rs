@@ -249,6 +249,34 @@ const FLEET: &[OpUse] = &[
         dtype: MQ6G256V2,
         archs: &["gfx1200", "gfx1201"],
     },
+    // ── MQ4G256V2Lloyd (qt52): same dual-half wire + per-tensor Lloyd LUT ──
+    // Plain/residual/swiglu share the V2 prerotated GEMV keys; fused QKV/QKVZA/
+    // GateUp have dedicated Always-gated Lloyd keys (see mqv2_fused test).
+    OpUse {
+        model: "qwen3.8-27b.mq4-lloyd",
+        role: Role::Plain,
+        dtype: MQ4G256V2Lloyd,
+        archs: WAVE32,
+    },
+    OpUse {
+        model: "qwen3.8-27b.mq4-lloyd",
+        role: Role::Residual,
+        dtype: MQ4G256V2Lloyd,
+        archs: WAVE32,
+    },
+    OpUse {
+        model: "qwen3.8-27b.mq4-lloyd",
+        role: Role::SwigluResidual,
+        dtype: MQ4G256V2Lloyd,
+        archs: WAVE32,
+    },
+    // RDNA4 anchors — Lloyd V2 must not re-acquire a gfx11-only gate.
+    OpUse {
+        model: "qwen-mq4v2-lloyd-rdna4",
+        role: Role::Plain,
+        dtype: MQ4G256V2Lloyd,
+        archs: &["gfx1200", "gfx1201"],
+    },
 ];
 
 /// Does the forward lowering for (role, dtype) have ANY dispatch plan (so it
@@ -992,6 +1020,32 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
         FusedKeyUse {
             key: KernelKey::FusedGateUpMq4G256Lloyd,
             archs: WMMA_ARCHS,
+        },
+        // ── MQ4G256V2 / MQ4G256V2Lloyd fused (qt44/qt52 dual-half): Always ──
+        // Same gate as table rows; WAVE32 floor like the V2 GEMV path.
+        FusedKeyUse {
+            key: KernelKey::FusedQkvMq4G256V2,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaMq4G256V2,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpMq4G256V2,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvMq4G256V2Lloyd,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaMq4G256V2Lloyd,
+            archs: WAVE32,
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpMq4G256V2Lloyd,
+            archs: WAVE32,
         },
         // ── #397 Ship 5.2 slice 2: prefill gate+up dtypes ──
         // HFQ3G256: Always — base `gemm_gate_up_hfq3g256` carries a full
@@ -1772,6 +1826,9 @@ fn mqv2_fused_and_gemm_keys_resolve_on_gfx11_gfx12() {
         KernelKey::FusedQkvMq4G256V2,
         KernelKey::FusedQkvzaMq4G256V2,
         KernelKey::FusedGateUpMq4G256V2,
+        KernelKey::FusedQkvMq4G256V2Lloyd,
+        KernelKey::FusedQkvzaMq4G256V2Lloyd,
+        KernelKey::FusedGateUpMq4G256V2Lloyd,
         KernelKey::FusedQkvMq6G256V2,
         KernelKey::FusedQkvzaMq6G256V2,
         KernelKey::FusedGateUpMq6G256V2,

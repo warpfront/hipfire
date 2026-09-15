@@ -8,7 +8,7 @@
 // existed for that path. This kernel completes the AWQ math
 // `(W·s) · (silu(g)*u / s) = W · silu(g)*u` by dividing each element by
 // `awq_scale[i]` AFTER the silu*up reduction but BEFORE the signs1 gather
-// and FWHT. Exact mirror of `fused_rmsnorm_mq_rotate_awq.hip` Phase 1c.
+// and FWHT. Exact mirror of `fused_rmsnorm_mq_rotate_awq` (derived from fused_rmsnorm_mq_rotate.hip via -DHIPFIRE_RMSNORM_AWQ) Phase 1c.
 //
 // Backward compatibility: dispatched ONLY when the upcoming linear
 // (down_proj / w_down) carries an `awq_scale`. Otherwise the standard
