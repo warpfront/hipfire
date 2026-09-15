@@ -106,7 +106,7 @@ Use ROCm `llvm-readobj --notes <object.hsaco>` and `llvm-objdump --disassemble <
 | T0 z M64 | ≤192 for two blocks; **≤128** required to claim three | dynamic 19968 B, block256 | both 0 |
 | T0 qkv union | ≤192 | dynamic 30720 B, block256 | both 0 |
 | S1 screen | each incumbent unchanged and individually admitted | simultaneous IU4+FA2 total 63488 B/CU; calculate combined VGPR demand | both 0 |
-| W2 future Sol prerequisite only | ≤300 for the **whole kernel**, not different fictitious allocations per role | exactly 61440 B, block320, 10 waves | both 0 |
+| W2 future Sol prerequisite only | ≤256 for the **whole kernel** (gfx11 wave32 architectural maximum; the earlier ≤300 figure was unattainable — W2.0 compiled to 256 with 391 spills), not different fictitious allocations per role | exactly 61440 B, block320, 10 waves | both 0 |
 | G2 future Sol prerequisite only | ≤192 at block128 (conservative) | ≤28672 B, all arrays itemized in its separate spec | both 0 |
 
 The current IU4 source comment records 190 VGPR/zero spills, but this is not a fresh object measurement (`kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip:48-51`). A `__launch_bounds__(256,3)` spelling does not create three resident blocks when LDS requires two. Reject spills immediately: no timed “maybe it still wins” branch.
