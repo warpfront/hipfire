@@ -3850,8 +3850,45 @@ impl Gpu {
     /// `max_ctx_len` is max(positions)+1; the kernel never reads it
     /// (causal bounds come from `positions[]`); it exists only for profile
     /// byte attribution, mirroring the incumbent.
+    ///
+    /// Production batch envelope is `1..=512`. For Gate F N=1024 oracle only,
+    /// use [`Self::attention_q8_0_fa2_gqa_gfx11_direct_unchecked`].
     #[allow(clippy::too_many_arguments)]
     pub fn attention_q8_0_fa2_gqa_gfx11(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if batch_size == 0 || batch_size > 512 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_gfx11 requires 1 <= batch <= 512, got {batch_size}"
+                ),
+            ));
+        }
+        self.attention_q8_0_fa2_gqa_gfx11_direct_unchecked(
+            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+        )
+    }
+
+    /// Oracle-only twin of [`Self::attention_q8_0_fa2_gqa_gfx11`] that skips
+    /// **only** the production `batch <= 512` cap (still rejects `batch == 0`).
+    ///
+    /// Gate F prerequisite (1): prove one N=1024 FA2 launch is bit-identical to
+    /// two disjoint N=512 launches. Do not use from production ingress.
+    /// Remove or promote when Gate F host envelope (prereq 2) lands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_fa2_gqa_gfx11_direct_unchecked(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -3886,12 +3923,11 @@ impl Gpu {
                 ),
             ));
         }
-        if batch_size == 0 || batch_size > 512 {
+        // Oracle-only: no upper batch cap (production wrapper enforces <=512).
+        if batch_size == 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "attention_q8_0_fa2_gqa_gfx11 requires 1 <= batch <= 512, got {batch_size}"
-                ),
+                "attention_q8_0_fa2_gqa_gfx11_direct_unchecked requires batch >= 1",
             ));
         }
         if max_ctx_len == 0 || max_ctx_len > 32768 {
@@ -4006,8 +4042,45 @@ impl Gpu {
     /// `max_ctx_len` is max(positions)+1; the kernel never reads it
     /// (causal bounds come from `positions[]`); it exists only for profile
     /// byte attribution, mirroring the incumbent.
+    ///
+    /// Production batch envelope is `1..=512`. For Gate F N=1024 oracle only,
+    /// use [`Self::attention_q8_0_fa2_gqa_fwht3k_gfx11_direct_unchecked`].
     #[allow(clippy::too_many_arguments)]
     pub fn attention_q8_0_fa2_gqa_fwht3k_gfx11(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        signs1: &GpuTensor,
+        signs2: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if batch_size == 0 || batch_size > 512 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 1 <= batch <= 512, got {batch_size}"
+                ),
+            ));
+        }
+        self.attention_q8_0_fa2_gqa_fwht3k_gfx11_direct_unchecked(
+            q, k_cache, v_cache, out, positions, signs1, signs2, n_heads, n_kv_heads, head_dim,
+            max_ctx_len, batch_size,
+        )
+    }
+
+    /// Oracle-only twin of [`Self::attention_q8_0_fa2_gqa_fwht3k_gfx11`] that
+    /// skips **only** the production `batch <= 512` cap (still rejects
+    /// `batch == 0`). Gate F prerequisite (1) N=1024 bit-identity oracle.
+    /// Remove or promote when Gate F host envelope (prereq 2) lands.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_fa2_gqa_fwht3k_gfx11_direct_unchecked(
         &mut self,
         q: &GpuTensor,
         k_cache: &GpuTensor,
@@ -4051,12 +4124,11 @@ impl Gpu {
                 ),
             ));
         }
-        if batch_size == 0 || batch_size > 512 {
+        // Oracle-only: no upper batch cap (production wrapper enforces <=512).
+        if batch_size == 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "attention_q8_0_fa2_gqa_fwht3k_gfx11 requires 1 <= batch <= 512, got {batch_size}"
-                ),
+                "attention_q8_0_fa2_gqa_fwht3k_gfx11_direct_unchecked requires batch >= 1",
             ));
         }
         if max_ctx_len == 0 || max_ctx_len > 32768 {
