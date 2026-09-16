@@ -229,6 +229,10 @@ pub struct FeatureFlags {
     /// Default ON on gfx1100/gfx1151; `=1` forces it on other arches
     /// (launchers stay on the gfx11 allowlist).
     pub gfx11_fa2_prefill: bool,
+    /// `HIPFIRE_KV_SHADOW_F16=0` opts out of the f16 KV shadow (Halo-only:
+    /// effective only on exact gfx1151 even when set). Default ON everywhere;
+    /// the arch gate lives at the use sites (allocation + FA2 shadow route).
+    pub kv_shadow_f16: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
     pub mw16: bool,
@@ -588,8 +592,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_qkvza: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKVZA")
                 .unwrap_or(arch == "gfx1201"),
-            gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
-                .unwrap_or(arch == "gfx1201"),
+            kv_shadow_f16: parse_bool("HIPFIRE_KV_SHADOW_F16").unwrap_or(true),
             gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
                 .unwrap_or(arch == "gfx1201"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
@@ -886,6 +889,7 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_qkv: false,
             gfx12_fa2_prefill: false,
             gfx11_fa2_prefill: false,
+            kv_shadow_f16: false,
             gemm_dump: false,
             deterministic: false,
             mw16: false,

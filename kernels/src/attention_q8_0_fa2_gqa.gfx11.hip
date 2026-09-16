@@ -229,6 +229,18 @@ __device__ __forceinline__ void fa2_gqa_body(
     uint32_t pf_ks;
     uint32_t pf_kc[KT_KITERS * 8];
 #endif
+#ifdef HIPFIRE_FA2_SHADOW
+    // Shadow: 2 slots/lane x 32 f16 = 64 f16 = 32 dwords of raw f16 bytes
+    // (both K modes share the row-major f16 shadow layout, so one staging
+    // array covers both). Same F6 discipline: staged after the post-fill
+    // barrier, consumed by the next tile's fill with no fresh K loads.
+    // VGPR note: 32 dwords vs the Q8 path's 17 — Halo-measured; if this
+    // spills, compile with HIPFIRE_FA2_SHADOW_PF=0 to fill straight from
+    // global (still no dequant).
+#ifndef HIPFIRE_FA2_SHADOW_PF
+#define HIPFIRE_FA2_SHADOW_PF 1
+#endif
+    uint32_t pf_sh[KT_KITERS * 16];
 #endif
     // ---- Transitions 2-4: KT tiles ----
     for (int tile = 0; ; ++tile) {
@@ -248,6 +260,132 @@ __device__ __forceinline__ void fa2_gqa_body(
 #endif
 
         // ---- Transition 2: cooperative KT fill (all four waves) ----
+#ifdef HIPFIRE_FA2_SHADOW
+        // Shadow K fill: f16 rows [pos, 4, 256] straight into the swizzled
+        // dword plane (same store as the Q8/fwht3 paths, no dequant). Slot
+        // (k,b) owns dims b*32..b*32+31 in both K modes (fwht3 pairs
+        // b*16..b*16+15 cover the same 32 dims as Q8 block b). OOB slots
+        // zero-fill (+0.0); they are softmax-masked, so outputs match the
+        // Q8/fwht3 fill bit-for-bit.
+#if HIPFIRE_FA2_KMODE == 3
+#if HIPFIRE_FA2_SHADOW_PF
+        if (have_pf) {
+#if HIPFIRE_FA2_KT == 32
+#pragma unroll 1
+            for (int t = 0; t < KT_KITERS; ++t) {
+                const int s = tid + t * 128;
+                const int k = s >> 3;
+                const int b = s & 7;
+                const int rot = fa2_swiz(k & 15);
+                const int base = k * 128;
+#pragma unroll 1
+                for (int m = 0; m < 4; ++m) {
+                    const int p0 = (b * 4 + m) * 4;
+#pragma unroll
+                    for (int i = 0; i < 4; ++i)
+                        Kdw[base + ((p0 + i + rot) & 127)] = pf_sh[t * 16 + m * 4 + i];
+                }
+            }
+#endif
+        } else
+#endif
+        for (int t = 0; t < KT_KITERS; ++t) {
+            const int s = tid + t * 128;
+            const int k = s >> 3;
+            const int b = s & 7;
+            const int gk = ktile + k;
+            const _Float16* row = (gk < seq_len)
+                ? (const _Float16*)k_cache + (unsigned long long)gk * 1024ULL + (unsigned long long)kv_h * 256ULL
+                : nullptr;
+            const int rot = fa2_swiz(k & 15);
+            const int base = k * 128;
+#pragma unroll 1
+            for (int m = 0; m < 4; ++m) {
+                const int p0 = (b * 4 + m) * 4;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    uint32_t u = 0;
+                    if (row != nullptr)
+                        __builtin_memcpy(&u, row + (p0 + i) * 2, 4);
+                    Kdw[base + ((p0 + i + rot) & 127)] = u;
+                }
+            }
+        }
+#else
+        // Shadow K fill, Q8-K mode: slot (k,b) = dims b*32..b*32+31.
+#if HIPFIRE_FA2_SHADOW_PF
+        if (have_pf) {
+#if HIPFIRE_FA2_KT == 32
+#pragma unroll 1
+            for (int t = 0; t < KT_KITERS; ++t) {
+                const int idx = tid + t * 128;
+                const int k = idx >> 3;
+                const int b = idx & 7;
+                const int rot = fa2_swiz(k & 15);
+                const int base = k * 128;
+                const int pb = b * 16;
+#pragma unroll 1
+                for (int w = 0; w < 8; ++w) {
+                    Kdw[base + ((pb + w * 2 + rot) & 127)] = pf_sh[t * 16 + w * 2];
+                    Kdw[base + ((pb + w * 2 + 1 + rot) & 127)] = pf_sh[t * 16 + w * 2 + 1];
+                }
+            }
+#endif
+        } else
+#endif
+        for (int t = 0; t < KT_KITERS; ++t) {
+            const int idx = tid + t * 128;
+            const int k = idx >> 3;
+            const int b = idx & 7;
+            const int gk = ktile + k;
+            const _Float16* row = (gk < seq_len)
+                ? (const _Float16*)k_cache + (unsigned long long)gk * 1024ULL + (unsigned long long)kv_h * 256ULL
+                : nullptr;
+            const int rot = fa2_swiz(k & 15);
+            const int base = k * 128;
+            const int pb = b * 16;
+#pragma unroll 1
+            for (int w = 0; w < 8; ++w) {
+                uint32_t u0 = 0, u1 = 0;
+                if (row != nullptr) {
+                    __builtin_memcpy(&u0, row + b * 32 + w * 4, 4);
+                    __builtin_memcpy(&u1, row + b * 32 + w * 4 + 2, 4);
+                }
+                Kdw[base + ((pb + w * 2 + rot) & 127)] = u0;
+                Kdw[base + ((pb + w * 2 + 1 + rot) & 127)] = u1;
+            }
+        }
+#endif
+        // Shadow V fill: f16 pairs (V[2m][d], V[2m+1][d]) straight into the
+        // transposed plane (same store as the Q8 path, no dequant).
+        for (int t = 0; t < KT_VITERS; ++t) {
+            const int pair = tid + t * 128;
+            const int m = pair >> 3;
+            const int b = pair & 7;
+            const int k0 = ktile + 2 * m;
+            const _Float16* row0 = (k0 < seq_len)
+                ? (const _Float16*)v_cache + (unsigned long long)k0 * 1024ULL + (unsigned long long)kv_h * 256ULL
+                : nullptr;
+            const _Float16* row1 = (k0 + 1 < seq_len)
+                ? (const _Float16*)v_cache + (unsigned long long)(k0 + 1) * 1024ULL + (unsigned long long)kv_h * 256ULL
+                : nullptr;
+#pragma unroll 1
+            for (int w = 0; w < 8; ++w) {
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int d = b * 32 + w * 4 + c;
+                    _Float16 e0 = (_Float16)0.0f;
+                    _Float16 e1 = (_Float16)0.0f;
+                    if (row0 != nullptr) e0 = row0[d];
+                    if (row1 != nullptr) e1 = row1[d];
+                    fa2_dw_t dw;
+                    dw.h[0] = e0;
+                    dw.h[1] = e1;
+                    Vdw[d * V_ROW + ((m + fa2_swiz(d & 15)) & V_MASK)] = dw.u;
+                }
+            }
+        }
+#else
 #if HIPFIRE_FA2_KMODE == 3
         // fwht3 K: per (position, kv head) record = [f32 cnorm][96 B codes]
         // (k_bytes_per_head = 100, k_bytes_per_pos = 4*100 = 400, head offset
@@ -442,8 +580,40 @@ __device__ __forceinline__ void fa2_gqa_body(
                 }
             }
         }
+#endif
         __syncthreads();
 #if HIPFIRE_FA2_KT == 32
+#ifdef HIPFIRE_FA2_SHADOW
+#if HIPFIRE_FA2_SHADOW_PF
+        // ---- F6 shadow: prefetch the next tile's raw f16 K bytes ----
+        // Same discipline as above (post-fill barrier, overlap compute);
+        // the next tile's K fill copies from pf_sh with no fresh K loads.
+        // Both K modes share the row-major f16 shadow layout: 2 slots/lane
+        // x 16 dwords. OOB slots stage zeros (softmax-masked downstream).
+        {
+            const int ktile_next = ktile + KT;
+            if (ktile_next < seq_len) {
+#pragma unroll 1
+                for (int t = 0; t < KT_KITERS; ++t) {
+                    const int idx = tid + t * 128;
+                    const int k = idx >> 3;
+                    const int b = idx & 7;
+                    const int gk = ktile_next + k;
+                    const _Float16* row = (gk < seq_len)
+                        ? (const _Float16*)k_cache + (unsigned long long)gk * 1024ULL + (unsigned long long)kv_h * 256ULL
+                        : nullptr;
+#pragma unroll 1
+                    for (int w = 0; w < 16; ++w) {
+                        uint32_t u = 0;
+                        if (row != nullptr)
+                            __builtin_memcpy(&u, row + b * 32 + w * 2, 4);
+                        pf_sh[t * 16 + w] = u;
+                    }
+                }
+            }
+        }
+#endif
+#else
         // ---- F6: prefetch the next tile's raw K bytes (all four waves) ----
         // Issued immediately after the post-fill barrier so these global
         // loads overlap the current tile's QK/softmax/PV below; the next

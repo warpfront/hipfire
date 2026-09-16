@@ -328,6 +328,14 @@ pub struct KvCache {
     /// absolute phase, and the cache write still lands at `pos` (physical).
     /// Zero when no compaction has happened.
     pub compact_offset: usize,
+    /// f16 KV shadow (Halo-only, exact gfx1151): per-layer f16 copies of K/V
+    /// for FULL-ATTENTION layers, row-major [physical_cap × n_kv_heads ×
+    /// head_dim] f16 (2 B/elem). Empty vecs = absent (every other arch, and
+    /// gfx1151 with `attention.kv_shadow_f16=false`). Allocated by
+    /// [`Self::ensure_shadow_f16`] alongside the Q8/fwht3 cache rows in the
+    /// same per-layer slot geometry; decode keeps reading Q8.
+    pub k_shadow_f16: Vec<GpuTensor>,
+    pub v_shadow_f16: Vec<GpuTensor>,
 }
 
 /// Layer addressing for [`KvCache::from_mode`]: a per-layer "is this a
@@ -970,6 +978,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: Vec::new(),
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: Vec::new(),
             kv_dim: self.kv_dim,
             max_seq: lane_capacity,
@@ -1156,6 +1166,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -1178,6 +1190,77 @@ impl KvCache {
             compact_offset: 0,
             v_mode: VMode::Q8,
         })
+    }
+
+    /// f16 shadow bytes per token for one K or V side
+    /// (`n_kv_heads × head_dim` f16, row-major `[heads, dim]` per token).
+    pub fn shadow_f16_bytes_per_token(n_kv_heads: usize, head_dim: usize) -> usize {
+        n_kv_heads * head_dim * 2
+    }
+
+    /// True when `k_gpu` index `l` carries an allocated f16 shadow pair.
+    pub fn shadow_present(&self, l: usize) -> bool {
+        self.k_shadow_f16.get(l).map_or(false, |t| t.numel() > 1)
+            && self.v_shadow_f16.get(l).map_or(false, |t| t.numel() > 1)
+    }
+
+    /// Allocate f16 K/V shadows for `layers` (`k_gpu`/`v_gpu` indexes of the
+    /// FULL-ATTENTION layers), sized `physical_cap × n_kv_heads × head_dim`
+    /// f16 alongside the Q8/fwht3 cache rows in the same per-layer slot
+    /// geometry (row-major `[cap, heads, dim]` f16 per side). Idempotent:
+    /// slots already carrying a full-size shadow are kept (content
+    /// preserved); absent or undersized slots are (re)allocated zeroed.
+    /// Non-KV placeholder slots (`numel <= 1`) stay placeholders so the
+    /// shadow vecs stay index-aligned with `k_gpu`/`v_gpu`. Logs the total
+    /// once per process. VRAM per FA layer: `2 sides × cap × heads × dim ×
+    /// 2 B` (e.g. 16 FA layers × 4 heads × 256 dim × 32K ctx = 1.07 GiB per
+    /// K or V side at 32K ctx).
+    pub fn ensure_shadow_f16(&mut self, gpu: &mut Gpu, layers: &[usize]) -> HipResult<()> {
+        let n_slots = self.k_gpu.len();
+        for vec in [&mut self.k_shadow_f16, &mut self.v_shadow_f16] {
+            while vec.len() < n_slots {
+                vec.push(gpu.zeros(&[1], DType::F32)?);
+            }
+        }
+        let need_elems = self
+            .physical_cap
+            .checked_mul(self.n_kv_heads)
+            .and_then(|n| n.checked_mul(self.head_dim))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "shadow f16 extent overflowed"))?;
+        let mut newly_bytes = 0usize;
+        for &l in layers {
+            if l >= n_slots {
+                continue;
+            }
+            let real_k = self.k_gpu[l].numel() > 1;
+            let real_v = self.v_gpu[l].numel() > 1;
+            if real_k && self.k_shadow_f16[l].numel() < need_elems {
+                self.k_shadow_f16[l] = gpu.zeros(&[need_elems], DType::F16)?;
+                newly_bytes += need_elems * 2;
+            }
+            if real_v && self.v_shadow_f16[l].numel() < need_elems {
+                self.v_shadow_f16[l] = gpu.zeros(&[need_elems], DType::F16)?;
+                newly_bytes += need_elems * 2;
+            }
+        }
+        if newly_bytes > 0 {
+            static SHADOW_LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !SHADOW_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                let per_side = Self::shadow_f16_bytes_per_token(self.n_kv_heads, self.head_dim);
+                eprintln!(
+                    "kv_shadow_f16: {} FA slots × cap {} × {} heads × {} dim: \
+                     {} B/token/side ({} MiB/side at full ctx), K+V live",
+                    layers.len(),
+                    self.physical_cap,
+                    self.n_kv_heads,
+                    self.head_dim,
+                    per_side,
+                    per_side.saturating_mul(self.physical_cap) / (1 << 20),
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Create quantized KV cache (HFQ4-G128). 3.56x smaller than FP32.
@@ -1205,6 +1288,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -1315,6 +1400,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -1398,6 +1485,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -2512,6 +2601,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim: layout.kv_dim,
             max_seq,
@@ -2608,6 +2699,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -2725,6 +2818,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim: layout.kv_dim,
             max_seq: max_seq_len,
@@ -2820,6 +2915,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -2867,6 +2964,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -2916,6 +3015,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales,
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales,
             kv_dim,
             max_seq: max_seq_len,
@@ -2967,6 +3068,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales,
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales,
             kv_dim,
             max_seq: max_seq_len,
@@ -3066,6 +3169,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -3138,6 +3243,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -3211,6 +3318,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -3311,6 +3420,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -3438,6 +3549,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -3621,6 +3734,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -3816,6 +3931,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -3900,6 +4017,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -3990,6 +4109,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -4063,6 +4184,8 @@ impl KvCache {
             k_gpu,
             v_gpu,
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim,
             max_seq: max_seq_len,
@@ -4222,6 +4345,8 @@ mod vmm_layout_tests {
             k_gpu: vec![],
             v_gpu: vec![],
             k_scales: vec![],
+            k_shadow_f16: vec![],
+            v_shadow_f16: vec![],
             v_scales: vec![],
             kv_dim: n_kv_heads * head_dim,
             max_seq: 128,

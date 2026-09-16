@@ -30,6 +30,16 @@ Source base: `/home/kaden/ClaudeCode/warpfront/wt-lloyd`, `cadd315a1`; the paren
 > reverted. Remaining FA2 fill cost is V dequant VALU + LDS stores, not load
 > latency; the exact lever left is a pre-dequantized f16 V (KV shadow).
 
+> **DECODE FLOORS (user-set, 2026-09-16) — hard gates for every port and
+> every Halo unit:** gfx1201 (R9700) **36.5 tok/s**, gfx1100 (XTX) **49.5**,
+> gfx1151 (Halo) **14.66**. Same-tree A/B on the R9700 (`--matrix --ctx 128
+> --tg 64`, 3 runs): pre-campaign 6a64c0803 = 36.11, HEAD = 36.11 (identical
+> samples) — this session did not move gfx1201 decode. Approved tracks:
+> (1) GM in-place via multirow gemv (bit-exact, 0 VRAM); (2) f16 K/V shadow
+> for FA layers on gfx1151 only (~32 KB/token, ~2.1 GB at 32K ctx); (3) exact
+> tail fusions; (C) port F4a/F4b/F6 to the gfx1201 FA2 kernel; IU4-family
+> units are N/A on gfx1201 and opt-in-only on gfx1100.
+
 ## 1. Order and immutable contract
 
 Execute: **C0 latent FA2 blob fix → A0 calibration → A5 grid order → F1 repaired oracle and F2 1024 host/cadence envelope → B6 fill issue structure → G1 sequential GDN constants → T0 tails → S1 co-scheduling screen → W2-versus-S1 Sol-spec decision.** This is the max brainstorm's first-week order, with the mandatory correctness fix in front and the host half of F made explicit (`docs/plans/2026-09-15-halo-gap-levers-max.md:592-604`). F2 has its own early kill; a failed chunk-size experiment must not block B6/G1/T0 at N512.

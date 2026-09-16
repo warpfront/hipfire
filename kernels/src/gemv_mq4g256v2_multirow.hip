@@ -485,3 +485,476 @@ extern "C" __global__ void gemv_mq4g256v2_multirow_r8(
 ) {
     gemv_mq4g256v2_multirow_body<8>(A, x, y, M, K);
 }
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1200__) || defined(__gfx1201__)
+// Group-major twin of gemv_mq4g256v2_multirow_r2 (the gfx1151 N=1 decode
+// oracle: gemv_rows_default is 2 on gfx1151, so plain decode dispatches the
+// r2 kernel, not the scalar one). Byte-identical except the A group base
+// address. Shipping: row_ptr0 = A + row0 * groups_per_row * 136,
+// gp = row_ptr0 + g * 136 (same for row1). Group-major:
+// gp = A + 136 * (g * M + row). Same ABI/grid [ceil(M/2)]/block 32/LDS 0;
+// same x-hoist, branchless dual-row DOG order, tails, and writeback;
+// bit-exact by construction. Carried quad base qb advances by 4 groups per
+// iteration so the loop body needs no multiply.
+__launch_bounds__(32, 18)
+extern "C" __global__ void gemv_mq4g256v2_multirow_r2_gm(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row0 = blockIdx.x << 1;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const bool have_row1 = row1 < M;
+    const int tid = threadIdx.x;
+
+#if defined(HIPFIRE_GFX1151_LM_HEAD_K2048)
+    const int groups_per_row = 8;
+#else
+    const int groups_per_row = K / 256;
+#endif
+    const long long m136 = (long long)M * 136;
+    const long long r0off = (long long)row0 * 136;
+    // Adjacent rows: row r+1's group base is exactly +136 B past row r's (or
+    // +0 when the trailing odd row clamps r1 to r0). One base + uniform delta
+    // replaces the second full A+qb+roff address computation per group.
+    const long long r1_delta = have_row1 ? 136 : 0;
+    const unsigned int r1_delta_u = (unsigned int)r1_delta;
+    const long long m4 = 4 * m136;
+    const int boff = tid * 4;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const auto weight_rsrc_gm = HIPFIRE_WEIGHT_RSRC(A);
+#endif
+#if defined(HIPFIRE_GFX1151_LM_HEAD_X_BUFFER)
+    const auto x_rsrc_gm = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<float*>(x), 0, 0xffffffffu, 0x31004000u);
+#endif
+
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
+    const int quads = groups_per_row >> 2;
+    const int tail = groups_per_row & 3;
+
+#if defined(HIPFIRE_GFX1151_LM_HEAD_X_BUFFER)
+    #define LOAD_X8_INTO_GM(b, pfx) \
+        const hipfire_lm_f32x4 pfx##v0 = __builtin_bit_cast( \
+            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128( \
+                x_rsrc_gm, (unsigned int)(b) * 4u, 0, 0)); \
+        const hipfire_lm_f32x4 pfx##v1 = __builtin_bit_cast( \
+            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128( \
+                x_rsrc_gm, ((unsigned int)(b) + 4u) * 4u, 0, 0)); \
+        const float pfx##0 = pfx##v0.x, pfx##1 = pfx##v0.y, pfx##2 = pfx##v0.z, pfx##3 = pfx##v0.w; \
+        const float pfx##4 = pfx##v1.x, pfx##5 = pfx##v1.y, pfx##6 = pfx##v1.z, pfx##7 = pfx##v1.w
+#else
+    #define LOAD_X8_INTO_GM(b, pfx) \
+        const float4 pfx##v0 = *reinterpret_cast<const float4*>(x + (b)); \
+        const float4 pfx##v1 = *reinterpret_cast<const float4*>(x + (b) + 4); \
+        const float pfx##0 = pfx##v0.x, pfx##1 = pfx##v0.y, pfx##2 = pfx##v0.z, pfx##3 = pfx##v0.w; \
+        const float pfx##4 = pfx##v1.x, pfx##5 = pfx##v1.y, pfx##6 = pfx##v1.z, pfx##7 = pfx##v1.w
+#endif
+
+#if defined(HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER)
+    #define LOAD_LM_HEADER_GM(gp, weight_offset) (*(const unsigned int*)(gp))
+#else
+    #define LOAD_LM_HEADER_GM(gp, weight_offset) \
+        HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc_gm, gp, weight_offset)
+#endif
+    #define LOAD_LM_PACKED_GM(gp, weight_offset) \
+        HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc_gm, gp, weight_offset)
+
+    // Paired dual-row DOG: row0 base is one full A+qb+r0off computation per
+    // group; row1 rides +r1_delta (adjacent rows are +136 B apart, +0 when
+    // the trailing odd row clamps r1 to r0). Same per-row bytes and same
+    // (a0,b0,a1,b1,...) accumulation order as the split sequence below was;
+    // bit-exact by construction.
+    #define DOG_X8_GM_PAIR(qb, a, b, pfx) do { \
+        const char* gp0_gm = A + (qb) + r0off; \
+        const char* gp1_gm = gp0_gm + r1_delta; \
+        const unsigned int w0_gm = (unsigned int)((qb) + r0off); \
+        const unsigned int w1_gm = w0_gm + r1_delta_u; \
+        const unsigned int hA0 = LOAD_LM_HEADER_GM(gp0_gm, w0_gm); \
+        const unsigned int hB0 = LOAD_LM_HEADER_GM((gp0_gm) + 4, (w0_gm) + 4); \
+        const unsigned int hs0 = (tid < 16) ? hA0 : hB0; \
+        float sc0 = __half2float(__ushort_as_half((unsigned short)(hs0 & 0xFFFFu))); \
+        float zp0 = __half2float(__ushort_as_half((unsigned short)(hs0 >> 16))); \
+        unsigned int pk0 = LOAD_LM_PACKED_GM((gp0_gm) + 8 + boff, (w0_gm) + 8 + boff); \
+        (a) += (sc0 * (float)((pk0) & 0xFu)         + zp0) * pfx##0 \
+             + (sc0 * (float)(((pk0) >> 4) & 0xFu)  + zp0) * pfx##1 \
+             + (sc0 * (float)(((pk0) >> 8) & 0xFu)  + zp0) * pfx##2 \
+             + (sc0 * (float)(((pk0) >> 12) & 0xFu) + zp0) * pfx##3 \
+             + (sc0 * (float)(((pk0) >> 16) & 0xFu) + zp0) * pfx##4 \
+             + (sc0 * (float)(((pk0) >> 20) & 0xFu) + zp0) * pfx##5 \
+             + (sc0 * (float)(((pk0) >> 24) & 0xFu) + zp0) * pfx##6 \
+             + (sc0 * (float)(((pk0) >> 28) & 0xFu) + zp0) * pfx##7; \
+        const unsigned int hA1 = LOAD_LM_HEADER_GM(gp1_gm, w1_gm); \
+        const unsigned int hB1 = LOAD_LM_HEADER_GM((gp1_gm) + 4, (w1_gm) + 4); \
+        const unsigned int hs1 = (tid < 16) ? hA1 : hB1; \
+        float sc1 = __half2float(__ushort_as_half((unsigned short)(hs1 & 0xFFFFu))); \
+        float zp1 = __half2float(__ushort_as_half((unsigned short)(hs1 >> 16))); \
+        unsigned int pk1 = LOAD_LM_PACKED_GM((gp1_gm) + 8 + boff, (w1_gm) + 8 + boff); \
+        (b) += (sc1 * (float)((pk1) & 0xFu)         + zp1) * pfx##0 \
+             + (sc1 * (float)(((pk1) >> 4) & 0xFu)  + zp1) * pfx##1 \
+             + (sc1 * (float)(((pk1) >> 8) & 0xFu)  + zp1) * pfx##2 \
+             + (sc1 * (float)(((pk1) >> 12) & 0xFu) + zp1) * pfx##3 \
+             + (sc1 * (float)(((pk1) >> 16) & 0xFu) + zp1) * pfx##4 \
+             + (sc1 * (float)(((pk1) >> 20) & 0xFu) + zp1) * pfx##5 \
+             + (sc1 * (float)(((pk1) >> 24) & 0xFu) + zp1) * pfx##6 \
+             + (sc1 * (float)(((pk1) >> 28) & 0xFu) + zp1) * pfx##7; \
+    } while (0)
+
+    long long qb = 0;
+    for (int q = 0; q < quads; q++) {
+        const long long q1 = qb + m136;
+        const long long q2 = q1 + m136;
+        const long long q3 = q2 + m136;
+
+        const int base0 = (q << 2) * 256 + tid * 8;
+
+        LOAD_X8_INTO_GM(base0, xa);
+        LOAD_X8_INTO_GM(base0 + 256, xb);
+        LOAD_X8_INTO_GM(base0 + 512, xc);
+        LOAD_X8_INTO_GM(base0 + 768, xd);
+#if defined(HIPFIRE_GFX1151_LM_HEAD_X_BUFFER)
+        asm volatile("" : :
+            "v"(xav0), "v"(xav1), "v"(xbv0), "v"(xbv1),
+            "v"(xcv0), "v"(xcv1), "v"(xdv0), "v"(xdv1) : "memory");
+#endif
+
+        DOG_X8_GM_PAIR(qb, a0, b0, xa);
+        DOG_X8_GM_PAIR(q1, a1, b1, xb);
+        DOG_X8_GM_PAIR(q2, a2, b2, xc);
+        DOG_X8_GM_PAIR(q3, a3, b3, xd);
+        qb += m4;
+    }
+
+    #define LOAD_X8_GM(b) \
+        const float4 xv0 = *reinterpret_cast<const float4*>(x + (b)); \
+        const float4 xv1 = *reinterpret_cast<const float4*>(x + (b) + 4); \
+        const float x0 = xv0.x, x1 = xv0.y, x2 = xv0.z, x3 = xv0.w; \
+        const float x4 = xv1.x, x5 = xv1.y, x6 = xv1.z, x7 = xv1.w
+
+    #define DOG_X8_TAIL_GM_PAIR(qb, a, b) do { \
+        const char* gp0_gm = A + (qb) + r0off; \
+        const char* gp1_gm = gp0_gm + r1_delta; \
+        const unsigned int w0_gm = (unsigned int)((qb) + r0off); \
+        const unsigned int w1_gm = w0_gm + r1_delta_u; \
+        const unsigned int hA0 = LOAD_LM_HEADER_GM(gp0_gm, w0_gm); \
+        const unsigned int hB0 = LOAD_LM_HEADER_GM((gp0_gm) + 4, (w0_gm) + 4); \
+        const unsigned int hs0 = (tid < 16) ? hA0 : hB0; \
+        float sc0 = __half2float(__ushort_as_half((unsigned short)(hs0 & 0xFFFFu))); \
+        float zp0 = __half2float(__ushort_as_half((unsigned short)(hs0 >> 16))); \
+        unsigned int pk0 = LOAD_LM_PACKED_GM((gp0_gm) + 8 + boff, (w0_gm) + 8 + boff); \
+        (a) += (sc0 * (float)((pk0) & 0xFu)         + zp0) * x0 \
+             + (sc0 * (float)(((pk0) >> 4) & 0xFu)  + zp0) * x1 \
+             + (sc0 * (float)(((pk0) >> 8) & 0xFu)  + zp0) * x2 \
+             + (sc0 * (float)(((pk0) >> 12) & 0xFu) + zp0) * x3 \
+             + (sc0 * (float)(((pk0) >> 16) & 0xFu) + zp0) * x4 \
+             + (sc0 * (float)(((pk0) >> 20) & 0xFu) + zp0) * x5 \
+             + (sc0 * (float)(((pk0) >> 24) & 0xFu) + zp0) * x6 \
+             + (sc0 * (float)(((pk0) >> 28) & 0xFu) + zp0) * x7; \
+        const unsigned int hA1 = LOAD_LM_HEADER_GM(gp1_gm, w1_gm); \
+        const unsigned int hB1 = LOAD_LM_HEADER_GM((gp1_gm) + 4, (w1_gm) + 4); \
+        const unsigned int hs1 = (tid < 16) ? hA1 : hB1; \
+        float sc1 = __half2float(__ushort_as_half((unsigned short)(hs1 & 0xFFFFu))); \
+        float zp1 = __half2float(__ushort_as_half((unsigned short)(hs1 >> 16))); \
+        unsigned int pk1 = LOAD_LM_PACKED_GM((gp1_gm) + 8 + boff, (w1_gm) + 8 + boff); \
+        (b) += (sc1 * (float)((pk1) & 0xFu)         + zp1) * x0 \
+             + (sc1 * (float)(((pk1) >> 4) & 0xFu)  + zp1) * x1 \
+             + (sc1 * (float)(((pk1) >> 8) & 0xFu)  + zp1) * x2 \
+             + (sc1 * (float)(((pk1) >> 12) & 0xFu) + zp1) * x3 \
+             + (sc1 * (float)(((pk1) >> 16) & 0xFu) + zp1) * x4 \
+             + (sc1 * (float)(((pk1) >> 20) & 0xFu) + zp1) * x5 \
+             + (sc1 * (float)(((pk1) >> 24) & 0xFu) + zp1) * x6 \
+             + (sc1 * (float)(((pk1) >> 28) & 0xFu) + zp1) * x7; \
+    } while (0)
+
+    if (tail >= 1) {
+        const int g = quads << 2;
+        const int base = g * 256 + tid * 8;
+        LOAD_X8_GM(base);
+        DOG_X8_TAIL_GM_PAIR(qb, a0, b0);
+        qb += m136;
+    }
+    if (tail >= 2) {
+        const int g = (quads << 2) + 1;
+        const int base = g * 256 + tid * 8;
+        LOAD_X8_GM(base);
+        DOG_X8_TAIL_GM_PAIR(qb, a1, b1);
+        qb += m136;
+    }
+    if (tail >= 3) {
+        const int g = (quads << 2) + 2;
+        const int base = g * 256 + tid * 8;
+        LOAD_X8_GM(base);
+        DOG_X8_TAIL_GM_PAIR(qb, a2, b2);
+    }
+    #undef DOG_X8_TAIL_GM_PAIR
+    #undef LOAD_X8_GM
+    #undef DOG_X8_GM_PAIR
+    #undef LOAD_X8_INTO_GM
+    #undef LOAD_LM_PACKED_GM
+    #undef LOAD_LM_HEADER_GM
+
+    float s0 = (a0 + a1) + (a2 + a3);
+    float s1 = (b0 + b1) + (b2 + b3);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        s0 += __shfl_down(s0, offset);
+        s1 += __shfl_down(s1, offset);
+    }
+
+    if (tid == 0) {
+        y[row0] = s0;
+        if (have_row1) y[row1] = s1;
+    }
+}
+
+// Group-major twins of the generic R-row body (R=4/R=8): byte-identical math
+// to gemv_mq4g256v2_multirow_body<R> except the A group base address.
+// Shipping: gp(r, g) = A + safe_row(r) * groups_per_row * 136 + g * 136.
+// Group-major: gp(r, g) = A + 136 * (g * M + row(r)). At the same kb the R
+// rows are R contiguous 136-B groups, so one SGPR stride cursor qb (the
+// group-kb base, advancing by m136 per group / m4 per quad, no kb*M
+// recompute) plus the uniform row_base offset r0off serves all R rows:
+// gp(r) = A + qb + r0off + row_delta[r]. Same ABI/grid [ceil(M/R)]/block 32/
+// LDS 0; same x-hoist, per-row DOG order, tail slots (acc[r][g%4]), pairwise
+// combine, and shfl reduction order; bit-exact by construction.
+template<int R>
+__device__ __forceinline__ void gemv_mq4g256v2_multirow_gm_body(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row_base = blockIdx.x * R;
+    if (row_base >= M) return;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 256;
+    const long long m136 = (long long)M * 136;
+    const long long m4 = m136 * 4;
+    const long long r0off = (long long)row_base * 136;
+    const int boff = tid * 4;
+
+    // Row deltas from row_base. For partial final workgroups
+    // (row_base + r >= M) the delta clamps to 0 so reads stay in-bounds on
+    // row_base; the write is masked separately by the row_valid check.
+    int row_delta[R];
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        row_delta[r] = (row_base + r < M) ? r * 136 : 0;
+    }
+
+    float acc[R][4];
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        acc[r][0] = 0.0f;
+        acc[r][1] = 0.0f;
+        acc[r][2] = 0.0f;
+        acc[r][3] = 0.0f;
+    }
+
+    const int quads = groups_per_row >> 2;
+    const int tail = groups_per_row & 3;
+
+    // Main loop: 4 groups per iteration.
+    long long qb = 0;
+    for (int q = 0; q < quads; q++) {
+        const long long q1 = qb + m136;
+        const long long q2 = q1 + m136;
+        const long long q3 = q2 + m136;
+        const int g = q << 2;
+        const int base = g * 256 + tid * 8;
+
+        // Hoist x loads — identical across all R rows. The compiler will
+        // keep these in registers for the duration of the row loop.
+        const float x00 = x[base + 0],   x01 = x[base + 1],
+                    x02 = x[base + 2],   x03 = x[base + 3],
+                    x04 = x[base + 4],   x05 = x[base + 5],
+                    x06 = x[base + 6],   x07 = x[base + 7];
+        const float x10 = x[base + 256 + 0], x11 = x[base + 256 + 1],
+                    x12 = x[base + 256 + 2], x13 = x[base + 256 + 3],
+                    x14 = x[base + 256 + 4], x15 = x[base + 256 + 5],
+                    x16 = x[base + 256 + 6], x17 = x[base + 256 + 7];
+        const float x20 = x[base + 512 + 0], x21 = x[base + 512 + 1],
+                    x22 = x[base + 512 + 2], x23 = x[base + 512 + 3],
+                    x24 = x[base + 512 + 4], x25 = x[base + 512 + 5],
+                    x26 = x[base + 512 + 6], x27 = x[base + 512 + 7];
+        const float x30 = x[base + 768 + 0], x31 = x[base + 768 + 1],
+                    x32 = x[base + 768 + 2], x33 = x[base + 768 + 3],
+                    x34 = x[base + 768 + 4], x35 = x[base + 768 + 5],
+                    x36 = x[base + 768 + 6], x37 = x[base + 768 + 7];
+
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            const char* gp0 = A + qb + r0off + row_delta[r];
+            const char* gp1 = A + q1 + r0off + row_delta[r];
+            const char* gp2 = A + q2 + r0off + row_delta[r];
+            const char* gp3 = A + q3 + r0off + row_delta[r];
+
+            const unsigned int hA0 = *(const unsigned int*)(gp0);
+            const unsigned int hB0 = *(const unsigned int*)(gp0 + 4);
+            const unsigned int hs0 = (tid < 16) ? hA0 : hB0;
+            float sc0 = __half2float(__ushort_as_half((unsigned short)(hs0 & 0xFFFFu)));
+            float zp0 = __half2float(__ushort_as_half((unsigned short)(hs0 >> 16)));
+            const unsigned int hA1 = *(const unsigned int*)(gp1);
+            const unsigned int hB1 = *(const unsigned int*)(gp1 + 4);
+            const unsigned int hs1 = (tid < 16) ? hA1 : hB1;
+            float sc1 = __half2float(__ushort_as_half((unsigned short)(hs1 & 0xFFFFu)));
+            float zp1 = __half2float(__ushort_as_half((unsigned short)(hs1 >> 16)));
+            const unsigned int hA2 = *(const unsigned int*)(gp2);
+            const unsigned int hB2 = *(const unsigned int*)(gp2 + 4);
+            const unsigned int hs2 = (tid < 16) ? hA2 : hB2;
+            float sc2 = __half2float(__ushort_as_half((unsigned short)(hs2 & 0xFFFFu)));
+            float zp2 = __half2float(__ushort_as_half((unsigned short)(hs2 >> 16)));
+            const unsigned int hA3 = *(const unsigned int*)(gp3);
+            const unsigned int hB3 = *(const unsigned int*)(gp3 + 4);
+            const unsigned int hs3 = (tid < 16) ? hA3 : hB3;
+            float sc3 = __half2float(__ushort_as_half((unsigned short)(hs3 & 0xFFFFu)));
+            float zp3 = __half2float(__ushort_as_half((unsigned short)(hs3 >> 16)));
+
+            unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
+            unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
+            unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
+            unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
+
+            acc[r][0] += (sc0 * (float)((pk0 >>  0) & 0xFu) + zp0) * x00
+                       + (sc0 * (float)((pk0 >>  4) & 0xFu) + zp0) * x01
+                       + (sc0 * (float)((pk0 >>  8) & 0xFu) + zp0) * x02
+                       + (sc0 * (float)((pk0 >> 12) & 0xFu) + zp0) * x03
+                       + (sc0 * (float)((pk0 >> 16) & 0xFu) + zp0) * x04
+                       + (sc0 * (float)((pk0 >> 20) & 0xFu) + zp0) * x05
+                       + (sc0 * (float)((pk0 >> 24) & 0xFu) + zp0) * x06
+                       + (sc0 * (float)((pk0 >> 28) & 0xFu) + zp0) * x07;
+            acc[r][1] += (sc1 * (float)((pk1 >>  0) & 0xFu) + zp1) * x10
+                       + (sc1 * (float)((pk1 >>  4) & 0xFu) + zp1) * x11
+                       + (sc1 * (float)((pk1 >>  8) & 0xFu) + zp1) * x12
+                       + (sc1 * (float)((pk1 >> 12) & 0xFu) + zp1) * x13
+                       + (sc1 * (float)((pk1 >> 16) & 0xFu) + zp1) * x14
+                       + (sc1 * (float)((pk1 >> 20) & 0xFu) + zp1) * x15
+                       + (sc1 * (float)((pk1 >> 24) & 0xFu) + zp1) * x16
+                       + (sc1 * (float)((pk1 >> 28) & 0xFu) + zp1) * x17;
+            acc[r][2] += (sc2 * (float)((pk2 >>  0) & 0xFu) + zp2) * x20
+                       + (sc2 * (float)((pk2 >>  4) & 0xFu) + zp2) * x21
+                       + (sc2 * (float)((pk2 >>  8) & 0xFu) + zp2) * x22
+                       + (sc2 * (float)((pk2 >> 12) & 0xFu) + zp2) * x23
+                       + (sc2 * (float)((pk2 >> 16) & 0xFu) + zp2) * x24
+                       + (sc2 * (float)((pk2 >> 20) & 0xFu) + zp2) * x25
+                       + (sc2 * (float)((pk2 >> 24) & 0xFu) + zp2) * x26
+                       + (sc2 * (float)((pk2 >> 28) & 0xFu) + zp2) * x27;
+            acc[r][3] += (sc3 * (float)((pk3 >>  0) & 0xFu) + zp3) * x30
+                       + (sc3 * (float)((pk3 >>  4) & 0xFu) + zp3) * x31
+                       + (sc3 * (float)((pk3 >>  8) & 0xFu) + zp3) * x32
+                       + (sc3 * (float)((pk3 >> 12) & 0xFu) + zp3) * x33
+                       + (sc3 * (float)((pk3 >> 16) & 0xFu) + zp3) * x34
+                       + (sc3 * (float)((pk3 >> 20) & 0xFu) + zp3) * x35
+                       + (sc3 * (float)((pk3 >> 24) & 0xFu) + zp3) * x36
+                       + (sc3 * (float)((pk3 >> 28) & 0xFu) + zp3) * x37;
+        }
+        qb += m4;
+    }
+
+    // Tail: per-row, accumulate into acc[r][gi] to preserve the 4-way
+    // interleaving (same reason as the single-row kernel — 5302926).
+    // qb already points at the first tail group; each taken tail advances
+    // it by one group stride.
+    #define TAIL_LOAD_X_GM(b) \
+        const float txv0 = x[(b) + 0], txv1 = x[(b) + 1], \
+                    txv2 = x[(b) + 2], txv3 = x[(b) + 3], \
+                    txv4 = x[(b) + 4], txv5 = x[(b) + 5], \
+                    txv6 = x[(b) + 6], txv7 = x[(b) + 7]
+    #define TAIL_DOG_GM(pk, sc, zp, a) \
+        (a) += (sc * (float)((pk) & 0xFu)        + zp) * txv0  \
+             + (sc * (float)(((pk) >>  4) & 0xFu) + zp) * txv1 \
+             + (sc * (float)(((pk) >>  8) & 0xFu) + zp) * txv2 \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * txv3 \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * txv4 \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * txv5 \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * txv6 \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * txv7
+
+    if (tail >= 1) {
+        const int g = quads << 2;
+        const int base = g * 256 + tid * 8;
+        TAIL_LOAD_X_GM(base);
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            const char* gp = A + qb + r0off + row_delta[r];
+            const unsigned int hA = *(const unsigned int*)(gp);
+            const unsigned int hB = *(const unsigned int*)(gp + 4);
+            const unsigned int hs = (tid < 16) ? hA : hB;
+            float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
+            float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+            unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+            TAIL_DOG_GM(pk, sc, zp, acc[r][0]);
+        }
+        qb += m136;
+    }
+    if (tail >= 2) {
+        const int g = (quads << 2) + 1;
+        const int base = g * 256 + tid * 8;
+        TAIL_LOAD_X_GM(base);
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            const char* gp = A + qb + r0off + row_delta[r];
+            const unsigned int hA = *(const unsigned int*)(gp);
+            const unsigned int hB = *(const unsigned int*)(gp + 4);
+            const unsigned int hs = (tid < 16) ? hA : hB;
+            float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
+            float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+            unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+            TAIL_DOG_GM(pk, sc, zp, acc[r][1]);
+        }
+        qb += m136;
+    }
+    if (tail >= 3) {
+        const int g = (quads << 2) + 2;
+        const int base = g * 256 + tid * 8;
+        TAIL_LOAD_X_GM(base);
+        #pragma unroll
+        for (int r = 0; r < R; r++) {
+            const char* gp = A + qb + r0off + row_delta[r];
+            const unsigned int hA = *(const unsigned int*)(gp);
+            const unsigned int hB = *(const unsigned int*)(gp + 4);
+            const unsigned int hs = (tid < 16) ? hA : hB;
+            float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
+            float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+            unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+            TAIL_DOG_GM(pk, sc, zp, acc[r][2]);
+        }
+    }
+    #undef TAIL_LOAD_X_GM
+    #undef TAIL_DOG_GM
+
+    // Per-row warp reduction and write-back.
+    #pragma unroll
+    for (int r = 0; r < R; r++) {
+        float s = (acc[r][0] + acc[r][1]) + (acc[r][2] + acc[r][3]);
+        for (int offset = 16; offset > 0; offset >>= 1)
+            s += __shfl_down(s, offset);
+        int row = row_base + r;
+        if (tid == 0 && row < M) y[row] = s;
+    }
+}
+
+// Same launch_bounds as the row-major twins: VGPR pressure scales with R
+// identically (R×4 accumulators + hoisted x + R int deltas vs R pointers).
+__launch_bounds__(32, 18)
+extern "C" __global__ void gemv_mq4g256v2_multirow_r4_gm(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    gemv_mq4g256v2_multirow_gm_body<4>(A, x, y, M, K);
+}
+
+__launch_bounds__(32, 6)
+extern "C" __global__ void gemv_mq4g256v2_multirow_r8_gm(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    gemv_mq4g256v2_multirow_gm_body<8>(A, x, y, M, K);
+}
+#endif // GM twins (gfx11 + gfx12)

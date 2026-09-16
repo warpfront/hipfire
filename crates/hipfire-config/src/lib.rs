@@ -2364,6 +2364,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Preallocated caller-owned bytes for the optional CK staged attention path."
     ),
     process_bool_field!(
+        "attention.kv_shadow_f16",
+        "kv_shadow_f16",
+        Attention,
+        true,
+        false,
+        "HIPFIRE_KV_SHADOW_F16",
+        "Write an f16 copy of FULL-ATTENTION K/V alongside the quantized KV cache (Halo-only: effective only on exact gfx1151; decode keeps reading Q8). Set to false or HIPFIRE_KV_SHADOW_F16=0 to opt out."
+    ),
+    process_bool_field!(
         "kernel.gfx942_gemv_v3",
         "gfx942_gemv_v3",
         Kernel,
