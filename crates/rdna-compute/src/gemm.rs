@@ -19063,7 +19063,7 @@ impl Gpu {
         }
         self.bind_thread()?;
         let full = m % 128 == 0 && batch_size % 128 == 0;
-        // A5: exact gfx1151 + eager + full tiles only → column-adjacent
+        // A5: gfx1151/gfx1100 + eager + full tiles only → column-adjacent
         // entries with grid [N/128, M/128, 1]. Non-full, capture/replay, and
         // non-gfx1151 keep baseline symbols and [M/128, N/128, 1].
         let use_col = full
