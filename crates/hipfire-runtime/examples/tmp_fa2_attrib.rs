@@ -2051,6 +2051,7 @@ fn iu8_host_fold_check() -> bool {
         }
         let mut acc_f32 = 0f32;
         let mut acc_f64 = 0f64;
+        let mut abs_terms = 0f64;
         let mut cbs = [0i32; 8];
         for b in 0..8 {
             let mut cb = 0i32;
@@ -2064,11 +2065,15 @@ fn iu8_host_fold_check() -> bool {
             }
             acc_f32 += cb as f32 * (sq * sk[b]) as f32;
             acc_f64 += cb as f64 * (sq * sk[b]);
+            abs_terms += (cb as f64 * (sq * sk[b])).abs();
         }
         let s_f32 = scale_attn as f32 * acc_f32;
         let s_f64 = scale_attn * acc_f64;
-        if s_f64.abs() > 1e-9 {
-            let rel = ((s_f32 as f64 - s_f64).abs()) / s_f64.abs();
+        // f32 accumulation of 8 signed terms: judge the error against the
+        // sum of term magnitudes (cancellation makes the plain relative
+        // error unbounded near zero and says nothing about the hardware).
+        if abs_terms > 1e-9 {
+            let rel = ((s_f32 as f64 - s_f64).abs()) / (scale_attn * abs_terms);
             worst_rel = worst_rel.max(rel);
             if rel > 1e-5 {
                 ok = false;
