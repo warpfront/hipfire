@@ -5729,6 +5729,7 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC: &str = concat!(
 /// `kernels/src`. JIT-only via the `attention_q8_0_fa2_gqa_i8_gfx11` lab
 /// launcher; never on a default path.
 pub const ATTENTION_Q8_0_FA2_GQA_I8_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_I8 1\n",
     include_str!("../../../kernels/src/turbo_common.h"),
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
 );
@@ -5742,7 +5743,7 @@ pub const ATTENTION_Q8_0_FA2_GQA_I8_GFX11_SRC: &str = concat!(
 /// registration. JIT-only via the `attention_q8_0_fa2_gqa_fwht3k_i8_gfx11`
 /// lab launcher; never on a default path.
 pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_I8_GFX11_SRC: &str = concat!(
-    "#define HIPFIRE_FA2_KMODE 3\n",
+    "#define HIPFIRE_FA2_I8 1\n#define HIPFIRE_FA2_KMODE 3\n",
     include_str!("../../../kernels/src/turbo_common.h"),
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
 );

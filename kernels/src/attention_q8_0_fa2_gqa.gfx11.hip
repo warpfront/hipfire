@@ -1025,6 +1025,10 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
                  scale_attn, kv_h, q_base);
 }
 #endif
+#if defined(HIPFIRE_FA2_I8)
+// The whole F5a section is compiled only into the two i8 lab modules
+// (kernels.rs prepends `#define HIPFIRE_FA2_I8 1` + turbo_common.h); the
+// shipping Q8/fwht3 modules never see it.
 // ---- F5a: int8-WMMA QK lab arm (KT32-only) ----
 // Lab-only symbols in this section (never on a default path):
 //   attention_fa2_q_preconvert_i8_gfx11  — f32 Q -> i8 codes + f32 sQ/row.
@@ -1811,3 +1815,5 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
                     scale_attn, kv_h, q_base);
 }
 #endif
+
+#endif // HIPFIRE_FA2_I8
