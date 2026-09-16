@@ -675,7 +675,3 @@ required-features = ["deltanet"]
 [[example]]
 name = "tmp_halo_iu4_oracle"
 required-features = ["lab"]
-
-[[example]]
-name = "tmp_halo_iu4_t64"
-required-features = ["lab"]
