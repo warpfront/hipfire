@@ -19073,19 +19073,47 @@ impl Gpu {
         // LF: exact gfx1151 full SET tiles → 16-wave sum[32] entry (2 WG/CU);
         // add tiles measured slower on it and stay on the 8-wave entry.
         let use_lf16 = use_col && !add && self.arch.as_str() == "gfx1151";
-        let kernel_name = match (full, add, use_col) {
-            (true, true, true) => {
+        // GM wiring (single-site layout switch): full eager tiles on exact
+        // gfx1151 read the tensor's layout attribute. `GroupMajor` routes set
+        // tiles to `..._full_set_lf16_gm_col_gfx1151` and add tiles to
+        // `..._full_add_gm_col_gfx1151` with `A_gm`; everything else (decode
+        // GEMV, M/N tails, other archs, capture/replay, flag off) keeps the
+        // row-major tensor and baseline symbols. Sources, in priority order:
+        //   1. cached `_gm` duplicate (load-time permute producer);
+        //   2. in-place group-major bytes (future cutover / sidecar reader —
+        //      recorded via `set_mq4v2_weight_layout`, no duplicate needed).
+        let layout = self.mq4v2_weight_layout(a_raw);
+        let mut gm_ptr: Option<*mut c_void> = self.mq4v2_gm_ptr(a_raw);
+        if gm_ptr.is_none()
+            && layout == crate::dispatch::WeightLayout::GroupMajor
+            && self.arch.as_str() == "gfx1151"
+        {
+            gm_ptr = Some(a_raw.buf.as_ptr());
+        }
+        let use_gm = gm_ptr.is_some()
+            && full
+            && use_col
+            && self.arch.as_str() == "gfx1151"
+            && self.prefill_weight_layout_gm_enabled();
+        let kernel_name = match (full, add, use_col, use_gm) {
+            (true, true, _, true) => {
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_gm_col_gfx1151"
+            }
+            (true, false, _, true) => {
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gm_col_gfx1151"
+            }
+            (true, true, true, false) => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151"
             }
-            (true, false, true) if use_lf16 => {
+            (true, false, true, false) if use_lf16 => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151"
             }
-            (true, false, true) => {
+            (true, false, true, false) => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151"
             }
-            (true, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
-            (true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
-            (false, _, _) => "gemm_mq4g256v2_residual_mmq_iu4",
+            (true, true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
+            (true, false, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+            (false, _, _, _) => "gemm_mq4g256v2_residual_mmq_iu4",
         };
         let block = if use_lf16 { [32, 16, 1] } else { [32, 8, 1] };
         const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
@@ -19094,7 +19122,7 @@ impl Gpu {
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
             kernel_name,
         )?;
-        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut a_ptr = if use_gm { gm_ptr.unwrap_or(a_raw.buf.as_ptr()) } else { a_raw.buf.as_ptr() };
         let mut xq_ptr = x_i4_ptr;
         let mut y_ptr = y.buf.as_ptr();
         let mut m_val = m as i32;

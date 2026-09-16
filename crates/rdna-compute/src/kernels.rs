@@ -3418,6 +3418,12 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
 );
+/// MQ4G256V2 row-major -> group-major relayout producer for the IU4 prefill
+/// `_gm_col_gfx1151` entries: `dst[136*(kb*M+row)] = src[136*(row*gpr+kb)]`,
+/// one thread per 136 B group. Launched once per tensor at load by
+/// `Gpu::ensure_mq4v2_gm`.
+pub const MQ4V2_RELAYOUT_GM_SRC: &str =
+    include_str!("../../../kernels/src/mq4v2_relayout_gm.hip");
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =

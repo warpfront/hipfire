@@ -2148,6 +2148,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx11 iu4-direct MMQ prefill route (opt-in on gfx1100/gfx1151; set to true or HIPFIRE_GFX11_MQ4V2_IU4=1 to opt in)."
     ),
     process_bool_field!(
+        "prefill.weight_layout_gm",
+        "weight_layout_gm",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM",
+        "Build a group-major duplicate of the IU4-consumed MQ4G256V2 weights (gate/up/down of every layer; not lm_head/experts) for the IU4 prefill path (opt-in on exact gfx1151 only; set to true or HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM=1 to opt in; expect +~14 GB VRAM on Qwen3.8-27B)."
+    ),
+    process_bool_field!(
         "kernel.dot2_gemv",
         "dot2_gemv",
         Kernel,
@@ -4973,6 +4982,40 @@ mod tests {
                 .default
                 .to_value(),
             ConfigValue::String("off".into())
+        );
+    }
+
+    #[test]
+    fn prefill_weight_layout_gm_defaults_off_with_env_compat() {
+        // Opt-in VRAM-for-speed trade (Halo only): the schema default is
+        // off, so an unset key resolves through the default-off process
+        // config and never builds the ~14 GB duplicate unasked.
+        let field = field("prefill.weight_layout_gm").expect("prefill.weight_layout_gm schema field");
+        assert_eq!(field.env_compat, Some("HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM"));
+        assert_eq!(field.default.to_value(), ConfigValue::Bool(false));
+        assert!(matches!(field.scope, ConfigScope::Process));
+        // Resolved default stays off end to end (bridge defaults are sparse:
+        // absence selects the default-off policy downstream).
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        assert_eq!(
+            process.legacy_value("HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM"),
+            None
+        );
+        // Explicit opt-in parses through.
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("prefill.weight_layout_gm", "true").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        assert_eq!(
+            process.legacy_value("HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM").as_deref(),
+            Some("1")
         );
     }
 
