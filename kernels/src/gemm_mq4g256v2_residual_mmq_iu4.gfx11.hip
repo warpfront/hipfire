@@ -362,6 +362,9 @@ static __device__ __forceinline__ void load_iu4_tile_lf16_gfx1151(
     // Payload: 8 rows/thread (i = i0+w, i0 = 0,16,...,112) in two packets.
     // Each packet issues its 4 row-dword loads before the 4 LDS stores so
     // the wave has 4 A loads in flight ahead of the first VM wait.
+    // Register note: four independent row pointers (not one base + stride):
+    // the stride is block-uniform and the backend keeps these CSE'd without
+    // extending a shared base's live range across the packets.
     #pragma unroll 1
     for (int p = 0; p < 2; ++p) {
         const int base = p * 64 + w;
@@ -381,11 +384,19 @@ static __device__ __forceinline__ void load_iu4_tile_lf16_gfx1151(
     // Headers: waves 0..7 only (uniform skip for waves 8..15); each of the
     // 256 global header words has exactly one writer, replicated to the 4
     // slots 32+4*ksc+[0,3] exactly as shipping.
+    // Address: payload-form base (A+4*lane) + 136*((row0+i)*gpr+kb) + adj,
+    // adj = 4*ksc-4*lane. Header = packet+4*ksc. The adj is tied to kb via
+    // opaque asm so the backend cannot fold (A+4*lane)+adj into a loop-
+    // invariant A+4*ksc 64-bit (that pair was a 2-VGPR spill across kb).
     if (w < 8) {
         const int i = 16 * w + lane / 2;
         const int ksc = lane & 1;
-        const char* gp = A + ((long long)(row0 + i) * groups_per_row + kb) * 136;
-        const unsigned int hs = *(const unsigned int*)(gp + 4 * ksc);
+        int adj = 4 * ksc - 4 * lane;
+        asm volatile("" : "+v"(adj) : "r"(kb));
+        const char* pld = A + 4 * lane
+            + ((long long)(row0 + i) * groups_per_row + kb) * 136;
+        const unsigned int hs =
+            *(const unsigned int*)(pld + adj);
         const float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
         const float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
         const half2 dm = make_half2((_Float16)sc, (_Float16)zp);
@@ -486,6 +497,10 @@ static __device__ __forceinline__ void vec_dot_i4_x128_lf16_gfx1151(
 // always stores, add entry always adds). The `add` kernarg is retained in the
 // seven-arg ABI for layout parity but deliberately ignored here; do NOT
 // reintroduce a runtime branch on it (its VGPR spans the whole kernel).
+// The h1 guard is always true (2*kb+1 < 2*groups_per_row for every kb in
+// [0, groups_per_row)) but is load-bearing for the allocator: the branch
+// keeps the h1 live ranges out of the h0 scheduling region (measured 4
+// spills with it, ~47 without). Do NOT straight-line it.
 template <bool IS_ADD>
 static __device__ __forceinline__ void gemm_iu4_body_lf16_gfx1151(
     const char* __restrict__ A,
@@ -499,16 +514,18 @@ static __device__ __forceinline__ void gemm_iu4_body_lf16_gfx1151(
     int col_tile
 ) {
     (void)add;
+    // NOTE: SGPR-pinning row0/col0 via asm "+s" was tried: zero VGPR change.
+    // threadIdx.y cannot be pinned (backend rejects VGPR->SGPR as illegal).
     const int row0 = row_tile * IU4_MMQ_Y;
     const int col0 = col_tile * IU4_MMQ_X;
     const int groups_per_row = K / 256;
     extern __shared__ int smem[];
     int* tile_y = smem;
     int* tile_x = tile_y + IU4_MMQ_X * IU4_TILE_Y_K;
-    const int w = threadIdx.y;
-    const int lane = threadIdx.x;
-    const int wave_row = 16 * (w / 2);
-    const int wave_col = 64 * (w % 2);
+    // w/lane/wave_row/wave_col intentionally NOT materialised here: they are
+    // pure functions of threadIdx and only feed the Y epilogue. Precomputing
+    // the two address pieces (col-part = wave_col|(lane%16), row-part =
+    // wave_row+lane/16) before kb spilled both across the whole loop.
     float sum[IU4_LF16_SUMS] = {0.0f};
     for (int kb = 0; kb < groups_per_row; ++kb) {
         load_iu4_tile_lf16_gfx1151(A, tile_x, row0, kb, groups_per_row);
@@ -529,18 +546,38 @@ static __device__ __forceinline__ void gemm_iu4_body_lf16_gfx1151(
             __syncthreads();
         }
     }
-    #pragma unroll
-    for (int c = 0; c < 4; ++c) {
+    // Y epilogue: materialise row_part/col_part AFTER kb. Lane via v_mbcnt_lo
+    // inside the asm (wave32 == threadIdx.x) so raw tid_x is not an asm input
+    // and is not carried across kb. tid_y stays live as the wave index.
+    // sum[0] anchors after accumulation. Y_index = (col0+j)*M+(row0+i).
+    {
+        const int tid_y = (int)__builtin_amdgcn_workitem_id_y();
+        int row_part, col_part, tmp;
+        asm volatile(
+            "v_mbcnt_lo_u32_b32 %2, -1, 0\n\t"      // lane = 0..31
+            "v_lshrrev_b32_e32 %0, 1, %3\n\t"       // w/2
+            "v_bfe_u32 %1, %2, 4, 1\n\t"            // lane/16 (scratch in %1)
+            "v_lshl_or_b32 %0, %0, 4, %1\n\t"       // row_part = 16*(w/2)+lane/16
+            "v_and_b32_e32 %1, 1, %3\n\t"           // w&1
+            "v_and_b32_e32 %2, 15, %2\n\t"          // lane&15
+            "v_lshl_or_b32 %1, %1, 6, %2"           // col_part = 64*(w%2)+lane%16
+            : "=&v"(row_part), "=&v"(col_part), "=&v"(tmp)
+            : "v"(tid_y), "v"(sum[0]));
+        const int row0e = row_tile * IU4_MMQ_Y;
+        const int col0e = col_tile * IU4_MMQ_X;
         #pragma unroll
-        for (int l = 0; l < 8; ++l) {
-            const int i = wave_row + 2 * l + lane / 16;
-            const int j = wave_col + 16 * c + lane % 16;
-            float* yp = Y + (long long)(col0 + j) * M + (row0 + i);
-            const float v = sum[8 * c + l];
-            if constexpr (IS_ADD) {
-                *yp += v;
-            } else {
-                *yp = v;
+        for (int c = 0; c < 4; ++c) {
+            #pragma unroll
+            for (int l = 0; l < 8; ++l) {
+                const int i = row_part + 2 * l;
+                const int j = col_part + 16 * c;
+                float* yp = Y + (long long)(col0e + j) * M + (row0e + i);
+                const float v = sum[8 * c + l];
+                if constexpr (IS_ADD) {
+                    *yp += v;
+                } else {
+                    *yp = v;
+                }
             }
         }
     }
