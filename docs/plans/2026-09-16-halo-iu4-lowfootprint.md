@@ -12,6 +12,19 @@ Date: 2026-09-16. Planning-only specification for `/home/kaden/ClaudeCode/warpfr
 > pp8192 651** (from 665/655/613), eval md5 unchanged. Open: the 4 spills vs
 > the spill=reject rule (measured cost already included), and why down loses.
 
+> **GM (group-major MQ4G256V2 weight layout) — KILLED 2026-09-16.** rocprof
+> showed `down` (K=17408) at 80 % L1 miss vs gate's 53 % from the 9 KB row
+> stride; group-major (offset 136·(kb·M+row)) fixed it bit-exactly: prefill
+> IU4 down −10.7 %, gate occ3 −10.8 %, gate lf16 −3.9 %; batched decode WMMA
+> N=2…64 −13…−17 %. But single-stream decode gemv is **+4.1…4.3 % slower**
+> even at full register parity (SGPR stride cursor; VGPR 76/97/96 = shipping):
+> the row-streaming gemv loses DRAM row locality when consecutive groups sit
+> 2.4 MB apart, and it runs near the bus limit. Rule: decode loss = kill; a
+> prefill-side duplicate (+15 GB) is not acceptable (VRAM-neutral rule). All
+> twins, wiring and oracles reverted. Numbers kept here for a future
+> sidecar/format discussion (e.g. a group-major layout only for tensors whose
+> decode route is the batched WMMA path).
+
 ## Ten-line summary
 
 1. Select **M128 × N128 with 16 wave32s**, block `[32,16,1]`, four 16×16 subtiles/wave and `sum[32]`; retain A5 column-adjacent order.
