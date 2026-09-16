@@ -83,57 +83,6 @@ pub const GL_MQ3_GROUP_IDX_BYTES: usize = 96;
 /// Little-endian, low 16 bits scale, high 16 zero within each dword,
 /// half-wave uniform, lane-invariant scalar loads. `K % 256 == 0`.
 pub const MQ4V2_GROUP_BYTES: usize = 136;
-/// Tensor-level weight-layout attribute for MQ4G256V2 prefill consumption.
-///
-/// `GpuTensor` has 100+ struct-literal sites across crates, so the attribute
-/// lives in the `Gpu` side-table keyed by tensor pointer (default `RowMajor`
-/// when absent) rather than as a struct field — same one-site-switch
-/// property: every consumer reads it through [`Gpu::mq4v2_weight_layout`].
-///
-/// - `RowMajor`: shipping layout; group `(row, kb)` at `136*(row*gpr+kb)`.
-/// - `GroupMajor`: group `(row, kb)` at `136*(kb*M+row)`, so each 128-row x
-///   1-group tile is one contiguous block (what the IU4 `_gm_col_gfx1151`
-///   entries address). Today that means "a `_gm` duplicate exists in the
-///   side-table" (built by the load-time permute producer); after the
-///   in-place cutover it will mean the tensor bytes themselves are
-///   group-major (set by the loader / sidecar reader via
-///   [`Gpu::set_mq4v2_weight_layout`]), and the selector needs no change.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
-pub enum WeightLayout {
-    #[default]
-    RowMajor,
-    GroupMajor,
-}
-
-/// Byte offset of group `(row, kb)` in a row-major MQ4V2 tensor. Pure;
-/// CPU-testable. Mirrors the shipping address in `load_iu4_tile`.
-#[inline]
-pub fn mq4v2_row_major_group_offset(row: usize, kb: usize, groups_per_row: usize) -> usize {
-    (row * groups_per_row + kb) * MQ4V2_GROUP_BYTES
-}
-
-/// Byte offset of group `(row, kb)` in a group-major MQ4V2 tensor. Pure;
-/// CPU-testable. Mirrors `load_iu4_tile_gm` /
-/// `load_iu4_tile_lf16_gm_gfx1151` (`A + 136*(kb*M + row)`).
-#[inline]
-pub fn mq4v2_group_major_offset(kb: usize, row: usize, m: usize) -> usize {
-    (kb * m + row) * MQ4V2_GROUP_BYTES
-}
-
-/// Extra VRAM bytes for one `(m, k)` tensor's group-major duplicate. Pure;
-/// the duplicate is byte-identical in size to the row-major tensor.
-#[inline]
-pub fn mq4v2_gm_extra_bytes(m: usize, k: usize) -> usize {
-    m * (k / 256) * MQ4V2_GROUP_BYTES
-}
-
-/// Eligibility for the GM path: exact gfx1151 with whole G256 groups.
-/// "Unavailable elsewhere" lives here and in
-/// `FeatureFlags::prefill_weight_layout_gm_enabled`, never at call sites.
-#[inline]
-pub fn mq4v2_gm_eligible(arch: &str, k: usize) -> bool {
-    arch == "gfx1151" && k % 256 == 0
-}
 
 /// Per-group bytes for MQ4-G256-C (qt=45): 136 B/group, 4.25 bpw, byte-identical
 /// payload to MQ4G256 (qt=13) at the same offset. Pad layout (NOT the earlier
@@ -757,24 +706,6 @@ pub struct Gpu {
     /// Only populated on CDNA3 when rocBLAS loaded — 4× VRAM blow-up vs MQ4
     /// so consumer cards stay on the wave32/64 hand-rolled GEMV path.
     fp16_shadow_cache: HashMap<usize, GpuTensor>,
-    /// Group-major MQ4G256V2 duplicates for the IU4 prefill `_gm_col_gfx1151`
-    /// entries. Key is the row-major tensor device pointer; value owns the GM
-    /// duplicate (same byte size, `136*(kb*M+row)` group order). Built at load
-    /// by the permute producer ([`Self::ensure_mq4v2_gm`]); decode GEMV, M/N
-    /// tails, and other archs keep reading the row-major tensor. A future
-    /// on-disk prefill-layout sidecar populates this table (or sets
-    /// [`WeightLayout::GroupMajor`] in place via
-    /// [`Self::set_mq4v2_weight_layout`]) without touching kernels or
-    /// selectors. Memory is not freed until the Gpu itself drops (weights are
-    /// assumed immutable for a model's lifetime).
-    mq4v2_gm_cache: HashMap<usize, GpuTensor>,
-    /// Explicit tensor-level layout attributes, keyed by tensor device
-    /// pointer. The loader / sidecar reader writes [`WeightLayout::GroupMajor`]
-    /// here for tensors whose bytes are already group-major in place (the
-    /// in-place cutover / sidecar future); read through
-    /// [`Self::mq4v2_weight_layout`], which also derives `GroupMajor` from a
-    /// cached duplicate so the two can never diverge.
-    mq4v2_layout: HashMap<usize, WeightLayout>,
 
     /// Calibration activation capture (Tier-1 collector). When `Some`, the
     /// instrumented linear dispatch arms resolve their weight buffer pointer
@@ -1486,8 +1417,6 @@ impl Gpu {
                 },
             },
             rocblas: None,
-            mq4v2_gm_cache: HashMap::new(),
-            mq4v2_layout: HashMap::new(),
             fp16_shadow_cache: HashMap::new(),
             active_capture: None,
             capture_names: HashMap::new(),
@@ -3176,144 +3105,6 @@ impl Gpu {
         Ok(Some(ptr))
     }
 
-    /// Whether this Gpu builds/uses group-major MQ4V2 duplicates: opt-in
-    /// `prefill.weight_layout_gm`, honored on exact gfx1151 only.
-    pub fn prefill_weight_layout_gm_enabled(&self) -> bool {
-        // bind_thread: skip — pure flag read, touches no device state.
-        self.flags.prefill_weight_layout_gm_enabled()
-    }
-
-    /// Tensor-level layout attribute read — the one-site switch for the IU4
-    /// prefill selector (and the future in-place cutover / sidecar reader).
-    /// `GroupMajor` iff the loader recorded it explicitly (in-place bytes) or
-    /// a GM duplicate is cached; `RowMajor` otherwise (absent key included).
-    pub fn mq4v2_weight_layout(&self, a_raw: &GpuTensor) -> WeightLayout {
-        // bind_thread: skip — pure map lookup, touches no device state.
-        let key = a_raw.buf.as_ptr() as usize;
-        if let Some(&layout) = self.mq4v2_layout.get(&key) {
-            return layout;
-        }
-        if self.mq4v2_gm_cache.contains_key(&key) {
-            WeightLayout::GroupMajor
-        } else {
-            WeightLayout::RowMajor
-        }
-    }
-
-    /// Record the tensor-level layout attribute (loader / future sidecar
-    /// reader entry). The in-place cutover is exactly this call with
-    /// [`WeightLayout::GroupMajor`] for tensors whose bytes are already
-    /// group-major — the IU4 selector needs no change.
-    pub fn set_mq4v2_weight_layout(&mut self, a_raw: &GpuTensor, layout: WeightLayout) {
-        self.bind_thread_or_warn();
-        self.mq4v2_layout
-            .insert(a_raw.buf.as_ptr() as usize, layout);
-    }
-
-    /// Cached GM duplicate pointer for `a_raw`, if any. `None` means the IU4
-    /// selector must use the row-major tensor.
-    pub fn mq4v2_gm_ptr(&self, a_raw: &GpuTensor) -> Option<*mut c_void> {
-        // bind_thread: skip — pure map lookup, touches no device state.
-        self.mq4v2_gm_cache
-            .get(&(a_raw.buf.as_ptr() as usize))
-            .map(|t| t.buf.as_ptr())
-    }
-
-    /// Total cached GM duplicate bytes (VRAM accounting).
-    pub fn mq4v2_gm_cached_bytes(&self) -> usize {
-        // bind_thread: skip — pure map fold, touches no device state.
-        self.mq4v2_gm_cache.values().map(|t| t.buf.size()).sum()
-    }
-
-    /// Ensure a group-major duplicate of the `(m, k)` MQ4V2 tensor `a_raw`
-    /// exists in `mq4v2_gm_cache`. The load-time permute producer (the loader
-    /// pre-warms every IU4-consumed tensor at load). Returns the GM device
-    /// pointer, or `None` when the route is disabled/ineligible — the caller
-    /// keeps the row-major tensor (decode GEMV, tails, other archs never call
-    /// here).
-    ///
-    /// Fails closed on shape mismatch; a launch failure frees the fresh buffer
-    /// and propagates (the selector maps `Err` back to row-major).
-    pub fn ensure_mq4v2_gm(
-        &mut self,
-        a_raw: &GpuTensor,
-        m: usize,
-        k: usize,
-    ) -> HipResult<Option<*mut c_void>> {
-        if !self.prefill_weight_layout_gm_enabled() || !mq4v2_gm_eligible(&self.arch, k) {
-            return Ok(None);
-        }
-        if m == 0 || k == 0 {
-            return Ok(None);
-        }
-        // No allocations or launches mid-tape: capture/replay keeps row-major.
-        if self.graphs.capture_mode || self.replay.is_recording() {
-            return Ok(None);
-        }
-        let key = a_raw.buf.as_ptr() as usize;
-        if let Some(dup) = self.mq4v2_gm_cache.get(&key) {
-            return Ok(Some(dup.buf.as_ptr()));
-        }
-        self.bind_thread()?;
-        let bytes = mq4v2_gm_extra_bytes(m, k);
-        if a_raw.buf.size() < bytes {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "ensure_mq4v2_gm: tensor buffer {} B smaller than MQ4V2 (m={m} k={k}) payload {bytes} B",
-                    a_raw.buf.size()
-                ),
-            ));
-        }
-        let gm = self.alloc_tensor(&[bytes], DType::Raw)?;
-        let result = (|| -> HipResult<*mut c_void> {
-            self.ensure_kernel(
-                "mq4v2_relayout_gm",
-                crate::kernels::MQ4V2_RELAYOUT_GM_SRC,
-                "mq4v2_relayout_gm",
-            )?;
-            let groups = m * (k / 256);
-            let grid_x = groups.div_ceil(256) as u32;
-            let mut src_ptr = a_raw.buf.as_ptr();
-            let mut dst_ptr = gm.buf.as_ptr();
-            let mut m_val = m as i32;
-            let mut gpr_val = (k / 256) as i32;
-            let mut params: Vec<*mut c_void> = vec![
-                &mut src_ptr as *mut _ as *mut c_void,
-                &mut dst_ptr as *mut _ as *mut c_void,
-                &mut m_val as *mut _ as *mut c_void,
-                &mut gpr_val as *mut _ as *mut c_void,
-            ];
-            self.launch_maybe_blob(
-                "mq4v2_relayout_gm",
-                [grid_x, 1, 1],
-                [256, 1, 1],
-                0,
-                &mut params,
-                || {
-                    let mut b = hip_bridge::KernargBlob::new();
-                    b.push_ptr(src_ptr);
-                    b.push_ptr(dst_ptr);
-                    b.push_i32(m_val);
-                    b.push_i32(gpr_val);
-                    b
-                },
-            )?;
-            Ok(gm.buf.as_ptr())
-        })();
-        match result {
-            Ok(ptr) => {
-                eprintln!("  [gm] MQ4V2 group-major duplicate: m={m} k={k} +{bytes} B");
-                self.mq4v2_gm_cache.insert(key, gm);
-                Ok(Some(ptr))
-            }
-            Err(e) => {
-                let _ = self.free_tensor(gm);
-                Err(e)
-            }
-        }
-    }
-
     /// Whether the arch is eligible for the rocBLAS/MFMA batched-prefill
     /// path. Default: CDNA3 only (MI300-series, gfx94x). Override with
     /// `HIPFIRE_ROCBLAS_ALL_ARCHS=1` for local testing on RDNA3+ — rocBLAS
@@ -4202,19 +3993,11 @@ impl Gpu {
     ///   * fp16_shadow_cache: lazily-built FP16 dequant of HFQ4 weights for
     ///     the rocBLAS prefill path (CDNA3-only). Owns GpuTensors, so the
     ///     entries are released back to the pool here.
-    ///   * mq4v2_gm_cache + mq4v2_layout: group-major MQ4V2 duplicates and
-    ///     layout attributes for the IU4 prefill path. Same ownership as the
-    ///     fp16 shadows.
     pub fn invalidate_weight_caches(&mut self) {
         self.bind_thread_or_warn();
         self.mmq_screen.cache.clear();
         let shadows: Vec<GpuTensor> = self.fp16_shadow_cache.drain().map(|(_, t)| t).collect();
         for t in shadows {
-            let _ = self.free_tensor(t);
-        }
-        self.mq4v2_layout.clear();
-        let gm_dups: Vec<GpuTensor> = self.mq4v2_gm_cache.drain().map(|(_, t)| t).collect();
-        for t in gm_dups {
             let _ = self.free_tensor(t);
         }
     }
@@ -5547,10 +5330,6 @@ impl Drop for Gpu {
 #[cfg(test)]
 mod tests {
     use super::gen_fwht_signs;
-    use super::mq4v2_gm_eligible;
-    use super::mq4v2_gm_extra_bytes;
-    use super::mq4v2_group_major_offset;
-    use super::mq4v2_row_major_group_offset;
     use super::DType;
     use super::Gpu;
     use super::HessianCapture;
@@ -6283,78 +6062,5 @@ mod tests {
         })
         .expect_err("query errors must propagate");
         assert!(err.to_string().contains("boom"), "{err}");
-    }
-
-    #[test]
-    fn mq4v2_gm_offsets_spot_checks_5120x17408() {
-        // Qwen-scale up-projection: M=5120 rows, K=17408 cols, gpr=68.
-        // Row-major: ((row)*gpr + kb)*136. Group-major: (kb*M + row)*136.
-        let (m, k, gpr) = (5120usize, 17408usize, 68usize);
-        assert_eq!(k / 256, gpr);
-        assert_eq!(mq4v2_row_major_group_offset(0, 0, gpr), 0);
-        assert_eq!(mq4v2_group_major_offset(0, 0, m), 0);
-        // row=1, kb=0: row-major strides a full row of groups past row 0.
-        assert_eq!(mq4v2_row_major_group_offset(1, 0, gpr), 68 * 136);
-        assert_eq!(mq4v2_group_major_offset(0, 1, m), 1 * 136);
-        // row=0, kb=1: adjacent groups row-major, M rows apart group-major.
-        assert_eq!(mq4v2_row_major_group_offset(0, 1, gpr), 1 * 136);
-        assert_eq!(mq4v2_group_major_offset(1, 0, m), 5120 * 136);
-        // Last group: both layouts end at (groups-1)*136.
-        let groups = m * gpr;
-        assert_eq!(mq4v2_row_major_group_offset(m - 1, gpr - 1, gpr), (groups - 1) * 136);
-        assert_eq!(mq4v2_group_major_offset(gpr - 1, m - 1, m), (groups - 1) * 136);
-        // Duplicate costs exactly one tensor payload.
-        assert_eq!(mq4v2_gm_extra_bytes(m, k), m * gpr * 136);
-        assert_eq!(mq4v2_gm_extra_bytes(m, k), 5120 * 68 * 136);
-    }
-
-    #[test]
-    fn mq4v2_gm_offsets_spot_checks_17408x5120() {
-        // Transposed FFN shape: M=17408 rows, K=5120 cols, gpr=20.
-        let (m, k, gpr) = (17408usize, 5120usize, 20usize);
-        assert_eq!(k / 256, gpr);
-        assert_eq!(mq4v2_row_major_group_offset(0, 0, gpr), 0);
-        assert_eq!(mq4v2_group_major_offset(0, 0, m), 0);
-        assert_eq!(mq4v2_row_major_group_offset(1, 0, gpr), 20 * 136);
-        assert_eq!(mq4v2_group_major_offset(0, 1, m), 1 * 136);
-        assert_eq!(mq4v2_row_major_group_offset(0, 1, gpr), 1 * 136);
-        assert_eq!(mq4v2_group_major_offset(1, 0, m), 17408 * 136);
-        let groups = m * gpr;
-        assert_eq!(mq4v2_row_major_group_offset(m - 1, gpr - 1, gpr), (groups - 1) * 136);
-        assert_eq!(mq4v2_group_major_offset(gpr - 1, m - 1, m), (groups - 1) * 136);
-        assert_eq!(mq4v2_gm_extra_bytes(m, k), 17408 * 20 * 136);
-    }
-
-    #[test]
-    fn mq4v2_gm_permutation_is_bijective() {
-        // Exhaustive small case (M=16, K=512, gpr=2): the relayout must move
-        // every 136 B group exactly once — full coverage, no collisions.
-        let (m, gpr) = (16usize, 2usize);
-        let groups = m * gpr;
-        let mut seen = vec![false; groups];
-        for row in 0..m {
-            for kb in 0..gpr {
-                let src = mq4v2_row_major_group_offset(row, kb, gpr) / 136;
-                let dst = mq4v2_group_major_offset(kb, row, m) / 136;
-                assert!(src < groups && dst < groups, "row={row} kb={kb}");
-                assert!(!seen[dst], "collision at dst group {dst} (row={row} kb={kb})");
-                seen[dst] = true;
-                // Round-trip: dst index decodes back to the same group.
-                assert_eq!(dst, kb * m + row);
-                assert_eq!(src, row * gpr + kb);
-            }
-        }
-        assert!(seen.iter().all(|&s| s), "every group-major slot written once");
-    }
-
-    #[test]
-    fn mq4v2_gm_eligible_exact_gfx1151_only() {
-        assert!(mq4v2_gm_eligible("gfx1151", 256));
-        assert!(mq4v2_gm_eligible("gfx1151", 17408));
-        assert!(!mq4v2_gm_eligible("gfx1151", 255));
-        assert!(!mq4v2_gm_eligible("gfx1151", 128));
-        for arch in ["gfx1100", "gfx1101", "gfx1150", "gfx1201", "gfx942"] {
-            assert!(!mq4v2_gm_eligible(arch, 17408), "arch={arch}");
-        }
     }
 }

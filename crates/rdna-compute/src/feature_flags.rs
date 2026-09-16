@@ -44,12 +44,6 @@ pub struct FeatureFlags {
     /// off everywhere); unset/`=0` keeps the incumbent Q8_1 MMQ route.
     /// Expected quality cost ~+0.014 WT2 KLD for the MQ4-XT speed rung.
     pub gfx11_mmq_iu4: Option<bool>,
-    /// Group-major MQ4G256V2 duplicate for the IU4 prefill `_gm_col_gfx1151`
-    /// entries (`HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM`,
-    /// `prefill.weight_layout_gm`). Opt-in, default off; honored on exact
-    /// gfx1151 only (see `prefill_weight_layout_gm_enabled`) — unset keeps
-    /// the row-major tensor everywhere.
-    pub prefill_weight_layout_gm: Option<bool>,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -469,7 +463,6 @@ impl FeatureFlags {
             gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             gfx11_mmq_iu4: parse_bool("HIPFIRE_GFX11_MQ4V2_IU4"),
-            prefill_weight_layout_gm: parse_bool("HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -742,14 +735,6 @@ impl FeatureFlags {
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
     }
 
-    /// Resolved group-major MQ4V2 duplicate route: explicit opt-in, honored
-    /// on exact gfx1151 only — unset/`=0` (or any other arch) keeps the
-    /// row-major tensor. Unavailable elsewhere by construction, so the flag
-    /// can ride the default-off process config without affecting targets.
-    pub fn prefill_weight_layout_gm_enabled(&self) -> bool {
-        self.prefill_weight_layout_gm.unwrap_or(false) && self.arch == "gfx1151"
-    }
-
     /// C2 producer-emitted IU4 sidecar route: exact gfx1151 + IU4 opt-in.
     /// When live (and eager + batch/K admission), RMSNorm/FWHT and
     /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
@@ -819,7 +804,6 @@ impl FeatureFlags {
             gfx1151_e8_buffer: None,
             gfx11_mmq_x128: None,
             gfx11_mmq_iu4: None,
-            prefill_weight_layout_gm: None,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,
@@ -1092,42 +1076,6 @@ mod tests {
             let test_flags = FeatureFlags::for_test(arch);
             assert!(!test_flags.gfx11_mmq_iu4_enabled(), "arch={arch}");
         }
-    }
-
-    #[test]
-    fn prefill_weight_layout_gm_opt_in_exact_gfx1151_only() {
-        // Default process policy: the group-major duplicate stays off
-        // everywhere until `prefill.weight_layout_gm=true` (or
-        // `HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM=1`); the opt-in admits only
-        // exact gfx1151.
-        let resolved = resolve([]).unwrap();
-        let process = ProcessConfig::from_resolved(&resolved).unwrap();
-        for arch in ["gfx1151", "gfx1100", "gfx1201", "gfx942"] {
-            let flags = FeatureFlags::from_process_config(arch, &process);
-            assert!(!flags.prefill_weight_layout_gm_enabled(), "arch={arch}");
-        }
-
-        let mut layer = ConfigLayer::default();
-        layer.set_cli("prefill.weight_layout_gm", "true").unwrap();
-        let resolved = resolve([NamedLayer {
-            source: ConfigSource::GlobalUser {
-                path: "config.toml".into(),
-            },
-            layer,
-        }])
-        .unwrap();
-        let process = ProcessConfig::from_resolved(&resolved).unwrap();
-        let flags = FeatureFlags::from_process_config("gfx1151", &process);
-        assert!(flags.prefill_weight_layout_gm_enabled());
-        for arch in ["gfx1100", "gfx1101", "gfx1150", "gfx1201", "gfx942"] {
-            let flags = FeatureFlags::from_process_config(arch, &process);
-            assert!(!flags.prefill_weight_layout_gm_enabled(), "arch={arch}");
-        }
-
-        // The unit-test constructor stays off (deterministic baseline).
-        assert!(!FeatureFlags::for_test("gfx1151").prefill_weight_layout_gm_enabled());
-        assert!(!FeatureFlags::for_test("gfx1100").prefill_weight_layout_gm_enabled());
-        assert!(!FeatureFlags::for_test("gfx1201").prefill_weight_layout_gm_enabled());
     }
 
     #[test]
