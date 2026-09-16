@@ -109,7 +109,7 @@ extern "C" __global__ void gemm_mq4g256v2_residual_wmma(
     }
 }
 
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__)
+#if defined(__gfx1151__)
 // Group-major twin of gemm_mq4g256v2_residual_wmma (decode/batched-decode
 // oracle): byte-identical except the A group base address. Row-major
 // shipping: gp = A + (safe_row * groups_per_row + g) * 136 (each row's
@@ -182,5 +182,5 @@ extern "C" __global__ void gemm_mq4g256v2_residual_wmma_gm(
         }
     }
 }
-#endif // GM twin (gfx11; no gfx12: w32 WMMA intrinsic is RDNA3-only)
+#endif // __gfx1151__
 

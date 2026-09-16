@@ -486,7 +486,7 @@ extern "C" __global__ void gemv_mq4g256v2_multirow_r8(
     gemv_mq4g256v2_multirow_body<8>(A, x, y, M, K);
 }
 
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(__gfx1151__)
 // Group-major twin of gemv_mq4g256v2_multirow_r2 (the gfx1151 N=1 decode
 // oracle: gemv_rows_default is 2 on gfx1151, so plain decode dispatches the
 // r2 kernel, not the scalar one). Byte-identical except the A group base
@@ -514,13 +514,10 @@ extern "C" __global__ void gemv_mq4g256v2_multirow_r2_gm(
 #else
     const int groups_per_row = K / 256;
 #endif
+    const int r1s = have_row1 ? row1 : row0;
     const long long m136 = (long long)M * 136;
     const long long r0off = (long long)row0 * 136;
-    // Adjacent rows: row r+1's group base is exactly +136 B past row r's (or
-    // +0 when the trailing odd row clamps r1 to r0). One base + uniform delta
-    // replaces the second full A+qb+roff address computation per group.
-    const long long r1_delta = have_row1 ? 136 : 0;
-    const unsigned int r1_delta_u = (unsigned int)r1_delta;
+    const long long r1off = (long long)r1s * 136;
     const long long m4 = 4 * m136;
     const int boff = tid * 4;
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
@@ -563,44 +560,23 @@ extern "C" __global__ void gemv_mq4g256v2_multirow_r2_gm(
     #define LOAD_LM_PACKED_GM(gp, weight_offset) \
         HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc_gm, gp, weight_offset)
 
-    // Paired dual-row DOG: row0 base is one full A+qb+r0off computation per
-    // group; row1 rides +r1_delta (adjacent rows are +136 B apart, +0 when
-    // the trailing odd row clamps r1 to r0). Same per-row bytes and same
-    // (a0,b0,a1,b1,...) accumulation order as the split sequence below was;
-    // bit-exact by construction.
-    #define DOG_X8_GM_PAIR(qb, a, b, pfx) do { \
-        const char* gp0_gm = A + (qb) + r0off; \
-        const char* gp1_gm = gp0_gm + r1_delta; \
-        const unsigned int w0_gm = (unsigned int)((qb) + r0off); \
-        const unsigned int w1_gm = w0_gm + r1_delta_u; \
-        const unsigned int hA0 = LOAD_LM_HEADER_GM(gp0_gm, w0_gm); \
-        const unsigned int hB0 = LOAD_LM_HEADER_GM((gp0_gm) + 4, (w0_gm) + 4); \
-        const unsigned int hs0 = (tid < 16) ? hA0 : hB0; \
-        float sc0 = __half2float(__ushort_as_half((unsigned short)(hs0 & 0xFFFFu))); \
-        float zp0 = __half2float(__ushort_as_half((unsigned short)(hs0 >> 16))); \
-        unsigned int pk0 = LOAD_LM_PACKED_GM((gp0_gm) + 8 + boff, (w0_gm) + 8 + boff); \
-        (a) += (sc0 * (float)((pk0) & 0xFu)         + zp0) * pfx##0 \
-             + (sc0 * (float)(((pk0) >> 4) & 0xFu)  + zp0) * pfx##1 \
-             + (sc0 * (float)(((pk0) >> 8) & 0xFu)  + zp0) * pfx##2 \
-             + (sc0 * (float)(((pk0) >> 12) & 0xFu) + zp0) * pfx##3 \
-             + (sc0 * (float)(((pk0) >> 16) & 0xFu) + zp0) * pfx##4 \
-             + (sc0 * (float)(((pk0) >> 20) & 0xFu) + zp0) * pfx##5 \
-             + (sc0 * (float)(((pk0) >> 24) & 0xFu) + zp0) * pfx##6 \
-             + (sc0 * (float)(((pk0) >> 28) & 0xFu) + zp0) * pfx##7; \
-        const unsigned int hA1 = LOAD_LM_HEADER_GM(gp1_gm, w1_gm); \
-        const unsigned int hB1 = LOAD_LM_HEADER_GM((gp1_gm) + 4, (w1_gm) + 4); \
-        const unsigned int hs1 = (tid < 16) ? hA1 : hB1; \
-        float sc1 = __half2float(__ushort_as_half((unsigned short)(hs1 & 0xFFFFu))); \
-        float zp1 = __half2float(__ushort_as_half((unsigned short)(hs1 >> 16))); \
-        unsigned int pk1 = LOAD_LM_PACKED_GM((gp1_gm) + 8 + boff, (w1_gm) + 8 + boff); \
-        (b) += (sc1 * (float)((pk1) & 0xFu)         + zp1) * pfx##0 \
-             + (sc1 * (float)(((pk1) >> 4) & 0xFu)  + zp1) * pfx##1 \
-             + (sc1 * (float)(((pk1) >> 8) & 0xFu)  + zp1) * pfx##2 \
-             + (sc1 * (float)(((pk1) >> 12) & 0xFu) + zp1) * pfx##3 \
-             + (sc1 * (float)(((pk1) >> 16) & 0xFu) + zp1) * pfx##4 \
-             + (sc1 * (float)(((pk1) >> 20) & 0xFu) + zp1) * pfx##5 \
-             + (sc1 * (float)(((pk1) >> 24) & 0xFu) + zp1) * pfx##6 \
-             + (sc1 * (float)(((pk1) >> 28) & 0xFu) + zp1) * pfx##7; \
+    #define DOG_X8_GM(qb, roff, a, pfx) do { \
+        const char* gp_gm = A + (qb) + (roff); \
+        const unsigned int woff_gm = (unsigned int)((qb) + (roff)); \
+        const unsigned int hA = LOAD_LM_HEADER_GM(gp_gm, woff_gm); \
+        const unsigned int hB = LOAD_LM_HEADER_GM((gp_gm) + 4, (woff_gm) + 4); \
+        const unsigned int hs = (tid < 16) ? hA : hB; \
+        float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu))); \
+        float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16))); \
+        unsigned int pk = LOAD_LM_PACKED_GM((gp_gm) + 8 + boff, (woff_gm) + 8 + boff); \
+        (a) += (sc * (float)((pk) & 0xFu)         + zp) * pfx##0 \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * pfx##1 \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * pfx##2 \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * pfx##3 \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * pfx##4 \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * pfx##5 \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * pfx##6 \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * pfx##7; \
     } while (0)
 
     long long qb = 0;
@@ -621,10 +597,14 @@ extern "C" __global__ void gemv_mq4g256v2_multirow_r2_gm(
             "v"(xcv0), "v"(xcv1), "v"(xdv0), "v"(xdv1) : "memory");
 #endif
 
-        DOG_X8_GM_PAIR(qb, a0, b0, xa);
-        DOG_X8_GM_PAIR(q1, a1, b1, xb);
-        DOG_X8_GM_PAIR(q2, a2, b2, xc);
-        DOG_X8_GM_PAIR(q3, a3, b3, xd);
+        DOG_X8_GM(qb, r0off, a0, xa);
+        DOG_X8_GM(qb, r1off, b0, xa);
+        DOG_X8_GM(q1, r0off, a1, xb);
+        DOG_X8_GM(q1, r1off, b1, xb);
+        DOG_X8_GM(q2, r0off, a2, xc);
+        DOG_X8_GM(q2, r1off, b2, xc);
+        DOG_X8_GM(q3, r0off, a3, xd);
+        DOG_X8_GM(q3, r1off, b3, xd);
         qb += m4;
     }
 
@@ -634,64 +614,49 @@ extern "C" __global__ void gemv_mq4g256v2_multirow_r2_gm(
         const float x0 = xv0.x, x1 = xv0.y, x2 = xv0.z, x3 = xv0.w; \
         const float x4 = xv1.x, x5 = xv1.y, x6 = xv1.z, x7 = xv1.w
 
-    #define DOG_X8_TAIL_GM_PAIR(qb, a, b) do { \
-        const char* gp0_gm = A + (qb) + r0off; \
-        const char* gp1_gm = gp0_gm + r1_delta; \
-        const unsigned int w0_gm = (unsigned int)((qb) + r0off); \
-        const unsigned int w1_gm = w0_gm + r1_delta_u; \
-        const unsigned int hA0 = LOAD_LM_HEADER_GM(gp0_gm, w0_gm); \
-        const unsigned int hB0 = LOAD_LM_HEADER_GM((gp0_gm) + 4, (w0_gm) + 4); \
-        const unsigned int hs0 = (tid < 16) ? hA0 : hB0; \
-        float sc0 = __half2float(__ushort_as_half((unsigned short)(hs0 & 0xFFFFu))); \
-        float zp0 = __half2float(__ushort_as_half((unsigned short)(hs0 >> 16))); \
-        unsigned int pk0 = LOAD_LM_PACKED_GM((gp0_gm) + 8 + boff, (w0_gm) + 8 + boff); \
-        (a) += (sc0 * (float)((pk0) & 0xFu)         + zp0) * x0 \
-             + (sc0 * (float)(((pk0) >> 4) & 0xFu)  + zp0) * x1 \
-             + (sc0 * (float)(((pk0) >> 8) & 0xFu)  + zp0) * x2 \
-             + (sc0 * (float)(((pk0) >> 12) & 0xFu) + zp0) * x3 \
-             + (sc0 * (float)(((pk0) >> 16) & 0xFu) + zp0) * x4 \
-             + (sc0 * (float)(((pk0) >> 20) & 0xFu) + zp0) * x5 \
-             + (sc0 * (float)(((pk0) >> 24) & 0xFu) + zp0) * x6 \
-             + (sc0 * (float)(((pk0) >> 28) & 0xFu) + zp0) * x7; \
-        const unsigned int hA1 = LOAD_LM_HEADER_GM(gp1_gm, w1_gm); \
-        const unsigned int hB1 = LOAD_LM_HEADER_GM((gp1_gm) + 4, (w1_gm) + 4); \
-        const unsigned int hs1 = (tid < 16) ? hA1 : hB1; \
-        float sc1 = __half2float(__ushort_as_half((unsigned short)(hs1 & 0xFFFFu))); \
-        float zp1 = __half2float(__ushort_as_half((unsigned short)(hs1 >> 16))); \
-        unsigned int pk1 = LOAD_LM_PACKED_GM((gp1_gm) + 8 + boff, (w1_gm) + 8 + boff); \
-        (b) += (sc1 * (float)((pk1) & 0xFu)         + zp1) * x0 \
-             + (sc1 * (float)(((pk1) >> 4) & 0xFu)  + zp1) * x1 \
-             + (sc1 * (float)(((pk1) >> 8) & 0xFu)  + zp1) * x2 \
-             + (sc1 * (float)(((pk1) >> 12) & 0xFu) + zp1) * x3 \
-             + (sc1 * (float)(((pk1) >> 16) & 0xFu) + zp1) * x4 \
-             + (sc1 * (float)(((pk1) >> 20) & 0xFu) + zp1) * x5 \
-             + (sc1 * (float)(((pk1) >> 24) & 0xFu) + zp1) * x6 \
-             + (sc1 * (float)(((pk1) >> 28) & 0xFu) + zp1) * x7; \
+    #define DOG_X8_TAIL_GM(qb, roff, a) do { \
+        const char* gp_gm = A + (qb) + (roff); \
+        const unsigned int woff_gm = (unsigned int)((qb) + (roff)); \
+        const unsigned int hA = LOAD_LM_HEADER_GM(gp_gm, woff_gm); \
+        const unsigned int hB = LOAD_LM_HEADER_GM((gp_gm) + 4, (woff_gm) + 4); \
+        const unsigned int hs = (tid < 16) ? hA : hB; \
+        float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu))); \
+        float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16))); \
+        unsigned int pk = LOAD_LM_PACKED_GM((gp_gm) + 8 + boff, (woff_gm) + 8 + boff); \
+        (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x3 \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x4 \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x5 \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x6 \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x7; \
     } while (0)
 
     if (tail >= 1) {
         const int g = quads << 2;
         const int base = g * 256 + tid * 8;
         LOAD_X8_GM(base);
-        DOG_X8_TAIL_GM_PAIR(qb, a0, b0);
-        qb += m136;
+        DOG_X8_TAIL_GM(qb, r0off, a0);
+        DOG_X8_TAIL_GM(qb, r1off, b0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
         const int base = g * 256 + tid * 8;
         LOAD_X8_GM(base);
-        DOG_X8_TAIL_GM_PAIR(qb, a1, b1);
-        qb += m136;
+        DOG_X8_TAIL_GM(qb + m136, r0off, a1);
+        DOG_X8_TAIL_GM(qb + m136, r1off, b1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
         const int base = g * 256 + tid * 8;
         LOAD_X8_GM(base);
-        DOG_X8_TAIL_GM_PAIR(qb, a2, b2);
+        DOG_X8_TAIL_GM(qb + 2 * m136, r0off, a2);
+        DOG_X8_TAIL_GM(qb + 2 * m136, r1off, b2);
     }
-    #undef DOG_X8_TAIL_GM_PAIR
+    #undef DOG_X8_TAIL_GM
     #undef LOAD_X8_GM
-    #undef DOG_X8_GM_PAIR
+    #undef DOG_X8_GM
     #undef LOAD_X8_INTO_GM
     #undef LOAD_LM_PACKED_GM
     #undef LOAD_LM_HEADER_GM
@@ -708,4 +673,4 @@ extern "C" __global__ void gemv_mq4g256v2_multirow_r2_gm(
         if (have_row1) y[row1] = s1;
     }
 }
-#endif // GM twin (gfx11 + gfx12)
+#endif // __gfx1151__

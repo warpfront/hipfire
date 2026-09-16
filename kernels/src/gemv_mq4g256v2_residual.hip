@@ -258,7 +258,7 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     }
 }
 
-#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__) || defined(__gfx1152__) || defined(__gfx1200__) || defined(__gfx1201__)
+#if defined(__gfx1151__)
 // Group-major twin of gemv_mq4g256v2_residual (residual-decode oracle):
 // byte-identical except the A group base address. Shipping:
 //   row_ptr0 = A + row0 * groups_per_row * 136; gp = row_ptr0 + g * 136
@@ -313,31 +313,13 @@ extern "C" __global__ void gemv_mq4g256v2_residual_gm(
     #endif
 
     // Group-major address invariants hoisted out of the group loop (mirrors
-    // shipping's hoisted row_ptr/row_weight_offset): per-group qbase walks
-    // one uniform stride per group, plus loop-invariant row offsets. The two
-    // rows are adjacent, so row r+1's base is exactly +136 B past row r's
-    // (+0 when the trailing odd row clamps r1 to r0): one base + uniform
-    // delta replaces the second full A+qbase+roff computation per group.
+    // shipping's hoisted row_ptr/row_weight_offset): gp = A + qbase + roff
+    // with per-quad qbase = g*M*136 and loop-invariant row offsets.
     const long long m136_gm = (long long)M * 136;
     const long long r0off_gm = (long long)row0 * 136;
     const int r1s_gm = have_row1 ? row1 : row0;
     const long long r1off_gm = (long long)r1s_gm * 136;
-    const long long r1_delta_gm = have_row1 ? 136 : 0;
-    const unsigned int r1_delta_u_gm = (unsigned int)r1_delta_gm;
-    // Lane-offset selection: on exact-gfx1100 the per-iteration launder below
-    // keeps (stride+boff) offsets iteration-local (else LICM hoists them to
-    // the preheader, +15 VGPR vs shipping's 81). Other archs use boff_gm
-    // directly (parity already holds there; identical codegen).
-    int boff_q_gm = boff_gm;
-#if defined(__gfx1100__)
-    #define BOFF_GM boff_q_gm
-#else
-    #define BOFF_GM boff_gm
-#endif
-    // Single-row loader: the exact-gfx1100 branch below keeps shipping's
-    // row0-then-row1 split (with its scheduling barrier), so each row's four
-    // groups load exactly as before, only off the group-major base.
-    #define LOAD_W_GM_1R(qbase, roff, sc, zp, pk) do { \
+    #define LOAD_W_GM_Q(qbase, roff, sc, zp, pk) do { \
         const char* gp_gm = A + (qbase) + (roff); \
         const unsigned int woff_gm = (unsigned int)((qbase) + (roff)); \
         const unsigned int hA_gm = HIPFIRE_RESIDUAL_LOAD_SC_GM(weight_rsrc_gm, gp_gm, woff_gm); \
@@ -345,36 +327,12 @@ extern "C" __global__ void gemv_mq4g256v2_residual_gm(
         const unsigned int hs_gm = (tid < 16) ? hA_gm : hB_gm; \
         (sc) = __half2float(__ushort_as_half((unsigned short)(hs_gm & 0xFFFFu))); \
         (zp) = __half2float(__ushort_as_half((unsigned short)(hs_gm >> 16))); \
-        (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc_gm, (gp_gm) + 8 + BOFF_GM, (woff_gm) + 8 + BOFF_GM); \
-    } while (0)
-    #define LOAD_W_GM_PAIR(qbase, sc0, zp0, pk0, sc1, zp1, pk1) do { \
-        const char* gp0_gm = A + (qbase) + r0off_gm; \
-        const char* gp1_gm = gp0_gm + r1_delta_gm; \
-        const unsigned int w0_gm = (unsigned int)((qbase) + r0off_gm); \
-        const unsigned int w1_gm = w0_gm + r1_delta_u_gm; \
-        const unsigned int hA0_gm = HIPFIRE_RESIDUAL_LOAD_SC_GM(weight_rsrc_gm, gp0_gm, w0_gm); \
-        const unsigned int hB0_gm = HIPFIRE_RESIDUAL_LOAD_ZP_GM(weight_rsrc_gm, gp0_gm, w0_gm); \
-        const unsigned int hs0_gm = (tid < 16) ? hA0_gm : hB0_gm; \
-        (sc0) = __half2float(__ushort_as_half((unsigned short)(hs0_gm & 0xFFFFu))); \
-        (zp0) = __half2float(__ushort_as_half((unsigned short)(hs0_gm >> 16))); \
-        (pk0) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc_gm, (gp0_gm) + 8 + BOFF_GM, (w0_gm) + 8 + BOFF_GM); \
-        const unsigned int hA1_gm = HIPFIRE_RESIDUAL_LOAD_SC_GM(weight_rsrc_gm, gp1_gm, w1_gm); \
-        const unsigned int hB1_gm = HIPFIRE_RESIDUAL_LOAD_ZP_GM(weight_rsrc_gm, gp1_gm, w1_gm); \
-        const unsigned int hs1_gm = (tid < 16) ? hA1_gm : hB1_gm; \
-        (sc1) = __half2float(__ushort_as_half((unsigned short)(hs1_gm & 0xFFFFu))); \
-        (zp1) = __half2float(__ushort_as_half((unsigned short)(hs1_gm >> 16))); \
-        (pk1) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc_gm, (gp1_gm) + 8 + BOFF_GM, (w1_gm) + 8 + BOFF_GM); \
+        (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc_gm, (gp_gm) + 8 + boff_gm, (woff_gm) + 8 + boff_gm); \
     } while (0)
 
-    long long qb_gm = 0;
-    const long long m4_gm = 4 * m136_gm;
     for (int q = 0; q < quads_gm; q++) {
         const int g = q << 2;
         const int base0 = g * 256 + tid * 8;
-#if defined(__gfx1100__)
-        boff_q_gm = boff_gm;
-        asm volatile("" : "+v"(boff_q_gm));
-#endif
 
         const float4 xv0a = *reinterpret_cast<const float4*>(x + base0);
         const float4 xv0b = *reinterpret_cast<const float4*>(x + base0 + 4);
@@ -389,48 +347,49 @@ extern "C" __global__ void gemv_mq4g256v2_residual_gm(
         unsigned int pk0a, pk1a, pk2a, pk3a;
         float sc0b, zp0b, sc1b, zp1b, sc2b, zp2b, sc3b, zp3b;
         unsigned int pk0b, pk1b, pk2b, pk3b;
-        const long long q0_gm = qb_gm;
+        const long long q0_gm = (long long)g * M * 136;
         const long long q1_gm = q0_gm + m136_gm;
         const long long q2_gm = q1_gm + m136_gm;
         const long long q3_gm = q2_gm + m136_gm;
-        qb_gm += m4_gm;
 
 #if defined(__gfx1100__)
-        // Sequential within each half: one address pair + one value set live
-        // at a time (reused sc0a/zp0a/pk0a), matching shipping's peak. Same
-        // load bytes and same row0-quartet/barrier/row1-quartet DOG order;
-        // bit-exact by construction.
-        LOAD_W_GM_1R(q0_gm, r0off_gm, sc0a, zp0a, pk0a);
+        LOAD_W_GM_Q(q0_gm, r0off_gm, sc0a, zp0a, pk0a);
+        LOAD_W_GM_Q(q1_gm, r0off_gm, sc1a, zp1a, pk1a);
+        LOAD_W_GM_Q(q2_gm, r0off_gm, sc2a, zp2a, pk2a);
+        LOAD_W_GM_Q(q3_gm, r0off_gm, sc3a, zp3a, pk3a);
+
         DOG_X8_GM(sc0a, zp0a, pk0a, acc0,
                xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-        LOAD_W_GM_1R(q1_gm, r0off_gm, sc0a, zp0a, pk0a);
-        DOG_X8_GM(sc0a, zp0a, pk0a, acc1,
+        DOG_X8_GM(sc1a, zp1a, pk1a, acc1,
                xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
-        LOAD_W_GM_1R(q2_gm, r0off_gm, sc0a, zp0a, pk0a);
-        DOG_X8_GM(sc0a, zp0a, pk0a, acc2,
+        DOG_X8_GM(sc2a, zp2a, pk2a, acc2,
                xv2a.x, xv2a.y, xv2a.z, xv2a.w, xv2b.x, xv2b.y, xv2b.z, xv2b.w);
-        LOAD_W_GM_1R(q3_gm, r0off_gm, sc0a, zp0a, pk0a);
-        DOG_X8_GM(sc0a, zp0a, pk0a, acc3,
+        DOG_X8_GM(sc3a, zp3a, pk3a, acc3,
                xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
 
         asm volatile("" : "+v"(acc0), "+v"(acc1), "+v"(acc2), "+v"(acc3) :: "memory");
-        LOAD_W_GM_1R(q0_gm, r1off_gm, sc0a, zp0a, pk0a);
-        DOG_X8_GM(sc0a, zp0a, pk0a, bcc0,
+
+        LOAD_W_GM_Q(q0_gm, r1off_gm, sc0b, zp0b, pk0b);
+        LOAD_W_GM_Q(q1_gm, r1off_gm, sc1b, zp1b, pk1b);
+        LOAD_W_GM_Q(q2_gm, r1off_gm, sc2b, zp2b, pk2b);
+        LOAD_W_GM_Q(q3_gm, r1off_gm, sc3b, zp3b, pk3b);
+        DOG_X8_GM(sc0b, zp0b, pk0b, bcc0,
                xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
-        LOAD_W_GM_1R(q1_gm, r1off_gm, sc0a, zp0a, pk0a);
-        DOG_X8_GM(sc0a, zp0a, pk0a, bcc1,
+        DOG_X8_GM(sc1b, zp1b, pk1b, bcc1,
                xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
-        LOAD_W_GM_1R(q2_gm, r1off_gm, sc0a, zp0a, pk0a);
-        DOG_X8_GM(sc0a, zp0a, pk0a, bcc2,
+        DOG_X8_GM(sc2b, zp2b, pk2b, bcc2,
                xv2a.x, xv2a.y, xv2a.z, xv2a.w, xv2b.x, xv2b.y, xv2b.z, xv2b.w);
-        LOAD_W_GM_1R(q3_gm, r1off_gm, sc0a, zp0a, pk0a);
-        DOG_X8_GM(sc0a, zp0a, pk0a, bcc3,
+        DOG_X8_GM(sc3b, zp3b, pk3b, bcc3,
                xv3a.x, xv3a.y, xv3a.z, xv3a.w, xv3b.x, xv3b.y, xv3b.z, xv3b.w);
 #else
-        LOAD_W_GM_PAIR(q0_gm, sc0a, zp0a, pk0a, sc0b, zp0b, pk0b);
-        LOAD_W_GM_PAIR(q1_gm, sc1a, zp1a, pk1a, sc1b, zp1b, pk1b);
-        LOAD_W_GM_PAIR(q2_gm, sc2a, zp2a, pk2a, sc2b, zp2b, pk2b);
-        LOAD_W_GM_PAIR(q3_gm, sc3a, zp3a, pk3a, sc3b, zp3b, pk3b);
+        LOAD_W_GM_Q(q0_gm, r0off_gm, sc0a, zp0a, pk0a);
+        LOAD_W_GM_Q(q1_gm, r0off_gm, sc1a, zp1a, pk1a);
+        LOAD_W_GM_Q(q2_gm, r0off_gm, sc2a, zp2a, pk2a);
+        LOAD_W_GM_Q(q3_gm, r0off_gm, sc3a, zp3a, pk3a);
+        LOAD_W_GM_Q(q0_gm, r1off_gm, sc0b, zp0b, pk0b);
+        LOAD_W_GM_Q(q1_gm, r1off_gm, sc1b, zp1b, pk1b);
+        LOAD_W_GM_Q(q2_gm, r1off_gm, sc2b, zp2b, pk2b);
+        LOAD_W_GM_Q(q3_gm, r1off_gm, sc3b, zp3b, pk3b);
 
         DOG_X8_GM(sc0a, zp0a, pk0a, acc0,
                xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
@@ -458,8 +417,9 @@ extern "C" __global__ void gemv_mq4g256v2_residual_gm(
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
         float sc0, zp0, sc1, zp1;
         unsigned int pk0, pk1;
-        LOAD_W_GM_PAIR(qb_gm, sc0, zp0, pk0, sc1, zp1, pk1);
-        qb_gm += m136_gm;
+        const long long qt_gm = (long long)g * M * 136;
+        LOAD_W_GM_Q(qt_gm, r0off_gm, sc0, zp0, pk0);
+        LOAD_W_GM_Q(qt_gm, r1off_gm, sc1, zp1, pk1);
         DOG_X8_GM(sc0, zp0, pk0, acc0,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
         DOG_X8_GM(sc1, zp1, pk1, bcc0,
@@ -472,8 +432,9 @@ extern "C" __global__ void gemv_mq4g256v2_residual_gm(
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
         float sc0, zp0, sc1, zp1;
         unsigned int pk0, pk1;
-        LOAD_W_GM_PAIR(qb_gm, sc0, zp0, pk0, sc1, zp1, pk1);
-        qb_gm += m136_gm;
+        const long long qt_gm = (long long)g * M * 136;
+        LOAD_W_GM_Q(qt_gm, r0off_gm, sc0, zp0, pk0);
+        LOAD_W_GM_Q(qt_gm, r1off_gm, sc1, zp1, pk1);
         DOG_X8_GM(sc0, zp0, pk0, acc1,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
         DOG_X8_GM(sc1, zp1, pk1, bcc1,
@@ -486,14 +447,15 @@ extern "C" __global__ void gemv_mq4g256v2_residual_gm(
         const float4 xb = *reinterpret_cast<const float4*>(x + base + 4);
         float sc0, zp0, sc1, zp1;
         unsigned int pk0, pk1;
-        LOAD_W_GM_PAIR(qb_gm, sc0, zp0, pk0, sc1, zp1, pk1);
+        const long long qt_gm = (long long)g * M * 136;
+        LOAD_W_GM_Q(qt_gm, r0off_gm, sc0, zp0, pk0);
+        LOAD_W_GM_Q(qt_gm, r1off_gm, sc1, zp1, pk1);
         DOG_X8_GM(sc0, zp0, pk0, acc2,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
         DOG_X8_GM(sc1, zp1, pk1, bcc2,
                xa.x, xa.y, xa.z, xa.w, xb.x, xb.y, xb.z, xb.w);
     }
-    #undef LOAD_W_GM_PAIR
-    #undef LOAD_W_GM_1R
+    #undef LOAD_W_GM_Q
     #undef HIPFIRE_RESIDUAL_LOAD_SC_GM
     #undef HIPFIRE_RESIDUAL_LOAD_ZP_GM
     #undef DOG_X8_GM
@@ -516,4 +478,4 @@ extern "C" __global__ void gemv_mq4g256v2_residual_gm(
         }
     }
 }
-#endif // GM twin (gfx11 + gfx12)
+#endif // __gfx1151__

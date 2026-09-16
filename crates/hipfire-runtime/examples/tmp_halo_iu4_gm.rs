@@ -445,35 +445,22 @@ fn main() {
         }
     };
     eprintln!("tmp_halo_iu4_gm on {}  model={model}  TIME={time}", gpu.arch);
-    // IU4 twins cover the gfx11 family (occ3 pair also gfx1100; lf16 pair is
-    // gfx1151-only, like its shipping counterpart). gfx1201 has no IU4 path:
-    // the .gfx11.hip file builds stubs there and gfx12 prefill routes to the
-    // FP8/F16 gfx12 WMMA family instead (see yield report) — skip cleanly.
-    if gpu.arch.starts_with("gfx12") {
+    if gpu.arch != "gfx1151" {
         eprintln!(
-            "SKIP: IU4 MMQ is RDNA3-only (arch={}); gfx12 prefill uses \
-             gemm_mq4g256v2_residual_wmma_fp8_gfx12_* (opt-in) or \
-             gemm_mq4g256v2_residual_wmma_gfx12[_bt*] instead — no gm twin \
-             implemented for those files",
-            gpu.arch
-        );
-        return;
-    }
-    let use_lf16 = gpu.arch == "gfx1151";
-    if !use_lf16 {
-        eprintln!(
-            "NOTE: arch={} runs the occ3 pairs only (lf16 shipping + gm entries are gfx1151-only)",
+            "WARN: gm symbols are #if __gfx1151__; arch={} may fail JIT of gm entries",
             gpu.arch
         );
     }
 
-    // Compile-only: JIT the covered entries, print the cache path, return.
-    let mut syms: Vec<&str> = vec![REF_SET_OCC3, GM_SET_OCC3, REF_ADD_OCC3, GM_ADD_OCC3];
-    if use_lf16 {
-        syms.push(REF_SET_LF16);
-        syms.push(GM_SET_LF16);
-    }
-    for sym in syms {
+    // Compile-only: JIT all six entries, print the cache path, return.
+    for sym in [
+        REF_SET_OCC3,
+        GM_SET_OCC3,
+        REF_SET_LF16,
+        GM_SET_LF16,
+        REF_ADD_OCC3,
+        GM_ADD_OCC3,
+    ] {
         gpu.ensure_kernel_public(MODULE, IU4_SRC, sym)
             .unwrap_or_else(|e| panic!("JIT {sym}: {e}"));
         eprintln!("JIT OK: {sym}");
@@ -529,24 +516,22 @@ fn main() {
         0x6A6D_0000,
         time,
     );
-    if use_lf16 {
-        ok &= run_case(
-            &mut gpu,
-            "gate_proj/set/lf16",
-            &gate,
-            &gate_gm,
-            gate_m,
-            gate_k,
-            512,
-            false,
-            REF_SET_LF16,
-            GM_SET_LF16,
-            LF16_BLOCK,
-            LF16_BLOCK,
-            0x6A6D_0001,
-            time,
-        );
-    }
+    ok &= run_case(
+        &mut gpu,
+        "gate_proj/set/lf16",
+        &gate,
+        &gate_gm,
+        gate_m,
+        gate_k,
+        512,
+        false,
+        REF_SET_LF16,
+        GM_SET_LF16,
+        LF16_BLOCK,
+        LF16_BLOCK,
+        0x6A6D_0001,
+        time,
+    );
     ok &= run_case(
         &mut gpu,
         "down_proj/add/occ3",

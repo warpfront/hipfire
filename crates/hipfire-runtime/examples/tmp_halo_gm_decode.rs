@@ -409,38 +409,26 @@ fn main() {
         }
     };
     eprintln!("tmp_halo_gm_decode on {}  model={model}  TIME={time}", gpu.arch);
-    // GM twins now compile on the gfx11 family + gfx12 (gemv trio), gfx11
-    // (wmma base), gfx1100/1151 (mw4_lds). gfx1201 skips the WMMA pairs: the
-    // base w32 intrinsic is RDNA3-only there and the MW file is RDNA3-only,
-    // so the gfx12 prefill story lives in the .gfx12.hip family instead.
-    let is_gfx12 = gpu.arch.starts_with("gfx12");
-    if !matches!(gpu.arch.as_str(), "gfx1151" | "gfx1100" | "gfx1201") {
+    if gpu.arch != "gfx1151" {
         eprintln!(
-            "WARN: gm twins cover gfx11/gfx12; arch={} may fail JIT of gm entries",
+            "WARN: gm symbols are #if __gfx1151__; arch={} may fail JIT of gm entries",
             gpu.arch
         );
     }
 
-    // Compile-only: JIT the covered entries, print the cache path, return.
-    let mut jit: Vec<(&str, &str, &str)> = vec![
+    // Compile-only: JIT all ten entries, print the cache path, return.
+    for (md, src, sym) in [
         (GEMV_MOD, GEMV_SRC, GEMV_REF),
         (GEMV_MOD, GEMV_SRC, GEMV_GM),
         (GEMV_RES_MOD, GEMV_RES_SRC, GEMV_RES_REF),
         (GEMV_RES_MOD, GEMV_RES_SRC, GEMV_RES_GM),
         (GEMV_MR_MOD, GEMV_MR_SRC, GEMV_MR_REF),
         (GEMV_MR_MOD, GEMV_MR_SRC, GEMV_MR_GM),
-    ];
-    if !is_gfx12 {
-        jit.extend([
-            (GEMM_MOD, GEMM_SRC, GEMM_REF),
-            (GEMM_MOD, GEMM_SRC, GEMM_GM),
-            (MW_MOD, MW_SRC, MW_REF),
-            (MW_MOD, MW_SRC, MW_GM),
-        ]);
-    } else {
-        eprintln!("NOTE: gfx1201 skips GEMM/MW pairs (RDNA3-only w32/MW files); gemv trio still covered");
-    }
-    for (md, src, sym) in jit {
+        (GEMM_MOD, GEMM_SRC, GEMM_REF),
+        (GEMM_MOD, GEMM_SRC, GEMM_GM),
+        (MW_MOD, MW_SRC, MW_REF),
+        (MW_MOD, MW_SRC, MW_GM),
+    ] {
         gpu.ensure_kernel_public(md, src, sym)
             .unwrap_or_else(|e| panic!("JIT {sym}: {e}"));
         eprintln!("JIT OK: {sym}");
@@ -571,10 +559,7 @@ fn main() {
                 for t in like2.held.drain(..) {
                     let _ = gpu.free_tensor(t);
                 }
-            } else if !is_gfx12 {
-                // RDNA3-only WMMA files (see JIT gate above). On gfx12 only
-                // the N=1 gemv pairs run; the gfx12 prefill story lives in
-                // the .gfx12.hip kernel family instead.
+            } else {
                 // N>=2 batched-decode GEMM, F16 x [N x K] row-major (same
                 // bytes the shipping ensure_fp16_x convert would produce are
                 // unnecessary here: both sides share one X buffer, so any
@@ -640,15 +625,15 @@ fn main() {
             }
         }
     }
+
     eprintln!(
-        "NOTE {} decode routes: N=1 gemv_mq4g256v2 (+residual twin where the \
-         caller holds a residual); N=2..95 base gemm_mq4g256v2_residual_wmma (RDNA3-only \
-         file; skipped on gfx12); N>=96 gfx1151 BT4 (prefill, not covered here). DFlash \
-         ksplit/ldsstage and the draft-collapse overwrite GEMM are exact-gfx1100-only \
-         (Off on gfx1151); gfx11 MW4 is off the big-M policy but serves small-M MMQ tails \
-         via small_tail_set (covered above as the tail oracle). Fused gate_up/qkvza \
-         GEMMs are prefill-only (N>=96 policy) — same 136-B groups, untouched.",
-        gpu.arch
+        "NOTE gfx1151 decode routes: N=1 gemv_mq4g256v2 (+residual twin where the \
+         caller holds a residual); N=2..95 base gemm_mq4g256v2_residual_wmma; N>=96 \
+         gfx1151 BT4 (prefill, not covered here). DFlash ksplit/ldsstage and the \
+         draft-collapse overwrite GEMM are exact-gfx1100-only (Off on gfx1151); \
+         gfx11 MW4 is off the big-M policy but serves small-M MMQ tails via \
+         small_tail_set (covered above as the tail oracle). Fused gate_up/qkvza \
+         GEMMs are prefill-only (N>=96 policy) — same 136-B groups, untouched."
     );
     if ok {
         eprintln!("GM DECODE PASS: row-major shipping vs group-major bitwise-equal on all cases");

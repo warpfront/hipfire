@@ -676,20 +676,6 @@ impl Carrier for Qwen35Carrier {
                 )
                 .map_err(|e| format!("load_weights: {e:?}"))?;
                 hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-                // Group-major prefill duplicates (IU4 `_gm_col_gfx1151` path):
-                // same load-time permute producer as `finish_qwen35_load`.
-                {
-                    let tensors = crate::weight_layout::qwen35_mq4v2_tensors(&weights);
-                    let refs: Vec<(&str, &hipfire_runtime::llama::WeightTensor)> = tensors
-                        .iter()
-                        .map(|(name, w)| (name.as_str(), *w))
-                        .collect();
-                    crate::weight_layout::warm_mq4v2_gm(
-                        ctx.gpu,
-                        &refs,
-                        crate::weight_layout::GmProducer::Permute,
-                    );
-                }
 
                 // Staged GPU free on every post-weight error (VMM arenas via free_gpu).
                 let kv_cache = match <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode_with_backend(
