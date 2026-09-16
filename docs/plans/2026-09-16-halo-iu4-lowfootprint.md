@@ -25,6 +25,14 @@ Date: 2026-09-16. Planning-only specification for `/home/kaden/ClaudeCode/warpfr
 > sidecar/format discussion (e.g. a group-major layout only for tensors whose
 > decode route is the batched WMMA path).
 
+> **T64 (64×64 tile, 4 WG/CU, 91 VGPR) — measured 2026-09-16, not routed:**
+> bit-exact; gate set −9.3 % vs occ3 (lf16 already −13 %), **down add −2.1 %**.
+> Residency was not down's problem; the layout (GM) was. Removed.
+> **GDN 1024-row pair merge — no-go by construction:** the Q8 GDN requantizes
+> state (single-end, seeded stochastic rounding) at the 512 boundary, so one
+> 1024-row launch is a different trajectory; glue kernels only save launch
+> overhead against staging copies.
+
 ## Ten-line summary
 
 1. Select **M128 × N128 with 16 wave32s**, block `[32,16,1]`, four 16×16 subtiles/wave and `sum[32]`; retain A5 column-adjacent order.
