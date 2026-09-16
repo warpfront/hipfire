@@ -177,6 +177,23 @@ while C ran.
 NPU kernel would move much more data and could look worse; this number is
 **stock-example supplemental**, not a hero-kernel contention proof.
 
+**Pinned GPU reference (per Main, for every contention window):**
+`/home/kaden/wt-lloyd` @ `7ec3829a82714712afd4095857096e607e244315`
+(“wip(halo LF.7): lf16 at 96 VGPR / 0 spill …”, detached HEAD, tree clean;
+never checked out or rebuilt — read-only `git log` only). Binary
+`/home/kaden/wt-lloyd/target/release/examples/tmp_halo_iu4_oracle`
+sha256 `da87a0bce21f5663838e5a02e433aff5bf7894b978f20943e2ff2c1afd4970db`.
+JIT kernels (all four, both legs):
+`gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151`,
+`…_full_add_occ3_col_gfx1151`, `…_full_set_lf16_col_gfx1151`,
+`…_full_add_lf16_col_gfx1151`.
+Cache note: this probe ran with `HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-lf3` per
+the original orders; Main’s pinned cache for later windows is
+`/tmp/kc-halo-lf4` with alone-baseline gate ref 2140 / lf16 1856, down ref
+2153 / lf16 2248 (this probe’s G0: 2146.057 / 1913.422 and 2152.891 /
+2291.189 — same binary, lf3 cache, within run noise except lf16 gate
++3.1%).
+
 ## 5. Verdict table (per prefill kernel class, chunk-512 layer slice)
 
 GPU campaign baselines (pp2048 profile, not remeasured except the oracle
