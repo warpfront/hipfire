@@ -1,3 +1,4 @@
+// SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Daniil Markevich
 // hipfire — see LICENSE and NOTICE in the project root.
 //
@@ -66,12 +67,6 @@ extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set(
 extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
 extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3(
-    const char*, const block_i4_128*, float*, int, int, int, int) {}
-extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_silumul(
-    const char*, const block_i4_128*, float*, int, int, int, int) {}
-extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_silumul_occ3(
-    const char*, const block_i4_128*, float*, int, int, int, int) {}
-extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_silumul_occ3_col_gfx1151(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
 extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
@@ -221,18 +216,7 @@ static __device__ __forceinline__ void vec_dot_i4_x128(
     }
 }
 
-// SILUMUL=false: set/add epilogue (add selects Y += sum vs Y = sum).
-// SILUMUL=true: SwiGLU-fusion epilogue for the up_proj prefill launch —
-// Y already holds the gate_proj output (gate GEMM `set` into the same
-// buffer), and each element is replaced in place by
-//   Y[i] = silu(Y[i]) * sum,  silu(z) = z / (1 + exp(-z)),
-// where sum is this GEMM's f32 dot product (the `up` value). The expression
-// mirrors fused_silu_mul_mq_rotate's SILU_MUL(g,u) = (g)/(1+expf(-(g)))*(u)
-// op-for-op (same div-then-mul tree, same expf form), so the fused buffer is
-// bit-identical to the old gate/up tensor pair's product and the downstream
-// single-input rotate+quantize kernel reproduces the old bytes exactly.
-// if constexpr keeps set/add codegen untouched when SILUMUL=false.
-template <bool FULL, bool SILUMUL>
+template <bool FULL>
 static __device__ __forceinline__ void gemm_iu4_body(
     const char* __restrict__ A,
     const block_i4_128* __restrict__ Xq,
@@ -299,13 +283,7 @@ static __device__ __forceinline__ void gemm_iu4_body(
                 if (FULL || (row0 + i < M && col0 + j < N)) {
                     float* yp = Y + (long long)(col0 + j) * M + (row0 + i);
                     const float v = sum[(j0 / tile_C::J + n) * tile_C::ne + l];
-                    if constexpr (SILUMUL) {
-                        // In-place SwiGLU: *yp holds gate (exact f32 reload of
-                        // the gate-proj `set`); v is the up-proj dot product.
-                        // Bit-exact vs SILU_MUL(g,u): same g/(1+expf(-g))*v tree.
-                        const float g = *yp;
-                        *yp = g / (1.0f + expf(-(g))) * v;
-                    } else if (add) {
+                    if (add) {
                         *yp += v;
                     } else {
                         *yp = v;
@@ -316,22 +294,17 @@ static __device__ __forceinline__ void gemm_iu4_body(
     }
 }
 
-#define IU4_ENTRY(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body<full, false>(A, Xq, Y, M, K, N, add, blockIdx.x, blockIdx.y); }
-#define IU4_ENTRY_COL(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body<full, false>(A, Xq, Y, M, K, N, add, blockIdx.y, blockIdx.x); }
-#define IU4_ENTRY_SILUMUL(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body<full, true>(A, Xq, Y, M, K, N, add, blockIdx.x, blockIdx.y); }
-#define IU4_ENTRY_SILUMUL_COL(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body<full, true>(A, Xq, Y, M, K, N, add, blockIdx.y, blockIdx.x); }
+#define IU4_ENTRY(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body<full>(A, Xq, Y, M, K, N, add, blockIdx.x, blockIdx.y); }
+#define IU4_ENTRY_COL(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body<full>(A, Xq, Y, M, K, N, add, blockIdx.y, blockIdx.x); }
 
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4, false, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3, true, 3)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3, true, 3)
-IU4_ENTRY_SILUMUL(gemm_mq4g256v2_residual_mmq_iu4_silumul, false, 2)
-IU4_ENTRY_SILUMUL(gemm_mq4g256v2_residual_mmq_iu4_full_silumul_occ3, true, 3)
 #if defined(__gfx1151__) || defined(__gfx1100__)
 IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151, true, 3)
 IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151, true, 3)
-IU4_ENTRY_SILUMUL_COL(gemm_mq4g256v2_residual_mmq_iu4_full_silumul_occ3_col_gfx1151, true, 3)
 #endif
 
 #endif

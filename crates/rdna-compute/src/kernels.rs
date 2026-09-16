@@ -6481,14 +6481,6 @@ pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
     include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
 );
 
-/// T-C Halo prefill fusion: conv1d+SiLU+split with the DeltaNet Q/K L2-norm,
-/// Q scale, and repeat-interleave tail in one launch. Sequential single-lane
-/// batches only; see
-/// `kernels/src/conv1d_silu_split_qknorm_interleave_batched.hip`.
-#[cfg(feature = "deltanet")]
-pub const CONV1D_SILU_SPLIT_QKNORM_INTERLEAVE_BATCHED_SRC: &str =
-    include_str!("../../../kernels/src/conv1d_silu_split_qknorm_interleave_batched.hip");
-
 /// Tree-aware variant of conv1d_silu_split. Each in-block token walks its
 /// ancestor chain via parent_indices[] for the 3-tap causal window, falling
 /// back to pre-block conv_state when the chain exits the block. Leaves

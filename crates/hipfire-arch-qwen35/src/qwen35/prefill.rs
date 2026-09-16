@@ -106,50 +106,6 @@ fn try_iu4_silu_prepared(
     Ok(Some(prep))
 }
 
-/// T-A: true when the w_down side will consume the IU4 silu producer, so
-/// gate_up may fuse silu(gate)*up into the gate buffer in place.
-/// Mirrors the ffn_down IU4 branch exactly: Residual epilogue + MQ4G256V2
-/// w_down + producer sidecar live for (hidden_dim, n). The S4-f16 fast path
-/// can never coincide (it needs n <= 16; the sidecar needs n >= 128).
-fn ffn_down_takes_iu4_silu(
-    gpu: &Gpu,
-    w_down_dtype: DType,
-    epilogue: &BatchEpilogue<'_>,
-    hidden_dim: usize,
-    n: usize,
-) -> bool {
-    matches!(epilogue, BatchEpilogue::Residual)
-        && w_down_dtype == DType::MQ4G256V2
-        && gpu.iu4_producer_sidecar_active(n, hidden_dim)
-}
-
-/// T-A: single-input C2 SwiGLU/FWHT IU4 producer for w_down. `w` holds the
-/// pre-fused silu(gate)*up (up_proj `silumul` over the gate buffer).
-/// `None` → caller keeps the two-input producer path.
-fn try_iu4_silu_fused_prepared(
-    gpu: &mut Gpu,
-    w_down: &hipfire_runtime::llama::WeightTensor,
-    w: &GpuTensor,
-    x_rot: &GpuTensor,
-    k: usize,
-    n: usize,
-    emit_f32: bool,
-) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
-    if w_down.gpu_dtype != DType::MQ4G256V2 || !gpu.iu4_producer_sidecar_active(n, k) {
-        return Ok(None);
-    }
-    let res = gpu.reserve_int4_mmq(k, n)?;
-    let prep = gpu.fused_silu_mul_rotate_mq_i4_batched_fused(
-        w,
-        w_down.awq_scale.as_ref(),
-        if emit_f32 { Some(x_rot) } else { None },
-        res,
-        k,
-        n,
-    )?;
-    Ok(Some(prep))
-}
-
 /// T-B: FWHT-rotate + `block_i4_128` IU4 producer for wo (residual) inputs.
 /// The wo input is a gated_norm/sigmoid output (never an rmsnorm output),
 /// so the C2 producers can't cover it; its only IU4 consumer is the residual
@@ -5084,32 +5040,6 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
     // caller runs linear replay on the accepted spine
     // post-acceptance to commit the trajectory.
     let tree_parents = tree_verify.and_then(|c| c.parent_indices);
-    // T-C: conv + QK-norm + interleave fusion (one launch). Tree-verify
-    // keeps its own read-only conv (state must not advance); sequential
-    // single-lane batches only.
-    let tc_cqn_ok = hd == 128
-        && matches!(batch_semantics, BatchSemantics::Sequential)
-        && tree_parents.is_none()
-        && hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_FUSE_OFF").is_err();
-    if tc_cqn_ok {
-        let ratio = n_v_heads / config.linear_num_key_heads;
-        gpu.conv1d_silu_split_qknorm_interleave_batched(
-            &pbs.dn_q_batch,
-            &pbs.dn_k_batch,
-            &pbs.dn_v_batch,
-            &pbs.dn_qkv_batch,
-            &layer.conv_weight,
-            &dn_state.conv_states[delta_layer_idx],
-            k_dim,
-            v_dim,
-            n,
-            config.linear_num_key_heads,
-            ratio,
-            hd,
-            1.0 / (hd as f32).sqrt(),
-            config.norm_eps,
-        )?;
-    } else {
     if let Some(parents) = tree_parents {
         gpu.conv1d_silu_split_tree_f32_n(
             &pbs.dn_q_raw_batch,
@@ -5201,7 +5131,6 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
         )?;
         gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
         gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
-    }
     }
     Ok(tree_parents)
 }
@@ -5634,9 +5563,6 @@ fn batch_chunk_delta_net_ffn_gate_up(
     dim: usize,
     q8_wmma_arch: bool,
     fusion: DflashFusionCtx,
-    // T-A: fold silu(gate)*up into the gate buffer (up `silumul`); the
-    // matching ffn_down must consume the single-input IU4 producer.
-    fuse_up_silumul: bool,
 ) -> HipResult<()> {
     let _ = fusion;
     // S3-f16-projection-inputs fast path: exact-FP16 FFN gate/up inputs.
@@ -5743,32 +5669,17 @@ fn batch_chunk_delta_net_ffn_gate_up(
     // split is folded into the FusedGateUpHfq3G256 run-arm, which
     // re-derives it from gpu.arch_caps.has_wmma() (== arch_has_wmma).
     if let Some(prep) = &iu4_prep {
-        // T-A: SwiGLU fusion — gate `set` + up `silumul` in place, leaving
-        // silu(gate)*up in gate_ffn_batch (one f32 tensor instead of two).
-        if fuse_up_silumul {
-            gpu.gemm_gate_up_mq4g256v2_wmma_iu4_prepared_fused(
-                &layer.w_gate.buf,
-                &layer.w_up.buf,
-                prep,
-                &pbs.gate_ffn_batch,
-                layer.w_gate.m,
-                layer.w_up.m,
-                layer.w_gate.k,
-                n,
-            )?;
-        } else {
-            gpu.gemm_gate_up_mq4g256v2_wmma_iu4_prepared(
-                &layer.w_gate.buf,
-                &layer.w_up.buf,
-                prep,
-                &pbs.gate_ffn_batch,
-                &pbs.up_batch,
-                layer.w_gate.m,
-                layer.w_up.m,
-                layer.w_gate.k,
-                n,
-            )?;
-        }
+        gpu.gemm_gate_up_mq4g256v2_wmma_iu4_prepared(
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
+            prep,
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            layer.w_gate.m,
+            layer.w_up.m,
+            layer.w_gate.k,
+            n,
+        )?;
     } else if ffn_is_6bit {
         run_fused_gate_up_key(
             gpu,
@@ -5940,9 +5851,6 @@ fn batch_chunk_delta_net_ffn_down(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
-    // T-A: gate_up folded silu(gate)*up into gate_ffn_batch; consume the
-    // single-input IU4 producer. Always implies the IU4 branch below.
-    gate_up_fused: bool,
 ) -> HipResult<()> {
     // S4: one silu*up+FWHT+F16 producer + direct-F16 residual GEMM instead
     // of fused_silu_mul_rotate_mq_batched + convert.
@@ -5998,37 +5906,16 @@ fn batch_chunk_delta_net_ffn_down(
         // C2: SwiGLU/FWHT IU4 producer for w_down (emit_f32=false). Residual only —
         // Partial TP epilogue still needs the f32 rotated buffer.
         if matches!(&epilogue, BatchEpilogue::Residual) {
-            // T-A: gate_up already folded silu(gate)*up into gate_ffn_batch.
-            iu4_prep = if gate_up_fused {
-                try_iu4_silu_fused_prepared(
-                    gpu,
-                    &layer.w_down,
-                    &pbs.gate_ffn_batch,
-                    &pbs.ffn_hidden_batch,
-                    hidden_dim,
-                    n,
-                    false,
-                )?
-            } else {
-                try_iu4_silu_prepared(
-                    gpu,
-                    &layer.w_down,
-                    &pbs.gate_ffn_batch,
-                    &pbs.up_batch,
-                    &pbs.ffn_hidden_batch,
-                    hidden_dim,
-                    n,
-                    false,
-                )?
-            };
-        } else if gate_up_fused {
-            // Unreachable: fusion requires a Residual epilogue (see
-            // ffn_down_takes_iu4_silu). Fail loud rather than reading a
-            // never-written up_batch through the two-input path.
-            return Err(HipError::new(
-                0,
-                "batch_chunk_delta_net_ffn_down: gate_up_fused with non-Residual epilogue",
-            ));
+            iu4_prep = try_iu4_silu_prepared(
+                gpu,
+                &layer.w_down,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                &pbs.ffn_hidden_batch,
+                hidden_dim,
+                n,
+                false,
+            )?;
         }
         if iu4_prep.is_none() {
             // F2: AWQ-aware silu_mul+rotate for w_down input.
@@ -6083,15 +5970,7 @@ pub(crate) fn batch_chunk_delta_net_ffn(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
-    // T-A: single source of truth for the SwiGLU fusion — gate_up folds
-    // silu(gate)*up in place iff the w_down side is guaranteed to consume
-    // the single-input IU4 producer (same layouts required for the in-place
-    // read).
-    let fuse_up_silumul = ffn_down_takes_iu4_silu(gpu, layer.w_down.gpu_dtype, &epilogue, hidden_dim, n)
-        && layer.w_gate.m == layer.w_up.m;
-    batch_chunk_delta_net_ffn_gate_up(
-        gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion, fuse_up_silumul,
-    )?;
+    batch_chunk_delta_net_ffn_gate_up(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
 
     batch_chunk_delta_net_ffn_down(
         gpu,
@@ -6103,7 +5982,6 @@ pub(crate) fn batch_chunk_delta_net_ffn(
         arch_has_wmma,
         epilogue,
         fusion,
-        fuse_up_silumul,
     )?;
 
     Ok(())
@@ -6533,41 +6411,19 @@ fn batch_chunk_full_attn_prepare(
             n,
         )?;
     } else {
-        // T-C: fused deinterleave + Q-rmsnorm — one launch instead of two,
-        // no Q global-memory round trip. K-norm, triattn tap, and RoPE below
-        // are unchanged.
-        if hipfire_config::developer_var("HIPFIRE_DEINT_QNORM_FUSE_OFF").is_err() {
-            gpu.deinterleave_q_rmsnorm_f32_batched(
-                &pbs.fa_q_full_batch,
-                &pbs.fa_q_batch,
-                &pbs.fa_gate_batch,
-                &layer.q_norm,
-                config.n_heads,
-                config.head_dim,
-                n,
-                config.norm_eps,
-            )?;
-        } else {
-            // 3. Batched deinterleave Q + gate: one kernel launch for all N tokens.
-            gpu.deinterleave_f32_batched(
-                &pbs.fa_q_full_batch,
-                &pbs.fa_q_batch,
-                &pbs.fa_gate_batch,
-                config.n_heads,
-                config.head_dim,
-                n,
-            )?;
-
-            // 4. Per-head Q rmsnorm (K below is untouched by the fusion).
-            gpu.rmsnorm_batched(
-                &pbs.fa_q_batch,
-                &layer.q_norm,
-                &pbs.fa_q_batch,
-                n * config.n_heads,
-                config.head_dim,
-                config.norm_eps,
-            )?;
-        }
+        // Fused deinterleave + Q-rmsnorm — one launch instead of two, no Q
+        // global-memory round trip. K-norm, triattn tap, and RoPE below are
+        // unchanged.
+        gpu.deinterleave_q_rmsnorm_f32_batched(
+            &pbs.fa_q_full_batch,
+            &pbs.fa_q_batch,
+            &pbs.fa_gate_batch,
+            &layer.q_norm,
+            config.n_heads,
+            config.head_dim,
+            n,
+            config.norm_eps,
+        )?;
         gpu.rmsnorm_batched(
             &pbs.fa_k_batch,
             &layer.k_norm,
@@ -7032,9 +6888,6 @@ fn batch_chunk_full_attn_ffn_gate_up(
     dim: usize,
     q8_wmma_arch: bool,
     fusion: DflashFusionCtx,
-    // T-A: fold silu(gate)*up into the gate buffer (up `silumul`); the
-    // matching ffn_down must consume the single-input IU4 producer.
-    fuse_up_silumul: bool,
 ) -> HipResult<()> {
     let _ = fusion;
     // S3-f16-projection-inputs fast path: exact-FP16 FA-FFN gate/up inputs.
@@ -7136,32 +6989,17 @@ fn batch_chunk_full_attn_ffn_gate_up(
     // above. Q8-non-WMMA stays as two plain GEMMs; HFQ3 WMMA-vs-base
     // is folded into the FusedGateUpHfq3G256 run-arm.
     if let Some(prep) = &iu4_prep {
-        // T-A: SwiGLU fusion — gate `set` + up `silumul` in place, leaving
-        // silu(gate)*up in gate_ffn_batch (one f32 tensor instead of two).
-        if fuse_up_silumul {
-            gpu.gemm_gate_up_mq4g256v2_wmma_iu4_prepared_fused(
-                &layer.w_gate.buf,
-                &layer.w_up.buf,
-                prep,
-                &pbs.gate_ffn_batch,
-                layer.w_gate.m,
-                layer.w_up.m,
-                layer.w_gate.k,
-                n,
-            )?;
-        } else {
-            gpu.gemm_gate_up_mq4g256v2_wmma_iu4_prepared(
-                &layer.w_gate.buf,
-                &layer.w_up.buf,
-                prep,
-                &pbs.gate_ffn_batch,
-                &pbs.up_batch,
-                layer.w_gate.m,
-                layer.w_up.m,
-                layer.w_gate.k,
-                n,
-            )?;
-        }
+        gpu.gemm_gate_up_mq4g256v2_wmma_iu4_prepared(
+            &layer.w_gate.buf,
+            &layer.w_up.buf,
+            prep,
+            &pbs.gate_ffn_batch,
+            &pbs.up_batch,
+            layer.w_gate.m,
+            layer.w_up.m,
+            layer.w_gate.k,
+            n,
+        )?;
     } else if fa_ffn_is_6bit {
         run_fused_gate_up_key(
             gpu,
@@ -7333,9 +7171,6 @@ fn batch_chunk_full_attn_ffn_down(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
-    // T-A: gate_up folded silu(gate)*up into gate_ffn_batch; consume the
-    // single-input IU4 producer. Always implies the IU4 branch below.
-    gate_up_fused: bool,
 ) -> HipResult<()> {
     // S4: one silu*up+FWHT+F16 producer + direct-F16 residual GEMM instead
     // of fused_silu_mul_rotate_mq_batched + convert.
@@ -7383,37 +7218,16 @@ fn batch_chunk_full_attn_ffn_down(
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     if fa_w_down_is_mq {
         if matches!(&epilogue, BatchEpilogue::Residual) {
-            // T-A: gate_up already folded silu(gate)*up into gate_ffn_batch.
-            iu4_prep = if gate_up_fused {
-                try_iu4_silu_fused_prepared(
-                    gpu,
-                    &layer.w_down,
-                    &pbs.gate_ffn_batch,
-                    &pbs.ffn_hidden_batch,
-                    hidden_dim,
-                    n,
-                    false,
-                )?
-            } else {
-                try_iu4_silu_prepared(
-                    gpu,
-                    &layer.w_down,
-                    &pbs.gate_ffn_batch,
-                    &pbs.up_batch,
-                    &pbs.ffn_hidden_batch,
-                    hidden_dim,
-                    n,
-                    false,
-                )?
-            };
-        } else if gate_up_fused {
-            // Unreachable: fusion requires a Residual epilogue (see
-            // ffn_down_takes_iu4_silu). Fail loud rather than reading a
-            // never-written up_batch through the two-input path.
-            return Err(HipError::new(
-                0,
-                "batch_chunk_full_attn_ffn_down: gate_up_fused with non-Residual epilogue",
-            ));
+            iu4_prep = try_iu4_silu_prepared(
+                gpu,
+                &layer.w_down,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                &pbs.ffn_hidden_batch,
+                hidden_dim,
+                n,
+                false,
+            )?;
         }
         if iu4_prep.is_none() {
             fused_silu_mul_rotate_mq_batched_for(
@@ -7466,15 +7280,7 @@ pub(crate) fn batch_chunk_full_attn_ffn(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
-    // T-A: single source of truth for the SwiGLU fusion — gate_up folds
-    // silu(gate)*up in place iff the w_down side is guaranteed to consume
-    // the single-input IU4 producer (same layouts required for the in-place
-    // read).
-    let fuse_up_silumul = ffn_down_takes_iu4_silu(gpu, layer.w_down.gpu_dtype, &epilogue, hidden_dim, n)
-        && layer.w_gate.m == layer.w_up.m;
-    batch_chunk_full_attn_ffn_gate_up(
-        gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion, fuse_up_silumul,
-    )?;
+    batch_chunk_full_attn_ffn_gate_up(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
     batch_chunk_full_attn_ffn_down(
         gpu,
         layer,
@@ -7485,7 +7291,6 @@ pub(crate) fn batch_chunk_full_attn_ffn(
         arch_has_wmma,
         epilogue,
         fusion,
-        fuse_up_silumul,
     )?;
 
     Ok(())
@@ -7893,32 +7698,6 @@ fn batch_chunk_delta_net_moe(
     }
     // Same tree-aware dispatch gate as dense LA branch above.
     let tree_parents = tree_verify.as_ref().and_then(|c| c.parent_indices);
-    // T-C: conv + QK-norm + interleave fusion (one launch). Tree-verify
-    // keeps its own read-only conv (state must not advance); sequential
-    // single-lane batches only.
-    let tc_cqn_ok = hd == 128
-        && matches!(batch_semantics, BatchSemantics::Sequential)
-        && tree_parents.is_none()
-        && hipfire_config::developer_var("HIPFIRE_CONV_QKNORM_FUSE_OFF").is_err();
-    if tc_cqn_ok {
-        let ratio = n_v_heads / config.linear_num_key_heads;
-        gpu.conv1d_silu_split_qknorm_interleave_batched(
-            &pbs.dn_q_batch,
-            &pbs.dn_k_batch,
-            &pbs.dn_v_batch,
-            &pbs.dn_qkv_batch,
-            &layer.conv_weight,
-            &dn_state.conv_states[delta_layer_idx],
-            k_dim,
-            v_dim,
-            n,
-            config.linear_num_key_heads,
-            ratio,
-            hd,
-            1.0 / (hd as f32).sqrt(),
-            config.norm_eps,
-        )?;
-    } else {
     if let Some(parents) = tree_parents {
         gpu.conv1d_silu_split_tree_f32_n(
             &pbs.dn_q_raw_batch,
@@ -7997,7 +7776,6 @@ fn batch_chunk_delta_net_moe(
     } else {
         gpu.memcpy_dtod_auto(&pbs.dn_q_batch.buf, &pbs.dn_q_raw_batch.buf, n * k_dim * 4)?;
         gpu.memcpy_dtod_auto(&pbs.dn_k_batch.buf, &pbs.dn_k_raw_batch.buf, n * k_dim * 4)?;
-    }
     }
     // DIAG: dump GDN inputs (batched, MoE branch)
     if layer_idx == 0 {
@@ -8657,38 +8435,19 @@ fn batch_chunk_full_attn_moe(
         batched_gemm_single_weight(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
         batched_gemm_single_weight(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
     }
-    // T-C: fused deinterleave + Q-rmsnorm — one launch instead of two,
-    // no Q global-memory round trip. K-norm, triattn tap, and RoPE below
-    // are unchanged.
-    if hipfire_config::developer_var("HIPFIRE_DEINT_QNORM_FUSE_OFF").is_err() {
-        gpu.deinterleave_q_rmsnorm_f32_batched(
-            &pbs.fa_q_full_batch,
-            &pbs.fa_q_batch,
-            &pbs.fa_gate_batch,
-            &layer.q_norm,
-            config.n_heads,
-            config.head_dim,
-            n,
-            config.norm_eps,
-        )?;
-    } else {
-        gpu.deinterleave_f32_batched(
-            &pbs.fa_q_full_batch,
-            &pbs.fa_q_batch,
-            &pbs.fa_gate_batch,
-            config.n_heads,
-            config.head_dim,
-            n,
-        )?;
-        gpu.rmsnorm_batched(
-            &pbs.fa_q_batch,
-            &layer.q_norm,
-            &pbs.fa_q_batch,
-            n * config.n_heads,
-            config.head_dim,
-            config.norm_eps,
-        )?;
-    }
+    // Fused deinterleave + Q-rmsnorm — one launch instead of two, no Q
+    // global-memory round trip. K-norm, triattn tap, and RoPE below are
+    // unchanged.
+    gpu.deinterleave_q_rmsnorm_f32_batched(
+        &pbs.fa_q_full_batch,
+        &pbs.fa_q_batch,
+        &pbs.fa_gate_batch,
+        &layer.q_norm,
+        config.n_heads,
+        config.head_dim,
+        n,
+        config.norm_eps,
+    )?;
     gpu.rmsnorm_batched(
         &pbs.fa_k_batch,
         &layer.k_norm,
