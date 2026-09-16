@@ -328,6 +328,247 @@ IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3, true, 3)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3, true, 3)
+#if defined(__gfx1151__)
+// Halo IU4 low-footprint (LF.1): M128 x N128 tiled over SIXTEEN wave32s.
+// Same 128x128 output tile, same LDS planes (Xq [0,9216), A [9216,30720)),
+// same grid walk (column-adjacent) and same arithmetic DAG (IU4_FOLD_RN) as
+// shipping. Differences vs shipping vec_dot_i4_x128 / gemm_iu4_body:
+//  - 32 running sums/lane (4 column subtiles c=0..3 x 8 rows l=0..7);
+//  - exactly ONE live int32x8 WMMA chain: each c is folded through
+//    IU4_FOLD_RN into its own sums before the next c starts;
+//  - A payload fill issues 4 row-dword loads before their stores/first wait
+//    (two packets cover the 8 rows/wave); headers by waves 0..7 only;
+//  - Xq half fill uses all 512 threads (5 words for tid<256, else 4).
+// Per-lane ownership (w = threadIdx.y in [0,15], lane = threadIdx.x):
+//   wave_row = 16*(w/2); wave_col = 64*(w%2);
+//   i = wave_row + 2*l + lane/16; j = wave_col + 16*c + lane%16;
+//   sum_index = 8*c + l. This is the frozen §4.1 mapping (CPU-enumerated
+//   there to cover all 16384 outputs exactly once).
+#define IU4_LF16_NWARPS 16
+#define IU4_LF16_SUMS 32
+#define IU4_LF16_XQ_WORDS 2304
+
+// A-plane fill for one K group: payload packet-4 + replicated headers.
+// Full-tile only (callers guarantee row0+i < M); mirrors load_iu4_tile.
+static __device__ __forceinline__ void load_iu4_tile_lf16_gfx1151(
+    const char* __restrict__ A,
+    int* __restrict__ tile_x,
+    int row0,
+    int kb,
+    int groups_per_row
+) {
+    const int lane = threadIdx.x;
+    const int w = threadIdx.y;
+    // Payload: 8 rows/thread (i = i0+w, i0 = 0,16,...,112) in two packets.
+    // Each packet issues its 4 row-dword loads before the 4 LDS stores so
+    // the wave has 4 A loads in flight ahead of the first VM wait.
+    #pragma unroll 1
+    for (int p = 0; p < 2; ++p) {
+        const int base = p * 64 + w;
+        const char* gp0 = A + ((long long)(row0 + base) * groups_per_row + kb) * 136;
+        const char* gp1 = A + ((long long)(row0 + base + 16) * groups_per_row + kb) * 136;
+        const char* gp2 = A + ((long long)(row0 + base + 32) * groups_per_row + kb) * 136;
+        const char* gp3 = A + ((long long)(row0 + base + 48) * groups_per_row + kb) * 136;
+        const int v0 = *(const int*)(gp0 + 8 + lane * 4);
+        const int v1 = *(const int*)(gp1 + 8 + lane * 4);
+        const int v2 = *(const int*)(gp2 + 8 + lane * 4);
+        const int v3 = *(const int*)(gp3 + 8 + lane * 4);
+        tile_x[base * IU4_TILE_X_K + lane] = v0;
+        tile_x[(base + 16) * IU4_TILE_X_K + lane] = v1;
+        tile_x[(base + 32) * IU4_TILE_X_K + lane] = v2;
+        tile_x[(base + 48) * IU4_TILE_X_K + lane] = v3;
+    }
+    // Headers: waves 0..7 only (uniform skip for waves 8..15); each of the
+    // 256 global header words has exactly one writer, replicated to the 4
+    // slots 32+4*ksc+[0,3] exactly as shipping.
+    if (w < 8) {
+        const int i = 16 * w + lane / 2;
+        const int ksc = lane & 1;
+        const char* gp = A + ((long long)(row0 + i) * groups_per_row + kb) * 136;
+        const unsigned int hs = *(const unsigned int*)(gp + 4 * ksc);
+        const float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
+        const float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+        const half2 dm = make_half2((_Float16)sc, (_Float16)zp);
+        half2* x_dm = (half2*)(tile_x + i * IU4_TILE_X_K + IU4_X_DM_OFF);
+        #pragma unroll
+        for (int l = 0; l < 4; ++l)
+            x_dm[4 * ksc + l] = dm;
+    }
+}
+
+// X128-structured dot over ONE 128-K half (h = 0/1) for the 16-wave tile:
+// per column subtile c, 8 iu4 WMMAs (t = 0..3, low/high in shipping order)
+// into one int32x8 C, then the pinned fold into sums[8*c+l] before the next
+// c lifetime begins. d/s come from the single output column lane%16.
+static __device__ __forceinline__ void vec_dot_i4_x128_lf16_gfx1151(
+    const int* __restrict__ x,
+    const int* __restrict__ y,
+    float* __restrict__ sum,
+    int h
+) {
+    const int lane = threadIdx.x;
+    const int w = threadIdx.y;
+    const int wave_row = 16 * (w / 2);
+    const int wave_col = 64 * (w % 2);
+    const int lane_row = lane % 16;
+    const int lane_hi = lane / 16;
+    const int a_row = wave_row + lane_row;
+    // One live integer chain per half: t is unrolled in source (t0..t3 order
+    // kept) while c unrolls to static sum indices. With the t loop rolled the
+    // backend sinks all four folds past every WMMA loop and retains four
+    // completed chains (113 VGPR); unrolled, each fold stays with its chain.
+    // The sched fence retires each fold before the next chain starts, so the
+    // allocator reuses a single int32x8 bank (98 VGPR). It emits no ISA.
+    int32x8_t acc;
+    float d_x;
+    int s_x;
+    int b_col;
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        acc = (int32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
+        b_col = wave_col + 16 * c + lane_row;
+        {
+            const int* ap = x + a_row * IU4_TILE_X_K + h * 16 + 0;
+            const int* bp = y + b_col * IU4_TILE_Y_K + 2 + 0;
+            const int32x2_t av0 = *(const int32x2_t*)(ap + 0);
+            const int32x2_t av1 = *(const int32x2_t*)(ap + 2);
+            const int32x2_t bv0 = *(const int32x2_t*)(bp + 0);
+            const int32x2_t bv1 = *(const int32x2_t*)(bp + 2);
+            acc = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av0, true, bv0, acc, false);
+            acc = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av1, true, bv1, acc, false);
+        }
+        {
+            const int* ap = x + a_row * IU4_TILE_X_K + h * 16 + 4;
+            const int* bp = y + b_col * IU4_TILE_Y_K + 2 + 4;
+            const int32x2_t av0 = *(const int32x2_t*)(ap + 0);
+            const int32x2_t av1 = *(const int32x2_t*)(ap + 2);
+            const int32x2_t bv0 = *(const int32x2_t*)(bp + 0);
+            const int32x2_t bv1 = *(const int32x2_t*)(bp + 2);
+            acc = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av0, true, bv0, acc, false);
+            acc = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av1, true, bv1, acc, false);
+        }
+        {
+            const int* ap = x + a_row * IU4_TILE_X_K + h * 16 + 8;
+            const int* bp = y + b_col * IU4_TILE_Y_K + 2 + 8;
+            const int32x2_t av0 = *(const int32x2_t*)(ap + 0);
+            const int32x2_t av1 = *(const int32x2_t*)(ap + 2);
+            const int32x2_t bv0 = *(const int32x2_t*)(bp + 0);
+            const int32x2_t bv1 = *(const int32x2_t*)(bp + 2);
+            acc = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av0, true, bv0, acc, false);
+            acc = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av1, true, bv1, acc, false);
+        }
+        {
+            const int* ap = x + a_row * IU4_TILE_X_K + h * 16 + 12;
+            const int* bp = y + b_col * IU4_TILE_Y_K + 2 + 12;
+            const int32x2_t av0 = *(const int32x2_t*)(ap + 0);
+            const int32x2_t av1 = *(const int32x2_t*)(ap + 2);
+            const int32x2_t bv0 = *(const int32x2_t*)(bp + 0);
+            const int32x2_t bv1 = *(const int32x2_t*)(bp + 2);
+            acc = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av0, true, bv0, acc, false);
+            acc = __builtin_amdgcn_wmma_i32_16x16x16_iu4_w32(false, av1, true, bv1, acc, false);
+        }
+        d_x = *(const float*)(y + b_col * IU4_TILE_Y_K);
+        s_x = *(const int*)(y + b_col * IU4_TILE_Y_K + 1);
+        const int* acc_i = (const int*)&acc;
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const int i = wave_row + 2 * l + lane_hi;
+            const half2 dm = ((const half2*)(x + i * IU4_TILE_X_K + IU4_X_DM_OFF))[4 * h];
+            const float2 dmA = __half22float2(dm);
+            IU4_FOLD_RN(sum[8 * c + l], dmA.x, dmA.y, d_x, acc_i[l], s_x);
+        }
+        __builtin_amdgcn_sched_barrier(0);
+    }
+}
+// Full-tile 16-wave body: four LDS barriers per K group, kb-increasing
+// accumulation with h0 before h1, single residual add after all groups.
+// Specialized on the store mode (host symbol fully determines it: set entry
+// always stores, add entry always adds). The `add` kernarg is retained in the
+// seven-arg ABI for layout parity but deliberately ignored here; do NOT
+// reintroduce a runtime branch on it (its VGPR spans the whole kernel).
+template <bool IS_ADD>
+static __device__ __forceinline__ void gemm_iu4_body_lf16_gfx1151(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add,
+    int row_tile,
+    int col_tile
+) {
+    (void)add;
+    const int row0 = row_tile * IU4_MMQ_Y;
+    const int col0 = col_tile * IU4_MMQ_X;
+    const int groups_per_row = K / 256;
+    extern __shared__ int smem[];
+    int* tile_y = smem;
+    int* tile_x = tile_y + IU4_MMQ_X * IU4_TILE_Y_K;
+    const int w = threadIdx.y;
+    const int lane = threadIdx.x;
+    const int wave_row = 16 * (w / 2);
+    const int wave_col = 64 * (w % 2);
+    float sum[IU4_LF16_SUMS] = {0.0f};
+    for (int kb = 0; kb < groups_per_row; ++kb) {
+        load_iu4_tile_lf16_gfx1151(A, tile_x, row0, kb, groups_per_row);
+        const int* by0 = (const int*)(Xq + (long long)(2 * kb) * N + col0);
+        #pragma unroll 1
+        for (int l = threadIdx.y * IU4_WARP_SIZE + threadIdx.x; l < IU4_LF16_XQ_WORDS; l += 512)
+            tile_y[l] = by0[l];
+        __syncthreads();
+        vec_dot_i4_x128_lf16_gfx1151(tile_x, tile_y, sum, 0);
+        __syncthreads();
+        if (2 * kb + 1 < 2 * groups_per_row) {
+            const int* by1 = (const int*)(Xq + (long long)(2 * kb + 1) * N + col0);
+            #pragma unroll 1
+            for (int l = threadIdx.y * IU4_WARP_SIZE + threadIdx.x; l < IU4_LF16_XQ_WORDS; l += 512)
+                tile_y[l] = by1[l];
+            __syncthreads();
+            vec_dot_i4_x128_lf16_gfx1151(tile_x, tile_y, sum, 1);
+            __syncthreads();
+        }
+    }
+    #pragma unroll
+    for (int c = 0; c < 4; ++c) {
+        #pragma unroll
+        for (int l = 0; l < 8; ++l) {
+            const int i = wave_row + 2 * l + lane / 16;
+            const int j = wave_col + 16 * c + lane % 16;
+            float* yp = Y + (long long)(col0 + j) * M + (row0 + i);
+            const float v = sum[8 * c + l];
+            if constexpr (IS_ADD) {
+                *yp += v;
+            } else {
+                *yp = v;
+            }
+        }
+    }
+}
+
+extern "C" __global__ __launch_bounds__(512, 2) void gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    gemm_iu4_body_lf16_gfx1151<false>(A, Xq, Y, M, K, N, add, blockIdx.y, blockIdx.x);
+}
+extern "C" __global__ __launch_bounds__(512, 2) void gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    gemm_iu4_body_lf16_gfx1151<true>(A, Xq, Y, M, K, N, add, blockIdx.y, blockIdx.x);
+}
+#endif
 #if defined(__gfx1151__) || defined(__gfx1100__)
 IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151, true, 3)
 IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151, true, 3)
