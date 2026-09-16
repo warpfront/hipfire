@@ -265,4 +265,80 @@ GEN_RESID_MW_LDS(5, 8)
 GEN_RESID_MW_LDS(6, 4)
 GEN_RESID_MW_LDS(6, 8)
 
+#if defined(__gfx1151__)
+// Group-major twin of gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds (small-M /
+// small-N tail oracle, e.g. MMQ small_tail_set on gfx1151): byte-identical
+// except the A group base address. Shipping:
+//   gp = A + safe_row * groups_per_row * GROUP_BYTES + g * GROUP_BYTES.
+// Group-major: gp = A + (g * M + safe_row) * GROUP_BYTES (GROUP_BYTES=136
+// for BITS=4), so each group index's M rows are contiguous. Same ABI
+// (A, X, Y, M, K, N), grid [ceil(M/16), ceil(N/64)], block [128], LDS 8192.
+extern "C" __launch_bounds__(128, 1) __global__ void
+    gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds_gm(
+        const char* __restrict__ A, const _Float16* __restrict__ X, float* __restrict__ Y,
+        int M, int K, int N) {
+        constexpr int GROUP_BYTES = 8 + 32 * 4;
+        constexpr int NW = 4;
+        const int tid = threadIdx.x;
+        const int lane = tid & 31;
+        const int wave_id = tid >> 5;
+        const int ml = lane & 15;
+        const int row_start = blockIdx.x * 16;
+        const int n_block_start = blockIdx.y * (16 * (NW));
+        const int out_col = n_block_start + wave_id * 16 + ml;
+        const int safe_batch = (out_col < N) ? out_col : 0;
+        const int groups_per_row = K / 256;
+
+        __shared__ __align__(32) _Float16 w_lds[16][16][16];
+
+        float8_t acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+
+        for (int g = 0; g < groups_per_row; g++) {
+            for (int job = tid; job < 128; job += 32 * (NW)) {
+                const int row = job / 8;
+                const int segment = job % 8;
+                const int safe_row = (row_start + row < M) ? (row_start + row) : (M - 1);
+                const char* gp = A + ((long long)g * M + safe_row) * GROUP_BYTES;
+                const unsigned int h =
+                    *(const unsigned int*)(gp + ((segment < 4) ? 0 : 4));
+                const _Float16 sc_h =
+                    (_Float16)__half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu)));
+                const _Float16 zp_h =
+                    (_Float16)__half2float(__ushort_as_half((unsigned short)(h >> 16)));
+                const unsigned char* payload = (const unsigned char*)(gp + 8);
+                const int kt0 = 2 * segment;
+                const int kt1 = kt0 + 1;
+                half16_t frag = decode_tile<4>(payload, kt0, sc_h, zp_h);
+                *(half16_t*)(&w_lds[kt0][row][0]) = frag;
+                frag = decode_tile<4>(payload, kt1, sc_h, zp_h);
+                *(half16_t*)(&w_lds[kt1][row][0]) = frag;
+            }
+            __syncthreads();
+
+            const _Float16* xg = X + (long long)safe_batch * K + (long long)g * 256;
+            _Pragma("unroll")
+            for (int kt = 0; kt < 16; kt += 2) {
+                half16_t a_reg = *(const half16_t*)(&w_lds[kt][ml][0]);
+                half16_t b_reg = *(const half16_t*)(xg + kt * 16);
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);
+                a_reg = *(const half16_t*)(&w_lds[kt + 1][ml][0]);
+                b_reg = *(const half16_t*)(xg + (kt + 1) * 16);
+                acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, acc);
+            }
+
+            __syncthreads();
+        }
+
+        if (out_col < N) {
+            _Pragma("unroll")
+            for (int j = 0; j < 8; j++) {
+                const int out_row = row_start + 2 * j + (lane >> 4);
+                if (out_row < M) {
+                    Y[(long long)out_col * M + out_row] += acc[j];
+                }
+            }
+        }
+    }
+#endif // __gfx1151__ GM twin
+
 #endif // __gfx1100__ || __gfx1151__

@@ -485,3 +485,192 @@ extern "C" __global__ void gemv_mq4g256v2_multirow_r8(
 ) {
     gemv_mq4g256v2_multirow_body<8>(A, x, y, M, K);
 }
+
+#if defined(__gfx1151__)
+// Group-major twin of gemv_mq4g256v2_multirow_r2 (the gfx1151 N=1 decode
+// oracle: gemv_rows_default is 2 on gfx1151, so plain decode dispatches the
+// r2 kernel, not the scalar one). Byte-identical except the A group base
+// address. Shipping: row_ptr0 = A + row0 * groups_per_row * 136,
+// gp = row_ptr0 + g * 136 (same for row1). Group-major:
+// gp = A + 136 * (g * M + row). Same ABI/grid [ceil(M/2)]/block 32/LDS 0;
+// same x-hoist, branchless dual-row DOG order, tails, and writeback;
+// bit-exact by construction. Carried quad base qb advances by 4 groups per
+// iteration so the loop body needs no multiply.
+__launch_bounds__(32, 18)
+extern "C" __global__ void gemv_mq4g256v2_multirow_r2_gm(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int row0 = blockIdx.x << 1;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const bool have_row1 = row1 < M;
+    const int tid = threadIdx.x;
+
+#if defined(HIPFIRE_GFX1151_LM_HEAD_K2048)
+    const int groups_per_row = 8;
+#else
+    const int groups_per_row = K / 256;
+#endif
+    const int r1s = have_row1 ? row1 : row0;
+    const long long m136 = (long long)M * 136;
+    const long long r0off = (long long)row0 * 136;
+    const long long r1off = (long long)r1s * 136;
+    const long long m4 = 4 * m136;
+    const int boff = tid * 4;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const auto weight_rsrc_gm = HIPFIRE_WEIGHT_RSRC(A);
+#endif
+#if defined(HIPFIRE_GFX1151_LM_HEAD_X_BUFFER)
+    const auto x_rsrc_gm = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<float*>(x), 0, 0xffffffffu, 0x31004000u);
+#endif
+
+    float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+    float b0 = 0.0f, b1 = 0.0f, b2 = 0.0f, b3 = 0.0f;
+    const int quads = groups_per_row >> 2;
+    const int tail = groups_per_row & 3;
+
+#if defined(HIPFIRE_GFX1151_LM_HEAD_X_BUFFER)
+    #define LOAD_X8_INTO_GM(b, pfx) \
+        const hipfire_lm_f32x4 pfx##v0 = __builtin_bit_cast( \
+            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128( \
+                x_rsrc_gm, (unsigned int)(b) * 4u, 0, 0)); \
+        const hipfire_lm_f32x4 pfx##v1 = __builtin_bit_cast( \
+            hipfire_lm_f32x4, __builtin_amdgcn_raw_buffer_load_b128( \
+                x_rsrc_gm, ((unsigned int)(b) + 4u) * 4u, 0, 0)); \
+        const float pfx##0 = pfx##v0.x, pfx##1 = pfx##v0.y, pfx##2 = pfx##v0.z, pfx##3 = pfx##v0.w; \
+        const float pfx##4 = pfx##v1.x, pfx##5 = pfx##v1.y, pfx##6 = pfx##v1.z, pfx##7 = pfx##v1.w
+#else
+    #define LOAD_X8_INTO_GM(b, pfx) \
+        const float4 pfx##v0 = *reinterpret_cast<const float4*>(x + (b)); \
+        const float4 pfx##v1 = *reinterpret_cast<const float4*>(x + (b) + 4); \
+        const float pfx##0 = pfx##v0.x, pfx##1 = pfx##v0.y, pfx##2 = pfx##v0.z, pfx##3 = pfx##v0.w; \
+        const float pfx##4 = pfx##v1.x, pfx##5 = pfx##v1.y, pfx##6 = pfx##v1.z, pfx##7 = pfx##v1.w
+#endif
+
+#if defined(HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER)
+    #define LOAD_LM_HEADER_GM(gp, weight_offset) (*(const unsigned int*)(gp))
+#else
+    #define LOAD_LM_HEADER_GM(gp, weight_offset) \
+        HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc_gm, gp, weight_offset)
+#endif
+    #define LOAD_LM_PACKED_GM(gp, weight_offset) \
+        HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc_gm, gp, weight_offset)
+
+    #define DOG_X8_GM(qb, roff, a, pfx) do { \
+        const char* gp_gm = A + (qb) + (roff); \
+        const unsigned int woff_gm = (unsigned int)((qb) + (roff)); \
+        const unsigned int hA = LOAD_LM_HEADER_GM(gp_gm, woff_gm); \
+        const unsigned int hB = LOAD_LM_HEADER_GM((gp_gm) + 4, (woff_gm) + 4); \
+        const unsigned int hs = (tid < 16) ? hA : hB; \
+        float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu))); \
+        float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16))); \
+        unsigned int pk = LOAD_LM_PACKED_GM((gp_gm) + 8 + boff, (woff_gm) + 8 + boff); \
+        (a) += (sc * (float)((pk) & 0xFu)         + zp) * pfx##0 \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * pfx##1 \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * pfx##2 \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * pfx##3 \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * pfx##4 \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * pfx##5 \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * pfx##6 \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * pfx##7; \
+    } while (0)
+
+    long long qb = 0;
+    for (int q = 0; q < quads; q++) {
+        const long long q1 = qb + m136;
+        const long long q2 = q1 + m136;
+        const long long q3 = q2 + m136;
+
+        const int base0 = (q << 2) * 256 + tid * 8;
+
+        LOAD_X8_INTO_GM(base0, xa);
+        LOAD_X8_INTO_GM(base0 + 256, xb);
+        LOAD_X8_INTO_GM(base0 + 512, xc);
+        LOAD_X8_INTO_GM(base0 + 768, xd);
+#if defined(HIPFIRE_GFX1151_LM_HEAD_X_BUFFER)
+        asm volatile("" : :
+            "v"(xav0), "v"(xav1), "v"(xbv0), "v"(xbv1),
+            "v"(xcv0), "v"(xcv1), "v"(xdv0), "v"(xdv1) : "memory");
+#endif
+
+        DOG_X8_GM(qb, r0off, a0, xa);
+        DOG_X8_GM(qb, r1off, b0, xa);
+        DOG_X8_GM(q1, r0off, a1, xb);
+        DOG_X8_GM(q1, r1off, b1, xb);
+        DOG_X8_GM(q2, r0off, a2, xc);
+        DOG_X8_GM(q2, r1off, b2, xc);
+        DOG_X8_GM(q3, r0off, a3, xd);
+        DOG_X8_GM(q3, r1off, b3, xd);
+        qb += m4;
+    }
+
+    #define LOAD_X8_GM(b) \
+        const float4 xv0 = *reinterpret_cast<const float4*>(x + (b)); \
+        const float4 xv1 = *reinterpret_cast<const float4*>(x + (b) + 4); \
+        const float x0 = xv0.x, x1 = xv0.y, x2 = xv0.z, x3 = xv0.w; \
+        const float x4 = xv1.x, x5 = xv1.y, x6 = xv1.z, x7 = xv1.w
+
+    #define DOG_X8_TAIL_GM(qb, roff, a) do { \
+        const char* gp_gm = A + (qb) + (roff); \
+        const unsigned int woff_gm = (unsigned int)((qb) + (roff)); \
+        const unsigned int hA = LOAD_LM_HEADER_GM(gp_gm, woff_gm); \
+        const unsigned int hB = LOAD_LM_HEADER_GM((gp_gm) + 4, (woff_gm) + 4); \
+        const unsigned int hs = (tid < 16) ? hA : hB; \
+        float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu))); \
+        float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16))); \
+        unsigned int pk = LOAD_LM_PACKED_GM((gp_gm) + 8 + boff, (woff_gm) + 8 + boff); \
+        (a) += (sc * (float)((pk) & 0xFu)         + zp) * x0 \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x1 \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x2 \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x3 \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x4 \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x5 \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x6 \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x7; \
+    } while (0)
+
+    if (tail >= 1) {
+        const int g = quads << 2;
+        const int base = g * 256 + tid * 8;
+        LOAD_X8_GM(base);
+        DOG_X8_TAIL_GM(qb, r0off, a0);
+        DOG_X8_TAIL_GM(qb, r1off, b0);
+    }
+    if (tail >= 2) {
+        const int g = (quads << 2) + 1;
+        const int base = g * 256 + tid * 8;
+        LOAD_X8_GM(base);
+        DOG_X8_TAIL_GM(qb + m136, r0off, a1);
+        DOG_X8_TAIL_GM(qb + m136, r1off, b1);
+    }
+    if (tail >= 3) {
+        const int g = (quads << 2) + 2;
+        const int base = g * 256 + tid * 8;
+        LOAD_X8_GM(base);
+        DOG_X8_TAIL_GM(qb + 2 * m136, r0off, a2);
+        DOG_X8_TAIL_GM(qb + 2 * m136, r1off, b2);
+    }
+    #undef DOG_X8_TAIL_GM
+    #undef LOAD_X8_GM
+    #undef DOG_X8_GM
+    #undef LOAD_X8_INTO_GM
+    #undef LOAD_LM_PACKED_GM
+    #undef LOAD_LM_HEADER_GM
+
+    float s0 = (a0 + a1) + (a2 + a3);
+    float s1 = (b0 + b1) + (b2 + b3);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        s0 += __shfl_down(s0, offset);
+        s1 += __shfl_down(s1, offset);
+    }
+
+    if (tid == 0) {
+        y[row0] = s0;
+        if (have_row1) y[row1] = s1;
+    }
+}
+#endif // __gfx1151__

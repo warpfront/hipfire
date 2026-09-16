@@ -452,3 +452,252 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_XBATCH_KERNEL(
 }
 
 #endif  // HIPFIRE_MQ4G256V2_XBATCH
+
+#if defined(__gfx1151__)
+// Group-major twin of gemv_mq4g256v2 (N=1 decode oracle): byte-identical
+// except the A group base address. Row-major shipping:
+//   row_ptr = A + row * groups_per_row * 136; gp = row_ptr + g * 136.
+// Group-major: gp = A + 136 * (g * M + row), so each 256-K group index's M
+// rows are contiguous. Same ABI (A, x, y, M, K [+ LUT dwords]) / grid [M] /
+// block 32; same 4-accumulator interleaving, tail distribution, LUT and
+// epilogue branches; bit-exact by construction.
+__launch_bounds__(32, 16)
+extern "C" __global__ void gemv_mq4g256v2_gm(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+#if defined(HIPFIRE_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_EPILOGUE)
+    const float* __restrict__ c_buf,
+#endif
+    int M, int K
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    , const unsigned int LUT0, const unsigned int LUT1,
+    const unsigned int LUT2, const unsigned int LUT3,
+    const unsigned int LUT4, const unsigned int LUT5,
+    const unsigned int LUT6, const unsigned int LUT7
+#endif
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+#if defined(HIPFIRE_MQ4G256V2_K2048)
+    const int groups_per_row = 8;
+#elif defined(HIPFIRE_MQ4G256V2_K4096)
+    const int groups_per_row = 16;
+#elif defined(HIPFIRE_MQ4G256V2_K512)
+    const int groups_per_row = 2;
+#else
+    const int groups_per_row = K / 256;
+#endif
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    __shared__ unsigned short LUT_SMEM_GM[16];
+    {
+        unsigned int d;
+        if (tid == 0) d = LUT0; else if (tid == 1) d = LUT1;
+        else if (tid == 2) d = LUT2; else if (tid == 3) d = LUT3;
+        else if (tid == 4) d = LUT4; else if (tid == 5) d = LUT5;
+        else if (tid == 6) d = LUT6; else d = LUT7;
+        if (tid < 8) ((unsigned int*)LUT_SMEM_GM)[tid] = d;
+    }
+    __syncthreads();
+#define MQ4V2_LUT_GM(q) (__half2float(__ushort_as_half(LUT_SMEM_GM[(q)])))
+#endif
+    const int boff_gm = tid * 4;
+    // Group-major address invariants hoisted out of the group loop (mirrors
+    // shipping's hoisted row_ptr/row_weight_offset): per-quad base qbase_gm
+    // plus row offset roff_gm; consecutive groups stride by m136_gm.
+    const long long m136_gm = (long long)M * 136;
+    const long long roff_gm = (long long)row * 136;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const auto weight_rsrc_gm = HIPFIRE_WEIGHT_RSRC(A);
+    #if defined(HIPFIRE_GFX1151_LM_HEAD_HYBRID_BUFFER)
+        #define LOAD_WEIGHT_HEADER_GM(ptr, offset) (*(const unsigned int*)(ptr))
+    #else
+        #define LOAD_WEIGHT_HEADER_GM(ptr, offset) \
+            HIPFIRE_WEIGHT_LOAD_U32(weight_rsrc_gm, (offset))
+    #endif
+    #define LOAD_WEIGHT_PACKED_GM(ptr, offset) \
+        HIPFIRE_WEIGHT_LOAD_U32(weight_rsrc_gm, (offset))
+#else
+    #define LOAD_WEIGHT_HEADER_GM(ptr, offset) (*(const unsigned int*)(ptr))
+    #define LOAD_WEIGHT_PACKED_GM(ptr, offset) (*(const unsigned int*)(ptr))
+#endif
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    const int quads = groups_per_row >> 2;
+    const int tail = groups_per_row & 3;
+
+#ifdef HIPFIRE_MQ4G256V2_LUT
+        #define DOG_LUT_GM(pk, sc, zp, b, a) \
+            (a) += (sc * MQ4V2_LUT_GM((pk) & 0xFu)        + zp) * x[(b)]     \
+                 + (sc * MQ4V2_LUT_GM(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+                 + (sc * MQ4V2_LUT_GM(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+                 + (sc * MQ4V2_LUT_GM(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+                 + (sc * MQ4V2_LUT_GM(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+                 + (sc * MQ4V2_LUT_GM(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+                 + (sc * MQ4V2_LUT_GM(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+                 + (sc * MQ4V2_LUT_GM(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+#endif
+    // Carried group pointers: gp0/goff advance by 4 groups per quad, so the
+    // loop body needs no multiply (mirrors shipping's gp0 = row_ptr + g*136
+    // adds). g is kept for the x base only.
+    const long long m4_136_gm = 4 * m136_gm;
+    const unsigned int m136u_gm = (unsigned int)m136_gm;
+    const unsigned int m4u_gm = 4 * m136u_gm;
+    const char* gp0c = A + roff_gm;
+    unsigned int goffc = (unsigned int)roff_gm;
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        const char* gp0 = gp0c;
+        const char* gp1 = gp0 + m136_gm;
+        const char* gp2 = gp1 + m136_gm;
+        const char* gp3 = gp2 + m136_gm;
+
+        const unsigned int goff = goffc;
+        const unsigned int hA0 = LOAD_WEIGHT_HEADER_GM(gp0, goff);
+        const unsigned int hB0 = LOAD_WEIGHT_HEADER_GM(gp0 + 4, goff + 4u);
+        const unsigned int hs0 = (tid < 16) ? hA0 : hB0;
+        float sc0 = __half2float(__ushort_as_half((unsigned short)(hs0 & 0xFFFFu)));
+        float zp0 = __half2float(__ushort_as_half((unsigned short)(hs0 >> 16)));
+        const unsigned int hA1 = LOAD_WEIGHT_HEADER_GM(gp1, goff + m136u_gm);
+        const unsigned int hB1 = LOAD_WEIGHT_HEADER_GM(gp1 + 4, goff + m136u_gm + 4u);
+        const unsigned int hs1 = (tid < 16) ? hA1 : hB1;
+        float sc1 = __half2float(__ushort_as_half((unsigned short)(hs1 & 0xFFFFu)));
+        float zp1 = __half2float(__ushort_as_half((unsigned short)(hs1 >> 16)));
+        const unsigned int hA2 = LOAD_WEIGHT_HEADER_GM(gp2, goff + 2u * m136u_gm);
+        const unsigned int hB2 = LOAD_WEIGHT_HEADER_GM(gp2 + 4, goff + 2u * m136u_gm + 4u);
+        const unsigned int hs2 = (tid < 16) ? hA2 : hB2;
+        float sc2 = __half2float(__ushort_as_half((unsigned short)(hs2 & 0xFFFFu)));
+        float zp2 = __half2float(__ushort_as_half((unsigned short)(hs2 >> 16)));
+        const unsigned int hA3 = LOAD_WEIGHT_HEADER_GM(gp3, goff + 3u * m136u_gm);
+        const unsigned int hB3 = LOAD_WEIGHT_HEADER_GM(gp3 + 4, goff + 3u * m136u_gm + 4u);
+        const unsigned int hs3 = (tid < 16) ? hA3 : hB3;
+        float sc3 = __half2float(__ushort_as_half((unsigned short)(hs3 & 0xFFFFu)));
+        float zp3 = __half2float(__ushort_as_half((unsigned short)(hs3 >> 16)));
+
+        unsigned int pk0 = LOAD_WEIGHT_PACKED_GM(gp0 + 8 + boff_gm, goff + 8u + boff_gm);
+        unsigned int pk1 = LOAD_WEIGHT_PACKED_GM(gp1 + 8 + boff_gm, goff + m136u_gm + 8u + boff_gm);
+        unsigned int pk2 = LOAD_WEIGHT_PACKED_GM(gp2 + 8 + boff_gm, goff + 2u * m136u_gm + 8u + boff_gm);
+        unsigned int pk3 = LOAD_WEIGHT_PACKED_GM(gp3 + 8 + boff_gm, goff + 3u * m136u_gm + 8u + boff_gm);
+
+        int base = g * 256 + tid * 8;
+
+        #define DOG_GM(pk, sc, zp, b, a) \
+            (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
+                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+
+#ifdef HIPFIRE_MQ4G256V2_LUT
+        DOG_LUT_GM(pk0, sc0, zp0, base, acc0);
+        DOG_LUT_GM(pk1, sc1, zp1, base + 256, acc1);
+        DOG_LUT_GM(pk2, sc2, zp2, base + 512, acc2);
+        DOG_LUT_GM(pk3, sc3, zp3, base + 768, acc3);
+#else
+        DOG_GM(pk0, sc0, zp0, base, acc0);
+        DOG_GM(pk1, sc1, zp1, base + 256, acc1);
+        DOG_GM(pk2, sc2, zp2, base + 512, acc2);
+        DOG_GM(pk3, sc3, zp3, base + 768, acc3);
+#endif
+        #undef DOG_GM
+        gp0c += m4_136_gm;
+        goffc += m4u_gm;
+    }
+
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    #define TAIL_DOG_LUT_GM(pk, sc, zp, b, a) \
+        (a) += (sc * MQ4V2_LUT_GM((pk) & 0xFu)        + zp) * x[(b)]     \
+             + (sc * MQ4V2_LUT_GM(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+             + (sc * MQ4V2_LUT_GM(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+             + (sc * MQ4V2_LUT_GM(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+             + (sc * MQ4V2_LUT_GM(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+             + (sc * MQ4V2_LUT_GM(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+             + (sc * MQ4V2_LUT_GM(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+             + (sc * MQ4V2_LUT_GM(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+#endif
+    #define TAIL_DOG_GM(pk, sc, zp, b, a) \
+        (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+
+    if (tail >= 1) {
+        const int g = quads << 2;
+        const char* gp = gp0c;
+        const unsigned int goff = goffc;
+        const unsigned int hA = LOAD_WEIGHT_HEADER_GM(gp, goff);
+        const unsigned int hB = LOAD_WEIGHT_HEADER_GM(gp + 4, goff + 4u);
+        const unsigned int hs = (tid < 16) ? hA : hB;
+        float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
+        float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+        unsigned int pk = LOAD_WEIGHT_PACKED_GM(gp + 8 + boff_gm, goff + 8u + boff_gm);
+        int base = g * 256 + tid * 8;
+#ifdef HIPFIRE_MQ4G256V2_LUT
+        TAIL_DOG_LUT_GM(pk, sc, zp, base, acc0);
+#else
+        TAIL_DOG_GM(pk, sc, zp, base, acc0);
+#endif
+    }
+    if (tail >= 2) {
+        const int g = (quads << 2) + 1;
+        const char* gp = gp0c + m136_gm;
+        const unsigned int goff = goffc + m136u_gm;
+        const unsigned int hA = LOAD_WEIGHT_HEADER_GM(gp, goff);
+        const unsigned int hB = LOAD_WEIGHT_HEADER_GM(gp + 4, goff + 4u);
+        const unsigned int hs = (tid < 16) ? hA : hB;
+        float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
+        float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+        unsigned int pk = LOAD_WEIGHT_PACKED_GM(gp + 8 + boff_gm, goff + 8u + boff_gm);
+        int base = g * 256 + tid * 8;
+#ifdef HIPFIRE_MQ4G256V2_LUT
+        TAIL_DOG_LUT_GM(pk, sc, zp, base, acc1);
+#else
+        TAIL_DOG_GM(pk, sc, zp, base, acc1);
+#endif
+    }
+    if (tail >= 3) {
+        const int g = (quads << 2) + 2;
+        const char* gp = gp0c + 2 * m136_gm;
+        const unsigned int goff = goffc + 2 * m136u_gm;
+        const unsigned int hA = LOAD_WEIGHT_HEADER_GM(gp, goff);
+        const unsigned int hB = LOAD_WEIGHT_HEADER_GM(gp + 4, goff + 4u);
+        const unsigned int hs = (tid < 16) ? hA : hB;
+        float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
+        float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
+        unsigned int pk = LOAD_WEIGHT_PACKED_GM(gp + 8 + boff_gm, goff + 8u + boff_gm);
+        int base = g * 256 + tid * 8;
+#ifdef HIPFIRE_MQ4G256V2_LUT
+        TAIL_DOG_LUT_GM(pk, sc, zp, base, acc2);
+#else
+        TAIL_DOG_GM(pk, sc, zp, base, acc2);
+#endif
+    }
+    #undef TAIL_DOG_GM
+    #undef LOAD_WEIGHT_PACKED_GM
+    #undef LOAD_WEIGHT_HEADER_GM
+
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+#if defined(HIPFIRE_MQ4G256V2_RESIDUAL_SIGMOID_SCALED_EPILOGUE)
+    if (tid == 0) {
+        float gate = 1.0f / (1.0f + expf(-c_buf[0]));
+        y[row] += gate * acc;
+    }
+#elif defined(HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE)
+    if (tid == 0) y[row] += acc;
+#else
+    if (tid == 0) y[row] = acc;
+#endif
+}
+#endif // __gfx1151__
