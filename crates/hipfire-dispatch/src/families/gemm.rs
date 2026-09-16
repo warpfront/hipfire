@@ -16,6 +16,41 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 
+/// Run a Q8 projection while refreshing the F16 activation conversion on every
+/// invocation. Pointer-keyed conversion caches are unsafe for layer-reused
+/// scratch buffers whose contents change between projections.
+#[inline]
+pub fn run_q8_projection_fresh(
+    gpu: &mut Gpu,
+    w: &GpuTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    m: usize,
+    k: usize,
+    batch_size: usize,
+    x_f16: &GpuTensor,
+    enable_wmma: bool,
+) -> hip_bridge::HipResult<()> {
+    if enable_wmma && gpu.arch_caps.has_wmma() && k % 32 == 0 {
+        gpu.deepseek4_convert_f32_to_f16(x, x_f16, (batch_size * k) as i64)?;
+        gpu.gemm_q8_0_wmma(w, x_f16, y, m, k, batch_size)
+    } else {
+        gpu.gemm_q8_0_batched_chunked(w, x, y, m, k, batch_size)
+    }
+}
+
+/// Select the residual GEMM key for a packed weight container.
+pub fn residual_gemm_key_for(dtype: DType) -> KernelKey {
+    match dtype {
+        DType::MQ4G256V2 => KernelKey::GemmMq4G256V2Residual,
+        DType::MQ4CG256 => KernelKey::GemmMq4CG256Residual,
+        DType::MQ6G256V2 => KernelKey::GemmMq6G256V2Residual,
+        DType::MQ5G256V2 => KernelKey::GemmMq5G256V2Residual,
+        DType::MQ3G256V2 => KernelKey::GemmMq3G256V2Residual,
+        DType::MQ2G256V2 => KernelKey::GemmMq2G256V2Residual,
+        _ => KernelKey::GemmHfq4G256Residual,
+    }
+}
 fn is_gemm_hfq4_key(key: KernelKey) -> bool {
     matches!(
         key,

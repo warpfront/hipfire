@@ -1429,6 +1429,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-config",
  "rdna-compute",
+ "smallvec",
 ]
 
 [[package]]

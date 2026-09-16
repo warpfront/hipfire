@@ -27,7 +27,7 @@
 //! #397 Phase-0.4 should adopt — a single coverage gate over (op × dtype × arch).
 
 use crate::context::DispatchCtx;
-use crate::families::moe::{MoeDtypes, MoeResolution};
+use crate::families::moe::{MoeDtypes, MoeResolution, MoeSharedDtypes};
 use crate::types::*;
 use rdna_compute::DType::{self, *};
 
@@ -428,10 +428,12 @@ fn non_k8_and_q8_routed_moe_has_a_dispatch_plan() {
     ] {
         let d = MoeDtypes {
             router: Q8_0,
-            shared_gate: Q8_0,
-            shared_expert_gate: Q8_0,
-            shared_expert_up: Q8_0,
-            shared_expert_down: Q8_0,
+            shared: Some(MoeSharedDtypes {
+                selector: Q8_0,
+                gate: Q8_0,
+                up: Q8_0,
+                down: Q8_0,
+            }),
             experts_all_gate_up_mq4: u.routed_gate_up == MQ4G256,
             routed_gate_up: u.routed_gate_up,
             routed_down: u.routed_down,
@@ -488,10 +490,12 @@ fn moe_decode_pre_guard_admits_fallback_and_rejects_invalid() {
     // (op=moe, dtype=MQ4G256, k=4) → resolves to the CPU fallback, NOT GPU-top-K.
     let mq4_k4 = MoeDtypes {
         router: Q8_0,
-        shared_gate: Q8_0,
-        shared_expert_gate: Q8_0,
-        shared_expert_up: Q8_0,
-        shared_expert_down: Q8_0,
+        shared: Some(MoeSharedDtypes {
+            selector: Q8_0,
+            gate: Q8_0,
+            up: Q8_0,
+            down: Q8_0,
+        }),
         experts_all_gate_up_mq4: true,
         routed_gate_up: MQ4G256,
         routed_down: MQ4G256,
@@ -1365,10 +1369,12 @@ fn w4_mq3_lloyd_still_rejected_on_cdna_wave64() {
 fn moe_dtypes_uniform(gate_up: DType, down: DType) -> MoeDtypes<'static> {
     MoeDtypes {
         router: Q8_0,
-        shared_gate: Q8_0,
-        shared_expert_gate: Q8_0,
-        shared_expert_up: Q8_0,
-        shared_expert_down: Q8_0,
+        shared: Some(MoeSharedDtypes {
+            selector: Q8_0,
+            gate: Q8_0,
+            up: Q8_0,
+            down: Q8_0,
+        }),
         experts_all_gate_up_mq4: false,
         routed_gate_up: gate_up,
         routed_down: down,

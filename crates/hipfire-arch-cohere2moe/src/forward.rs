@@ -19,10 +19,10 @@
 //!            h += Σ w_e · expert_e(normed)
 //! then logits = lm_head(rmsnorm(h, model.norm)) · logit_scale.
 //!
-//! Routed experts: the MQ4/MQ6 tiers use the FWHT-pre-rotated indexed-MoE GEMV
-//! kernels (exactly the qwen35/lfm2/minimax path). The F16 oracle and Q8 expert
-//! tiers have no indexed kernel, so they take a per-expert `weight_gemv` loop
-//! (correctness over speed — the KLD/PPL harness is offline).
+//! Routed experts use the shared sealed-MoE executor: its indexed kernels handle
+//! MQ4/MQ6 tiers, while its host-expert operation preserves the F16/Q8
+//! correctness path (including activation weighting before down projection).
+//! Architecture code only binds the owned weights and scratch resources.
 //!
 //! Attention: a per-layer NoPE/RoPE split (full_attention layers are NoPE;
 //! sliding layers use interleaved RoPE), plus a windowed-mask flash path
@@ -34,35 +34,16 @@ use crate::cohere2moe::{Cohere2MoeState, Cohere2MoeWeights, Ffn};
 use crate::config::{AttnKind, Cohere2MoeConfig};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::GivensRef;
-use hipfire_dispatch::families::moe::{MoeDtypes, MoePrefillParams};
+use hipfire_dispatch::families::moe::{
+    MoeDtypes, MoeEpMode, MoeNormalization, MoeParams, MoePrefillParams, MoePrefillPrelude,
+    MoeQ8RouterPolicy, MoeRecipe, MOE_GROUPED_BLOCK_M,
+};
 use hipfire_dispatch::pipeline::sealed_moe::{
-    produce_prefill_route, seal_prefill_with_router, BoundMoeExperts, MoeRouterInput,
+    checked_grouped_m_total_bound, seal_decode, seal_prefill, BoundMoeExperts, PrefillRouteMode,
 };
 use hipfire_dispatch::pipeline::{execute_steps, Step};
-use hipfire_runtime::llama::{
-    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_batched_for, rotate_x_mq_for, weight_gemv,
-    weight_gemv_residual, KvCacheExt,
-};
+use hipfire_runtime::llama::{weight_gemv, weight_gemv_residual, KvCacheExt};
 use rdna_compute::{DType, Gpu, GpuTensor};
-
-/// Grouped-MoE prefill tiling constant — must match `run_moe_prefill`'s
-/// `MOE_GROUPED_BLOCK_M` (tokens are scattered into per-expert groups padded to
-/// a multiple of this).
-const MOE_GROUPED_BLOCK_M: usize = 16;
-#[inline]
-fn align_up_usize(x: usize, a: usize) -> usize {
-    x.div_ceil(a) * a
-}
-/// Upper bound on the padded total scattered-slot count: every live expert can
-/// waste up to `BLOCK_M-1` pad slots. `total_slots = batch * k_top`.
-#[inline]
-fn moe_grouped_m_total_bound(total_slots: usize, n_exp: usize) -> usize {
-    let live = total_slots.min(n_exp);
-    align_up_usize(
-        total_slots + live * (MOE_GROUPED_BLOCK_M - 1),
-        MOE_GROUPED_BLOCK_M,
-    )
-}
 
 /// Batched Q8_0 projection GEMM for prefill (`Y[b,m] = X[b,k] @ W_q8[m,k]^T`).
 /// On WMMA archs (gfx11+/RDNA3.5/RDNA4) with K%32==0 it routes to the
@@ -92,18 +73,17 @@ fn q8_proj_raw(
     b: usize,
     x_f16: &GpuTensor,
 ) -> hip_bridge::HipResult<()> {
-    if q8_wmma_enabled() && gpu.arch_caps.has_wmma() && k % 32 == 0 {
-        // Convert THIS activation to F16 fresh into our own buffer, then feed
-        // the F16 tensor to gemm_q8_0_wmma. We must NOT let gemm_q8_0_wmma run
-        // its internal `ensure_fp16_x`: that cache is keyed on the source
-        // POINTER and only reconverts when the pointer changes — but `normed`
-        // and `attn_out` are single buffers reused every layer with NEW
-        // contents, so it would return layer-0's STALE F16 for layers 1..N.
-        gpu.deepseek4_convert_f32_to_f16(x, x_f16, (b * k) as i64)?;
-        gpu.gemm_q8_0_wmma(w, x_f16, y, m, k, b)
-    } else {
-        gpu.gemm_q8_0_batched_chunked(w, x, y, m, k, b)
-    }
+    hipfire_dispatch::families::gemm::run_q8_projection_fresh(
+        gpu,
+        w,
+        x,
+        y,
+        m,
+        k,
+        b,
+        x_f16,
+        q8_wmma_enabled(),
+    )
 }
 
 /// Decode one token; returns the full logits vector.
@@ -296,121 +276,96 @@ fn decode_step_body(
                     .map_err(|e| format!("cohere2moe L{l}: dense down_proj: {e}"))?;
             }
             Ffn::Moe(m) => {
-                // Router: sigmoid(logits) → top-k. `norm_topk_prob=false` for
-                // North-Mini-Code, so the top-8 raw sigmoid scores are the
-                // combine weights (NO renormalization). Selection by sigmoid is
-                // monotonic in the logits, so it matches HF `expert_selection_fn`.
-                weight_gemv(gpu, &m.router, &state.normed, &state.router_logits)
-                    .map_err(|e| format!("cohere2moe L{l}: router: {e}"))?;
-                gpu.sigmoid_f32(&state.router_logits)
-                    .map_err(|e| format!("cohere2moe L{l}: sigmoid: {e:?}"))?;
-                gpu.moe_topk_renorm_k8(
-                    &state.router_logits,
-                    &state.topk_indices,
-                    &state.topk_weights,
+                let gate_up_dtypes = m.sealed.gate_up_dtypes.as_ref();
+                let down_dtypes = m.sealed.down_dtypes.as_ref();
+                let tier_varies = |tiers: &[DType]| {
+                    tiers
+                        .first()
+                        .is_some_and(|&first| tiers.iter().skip(1).any(|&dtype| dtype != first))
+                };
+                let gate_up_mixed = tier_varies(gate_up_dtypes);
+                let down_mixed = tier_varies(down_dtypes);
+                let routed_gate_up = gate_up_dtypes
+                    .first()
+                    .copied()
+                    .ok_or_else(|| format!("cohere2moe L{l}: no gate/up expert dtype"))?;
+                let routed_down = down_dtypes
+                    .first()
+                    .copied()
+                    .ok_or_else(|| format!("cohere2moe L{l}: no down expert dtype"))?;
+                let params_gate_paro = m.experts[0].gate_up.paro.as_ref().map(|paro| GivensRef {
+                    pairs: &paro.pairs,
+                    theta: &paro.theta,
+                    scales: &paro.channel_scales,
+                    krot: paro.krot as usize,
+                });
+                let params_down_paro = m.experts[0].down.paro.as_ref().map(|paro| GivensRef {
+                    pairs: &paro.pairs,
+                    theta: &paro.theta,
+                    scales: &paro.channel_scales,
+                    krot: paro.krot as usize,
+                });
+                let params = MoeParams {
+                    dtypes: MoeDtypes {
+                        router: m.router.gpu_dtype,
+                        shared: None,
+                        experts_all_gate_up_mq4: gate_up_dtypes
+                            .iter()
+                            .all(|&dtype| dtype == DType::MQ4G256),
+                        routed_gate_up,
+                        routed_down,
+                        routed_has_mixed_experts: gate_up_mixed || down_mixed,
+                        has_paro_shared: m.paro_shared.is_some(),
+                        per_expert_gate_up: gate_up_mixed.then_some(gate_up_dtypes),
+                        per_expert_down: down_mixed.then_some(down_dtypes),
+                    },
+                    recipe: MoeRecipe::SigmoidRoutedNoShared,
+                    normalization: MoeNormalization::Provided,
+                    batch_size: 1,
+                    hidden,
+                    mi: moe_inter,
+                    k: k_top,
                     n_exp,
-                    cfg.norm_topk_prob,
-                )
-                .map_err(|e| format!("cohere2moe L{l}: topk: {e:?}"))?;
-
-                let edt = m.experts[0].gate_up.gpu_dtype;
-                match edt {
-                    // FWHT-pre-rotated indexed MoE GEMV (MQ4/MQ6 tiers).
-                    DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256 | DType::HFQ6G256 => {
-                        let mq6 = matches!(edt, DType::MQ6G256 | DType::HFQ6G256);
-                        rotate_x_mq_for(
-                            gpu,
-                            &m.experts[0].gate_up,
-                            &state.normed,
-                            &state.ffn_x_rot,
-                            hidden,
-                        )
-                        .map_err(|e| format!("cohere2moe L{l}: ffn rotate: {e:?}"))?;
-                        if mq6 {
-                            gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
-                                &m.expert_gate_up_ptrs,
-                                &state.topk_indices,
-                                &state.ffn_x_rot,
-                                &state.gate_batch,
-                                &state.up_batch,
-                                2 * moe_inter,
-                                hidden,
-                                k_top,
-                                1,
-                            )
-                            .map_err(|e| format!("cohere2moe L{l}: gate_up(mq6): {e:?}"))?;
-                        } else {
-                            gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
-                                &m.expert_gate_up_ptrs,
-                                &state.topk_indices,
-                                &state.ffn_x_rot,
-                                &state.gate_batch,
-                                &state.up_batch,
-                                2 * moe_inter,
-                                hidden,
-                                k_top,
-                                1,
-                            )
-                            .map_err(|e| format!("cohere2moe L{l}: gate_up(mq4): {e:?}"))?;
-                        }
-                        fused_silu_mul_rotate_mq_batched_for(
-                            gpu,
-                            &m.experts[0].down,
-                            &state.gate_batch,
-                            &state.up_batch,
-                            &state.rot_batch,
-                            moe_inter,
-                            k_top,
-                        )
-                        .map_err(|e| format!("cohere2moe L{l}: silu_mul_rotate: {e:?}"))?;
-                        if mq6 {
-                            gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
-                                &m.expert_down_ptrs,
-                                &state.topk_indices,
-                                &state.rot_batch,
-                                &state.down_expanded,
-                                hidden,
-                                moe_inter,
-                                k_top,
-                                1,
-                            )
-                            .map_err(|e| format!("cohere2moe L{l}: down(mq6): {e:?}"))?;
-                        } else {
-                            gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-                                &m.expert_down_ptrs,
-                                &state.topk_indices,
-                                &state.rot_batch,
-                                &state.down_expanded,
-                                hidden,
-                                moe_inter,
-                                k_top,
-                                1,
-                            )
-                            .map_err(|e| format!("cohere2moe L{l}: down(mq4): {e:?}"))?;
-                        }
-                        gpu.moe_down_combine_k8_batched(
-                            &state.down_expanded,
-                            &state.topk_weights,
-                            &state.h,
-                            hidden,
-                            k_top,
-                            1,
-                        )
-                        .map_err(|e| format!("cohere2moe L{l}: combine: {e:?}"))?;
-                    }
-                    // Per-expert path for the bf16 oracle + Q8 tier (no indexed
-                    // kernel for these dtypes). Reads the 8 selected experts off
-                    // the device topk buffers and runs a plain GEMV each
-                    // (weight_gemv → run_auto handles BF16/F16/F32/Q8).
-                    DType::BF16 | DType::Q8_0 | DType::F16 | DType::F32 => {
-                        moe_per_expert(gpu, m, state, moe_inter, k_top, l)?;
-                    }
-                    other => {
-                        return Err(format!(
-                            "cohere2moe L{l}: unsupported expert dtype {other:?}"
-                        ))
-                    }
-                }
+                    norm_topk_prob: cfg.norm_topk_prob,
+                    x_rot_prerotated: false,
+                    defer_routed_combine: false,
+                    ep_mode: MoeEpMode::None,
+                    layer_idx: l as u16,
+                    x_norm: &state.normed,
+                    x_residual: &state.h,
+                    routed_out: None,
+                    skip_shared: false,
+                    router: m.router.dispatch_ref(),
+                    shared: None,
+                    expert_gate_up_ptrs: &m.expert_gate_up_ptrs,
+                    expert_down_ptrs: &m.expert_down_ptrs,
+                    expert_down_awq_ptrs: None,
+                    expert_dtype_tags: None,
+                    routed_gate_up_k: m.experts[0].gate_up.k,
+                    routed_down_m: m.experts[0].down.m,
+                    routed_down_k: m.experts[0].down.k,
+                    routed_experts: m,
+                    routed_gate_up_paro: params_gate_paro,
+                    routed_down_paro: params_down_paro,
+                    router_logits: &state.router_logits,
+                    x_rot_local: &state.ffn_x_rot,
+                    gate_up_buf: &state.expert_gate_up,
+                    ffn_hidden: &state.expert_act,
+                    ffn_out: &state.expert_down,
+                    gate_batch: &state.gate_batch,
+                    up_batch: &state.up_batch,
+                    rot_batch: &state.rot_batch,
+                    topk_indices: &state.topk_indices,
+                    topk_weights: &state.topk_weights,
+                    down_expanded: &state.down_expanded,
+                };
+                let ctx = DispatchCtx::new(gpu);
+                let bound = BoundMoeExperts::from_cache(&m.sealed.table, &m.sealed.cache)
+                    .map_err(|e| format!("cohere2moe L{l} bind experts: {e:?}"))?;
+                let call = seal_decode(bound, &ctx, params)
+                    .map_err(|e| format!("cohere2moe L{l} seal decode: {e:?}"))?;
+                execute_steps(gpu, &ctx, &[Step::Moe(call)])
+                    .map_err(|e| format!("cohere2moe L{l} sealed decode: {e:?}"))?;
             }
         }
         if hipfire_config::developer_var_os("HIPFIRE_COHERE_DEBUG").is_some() {
@@ -442,71 +397,17 @@ fn decode_step_body(
     Ok(())
 }
 
-/// Per-expert SwiGLU for non-indexable expert dtypes (F16 oracle / Q8 tier).
-/// Recovers the 8 selected expert ids from the device topk buffers (the
-/// i32 indices are bit-preserved through `download_f32`), runs a plain
-/// `weight_gemv` per selected expert, and accumulates `w_e · down(silu(gate)·up)`
-/// into the residual. `normed` is the parallel-block layernorm output.
-fn moe_per_expert(
-    gpu: &mut Gpu,
-    m: &crate::cohere2moe::MoeFfn,
-    state: &Cohere2MoeState,
-    moe_inter: usize,
-    k_top: usize,
-    l: usize,
-) -> Result<(), String> {
-    // i32 expert ids are stored in an F32-typed tensor; download_f32 is a
-    // bit-preserving copy, so `.to_bits()` recovers the original index.
-    let idx_bits = gpu
-        .download_f32(&state.topk_indices)
-        .map_err(|e| format!("cohere2moe L{l}: dl topk idx: {e:?}"))?;
-    let weights = gpu
-        .download_f32(&state.topk_weights)
-        .map_err(|e| format!("cohere2moe L{l}: dl topk w: {e:?}"))?;
-    for j in 0..k_top {
-        // The router must produce in-range expert ids; a silent `.min()` clamp
-        // would mask a routing/topk bug as quietly-wrong output (worst place to
-        // be silent — this is the oracle/Q8 correctness path). Fail loudly.
-        // (The batched `run_prefill` path instead clamps an OOB id to expert 0
-        // in-kernel — bounded-wrong but memory-safe, since the indexed GEMM
-        // can't take a runtime loop bound; that asymmetry is intentional.)
-        let e = idx_bits[j].to_bits() as usize;
-        if e >= m.experts.len() {
-            return Err(format!(
-                "cohere2moe L{l}: router produced OOB expert id {e} (n_experts={})",
-                m.experts.len()
-            ));
-        }
-        let w = weights[j];
-        let expert = &m.experts[e];
-        // gate_up = [2*moe_inter] (gate ‖ up), then split into halves.
-        weight_gemv(gpu, &expert.gate_up, &state.normed, &state.expert_gate_up)
-            .map_err(|e2| format!("cohere2moe L{l}E{e}: gate_up gemv: {e2}"))?;
-        let gate_view = state.expert_gate_up.sub_offset(0, moe_inter);
-        let up_view = state.expert_gate_up.sub_offset(moe_inter, moe_inter);
-        gpu.silu_mul_f32(&gate_view, &up_view, &state.expert_act)
-            .map_err(|e2| format!("cohere2moe L{l}E{e}: silu_mul: {e2:?}"))?;
-        // Fold the router weight into the activation (down is linear:
-        // w·down(act) = down(w·act)), then accumulate down(·) into h.
-        gpu.scale_f32(&state.expert_act, w)
-            .map_err(|e2| format!("cohere2moe L{l}E{e}: scale: {e2:?}"))?;
-        weight_gemv_residual(gpu, &expert.down, &state.expert_act, &state.h)
-            .map_err(|e2| format!("cohere2moe L{l}E{e}: down gemv: {e2}"))?;
-    }
-    Ok(())
-}
-
 /// True iff `forward_batch` supports this model: Q8 attention/dense/router and
-/// indexed (MQ4/MQ6/HFQ4/HFQ6) experts. The bf16 oracle and Q8-expert tiers
-/// fall back to per-token `decode_step` (no indexed-MoE / batched-bf16 path).
+/// the shared indexed grouped-MoE admission predicate. Unsupported expert tiers
+/// fall back to per-token `decode_step`; this is an admission choice, not a
+/// second architecture-local MoE execution path.
 pub fn forward_batch_supported(weights: &Cohere2MoeWeights) -> bool {
     weights.layers.iter().all(|l| {
         l.wq.gpu_dtype == DType::Q8_0
             && match &l.ffn {
                 Ffn::Dense(_) => true,
-                Ffn::Moe(m) => matches!(
+                Ffn::Moe(m) => hipfire_dispatch::families::moe::sigmoid_routed_prefill_supported(
                     m.experts[0].gate_up.gpu_dtype,
-                    DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256 | DType::HFQ6G256
                 ),
             }
     })
@@ -636,7 +537,11 @@ pub fn forward_batch(
     // DType::Raw byte tensors at 4 bytes/elem) + grouped-WMMA output buffers.
     // Path 1 (indexed) ignores these; Path 2 (grouped) uses them. Always
     // allocated since MoePrefillParams takes every buffer by reference.
-    let m_total_max = moe_grouped_m_total_bound(b * k_top, n_exp);
+    let total_slots = b
+        .checked_mul(k_top)
+        .ok_or_else(|| "forward_batch MoE route-slot count overflows".to_string())?;
+    let m_total_max = checked_grouped_m_total_bound(total_slots, n_exp, MOE_GROUPED_BLOCK_M)
+        .map_err(|e| format!("forward_batch grouped MoE bound: {e:?}"))?;
     let raw = |g: &mut Gpu, n: usize, label: &str| -> Result<GpuTensor, String> {
         g.alloc_tensor(&[n], DType::Raw)
             .map_err(|e| format!("forward_batch alloc {label}: {e:?}"))
@@ -812,29 +717,12 @@ pub fn forward_batch(
                     .map_err(|e| format!("cohere2moe L{l} batch ddown-resid: {e:?}"))?;
             }
             Ffn::Moe(m) => {
-                q8_proj_raw(
-                    gpu,
-                    &m.router.buf,
-                    &normed,
-                    &router_logits,
-                    n_exp,
-                    hidden,
-                    b,
-                    &x_f16,
-                )
-                .map_err(|e| format!("cohere2moe L{l} batch router: {e:?}"))?;
-
-                // The table/cache pair was validated once at load and is the
-                // only authority for expert ownership and source metadata.
-                // Pairing it here is allocation-free; a missing/invalid owner
-                // can never fall back to raw pointer execution.
+                // The sealed recipe owns router projection, sigmoid/top-eight,
+                // activation-basis preparation, and the indexed/grouped
+                // routed tail. Cohere has no shared expert.
                 let ctx = DispatchCtx::new(gpu);
                 let bound = BoundMoeExperts::from_cache(&m.sealed.table, &m.sealed.cache)
                     .map_err(|e| format!("cohere2moe L{l} bind experts: {e:?}"))?;
-                // Dtype tiers are cached in the immutable load-time binding.
-                // Borrowing them here keeps the prefill call allocation-free
-                // while avoiding the old expert-zero assumption for mixed
-                // layers.
                 let gate_up_dtypes = m.sealed.gate_up_dtypes.as_ref();
                 let down_dtypes = m.sealed.down_dtypes.as_ref();
                 let tier_varies = |tiers: &[DType]| {
@@ -844,10 +732,14 @@ pub fn forward_batch(
                 };
                 let gate_up_mixed = tier_varies(gate_up_dtypes);
                 let down_mixed = tier_varies(down_dtypes);
-                let edt = gate_up_dtypes.first().copied().unwrap_or(DType::F32);
-                let routed_down = down_dtypes.first().copied().unwrap_or(DType::F32);
-                let experts_all_gate_up_mq4 = !gate_up_dtypes.is_empty()
-                    && gate_up_dtypes.iter().all(|&dtype| dtype == DType::MQ4G256);
+                let routed_gate_up = gate_up_dtypes
+                    .first()
+                    .copied()
+                    .ok_or_else(|| format!("cohere2moe L{l}: no gate/up expert dtype"))?;
+                let routed_down = down_dtypes
+                    .first()
+                    .copied()
+                    .ok_or_else(|| format!("cohere2moe L{l}: no down expert dtype"))?;
                 let params_gate_paro = m.experts[0].gate_up.paro.as_ref().map(|paro| GivensRef {
                     pairs: &paro.pairs,
                     theta: &paro.theta,
@@ -863,20 +755,32 @@ pub fn forward_batch(
                 let params = MoePrefillParams {
                     dtypes: MoeDtypes {
                         router: m.router.gpu_dtype,
-                        // Cohere has no shared expert. These inert values keep
-                        // the existing family parameter shape while the sealed
-                        // call records `MoeSharedContribution::PerRankResidual`.
-                        shared_gate: DType::Q8_0,
-                        shared_expert_gate: DType::Q8_0,
-                        shared_expert_up: DType::Q8_0,
-                        shared_expert_down: DType::Q8_0,
-                        experts_all_gate_up_mq4,
-                        routed_gate_up: edt,
+                        shared: None,
+                        experts_all_gate_up_mq4: gate_up_dtypes
+                            .iter()
+                            .all(|&dtype| dtype == DType::MQ4G256),
+                        routed_gate_up,
                         routed_down,
                         routed_has_mixed_experts: gate_up_mixed || down_mixed,
+                        has_paro_shared: m.paro_shared.is_some(),
                         per_expert_gate_up: gate_up_mixed.then_some(gate_up_dtypes),
                         per_expert_down: down_mixed.then_some(down_dtypes),
-                        has_paro_shared: m.paro_shared.is_some(),
+                    },
+                    recipe: MoeRecipe::SigmoidRoutedNoShared,
+                    prelude: MoePrefillPrelude {
+                        normalization: MoeNormalization::Provided,
+                        router: m.router.dispatch_ref(),
+                        router_logits: &router_logits,
+                        // The preallocated 2-D score view is the exact
+                        // router-logits allocation, not a reshaped copy.
+                        router_scores: &router_logits,
+                        norm_topk_prob: cfg.norm_topk_prob,
+                        route: PrefillRouteMode::Replicated,
+                        shared: None,
+                        q8_router_policy: MoeQ8RouterPolicy::FreshFp16Wmma {
+                            enabled: q8_wmma_enabled(),
+                            scratch: &x_f16,
+                        },
                     },
                     batch_size: b,
                     mi: moe_inter,
@@ -913,23 +817,8 @@ pub fn forward_batch(
                     down_awq_scale: None,
                     routed_out: None,
                 };
-                let mut call = seal_prefill_with_router(
-                    bound,
-                    &ctx,
-                    params,
-                    MoeRouterInput::PrecomputedSigmoidTopK,
-                )
-                .map_err(|e| format!("cohere2moe L{l} seal prefill: {e:?}"))?;
-                let receipt = produce_prefill_route(&call, gpu, &router_logits, cfg.norm_topk_prob)
-                    .map_err(|e| format!("cohere2moe L{l} route producer: {e:?}"))?;
-                call.attach_route_receipt(receipt)
-                    .map_err(|e| format!("cohere2moe L{l} route receipt: {e:?}"))?;
-
-                // `ffn_x_rot` is the model-owned activation basis required by
-                // the Paro/MQ indexed kernels. Keep this transform before the
-                // sealed route executor, exactly as in the previous path.
-                rotate_x_mq_batched_for(gpu, &m.experts[0].gate_up, &normed, &ffn_x_rot, hidden, b)
-                    .map_err(|e| format!("cohere2moe L{l} batch rot: {e}"))?;
+                let call = seal_prefill(bound, &ctx, params)
+                    .map_err(|e| format!("cohere2moe L{l} seal prefill: {e:?}"))?;
                 execute_steps(gpu, &ctx, &[Step::Moe(call)])
                     .map_err(|e| format!("cohere2moe L{l} sealed prefill: {e:?}"))?;
             }

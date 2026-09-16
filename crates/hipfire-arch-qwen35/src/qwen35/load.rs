@@ -5236,6 +5236,30 @@ pub(crate) struct SealedEpLoadCtx<'a> {
     pub assignment: ExpertAssign,
 }
 
+fn validate_ep_physical_device_ids(
+    physical_devices: &[i32],
+    emulation_enabled: bool,
+) -> HipResult<()> {
+    let mut seen = std::collections::HashSet::new();
+    for (device_rank, &device) in physical_devices.iter().enumerate() {
+        if device < 0 {
+            return Err(HipError::new(
+                0,
+                &format!("qwen35: EP physical device id {device} is invalid at rank {device_rank}"),
+            ));
+        }
+        if !emulation_enabled && !seen.insert(device) {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "qwen35: EP physical device id {device} is duplicate at rank {device_rank}"
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate every EP admission rule BEFORE any GPU allocation: mesh/rank
 /// identity, physical device agreement, supported (exact Stride/Contiguous)
 /// assignment, no REAP/paging/AWQ, and a well-formed MoE config. Returns the
@@ -5283,17 +5307,8 @@ fn validate_ep_load_topology(
             ),
         ));
     }
-    let mut seen = std::collections::HashSet::new();
-    for (device_rank, &device) in physical_devices.iter().enumerate() {
-        if device < 0 || !seen.insert(device) {
-            return Err(HipError::new(
-                0,
-                &format!(
-                    "qwen35: EP physical device id {device} is duplicate or invalid at rank {device_rank}"
-                ),
-            ));
-        }
-    }
+    let emulation_enabled = hipfire_runtime::config::get().emulate_gpus.is_some();
+    validate_ep_physical_device_ids(physical_devices, emulation_enabled)?;
     if physical_devices[rank] != gpu.device_id {
         return Err(HipError::new(
             0,
@@ -6034,8 +6049,8 @@ fn load_weights_ep_rank_inner(
 #[cfg(test)]
 mod sealed_ep_tests {
     use super::{
-        load_weights, load_weights_ep_rank, load_weights_ep_rank_with_fault, EpFault, EpLoadStage,
-        HfqSource, Layout,
+        load_weights, load_weights_ep_rank, load_weights_ep_rank_with_fault,
+        validate_ep_physical_device_ids, EpFault, EpLoadStage, HfqSource, Layout,
     };
     use crate::qwen35::{
         config_from_hfq, shard_all_moe_layers, shard_all_moe_layers_with_fault, LayerWeights,
@@ -6679,6 +6694,12 @@ mod sealed_ep_tests {
         weights.free_gpu(&mut gpus.devices[0]);
         gpus.devices[0].drain_pool();
         gpus.devices[1].drain_pool();
+    }
+    #[test]
+    fn ep_load_physical_device_aliases_require_explicit_emulation() {
+        assert!(validate_ep_physical_device_ids(&[7, 7], false).is_err());
+        assert!(validate_ep_physical_device_ids(&[7, 7], true).is_ok());
+        assert!(validate_ep_physical_device_ids(&[-1, 7], true).is_err());
     }
 }
 /// Direct-Qwen35 load fault-boundary evidence (G4.3 final-head).

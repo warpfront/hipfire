@@ -22,11 +22,155 @@ use rdna_compute::{Gpu, GpuTensor};
 
 use crate::context::DispatchCtx;
 use crate::families::gemv::{GivensRef, WeightRef};
-use crate::tables::moe_table;
+use crate::pipeline::sealed_moe::PrefillRouteMode;
 use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 
+/// Grouped-MoE WMMA tile row count used by capacity bounds and scatter.
+pub const MOE_GROUPED_BLOCK_M: usize = 16;
+
+/// The complete semantic recipe selected by an architecture binding.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MoeRecipe {
+    SoftmaxGatedShared,
+    SigmoidRoutedNoShared,
+}
+
+/// Source of the activation consumed by a MoE recipe.
+pub enum MoeNormalization<'a> {
+    Provided,
+    RmsNorm {
+        weight: &'a GpuTensor,
+        plain_out: &'a GpuTensor,
+        eps: f32,
+    },
+}
+
+/// Dtypes for the optional replicated/shared expert.
+#[derive(Clone, Copy, Debug)]
+pub struct MoeSharedDtypes {
+    pub selector: DType,
+    pub gate: DType,
+    pub up: DType,
+    pub down: DType,
+}
+
+/// Borrowed weights for the optional replicated/shared expert.
+pub struct MoeSharedWeights<'a> {
+    pub selector: WeightRef<'a>,
+    pub gate: WeightRef<'a>,
+    pub up: WeightRef<'a>,
+    pub down: WeightRef<'a>,
+}
+
+/// Decode scratch and weights for the optional replicated/shared expert.
+pub struct MoeSharedDecode<'a> {
+    pub weights: MoeSharedWeights<'a>,
+    pub intermediate: usize,
+    pub scalar: &'a GpuTensor,
+    pub gate_out: &'a GpuTensor,
+    pub up_out: &'a GpuTensor,
+}
+
+/// Prefill scratch and weights for the optional replicated/shared expert.
+pub struct MoeSharedPrefill<'a> {
+    pub weights: MoeSharedWeights<'a>,
+    pub intermediate: usize,
+    pub scalar: &'a GpuTensor,
+    pub gate_out: &'a GpuTensor,
+    pub up_out: &'a GpuTensor,
+    pub rotated: &'a GpuTensor,
+}
+
+/// Router projection policy for Q8 prefill inputs.
+pub enum MoeQ8RouterPolicy<'a> {
+    DispatcherEntry,
+    FreshFp16Wmma {
+        enabled: bool,
+        scratch: &'a GpuTensor,
+    },
+}
+
+/// Complete prefill prologue declaration.
+pub struct MoePrefillPrelude<'a> {
+    pub normalization: MoeNormalization<'a>,
+    pub router: WeightRef<'a>,
+    pub router_logits: &'a GpuTensor,
+    pub router_scores: &'a GpuTensor,
+    pub norm_topk_prob: bool,
+    pub route: PrefillRouteMode<'a>,
+    pub shared: Option<MoeSharedPrefill<'a>>,
+    pub q8_router_policy: MoeQ8RouterPolicy<'a>,
+}
+
+/// Whether the Qwen softmax/shared gate quartet has the exact V1 MQ4 layout
+/// consumed by the fused gate-side kernel.
+pub fn softmax_shared_gate_uniform_mq4(
+    router: DType,
+    selector: DType,
+    gate: DType,
+    up: DType,
+) -> bool {
+    [router, selector, gate, up]
+        .into_iter()
+        .all(|dtype| dtype == DType::MQ4G256)
+}
+
+/// Whether normalization may write the Qwen softmax/shared activation directly
+/// in the prerotated basis consumed by the fused gate-side operation.
+///
+/// V1 is dtype-selected on every architecture, matching the established
+/// `fused_qkvza_hfq4g256` route. V2 is restricted to its exact Ornith quartet,
+/// no AWQ companions, and the two architectures with the matching fused kernel.
+pub fn softmax_shared_gate_prerotated(
+    ctx: &DispatchCtx,
+    router: &WeightRef<'_>,
+    shared: &MoeSharedWeights<'_>,
+) -> bool {
+    if softmax_shared_gate_uniform_mq4(
+        router.dtype,
+        shared.selector.dtype,
+        shared.gate.dtype,
+        shared.up.dtype,
+    ) {
+        return true;
+    }
+    if !(ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201()) {
+        return false;
+    }
+    softmax_shared_gate_mq4v2_layouts([
+        (router.dtype, router.m, router.k, router.awq_scale.is_some()),
+        (
+            shared.selector.dtype,
+            shared.selector.m,
+            shared.selector.k,
+            shared.selector.awq_scale.is_some(),
+        ),
+        (
+            shared.gate.dtype,
+            shared.gate.m,
+            shared.gate.k,
+            shared.gate.awq_scale.is_some(),
+        ),
+        (
+            shared.up.dtype,
+            shared.up.m,
+            shared.up.k,
+            shared.up.awq_scale.is_some(),
+        ),
+    ])
+}
+
+fn softmax_shared_gate_mq4v2_layouts(layouts: [(DType, usize, usize, bool); 4]) -> bool {
+    let expected = [(256, 2_048), (1, 2_048), (512, 2_048), (512, 2_048)];
+    layouts
+        .into_iter()
+        .zip(expected)
+        .all(|((dtype, m, k, has_awq), (want_m, want_k))| {
+            dtype == DType::MQ4G256V2 && m == want_m && k == want_k && !has_awq
+        })
+}
 // ── MoE eligibility lattice ────────────────────────────
 
 /// Routed-expert tiers the mixed-tier graded decode path can execute: the
@@ -53,56 +197,37 @@ pub const MIXED_SUPPORTED_TIERS: [DType; 5] = [
 ///
 /// `experts_all_gate_up_mq4` mirrors the `ffn.experts.iter().all(..)` clause
 /// the original `gate_side_mq4` check used (qwen35.rs:4598-4605). The routed
-/// fields use experts[0] as the representative only for uniform dispatch;
-/// genuinely mixed layers carry their load-time per-expert slices below.
 pub struct MoeDtypes<'a> {
     pub router: DType,
-    pub shared_gate: DType,        // ffn.shared_expert_gate
-    pub shared_expert_gate: DType, // ffn.shared_expert.gate
-    pub shared_expert_up: DType,   // ffn.shared_expert.up
-    pub shared_expert_down: DType, // ffn.shared_expert.down
+    /// Optional shared-expert projection dtypes. `None` is a first-class
+    /// no-shared recipe, independent of `has_paro_shared`.
+    pub shared: Option<MoeSharedDtypes>,
     pub experts_all_gate_up_mq4: bool,
     pub routed_gate_up: DType, // ffn.experts[0].gate_up
     pub routed_down: DType,    // ffn.experts[0].down
     /// Per-expert mixed routed dtype: experts in one layer carry DIFFERENT
     /// gate_up and/or down dtypes (N-tier graded: MQ6 hot / MQ4 mid / MQ2L
     /// or MQ3L or E8-family cold), so `routed_gate_up` / `routed_down`
-    /// (= experts[0]) are NOT representative. The model borrows the
-    /// load-time mixed-only slices below; no token-time table is rebuilt.
-    ///   0 = MQ6G256       (200 B/grp affine)
-    ///   1 = MQ2G256Lloyd  ( 72 B/grp codebook)
-    ///   2 = MQ4G256       (136 B/grp affine)
-    ///   3 = MQ3G256Lloyd  (112 B/grp codebook)
-    ///   4 = MFP4G32E8     (16 B hdr + (K/32)*17 B; 4-bit E8 lattice, 4.25 bpw)
-    ///   5 = MFP3G32E8     (16 B hdr + (K/32)*13 B; 3-bit E8 lattice, 3.25 bpw)
-    ///   6 = MFP2G32E8     (16 B hdr + (K/32)*9  B; 2-bit E8 lattice, 2.25 bpw)
-    /// Drives the merged dtype-tag-branched gate_up AND down decode kernels.
+    /// (= experts[0]) are NOT representative.
     pub routed_has_mixed_experts: bool,
     pub has_paro_shared: bool, // ffn.paro_shared.is_some()
-    /// Per-expert gate_up tiers for intra-layer mixed-tier dispatch. `None`
-    /// (default) ⇒ today's uniform path (representative `routed_gate_up` drives
-    /// resolution). `Some(table)` with >1 distinct DType marks the layer
-    /// `mixed`; a `Some` table that is all-equal collapses to the uniform path.
-    /// The slice is borrowed from immutable load-time metadata; decode and
-    /// prefill must not rebuild or allocate this table.
+    /// Per-expert gate_up tiers for intra-layer mixed-tier dispatch.
     pub per_expert_gate_up: Option<&'a [DType]>,
-    /// Per-expert down tiers (parallel to `per_expert_gate_up`). Same semantics.
+    /// Per-expert down tiers (parallel to `per_expert_gate_up`).
     pub per_expert_down: Option<&'a [DType]>,
 }
 
 impl MoeDtypes<'_> {
     pub fn has_mq6_projection(&self) -> bool {
-        [
-            self.shared_expert_gate,
-            self.shared_expert_up,
-            self.shared_expert_down,
-            self.routed_gate_up,
-            self.routed_down,
-        ]
-        .iter()
-        // V1 (qt14) and V2 (qt47) are both 6-bit FWHT projections that trip
-        // the gfx1151 MQ4-i8 grouped fence via `force_mq4_grouped_fp16`.
-        .any(|dt| matches!(*dt, DType::MQ6G256 | DType::MQ6G256V2))
+        let shared_has_mq6 = self.shared.is_some_and(|shared| {
+            [shared.selector, shared.gate, shared.up, shared.down]
+                .iter()
+                .any(|dt| matches!(*dt, DType::MQ6G256 | DType::MQ6G256V2))
+        });
+        shared_has_mq6
+            || [self.routed_gate_up, self.routed_down]
+                .iter()
+                .any(|dt| matches!(*dt, DType::MQ6G256 | DType::MQ6G256V2))
     }
 }
 
@@ -205,14 +330,21 @@ impl MoeResolution {
         // scalar fused launcher. Mixed V1/V2 gate-side stays on the generic
         // four-GEMV path. Independent of routed-expert dtype: all rotated MQ
         // families consume the same FwhtG256 activation.
-        let gate_fusable = d.router == MQ4G256
-            && d.shared_gate == MQ4G256
-            && d.shared_expert_gate == MQ4G256
-            && d.shared_expert_up == MQ4G256;
-        let gate_fusable_mq4v2 = d.router == MQ4G256V2
-            && d.shared_gate == MQ4G256V2
-            && d.shared_expert_gate == MQ4G256V2
-            && d.shared_expert_up == MQ4G256V2;
+        let shared = d.shared;
+        // A no-shared recipe cannot enter any shared/gate-quartet fusion.
+        // `has_paro_shared` remains independent metadata for routed Paro.
+        let gate_fusable = shared.is_some_and(|shared| {
+            d.router == MQ4G256
+                && shared.selector == MQ4G256
+                && shared.gate == MQ4G256
+                && shared.up == MQ4G256
+        });
+        let gate_fusable_mq4v2 = shared.is_some_and(|shared| {
+            d.router == MQ4G256V2
+                && shared.selector == MQ4G256V2
+                && shared.gate == MQ4G256V2
+                && shared.up == MQ4G256V2
+        });
         // gate_side_mq4 keeps the stricter all-MQ4 meaning (incl. routed experts)
         // for the rotate/AWQ branch + callers that assume a uniform-MQ4 FFN.
         let gate_side_mq4 = gate_fusable && d.experts_all_gate_up_mq4;
@@ -453,13 +585,13 @@ pub trait RoutedExpertWeights {
 /// [`MoeResolution`] from [`MoeDtypes`] on entry.
 pub struct MoeParams<'a> {
     pub dtypes: MoeDtypes<'a>,
+    pub recipe: MoeRecipe,
+    pub normalization: MoeNormalization<'a>,
     /// Token-batch width. Decode = 1. >1 must route to grouped prefill (Step 8).
-    /// Guarded at runtime matching the bias-aware decode guard.
     pub batch_size: usize,
     // dims / config scalars
     pub hidden: usize,
     pub mi: usize,
-    pub smi: usize,
     pub k: usize,
     pub n_exp: usize,
     pub norm_topk_prob: bool,
@@ -468,38 +600,19 @@ pub struct MoeParams<'a> {
     /// output expanded so the architecture layer can combine it into the
     /// residual while producing the next layer's normalized activation.
     pub defer_routed_combine: bool,
-    /// Sealed decode mode (see [`MoeEpMode`]). `None` = Single (with or
-    /// without the deferred-combine experiment, still `routed_out=None`);
-    /// `RootRoutedPartial` = root-routed EP (requires `routed_out=Some`,
-    /// `defer_routed_combine=false`, root `skip_shared=false`, non-root
-    /// `skip_shared=true`). The sealer rejects any other
-    /// mode/parameter combination before launch.
+    /// Sealed decode mode (see [`MoeEpMode`]).
     pub ep_mode: MoeEpMode,
-    /// Safetensors layer index (== `MoeFfnWeights.layer_idx`). Only used
-    /// by native GPTQ-on-E8 Hessian capture in the CPU-top-K fallback to
-    /// build the per-(tensor,expert) key; ignored on the hot path.
+    /// Safetensors layer index used by native GPTQ-on-E8 Hessian capture.
     pub layer_idx: u16,
     // activations / residual
     pub x_norm: &'a GpuTensor,
     pub x_residual: &'a GpuTensor,
-    /// EP (expert-parallel, Ship 6 substrate-EP) routed-output redirect. When
-    /// `Some`, the routed combine AND the shared-expert down accumulate into
-    /// this **zeroed** partial buffer instead of `x_residual`; the EP executor
-    /// then all-reduces the partial across ranks and adds it into `x_residual`
-    /// once. `None` (default) = single-GPU: accumulate directly into
-    /// `x_residual`, byte-identical to pre-EP behavior.
     pub routed_out: Option<&'a GpuTensor>,
-    /// EP: skip the shared-expert **down** projection so the replicated shared
-    /// expert is computed on rank 0 only (not summed N× by the all-reduce).
-    /// `false` (default) = run it (single-GPU). Router + shared gate/up still
-    /// run on every rank (they share the fused gate-side GEMV with the router).
+    /// EP: skip the shared-expert down projection on non-root ranks.
     pub skip_shared: bool,
     // gate-side weights
     pub router: WeightRef<'a>,
-    pub shared_expert_gate: WeightRef<'a>,
-    pub shared_gate_w: WeightRef<'a>,
-    pub shared_up_w: WeightRef<'a>,
-    pub shared_down_w: WeightRef<'a>,
+    pub shared: Option<MoeSharedDecode<'a>>,
     // routed expert pointer tables + dims
     pub expert_gate_up_ptrs: &'a GpuTensor,
     pub expert_down_ptrs: &'a GpuTensor,
@@ -530,16 +643,9 @@ pub struct MoeParams<'a> {
     pub routed_down_paro: Option<GivensRef<'a>>,
     // scratch buffers
     pub router_logits: &'a GpuTensor,
-    pub scalar_buf: &'a GpuTensor,
     pub x_rot_local: &'a GpuTensor,
-    /// Fused [gate||up] scratch of length `2 * max(mi, smi)`. Used by the
-    /// generic CPU-top-K fallback to receive a single routed expert's fused
-    /// gate_up GEMV output (master wrote `expert.gate_up` into one buffer of
-    /// width `2*mi`, then sliced gate/up halves). The GPU-top-K fast path
-    /// does not read this field.
+    /// Fused [gate||up] scratch for a single routed expert in the host path.
     pub gate_up_buf: &'a GpuTensor,
-    pub gate_buf: &'a GpuTensor,
-    pub up_buf: &'a GpuTensor,
     pub ffn_hidden: &'a GpuTensor,
     pub ffn_out: &'a GpuTensor,
     pub gate_batch: &'a GpuTensor,
@@ -806,6 +912,10 @@ pub struct MoeBiasAwarePrefillParams<'a> {
 pub struct MoePrefillParams<'a> {
     // dtype snapshot
     pub dtypes: MoeDtypes<'a>,
+    pub recipe: MoeRecipe,
+    /// Complete normalization/router/shared prelude. The routed tail below
+    /// remains unchanged and consumes the declared route buffers.
+    pub prelude: MoePrefillPrelude<'a>,
     // dims
     pub batch_size: usize,
     pub mi: usize,
@@ -875,6 +985,264 @@ pub struct MoePrefillParams<'a> {
     /// no all-reduce). `None` (the default) accumulates routed into `x_batch`,
     /// byte-identical to pre-EP behavior.
     pub routed_out: Option<&'a GpuTensor>,
+}
+/// Dtype-only admission snapshot for grouped MoE prefill.
+///
+/// This record intentionally has no architecture dependency. Model loaders
+/// assemble it from their owned weights and pass it to the shared policy.
+#[derive(Debug, Clone, Copy)]
+pub struct MoePrefillDtypes {
+    pub router: DType,
+    pub shared_expert_scalar_gate: DType,
+    pub shared_expert_gate: DType,
+    pub shared_expert_up: DType,
+    pub shared_expert_down: DType,
+    pub expert_gate_up: DType,
+    pub expert_down: DType,
+    pub expert_gate_up_uniform: bool,
+    pub expert_down_uniform: bool,
+    pub routed_mixed_merged: bool,
+}
+
+impl MoePrefillDtypes {
+    /// Construct a uniform prefill dtype snapshot.
+    pub fn uniform(dtype: DType) -> Self {
+        Self {
+            router: dtype,
+            shared_expert_scalar_gate: dtype,
+            shared_expert_gate: dtype,
+            shared_expert_up: dtype,
+            shared_expert_down: dtype,
+            expert_gate_up: dtype,
+            expert_down: dtype,
+            expert_gate_up_uniform: true,
+            expert_down_uniform: true,
+            routed_mixed_merged: false,
+        }
+    }
+}
+
+#[inline]
+pub fn paro_batched_admit_enabled_from_env(value: Option<&str>) -> bool {
+    value == Some("1")
+}
+
+#[inline]
+pub fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
+    k_top == 8 && num_experts <= 1024
+}
+
+/// Quantized routed-expert formats with an implemented Cohere sigmoid
+/// grouped-prefill path.
+#[inline]
+pub fn sigmoid_routed_prefill_supported(gate_up: DType) -> bool {
+    matches!(
+        gate_up,
+        DType::MQ4G256 | DType::HFQ4G256 | DType::MQ6G256 | DType::HFQ6G256
+    )
+}
+
+#[inline]
+pub fn routed_codebook_grouped_supported(dt: DType) -> bool {
+    matches!(
+        dt,
+        DType::MQ4G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
+    )
+}
+
+#[inline]
+pub fn routed_uniform_mqv2_grouped_supported(dt: DType) -> bool {
+    matches!(dt, DType::MQ4G256V2 | DType::MQ6G256V2)
+}
+
+#[inline]
+pub fn routed_codebook_pair_batched_supported(gate_up: DType, down: DType) -> bool {
+    routed_codebook_grouped_supported(gate_up)
+        && routed_codebook_grouped_supported(down)
+        && (matches!(gate_up, DType::MQ2G256Lloyd | DType::MQ3G256Lloyd)
+            || matches!(down, DType::MQ2G256Lloyd | DType::MQ3G256Lloyd))
+}
+
+pub fn codebook_batched_admit_enabled_from_env(
+    value: Option<&str>,
+    grouped_gemm_value: Option<&str>,
+    _arch: &str,
+) -> bool {
+    let grouped_gemm_on = !matches!(grouped_gemm_value, Some("0") | Some("off"));
+    match value {
+        Some("0") | Some("off") | Some("false") => false,
+        Some("1") | Some("on") | Some("true") => grouped_gemm_on,
+        _ => false,
+    }
+}
+
+pub fn codebook_batched_admit_enabled(arch: &str) -> bool {
+    codebook_batched_admit_enabled_from_env(
+        hipfire_config::developer_var("HIPFIRE_MOE_CODEBOOK_BATCHED")
+            .ok()
+            .as_deref(),
+        hipfire_config::developer_var("HIPFIRE_MOE_GROUPED_GEMM")
+            .ok()
+            .as_deref(),
+        arch,
+    )
+}
+
+/// Whether MQ6 grouped prefill is admitted by the process policy.
+pub fn mq6_batched_admit_enabled_from_env(value: Option<&str>, arch: &str) -> bool {
+    match value {
+        Some("0") | Some("off") | Some("false") => false,
+        Some("1") | Some("on") | Some("true") => true,
+        _ => arch.starts_with("gfx11") || arch.starts_with("gfx12"),
+    }
+}
+
+pub fn gated_moe_prefill_admissible_for_dtypes(
+    dtypes: &MoePrefillDtypes,
+    admit_mq6: bool,
+    admit_paro: bool,
+    admit_e8: bool,
+    admit_codebook: bool,
+) -> bool {
+    let router_ok = matches!(
+        dtypes.router,
+        DType::MQ4G256 | DType::MQ4G256V2 | DType::Q8_0 | DType::F32
+    );
+    let shared_gate_ok = matches!(
+        dtypes.shared_expert_scalar_gate,
+        DType::MQ4G256 | DType::MQ4G256V2 | DType::Q8_0 | DType::F32
+    );
+    let routed_ok =
+        dtypes.routed_mixed_merged || (dtypes.expert_gate_up_uniform && dtypes.expert_down_uniform);
+    if !(router_ok && shared_gate_ok && routed_ok) {
+        return false;
+    }
+
+    let is_e8_family = |dt| matches!(dt, DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8);
+    if dtypes.routed_mixed_merged {
+        let shared_gu_ok = (dtypes.shared_expert_gate == dtypes.shared_expert_up
+            && matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ4G256V2))
+            || (admit_mq6
+                && matches!(
+                    dtypes.shared_expert_gate,
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
+                )
+                && dtypes.shared_expert_up == dtypes.shared_expert_gate);
+        let shared_dn_ok = matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ4G256V2)
+            || (admit_mq6
+                && matches!(dtypes.shared_expert_down, DType::MQ6G256 | DType::MQ6G256V2));
+        return shared_gu_ok && shared_dn_ok;
+    }
+
+    if admit_e8
+        && dtypes.shared_expert_gate == DType::Q8_0
+        && dtypes.shared_expert_up == DType::Q8_0
+        && dtypes.shared_expert_down == DType::Q8_0
+        && is_e8_family(dtypes.expert_gate_up)
+        && is_e8_family(dtypes.expert_down)
+    {
+        return true;
+    }
+
+    if admit_e8
+        && is_e8_family(dtypes.expert_gate_up)
+        && is_e8_family(dtypes.expert_down)
+        && dtypes.shared_expert_gate == dtypes.shared_expert_up
+        && matches!(
+            dtypes.shared_expert_gate,
+            DType::Q8_0 | DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8
+        )
+        && matches!(
+            dtypes.shared_expert_down,
+            DType::Q8_0 | DType::MFP4G32E8 | DType::MFP3G32E8 | DType::MFP2G32E8
+        )
+    {
+        return true;
+    }
+
+    if admit_codebook
+        && routed_codebook_pair_batched_supported(dtypes.expert_gate_up, dtypes.expert_down)
+    {
+        let shared_gu_ok = (dtypes.shared_expert_gate == dtypes.shared_expert_up
+            && matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ4G256V2))
+            || (admit_mq6
+                && matches!(
+                    dtypes.shared_expert_gate,
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
+                )
+                && dtypes.shared_expert_up == dtypes.shared_expert_gate);
+        let shared_dn_ok = matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ4G256V2)
+            || (admit_mq6
+                && matches!(dtypes.shared_expert_down, DType::MQ6G256 | DType::MQ6G256V2));
+        if shared_gu_ok && shared_dn_ok {
+            return true;
+        }
+    }
+
+    if admit_paro
+        && dtypes.shared_expert_gate == DType::ParoQ4G128
+        && dtypes.shared_expert_up == DType::ParoQ4G128
+        && dtypes.shared_expert_down == DType::ParoQ4G128
+        && dtypes.expert_gate_up == DType::ParoQ4G128
+        && dtypes.expert_down == DType::ParoQ4G128
+    {
+        return true;
+    }
+
+    if admit_mq6 {
+        let shared_gu_dt = dtypes.shared_expert_gate;
+        let shared_gu_ok = matches!(
+            shared_gu_dt,
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
+        ) && dtypes.shared_expert_up == shared_gu_dt;
+        let shared_dn_ok = matches!(
+            dtypes.shared_expert_down,
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
+        );
+        let experts_ok = matches!(
+            dtypes.expert_gate_up,
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
+        ) && matches!(
+            dtypes.expert_down,
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
+        );
+        shared_gu_ok && shared_dn_ok && experts_ok
+    } else {
+        dtypes.shared_expert_gate == dtypes.shared_expert_up
+            && matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ4G256V2)
+            && matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ4G256V2)
+            && matches!(dtypes.expert_gate_up, DType::MQ4G256 | DType::MQ4G256V2)
+            && matches!(dtypes.expert_down, DType::MQ4G256 | DType::MQ4G256V2)
+    }
+}
+
+/// Shared admission policy for Qwen-style softmax gated/shared prefill.
+pub fn gated_moe_prefill_admissible(
+    dtypes: &MoePrefillDtypes,
+    admit_mq6: bool,
+    arch: &str,
+) -> bool {
+    let admit_e8 = matches!(
+        arch,
+        "gfx1100"
+            | "gfx1101"
+            | "gfx1102"
+            | "gfx1150"
+            | "gfx1151"
+            | "gfx1152"
+            | "gfx1200"
+            | "gfx1201"
+    ) && hipfire_config::developer_var("HIPFIRE_E8_GFX12")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let admit_paro = paro_batched_admit_enabled_from_env(
+        hipfire_config::developer_var("HIPFIRE_PARO_BATCHED")
+            .ok()
+            .as_deref(),
+    );
+    let admit_codebook = codebook_batched_admit_enabled(arch);
+    gated_moe_prefill_admissible_for_dtypes(dtypes, admit_mq6, admit_paro, admit_e8, admit_codebook)
 }
 
 /// Resolved dispatch plan for the qwen35 batched MoE prefill routed block.
@@ -976,6 +1344,8 @@ impl MoePrefillResolution {
     }
 }
 
+use crate::tables::moe_table;
+
 // ── Family ─────────────────────────────────────────────
 
 pub struct MoeFamily {
@@ -1072,10 +1442,12 @@ mod tests {
     fn uniform_mq4() -> MoeDtypes<'static> {
         MoeDtypes {
             router: DType::MQ4G256,
-            shared_gate: DType::MQ4G256,
-            shared_expert_gate: DType::MQ4G256,
-            shared_expert_up: DType::MQ4G256,
-            shared_expert_down: DType::MQ4G256,
+            shared: Some(MoeSharedDtypes {
+                selector: DType::MQ4G256,
+                gate: DType::MQ4G256,
+                up: DType::MQ4G256,
+                down: DType::MQ4G256,
+            }),
             experts_all_gate_up_mq4: true,
             routed_gate_up: DType::MQ4G256,
             routed_down: DType::MQ4G256,
@@ -1084,6 +1456,40 @@ mod tests {
             per_expert_gate_up: None,
             per_expert_down: None,
         }
+    }
+
+    #[test]
+    fn qwen_gate_prerotation_requires_exact_v1_or_ornith_v2_quartet() {
+        assert!(softmax_shared_gate_uniform_mq4(
+            DType::MQ4G256,
+            DType::MQ4G256,
+            DType::MQ4G256,
+            DType::MQ4G256,
+        ));
+        assert!(!softmax_shared_gate_uniform_mq4(
+            DType::MQ4G256V2,
+            DType::MQ4G256V2,
+            DType::MQ4G256V2,
+            DType::MQ4G256V2,
+        ));
+        let exact = [
+            (DType::MQ4G256V2, 256, 2_048, false),
+            (DType::MQ4G256V2, 1, 2_048, false),
+            (DType::MQ4G256V2, 512, 2_048, false),
+            (DType::MQ4G256V2, 512, 2_048, false),
+        ];
+        assert!(softmax_shared_gate_mq4v2_layouts(exact));
+        for slot in 0..4 {
+            let mut mixed = exact;
+            mixed[slot].0 = DType::MQ4G256;
+            assert!(!softmax_shared_gate_mq4v2_layouts(mixed));
+            let mut awq = exact;
+            awq[slot].3 = true;
+            assert!(!softmax_shared_gate_mq4v2_layouts(awq));
+        }
+        let mut wrong_shape = exact;
+        wrong_shape[2].1 = 511;
+        assert!(!softmax_shared_gate_mq4v2_layouts(wrong_shape));
     }
 
     #[test]
@@ -1199,13 +1605,23 @@ mod tests {
         );
 
         d.routed_down = DType::MQ4G256;
-        d.shared_expert_gate = DType::MQ6G256V2;
+        d.shared = Some(MoeSharedDtypes {
+            selector: DType::MQ4G256,
+            gate: DType::MQ6G256V2,
+            up: DType::MQ4G256,
+            down: DType::MQ4G256,
+        });
         assert!(
             d.has_mq6_projection(),
             "shared-expert MQ6V2 must trip has_mq6_projection"
         );
 
-        d.shared_expert_gate = DType::MQ4G256V2;
+        d.shared = Some(MoeSharedDtypes {
+            selector: DType::MQ4G256,
+            gate: DType::MQ4G256V2,
+            up: DType::MQ4G256,
+            down: DType::MQ4G256,
+        });
         assert!(
             !d.has_mq6_projection(),
             "MQ4V2 must not be treated as an MQ6 projection"

@@ -88,6 +88,7 @@ pub struct RuntimeConfig {
     pub experimental_budget_alert: bool,
     pub max_total_think_tokens: usize,
     pub devices: Option<String>,
+    pub emulate_gpus: Option<usize>,
     pub allow_mixed_arch: bool,
     pub uniform_vram_tolerance_gb: Option<f32>,
     pub mtp_mode: String,
@@ -193,6 +194,9 @@ impl RuntimeConfig {
                         .collect::<Vec<_>>()
                         .join(",")
                 }),
+            emulate_gpus: value("HIPFIRE_EMULATE_GPUS")
+                .and_then(|value| value.parse::<usize>().ok())
+                .filter(|&value| value >= 2),
             allow_mixed_arch: value("HIPFIRE_ALLOW_MIXED_ARCH").as_deref() == Some("1"),
             uniform_vram_tolerance_gb: value("HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB")
                 .and_then(|s| s.parse().ok()),
@@ -256,6 +260,35 @@ mod tests {
         assert_eq!(config.ngram_loop_threshold, 12);
         assert_eq!(config.devices.as_deref(), Some("0,1"));
         assert!(config.prefill_batched, "sparse arch defaults remain intact");
+    }
+
+    #[test]
+    fn emulate_gpus_parser_requires_at_least_two() {
+        fn parse(raw: Option<&str>) -> Option<usize> {
+            RuntimeConfig::from_lookup(|name| {
+                if name == "HIPFIRE_EMULATE_GPUS" {
+                    raw.map(str::to_owned)
+                } else {
+                    None
+                }
+            })
+            .emulate_gpus
+        }
+
+        for (raw, expected) in [
+            (None, None),
+            (Some("malformed"), None),
+            (Some("0"), None),
+            (Some("1"), None),
+            (Some("2"), Some(2)),
+            (Some("4"), Some(4)),
+        ] {
+            assert_eq!(
+                parse(raw),
+                expected,
+                "unexpected emulation parse for {raw:?}"
+            );
+        }
     }
 
     #[test]

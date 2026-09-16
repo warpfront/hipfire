@@ -35,7 +35,6 @@ use super::prefill::is_batchable_la;
 use super::prefill::qwen35_layer_batch_admissible;
 use super::prefill::upload_prefill_batch_inputs;
 use super::prefill::PrefillBandCtx;
-use super::prefill::PrefillRouteMode;
 use super::prefill::PREFILL_MAX_BATCH;
 use super::weights::mixed_expert_tag;
 use super::weights::DeltaNetState;
@@ -51,8 +50,14 @@ use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::execute_steps;
+use hipfire_dispatch::pipeline::sealed_moe::PrefillRouteMode;
+
 use hipfire_dispatch::pipeline::GemvInput;
 use hipfire_dispatch::pipeline::Step;
+use hipfire_runtime::ep::{
+    execute_root_routed_ep, EpRouteBuffers, RootRoutedEpOperands, RootRoutedEpReduction,
+    RootRoutedEpSchedule,
+};
 use hipfire_runtime::llama;
 use hipfire_runtime::llama::fused_rmsnorm_rotate_for_mq;
 use hipfire_runtime::llama::weight_gemv_prerotated;
@@ -61,6 +66,7 @@ use hipfire_runtime::llama::EmbeddingFormat;
 use hipfire_runtime::llama::WeightTensor;
 use hipfire_runtime::multi_gpu::Gpus;
 use rdna_compute::DType;
+use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
 
 fn layer_moe_ffn(layer: &LayerWeights) -> Option<&MoeFfnWeights> {
@@ -71,9 +77,85 @@ fn layer_moe_ffn(layer: &LayerWeights) -> Option<&MoeFfnWeights> {
     }
 }
 
-/// Validate EP batch compatibility for the exact 4×gfx1201 MQ4R route.
-/// Fails closed on any mismatch: arch, PP, provenance, geometry, dtype,
-/// REAP/paged/AWQ/GL, Q8/EF, capacities, LDS. Returns attested receipt on success.
+fn layer_moe_ffn_norm(layer: &LayerWeights) -> Option<&GpuTensor> {
+    match layer {
+        LayerWeights::DeltaNetMoe(weights) => Some(&weights.ffn_norm),
+        LayerWeights::FullAttnMoe(weights) => Some(&weights.ffn_norm),
+        _ => None,
+    }
+}
+
+fn validate_ep_batch_architecture(
+    architectures: &[&str],
+    physical_devices: &[i32],
+    emulation_enabled: bool,
+) -> HipResult<()> {
+    if architectures.len() != 4 {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "EP batch: architecture list must contain 4 ranks, got {}",
+                architectures.len()
+            ),
+        ));
+    }
+    if physical_devices.len() != 4 {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "EP batch: physical device list must contain 4 ranks, got {}",
+                physical_devices.len()
+            ),
+        ));
+    }
+    if let Some((rank, &device)) = physical_devices
+        .iter()
+        .enumerate()
+        .find(|(_, &device)| device < 0)
+    {
+        return Err(HipError::new(
+            0,
+            &format!("EP batch: rank {rank} has invalid physical device id {device}"),
+        ));
+    }
+
+    if emulation_enabled {
+        if architectures.iter().all(|&arch| arch == "gfx1151") {
+            let physical_device = physical_devices[0];
+            if physical_devices
+                .iter()
+                .all(|&device| device == physical_device)
+            {
+                return Ok(());
+            }
+            return Err(HipError::new(
+                0,
+                "EP batch: emulation requires all gfx1151 ranks to alias one physical device",
+            ));
+        }
+        return Err(HipError::new(
+            0,
+            "EP batch: emulation requires exactly four gfx1151 ranks",
+        ));
+    }
+
+    if architectures.iter().all(|&arch| arch == "gfx1201") {
+        return Ok(());
+    }
+    let (rank, arch) = architectures
+        .iter()
+        .enumerate()
+        .find(|(_, &arch)| arch != "gfx1201")
+        .expect("non-gfx1201 architecture must exist");
+    Err(HipError::new(
+        0,
+        &format!("EP batch: rank {rank} arch {arch} != gfx1201"),
+    ))
+}
+
+/// Validate EP batch compatibility for the exact four-rank MQ4R route:
+/// ordinary execution requires gfx1201 on every rank; diagnostic emulation
+/// requires four gfx1151 logical ranks aliased to one physical device.
 pub fn validate_ep_batch_compatibility(
     gpus: &Gpus,
     weights_per_rank: &[Qwen35Weights],
@@ -117,14 +199,22 @@ pub fn validate_ep_batch_compatibility(
             ),
         ));
     }
-    for (i, dev) in gpus.devices.iter().enumerate() {
-        if !dev.arch_caps.is_gfx1201() {
-            return Err(HipError::new(
-                0,
-                &format!("EP batch: rank {i} arch {} != gfx1201", dev.arch),
-            ));
-        }
-    }
+    let emulation_enabled = hipfire_runtime::config::get().emulate_gpus.is_some();
+    let architectures: Vec<&str> = gpus
+        .devices
+        .iter()
+        .map(|dev| {
+            if dev.arch_caps.is_gfx1201() {
+                "gfx1201"
+            } else if dev.arch_caps.is_gfx1151() {
+                "gfx1151"
+            } else {
+                dev.arch.as_str()
+            }
+        })
+        .collect();
+    let physical_devices: Vec<i32> = gpus.devices.iter().map(|dev| dev.device_id).collect();
+    validate_ep_batch_architecture(&architectures, &physical_devices, emulation_enabled)?;
     if gpus.layer_to_device.len() != config.n_layers {
         return Err(HipError::new(
             0,
@@ -1084,6 +1174,625 @@ impl EpBatchBuildGuard {
         )
     }
 }
+struct PrefillRootScheduleContext<'a> {
+    weights: &'a [Qwen35Weights],
+    config: &'a Qwen35Config,
+    tokens: &'a [u32],
+    start_pos: usize,
+    kv_per_rank: &'a mut [llama::KvCache],
+    dn_per_rank: &'a mut [DeltaNetState],
+    scratch_per_rank: &'a [Qwen35Scratch],
+    pbs_per_rank: &'a [PrefillBatchScratch],
+    layer_idx: usize,
+    delta_layer_offset: usize,
+    kv_layer_offset: usize,
+    pre_uploaded: bool,
+    pre_embedded: bool,
+    semantics: BatchSemantics<'a>,
+    contract_id: u64,
+    rank_count: usize,
+    reduce_count: usize,
+    route_count: usize,
+    contribution_count: usize,
+}
+
+impl PrefillRootScheduleContext<'_> {
+    fn ffn(&self, rank: usize) -> Result<&MoeFfnWeights, hipfire_dispatch::types::DispatchError> {
+        layer_moe_ffn(
+            self.weights
+                .get(rank)
+                .and_then(|w| w.layers.get(self.layer_idx))
+                .ok_or_else(|| {
+                    hipfire_dispatch::types::DispatchError::Hip(format!(
+                        "Qwen root EP rank {rank} layer {} is unavailable",
+                        self.layer_idx
+                    ))
+                })?,
+        )
+        .ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP rank {rank} layer {} is not MoE",
+                self.layer_idx
+            ))
+        })
+    }
+
+    fn preflight_rank(&self, rank: usize, gpu: &Gpu, partial: &GpuTensor) -> HipResult<()> {
+        let ffn = self
+            .ffn(rank)
+            .map_err(|e| HipError::new(0, &e.to_string()))?;
+        let ffn_norm = self
+            .weights
+            .get(rank)
+            .and_then(|weights| weights.layers.get(self.layer_idx))
+            .and_then(layer_moe_ffn_norm)
+            .ok_or_else(|| HipError::new(0, "Qwen root EP preflight missing ffn norm"))?;
+
+        let bound = ffn.bound_experts()?;
+        let contract = bound
+            .execution_contract()
+            .ok_or_else(|| HipError::new(0, "Qwen root EP preflight missing execution contract"))?;
+        if bound.local_rank() != rank
+            || bound.rank_count() != self.rank_count
+            || contract.contract_id() != self.contract_id
+            || !contract.is_root_routed_ep()
+        {
+            return Err(HipError::new(
+                0,
+                &format!("Qwen root EP rank {rank} disagrees with admitted schedule"),
+            ));
+        }
+        let routed = partial.sub_offset(0, self.reduce_count);
+        let dispatch_ctx = DispatchCtx::new(gpu);
+        super::prefill::preflight_moe_ffn_batched_ep(
+            gpu,
+            ffn,
+            ffn_norm,
+            self.config,
+            self.pbs_per_rank
+                .get(rank)
+                .ok_or_else(|| HipError::new(0, "Qwen root EP PBS rank is unavailable"))?,
+            self.tokens.len(),
+            &dispatch_ctx,
+            self.model_has_mq6_moe_for_rank(rank),
+            &routed,
+        )
+    }
+
+    fn model_has_mq6_moe_for_rank(&self, rank: usize) -> bool {
+        self.weights
+            .get(rank)
+            .map(|weights| weights.moe_has_mq6)
+            .unwrap_or(false)
+    }
+
+    fn band<'a>(&self, route: PrefillRouteMode<'a>) -> PrefillBandCtx<'a> {
+        PrefillBandCtx {
+            layer_start: self.layer_idx,
+            layer_end: self.layer_idx + 1,
+            delta_layer_offset: self.delta_layer_offset,
+            kv_layer_offset: self.kv_layer_offset,
+            is_first_band: self.layer_idx == 0,
+            is_last_band: false,
+            givens_cos: None,
+            givens_sin: None,
+            route,
+        }
+    }
+
+    fn run_rank(
+        &mut self,
+        gpu: &mut Gpu,
+        rank: usize,
+        band: &PrefillBandCtx<'_>,
+        partial: &GpuTensor,
+    ) -> HipResult<()> {
+        let routed = partial.sub_offset(0, self.reduce_count);
+        forward_batch_chunk_impl(
+            gpu,
+            &self.weights[rank],
+            self.config,
+            self.tokens,
+            self.start_pos,
+            &mut self.kv_per_rank[rank],
+            &mut self.dn_per_rank[rank],
+            &self.scratch_per_rank[rank],
+            &self.pbs_per_rank[rank],
+            None,
+            None,
+            None,
+            0,
+            None,
+            self.pre_uploaded,
+            self.pre_embedded,
+            Some(band),
+            None,
+            false,
+            None,
+            Some(&routed),
+            self.semantics,
+            DflashFusionCtx::Off,
+        )
+    }
+
+    fn root_compute(
+        &mut self,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+    ) -> Result<
+        hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof,
+        hipfire_dispatch::types::DispatchError,
+    > {
+        let proof_slot = std::cell::Cell::new(None);
+        let band = self.band(PrefillRouteMode::ProduceRoot { slot: &proof_slot });
+        self.run_rank(gpu, 0, &band, partial)
+            .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))?;
+        proof_slot.get().ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(
+                "Qwen root EP root produced no prefill route proof".into(),
+            )
+        })
+    }
+
+    fn rank_contribute(
+        &mut self,
+        gpu: &mut Gpu,
+        rank: usize,
+        proof: &hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof,
+        partial: &GpuTensor,
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let band = self.band(PrefillRouteMode::AdoptRoot { proof });
+        self.run_rank(gpu, rank, &band, partial)
+            .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
+    }
+
+    fn route_buffers(
+        &self,
+        rank: usize,
+    ) -> Result<EpRouteBuffers<'_>, hipfire_dispatch::types::DispatchError> {
+        let pbs = self.pbs_per_rank.get(rank).ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP route rank {rank} PBS is unavailable"
+            ))
+        })?;
+        let ids = pbs.moe_topk_indices_batch.as_ref().ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP route rank {rank} IDs are unavailable"
+            ))
+        })?;
+        let weights = pbs.moe_topk_weights_batch.as_ref().ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP route rank {rank} weights are unavailable"
+            ))
+        })?;
+        Ok(EpRouteBuffers {
+            ids: &ids.buf,
+            weights: &weights.buf,
+            slot_outputs: &self.slot_outputs(rank)?.buf,
+        })
+    }
+
+    fn slot_outputs(
+        &self,
+        rank: usize,
+    ) -> Result<&GpuTensor, hipfire_dispatch::types::DispatchError> {
+        let pbs = self.pbs_per_rank.get(rank).ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP slot-output rank {rank} PBS is unavailable"
+            ))
+        })?;
+        let output = pbs.moe_down_expanded_batch.as_ref();
+        output.ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP slot-output rank {rank} is unavailable"
+            ))
+        })
+    }
+
+    fn finish_combine(
+        &mut self,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let ffn = self.ffn(0)?;
+        let ffn_norm = self.weights[0]
+            .layers
+            .get(self.layer_idx)
+            .and_then(layer_moe_ffn_norm)
+            .ok_or_else(|| {
+                hipfire_dispatch::types::DispatchError::Hip(
+                    "Qwen root EP combine missing ffn norm".into(),
+                )
+            })?;
+        let routed = partial.sub_offset(0, self.reduce_count);
+        let dispatch_ctx = DispatchCtx::new(gpu);
+        super::prefill::finish_moe_ffn_batched_ep_slot_order(
+            gpu,
+            ffn,
+            ffn_norm,
+            self.config,
+            &self.pbs_per_rank[0],
+            self.tokens.len(),
+            &dispatch_ctx,
+            self.model_has_mq6_moe_for_rank(0),
+            &routed,
+        )
+        .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_prefill_root_schedule(
+    gpus: &mut Gpus,
+    context: &mut PrefillRootScheduleContext<'_>,
+    schedule: RootRoutedEpSchedule,
+    partials: &[GpuTensor],
+    peer_lease: Option<&hipfire_runtime::multi_gpu::PeerReduceScratchLease>,
+) -> HipResult<()> {
+    let partial_bytes = context
+        .reduce_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| HipError::new(0, "Qwen root EP partial byte count overflow"))?;
+    let reduce_count = context.reduce_count;
+    let route_count = context.route_count;
+    let contribution_count = context.contribution_count;
+    let operands = RootRoutedEpOperands {
+        partials,
+        partial_bytes,
+        reduce_count,
+        route_count,
+        contribution_count,
+        contribution_chunk: context.reduce_count,
+    };
+    execute_root_routed_ep(
+        gpus,
+        context,
+        schedule,
+        operands,
+        peer_lease,
+        |ctx, gpu, partial| {
+            ctx.preflight_rank(0, gpu, partial)
+                .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
+                .map(|_| ())
+        },
+        |ctx, rank, gpu, partial, _admission| {
+            ctx.preflight_rank(rank, gpu, partial)
+                .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
+        },
+        |ctx, gpu, partial, _admission| ctx.root_compute(gpu, partial),
+        |ctx, rank| ctx.route_buffers(rank),
+        |ctx, rank, gpu, proof, partial| ctx.rank_contribute(gpu, rank, proof, partial),
+        |_ctx, _gpus, _count| Ok(()),
+        |ctx, gpu, partial| ctx.finish_combine(gpu, partial),
+        |_ctx, _rank, _gpu, _partial| Ok(()),
+        |ctx, rank, gpu, partial| {
+            let dst = ctx.pbs_per_rank[rank]
+                .x_batch
+                .sub_offset(0, ctx.reduce_count);
+            let src = partial.sub_offset(0, ctx.reduce_count);
+            gpu.add_inplace_f32(&dst, &src)
+                .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
+        },
+    )
+    .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
+struct TickRootScheduleContext<'a> {
+    weights: &'a [Qwen35Weights],
+    config: &'a Qwen35Config,
+    tokens: &'a [u32],
+    positions: &'a [usize],
+    lane_capacity: usize,
+    active_mask: u64,
+    ranks: &'a mut [Qwen35DecodeBatchState],
+    scratches: &'a [Qwen35Scratch],
+    layer_idx: usize,
+    delta_layer_offset: usize,
+    kv_layer_offset: usize,
+    pre_uploaded: bool,
+    pre_embedded: bool,
+    contract_id: u64,
+    rank_count: usize,
+    reduce_count: usize,
+    route_count: usize,
+    contribution_count: usize,
+    model_has_mq6_moe: bool,
+    full_mask: u64,
+}
+
+impl TickRootScheduleContext<'_> {
+    fn ffn(&self, rank: usize) -> Result<&MoeFfnWeights, hipfire_dispatch::types::DispatchError> {
+        layer_moe_ffn(
+            self.weights
+                .get(rank)
+                .and_then(|w| w.layers.get(self.layer_idx))
+                .ok_or_else(|| {
+                    hipfire_dispatch::types::DispatchError::Hip(format!(
+                        "Qwen root EP rank {rank} layer {} is unavailable",
+                        self.layer_idx
+                    ))
+                })?,
+        )
+        .ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP rank {rank} layer {} is not MoE",
+                self.layer_idx
+            ))
+        })
+    }
+
+    fn preflight_rank(&self, rank: usize, gpu: &Gpu, partial: &GpuTensor) -> HipResult<()> {
+        let ffn = self
+            .ffn(rank)
+            .map_err(|e| HipError::new(0, &e.to_string()))?;
+        let ffn_norm = self
+            .weights
+            .get(rank)
+            .and_then(|weights| weights.layers.get(self.layer_idx))
+            .and_then(layer_moe_ffn_norm)
+            .ok_or_else(|| HipError::new(0, "Qwen root EP preflight missing ffn norm"))?;
+
+        let bound = ffn.bound_experts()?;
+        let contract = bound
+            .execution_contract()
+            .ok_or_else(|| HipError::new(0, "Qwen root EP preflight missing execution contract"))?;
+        if bound.local_rank() != rank
+            || bound.rank_count() != self.rank_count
+            || contract.contract_id() != self.contract_id
+            || !contract.is_root_routed_ep()
+        {
+            return Err(HipError::new(
+                0,
+                &format!("Qwen root EP rank {rank} disagrees with admitted schedule"),
+            ));
+        }
+        let routed = partial.sub_offset(0, self.reduce_count);
+        let dispatch_ctx = DispatchCtx::new(gpu);
+        super::prefill::preflight_moe_ffn_batched_ep(
+            gpu,
+            ffn,
+            ffn_norm,
+            self.config,
+            &self.ranks[rank].pbs,
+            self.tokens.len(),
+            &dispatch_ctx,
+            self.model_has_mq6_moe,
+            &routed,
+        )
+    }
+
+    fn band<'a>(&self, route: PrefillRouteMode<'a>) -> PrefillBandCtx<'a> {
+        PrefillBandCtx {
+            layer_start: self.layer_idx,
+            layer_end: self.layer_idx + 1,
+            delta_layer_offset: self.delta_layer_offset,
+            kv_layer_offset: self.kv_layer_offset,
+            is_first_band: self.layer_idx == 0,
+            is_last_band: false,
+            givens_cos: None,
+            givens_sin: None,
+            route,
+        }
+    }
+
+    fn run_rank(
+        &mut self,
+        gpu: &mut Gpu,
+        rank: usize,
+        band: &PrefillBandCtx<'_>,
+        partial: &GpuTensor,
+    ) -> HipResult<()> {
+        let routed = partial.sub_offset(0, self.reduce_count);
+        let state = &mut self.ranks[rank];
+        forward_batch_chunk_impl(
+            gpu,
+            &self.weights[rank],
+            self.config,
+            self.tokens,
+            0,
+            &mut state.kv_cache,
+            &mut state.dn_state,
+            &self.scratches[rank],
+            &state.pbs,
+            None,
+            None,
+            None,
+            0,
+            None,
+            self.pre_uploaded,
+            self.pre_embedded,
+            Some(band),
+            None,
+            false,
+            None,
+            Some(&routed),
+            BatchSemantics::Independent {
+                positions: self.positions,
+                lane_capacity: self.lane_capacity,
+                active_mask: self.active_mask,
+            },
+            DflashFusionCtx::Off,
+        )
+    }
+
+    fn root_compute(
+        &mut self,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+    ) -> Result<
+        hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof,
+        hipfire_dispatch::types::DispatchError,
+    > {
+        let proof_slot = std::cell::Cell::new(None);
+        let band = self.band(PrefillRouteMode::ProduceRoot { slot: &proof_slot });
+        self.run_rank(gpu, 0, &band, partial)
+            .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))?;
+        proof_slot.get().ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(
+                "Qwen root EP root produced no prefill route proof".into(),
+            )
+        })
+    }
+
+    fn rank_contribute(
+        &mut self,
+        gpu: &mut Gpu,
+        rank: usize,
+        proof: &hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof,
+        partial: &GpuTensor,
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let band = self.band(PrefillRouteMode::AdoptRoot { proof });
+        self.run_rank(gpu, rank, &band, partial)
+            .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
+    }
+
+    fn route_buffers(
+        &self,
+        rank: usize,
+    ) -> Result<EpRouteBuffers<'_>, hipfire_dispatch::types::DispatchError> {
+        let pbs = &self
+            .ranks
+            .get(rank)
+            .ok_or_else(|| {
+                hipfire_dispatch::types::DispatchError::Hip(format!(
+                    "Qwen root EP route rank {rank} state is unavailable"
+                ))
+            })?
+            .pbs;
+        let ids = pbs.moe_topk_indices_batch.as_ref().ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP route rank {rank} IDs are unavailable"
+            ))
+        })?;
+        let weights = pbs.moe_topk_weights_batch.as_ref().ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP route rank {rank} weights are unavailable"
+            ))
+        })?;
+        Ok(EpRouteBuffers {
+            ids: &ids.buf,
+            weights: &weights.buf,
+            slot_outputs: &self.slot_outputs(rank)?.buf,
+        })
+    }
+
+    fn slot_outputs(
+        &self,
+        rank: usize,
+    ) -> Result<&GpuTensor, hipfire_dispatch::types::DispatchError> {
+        let pbs = &self
+            .ranks
+            .get(rank)
+            .ok_or_else(|| {
+                hipfire_dispatch::types::DispatchError::Hip(format!(
+                    "Qwen root EP slot-output rank {rank} state is unavailable"
+                ))
+            })?
+            .pbs;
+        let output = pbs.moe_down_expanded_batch.as_ref();
+        output.ok_or_else(|| {
+            hipfire_dispatch::types::DispatchError::Hip(format!(
+                "Qwen root EP slot-output rank {rank} is unavailable"
+            ))
+        })
+    }
+
+    fn finish_combine(
+        &mut self,
+        gpu: &mut Gpu,
+        partial: &GpuTensor,
+    ) -> Result<(), hipfire_dispatch::types::DispatchError> {
+        let ffn = self.ffn(0)?;
+        let ffn_norm = self.weights[0]
+            .layers
+            .get(self.layer_idx)
+            .and_then(layer_moe_ffn_norm)
+            .ok_or_else(|| {
+                hipfire_dispatch::types::DispatchError::Hip(
+                    "Qwen root EP combine missing ffn norm".into(),
+                )
+            })?;
+        let routed = partial.sub_offset(0, self.reduce_count);
+        let dispatch_ctx = DispatchCtx::new(gpu);
+        super::prefill::finish_moe_ffn_batched_ep_slot_order(
+            gpu,
+            ffn,
+            ffn_norm,
+            self.config,
+            &self.ranks[0].pbs,
+            self.tokens.len(),
+            &dispatch_ctx,
+            self.model_has_mq6_moe,
+            &routed,
+        )
+        .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_tick_root_schedule(
+    gpus: &mut Gpus,
+    context: &mut TickRootScheduleContext<'_>,
+    schedule: RootRoutedEpSchedule,
+    partials: &[GpuTensor],
+    peer_lease: Option<&hipfire_runtime::multi_gpu::PeerReduceScratchLease>,
+) -> HipResult<()> {
+    let partial_bytes = context
+        .reduce_count
+        .checked_mul(std::mem::size_of::<f32>())
+        .ok_or_else(|| HipError::new(0, "Qwen root EP partial byte count overflow"))?;
+    let reduce_count = context.reduce_count;
+    let route_count = context.route_count;
+    let operands = RootRoutedEpOperands {
+        partials,
+        partial_bytes,
+        reduce_count,
+        route_count,
+        contribution_count: context.contribution_count,
+        contribution_chunk: context.reduce_count,
+    };
+    execute_root_routed_ep(
+        gpus,
+        context,
+        schedule,
+        operands,
+        peer_lease,
+        |ctx, gpu, partial| {
+            ctx.preflight_rank(0, gpu, partial)
+                .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
+                .map(|_| ())
+        },
+        |ctx, rank, gpu, partial, _admission| {
+            ctx.preflight_rank(rank, gpu, partial)
+                .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
+        },
+        |ctx, gpu, partial, _admission| ctx.root_compute(gpu, partial),
+        |ctx, rank| ctx.route_buffers(rank),
+        |ctx, rank, gpu, proof, partial| ctx.rank_contribute(gpu, rank, proof, partial),
+        |_ctx, _gpus, _count| Ok(()),
+        |ctx, gpu, partial| ctx.finish_combine(gpu, partial),
+        |ctx, _rank, gpu, partial| {
+            if ctx.active_mask != ctx.full_mask {
+                gpu.zero_inactive_rows_f32(
+                    partial,
+                    ctx.tokens.len(),
+                    ctx.config.dim,
+                    ctx.active_mask,
+                )
+                .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))?;
+            }
+            Ok(())
+        },
+        |ctx, rank, gpu, partial| {
+            let dst = ctx.ranks[rank].pbs.x_batch.sub_offset(0, ctx.reduce_count);
+            let src = partial.sub_offset(0, ctx.reduce_count);
+            gpu.add_inplace_f32(&dst, &src)
+                .map_err(|e| hipfire_dispatch::types::DispatchError::Hip(e.to_string()))
+        },
+    )
+    .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
 impl Qwen35DecodeBatchEpState {
     pub fn max_batch(&self) -> usize {
         self.max_batch
@@ -1136,6 +1845,32 @@ impl Qwen35DecodeBatchEpState {
     pub fn lane_state(&self, lane: usize) -> Option<LaneState> {
         self.lane_states.get(lane).copied()
     }
+    /// Download the root logits and every rank's post-combine residual.
+    ///
+    /// This read-only diagnostic seam is consumed by the ignored route oracle;
+    /// it intentionally exposes no mutable batch state or product-facing API.
+    #[doc(hidden)]
+    pub fn download_rank_outputs(&self, gpus: &mut Gpus) -> HipResult<(Vec<f32>, Vec<Vec<f32>>)> {
+        if gpus.devices.len() != self.ranks.len() || gpus.devices.is_empty() {
+            return Err(HipError::new(
+                0,
+                "download_rank_outputs: rank count mismatch",
+            ));
+        }
+        let mut root_logits = None;
+        let mut residuals = Vec::with_capacity(self.ranks.len());
+        for rank in 0..self.ranks.len() {
+            let gpu = &mut gpus.devices[rank];
+            gpu.bind_thread()?;
+            gpu.hip.device_synchronize()?;
+            if rank == 0 {
+                root_logits = Some(gpu.download_f32(&self.ranks[rank].logits)?);
+            }
+            residuals.push(gpu.download_f32(&self.ranks[rank].pbs.x_batch)?);
+        }
+        Ok((root_logits.expect("non-empty rank outputs"), residuals))
+    }
+
     pub fn new(
         gpus: &mut Gpus,
         weights_per_rank: &[Qwen35Weights],
@@ -1546,7 +2281,7 @@ impl Qwen35DecodeBatchEpState {
                     } else {
                         false
                     };
-                    if is_moe {
+                    if is_moe && !compact_ep {
                         for rank in 0..n {
                             gpus.devices[rank].bind_thread()?;
                             let partial = &self.seed_partials[rank];
@@ -1564,148 +2299,87 @@ impl Qwen35DecodeBatchEpState {
                         }
                     }
                     if is_moe && compact_ep {
-                        // Root produces the route (router GEMM + softmax/topk
-                        // ONLY on rank 0); the proof is captured through the
-                        // band-carried stack cell, no heap allocation.
-                        let proof_slot: std::cell::Cell<
-                            Option<
-                                hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof,
-                            >,
-                        > = std::cell::Cell::new(None);
-                        {
-                            gpus.devices[0].bind_thread()?;
-                            let band = PrefillBandCtx {
-                                layer_start: layer_idx,
-                                layer_end: layer_idx + 1,
-                                delta_layer_offset: delta_off,
-                                kv_layer_offset: fa_off,
-                                is_first_band: layer_idx == 0,
-                                is_last_band: false,
-                                givens_cos: None,
-                                givens_sin: None,
-                                route: PrefillRouteMode::ProduceRoot { slot: &proof_slot },
-                            };
-                            let routed_out =
-                                Some(self.seed_partials[0].sub_offset(0, chunk_n * dim));
-                            let rank_scratch = &self.scratches[0];
-                            let rank_pbs = &self.seed_pbs[0];
-                            let rank_kv = &mut kv_lanes[0];
-                            let rank_dn = &mut dn_lanes[0];
-                            forward_batch_chunk_impl(
-                                &mut gpus.devices[0],
-                                &weights_per_rank[0],
-                                config,
-                                chunk,
-                                start_pos,
-                                rank_kv,
-                                rank_dn,
-                                rank_scratch,
-                                rank_pbs,
-                                None,
-                                None,
-                                None,
-                                0,
-                                None,
-                                true,
-                                false,
-                                Some(&band),
-                                None,
-                                false,
-                                None,
-                                routed_out.as_ref(),
-                                BatchSemantics::Sequential,
-                                DflashFusionCtx::Off,
-                            )?;
-                        }
-                        let root_proof = proof_slot.get().ok_or_else(|| {
-                            HipError::new(0, "prefill_lane: root produced no route proof")
+                        let ffn = layer_moe_ffn(&weights_per_rank[0].layers[layer_idx])
+                            .ok_or_else(|| HipError::new(0, "prefill_lane: MoE FFN missing"))?;
+                        let bound = ffn.bound_experts()?;
+                        let contract = bound.execution_contract().ok_or_else(|| {
+                            HipError::new(0, "prefill_lane: MoE execution contract missing")
                         })?;
-                        // Broadcast the root's first N*k route entries to the
-                        // other ranks (device-to-device, no host bytes; `k`
-                        // is the FLAT element count).
-                        {
-                            let k_flat = chunk_n.checked_mul(k_top).ok_or_else(|| {
-                                HipError::new(0, "prefill_lane: route count overflow")
+                        let reduce_count = chunk_n.checked_mul(dim).ok_or_else(|| {
+                            HipError::new(0, "prefill_lane: reduction count overflow")
+                        })?;
+                        let partial_bytes = reduce_count
+                            .checked_mul(std::mem::size_of::<f32>())
+                            .ok_or_else(|| {
+                                HipError::new(0, "prefill_lane: partial byte count overflow")
                             })?;
-                            let root_ids = self.seed_pbs[0]
-                                .moe_topk_indices_batch
-                                .as_ref()
-                                .expect("moe scratch");
-                            let root_weights = self.seed_pbs[0]
-                                .moe_topk_weights_batch
-                                .as_ref()
-                                .expect("moe scratch");
-                            gpus.broadcast_ep_route(
-                                &root_ids.buf,
-                                &root_weights.buf,
-                                |r| {
-                                    let pbs = &self.seed_pbs[r];
-                                    (
-                                        &pbs.moe_topk_indices_batch
-                                            .as_ref()
-                                            .expect("moe scratch")
-                                            .buf,
-                                        &pbs.moe_topk_weights_batch
-                                            .as_ref()
-                                            .expect("moe scratch")
-                                            .buf,
-                                    )
-                                },
-                                k_flat,
-                            )
-                            .map_err(|e| HipError::new(0, &e.to_string()))?;
-                        }
-                        // Non-roots adopt the proof and execute the grouped
-                        // MoE over the broadcast bytes. Shared stays
-                        // replicated; routed partials reduce once below.
-                        for rank in 1..n {
-                            gpus.devices[rank].bind_thread()?;
-                            let band = PrefillBandCtx {
-                                layer_start: layer_idx,
-                                layer_end: layer_idx + 1,
-                                delta_layer_offset: delta_off,
-                                kv_layer_offset: fa_off,
-                                is_first_band: layer_idx == 0,
-                                is_last_band: false,
-                                givens_cos: None,
-                                givens_sin: None,
-                                route: PrefillRouteMode::AdoptRoot { proof: &root_proof },
-                            };
-                            let routed_out = if is_moe {
-                                Some(self.seed_partials[rank].sub_offset(0, chunk_n * dim))
-                            } else {
-                                None
-                            };
-                            let rank_scratch = &self.scratches[rank];
-                            let rank_pbs = &self.seed_pbs[rank];
-                            let rank_kv = &mut kv_lanes[rank];
-                            let rank_dn = &mut dn_lanes[rank];
-                            forward_batch_chunk_impl(
-                                &mut gpus.devices[rank],
-                                &weights_per_rank[rank],
-                                config,
-                                chunk,
-                                start_pos,
-                                rank_kv,
-                                rank_dn,
-                                rank_scratch,
-                                rank_pbs,
-                                None,
-                                None,
-                                None,
-                                0,
-                                None,
-                                true,
-                                false,
-                                Some(&band),
-                                None,
-                                false,
-                                None,
-                                routed_out.as_ref(),
-                                BatchSemantics::Sequential,
-                                DflashFusionCtx::Off,
-                            )?;
-                        }
+                        let route_count = chunk_n.checked_mul(k_top).ok_or_else(|| {
+                            HipError::new(0, "prefill_lane: route count overflow")
+                        })?;
+                        let ffn_norm = layer_moe_ffn_norm(&weights_per_rank[0].layers[layer_idx])
+                            .ok_or_else(|| {
+                            HipError::new(0, "prefill_lane: MoE FFN norm missing")
+                        })?;
+                        let routed = self.seed_partials[0].sub_offset(0, reduce_count);
+                        let dispatch_ctx = DispatchCtx::new(&gpus.devices[0]);
+                        let contribution_count = super::prefill::moe_ffn_batched_ep_slot_geometry(
+                            &gpus.devices[0],
+                            ffn,
+                            ffn_norm,
+                            config,
+                            &self.seed_pbs[0],
+                            chunk_n,
+                            &dispatch_ctx,
+                            weights_per_rank[0].moe_has_mq6,
+                            &routed,
+                        )?;
+                        let schedule = RootRoutedEpSchedule::derive(
+                            contract,
+                            n,
+                            layer_idx,
+                            route_count,
+                            partial_bytes,
+                            reduce_count,
+                            contribution_count,
+                            reduce_count,
+                            RootRoutedEpReduction::Prefill,
+                        )
+                        .map_err(|e| HipError::new(0, &e.to_string()))?;
+                        let scratch_per_rank = &self.scratches;
+                        let pbs_per_rank = &self.seed_pbs;
+                        let partials = self.seed_partials.as_slice();
+                        let peer_lease = self.peer_lease.as_ref();
+                        let mut schedule_context = PrefillRootScheduleContext {
+                            weights: weights_per_rank,
+                            config,
+                            tokens: chunk,
+                            start_pos,
+                            kv_per_rank: &mut kv_lanes,
+                            dn_per_rank: &mut dn_lanes,
+                            scratch_per_rank,
+                            pbs_per_rank,
+                            layer_idx,
+                            delta_layer_offset: delta_off,
+                            kv_layer_offset: fa_off,
+                            pre_uploaded: true,
+                            pre_embedded: false,
+                            semantics: BatchSemantics::Sequential,
+                            contract_id: schedule.contract_id(),
+                            rank_count: n,
+                            contribution_count,
+                            reduce_count,
+                            route_count,
+                        };
+                        execute_prefill_root_schedule(
+                            gpus,
+                            &mut schedule_context,
+                            schedule,
+                            partials,
+                            peer_lease,
+                        )?;
+                        observed = observed
+                            .checked_add(1)
+                            .ok_or_else(|| HipError::new(0, "prefill observed overflow"))?;
                     } else {
                         for rank in 0..n {
                             gpus.devices[rank].bind_thread()?;
@@ -1756,7 +2430,7 @@ impl Qwen35DecodeBatchEpState {
                             )?;
                         }
                     }
-                    if is_moe {
+                    if is_moe && !compact_ep {
                         let count = chunk_n * dim;
                         let bufs: Vec<&hip_bridge::DeviceBuffer> =
                             self.seed_partials.iter().map(|t| &t.buf).collect();
@@ -1967,19 +2641,7 @@ impl Qwen35DecodeBatchEpState {
                 // any rank mutates (pure, launches nothing). Each rank's full
                 // seal/proof validation still runs inside its chunk before its
                 // own mutation.
-                if is_moe && compact_ep {
-                    for rank in 0..n {
-                        let ffn = layer_moe_ffn(&weights_per_rank[rank].layers[layer_idx])
-                            .ok_or_else(|| {
-                                HipError::new(
-                                    0,
-                                    &format!("forward_tick: MoE FFN missing on rank {rank}"),
-                                )
-                            })?;
-                        ffn.bound_experts()?;
-                    }
-                }
-                if is_moe {
+                if is_moe && !compact_ep {
                     for rank in 0..n {
                         gpus.devices[rank].bind_thread()?;
                         let partial = &self.decode_partials[rank];
@@ -2008,151 +2670,84 @@ impl Qwen35DecodeBatchEpState {
                 // `BatchSemantics::Independent` over the fixed slots — no
                 // token-sequential dependency, no per-token fallback.
                 if is_moe && compact_ep {
-                    // Root produces the route (router GEMM + softmax/topk
-                    // ONLY on rank 0); the proof is captured through the
-                    // band-carried stack cell, no heap allocation.
-                    let proof_slot: std::cell::Cell<
-                        Option<
-                            hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof,
-                        >,
-                    > = std::cell::Cell::new(None);
-                    {
-                        gpus.devices[0].bind_thread()?;
-                        let band = PrefillBandCtx {
-                            layer_start: layer_idx,
-                            layer_end: layer_idx + 1,
-                            delta_layer_offset: delta_off,
-                            kv_layer_offset: fa_off,
-                            is_first_band: layer_idx == 0,
-                            is_last_band: false,
-                            givens_cos: None,
-                            givens_sin: None,
-                            route: PrefillRouteMode::ProduceRoot { slot: &proof_slot },
-                        };
-                        let routed_out = Some(self.decode_partials[0].sub_offset(0, b * dim));
-                        let rank_state = &mut self.ranks[0];
-                        let rank_scratch = &self.scratches[0];
-                        let rank_pbs = &rank_state.pbs;
-                        forward_batch_chunk_impl(
-                            &mut gpus.devices[0],
-                            &weights_per_rank[0],
-                            config,
-                            tokens,
-                            0,
-                            &mut rank_state.kv_cache,
-                            &mut rank_state.dn_state,
-                            rank_scratch,
-                            rank_pbs,
-                            None,
-                            None,
-                            None,
-                            0,
-                            None,
-                            inputs_prepared,
-                            inputs_prepared,
-                            Some(&band),
-                            None,
-                            false,
-                            None,
-                            routed_out.as_ref(),
-                            BatchSemantics::Independent {
-                                positions,
-                                lane_capacity: self.lane_capacity,
-                                active_mask,
-                            },
-                            DflashFusionCtx::Off,
-                        )?;
-                    }
-                    let root_proof = proof_slot.get().ok_or_else(|| {
-                        HipError::new(0, "forward_tick: root produced no route proof")
+                    let ffn = layer_moe_ffn(&weights_per_rank[0].layers[layer_idx])
+                        .ok_or_else(|| HipError::new(0, "forward_tick: MoE FFN missing"))?;
+                    let bound = ffn.bound_experts()?;
+                    let contract = bound.execution_contract().ok_or_else(|| {
+                        HipError::new(0, "forward_tick: MoE execution contract missing")
                     })?;
-                    // Broadcast the root's first N*k route entries to the
-                    // other ranks (device-to-device, no host bytes; `k`
-                    // is the FLAT element count).
-                    {
-                        let k_flat = b.checked_mul(k_top).ok_or_else(|| {
-                            HipError::new(0, "forward_tick: route count overflow")
+                    let reduce_count = elem_count;
+                    let partial_bytes = reduce_count
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .ok_or_else(|| {
+                            HipError::new(0, "forward_tick: partial byte count overflow")
                         })?;
-                        let root_ids = self.ranks[0]
-                            .pbs
-                            .moe_topk_indices_batch
-                            .as_ref()
-                            .expect("moe scratch");
-                        let root_weights = self.ranks[0]
-                            .pbs
-                            .moe_topk_weights_batch
-                            .as_ref()
-                            .expect("moe scratch");
-                        gpus.broadcast_ep_route(
-                            &root_ids.buf,
-                            &root_weights.buf,
-                            |r| {
-                                let pbs = &self.ranks[r].pbs;
-                                (
-                                    &pbs.moe_topk_indices_batch
-                                        .as_ref()
-                                        .expect("moe scratch")
-                                        .buf,
-                                    &pbs.moe_topk_weights_batch
-                                        .as_ref()
-                                        .expect("moe scratch")
-                                        .buf,
-                                )
-                            },
-                            k_flat,
-                        )
-                        .map_err(|e| HipError::new(0, &e.to_string()))?;
-                    }
-                    // Non-roots adopt the proof and execute the grouped
-                    // MoE over the broadcast bytes. Shared stays
-                    // replicated; routed partials reduce once below.
-                    for rank in 1..n {
-                        gpus.devices[rank].bind_thread()?;
-                        let band = PrefillBandCtx {
-                            layer_start: layer_idx,
-                            layer_end: layer_idx + 1,
-                            delta_layer_offset: delta_off,
-                            kv_layer_offset: fa_off,
-                            is_first_band: layer_idx == 0,
-                            is_last_band: false,
-                            givens_cos: None,
-                            givens_sin: None,
-                            route: PrefillRouteMode::AdoptRoot { proof: &root_proof },
-                        };
-                        let routed_out = Some(self.decode_partials[rank].sub_offset(0, b * dim));
-                        let rank_state = &mut self.ranks[rank];
-                        let rank_scratch = &self.scratches[rank];
-                        let rank_pbs = &rank_state.pbs;
-                        forward_batch_chunk_impl(
-                            &mut gpus.devices[rank],
-                            &weights_per_rank[rank],
-                            config,
-                            tokens,
-                            0,
-                            &mut rank_state.kv_cache,
-                            &mut rank_state.dn_state,
-                            rank_scratch,
-                            rank_pbs,
-                            None,
-                            None,
-                            None,
-                            0,
-                            None,
-                            inputs_prepared,
-                            inputs_prepared,
-                            Some(&band),
-                            None,
-                            false,
-                            None,
-                            routed_out.as_ref(),
-                            BatchSemantics::Independent {
-                                positions,
-                                lane_capacity: self.lane_capacity,
-                                active_mask,
-                            },
-                            DflashFusionCtx::Off,
-                        )?;
-                    }
+                    let route_count = b
+                        .checked_mul(k_top)
+                        .ok_or_else(|| HipError::new(0, "forward_tick: route count overflow"))?;
+                    let ffn_norm = layer_moe_ffn_norm(&weights_per_rank[0].layers[layer_idx])
+                        .ok_or_else(|| HipError::new(0, "forward_tick: MoE FFN norm missing"))?;
+                    let routed = self.decode_partials[0].sub_offset(0, reduce_count);
+                    let dispatch_ctx = DispatchCtx::new(&gpus.devices[0]);
+                    let contribution_count = super::prefill::moe_ffn_batched_ep_slot_geometry(
+                        &gpus.devices[0],
+                        ffn,
+                        ffn_norm,
+                        config,
+                        &self.ranks[0].pbs,
+                        b,
+                        &dispatch_ctx,
+                        weights_per_rank[0].moe_has_mq6,
+                        &routed,
+                    )?;
+                    let schedule = RootRoutedEpSchedule::derive(
+                        contract,
+                        n,
+                        layer_idx,
+                        route_count,
+                        partial_bytes,
+                        reduce_count,
+                        contribution_count,
+                        reduce_count,
+                        RootRoutedEpReduction::Decode,
+                    )
+                    .map_err(|e| HipError::new(0, &e.to_string()))?;
+                    let lane_capacity = self.lane_capacity;
+                    let scratches = &self.scratches;
+                    let partials = self.decode_partials.as_slice();
+                    let peer_lease = self.peer_lease.as_ref();
+                    let mut schedule_context = TickRootScheduleContext {
+                        weights: weights_per_rank,
+                        config,
+                        tokens,
+                        positions,
+                        lane_capacity,
+                        active_mask,
+                        ranks: &mut self.ranks,
+                        scratches,
+                        layer_idx,
+                        delta_layer_offset: delta_off,
+                        kv_layer_offset: fa_off,
+                        pre_uploaded: inputs_prepared,
+                        pre_embedded: inputs_prepared,
+                        contract_id: schedule.contract_id(),
+                        rank_count: n,
+                        reduce_count,
+                        route_count,
+                        contribution_count,
+                        model_has_mq6_moe: weights_per_rank[0].moe_has_mq6,
+                        full_mask,
+                    };
+                    execute_tick_root_schedule(
+                        gpus,
+                        &mut schedule_context,
+                        schedule,
+                        partials,
+                        peer_lease,
+                    )?;
+                    observed = observed
+                        .checked_add(1)
+                        .ok_or_else(|| HipError::new(0, "forward_tick observed overflow"))?;
                 } else {
                     for rank in 0..n {
                         gpus.devices[rank].bind_thread()?;
@@ -2206,7 +2801,7 @@ impl Qwen35DecodeBatchEpState {
                         )?;
                     }
                 }
-                if is_moe {
+                if is_moe && !compact_ep {
                     // Zero inactive rows before the leased reduce so they contribute +0.0f32 in rooted order.
                     if active_mask != full_mask {
                         for rank in 0..n {
@@ -2842,7 +3437,7 @@ pub fn forward_prefill_batch_ep(
 
         // 1. Zero each rank's routed partial (on its active_stream, so it's
         //    ordered before the chunk's routed combine that writes into it).
-        if is_moe {
+        if is_moe && !compact_ep {
             for r in 0..n_rank {
                 gpus.devices[r].bind_thread()?;
                 let stream = gpus.devices[r].active_stream.as_ref().ok_or_else(|| {
@@ -2860,137 +3455,88 @@ pub fn forward_prefill_batch_ep(
         // 2. Run the layer's batched chunk (single-layer bands).
         let t_c = std::time::Instant::now();
         if is_moe && compact_ep {
-            // 2a. Root produces the route: router GEMM + softmax/topk run
-            // ONLY on rank 0; the opaque producer proof is captured through
-            // the band-carried cell (caller-owned stack slot, no heap
-            // allocation). Shared-expert output stays replicated in rank 0's
-            // x_batch here, exactly like every other rank's below.
-            let proof_slot: std::cell::Cell<
-                Option<hipfire_dispatch::pipeline::sealed_moe::MoePrefillRouteProducerProof>,
-            > = std::cell::Cell::new(None);
-            {
-                gpus.devices[0].bind_thread()?;
-                let band = PrefillBandCtx {
-                    layer_start: layer_idx,
-                    layer_end: layer_idx + 1,
-                    delta_layer_offset: delta_off,
-                    kv_layer_offset: fa_off,
-                    is_first_band: layer_idx == 0,
-                    is_last_band: false, // final norm + lm_head done explicitly below
-                    // v1 EP prefill is q8/non-asym KV → no per-rank Givens replicas.
-                    givens_cos: None,
-                    givens_sin: None,
-                    route: PrefillRouteMode::ProduceRoot { slot: &proof_slot },
-                };
-                forward_prefill_chunk(
-                    &mut gpus.devices[0],
-                    &weights_per_rank[0],
-                    config,
-                    tokens,
-                    start_pos,
-                    &mut kv_per_rank[0],
-                    &mut dn_per_rank[0],
-                    &scratch_per_rank[0],
-                    &pbs_per_rank[0],
-                    None, // hidden_rb
-                    None, // per_token_hidden_out
-                    None, // gdn_tape
-                    0,    // tape_offset
-                    None, // tree_verify
-                    true, // pre_uploaded (hoisted above)
-                    Some(&band),
-                    None,  // mask_override
-                    false, // needs_last_token_logits (no lm_head in band)
-                    None,  // max_layer
-                    Some(&partials[0]),
-                    DflashFusionCtx::Off,
-                )?;
-            }
-            let root_proof = proof_slot.get().ok_or_else(|| {
-                HipError::new(0, "forward_prefill_batch_ep: root produced no route proof")
-            })?;
-            // 2b. Broadcast the root's first N*k route entries to every other
-            // rank (device-to-device, no host bytes). `k` here is the FLAT
-            // element count (`N*k_top`); bytes per array = `k*4`. The
-            // destination-owned FIFO transport (root-ready event, per-dst
-            // copies, reverse source-reuse) orders the adopting ranks'
-            // expert kernels — enqueued after, on their own streams — behind
-            // the copy by same-stream FIFO.
-            {
-                let k_flat = n.checked_mul(k_top).ok_or_else(|| {
-                    HipError::new(0, "forward_prefill_batch_ep: route count overflow")
-                })?;
-                let root_ids = pbs_per_rank[0]
-                    .moe_topk_indices_batch
-                    .as_ref()
-                    .expect("moe scratch");
-                let root_weights = pbs_per_rank[0]
-                    .moe_topk_weights_batch
-                    .as_ref()
-                    .expect("moe scratch");
-                gpus.broadcast_ep_route(
-                    &root_ids.buf,
-                    &root_weights.buf,
-                    |r| {
-                        let pbs = &pbs_per_rank[r];
-                        (
-                            &pbs.moe_topk_indices_batch
-                                .as_ref()
-                                .expect("moe scratch")
-                                .buf,
-                            &pbs.moe_topk_weights_batch
-                                .as_ref()
-                                .expect("moe scratch")
-                                .buf,
-                        )
-                    },
-                    k_flat,
+            let ffn = layer_moe_ffn(&weights_per_rank[0].layers[layer_idx])
+                .ok_or_else(|| HipError::new(0, "forward_prefill_batch_ep: MoE FFN missing"))?;
+            let bound = ffn.bound_experts()?;
+            let contract = bound.execution_contract().ok_or_else(|| {
+                HipError::new(
+                    0,
+                    "forward_prefill_batch_ep: MoE execution contract missing",
                 )
-                .map_err(|e| HipError::new(0, &e.to_string()))?;
-            }
-            // 2c. Non-roots adopt: skip router GEMM + softmax/topk + produce,
-            // execute the grouped MoE over the broadcast bytes into their own
-            // zeroed partials. Shared-expert output stays replicated in each
-            // rank's x_batch (never reduced); the routed partials are
-            // all-reduced once below and added once per rank (step 3).
-            for r in 1..n_rank {
-                gpus.devices[r].bind_thread()?;
-                let band = PrefillBandCtx {
-                    layer_start: layer_idx,
-                    layer_end: layer_idx + 1,
-                    delta_layer_offset: delta_off,
-                    kv_layer_offset: fa_off,
-                    is_first_band: layer_idx == 0,
-                    is_last_band: false, // final norm + lm_head done explicitly below
-                    // v1 EP prefill is q8/non-asym KV → no per-rank Givens replicas.
-                    givens_cos: None,
-                    givens_sin: None,
-                    route: PrefillRouteMode::AdoptRoot { proof: &root_proof },
-                };
-                forward_prefill_chunk(
-                    &mut gpus.devices[r],
-                    &weights_per_rank[r],
-                    config,
-                    tokens,
-                    start_pos,
-                    &mut kv_per_rank[r],
-                    &mut dn_per_rank[r],
-                    &scratch_per_rank[r],
-                    &pbs_per_rank[r],
-                    None, // hidden_rb
-                    None, // per_token_hidden_out
-                    None, // gdn_tape
-                    0,    // tape_offset
-                    None, // tree_verify
-                    true, // pre_uploaded (hoisted above)
-                    Some(&band),
-                    None,  // mask_override
-                    false, // needs_last_token_logits (no lm_head in band)
-                    None,  // max_layer
-                    Some(&partials[r]),
-                    DflashFusionCtx::Off,
-                )?;
-            }
+            })?;
+            let reduce_count = n.checked_mul(dim).ok_or_else(|| {
+                HipError::new(0, "forward_prefill_batch_ep: reduction count overflow")
+            })?;
+            let partial_bytes = reduce_count
+                .checked_mul(std::mem::size_of::<f32>())
+                .ok_or_else(|| {
+                    HipError::new(0, "forward_prefill_batch_ep: partial byte count overflow")
+                })?;
+            let route_count = n.checked_mul(k_top).ok_or_else(|| {
+                HipError::new(0, "forward_prefill_batch_ep: route count overflow")
+            })?;
+            let ffn_norm =
+                layer_moe_ffn_norm(&weights_per_rank[0].layers[layer_idx]).ok_or_else(|| {
+                    HipError::new(0, "forward_prefill_batch_ep: MoE FFN norm missing")
+                })?;
+            let routed = partials[0].sub_offset(0, reduce_count);
+            let dispatch_ctx = DispatchCtx::new(&gpus.devices[0]);
+            let contribution_count = super::prefill::moe_ffn_batched_ep_slot_geometry(
+                &gpus.devices[0],
+                ffn,
+                ffn_norm,
+                config,
+                &pbs_per_rank[0],
+                n,
+                &dispatch_ctx,
+                weights_per_rank[0].moe_has_mq6,
+                &routed,
+            )?;
+            let reduction = if ep_skip_ar {
+                RootRoutedEpReduction::PrefillSkipAllReduce
+            } else {
+                RootRoutedEpReduction::Prefill
+            };
+            let schedule = RootRoutedEpSchedule::derive(
+                contract,
+                n_rank,
+                layer_idx,
+                route_count,
+                partial_bytes,
+                reduce_count,
+                contribution_count,
+                reduce_count,
+                reduction,
+            )
+            .map_err(|e| HipError::new(0, &e.to_string()))?;
+            let mut schedule_context = PrefillRootScheduleContext {
+                weights: weights_per_rank,
+                config,
+                tokens,
+                start_pos,
+                kv_per_rank,
+                dn_per_rank,
+                scratch_per_rank,
+                pbs_per_rank,
+                layer_idx,
+                delta_layer_offset: delta_off,
+                kv_layer_offset: fa_off,
+                pre_uploaded: true,
+                pre_embedded: false,
+                semantics: BatchSemantics::Sequential,
+                contract_id: schedule.contract_id(),
+                rank_count: n_rank,
+                reduce_count,
+                route_count,
+                contribution_count,
+            };
+            execute_prefill_root_schedule(
+                gpus,
+                &mut schedule_context,
+                schedule,
+                partials,
+                peer_lease,
+            )?;
         } else {
             // Legacy replicated path: every rank routes locally. This covers
             // all non-MoE layers on every binding plus MoE layers on Single
@@ -3042,7 +3588,7 @@ pub fn forward_prefill_batch_ep(
         }
 
         // 3. All-reduce the routed partials, add into each rank's residual.
-        if is_moe && !ep_skip_ar {
+        if is_moe && !compact_ep && !ep_skip_ar {
             let t_a = std::time::Instant::now();
             let refs: Vec<&hip_bridge::DeviceBuffer> = partials.iter().map(|p| &p.buf).collect();
             // Selection log line: names the active path (once per process). The
@@ -3432,7 +3978,8 @@ fn forward_scratch_layers_multi(
                             None => &s.tmp,
                         };
                         if matches!(dt_g, DType::MQ4CG256 | DType::MQ4G256V2 | DType::MQ6G256V2) {
-                            let key = crate::forward_slots::fused_gate_up_key_for(dt_g);
+                            let key =
+                                hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for(dt_g);
                             let ctx = DispatchCtx::new(gpu);
                             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                                 kind: key,
@@ -3918,7 +4465,8 @@ fn forward_scratch_layers_multi(
                             None => &s.tmp,
                         };
                         if matches!(dt_g, DType::MQ4CG256 | DType::MQ4G256V2 | DType::MQ6G256V2) {
-                            let key = crate::forward_slots::fused_gate_up_key_for(dt_g);
+                            let key =
+                                hipfire_dispatch::families::fused_qkv::fused_gate_up_key_for(dt_g);
                             let ctx = DispatchCtx::new(gpu);
                             let params = hipfire_dispatch::families::fused_qkv::FusedQkvParams {
                                 kind: key,
@@ -5416,5 +5964,24 @@ mod tests {
         assert!(ep_tick_inputs_prepared(usize::MAX));
         // Saturating representative: any non-zero later band is prepared.
         assert!(ep_tick_inputs_prepared(usize::MAX.saturating_sub(1)));
+    }
+
+    #[test]
+    fn qwen35_ep_batch_architecture_policy_is_exact() {
+        let gfx1201 = ["gfx1201"; 4];
+        let gfx1151 = ["gfx1151"; 4];
+        let other = ["gfx1100"; 4];
+        let physical = [0, 1, 2, 3];
+        let aliased = [0, 0, 0, 0];
+
+        assert!(validate_ep_batch_architecture(&gfx1201, &physical, false).is_ok());
+        assert!(validate_ep_batch_architecture(&gfx1151, &aliased, false).is_err());
+        assert!(validate_ep_batch_architecture(&gfx1151, &aliased, true).is_ok());
+        assert!(validate_ep_batch_architecture(&gfx1151, &physical, true).is_err());
+        assert!(validate_ep_batch_architecture(&gfx1151, &[0, 0, 1, 0], true).is_err());
+        assert!(validate_ep_batch_architecture(&gfx1201, &aliased, true).is_err());
+        assert!(validate_ep_batch_architecture(&other, &aliased, true).is_err());
+        assert!(validate_ep_batch_architecture(&gfx1151, &[-1, -1, -1, -1], true).is_err());
+        assert!(validate_ep_batch_architecture(&gfx1151[..3], &aliased[..3], true).is_err());
     }
 }

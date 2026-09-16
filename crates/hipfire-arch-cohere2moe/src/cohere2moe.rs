@@ -19,9 +19,8 @@
 //! Expert weights ship pre-split (gate_proj/up_proj/down_proj); the loader
 //! byte-fuses gate_proj‖up_proj into the per-expert `gate_up` blob the indexed
 //! GEMV kernels expect. Per-expert buffers are retained (not just a packed
-//! blob) so the forward can take a per-expert `weight_gemv` path for the F16
-//! oracle / Q8 expert tiers (which have no indexed MoE kernel) and the indexed
-//! kernels for the MQ4/MQ6 tiers.
+//! blob) so the shared sealed-MoE executor can select indexed kernels for
+//! MQ4/MQ6 and the host-expert operation for F16/Q8 tiers.
 
 use std::hash::{Hash, Hasher};
 

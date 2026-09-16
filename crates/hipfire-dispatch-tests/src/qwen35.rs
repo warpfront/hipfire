@@ -128,15 +128,17 @@ fn qwen35_moe_mq3_refused_at_load_time() {
 
 // ─── MoE resolution (Ship 4.1, GPU-free) ─────────────────────
 
-use hipfire_dispatch::families::moe::{MoeDtypes, MoeResolution};
+use hipfire_dispatch::families::moe::{MoeDtypes, MoeResolution, MoeSharedDtypes};
 
 fn mq4_dtypes() -> MoeDtypes<'static> {
     MoeDtypes {
         router: DType::MQ4G256,
-        shared_gate: DType::MQ4G256,
-        shared_expert_gate: DType::MQ4G256,
-        shared_expert_up: DType::MQ4G256,
-        shared_expert_down: DType::MQ4G256,
+        shared: Some(MoeSharedDtypes {
+            selector: DType::MQ4G256,
+            gate: DType::MQ4G256,
+            up: DType::MQ4G256,
+            down: DType::MQ4G256,
+        }),
         experts_all_gate_up_mq4: true,
         routed_gate_up: DType::MQ4G256,
         routed_down: DType::MQ4G256,
@@ -233,9 +235,12 @@ fn moe_resolve_needs_x_rot_local_when_gate_side_mq4() {
 fn moe_resolve_no_rotation_when_all_f32() {
     let d = MoeDtypes {
         router: DType::F32,
-        shared_gate: DType::F32,
-        shared_expert_gate: DType::F32,
-        shared_expert_up: DType::F32,
+        shared: Some(MoeSharedDtypes {
+            selector: DType::F32,
+            gate: DType::F32,
+            up: DType::F32,
+            down: DType::F32,
+        }),
         routed_gate_up: DType::F32,
         routed_down: DType::F32,
         ..mq4_dtypes()

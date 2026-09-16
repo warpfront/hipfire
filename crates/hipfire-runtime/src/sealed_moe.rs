@@ -1232,6 +1232,26 @@ fn validate_and_build_group(
     })
 }
 
+fn validate_physical_device_ids(
+    physical_devices: &[i32],
+    emulation_enabled: bool,
+) -> Result<(), String> {
+    let mut physical_seen = HashSet::new();
+    for (rank, &device) in physical_devices.iter().enumerate() {
+        if device < 0 {
+            return Err(format!(
+                "physical device id {device} is invalid at rank {rank}"
+            ));
+        }
+        if !emulation_enabled && !physical_seen.insert(device) {
+            return Err(format!(
+                "physical device id {device} is duplicate at rank {rank}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate and construct all sealed expert plans.  Every source, rank, and
 /// expert is checked before the first plan is returned; the function performs
 /// no persistent ownership mutation and is safe to retry after an error.
@@ -1257,14 +1277,8 @@ pub fn plan_expert_execution(
             mesh.n_devices()
         ));
     }
-    let mut physical_seen = HashSet::new();
-    for (rank, &device) in physical_devices.iter().enumerate() {
-        if device < 0 || !physical_seen.insert(device) {
-            return Err(format!(
-                "physical device id {device} is duplicate or invalid at rank {rank}"
-            ));
-        }
-    }
+    let emulation_enabled = crate::config::get().emulate_gpus.is_some();
+    validate_physical_device_ids(physical_devices, emulation_enabled)?;
     crate::weight_manifest::validate_expert_group_specs(specs, manifest)?;
     let source_by_name = source_map(sources)?;
     let manifest_names = manifest_source_names(specs)?;
@@ -2511,15 +2525,7 @@ mod tests {
     #[test]
     fn duplicate_physical_ids_and_alias_cycles_are_refused_without_state() {
         let (manifest, manifest_plan, specs, sources, mesh) = ep_fixture();
-        assert!(plan_expert_execution(
-            &manifest,
-            &manifest_plan,
-            &specs,
-            &sources,
-            &mesh,
-            &[7, 7, 11, 5]
-        )
-        .is_err());
+        assert!(validate_physical_device_ids(&[7, 7, 11, 5], false).is_err());
         let mut cyclic = sources.clone();
         cyclic[0] = cyclic[0].clone().alias("up", 0);
         cyclic[1] = cyclic[1].clone().alias("gate", 0);
@@ -2532,6 +2538,13 @@ mod tests {
             &[7, 2, 11, 5]
         )
         .is_err());
+    }
+
+    #[test]
+    fn physical_device_aliases_require_explicit_emulation() {
+        assert!(validate_physical_device_ids(&[7, 7, 11, 5], false).is_err());
+        assert!(validate_physical_device_ids(&[7, 7, 11, 5], true).is_ok());
+        assert!(validate_physical_device_ids(&[-1, -1], true).is_err());
     }
     fn per_expert_fixture() -> (
         Vec<WeightEntry>,
@@ -3626,10 +3639,8 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.contains("physical device count"), "got: {error}");
-        let error =
-            plan_expert_execution(&manifest, &manifest_plan, &specs, &sources, &mesh, &[7, 7])
-                .unwrap_err();
-        assert!(error.contains("duplicate or invalid"), "got: {error}");
+        let error = validate_physical_device_ids(&[7, 7], false).unwrap_err();
+        assert!(error.contains("duplicate"), "got: {error}");
     }
 
     #[test]

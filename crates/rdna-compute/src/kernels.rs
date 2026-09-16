@@ -3086,6 +3086,11 @@ pub const GEMM_Q8_0_MMQ_GFX1030_SRC: &str =
 /// a unique thread).
 pub const MOE_DOWN_COMBINE_GROUPED_K8_SRC: &str =
     include_str!("../../../kernels/src/moe_down_combine_grouped_k8.hip");
+/// Restore grouped path-2 down outputs to canonical flat `(token, k_rank)`
+/// slot order. Each rank runs this before EP contribution gathering; the root
+/// then uses the ordinary slot-order weighted combine.
+pub const MOE_DOWN_UNSCATTER_K8_SRC: &str =
+    include_str!("../../../kernels/src/moe_down_unscatter_k8.hip");
 
 /// Fused single-CTA SGLang-style MoE scatter pipeline: combines
 /// histogram + padded prefix-sum + permutation in one launch. Saves
