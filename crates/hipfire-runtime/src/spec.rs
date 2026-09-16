@@ -863,6 +863,15 @@ pub trait Speculator {
     /// error rather than a silent VRAM leak.
     fn free(self: Box<Self>, gpu: &mut Gpu);
 
+    /// [`Self::free`] for a mesh unload: a dense-TP drafter owns per-rank
+    /// buffers the daemon's single `Gpu` cannot reach.
+    fn free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
+        if let Some(dev) = gpus.devices.first_mut() {
+            let _ = dev.bind_thread();
+            self.free(dev);
+        }
+    }
+
     /// Whether this drafter requires greedy verification (temperature 0).
     /// A greedy-only drafter (n-gram chain, the MTP-via-`Speculator` wrapper)
     /// returns `true`; a sampling-capable drafter (DFlash with lossless rejection
@@ -1117,6 +1126,14 @@ pub trait MtpDrafter {
     /// Release all GPU buffers the drafter owns.
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu);
 
+    /// [`Self::mtp_free`] for a mesh unload.
+    fn mtp_free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
+        if let Some(dev) = gpus.devices.first_mut() {
+            let _ = dev.bind_thread();
+            self.mtp_free(dev);
+        }
+    }
+
     /// Draft window size (K).
     fn k(&self) -> usize;
 
@@ -1334,6 +1351,10 @@ impl<A: MtpDrafter> Speculator for MtpSpeculator<A> {
     fn free(self: Box<Self>, gpu: &mut Gpu) {
         // Move the drafter out of the box and hand it its own boxed-self free.
         Box::new(self.arch).mtp_free(gpu);
+    }
+
+    fn free_multi(self: Box<Self>, gpus: &mut crate::multi_gpu::Gpus) {
+        Box::new(self.arch).mtp_free_multi(gpus);
     }
 
     fn requires_greedy(&self) -> bool {

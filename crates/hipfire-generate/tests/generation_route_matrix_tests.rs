@@ -20,6 +20,7 @@ use hipfire_generate::common::*;
 /// Baseline inputs that select nothing special (unknown arch, no EP/PP/spec).
 fn base() -> GenerationRouteInputs {
     GenerationRouteInputs {
+        dense_tp: false,
         arch_id: 255,
         ep: false,
         pp: 1,
@@ -387,6 +388,68 @@ fn exact_safe_set_is_qwen_ar_dflash_ds4_ar_ep_spec_glimmer_ar_spec_and_maple_ar(
             assert!(!r.supports_tools(), "{:?} must not be tool-safe", r);
         }
     }
+}
+
+#[test]
+fn dense_tp_qwen_with_mtp_takes_the_spec_route_only_when_it_can_serve() {
+    // Dense TP (arch 5 under an EP-shaped topology) with an MTP drafter serves
+    // greedy and sampled-verify requests on the spec route; anything it cannot
+    // verify stays on the EP AR arm.
+    let tp_mtp = GenerationRouteInputs {
+        arch_id: 5,
+        ep: true,
+        dense_tp: true,
+        has_speculator: true,
+        speculator_is_mtp: true,
+        supports_temp_swor: true,
+        temp: 0.0,
+        ..base()
+    };
+    assert_eq!(
+        select_generation_route(&tp_mtp),
+        GenerationRoute::QwenDflash
+    );
+    let sampled = GenerationRouteInputs {
+        temp: 0.7,
+        ..tp_mtp
+    };
+    assert_eq!(
+        select_generation_route(&sampled),
+        GenerationRoute::QwenDflash
+    );
+    // A drafter that cannot verify sampled output keeps temp>0 on the AR arm.
+    let greedy_only = GenerationRouteInputs {
+        temp: 0.7,
+        supports_temp_swor: false,
+        ..tp_mtp
+    };
+    assert_eq!(
+        select_generation_route(&greedy_only),
+        GenerationRoute::QwenAr
+    );
+    // Forced AR chat, adaptive KV and non-MTP drafters never reach it.
+    let forced_ar = GenerationRouteInputs {
+        force_ar_chat: true,
+        ..tp_mtp
+    };
+    assert_eq!(select_generation_route(&forced_ar), GenerationRoute::QwenAr);
+    let adaptive = GenerationRouteInputs {
+        kv_adaptive: true,
+        ..tp_mtp
+    };
+    assert_eq!(select_generation_route(&adaptive), GenerationRoute::QwenAr);
+    let ngram = GenerationRouteInputs {
+        speculator_is_mtp: false,
+        ..tp_mtp
+    };
+    assert_eq!(select_generation_route(&ngram), GenerationRoute::QwenAr);
+    // The MoE EP topology keeps its EP route even with a drafter attached.
+    let moe = GenerationRouteInputs {
+        arch_id: 6,
+        dense_tp: false,
+        ..tp_mtp
+    };
+    assert_eq!(select_generation_route(&moe), GenerationRoute::QwenAr);
 }
 
 #[test]

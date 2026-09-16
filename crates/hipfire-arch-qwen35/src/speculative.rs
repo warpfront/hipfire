@@ -27,7 +27,7 @@ use crate::dflash_spec::DenseTpDflashRankState;
 use hipfire_dispatch::families::kv_tier::KTier;
 use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use crate::qwen35::forward::{
-    forward_prefill_dense_tp, forward_prefill_dense_tp_with_pbs_capture, DenseTpDflashCapture,
+    forward_prefill_dense_tp, forward_prefill_dense_tp_verify_capture, DenseTpSpecCapture,
 };
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
@@ -6059,16 +6059,16 @@ pub fn seed_target_hidden_dense_tp2_abortable(
             )?;
             let fh = s0.dflash.verify_scratch.final_hidden.sub_offset(0, n * dim);
             let mut caps = [
-                DenseTpDflashCapture {
+                DenseTpSpecCapture {
                     hidden: &mut s0.dflash.hidden_rb,
-                    tape: &mut s0.dflash.gdn_tape,
+                    tape: Some(&mut s0.dflash.gdn_tape),
                 },
-                DenseTpDflashCapture {
+                DenseTpSpecCapture {
                     hidden: &mut s1.dflash.hidden_rb,
-                    tape: &mut s1.dflash.gdn_tape,
+                    tape: Some(&mut s1.dflash.gdn_tape),
                 },
             ];
-            forward_prefill_dense_tp_with_pbs_capture(
+            forward_prefill_dense_tp_verify_capture(
                 gpus,
                 target.shard,
                 target.weights,
@@ -6082,6 +6082,7 @@ pub fn seed_target_hidden_dense_tp2_abortable(
                 &[&s0.tp_partial, &s1.tp_partial],
                 &mut caps,
                 &fh,
+                None,
             )
             .map_err(|e| e.to_string())?;
         }
@@ -6217,16 +6218,16 @@ pub fn verify_dflash_block_dense_tp2(
             .ok_or_else(|| HipError::new(0, "dense TP DFlash rank 1 lost its PBS"))?;
         let fh = s0.dflash.verify_scratch.final_hidden.sub_offset(0, b * dim);
         let mut caps = [
-            DenseTpDflashCapture {
+            DenseTpSpecCapture {
                 hidden: &mut s0.dflash.hidden_rb,
-                tape: &mut s0.dflash.gdn_tape,
+                tape: Some(&mut s0.dflash.gdn_tape),
             },
-            DenseTpDflashCapture {
+            DenseTpSpecCapture {
                 hidden: &mut s1.dflash.hidden_rb,
-                tape: &mut s1.dflash.gdn_tape,
+                tape: Some(&mut s1.dflash.gdn_tape),
             },
         ];
-        forward_prefill_dense_tp_with_pbs_capture(
+        forward_prefill_dense_tp_verify_capture(
             gpus,
             target.shard,
             target.weights,
@@ -6240,6 +6241,7 @@ pub fn verify_dflash_block_dense_tp2(
             &[&s0.tp_partial, &s1.tp_partial],
             &mut caps,
             &fh,
+            None,
         )?;
     }
     // Rank-0 final norm (per row; the single-GPU batch path norms inside its

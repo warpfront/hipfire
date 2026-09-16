@@ -38,7 +38,9 @@ required_features_daemon    == 0
 # model still serving; the guard refuses it before any teardown or allocation.
 # The load arm was sitting exactly at the old ceiling, so no correctness fix
 # there fits under it. Paid down when the arm's branch duplication is factored.
-daemon_lines                <= 4863
+# RATCHET-RAISE 4863 -> 4864: the EP load arm forwards the typed SpecLoadCfg
+# so a tp>1 dense Qwen load honors the request's mtp_mode/mtp_k like tp=1 does.
+daemon_lines                <= 4864
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.

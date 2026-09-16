@@ -36,7 +36,7 @@ use crate::mtp_head::{
 use crate::qwen35::{self, Qwen35Weights};
 use crate::speculative::{apply_topp_trunc, sample_categorical, sample_residual};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
-use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
+use hip_bridge::{Event, Graph, GraphExec, HipError, HipResult, Stream};
 use hipfire_runtime::llama;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
@@ -603,6 +603,28 @@ impl MtpSpecState {
         verify_capacity: usize,
         kv_mode: crate::mtp_head::MtpKvMode,
     ) -> HipResult<Self> {
+        Self::new_for_parts_with_verify_capacity(
+            gpu,
+            &target.config,
+            &target.dn_state,
+            head,
+            max_n,
+            verify_capacity,
+            kv_mode,
+        )
+    }
+
+    /// Same allocation from loose parts: dense TP has no `ModelSlot`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_for_parts_with_verify_capacity(
+        gpu: &mut Gpu,
+        config: &qwen35::Qwen35Config,
+        dn_state: &qwen35::DeltaNetState,
+        head: &Qwen35MtpHead,
+        max_n: usize,
+        verify_capacity: usize,
+        kv_mode: crate::mtp_head::MtpKvMode,
+    ) -> HipResult<Self> {
         assert!(
             max_n >= 1,
             "MtpSpecState::new_for_slot: max_n must be ≥ 1 (chain depth)"
@@ -611,8 +633,8 @@ impl MtpSpecState {
             verify_capacity >= max_n,
             "MtpSpecState: verify_capacity {verify_capacity} must be >= max_n {max_n}"
         );
-        let dim = target.config.dim;
-        let vocab = target.config.vocab_size;
+        let dim = config.dim;
+        let vocab = config.vocab_size;
         assert_eq!(
             head.config.n_embd, dim,
             "MtpSpecState: trunk dim={dim} but head n_embd={}",
@@ -629,7 +651,7 @@ impl MtpSpecState {
         let verify_logits = gpu.alloc_tensor(&[(verify_capacity + 1) * vocab], DType::F32)?;
         let verify_rot = gpu.alloc_tensor(&[(verify_capacity + 1) * dim], DType::F32)?;
         let verify_argmax = gpu.alloc_tensor(&[verify_capacity + 1], DType::F32)?;
-        let trunk_snap = DeltaNetSnapshot::new_for(gpu, &target.dn_state)?;
+        let trunk_snap = DeltaNetSnapshot::new_for(gpu, dn_state)?;
         // Snapshot overlap resources are construction-time only; set the env
         // before creating MtpSpecState when comparing the opt-in path.
         let (trunk_snap_stream, trunk_snap_start_event) = if mtp_snapshot_overlap_enabled_from_env()
@@ -641,8 +663,8 @@ impl MtpSpecState {
         } else {
             (None, None)
         };
-        let trunk_pbs = qwen35::PrefillBatchScratch::new(gpu, &target.config, verify_capacity + 1)?;
-        let trunk_gdn_tape = GdnTape::new_for_config(gpu, &target.config, verify_capacity + 1)?;
+        let trunk_pbs = qwen35::PrefillBatchScratch::new(gpu, config, verify_capacity + 1)?;
+        let trunk_gdn_tape = GdnTape::new_for_config(gpu, config, verify_capacity + 1)?;
         let mtp_scratch = Qwen35MtpHeadScratch::new(gpu, &head.config)?;
         let mtp_kv = Qwen35MtpHeadKvCache::new_with_kv_mode(gpu, &head.config, kv_mode)?;
 
@@ -973,7 +995,7 @@ fn mtp_proposal_graph_seq_cap(cur_pos: usize, max_n: usize, kv_max_seq: usize) -
 #[allow(clippy::too_many_arguments)]
 fn run_mtp_proposal_graph_body_q8(
     gpu: &mut Gpu,
-    target: &ModelSlot,
+    trunk_weights: &Qwen35Weights,
     head: &Qwen35MtpHead,
     state: &mut MtpSpecState,
     cur_pos: usize,
@@ -998,13 +1020,7 @@ fn run_mtp_proposal_graph_body_q8(
 
     for k in 0..max_n {
         let token_slot = state.mtp_token_chain.sub_offset(k, 1);
-        embed_device_token_into(
-            gpu,
-            &target.weights,
-            &state.mtp_token_embed,
-            &token_slot,
-            dim,
-        )?;
+        embed_device_token_into(gpu, trunk_weights, &state.mtp_token_embed, &token_slot, dim)?;
 
         let pos_slot = state.mtp_positions.sub_offset(k, 1);
         if k == 0 {
@@ -1019,7 +1035,7 @@ fn run_mtp_proposal_graph_body_q8(
                 &pos_slot.buf,
                 cur_pos + k,
                 seq_cap,
-                &target.weights,
+                trunk_weights,
             )?;
         } else {
             let prev_row = state.mtp_t_outs.sub_offset((k - 1) * dim, dim);
@@ -1034,7 +1050,7 @@ fn run_mtp_proposal_graph_body_q8(
                 &pos_slot.buf,
                 cur_pos + k,
                 seq_cap,
-                &target.weights,
+                trunk_weights,
             )?;
         }
         mtp_head::mtp_head_apply_lm_head_draft(gpu, head, &state.mtp_scratch)?;
@@ -1202,7 +1218,7 @@ fn mtp_takeover_kv_repair_forwards(mtp_already_retired: bool, accept_count: usiz
 /// fall through to `n_verify` sequential GEMVs now that the validated gfx11 /
 /// gfx12 batched lm_head family exists.
 #[allow(clippy::too_many_arguments)]
-fn mtp_trunk_verify_lm_head(
+pub(crate) fn mtp_trunk_verify_lm_head(
     gpu: &mut Gpu,
     w_out: &llama::WeightTensor,
     verify_hidden: &GpuTensor,
@@ -1361,10 +1377,186 @@ fn mtp_trunk_verify_lm_head(
     Ok(())
 }
 
+/// Trunk seam for the shared MTP verify: a single-GPU slot or a dense-TP mesh.
+pub(crate) trait MtpTrunkBackend {
+    fn dim(&self) -> usize;
+    fn vocab(&self) -> usize;
+    fn gpu0(&mut self) -> &mut Gpu;
+    fn ensure_active_stream(&mut self) -> HipResult<()>;
+    fn snapshot_sync(&mut self, state: &mut MtpSpecState) -> HipResult<()>;
+    fn await_async_snapshot(&mut self, state: &mut MtpSpecState) -> HipResult<()>;
+    fn restore_snapshot(&mut self, state: &mut MtpSpecState) -> HipResult<()>;
+    fn tape_eligible(&self, n_verify: usize) -> bool;
+    fn verify_forward(
+        &mut self,
+        state: &mut MtpSpecState,
+        tokens: &[u32],
+        cur_pos: usize,
+        capture_tape: bool,
+    ) -> HipResult<()>;
+    fn verify_lm_head(&mut self, state: &mut MtpSpecState, n_verify: usize) -> HipResult<()>;
+    fn replay_from_tape(&mut self, state: &mut MtpSpecState, advance: usize) -> HipResult<()>;
+    fn replay_tokens(
+        &mut self,
+        state: &mut MtpSpecState,
+        tokens: &[u32],
+        cur_pos: usize,
+    ) -> HipResult<()>;
+}
+
+pub(crate) struct SlotTrunk<'a> {
+    pub gpu: &'a mut Gpu,
+    pub slot: &'a mut ModelSlot,
+}
+
+impl MtpTrunkBackend for SlotTrunk<'_> {
+    fn dim(&self) -> usize {
+        self.slot.config.dim
+    }
+
+    fn vocab(&self) -> usize {
+        self.slot.config.vocab_size
+    }
+
+    fn gpu0(&mut self) -> &mut Gpu {
+        self.gpu
+    }
+
+    fn ensure_active_stream(&mut self) -> HipResult<()> {
+        if self.gpu.active_stream.is_none() {
+            self.gpu.active_stream = Some(self.gpu.hip.stream_create()?);
+        }
+        Ok(())
+    }
+
+    fn snapshot_sync(&mut self, state: &mut MtpSpecState) -> HipResult<()> {
+        state.trunk_snap.save_from(&self.slot.dn_state, self.gpu)
+    }
+
+    fn await_async_snapshot(&mut self, state: &mut MtpSpecState) -> HipResult<()> {
+        let stream = state
+            .trunk_snap_stream
+            .as_ref()
+            .ok_or_else(|| HipError::new(0, "MTP snapshot overlap without a snapshot stream"))?;
+        self.gpu.hip.stream_synchronize(stream)
+    }
+
+    fn restore_snapshot(&mut self, state: &mut MtpSpecState) -> HipResult<()> {
+        state
+            .trunk_snap
+            .restore_to(&mut self.slot.dn_state, self.gpu)
+    }
+
+    fn tape_eligible(&self, n_verify: usize) -> bool {
+        qwen35::prefill_batch_pbs_eligible(
+            &self.slot.weights,
+            &self.slot.config,
+            &self.slot.dn_state,
+            n_verify,
+            self.gpu.arch.as_str(),
+            /* moe_router_logits_present — dense trunk: arm never matched */ true,
+        )
+    }
+
+    fn verify_forward(
+        &mut self,
+        state: &mut MtpSpecState,
+        tokens: &[u32],
+        cur_pos: usize,
+        capture_tape: bool,
+    ) -> HipResult<()> {
+        let verify_tape: Option<&mut GdnTape> = if capture_tape {
+            Some(&mut state.trunk_gdn_tape)
+        } else {
+            None
+        };
+        qwen35::forward_prefill_batch_with_pbs_opts(
+            self.gpu,
+            &self.slot.weights,
+            &self.slot.config,
+            tokens,
+            cur_pos,
+            &mut self.slot.kv_cache,
+            &mut self.slot.dn_state,
+            &self.slot.scratch,
+            None,
+            Some(&state.verify_hidden),
+            verify_tape,
+            None,
+            Some(&state.trunk_pbs),
+            None,
+            None,
+            false,
+            qwen35::DflashFusionCtx::Off,
+        )
+    }
+
+    fn verify_lm_head(&mut self, state: &mut MtpSpecState, n_verify: usize) -> HipResult<()> {
+        let dim = self.slot.config.dim;
+        let vocab = self.slot.config.vocab_size;
+        let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
+        mtp_trunk_verify_lm_head(
+            self.gpu,
+            &self.slot.weights.output,
+            &state.verify_hidden,
+            &state.verify_rot,
+            &logits_view,
+            n_verify,
+            dim,
+            vocab,
+        )
+    }
+
+    fn replay_from_tape(&mut self, state: &mut MtpSpecState, advance: usize) -> HipResult<()> {
+        state.trunk_gdn_tape.replay_gdn(
+            self.gpu,
+            &self.slot.weights,
+            &self.slot.config,
+            &mut self.slot.dn_state,
+            advance,
+        )
+    }
+
+    fn replay_tokens(
+        &mut self,
+        _state: &mut MtpSpecState,
+        tokens: &[u32],
+        cur_pos: usize,
+    ) -> HipResult<()> {
+        if tokens.len() >= 2 {
+            qwen35::forward_prefill_batch(
+                self.gpu,
+                &self.slot.weights,
+                &self.slot.config,
+                tokens,
+                cur_pos,
+                &mut self.slot.kv_cache,
+                &mut self.slot.dn_state,
+                &self.slot.scratch,
+                None,
+                None,
+                None,
+                None,
+            )
+        } else {
+            self.gpu.graphs.ar_graph_eligible = false;
+            qwen35::forward_scratch(
+                self.gpu,
+                &self.slot.weights,
+                &self.slot.config,
+                tokens[0],
+                cur_pos,
+                &mut self.slot.kv_cache,
+                &mut self.slot.dn_state,
+                &self.slot.scratch,
+            )
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn mtp_shared_verify_accept_rollback(
-    gpu: &mut Gpu,
-    target: &mut ModelSlot,
+pub(crate) fn mtp_shared_verify_accept_rollback(
+    trunk: &mut dyn MtpTrunkBackend,
     state: &mut MtpSpecState,
     cur_pos: usize,
     last_committed: u32,
@@ -1380,13 +1572,10 @@ fn mtp_shared_verify_accept_rollback(
     is_external: bool,
     use_device_token_chain: bool,
 ) -> HipResult<MtpSpecResult> {
-    let dim = target.config.dim;
-    let vocab = target.config.vocab_size;
-    let trunk_weights: &Qwen35Weights = &target.weights;
+    let dim = trunk.dim();
+    let vocab = trunk.vocab();
 
-    if gpu.active_stream.is_none() {
-        gpu.active_stream = Some(gpu.hip.stream_create()?);
-    }
+    trunk.ensure_active_stream()?;
 
     // ── 2. Trunk verify (shared) ──────────────────────────────────────
     let verify_tokens = mtp_assemble_verify_tokens(last_committed, candidates);
@@ -1395,58 +1584,14 @@ fn mtp_shared_verify_accept_rollback(
     debug_assert!(n_verify <= state.verify_capacity + 1);
 
     if overlap_trunk_snap {
-        gpu.hip
-            .stream_synchronize(state.trunk_snap_stream.as_ref().unwrap())?;
+        trunk.await_async_snapshot(state)?;
     } else {
-        state.trunk_snap.save_from(&target.dn_state, gpu)?;
+        trunk.snapshot_sync(state)?;
     }
 
-    let tape_captured = qwen35::prefill_batch_pbs_eligible(
-        trunk_weights,
-        &target.config,
-        &target.dn_state,
-        n_verify,
-        gpu.arch.as_str(),
-        /* moe_router_logits_present — dense trunk: arm never matched */ true,
-    );
-    let verify_tape: Option<&mut GdnTape> = if tape_captured {
-        Some(&mut state.trunk_gdn_tape)
-    } else {
-        None
-    };
-
-    qwen35::forward_prefill_batch_with_pbs_opts(
-        gpu,
-        trunk_weights,
-        &target.config,
-        &verify_tokens,
-        cur_pos,
-        &mut target.kv_cache,
-        &mut target.dn_state,
-        &target.scratch,
-        None,
-        Some(&state.verify_hidden),
-        verify_tape,
-        None,
-        Some(&state.trunk_pbs),
-        None,
-        None,
-        false,
-        qwen35::DflashFusionCtx::Off,
-    )?;
-
-    let w_out = &trunk_weights.output;
-    let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
-    mtp_trunk_verify_lm_head(
-        gpu,
-        w_out,
-        &state.verify_hidden,
-        &state.verify_rot,
-        &logits_view,
-        n_verify,
-        dim,
-        vocab,
-    )?;
+    let tape_captured = trunk.tape_eligible(n_verify);
+    trunk.verify_forward(state, &verify_tokens, cur_pos, tape_captured)?;
+    trunk.verify_lm_head(state, n_verify)?;
 
     let mut accept_count = 0usize;
     let hit_eos;
@@ -1454,6 +1599,8 @@ fn mtp_shared_verify_accept_rollback(
 
     let effective_use_sampling = if is_external { false } else { use_sampling };
 
+    let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
+    let gpu = trunk.gpu0();
     if effective_use_sampling {
         hit_eos = mtp_sampled_accept(
             gpu,
@@ -1524,51 +1671,17 @@ fn mtp_shared_verify_accept_rollback(
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
 
     let prev_hidden_row = advance - 1;
-    state.capture_prev_hidden_from_verify_row(gpu, prev_hidden_row, dim)?;
+    state.capture_prev_hidden_from_verify_row(trunk.gpu0(), prev_hidden_row, dim)?;
 
     // ── 3. KV / DN rollback (or skip on full accept) ─────────────────
     let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
     let replay_skipped = full_accept_no_eos;
     if !full_accept_no_eos {
-        state.trunk_snap.restore_to(&mut target.dn_state, gpu)?;
+        trunk.restore_snapshot(state)?;
         if tape_captured {
-            state.trunk_gdn_tape.replay_gdn(
-                gpu,
-                trunk_weights,
-                &target.config,
-                &mut target.dn_state,
-                advance,
-            )?;
+            trunk.replay_from_tape(state, advance)?;
         } else {
-            if advance >= 2 {
-                let replay = &verify_tokens[..advance];
-                qwen35::forward_prefill_batch(
-                    gpu,
-                    trunk_weights,
-                    &target.config,
-                    replay,
-                    cur_pos,
-                    &mut target.kv_cache,
-                    &mut target.dn_state,
-                    &target.scratch,
-                    None,
-                    None,
-                    None,
-                    None,
-                )?;
-            } else {
-                gpu.graphs.ar_graph_eligible = false;
-                qwen35::forward_scratch(
-                    gpu,
-                    trunk_weights,
-                    &target.config,
-                    verify_tokens[0],
-                    cur_pos,
-                    &mut target.kv_cache,
-                    &mut target.dn_state,
-                    &target.scratch,
-                )?;
-            }
+            trunk.replay_tokens(state, &verify_tokens[..advance], cur_pos)?;
         }
     }
 
@@ -2772,26 +2885,31 @@ pub fn spec_step_mtp_compressed_serial(
     )
 }
 
-/// Budget-aware compressed-serial MTP step: draft at most `k` candidates.
-/// `k == 0` verifies `[last_committed]` only and emits the single bonus token.
+/// Rank-0-local K-step head proposal: everything before the trunk verify.
+pub(crate) struct MtpDraftChain {
+    pub candidates: Vec<u32>,
+    pub drafts_generated: usize,
+    pub chain_truncated: bool,
+    pub use_sampling: bool,
+    pub sampling: MtpSamplingConfig,
+    pub draft_probs: Vec<f32>,
+    pub draft_softmaxes: Vec<Vec<f32>>,
+    pub use_device_token_chain: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
-pub fn spec_step_mtp_compressed_serial_with_k(
+pub(crate) fn mtp_draft_chain(
     gpu: &mut Gpu,
-    target: &mut ModelSlot,
+    trunk_weights: &Qwen35Weights,
     head: &Qwen35MtpHead,
     state: &mut MtpSpecState,
     cur_pos: usize,
     last_committed: u32,
-    eos_token_id: u32,
-    k: usize,
-) -> HipResult<MtpSpecResult> {
-    // Per-call k is authoritative (remaining max_emit from MtpSpeculator). Never
-    // draft more than state.max_n, and k==0 means verify [seed] only + bonus.
-    let max_n = k.min(state.max_n);
-    let dim = target.config.dim;
-    let vocab = target.config.vocab_size;
-    let trunk_weights: &Qwen35Weights = &target.weights;
-
+    max_n: usize,
+    dim: usize,
+    vocab: usize,
+    allow_proposal_graph: bool,
+) -> HipResult<MtpDraftChain> {
     // Two modes for the K-step draft lm_head dispatch:
     //
     //   compressed (FastMTP-style): use head's own lm_head_draft (32K-row
@@ -2835,25 +2953,6 @@ pub fn spec_step_mtp_compressed_serial_with_k(
         );
         (Some(vm), c)
     };
-
-    if gpu.active_stream.is_none() {
-        gpu.active_stream = Some(gpu.hip.stream_create()?);
-    }
-    let overlap_trunk_snap = mtp_snapshot_overlap_enabled_from_env()
-        && state.trunk_snap_stream.is_some()
-        && state.trunk_snap_start_event.is_some();
-    if overlap_trunk_snap {
-        let snap_event = state.trunk_snap_start_event.as_ref().unwrap();
-        let snap_stream = state.trunk_snap_stream.as_ref().unwrap();
-        {
-            let active_stream = gpu.active_stream.as_ref().unwrap();
-            gpu.hip.event_record(snap_event, Some(active_stream))?;
-            gpu.hip.stream_wait_event(snap_stream, snap_event)?;
-        }
-        state
-            .trunk_snap
-            .save_from_async_on(&target.dn_state, gpu, snap_stream)?;
-    }
 
     let dim_bytes = dim * 4;
     let mut candidates: Vec<u32> = Vec::with_capacity(max_n);
@@ -2963,7 +3062,8 @@ pub fn spec_step_mtp_compressed_serial_with_k(
         );
     }
     let proposal_graph_policy = mtp_proposal_graph_policy_from_env();
-    let use_proposal_graph = max_n > 0
+    let use_proposal_graph = allow_proposal_graph
+        && max_n > 0
         && !state.mtp_proposal_graph_disabled
         && mtp_proposal_graph_eligible_for(
             proposal_graph_policy,
@@ -3007,7 +3107,7 @@ pub fn spec_step_mtp_compressed_serial_with_k(
                 begin_mtp_proposal_graph_capture(gpu)?;
                 if let Err(e) = run_mtp_proposal_graph_body_q8(
                     gpu,
-                    target,
+                    trunk_weights,
                     head,
                     state,
                     cur_pos,
@@ -3401,6 +3501,67 @@ pub fn spec_step_mtp_compressed_serial_with_k(
     } else {
         candidates.len()
     };
+    Ok(MtpDraftChain {
+        candidates,
+        drafts_generated,
+        chain_truncated,
+        use_sampling,
+        sampling,
+        draft_probs,
+        draft_softmaxes,
+        use_device_token_chain,
+    })
+}
+
+/// Budget-aware compressed-serial MTP step: draft at most `k` candidates.
+/// `k == 0` verifies `[last_committed]` only and emits the single bonus token.
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_mtp_compressed_serial_with_k(
+    gpu: &mut Gpu,
+    target: &mut ModelSlot,
+    head: &Qwen35MtpHead,
+    state: &mut MtpSpecState,
+    cur_pos: usize,
+    last_committed: u32,
+    eos_token_id: u32,
+    k: usize,
+) -> HipResult<MtpSpecResult> {
+    // Per-call k is authoritative (remaining max_emit from MtpSpeculator). Never
+    // draft more than state.max_n, and k==0 means verify [seed] only + bonus.
+    let max_n = k.min(state.max_n);
+    let dim = target.config.dim;
+    let vocab = target.config.vocab_size;
+    if gpu.active_stream.is_none() {
+        gpu.active_stream = Some(gpu.hip.stream_create()?);
+    }
+    let overlap_trunk_snap = mtp_snapshot_overlap_enabled_from_env()
+        && state.trunk_snap_stream.is_some()
+        && state.trunk_snap_start_event.is_some();
+    if overlap_trunk_snap {
+        let snap_event = state.trunk_snap_start_event.as_ref().unwrap();
+        let snap_stream = state.trunk_snap_stream.as_ref().unwrap();
+        {
+            let active_stream = gpu.active_stream.as_ref().unwrap();
+            gpu.hip.event_record(snap_event, Some(active_stream))?;
+            gpu.hip.stream_wait_event(snap_stream, snap_event)?;
+        }
+        state
+            .trunk_snap
+            .save_from_async_on(&target.dn_state, gpu, snap_stream)?;
+    }
+
+    let draft = mtp_draft_chain(
+        gpu,
+        &target.weights,
+        head,
+        state,
+        cur_pos,
+        last_committed,
+        max_n,
+        dim,
+        vocab,
+        true,
+    )?;
 
     // ── 2. Trunk verify + accept + rollback shared with external path ──
     // Head proposal (including device-token chain / proposal graph) is
@@ -3408,23 +3569,23 @@ pub fn spec_step_mtp_compressed_serial_with_k(
     // points stay byte-identical on the verify side. Sampled head path
     // stays host-driven via mtp_sampled_accept; greedy head path may use
     // the device-chain GPU accept when enabled.
+    let mut trunk = SlotTrunk { gpu, slot: target };
     return mtp_shared_verify_accept_rollback(
-        gpu,
-        target,
+        &mut trunk,
         state,
         cur_pos,
         last_committed,
         eos_token_id,
-        &candidates,
-        drafts_generated,
-        chain_truncated,
+        &draft.candidates,
+        draft.drafts_generated,
+        draft.chain_truncated,
         overlap_trunk_snap,
-        use_sampling,
-        sampling,
-        &draft_probs,
-        &draft_softmaxes,
+        draft.use_sampling,
+        draft.sampling,
+        &draft.draft_probs,
+        &draft.draft_softmaxes,
         false,
-        use_device_token_chain,
+        draft.use_device_token_chain,
     );
 }
 
@@ -3525,9 +3686,9 @@ pub fn spec_step_mtp_compressed_serial_with_takeover_candidates(
     // Shared greedy verify/accept/rollback. Sampling is forced greedy for
     // external windows even if state.sampling.temp > 0 (daemon guarantees
     // temp==0 for ngram/PLD hits; this keeps core lossless).
+    let mut trunk = SlotTrunk { gpu, slot: target };
     let mut result = mtp_shared_verify_accept_rollback(
-        gpu,
-        target,
+        &mut trunk,
         state,
         cur_pos,
         last_committed,

@@ -117,6 +117,7 @@ pub trait Carrier: Send + Sync {
     fn spec_target_guard<'m>(
         &self,
         _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _ep: &'m mut Option<EpState>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         Err(format!("{}: spec-decode target unsupported", self.name()))
@@ -1888,6 +1889,68 @@ fn build_qwen35_eviction(
     }
 }
 
+/// Bundled `.mq4-mtp` trailer first, then a sibling `.mtp` sidecar. Returns the
+/// head and the last load error; the caller decides whether a missing head is
+/// fatal (`mtp=on`) or an AR fallback. `device` names the device in the log
+/// line when the head does not live on the daemon's own GPU.
+fn resolve_qwen35_mtp_head(
+    trunk_path: &Path,
+    gpu: &mut rdna_compute::Gpu,
+    physical_cap: usize,
+    device: Option<&str>,
+) -> (
+    Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
+    Option<String>,
+) {
+    let tag = device.map(|d| format!(", {d}")).unwrap_or_default();
+    let sidecar = trunk_path.with_extension("mtp");
+    let load_sidecar =
+        |gpu: &mut rdna_compute::Gpu| -> Result<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String> {
+            hipfire_arch_qwen35::mtp_head::load_mtp_head(&sidecar, gpu, physical_cap)
+                .map_err(|e| format!("sidecar {} load failed: {e}", sidecar.display()))
+        };
+    match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(trunk_path, gpu, physical_cap) {
+        Ok(Some(h)) => {
+            eprintln!(
+                "  MTP head loaded (bundled .mq4-mtp{tag}): n_embd={} vocab={}",
+                h.config.n_embd, h.config.vocab_size
+            );
+            (Some(h), None)
+        }
+        Ok(None) if sidecar.exists() => match load_sidecar(gpu) {
+            Ok(h) => {
+                eprintln!(
+                    "  MTP head loaded (sidecar {}{tag}): n_embd={} vocab={}",
+                    sidecar.display(),
+                    h.config.n_embd,
+                    h.config.vocab_size
+                );
+                (Some(h), None)
+            }
+            Err(e) => (None, Some(e)),
+        },
+        Ok(None) => (None, None),
+        Err(e) => {
+            let bundled_err = format!("bundled trailer load failed: {e}");
+            if !sidecar.exists() {
+                return (None, Some(bundled_err));
+            }
+            match load_sidecar(gpu) {
+                Ok(h) => {
+                    eprintln!(
+                        "  MTP head loaded (sidecar {} after bundled error{tag}): n_embd={} vocab={}",
+                        sidecar.display(),
+                        h.config.n_embd,
+                        h.config.vocab_size
+                    );
+                    (Some(h), None)
+                }
+                Err(e2) => (None, Some(format!("{bundled_err}; {e2}"))),
+            }
+        }
+    }
+}
+
 /// Build a `LoadedModel` from a carrier `Bundle`, shared fields, and
 /// eviction/DFlash state. This is the common body for qwen35 dispatch
 /// where eviction and DFlash need per-arch type info.
@@ -2111,72 +2174,8 @@ fn finish_qwen35_load(
     {
         None
     } else {
-        let trunk_path = Path::new(ctx.path);
-        let mut head_opt: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = None;
-        let mut load_err: Option<String> = None;
-        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(
-            trunk_path,
-            ctx.gpu,
-            physical_cap,
-        ) {
-            Ok(Some(h)) => {
-                eprintln!(
-                    "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={}",
-                    h.config.n_embd, h.config.vocab_size
-                );
-                head_opt = Some(h);
-            }
-            Ok(None) => {
-                let sidecar = trunk_path.with_extension("mtp");
-                if sidecar.exists() {
-                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(
-                        &sidecar,
-                        ctx.gpu,
-                        physical_cap,
-                    ) {
-                        Ok(h) => {
-                            eprintln!(
-                                "  MTP head loaded (sidecar {}): n_embd={} vocab={}",
-                                sidecar.display(),
-                                h.config.n_embd,
-                                h.config.vocab_size
-                            );
-                            head_opt = Some(h);
-                        }
-                        Err(e) => {
-                            load_err =
-                                Some(format!("sidecar {} load failed: {e}", sidecar.display()));
-                        }
-                    }
-                }
-            }
-            Err(e) => {
-                load_err = Some(format!("bundled trailer load failed: {e}"));
-                let sidecar = trunk_path.with_extension("mtp");
-                if sidecar.exists() {
-                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(
-                        &sidecar,
-                        ctx.gpu,
-                        physical_cap,
-                    ) {
-                        Ok(h) => {
-                            eprintln!(
-                                "  MTP head loaded (sidecar {} after bundled error): n_embd={} vocab={}",
-                                sidecar.display(),
-                                h.config.n_embd,
-                                h.config.vocab_size
-                            );
-                            head_opt = Some(h);
-                            load_err = None;
-                        }
-                        Err(e2) => {
-                            load_err =
-                                Some(format!("bundled: {e}; sidecar {}: {e2}", sidecar.display()));
-                        }
-                    }
-                }
-            }
-        }
+        let (head_opt, load_err) =
+            resolve_qwen35_mtp_head(Path::new(ctx.path), ctx.gpu, physical_cap, None);
         if head_opt.is_none() {
             if ctx.spec.mtp == Some(true) {
                 return Err(rollback_unfinished_qwen35(
@@ -3182,6 +3181,7 @@ pub fn load_model_ep_with_kv_mode(
         kv_mode,
         kv_backend,
         state_quant,
+        hipfire_runtime::loader_api::SpecLoadCfg::default(),
     )
 }
 
@@ -3198,6 +3198,7 @@ pub fn load_model_ep_admitted(
     kv_mode: Option<&str>,
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
+    spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
     match admission.arch_id {
         9 => load_model_ep_ds4(
@@ -3207,7 +3208,7 @@ pub fn load_model_ep_admitted(
             resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
         ),
         10 => load_model_ep_minimax(path, max_seq, tp),
-        5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_backend, state_quant),
+        5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_backend, state_quant, spec),
         // Backstop: `admit_source` above already refused every other arch_id.
         // Route through the shared constructor (not `unreachable!`) so the
         // refusal survives a future edit that drops the early classification,
@@ -3235,7 +3236,15 @@ pub fn load_model_ep_with_compressor_cache(
         }
         10 => Err("DeepSeek V4 compressor-cache storage cannot be applied to MiniMax".to_string()),
         5 | 6 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
-            load_model_ep_qwen35(path, max_seq, tp, None, None, None)
+            load_model_ep_qwen35(
+                path,
+                max_seq,
+                tp,
+                None,
+                None,
+                None,
+                hipfire_runtime::loader_api::SpecLoadCfg::default(),
+            )
         }
         5 | 6 => {
             Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string())
@@ -3627,6 +3636,7 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         )
     })
 }
+#[allow(clippy::too_many_arguments)]
 fn load_model_ep_qwen35(
     path: &str,
     max_seq: usize,
@@ -3634,6 +3644,7 @@ fn load_model_ep_qwen35(
     kv_mode: Option<&str>,
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
+    spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
@@ -3650,7 +3661,15 @@ fn load_model_ep_qwen35(
     let config = qwen35::config_from_hfq(&hfq_probe).map_err(|e| format!("qwen35 config: {e}"))?;
     if config.num_experts == 0 {
         drop(hfq_probe);
-        return load_model_tp_qwen35_dense(path, max_seq, tp, kv_mode, kv_backend, state_quant);
+        return load_model_tp_qwen35_dense(
+            path,
+            max_seq,
+            tp,
+            kv_mode,
+            kv_backend,
+            state_quant,
+            spec,
+        );
     }
     // Supported-topology gate (mirrors admission): refuse before `Gpus::init_ep`
     // (first device init) and the per-rank weight upload, not after a full load.
@@ -3881,6 +3900,7 @@ fn load_model_ep_qwen35(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn load_model_tp_qwen35_dense(
     path: &str,
     max_seq: usize,
@@ -3888,6 +3908,7 @@ fn load_model_tp_qwen35_dense(
     kv_mode: Option<&str>,
     kv_backend: Option<&str>,
     state_quant: Option<&str>,
+    spec: hipfire_runtime::loader_api::SpecLoadCfg,
 ) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
@@ -4040,7 +4061,48 @@ fn load_model_tp_qwen35_dense(
     let (gpus, weights, kv_caches, dn_states, scratches) = staging.into_parts();
     eprintln!("[loader] dense qwen TP load complete: {tp} ranks, peer_access={peer}");
 
+    // The MTP head is replicated on rank 0 (the trunk stays sharded), under the
+    // same typed `spec.mtp` policy the single-GPU loader honors.
+    let mut gpus = gpus;
+    let mtp_head = if spec.mtp == Some(false) {
+        None
+    } else {
+        let (head, load_err) = resolve_qwen35_mtp_head(
+            Path::new(path),
+            &mut gpus.devices[0],
+            max_seq,
+            Some("dense TP rank 0"),
+        );
+        if head.is_none() {
+            if spec.mtp == Some(true) {
+                return Err(format!(
+                    "MTP head required (mtp=on) but not found: {}",
+                    load_err.unwrap_or_else(|| "no bundled trailer or .mtp sidecar found".into())
+                ));
+            }
+            if let Some(err) = load_err {
+                eprintln!("  dense TP MTP head load failed: {err} — falling back to AR");
+            }
+        }
+        head
+    };
+    let mtp_present = mtp_head.is_some();
+    // Block-verify drafters cannot run on the mesh (`Qwen35DenseTpTarget`
+    // refuses `verify_block`), so an `ngram=on` request must not build one
+    // here: it would sit inert behind the AR route and lie in the load log.
+    let mesh_spec = hipfire_runtime::loader_api::SpecLoadCfg {
+        ngram_draft: Some(false),
+        ..spec
+    };
+    if spec.ngram_draft == Some(true) {
+        eprintln!("  dense TP: n-gram drafter refused (block verify is not wired on the mesh)");
+    }
+    let speculator =
+        crate::spec_build::build_speculator(arch_id, None, mtp_head, true, max_seq, mesh_spec);
+
     Ok(LoadedModel {
+        speculator,
+        mtp_weights_present: mtp_present,
         ep: Some(EpState {
             gpus,
             inner: EpArch::Qwen35DenseTp {
@@ -4290,6 +4352,12 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                     }
                 }
             }
+        }
+        // Ahead of the pool teardown: the EP arm returns before the single-GPU
+        // `spec.free(gpu)` below, and a mesh drafter's per-rank buffers are not
+        // reachable from the daemon's `gpu`.
+        if let Some(spec) = m.speculator.take() {
+            spec.free_multi(&mut gpus);
         }
         // Reclaim unleased peer-rooted collective scratch before device pool
         // teardown. Idempotent across EP variants; fold first error into
