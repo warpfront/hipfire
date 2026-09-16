@@ -33,6 +33,11 @@ Date: 2026-09-16. Planning-only specification for `/home/kaden/ClaudeCode/warpfr
 > 1024-row launch is a different trajectory; glue kernels only save launch
 > overhead against staging copies.
 
+> **GM Track A follow-up (multirow gemv on group-major, bit-exact) — closed
+> 2026-09-16:** N=1 on the Halo vs shipping r2: r2_gm +11/+25 %, r4_gm
+> +14/+17 %, r8_gm +16/+42 % (gate/down); row-major r4/r8 also lose to r2.
+> No lane mapping rescues decode on this layout; GM stays closed.
+
 ## Ten-line summary
 
 1. Select **M128 × N128 with 16 wave32s**, block `[32,16,1]`, four 16×16 subtiles/wave and `sum[32]`; retain A5 column-adjacent order.

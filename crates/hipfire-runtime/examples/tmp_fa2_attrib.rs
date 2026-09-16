@@ -40,6 +40,18 @@
 //!     cargo run --release -p hipfire-runtime --features lab \
 //!       --example tmp_fa2_attrib -- ship
 //!
+//! Arm `ship1201` (argv[1]=="ship1201", gfx1201/R9700 only): launch SHIPPING
+//! gfx1201 kernels via the runtime direct launchers vs frozen pre-change
+//! (b81) gfx1201 twins (`fa2_attrib_prod_1201` Q8, `fa2_attrib_prod_1201_fwht3`
+//! from `tmp_fa2_attrib_prod_1201*.hip`). Prints bitwise_eq out (and, for
+//! fwht3, ship-Q-unchanged vs input + prod-rotated sanity) + interleaved
+//! medians ship vs prod per L at L ∈ {1024,8192,32768}. Arch gate: gfx1201.
+//!
+//! R9700 ship1201 (parent runs gates):
+//!   HOME=/tmp/home-ab0 HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=0 \
+//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-r9700-fa2 \
+//!     ./target/release/examples/tmp_fa2_attrib ship1201
+//!
 //! Arm `rotcheck` (argv[1]=="rotcheck"): fwht3 Q-rotation isolation (L=1024
 //! fixture). Runs the frozen prod twin once and downloads the rotated f32 Q;
 //! runs the shipping pre-convert entry raw (do_rotate=1) on a fresh ORIGINAL
@@ -80,6 +92,8 @@
 //!   fa2_attrib_qf16
 //!   fa2_attrib_qshare2_f16
 //!   fa2_attrib_prod_fwht3   (frozen pre-change fwht3 entry)
+//!   fa2_attrib_prod_1201        (frozen pre-change gfx1201 Q8 entry)
+//!   fa2_attrib_prod_1201_fwht3  (frozen pre-change gfx1201 fwht3 entry)
 
 use hip_bridge::KernargBlob;
 use rdna_compute::{gen_fwht_signs, DType, Gpu};
@@ -104,6 +118,11 @@ const FWHT3_POS: usize = N_KV * FWHT3_HEAD; // 400
 const PROD_Q8_SYM: &str = "fa2_attrib_prod";
 const PROD_FWHT3_SYM: &str = "fa2_attrib_prod_fwht3";
 const PROD_FWHT3_MOD: &str = "halo_fa2_f4a_prod_fwht3";
+const PROD_1201_Q8_SYM: &str = "fa2_attrib_prod_1201";
+const PROD_1201_Q8_MOD: &str = "fa2_1201_prod_q8";
+const PROD_1201_FWHT3_SYM: &str = "fa2_attrib_prod_1201_fwht3";
+const PROD_1201_FWHT3_MOD: &str = "fa2_1201_prod_fwht3";
+const LDS_1201_BYTES: u32 = 65536;
 
 /// Frozen pre-qshare2 fwht3 entry (HEAD kernel, renamed symbol) + turbo_common.
 const PROD_FWHT3_SRC: &str = concat!(
@@ -111,6 +130,19 @@ const PROD_FWHT3_SRC: &str = concat!(
     "#define HIPFIRE_FA2_KT 32\n",
     include_str!("../../../kernels/src/turbo_common.h"),
     include_str!("tmp_fa2_attrib_prod_fwht3.hip"),
+);
+/// Frozen pre-change (b81) gfx1201 Q8 direct entry, all symbols renamed
+/// (`fa2_attrib_prod_1201*`) so the symbol-keyed host function cache never
+/// collides with the shipping `attention_q8_0_fa2_gqa_gfx1201*` modules.
+const PROD_1201_Q8_SRC: &str =
+    include_str!("tmp_fa2_attrib_prod_1201.hip");
+/// Frozen pre-change (b81) gfx1201 fwht3 entry (in-place Q rotation, like the
+/// old shipping path) + turbo_common, all symbols renamed. Only
+/// `fa2_attrib_prod_1201_fwht3` is ever ensured out of this module.
+const PROD_1201_FWHT3_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 3\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("tmp_fa2_attrib_prod_1201_fwht3.hip"),
 );
 /// F4b rotcheck: example-local f32 debug entry. Mirrors the production
 /// pre-convert exactly (same loads, same `fwht_shfl_forward_256` call, same
@@ -1625,6 +1657,397 @@ fn run_ship(gpu: &mut Gpu) {
     eprintln!("\nF4b ship arm complete.");
 }
 
+fn ensure_prod_1201(gpu: &mut Gpu) {
+    gpu.ensure_kernel_public(PROD_1201_Q8_MOD, PROD_1201_Q8_SRC, PROD_1201_Q8_SYM)
+        .unwrap_or_else(|e| panic!("compile {PROD_1201_Q8_SYM}: {e:?}"));
+    gpu.ensure_kernel_public(
+        PROD_1201_FWHT3_MOD,
+        PROD_1201_FWHT3_SRC,
+        PROD_1201_FWHT3_SYM,
+    )
+    .unwrap_or_else(|e| panic!("compile {PROD_1201_FWHT3_SYM}: {e:?}"));
+    eprintln!("ship1201 meta: compiled frozen twins {PROD_1201_Q8_SYM} + {PROD_1201_FWHT3_SYM}");
+}
+
+fn launch_prod_1201(
+    gpu: &mut Gpu,
+    sym: &str,
+    d_q: &rdna_compute::GpuTensor,
+    d_k: &rdna_compute::GpuTensor,
+    d_v: &rdna_compute::GpuTensor,
+    d_out: &rdna_compute::GpuTensor,
+    d_pos: &rdna_compute::GpuTensor,
+    d_s1: Option<&rdna_compute::GpuTensor>,
+    d_s2: Option<&rdna_compute::GpuTensor>,
+    batch: i32,
+) -> f64 {
+    // Kernargs mirror the pre-change shipping ABI: f32 q@0 (+ signs for the
+    // fwht3 twin, which rotates Q in place). LDS is the full 64 KiB planes.
+    let start = gpu.hip.event_create().unwrap();
+    let stop = gpu.hip.event_create().unwrap();
+    let mut args = KernargBlob::new();
+    args.push_ptr(d_q.buf.as_ptr());
+    args.push_ptr(d_k.buf.as_ptr());
+    args.push_ptr(d_v.buf.as_ptr());
+    args.push_ptr(d_out.buf.as_ptr());
+    args.push_ptr(d_pos.buf.as_ptr());
+    if let (Some(s1), Some(s2)) = (d_s1, d_s2) {
+        args.push_ptr(s1.buf.as_ptr());
+        args.push_ptr(s2.buf.as_ptr());
+    }
+    args.push_i32(N_HEADS as i32);
+    args.push_i32(N_KV as i32);
+    args.push_i32(HD as i32);
+    args.push_i32(batch);
+    args.push_f32(SCALE);
+    let grid_x = (batch as u32).div_ceil(8);
+    gpu.hip
+        .event_record(&start, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.launch_kernel_blob(sym, [grid_x, 4, 1], BLOCK, LDS_1201_BYTES, args.as_mut_slice())
+        .unwrap_or_else(|e| panic!("launch {sym}: {e:?}"));
+    gpu.hip
+        .event_record(&stop, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.hip.event_synchronize(&stop).unwrap();
+    let ms = gpu.hip.event_elapsed_ms(&start, &stop).unwrap() as f64;
+    let _ = gpu.hip.event_destroy(start);
+    let _ = gpu.hip.event_destroy(stop);
+    ms * 1000.0
+}
+
+fn launch_ship_1201_q8(
+    gpu: &mut Gpu,
+    d_q: &rdna_compute::GpuTensor,
+    d_k: &rdna_compute::GpuTensor,
+    d_v: &rdna_compute::GpuTensor,
+    d_out: &rdna_compute::GpuTensor,
+    d_pos: &rdna_compute::GpuTensor,
+    batch: usize,
+    seq_len: usize,
+) -> f64 {
+    let start = gpu.hip.event_create().unwrap();
+    let stop = gpu.hip.event_create().unwrap();
+    gpu.hip
+        .event_record(&start, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.attention_q8_0_fa2_gqa_gfx1201(
+        d_q, d_k, d_v, d_out, d_pos, N_HEADS, N_KV, HD, seq_len, batch,
+    )
+    .unwrap_or_else(|e| panic!("ship1201 q8 launch: {e:?}"));
+    gpu.hip
+        .event_record(&stop, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.hip.event_synchronize(&stop).unwrap();
+    let ms = gpu.hip.event_elapsed_ms(&start, &stop).unwrap() as f64;
+    let _ = gpu.hip.event_destroy(start);
+    let _ = gpu.hip.event_destroy(stop);
+    ms * 1000.0
+}
+
+fn launch_ship_1201_fwht3(
+    gpu: &mut Gpu,
+    d_q: &rdna_compute::GpuTensor,
+    d_k: &rdna_compute::GpuTensor,
+    d_v: &rdna_compute::GpuTensor,
+    d_out: &rdna_compute::GpuTensor,
+    d_pos: &rdna_compute::GpuTensor,
+    d_s1: &rdna_compute::GpuTensor,
+    d_s2: &rdna_compute::GpuTensor,
+    batch: usize,
+    seq_len: usize,
+) -> f64 {
+    let start = gpu.hip.event_create().unwrap();
+    let stop = gpu.hip.event_create().unwrap();
+    gpu.hip
+        .event_record(&start, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.attention_q8_0_fa2_gqa_fwht3k_gfx1201(
+        d_q, d_k, d_v, d_out, d_pos, d_s1, d_s2, N_HEADS, N_KV, HD, seq_len, batch,
+    )
+    .unwrap_or_else(|e| panic!("ship1201 fwht3 launch: {e:?}"));
+    gpu.hip
+        .event_record(&stop, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.hip.event_synchronize(&stop).unwrap();
+    let ms = gpu.hip.event_elapsed_ms(&start, &stop).unwrap() as f64;
+    let _ = gpu.hip.event_destroy(start);
+    let _ = gpu.hip.event_destroy(stop);
+    ms * 1000.0
+}
+
+fn run_ship1201(gpu: &mut Gpu) {
+    eprintln!("\n=== ship1201 arm: shipping gfx1201 FA2 vs frozen pre-change twins ===");
+    eprintln!(
+        "shape H{N_HEADS}/KV{N_KV}/D{HD} batch={BATCH}  L∈{L_VALUES:?}  positions at end of L"
+    );
+    eprintln!("Q8: ship=attention_q8_0_fa2_gqa_gfx1201  prod={PROD_1201_Q8_SYM} (frozen b81)");
+    eprintln!(
+        "fwht3: ship=attention_q8_0_fa2_gqa_fwht3k_gfx1201  prod={PROD_1201_FWHT3_SYM} (frozen b81)"
+    );
+    ensure_prod_1201(gpu);
+
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+    let d_s1 = gpu.upload_f32(&signs1, &[256]).unwrap();
+    let d_s2 = gpu.upload_f32(&signs2, &[256]).unwrap();
+
+    for &l in &L_VALUES {
+        eprintln!("\n-- L={l} (positions {}..{}) --", l - BATCH, l - 1);
+        let t_pack = Instant::now();
+        let pos_h = fill_positions_end_of_l(BATCH, l);
+        let q_h = fill_q(BATCH, 0xF30A);
+        let k_q8 = fill_q8_cache(l, 0xF30B);
+        let v_h = fill_q8_cache(l, 0xF30C);
+        let k_fw = fill_fwht3_k(l, 0xF30D);
+        eprintln!(
+            "packed Q={}  Kq8={}  Kfw={}  V={}  pos={} in {:.2}s",
+            q_h.len(),
+            k_q8.len(),
+            k_fw.len(),
+            v_h.len(),
+            pos_h.len(),
+            t_pack.elapsed().as_secs_f64()
+        );
+
+        let d_k_q8 = gpu.upload_raw(&k_q8, &[k_q8.len()]).unwrap();
+        let d_k_fw = gpu.upload_raw(&k_fw, &[k_fw.len()]).unwrap();
+        let d_v = gpu.upload_raw(&v_h, &[v_h.len()]).unwrap();
+        let pos_bytes = positions_to_bytes(&pos_h);
+        let d_pos = gpu.upload_raw(&pos_bytes, &[pos_bytes.len()]).unwrap();
+
+        let d_out_prod_q8 = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+        let d_out_ship_q8 = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+        let d_out_prod_fw = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+        let d_out_ship_fw = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+
+        // ---- Q8 bit-exact: frozen prod vs shipping launcher (out) ----
+        let d_q_prod = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+        let d_q_ship = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+        zero_out(gpu, &d_out_prod_q8, BATCH * QO_ROW);
+        zero_out(gpu, &d_out_ship_q8, BATCH * QO_ROW);
+        let _ = launch_prod_1201(
+            gpu,
+            PROD_1201_Q8_SYM,
+            &d_q_prod,
+            &d_k_q8,
+            &d_v,
+            &d_out_prod_q8,
+            &d_pos,
+            None,
+            None,
+            BATCH as i32,
+        );
+        let _ = launch_ship_1201_q8(
+            gpu, &d_q_ship, &d_k_q8, &d_v, &d_out_ship_q8, &d_pos, BATCH, l,
+        );
+        let prod_out = download_f32(gpu, &d_out_prod_q8, BATCH * QO_ROW);
+        let ship_out = download_f32(gpu, &d_out_ship_q8, BATCH * QO_ROW);
+        let eq = bitwise_eq_f32(&prod_out, &ship_out);
+        let mut n_diff = 0usize;
+        let mut max_abs = 0.0f32;
+        for (a, b) in prod_out.iter().zip(ship_out.iter()) {
+            if a.to_bits() != b.to_bits() {
+                n_diff += 1;
+                max_abs = max_abs.max((a - b).abs());
+            }
+        }
+        eprintln!(
+            "  bitwise_eq L={l} Q8 ship_vs_prod = {eq}  n_diff={n_diff} max_abs={max_abs:.6e}"
+        );
+
+        // ---- fwht3 bit-exact: frozen prod vs shipping (out + post-Q) ----
+        // The frozen prod twin still rotates Q in place (needs a fresh
+        // upload before every launch); the shipping launcher pre-converts
+        // internally and never mutates Q (post-Q must equal the input bytes).
+        let q_bytes_host: Vec<u8> = q_h.iter().flat_map(|x| x.to_le_bytes()).collect();
+        let d_q_prod_fw = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+        let d_q_ship_fw = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+        zero_out(gpu, &d_out_prod_fw, BATCH * QO_ROW);
+        zero_out(gpu, &d_out_ship_fw, BATCH * QO_ROW);
+        let _ = launch_prod_1201(
+            gpu,
+            PROD_1201_FWHT3_SYM,
+            &d_q_prod_fw,
+            &d_k_fw,
+            &d_v,
+            &d_out_prod_fw,
+            &d_pos,
+            Some(&d_s1),
+            Some(&d_s2),
+            BATCH as i32,
+        );
+        let _ = launch_ship_1201_fwht3(
+            gpu,
+            &d_q_ship_fw,
+            &d_k_fw,
+            &d_v,
+            &d_out_ship_fw,
+            &d_pos,
+            &d_s1,
+            &d_s2,
+            BATCH,
+            l,
+        );
+        let prod_fw_out = download_f32(gpu, &d_out_prod_fw, BATCH * QO_ROW);
+        let ship_fw_out = download_f32(gpu, &d_out_ship_fw, BATCH * QO_ROW);
+        let eq_o = bitwise_eq_f32(&prod_fw_out, &ship_fw_out);
+        let mut n_diff_o = 0usize;
+        let mut max_abs_o = 0.0f32;
+        for (a, b) in prod_fw_out.iter().zip(ship_fw_out.iter()) {
+            if a.to_bits() != b.to_bits() {
+                n_diff_o += 1;
+                max_abs_o = max_abs_o.max((a - b).abs());
+            }
+        }
+        eprintln!(
+            "  bitwise_eq L={l} fwht3 out ship_vs_prod = {eq_o}  n_diff={n_diff_o} max_abs={max_abs_o:.6e}"
+        );
+        // Ship Q must be bit-identical to the pre-launch input (the
+        // launcher pre-converts internally; Q immutable). Prod Q is rotated
+        // in place by the frozen twin, so it must DIFFER (sanity: rotation
+        // really happened on the prod side).
+        let q_bytes = BATCH * QO_ROW * 4;
+        let prod_q_post = download_bytes(gpu, &d_q_prod_fw, q_bytes);
+        let ship_q_post = download_bytes(gpu, &d_q_ship_fw, q_bytes);
+        let eq_q = bitwise_eq_bytes(&ship_q_post, &q_bytes_host);
+        let mut n_diff_q = 0usize;
+        for (a, b) in ship_q_post.iter().zip(q_bytes_host.iter()) {
+            if a != b {
+                n_diff_q += 1;
+            }
+        }
+        eprintln!(
+            "  bitwise_eq L={l} fwht3 postQ ship_vs_input = {eq_q}  n_diff_bytes={n_diff_q}"
+        );
+        let prod_rotated = !bitwise_eq_bytes(&prod_q_post, &q_bytes_host);
+        eprintln!("  fwht3 prod rotated in place = {prod_rotated} (expect true)");
+
+        // ---- Warmup ----
+        for _ in 0..ATTR_WARMUP {
+            let _ = launch_prod_1201(
+                gpu,
+                PROD_1201_Q8_SYM,
+                &d_q_prod,
+                &d_k_q8,
+                &d_v,
+                &d_out_prod_q8,
+                &d_pos,
+                None,
+                None,
+                BATCH as i32,
+            );
+            let _ = launch_ship_1201_q8(
+                gpu, &d_q_ship, &d_k_q8, &d_v, &d_out_ship_q8, &d_pos, BATCH, l,
+            );
+            // fwht3: refresh PROD Q outside timed path (in-place rotate
+            // consumes it). Ship Q is immutable — no refresh.
+            gpu.hip
+                .memcpy_htod(&d_q_prod_fw.buf, &q_bytes_host)
+                .unwrap();
+            let _ = launch_prod_1201(
+                gpu,
+                PROD_1201_FWHT3_SYM,
+                &d_q_prod_fw,
+                &d_k_fw,
+                &d_v,
+                &d_out_prod_fw,
+                &d_pos,
+                Some(&d_s1),
+                Some(&d_s2),
+                BATCH as i32,
+            );
+            let _ = launch_ship_1201_fwht3(
+                gpu,
+                &d_q_ship_fw,
+                &d_k_fw,
+                &d_v,
+                &d_out_ship_fw,
+                &d_pos,
+                &d_s1,
+                &d_s2,
+                BATCH,
+                l,
+            );
+        }
+
+        let mut samp_prod_q8 = Vec::with_capacity(ATTR_ITERS);
+        let mut samp_ship_q8 = Vec::with_capacity(ATTR_ITERS);
+        let mut samp_prod_fw = Vec::with_capacity(ATTR_ITERS);
+        let mut samp_ship_fw = Vec::with_capacity(ATTR_ITERS);
+        for _ in 0..ATTR_ITERS {
+            let us = launch_prod_1201(
+                gpu,
+                PROD_1201_Q8_SYM,
+                &d_q_prod,
+                &d_k_q8,
+                &d_v,
+                &d_out_prod_q8,
+                &d_pos,
+                None,
+                None,
+                BATCH as i32,
+            );
+            samp_prod_q8.push(us);
+            let us = launch_ship_1201_q8(
+                gpu, &d_q_ship, &d_k_q8, &d_v, &d_out_ship_q8, &d_pos, BATCH, l,
+            );
+            samp_ship_q8.push(us);
+
+            // fwht3: refresh PROD Q before each launch (outside timed
+            // interval is the memcpy; event timer only wraps the kernel).
+            // Ship Q is immutable — launched as-is every iteration.
+            gpu.hip
+                .memcpy_htod(&d_q_prod_fw.buf, &q_bytes_host)
+                .unwrap();
+            let us = launch_prod_1201(
+                gpu,
+                PROD_1201_FWHT3_SYM,
+                &d_q_prod_fw,
+                &d_k_fw,
+                &d_v,
+                &d_out_prod_fw,
+                &d_pos,
+                Some(&d_s1),
+                Some(&d_s2),
+                BATCH as i32,
+            );
+            samp_prod_fw.push(us);
+            let us = launch_ship_1201_fwht3(
+                gpu,
+                &d_q_ship_fw,
+                &d_k_fw,
+                &d_v,
+                &d_out_ship_fw,
+                &d_pos,
+                &d_s1,
+                &d_s2,
+                BATCH,
+                l,
+            );
+            samp_ship_fw.push(us);
+        }
+
+        let med_pq = median_f64(&mut samp_prod_q8);
+        let med_sq = median_f64(&mut samp_ship_q8);
+        let med_pf = median_f64(&mut samp_prod_fw);
+        let med_sf = median_f64(&mut samp_ship_fw);
+        let r_q8 = med_sq / med_pq.max(1e-30);
+        let r_fw = med_sf / med_pf.max(1e-30);
+        eprintln!(
+            "  Q8   prod_median_us={med_pq:.2}  ship_median_us={med_sq:.2}  ship/prod={r_q8:.4}  ({:.2}% of prod)  speedup={:.2}%",
+            r_q8 * 100.0,
+            (1.0 - r_q8) * 100.0
+        );
+        eprintln!(
+            "  fwht3 prod_median_us={med_pf:.2}  ship_median_us={med_sf:.2}  ship/prod={r_fw:.4}  ({:.2}% of prod)  speedup={:.2}%",
+            r_fw * 100.0,
+            (1.0 - r_fw) * 100.0
+        );
+    }
+    eprintln!("\nship1201 arm complete.");
+}
+
 fn launch_preconvert_raw(
     gpu: &mut Gpu,
     sym: &str,
@@ -2389,13 +2812,16 @@ fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     let arm = std::env::args().nth(1).unwrap_or_default();
     let is_ship = arm == "ship";
+    let is_ship1201 = arm == "ship1201";
     let is_rotcheck = arm == "rotcheck";
     let is_iu8probe = arm == "iu8probe";
     eprintln!(
-        "tmp_fa2_attrib arch={}  arm={}  (F3.0 attribution / F4b ship+rotcheck / F5.1 iu8probe)",
+        "tmp_fa2_attrib arch={}  arm={}  (F3.0 attribution / F4b ship+rotcheck / ship1201 / F5.1 iu8probe)",
         gpu.arch,
         if is_ship {
             "ship"
+        } else if is_ship1201 {
+            "ship1201"
         } else if is_rotcheck {
             "rotcheck"
         } else if is_iu8probe {
@@ -2404,6 +2830,27 @@ fn main() {
             "attrib"
         }
     );
+    // ship1201 is arch-gated to gfx1201 (R9700) and runs before the gfx11
+    // family gate below.
+    if is_ship1201 {
+        if gpu.arch != "gfx1201" {
+            eprintln!("skip: ship1201 needs gfx1201, got {}", gpu.arch);
+            eprintln!("R9700 command (parent runs gates):");
+            eprintln!(
+                "  HOME=/tmp/home-ab0 HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=0 \\"
+            );
+            eprintln!("    HIPFIRE_KERNEL_CACHE=/tmp/kc-r9700-fa2 \\");
+            eprintln!(
+                "    ./target/release/examples/tmp_fa2_attrib ship1201"
+            );
+            return;
+        }
+        if gpu.active_stream.is_none() {
+            gpu.active_stream = Some(gpu.hip.stream_create().expect("stream"));
+        }
+        run_ship1201(&mut gpu);
+        return;
+    }
     eprintln!(
         "Production Q conversion: (_Float16)float C cast → AMD v_cvt_f16_f32 (RNE)."
     );
