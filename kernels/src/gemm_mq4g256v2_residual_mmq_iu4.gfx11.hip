@@ -302,7 +302,7 @@ IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3, true, 3)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3, true, 3)
-#if defined(__gfx1151__)
+#if defined(__gfx1151__) || defined(__gfx1100__)
 IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151, true, 3)
 IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151, true, 3)
 #endif

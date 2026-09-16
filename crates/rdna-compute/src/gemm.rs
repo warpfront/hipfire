@@ -19067,7 +19067,7 @@ impl Gpu {
         // entries with grid [N/128, M/128, 1]. Non-full, capture/replay, and
         // non-gfx1151 keep baseline symbols and [M/128, N/128, 1].
         let use_col = full
-            && self.arch.as_str() == "gfx1151"
+            && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
             && !self.replay.is_recording()
             && !self.graphs.capture_mode;
         let kernel_name = match (full, add, use_col) {
