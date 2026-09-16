@@ -23,6 +23,13 @@ Source base: `/home/kaden/ClaudeCode/warpfront/wt-lloyd`, `cadd315a1`; the paren
 > iu8 = f16 rate ⇒ F5's i8 WMMA has no MAC-rate lever (fill/bytes only).
 > Next: W2 re-targeted at ≥70 % of iu4 peak (spec revision), then F2/fill.
 
+> **F6 admitted / F7 rejected (2026-09-16).** F6 = K-only register prefetch of
+> the next KT32 tile (bit-exact; FA2 −3.7 % Halo / −4.6 % XTX; 224 VGPR).
+> F7 = adding an even-key V-half prefetch (240 VGPR): bit-exact but FA2
+> +1.5…+3 % Halo, +4 % XTX — staging cost exceeds the hidden latency;
+> reverted. Remaining FA2 fill cost is V dequant VALU + LDS stores, not load
+> latency; the exact lever left is a pre-dequantized f16 V (KV shadow).
+
 ## 1. Order and immutable contract
 
 Execute: **C0 latent FA2 blob fix → A0 calibration → A5 grid order → F1 repaired oracle and F2 1024 host/cadence envelope → B6 fill issue structure → G1 sequential GDN constants → T0 tails → S1 co-scheduling screen → W2-versus-S1 Sol-spec decision.** This is the max brainstorm's first-week order, with the mandatory correctness fix in front and the host half of F made explicit (`docs/plans/2026-09-15-halo-gap-levers-max.md:592-604`). F2 has its own early kill; a failed chunk-size experiment must not block B6/G1/T0 at N512.
