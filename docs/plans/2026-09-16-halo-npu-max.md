@@ -2,6 +2,19 @@
 
 Date: 2026-09-16. Coordinator/research: HaloNpuMax. Execution is delegated through Main. Source worktree is `/home/kaden/ClaudeCode/warpfront/wt-lloyd`; all device artifacts belong under `hipx:/home/kaden/npu-screen`. No production wiring or commits. This document is updated as executable evidence arrives; unmeasured entries are not performance claims.
 
+> **UPDATE 2026-09-16 (NpuZeroCopy2, hipx:/home/kaden/npu-screen/zero-copy2/):
+> one-direction zero-copy WORKS with no driver change — GPU-owned
+> hipMalloc/finegrained buffers PRIME-imported into xdna are READ and WRITTEN
+> by an NPU kernel bit-exactly (control 6/6, import-read 12/12, import-write
+> 36/36 across CPU-mmap / on-GPU / DtoH verify; dmesg clean). GPU bandwidth
+> on the shared buffers stays hipMalloc-class (147–176 R / 122–189 W GB/s);
+> import setup 0.8–3.9 ms once. Hazards: packet BO must be CMD-type;
+> SYNC_BO on an imported handle kernel-oopses (use clflush +
+> hipDeviceSynchronize). The earlier "unproven" was a broken control. With
+> the staged-copy tax gone, at the measured 13 TOPS a ~20 % gate row slice
+> hides under the GPU (≈ −20 % gate ≈ −6 % pp2048) before any tuning of
+> placement/k_mt. Park line now depends only on sustained TOPS.
+
 > **STATUS 2026-09-16 (parent, final for this session) — FEASIBLE, PARKED.**
 > Measured: bare `amdxdna` ioctl dispatch works (libc-only, bit-for-bit vs XRT,
 > ~103 µs submit→complete, no overhead); NPU↔GPU contention ≤ 2 %; tuned
