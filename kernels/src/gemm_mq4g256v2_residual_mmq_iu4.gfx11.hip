@@ -72,6 +72,10 @@ extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx
     const char*, const block_i4_128*, float*, int, int, int, int) {}
 extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_pf_gfx11(
+    const char*, const block_i4_128*, float*, int, int, int, int) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_pf_gfx11(
+    const char*, const block_i4_128*, float*, int, int, int, int) {}
 
 #else
 
@@ -293,9 +297,112 @@ static __device__ __forceinline__ void gemm_iu4_body(
         }
     }
 }
+// W5: in-register software-prefetch sister of gemm_iu4_body (FULL path only
+// in practice; template kept for ABI symmetry). Same grid/block/LDS/wave
+// map, same 4 barriers/group, same LDS planes, same dot/fold/epilogue text.
+// Only the GLOBAL load issue point moves earlier: right after the barrier
+// that publishes half-0, PF_W dwords/lane of the next Xq half are loaded
+// into registers; the dot/fold then runs on current LDS data; those
+// registers are stored to LDS in the existing fill slot (remaining 9-PF_W
+// dwords still load from global there). Compiler loop on gfx1151/gfx1100:
+// PF_W=9 → 198 VGPR, PF_W=2 → 193, PF_W=1 → 192/0/0 (occupancy 8). A-side
+// stays direct globals->LDS (no budget for A prefetch). 
+// __builtin_amdgcn_sched_barrier(0) keeps the prefetch loads above the
+// WMMA loop; no asm memory clobbers.
+template <bool FULL>
+static __device__ __forceinline__ void gemm_iu4_body_pf(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add,
+    int row_tile,
+    int col_tile
+) {
+    const int row0 = row_tile * IU4_MMQ_Y;
+    const int col0 = col_tile * IU4_MMQ_X;
+    if (!FULL && (row0 >= M || col0 >= N)) return;
+
+    const int groups_per_row = K / 256;
+    const int blocks128 = K / 128;
+
+    extern __shared__ int smem[];
+    int* tile_y = smem;
+    int* tile_x = tile_y + IU4_MMQ_X * IU4_TILE_Y_K;
+
+    float sum[IU4_MMQ_X * IU4_MMQ_Y / (IU4_MMQ_NWARPS * IU4_WARP_SIZE)] = {0.0f};
+
+    constexpr int PW = IU4_MMQ_NWARPS * IU4_WARP_SIZE;
+    constexpr int PF_W = 1;
+    int pf_x[PF_W];
+    for (int kb = 0; kb < groups_per_row; ++kb) {
+        load_iu4_tile<FULL>(A, tile_x, row0, kb, M, groups_per_row);
+        const int* by0 = (const int*)(Xq + (long long)(2 * kb) * N + col0);
+        for (int l0 = 0; l0 < IU4_MMQ_X * IU4_TILE_Y_K; l0 += IU4_MMQ_NWARPS * IU4_WARP_SIZE) {
+            const int l = l0 + threadIdx.y * IU4_WARP_SIZE + threadIdx.x;
+            if (FULL || col0 + l / IU4_TILE_Y_K < N) tile_y[l] = by0[l];
+            else tile_y[l] = 0;
+        }
+        __syncthreads();
+        const int* by1 = (const int*)(Xq + (long long)(2 * kb + 1) * N + col0);
+        #pragma unroll
+        for (int u = 0; u < PF_W; ++u) {
+            const int l = u * PW + (threadIdx.y * IU4_WARP_SIZE + threadIdx.x);
+            if (FULL || col0 + l / IU4_TILE_Y_K < N) pf_x[u] = by1[l];
+            else pf_x[u] = 0;
+        }
+        __builtin_amdgcn_sched_barrier(0);
+        vec_dot_i4_x128(tile_x, tile_y, sum, 0);
+        __syncthreads();
+
+        if (2 * kb + 1 < blocks128) {
+            #pragma unroll
+            for (int u = 0; u < PF_W; ++u) {
+                const int l = u * PW + (threadIdx.y * IU4_WARP_SIZE + threadIdx.x);
+                tile_y[l] = pf_x[u];
+            }
+            for (int u = PF_W; u < 9; ++u) {
+                const int l = u * PW + (threadIdx.y * IU4_WARP_SIZE + threadIdx.x);
+                if (FULL || col0 + l / IU4_TILE_Y_K < N) tile_y[l] = by1[l];
+                else tile_y[l] = 0;
+            }
+            __syncthreads();
+            vec_dot_i4_x128(tile_x, tile_y, sum, 1);
+            __syncthreads();
+        }
+    }
+    using tile_C = tile<16, 16, int, DATA_LAYOUT_J_MAJOR>;
+    constexpr int rows_per_warp = 32;
+    constexpr int ntx = rows_per_warp / tile_C::I;
+    const int i0 = (threadIdx.y / ntx) * rows_per_warp;
+
+    #pragma unroll
+    for (int j0 = 0; j0 < IU4_MMQ_X; j0 += ntx * tile_C::J) {
+        #pragma unroll
+        for (int n = 0; n < ntx; ++n) {
+            #pragma unroll
+            for (int l = 0; l < tile_C::ne; ++l) {
+                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+                const int i = i0 + n * tile_C::I + tile_C::get_i(l);
+                if (FULL || (row0 + i < M && col0 + j < N)) {
+                    float* yp = Y + (long long)(col0 + j) * M + (row0 + i);
+                    const float v = sum[(j0 / tile_C::J + n) * tile_C::ne + l];
+                    if (add) {
+                        *yp += v;
+                    } else {
+                        *yp = v;
+                    }
+                }
+            }
+        }
+    }
+}
 
 #define IU4_ENTRY(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body<full>(A, Xq, Y, M, K, N, add, blockIdx.x, blockIdx.y); }
 #define IU4_ENTRY_COL(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body<full>(A, Xq, Y, M, K, N, add, blockIdx.y, blockIdx.x); }
+#define IU4_ENTRY_PF_COL(name, full, bounds_min) extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, bounds_min) void name(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body_pf<full>(A, Xq, Y, M, K, N, add, blockIdx.y, blockIdx.x); }
 
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4, false, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add, true, 2)
@@ -305,6 +412,8 @@ IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3, true, 3)
 #if defined(__gfx1151__) || defined(__gfx1100__)
 IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151, true, 3)
 IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151, true, 3)
+IU4_ENTRY_PF_COL(gemm_mq4g256v2_residual_mmq_iu4_full_add_pf_gfx11, true, 3)
+IU4_ENTRY_PF_COL(gemm_mq4g256v2_residual_mmq_iu4_full_set_pf_gfx11, true, 3)
 #endif
 
 #endif
