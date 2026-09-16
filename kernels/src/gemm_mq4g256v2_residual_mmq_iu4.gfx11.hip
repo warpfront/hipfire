@@ -163,6 +163,32 @@ static __device__ __forceinline__ void load_iu4_tile(
     }
 }
 
+// IU4_FOLD_RN — W4.0/LF.0 bit-exact fold pin (all gfx11 entries share it).
+// Every output element folds one int32 WMMA result C through EXACTLY this DAG
+// (traced in emitted gfx1151 ISA, full_set_occ3_col h0 cluster: t1 L16340,
+// p L16346, t2 L16347, term L16365, sum-add L16380; 128 instances per entry =
+// 64 sums x h0/h1, so per-entry/per-arch differences are only scheduling):
+//   t1   = RN(sc * d)            v_fma_mix_f32 (header.lo x d + (-0.0))
+//   p    = RN(t1 * float(C))     v_mul_f32 (dual-issued on gfx1151)
+//   t2   = RN(zp * d)            v_fma_mix_f32 (header.hi x d + (-0.0))
+//   term = RN(t2 * float(s) + p) v_fmac_f32 (the zp term is the FMA product,
+//                                          NOT the running sum)
+//   sum  = RN(sum + term)        v_add_f32 (separate add, never fused)
+// Spelling the products/FMA/final-add as __fmul_rn/__fmaf_rn/__fadd_rn pins the
+// contraction choice explicitly instead of relying on fp-contract fusion order.
+// The fpext+fmul idiom on the half2 lanes still folds to v_fma_mix_f32 in the
+// backend exactly as before. d is evaluated once into a temporary; the sum
+// lvalue keeps += read/modify/write semantics.
+#define IU4_FOLD_RN(sum_lvalue, sc, zp, d, acc_i32, s_i32) \
+    do { \
+        const float iu4_fold_d_ = (d); \
+        const float iu4_fold_t1_ = __fmul_rn((sc), iu4_fold_d_); \
+        const float iu4_fold_p_ = __fmul_rn(iu4_fold_t1_, (float)(acc_i32)); \
+        const float iu4_fold_t2_ = __fmul_rn((zp), iu4_fold_d_); \
+        const float iu4_fold_term_ = __fmaf_rn(iu4_fold_t2_, (float)(s_i32), iu4_fold_p_); \
+        (sum_lvalue) = __fadd_rn((sum_lvalue), iu4_fold_term_); \
+    } while (0)
+
 // X128-structured dot over ONE 128-K half (h = 0/1): 8 iu4 WMMAs into one
 // i32 C per (j0, n), then one fold with (d_x, s_x=int sum).
 static __device__ __forceinline__ void vec_dot_i4_x128(
@@ -209,8 +235,8 @@ static __device__ __forceinline__ void vec_dot_i4_x128(
                 const int i = i0 + n * tile_C::I + tile_C::get_i(l);
                 const half2 dm = ((const half2*)(x_qs + i * IU4_TILE_X_K + IU4_X_DM_OFF))[4 * h];
                 const float2 dmA = __half22float2(dm);
-                sum[(j0 / tile_C::J + n) * tile_C::ne + l] +=
-                    dmA.x * d_x * (float)acc_i[l] + dmA.y * d_x * (float)s_x;
+                IU4_FOLD_RN(sum[(j0 / tile_C::J + n) * tile_C::ne + l],
+                            dmA.x, dmA.y, d_x, acc_i[l], s_x);
             }
         }
     }
