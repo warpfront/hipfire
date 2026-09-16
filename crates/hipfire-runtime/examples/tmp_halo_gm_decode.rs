@@ -355,9 +355,8 @@ fn main() {
                 }
             }
             let mut meds = Vec::with_capacity(arms.len());
-            for (arm, v) in arms.iter().zip(acc.iter_mut()) {
+            for v in acc.iter_mut() {
                 meds.push(median(v));
-                let _ = arm;
             }
             for (arm, med) in arms.iter().zip(meds.iter()) {
                 eprintln!(

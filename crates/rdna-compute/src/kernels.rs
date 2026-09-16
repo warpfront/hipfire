@@ -5662,18 +5662,25 @@ pub const ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC: &str =
 
 /// gfx1201-only GQA-fused FA2 prefill (research opt-in). One workgroup per
 /// KV head x 8 positions; K/V dequantized once per KT64 tile into 64 KiB
-/// swizzled LDS. Three symbols: `attention_q8_0_fa2_gqa_gfx1201` (direct),
+/// swizzled LDS. Four symbols: `attention_q8_0_fa2_gqa_gfx1201` (direct),
 /// `attention_q8_0_fa2_gqa_partial_gfx1201` (split-KV records, stride 258),
-/// `attention_q8_0_fa2_gqa_merge_gfx1201` (stable LSE merge). JIT-only via
+/// `attention_q8_0_fa2_gqa_merge_gfx1201` (stable LSE merge), plus
+/// `attention_fa2_q_preconvert_gfx1201` (F4b: f32 Q -> f16 scratch ahead of
+/// the body, same file). JIT-only via
 /// the `attention_q8_0_fa2_gqa_gfx1201*` launchers; never on a default path.
 pub const ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip");
 
-/// fwht3-K variant of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] (`HIPFIRE_FA2_KMODE=3):
+/// fwht3-K variant of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] (`HIPFIRE_FA2_KMODE=3`):
 /// K dequantizes fwht3 records (f32 cnorm + 96 B of 3-bit codes, K stored
-/// FWHT-rotated) into the unchanged K plane, and the entry symbol
-/// `attention_q8_0_fa2_gqa_fwht3k_gfx1201` rotates this WG's Q rows in place
-/// (signed FWHT-256) before the shared body. `turbo_common.h` is prepended
+/// FWHT-rotated) into the unchanged K plane. F4b: the Q-side signed-FWHT-256
+/// rotation moved out of the body into `attention_fa2_q_preconvert_fwht3_gfx1201`
+/// (same helper, same op order — bit-identical; KMODE-selected symbol,
+/// distinct from the Q8 module's `attention_fa2_q_preconvert_gfx1201` because
+/// the host function cache is keyed by symbol), so the entry symbol
+/// `attention_q8_0_fa2_gqa_fwht3k_gfx1201` takes the SAME kernarg list as the
+/// Q8 entry (f16 q16 at offset 0, no signs) and never mutates Q:
+/// replay-idempotent, capture-safe. `turbo_common.h` is prepended
 /// (same pattern as the `KV_SLOT_DESC_H` sites) because the runtime compile
 /// has no `-I` to `kernels/src`. JIT-only via
 /// `attention_q8_0_fa2_gqa_fwht3k_gfx1201`; never on a default path.

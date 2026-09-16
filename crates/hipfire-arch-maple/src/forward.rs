@@ -193,6 +193,8 @@ fn decode_step_body(
             v: &state.fa_v,
             k_cache: &state.kv.k_gpu[l],
             v_cache: &state.kv.v_gpu[l],
+            k_shadow: None,
+            v_shadow: None,
             k_scales: None,
             v_scales: None,
             pos_buf: &state.pos_buf,
@@ -1256,6 +1258,8 @@ fn batched_attend(
         v: &state.b_v,
         k_cache: &state.kv.k_gpu[l],
         v_cache: &state.kv.v_gpu[l],
+        k_shadow: None,
+        v_shadow: None,
         k_scales: None,
         v_scales: None,
         // `pos_buf` / `pos` are the batch_size==1 path; with batch_size > 1 the

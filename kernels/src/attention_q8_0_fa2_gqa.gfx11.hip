@@ -240,7 +240,9 @@ __device__ __forceinline__ void fa2_gqa_body(
 #ifndef HIPFIRE_FA2_SHADOW_PF
 #define HIPFIRE_FA2_SHADOW_PF 1
 #endif
+#if HIPFIRE_FA2_SHADOW_PF
     uint32_t pf_sh[KT_KITERS * 16];
+#endif
 #endif
     // ---- Transitions 2-4: KT tiles ----
     for (int tile = 0; ; ++tile) {
@@ -261,6 +263,13 @@ __device__ __forceinline__ void fa2_gqa_body(
 
         // ---- Transition 2: cooperative KT fill (all four waves) ----
 #ifdef HIPFIRE_FA2_SHADOW
+#if !HIPFIRE_FA2_SHADOW_PF
+        (void)have_pf;
+#endif
+        // Q8-stride locals are consumed only by the dequant fills below
+        // (compiled out here); the shadow fills use direct f16 row math.
+        (void)row_stride;
+        (void)kv_blk;
         // Shadow K fill: f16 rows [pos, 4, 256] straight into the swizzled
         // dword plane (same store as the Q8/fwht3 paths, no dequant). Slot
         // (k,b) owns dims b*32..b*32+31 in both K modes (fwht3 pairs
@@ -678,6 +687,7 @@ __device__ __forceinline__ void fa2_gqa_body(
             }
         }
 #endif
+#endif
 
         // ---- Transition 3: KT/16 QK/softmax/PV subtiles of 16 keys ----
         if (compute) {
@@ -1086,6 +1096,11 @@ __device__ __forceinline__ void fa2_gqa_body(
 // deterministic near-miss on both cards (near-uniform softmax hides the
 // missing rotation to ~1e-3), not an op-order race. Distinct symbols make
 // each launcher resolve its own module's build.
+// Shadow modules (HIPFIRE_FA2_SHADOW) reuse the Q8 / fwht3 module's
+// pre-convert symbols (same source, same build) and must not re-export them:
+// the host function cache is keyed by symbol, so a duplicate registration
+// would shadow the canonical build.
+#ifndef HIPFIRE_FA2_SHADOW
 #if HIPFIRE_FA2_KMODE == 3
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht3_gfx11
 #else
@@ -1135,9 +1150,11 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
     o[6] = (_Float16)v6; o[7] = (_Float16)v7;
     *(half8_t*)(wp + lane * 8) = o;
 }
+#endif
 
 // Body entries take pre-converted f16 Q at kernarg offset 0 (same slot, same
 // size as the old f32 Q pointer, so the pointer-array blob ABI is unchanged).
+#ifndef HIPFIRE_FA2_SHADOW
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx11(
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
@@ -1161,6 +1178,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1
     fa2_gqa_body(q16, k_cache, v_cache, out, positions, batch_size,
                  scale_attn, kv_h, q_base);
 }
+#endif
 
 // ---- KMODE=3 entry: fwht3 K, pre-rotated + pre-converted f16 Q ----
 // K is stored FWHT-rotated, so Q must be rotated before QK (orthogonal
@@ -1170,6 +1188,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1
 // attention_fa2_q_preconvert_fwht3_gfx11 (same helper, same op order), so this
 // entry takes the SAME kernarg list as the Q8 entry above (q16 at offset 0,
 // no signs) and never mutates Q: replay-idempotent, capture-safe.
+#ifndef HIPFIRE_FA2_SHADOW
 #if HIPFIRE_FA2_KMODE == 3
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_gfx11(
     const _Float16* __restrict__ q16,
@@ -1194,4 +1213,64 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
     fa2_gqa_body(q16, k_cache, v_cache, out, positions, batch_size,
                  scale_attn, kv_h, q_base);
 }
+#endif
+#endif
+
+// ---- Shadow-fed entries (HIPFIRE_FA2_SHADOW only) ----
+// `k_cache`/`v_cache` carry the f16 shadow rows ([pos, 4, 256] f16) instead
+// of Q8_0 / fwht3 records; the body copies them straight into the same LDS
+// planes (same swizzle/layout) with no dequant. Same kernarg list as the
+// Q8/fwht3k entries above (q16 at offset 0), so the pointer-array blob ABI
+// is unchanged. QK/softmax/PV/epilogue untouched: outputs bitwise-identical
+// to the dequant path. Replay-idempotent, capture-safe.
+#ifdef HIPFIRE_FA2_SHADOW
+#if HIPFIRE_FA2_KMODE == 3
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_shadow_gfx11(
+    const _Float16* __restrict__ q16,
+    const _Float16* __restrict__ k_shadow,
+    const _Float16* __restrict__ v_shadow,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    fa2_gqa_body(q16, (const unsigned char*)k_shadow, (const unsigned char*)v_shadow,
+                 out, positions, batch_size, scale_attn, kv_h, q_base);
+}
+#else
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_shadow_gfx11(
+    const _Float16* __restrict__ q16,
+    const _Float16* __restrict__ k_shadow,
+    const _Float16* __restrict__ v_shadow,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    fa2_gqa_body(q16, (const unsigned char*)k_shadow, (const unsigned char*)v_shadow,
+                 out, positions, batch_size, scale_attn, kv_h, q_base);
+}
+#endif
 #endif

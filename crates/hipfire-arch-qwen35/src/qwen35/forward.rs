@@ -4281,12 +4281,15 @@ pub(crate) fn kv_cache_attention_dispatch(
     let fused_epilogue_route =
         qwen35_fa_epilogue_route_supported(gpu.arch_caps.is_gfx1201(), q8_route, asym3_route);
     let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo) && fused_epilogue_route;
+    let (k_shadow, v_shadow) = kv_cache.shadow_pair(layer_idx);
     let io = AttnParams {
         q: &s.fa_q,
         k: &s.fa_k,
         v: &s.fa_v,
         k_cache: &kv_cache.k_gpu[layer_idx],
         v_cache: &kv_cache.v_gpu[layer_idx],
+        k_shadow,
+        v_shadow,
         k_scales: None,
         v_scales: None,
         pos_buf: &s.pos_buf,

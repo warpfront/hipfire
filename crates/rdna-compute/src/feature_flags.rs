@@ -592,6 +592,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_qkvza: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKVZA")
                 .unwrap_or(arch == "gfx1201"),
+            gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
+                .unwrap_or(arch == "gfx1201"),
             kv_shadow_f16: parse_bool("HIPFIRE_KV_SHADOW_F16").unwrap_or(true),
             gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
                 .unwrap_or(arch == "gfx1201"),

@@ -1204,6 +1204,16 @@ impl KvCache {
             && self.v_shadow_f16.get(l).map_or(false, |t| t.numel() > 1)
     }
 
+    /// Borrow the f16 shadow pair for `k_gpu` index `l` (`(None, None)` when
+    /// absent). Convenience for attention dispatch `io` construction.
+    pub fn shadow_pair(&self, l: usize) -> (Option<&GpuTensor>, Option<&GpuTensor>) {
+        if self.shadow_present(l) {
+            (self.k_shadow_f16.get(l), self.v_shadow_f16.get(l))
+        } else {
+            (None, None)
+        }
+    }
+
     /// Allocate f16 K/V shadows for `layers` (`k_gpu`/`v_gpu` indexes of the
     /// FULL-ATTENTION layers), sized `physical_cap × n_kv_heads × head_dim`
     /// f16 alongside the Q8/fwht3 cache rows in the same per-layer slot
@@ -4250,6 +4260,12 @@ impl KvCache {
             note(gpu.free_tensor(t));
         }
         for t in self.v_scales {
+            note(gpu.free_tensor(t));
+        }
+        for t in self.k_shadow_f16 {
+            note(gpu.free_tensor(t));
+        }
+        for t in self.v_shadow_f16 {
             note(gpu.free_tensor(t));
         }
         if let Some(t) = self.givens_cos {

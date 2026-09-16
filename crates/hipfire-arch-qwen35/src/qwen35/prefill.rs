@@ -6915,12 +6915,15 @@ fn execute_fa_attend_step(
         ..kv_cache.tier_inputs()
     })
     .map_err(|e| HipError::new(0, &e.to_string()))?;
+    let (k_shadow, v_shadow) = kv_cache.shadow_pair(layer_idx);
     let io = AttnParams {
         q,
         k,
         v,
         k_cache: &kv_cache.k_gpu[layer_idx],
         v_cache: &kv_cache.v_gpu[layer_idx],
+        k_shadow,
+        v_shadow,
         k_scales: None,
         v_scales: None,
         pos_buf: &s.pos_buf,

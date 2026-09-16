@@ -1657,6 +1657,8 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         v: &scratch.v,
         k_cache: &kv.inner.k_gpu[0],
         v_cache: &kv.inner.v_gpu[0],
+        k_shadow: None,
+        v_shadow: None,
         k_scales: None,
         v_scales: None,
         pos_buf,

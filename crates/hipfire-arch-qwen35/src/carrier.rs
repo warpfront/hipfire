@@ -343,6 +343,50 @@ fn validate_cask_static_layout(
     Ok(())
 }
 
+/// Allocate the f16 KV shadow for FULL-ATTENTION layers when the Halo
+/// contract applies, else leave the shadow vecs empty (no VRAM, no behavior
+/// change). Gates (all required):
+///   - exact gfx1151 (`attention.kv_shadow_f16` is Halo-only by contract);
+///   - `gpu.flags.kv_shadow_f16` (default on; `HIPFIRE_KV_SHADOW_F16=0` opts out);
+///   - static Q8 or fwht3 K with Q8 V (the only K/V modes the shadow-fed
+///     FA2 entries read; adaptive starts FWHT4 and lloyd-V lives in rotated
+///     space, so the adaptive path is out of scope);
+///   - contiguous backend (shadows mirror the per-layer slot geometry in
+///     plain device buffers; VMM arenas stay shadow-free and route Q8);
+///   - full (non-eviction) sizing: `physical_cap == max_seq`, so absolute
+///     positions index shadow rows 1:1 with no wrap or compaction drift.
+fn maybe_alloc_kv_shadow_f16(
+    gpu: &mut rdna_compute::Gpu,
+    kv: &mut KvCache,
+    plan: &Qwen35KvPlan,
+    backend: KvBackend,
+) -> Result<(), String> {
+    if backend != KvBackend::Contiguous {
+        return Ok(());
+    }
+    if plan.dims.physical_cap != Some(plan.dims.max_seq) {
+        return Ok(());
+    }
+    if gpu.arch.as_str() != "gfx1151" || !gpu.flags.kv_shadow_f16 {
+        return Ok(());
+    }
+    let k_ok = matches!(
+        plan.mode,
+        kv_mode::KvMode::Q8 | kv_mode::KvMode::Fwht3
+    );
+    if !k_ok || !matches!(plan.static_v, llama::VMode::Q8) {
+        return Ok(());
+    }
+    let layers: Vec<usize> = plan
+        .is_kv_layer
+        .iter()
+        .enumerate()
+        .filter_map(|(l, &b)| b.then_some(l))
+        .collect();
+    kv.ensure_shadow_f16(gpu, &layers)
+        .map_err(|e| format!("kv_shadow_f16: {e}"))
+}
+
 fn construct_kv_cache(
     config: &Qwen35Config,
     ctx: &mut LoadCtx,
@@ -406,7 +450,7 @@ fn construct_kv_cache(
             .dims
             .physical_cap
             .expect("Qwen3.5 KV plan always resolves physical_cap");
-        let kv = match (ctx.kv_backend, static_v) {
+        let mut kv = match (ctx.kv_backend, static_v) {
             (KvBackend::Vmm, vm) => {
                 // Unified VMM constructor: reserve == current; never post-alloc realloc.
                 KvCache::new_gpu_vmm_capped_filtered(
@@ -448,6 +492,10 @@ fn construct_kv_cache(
                 "[hipfire-arch-qwen35] V-cache mode override → {} (256-wide lloyd-V on fwht K)",
                 plan.kv_v_env
             );
+        }
+        if let Err(e) = maybe_alloc_kv_shadow_f16(ctx.gpu, &mut kv, &plan, ctx.kv_backend) {
+            let cleanup = kv.free_gpu(ctx.gpu).map_err(|fe| fe.to_string());
+            return Err(append_cleanup_context(e, cleanup));
         }
         Ok((kv, None))
     }

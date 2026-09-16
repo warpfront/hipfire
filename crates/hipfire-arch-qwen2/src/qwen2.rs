@@ -2158,6 +2158,8 @@ impl DenseArch for Qwen2Dense<'_> {
             v: &st.v,
             k_cache: &st.k_cache[l],
             v_cache: &st.v_cache[l],
+            k_shadow: None,
+            v_shadow: None,
             k_scales: None,
             v_scales: None,
             pos_buf: &st.pos_buf,

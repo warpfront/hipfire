@@ -478,6 +478,8 @@ impl Llama {
                     v: &scratch.v,
                     k_cache: &kv_cache.k_gpu[layer_idx],
                     v_cache: &kv_cache.v_gpu[layer_idx],
+                    k_shadow: None,
+                    v_shadow: None,
                     k_scales,
                     v_scales,
                     pos_buf: &scratch.pos_buf,
