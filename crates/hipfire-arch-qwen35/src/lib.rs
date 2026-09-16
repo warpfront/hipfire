@@ -58,6 +58,7 @@ pub(crate) mod layer_driver;
 #[cfg(feature = "deltanet")]
 pub mod mtp_compose;
 #[cfg(feature = "deltanet")]
+pub mod mtp_dense_tp;
 pub mod mtp_head;
 #[cfg(feature = "deltanet")]
 pub mod mtp_probe;

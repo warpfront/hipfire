@@ -174,6 +174,13 @@ string or a blanket “always refuse at load.”
 
 EP-only: `tp>1` with a DFlash draft → refused; non-EP arch → `load_model_ep` error.
 
+Dense Qwen3.5/3.6 at `tp>1` is the one mesh topology that speculates: when the
+artifact carries an MTP head (bundled `.mq4-mtp` trailer or a sibling `.mtp`
+sidecar) the loader replicates it on rank 0 and the request takes the spec
+route, drafting on rank 0 and verifying across ranks. `speculation.mtp = off`
+keeps the AR mesh loop; `on` makes a missing head a load error. Block-verify
+drafters (n-gram, DFlash, DSpark) stay refused on dense TP.
+
 ### Architectural limits (current)
 
 - Homogeneous **exact arch string** by default (`ALLOW_MIXED_ARCH` is opt-in).
