@@ -2,6 +2,16 @@
 
 Date: 2026-09-16. Planning-only specification for `/home/kaden/ClaudeCode/warpfront/wt-lloyd` (`mq4-lloyd`). No kernel/host changes, GPU execution, project build/test suite, formatter, linter, or commit were performed. A standalone **CPU-only gfx1151 compilation of shipping source** and CPU arithmetic/ownership checks were performed; their evidence is below. Local ISA is not the Halo shipping JIT object and is not a performance or numerical-parity result. Main owns hardware gates; the independent reviewer owns final veto.
 
+> **STATUS 2026-09-16 (parent).** LF.0 pin: ISA-identical on both archs.
+> LF.1 lf16 (16 waves, sum[32]): bitwise-equal to shipping on all 16 oracle
+> cases (first restructure of this kernel that is bit-exact — the pin works).
+> At 98 used (104 allocated, one 16-wave WG/CU): gate −1 %, down +11 %.
+> Forced to 96 via `amdgpu_num_vgpr(96)` (4 spills, 20 B scratch, two WGs/CU):
+> **gate −10.5 %, down +7.7 %** (100 interleaved). Routed set-only on exact
+> gfx1151 (add stays on the 8-wave entry): Halo **pp512 712 / pp2048 700 /
+> pp8192 651** (from 665/655/613), eval md5 unchanged. Open: the 4 spills vs
+> the spill=reject rule (measured cost already included), and why down loses.
+
 ## Ten-line summary
 
 1. Select **M128 × N128 with 16 wave32s**, block `[32,16,1]`, four 16×16 subtiles/wave and `sum[32]`; retain A5 column-adjacent order.
