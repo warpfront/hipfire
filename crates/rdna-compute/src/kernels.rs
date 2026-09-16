@@ -5722,10 +5722,16 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC: &str = concat!(
 /// `attention_q8_0_fa2_gqa_i8_gfx11`) — the entries do not exist yet, so this
 /// source is only compiled once those symbols land. The Q8 i8 body keeps the
 /// shipping flat kernarg list with `const unsigned char* q8_scratch` in slot
-/// 0 (same 8-byte pointer slot as f32 Q / f16 q16). JIT-only via the
-/// `attention_q8_0_fa2_gqa_i8_gfx11` lab launcher; never on a default path.
-pub const ATTENTION_Q8_0_FA2_GQA_I8_GFX11_SRC: &str =
-    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip");
+/// 0 (same 8-byte pointer slot as f32 Q / f16 q16). `turbo_common.h` is
+/// prepended (no `HIPFIRE_FA2_KMODE` define, so KMODE defaults to 0)
+/// because the shared i8 pre-convert calls `fwht_shfl_forward_256` under a
+/// runtime `rotate_fwht3` select and the runtime compile has no `-I` to
+/// `kernels/src`. JIT-only via the `attention_q8_0_fa2_gqa_i8_gfx11` lab
+/// launcher; never on a default path.
+pub const ATTENTION_Q8_0_FA2_GQA_I8_GFX11_SRC: &str = concat!(
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
+);
 
 /// F5a lab-only fwht3-K variant of [`ATTENTION_Q8_0_FA2_GQA_I8_GFX11_SRC`]
 /// (`HIPFIRE_FA2_KMODE=3`): same concat/prelude convention as

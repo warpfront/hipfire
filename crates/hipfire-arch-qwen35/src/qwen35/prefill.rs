@@ -1460,6 +1460,9 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // chunk length is min(configured/capped max, pbs.max_batch, hidden_rb
     // staging) so no write exceeds a staging owner.
     let mut own_pbs: Option<PrefillBatchScratch> = None;
+    // F2 pair scratch (second 512-row PBS + 1024-row FA staging), allocated
+    // lazily on the first pair and shared by all pairs of this call.
+    let mut pair_scratch: Option<(PrefillBatchScratch, FaPairStage)> = None;
     let result = (|| -> HipResult<()> {
         let pbs: &PrefillBatchScratch = match pbs_in {
             Some(p) => p,
@@ -1480,6 +1483,26 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             pbs.max_batch,
             hidden_rb.as_ref().map(|rb| rb.max_batch),
         );
+        // F2 pair envelope, loop-invariant half: ordinary sequential prefill
+        // with FA layers batch-admissible, no tree/tape/max_layer machinery,
+        // no hidden ring (its staging commit is chunk-sequential), plain
+        // DFlash fusion. Per-pair checks (exact 512+512, eager, shapes, KV
+        // tier, max_ctx window) happen at each step below.
+        let fa_pair_common_admitted = tree_verify.is_none()
+            && gdn_tape.is_none()
+            && max_layer.is_none()
+            && hidden_rb.is_none()
+            && matches!(fusion, DflashFusionCtx::Off)
+            && (kv_cache.quant_q8
+                || kv_cache.quant_asym4
+                || kv_cache.quant_asym3
+                || kv_cache.quant_asym2)
+            && weights.layers.iter().all(|lw| match lw {
+                LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_) => {
+                    qwen35_layer_batch_admissible(lw, config, gpu.arch.as_str()).is_ok()
+                }
+                _ => true,
+            });
         let mut chunk_start = 0usize;
         while chunk_start < n {
             let remaining = n - chunk_start;
@@ -1489,6 +1512,70 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     "forward_prefill_batch: chunk plan cannot satisfy the two-token minimum",
                 )
             })?;
+            // F2 pair peek: merge exactly two complete 512-row chunks (never
+            // a partial tail — the tail selector below is unchanged, so 513
+            // stays 511+2 and 1025 stays 512+511+2). The second length is
+            // only computed when the first is a complete half.
+            let pair_b = if chunk_n == FA_PAIR_ROWS
+                && fa_pair_common_admitted
+                && remaining - chunk_n >= MIN_BATCH
+            {
+                next_prefill_chunk_len(remaining - chunk_n, chunk_batch)
+            } else {
+                None
+            };
+            if pair_b == Some(FA_PAIR_ROWS)
+                && fa_pair_merge_admitted(
+                    chunk_n,
+                    FA_PAIR_ROWS,
+                    gpu.arch.as_str(),
+                    gpu.graphs.capture_mode,
+                    gpu.replay.is_recording(),
+                )
+                && fa_pair_env_admitted(
+                    gpu,
+                    config,
+                    kv_cache,
+                    start_pos + chunk_start + 2 * FA_PAIR_ROWS,
+                    fusion,
+                )
+            {
+                // Lazily allocate the second PBS + pair staging; both are
+                // shared by the rest of this call. Transactional: the stage
+                // is freed when the PBS allocation fails, so no leak.
+                if pair_scratch.is_none() {
+                    let stage = FaPairStage::alloc(gpu, config)?;
+                    match PrefillBatchScratch::new_opt(gpu, config, FA_PAIR_ROWS, false) {
+                        Ok(pbs2) => pair_scratch = Some((pbs2, stage)),
+                        Err(e) => {
+                            let _ = stage.free_gpu(gpu);
+                            return Err(e);
+                        }
+                    }
+                }
+                let (pbs2, stage) = pair_scratch.as_ref().unwrap();
+                forward_prefill_chunk_pair(
+                    gpu,
+                    weights,
+                    config,
+                    &tokens[chunk_start..chunk_start + FA_PAIR_ROWS],
+                    &tokens[chunk_start + FA_PAIR_ROWS..chunk_start + 2 * FA_PAIR_ROWS],
+                    start_pos,
+                    chunk_start,
+                    kv_cache,
+                    dn_state,
+                    scratch,
+                    pbs,
+                    pbs2,
+                    stage,
+                    per_token_hidden_out,
+                    mask_override,
+                    needs_last_token_logits,
+                    fusion,
+                )?;
+                chunk_start += 2 * FA_PAIR_ROWS;
+                continue;
+            }
             let chunk_end = chunk_start + chunk_n;
             let chunk = &tokens[chunk_start..chunk_end];
             // The chunk only reads the ring buffer's head/dims to place its
@@ -1567,6 +1654,10 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     })();
     if let Some(owned) = own_pbs {
         owned.free_gpu(gpu);
+    }
+    if let Some((pbs2, stage)) = pair_scratch {
+        let _ = stage.free_gpu(gpu);
+        let _ = pbs2.free_gpu(gpu);
     }
     result
 }
@@ -6347,22 +6438,28 @@ fn batch_chunk_full_attn_input_projection(
 #[allow(clippy::too_many_arguments)]
 /// Prescaffold (behavior-only) extraction for S6-fa-prep-q8-pair.
 ///
-/// Same statements, same order, same launches as the inlined block.
+/// Same statements, same order, same launches as the inlined block, except
+/// the trailing KV-write + flash-attention dispatch (F2 split): the caller
+/// (`batch_chunk_full_attn_attn`) issues it via `batch_chunk_fa_attend`
+/// immediately after, so single-chunk launch order is unchanged.
 fn batch_chunk_full_attn_prepare(
     gpu: &mut Gpu,
-    fa_attn_multirow: bool,
+    // F2 split: the trailing KV-write + flash-attention dispatch moved to
+    // the caller, so these attend-only params are kept for signature
+    // stability but currently unused.
+    _fa_attn_multirow: bool,
     layer: &FullAttnLayerWeights,
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
-    s: &Qwen35Scratch,
+    _s: &Qwen35Scratch,
     kv_cache: &llama::KvCache,
     n: usize,
-    start_pos: usize,
-    max_ctx_len: usize,
-    ctx: &DispatchCtx,
-    batch_semantics: BatchSemantics<'_>,
+    _start_pos: usize,
+    _max_ctx_len: usize,
+    _ctx: &DispatchCtx,
+    _batch_semantics: BatchSemantics<'_>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
-    kv_layer_idx: usize,
+    _kv_layer_idx: usize,
     layer_idx: usize,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
@@ -6497,22 +6594,9 @@ fn batch_chunk_full_attn_prepare(
         )?;
     }
 
-    // 6–7. Batched KV write + flash attention (via dispatch).
-    batch_chunk_fa_attend(
-        gpu,
-        config,
-        pbs,
-        s,
-        kv_cache,
-        n,
-        start_pos,
-        max_ctx_len,
-        ctx,
-        batch_semantics,
-        tree_verify,
-        layer_idx,
-        fa_attn_multirow,
-    )?;
+    // 6–7. (F2 split: the KV write + flash attention dispatch now lives in
+    // the caller via `batch_chunk_fa_attend`, so a pair of chunks can share
+    // one merged 1024-row attend step. Single-chunk order is unchanged.)
     Ok(())
 }
 
@@ -6764,7 +6848,54 @@ fn batch_chunk_fa_attend(
         // below rather than silently exploding the verify block into n
         // independent attention launches.
     }
+    // Shared dispatch tail (F2 extraction): identical plan derivation and
+    // single write-then-attend step with this chunk's own FA tensors.
+    execute_fa_attend_step(
+        gpu,
+        config,
+        &pbs.fa_q_batch,
+        &pbs.fa_k_batch,
+        &pbs.fa_v_batch,
+        &pbs.positions,
+        &pbs.fa_attn_out_batch,
+        s,
+        kv_cache,
+        n,
+        start_pos,
+        max_ctx_len,
+        ctx,
+        tree_verify,
+        layer_idx,
+    )
 
+}
+
+/// Shared KV-write + flash-attention dispatch tail (F2 extraction).
+///
+/// `batch_chunk_fa_attend` calls this with the chunk's own FA tensors; the
+/// F2 pair path calls it once with 1024-row staged tensors covering both
+/// halves. Same plan derivation, same single `Step::Attend` (the family
+/// writes the KV rows from `k`/`v` at `positions` before attending, so both
+/// halves' KV are fully written before the merged FA2 reads them), same
+/// stream ordering.
+#[allow(clippy::too_many_arguments)]
+fn execute_fa_attend_step(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    positions: &GpuTensor,
+    output: &GpuTensor,
+    s: &Qwen35Scratch,
+    kv_cache: &llama::KvCache,
+    n: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    ctx: &DispatchCtx,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    layer_idx: usize,
+) -> HipResult<()> {
     let is_tree = tree_verify.is_some();
     let (block_start, block_cols) = match tree_verify.as_ref() {
         Some(_) => (start_pos, n),
@@ -6781,16 +6912,16 @@ fn batch_chunk_fa_attend(
     })
     .map_err(|e| HipError::new(0, &e.to_string()))?;
     let io = AttnParams {
-        q: &pbs.fa_q_batch,
-        k: &pbs.fa_k_batch,
-        v: &pbs.fa_v_batch,
+        q,
+        k,
+        v,
         k_cache: &kv_cache.k_gpu[layer_idx],
         v_cache: &kv_cache.v_gpu[layer_idx],
         k_scales: None,
         v_scales: None,
         pos_buf: &s.pos_buf,
         pos: start_pos,
-        positions: Some(&pbs.positions),
+        positions: Some(positions),
         n_heads: config.n_heads,
         n_kv_heads: config.n_kv_heads,
         head_dim: config.head_dim,
@@ -6804,7 +6935,7 @@ fn batch_chunk_fa_attend(
         block_start,
         block_cols,
         output_gate: None,
-        output: &pbs.fa_attn_out_batch,
+        output,
     };
     execute_steps(gpu, ctx, &[Step::Attend { plan, io }])
         .map_err(|e| HipError::new(0, &e.to_string()))
@@ -6858,6 +6989,25 @@ pub(crate) fn batch_chunk_full_attn_attn(
         fusion,
     )?;
 
+    // 6–7. Batched KV write + flash attention (via dispatch). Split out of
+    // `batch_chunk_full_attn_prepare` (F2) so a chunk pair can run both
+    // halves' prep first and share one merged attend step; called here for
+    // the single-chunk path in the original position.
+    batch_chunk_fa_attend(
+        gpu,
+        config,
+        pbs,
+        s,
+        kv_cache,
+        n,
+        start_pos,
+        max_ctx_len,
+        ctx,
+        batch_semantics,
+        tree_verify,
+        layer_idx,
+        fa_attn_multirow,
+    )?;
     batch_chunk_full_attn_output_projection(
         gpu,
         layer,
@@ -8169,6 +8319,63 @@ fn batch_chunk_full_attn_moe(
     weights: &Qwen35Weights,
     route: PrefillRouteMode<'_>,
 ) -> HipResult<()> {
+    // F2 split: QKV projection + norms + RoPE (everything above the old
+    // attend call) live in `batch_chunk_full_attn_moe_prep`; called here
+    // for the single-chunk path in the original position.
+    batch_chunk_full_attn_moe_prep(
+        gpu,
+        layer,
+        config,
+        pbs,
+        n,
+        dim,
+        kv_cache,
+        tree_verify,
+        layer_idx,
+    )?;
+    // F2 split: KV-write + flash attention, sigmoid/wo and the MoE FFN now
+    // live in `batch_chunk_full_attn_moe_finish` so a chunk pair can share
+    // one merged attend step; called here for the single-chunk path in the
+    // original position.
+    batch_chunk_full_attn_moe_finish(
+        gpu,
+        fa_attn_multirow,
+        layer,
+        config,
+        pbs,
+        s,
+        kv_cache,
+        n,
+        start_pos,
+        max_ctx_len,
+        ctx,
+        batch_semantics,
+        tree_verify,
+        q8_wmma_arch,
+        layer_idx,
+        weights,
+        routed_out,
+        route,
+    )?;
+    Ok(())
+}
+
+/// F2 split of `batch_chunk_full_attn_moe`: QKV projection (all dtype arms)
+/// + deinterleave/Q-norm/K-norm + triattn tap + RoPE. Same statements, same
+/// order, same launches as the inlined head. The pair path calls this per
+/// half, then runs one merged attend step, then the finish per half.
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_full_attn_moe_prep(
+    gpu: &mut Gpu,
+    layer: &FullAttnMoeLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    dim: usize,
+    kv_cache: &llama::KvCache,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    layer_idx: usize,
+) -> HipResult<()> {
     // Batched MoE FA layer. FA body is the same as FullAttn
     // (rmsnorm + qkv + deinterleave + q/k norm + RoPE +
     // kv_write + attention + sigmoid_mul + wo+residual);
@@ -8510,6 +8717,36 @@ fn batch_chunk_full_attn_moe(
         n,
         kv_cache.compact_offset as i32,
     )?;
+    Ok(())
+}
+
+/// F2 split of `batch_chunk_full_attn_moe`: KV-write + flash attention,
+/// sigmoid/wo residual and the batched MoE FFN. Same statements, same order,
+/// same launches as the inlined tail. The pair path calls the prep head
+/// (everything above the old attend call) for both halves, runs one merged
+/// attend step, then this finish per half.
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_full_attn_moe_finish(
+    gpu: &mut Gpu,
+    fa_attn_multirow: bool,
+    layer: &FullAttnMoeLayerWeights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    kv_cache: &llama::KvCache,
+    n: usize,
+    start_pos: usize,
+    max_ctx_len: usize,
+    ctx: &DispatchCtx,
+    batch_semantics: BatchSemantics<'_>,
+    tree_verify: Option<TreeVerifyCtx<'_>>,
+    q8_wmma_arch: bool,
+    layer_idx: usize,
+    weights: &Qwen35Weights,
+    routed_out: Option<&GpuTensor>,
+    route: PrefillRouteMode<'_>,
+) -> HipResult<()> {
+
     // Batched KV write + flash attention (via dispatch).
     batch_chunk_fa_attend(
         gpu,
@@ -8765,6 +9002,910 @@ fn batch_chunk_final_logits(
             }
         }
     }
+
+    Ok(())
+}
+
+// ── F2 N1024 pair envelope ──────────────────────────────────────────────
+// On exact gfx1151, two complete consecutive 512-row prefill chunks for the
+// same request share ONE FA2 launch over 1024 query rows instead of two 512
+// launches (F1-oracle-proven bit-exact over identical complete KV, 6–8%
+// faster at L8192/L32768). Everything except the FA layers' attention call
+// stays on the per-512 chunk pipeline: GDN layers keep their per-512 state
+// cadence (half C fully before half N per layer), projections/norms/FFN run
+// per 512-row half out of two 512-row PBS instances, and only the FA2
+// kernel sees 1024 rows (contiguous staged Q/K/V/positions plus staged out,
+// split back into the halves afterwards).
+//
+// Bit-identity argument: the merged `Step::Attend` derives the same tier
+// plan as the halves (derivation is batch-size agnostic beyond batch > 1)
+// and dispatch routes it to the identical FA2 kernel (the widened
+// exactly-1024 gfx1151 gates) with identical inputs — the same Q/K/V bytes
+// the halves' own prep produced, the same positions, the same caches — so
+// F1's one-launch-vs-two-halves proof applies verbatim. The dispatch write
+// runs first inside the same step on the same stream, so both halves' KV
+// rows (keys up to start + 1023) are fully written before the FA2 body
+// reads them; positions for rows 512..1024 refer to those just-written
+// keys. The F16 Q pre-convert scratch is Gpu-owned and scales with the
+// launch batch (`batch * 24 * 256 * 2` bytes), so 1024 rows are covered.
+// The merged path is eager-only: changing the launch count would
+// invalidate graph capture/replay.
+//
+// Envelope (anything outside falls back to sequential 512 chunks): exact
+// gfx1151, eager, sequential single-request prefill, both chunks exactly
+// 512 rows, H24/KV4/D256, KV tier Q8 or fwht3-Asym3, no tree/tape/band/
+// max_layer, no hidden ring (its per-chunk staging commit is
+// chunk-sequential), DFlash fusion Off.
+
+/// Rows per F2 pair half. Only two complete halves ever merge — never a
+/// partial chunk.
+pub(crate) const FA_PAIR_ROWS: usize = 512;
+/// Merged FA2 batch for one F2 pair.
+pub(crate) const FA_PAIR_BATCH: usize = 1024;
+
+/// Pure F2 pairing decision: which consecutive chunk lengths merge, on which
+/// arch, under which capture/replay state. CPU-only, unit-tested.
+fn fa_pair_merge_admitted(
+    chunk_a: usize,
+    chunk_b: usize,
+    arch: &str,
+    capture_mode: bool,
+    replay_recording: bool,
+) -> bool {
+    chunk_a == FA_PAIR_ROWS
+        && chunk_b == FA_PAIR_ROWS
+        && arch == "gfx1151"
+        && !capture_mode
+        && !replay_recording
+}
+
+/// Runtime half of the F2 guard: everything the pure pairing decision cannot
+/// see. Each predicate mirrors the FA2 route the two halves would take
+/// through dispatch, so the merged 1024-row launch selects the identical
+/// kernel (see `fa2_gfx11_batch_admitted`).
+fn fa_pair_env_admitted(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    kv_cache: &llama::KvCache,
+    max_ctx_end: usize,
+    fusion: DflashFusionCtx,
+) -> bool {
+    if gpu.arch.as_str() != "gfx1151" {
+        return false;
+    }
+    if config.n_heads != 24 || config.n_kv_heads != 4 || config.head_dim != 256 {
+        return false;
+    }
+    if !matches!(fusion, DflashFusionCtx::Off) {
+        return false;
+    }
+    // Same window the second half would see through ingress/dispatch.
+    if !(64..=32768).contains(&max_ctx_end) {
+        return false;
+    }
+    if !gpu.flags.gfx11_fa2_prefill {
+        return false;
+    }
+    // No 1024-vs-2x512 bit-identity proof exists for CK tiling.
+    if gpu.flash_attn_ck_loaded() {
+        return false;
+    }
+    let tier_inputs = kv_cache.tier_inputs();
+    match hipfire_dispatch::families::kv_tier::classify(
+        tier_inputs.quant_q8,
+        tier_inputs.quant_asym4,
+        tier_inputs.quant_asym3,
+        tier_inputs.quant_asym2,
+        tier_inputs.quant_hfq4,
+        tier_inputs.quant_q4,
+        tier_inputs.quant_int8,
+        tier_inputs.quant_hfq8,
+        tier_inputs.quant_fwht,
+        tier_inputs.quant_bf16,
+    ) {
+        hipfire_dispatch::families::kv_tier::KTier::Q8 => {
+            // The halves take the WMMA/flash-prefill route into ingress;
+            // require exactly that (same env read as dispatch, default-on
+            // for gfx11). Windowed Q8 (non-Qwen) has no FA2 arm.
+            if tier_inputs.q8_windowed {
+                return false;
+            }
+            let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+                .ok()
+                .as_deref()
+            {
+                Some("0") | Some("off") | Some("false") => false,
+                Some("1") | Some("on") | Some("true") => true,
+                _ => gpu.arch.starts_with("gfx11"),
+            };
+            if !flash_optin {
+                return false;
+            }
+            gpu.arch_caps.has_wmma_w32() || gpu.arch_caps.has_wmma_w32_gfx12()
+        }
+        hipfire_dispatch::families::kv_tier::KTier::Asym3 { fwht: true } => {
+            // fwht3-K FA2 arm: V must be Q8_0 and the givens tables present.
+            tier_inputs.v_mode_bits == 8
+                && kv_cache.givens_cos.is_some()
+                && kv_cache.givens_sin.is_some()
+        }
+        _ => false,
+    }
+}
+
+/// Device-side staging for one F2 pair's merged FA2 step: contiguous
+/// 1024-row Q/K/V/positions inputs plus the 1024-row output. The halves'
+/// own prep writes into their own PBS tensors; the merged step reads the
+/// staged concatenation and the halves' outputs are copied back afterwards.
+/// Allocated once per prefill call that forms at least one pair and shared
+/// by every FA layer of every pair (never per-layer).
+struct FaPairStage {
+    q: GpuTensor,
+    k: GpuTensor,
+    v: GpuTensor,
+    pos: GpuTensor,
+    out: GpuTensor,
+}
+
+impl FaPairStage {
+    fn alloc(gpu: &mut Gpu, config: &Qwen35Config) -> HipResult<Self> {
+        let pair = FA_PAIR_BATCH;
+        let q_dim = config.n_heads * config.head_dim;
+        let kv_dim = config.n_kv_heads * config.head_dim;
+        // Transactional: free whatever was allocated if a later alloc fails.
+        let mut done: Vec<GpuTensor> = Vec::with_capacity(5);
+        macro_rules! stage {
+            ($shape:expr) => {{
+                match gpu.alloc_tensor($shape, DType::F32) {
+                    Ok(t) => {
+                        done.push(t);
+                    }
+                    Err(e) => {
+                        for t in done.drain(..) {
+                            let _ = gpu.free_tensor(t);
+                        }
+                        return Err(e);
+                    }
+                }
+            }};
+        }
+        stage!(&[pair * q_dim]);
+        stage!(&[pair * kv_dim]);
+        stage!(&[pair * kv_dim]);
+        stage!(&[pair]);
+        stage!(&[pair * q_dim]);
+        let mut it = done.into_iter();
+        let mut take = || it.next().expect("FaPairStage slot");
+        Ok(Self {
+            q: take(),
+            k: take(),
+            v: take(),
+            pos: take(),
+            out: take(),
+        })
+    }
+
+    fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
+        let mut first_err: Option<HipError> = None;
+        for t in [self.q, self.k, self.v, self.pos, self.out] {
+            if let Err(e) = gpu.free_tensor(t) {
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
+    }
+}
+
+/// One merged FA2 step for an F2 pair: stage both halves' Q/K/V/positions
+/// contiguously, run the shared write-then-attend dispatch once at batch
+/// 1024, split the outputs back into the halves' own PBS tensors.
+/// `start_c` is the first half's absolute start; the merged max_ctx is
+/// `start_c + 1024` (the value the second half would see).
+#[allow(clippy::too_many_arguments)]
+fn batch_chunk_fa_attend_merged(
+    gpu: &mut Gpu,
+    config: &Qwen35Config,
+    pbs_c: &PrefillBatchScratch,
+    pbs_n: &PrefillBatchScratch,
+    stage: &FaPairStage,
+    s: &Qwen35Scratch,
+    kv_cache: &llama::KvCache,
+    start_c: usize,
+    max_ctx_len: usize,
+    ctx: &DispatchCtx,
+    layer_idx: usize,
+) -> HipResult<()> {
+    let q_dim = config.n_heads * config.head_dim;
+    let kv_dim = config.n_kv_heads * config.head_dim;
+    let half_q_bytes = FA_PAIR_ROWS * q_dim * 4;
+    let half_kv_bytes = FA_PAIR_ROWS * kv_dim * 4;
+    let half_pos_bytes = FA_PAIR_ROWS * 4;
+    // Same stream throughout: no sync is needed between the staging copies
+    // and the attend step, or between the attend step and the split copies.
+    gpu.hip.memcpy_dtod_at(&stage.q.buf, 0, &pbs_c.fa_q_batch.buf, 0, half_q_bytes)?;
+    gpu.hip
+        .memcpy_dtod_at(&stage.q.buf, half_q_bytes, &pbs_n.fa_q_batch.buf, 0, half_q_bytes)?;
+    gpu.hip.memcpy_dtod_at(&stage.k.buf, 0, &pbs_c.fa_k_batch.buf, 0, half_kv_bytes)?;
+    gpu.hip
+        .memcpy_dtod_at(&stage.k.buf, half_kv_bytes, &pbs_n.fa_k_batch.buf, 0, half_kv_bytes)?;
+    gpu.hip.memcpy_dtod_at(&stage.v.buf, 0, &pbs_c.fa_v_batch.buf, 0, half_kv_bytes)?;
+    gpu.hip
+        .memcpy_dtod_at(&stage.v.buf, half_kv_bytes, &pbs_n.fa_v_batch.buf, 0, half_kv_bytes)?;
+    gpu.hip.memcpy_dtod_at(&stage.pos.buf, 0, &pbs_c.positions.buf, 0, half_pos_bytes)?;
+    gpu.hip.memcpy_dtod_at(
+        &stage.pos.buf,
+        half_pos_bytes,
+        &pbs_n.positions.buf,
+        0,
+        half_pos_bytes,
+    )?;
+    execute_fa_attend_step(
+        gpu,
+        config,
+        &stage.q,
+        &stage.k,
+        &stage.v,
+        &stage.pos,
+        &stage.out,
+        s,
+        kv_cache,
+        FA_PAIR_BATCH,
+        start_c,
+        max_ctx_len,
+        ctx,
+        None,
+        layer_idx,
+    )?;
+    gpu.hip.memcpy_dtod_at(
+        &pbs_c.fa_attn_out_batch.buf,
+        0,
+        &stage.out.buf,
+        0,
+        half_q_bytes,
+    )?;
+    gpu.hip.memcpy_dtod_at(
+        &pbs_n.fa_attn_out_batch.buf,
+        0,
+        &stage.out.buf,
+        half_q_bytes,
+        half_q_bytes,
+    )?;
+    Ok(())
+}
+
+/// F2 pair chunk: run two complete consecutive 512-row chunks of one request
+/// through the layer stack lockstep, merging only the FA layers' attention
+/// call into one 1024-row FA2 launch per FA layer.
+///
+/// Per-layer order matches two sequential chunks exactly: for GDN/MoE-LA
+/// layers half C runs fully before half N (recurrence cadence unchanged);
+/// for FA layers both halves' QKV prep (projection + norms + RoPE) runs
+/// first, then one merged write-then-attend step, then each half's output
+/// projection/FFN. `dn_state`, the KV cache and `per_token_hidden_out` see
+/// the same row order as sequential chunks; each half keeps its own PBS
+/// (no cross-half scratch aliasing).
+///
+/// Callers guarantee the F2 envelope (see `fa_pair_env_admitted`); in
+/// particular `hidden_rb` is None (its per-chunk staging commit is
+/// chunk-sequential), `gdn_tape`/`tree_verify`/band are absent, and both
+/// halves are exactly `FA_PAIR_ROWS`.
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_chunk_pair(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    tokens_c: &[u32],
+    tokens_n: &[u32],
+    start_pos: usize,
+    chunk_start_c: usize,
+    kv_cache: &mut llama::KvCache,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+    pbs_c: &PrefillBatchScratch,
+    pbs_n: &PrefillBatchScratch,
+    stage: &FaPairStage,
+    per_token_hidden_out: Option<&GpuTensor>,
+    mask_override: Option<MaskEmbedOverride<'_>>,
+    needs_last_token_logits: bool,
+    fusion: DflashFusionCtx,
+) -> HipResult<()> {
+    let n = FA_PAIR_ROWS;
+    debug_assert!(tokens_c.len() == n && tokens_n.len() == n);
+    debug_assert!(pbs_c.max_batch >= n && pbs_n.max_batch >= n);
+    let start_c = start_pos + chunk_start_c;
+    let start_n = start_c + n;
+    let max_ctx_c = start_c + n;
+    let max_ctx_n = start_n + n;
+    let max_ctx_merged = start_c + 2 * n;
+    kv_cache
+        .require_mapped_capacity(checked_kv_end(start_c, 2 * n, "forward_prefill_chunk_pair")?)?;
+
+    let dim = config.dim;
+    let hidden_dim = config.hidden_dim;
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    let dim_row_bytes = dim * 4;
+    let dispatch_workload = prefill_dispatch_workload(per_token_hidden_out.is_some(), false, false);
+    let ctx = DispatchCtx::new(gpu).with_workload(dispatch_workload);
+
+    // Mask slot is call-relative: rebase per half.
+    let mo_c = mask_override.as_ref().and_then(|ovr| {
+        if ovr.slot >= chunk_start_c && ovr.slot < chunk_start_c + n {
+            Some(MaskEmbedOverride {
+                slot: ovr.slot - chunk_start_c,
+                embed: ovr.embed,
+            })
+        } else {
+            None
+        }
+    });
+    let mo_n = mask_override.as_ref().and_then(|ovr| {
+        if ovr.slot >= chunk_start_c + n && ovr.slot < chunk_start_c + 2 * n {
+            Some(MaskEmbedOverride {
+                slot: ovr.slot - chunk_start_c - n,
+                embed: ovr.embed,
+            })
+        } else {
+            None
+        }
+    });
+
+    batch_chunk_embed_tokens(
+        gpu, weights, tokens_c, s, pbs_c, n, dim, dim_row_bytes, true, false, false, mo_c,
+    )?;
+    batch_chunk_upload_positions(
+        gpu,
+        pbs_c,
+        BatchSemantics::Sequential,
+        start_c,
+        n,
+        None,
+        false,
+    )?;
+    batch_chunk_embed_tokens(
+        gpu, weights, tokens_n, s, pbs_n, n, dim, dim_row_bytes, true, false, false, mo_n,
+    )?;
+    batch_chunk_upload_positions(
+        gpu,
+        pbs_n,
+        BatchSemantics::Sequential,
+        start_n,
+        n,
+        None,
+        false,
+    )?;
+
+    #[cfg(feature = "moe-oracle")]
+    crate::qwen35::oracle::set_prefill_start(start_c)
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    #[cfg(feature = "moe-oracle")]
+    crate::qwen35::oracle::set_prefill_start(start_n)
+        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    // Once per half, exactly as two sequential chunks would validate.
+    batch_chunk_validate_independent(
+        n,
+        BatchSemantics::Sequential,
+        dn_state,
+        kv_cache,
+        None,
+        None,
+    )?;
+    batch_chunk_validate_independent(
+        n,
+        BatchSemantics::Sequential,
+        dn_state,
+        kv_cache,
+        None,
+        None,
+    )?;
+
+    let fa_arch = gpu.arch.as_str();
+    let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
+    let arch_has_wmma = q8_wmma_arch;
+    let fa_batched_ok = (kv_cache.quant_q8
+        || kv_cache.quant_asym4
+        || kv_cache.quant_asym3
+        || kv_cache.quant_asym2)
+        && weights.layers.iter().all(|lw| match lw {
+            LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_) => {
+                qwen35_layer_batch_admissible(lw, config, fa_arch).is_ok()
+            }
+            _ => true,
+        });
+    // Merge only when both halves take the plain dispatch route. Multirow
+    // is never admitted on gfx1151 (arch gate above it); the per-half
+    // fallback below keeps this fail-closed if that ever changes.
+    let multirow_common = (
+        gpu.arch_caps.arch(),
+        kv_cache.quant_q8,
+        config.head_dim,
+        fa_pertoken_min_ctx(),
+        gpu.graphs.capture_mode,
+        gpu.replay.is_recording(),
+    );
+    let multirow_admitted = |max_ctx: usize| {
+        q8_multirow_attn_admitted(
+            multirow_common.0,
+            multirow_common.1,
+            multirow_common.2,
+            n,
+            max_ctx,
+            multirow_common.3,
+            false,
+            false,
+            multirow_common.4,
+            multirow_common.5,
+        )
+    };
+    let multirow_c = multirow_admitted(max_ctx_c);
+    let multirow_n = multirow_admitted(max_ctx_n);
+    let merge_fa = !multirow_c && !multirow_n;
+
+    let mut delta_layer_idx = 0usize;
+    let mut kv_layer_idx = 0usize;
+    for layer_idx in 0..config.n_layers {
+        match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
+            (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                for (half_pbs, half_start, half_tape) in
+                    [(pbs_c, start_c, chunk_start_c), (pbs_n, start_n, chunk_start_c + n)]
+                {
+                    batch_chunk_delta_net_attn(
+                        gpu,
+                        layer,
+                        config,
+                        half_pbs,
+                        dn_state,
+                        n,
+                        dim,
+                        k_dim,
+                        v_dim,
+                        n_v_heads,
+                        hd,
+                        BatchSemantics::Sequential,
+                        None,
+                        None,
+                        half_tape,
+                        delta_layer_idx,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        BatchEpilogue::Residual,
+                        fusion,
+                    )?;
+                    batch_chunk_delta_net_ffn(
+                        gpu,
+                        layer,
+                        config,
+                        half_pbs,
+                        n,
+                        dim,
+                        hidden_dim,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        BatchEpilogue::Residual,
+                        fusion,
+                    )?;
+                    dump_hidden_localize(
+                        gpu,
+                        &half_pbs.x_batch,
+                        n,
+                        half_start,
+                        dim,
+                        layer_idx,
+                        "batched",
+                    );
+                }
+                delta_layer_idx += 1;
+            }
+            (LayerWeights::FullAttn(layer), LayerType::FullAttention) if fa_batched_ok => {
+                if merge_fa {
+                    batch_chunk_full_attn_input_projection(
+                        gpu, layer, config, pbs_c, n, dim, q8_wmma_arch, fusion,
+                    )?;
+                    batch_chunk_full_attn_prepare(
+                        gpu,
+                        false,
+                        layer,
+                        config,
+                        pbs_c,
+                        s,
+                        kv_cache,
+                        n,
+                        start_c,
+                        max_ctx_c,
+                        &ctx,
+                        BatchSemantics::Sequential,
+                        None,
+                        kv_layer_idx,
+                        layer_idx,
+                        fusion,
+                    )?;
+                    batch_chunk_full_attn_input_projection(
+                        gpu, layer, config, pbs_n, n, dim, q8_wmma_arch, fusion,
+                    )?;
+                    batch_chunk_full_attn_prepare(
+                        gpu,
+                        false,
+                        layer,
+                        config,
+                        pbs_n,
+                        s,
+                        kv_cache,
+                        n,
+                        start_n,
+                        max_ctx_n,
+                        &ctx,
+                        BatchSemantics::Sequential,
+                        None,
+                        kv_layer_idx,
+                        layer_idx,
+                        fusion,
+                    )?;
+                    batch_chunk_fa_attend_merged(
+                        gpu,
+                        config,
+                        pbs_c,
+                        pbs_n,
+                        stage,
+                        s,
+                        kv_cache,
+                        start_c,
+                        max_ctx_merged,
+                        &ctx,
+                        layer_idx,
+                    )?;
+                    batch_chunk_full_attn_output_projection(
+                        gpu,
+                        layer,
+                        pbs_c,
+                        n,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        BatchEpilogue::Residual,
+                        fusion,
+                    )?;
+                    batch_chunk_full_attn_ffn(
+                        gpu,
+                        layer,
+                        config,
+                        pbs_c,
+                        n,
+                        dim,
+                        hidden_dim,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        BatchEpilogue::Residual,
+                        fusion,
+                    )?;
+                    batch_chunk_full_attn_output_projection(
+                        gpu,
+                        layer,
+                        pbs_n,
+                        n,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        BatchEpilogue::Residual,
+                        fusion,
+                    )?;
+                    batch_chunk_full_attn_ffn(
+                        gpu,
+                        layer,
+                        config,
+                        pbs_n,
+                        n,
+                        dim,
+                        hidden_dim,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        BatchEpilogue::Residual,
+                        fusion,
+                    )?;
+                } else {
+                    batch_chunk_full_attn_attn(
+                        gpu,
+                        multirow_c,
+                        layer,
+                        config,
+                        pbs_c,
+                        s,
+                        kv_cache,
+                        n,
+                        dim,
+                        start_c,
+                        max_ctx_c,
+                        &ctx,
+                        BatchSemantics::Sequential,
+                        None,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        kv_layer_idx,
+                        layer_idx,
+                        BatchEpilogue::Residual,
+                        fusion,
+                    )?;
+                    batch_chunk_full_attn_ffn(
+                        gpu,
+                        layer,
+                        config,
+                        pbs_c,
+                        n,
+                        dim,
+                        hidden_dim,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        BatchEpilogue::Residual,
+                        fusion,
+                    )?;
+                    batch_chunk_full_attn_attn(
+                        gpu,
+                        multirow_n,
+                        layer,
+                        config,
+                        pbs_n,
+                        s,
+                        kv_cache,
+                        n,
+                        dim,
+                        start_n,
+                        max_ctx_n,
+                        &ctx,
+                        BatchSemantics::Sequential,
+                        None,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        kv_layer_idx,
+                        layer_idx,
+                        BatchEpilogue::Residual,
+                        fusion,
+                    )?;
+                    batch_chunk_full_attn_ffn(
+                        gpu,
+                        layer,
+                        config,
+                        pbs_n,
+                        n,
+                        dim,
+                        hidden_dim,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        BatchEpilogue::Residual,
+                        fusion,
+                    )?;
+                }
+                kv_layer_idx += 1;
+                dump_hidden_localize(gpu, &pbs_c.x_batch, n, start_c, dim, layer_idx, "batched");
+                dump_hidden_localize(gpu, &pbs_n.x_batch, n, start_n, dim, layer_idx, "batched");
+            }
+            (LayerWeights::FullAttn(_layer), LayerType::FullAttention) => {
+                batch_chunk_full_attn_fallback(
+                    gpu,
+                    weights,
+                    config,
+                    layer_idx,
+                    kv_layer_idx,
+                    start_c,
+                    n,
+                    dim_row_bytes,
+                    kv_cache,
+                    s,
+                    pbs_c,
+                )?;
+                batch_chunk_full_attn_fallback(
+                    gpu,
+                    weights,
+                    config,
+                    layer_idx,
+                    kv_layer_idx,
+                    start_n,
+                    n,
+                    dim_row_bytes,
+                    kv_cache,
+                    s,
+                    pbs_n,
+                )?;
+                kv_layer_idx += 1;
+                dump_hidden_localize(gpu, &pbs_c.x_batch, n, start_c, dim, layer_idx, "batched");
+                dump_hidden_localize(gpu, &pbs_n.x_batch, n, start_n, dim, layer_idx, "batched");
+            }
+            (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
+                for (half_pbs, half_start, half_tape) in
+                    [(pbs_c, start_c, chunk_start_c), (pbs_n, start_n, chunk_start_c + n)]
+                {
+                    batch_chunk_delta_net_moe(
+                        gpu,
+                        layer,
+                        config,
+                        half_pbs,
+                        dn_state,
+                        n,
+                        dim,
+                        hidden_dim,
+                        k_dim,
+                        v_dim,
+                        n_v_heads,
+                        hd,
+                        BatchSemantics::Sequential,
+                        None,
+                        None,
+                        half_tape,
+                        delta_layer_idx,
+                        q8_wmma_arch,
+                        half_start,
+                        layer_idx,
+                        &ctx,
+                        weights,
+                        None,
+                        PrefillRouteMode::Replicated,
+                    )?;
+                    dump_hidden_localize(
+                        gpu,
+                        &half_pbs.x_batch,
+                        n,
+                        half_start,
+                        dim,
+                        layer_idx,
+                        "batched",
+                    );
+                }
+                delta_layer_idx += 1;
+            }
+            (LayerWeights::FullAttnMoe(layer), LayerType::FullAttention) if fa_batched_ok => {
+                if merge_fa {
+                    batch_chunk_full_attn_moe_prep(
+                        gpu, layer, config, pbs_c, n, dim, kv_cache, None, layer_idx,
+                    )?;
+                    batch_chunk_full_attn_moe_prep(
+                        gpu, layer, config, pbs_n, n, dim, kv_cache, None, layer_idx,
+                    )?;
+                    batch_chunk_fa_attend_merged(
+                        gpu,
+                        config,
+                        pbs_c,
+                        pbs_n,
+                        stage,
+                        s,
+                        kv_cache,
+                        start_c,
+                        max_ctx_merged,
+                        &ctx,
+                        layer_idx,
+                    )?;
+                    batch_chunk_full_attn_moe_finish(
+                        gpu,
+                        false,
+                        layer,
+                        config,
+                        pbs_c,
+                        s,
+                        kv_cache,
+                        n,
+                        start_c,
+                        max_ctx_c,
+                        &ctx,
+                        BatchSemantics::Sequential,
+                        None,
+                        q8_wmma_arch,
+                        layer_idx,
+                        weights,
+                        None,
+                        PrefillRouteMode::Replicated,
+                    )?;
+                    batch_chunk_full_attn_moe_finish(
+                        gpu,
+                        false,
+                        layer,
+                        config,
+                        pbs_n,
+                        s,
+                        kv_cache,
+                        n,
+                        start_n,
+                        max_ctx_n,
+                        &ctx,
+                        BatchSemantics::Sequential,
+                        None,
+                        q8_wmma_arch,
+                        layer_idx,
+                        weights,
+                        None,
+                        PrefillRouteMode::Replicated,
+                    )?;
+                } else {
+                    batch_chunk_full_attn_moe(
+                        gpu,
+                        multirow_c,
+                        layer,
+                        config,
+                        pbs_c,
+                        s,
+                        kv_cache,
+                        n,
+                        dim,
+                        start_c,
+                        max_ctx_c,
+                        &ctx,
+                        BatchSemantics::Sequential,
+                        None,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        kv_layer_idx,
+                        layer_idx,
+                        None,
+                        weights,
+                        PrefillRouteMode::Replicated,
+                    )?;
+                    batch_chunk_full_attn_moe(
+                        gpu,
+                        multirow_n,
+                        layer,
+                        config,
+                        pbs_n,
+                        s,
+                        kv_cache,
+                        n,
+                        dim,
+                        start_n,
+                        max_ctx_n,
+                        &ctx,
+                        BatchSemantics::Sequential,
+                        None,
+                        q8_wmma_arch,
+                        arch_has_wmma,
+                        kv_layer_idx,
+                        layer_idx,
+                        None,
+                        weights,
+                        PrefillRouteMode::Replicated,
+                    )?;
+                }
+                kv_layer_idx += 1;
+                dump_hidden_localize(gpu, &pbs_c.x_batch, n, start_c, dim, layer_idx, "batched");
+                dump_hidden_localize(gpu, &pbs_n.x_batch, n, start_n, dim, layer_idx, "batched");
+            }
+            _ => panic!("layer type mismatch at layer {layer_idx}"),
+        }
+    }
+
+    // Tail logits exactly as two sequential chunks would: each half norms
+    // its own rows into the caller's per-token buffer (when present) with
+    // its own chunk-relative offset, and the legacy last-token path runs
+    // per half in order so `s.logits` ends on the pair's last token.
+    let pth_c = per_token_hidden_out.map(|t| (t, chunk_start_c));
+    let pth_n = per_token_hidden_out.map(|t| (t, chunk_start_c + n));
+    batch_chunk_final_logits(
+        gpu,
+        weights,
+        config,
+        s,
+        pbs_c,
+        n,
+        dim,
+        dim_row_bytes,
+        pth_c,
+        needs_last_token_logits,
+        true,
+        &ctx,
+    )?;
+    batch_chunk_final_logits(
+        gpu,
+        weights,
+        config,
+        s,
+        pbs_n,
+        n,
+        dim,
+        dim_row_bytes,
+        pth_n,
+        needs_last_token_logits,
+        true,
+        &ctx,
+    )?;
 
     Ok(())
 }
@@ -11316,6 +12457,33 @@ mod tests {
     #[test]
     fn prefill_chunk_plan_refuses_unpartitionable_minimum_batch() {
         assert_eq!(next_prefill_chunk_len(3, 2), None);
+    }
+
+    #[test]
+    fn fa_pair_merge_decision() {
+        // Only two complete 512-row chunks merge, on exact gfx1151, eager.
+        assert!(fa_pair_merge_admitted(512, 512, "gfx1151", false, false));
+        // Partial chunks never merge (tails keep today's dispatch); a 1024
+        // chunk never merges either (the merged launch is exactly one pair).
+        for partial in [2, 64, 255, 256, 384, 511, 513, 1024] {
+            assert!(!fa_pair_merge_admitted(512, partial, "gfx1151", false, false));
+            assert!(!fa_pair_merge_admitted(partial, 512, "gfx1151", false, false));
+        }
+        assert!(!fa_pair_merge_admitted(1024, 1024, "gfx1151", false, false));
+        // Every other arch is byte-identical: no pairs anywhere.
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx1201", "gfx942",
+        ] {
+            assert!(!fa_pair_merge_admitted(512, 512, arch, false, false));
+        }
+        // Capture/replay change the launch count: the merged path is
+        // eager-only.
+        assert!(!fa_pair_merge_admitted(512, 512, "gfx1151", true, false));
+        assert!(!fa_pair_merge_admitted(512, 512, "gfx1151", false, true));
+        assert!(!fa_pair_merge_admitted(512, 512, "gfx1151", true, true));
+        // Geometry consts stay consistent with the merged launch.
+        assert_eq!(FA_PAIR_ROWS, 512);
+        assert_eq!(FA_PAIR_BATCH, 2 * FA_PAIR_ROWS);
     }
 
     #[test]

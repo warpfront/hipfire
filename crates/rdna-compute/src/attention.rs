@@ -3216,6 +3216,36 @@ impl Gpu {
         result
     }
 
+    /// Batch sizes the gfx11 FA2 prefill ingress accepts on this GPU.
+    ///
+    /// F2 N1024 pair envelope: exactly 1024 is admitted on exact gfx1151
+    /// only (F1-oracle-proven bit-exact vs two N512 launches over identical
+    /// complete KV). Every other arch keeps the historical 64..=512 gate,
+    /// and every non-1024 batch above 512 still falls through to the
+    /// byte-identical incumbent — so all non-pair callers are unaffected.
+    pub fn fa2_gfx11_batch_admitted(&self, batch_size: usize) -> bool {
+        if self.arch.as_str() == "gfx1151" {
+            (64..=512).contains(&batch_size) || batch_size == 1024
+        } else {
+            (64..=512).contains(&batch_size)
+        }
+    }
+
+    /// True when a Composable-Kernel FA library is loaded in this process.
+    /// The F2 N1024 pair envelope requires this to be false (there is no
+    /// 1024-vs-2x512 bit-identity proof for CK tiling); CK stays fail-closed
+    /// (explicit `.so` load) so ordinary production prefill never sees it.
+    #[cfg(feature = "flash-attn-ck")]
+    pub fn flash_attn_ck_loaded(&self) -> bool {
+        self.flash_attn_ck.is_some()
+    }
+
+    /// CK support not compiled in — trivially inactive.
+    #[cfg(not(feature = "flash-attn-ck"))]
+    pub fn flash_attn_ck_loaded(&self) -> bool {
+        false
+    }
+
     /// WMMA (matrix-core) variant of `attention_q8_0_flash_prefill`.
     ///
     /// Fixed 16-query / 16-key tiles (the WMMA fragment shape), one wave32 per
@@ -3271,7 +3301,7 @@ impl Gpu {
             && n_heads == 24
             && n_kv_heads == 4
             && head_dim == 256
-            && (64..=512).contains(&batch_size)
+            && self.fa2_gfx11_batch_admitted(batch_size)
             && batch_size % 16 == 0
             && (64..=32768).contains(&max_ctx_len)
         {
@@ -3949,9 +3979,10 @@ impl Gpu {
                 ),
             ));
         }
-        // Lab-only: exact gfx1151 allows N1024 on the direct launcher so the
-        // F1 oracle can single-launch vs two N512 halves. Production ingress
-        // (`attention_q8_0_flash_prefill_wmma`) stays capped at 512.
+        // F2 production envelope: exact gfx1151 allows N1024 on the direct
+        // launcher (F1-oracle-proven bit-exact vs two N512 halves); the F2
+        // pair path launches the merged 1024-row FA2 through production
+        // ingress, which admits exactly-1024 on gfx1151 only.
         let max_fa2_batch: usize = if self.arch.as_str() == "gfx1151" {
             1024
         } else {
@@ -4129,8 +4160,9 @@ impl Gpu {
                 ),
             ));
         }
-        // Lab-only: exact gfx1151 N1024 on direct launcher (F1 oracle).
-        // Production ingress stays 512.
+        // F2 production envelope: exact gfx1151 allows N1024 on the direct
+        // launcher (F1-oracle-proven bit-exact vs two N512 halves); the F2
+        // pair path reaches this kernel through the widened dispatch arm.
         let max_fa2_batch: usize = if self.arch.as_str() == "gfx1151" {
             1024
         } else {

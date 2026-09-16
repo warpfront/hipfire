@@ -1926,8 +1926,11 @@ fn iu8_launch(
     let _ = gpu.hip.event_destroy(ev);
 }
 
-/// Host scalar reference under the hypothesized map. Canonical copies are
-/// lanes 0..15 (lanes 16..31 must duplicate for valid use).
+/// Host scalar reference under the VERIFIED map (gfx1151 iu8probe):
+/// A[lane][byte] -> (row = lane & 15, k = byte);
+/// B[lane][byte] -> (k = byte, col = lane & 15);
+/// acc[lane][j] -> C[2*j + (lane >> 4)][lane & 15].
+/// Canonical copies are lanes 0..15 (lanes 16..31 duplicate per docs).
 fn iu8_expected(
     a_lanes: &[[u8; 16]; 32],
     b_lanes: &[[u8; 16]; 32],
@@ -1937,13 +1940,22 @@ fn iu8_expected(
     clamp: bool,
 ) -> [[i32; 8]; 32] {
     let mut a = [[0i32; 16]; 16];
-    let mut b = [[0i32; 16]; 16];
     for l in 0..16 {
         for by in 0..16 {
             let av = a_lanes[l][by] as i32;
+            // A[lane][byte] -> (row = lane, k = byte): tile row-major.
             a[l][by] = if a_sign { (av as i8) as i32 } else { av };
+        }
+    }
+    // B[lane][byte] -> (k = byte, col = lane): tile B[K][C] = frag[C][K].
+    // NOTE (probe fix): the first probe run assembled this transposed
+    // (frag[K][C]), which caused every b_col/k_match/k_mismatch FAIL
+    // against correct hardware; the device data matches the spec map.
+    let mut b = [[0i32; 16]; 16];
+    for l in 0..16 {
+        for by in 0..16 {
             let bv = b_lanes[l][by] as i32;
-            b[l][by] = if b_sign { (bv as i8) as i32 } else { bv };
+            b[by][l] = if b_sign { (bv as i8) as i32 } else { bv };
         }
     }
     let mut d = [[0i32; 16]; 16];
@@ -1970,6 +1982,15 @@ fn iu8_expected(
         }
     }
     out
+}
+
+/// Model-independent diagnostic: lanes whose whole accumulator equals `val`.
+/// Pins the B-lane->col / acc-lane->col maps on the re-run regardless of
+/// pass/fail (b_col c must show exactly [c, c+16] for val=16).
+fn iu8_hotlanes(got: &[i32], val: i32) -> Vec<usize> {
+    (0..32)
+        .filter(|&l| (0..8).all(|j| got[l * 8 + j] == val))
+        .collect()
 }
 
 fn iu8_check(name: &str, got: &[i32], exp: &[[i32; 8]; 32]) -> bool {
@@ -2195,9 +2216,11 @@ fn run_iu8probe(gpu: &mut Gpu) {
                 b[l] = [1u8; 16];
             }
         }
+        let got_bc = run(&s110, &ones, &b, None);
+        eprintln!("    b_col c={c0} hot16={:?}", iu8_hotlanes(&got_bc, 16));
         e3 &= iu8_check(
             &format!("b_col c={c0}"),
-            &run(&s110, &ones, &b, None),
+            &got_bc,
             &iu8_expected(&ones, &b, None, true, true, false),
         );
     }
@@ -2212,9 +2235,11 @@ fn run_iu8probe(gpu: &mut Gpu) {
             a[l][k0] = 1;
             b[l][k0] = 1;
         }
+        let got_km = run(&s110, &a, &b, None);
+        eprintln!("    k_match k={k0} hot1={:?}", iu8_hotlanes(&got_km, 1));
         e4m &= iu8_check(
             &format!("k_match k={k0}"),
-            &run(&s110, &a, &b, None),
+            &got_km,
             &iu8_expected(&a, &b, None, true, true, false),
         );
     }
@@ -2366,7 +2391,7 @@ fn run_iu8probe(gpu: &mut Gpu) {
     let b_ok = e3 && e4m;
     let c_ok = e0 && e2 && e3;
     eprintln!(
-        "  IU8 finding: fragment byte b <-> k=b (dword w LE <-> k=4w..4w+3); A lane L <-> row L&15 (L+16 duplicates); B lane L <-> col L&15; acc[lane][j] = C[2j+(lane>>4)][lane&15]"
+        "  IU8 finding: fragment byte b <-> k=b (dword w LE <-> k=4w..4w+3); A lane L <-> row L&15 (L+16 duplicates); B lane L <-> col L&15; acc[lane][j] = C[2j+(lane>>4)][lane&15]. First run FAILs were a transposed host B (frag[K][C]); device matches this map. b_col hot16 must read [c,c+16]; k_match hot1 all lanes."
     );
     iu8_emit_maps(&arch, a_ok, b_ok, c_ok);
     eprintln!(
