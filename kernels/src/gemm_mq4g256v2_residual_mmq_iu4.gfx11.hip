@@ -546,7 +546,7 @@ static __device__ __forceinline__ void gemm_iu4_body_lf16_gfx1151(
     }
 }
 
-extern "C" __global__ __launch_bounds__(512, 2) void gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151(
+extern "C" __global__ __launch_bounds__(512, 2) __attribute__((amdgpu_num_vgpr(96))) void gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151(
     const char* __restrict__ A,
     const block_i4_128* __restrict__ Xq,
     float* __restrict__ Y,
@@ -557,7 +557,7 @@ extern "C" __global__ __launch_bounds__(512, 2) void gemm_mq4g256v2_residual_mmq
 ) {
     gemm_iu4_body_lf16_gfx1151<false>(A, Xq, Y, M, K, N, add, blockIdx.y, blockIdx.x);
 }
-extern "C" __global__ __launch_bounds__(512, 2) void gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151(
+extern "C" __global__ __launch_bounds__(512, 2) __attribute__((amdgpu_num_vgpr(96))) void gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151(
     const char* __restrict__ A,
     const block_i4_128* __restrict__ Xq,
     float* __restrict__ Y,
