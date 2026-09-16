@@ -58,6 +58,17 @@ Date: 2026-09-16. Planning-only specification for `/home/kaden/ClaudeCode/warpfr
 > Halo (714/686/641 vs 726/708/660) — dispatch overhead is not a prefill
 > lever; prefill PM4 replay dropped.
 
+> **Pre-tiled resident 4-bit twin (2026-09-16) — REJECTED, and it settles
+> the question.** A second copy holding the exact 128×42-dword LDS image per
+> (tile, group) (5.25 bpw; fill = pure coalesced copy, no unpack/convert/
+> gather; bit-exact on all 16 cases): gate set −10 % (96 VGPR, 11 spills),
+> down add **+16 %**, LDS-double-buffered prefetch variant +29 %. If fill
+> work were the bottleneck a memcpy fill would be 20–30 % faster; it is not.
+> The IU4 GEMM on gfx1151 is bound by per-launch weight-byte latency at
+> 2 WG/CU with no register headroom — bytes, not conversion. Resident
+> "precomputed" weight formats cannot pay on gfx11; only fewer/better-
+> ordered bytes (A5) or more waves (lf16) have. Twin removed.
+
 ## Ten-line summary
 
 1. Select **M128 × N128 with 16 wave32s**, block `[32,16,1]`, four 16×16 subtiles/wave and `sum[32]`; retain A5 column-adjacent order.
