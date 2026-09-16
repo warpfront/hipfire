@@ -2,6 +2,23 @@
 
 Date: 2026-09-16. Coordinator/research: HaloNpuMax. Execution is delegated through Main. Source worktree is `/home/kaden/ClaudeCode/warpfront/wt-lloyd`; all device artifacts belong under `hipx:/home/kaden/npu-screen`. No production wiring or commits. This document is updated as executable evidence arrives; unmeasured entries are not performance claims.
 
+> **SIDECAR WAVE 1 RESULT (2026-09-16).** Landed on the branch: `hipfire-xdna`
+> raw-ioctl crate (libc-only, kernel 7.0 uapi, ERT golden tests),
+> `kernel.npu_spillover` (default off), registry `ModelEntry.xdna` + manifest v1
+> stored-zip parser, `load_params` → `LoadCtx.xdna`. Artifact: the bit-exact
+> **i32 K128-partials** kernel passes parity on all three gate profiles but
+> runs at **2.8–2.9 TOPS** (M1024 1.93 ms, M2048 3.70, M4096 7.52) because
+> the 40× output volume (335 MB/call at M4096) is writeback-bound — no static
+> split beats the GPU's 1.86 ms full gate. Zip published as a parity-verified
+> research artifact only (hipx:/home/kaden/npu-screen/sidecar/
+> qwen3.8-27b.mq4-xt.xdna.zip, sha256 5934086e…); no registry entry, no
+> admission. Coarser partials cannot preserve the per-128-half fold.
+> Remaining path: hardware-precision f32 rows on the AIE (slice C spec,
+> `2026-09-16-xdna-f32-fold-slice-c.md`, not dispatched): analytical ceiling
+> ≈ −6 % gate / −4 % pp2048 at M2048 under a ≤ 1.64 ms complete-path gate and
+> a KLD/serve admission — user decision pending. Integration (slice 4) not
+> started; nothing NPU-related runs unless the flag is on.
+
 > **UPDATE 2026-09-16 (NpuZeroCopy2, hipx:/home/kaden/npu-screen/zero-copy2/):
 > one-direction zero-copy WORKS with no driver change — GPU-owned
 > hipMalloc/finegrained buffers PRIME-imported into xdna are READ and WRITTEN
@@ -491,3 +508,17 @@ The contracts above are frozen before implementation. Every composer skips forma
 **Numeric gate:** evaluate NPU-owned rows separately and the final model against the same GPU baseline, artifact, prompts/tokens and serving settings. Record per-layer finite/error diagnostics, output/logit mean/p99/max KLD and existing model-release quality criteria; run `scripts/serve_harness.py --model <same-model>` with the same prompt battery/config on both paths, including long-prefill/reuse cases. The artifact certificate binds the predeclared per-model numeric limits and both reports; absent limits/report or any failed limit blocks opt-in admission. No KLD tolerance or serving PASS is invented here, and no runtime quality reclassification occurs automatically.
 
 **Performance/claim gate:** repeat quiet GPU-alone→NPU-alone→overlap→GPU-alone with the pinned binary/cache; include fresh X expansion, real copies/cache maintenance, integrated fold, output scatter/ADD and all waits. Require a sustained per-shape net win and no unbounded power/clock drift; the 700 tok/s formula in §6 remains a projection until an actual pp2048 run. Stop unsupported or non-winning kernel/layout ideas at their measured abandon gate. No production implementation, shipping claim, or additional experiment dispatch is made by this document.
+
+### Slice B status (2026-09-16): i32-partials sidecar packaged, performance-negative
+
+This artifact is int8→i32 K128 partials (40× dense i32 output volume), not the future f32 hardware fold designed above. Performance-negative research artifact: sustained ~2.8–2.9 TOPS sits far below the §7 15 TOPS park line, so this direction stays parked; GPU read/fold cost of the partial volume remains unmeasured. No registry publication, no runtime admission, no gfx1201/gfx1100 behavior certified.
+
+Per-profile exact-AOT execution (10 warm + n=50 timed, K5120/N512, validation PASS plus changed-input/sentinel replay PASS; NPU timer is submit+wait host service µs):
+
+| M | NPU service med/p90 | e2e med/p90 | TOPS=2MKN/(med·1e6) | extra DDR vs dense |
+|---:|---|---|---|---:|
+| 1024 | 1925.2/1934.1 | 2066.0/2083.0 | 2.79 | 81788928 |
+| 2048 | 3696.3/3963.5 | 3837.5/4349.2 | 2.90 | 163577856 |
+| 4096 | 7520.6/7872.8 | 7891.7/8240.6 | 2.86 | 327155712 |
+
+P layout (manifest arg name): `P:i32le[pair=M/1024][kg=K/512][col=8][rb=2][h4=4][r=512][c=64]`; A/B plain. Row=`pair*1024+rb*512+r`, half=`kg*4+h4`, column=`col*64+c`; value sums exactly K indices. ZIP `/home/kaden/npu-screen/sidecar/qwen3.8-27b.mq4-xt.xdna.zip` (968153 B, sha256 `5934086e6e313eabd261aa589211feca5e11fbb799ef252bec2657d6ca7466ca`): 7 stored entries (manifest.json + per-M main.pdi/insts.bin); PDI bytes sliced from the executed xclbins (record-bound SHA256), source xclbin SHAs in beside-zip provenance. `XdnaSidecarDescriptor::load_verified` accepts the published bytes (verified=true, 3 profiles); gfx1151 admits, gfx1201/gfx1100 reject. Root cause fixed en route: wrong decoder order + stale JIT cache artifact + premature live-BD reuse.
