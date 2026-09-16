@@ -1728,16 +1728,16 @@ fn dispatch_attend(
                 );
                 // gfx1201 FA2 prefill with fwht3 K (default on;
                 // `HIPFIRE_GFX12_FA2_PREFILL=0` opts out). K stays in the fwht3 layout
-                // (100 B/head); the kernel rotates this WG's Q rows in place
-                // and dequantizes fwht3 K into its K plane, V unchanged Q8.
-                // Same shape/eager predicates as the Q8 FA2 ingress, plus:
+                // (100 B/head); F4b: the launcher pre-converts Q into f16
+                // scratch (rotation fused, Q never mutated) and dequantizes
+                // fwht3 K into its K plane, V unchanged Q8 — replay-idempotent
+                // and capture-safe, so no recorder/capture gates (like the
+                // Q8 FA2 ingress). Same shape predicates as before, plus:
                 // no tree-verify (FA2 has no tree path) and V must be Q8_0
                 // (v_mode 8 — lloyd V lives in rotated space FA2 never
                 // inverts). Falls through to the incumbent below otherwise.
                 if gpu.flags.gfx12_fa2_prefill
                     && gpu.arch == "gfx1201"
-                    && !gpu.replay.is_recording()
-                    && !gpu.graphs.capture_mode
                     && io.n_heads == 24
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
@@ -1766,7 +1766,7 @@ fn dispatch_attend(
                 // gfx11 FA2 prefill with fwht3 K (default on;
                 // `HIPFIRE_GFX11_FA2_PREFILL=0` opts out). F4b: the launcher
                 // pre-converts Q into f16 scratch (rotation fused, Q never
-                // mutated), so unlike the gfx1201 arm above this one is
+                // mutated), so like the gfx1201 arm above this one is
                 // replay-idempotent and capture-safe — no recorder/capture
                 // gates. Otherwise same shape predicates (arch-disjoint
                 // gfx11 allowlist, independent flag). F2: exactly-1024 is

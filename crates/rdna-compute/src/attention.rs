@@ -3930,6 +3930,7 @@ impl Gpu {
             "attention",
             "attention_q8_0_fa2_gqa_gfx1201",
             bytes,
+        );
         // F4b: pre-convert f32 Q -> f16 scratch on the same stream, then run
         // the body against the scratch. Both via launch_maybe_blob so graph
         // capture stays valid. The blob ABI below is unchanged (q16 reuses
@@ -3975,12 +3976,12 @@ impl Gpu {
     /// Same contract as [`Self::attention_q8_0_fa2_gqa_gfx1201`] except K is
     /// read as fwht3 records (`k_bytes_per_head = 100`, `k_bytes_per_pos =
     /// 400`, head offset `kv_h * 100` — the
-    /// `kv_cache_write_asym_k_fwht3*`/`attention_flash_fwht3_tile_batched`
-    /// contract) and V stays Q8_0. The kernel rotates this WG's Q rows
-    /// in place (signed FWHT-256) before the shared body, so `q` MUST be a
-    /// single-use prefill buffer: this launcher fails closed under replay
-    /// recording or graph capture (rotation is not idempotent), and the
-    /// dispatch ingress additionally gates tree-verify off. `signs1`/`signs2`
+    /// contract) and V stays Q8_0. F4b: the launcher pre-converts f32 `q`
+    /// into f16 scratch (`attention_fa2_q_preconvert_fwht3_gfx1201`, rotation
+    /// fused, same stream) and the body reads the scratch — `q` is never
+    /// mutated, so this launcher is replay-idempotent and capture-safe
+    /// (no recorder/capture gates; the dispatch ingress gates tree-verify
+    /// off only because FA2 has no tree path). `signs1`/`signs2`
     /// are the 256-element FWHT sign tables (same tensors the fwht3 K-write
     /// used). Production ingress is the opt-in branch in the
     /// `AttnFlashAsym3FwhtBatchedMasked` dispatch arm; call this directly
@@ -4012,13 +4013,6 @@ impl Gpu {
                     "attention_q8_0_fa2_gqa_fwht3k_gfx1201 requires gfx1201, got {}",
                     self.arch
                 ),
-            ));
-        }
-        if self.replay.is_recording() || self.graphs.capture_mode {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "attention_q8_0_fa2_gqa_fwht3k_gfx1201 is eager-only: the in-place Q \
-                 rotation is not replay-idempotent",
             ));
         }
         if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
@@ -4071,35 +4065,46 @@ impl Gpu {
             ));
         }
         const SYMBOL: &str = "attention_q8_0_fa2_gqa_fwht3k_gfx1201";
-        if !self.functions.contains_key(SYMBOL) {
+        // F4b: the body reads pre-rotated, pre-converted f16 Q from
+        // Gpu-owned scratch (same stream just below); the entry symbol and
+        // the pre-convert symbol both resolve out of this module's source.
+        // The pre-convert symbol is KMODE-distinct from the Q8 module's
+        // (function cache is symbol-keyed).
+        const PRECONVERT: &str = "attention_fa2_q_preconvert_fwht3_gfx1201";
+        if !self.functions.contains_key(SYMBOL) || !self.functions.contains_key(PRECONVERT) {
             self.ensure_kernel(
                 SYMBOL,
                 kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC,
                 SYMBOL,
             )?;
+            self.ensure_kernel(
+                SYMBOL,
+                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC,
+                PRECONVERT,
+            )?;
         }
+        // F4b scratch: [batch, 24, 256] f16 (n_heads/head_dim validated
+        // H24/D256 above), Gpu-owned, grows-never-shrinks.
+        let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let mut q_ptr = q.buf.as_ptr();
+        let mut q16_arg = q16_ptr;
         let mut k_ptr = k_cache.buf.as_ptr();
         let mut v_ptr = v_cache.buf.as_ptr();
         let mut out_ptr = out.buf.as_ptr();
         let mut pos_ptr = positions.buf.as_ptr();
-        let mut s1_ptr = signs1.buf.as_ptr();
-        let mut s2_ptr = signs2.buf.as_ptr();
         let mut nh = n_heads as i32;
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
         let mut bs = batch_size as i32;
         let mut sc = scale;
         let mut params: Vec<*mut c_void> = vec![
-            &mut q_ptr as *mut _ as *mut c_void,
+            &mut q16_arg as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
             &mut v_ptr as *mut _ as *mut c_void,
             &mut out_ptr as *mut _ as *mut c_void,
             &mut pos_ptr as *mut _ as *mut c_void,
-            &mut s1_ptr as *mut _ as *mut c_void,
-            &mut s2_ptr as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
@@ -4118,6 +4123,20 @@ impl Gpu {
             "attention_q8_0_fa2_gqa_fwht3k_gfx1201",
             bytes,
         );
+        // F4b: pre-convert (rotation fused) f32 Q -> f16 scratch on the same
+        // stream, then run the body against the scratch. Both via
+        // launch_maybe_blob so graph capture stays valid. The body blob ABI
+        // below drops the signs (q16 reuses the old f32 Q slot: same offset
+        // 0, same size); the signs travel only to the pre-convert launch.
+        self.launch_fa2_q_preconvert_gfx11(
+            PRECONVERT,
+            q.buf.as_ptr(),
+            q16_ptr,
+            signs1.buf.as_ptr(),
+            signs2.buf.as_ptr(),
+            batch_size,
+            1,
+        )?;
         let result = self.launch_maybe_blob(
             SYMBOL,
             [grid_x, 4, 1],
@@ -4126,13 +4145,11 @@ impl Gpu {
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(q_ptr);
+                b.push_ptr(q16_arg);
                 b.push_ptr(k_ptr);
                 b.push_ptr(v_ptr);
                 b.push_ptr(out_ptr);
                 b.push_ptr(pos_ptr);
-                b.push_ptr(s1_ptr);
-                b.push_ptr(s2_ptr);
                 b.push_i32(nh);
                 b.push_i32(nkv);
                 b.push_i32(hd);
@@ -4146,10 +4163,9 @@ impl Gpu {
         }
         result
     }
-    /// F4b on-device Q pre-convert shared by the gfx11 FA2 pair.
+    /// F4b on-device Q pre-convert shared by the FA2 pairs (gfx11 + gfx1201).
     ///
     /// `symbol` selects the KMODE build: `attention_fa2_q_preconvert_gfx11`
-    /// (Q8 module) or `attention_fa2_q_preconvert_fwht3_gfx11` (fwht3
     /// module). The two modules export DIFFERENT symbols on purpose — the
     /// function cache is keyed by symbol, so a shared name would silently
     /// bind whichever module build registered first (and the KMODE=0 build
@@ -4991,11 +5007,23 @@ impl Gpu {
         }
         const PARTIAL: &str = "attention_q8_0_fa2_gqa_partial_gfx1201";
         const MERGE: &str = "attention_q8_0_fa2_gqa_merge_gfx1201";
+        // F4b: the partial body reads f16 Q from Gpu-owned scratch
+        // (pre-converted on the same stream just below); the pre-convert
+        // symbol resolves out of this same Q8 module object, so a
+        // standalone bench run compiles exactly one module.
+        const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx1201";
         if !self.functions.contains_key(PARTIAL) {
             self.ensure_kernel(
                 PARTIAL,
                 kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
                 PARTIAL,
+            )?;
+        }
+        if !self.functions.contains_key(PRECONVERT) {
+            self.ensure_kernel(
+                PARTIAL,
+                kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
+                PRECONVERT,
             )?;
         }
         if !self.functions.contains_key(MERGE) {
@@ -5005,9 +5033,12 @@ impl Gpu {
                 MERGE,
             )?;
         }
+        // F4b scratch: [batch, 24, 256] f16, Gpu-owned, grows-never-shrinks.
+        let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let mut q_ptr = q.buf.as_ptr();
+        let mut q16_arg = q16_ptr;
         let mut k_ptr = k_cache.buf.as_ptr();
         let mut v_ptr = v_cache.buf.as_ptr();
         let mut p_ptr = partials.buf.as_ptr();
@@ -5019,7 +5050,7 @@ impl Gpu {
         let mut sc = scale;
         let mut ns = n_splits as i32;
         let mut params: Vec<*mut c_void> = vec![
-            &mut q_ptr as *mut _ as *mut c_void,
+            &mut q16_arg as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
             &mut v_ptr as *mut _ as *mut c_void,
             &mut p_ptr as *mut _ as *mut c_void,
@@ -5031,6 +5062,18 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
             &mut ns as *mut _ as *mut c_void,
         ];
+        // F4b: pre-convert f32 Q -> f16 scratch on the same stream, then run
+        // the partial body against the scratch (q16 reuses the old f32 Q
+        // slot: same offset 0, same size).
+        self.launch_fa2_q_preconvert_gfx11(
+            PRECONVERT,
+            q.buf.as_ptr(),
+            q16_ptr,
+            std::ptr::null(),
+            std::ptr::null(),
+            batch_size,
+            0,
+        )?;
         self.launch_maybe_blob(
             PARTIAL,
             [grid_x, 4, n_splits as u32],
@@ -5039,7 +5082,7 @@ impl Gpu {
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(q_ptr);
+                b.push_ptr(q16_arg);
                 b.push_ptr(k_ptr);
                 b.push_ptr(v_ptr);
                 b.push_ptr(p_ptr);
