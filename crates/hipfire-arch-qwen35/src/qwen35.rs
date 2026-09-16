@@ -34,11 +34,12 @@ pub use ep_batch::{
     validate_ep_batch_compatibility, Qwen35DecodeBatchEpState,
 };
 pub use forward::{
-    dump_expert_stats, forward, forward_gpu, forward_prefill_dense_tp, forward_scratch,
-    forward_scratch_dense_tp, forward_scratch_embed, forward_scratch_embed_mrope,
-    forward_scratch_mrope, forward_scratch_with_hidden, forward_with_embedding,
-    prepare_scratch_inputs, shard_all_moe_layers, shard_all_moe_layers_with_fault,
-    shard_moe_experts, Qwen35Scratch, Qwen35ScratchSet,
+    dump_expert_stats, forward, forward_gpu, forward_prefill_dense_tp,
+    forward_prefill_dense_tp_with_hidden, forward_scratch, forward_scratch_dense_tp,
+    forward_scratch_embed, forward_scratch_embed_mrope, forward_scratch_mrope,
+    forward_scratch_with_hidden, forward_with_embedding, prepare_scratch_inputs,
+    shard_all_moe_layers, shard_all_moe_layers_with_fault, shard_moe_experts, Qwen35Scratch,
+    Qwen35ScratchSet,
 };
 pub use load::{
     load_weights, load_weights_dense_tp_rank, load_weights_ep_rank,

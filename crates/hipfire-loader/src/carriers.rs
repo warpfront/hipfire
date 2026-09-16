@@ -111,6 +111,7 @@ impl Carrier for Qwen2Carrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _ep: &'m mut Option<crate::EpState>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state.as_mut().and_then(|s| {
@@ -363,8 +364,17 @@ impl Carrier for Qwen35Carrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        ep: &'m mut Option<crate::EpState>,
         model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        // A dense-TP trunk lives in `ep`, not `state`, so it needs its own
+        // move-out guard; everything else takes the #462 bundle route.
+        if matches!(
+            ep.as_ref().map(|e| &e.inner),
+            Some(crate::EpArch::Qwen35DenseTp { .. })
+        ) {
+            return Ok(Box::new(Qwen35DenseTpGuard::take(ep)?));
+        }
         // qwen35 moves its bundle out of `state` into the RAII Qwen35SlotGuard
         // (lazy HfqFile reopen, bundle restored on Drop — the #462 guard).
         Ok(Box::new(Qwen35SlotGuard::take(state, model_path)?))
@@ -757,6 +767,7 @@ impl Carrier for LlamaCarrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _ep: &'m mut Option<crate::EpState>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state.as_mut().and_then(|s| {
@@ -1161,6 +1172,7 @@ impl Carrier for Deepseek4Carrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _ep: &'m mut Option<crate::EpState>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         if state
@@ -1378,6 +1390,7 @@ impl Carrier for MinimaxCarrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _ep: &'m mut Option<crate::EpState>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state
@@ -1486,6 +1499,7 @@ impl Carrier for Lfm2MoeCarrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _ep: &'m mut Option<crate::EpState>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state
@@ -1661,6 +1675,7 @@ impl Carrier for Cohere2MoeCarrier {
     fn spec_target_guard<'m>(
         &self,
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _ep: &'m mut Option<crate::EpState>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         match state
@@ -1930,6 +1945,7 @@ impl Carrier for Gemma4Carrier {
     fn spec_target_guard<'m>(
         &self,
         _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _ep: &'m mut Option<crate::EpState>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         Err("gemma4: spec decode not yet wired (AR-only)".into())
@@ -2279,6 +2295,7 @@ impl Carrier for MuseGlimmerCarrier {
     fn spec_target_guard<'m>(
         &self,
         _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _ep: &'m mut Option<crate::EpState>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
         Err("muse_glimmer: spec decode not yet wired (AR-only)".into())
@@ -2861,5 +2878,79 @@ mod gemma4_route_tests {
         assert!(gemma4_validate_drafter_route(true, true).is_err());
         assert!(gemma4_validate_drafter_route(true, false).is_ok());
         assert!(gemma4_validate_drafter_route(false, true).is_ok());
+    }
+}
+
+/// Moves the dense-TP mesh out of `EpState` for the request and puts it back on
+/// drop, the `ep` twin of `Qwen35SlotGuard`.
+pub struct Qwen35DenseTpGuard<'m> {
+    ep: &'m mut Option<crate::EpState>,
+    target: Option<hipfire_arch_qwen35::mtp_dense_tp::Qwen35DenseTpTarget>,
+}
+
+impl<'m> Qwen35DenseTpGuard<'m> {
+    fn take(ep: &'m mut Option<crate::EpState>) -> Result<Self, String> {
+        // Refuse before `take()`: moving the mesh out and dropping it on the
+        // error path would silently free every rank's weights and KV.
+        match ep.as_ref().map(|e| &e.inner) {
+            Some(crate::EpArch::Qwen35DenseTp { .. }) => {}
+            Some(_) => return Err("dense TP guard: EP arch is not dense TP".to_string()),
+            None => return Err("dense TP guard: no EP state".to_string()),
+        }
+        let crate::EpState { gpus, inner } = ep.take().expect("checked above");
+        let crate::EpArch::Qwen35DenseTp {
+            shard,
+            configs,
+            weights,
+            kv_caches,
+            dn_states,
+            scratches,
+        } = inner
+        else {
+            unreachable!("variant checked before take");
+        };
+        let eos_token = configs[0].eos_token;
+        let ctx_capacity = kv_caches[0].max_seq;
+        Ok(Self {
+            ep,
+            target: Some(hipfire_arch_qwen35::mtp_dense_tp::Qwen35DenseTpTarget {
+                gpus,
+                shard,
+                weights,
+                configs,
+                kv_caches,
+                dn_states,
+                scratches,
+                eos_token,
+                ctx_capacity,
+            }),
+        })
+    }
+}
+
+impl SpecTargetGuard for Qwen35DenseTpGuard<'_> {
+    fn slot(&mut self) -> Result<&mut dyn hipfire_runtime::spec::SpecTarget, String> {
+        self.target
+            .as_mut()
+            .map(|t| t as &mut dyn hipfire_runtime::spec::SpecTarget)
+            .ok_or_else(|| "dense TP guard: target already returned".to_string())
+    }
+}
+
+impl Drop for Qwen35DenseTpGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(t) = self.target.take() {
+            *self.ep = Some(crate::EpState {
+                gpus: t.gpus,
+                inner: crate::EpArch::Qwen35DenseTp {
+                    shard: t.shard,
+                    configs: t.configs,
+                    weights: t.weights,
+                    kv_caches: t.kv_caches,
+                    dn_states: t.dn_states,
+                    scratches: t.scratches,
+                },
+            });
+        }
     }
 }

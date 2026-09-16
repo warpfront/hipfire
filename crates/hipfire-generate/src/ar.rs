@@ -1471,6 +1471,9 @@ pub fn emit_active_route_cancel(output: &mut dyn Write, id: &str, completion_tok
 pub struct GenerationRouteInputs {
     pub arch_id: u32,
     pub ep: bool,
+    /// EP-shaped topology that is actually a dense tensor-parallel trunk
+    /// (`EpArch::Qwen35DenseTp`), the one mesh route that carries a drafter.
+    pub dense_tp: bool,
     pub pp: usize,
     pub has_speculator: bool,
     pub speculator_is_mtp: bool,
@@ -1496,8 +1499,22 @@ pub struct GenerationRouteInputs {
 
 /// Pure production route selector. Precedence is intentional and exhaustive.
 pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
-    // 1. Expert-parallel first (before any arch short-circuit).
+    // 1. Expert-parallel first (before any arch short-circuit). Dense TP is the
+    // one mesh topology that carries a speculator — its MTP drafter runs on the
+    // replicated rank-0 head and verifies across ranks — so a request it can
+    // serve takes the spec route; anything else stays on the EP AR arm, which
+    // is the only loop that can drive a sharded trunk.
     if i.ep {
+        let dense_tp_mtp = i.dense_tp
+            && i.arch_id == 5
+            && i.has_speculator
+            && i.speculator_is_mtp
+            && !i.force_ar_chat
+            && !i.kv_adaptive
+            && (i.temp <= 1e-6 || i.supports_temp_swor);
+        if dense_tp_mtp {
+            return GenerationRoute::QwenDflash;
+        }
         return match i.arch_id {
             5 | 6 => GenerationRoute::QwenAr,
             9 => GenerationRoute::Deepseek4Ep,
@@ -1726,6 +1743,10 @@ pub fn generate(
     let route_inputs = GenerationRouteInputs {
         arch_id: m.arch_id,
         ep: m.ep.is_some(),
+        dense_tp: matches!(
+            m.ep.as_ref().map(|e| &e.inner),
+            Some(hipfire_loader::EpArch::Qwen35DenseTp { .. })
+        ),
         pp: m.pp,
         has_speculator: m.speculator.is_some(),
         speculator_is_mtp: m.speculator.as_ref().is_some_and(|s| s.name() == "mtp"),

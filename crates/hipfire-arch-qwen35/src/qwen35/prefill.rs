@@ -6115,7 +6115,7 @@ pub(crate) fn fa_pertoken_min_ctx() -> Option<usize> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn q8_multirow_attn_admitted(
+pub(crate) fn q8_multirow_attn_admitted(
     arch: &str,
     quant_q8: bool,
     head_dim: usize,
@@ -6130,7 +6130,7 @@ fn q8_multirow_attn_admitted(
     matches!(arch, "gfx1100" | "gfx1201")
         && quant_q8
         && matches!(head_dim, 128 | 256)
-        && (4..=32).contains(&n)
+        && (2..=32).contains(&n)
         && min_ctx.is_some_and(|threshold| logical_ctx > threshold)
         && !is_tree
         && !is_independent
@@ -9033,7 +9033,7 @@ mod tests {
     fn q8_multirow_attn_admits_only_measured_arch_shapes() {
         for arch in ["gfx1100", "gfx1201"] {
             for head_dim in [128, 256] {
-                for n in [4, 8, 32] {
+                for n in [2, 3, 4, 8, 32] {
                     assert!(q8_multirow_attn_admitted(
                         arch,
                         true,
@@ -9114,7 +9114,7 @@ mod tests {
                 false,
             ));
         }
-        for n in [1, 3, 33] {
+        for n in [0, 1, 33, 64] {
             assert!(!admitted(
                 "gfx1100",
                 true,
