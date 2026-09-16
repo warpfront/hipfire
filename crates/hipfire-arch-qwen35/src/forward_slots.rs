@@ -337,6 +337,11 @@ pub(crate) fn residual_gemm_key_for(dt: DType) -> KernelKey {
         DType::MQ5G256V2 => KernelKey::GemmMq5G256V2Residual,
         DType::MQ3G256V2 => KernelKey::GemmMq3G256V2Residual,
         DType::MQ2G256V2 => KernelKey::GemmMq2G256V2Residual,
+        // qt=52 must NEVER alias a uniform key (silent noise at full speed):
+        // Lloyd prefill uses the FP8-LUT launchers directly, never these keys.
+        DType::MQ4G256V2Lloyd => panic!(
+            "residual_gemm_key_for: MQ4G256V2Lloyd (qt=52) has no uniform residual key — route Lloyd prefill through gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
         _ => KernelKey::GemmHfq4G256Residual,
     }
 }
@@ -349,6 +354,10 @@ pub(crate) fn fused_qkvza_key_for(dt: DType) -> KernelKey {
         DType::MQ5G256V2 => KernelKey::FusedQkvzaMq5G256V2,
         DType::MQ3G256V2 => KernelKey::FusedQkvzaMq3G256V2,
         DType::MQ2G256V2 => KernelKey::FusedQkvzaMq2G256V2,
+        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
+        DType::MQ4G256V2Lloyd => panic!(
+            "fused_qkvza_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
         _ => KernelKey::FusedQkvzaHfq4G256,
     }
 }
@@ -361,6 +370,10 @@ pub(crate) fn fused_qkv_key_for(dt: DType) -> KernelKey {
         DType::MQ5G256V2 => KernelKey::FusedQkvMq5G256V2,
         DType::MQ3G256V2 => KernelKey::FusedQkvMq3G256V2,
         DType::MQ2G256V2 => KernelKey::FusedQkvMq2G256V2,
+        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
+        DType::MQ4G256V2Lloyd => panic!(
+            "fused_qkv_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
         _ => KernelKey::FusedQkvHfq4G256,
     }
 }
@@ -373,6 +386,10 @@ pub(crate) fn fused_gate_up_key_for(dt: DType) -> KernelKey {
         DType::MQ5G256V2 => KernelKey::FusedGateUpMq5G256V2,
         DType::MQ3G256V2 => KernelKey::FusedGateUpMq3G256V2,
         DType::MQ2G256V2 => KernelKey::FusedGateUpMq2G256V2,
+        // qt=52 must NEVER alias a uniform fused key: no fused LUT kernel exists.
+        DType::MQ4G256V2Lloyd => panic!(
+            "fused_gate_up_key_for: MQ4G256V2Lloyd (qt=52) has no fused key — route Lloyd prefill through gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd"
+        ),
         _ => KernelKey::FusedGateUpHfq4G256,
     }
 }
@@ -1463,7 +1480,15 @@ fn q8_attend_slots(
             let k_view = k_cache.sub_offset(k_base as usize, slab_bytes);
             let v_view = v_cache.sub_offset(k_base as usize, slab_bytes);
             return gpu.attention_q8_0_flash_prefill_wmma(
-                q, &k_view, &v_view, out, positions, n_heads, n_kv_heads, head_dim, max_ctx_len,
+                q,
+                &k_view,
+                &v_view,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
                 batch_size,
             );
         }

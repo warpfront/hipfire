@@ -834,6 +834,14 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
     ) {
         return Some(vec![read(0), read(8), write(16)]);
     }
+    // MQ4G256V2-Lloyd LUT GEMVs (qt52): same 3-pointer ABI as the uniform V2
+    // pair (a_raw, x read; y write/RMW) plus 8 by-value LUT dwords and 2 i32.
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2_lloyd" | "gemv_mq4g256v2_residual_lloyd"
+    ) {
+        return Some(vec![read(0), read(8), write(16)]);
+    }
     // Dense shared-expert V2 residual WMMA GEMM (prefill/batched). 3 pointers + 3 i32
     // (M,K,batch). Y is write (output) via residual path; distinct symbols per arch tile.
     if matches!(
@@ -935,6 +943,9 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]);
+    }
+    if kernel == "deinterleave_q_rmsnorm_f32_batched" {
+        return Some(vec![read(0), write(8), write(16), read(24)]);
     }
     match kernel {
         "add_inplace_f32" => Some(vec![write(0), read(8)]),
@@ -1486,6 +1497,13 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     ) {
         return Some(32);
     }
+    // LUT GEMVs: 3 ptrs (24 B) + 2 i32 (8 B) + 8 LUT dwords (32 B) = 64 B.
+    if matches!(
+        kernel,
+        "gemv_mq4g256v2_lloyd" | "gemv_mq4g256v2_residual_lloyd"
+    ) {
+        return Some(64);
+    }
     if matches!(
         kernel,
         "gemm_mq4g256v2_residual_wmma"
@@ -1524,6 +1542,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
     if kernel.starts_with("conv1d_silu_split_qknorm_") {
         return Some(80);
+    }
+    // T-C Halo prefill fusion: 4 ptr + 3 i32 + 1 f32 = 48.
+    if kernel == "deinterleave_q_rmsnorm_f32_batched" {
+        return Some(48);
     }
     if kernel == "fused_qkvza_hfq4g256_k2048_scalar_prep" {
         return Some(112);

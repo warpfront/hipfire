@@ -67,6 +67,16 @@ extern "C" __global__ void HIPFIRE_QKV_KERNEL_NAME(
     float*       __restrict__ y_v,
     int q_m, int k_m, int v_m,
     int K HIPFIRE_QKV_BIAS_ARGS
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    // Lloyd (qt=52): three per-tensor centered f16 codebooks (q, k, v),
+    // 8 dwords each, staged to LDS once; the block indexes its source.
+    , const unsigned int L0, const unsigned int L1, const unsigned int L2, const unsigned int L3,
+    const unsigned int L4, const unsigned int L5, const unsigned int L6, const unsigned int L7,
+    const unsigned int L8, const unsigned int L9, const unsigned int L10, const unsigned int L11,
+    const unsigned int L12, const unsigned int L13, const unsigned int L14, const unsigned int L15,
+    const unsigned int L16, const unsigned int L17, const unsigned int L18, const unsigned int L19,
+    const unsigned int L20, const unsigned int L21, const unsigned int L22, const unsigned int L23
+#endif
 ) {
     const int gid = blockIdx.x;
     const int total_m = q_m + k_m + v_m;
@@ -77,15 +87,36 @@ extern "C" __global__ void HIPFIRE_QKV_KERNEL_NAME(
     float* y;
     int row;
     HIPFIRE_QKV_BIAS_DECL
+    int lut_base = 0;
     if (gid < q_m) {
         A = A_q; y = y_q; row = gid; HIPFIRE_QKV_BIAS_Q
     } else if (gid < q_m + k_m) {
-        A = A_k; y = y_k; row = gid - q_m; HIPFIRE_QKV_BIAS_K
+        A = A_k; y = y_k; row = gid - q_m; HIPFIRE_QKV_BIAS_K              lut_base = 16;
     } else {
-        A = A_v; y = y_v; row = gid - q_m - k_m; HIPFIRE_QKV_BIAS_V
+        A = A_v; y = y_v; row = gid - q_m - k_m; HIPFIRE_QKV_BIAS_V        lut_base = 32;
     }
 
     const int tid = threadIdx.x;
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    __shared__ unsigned short LUT_SMEM[48];
+    if (tid < 24) {
+        unsigned int d;
+        switch (tid) {
+            case 0: d = L0; break;   case 1: d = L1; break;   case 2: d = L2; break;   case 3: d = L3; break;
+            case 4: d = L4; break;   case 5: d = L5; break;   case 6: d = L6; break;   case 7: d = L7; break;
+            case 8: d = L8; break;   case 9: d = L9; break;   case 10: d = L10; break; case 11: d = L11; break;
+            case 12: d = L12; break; case 13: d = L13; break; case 14: d = L14; break; case 15: d = L15; break;
+            case 16: d = L16; break; case 17: d = L17; break; case 18: d = L18; break; case 19: d = L19; break;
+            case 20: d = L20; break; case 21: d = L21; break; case 22: d = L22; break; default: d = L23; break;
+        }
+        ((unsigned int*)LUT_SMEM)[tid] = d;
+    }
+    __syncthreads();
+    #define MQ4V2_DEQ(q) (__half2float(__ushort_as_half(LUT_SMEM[lut_base + (q)])))
+#else
+    (void)lut_base;
+    #define MQ4V2_DEQ(q) ((float)(q))
+#endif
 #if defined(HIPFIRE_RDNA3_QKV_K2048)
     const int groups_per_row = 8;
 #else
@@ -165,14 +196,14 @@ extern "C" __global__ void HIPFIRE_QKV_KERNEL_NAME(
             hipfire_qkv_f32x4, __builtin_amdgcn_raw_buffer_load_b128(
                 x_rsrc, (base + 772) * 4, 0, 0));
         #define DOG_V(pk, sc, zp, a, x0, x1, x2, x3, x4, x5, x6, x7) \
-            (a) += (sc * (float)((pk) & 0xFu)         + zp) * (x0) \
-                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
-                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * (x2) \
-                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * (x3) \
-                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * (x4) \
-                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * (x5) \
-                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * (x6) \
-                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * (x7)
+            (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)         + zp) * (x0) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 4) & 0xFu)  + zp) * (x1) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 8) & 0xFu)  + zp) * (x2) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * (x3) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * (x4) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * (x5) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * (x6) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * (x7)
         DOG_V(pk0, sc0, zp0, acc0, xv0a.x,xv0a.y,xv0a.z,xv0a.w,xv0b.x,xv0b.y,xv0b.z,xv0b.w);
         DOG_V(pk1, sc1, zp1, acc1, xv1a.x,xv1a.y,xv1a.z,xv1a.w,xv1b.x,xv1b.y,xv1b.z,xv1b.w);
         DOG_V(pk2, sc2, zp2, acc2, xv2a.x,xv2a.y,xv2a.z,xv2a.w,xv2b.x,xv2b.y,xv2b.z,xv2b.w);
@@ -180,14 +211,14 @@ extern "C" __global__ void HIPFIRE_QKV_KERNEL_NAME(
         #undef DOG_V
 #else
         #define DOG(pk, sc, zp, b, a) \
-            (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
-                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
-                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
-                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
-                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
-                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
-                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
-                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+            (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)        + zp) * x[(b)]     \
+                 + (sc * MQ4V2_DEQ(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
 
         DOG(pk0, sc0, zp0, base,       acc0);
         DOG(pk1, sc1, zp1, base + 256, acc1);
@@ -199,14 +230,14 @@ extern "C" __global__ void HIPFIRE_QKV_KERNEL_NAME(
 
     // Tail handling: preserve acc[gi] interleaving. See 5302926 bug report.
     #define TAIL_DOG(pk, sc, zp, b, a) \
-        (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
-             + (sc * (float)(((pk) >>  4) & 0xFu) + zp) * x[(b) + 1] \
-             + (sc * (float)(((pk) >>  8) & 0xFu) + zp) * x[(b) + 2] \
-             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
-             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
-             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
-             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
-             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+        (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)        + zp) * x[(b)]     \
+             + (sc * MQ4V2_DEQ(((pk) >>  4) & 0xFu) + zp) * x[(b) + 1] \
+             + (sc * MQ4V2_DEQ(((pk) >>  8) & 0xFu) + zp) * x[(b) + 2] \
+             + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+             + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+             + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+             + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+             + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
 
     if (tail >= 1) {
         const int g = quads << 2;

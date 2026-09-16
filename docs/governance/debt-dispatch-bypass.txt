@@ -32,7 +32,7 @@
 #
 # Format:  <crate>  <status>  <bypass>  <registry>  [note]
 
-hipfire-arch-qwen35        partial   121   191   migrate last; MTP routed MoE now dispatch-layer owned; +10 = DFlash fp16-X GEMM entries (S3/S4 launch fusion); -20 = MQ v2 lm_head match deduped in speculative.rs
+hipfire-arch-qwen35        partial   142   191   migrate last; MTP routed MoE now dispatch-layer owned; +10 = DFlash fp16-X GEMM entries (S3/S4 launch fusion); -20 = MQ v2 lm_head match deduped in speculative.rs; +7 = MQ4-Lloyd (qt=52) FP8-LUT prefill arms (gemm_*_fp8_lloyd) pending registry keys with LUT plumbing (gfx11 MMQ-LUT PR); +15 = MQ4-Lloyd gfx11 MMQ-LUT prefill arms (gemm_*_mmq_lloyd), same registry-key debt as the FP8-LUT arms
 hipfire-arch-deepseek4     debt       19     0   cheapest full conversion; no registry use to reconcile
 hipfire-arch-gemma4        partial    17     4
 hipfire-arch-lfm2moe       debt       17     0   cheapest full conversion; no registry use to reconcile

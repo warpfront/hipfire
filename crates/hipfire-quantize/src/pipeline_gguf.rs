@@ -10,6 +10,9 @@
     non_snake_case,
     clippy::all
 )]
+use crate::quant_mq4v2_lloyd::{
+    lloyd_levels_sidecar_name, lloyd_levels_to_f32_bytes, quantize_mq4g256v2_lloyd,
+};
 
 use std::collections::HashMap;
 use std::fs::File;
@@ -61,6 +64,7 @@ pub(crate) enum GgufFormat {
     Hfq6,
     Mq4,
     Mq4V2,
+    Mq4V2Lloyd, // mq4v2 + per-tensor 16-level Lloyd codebook (qt=52)
     Mq4C,
     Mq5,
     Mq6,
@@ -106,6 +110,9 @@ impl GgufFormat {
             "hfq6" | "hfq6g256" | "hf6" => Some(Self::Hfq6),
             "mq4v1" | "mq4g256" | "magnum" => Some(Self::Mq4),
             "mq4v2" | "mq4" | "mq4g256v2" => Some(Self::Mq4V2),
+            "mq4v2-lloyd" | "mq4v2l" | "mq4l" | "mq4g256v2l" | "mq4g256v2-lloyd" => {
+                Some(Self::Mq4V2Lloyd)
+            }
             "mq4c" | "mq4cg256" | "mq4g256c" => Some(Self::Mq4C),
             "mq5" | "mq5g256" => Some(Self::Mq5),
             "mq6" | "mq6g256" => Some(Self::Mq6),
@@ -144,6 +151,7 @@ impl GgufFormat {
             Self::Hfq6 => "HFQ6G256",
             Self::Mq4 => "MQ4G256",
             Self::Mq4V2 => "MQ4G256V2",
+            Self::Mq4V2Lloyd => "MQ4G256V2L",
             Self::Mq4C => "MQ4CG256",
             Self::Mq5 => "MQ5G256",
             Self::Mq6 => "MQ6G256",
@@ -284,6 +292,7 @@ pub(crate) fn run_gguf_pipeline(
         format,
         GgufFormat::Mq4
             | GgufFormat::Mq4V2
+            | GgufFormat::Mq4V2Lloyd
             | GgufFormat::Mq4C
             | GgufFormat::Mq6
             | GgufFormat::Mq6V2
@@ -415,6 +424,7 @@ pub(crate) fn run_gguf_pipeline(
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 
+        let mut lloyd_levels: Option<[f32; 16]> = None;
         let (data, quant_type, group_size, label) = if is_norm || !is_2d {
             // Norms and 1D tensors always F16 (primary gate)
             let f32_data = gguf_input::tensor_to_f32(info, raw);
@@ -543,6 +553,7 @@ pub(crate) fn run_gguf_pipeline(
             match format {
                 GgufFormat::Mq4
                 | GgufFormat::Mq4V2
+                | GgufFormat::Mq4V2Lloyd
                 | GgufFormat::Mq4C
                 | GgufFormat::Mq3
                 | GgufFormat::Mq2
@@ -653,6 +664,13 @@ pub(crate) fn run_gguf_pipeline(
                     let k = info.shape[1] as usize;
                     let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                }
+                GgufFormat::Mq4V2Lloyd => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let r = quantize_mq4g256v2_lloyd(&f32_data, m, k, &signs1, &signs2);
+                    lloyd_levels = Some(r.levels);
+                    (r.data, QuantType::MQ4G256V2L, 256u32, "MQ4G256V2L")
                 }
                 GgufFormat::Mq4C => {
                     let m = info.shape[0] as usize;
@@ -789,6 +807,13 @@ pub(crate) fn run_gguf_pipeline(
                     let k = info.shape[1] as usize;
                     let q = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
                     (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                }
+                GgufFormat::Mq4V2Lloyd => {
+                    let m = info.shape[0] as usize;
+                    let k = info.shape[1] as usize;
+                    let r = quantize_mq4g256v2_lloyd(&f32_data, m, k, &signs1, &signs2);
+                    lloyd_levels = Some(r.levels);
+                    (r.data, QuantType::MQ4G256V2L, 256u32, "MQ4G256V2L")
                 }
                 GgufFormat::Mq4C => {
                     let m = info.shape[0] as usize;
@@ -936,13 +961,30 @@ pub(crate) fn run_gguf_pipeline(
         );
 
         hfq_tensors.push(HfqTensor {
-            name: out_name,
+            name: out_name.clone(),
             quant_type,
             shape,
             group_size,
             data,
             spilled_len: 0,
         });
+        if let Some(levels) = lloyd_levels {
+            let sc_name = lloyd_levels_sidecar_name(&out_name);
+            let bytes = lloyd_levels_to_f32_bytes(&levels);
+            eprintln!(
+                "    Lloyd:  {} [16] (1D F32 levels, {} B)",
+                sc_name,
+                bytes.len()
+            );
+            hfq_tensors.push(HfqTensor {
+                name: sc_name,
+                quant_type: QuantType::F32,
+                shape: vec![16],
+                group_size: 0,
+                data: bytes,
+                spilled_len: 0,
+            });
+        }
     }
 
     eprintln!("\n=== GGUF → MQ4 Summary ===");

@@ -32,6 +32,106 @@ pub struct Mq4v2Fp8Prepared {
     pub scale_mode: i32,
 }
 
+/// Opaque reservation of the shared `int4_mmq_x_scratch` buffer for a
+/// producer-emitted IU4 sidecar (C2). Obtained from
+/// [`ScratchState::reserve_int4_mmq`] / [`crate::Gpu::reserve_int4_mmq`].
+/// Does not launch a quantizer — the producer writes `block_i4_128` in place.
+/// Converted to [`Int4MmqPrepared`] only after a successful producer launch.
+#[derive(Debug)]
+pub struct Int4MmqReservation {
+    ptr: *mut c_void,
+    k: usize,
+    n: usize,
+    generation: u64,
+}
+
+impl Int4MmqReservation {
+    #[inline]
+    pub fn ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    #[inline]
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    #[inline]
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Frozen producer-emitted IU4 handle. Fields are intentionally private so
+/// consumers cannot reconstruct a fake handle or bypass generation checks.
+/// Valid only until the next `reserve_int4_mmq` on the same Gpu (generation
+/// bump) or teardown.
+#[derive(Debug)]
+pub struct Int4MmqPrepared {
+    ptr: *mut c_void,
+    k: usize,
+    n: usize,
+    generation: u64,
+}
+
+impl Int4MmqPrepared {
+    /// Seal a reservation after the producer wrote the sidecar. Host only —
+    /// no device work.
+    pub fn from_reservation(res: Int4MmqReservation) -> Self {
+        Self {
+            ptr: res.ptr,
+            k: res.k,
+            n: res.n,
+            generation: res.generation,
+        }
+    }
+
+    /// Validate generation / (k,n) / pointer against the live scratch and
+    /// return the device pointer for the IU4 consumer. Fails closed on any
+    /// mismatch so a stale handle cannot silently re-enter the standalone
+    /// quantizer path.
+    pub fn checked_ptr(
+        &self,
+        live_generation: u64,
+        live_ptr: *mut c_void,
+        k: usize,
+        n: usize,
+    ) -> HipResult<*mut c_void> {
+        if self.ptr.is_null()
+            || live_ptr.is_null()
+            || self.ptr != live_ptr
+            || self.generation != live_generation
+            || self.k != k
+            || self.n != n
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "Int4MmqPrepared: stale or mismatched IU4 sidecar handle",
+            ));
+        }
+        Ok(self.ptr)
+    }
+
+    #[inline]
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    #[inline]
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
 
 pub struct ScratchState {
     pub mq_signs1: Option<GpuTensor>,
@@ -72,6 +172,9 @@ pub struct ScratchState {
     /// never writes, so aliasing would corrupt both routes.
     pub int4_mmq_x_scratch: Option<DeviceBuffer>,
     pub int4_mmq_x_scratch_bytes: usize,
+    /// Generation bumped on every `reserve_int4_mmq` so a prepared handle
+    /// cannot outlive a later re-reservation of the same scratch slot.
+    pub int4_mmq_generation: u64,
     /// Dedicated MQ4v2 FP8 pre-pass X buffer (E4M3 bytes, [N,K]). Not shared
     /// with `fp8_x_scratch` and never pointer-cached — always overwritten.
     pub mq4v2_fp8_x_scratch: Option<DeviceBuffer>,
@@ -92,6 +195,12 @@ pub struct ScratchState {
     /// in one allocation; grows-never-shrinks.
     pub sample_partials: Option<DeviceBuffer>,
     pub sample_partials_bytes: usize,
+    /// F4b: f16 Q scratch for the gfx11 FA2 pair (`attention_fa2_q_preconvert_gfx11`
+    /// writes it, the FA2 body reads it): [batch, 24, 256] f16, grows-never-shrinks.
+    /// Every valid cell is written by the pre-convert launch before the body reads
+    /// it (same-stream ordering), so no init is needed.
+    pub fa2_q16_scratch: Option<DeviceBuffer>,
+    pub fa2_q16_scratch_bytes: usize,
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
@@ -404,6 +513,25 @@ impl ScratchState {
             n_bytes,
         )?;
         Ok(self.sample_partials.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure the F4b FA2 f16 Q scratch holds at least `n_bytes`
+    /// (batch*24*256*2 for the gfx11 FA2 pair), growing (never shrinking).
+    /// Returns the device base pointer. No init needed: the pre-convert
+    /// launch writes every valid cell before the FA2 body reads it
+    /// (same-stream ordering).
+    pub fn ensure_fa2_q16_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        n_bytes: usize,
+    ) -> HipResult<*mut c_void> {
+        grow_scratch_buffer(
+            hip,
+            &mut self.fa2_q16_scratch,
+            &mut self.fa2_q16_scratch_bytes,
+            n_bytes,
+        )?;
+        Ok(self.fa2_q16_scratch.as_ref().unwrap().as_ptr())
     }
 
     /// Ensure the dedicated GEMV-residual temporary can hold at least
@@ -1207,6 +1335,7 @@ impl ScratchState {
     /// lifetime contract as [`Self::ensure_q8_1_mmq_x128`], but a dedicated
     /// `int4_mmq_x_scratch` buffer — the layouts differ (72 B vs 144 B) and
     /// the iu4 consumer reads nibble headers the Q8_1 prelude never writes.
+    /// Bumps `int4_mmq_generation` so any prior prepared handle fails closed.
     pub fn ensure_int4_mmq_x(
         &mut self,
         hip: &HipRuntime,
@@ -1243,6 +1372,8 @@ impl ScratchState {
             &mut self.int4_mmq_x_scratch_bytes,
             needed,
         )?;
+        // Invalidate any outstanding prepared producer handle.
+        self.int4_mmq_generation = self.int4_mmq_generation.wrapping_add(1);
 
         let src_ptr = x.buf.as_ptr();
         let must_convert = true;
@@ -1292,6 +1423,50 @@ impl ScratchState {
         }
 
         Ok(self.int4_mmq_x_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Grow `int4_mmq_x_scratch` for a producer-emitted IU4 sidecar and bump
+    /// the generation. Does **not** launch `quantize_int4_mmq_ds128` — the
+    /// RMSNorm/FWHT or SwiGLU/FWHT producer writes the 72-byte blocks.
+    pub fn reserve_int4_mmq(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<Int4MmqReservation> {
+        if k == 0 || n == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "reserve_int4_mmq: need k%256==0 and n>0",
+            ));
+        }
+        let blocks_k = k / 128;
+        let needed = blocks_k * n * 72;
+        grow_scratch_buffer(
+            hip,
+            &mut self.int4_mmq_x_scratch,
+            &mut self.int4_mmq_x_scratch_bytes,
+            needed,
+        )?;
+        self.int4_mmq_generation = self.int4_mmq_generation.wrapping_add(1);
+        let ptr = self.int4_mmq_x_scratch.as_ref().unwrap().as_ptr();
+        Ok(Int4MmqReservation {
+            ptr,
+            k,
+            n,
+            generation: self.int4_mmq_generation,
+        })
+    }
+
+    /// Live generation + pointer for [`Int4MmqPrepared::checked_ptr`].
+    #[inline]
+    pub fn int4_mmq_live(&self) -> (u64, *mut c_void) {
+        let ptr = self
+            .int4_mmq_x_scratch
+            .as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        (self.int4_mmq_generation, ptr)
     }
 
     /// Invalidate the FP16/FP8 activation scratch caches. Must be called

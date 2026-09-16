@@ -459,6 +459,9 @@ pub fn load_from_source(
                     row_stride: gate_up_row_stride,
                     paro: Some(gate_up_paro),
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 };
                 let down = WeightTensor {
                     buf: tx.take_tensor(down_slot)?,
@@ -468,6 +471,9 @@ pub fn load_from_source(
                     row_stride: down_row_stride,
                     paro: Some(down_paro),
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 };
                 let expert = ExpertWeights { gate_up, down };
                 expert_slots.push(tx.hold_expert(expert));

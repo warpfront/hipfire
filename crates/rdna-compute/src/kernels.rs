@@ -1079,17 +1079,48 @@ pub const FUSED_RMSNORM_MQ_ROTATE_VECSUM_SIGN_CONST_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_RDNA3_RMSNORM_VECSUM_KERNEL fused_rmsnorm_mq_rotate_vecsum_sign_const\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_vecsum.gfx1100.hip")
 );
-pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str =
-    // gfx1100 K=5120: preserving the reduction tree while replacing its
-    // wave-local tail with shuffles was token-exact but reduced graph-on ABBA
-    // decode 36.922->36.773 tok/s (-0.40%); retain the LDS barrier tree.
-    // Native/refined reciprocal gained 0.3-0.5% but diverged by token 190/286;
-    // a 1025-token-exact FMA quotient correction retained only +0.12% ABBA.
-    // Keep the IEEE divide: its special-case work is not the decode bottleneck.
-    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq.hip");
-pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC: &str =
-    // K=5120 direct float4 path: certified default for Qwen3.6-27B on gfx1100.
-    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq_direct.gfx1100.hip");
+/// AWQ twin of `FUSED_RMSNORM_MQ_ROTATE_SRC`, derived from the same source
+/// (`-DHIPFIRE_RMSNORM_AWQ=1`): same prefetch and reduction tree, one extra
+/// `awq_scale[K]` divide before the FWHT. Replaced the LDS-staged fork
+/// (K+256 floats of LDS, 18.6 us vs 13.2 us at K=5120 on gfx1201) and the
+/// gfx1100-only `_direct` variant; LDS is 256 floats like the uniform symbol.
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC: &str = concat!(
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+/// C2 IU4 producer sidecar: RMSNorm/FWHT + in-register `block_i4_128` emit.
+/// Prepends the shared quant recipe; old plain/AWQ symbols stay untouched.
+pub const BLOCK_I4_128_QUANT_SRC: &str =
+    include_str!("../../../kernels/src/block_i4_128_quant.hip");
+pub const FUSED_RMSNORM_MQ_ROTATE_I4_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+/// T-B IU4 producer sidecar: standalone FWHT rotate + in-register
+/// `block_i4_128` emit for wo (residual) inputs. Prepends the shared quant
+/// recipe; the old `mq_rotate_x` / `rotate_x_mq_awq` symbols stay untouched.
+pub const MQ_ROTATE_X_I4_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
+pub const MQ_ROTATE_X_AWQ_I4_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_AWQ 1\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
 
 pub const RMSNORM_REDUCE_GFX942_SRC: &str =
     include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");
@@ -1105,6 +1136,14 @@ pub const GEMM_HFQ4G256_RESIDUAL_MFMA_V4_GFX942_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_mfma_v4.gfx942.hip");
 pub const FUSED_SILU_MUL_MQ_ROTATE_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip");
+/// C2 IU4 producer: SwiGLU/FWHT + in-register block_i4_128 emit.
+pub const FUSED_SILU_MUL_MQ_ROTATE_I4_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_i4\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip")
+);
 pub const GATED_NORM_MQ_ROTATE_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip");
 pub fn gated_norm_mq_rotate_k6144_gfx1100_src() -> &'static str {
@@ -1142,6 +1181,14 @@ pub const ROTATE_X_MQ_AWQ_SRC: &str = include_str!("../../../kernels/src/rotate_
 /// signs1 gather and FWHT.
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip");
+/// C2 IU4 AWQ SwiGLU/FWHT producer sidecar.
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
+);
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq_indexed.hip");
 
@@ -1573,6 +1620,20 @@ pub const GEMV_MQ4CG256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4c
 /// s1/z1 for w128..255) instead of one f32 pair. Decode selects s/z by
 /// `tid < 16` (payload `gp+8+tid*4 < gp+8+64`).
 pub const GEMV_MQ4G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256v2.hip");
+/// MQ4G256V2-Lloyd (qt=52) GEMV: `-DHIPFIRE_MQ4G256V2_LUT=1` adds 8 kernel-arg
+/// dwords (16 centered f16 codebook levels, staged to LDS) and decodes nibbles
+/// through them (`w = sc*C[q] + zp'`, zp' pre-folded in the headers). Distinct
+/// symbol (`gemv_mq4g256v2_lloyd`) so the module cannot alias the uniform one.
+pub const GEMV_MQ4G256V2_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_lloyd\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
+/// Residual-epilogue twin of `GEMV_MQ4G256V2_LUT_SRC` (`y +=`, symbol
+/// `gemv_mq4g256v2_residual_lloyd`).
+pub const GEMV_MQ4G256V2_RESIDUAL_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_residual_lloyd\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
 /// MQ5G256V2: dual-scale 5-bit (qt=48). Same 168 B stride and 5-bit payload as MQ5G256, header dual fp16.
 pub const GEMV_MQ5G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256v2.hip");
 /// MQ3G256V2: dual-scale 3-bit (qt=49).
@@ -3332,12 +3393,31 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str =
 // unchanged; metadata loads select the dual fp16 header per 128-weight half.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip");
+// MQ4G256V2-Lloyd (qt=52) MMQ-LUT twin: `-DHIPFIRE_MMQ_LUT=1` swaps nibble→byte
+// expand for a C16 lookup + sc/16, and emits `*_lloyd` entry symbols with +4
+// u32 kernargs. Distinct MODULE (`gemm_mq4g256v2_residual_mmq_lloyd`) so the
+// code-object cache cannot alias the uniform module. Outcome A: signed i8
+// codes (WMMA A_sign=true at mma_i8). Default decode is HIPFIRE_MMQ_LUT_PAIRTAB
+// (256×u16 LDS pair table, +512 B → shared 57856); set PAIRTAB=0 for the
+// v_perm A/B baseline (shared 57344, same as uniform).
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_MMQ_LUT 1\n",
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip")
+);
+/// Same twin with v_perm spread4+lut8 decode (no extra LDS). A/B vs PAIRTAB.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_LUT_PERM_SRC: &str = concat!(
+    "#define HIPFIRE_MMQ_LUT 1\n",
+    "#define HIPFIRE_MMQ_LUT_PAIRTAB 0\n",
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip")
+);
 // MQ4V2 (qt44) iu4-direct MMQ sister (W4A4 prefill): weight nibbles feed
-// wmma_i32_16x16x16_iu4 directly, activations are int4 via the
-// quantize_int4_mmq_ds128 prelude in the same file. Opt-in through
-// HIPFIRE_GFX11_MQ4V2_IU4 on gfx1100/gfx1151.
-pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC: &str =
-    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip");
+// wmma_i32_16x16x16_iu4 directly, activations are int4 via the shared
+// block_i4_128 quant recipe (standalone quantize_int4_mmq_ds128 + C2
+// producer sidecars). Opt-in through HIPFIRE_GFX11_MQ4V2_IU4 on gfx1100/gfx1151.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC: &str = concat!(
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
+);
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =
@@ -3513,64 +3593,132 @@ pub const GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_gfx12_bt.hip");
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip");
+/// LUT-arg twin of `GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT_SRC` (MQ4G256V2-Lloyd,
+/// qt=52): `-DHIPFIRE_FP8_LUT_ARG=1` replaces the uniform C0..C3 immediates with
+/// per-tensor kernel-arg LUT dwords. Distinct symbol (`..._bt12_lut`) so the
+/// code-object cache cannot alias the uniform module.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt12_lut\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT8_SRC: &str = concat!(
     "#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT8_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt8_lut\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC: &str = concat!(
     "#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt4\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_BT4_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt4_lut\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_SRC: &str = concat!(
     "#define HIPFIRE_FP8_SLABS 2\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_s2bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_SLABS 2\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_s2bt8_lut\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT12_SRC: &str = concat!(
     "#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 12\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt12\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT12_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 12\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt12_lut\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT8_SRC: &str = concat!(
     "#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT8_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt8_lut\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT4_SRC: &str = concat!(
     "#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt4\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_BT4_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_bt4_lut\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_S2BT8_SRC: &str = concat!(
     "#define HIPFIRE_FP8_SLABS 2\n#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_s2bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_S2BT8_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_SLABS 2\n#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_gfx12_s2bt8_lut\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC: &str = concat!(
     "#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 12\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt12\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT12_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 12\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt12_lut\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT8_SRC: &str = concat!(
     "#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT8_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt8_lut\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC: &str = concat!(
     "#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt4\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT4_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt4_lut\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_SRC: &str = concat!(
     "#define HIPFIRE_FP8_SLABS 2\n#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_s2bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_SLABS 2\n#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_s2bt8_lut\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
 pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC: &str = concat!(
     "#define HIPFIRE_FP8_QKV 1\n#define HIPFIRE_FP8_BV 12\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt12\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
+pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT12_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_QKV 1\n#define HIPFIRE_FP8_BV 12\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt12_lut\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
 pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT8_SRC: &str = concat!(
     "#define HIPFIRE_FP8_QKV 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT8_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_QKV 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt8_lut\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
 pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC: &str = concat!(
     "#define HIPFIRE_FP8_QKV 1\n#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt4\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
+pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT4_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_QKV 1\n#define HIPFIRE_FP8_BV 4\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt4_lut\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
 pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_SRC: &str = concat!(
     "#define HIPFIRE_FP8_SLABS 2\n#define HIPFIRE_FP8_QKV 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_gfx12_s2bt8\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_SLABS 2\n#define HIPFIRE_FP8_QKV 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_gfx12_s2bt8_lut\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_GFX12_BT_SRC: &str =
@@ -4177,6 +4325,14 @@ pub const FUSED_QKVZA_MQ4G256V2_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
 );
+/// MQ4G256V2-Lloyd (qt=52) fused QKVZA decode: 32 LUT dwords (qkv, z, beta,
+/// alpha codebooks in row-source order). See `FUSED_GATE_UP_MQ4G256V2_LUT_SRC`.
+pub const FUSED_QKVZA_MQ4G256V2_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_QKVZA_KERNEL_NAME fused_qkvza_mq4g256v2_lloyd\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkvza_mq4g256v2.hip")
+);
 pub const FUSED_QKVZA_MQ4G256V2_K2048_HOIST_X32_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_RDNA3_QKVZA_K2048 1\n",
     "#define HIPFIRE_RDNA3_QKVZA_HOIST_X32 1\n",
@@ -4509,6 +4665,14 @@ pub const FUSED_QKV_HFQ4G256_QWEN2_BIAS_SRC: &str = concat!(
     include_str!("../../../kernels/src/fused_qkv_hfq4g256.hip")
 );
 pub const FUSED_QKV_MQ4G256V2_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_qkv_mq4g256v2.hip")
+);
+/// MQ4G256V2-Lloyd (qt=52) fused QKV decode: 24 LUT dwords (q, k, v codebooks
+/// in row-source order). See `FUSED_GATE_UP_MQ4G256V2_LUT_SRC`.
+pub const FUSED_QKV_MQ4G256V2_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_QKV_KERNEL_NAME fused_qkv_mq4g256v2_lloyd\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_qkv_mq4g256v2.hip")
@@ -5283,6 +5447,16 @@ pub const FUSED_GATE_UP_MQ4G256V2_SRC: &str = concat!(
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/fused_gate_up_mq4g256v2.hip")
 );
+/// MQ4G256V2-Lloyd (qt=52) fused gate+up decode: `-DHIPFIRE_MQ4G256V2_LUT=1`
+/// adds 16 kernel-arg dwords (gate + up centered f16 codebooks) and decodes
+/// nibbles through the block's row-source LUT. Distinct symbol so the module
+/// cannot alias the uniform one. Same FMA order/tree as the uniform kernel.
+pub const FUSED_GATE_UP_MQ4G256V2_LUT_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_LUT 1\n#define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_mq4g256v2_lloyd\n",
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/fused_gate_up_mq4g256v2.hip")
+);
 pub const FUSED_GATE_UP_MQ5G256V2_SRC: &str = concat!(
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
@@ -5516,16 +5690,23 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC: &str = concat!(
 /// half16 WMMA with the measured lane-pair mapping (lanes r and r+16
 /// supply identical rows; QK even/odd key ownership, xor-16 pair
 /// reductions, full-P reconstruction, PV even/odd dimension ownership).
-/// JIT-only via the `attention_q8_0_fa2_gqa_gfx11*` launchers; never on a
-/// default path.
+/// F4b: the body reads f16 Q from Gpu-owned scratch (one aligned 16-byte
+/// load per 8 dims, no cvt); `attention_fa2_q_preconvert_gfx11` in this
+/// same file fills the scratch from f32 Q ahead of the body. JIT-only via
+/// the `attention_q8_0_fa2_gqa_gfx11*` launchers; never on a default path.
 pub const ATTENTION_Q8_0_FA2_GQA_GFX11_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip");
 
 /// fwht3-K variant of [`ATTENTION_Q8_0_FA2_GQA_GFX11_SRC`] (`HIPFIRE_FA2_KMODE=3`):
 /// K dequantizes fwht3 records (f32 cnorm + 96 B of 3-bit codes, K stored
-/// FWHT-rotated) into the unchanged K plane, and the entry symbol
-/// `attention_q8_0_fa2_gqa_fwht3k_gfx11` rotates this WG's Q rows in place
-/// (signed FWHT-256) before the shared body. `turbo_common.h` is prepended
+/// FWHT-rotated) into the unchanged K plane. F4b: the Q-side signed-FWHT-256
+/// rotation moved out of the body into `attention_fa2_q_preconvert_fwht3_gfx11`
+/// (same helper, same op order — bit-identical; KMODE-selected symbol,
+/// distinct from the Q8 module's `attention_fa2_q_preconvert_gfx11` because
+/// the host function cache is keyed by symbol), so the entry symbol
+/// `attention_q8_0_fa2_gqa_fwht3k_gfx11` takes the SAME kernarg list as the
+/// Q8 entry (f16 q16 at offset 0, no signs) and never mutates Q:
+/// replay-idempotent, capture-safe. `turbo_common.h` is prepended
 /// (same pattern as the `KV_SLOT_DESC_H` sites) because the runtime compile
 /// has no `-I` to `kernels/src`. JIT-only via
 /// `attention_q8_0_fa2_gqa_fwht3k_gfx11`; never on a default path.
@@ -5534,6 +5715,7 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC: &str = concat!(
     include_str!("../../../kernels/src/turbo_common.h"),
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
 );
+
 
 /// Benchmark-only gfx1201 LongSpec partition WMMA flash: same arithmetic as
 /// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC` but writes retained online-
@@ -6147,8 +6329,12 @@ pub const GATED_DELTA_NET_Q8_SRC: &str =
 
 /// Fast variant for the default MQ4/HFQ4 path: no per-token requant,
 /// requant outside the loop. Supports EF residual. Lower VGPR pressure.
-pub const GATED_DELTA_NET_Q8_FAST_SRC: &str =
-    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip");
+/// DPP order-preserving tree + one-token prefetch; bitwise-equal to the
+/// ds_bpermute form.
+pub const GATED_DELTA_NET_Q8_FAST_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_PREFETCH 1\n",
+    include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
+);
 
 /// Decode-only compact-QK variants for Qwen3.5 DeltaNet GQA (16 Q/K heads,
 /// 32 value/state heads). Each pair of state heads reads one normalized Q/K
@@ -6197,9 +6383,10 @@ pub const GATED_DELTA_NET_Q8_COMPACT2_R4X2_GFX1151_SRC: &str = concat!(
 /// gfx1151 reduction experiment: retain the certified four-row wave geometry
 /// but replace shuffle-backed LDS bpermutes with DPP/permlane VALU operations.
 pub const GATED_DELTA_NET_Q8_COMPACT2_DPP_GFX1151_SRC: &str = concat!(
-    "#define HIPFIRE_GDN_QK_HEAD_DIV 2\n#define HIPFIRE_GDN_MIN_BLOCKS 2\n#define HIPFIRE_GFX1151_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_compact2_dpp_gfx1151\n",
+    "#define HIPFIRE_GDN_QK_HEAD_DIV 2\n#define HIPFIRE_GDN_MIN_BLOCKS 2\n#define HIPFIRE_GDN_DPP_REDUCE 1\n#define HIPFIRE_GDN_KERNEL gated_delta_net_q8_compact2_dpp_gfx1151\n",
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
+
 
 /// Tree-aware variant of gated_delta_net_q8. Per-token S-tile persist-write
 /// to a caller-owned tape buffer, so sibling tokens read the parent's
@@ -6602,6 +6789,12 @@ pub const DEINTERLEAVE_SRC: &str = include_str!("../../../kernels/src/deinterlea
 /// Batched deinterleave: same as DEINTERLEAVE but processes N tokens in one launch.
 pub const DEINTERLEAVE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deinterleave_batched.hip");
+
+/// T-C Halo prefill fusion: batched deinterleave with the FullAttention Q
+/// RMSNorm folded in (gate passes through). See
+/// `kernels/src/deinterleave_q_rmsnorm_f32_batched.hip`.
+pub const DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/deinterleave_q_rmsnorm_f32_batched.hip");
 
 /// Single-token repeat-interleave Q and K key heads up to value heads count.
 pub const REPEAT_INTERLEAVE_QK_SRC: &str =
@@ -7690,14 +7883,32 @@ mod dispatch_tests {
     }
 
     #[test]
-    fn gfx1100_awq_direct_keeps_abi_and_drops_full_lds_stage() {
-        assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC
-            .contains("void fused_rmsnorm_mq_rotate_awq("));
-        assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC
-            .contains("extern __shared__ float reduce[];"));
-        assert!(!FUSED_RMSNORM_MQ_ROTATE_AWQ_DIRECT_GFX1100_SRC.contains("x_shared"));
-        assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC.contains("float* x_shared"));
+    fn awq_rmsnorm_rotate_is_derived_from_the_uniform_source() {
+        assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC.starts_with("#define HIPFIRE_RMSNORM_AWQ 1\n"));
+        assert!(FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC
+            .contains("HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq"));
+        assert!(!FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC.contains("x_shared"));
+        assert!(!FUSED_RMSNORM_MQ_ROTATE_SRC.contains("#define HIPFIRE_RMSNORM_AWQ 1"));
     }
+    #[test]
+    fn rotate_i4_sidecars_derive_from_the_uniform_source() {
+        assert!(!MQ_ROTATE_X_I4_SRC.contains("#define HIPFIRE_ROTATE_AWQ 1"));
+        assert!(MQ_ROTATE_X_AWQ_I4_SRC.contains("#define HIPFIRE_ROTATE_AWQ 1\n"));
+        assert!(MQ_ROTATE_X_I4_SRC.contains("#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i4"));
+        assert!(MQ_ROTATE_X_AWQ_I4_SRC
+            .contains("#define HIPFIRE_ROTATE_KERNEL rotate_x_mq_awq_i4"));
+        // Shared recipe (struct + emit helper) must precede the kernel body,
+        // and the standalone symbol must stay out of the concat.
+        for src in [MQ_ROTATE_X_I4_SRC, MQ_ROTATE_X_AWQ_I4_SRC] {
+            assert!(src.contains("#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1"));
+            let recipe = src.find("struct block_i4_128").expect("recipe first");
+            let kernel = src
+                .find("extern \"C\" __global__ void HIPFIRE_ROTATE_KERNEL")
+                .expect("kernel last");
+            assert!(recipe < kernel);
+        }
+    }
+
 
     #[test]
     fn qwen2_bias_symbols_are_isolated_from_existing_qkv_modules() {

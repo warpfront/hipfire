@@ -134,6 +134,9 @@ fn run_prefill_gemm_inner(
                 row_stride: w.k,
                 rotation: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             };
             let ctx = DispatchCtx::new(gpu);
             let params = GemmParams {
@@ -169,6 +172,9 @@ fn run_prefill_gemm_inner(
                 row_stride: w.k,
                 rotation: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             };
             let ctx = DispatchCtx::new(gpu);
             let params = GemmParams {
@@ -199,6 +205,9 @@ fn run_prefill_gemm_inner(
             row_stride: w.k,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         let ctx = DispatchCtx::new(gpu);
         let params = GemmParams {
@@ -228,6 +237,9 @@ fn run_prefill_gemm_inner(
         row_stride: w.k,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let params = GemmParams {
         w: &w_ref,
@@ -1048,6 +1060,9 @@ fn load_gemma4_weight_impl(
                 k,
                 row_stride: 0,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
                 paro: None,
             });
         }
@@ -1063,6 +1078,9 @@ fn load_gemma4_weight_impl(
                     k,
                     row_stride: 0,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                     paro: None,
                 });
             }
@@ -1082,6 +1100,9 @@ fn load_gemma4_weight_impl(
                 k,
                 row_stride: 0,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
                 paro: None,
             });
         }
@@ -1095,6 +1116,9 @@ fn load_gemma4_weight_impl(
                 k,
                 row_stride: 0,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
                 paro: None,
             });
         }
@@ -1155,6 +1179,9 @@ fn load_gemma4_weight_impl(
         k,
         row_stride: 0,
         awq_scale,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
         paro: None,
     })
 }
@@ -1403,6 +1430,9 @@ fn load_moe_layer_extras(
                 k: dim,
                 row_stride: 0,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
                 paro: None,
             },
             down_proj: WeightTensor {
@@ -1412,6 +1442,9 @@ fn load_moe_layer_extras(
                 k: mi,
                 row_stride: 0,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
                 paro: None,
             },
         });
@@ -1672,6 +1705,9 @@ fn load_weights_impl(
             k: config.dim,
             row_stride: 0,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
             paro: None,
         }
     };

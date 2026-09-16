@@ -735,6 +735,14 @@ impl FeatureFlags {
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
     }
 
+    /// C2 producer-emitted IU4 sidecar route: exact gfx1151 + IU4 opt-in.
+    /// When live (and eager + batch/K admission), RMSNorm/FWHT and
+    /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
+    /// keep standalone `quantize_int4_mmq_ds128`.
+    pub fn iu4_producer_sidecar_enabled(&self) -> bool {
+        self.gfx11_mmq_iu4.unwrap_or(false) && self.arch == "gfx1151"
+    }
+
     pub fn hfq3_mmq_layer_gate_pass(&self) -> bool {
         let lo = self.hfq3_mmq_layer_min;
         let hi = self.hfq3_mmq_layer_max;

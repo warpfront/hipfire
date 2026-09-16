@@ -2819,6 +2819,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: wqkv.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wqkv.lloyd_lut_e4m3,
+            lloyd_lut_f16: wqkv.lloyd_lut_f16,
+            lloyd_lut_c16: wqkv.lloyd_lut_c16,
         };
         let wr_z = WeightRef {
             buf: &wz.buf,
@@ -2828,6 +2831,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: wz.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wz.lloyd_lut_e4m3,
+            lloyd_lut_f16: wz.lloyd_lut_f16,
+            lloyd_lut_c16: wz.lloyd_lut_c16,
         };
         let wr_beta = WeightRef {
             buf: &w_beta.buf,
@@ -2837,6 +2843,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: w_beta.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: w_beta.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_beta.lloyd_lut_f16,
+            lloyd_lut_c16: w_beta.lloyd_lut_c16,
         };
         let wr_alpha = WeightRef {
             buf: &w_alpha.buf,
@@ -2846,6 +2855,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: w_alpha.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: w_alpha.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_alpha.lloyd_lut_f16,
+            lloyd_lut_c16: w_alpha.lloyd_lut_c16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -2892,6 +2904,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wqkv.lloyd_lut_e4m3,
+            lloyd_lut_f16: wqkv.lloyd_lut_f16,
+            lloyd_lut_c16: wqkv.lloyd_lut_c16,
         };
         let wr_z = WeightRef {
             buf: &wz.buf,
@@ -2901,6 +2916,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wz.lloyd_lut_e4m3,
+            lloyd_lut_f16: wz.lloyd_lut_f16,
+            lloyd_lut_c16: wz.lloyd_lut_c16,
         };
         let wr_beta = WeightRef {
             buf: &w_beta.buf,
@@ -2910,6 +2928,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w_beta.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_beta.lloyd_lut_f16,
+            lloyd_lut_c16: w_beta.lloyd_lut_c16,
         };
         let wr_alpha = WeightRef {
             buf: &w_alpha.buf,
@@ -2919,6 +2940,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w_alpha.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_alpha.lloyd_lut_f16,
+            lloyd_lut_c16: w_alpha.lloyd_lut_c16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -2986,6 +3010,9 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wq.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wq.lloyd_lut_e4m3,
+            lloyd_lut_f16: wq.lloyd_lut_f16,
+            lloyd_lut_c16: wq.lloyd_lut_c16,
         };
         let wrk = WeightRef {
             buf: &wk.buf,
@@ -2995,6 +3022,9 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wk.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wk.lloyd_lut_e4m3,
+            lloyd_lut_f16: wk.lloyd_lut_f16,
+            lloyd_lut_c16: wk.lloyd_lut_c16,
         };
         let wrv = WeightRef {
             buf: &wv.buf,
@@ -3004,6 +3034,9 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wv.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wv.lloyd_lut_e4m3,
+            lloyd_lut_f16: wv.lloyd_lut_f16,
+            lloyd_lut_c16: wv.lloyd_lut_c16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3042,6 +3075,9 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wq.lloyd_lut_e4m3,
+            lloyd_lut_f16: wq.lloyd_lut_f16,
+            lloyd_lut_c16: wq.lloyd_lut_c16,
         };
         let wrk = WeightRef {
             buf: &wk.buf,
@@ -3051,6 +3087,9 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wk.lloyd_lut_e4m3,
+            lloyd_lut_f16: wk.lloyd_lut_f16,
+            lloyd_lut_c16: wk.lloyd_lut_c16,
         };
         let wrv = WeightRef {
             buf: &wv.buf,
@@ -3060,6 +3099,9 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wv.lloyd_lut_e4m3,
+            lloyd_lut_f16: wv.lloyd_lut_f16,
+            lloyd_lut_c16: wv.lloyd_lut_c16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3118,6 +3160,9 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: w_gate.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: w_gate.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_gate.lloyd_lut_f16,
+            lloyd_lut_c16: w_gate.lloyd_lut_c16,
         };
         let wru = WeightRef {
             buf: &w_up.buf,
@@ -3127,6 +3172,9 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: w_up.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: w_up.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_up.lloyd_lut_f16,
+            lloyd_lut_c16: w_up.lloyd_lut_c16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3160,6 +3208,9 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w_gate.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_gate.lloyd_lut_f16,
+            lloyd_lut_c16: w_gate.lloyd_lut_c16,
         };
         let wru = WeightRef {
             buf: &w_up.buf,
@@ -3169,6 +3220,9 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w_up.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_up.lloyd_lut_f16,
+            lloyd_lut_c16: w_up.lloyd_lut_c16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -5242,8 +5296,18 @@ pub(crate) fn forward_prefill_dense_tp_with_pbs_capture(
         ));
     }
     let last_n = forward_prefill_dense_tp_batched(
-        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, pbs,
-        partials, Some(captures),
+        gpus,
+        shard,
+        weights,
+        configs,
+        tokens,
+        start_pos,
+        kv_caches,
+        dn_states,
+        scratches,
+        pbs,
+        partials,
+        Some(captures),
     )?;
     debug_assert_eq!(last_n, n);
     gpus.devices[0].bind_thread()?;
@@ -5443,8 +5507,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5456,9 +5519,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5503,8 +5564,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5516,9 +5576,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5581,8 +5639,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5594,9 +5651,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5641,8 +5696,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5654,9 +5708,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5701,8 +5753,8 @@ fn forward_prefill_dense_tp_batched(
             }
             offset += n;
         }
-    Ok(last_chunk_n)
-}
+        Ok(last_chunk_n)
+    }
 }
 
 /// Layer-granular batched dense-TP prefill. Chunks with the existing
@@ -5783,8 +5835,18 @@ pub fn forward_prefill_dense_tp(
     let pbs_refs: Vec<&PrefillBatchScratch> = pbs_vec.iter().collect();
     let partial_refs: Vec<&GpuTensor> = partials.iter().collect();
     let last_chunk_n = match forward_prefill_dense_tp_batched(
-        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, &pbs_refs,
-        &partial_refs, None,
+        gpus,
+        shard,
+        weights,
+        configs,
+        tokens,
+        start_pos,
+        kv_caches,
+        dn_states,
+        scratches,
+        &pbs_refs,
+        &partial_refs,
+        None,
     ) {
         Ok(n) => n,
         Err(e) => {

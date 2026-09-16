@@ -308,6 +308,15 @@ pub enum DType {
     /// Little-endian, low 16 scale / high 16 zero per dword, half-wave uniform,
     /// lane-invariant scalar loads. `K % 256 == 0`, 4.25 bpw.
     MQ4G256V2,
+    /// MQ4-G256 v2 Lloyd (qt=52): FWHT-rotated, 136 B/group, wire layout
+    /// BYTE-IDENTICAL to MQ4G256V2 (dual fp16 half-grids + 128 B nibbles).
+    /// Nibble q decodes through a PER-TENSOR 16-level centered codebook
+    /// `w = sc·(C[q]) + zp'` with `C[q] = L[q]−7.5` (sidecar `lloyd_levels`,
+    /// f32[16] in [0,15] units, E4M3-snapped) and rewritten headers
+    /// `zp' = fp16(zp+7.5·sc)` per half (loader-applied; the file keeps the
+    /// uncentered zp). `K % 256 == 0`, 4.25 bpw. NEVER decoded by a uniform
+    /// kernel: every dispatch arm must check the LUT variant / fail closed.
+    MQ4G256V2Lloyd,
     /// MQ4-G256-C (qt=45): FWHT-rotated, 136 B/group, 4.25 bpw, pad layout:
     /// per group 136 B: `[0..4)` fp16 header (low scale, high zero), `[4..8)` zero padding,
     /// `[8..136)` 128 B nibbles at same offset as v1 (MQ4G256). ONE affine grid per 256
@@ -419,6 +428,7 @@ impl DType {
             | DType::HFQ6G256
             | DType::MQ4G256
             | DType::MQ4G256V2
+            | DType::MQ4G256V2Lloyd
             | DType::MQ4CG256
             | DType::MQ6G256V2
             | DType::MQ5G256V2
@@ -517,6 +527,10 @@ impl DType {
                 // That is the May 2026 regression this predicate was centralised to
                 // prevent; qt=44's artifact carries 496 sidecars.
                 | DType::MQ4G256V2
+                // qt=52 shares qt=44's AWQ contract exactly (same pipeline,
+                // same rotate-step x/s division). Omitting it silently drops
+                // the sidecar → (W·s)·x scale error on every projection.
+                | DType::MQ4G256V2Lloyd
                 // qt=45 shares qt=13/qt=44's AWQ contract exactly — same failure mode
                 // if omitted: silent sidecar drop → (W·s)·x. Include it.
                 | DType::MQ4CG256
@@ -557,6 +571,7 @@ impl DType {
                 | DType::MQ2G256GL
                 | DType::MQ3G256GL
                 | DType::MQ4G256V2
+                | DType::MQ4G256V2Lloyd
                 | DType::MQ4CG256
                 | DType::MQ6G256V2
                 | DType::MQ5G256V2
@@ -1352,6 +1367,7 @@ impl Gpu {
                 q8_1_mmq_x_scratch_bytes: 0,
                 int4_mmq_x_scratch: None,
                 int4_mmq_x_scratch_bytes: 0,
+                int4_mmq_generation: 0,
                 mq4v2_fp8_x_scratch: None,
                 mq4v2_fp8_x_scratch_bytes: 0,
                 mq4v2_fp8_half_sums_scratch: None,
@@ -1362,6 +1378,8 @@ impl Gpu {
                 ksplit_det_partials_bytes: 0,
                 sample_partials: None,
                 sample_partials_bytes: 0,
+                fa2_q16_scratch: None,
+                fa2_q16_scratch_bytes: 0,
             },
             replay: crate::replay::ReplayController::from_config(),
             #[cfg(feature = "flash-attn-ck")]
@@ -2839,7 +2857,6 @@ impl Gpu {
             k,
         )
     }
-
     /// Ensure prefill activations are quantized to int4 (`block_i4_128`) for
     /// the iu4-direct MMQ consumer (`HIPFIRE_GFX11_MQ4V2_IU4` path).
     /// See `scratch.rs::ensure_int4_mmq_x`.
@@ -2867,6 +2884,40 @@ impl Gpu {
             batch_size,
             k,
         )
+    }
+
+    /// Reserve `int4_mmq_x_scratch` for a producer-emitted IU4 sidecar (C2).
+    /// Does not launch the standalone quantizer.
+    pub fn reserve_int4_mmq(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int4MmqReservation> {
+        self.scratch.reserve_int4_mmq(&self.hip, k, n)
+    }
+
+    /// True when the C2 producer-sidecar route is live for this call:
+    /// IU4 + gfx1151 + eager (no replay/capture) + batch and K constraints
+    /// of the iu4 MMQ consumer.
+    pub fn iu4_producer_sidecar_active(&self, batch: usize, k: usize) -> bool {
+        self.flags.iu4_producer_sidecar_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && batch >= 128
+            && batch % 128 == 0
+            && k > 0
+            && k % 256 == 0
+    }
+
+    /// Validate a prepared IU4 handle against the live scratch generation.
+    pub fn int4_mmq_prepared_ptr(
+        &self,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        k: usize,
+        n: usize,
+    ) -> HipResult<*mut c_void> {
+        let (gen, ptr) = self.scratch.int4_mmq_live();
+        prepared.checked_ptr(gen, ptr, k, n)
     }
 
     /// Returns the number of launches recorded by the `ReplayController`.

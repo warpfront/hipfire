@@ -83,3 +83,4 @@
 49  MQ3G256V2     passthrough
 50  MQ2G256V2     passthrough
 51  MQ2G256LloydU  passthrough  Maple native-ternary (unrotated MQ2-Lloyd)
+52  MQ4G256V2L    passthrough  MQ4v2 wire + per-tensor 16-level Lloyd codebook (lloyd_levels sidecar)

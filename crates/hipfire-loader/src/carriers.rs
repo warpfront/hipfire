@@ -419,7 +419,7 @@ impl Carrier for Qwen35Carrier {
         gpu: &mut rdna_compute::Gpu,
         synthetic: &[u32],
         _n: usize,
-        _prefill_err: &mut Option<String>,
+        prefill_err: &mut Option<String>,
     ) -> Option<bool> {
         let b = m.qwen35_mut().unwrap();
         let config = &b.config;
@@ -427,12 +427,15 @@ impl Carrier for Qwen35Carrier {
         let scratch = &b.scratch;
         let kv = &mut b.kv_cache;
         let dn = &mut b.dn_state;
-        Some(
-            hipfire_arch_qwen35::qwen35::forward_prefill_batch(
-                gpu, weights, config, synthetic, 0, kv, dn, scratch, None, None, None, None,
-            )
-            .is_ok(),
-        )
+        match hipfire_arch_qwen35::qwen35::forward_prefill_batch(
+            gpu, weights, config, synthetic, 0, kv, dn, scratch, None, None, None, None,
+        ) {
+            Ok(()) => Some(true),
+            Err(e) => {
+                *prefill_err = Some(format!("{e:?}"));
+                Some(false)
+            }
+        }
     }
     fn bench_decode_prime(
         &self,

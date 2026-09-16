@@ -87,6 +87,7 @@ impl QuantType {
             49 => Some(Self::MQ3G256V2),
             50 => Some(Self::MQ2G256V2),
             51 => Some(Self::MQ2G256LloydU),
+            52 => Some(Self::MQ4G256V2L),
             _ => None,
         }
     }
@@ -235,6 +236,11 @@ pub(crate) enum QuantType {
     /// never indexed. 2.25 bpw. `K % 256 == 0`.
     /// See `docs/design/2026-08-22-maple-preview-20b-a1b.md`.
     MQ2G256LloydU = 51,
+    /// MQ4G256V2L (qt=52): MQ4v2 wire layout (136 B/group, per-128 fp16 sc/zp) with
+    /// codes indexing a per-tensor 16-level Lloyd-Max codebook `L` in [0,15] units.
+    /// Dequant: `w = sc · L[q] + zp`. Codebook shipped as F32 sidecar
+    /// `<stem>.lloyd_levels.weight` shape `[16]` (not embedded in the weight blob).
+    MQ4G256V2L = 52,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -268,6 +274,7 @@ pub(crate) fn default_promote_target(base: GgufFormat) -> GgufFormat {
         | GgufFormat::Mq3
         | GgufFormat::Mq4
         | GgufFormat::Mq4V2
+        | GgufFormat::Mq4V2Lloyd
         | GgufFormat::Mq4C
         | GgufFormat::Mq5
         | GgufFormat::Mq6
