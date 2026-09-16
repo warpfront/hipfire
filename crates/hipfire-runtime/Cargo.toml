@@ -658,10 +658,6 @@ name = "tmp_halo_iu4_calibrate"
 required-features = []
 
 [[example]]
-name = "tmp_halo_iu4_oracle"
-required-features = ["lab"]
-
-[[example]]
 name = "wmma_fa_spike"
 required-features = ["lab"]
 

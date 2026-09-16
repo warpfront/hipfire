@@ -25,6 +25,15 @@ Date: 2026-09-15, revision after the plateaued peak probe. Worktree: `/home/kade
 > and oracle removed. Next lever (W4): 64×256 tile (same LDS, 2 WG/CU, weight
 > re-reads 4×→2× per launch, fill per output halved).
 
+> **W5 (in-register Xq prefetch inside the shipping structure) REJECTED
+> 2026-09-15:** only 1 of 9 Xq dwords fits under the 192-VGPR 2-WG/CU cap
+> (shipping is at 190); paired oracle ±1–3 % (noise). rocprof on the shipping
+> kernel: SQ_WAIT_CNT_ANY 36 % (gate) / 47 % (down) of wave-cycles, barriers
+> 2 %, LDS bank conflicts ~2 % ⇒ memory-latency-bound with no register room
+> for more loads in flight; 1 WG/CU designs (WS4) lose more residency than they
+> gain. GEMM track closed at this tier; the admitted GEMM change is A5 (grid
+> order, gate L2 miss 37 %→ fixed), worth −9 % gate / −4.6 % down on the Halo.
+
 ## 1. Decision and immutable constraints
 
 **Select WS4: eight compute waves with four independent output chains/wave, plus two loader waves; one320-thread WG/CU; two A planes and two Xq-half planes,61,440 bytes LDS.** Keep `sum[64]`, the128×128 output tile, original row/column tile walk, K256 group/fold boundaries and seven-argument ABI. Loader waves stream into planes not read by the compute waves; there is no pending global-load array in compute waves. Balance each steady-state loader phase as64 **whole weight rows** of the next group plus one128-column Xq half:17,920 logical bytes. Each group uses two producer/consumer rendezvous barriers, rather than four serialized fill/compute barriers.
