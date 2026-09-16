@@ -244,6 +244,7 @@ __device__ __forceinline__ void fa2_gqa_body(
     uint32_t pf_sh[KT_KITERS * 16];
 #endif
 #endif
+#endif // HIPFIRE_FA2_KT == 32 (F6 + shadow prefetch declarations)
     // ---- Transitions 2-4: KT tiles ----
     for (int tile = 0; ; ++tile) {
         const int ktile = tile * KT;
