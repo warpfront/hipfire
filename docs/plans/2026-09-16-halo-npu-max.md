@@ -2,6 +2,29 @@
 
 Date: 2026-09-16. Coordinator/research: HaloNpuMax. Execution is delegated through Main. Source worktree is `/home/kaden/ClaudeCode/warpfront/wt-lloyd`; all device artifacts belong under `hipx:/home/kaden/npu-screen`. No production wiring or commits. This document is updated as executable evidence arrives; unmeasured entries are not performance claims.
 
+> **STATUS 2026-09-16 (parent, final for this session) — FEASIBLE, PARKED.**
+> Measured: bare `amdxdna` ioctl dispatch works (libc-only, bit-for-bit vs XRT,
+> ~103 µs submit→complete, no overhead); NPU↔GPU contention ≤ 2 %; tuned
+> int8→i32 GEMM best **13.09 TOPS** gate (128/64/64 single-C, cols 8; stock 5.6)
+> and 6.82 TOPS down (B refetch 34×, ~0.9 ms host/call); slices scale linearly
+> (gate M4096 1612 µs ⇒ ≈ 23 % of rows in the GPU's window, ≈ −13 % gate
+> *before* copies). Down spillover is dead (smallest legal 1024-row slice
+> 2714 µs > GPU full 2155 µs). AIE fold is not bit-exact on the pinned Peano
+> (fmaf unlinkable; softfloat muls; vector mul −0/min-normal misses; vector
+> mac returns zeros) ⇒ NPU rows would need a KLD/serve gate. **No zero-copy**:
+> NPU→GPU import is refused by KFD (`amdgpu_amdkfd_get_dmabuf_info`: non-amdgpu
+> dma-bufs rejected — upstream kernel limit); GPU→NPU import is CPU-visible but
+> NPU reads unproven; staged copies ~231 + 267 µs/call (CPU memcpy bench) wipe
+> out the gate gain at 13 TOPS. CPU spillover killed (GPU −14 % at 4 threads).
+> Park line: ≥ 15–18 TOPS sustained AND copy overlap/zero-copy. Product shape
+> if revived: opt-in, exact-gfx1151-only registry sidecar (xclbin PDI + insts)
+> consuming existing MQ4G256V2/block_i4_128 quants via an int8 slice copy,
+> `hipfire-xdna` raw-ioctl crate, off by default, never in gfx1201/gfx1100
+> paths. Artifacts: hipx:/home/kaden/npu-screen/{max-tune,raw-dispatch,
+> fold-probe,zero-copy,cpu-probe}/README.md|RESULTS.md. Open experiments:
+> explicit Tile placement (B column-local), k_mt layout composition, A5
+> write-only BW, hardware traces (routing-saturated at 8 cols).
+
 ## 1. Findings, scope, and evidence discipline
 
 This investigation separates (A) the throughput of a properly tuned **int8→int32** dense GEMM, (B) direct amdxdna submission without XRT userspace, and (C) the additional contract required to replace hipfire IU4 rows. Success in A or B is not proof of C.
