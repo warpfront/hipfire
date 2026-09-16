@@ -165,39 +165,12 @@ __device__ __forceinline__ void fa2_gqa_body(
     const int gmax = __builtin_amdgcn_readfirstlane((int)LDS[16382]);
     const int gmin = __builtin_amdgcn_readfirstlane((int)LDS[16383]);
     const int seq_len = gmax + 1;
-    // ---- F6: software prefetch of the next tile's raw K bytes ----
-    // Per-lane raw K share at KT64 (all four waves fill): 512 slots /
-    // 128 lanes = 4 slots/lane.
-    //   Q8 K: 4 slots/lane x 34 B (f16 scale + 32 i8 codes) = 136 B =
-    //         2 dwords (four f16 scales packed) + 32 code dwords.
-    //   fwht3 K: 4 slots/lane x (f32 cnorm + 4x3 B packed codes) = 64 B =
-    //         4 cnorm + 16 packed dwords.
-    // (Full K+V prefetch was measured first on gfx11: 256 VGPR + spill —
-    // over budget. K-only keeps the V fill on global loads exactly as
-    // before and overlaps the K half.)
-    // Staged raw (undequantized) right after the post-fill barrier so the
-    // K global loads overlap this tile's QK/softmax/PV; the next fill slot
-    // dequantizes K from here with no fresh K global loads.
-#if HIPFIRE_FA2_KMODE == 3
-    float pf_kcn[4];
-    uint32_t pf_kp[16];
-#else
-    uint32_t pf_ks[2];
-    uint32_t pf_kc[32];
-#endif
 
     // ---- Transitions 2-4: KT64 tiles ----
     for (int tile = tile0; tile < tile1; ++tile) {
         const int ktile = tile * 64;
         if (ktile >= seq_len)
             break;
-        // F6: tiles after the first consume the raw bytes prefetched into
-        // registers during the previous tile's compute phase (see below);
-        // the first tile of this launch's range fills from global exactly
-        // as before. Uniform (tile), so no divergence. tile > tile0 implies
-        // the prefetch ran: the previous iteration saw ktile_prev + 64 <
-        // seq_len, else this iteration would have broken out above.
-        const bool have_pf = (tile > tile0);
 
         // ---- Transition 2: cooperative KT64 fill (all four waves) ----
 #if HIPFIRE_FA2_KMODE == 3
@@ -212,35 +185,6 @@ __device__ __forceinline__ void fa2_gqa_body(
         // K[k][(p + S(k&15)) & 127] — identical layout downstream, so block
         // b covers pairs b*16..b*16+15 exactly as in the Q8 path). V fill
         // below is unchanged (Q8_0).
-        if (have_pf) {
-            // F6: decode the prefetched raw K bytes (no global loads here).
-            // Dequant/store lines are identical to the global path below;
-            // the prefetch staged zeros for OOB slots, so tails zero-fill
-            // bit-identically.
-#pragma unroll 1
-            for (int t = 0; t < 4; ++t) {
-                const int s = tid + t * 128;
-                const int k = s >> 3;
-                const int b = s & 7;
-                const float cnorm = pf_kcn[t];
-                const int rot = fa2_swiz(k & 15);
-                const int base = k * 128;
-#pragma unroll 1
-                for (int m = 0; m < 4; ++m) {
-                    const uint32_t packed = pf_kp[t * 4 + m];
-                    const int p0 = (b * 4 + m) * 4;
-#pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        const int code0 = (packed >> (6 * i)) & 7;
-                        const int code1 = (packed >> (6 * i + 3)) & 7;
-                        fa2_dw_t dw;
-                        dw.h[0] = (_Float16)(cnorm * TURBO_C3_256[code0]);
-                        dw.h[1] = (_Float16)(cnorm * TURBO_C3_256[code1]);
-                        Kdw[base + ((p0 + i + rot) & 127)] = dw.u;
-                    }
-                }
-            }
-        } else
         for (int t = 0; t < 4; ++t) {
             const int s = tid + t * 128;
             const int k = s >> 3;
@@ -276,41 +220,6 @@ __device__ __forceinline__ void fa2_gqa_body(
         // K: 512 blocks (k*8+b), one block per slot. Codes are loaded on
         // demand per pair (no staging array) and dequantized straight
         // into the swizzled dword plane.
-        if (have_pf) {
-            // F6: decode the prefetched raw K bytes (no global loads here).
-            // Dequant/store lines are identical to the global path below;
-            // the prefetch staged zeros for OOB slots, so tails zero-fill
-            // bit-identically. Scales unpack from the shared dwords
-            // (slot t in half t).
-#pragma unroll 1
-            for (int t = 0; t < 4; ++t) {
-                const int idx = tid + t * 128;
-                const int k = idx >> 3;
-                const int b = idx & 7;
-                const uint16_t su =
-                    (uint16_t)(pf_ks[t >> 1] >> ((t & 1) * 16));
-                _Float16 s = ((fa2_dw_t){.u = (uint32_t)su}).h[0];
-                const float sf = (float)s;
-                const int rot = fa2_swiz(k & 15);
-                const int base = k * 128;
-                const int pb = b * 16;
-#pragma unroll 1
-                for (int w = 0; w < 8; ++w) {
-                    const uint32_t u = pf_kc[t * 8 + w];
-                    const float c0 = (float)(int8_t)u;
-                    const float c1 = (float)(int8_t)(u >> 8);
-                    const float c2 = (float)(int8_t)(u >> 16);
-                    const float c3 = (float)(int8_t)(u >> 24);
-                    fa2_dw_t d0, d1;
-                    d0.h[0] = (_Float16)(sf * c0);
-                    d0.h[1] = (_Float16)(sf * c1);
-                    d1.h[0] = (_Float16)(sf * c2);
-                    d1.h[1] = (_Float16)(sf * c3);
-                    Kdw[base + ((pb + w * 2 + rot) & 127)] = d0.u;
-                    Kdw[base + ((pb + w * 2 + 1 + rot) & 127)] = d1.u;
-                }
-            }
-        } else
         for (int t = 0; t < 4; ++t) {
             const int idx = tid + t * 128;
             const int k = idx >> 3;
@@ -395,70 +304,6 @@ __device__ __forceinline__ void fa2_gqa_body(
             }
         }
         __syncthreads();
-        // ---- F6: prefetch the next tile's raw K bytes (all four waves) ----
-        // Issued immediately after the post-fill barrier so these global
-        // loads overlap the current tile's QK/softmax/PV below; the next
-        // iteration's K fill (above) dequantizes from these registers with
-        // no fresh K global loads (V still streams in its fill slot).
-        // Addressing and guards mirror the K fill loads exactly (no
-        // out-of-range reads); OOB slots stage zeros so tails zero-fill
-        // bit-identically to today. The QK/PV loops' existing compiler
-        // barriers already fence these loads above the QK loop, so no
-        // extra fence is used.
-        {
-            const int ktile_next = ktile + 64;
-            if (ktile_next < seq_len) {
-#if HIPFIRE_FA2_KMODE == 3
-#pragma unroll 1
-                for (int t = 0; t < 4; ++t) {
-                    const int s = tid + t * 128;
-                    const int k = s >> 3;
-                    const int b = s & 7;
-                    const int gk = ktile_next + k;
-                    const unsigned char* rec = (gk < seq_len)
-                        ? k_cache + (unsigned long long)gk * 400ULL
-                            + (unsigned long long)(kv_h * 100)
-                        : nullptr;
-                    float cnorm = 0.0f;
-                    if (rec != nullptr)
-                        __builtin_memcpy(&cnorm, rec, 4);
-                    pf_kcn[t] = cnorm;
-#pragma unroll 1
-                    for (int m = 0; m < 4; ++m) {
-                        uint32_t packed = 0;
-                        if (rec != nullptr)
-                            __builtin_memcpy(&packed, rec + 4 + (b * 4 + m) * 3, 3);
-                        pf_kp[t * 4 + m] = packed;
-                    }
-                }
-#else
-                pf_ks[0] = 0;
-                pf_ks[1] = 0;
-#pragma unroll 1
-                for (int t = 0; t < 4; ++t) {
-                    const int idx = tid + t * 128;
-                    const int k = idx >> 3;
-                    const int b = idx & 7;
-                    const int gk = ktile_next + k;
-                    const unsigned char* blk = (gk < seq_len)
-                        ? k_cache + (unsigned long long)gk * (unsigned long long)row_stride
-                            + (unsigned long long)(kv_blk + b) * 34ULL
-                        : nullptr;
-                    uint16_t su = 0;
-                    if (blk != nullptr)
-                        su = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
-                    pf_ks[t >> 1] |= (uint32_t)su << ((t & 1) * 16);
-#pragma unroll 1
-                    for (int w = 0; w < 8; ++w) {
-                        uint32_t u = 0;
-                        if (blk != nullptr)
-                            __builtin_memcpy(&u, blk + 2 + w * 4, 4);
-                        pf_kc[t * 8 + w] = u;
-                    }
-                }
-#endif
-            }
-        }
 
         // ---- Transition 3: four KT16 QK/softmax/PV subtiles ----
         // F4a: each Q dim-chunk fragment is loaded once per tile and shared
@@ -483,7 +328,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                 // QK as S^T = K*Q^T: A = K fragment (row ml = key),
                 // B = Q fragment loaded once per chunk (row ml = query).
                 // acc[j] = S[query=ml][key=8*kg+j].
-                const unsigned qb = qq_base + (unsigned)(kg * 8);
+                const unsigned qb = qq_base;
                 // Unrolled by 4: each group's Q loads issue once, then each
                 // live subtile's K loads + WMMAs consume the shared fragments
                 // (software pipelining for LDS/L1 latency). One scheduling
