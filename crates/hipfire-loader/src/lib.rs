@@ -9,6 +9,11 @@ pub mod batch_staging;
 mod carriers;
 pub use carriers::*;
 
+/// Group-major (GM) weight-layout producer entry for MQ4G256V2 IU4 prefill.
+/// Load-time permute warming + VRAM accounting; the future sidecar reader
+/// substitutes the producer here without touching kernels or selectors.
+pub mod weight_layout;
+
 /// Speculative-decode build/glue (RAII slot guard now; `DflashSpeculator` +
 /// `build_speculator` at Stages 1-2). Lives here at the top of the DAG where
 /// both `LoadedModel` and the arch crates are in scope.
@@ -1920,6 +1925,25 @@ fn finish_qwen35_load(
             ));
         }
     };
+    // ── Group-major prefill duplicates (IU4 `_gm_col_gfx1151` path) ──
+    // Load-time permute producer: builds each IU4-consumed MQ4G256V2 tensor's
+    // `A_gm` now and logs the total extra bytes once. Best-effort (never
+    // fails the load); the selector covers misses lazily. No-op unless exact
+    // gfx1151 with both `prefill.weight_layout_gm` (default on) and the IU4
+    // opt-in live. (PP ranks skip this entry and warm lazily via the
+    // selector — same producer, first-prefill cost instead of load cost.)
+    {
+        let tensors = crate::weight_layout::qwen35_mq4v2_tensors(&bundle.weights);
+        let refs: Vec<(&str, &hipfire_runtime::llama::WeightTensor)> = tensors
+            .iter()
+            .map(|(name, w)| (name.as_str(), *w))
+            .collect();
+        crate::weight_layout::warm_mq4v2_gm(
+            ctx.gpu,
+            &refs,
+            crate::weight_layout::GmProducer::Permute,
+        );
+    }
 
     // Extract references for DFlash/spec setup (borrow, don't move)
     let config = &bundle.config;

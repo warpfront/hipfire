@@ -2148,6 +2148,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx11 iu4-direct MMQ prefill route (opt-in on gfx1100/gfx1151; set to true or HIPFIRE_GFX11_MQ4V2_IU4=1 to opt in)."
     ),
     process_bool_field!(
+        "prefill.weight_layout_gm",
+        "weight_layout_gm",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM",
+        "Build a group-major duplicate of MQ4G256V2 weights for the IU4 prefill path (default on; honored on exact gfx1151 only, set to false or HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM=0 to keep row-major)."
+    ),
+    process_bool_field!(
         "kernel.dot2_gemv",
         "dot2_gemv",
         Kernel,

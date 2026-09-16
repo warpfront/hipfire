@@ -616,7 +616,7 @@ extern "C" __global__ __launch_bounds__(512, 2) __attribute__((amdgpu_num_vgpr(9
 IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151, true, 3)
 IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151, true, 3)
 #endif
-#if defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1101__) || defined(__gfx1102__) || defined(__gfx1103__) || defined(__gfx1150__) || defined(__gfx1151__)
 // IU4 group-major (GM) experiment: byte-identical to the shipping 8-wave
 // _occ3_col_gfx1151 entries except the A group address. Row-major shipping:
 //   gp = A + ((row)*groups_per_row + kb)*136  (128-row x 1-group tile spans
@@ -745,6 +745,10 @@ static __device__ __forceinline__ void gemm_iu4_body_gm(
 extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, 3) void gemm_mq4g256v2_residual_mmq_iu4_full_add_gm_col_gfx1151(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body_gm<true>(A, Xq, Y, M, K, N, add, blockIdx.y, blockIdx.x); }
 extern "C" __global__ __launch_bounds__(IU4_MMQ_NWARPS * IU4_WARP_SIZE, 3) void gemm_mq4g256v2_residual_mmq_iu4_full_set_gm_col_gfx1151(     const char* __restrict__ A,     const block_i4_128* __restrict__ Xq,     float* __restrict__ Y,     int M,     int K,     int N,     int add ) {     gemm_iu4_body_gm<true>(A, Xq, Y, M, K, N, add, blockIdx.y, blockIdx.x); }
 
+#endif // occ3 GM (RDNA3 list)
+#if defined(__gfx1151__)
+// LF16 GM twin is gfx1151-only, mirroring the shipping LF16 section: the
+// IU4_LF16_* geometry defines live under that same guard.
 // LF16 group-major twin of load_iu4_tile_lf16_gfx1151: same packets, same
 // header replication, same opaque-kb adj; only the group base changes from
 // (row0+i)*gpr+kb to kb*M+(row0+i). Takes M explicitly (shipping infers

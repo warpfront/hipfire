@@ -265,7 +265,7 @@ GEN_RESID_MW_LDS(5, 8)
 GEN_RESID_MW_LDS(6, 4)
 GEN_RESID_MW_LDS(6, 8)
 
-#if defined(__gfx1151__)
+#if defined(__gfx1100__) || defined(__gfx1151__)
 // Group-major twin of gemm_mq4g256v2_residual_wmma_gfx11_mw4_lds (small-M /
 // small-N tail oracle, e.g. MMQ small_tail_set on gfx1151): byte-identical
 // except the A group base address. Shipping:
@@ -339,6 +339,6 @@ extern "C" __launch_bounds__(128, 1) __global__ void
             }
         }
     }
-#endif // __gfx1151__ GM twin
+#endif // GM twin (gfx1100/1151, mirrors file guard; no gfx12 twin)
 
 #endif // __gfx1100__ || __gfx1151__
