@@ -19070,9 +19070,15 @@ impl Gpu {
             && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
             && !self.replay.is_recording()
             && !self.graphs.capture_mode;
+        // LF: exact gfx1151 full SET tiles → 16-wave sum[32] entry (2 WG/CU);
+        // add tiles measured slower on it and stay on the 8-wave entry.
+        let use_lf16 = use_col && !add && self.arch.as_str() == "gfx1151";
         let kernel_name = match (full, add, use_col) {
             (true, true, true) => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151"
+            }
+            (true, false, true) if use_lf16 => {
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151"
             }
             (true, false, true) => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151"
@@ -19081,6 +19087,7 @@ impl Gpu {
             (true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
             (false, _, _) => "gemm_mq4g256v2_residual_mmq_iu4",
         };
+        let block = if use_lf16 { [32, 16, 1] } else { [32, 8, 1] };
         const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
         self.ensure_kernel(
             MODULE,
@@ -19125,7 +19132,7 @@ impl Gpu {
         let result = self.launch_maybe_blob(
             kernel_name,
             grid,
-            [32, 8, 1],
+            block,
             shared_mem,
             &mut params,
             || {
