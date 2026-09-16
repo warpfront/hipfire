@@ -19090,6 +19090,17 @@ impl Gpu {
         {
             gm_ptr = Some(a_raw.buf.as_ptr());
         }
+        // Lazy producer: whichever load path ran, the first eager full-tile
+        // use of a tensor builds its group-major duplicate (one permute launch,
+        // logged once by ensure_mq4v2_gm). Capture/replay never allocates.
+        if gm_ptr.is_none()
+            && full
+            && use_col
+            && self.arch.as_str() == "gfx1151"
+            && self.prefill_weight_layout_gm_enabled()
+        {
+            gm_ptr = self.ensure_mq4v2_gm(a_raw, m, k)?;
+        }
         let use_gm = gm_ptr.is_some()
             && full
             && use_col
