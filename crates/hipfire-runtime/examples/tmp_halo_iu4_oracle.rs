@@ -1,39 +1,33 @@
-//! W2.P1 bit oracle: shipping IU4 full_{set,add}_occ3 vs WS4 W2 gfx1151 entries.
+//! W3 bit oracle: shipping IU4 full_{set,add}_occ3 vs MC gfx1151 candidates.
 //!
 //! Loads real qt=44 gate_proj (set) and down_proj (add, nonzero Y0) from an
 //! MQ4-XT HFQ, quantizes X via `ensure_int4_mmq_x`, and raw-launches
 //! `*_full_{set,add}_occ3` (block [32,8,1], LDS 30720) against
-//! `*_full_{set,add}_ws4_w2_gfx1151` (block [32,10,1], LDS 61440) on identical
-//! grid. Asserts bitwise-equal Y and immutable A/Xq. Phase-edge synthetic
+//! `*_full_{set,add}_{mc}_gfx1151` (same block/LDS) on identical grid.
+//! Asserts bitwise-equal Y and immutable A/Xq. Phase-edge synthetic
 //! fixtures cover G=1/2/3. TIME reports medians, TOPS, and % of 107.8 peak.
+//!
+//! Candidate select (argv wins over env, default mc2):
+//!   --w2-sym mc2|mc4     or     W2_SYM=mc2|mc4
 //!
 //! Compile-only (metadata gate; no alloc/launch):
 //!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
-//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-w2b HIPFIRE_GFX11_MQ4V2_IU4=1 \
+//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-mc HIPFIRE_GFX11_MQ4V2_IU4=1 \
+//!     W2_SYM=mc2 \
 //!     cargo run --release -p hipfire-runtime --features lab \
 //!       --example tmp_halo_iu4_oracle -- --compile-only
 //!
-//! Compile-only debug (WS4 role-path metadata; HIPFIRE_WS4_DEBUG=1):
-//!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
-//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-w2b HIPFIRE_GFX11_MQ4V2_IU4=1 \
-//!     cargo run --release -p hipfire-runtime --features lab \
-//!       --example tmp_halo_iu4_oracle -- --compile-only-debug
-
-//!
 //! Correctness / TIME:
 //!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
-//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-w2b HIPFIRE_GFX11_MQ4V2_IU4=1 \
+//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-mc HIPFIRE_GFX11_MQ4V2_IU4=1 \
 //!     cargo run --release -p hipfire-runtime --features lab \
-//!       --example tmp_halo_iu4_oracle -- \
+//!       --example tmp_halo_iu4_oracle -- --w2-sym mc4 \
 //!       /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
 //!   TIME=1 … (same)   # interleaved medians ≥100 samples, warm
 //!
 //! Production module/source identity matches gemm.rs:
 //!   MODULE = "gemm_mq4g256v2_residual_mmq_iu4"
 //!   SRC    = kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC (quant + IU4 HIP)
-//! Debug module (compile-only-debug):
-//!   MODULE = "gemm_mq4g256v2_residual_mmq_iu4_ws4dbg"
-//!   SRC    = "#define HIPFIRE_WS4_DEBUG 1\n" + production IU4 source
 
 
 use hip_bridge::{DeviceBuffer, KernargBlob};
@@ -49,20 +43,45 @@ const IU4_SRC: &str = concat!(
 );
 /// Production module name — same cache key as `Gpu::gemm_mq4g256v2_mmq_prequant_iu4`.
 const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
-/// Debug module — production IU4 source with `HIPFIRE_WS4_DEBUG` for role-path attribution.
-const MODULE_WS4DBG: &str = "gemm_mq4g256v2_residual_mmq_iu4_ws4dbg";
-const W2_SET_DBG_NOPROD: &str =
-    "gemm_mq4g256v2_residual_mmq_iu4_full_set_ws4_w2_dbg_noprod_gfx1151";
-
 const BASE_SET: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3";
 const BASE_ADD: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3";
-const W2_SET: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_set_ws4_w2_gfx1151";
-const W2_ADD: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_add_ws4_w2_gfx1151";
 
 const SHARED_BASE: u32 = (128 * 18 + 128 * 42) * 4; // 30720
-const SHARED_W2: u32 = 2 * SHARED_BASE; // 61440 — two A planes + two Xq halves
 const BLOCK_BASE: [u32; 3] = [32, 8, 1];
-const BLOCK_W2: [u32; 3] = [32, 10, 1];
+// MC candidates share block/LDS with shipping (same body, MC WMMA issue).
+const SHARED_MC: u32 = SHARED_BASE;
+const BLOCK_MC: [u32; 3] = BLOCK_BASE;
+
+/// Candidate suffix: `--w2-sym mc2|mc4` (argv) or `W2_SYM` (env); argv wins.
+fn parse_mc(argv: &mut Vec<String>) -> String {
+    let mut mc: Option<String> = None;
+    let mut i = 0;
+    while i < argv.len() {
+        if argv[i] == "--w2-sym" && i + 1 < argv.len() {
+            mc = Some(argv[i + 1].clone());
+            argv.drain(i..i + 2);
+            continue;
+        }
+        if let Some(s) = argv[i].strip_prefix("--w2-sym=") {
+            mc = Some(s.to_string());
+            argv.remove(i);
+            continue;
+        }
+        i += 1;
+    }
+    let mc = mc
+        .or_else(|| std::env::var("W2_SYM").ok())
+        .unwrap_or_else(|| "mc2".to_string());
+    assert!(
+        mc == "mc2" || mc == "mc4",
+        "candidate suffix must be mc2|mc4 (got {mc})"
+    );
+    mc
+}
+
+fn cand_sym(op: &str, mc: &str) -> String {
+    format!("gemm_mq4g256v2_residual_mmq_iu4_full_{op}_{mc}_gfx1151")
+}
 const N_DEFAULT: usize = 512;
 const QT_MQ4V2: u8 = 44;
 const GATE_NAME: &str = "model.language_model.layers.0.mlp.gate_proj.weight";
@@ -261,8 +280,8 @@ fn print_module_cache(arch: &str, module: &str) {
 }
 
 
-fn ensure_all(gpu: &mut Gpu) {
-    for sym in [BASE_SET, BASE_ADD, W2_SET, W2_ADD] {
+fn ensure_all(gpu: &mut Gpu, cand_set: &str, cand_add: &str) {
+    for sym in [BASE_SET, BASE_ADD, cand_set, cand_add] {
         gpu.ensure_kernel_public(MODULE, IU4_SRC, sym)
             .unwrap_or_else(|e| panic!("JIT {sym}: {e}"));
         eprintln!("compiled {sym} (module {MODULE})");
@@ -442,13 +461,15 @@ fn run_pair(
     add: bool,
     xq_mode: XqMode<'_>,
     time: bool,
+    cand_set: &str,
+    cand_add: &str,
 ) -> bool {
     assert!(m % 128 == 0 && n % 128 == 0 && k % 256 == 0);
     let grid = [(m / 128) as u32, (n / 128) as u32, 1];
-    let (base_sym, w2_sym) = if add {
-        (BASE_ADD, W2_ADD)
+    let (base_sym, mc_sym) = if add {
+        (BASE_ADD, cand_add)
     } else {
-        (BASE_SET, W2_SET)
+        (BASE_SET, cand_set)
     };
 
     let d_a = gpu.upload_raw(a_bytes, &[a_bytes.len()]).expect("upload A");
@@ -488,7 +509,7 @@ fn run_pair(
         vec![0.0f32; y_elems]
     };
     let d_y_base = gpu.upload_f32(&y0, &[n, m]).expect("upload Y base");
-    let d_y_w2 = gpu.upload_f32(&y0, &[n, m]).expect("upload Y w2");
+    let d_y_mc = gpu.upload_f32(&y0, &[n, m]).expect("upload Y mc");
 
     let add_i = i32::from(add);
     launch_once(
@@ -507,13 +528,13 @@ fn run_pair(
     );
     launch_once(
         gpu,
-        w2_sym,
+        mc_sym,
         grid,
-        BLOCK_W2,
-        SHARED_W2,
+        BLOCK_MC,
+        SHARED_MC,
         a_ptr,
         xq_ptr,
-        d_y_w2.buf.as_ptr() as *const _,
+        d_y_mc.buf.as_ptr() as *const _,
         m as i32,
         k as i32,
         n as i32,
@@ -522,9 +543,9 @@ fn run_pair(
     gpu.hip.device_synchronize().expect("sync parity");
 
     let y_base = gpu.download_f32(&d_y_base).expect("dl base");
-    let y_w2 = gpu.download_f32(&d_y_w2).expect("dl w2");
-    let finite = y_base.iter().all(|v| v.is_finite()) && y_w2.iter().all(|v| v.is_finite());
-    let (eq, mism, first) = bitwise_eq_f32(&y_base, &y_w2);
+    let y_mc = gpu.download_f32(&d_y_mc).expect("dl mc");
+    let finite = y_base.iter().all(|v| v.is_finite()) && y_mc.iter().all(|v| v.is_finite());
+    let (eq, mism, first) = bitwise_eq_f32(&y_base, &y_mc);
     let moved = if add {
         y_base
             .iter()
@@ -551,7 +572,7 @@ fn run_pair(
             let row = i % m;
             let col = i / m;
             eprintln!(
-                "    first Y mismatch idx={i} row={row} col={col} base={b:#010x} w2={w:#010x}"
+                "    first Y mismatch idx={i} row={row} col={col} base={b:#010x} mc={w:#010x}"
             );
         }
     }
@@ -566,8 +587,8 @@ fn run_pair(
                     .memcpy_htod(&d_y_base.buf, yb)
                     .expect("reseed Y base warm");
                 gpu.hip
-                    .memcpy_htod(&d_y_w2.buf, yb)
-                    .expect("reseed Y w2 warm");
+                    .memcpy_htod(&d_y_mc.buf, yb)
+                    .expect("reseed Y mc warm");
             }
             launch_once(
                 gpu,
@@ -585,13 +606,13 @@ fn run_pair(
             );
             launch_once(
                 gpu,
-                w2_sym,
+                mc_sym,
                 grid,
-                BLOCK_W2,
-                SHARED_W2,
+                BLOCK_MC,
+                SHARED_MC,
                 a_ptr,
                 xq_ptr,
-                d_y_w2.buf.as_ptr() as *const _,
+                d_y_mc.buf.as_ptr() as *const _,
                 m as i32,
                 k as i32,
                 n as i32,
@@ -601,15 +622,15 @@ fn run_pair(
         gpu.hip.device_synchronize().expect("sync warm");
 
         let mut base_us = Vec::with_capacity(SAMPLES);
-        let mut w2_us = Vec::with_capacity(SAMPLES);
+        let mut mc_us = Vec::with_capacity(SAMPLES);
         for i in 0..SAMPLES {
             if add {
                 gpu.hip
                     .memcpy_htod(&d_y_base.buf, yb)
                     .expect("reseed Y base");
                 gpu.hip
-                    .memcpy_htod(&d_y_w2.buf, yb)
-                    .expect("reseed Y w2");
+                    .memcpy_htod(&d_y_mc.buf, yb)
+                    .expect("reseed Y mc");
             }
             if i % 2 == 0 {
                 base_us.push(time_us(
@@ -626,30 +647,30 @@ fn run_pair(
                     n as i32,
                     add_i,
                 ));
-                w2_us.push(time_us(
+                mc_us.push(time_us(
                     gpu,
-                    w2_sym,
+                    mc_sym,
                     grid,
-                    BLOCK_W2,
-                    SHARED_W2,
+                    BLOCK_MC,
+                    SHARED_MC,
                     a_ptr,
                     xq_ptr,
-                    d_y_w2.buf.as_ptr() as *const _,
+                    d_y_mc.buf.as_ptr() as *const _,
                     m as i32,
                     k as i32,
                     n as i32,
                     add_i,
                 ));
             } else {
-                w2_us.push(time_us(
+                mc_us.push(time_us(
                     gpu,
-                    w2_sym,
+                    mc_sym,
                     grid,
-                    BLOCK_W2,
-                    SHARED_W2,
+                    BLOCK_MC,
+                    SHARED_MC,
                     a_ptr,
                     xq_ptr,
-                    d_y_w2.buf.as_ptr() as *const _,
+                    d_y_mc.buf.as_ptr() as *const _,
                     m as i32,
                     k as i32,
                     n as i32,
@@ -672,32 +693,32 @@ fn run_pair(
             }
         }
         let bmed = median_f64(&mut base_us);
-        let wmed = median_f64(&mut w2_us);
-        let delta = (wmed - bmed) / bmed * 100.0;
+        let mcmed = median_f64(&mut mc_us);
+        let delta = (mcmed - bmed) / bmed * 100.0;
         let bmin = base_us.iter().cloned().fold(f64::INFINITY, f64::min);
         let bmax = base_us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let wmin = w2_us.iter().cloned().fold(f64::INFINITY, f64::min);
-        let wmax = w2_us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let mcmin = mc_us.iter().cloned().fold(f64::INFINITY, f64::min);
+        let mcmax = mc_us.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
         const PEAK_TOPS: f64 = 107.8;
         let btops = tops_from_us(m, k, n, bmed);
-        let wtops = tops_from_us(m, k, n, wmed);
+        let mctops = tops_from_us(m, k, n, mcmed);
         let bpct = 100.0 * btops / PEAK_TOPS;
-        let wpct = 100.0 * wtops / PEAK_TOPS;
+        let mcpct = 100.0 * mctops / PEAK_TOPS;
         eprintln!(
             "  TIME {label}: base_med={bmed:.3} us (min={bmin:.3} max={bmax:.3})  \
-             w2_med={wmed:.3} us (min={wmin:.3} max={wmax:.3})  delta={delta:+.2}%  \
+             mc_med={mcmed:.3} us (min={mcmin:.3} max={mcmax:.3})  delta={delta:+.2}%  \
              (n={SAMPLES} interleaved)"
         );
         eprintln!(
             "  TOPS {label}: base={btops:.2} ({bpct:.1}% of {PEAK_TOPS})  \
-             ws4={wtops:.2} ({wpct:.1}% of {PEAK_TOPS})  ops=2*M*K*N={ops}",
+             mc={mctops:.2} ({mcpct:.1}% of {PEAK_TOPS})  ops=2*M*K*N={ops}",
             ops = 2usize.saturating_mul(m).saturating_mul(k).saturating_mul(n)
         );
     }
 
     let _ = gpu.free_tensor(d_a);
     let _ = gpu.free_tensor(d_y_base);
-    let _ = gpu.free_tensor(d_y_w2);
+    let _ = gpu.free_tensor(d_y_mc);
     if let Some(t) = x_owner {
         let _ = gpu.free_tensor(t);
     }
@@ -710,8 +731,10 @@ fn run_pair(
 fn main() {
     let mut argv: Vec<String> = std::env::args().skip(1).collect();
     let compile_only = argv.iter().any(|a| a == "--compile-only");
-    let compile_only_debug = argv.iter().any(|a| a == "--compile-only-debug");
-    argv.retain(|a| a != "--compile-only" && a != "--compile-only-debug");
+    argv.retain(|a| a != "--compile-only");
+    let mc = parse_mc(&mut argv);
+    let cand_set = cand_sym("set", &mc);
+    let cand_add = cand_sym("add", &mc);
 
 
     let model = argv
@@ -728,30 +751,19 @@ fn main() {
         }
     };
     eprintln!(
-        "tmp_halo_iu4_oracle on {}  model={model}  TIME={time}  compile_only={compile_only}  compile_only_debug={compile_only_debug}",
+        "tmp_halo_iu4_oracle on {}  model={model}  TIME={time}  mc={mc}  compile_only={compile_only}",
         gpu.arch
     );
 
     if gpu.arch != "gfx1151" {
         eprintln!(
-            "WARN: WS4 symbols are #if __gfx1151__; arch={} may fail JIT of _ws4_w2 entries",
+            "WARN: MC symbols are #if __gfx1151__; arch={} may fail JIT of _mc2/_mc4 entries",
             gpu.arch
         );
     }
 
-    if compile_only_debug {
-        // Debug module: same production IU4 source with HIPFIRE_WS4_DEBUG=1.
-        let src = format!("#define HIPFIRE_WS4_DEBUG 1\n{IU4_SRC}");
-        gpu.ensure_kernel_public(MODULE_WS4DBG, &src, W2_SET_DBG_NOPROD)
-            .unwrap_or_else(|e| panic!("JIT {W2_SET_DBG_NOPROD}: {e}"));
-        eprintln!("compiled {W2_SET_DBG_NOPROD} (module {MODULE_WS4DBG})");
-        print_module_cache(&gpu.arch, MODULE_WS4DBG);
-        eprintln!("--compile-only-debug: module ensured; returning before allocation/launch");
-        return;
-    }
-
     // Production module ensure — same MODULE + SRC as gemm.rs launcher.
-    ensure_all(&mut gpu);
+    ensure_all(&mut gpu, &cand_set, &cand_add);
     print_module_cache(&gpu.arch, MODULE);
 
     if compile_only {
@@ -786,6 +798,8 @@ fn main() {
         false,
         XqMode::EnsureInt4,
         time,
+        &cand_set,
+        &cand_add,
     );
     ok &= run_pair(
         &mut gpu,
@@ -797,6 +811,8 @@ fn main() {
         true,
         XqMode::EnsureInt4,
         time,
+        &cand_set,
+        &cand_add,
     );
 
     // Phase-edge synthetic: G=1,2,3 (K=256,512,768), set+add, boundary packs.
@@ -825,6 +841,8 @@ fn main() {
                 false,
                 XqMode::HostPacked(&xq),
                 false,
+                &cand_set,
+                &cand_add,
             );
         }
         if do_add {
@@ -838,16 +856,18 @@ fn main() {
                 true,
                 XqMode::HostPacked(&xq),
                 false,
+                &cand_set,
+                &cand_add,
             );
         }
     }
 
     if ok {
         eprintln!(
-            "W2 PASS: shipping occ3 vs ws4_w2_gfx1151 bitwise-equal (gate set + down add + edges)"
+            "MC PASS: shipping occ3 vs {mc} bitwise-equal (gate set + down add + edges)"
         );
     } else {
-        eprintln!("W2 FAIL");
+        eprintln!("MC FAIL");
         std::process::exit(1);
     }
 }
