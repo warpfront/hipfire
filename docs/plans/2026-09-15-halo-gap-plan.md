@@ -153,20 +153,14 @@ Compare each against production at gate/up `(M,K,N)=(17408,5120,512)` and down `
 
 ## 7. A5 — column-adjacent full-tile grid
 
-> **STATUS 2026-09-15 — A5 REJECTED in-model (amended).** Isolated oracle:
-> bitwise-equal, gate/up −7.3%, down −4.3% (100 interleaved samples). In-model
-> (profile_prefill pp512, 400 calls) the `_col` entries were *slower*: 2272 µs
-> vs 2188 µs for the baseline symbol measured under the same conditions
-> (≈ +4%). Both in-model figures were taken while a CPU build shared the APU
-> power budget (baseline unthrottled is 1688 µs), so only the direction is
-> evidence; the mechanism is weight-stream locality across back-to-back
-> launches (column-adjacent order walks every weight tile of a column strip).
-> Entries, selector and oracle removed. The 2×2 macrotile alternative is not
-> attempted: same mechanism.
->
-> **Measurement rule learned here:** the Halo is an APU — never run a CPU
-> build (CK, cargo of another tree) on hipx while taking Halo numbers; pause
-> it (`SIGSTOP`) or the GPU throttles ~30% on IU4.
+> **STATUS 2026-09-15 — A5 ADMITTED (rejection reversed).** The in-model
+> "+35 %" / "+4 %" figures were taken with a CPU build throttling the APU. Quiet
+> APU: gate 1688→1534 µs (−9.1 %), down 1643→1567 (−4.6 %), pp512 TOTAL
+> 818→766 ms; bitwise-equal (oracle); eval md5 unchanged. Bench: pp512 664,
+> pp2048 650, pp8192 606. Mechanism confirmed by rocprof: gate's L2 miss rate
+> 37 % vs down's 16 % because the four N-tiles of one weight-row block were
+> 136 WGs apart in the x-major grid. Column-adjacent order fixes that.
+> Measurement rule: never run a CPU build on hipx while taking Halo numbers.
 
 
 **Owners A+H under disjoint ownership; 1 h swap, at most 1 additional h for one 2×2 swizzle.**
