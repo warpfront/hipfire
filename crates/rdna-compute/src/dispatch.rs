@@ -1380,8 +1380,6 @@ impl Gpu {
                 sample_partials_bytes: 0,
                 fa2_q16_scratch: None,
                 fa2_q16_scratch_bytes: 0,
-                fa2_q8_scratch: None,
-                fa2_q8_scratch_bytes: 0,
             },
             replay: crate::replay::ReplayController::from_config(),
             #[cfg(feature = "flash-attn-ck")]
