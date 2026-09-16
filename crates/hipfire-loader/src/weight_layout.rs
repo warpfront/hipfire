@@ -6,7 +6,8 @@
 //! The IU4 `_gm_col_gfx1151` kernels read group `(row, kb)` at
 //! `136*(kb*M+row)` instead of the shipping `136*(row*gpr+kb)`. This module is
 //! the load-time producer entry: [`warm_mq4v2_gm`] walks the dense MQ4V2
-//! tensors the IU4 selector actually consumes (gate/up/down of every layer),
+//! tensors the IU4 selector actually consumes (every dense-layer projection
+//! with a full-tile prefill route: qkv/z/o and gate/up/down),
 //! builds each duplicate through `Gpu::ensure_mq4v2_gm` (the
 //! `mq4v2_relayout_gm` permute kernel), and logs the total extra bytes ONCE
 //! at load.
@@ -106,11 +107,18 @@ pub fn qwen35_mq4v2_tensors(
         }
         match layer {
             LayerWeights::DeltaNet(w) => {
+                push!("wqkv", &w.wqkv);
+                push!("wz", &w.wz);
+                push!("wo", &w.wo);
                 push!("w_gate", &w.w_gate);
                 push!("w_up", &w.w_up);
                 push!("w_down", &w.w_down);
             }
             LayerWeights::FullAttn(w) => {
+                push!("wq", &w.wq);
+                push!("wk", &w.wk);
+                push!("wv", &w.wv);
+                push!("wo", &w.wo);
                 push!("w_gate", &w.w_gate);
                 push!("w_up", &w.w_up);
                 push!("w_down", &w.w_down);

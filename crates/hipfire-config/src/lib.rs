@@ -2154,7 +2154,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         true,
         "HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM",
-        "Build a group-major duplicate of the IU4-consumed MQ4G256V2 weights (gate/up/down of every layer; not lm_head/experts) for the IU4 prefill path (opt-in on exact gfx1151 only; set to true or HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM=1 to opt in; expect +~14 GB VRAM on Qwen3.8-27B)."
+        "Build a group-major duplicate of the IU4-consumed MQ4G256V2 weights (every dense-layer projection the IU4 prefill route consumes: qkv/z/o and gate/up/down; not lm_head/experts) for the IU4 prefill path (opt-in on exact gfx1151 only; set to true or HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM=1 to opt in; costs the full MQ4 weight footprint again (~15 GB on Qwen3.8-27B) and a one-shot permute at load)."
     ),
     process_bool_field!(
         "kernel.dot2_gemv",
@@ -4989,7 +4989,7 @@ mod tests {
     fn prefill_weight_layout_gm_defaults_off_with_env_compat() {
         // Opt-in VRAM-for-speed trade (Halo only): the schema default is
         // off, so an unset key resolves through the default-off process
-        // config and never builds the ~14 GB duplicate unasked.
+        // config and never builds the ~15 GB duplicate unasked.
         let field = field("prefill.weight_layout_gm").expect("prefill.weight_layout_gm schema field");
         assert_eq!(field.env_compat, Some("HIPFIRE_PREFILL_WEIGHT_LAYOUT_GM"));
         assert_eq!(field.default.to_value(), ConfigValue::Bool(false));
