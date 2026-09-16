@@ -15,6 +15,16 @@ Date: 2026-09-15, revision after the plateaued peak probe. Worktree: `/home/kade
 > 8-wave / 2-WG structure, ≤192 VGPR, fold macro untouched (local hipcc
 > resource-usage workflow).
 
+> **W3 (multi-chain in the shipping structure) REJECTED 2026-09-15:** mc4
+> (4 chains, 188 VGPR, 2 WG/CU) −2.7 % gate / −5.1 % down; mc2 (noinline
+> blocks, 151 VGPR) +14.5 % / +8.9 %. Issue latency is already hidden by the
+> 16 resident waves. Mismatch counts were identical across WS4/mc2/mc4 ⇒ the
+> drift is FMA-contraction re-decision in the shipping fold, not the
+> candidates: any bit-exact restructure first needs the fold pinned with
+> explicit `__fmaf_rn`/`__fmul_rn` matching shipping's current ISA. Candidates
+> and oracle removed. Next lever (W4): 64×256 tile (same LDS, 2 WG/CU, weight
+> re-reads 4×→2× per launch, fill per output halved).
+
 ## 1. Decision and immutable constraints
 
 **Select WS4: eight compute waves with four independent output chains/wave, plus two loader waves; one320-thread WG/CU; two A planes and two Xq-half planes,61,440 bytes LDS.** Keep `sum[64]`, the128×128 output tile, original row/column tile walk, K256 group/fold boundaries and seven-argument ABI. Loader waves stream into planes not read by the compute waves; there is no pending global-load array in compute waves. Balance each steady-state loader phase as64 **whole weight rows** of the next group plus one128-column Xq half:17,920 logical bytes. Each group uses two producer/consumer rendezvous barriers, rather than four serialized fill/compute barriers.
