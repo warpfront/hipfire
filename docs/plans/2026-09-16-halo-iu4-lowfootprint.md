@@ -38,6 +38,16 @@ Date: 2026-09-16. Planning-only specification for `/home/kaden/ClaudeCode/warpfr
 > +14/+17 %, r8_gm +16/+42 % (gate/down); row-major r4/r8 also lose to r2.
 > No lane mapping rescues decode on this layout; GM stays closed.
 
+> **GM opt-in duplicate — measured and REMOVED 2026-09-16.** With a
+> load-time group-major duplicate (+15 GB, exact gfx1151, opt-in) the IU4
+> entries ran 5–10 % faster in profile but the bench moved only +1…+2 %
+> (720/692/650/520 vs 720/686/638/508), decode 14.66 unchanged. Rule set by
+> the user: +100 % VRAM must buy ≥ +50 % prefill by removing recomputation,
+> not by reordering the same bytes. On gfx11 no wider resident format is
+> also the faster MAC path (iu8 = f16 rate, half of iu4), so the trade
+> cannot exist here; on gfx12 the honest form is a resident fp8 copy
+> (fp8 WMMA is the fast path) — untested.
+
 ## Ten-line summary
 
 1. Select **M128 × N128 with 16 wave32s**, block `[32,16,1]`, four 16×16 subtiles/wave and `sum[32]`; retain A5 column-adjacent order.
