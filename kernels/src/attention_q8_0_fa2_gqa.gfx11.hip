@@ -229,6 +229,18 @@ __device__ __forceinline__ void fa2_gqa_body(
     uint32_t pf_ks;
     uint32_t pf_kc[KT_KITERS * 8];
 #endif
+    // ---- F7: software prefetch of the next tile's V even-key bytes ----
+    // Per-lane raw V share at KT32/block128 (all four waves fill,
+    // KT_VITERS=1, so each lane owns one (m,b) pair slot covering keys
+    // (2m, 2m+1)): only the EVEN key's block (f16 scale + 32 i8 codes =
+    // 34 B) stages here — 1 scale dword + 8 code dwords = 9 VGPR, i.e.
+    // half the tile's V bytes (the 16 even keys). The odd key's block
+    // keeps streaming from global in the fill slot. Full K+V staging
+    // (17+17) spilled at a 256-VGPR allocation; K-full (17) + V-half (9)
+    // = 26 keeps total allocation within 256 (6 waves/SIMD). V is Q8_0 in
+    // both K modes, so this staging is mode-independent.
+    uint32_t pf_vs0;
+    uint32_t pf_vc0[8];
 #endif
     // ---- Transitions 2-4: KT tiles ----
     for (int tile = 0; ; ++tile) {
@@ -398,8 +410,50 @@ __device__ __forceinline__ void fa2_gqa_body(
         }
 #endif
         // V: KT*2 key-pairs (m*8+b); each slot reads the even and odd block
-        // and packs (V[2m][d], V[2m+1][d]) per output dim. Codes are loaded
-        // on demand per dim (no staging array).
+        // and packs (V[2m][d], V[2m+1][d]) per output dim. Tiles after the
+        // first (KT32 only) decode the even-key block from the F7 prefetch
+        // registers (zeros staged for OOB, matching the nullptr path
+        // bit-identically); the odd-key block still streams from global.
+        // Tile 0 keeps the all-global path exactly as before.
+        if (have_pf) {
+#if HIPFIRE_FA2_KT == 32
+        for (int t = 0; t < KT_VITERS; ++t) {
+            const int pair = tid + t * 128;
+            const int m = pair >> 3;
+            const int b = pair & 7;
+            const int k0 = ktile + 2 * m;
+            const unsigned char* blk1 = (k0 + 1 < seq_len)
+                ? v_cache + (unsigned long long)(k0 + 1) * (unsigned long long)row_stride
+                    + (unsigned long long)(kv_blk + b) * 34ULL
+                : nullptr;
+            const uint16_t s0u = (uint16_t)pf_vs0;
+            uint16_t s1u = 0;
+            if (blk1 != nullptr)
+                s1u = (uint16_t)blk1[0] | ((uint16_t)blk1[1] << 8);
+            _Float16 s0 = ((fa2_dw_t){.u = (uint32_t)s0u}).h[0];
+            _Float16 s1 = ((fa2_dw_t){.u = (uint32_t)s1u}).h[0];
+            const float sf0 = (float)s0;
+            const float sf1 = (float)s1;
+#pragma unroll 1
+            for (int w = 0; w < 8; ++w) {
+                const uint32_t u0 = pf_vc0[w];
+                uint32_t u1 = 0;
+                if (blk1 != nullptr)
+                    __builtin_memcpy(&u1, blk1 + 2 + w * 4, 4);
+#pragma unroll
+                for (int c = 0; c < 4; ++c) {
+                    const int d = b * 32 + w * 4 + c;
+                    const float c0 = (float)(int8_t)(u0 >> (c * 8));
+                    const float c1 = (float)(int8_t)(u1 >> (c * 8));
+                    fa2_dw_t dw;
+                    dw.h[0] = (_Float16)(sf0 * c0);
+                    dw.h[1] = (_Float16)(sf1 * c1);
+                    Vdw[d * V_ROW + ((m + fa2_swiz(d & 15)) & V_MASK)] = dw.u;
+                }
+            }
+        }
+#endif
+        } else
         for (int t = 0; t < KT_VITERS; ++t) {
             const int pair = tid + t * 128;
             const int m = pair >> 3;
@@ -448,7 +502,8 @@ __device__ __forceinline__ void fa2_gqa_body(
         // Issued immediately after the post-fill barrier so these global
         // loads overlap the current tile's QK/softmax/PV below; the next
         // iteration's K fill (above) dequantizes from these registers with
-        // no fresh K global loads (V still streams in its fill slot).
+        // no fresh K global loads (the V odd-key half still streams in its
+        // fill slot; the V even-key half is prefetched below).
         // Addressing and guards mirror the K fill loads exactly (no
         // out-of-range reads); OOB slots stage zeros so tails zero-fill
         // bit-identically to today. The QK/PV loops' existing compiler
@@ -505,6 +560,38 @@ __device__ __forceinline__ void fa2_gqa_body(
                     }
                 }
 #endif
+            // ---- F7: prefetch the next tile's V even-key-block bytes ----
+            // Same issuance point (all four waves, immediately after the
+            // post-fill barrier), so these global loads overlap the current
+            // tile's QK/softmax/PV alongside the K prefetch above; the next
+            // iteration's V fill decodes the even-key block from these
+            // registers while the odd-key block streams in its fill slot.
+            // Slot mapping, addressing, and guards mirror the V fill's blk0
+            // loads exactly (no out-of-range reads); OOB slots stage zeros
+            // so tails zero-fill bit-identically. Mode-independent: V stays
+            // Q8_0 under KMODE=3.
+#pragma unroll 1
+            for (int t = 0; t < KT_VITERS; ++t) {
+                const int pair = tid + t * 128;
+                const int m = pair >> 3;
+                const int b = pair & 7;
+                const int k0n = ktile_next + 2 * m;
+                const unsigned char* blk0n = (k0n < seq_len)
+                    ? v_cache + (unsigned long long)k0n * (unsigned long long)row_stride
+                        + (unsigned long long)(kv_blk + b) * 34ULL
+                    : nullptr;
+                uint16_t s0n = 0;
+                if (blk0n != nullptr)
+                    s0n = (uint16_t)blk0n[0] | ((uint16_t)blk0n[1] << 8);
+                pf_vs0 = (uint32_t)s0n;
+#pragma unroll 1
+                for (int w = 0; w < 8; ++w) {
+                    uint32_t u = 0;
+                    if (blk0n != nullptr)
+                        __builtin_memcpy(&u, blk0n + 2 + w * 4, 4);
+                    pf_vc0[w] = u;
+                }
+            }
             }
         }
 #endif
