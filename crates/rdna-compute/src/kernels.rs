@@ -5716,6 +5716,31 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC: &str = concat!(
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
 );
 
+/// F5a lab-only i8-QK sister of [`ATTENTION_Q8_0_FA2_GQA_GFX11_SRC`]
+/// (research opt-in, exact gfx1151 only). Same shared kernel file; F5.3 adds
+/// the i8 lab symbols there (`attention_fa2_q_preconvert_i8_gfx11`,
+/// `attention_q8_0_fa2_gqa_i8_gfx11`) — the entries do not exist yet, so this
+/// source is only compiled once those symbols land. The Q8 i8 body keeps the
+/// shipping flat kernarg list with `const unsigned char* q8_scratch` in slot
+/// 0 (same 8-byte pointer slot as f32 Q / f16 q16). JIT-only via the
+/// `attention_q8_0_fa2_gqa_i8_gfx11` lab launcher; never on a default path.
+pub const ATTENTION_Q8_0_FA2_GQA_I8_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip");
+
+/// F5a lab-only fwht3-K variant of [`ATTENTION_Q8_0_FA2_GQA_I8_GFX11_SRC`]
+/// (`HIPFIRE_FA2_KMODE=3`): same concat/prelude convention as
+/// [`ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC`]. F5.3 adds the
+/// `attention_q8_0_fa2_gqa_fwht3k_i8_gfx11` entry alongside the i8
+/// pre-convert (shared frozen symbol `attention_fa2_q_preconvert_i8_gfx11`,
+/// runtime `rotate_fwht3` select); until then this source is only a
+/// registration. JIT-only via the `attention_q8_0_fa2_gqa_fwht3k_i8_gfx11`
+/// lab launcher; never on a default path.
+pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_I8_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 3\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
+);
+
 
 /// Benchmark-only gfx1201 LongSpec partition WMMA flash: same arithmetic as
 /// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC` but writes retained online-

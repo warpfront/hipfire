@@ -201,6 +201,15 @@ pub struct ScratchState {
     /// it (same-stream ordering), so no init is needed.
     pub fa2_q16_scratch: Option<DeviceBuffer>,
     pub fa2_q16_scratch_bytes: usize,
+    /// F5a lab-only: i8 Q scratch for the gfx11 i8 FA2 pair
+    /// (`attention_fa2_q_preconvert_i8_gfx11` writes it, the i8 FA2 body reads
+    /// it): [batch, 24, 260] bytes — 256 i8 codes plus one f32 row scale
+    /// (sQ) per query/head row, padded row stride 260 B, grows-never-shrinks.
+    /// Separate slot from F4b's `fa2_q16_scratch`; never reinterpreted.
+    /// Every valid cell is written by the pre-convert launch before the body
+    /// reads it (same-stream ordering), so no init is needed.
+    pub fa2_q8_scratch: Option<DeviceBuffer>,
+    pub fa2_q8_scratch_bytes: usize,
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
@@ -532,6 +541,25 @@ impl ScratchState {
             n_bytes,
         )?;
         Ok(self.fa2_q16_scratch.as_ref().unwrap().as_ptr())
+    }
+
+    /// Ensure the F5a lab-only FA2 i8 Q scratch holds at least `n_bytes`
+    /// (batch*24*260 for the gfx11 i8 FA2 pair), growing (never shrinking).
+    /// Returns the device base pointer. No init needed: the i8 pre-convert
+    /// launch writes every valid cell before the FA2 body reads it
+    /// (same-stream ordering).
+    pub fn ensure_fa2_q8_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        n_bytes: usize,
+    ) -> HipResult<*mut c_void> {
+        grow_scratch_buffer(
+            hip,
+            &mut self.fa2_q8_scratch,
+            &mut self.fa2_q8_scratch_bytes,
+            n_bytes,
+        )?;
+        Ok(self.fa2_q8_scratch.as_ref().unwrap().as_ptr())
     }
 
     /// Ensure the dedicated GEMV-residual temporary can hold at least
