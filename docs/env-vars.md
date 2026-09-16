@@ -843,6 +843,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_NORMALIZE_PROMPT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/build_kld_ref_native.rs |
 | `HIPFIRE_NO_REGISTRY_FETCH` | crates/hipfire-registry/src/lib.rs |
 | `HIPFIRE_NO_SPILL` | crates/hipfire-quantize/src/main.rs |
+| `HIPFIRE_NPU_SPILLOVER` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs, crates/hipfire-cli/src/main.rs |
 | `HIPFIRE_ORACLE_MAX` | scripts/seed_oracle_collect.sh |
 | `HIPFIRE_PARITY_MAX_TOK` | scripts/forward-lowered-parity.sh |
 | `HIPFIRE_PARITY_OUT` | scripts/forward-lowered-parity.sh |

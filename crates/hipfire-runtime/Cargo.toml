@@ -52,6 +52,7 @@ serve-fault-inject = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
+hipfire-registry = { path = "../hipfire-registry" }
 rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }

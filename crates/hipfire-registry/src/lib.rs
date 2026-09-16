@@ -18,6 +18,8 @@ use std::{
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use thiserror::Error;
+pub mod xdna;
+pub use xdna::{XdnaManifest, XdnaProfile, XdnaSidecarDescriptor};
 
 pub const REGISTRY_SCHEMA_VERSION: u32 = 1;
 pub const DEFAULT_REGISTRY_URL: &str =
@@ -204,6 +206,13 @@ pub struct ModelEntry {
     pub vae: Option<Sidecar>,
     #[serde(default)]
     pub dflash: Option<Sidecar>,
+    /// Opt-in gfx1151 XDNA NPU spillover sidecar (`.xdna.zip` with manifest
+    /// v1). Capability data only: `kernel.npu_spillover` must also be on, the
+    /// archive must verify, and the host arch must be exactly `gfx1151`.
+    /// No certified entries declare one yet; the first certified model binds
+    /// its payload hashes here via `sidecar.sha256`.
+    #[serde(default)]
+    pub xdna: Option<Sidecar>,
     /// Shared Qwen3.8-27B vision-tower sidecar (`qwen3.8-27b-vision.hfq`,
     /// llm.cpp mmproj-style). Every `qwen3.8:27b*` tier declares the same
     /// file so each text quant tier serves images without requantizing the
@@ -400,6 +409,7 @@ impl RegistryV1 {
                 &entry.mtp,
                 &entry.dspark,
                 &entry.dflash,
+                &entry.xdna,
                 &entry.vision,
                 &entry.t5,
                 &entry.clip,
@@ -923,6 +933,30 @@ mod tests {
         let (_, entry) = reg.model("m").unwrap();
         assert_eq!(entry.heads.len(), 1);
         assert_eq!(entry.heads["q4k"].file, "h.hfq");
+    }
+    /// The `xdna` sidecar must be VALIDATED like every other sidecar slot:
+    /// a malformed digest is REJECTED and a well-formed one parses onto the
+    /// entry. Without `&entry.xdna` in the `validate` walk, an unverifiable
+    /// `.xdna.zip` declaration would ship silently.
+    #[test]
+    fn xdna_sidecar_is_digest_validated() {
+        let with_bad_xdna = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{"m":{"repo":"r","file":"f.hfq","size_gb":1,"min_vram_gb":1,"desc":"d",
+              "xdna":{"file":"m.xdna.zip","sha256":"not-a-sha"}}},
+            "aliases":{}
+        }"#;
+        let err = RegistryV1::parse(with_bad_xdna, "test")
+            .expect_err("a malformed xdna digest must be rejected");
+        assert!(
+            format!("{err}").contains("invalid SHA-256"),
+            "expected a digest complaint, got: {err}"
+        );
+        let good = with_bad_xdna.replace("not-a-sha", &"b".repeat(64));
+        let reg = RegistryV1::parse(&good, "test").expect("valid xdna must parse");
+        let (_, entry) = reg.model("m").unwrap();
+        assert_eq!(entry.xdna.as_ref().unwrap().file, "m.xdna.zip");
     }
 
     fn reg_at(stamp: &str) -> RegistryV1 {

@@ -2148,6 +2148,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx11 iu4-direct MMQ prefill route (opt-in on gfx1100/gfx1151; set to true or HIPFIRE_GFX11_MQ4V2_IU4=1 to opt in)."
     ),
     process_bool_field!(
+        "kernel.npu_spillover",
+        "npu_spillover",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_NPU_SPILLOVER",
+        "Enable the opt-in gfx1151-only XDNA NPU spillover sidecar (requires a verified .xdna.zip registry sidecar; default off, never active on other architectures)."
+    ),
+    process_bool_field!(
         "kernel.dot2_gemv",
         "dot2_gemv",
         Kernel,
@@ -4997,6 +5006,40 @@ mod tests {
             );
         }
         assert!(field.parse_cli("sometimes").is_err());
+    }
+    #[test]
+    fn npu_spillover_defaults_off_with_env_parse() {
+        let field = field("kernel.npu_spillover").expect("npu_spillover schema field");
+        assert_eq!(field.legacy_key, "npu_spillover");
+        assert_eq!(field.env_compat, Some("HIPFIRE_NPU_SPILLOVER"));
+        assert_eq!(field.default.to_value(), ConfigValue::Bool(false));
+        assert_eq!(field.parse_cli("1").unwrap(), ConfigValue::Bool(true));
+        assert_eq!(field.parse_cli("0").unwrap(), ConfigValue::Bool(false));
+        // Default-off snapshot: an empty resolve leaves the bridge default
+        // absent (same as other default-false kernel flags), which the
+        // runtime parses as off.
+        let process =
+            ProcessConfig::from_resolved(&resolve([]).expect("empty resolve")).expect("process");
+        assert_eq!(process.legacy_value("HIPFIRE_NPU_SPILLOVER"), None);
+        // Env spelling flows through the env layer into the same snapshot.
+        // HIPFIRE_NPU_SPILLOVER is unique to this test; no other test reads it.
+        std::env::set_var("HIPFIRE_NPU_SPILLOVER", "1");
+        let env_layer = load_env_layer().expect("env layer");
+        std::env::remove_var("HIPFIRE_NPU_SPILLOVER");
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::LegacyEnv {
+                    name: "HIPFIRE_NPU_SPILLOVER".into(),
+                },
+                layer: env_layer,
+            }])
+            .expect("env resolve"),
+        )
+        .expect("process");
+        assert_eq!(
+            process.legacy_value("HIPFIRE_NPU_SPILLOVER").as_deref(),
+            Some("1")
+        );
     }
     #[test]
     fn image_decode_defaults_cpu_with_cpu_vcn_auto_values() {

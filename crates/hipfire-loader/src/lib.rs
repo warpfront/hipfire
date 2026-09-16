@@ -2421,6 +2421,9 @@ pub fn load_model_with_kv_backend(
         gpu,
         gemma4_drafter_path: None,
         gemma4_draft_len: GEMMA4_EAGLE_DRAFT_LEN,
+        // Slice 4 (integration) populates this from the daemon `xdna` param
+        // after flag + exact-gfx1151 admission; until then loads stay GPU-only.
+        xdna: None,
     };
 
     // Carrier registry dispatch. Collect all matches so an overlap between
@@ -2586,6 +2589,9 @@ pub fn load_admitted_with_gemma4_drafter(
         gpu,
         gemma4_drafter_path,
         gemma4_draft_len,
+        // Slice 4 (integration) populates this from the daemon `xdna` param
+        // after flag + exact-gfx1151 admission; until then loads stay GPU-only.
+        xdna: None,
     };
     let mut result = carrier.load(source, &mut ctx)?;
     if result.pp > 1 && result.pp_gpus.is_none() {
