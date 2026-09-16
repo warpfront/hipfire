@@ -48,6 +48,16 @@ Date: 2026-09-16. Planning-only specification for `/home/kaden/ClaudeCode/warpfr
 > cannot exist here; on gfx12 the honest form is a resident fp8 copy
 > (fp8 WMMA is the fast path) — untested.
 
+> **Resident-int8 W8A8 twin (2026-09-16):** bit-exact with the pinned fold but
+> 6.7× slower (12.5 ms vs 1.87) — the throwaway kernel was mis-structured
+> (K128 half-tiles, 8 waves), so it bounds nothing; iu8 = f16 WMMA rate on
+> gfx1151 (re-measured 54.6 vs 55.3 vs iu4 107 TOPS) remains the reason an
+> int8 resident copy is unattractive here. Next honest experiment: a
+> pre-tiled resident **4-bit** layout (fill → memcpy, full iu4 rate).
+> **Graph capture on prefill:** GRAPH=1 is 2–3 % slower than eager on the
+> Halo (714/686/641 vs 726/708/660) — dispatch overhead is not a prefill
+> lever; prefill PM4 replay dropped.
+
 ## Ten-line summary
 
 1. Select **M128 × N128 with 16 wave32s**, block `[32,16,1]`, four 16×16 subtiles/wave and `sum[32]`; retain A5 column-adjacent order.
