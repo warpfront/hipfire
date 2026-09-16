@@ -2425,10 +2425,13 @@ const I8_Q8_BODY_SYM: &str = "attention_q8_0_fa2_gqa_i8_gfx11";
 const I8_FW_BODY_SYM: &str = "attention_q8_0_fa2_gqa_fwht3k_i8_gfx11";
 const I8_PRECONVERT_SYM: &str = "attention_fa2_q_preconvert_i8_gfx11";
 const I8_Q8_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_I8 1\n",
     "#define HIPFIRE_FA2_KT 32\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip"),
 );
 const I8_FW_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_I8 1\n",
     "#define HIPFIRE_FA2_KT 32\n",
     "#define HIPFIRE_FA2_KMODE 3\n",
     include_str!("../../../kernels/src/turbo_common.h"),
