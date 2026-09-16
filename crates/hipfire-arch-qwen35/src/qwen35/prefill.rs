@@ -4284,6 +4284,12 @@ fn run_independent_q8_attention(
     active_mask: u64,
 ) -> HipResult<()> {
     debug_assert!(kv_cache.quant_q8);
+    // f16 shadow fallback (explicit): lane caches carry no shadows — this
+    // path uses the lane-major direct launchers below (never dispatch
+    // `Step::Attend`, never `shadow_pair`), so the non-shadow kernels run
+    // unconditionally and stale shadows on the request cache can never be
+    // read here. No shadow kernel is implemented for lane-major; do not add
+    // one without a lane-carried shadow contract.
     // Full-mask fast path preserves exact unmasked ABI; partial uses masked kernels.
     let full_mask = valid_lane_mask(batch_size)?;
     if active_mask == full_mask {

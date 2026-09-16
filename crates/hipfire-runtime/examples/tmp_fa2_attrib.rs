@@ -52,6 +52,22 @@
 //!     HIPFIRE_KERNEL_CACHE=/tmp/kc-r9700-fa2 \
 //!     ./target/release/examples/tmp_fa2_attrib ship1201
 //!
+//! Arm `shadow` (argv[1]=="shadow", exact gfx1151 only): shipping FA2
+//! entries (Q8 + fwht3) vs the shadow-fed entries
+//! (`attention_q8_0_fa2_gqa_shadow_gfx11` /
+//! `attention_q8_0_fa2_gqa_fwht3k_shadow_gfx11`) over host-built f16 shadows
+//! (`build_q8_shadow` / `build_fwht3_k_shadow`: exact kernel casts from the
+//! same K/V fixture bytes). Asserts bitwise-equal outputs per L at
+//! L ∈ {1024,8192,32768}; `TIME=1` adds interleaved medians ship vs shadow.
+//!
+//! Halo shadow (parent runs gates):
+//!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
+//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-shadow \
+//!     cargo run --release -p hipfire-runtime --features lab \
+//!       --example tmp_fa2_attrib -- shadow
+//!   TIME=1 cargo run --release -p hipfire-runtime --features lab \
+//!     --example tmp_fa2_attrib -- shadow
+//!
 //! Arm `rotcheck` (argv[1]=="rotcheck"): fwht3 Q-rotation isolation (L=1024
 //! fixture). Runs the frozen prod twin once and downloads the rotated f32 Q;
 //! runs the shipping pre-convert entry raw (do_rotate=1) on a fresh ORIGINAL
@@ -1234,6 +1250,92 @@ fn fill_fwht3_k(seq_len: usize, salt: u32) -> Vec<u8> {
     }
     buf
 }
+/// Exact IEEE754 f16-bits → f32 (matches device `(float)(_Float16)`; exact,
+/// no rounding — f16 is strictly narrower than f32).
+fn f16_bits_to_f32(bits: u16) -> f32 {
+    let sign = ((bits >> 15) & 1) as u32;
+    let exp = ((bits >> 10) & 0x1f) as u32;
+    let mant = (bits & 0x3ff) as u32;
+    let b: u32 = match (exp, mant) {
+        (0, 0) => sign << 31,
+        (0, _) => {
+            // Subnormal: renormalize (no fixture hits this; total anyway).
+            let mut m = mant;
+            let mut e: i32 = 127 - 14;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            (sign << 31) | ((e as u32) << 23) | ((m & 0x3ff) << 13)
+        }
+        (0x1f, 0) => (sign << 31) | (0xff << 23),
+        (0x1f, _) => (sign << 31) | (0xff << 23) | (mant << 13),
+        _ => (sign << 31) | ((exp + (127 - 15)) << 23) | (mant << 13),
+    };
+    f32::from_bits(b)
+}
+
+/// Host copy of `TURBO_C3_256` (turbo_common.h). Rust decimal→f32 literals
+/// are correctly rounded, exactly like the device `__constant__ float`
+/// initializers, so these bits match the device table.
+const TURBO_C3_256_HOST: [f32; 8] = [
+    -0.134860, -0.083320, -0.046469, -0.015176, 0.015176, 0.046469, 0.083320, 0.134860,
+];
+
+/// Host replica of `kv_cache_shadow_q8_0*` (same cast, same operand order):
+/// reload the f16 scale bits, `sf * code` in f32, RNE to f16. Row-major
+/// `[pos, N_KV, HD]` f16 bytes. Bitwise-identical to the device shadow.
+fn build_q8_shadow(cache: &[u8], seq_len: usize) -> Vec<u8> {
+    let bph = HD / 32;
+    let blocks_per_row = N_KV * bph;
+    let mut out = vec![0u8; seq_len * N_KV * HD * 2];
+    for g in 0..seq_len {
+        for kv in 0..N_KV {
+            for b in 0..bph {
+                let blk = g * blocks_per_row * Q8_BLOCK + (kv * bph + b) * Q8_BLOCK;
+                let su = u16::from_le_bytes([cache[blk], cache[blk + 1]]);
+                let sf = f16_bits_to_f32(su);
+                for c in 0..32 {
+                    let code = cache[blk + 2 + c] as i8 as f32;
+                    let h = f32_to_f16_rne(sf * code);
+                    let d = g * N_KV * HD + kv * HD + b * 32 + c;
+                    out[d * 2..d * 2 + 2].copy_from_slice(&h.to_le_bytes());
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Host replica of `kv_cache_shadow_fwht3_k*`: `(_Float16)(cnorm *
+/// TURBO_C3_256[code])` with the kernel's lane/pack mapping (lane `l` owns
+/// dims `l*8..l*8+7`; `code0=(packed>>6i)&7`, `code1=(packed>>(6i+3))&7`).
+/// Row-major `[pos, N_KV, HD]` f16 bytes. Bitwise-identical to the device.
+fn build_fwht3_k_shadow(k_fw: &[u8], seq_len: usize) -> Vec<u8> {
+    let mut out = vec![0u8; seq_len * N_KV * HD * 2];
+    for g in 0..seq_len {
+        for kv in 0..N_KV {
+            let base = g * FWHT3_POS + kv * FWHT3_HEAD;
+            let cnorm = f32::from_le_bytes([k_fw[base], k_fw[base + 1], k_fw[base + 2], k_fw[base + 3]]);
+            for lane in 0..32 {
+                let b0 = k_fw[base + 4 + lane * 3] as u32;
+                let b1 = k_fw[base + 4 + lane * 3 + 1] as u32;
+                let b2 = k_fw[base + 4 + lane * 3 + 2] as u32;
+                let packed = b0 | (b1 << 8) | (b2 << 16);
+                for i in 0..4 {
+                    let code0 = ((packed >> (6 * i)) & 7) as usize;
+                    let code1 = ((packed >> (6 * i + 3)) & 7) as usize;
+                    let h0 = f32_to_f16_rne(cnorm * TURBO_C3_256_HOST[code0]);
+                    let h1 = f32_to_f16_rne(cnorm * TURBO_C3_256_HOST[code1]);
+                    let d = g * N_KV * HD + kv * HD + lane * 8 + 2 * i;
+                    out[d * 2..d * 2 + 2].copy_from_slice(&h0.to_le_bytes());
+                    out[(d + 1) * 2..(d + 1) * 2 + 2].copy_from_slice(&h1.to_le_bytes());
+                }
+            }
+        }
+    }
+    out
+}
 
 fn download_bytes(gpu: &Gpu, t: &rdna_compute::GpuTensor, n_bytes: usize) -> Vec<u8> {
     let mut bytes = vec![0u8; n_bytes];
@@ -1351,6 +1453,65 @@ fn launch_ship_fwht3(
         d_q, d_k, d_v, d_out, d_pos, d_s1, d_s2, N_HEADS, N_KV, HD, seq_len, batch,
     )
     .unwrap_or_else(|e| panic!("ship fwht3 launch: {e:?}"));
+    gpu.hip
+        .event_record(&stop, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.hip.event_synchronize(&stop).unwrap();
+    let ms = gpu.hip.event_elapsed_ms(&start, &stop).unwrap() as f64;
+    let _ = gpu.hip.event_destroy(start);
+    let _ = gpu.hip.event_destroy(stop);
+    ms * 1000.0
+}
+fn launch_shadow_q8(
+    gpu: &mut Gpu,
+    d_q: &rdna_compute::GpuTensor,
+    d_ksh: &rdna_compute::GpuTensor,
+    d_vsh: &rdna_compute::GpuTensor,
+    d_out: &rdna_compute::GpuTensor,
+    d_pos: &rdna_compute::GpuTensor,
+    batch: usize,
+    seq_len: usize,
+) -> f64 {
+    let start = gpu.hip.event_create().unwrap();
+    let stop = gpu.hip.event_create().unwrap();
+    gpu.hip
+        .event_record(&start, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.attention_q8_0_fa2_gqa_shadow_gfx11(
+        d_q, d_ksh, d_vsh, d_out, d_pos, N_HEADS, N_KV, HD, seq_len, batch,
+    )
+    .unwrap_or_else(|e| panic!("shadow q8 launch: {e:?}"));
+    gpu.hip
+        .event_record(&stop, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.hip.event_synchronize(&stop).unwrap();
+    let ms = gpu.hip.event_elapsed_ms(&start, &stop).unwrap() as f64;
+    let _ = gpu.hip.event_destroy(start);
+    let _ = gpu.hip.event_destroy(stop);
+    ms * 1000.0
+}
+
+fn launch_shadow_fwht3(
+    gpu: &mut Gpu,
+    d_q: &rdna_compute::GpuTensor,
+    d_ksh: &rdna_compute::GpuTensor,
+    d_vsh: &rdna_compute::GpuTensor,
+    d_out: &rdna_compute::GpuTensor,
+    d_pos: &rdna_compute::GpuTensor,
+    d_s1: &rdna_compute::GpuTensor,
+    d_s2: &rdna_compute::GpuTensor,
+    batch: usize,
+    seq_len: usize,
+) -> f64 {
+    let start = gpu.hip.event_create().unwrap();
+    let stop = gpu.hip.event_create().unwrap();
+    gpu.hip
+        .event_record(&start, gpu.active_stream.as_ref())
+        .unwrap();
+    gpu.attention_q8_0_fa2_gqa_fwht3k_shadow_gfx11(
+        d_q, d_ksh, d_vsh, d_out, d_pos, d_s1, d_s2, N_HEADS, N_KV, HD, seq_len, batch,
+    )
+    .unwrap_or_else(|e| panic!("shadow fwht3 launch: {e:?}"));
     gpu.hip
         .event_record(&stop, gpu.active_stream.as_ref())
         .unwrap();
@@ -1655,6 +1816,176 @@ fn run_ship(gpu: &mut Gpu) {
         );
     }
     eprintln!("\nF4b ship arm complete.");
+}
+/// Shadow arm (argv[1]=="shadow", exact gfx1151 only): shipping FA2 entries
+/// (Q8 + fwht3, dequant in-fill) vs the shadow-fed entries
+/// (`attention_q8_0_fa2_gqa_shadow_gfx11` /
+/// `attention_q8_0_fa2_gqa_fwht3k_shadow_gfx11`) over host-built f16 shadows.
+/// Shadows come from the SAME K/V fixture bytes via `build_q8_shadow` /
+/// `build_fwht3_k_shadow` (exact kernel casts), so any fill divergence shows
+/// as output bits. Always asserts bitwise-equal outputs (panics with
+/// n_diff/max_abs otherwise); `TIME=1` additionally reports interleaved
+/// medians (ship/shadow alternating per iteration, same recipe as the ship
+/// arm). L ∈ {1024, 8192, 32768}, batch 512, positions at end of L.
+fn run_shadow(gpu: &mut Gpu) {
+    eprintln!("\n=== shadow arm: shipping FA2 vs shadow-fed entries ===");
+    eprintln!(
+        "shape H{N_HEADS}/KV{N_KV}/D{HD} batch={BATCH}  L∈{L_VALUES:?}  positions at end of L"
+    );
+    eprintln!("Q8: ship=attention_q8_0_fa2_gqa_gfx11  shadow=attention_q8_0_fa2_gqa_shadow_gfx11");
+    eprintln!(
+        "fwht3: ship=attention_q8_0_fa2_gqa_fwht3k_gfx11  shadow=attention_q8_0_fa2_gqa_fwht3k_shadow_gfx11"
+    );
+    let time_it = std::env::var("TIME").map(|v| v == "1").unwrap_or(false);
+    eprintln!("timing medians: {time_it} (TIME=1 enables)");
+
+    let signs1 = gen_fwht_signs(42, 256);
+    let signs2 = gen_fwht_signs(1042, 256);
+    let d_s1 = gpu.upload_f32(&signs1, &[256]).unwrap();
+    let d_s2 = gpu.upload_f32(&signs2, &[256]).unwrap();
+
+    for &l in &L_VALUES {
+        eprintln!("\n-- L={l} (positions {}..{}) --", l - BATCH, l - 1);
+        let t_pack = Instant::now();
+        let pos_h = fill_positions_end_of_l(BATCH, l);
+        let q_h = fill_q(BATCH, 0xF30A);
+        let k_q8 = fill_q8_cache(l, 0xF30B);
+        let v_h = fill_q8_cache(l, 0xF30C);
+        let k_fw = fill_fwht3_k(l, 0xF30D);
+        // Host shadows from the same bytes (exact kernel casts).
+        let ksh_q8 = build_q8_shadow(&k_q8, l);
+        let vsh = build_q8_shadow(&v_h, l);
+        let ksh_fw = build_fwht3_k_shadow(&k_fw, l);
+        eprintln!(
+            "packed Q={}  Kq8={}  Kfw={}  V={}  pos={}  shadows Kq8/V/Kfw={}/{}/{} in {:.2}s",
+            q_h.len(),
+            k_q8.len(),
+            k_fw.len(),
+            v_h.len(),
+            pos_h.len(),
+            ksh_q8.len(),
+            vsh.len(),
+            ksh_fw.len(),
+            t_pack.elapsed().as_secs_f64()
+        );
+
+        let d_k_q8 = gpu.upload_raw(&k_q8, &[k_q8.len()]).unwrap();
+        let d_k_fw = gpu.upload_raw(&k_fw, &[k_fw.len()]).unwrap();
+        let d_v = gpu.upload_raw(&v_h, &[v_h.len()]).unwrap();
+        let d_ksh_q8 = gpu.upload_raw(&ksh_q8, &[ksh_q8.len()]).unwrap();
+        let d_vsh = gpu.upload_raw(&vsh, &[vsh.len()]).unwrap();
+        let d_ksh_fw = gpu.upload_raw(&ksh_fw, &[ksh_fw.len()]).unwrap();
+        let pos_bytes = positions_to_bytes(&pos_h);
+        let d_pos = gpu.upload_raw(&pos_bytes, &[pos_bytes.len()]).unwrap();
+
+        let d_out_ship_q8 = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+        let d_out_sh_q8 = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+        let d_out_ship_fw = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+        let d_out_sh_fw = gpu.zeros(&[BATCH * QO_ROW], DType::F32).unwrap();
+
+        // ---- Q8 bit-exact: shipping (dequant in-fill) vs shadow-fed ----
+        // Both launchers pre-convert Q internally and never mutate it, so
+        // one Q upload serves both sides (unlike the frozen prod twin).
+        let d_q = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+        zero_out(gpu, &d_out_ship_q8, BATCH * QO_ROW);
+        zero_out(gpu, &d_out_sh_q8, BATCH * QO_ROW);
+        let _ = launch_ship_q8(gpu, &d_q, &d_k_q8, &d_v, &d_out_ship_q8, &d_pos, BATCH, l);
+        let _ = launch_shadow_q8(gpu, &d_q, &d_ksh_q8, &d_vsh, &d_out_sh_q8, &d_pos, BATCH, l);
+        let ship_out = download_f32(gpu, &d_out_ship_q8, BATCH * QO_ROW);
+        let sh_out = download_f32(gpu, &d_out_sh_q8, BATCH * QO_ROW);
+        let eq = bitwise_eq_f32(&ship_out, &sh_out);
+        let mut n_diff = 0usize;
+        let mut max_abs = 0.0f32;
+        for (a, b) in ship_out.iter().zip(sh_out.iter()) {
+            if a.to_bits() != b.to_bits() {
+                n_diff += 1;
+                max_abs = max_abs.max((a - b).abs());
+            }
+        }
+        eprintln!("  bitwise_eq L={l} Q8 ship_vs_shadow = {eq}  n_diff={n_diff} max_abs={max_abs:.6e}");
+        assert!(eq, "Q8 shadow mismatch at L={l}: n_diff={n_diff} max_abs={max_abs:.6e}");
+
+        // ---- fwht3 bit-exact: shipping vs shadow-fed ----
+        let d_q_fw = gpu.upload_f32(&q_h, &[BATCH, N_HEADS, HD]).unwrap();
+        zero_out(gpu, &d_out_ship_fw, BATCH * QO_ROW);
+        zero_out(gpu, &d_out_sh_fw, BATCH * QO_ROW);
+        let _ = launch_ship_fwht3(
+            gpu, &d_q_fw, &d_k_fw, &d_v, &d_out_ship_fw, &d_pos, &d_s1, &d_s2, BATCH, l,
+        );
+        let _ = launch_shadow_fwht3(
+            gpu, &d_q_fw, &d_ksh_fw, &d_vsh, &d_out_sh_fw, &d_pos, &d_s1, &d_s2, BATCH, l,
+        );
+        let ship_fw_out = download_f32(gpu, &d_out_ship_fw, BATCH * QO_ROW);
+        let sh_fw_out = download_f32(gpu, &d_out_sh_fw, BATCH * QO_ROW);
+        let eq_o = bitwise_eq_f32(&ship_fw_out, &sh_fw_out);
+        let mut n_diff_o = 0usize;
+        let mut max_abs_o = 0.0f32;
+        for (a, b) in ship_fw_out.iter().zip(sh_fw_out.iter()) {
+            if a.to_bits() != b.to_bits() {
+                n_diff_o += 1;
+                max_abs_o = max_abs_o.max((a - b).abs());
+            }
+        }
+        eprintln!(
+            "  bitwise_eq L={l} fwht3 ship_vs_shadow = {eq_o}  n_diff={n_diff_o} max_abs={max_abs_o:.6e}"
+        );
+        assert!(
+            eq_o,
+            "fwht3 shadow mismatch at L={l}: n_diff={n_diff_o} max_abs={max_abs_o:.6e}"
+        );
+
+        if !time_it {
+            continue;
+        }
+        // ---- Warmup (interleaved ship/shadow, Q immutable — no refresh) ----
+        for _ in 0..ATTR_WARMUP {
+            let _ = launch_ship_q8(gpu, &d_q, &d_k_q8, &d_v, &d_out_ship_q8, &d_pos, BATCH, l);
+            let _ = launch_shadow_q8(gpu, &d_q, &d_ksh_q8, &d_vsh, &d_out_sh_q8, &d_pos, BATCH, l);
+            let _ = launch_ship_fwht3(
+                gpu, &d_q_fw, &d_k_fw, &d_v, &d_out_ship_fw, &d_pos, &d_s1, &d_s2, BATCH, l,
+            );
+            let _ = launch_shadow_fwht3(
+                gpu, &d_q_fw, &d_ksh_fw, &d_vsh, &d_out_sh_fw, &d_pos, &d_s1, &d_s2, BATCH, l,
+            );
+        }
+
+        let mut samp_ship_q8 = Vec::with_capacity(ATTR_ITERS);
+        let mut samp_sh_q8 = Vec::with_capacity(ATTR_ITERS);
+        let mut samp_ship_fw = Vec::with_capacity(ATTR_ITERS);
+        let mut samp_sh_fw = Vec::with_capacity(ATTR_ITERS);
+        for _ in 0..ATTR_ITERS {
+            let us = launch_ship_q8(gpu, &d_q, &d_k_q8, &d_v, &d_out_ship_q8, &d_pos, BATCH, l);
+            samp_ship_q8.push(us);
+            let us = launch_shadow_q8(gpu, &d_q, &d_ksh_q8, &d_vsh, &d_out_sh_q8, &d_pos, BATCH, l);
+            samp_sh_q8.push(us);
+            let us = launch_ship_fwht3(
+                gpu, &d_q_fw, &d_k_fw, &d_v, &d_out_ship_fw, &d_pos, &d_s1, &d_s2, BATCH, l,
+            );
+            samp_ship_fw.push(us);
+            let us = launch_shadow_fwht3(
+                gpu, &d_q_fw, &d_ksh_fw, &d_vsh, &d_out_sh_fw, &d_pos, &d_s1, &d_s2, BATCH, l,
+            );
+            samp_sh_fw.push(us);
+        }
+
+        let med_sq = median_f64(&mut samp_ship_q8);
+        let med_hq = median_f64(&mut samp_sh_q8);
+        let med_sf = median_f64(&mut samp_ship_fw);
+        let med_hf = median_f64(&mut samp_sh_fw);
+        let r_q8 = med_hq / med_sq.max(1e-30);
+        let r_fw = med_hf / med_sf.max(1e-30);
+        eprintln!(
+            "  Q8   ship_median_us={med_sq:.2}  shadow_median_us={med_hq:.2}  shadow/ship={r_q8:.4}  ({:.2}% of ship)  speedup={:.2}%",
+            r_q8 * 100.0,
+            (1.0 - r_q8) * 100.0
+        );
+        eprintln!(
+            "  fwht3 ship_median_us={med_sf:.2}  shadow_median_us={med_hf:.2}  shadow/ship={r_fw:.4}  ({:.2}% of ship)  speedup={:.2}%",
+            r_fw * 100.0,
+            (1.0 - r_fw) * 100.0
+        );
+    }
+    eprintln!("\nshadow arm complete.");
 }
 
 fn ensure_prod_1201(gpu: &mut Gpu) {
@@ -2813,15 +3144,18 @@ fn main() {
     let arm = std::env::args().nth(1).unwrap_or_default();
     let is_ship = arm == "ship";
     let is_ship1201 = arm == "ship1201";
+    let is_shadow = arm == "shadow";
     let is_rotcheck = arm == "rotcheck";
     let is_iu8probe = arm == "iu8probe";
     eprintln!(
-        "tmp_fa2_attrib arch={}  arm={}  (F3.0 attribution / F4b ship+rotcheck / ship1201 / F5.1 iu8probe)",
+        "tmp_fa2_attrib arch={}  arm={}  (F3.0 attribution / F4b ship+rotcheck / ship1201 / shadow / F5.1 iu8probe)",
         gpu.arch,
         if is_ship {
             "ship"
         } else if is_ship1201 {
             "ship1201"
+        } else if is_shadow {
+            "shadow"
         } else if is_rotcheck {
             "rotcheck"
         } else if is_iu8probe {
@@ -2875,6 +3209,25 @@ fn main() {
         gpu.active_stream = Some(gpu.hip.stream_create().expect("stream"));
     }
 
+    if is_shadow {
+        if gpu.arch != "gfx1151" {
+            eprintln!("skip: shadow needs exact gfx1151, got {}", gpu.arch);
+            eprintln!("Halo command (parent runs gates):");
+            eprintln!(
+                "  HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \\"
+            );
+            eprintln!("    HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-shadow \\");
+            eprintln!(
+                "    cargo run --release -p hipfire-runtime --features lab --example tmp_fa2_attrib -- shadow"
+            );
+            eprintln!(
+                "  TIME=1 cargo run --release -p hipfire-runtime --features lab --example tmp_fa2_attrib -- shadow"
+            );
+            return;
+        }
+        run_shadow(&mut gpu);
+        return;
+    }
     if is_ship {
         run_ship(&mut gpu);
         return;

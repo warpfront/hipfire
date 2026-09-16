@@ -1787,20 +1787,42 @@ fn dispatch_attend(
                     && io.tree_bias.is_none()
                     && plan.v_mode_bits == 8
                 {
-                    hip!(gpu.attention_q8_0_fa2_gqa_fwht3k_gfx11(
-                        io.q,
-                        io.k_cache,
-                        io.v_cache,
-                        io.output,
-                        io.positions(),
-                        ct,
-                        st,
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.max_ctx_len,
-                        io.batch_size,
-                    ))?;
+                    // f16 shadow (Halo-only): the write arm above already
+                    // emitted the shadows via `launch_maybe_blob`, so route
+                    // to the shadow-fed entry (same predicates — exact
+                    // gfx1151 comes from `kv_shadow_active`); else the
+                    // incumbent dequant entry below. Capture-safe either way.
+                    if kv_shadow_active(gpu, io) {
+                        hip!(gpu.attention_q8_0_fa2_gqa_fwht3k_shadow_gfx11(
+                            io.q,
+                            io.k_shadow.unwrap(),
+                            io.v_shadow.unwrap(),
+                            io.output,
+                            io.positions(),
+                            ct,
+                            st,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ))?;
+                    } else {
+                        hip!(gpu.attention_q8_0_fa2_gqa_fwht3k_gfx11(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            ct,
+                            st,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ))?;
+                    }
                     return Ok(());
                 }
                 #[cfg(feature = "flash-attn-ck")]
@@ -1944,6 +1966,41 @@ fn dispatch_attend(
             // gfx1151 measurement showed the opposite. Other arches keep 8192
             // until measured — do not globalise this without per-arch evidence.
             KernelKey::AttnQ8_0KvBatchedMasked => {
+                // f16 shadow FA2 (Halo-only): exact gfx1151 + shadow present
+                // routes to the shadow-fed entry ahead of every flash path
+                // below. Same shape predicates as the fwht3 FA2 ingress
+                // (H24/KV4/D256, batch-admitted, %16, ctx range, no tree,
+                // v_mode 8) plus `kv_shadow_active` (exact gfx1151 +
+                // `attention.kv_shadow_f16` + both shadow sides on `io`).
+                // The family write arms already emitted both chunks' shadows
+                // via `launch_maybe_blob`, so this is capture-safe; the
+                // shadow launcher reuses the shared kernarg pack. Falls
+                // through to the incumbent routes otherwise.
+                if kv_shadow_active(gpu, io)
+                    && gpu.flags.gfx11_fa2_prefill
+                    && io.n_heads == 24
+                    && io.n_kv_heads == 4
+                    && io.head_dim == 256
+                    && gpu.fa2_gfx11_batch_admitted(io.batch_size)
+                    && io.batch_size % 16 == 0
+                    && (64..=32768).contains(&io.max_ctx_len)
+                    && io.tree_bias.is_none()
+                    && plan.v_mode_bits == 8
+                {
+                    hip!(gpu.attention_q8_0_fa2_gqa_shadow_gfx11(
+                        io.q,
+                        io.k_shadow.unwrap(),
+                        io.v_shadow.unwrap(),
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ))?;
+                    return Ok(());
+                }
                 // HIPFIRE_FLASH_PREFILL=0 forces off anywhere. Resolve the
                 // single precedence rule before either backend is attempted,
                 // so CK and the native WMMA/scalar routes share one gate.
