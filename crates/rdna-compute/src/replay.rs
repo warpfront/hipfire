@@ -944,6 +944,22 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(40),
         ]);
     }
+    // T-C Halo prefill fusions. The conv fusion shares the decode qknorm
+    // ABI prefix layout (3 writes, 2 reads, state write) — spelled out
+    // explicitly so a future prefix-arm change cannot silently mislabel it.
+    if kernel == "conv1d_silu_split_qknorm_interleave_batched" {
+        return Some(vec![
+            write(0),
+            write(8),
+            write(16),
+            read(24),
+            read(32),
+            write(40),
+        ]);
+    }
+    if kernel == "deinterleave_q_rmsnorm_f32_batched" {
+        return Some(vec![read(0), write(8), write(16), read(24)]);
+    }
     match kernel {
         "add_inplace_f32" => Some(vec![write(0), read(8)]),
         "fused_rmsnorm_mq_rotate"
@@ -1539,6 +1555,15 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     }
     if kernel.starts_with("conv1d_silu_split_qknorm_") {
         return Some(80);
+    }
+    // T-C Halo prefill fusions: 6 ptr + 5 i32 + 2 f32 = 76 -> 80, and
+    // 4 ptr + 3 i32 + 1 f32 = 48. (The conv fusion also matches the
+    // qknorm prefix arm above at the same size; spelled out explicitly.)
+    if kernel == "conv1d_silu_split_qknorm_interleave_batched" {
+        return Some(80);
+    }
+    if kernel == "deinterleave_q_rmsnorm_f32_batched" {
+        return Some(48);
     }
     if kernel == "fused_qkvza_hfq4g256_k2048_scalar_prep" {
         return Some(112);

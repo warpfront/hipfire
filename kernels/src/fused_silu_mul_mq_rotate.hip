@@ -224,3 +224,116 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     x_rot_b[base + 7] = f7;
 #endif
 }
+
+#ifdef HIPFIRE_IU4_SIDECAR
+// Single-input SwiGLU/FWHT IU4 producer: the up_proj GEMM already folded
+// silu(gate)*up into one f32 buffer (see the IU4 GEMM `silumul` epilogue),
+// so this entry applies only signs1 + FWHT + the block_i4_128 sidecar.
+// Phase 1 is bit-exact vs the two-input entry: v = w * signs1 with w the
+// exact f32 reload of SILU_MUL(g,u) = (g)/(1+expf(-(g)))*(u), i.e. the same
+// single multiply the two-input entry performs last. Butterfly, 0.0625
+// scale, signs2, x_rot store, and sidecar emit are verbatim copies — keep
+// them in sync with HIPFIRE_SILU_MQ_ROTATE_KERNEL above.
+extern "C" __launch_bounds__(32, 16)
+__global__ void fused_silu_mul_mq_rotate_i4_fused(
+    const float* __restrict__ w,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    float* __restrict__ x_rot,          // nullable when emit_f32=false
+    block_i4_128* __restrict__ x_i4,    // [K/128, N]
+    int K,
+    int N
+) {
+    const int group = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int groups_total = K / 256;
+    if (group >= groups_total) return;
+
+    // Batch row: grid.y is the batch dim. For decode grid=[groups_total, 1, 1]
+    // and blockIdx.y = 0 (byte-identical to pre-batching). For prefill,
+    // grid=[groups_total, N, 1]; w and x_rot are [N × K] row-major.
+    const long long batch_off = (long long)blockIdx.y * K;
+    const float* w_b  = w  + batch_off;
+          float* x_rot_b = (x_rot != nullptr) ? (x_rot + batch_off) : nullptr;
+
+    int d0 = tid * 8;
+    int base = group * 256 + d0;
+
+    // Phase 1: read the pre-fused silu(gate)*up, apply signs1.
+    float w0 = w_b[base];
+    float w1 = w_b[base + 1];
+    float w2 = w_b[base + 2];
+    float w3 = w_b[base + 3];
+    float w4 = w_b[base + 4];
+    float w5 = w_b[base + 5];
+    float w6 = w_b[base + 6];
+    float w7 = w_b[base + 7];
+
+    float v0 = w0 * signs1[d0];
+    float v1 = w1 * signs1[d0 + 1];
+    float v2 = w2 * signs1[d0 + 2];
+    float v3 = w3 * signs1[d0 + 3];
+    float v4 = w4 * signs1[d0 + 4];
+    float v5 = w5 * signs1[d0 + 5];
+    float v6 = w6 * signs1[d0 + 6];
+    float v7 = w7 * signs1[d0 + 7];
+
+    // Local butterfly: strides 1, 2, 4 — identical to mq_rotate_x.
+    float t;
+    t = v0; v0 = v0 + v1; v1 = t - v1;
+    t = v2; v2 = v2 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v5; v5 = t - v5;
+    t = v6; v6 = v6 + v7; v7 = t - v7;
+
+    t = v0; v0 = v0 + v2; v2 = t - v2;
+    t = v1; v1 = v1 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v6; v6 = t - v6;
+    t = v5; v5 = v5 + v7; v7 = t - v7;
+
+    t = v0; v0 = v0 + v4; v4 = t - v4;
+    t = v1; v1 = v1 + v5; v5 = t - v5;
+    t = v2; v2 = v2 + v6; v6 = t - v6;
+    t = v3; v3 = v3 + v7; v7 = t - v7;
+
+    // Wave butterfly via ds_swizzle — same as mq_rotate_x.
+    #define HBFLY_FUSED(v, pat, str) do { \
+        float _p = __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), (pat))); \
+        if (tid & (str)) { (v) = _p - (v); } else { (v) = (v) + _p; } \
+    } while(0)
+
+    #define HBFLY8_FUSED(pat, str) \
+        HBFLY_FUSED(v0,pat,str); HBFLY_FUSED(v1,pat,str); HBFLY_FUSED(v2,pat,str); HBFLY_FUSED(v3,pat,str); \
+        HBFLY_FUSED(v4,pat,str); HBFLY_FUSED(v5,pat,str); HBFLY_FUSED(v6,pat,str); HBFLY_FUSED(v7,pat,str)
+
+    HBFLY8_FUSED(0x041F, 1);
+    HBFLY8_FUSED(0x081F, 2);
+    HBFLY8_FUSED(0x101F, 4);
+    HBFLY8_FUSED(0x201F, 8);
+    HBFLY8_FUSED(0x401F, 16);
+    #undef HBFLY8_FUSED
+    #undef HBFLY_FUSED
+
+    const float s = 0.0625f;
+    float f0 = v0 * s * signs2[d0];
+    float f1 = v1 * s * signs2[d0 + 1];
+    float f2 = v2 * s * signs2[d0 + 2];
+    float f3 = v3 * s * signs2[d0 + 3];
+    float f4 = v4 * s * signs2[d0 + 4];
+    float f5 = v5 * s * signs2[d0 + 5];
+    float f6 = v6 * s * signs2[d0 + 6];
+    float f7 = v7 * s * signs2[d0 + 7];
+    if (x_rot_b != nullptr) {
+        x_rot_b[base]     = f0;
+        x_rot_b[base + 1] = f1;
+        x_rot_b[base + 2] = f2;
+        x_rot_b[base + 3] = f3;
+        x_rot_b[base + 4] = f4;
+        x_rot_b[base + 5] = f5;
+        x_rot_b[base + 6] = f6;
+        x_rot_b[base + 7] = f7;
+    }
+    emit_iu4_sidecar_from_producer8(
+        f0, f1, f2, f3, f4, f5, f6, f7,
+        x_i4, group, (int)blockIdx.y, N, tid);
+}
+#endif

@@ -2134,6 +2134,85 @@ impl Gpu {
         result
     }
 
+    /// T-C Halo prefill fusion: batched deinterleave with the FullAttention Q
+    /// RMSNorm folded in. Bit-identical q_out/gate_out to the
+    /// `deinterleave_f32_batched` + in-place `rmsnorm_batched(q)` sequence;
+    /// the Q global-memory round trip is gone. Uses the same blockDim the
+    /// unfused `rmsnorm_batched` would pick (min(256, head_dim)) so the
+    /// reduction order matches exactly. `q_out` must not alias `interleaved`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deinterleave_q_rmsnorm_f32_batched(
+        &mut self,
+        interleaved: &GpuTensor,
+        q_out: &GpuTensor,
+        gate_out: &GpuTensor,
+        q_norm: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        n: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let block = 256u32.min(head_dim as u32);
+        if head_dim > 8 * block as usize {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "deinterleave+qnorm fusion requires head_dim<=2048",
+            ));
+        }
+        const KERNEL: &str = "deinterleave_q_rmsnorm_f32_batched";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC,
+            KERNEL,
+        )?;
+        let mut inp = interleaved.buf.as_ptr();
+        let mut qp = q_out.buf.as_ptr();
+        let mut gp = gate_out.buf.as_ptr();
+        let mut wp = q_norm.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut nn = n as i32;
+        let mut ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut inp as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+        ];
+        // Fused traffic: interleaved read + Q/gate writes + norm weight;
+        // the Q store+reload round trip is gone.
+        let bytes = n * n_heads * head_dim * 4 * 4 + head_dim * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [n_heads as u32, n as u32, 1],
+            [block, 1, 1],
+            block * 4,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(inp);
+                b.push_ptr(qp);
+                b.push_ptr(gp);
+                b.push_ptr(wp);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(nn);
+                b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     #[cfg(feature = "deltanet")]
     pub fn sigmoid_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
@@ -4566,6 +4645,116 @@ impl Gpu {
                 b.push_i32(kd);
                 b.push_i32(vd);
                 b.push_i32(nt);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// T-C Halo prefill fusion: batched conv1d + SiLU + Q/K/V split with the
+    /// DeltaNet Q/K L2-norm, Q scale, and repeat-interleave tail in one
+    /// launch. Bit-identical q_dst/k_dst/v_out to the
+    /// `conv1d_silu_split_f32_n` + `fused_qk_l2_norm_scale_interleave_f32_batched`
+    /// (or + `fused_qk_l2_norm_scale_f32_batched` + `repeat_interleave_qk`)
+    /// sequence; `q_raw`/`k_raw` scratch is NOT populated (no downstream
+    /// reader — see batch_chunk_delta_net_pre_gdn). Sequential single-lane
+    /// batches only (`state` is `[(2*k_dim+v_dim) x 3]`); tree, independent,
+    /// and masked variants keep their own kernels. Requires head_dim == 128.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn conv1d_silu_split_qknorm_interleave_batched(
+        &mut self,
+        q_dst: &GpuTensor,
+        k_dst: &GpuTensor,
+        v_out: &GpuTensor,
+        input: &GpuTensor,
+        weight: &GpuTensor,
+        state: &GpuTensor,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+        n_key_heads: usize,
+        ratio: usize,
+        head_dim: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if head_dim != 128 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "conv+qknorm+interleave fusion requires head_dim=128",
+            ));
+        }
+        const KERNEL: &str = "conv1d_silu_split_qknorm_interleave_batched";
+        const BLOCK: u32 = 256;
+        self.ensure_kernel(
+            KERNEL,
+            kernels::CONV1D_SILU_SPLIT_QKNORM_INTERLEAVE_BATCHED_SRC,
+            KERNEL,
+        )?;
+        let qd = q_dst.buf.as_ptr();
+        let kd = k_dst.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let ip = input.buf.as_ptr();
+        let wp = weight.buf.as_ptr();
+        let sp = state.buf.as_ptr();
+        let kdi = k_dim as i32;
+        let vdi = v_dim as i32;
+        let nt = n_tokens as i32;
+        let nkh = n_key_heads as i32;
+        let rat = ratio as i32;
+        let hdi = head_dim as i32;
+        let qs = q_scale;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &qd as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &kdi as *const _ as *mut c_void,
+            &vdi as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &nkh as *const _ as *mut c_void,
+            &rat as *const _ as *mut c_void,
+            &hdi as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        let v_blocks = (v_dim as u32 + BLOCK - 1) / BLOCK;
+        let grid = n_key_heads as u32 + v_blocks;
+        // Fused traffic: full conv traffic plus the replicated (ratio-1)
+        // destination expansion; the q_raw/k_raw round trip is gone.
+        let bytes = crate::profile::conv1d_silu_bytes(2 * k_dim + v_dim) * n_tokens
+            + (ratio.saturating_sub(1) * k_dim) * 4 * 2 * n_tokens;
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [grid, 1, 1],
+            [BLOCK, 1, 1],
+            2 * 128 * 4,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qd);
+                b.push_ptr(kd);
+                b.push_ptr(vp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_i32(kdi);
+                b.push_i32(vdi);
+                b.push_i32(nt);
+                b.push_i32(nkh);
+                b.push_i32(rat);
+                b.push_i32(hdi);
+                b.push_f32(qs);
+                b.push_f32(ep);
                 b
             },
         );

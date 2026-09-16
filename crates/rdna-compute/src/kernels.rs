@@ -1107,6 +1107,20 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+/// T-B IU4 producer sidecar: standalone FWHT rotate + in-register
+/// `block_i4_128` emit for wo (residual) inputs. Prepends the shared quant
+/// recipe; the old `mq_rotate_x` / `rotate_x_mq_awq` symbols stay untouched.
+pub const MQ_ROTATE_X_I4_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
+pub const MQ_ROTATE_X_AWQ_I4_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_AWQ 1\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
 
 pub const RMSNORM_REDUCE_GFX942_SRC: &str =
     include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");
@@ -6467,6 +6481,14 @@ pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
     include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
 );
 
+/// T-C Halo prefill fusion: conv1d+SiLU+split with the DeltaNet Q/K L2-norm,
+/// Q scale, and repeat-interleave tail in one launch. Sequential single-lane
+/// batches only; see
+/// `kernels/src/conv1d_silu_split_qknorm_interleave_batched.hip`.
+#[cfg(feature = "deltanet")]
+pub const CONV1D_SILU_SPLIT_QKNORM_INTERLEAVE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/conv1d_silu_split_qknorm_interleave_batched.hip");
+
 /// Tree-aware variant of conv1d_silu_split. Each in-block token walks its
 /// ancestor chain via parent_indices[] for the 3-tap causal window, falling
 /// back to pre-block conv_state when the chain exits the block. Leaves
@@ -6775,6 +6797,12 @@ pub const DEINTERLEAVE_SRC: &str = include_str!("../../../kernels/src/deinterlea
 /// Batched deinterleave: same as DEINTERLEAVE but processes N tokens in one launch.
 pub const DEINTERLEAVE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/deinterleave_batched.hip");
+
+/// T-C Halo prefill fusion: batched deinterleave with the FullAttention Q
+/// RMSNorm folded in (gate passes through). See
+/// `kernels/src/deinterleave_q_rmsnorm_f32_batched.hip`.
+pub const DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/deinterleave_q_rmsnorm_f32_batched.hip");
 
 /// Single-token repeat-interleave Q and K key heads up to value heads count.
 pub const REPEAT_INTERLEAVE_QK_SRC: &str =
@@ -7870,6 +7898,25 @@ mod dispatch_tests {
         assert!(!FUSED_RMSNORM_MQ_ROTATE_AWQ_SRC.contains("x_shared"));
         assert!(!FUSED_RMSNORM_MQ_ROTATE_SRC.contains("#define HIPFIRE_RMSNORM_AWQ 1"));
     }
+    #[test]
+    fn rotate_i4_sidecars_derive_from_the_uniform_source() {
+        assert!(!MQ_ROTATE_X_I4_SRC.contains("#define HIPFIRE_ROTATE_AWQ 1"));
+        assert!(MQ_ROTATE_X_AWQ_I4_SRC.contains("#define HIPFIRE_ROTATE_AWQ 1\n"));
+        assert!(MQ_ROTATE_X_I4_SRC.contains("#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i4"));
+        assert!(MQ_ROTATE_X_AWQ_I4_SRC
+            .contains("#define HIPFIRE_ROTATE_KERNEL rotate_x_mq_awq_i4"));
+        // Shared recipe (struct + emit helper) must precede the kernel body,
+        // and the standalone symbol must stay out of the concat.
+        for src in [MQ_ROTATE_X_I4_SRC, MQ_ROTATE_X_AWQ_I4_SRC] {
+            assert!(src.contains("#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1"));
+            let recipe = src.find("struct block_i4_128").expect("recipe first");
+            let kernel = src
+                .find("extern \"C\" __global__ void HIPFIRE_ROTATE_KERNEL")
+                .expect("kernel last");
+            assert!(recipe < kernel);
+        }
+    }
+
 
     #[test]
     fn qwen2_bias_symbols_are_isolated_from_existing_qkv_modules() {

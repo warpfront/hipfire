@@ -313,6 +313,19 @@ enum Mq4v2QkvVariant {
     K2048XBufferGfx1100,
 }
 
+/// Epilogue selector for the iu4-direct MMQ consumer
+/// (`gemm_mq4g256v2_mmq_prequant_iu4`). `SiluMul` is the prefill SwiGLU-fusion
+/// mode: `Y` already holds the gate_proj output and each element is replaced
+/// in place by `silu(Y[i]) * dot` (see the `silumul` entries in
+/// `gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip`). Seven-arg ABI is kept; the
+/// `add` kernarg is ignored by the silumul entries.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Iu4Epilogue {
+    Set,
+    Add,
+    SiluMul,
+}
+
 /// Exact-gfx1100 MQ4V2 residual verify-tier pick (N<=16 DFlash tier).
 ///
 /// Shared by the F32 entry below and the F16 entry in
@@ -19044,7 +19057,7 @@ impl Gpu {
         m: usize,
         k: usize,
         batch_size: usize,
-        add: bool,
+        epilogue: Iu4Epilogue,
     ) -> HipResult<()> {
         if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151") {
             return Err(hip_bridge::HipError::new(
@@ -19070,15 +19083,22 @@ impl Gpu {
             && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
             && !self.replay.is_recording()
             && !self.graphs.capture_mode;
-        let kernel_name = match (full, add, use_col) {
-            (true, true, true) => {
+        let kernel_name = match (full, epilogue, use_col) {
+            (true, Iu4Epilogue::Add, true) => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151"
             }
-            (true, false, true) => {
+            (true, Iu4Epilogue::Set, true) => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151"
             }
-            (true, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
-            (true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+            (true, Iu4Epilogue::SiluMul, true) => {
+                "gemm_mq4g256v2_residual_mmq_iu4_full_silumul_occ3_col_gfx1151"
+            }
+            (true, Iu4Epilogue::Add, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
+            (true, Iu4Epilogue::Set, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+            (true, Iu4Epilogue::SiluMul, false) => {
+                "gemm_mq4g256v2_residual_mmq_iu4_full_silumul_occ3"
+            }
+            (false, Iu4Epilogue::SiluMul, _) => "gemm_mq4g256v2_residual_mmq_iu4_silumul",
             (false, _, _) => "gemm_mq4g256v2_residual_mmq_iu4",
         };
         const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
@@ -19093,7 +19113,8 @@ impl Gpu {
         let mut m_val = m as i32;
         let mut k_val = k as i32;
         let mut n_val = batch_size as i32;
-        let mut add_val = i32::from(add);
+        // SiluMul entries ignore the `add` kernarg (ABI kept at seven args).
+        let mut add_val = i32::from(epilogue == Iu4Epilogue::Add);
         let mut params: Vec<*mut c_void> = vec![
             &mut a_ptr as *mut _ as *mut c_void,
             &mut xq_ptr as *mut _ as *mut c_void,
@@ -19114,7 +19135,13 @@ impl Gpu {
         let batch_tiles = batch_size.div_ceil(MMQ_X);
         let shared_mem =
             ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
-        let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
+        let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4
+            // SiluMul re-reads the gate buffer resident from the gate_proj `set`.
+            + if epilogue == Iu4Epilogue::SiluMul {
+                batch_size * m * 4
+            } else {
+                0
+            };
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let grid = if use_col {
             // col_tile=blockIdx.x, row_tile=blockIdx.y
@@ -19155,7 +19182,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, false)
+        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, Iu4Epilogue::Set)
     }
 
     pub fn gemm_mq4g256v2_mmq_add_prequant_iu4(
@@ -19167,7 +19194,35 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, true)
+        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, Iu4Epilogue::Add)
+    }
+
+    /// In-place SwiGLU epilogue for the prefill up_proj launch: `y` must
+    /// already hold the gate_proj output (same shape, same layout — the gate
+    /// `set` into this buffer precedes this call on the same stream) and is
+    /// replaced elementwise by `silu(y[i]) * dot`. Bit-exact vs the old
+    /// gate/up tensor pair's `silu(g)*u`: the epilogue mirrors the fused
+    /// kernel's `SILU_MUL` op tree (`g / (1+expf(-g)) * dot`), the gate reload
+    /// is an exact f32 round-trip, and `dot` is the untouched accumulator —
+    /// so the downstream single-input rotate+quantize emits identical bytes.
+    pub fn gemm_mq4g256v2_mmq_silumul_prequant_iu4(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_i4_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_mmq_prequant_iu4(
+            a_raw,
+            x_i4_ptr,
+            y,
+            m,
+            k,
+            batch_size,
+            Iu4Epilogue::SiluMul,
+        )
     }
 
     /// WMMA-accelerated batched HFQ4-G256 GEMM with residual add.
@@ -30405,6 +30460,41 @@ impl Gpu {
             a_gate, xq, y_gate, gate_m, k, batch_size,
         )?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
+        Ok(())
+    }
+
+    /// C2 prepared IU4 consumer for gate_up with in-place SwiGLU fusion:
+    /// gate `set` into `y_fused`, then up `silumul` over the same buffer, so
+    /// `y_fused` leaves holding `silu(gate)*up` in one f32 tensor instead of
+    /// two. The caller must feed `y_fused` to the single-input
+    /// `fused_silu_mul_rotate_mq_i4_batched_fused` producer — never to the
+    /// two-input entry (its `up` half is never written here). Requires
+    /// `gate_m == up_m` (same [N × M] layout); refuses otherwise rather than
+    /// silently mis-striding the in-place read.
+    pub fn gemm_gate_up_mq4g256v2_wmma_iu4_prepared_fused(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_fused: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if gate_m != up_m {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "gemm_gate_up_mq4g256v2_wmma_iu4_prepared_fused: gate_m ({gate_m}) != up_m ({up_m}) — in-place silumul needs identical layouts"
+                ),
+            ));
+        }
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+            a_gate, xq, y_fused, gate_m, k, batch_size,
+        )?;
+        self.gemm_mq4g256v2_mmq_silumul_prequant_iu4(a_up, xq, y_fused, up_m, k, batch_size)?;
         Ok(())
     }
 
