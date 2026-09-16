@@ -32,9 +32,11 @@ Source base: `/home/kaden/ClaudeCode/warpfront/wt-lloyd`, `cadd315a1`; the paren
 
 > **DECODE FLOORS (user-set, 2026-09-16) — hard gates for every port and
 > every Halo unit:** gfx1201 (R9700) **36.5 tok/s**, gfx1100 (XTX) **49.5**,
-> gfx1151 (Halo) **14.66**. Same-tree A/B on the R9700 (`--matrix --ctx 128
-> --tg 64`, 3 runs): pre-campaign 6a64c0803 = 36.11, HEAD = 36.11 (identical
-> samples) — this session did not move gfx1201 decode. Approved tracks:
+> gfx1151 (Halo) **14.66**. Measured graphs-ON (`--matrix --ctx 128 --tg 64`,
+> 3 runs): gfx1201 master 36.63 / HEAD 36.63; gfx1100 master 49.51 / HEAD
+> 49.50 — this branch is at parity with master on both. (`HIPFIRE_GRAPH=0`,
+> used by the profiling scripts, reads ~1.4 % / 4.3 % lower — never use it for
+> a decode gate.) Approved tracks:
 > (1) GM in-place via multirow gemv (bit-exact, 0 VRAM); (2) f16 K/V shadow
 > for FA layers on gfx1151 only (~32 KB/token, ~2.1 GB at 32K ctx); (3) exact
 > tail fusions; (C) port F4a/F4b/F6 to the gfx1201 FA2 kernel; IU4-family
