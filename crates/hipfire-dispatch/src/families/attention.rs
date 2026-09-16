@@ -21,14 +21,6 @@ pub struct AttnParams<'a> {
     pub v: &'a GpuTensor,
     pub k_cache: &'a GpuTensor,
     pub v_cache: &'a GpuTensor,
-    /// f16 KV shadow rows (`None` = absent). When `Some` on exact gfx1151
-    /// with `attention.kv_shadow_f16` enabled, the FA-layer KV write arms
-    /// emit the f16 values alongside the Q8/fwht3 writes (same
-    /// `launch_maybe_blob` capture discipline), and the FA2 prefill arms
-    /// route to the shadow-fed entries. All other callers leave this `None`
-    /// (mirrors the `output_gate` precedent).
-    pub k_shadow: Option<&'a GpuTensor>,
-    pub v_shadow: Option<&'a GpuTensor>,
     /// TODO(ship 3.1b): llama HFQ8/INT8 attend scales
     pub k_scales: Option<&'a GpuTensor>,
     /// TODO(ship 3.1b): llama HFQ8/INT8 attend scales
@@ -88,19 +80,6 @@ impl<'a> AttnParams<'a> {
 #[inline]
 fn is_contiguous_prefill_prefix(pos: usize, batch_size: usize, max_ctx_len: usize) -> bool {
     pos.checked_add(batch_size) == Some(max_ctx_len)
-}
-
-/// f16 KV shadow gate: exact gfx1151 + `attention.kv_shadow_f16` on + both
-/// shadow sides present on `io`. Writes are then shadow-emitted in the same
-/// arm (same `launch_maybe_blob` capture discipline); FA2 prefill arms
-/// route to the shadow-fed entries. Everywhere else the Q8/fwht3 path is
-/// unchanged (decode keeps reading Q8 on all cards).
-#[inline]
-fn kv_shadow_active(gpu: &Gpu, io: &AttnParams) -> bool {
-    gpu.arch.as_str() == "gfx1151"
-        && gpu.flags.kv_shadow_f16
-        && io.k_shadow.is_some()
-        && io.v_shadow.is_some()
 }
 
 #[inline]
@@ -444,7 +423,7 @@ fn dispatch_kv_write(
                     io.pos_buf,
                     io.n_kv_heads,
                     io.head_dim,
-                ))?;
+                ))
             } else {
                 hip!(gpu.kv_cache_write_q8_0(
                     io.k_cache,
@@ -459,33 +438,9 @@ fn dispatch_kv_write(
                     io.pos_buf,
                     io.n_kv_heads,
                     io.head_dim,
-                ))?;
-            }
-            // f16 shadow (Halo-only): re-read the just-written Q8 rows and
-            // emit the FA2 fill's f16 values (same launch discipline, so
-            // capture covers both). Ring-windowed layers never carry shadows
-            // (returned above); the pair writer shares this emission.
-            if kv_shadow_active(gpu, io) {
-                let ksh = io.k_shadow.unwrap();
-                let vsh = io.v_shadow.unwrap();
-                hip!(gpu.kv_cache_shadow_q8_0(
-                    io.k_cache,
-                    ksh,
-                    io.pos_buf,
-                    io.n_kv_heads,
-                    io.head_dim,
-                ))?;
-                hip!(gpu.kv_cache_shadow_q8_0(
-                    io.v_cache,
-                    vsh,
-                    io.pos_buf,
-                    io.n_kv_heads,
-                    io.head_dim,
                 ))
-            } else {
-                Ok(())
             }
-            }
+        }
         KernelKey::KvWriteBf16 => {
             debug_assert_eq!(plan.batch_size, 1);
             // Two launches, K then V — same shape as the Q8 non-pair branch.
@@ -578,29 +533,7 @@ fn dispatch_kv_write(
                 io.n_kv_heads,
                 io.head_dim,
                 plan.v_mode_bits,
-            ))?;
-            // f16 shadow (Halo-only): K from the fwht3 record, V (Q8_0)
-            // from the V row — same launch discipline, captured together.
-            if kv_shadow_active(gpu, io) {
-                let ksh = io.k_shadow.unwrap();
-                let vsh = io.v_shadow.unwrap();
-                hip!(gpu.kv_cache_shadow_fwht3_k(
-                    io.k_cache,
-                    ksh,
-                    io.pos_buf,
-                    io.n_kv_heads,
-                    io.head_dim,
-                ))?;
-                hip!(gpu.kv_cache_shadow_q8_0(
-                    io.v_cache,
-                    vsh,
-                    io.pos_buf,
-                    io.n_kv_heads,
-                    io.head_dim,
-                ))
-            } else {
-                Ok(())
-            }
+            ))
         }
         KernelKey::KvWriteAsym2 => {
             debug_assert_eq!(plan.batch_size, 1);
@@ -701,31 +634,7 @@ fn dispatch_kv_write(
                 io.head_dim,
                 io.batch_size,
                 plan.v_mode_bits,
-            ))?;
-            // f16 shadow (Halo-only): batched K from fwht3 records, V from
-            // Q8 rows — same launch discipline, captured together.
-            if kv_shadow_active(gpu, io) {
-                let ksh = io.k_shadow.unwrap();
-                let vsh = io.v_shadow.unwrap();
-                hip!(gpu.kv_cache_shadow_fwht3_k_batched(
-                    io.k_cache,
-                    ksh,
-                    io.positions(),
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.batch_size,
-                ))?;
-                hip!(gpu.kv_cache_shadow_q8_0_batched(
-                    io.v_cache,
-                    vsh,
-                    io.positions(),
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.batch_size,
-                ))
-            } else {
-                Ok(())
-            }
+            ))
         }
         KernelKey::KvWriteAsym2Batched => {
             let ct = io.givens_cos.unwrap();
@@ -794,32 +703,7 @@ fn dispatch_kv_write(
                 io.n_kv_heads,
                 io.head_dim,
                 io.batch_size,
-            ))?;
-            // f16 shadow (Halo-only): batched K/V from Q8 rows. The gfx1100
-            // pair path returns above and never carries shadows (gfx1151-only
-            // gate below would fail anyway).
-            if kv_shadow_active(gpu, io) {
-                let ksh = io.k_shadow.unwrap();
-                let vsh = io.v_shadow.unwrap();
-                hip!(gpu.kv_cache_shadow_q8_0_batched(
-                    io.k_cache,
-                    ksh,
-                    pos,
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.batch_size,
-                ))?;
-                hip!(gpu.kv_cache_shadow_q8_0_batched(
-                    io.v_cache,
-                    vsh,
-                    pos,
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.batch_size,
-                ))
-            } else {
-                Ok(())
-            }
+            ))
         }
         KernelKey::KvWriteBf16Batched => {
             // Called twice (K, then V), like the Q8 batched write. Legacy
@@ -1787,42 +1671,20 @@ fn dispatch_attend(
                     && io.tree_bias.is_none()
                     && plan.v_mode_bits == 8
                 {
-                    // f16 shadow (Halo-only): the write arm above already
-                    // emitted the shadows via `launch_maybe_blob`, so route
-                    // to the shadow-fed entry (same predicates — exact
-                    // gfx1151 comes from `kv_shadow_active`); else the
-                    // incumbent dequant entry below. Capture-safe either way.
-                    if kv_shadow_active(gpu, io) {
-                        hip!(gpu.attention_q8_0_fa2_gqa_fwht3k_shadow_gfx11(
-                            io.q,
-                            io.k_shadow.unwrap(),
-                            io.v_shadow.unwrap(),
-                            io.output,
-                            io.positions(),
-                            ct,
-                            st,
-                            io.n_heads,
-                            io.n_kv_heads,
-                            io.head_dim,
-                            io.max_ctx_len,
-                            io.batch_size,
-                        ))?;
-                    } else {
-                        hip!(gpu.attention_q8_0_fa2_gqa_fwht3k_gfx11(
-                            io.q,
-                            io.k_cache,
-                            io.v_cache,
-                            io.output,
-                            io.positions(),
-                            ct,
-                            st,
-                            io.n_heads,
-                            io.n_kv_heads,
-                            io.head_dim,
-                            io.max_ctx_len,
-                            io.batch_size,
-                        ))?;
-                    }
+                    hip!(gpu.attention_q8_0_fa2_gqa_fwht3k_gfx11(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        ct,
+                        st,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ))?;
                     return Ok(());
                 }
                 #[cfg(feature = "flash-attn-ck")]
@@ -1966,41 +1828,6 @@ fn dispatch_attend(
             // gfx1151 measurement showed the opposite. Other arches keep 8192
             // until measured — do not globalise this without per-arch evidence.
             KernelKey::AttnQ8_0KvBatchedMasked => {
-                // f16 shadow FA2 (Halo-only): exact gfx1151 + shadow present
-                // routes to the shadow-fed entry ahead of every flash path
-                // below. Same shape predicates as the fwht3 FA2 ingress
-                // (H24/KV4/D256, batch-admitted, %16, ctx range, no tree,
-                // v_mode 8) plus `kv_shadow_active` (exact gfx1151 +
-                // `attention.kv_shadow_f16` + both shadow sides on `io`).
-                // The family write arms already emitted both chunks' shadows
-                // via `launch_maybe_blob`, so this is capture-safe; the
-                // shadow launcher reuses the shared kernarg pack. Falls
-                // through to the incumbent routes otherwise.
-                if kv_shadow_active(gpu, io)
-                    && gpu.flags.gfx11_fa2_prefill
-                    && io.n_heads == 24
-                    && io.n_kv_heads == 4
-                    && io.head_dim == 256
-                    && gpu.fa2_gfx11_batch_admitted(io.batch_size)
-                    && io.batch_size % 16 == 0
-                    && (64..=32768).contains(&io.max_ctx_len)
-                    && io.tree_bias.is_none()
-                    && plan.v_mode_bits == 8
-                {
-                    hip!(gpu.attention_q8_0_fa2_gqa_shadow_gfx11(
-                        io.q,
-                        io.k_shadow.unwrap(),
-                        io.v_shadow.unwrap(),
-                        io.output,
-                        io.positions(),
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.max_ctx_len,
-                        io.batch_size,
-                    ))?;
-                    return Ok(());
-                }
                 // HIPFIRE_FLASH_PREFILL=0 forces off anywhere. Resolve the
                 // single precedence rule before either backend is attempted,
                 // so CK and the native WMMA/scalar routes share one gate.

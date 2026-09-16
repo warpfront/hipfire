@@ -5722,48 +5722,6 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC: &str = concat!(
     include_str!("../../../kernels/src/turbo_common.h"),
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
 );
-/// f16 KV shadow writers (Halo-only): re-read admitted Q8_0 / fwht3 records
-/// and emit the f16 value the gfx11 FA2 fill computes (verbatim dequant
-/// expressions). Four symbols: `kv_cache_shadow_q8_0`,
-/// `kv_cache_shadow_q8_0_batched`, `kv_cache_shadow_fwht3_k`,
-/// `kv_cache_shadow_fwht3_k_batched`. `turbo_common.h` is prepended (same
-/// pattern as the fwht3 writer sites) because the runtime compile has no
-/// `-I` to `kernels/src`. JIT-only via the `kv_cache_shadow_*` launchers.
-pub const KV_CACHE_SHADOW_F16_SRC: &str = concat!(
-    include_str!("../../../kernels/src/turbo_common.h"),
-    include_str!("../../../kernels/src/kv_cache_shadow_f16.hip")
-);
-
-/// Shadow-fed variant of [`ATTENTION_Q8_0_FA2_GQA_GFX11_SRC`]
-/// (`HIPFIRE_FA2_SHADOW=1`): the K/V fills copy f16 straight from the KV
-/// shadow rows into the same swizzled LDS planes (K swizzle, V transpose)
-/// with F6-style prefetch of raw f16 bytes — no dequant. QK/softmax/PV and
-/// the epilogue are untouched, so outputs are bitwise-identical to the Q8
-/// fill. Entry `attention_q8_0_fa2_gqa_shadow_gfx11` takes the SAME kernarg
-/// list as the Q8 entry (q16, k, v, out, positions + scalars — the shadow
-/// row pointers ride the k/v slots), replay-idempotent, capture-safe.
-/// JIT-only via `attention_q8_0_fa2_gqa_shadow_gfx11`; gfx1151 + shadow
-/// present only, never on a default path.
-pub const ATTENTION_Q8_0_FA2_GQA_SHADOW_GFX11_SRC: &str = concat!(
-    "#define HIPFIRE_FA2_KT 32\n",
-    "#define HIPFIRE_FA2_SHADOW 1\n",
-    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
-);
-
-/// Shadow-fed variant of [`ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX11_SRC`]
-/// (`HIPFIRE_FA2_KMODE=3`, `HIPFIRE_FA2_SHADOW=1`): the K fill copies f16
-/// straight from the fwht3-K shadow rows (post-rotation values) into the
-/// same swizzled K plane; V copies from the Q8-V shadow rows into the same
-/// transposed V plane. Entry `attention_q8_0_fa2_gqa_fwht3k_shadow_gfx11`,
-/// same kernarg list as the fwht3k entry. JIT-only via
-/// `attention_q8_0_fa2_gqa_fwht3k_shadow_gfx11`; gfx1151 + shadow only.
-pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_SHADOW_GFX11_SRC: &str = concat!(
-    "#define HIPFIRE_FA2_KMODE 3\n",
-    "#define HIPFIRE_FA2_KT 32\n",
-    "#define HIPFIRE_FA2_SHADOW 1\n",
-    include_str!("../../../kernels/src/turbo_common.h"),
-    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip")
-);
 
 /// Benchmark-only gfx1201 LongSpec partition WMMA flash: same arithmetic as
 /// `ATTENTION_Q8_0_FLASH_PREFILL_WMMA_GFX12_SRC` but writes retained online-

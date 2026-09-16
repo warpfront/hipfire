@@ -229,22 +229,7 @@ __device__ __forceinline__ void fa2_gqa_body(
     uint32_t pf_ks;
     uint32_t pf_kc[KT_KITERS * 8];
 #endif
-#ifdef HIPFIRE_FA2_SHADOW
-    // Shadow: 2 slots/lane x 32 f16 = 64 f16 = 32 dwords of raw f16 bytes
-    // (both K modes share the row-major f16 shadow layout, so one staging
-    // array covers both). Same F6 discipline: staged after the post-fill
-    // barrier, consumed by the next tile's fill with no fresh K loads.
-    // VGPR note: 32 dwords vs the Q8 path's 17 — Halo-measured; if this
-    // spills, compile with HIPFIRE_FA2_SHADOW_PF=0 to fill straight from
-    // global (still no dequant).
-#ifndef HIPFIRE_FA2_SHADOW_PF
-#define HIPFIRE_FA2_SHADOW_PF 1
 #endif
-#if HIPFIRE_FA2_SHADOW_PF
-    uint32_t pf_sh[KT_KITERS * 16];
-#endif
-#endif
-#endif // HIPFIRE_FA2_KT == 32 (F6 + shadow prefetch declarations)
     // ---- Transitions 2-4: KT tiles ----
     for (int tile = 0; ; ++tile) {
         const int ktile = tile * KT;
@@ -263,139 +248,6 @@ __device__ __forceinline__ void fa2_gqa_body(
 #endif
 
         // ---- Transition 2: cooperative KT fill (all four waves) ----
-#ifdef HIPFIRE_FA2_SHADOW
-#if !HIPFIRE_FA2_SHADOW_PF
-        (void)have_pf;
-#endif
-        // Q8-stride locals are consumed only by the dequant fills below
-        // (compiled out here); the shadow fills use direct f16 row math.
-        (void)row_stride;
-        (void)kv_blk;
-        // Shadow K fill: f16 rows [pos, 4, 256] straight into the swizzled
-        // dword plane (same store as the Q8/fwht3 paths, no dequant). Slot
-        // (k,b) owns dims b*32..b*32+31 in both K modes (fwht3 pairs
-        // b*16..b*16+15 cover the same 32 dims as Q8 block b). OOB slots
-        // zero-fill (+0.0); they are softmax-masked, so outputs match the
-        // Q8/fwht3 fill bit-for-bit.
-#if HIPFIRE_FA2_KMODE == 3
-#if HIPFIRE_FA2_SHADOW_PF
-        if (have_pf) {
-#if HIPFIRE_FA2_KT == 32
-#pragma unroll 1
-            for (int t = 0; t < KT_KITERS; ++t) {
-                const int s = tid + t * 128;
-                const int k = s >> 3;
-                const int b = s & 7;
-                const int rot = fa2_swiz(k & 15);
-                const int base = k * 128;
-#pragma unroll 1
-                for (int m = 0; m < 4; ++m) {
-                    const int p0 = (b * 4 + m) * 4;
-#pragma unroll
-                    for (int i = 0; i < 4; ++i)
-                        Kdw[base + ((p0 + i + rot) & 127)] = pf_sh[t * 16 + m * 4 + i];
-                }
-            }
-#endif
-        } else
-#endif
-        for (int t = 0; t < KT_KITERS; ++t) {
-            const int s = tid + t * 128;
-            const int k = s >> 3;
-            const int b = s & 7;
-            const int gk = ktile + k;
-            const _Float16* row = (gk < seq_len)
-                ? (const _Float16*)k_cache + (unsigned long long)gk * 1024ULL + (unsigned long long)kv_h * 256ULL
-                : nullptr;
-            const int rot = fa2_swiz(k & 15);
-            const int base = k * 128;
-#pragma unroll 1
-            for (int m = 0; m < 4; ++m) {
-                const int p0 = (b * 4 + m) * 4;
-#pragma unroll
-                for (int i = 0; i < 4; ++i) {
-                    uint32_t u = 0;
-                    if (row != nullptr)
-                        __builtin_memcpy(&u, row + (p0 + i) * 2, 4);
-                    Kdw[base + ((p0 + i + rot) & 127)] = u;
-                }
-            }
-        }
-#else
-        // Shadow K fill, Q8-K mode: slot (k,b) = dims b*32..b*32+31.
-#if HIPFIRE_FA2_SHADOW_PF
-        if (have_pf) {
-#if HIPFIRE_FA2_KT == 32
-#pragma unroll 1
-            for (int t = 0; t < KT_KITERS; ++t) {
-                const int idx = tid + t * 128;
-                const int k = idx >> 3;
-                const int b = idx & 7;
-                const int rot = fa2_swiz(k & 15);
-                const int base = k * 128;
-                const int pb = b * 16;
-#pragma unroll 1
-                for (int w = 0; w < 8; ++w) {
-                    Kdw[base + ((pb + w * 2 + rot) & 127)] = pf_sh[t * 16 + w * 2];
-                    Kdw[base + ((pb + w * 2 + 1 + rot) & 127)] = pf_sh[t * 16 + w * 2 + 1];
-                }
-            }
-#endif
-        } else
-#endif
-        for (int t = 0; t < KT_KITERS; ++t) {
-            const int idx = tid + t * 128;
-            const int k = idx >> 3;
-            const int b = idx & 7;
-            const int gk = ktile + k;
-            const _Float16* row = (gk < seq_len)
-                ? (const _Float16*)k_cache + (unsigned long long)gk * 1024ULL + (unsigned long long)kv_h * 256ULL
-                : nullptr;
-            const int rot = fa2_swiz(k & 15);
-            const int base = k * 128;
-            const int pb = b * 16;
-#pragma unroll 1
-            for (int w = 0; w < 8; ++w) {
-                uint32_t u0 = 0, u1 = 0;
-                if (row != nullptr) {
-                    __builtin_memcpy(&u0, row + b * 32 + w * 4, 4);
-                    __builtin_memcpy(&u1, row + b * 32 + w * 4 + 2, 4);
-                }
-                Kdw[base + ((pb + w * 2 + rot) & 127)] = u0;
-                Kdw[base + ((pb + w * 2 + 1 + rot) & 127)] = u1;
-            }
-        }
-#endif
-        // Shadow V fill: f16 pairs (V[2m][d], V[2m+1][d]) straight into the
-        // transposed plane (same store as the Q8 path, no dequant).
-        for (int t = 0; t < KT_VITERS; ++t) {
-            const int pair = tid + t * 128;
-            const int m = pair >> 3;
-            const int b = pair & 7;
-            const int k0 = ktile + 2 * m;
-            const _Float16* row0 = (k0 < seq_len)
-                ? (const _Float16*)v_cache + (unsigned long long)k0 * 1024ULL + (unsigned long long)kv_h * 256ULL
-                : nullptr;
-            const _Float16* row1 = (k0 + 1 < seq_len)
-                ? (const _Float16*)v_cache + (unsigned long long)(k0 + 1) * 1024ULL + (unsigned long long)kv_h * 256ULL
-                : nullptr;
-#pragma unroll 1
-            for (int w = 0; w < 8; ++w) {
-#pragma unroll
-                for (int c = 0; c < 4; ++c) {
-                    const int d = b * 32 + w * 4 + c;
-                    _Float16 e0 = (_Float16)0.0f;
-                    _Float16 e1 = (_Float16)0.0f;
-                    if (row0 != nullptr) e0 = row0[d];
-                    if (row1 != nullptr) e1 = row1[d];
-                    fa2_dw_t dw;
-                    dw.h[0] = e0;
-                    dw.h[1] = e1;
-                    Vdw[d * V_ROW + ((m + fa2_swiz(d & 15)) & V_MASK)] = dw.u;
-                }
-            }
-        }
-#else
 #if HIPFIRE_FA2_KMODE == 3
         // fwht3 K: per (position, kv head) record = [f32 cnorm][96 B codes]
         // (k_bytes_per_head = 100, k_bytes_per_pos = 4*100 = 400, head offset
@@ -590,40 +442,8 @@ __device__ __forceinline__ void fa2_gqa_body(
                 }
             }
         }
-#endif
         __syncthreads();
 #if HIPFIRE_FA2_KT == 32
-#ifdef HIPFIRE_FA2_SHADOW
-#if HIPFIRE_FA2_SHADOW_PF
-        // ---- F6 shadow: prefetch the next tile's raw f16 K bytes ----
-        // Same discipline as above (post-fill barrier, overlap compute);
-        // the next tile's K fill copies from pf_sh with no fresh K loads.
-        // Both K modes share the row-major f16 shadow layout: 2 slots/lane
-        // x 16 dwords. OOB slots stage zeros (softmax-masked downstream).
-        {
-            const int ktile_next = ktile + KT;
-            if (ktile_next < seq_len) {
-#pragma unroll 1
-                for (int t = 0; t < KT_KITERS; ++t) {
-                    const int idx = tid + t * 128;
-                    const int k = idx >> 3;
-                    const int b = idx & 7;
-                    const int gk = ktile_next + k;
-                    const _Float16* row = (gk < seq_len)
-                        ? (const _Float16*)k_cache + (unsigned long long)gk * 1024ULL + (unsigned long long)kv_h * 256ULL
-                        : nullptr;
-#pragma unroll 1
-                    for (int w = 0; w < 16; ++w) {
-                        uint32_t u = 0;
-                        if (row != nullptr)
-                            __builtin_memcpy(&u, row + b * 32 + w * 2, 4);
-                        pf_sh[t * 16 + w] = u;
-                    }
-                }
-            }
-        }
-#endif
-#else
         // ---- F6: prefetch the next tile's raw K bytes (all four waves) ----
         // Issued immediately after the post-fill barrier so these global
         // loads overlap the current tile's QK/softmax/PV below; the next
@@ -687,7 +507,6 @@ __device__ __forceinline__ void fa2_gqa_body(
 #endif
             }
         }
-#endif
 #endif
 
         // ---- Transition 3: KT/16 QK/softmax/PV subtiles of 16 keys ----
@@ -1097,11 +916,6 @@ __device__ __forceinline__ void fa2_gqa_body(
 // deterministic near-miss on both cards (near-uniform softmax hides the
 // missing rotation to ~1e-3), not an op-order race. Distinct symbols make
 // each launcher resolve its own module's build.
-// Shadow modules (HIPFIRE_FA2_SHADOW) reuse the Q8 / fwht3 module's
-// pre-convert symbols (same source, same build) and must not re-export them:
-// the host function cache is keyed by symbol, so a duplicate registration
-// would shadow the canonical build.
-#ifndef HIPFIRE_FA2_SHADOW
 #if HIPFIRE_FA2_KMODE == 3
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht3_gfx11
 #else
@@ -1151,11 +965,9 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
     o[6] = (_Float16)v6; o[7] = (_Float16)v7;
     *(half8_t*)(wp + lane * 8) = o;
 }
-#endif
 
 // Body entries take pre-converted f16 Q at kernarg offset 0 (same slot, same
 // size as the old f32 Q pointer, so the pointer-array blob ABI is unchanged).
-#ifndef HIPFIRE_FA2_SHADOW
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx11(
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
@@ -1179,7 +991,6 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1
     fa2_gqa_body(q16, k_cache, v_cache, out, positions, batch_size,
                  scale_attn, kv_h, q_base);
 }
-#endif
 
 // ---- KMODE=3 entry: fwht3 K, pre-rotated + pre-converted f16 Q ----
 // K is stored FWHT-rotated, so Q must be rotated before QK (orthogonal
@@ -1189,7 +1000,6 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1
 // attention_fa2_q_preconvert_fwht3_gfx11 (same helper, same op order), so this
 // entry takes the SAME kernarg list as the Q8 entry above (q16 at offset 0,
 // no signs) and never mutates Q: replay-idempotent, capture-safe.
-#ifndef HIPFIRE_FA2_SHADOW
 #if HIPFIRE_FA2_KMODE == 3
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_gfx11(
     const _Float16* __restrict__ q16,
@@ -1214,64 +1024,4 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
     fa2_gqa_body(q16, k_cache, v_cache, out, positions, batch_size,
                  scale_attn, kv_h, q_base);
 }
-#endif
-#endif
-
-// ---- Shadow-fed entries (HIPFIRE_FA2_SHADOW only) ----
-// `k_cache`/`v_cache` carry the f16 shadow rows ([pos, 4, 256] f16) instead
-// of Q8_0 / fwht3 records; the body copies them straight into the same LDS
-// planes (same swizzle/layout) with no dequant. Same kernarg list as the
-// Q8/fwht3k entries above (q16 at offset 0), so the pointer-array blob ABI
-// is unchanged. QK/softmax/PV/epilogue untouched: outputs bitwise-identical
-// to the dequant path. Replay-idempotent, capture-safe.
-#ifdef HIPFIRE_FA2_SHADOW
-#if HIPFIRE_FA2_KMODE == 3
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_shadow_gfx11(
-    const _Float16* __restrict__ q16,
-    const _Float16* __restrict__ k_shadow,
-    const _Float16* __restrict__ v_shadow,
-    float* __restrict__ out,
-    const int* __restrict__ positions,
-    int n_heads,
-    int n_kv_heads,
-    int head_dim,
-    int batch_size,
-    float scale_attn)
-{
-    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
-        return;
-    const int kv_h = blockIdx.y;
-    if (kv_h >= 4)
-        return;
-    const int q_base = blockIdx.x * 8;
-    if (q_base >= batch_size)
-        return;
-    fa2_gqa_body(q16, (const unsigned char*)k_shadow, (const unsigned char*)v_shadow,
-                 out, positions, batch_size, scale_attn, kv_h, q_base);
-}
-#else
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_shadow_gfx11(
-    const _Float16* __restrict__ q16,
-    const _Float16* __restrict__ k_shadow,
-    const _Float16* __restrict__ v_shadow,
-    float* __restrict__ out,
-    const int* __restrict__ positions,
-    int n_heads,
-    int n_kv_heads,
-    int head_dim,
-    int batch_size,
-    float scale_attn)
-{
-    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
-        return;
-    const int kv_h = blockIdx.y;
-    if (kv_h >= 4)
-        return;
-    const int q_base = blockIdx.x * 8;
-    if (q_base >= batch_size)
-        return;
-    fa2_gqa_body(q16, (const unsigned char*)k_shadow, (const unsigned char*)v_shadow,
-                 out, positions, batch_size, scale_attn, kv_h, q_base);
-}
-#endif
 #endif
