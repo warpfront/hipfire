@@ -460,9 +460,13 @@ fn dispatch_batched_gemm_epilogue(
 /// fallback — the FA causal attention kernel can't yet be batched (task #71).
 ///
 /// `gated_delta_net_q8_batch_seq` runs one launch per LA layer; the kernel
-/// loops over the N tokens internally and requants the Q8 state after every
-/// token, matching the decode requant cadence (distributionally equivalent to
-/// decode, not byte-identical — the stochastic-rounding frame differs).
+/// loops over the N tokens internally and requants the Q8 state once at
+/// launch end (default fast kernel; `HIPFIRE_DN_REQUANT_PER_TOKEN=1` opts
+/// into the per-token round-trip slow kernel). Chunk-boundary requants are
+/// part of the trajectory: two 512-row launches are NOT numerically equal
+/// to one 1024-row launch (dropped mid Q8 round-trip plus a
+/// `frame + lane * n_tokens` reseed of the final requant), so the F2 pair
+/// path keeps the DeltaNet sequential kernels per-half — see its envelope.
 ///
 /// `tokens`: slice of prompt tokens to prefill in order.
 /// `start_pos`: first KV cache / DeltaNet position to write. Positions
@@ -9036,6 +9040,30 @@ fn batch_chunk_final_logits(
 // 512 rows, H24/KV4/D256, KV tier Q8 or fwht3-Asym3, no tree/tape/band/
 // max_layer, no hidden ring (its per-chunk staging commit is
 // chunk-sequential), DFlash fusion Off.
+// DeltaNet (dense LA + MoE-LA) sequential kernels stay 2x512 inside the
+// pair — deliberately NOT merged (pair-width analysis, 2026-09):
+// - `gated_delta_net_q8_batch_seq` (default fast kernel): single-end
+//   requant with a `frame + lane * n_tokens` stochastic seed (lane = 0 on
+//   the sequential path, grid.z = 1). One 1024-row launch would drop the
+//   token-512 Q8 round-trip (including the EF residual commit) and reseed
+//   the final requant (F vs F+512), so rows 512..1023 and the final
+//   S_q8/scales/EF diverge from 2x512 — an eval-md5 break. No 512 cap
+//   exists (any n_tokens runs; LDS is n-independent); the blocker is
+//   requant semantics, fixable only by mid-boundary requant kernel
+//   surgery, which is declined without GPU verification. (Under
+//   HIPFIRE_DN_REQUANT_PER_TOKEN=1 the slow kernel's per-token
+//   `frame + bt` seeds read pair-continuous at lane 0, so a merged launch
+//   would be identical there — but that path is ~1.8x slower and off-gate;
+//   still unmerged.)
+// - `conv1d_silu_split_f32_n`: generic n_tokens loop, so 1x1024 over a
+//   staged concatenation IS trajectory-identical (same per-channel op
+//   order, continuous ring) — but staging costs ~50 MB/layer (1024x6144x4 B
+//   qkv in + q/k/v raws out at 16/16x128) to save a single launch, which
+//   is net-negative against launch overhead. Stays split on perf.
+// - sigmoid / QK-norm / gated_norm glue: row-parallel, batch-agnostic per
+//   row; merging saves only launch overhead at staging-copy cost. Stay.
+// MoE-LA expert FFN (row-parallel grouped GEMM) is out of scope: not a
+// sequential-recurrence kernel, same copy-trap economics as the glue.
 
 /// Rows per F2 pair half. Only two complete halves ever merge — never a
 /// partial chunk.
@@ -9283,7 +9311,8 @@ fn batch_chunk_fa_attend_merged(
 /// call into one 1024-row FA2 launch per FA layer.
 ///
 /// Per-layer order matches two sequential chunks exactly: for GDN/MoE-LA
-/// layers half C runs fully before half N (recurrence cadence unchanged);
+/// layers half C runs fully before half N (recurrence cadence deliberately
+/// unmerged — see the F2 envelope above for the per-kernel analysis);
 /// for FA layers both halves' QKV prep (projection + norms + RoPE) runs
 /// first, then one merged write-then-attend step, then each half's output
 /// projection/FFN. `dn_state`, the KV cache and `per_token_hidden_out` see
