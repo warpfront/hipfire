@@ -2376,6 +2376,18 @@ impl Gpu {
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         let record = self.replay.is_recording();
+        // Slice 1: drain a post-scratch-growth binding refresh before the
+        // first launch that follows the growth. Growth always completes
+        // before this point (callers invalidate, then grow, then launch), so
+        // the probe sees post-growth addresses. One branch when idle; the
+        // refresh itself runs at most once per growth event. Failure drops
+        // the retained route (historic path) and the HIP launch below runs.
+        if self.replay.binding_refresh_pending() {
+            if let Err(reason) = self.replay.refresh_bindings_after_growth(&self.hip) {
+                eprintln!("[redline] PM4 binding refresh failed ({reason}); route re-armed");
+                self.replay.rearm_after_layout_growth();
+            }
+        }
         let result: HipResult<()> = if record
             || self.graphs.capture_mode
             || self.flags.force_blob_path
@@ -4423,11 +4435,14 @@ impl Gpu {
     }
 
     /// Drop captured execution state before a scratch slot grows. A captured
-    /// hipGraph (or retained Redline route) embeds the scratch pointers live
-    /// at capture time; freeing a replaced buffer under it replays freed
-    /// memory (`HipError(700)`). Reuses `invalidate_for_layout_growth`
-    /// (the model-swap teardown): AR graph, verify / replay graphs, and the
-    /// retained route are dropped, and everything re-captures lazily.
+    /// hipGraph embeds the pointers live at capture time; freeing a replaced
+    /// buffer under it replays freed memory (`HipError(700)`), so hipGraphs
+    /// still drop wholesale here. The retained PM4 route is different: its
+    /// kernarg segments re-encode from `ReplayBindings`, so the route is kept
+    /// and only armed for a post-growth re-resolve (revision bump +
+    /// re-encode, no re-lowering). The next launch drains the refresh; a
+    /// resource that actually moved fails closed back to the historic drop
+    /// path (`rearm_after_layout_growth`) and HIP runs.
     ///
     /// Called by every `Gpu` scratch wrapper that can grow, gated on
     /// [`crate::scratch::scratch_will_grow`]. Cheap no-op unless a graph has
@@ -4447,7 +4462,12 @@ impl Gpu {
         ) {
             return;
         }
-        self.invalidate_for_layout_growth();
+        self.invalidate_graph_state();
+        if self.replay.prepared_pm4_route_active() {
+            self.replay.arm_binding_refresh_for_scratch_growth();
+        } else {
+            self.replay.rearm_after_layout_growth();
+        }
     }
 
     // ── Kernel operations ───────────────────────────────────────

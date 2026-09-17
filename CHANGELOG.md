@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Redline generalized tape slice 1: the retained PM4 tape builds kernarg segments from `ReplayBindings` + `KernargAbi` (pointer slots per launch, everything else recorded bytes) instead of the raw snapshot, with a byte-equality fail-closed gate (`HIPFIRE_REPLAY_BINDINGS_VERIFY=1` for release) and a per-tape typed/untyped census at prepare. Scratch growth no longer drops the retained route: the revision bumps and segments re-encode in place (no re-lowering); a resource that actually moved still fails closed to HIP and re-capture. Zero behaviour change expected; gfx1100/1151/1201 harness exact + pm4_ib gates pending in the slice receipts.
 - MQ4-Lloyd (qt=52 `MQ4G256V2L` / `DType::MQ4G256V2Lloyd`): same 136 B V2 group container as qt=44 plus per-tensor F32[16] `lloyd_levels` sidecar; product tiers `mq4l-xt` / `mq4l` / `mq4l-pro`. WT2 KLD vs AWQ'd uniform tiers (24-chunk, gfx1201, prefill scoring, q8 KV): xt 0.0482→0.0408, base 0.0405→0.0346, pro 0.0335→0.0284.
 - mq4-pro batched-prefill fix: invalidate the F16 x-cache after `gated_norm_f32_batched` / `sigmoid_mul_f32` so Q8 `out_proj` does not read stale activations under the default gfx1201 FP8 prefill path (1-chunk WT2 KLD 6.42→0.019).
 - AWQ rmsnorm-rotate rewrite: `fused_rmsnorm_mq_rotate_awq` is derived from `fused_rmsnorm_mq_rotate.hip` via `-DHIPFIRE_RMSNORM_AWQ` (retired the LDS-staged fork and the gfx1100-only `_direct` variant / `HIPFIRE_GFX1100_AWQ_NORM_DIRECT`); +2.5% decode on AWQ'd MQ4V2 artifacts on gfx1201.
