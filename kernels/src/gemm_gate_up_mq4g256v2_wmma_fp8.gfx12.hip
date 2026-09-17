@@ -94,19 +94,37 @@ __device__ static inline unsigned int mq4_lut8(unsigned int sel,
     return (hi & m) | (lo & ~m);
 }
 #else
+// gfx120x device only. The !__HIP_DEVICE_COMPILE__ arm lets the host pass
+// (which also preprocesses this TU) through; a non-gfx12 DEVICE compile
+// still hits the #error below instead of silently building the wrong idiom.
+#if defined(__gfx1200__) || defined(__gfx1201__) || !defined(__HIP_DEVICE_COMPILE__)
+// Uniform-table gfx120x fast path (bit-exact vs the two-perm form above:
+// exhaustive on-device check of all 65536 x16 x 2 halves, see
+// /tmp/wmma_probe/expand_probe2.hip candidate B). The upper half of the
+// table is affine (q 8..15 -> 0x50+(q-8)), so one 8-byte perm serves q&7
+// and the final select is itself a v_perm keyed on the top nibble bit.
+// Per 4 nibbles this swaps one table v_perm plus the v_mul mask expansion
+// and the and/andn blend for one blend v_perm plus and/or/add, removing
+// the multi-cycle v_mul_lo_u32 pair from the chain.
+// Probe (gfx1201, load-fed): expand-only 0.74x, expand+wmma 0.77x.
 __device__ static inline unsigned int mq4_lut8(unsigned int sel) {
-    // q 0..3:   00 38 40 44. q 4..7:   48 4A 4C 4E.
-    // q 8..11:  50 51 52 53. q 12..15: 54 55 56 57.
+    // q 0..7: 00 38 40 44 48 4A 4C 4E (single 8-byte table).
+    // q 8..15: 50 51 52 53 54 55 56 57 = 0x50+(q-8).
     const unsigned int C0 = 0x44403800u;
     const unsigned int C1 = 0x4E4C4A48u;
-    const unsigned int C2 = 0x53525150u;
-    const unsigned int C3 = 0x57565554u;
+    const unsigned int idx = sel & 0x07070707u;
+    const unsigned int lo = __builtin_amdgcn_perm(C1, C0, idx);
+    // idx bytes are q&7 (<8): +0x50 never carries across byte lanes.
+    const unsigned int hi = idx + 0x50505050u;
     // v_perm_b32(hi, lo, s): result byte i = {lo,hi} byte s_i for s_i in 0..7.
-    const unsigned int lo = __builtin_amdgcn_perm(C1, C0, sel & 0x07070707u);
-    const unsigned int hi = __builtin_amdgcn_perm(C3, C2, sel & 0x07070707u);
-    const unsigned int m = ((sel >> 3) & 0x01010101u) * 0xFFu;
-    return (hi & m) | (lo & ~m);
+    // Selector byte i = i | ((q_i>>3)<<2): 0..3 -> lo lane, 4..7 -> hi lane.
+    // (sel & 0x08080808u) keeps only top bits, so >>1 lands cleanly on bit 2.
+    const unsigned int selp = 0x03020100u | ((sel & 0x08080808u) >> 1);
+    return __builtin_amdgcn_perm(hi, lo, selp);
 }
+#else
+#error "uniform mq4_lut8 perm-blend fast path requires gfx1200/gfx1201"
+#endif
 #endif
 
 #ifdef HIPFIRE_FP8_LUT_ARG
