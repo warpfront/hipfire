@@ -57,6 +57,14 @@
 #define HIPFIRE_FA2_KMODE 0
 #endif
 
+// U0 scaffold: HIPFIRE_FA2_FP8 renames entry symbols only. Body stays the
+// f16 kernel until Ua (planes) / Ub (QK) / Uc (PV). gfx120x-only.
+#ifdef HIPFIRE_FA2_FP8
+#if !defined(__gfx1200__) && !defined(__gfx1201__)
+#error "HIPFIRE_FA2_FP8 is gfx120x-only"
+#endif
+#endif
+
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
@@ -591,7 +599,11 @@ __device__ __forceinline__ void fa2_gqa_body(
 
 // Body entries take pre-converted f16 Q at kernarg offset 0 (same slot, same
 // size as the old f32 Q pointer, so the pointer-array blob ABI is unchanged).
+#ifdef HIPFIRE_FA2_FP8
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fp8_gfx1201(
+#else
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1201(
+#endif
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -697,7 +709,11 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
 // offset 0, no signs) and never mutates Q: replay-idempotent,
 // capture-safe.
 #if HIPFIRE_FA2_KMODE == 3
+#ifdef HIPFIRE_FA2_FP8
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_fp8_gfx1201(
+#else
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_gfx1201(
+#endif
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -722,7 +738,11 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
 }
 #endif
 
+#ifdef HIPFIRE_FA2_FP8
+extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_partial_fp8_gfx1201(
+#else
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_partial_gfx1201(
+#endif
     const _Float16* __restrict__ q16,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -761,7 +781,11 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_part
                        scale_attn, kv_h, q_base, t0, t1, split, n_splits);
 }
 
+#ifdef HIPFIRE_FA2_FP8
+extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_fp8_gfx1201(
+#else
 extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_gfx1201(
+#endif
     const float* __restrict__ partials,
     float* __restrict__ out,
     int batch_size,

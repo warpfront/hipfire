@@ -5739,6 +5739,37 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/turbo_common.h"),
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
+
+/// FP8 twin of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] (`HIPFIRE_FA2_FP8=1`):
+/// same f16 body at U0 (Ua+ rewrites planes/legs). Distinct entry symbols
+/// `attention_q8_0_fa2_gqa_fp8_gfx1201` / `_partial_fp8_` / `_merge_fp8_` so
+/// the symbol-keyed host function cache never collides with the f16 module.
+/// JIT-only via the FA2 launchers when `gfx12_fa2_fp8_enabled()`.
+pub const ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_FP8 1\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
+
+/// fwht3-K + FP8 twin (`HIPFIRE_FA2_FP8=1` + `HIPFIRE_FA2_KMODE=3`).
+/// Entry `attention_q8_0_fa2_gqa_fwht3k_fp8_gfx1201`. Same F4b pre-convert
+/// / turbo_common prepend pattern as the f16 fwht3 module.
+pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_FP8_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_FP8 1\n",
+    "#define HIPFIRE_FA2_KMODE 3\n",
+    include_str!("../../../kernels/src/turbo_common.h"),
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
+
+/// Partial-split entry twin of [`ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC`]
+/// (same source; hosts the `attention_q8_0_fa2_gqa_partial_fp8_gfx1201`
+/// symbol). Kept as its own constant so launchers name the module they own.
+pub const ATTENTION_Q8_0_FA2_GQA_PARTIAL_FP8_GFX1201_SRC: &str =
+    ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC;
+
+/// Merge entry twin of [`ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC`]
+/// (same source; hosts `attention_q8_0_fa2_gqa_merge_fp8_gfx1201`).
+pub const ATTENTION_Q8_0_FA2_GQA_MERGE_FP8_GFX1201_SRC: &str =
+    ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC;
 /// gfx11 (RDNA3) sister of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`]
 /// (research opt-in). One workgroup per KV head x 8 positions; K/V
 /// dequantized once per KT32 tile into two swizzled f16 LDS planes

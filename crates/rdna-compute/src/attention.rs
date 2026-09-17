@@ -3626,22 +3626,27 @@ impl Gpu {
                 ),
             ));
         }
-        const SYMBOL: &str = "attention_q8_0_fa2_gqa_gfx1201";
+        // U0: when gfx12_fa2_fp8_enabled, dispatch the distinct `_fp8_`
+        // entry (same f16 body until Ua). Symbol-keyed cache needs a
+        // separate name; SRC prepends `#define HIPFIRE_FA2_FP8 1`.
+        let use_fp8 = self.flags.gfx12_fa2_fp8_enabled();
+        let symbol = if use_fp8 {
+            "attention_q8_0_fa2_gqa_fp8_gfx1201"
+        } else {
+            "attention_q8_0_fa2_gqa_gfx1201"
+        };
+        let src = if use_fp8 {
+            kernels::ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC
+        } else {
+            kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC
+        };
         // F4b: the body reads f16 Q from Gpu-owned scratch (pre-converted on
         // the same stream just below); the entry symbol and the pre-convert
         // symbol both resolve out of this module's source.
         const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx1201";
-        if !self.functions.contains_key(SYMBOL) || !self.functions.contains_key(PRECONVERT) {
-            self.ensure_kernel(
-                SYMBOL,
-                kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
-                SYMBOL,
-            )?;
-            self.ensure_kernel(
-                SYMBOL,
-                kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
-                PRECONVERT,
-            )?;
+        if !self.functions.contains_key(symbol) || !self.functions.contains_key(PRECONVERT) {
+            self.ensure_kernel(symbol, src, symbol)?;
+            self.ensure_kernel(symbol, src, PRECONVERT)?;
         }
         // F4b scratch: [batch, 24, 256] f16 (n_heads/head_dim validated
         // H24/D256 above), Gpu-owned, grows-never-shrinks.
@@ -3680,7 +3685,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(
             &self.hip,
             "attention",
-            "attention_q8_0_fa2_gqa_gfx1201",
+            symbol,
             bytes,
         );
         // F4b: pre-convert f32 Q -> f16 scratch on the same stream, then run
@@ -3696,11 +3701,13 @@ impl Gpu {
             batch_size,
             0,
         )?;
+        // U0: keep 65536 dynamic LDS for `_fp8_` too (body plane layout
+        // unchanged). Ua: 32768 once e4m3 planes land.
         let result = self.launch_maybe_blob(
-            SYMBOL,
+            symbol,
             [grid_x, 4, 1],
             [128, 1, 1],
-            65536,
+            65536, // Ua: 32768
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -3816,24 +3823,27 @@ impl Gpu {
                 ),
             ));
         }
-        const SYMBOL: &str = "attention_q8_0_fa2_gqa_fwht3k_gfx1201";
+        // U0: fp8 twin entry when flag resolves on (body still f16).
+        let use_fp8 = self.flags.gfx12_fa2_fp8_enabled();
+        let symbol = if use_fp8 {
+            "attention_q8_0_fa2_gqa_fwht3k_fp8_gfx1201"
+        } else {
+            "attention_q8_0_fa2_gqa_fwht3k_gfx1201"
+        };
+        let src = if use_fp8 {
+            kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_FP8_GFX1201_SRC
+        } else {
+            kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC
+        };
         // F4b: the body reads pre-rotated, pre-converted f16 Q from
         // Gpu-owned scratch (same stream just below); the entry symbol and
         // the pre-convert symbol both resolve out of this module's source.
         // The pre-convert symbol is KMODE-distinct from the Q8 module's
         // (function cache is symbol-keyed).
         const PRECONVERT: &str = "attention_fa2_q_preconvert_fwht3_gfx1201";
-        if !self.functions.contains_key(SYMBOL) || !self.functions.contains_key(PRECONVERT) {
-            self.ensure_kernel(
-                SYMBOL,
-                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC,
-                SYMBOL,
-            )?;
-            self.ensure_kernel(
-                SYMBOL,
-                kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC,
-                PRECONVERT,
-            )?;
+        if !self.functions.contains_key(symbol) || !self.functions.contains_key(PRECONVERT) {
+            self.ensure_kernel(symbol, src, symbol)?;
+            self.ensure_kernel(symbol, src, PRECONVERT)?;
         }
         // F4b scratch: [batch, 24, 256] f16 (n_heads/head_dim validated
         // H24/D256 above), Gpu-owned, grows-never-shrinks.
@@ -3872,7 +3882,7 @@ impl Gpu {
         let timer = crate::profile::begin_timer(
             &self.hip,
             "attention",
-            "attention_q8_0_fa2_gqa_fwht3k_gfx1201",
+            symbol,
             bytes,
         );
         // F4b: pre-convert (rotation fused) f32 Q -> f16 scratch on the same
@@ -3889,11 +3899,12 @@ impl Gpu {
             batch_size,
             1,
         )?;
+        // U0: keep 65536 for `_fp8_` too. Ua: 32768 once e4m3 planes land.
         let result = self.launch_maybe_blob(
-            SYMBOL,
+            symbol,
             [grid_x, 4, 1],
             [128, 1, 1],
-            65536,
+            65536, // Ua: 32768
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -4411,33 +4422,41 @@ impl Gpu {
                 ),
             ));
         }
-        const PARTIAL: &str = "attention_q8_0_fa2_gqa_partial_gfx1201";
-        const MERGE: &str = "attention_q8_0_fa2_gqa_merge_gfx1201";
+        // U0: fp8 twin partial/merge entries when flag resolves on.
+        let use_fp8 = self.flags.gfx12_fa2_fp8_enabled();
+        let partial = if use_fp8 {
+            "attention_q8_0_fa2_gqa_partial_fp8_gfx1201"
+        } else {
+            "attention_q8_0_fa2_gqa_partial_gfx1201"
+        };
+        let merge = if use_fp8 {
+            "attention_q8_0_fa2_gqa_merge_fp8_gfx1201"
+        } else {
+            "attention_q8_0_fa2_gqa_merge_gfx1201"
+        };
+        let src = if use_fp8 {
+            kernels::ATTENTION_Q8_0_FA2_GQA_PARTIAL_FP8_GFX1201_SRC
+        } else {
+            kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC
+        };
+        let merge_src = if use_fp8 {
+            kernels::ATTENTION_Q8_0_FA2_GQA_MERGE_FP8_GFX1201_SRC
+        } else {
+            kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC
+        };
         // F4b: the partial body reads f16 Q from Gpu-owned scratch
         // (pre-converted on the same stream just below); the pre-convert
         // symbol resolves out of this same Q8 module object, so a
         // standalone bench run compiles exactly one module.
         const PRECONVERT: &str = "attention_fa2_q_preconvert_gfx1201";
-        if !self.functions.contains_key(PARTIAL) {
-            self.ensure_kernel(
-                PARTIAL,
-                kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
-                PARTIAL,
-            )?;
+        if !self.functions.contains_key(partial) {
+            self.ensure_kernel(partial, src, partial)?;
         }
         if !self.functions.contains_key(PRECONVERT) {
-            self.ensure_kernel(
-                PARTIAL,
-                kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
-                PRECONVERT,
-            )?;
+            self.ensure_kernel(partial, src, PRECONVERT)?;
         }
-        if !self.functions.contains_key(MERGE) {
-            self.ensure_kernel(
-                MERGE,
-                kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC,
-                MERGE,
-            )?;
+        if !self.functions.contains_key(merge) {
+            self.ensure_kernel(merge, merge_src, merge)?;
         }
         // F4b scratch: [batch, 24, 256] f16, Gpu-owned, grows-never-shrinks.
         let need_q16_bytes = batch_size * n_heads * head_dim * 2;
@@ -4480,11 +4499,12 @@ impl Gpu {
             batch_size,
             0,
         )?;
+        // U0: keep 65536 for `_fp8_` partial too. Ua: 32768.
         self.launch_maybe_blob(
-            PARTIAL,
+            partial,
             [grid_x, 4, n_splits as u32],
             [128, 1, 1],
-            65536,
+            65536, // Ua: 32768
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -4518,7 +4538,7 @@ impl Gpu {
         ];
         let n_rec = batch_size * n_heads;
         let merge_grid_x = n_rec.div_ceil(8) as u32;
-        self.launch_maybe_blob(MERGE, [merge_grid_x, 1, 1], [256, 1, 1], 0, &mut mparams, || {
+        self.launch_maybe_blob(merge, [merge_grid_x, 1, 1], [256, 1, 1], 0, &mut mparams, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(pp_ptr);
             b.push_ptr(o_ptr);

@@ -1686,6 +1686,15 @@ fn dispatch_attend(
                 // no tree-verify (FA2 has no tree path) and V must be Q8_0
                 // (v_mode 8 — lloyd V lives in rotated space FA2 never
                 // inverts). Falls through to the incumbent below otherwise.
+                //
+                // U0 fp8 twin: when `gfx12_fa2_fp8_enabled()` (exact gfx1200/
+                // gfx1201 + `HIPFIRE_GFX12_FA2_FP8=1` / `kernel.gfx12_fa2_fp8`)
+                // the launcher below selects the distinct
+                // `attention_q8_0_fa2_gqa_fwht3k_fp8_gfx1201` entry (body still
+                // f16 until Ua). No separate KernelKey — same exact-gfx1201
+                // predicate as the f16 FA2 arm; symbol swap is inside the
+                // launcher. Direct/partial/merge fp8 twins follow the same
+                // pattern on the Q8 FA2 ingress (`attention_q8_0_flash_prefill_wmma`).
                 if gpu.flags.gfx12_fa2_prefill
                     && gpu.arch == "gfx1201"
                     && io.n_heads == 24

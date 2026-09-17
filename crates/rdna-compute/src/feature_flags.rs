@@ -229,6 +229,11 @@ pub struct FeatureFlags {
     /// Default ON on gfx1100/gfx1151; `=1` forces it on other arches
     /// (launchers stay on the gfx11 allowlist).
     pub gfx11_fa2_prefill: bool,
+    /// gfx120x FA2 fp8 K/V planes (`HIPFIRE_GFX12_FA2_FP8`,
+    /// `kernel.gfx12_fa2_fp8`). Opt-in only (default off everywhere);
+    /// `gfx12_fa2_fp8_enabled()` also requires exact gfx1200/gfx1201.
+    /// Stage U0 scaffold: body still f16; Ua+ changes numerics.
+    pub gfx12_fa2_fp8: Option<bool>,
     pub gemm_dump: bool,
     pub deterministic: bool,
     pub mw16: bool,
@@ -594,6 +599,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
+            gfx12_fa2_fp8: parse_bool("HIPFIRE_GFX12_FA2_FP8"),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
@@ -733,6 +739,13 @@ impl FeatureFlags {
     pub fn gfx11_mmq_iu4_enabled(&self) -> bool {
         self.gfx11_mmq_iu4.unwrap_or(false)
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+    }
+
+    /// Resolved gfx120x FA2 fp8 route: explicit opt-in only, and only on
+    /// exact gfx1200/gfx1201. Unset/`=0`/other arches keep the f16 FA2 body.
+    pub fn gfx12_fa2_fp8_enabled(&self) -> bool {
+        self.gfx12_fa2_fp8.unwrap_or(false)
+            && matches!(self.arch.as_str(), "gfx1200" | "gfx1201")
     }
 
     /// C2 producer-emitted IU4 sidecar route: exact gfx1151 + IU4 opt-in.
@@ -886,6 +899,7 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_qkv: false,
             gfx12_fa2_prefill: false,
             gfx11_fa2_prefill: false,
+            gfx12_fa2_fp8: Some(false),
             gemm_dump: false,
             deterministic: false,
             mw16: false,
@@ -1075,6 +1089,45 @@ mod tests {
         for arch in ["gfx1100", "gfx1151"] {
             let test_flags = FeatureFlags::for_test(arch);
             assert!(!test_flags.gfx11_mmq_iu4_enabled(), "arch={arch}");
+        }
+    }
+
+    #[test]
+    fn gfx12_fa2_fp8_opt_in_on_gfx120x_only() {
+        // Default process policy: the FA2 fp8 route stays off everywhere
+        // until `kernel.gfx12_fa2_fp8=true` (or `HIPFIRE_GFX12_FA2_FP8=1`);
+        // the opt-in admits only exact gfx1200/gfx1201.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1201", "gfx1200", "gfx1100", "gfx1151", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_fa2_fp8_enabled(), "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx12_fa2_fp8", "true").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1200", "gfx1201"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(flags.gfx12_fa2_fp8_enabled(), "arch={arch}");
+        }
+        for arch in ["gfx1100", "gfx1151", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_fa2_fp8_enabled(), "arch={arch}");
+        }
+
+        // The unit-test constructor stays off (deterministic baseline).
+        for arch in ["gfx1201", "gfx1100", "gfx1151", "gfx942"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx12_fa2_fp8_enabled(), "arch={arch}");
+            assert_eq!(test_flags.gfx12_fa2_fp8, Some(false), "arch={arch}");
         }
     }
 
