@@ -381,6 +381,25 @@ impl Pm4Commands {
             }
         }
     }
+    /// Trailing release at the tape terminal: drain shaders, then emit the
+    /// architecture-matched full-system acquire so GL2 is written back for a
+    /// non-shader next consumer (e.g. an SDMA H2D copy). `CS_PARTIAL_FLUSH`
+    /// alone does not write back GL2. This is `ACQUIRE_MEM` with the GL2
+    /// writeback bits, not a `RELEASE_MEM` packet. Unconditional: a retained
+    /// tape costs one packet per tape.
+    fn trailing_release(&mut self) -> Result<(), String> {
+        self.wait_compute_idle()?;
+        match self {
+            Self::Legacy { commands, .. } => {
+                commands.acquire_system();
+                Ok(())
+            }
+            Self::Gfx12(commands) => {
+                commands.acquire_system_gfx12();
+                Ok(())
+            }
+        }
+    }
 
     #[cfg(test)]
     fn dependency_mode(&self) -> Option<LegacyDependencyMode> {
@@ -4975,7 +4994,7 @@ impl ReplayController {
                     dispatch_boundaries.push(boundary);
                 }
             }
-            commands.wait_compute_idle()?;
+            commands.trailing_release()?;
             if dispatch_profile {
                 commands.populate_dispatch_span_boundaries(&mut dispatch_boundaries)?;
             }
@@ -5190,7 +5209,7 @@ impl ReplayController {
                         }
                     }
                     for commands in &mut lanes {
-                        commands.wait_compute_idle()?;
+                        commands.trailing_release()?;
                         command_dwords = command_dwords
                             .checked_add(commands.len_dwords())
                             .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
@@ -5255,7 +5274,7 @@ impl ReplayController {
                         )
                         .map_err(|error| format!("{}: {error}", self.recorded[index].kernel))?;
                 }
-                commands.wait_compute_idle()?;
+                commands.trailing_release()?;
                 command_dwords = command_dwords
                     .checked_add(commands.len_dwords())
                     .ok_or_else(|| "PM4 command dword count overflow".to_owned())?;
@@ -6324,6 +6343,27 @@ mod tests {
         commands.wait_compute_idle().unwrap();
         let dwords = commands.dwords().unwrap();
         assert_eq!(dwords, &[0xc000_4600, 0x407]);
+    }
+    #[test]
+    fn trailing_release_emits_wait_then_system_acquire() {
+        // Terminal correctness: CS_PARTIAL_FLUSH drains shaders but does not
+        // write back GL2 for a non-shader next consumer. The trailing release
+        // is wait_compute_idle (2 dwords) followed by ACQUIRE_MEM with the
+        // GL2 writeback bits (8 dwords) — not a RELEASE_MEM packet.
+        let mut commands = Pm4Commands::new_with_dependency(
+            Pm4Architecture::Gfx11,
+            Pm4RegisterPolicy::Legacy,
+            Gfx10DispatchInitiatorPolicy::Legacy,
+            None,
+            Gfx11ComputeResourceLimitsPolicy::Legacy,
+            LegacyDependencyMode::CsPartialFlush,
+        );
+        commands.trailing_release().unwrap();
+        let dwords = commands.dwords().unwrap();
+        assert_eq!(dwords.len(), 2 + 8);
+        assert_eq!(&dwords[..2], &[0xc000_4600, 0x407]);
+        // ACQUIRE_MEM header: packet3 type 3, opcode 0x58, count 7.
+        assert_eq!(dwords[2], 0xc006_5800);
     }
 
     #[test]
