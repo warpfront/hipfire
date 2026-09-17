@@ -660,7 +660,7 @@ const WIDENED_RUNGS: [usize; 5] = [512, 1024, 2048, 4096, 8192];
 /// ship); raised one rung at a time only after that rung's E/M/S/V gates
 /// pass. Provisional final ceiling 4096 is an upper bound, not a per-device
 /// value — memory admission may still select a smaller rung per device.
-const WIDENED_PERF_CEILING: usize = 4096;
+const WIDENED_PERF_CEILING: usize = 512;
 ///
 /// Uncommitted-VRAM headroom reserved by the per-device capacity admission
 /// (plan §4.2). Conservative policy margin covering remaining state, output,
