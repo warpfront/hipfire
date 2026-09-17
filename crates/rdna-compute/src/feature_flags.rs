@@ -40,8 +40,10 @@ pub struct FeatureFlags {
     /// `=0` restores the per-32 MMQ route. Other arches stay per-32.
     pub gfx11_mmq_x128: Option<bool>,
     /// gfx11 iu4-direct MMQ prefill (W4A4, `HIPFIRE_GFX11_MQ4V2_IU4`,
-    /// `kernel.gfx11_mq4v2_iu4`). Opt-in on gfx1100/gfx1151 only (default
-    /// off everywhere); unset/`=0` keeps the incumbent Q8_1 MMQ route.
+    /// `kernel.gfx11_mq4v2_iu4`). Opt-in on gfx1100/gfx1151 (K16 iu4 kernel)
+    /// and gfx1201 (K32 iu4 kernel, standalone `quantize_int4_mmq_ds128`
+    /// activations; default off everywhere); unset/`=0` keeps the incumbent
+    /// Q8_1 MMQ (gfx11) / fp8 (gfx1201) route.
     /// Expected quality cost ~+0.014 WT2 KLD for the MQ4-XT speed rung.
     pub gfx11_mmq_iu4: Option<bool>,
 
@@ -734,11 +736,12 @@ impl FeatureFlags {
             .unwrap_or(matches!(self.arch.as_str(), "gfx1100" | "gfx1151"))
     }
 
-    /// Resolved gfx11 iu4-direct MMQ route: explicit opt-in only, and only
-    /// on gfx1100/gfx1151. Unset/`=0`/other arches keep the incumbent.
+    /// Resolved iu4-direct MMQ route: explicit opt-in only, and only on
+    /// exact gfx1100/gfx1151 (K16 kernel) or gfx1201 (K32 kernel).
+    /// Unset/`=0`/other arches keep the incumbent.
     pub fn gfx11_mmq_iu4_enabled(&self) -> bool {
         self.gfx11_mmq_iu4.unwrap_or(false)
-            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
 
     /// Resolved gfx120x FA2 fp8 route: explicit opt-in only, and only on
@@ -1052,13 +1055,12 @@ mod tests {
             assert!(!test_flags.gfx11_fa2_prefill, "arch={arch}");
         }
     }
-
     #[test]
-    fn gfx11_mmq_iu4_opt_in_on_gfx11_only() {
+    fn gfx11_mmq_iu4_opt_in_on_gfx11_and_gfx1201() {
         // Default process policy: the iu4-direct MMQ prefill route stays off
         // everywhere until `kernel.gfx11_mq4v2_iu4=true` (or
         // `HIPFIRE_GFX11_MQ4V2_IU4=1`); the opt-in admits only exact
-        // gfx1100/gfx1151.
+        // gfx1100/gfx1151 (K16 kernel) and gfx1201 (K32 kernel).
         let resolved = resolve([]).unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
         for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
@@ -1076,11 +1078,11 @@ mod tests {
         }])
         .unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
-        for arch in ["gfx1100", "gfx1151"] {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(flags.gfx11_mmq_iu4_enabled(), "arch={arch}");
         }
-        for arch in ["gfx1101", "gfx1150", "gfx1201", "gfx942"] {
+        for arch in ["gfx1101", "gfx1150", "gfx942"] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(!flags.gfx11_mmq_iu4_enabled(), "arch={arch}");
         }
