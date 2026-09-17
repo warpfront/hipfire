@@ -613,6 +613,19 @@ impl Gpu {
     /// Ensure the ParoQuant activation scratch buffer is allocated (F32, sized for dim).
     pub fn ensure_paro_scratch(&mut self, dim: usize) -> HipResult<()> {
         // bind_thread: skip — delegated to scratch.rs
+        // Pre-growth invalidation: `ensure_paro_scratch` frees the replaced
+        // buffer (no `Drop`); a captured graph may embed it.
+        {
+            let needed_bytes = dim * 4;
+            let will_grow = self
+                .scratch
+                .paro_x_scratch
+                .as_ref()
+                .map_or(true, |s| s.buf.size() < needed_bytes);
+            if will_grow {
+                self.invalidate_for_scratch_growth();
+            }
+        }
         self.scratch
             .ensure_paro_scratch(&self.hip, self.device_id, dim)
     }
@@ -620,6 +633,18 @@ impl Gpu {
     /// Ensure 4 rotation scratch buffers for Paro fused-kernel dispatch.
     /// Each buffer is sized [k] F32. Lazily allocated; grows on demand (never shrinks).
     pub fn ensure_paro_fused_scratch(&mut self, k: usize) -> HipResult<()> {
+        // Same contract for the four fused rotation buffers.
+        {
+            let needed_bytes = k * 4;
+            let will_grow = self
+                .scratch
+                .paro_fused_scratch
+                .as_ref()
+                .map_or(true, |bufs| bufs.iter().any(|b| b.buf.size() < needed_bytes));
+            if will_grow {
+                self.invalidate_for_scratch_growth();
+            }
+        }
         self.scratch
             .ensure_paro_fused_scratch(&self.hip, self.device_id, k)
     }
@@ -5937,6 +5962,15 @@ impl Gpu {
         )?;
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
+        // The FP8 sibling scratch (`mq_x_rot_fp8`, `k` bytes) grows inside;
+        // invalidate first so no captured graph replays the freed pointer.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.mq_x_rot_fp8_bytes,
+            self.scratch.mq_x_rot_fp8.is_some(),
+            k,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         self.scratch.rotate_x_mq_dual_fp8(
             &self.hip,
             &mut self.functions,

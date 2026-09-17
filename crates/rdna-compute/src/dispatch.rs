@@ -2664,6 +2664,16 @@ impl Gpu {
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
+        // Scratch growth under a captured graph would free a pointer the graph
+        // embeds: invalidate first (no-op unless captured). See
+        // `invalidate_for_scratch_growth`.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fp16_x_scratch_bytes,
+            self.scratch.fp16_x_scratch.is_some(),
+            n_elems * 2,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         // Split borrows so `self.replay` and `self.graphs`/`self.scratch` can be
         // borrowed simultaneously. The scratch helper will record into replay
         // when `is_recording()` and push to capture_blobs when `capture_mode`,
@@ -2687,6 +2697,13 @@ impl Gpu {
 
     /// Ensure the deterministic-ksplit partials scratch is at least `n_bytes`.
     pub(crate) fn ensure_ksplit_det_partials(&mut self, n_bytes: usize) -> HipResult<*mut c_void> {
+        if crate::scratch::scratch_will_grow(
+            self.scratch.ksplit_det_partials_bytes,
+            self.scratch.ksplit_det_partials.is_some(),
+            n_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         self.scratch.ensure_ksplit_det_partials(&self.hip, n_bytes)
     }
 
@@ -2700,6 +2717,13 @@ impl Gpu {
     ) -> HipResult<*mut c_void> {
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fp16_x_scratch_bytes,
+            self.scratch.fp16_x_scratch.is_some(),
+            n_elems * 2,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         self.scratch.convert_fp16_x_uncached(
             &self.hip,
             &mut self.compiler,
@@ -2722,6 +2746,13 @@ impl Gpu {
     pub(crate) fn ensure_fp8_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fp8_x_scratch_bytes,
+            self.scratch.fp8_x_scratch.is_some(),
+            n_elems,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         self.scratch.ensure_fp8_x(
             &self.hip,
             &mut self.compiler,
@@ -2760,6 +2791,27 @@ impl Gpu {
                 0,
                 "prepare_mq4v2_fp8_x: eager-only (capture/replay rejected)",
             ));
+        }
+        // All three MQ4v2 FP8 buffers grow below (both sub-paths); invalidate
+        // first if any of them will. Eager-only is already enforced above.
+        {
+            let (x8, half_sums, row_scales) = crate::scratch::mq4v2_fp8_needed(n, k);
+            let s = &self.scratch;
+            if crate::scratch::scratch_will_grow(
+                s.mq4v2_fp8_x_scratch_bytes,
+                s.mq4v2_fp8_x_scratch.is_some(),
+                x8,
+            ) || crate::scratch::scratch_will_grow(
+                s.mq4v2_fp8_half_sums_scratch_bytes,
+                s.mq4v2_fp8_half_sums_scratch.is_some(),
+                half_sums,
+            ) || crate::scratch::scratch_will_grow(
+                s.mq4v2_fp8_row_scales_scratch_bytes,
+                s.mq4v2_fp8_row_scales_scratch.is_some(),
+                row_scales,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
         }
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
@@ -2813,6 +2865,16 @@ impl Gpu {
         // bind_thread: skip — delegated to scratch.rs
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
+        {
+            let needed = crate::scratch::q8_1_mmq_x_needed(k, batch_size);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.q8_1_mmq_x_scratch_bytes,
+                self.scratch.q8_1_mmq_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
         self.scratch.ensure_q8_1_mmq_x(
             &self.hip,
             &mut self.compiler,
@@ -2841,6 +2903,16 @@ impl Gpu {
         // bind_thread: skip — delegated to scratch.rs
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
+        {
+            let needed = crate::scratch::q8_1_mmq_x_needed(k, batch_size);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.q8_1_mmq_x_scratch_bytes,
+                self.scratch.q8_1_mmq_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
         self.scratch.ensure_q8_1_mmq_x128(
             &self.hip,
             &mut self.compiler,
@@ -2869,6 +2941,16 @@ impl Gpu {
         // bind_thread: skip — delegated to scratch.rs
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
+        {
+            let needed = crate::scratch::int4_mmq_x_needed(k, batch_size);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.int4_mmq_x_scratch_bytes,
+                self.scratch.int4_mmq_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
         self.scratch.ensure_int4_mmq_x(
             &self.hip,
             &mut self.compiler,
@@ -2893,6 +2975,17 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<crate::scratch::Int4MmqReservation> {
+        // Mirror `reserve_int4_mmq`'s validity gate: no growth on the error path.
+        if k != 0 && n != 0 && k % 256 == 0 {
+            let needed = crate::scratch::int4_mmq_reserve_needed(k, n);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.int4_mmq_x_scratch_bytes,
+                self.scratch.int4_mmq_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
         self.scratch.reserve_int4_mmq(&self.hip, k, n)
     }
 
@@ -3204,6 +3297,17 @@ impl Gpu {
 
     pub fn ensure_gemv_residual_tmp(&mut self, min_elems: usize) -> HipResult<&GpuTensor> {
         // bind_thread: skip — delegated to scratch.rs (takes device_id explicitly).
+        {
+            let needed_bytes = min_elems * 4;
+            let will_grow = self
+                .scratch
+                .gemv_residual_tmp
+                .as_ref()
+                .map_or(true, |tmp| tmp.buf.size() < needed_bytes);
+            if will_grow {
+                self.invalidate_for_scratch_growth();
+            }
+        }
         self.scratch
             .ensure_gemv_residual_tmp(&self.hip, self.device_id, min_elems)
     }
@@ -4316,6 +4420,34 @@ impl Gpu {
         // bind_thread: skip — invalidate_graph_state binds; rearm is CPU.
         self.invalidate_graph_state();
         self.replay.rearm_after_layout_growth();
+    }
+
+    /// Drop captured execution state before a scratch slot grows. A captured
+    /// hipGraph (or retained Redline route) embeds the scratch pointers live
+    /// at capture time; freeing a replaced buffer under it replays freed
+    /// memory (`HipError(700)`). Reuses `invalidate_for_layout_growth`
+    /// (the model-swap teardown): AR graph, verify / replay graphs, and the
+    /// retained route are dropped, and everything re-captures lazily.
+    ///
+    /// Called by every `Gpu` scratch wrapper that can grow, gated on
+    /// [`crate::scratch::scratch_will_grow`]. Cheap no-op unless a graph has
+    /// been captured in this process (see
+    /// [`crate::graph::any_graph_captured`]); growth is monotonic and bounded
+    /// by the largest shape ever seen, so the invalidation is rare.
+    ///
+    /// Never invalidates mid-capture/record: destroying graph state then
+    /// would clear the `capture_blobs` the in-flight capture is filling.
+    /// Growth inside a capture keeps the historical behaviour (warmup-first
+    /// flows size scratch before capturing, so this is not expected).
+    pub fn invalidate_for_scratch_growth(&mut self) {
+        if !crate::scratch::scratch_growth_invalidates(
+            crate::graph::any_graph_captured(),
+            self.graphs.capture_mode,
+            self.replay.is_recording(),
+        ) {
+            return;
+        }
+        self.invalidate_for_layout_growth();
     }
 
     // ── Kernel operations ───────────────────────────────────────

@@ -18,17 +18,18 @@ use std::collections::{HashMap, HashSet};
 ///
 /// `scratch::grow_scratch_buffer` consults this before releasing a replaced
 /// scratch buffer: architectures that never capture (Muse Glimmer has no
-/// hipGraph decode path by design) get the memory back, while architectures
-/// that do capture (qwen35's verify / replay / AR-forward graphs) keep the old
-/// buffer alive exactly as before. Freeing under an active graph was measured
-/// to break qwen35 outright — every turn of a 4-turn DFlash session returned
-/// empty with `spec_step: HipError(700) ... reset_recurrent`, while the same
-/// build with the free suppressed ran 4/4 at 68.4 tok/s.
-///
-/// Releasing those buffers properly requires invalidating the captured graphs
-/// first (`invalidate_graph_state` / `drop_captured_graph`) so they re-capture
-/// against the new pointers. That is a larger change than a leak fix and owes
-/// its own per-arch gate, so it is deliberately not attempted here.
+/// hipGraph decode path by design) free immediately, while architectures
+/// that do capture (qwen35's verify / replay / AR-forward graphs) invalidate
+/// first. Freeing under a live graph was measured to break qwen35 outright
+/// — every turn of a 4-turn DFlash session returned empty with
+/// `spec_step: HipError(700) ... reset_recurrent` — so every `Gpu` scratch
+/// caller checks `scratch::scratch_will_grow` before delegating and drops
+/// all captured execution state via `Gpu::invalidate_for_scratch_growth`
+/// (the model-swap teardown `invalidate_for_layout_growth`: AR graph,
+/// verify / replay graphs, retained Redline route). Graphs re-capture
+/// lazily on the next replay; each growth event costs at most one
+/// re-capture. An earlier revision retained the old buffers with
+/// `std::mem::forget` instead — that leak is fixed; no path retains.
 static ANY_GRAPH_CAPTURED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 

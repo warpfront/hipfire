@@ -432,7 +432,7 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 /// session that sees a sequence of increasing shapes leaks one buffer per
 /// distinct larger shape.
 ///
-/// Measured on gfx1100 (25.8 GB) before this fix, issuing requests with
+/// Measured on gfx1100 (25.8 GB) before the leak fix, issuing requests with
 /// growing prompts and sampling VRAM between them: repeating the SAME shape
 /// cost +0.0 MB (the buffer is correctly reused), while each larger shape
 /// added its FULL size rather than the increment --
@@ -446,6 +446,22 @@ fn gen_fwht_signs(seed: u32, n: usize) -> Vec<f32> {
 /// bounded by the largest shape ever seen, so this sync is rare and its cost
 /// is irrelevant next to the allocation it replaces.
 ///
+/// A captured hipGraph embeds the pointers live at capture time, so this
+/// function MUST NOT free a replaced buffer while a stale graph could still
+/// replay it: freeing here once broke qwen35 outright, every turn empty with
+/// `spec_step: HipError(700) ... reset_recurrent`. The previous revision
+/// handled that with `std::mem::forget(old)` once any graph had been
+/// captured — correct output, but the retained buffers were the 5.7 GB leak
+/// above. The fix is invalidation, not retention: every `Gpu` caller checks
+/// [`scratch_will_grow`] before delegating and drops all captured execution
+/// state first (`Gpu::invalidate_for_scratch_growth`, which reuses the
+/// model-swap teardown `invalidate_for_layout_growth`: AR graph + verify /
+/// replay graphs + retained Redline route). Graphs re-capture lazily on the
+/// next replay, so each growth event costs at most one re-capture — rare, and
+/// bounded by the largest shape ever seen. Per-pointer attribution is
+/// impossible (captured graphs store only baked device pointers, no slot
+/// provenance), so invalidation is wholesale by design.
+///
 /// Frees BEFORE allocating: the whole point is to run when memory is tight,
 /// and holding both at once is what we are trying to avoid. On allocation
 /// failure the slot is left empty with a zero byte count, so the `?` in the
@@ -456,27 +472,98 @@ fn grow_scratch_buffer(
     have_bytes: &mut usize,
     needed: usize,
 ) -> HipResult<()> {
-    if *have_bytes >= needed && slot.is_some() {
+    if !scratch_will_grow(*have_bytes, slot.is_some(), needed) {
         return Ok(());
     }
     if let Some(old) = slot.take() {
-        if crate::graph::any_graph_captured() {
-            // A captured hipGraph embeds the pointers live at capture time, so
-            // releasing this buffer would make every later replay read freed
-            // memory. Measured: freeing here breaks qwen35 outright, every turn
-            // empty with `spec_step: HipError(700) ... reset_recurrent`. Retain
-            // it (the pre-existing behaviour) and let the process reclaim it.
-            std::mem::forget(old);
-        } else {
-            hip.device_synchronize()?;
-            let _ = hip.free(old);
-        }
+        // The caller invalidated captured graphs before delegating (see the
+        // doc comment): no live graph embeds `old`, so sync + free is safe.
+        hip.device_synchronize()?;
+        let _ = hip.free(old);
     }
     *have_bytes = 0;
     let fresh = hip.malloc(needed)?;
     *slot = Some(fresh);
     *have_bytes = needed;
     Ok(())
+}
+
+/// True when [`grow_scratch_buffer`] would replace the slot: the early-return
+/// condition factored out so `Gpu` callers can invalidate captured graphs
+/// BEFORE delegating. Single source of truth — the two sites cannot drift.
+///
+/// `slot_is_some` matters: a never-allocated slot with a stale non-zero byte
+/// count must still allocate.
+#[inline]
+pub(crate) fn scratch_will_grow(
+    have_bytes: usize,
+    slot_is_some: bool,
+    needed: usize,
+) -> bool {
+    !(have_bytes >= needed && slot_is_some)
+}
+
+/// Whether a scratch growth must invalidate captured execution state first:
+/// a graph has been captured in this process, and no capture/record is in
+/// flight (mid-flight invalidation would clear the `capture_blobs` the
+/// in-flight capture is filling). Pure so the contract is unit-testable;
+/// `Gpu::invalidate_for_scratch_growth` feeds it live state.
+#[inline]
+pub(crate) fn scratch_growth_invalidates(
+    graph_captured: bool,
+    capture_mode: bool,
+    recording: bool,
+) -> bool {
+    graph_captured && !capture_mode && !recording
+}
+
+/// Byte size of the `q8_1_mmq_x_scratch` slot for `(k, batch_size)`: one 144 B
+/// `block_q8_1_mmq` per [K/128 block, batch]. Shared by
+/// `ensure_q8_1_mmq_x` / `ensure_q8_1_mmq_x128` and their `Gpu` callers, which
+/// need the same number for the pre-growth invalidation check.
+#[inline]
+pub(crate) fn q8_1_mmq_x_needed(k: usize, batch_size: usize) -> usize {
+    let blocks_k = (k + 127) / 128;
+    let block_q8_1_mmq_bytes = 144usize;
+    blocks_k * batch_size * block_q8_1_mmq_bytes
+}
+
+/// Byte size of the `int4_mmq_x_scratch` slot for `(k, batch_size)`: one 72 B
+/// `block_i4_128` per [K/128 block, batch]. Shared by `ensure_int4_mmq_x`
+/// and its `Gpu` caller.
+#[inline]
+pub(crate) fn int4_mmq_x_needed(k: usize, batch_size: usize) -> usize {
+    let blocks_k = (k + 127) / 128;
+    let block_i4_128_bytes = 72usize;
+    blocks_k * batch_size * block_i4_128_bytes
+}
+
+/// Byte size of the `int4_mmq_x_scratch` slot for a producer reservation
+/// `(k, n)`. Shared by `reserve_int4_mmq` and its `Gpu` caller. The caller
+/// must have checked `k % 256 == 0 && n > 0` first (same as `reserve_int4_mmq`).
+#[inline]
+pub(crate) fn int4_mmq_reserve_needed(k: usize, n: usize) -> usize {
+    let blocks_k = k / 128;
+    blocks_k * n * 72
+}
+
+/// Byte sizes of the three MQ4v2 FP8 pre-pass buffers `(x_fp8, half_sums,
+/// row_scales)` for `(n, k)`: X8 = `n*k` bytes, half_sums =
+/// `n*(k/256)*2` f32, row_scales = `n` f32. Shared by
+/// `prepare_mq4v2_fp8_x` / `prepare_mq4v2_fp8_x_f32` and their `Gpu` caller.
+#[inline]
+pub(crate) fn mq4v2_fp8_needed(n: usize, k: usize) -> (usize, usize, usize) {
+    let x_fp8_bytes = n.checked_mul(k).expect("mq4v2 fp8 x extent overflow");
+    let groups = k / 256;
+    let half_sums_bytes = n
+        .checked_mul(groups)
+        .and_then(|v| v.checked_mul(2))
+        .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
+        .expect("mq4v2 fp8 half_sums extent overflow");
+    let row_scales_bytes = n
+        .checked_mul(std::mem::size_of::<f32>())
+        .expect("mq4v2 fp8 row_scales extent overflow");
+    (x_fp8_bytes, half_sums_bytes, row_scales_bytes)
 }
 
 impl ScratchState {
@@ -549,6 +636,13 @@ impl ScratchState {
             .as_ref()
             .map_or(true, |tmp| tmp.buf.size() < needed_bytes);
         if needs_grow {
+            // `GpuTensor` has no `Drop` impl: overwrite would strand the old
+            // device allocation. The `Gpu` caller invalidated captured graphs
+            // first (same contract as `grow_scratch_buffer`), so sync + free.
+            if let Some(old) = self.gemv_residual_tmp.take() {
+                hip.device_synchronize()?;
+                let _ = hip.free(old.buf);
+            }
             self.gemv_residual_tmp = Some(GpuTensor {
                 buf: hip.malloc(needed_bytes)?,
                 shape: vec![min_elems],
@@ -652,6 +746,11 @@ impl ScratchState {
                 return Ok(());
             }
         }
+        // Free-before-alloc: `GpuTensor` has no `Drop`; see `ensure_gemv_residual_tmp`.
+        if let Some(old) = self.paro_x_scratch.take() {
+            hip.device_synchronize()?;
+            let _ = hip.free(old.buf);
+        }
         let buf = hip.malloc(dim * 4)?; // F32
         self.paro_x_scratch = Some(GpuTensor {
             buf,
@@ -680,11 +779,23 @@ impl ScratchState {
                 // Grow any buffer that's too small (never shrinks).
                 for buf in bufs.iter_mut() {
                     if buf.buf.size() < needed_bytes {
-                        *buf = GpuTensor {
-                            buf: hip.malloc(needed_bytes)?,
-                            shape: vec![k],
-                            dtype: DType::F32,
-                        };
+                        // Alloc-first (not free-first): a malloc failure leaves
+                        // the old buffer live in the slot via `?`, and these
+                        // four F32 rows are small enough that briefly holding
+                        // both is harmless. `GpuTensor`/`DeviceBuffer` have no
+                        // `Drop`, so free the replaced buffer explicitly. The
+                        // `Gpu` caller invalidated captured graphs first (same
+                        // contract as `grow_scratch_buffer`), so sync + free.
+                        let old = std::mem::replace(
+                            buf,
+                            GpuTensor {
+                                buf: hip.malloc(needed_bytes)?,
+                                shape: vec![k],
+                                dtype: DType::F32,
+                            },
+                        );
+                        hip.device_synchronize()?;
+                        let _ = hip.free(old.buf);
                     }
                 }
             }
@@ -1042,16 +1153,7 @@ impl ScratchState {
     ) -> HipResult<Mq4v2Fp8Prepared> {
         compile_and_load_kernel(compiler, hip, modules, functions, module, ksrc, symbol)?;
 
-        let x_fp8_bytes = n.checked_mul(k).expect("mq4v2 fp8 x extent overflow");
-        let groups = k / 256;
-        let half_sums_bytes = n
-            .checked_mul(groups)
-            .and_then(|v| v.checked_mul(2))
-            .and_then(|v| v.checked_mul(std::mem::size_of::<f32>()))
-            .expect("mq4v2 fp8 half_sums extent overflow");
-        let row_scales_bytes = n
-            .checked_mul(std::mem::size_of::<f32>())
-            .expect("mq4v2 fp8 row_scales extent overflow");
+        let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) = mq4v2_fp8_needed(n, k);
 
         grow_scratch_buffer(
             hip,
@@ -1186,9 +1288,7 @@ impl ScratchState {
             "quantize_q8_1_mmq_ds4",
         )?;
 
-        let blocks_k = (k + 127) / 128;
-        let block_q8_1_mmq_bytes = 144usize;
-        let needed = blocks_k * batch_size * block_q8_1_mmq_bytes;
+        let needed = q8_1_mmq_x_needed(k, batch_size);
         grow_scratch_buffer(
             hip,
             &mut self.q8_1_mmq_x_scratch,
@@ -1274,9 +1374,7 @@ impl ScratchState {
             "quantize_q8_1_mmq_ds4_x128",
         )?;
 
-        let blocks_k = (k + 127) / 128;
-        let block_q8_1_mmq_bytes = 144usize;
-        let needed = blocks_k * batch_size * block_q8_1_mmq_bytes;
+        let needed = q8_1_mmq_x_needed(k, batch_size);
         grow_scratch_buffer(
             hip,
             &mut self.q8_1_mmq_x_scratch,
@@ -1363,9 +1461,7 @@ impl ScratchState {
             "quantize_int4_mmq_ds128",
         )?;
 
-        let blocks_k = (k + 127) / 128;
-        let block_i4_128_bytes = 72usize;
-        let needed = blocks_k * batch_size * block_i4_128_bytes;
+        let needed = int4_mmq_x_needed(k, batch_size);
         grow_scratch_buffer(
             hip,
             &mut self.int4_mmq_x_scratch,
@@ -1391,7 +1487,7 @@ impl ScratchState {
             ];
             let grid_x = ((k + 1023) / 1024) as u32;
             let grid_y = batch_size as u32;
-            let bytes = batch_size * k * 4 + blocks_k * batch_size * block_i4_128_bytes;
+            let bytes = batch_size * k * 4 + needed;
             let timer =
                 crate::profile::begin_timer(hip, "quantize", "quantize_int4_mmq_ds128", bytes);
             launch_maybe_blob(
@@ -1440,8 +1536,7 @@ impl ScratchState {
                 "reserve_int4_mmq: need k%256==0 and n>0",
             ));
         }
-        let blocks_k = k / 128;
-        let needed = blocks_k * n * 72;
+        let needed = int4_mmq_reserve_needed(k, n);
         grow_scratch_buffer(
             hip,
             &mut self.int4_mmq_x_scratch,
@@ -2009,4 +2104,62 @@ fn alloc_tensor_on(
         shape: shape.to_vec(),
         dtype,
     })
+}
+
+#[cfg(test)]
+mod scratch_growth_tests {
+    use super::*;
+
+    /// The will-grow predicate is the single source of truth shared by
+    /// `grow_scratch_buffer` and every `Gpu` pre-growth invalidation guard.
+    /// These two sites must agree, or a growth frees a buffer a live graph
+    /// embeds (HipError 700) or an invalidation fires without a growth
+    /// (needless re-capture every decode token).
+    #[test]
+    fn will_grow_matches_replacement_condition() {
+        // Empty slot must allocate, even against a stale byte count.
+        assert!(scratch_will_grow(0, false, 100));
+        assert!(scratch_will_grow(10_000, false, 100));
+        // Occupied slot: only when short.
+        assert!(scratch_will_grow(0, true, 100));
+        assert!(scratch_will_grow(99, true, 100));
+        assert!(!scratch_will_grow(100, true, 100));
+        assert!(!scratch_will_grow(10_000, true, 100));
+        // Zero-size requests never grow an occupied slot.
+        assert!(!scratch_will_grow(100, true, 0));
+    }
+
+    /// Invalidation fires exactly when a stale graph could exist and no
+    /// capture/record is in flight. Mid-flight invalidation would clear the
+    /// `capture_blobs` the in-flight capture is filling, corrupting it.
+    #[test]
+    fn invalidation_contract() {
+        // Nothing captured: never invalidate (keeps pre-capture prefill and
+        // the never-capturing archs on the fast path).
+        assert!(!scratch_growth_invalidates(false, false, false));
+        assert!(!scratch_growth_invalidates(false, true, false));
+        assert!(!scratch_growth_invalidates(false, false, true));
+        // Captured, steady state: invalidate (the leak fix).
+        assert!(scratch_growth_invalidates(true, false, false));
+        // Captured but mid-flight: never invalidate.
+        assert!(!scratch_growth_invalidates(true, true, false));
+        assert!(!scratch_growth_invalidates(true, false, true));
+        assert!(!scratch_growth_invalidates(true, true, true));
+    }
+
+    /// Geometry helpers shared by the ensure bodies and the `Gpu` guards:
+    /// both sides must compute the same byte counts.
+    #[test]
+    fn needed_helpers_match_slot_geometry() {
+        // q8_1: 144 B per [K/128 block, batch].
+        assert_eq!(q8_1_mmq_x_needed(2048, 8192), 16 * 8192 * 144);
+        assert_eq!(q8_1_mmq_x_needed(2048, 65535), 16 * 65535 * 144);
+        // Non-multiple K rounds up a block.
+        assert_eq!(q8_1_mmq_x_needed(2049, 1), 17 * 1 * 144);
+        // int4: 72 B per [K/128 block, batch].
+        assert_eq!(int4_mmq_x_needed(2048, 1024), 16 * 1024 * 72);
+        assert_eq!(int4_mmq_reserve_needed(2048, 1024), 16 * 1024 * 72);
+        // mq4v2 fp8: n*k bytes, n*(k/256)*2 f32 half-sums, n f32 row scales.
+        assert_eq!(mq4v2_fp8_needed(32, 2048), (65536, 32 * 8 * 2 * 4, 32 * 4));
+    }
 }

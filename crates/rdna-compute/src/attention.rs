@@ -3651,6 +3651,16 @@ impl Gpu {
         // F4b scratch: [batch, 24, 256] f16 (n_heads/head_dim validated
         // H24/D256 above), Gpu-owned, grows-never-shrinks.
         let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        // Pre-growth invalidation: the FA2 body reads this scratch from the
+        // captured graph's kernargs; freeing under a live graph replays freed
+        // memory (HipError 700). No-op unless a graph is captured.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -3848,6 +3858,14 @@ impl Gpu {
         // F4b scratch: [batch, 24, 256] f16 (n_heads/head_dim validated
         // H24/D256 above), Gpu-owned, grows-never-shrinks.
         let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        // Same pre-growth invalidation contract as above.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -4092,6 +4110,14 @@ impl Gpu {
         // F4b scratch: [batch, 24, 256] f16 (n_heads/head_dim validated
         // H24/D256 above), Gpu-owned, grows-never-shrinks.
         let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        // Same pre-growth invalidation contract as above.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -4283,6 +4309,14 @@ impl Gpu {
         }
         // F4b scratch: [batch, 24, 256] f16, Gpu-owned, grows-never-shrinks.
         let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        // Same pre-growth invalidation contract as above.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -4460,6 +4494,14 @@ impl Gpu {
         }
         // F4b scratch: [batch, 24, 256] f16, Gpu-owned, grows-never-shrinks.
         let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        // Same pre-growth invalidation contract as above.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_q16_scratch_bytes,
+            self.scratch.fa2_q16_scratch.is_some(),
+            need_q16_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();

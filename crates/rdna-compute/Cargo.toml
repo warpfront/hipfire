@@ -802,3 +802,7 @@ required-features = ["lab"]
 [[example]]
 name = "bench_attention_flux_vt"
 required-features = ["lab"]
+
+[[example]]
+name = "tmp_scratch_leak_probe"
+required-features = ["lab"]
