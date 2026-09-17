@@ -24,7 +24,7 @@ use radiowave::{CodeObjectCertification, KernelArgumentAccess, MutableReadCache}
 use redline_dispatch::aql::{
     load_symbols, BatchFencePolicy, Executable, FenceScope, Gfx10DispatchInitiatorPolicy,
     Gfx10Pm4CommandBuffer, Gfx10SetShRegRecord, Gfx11ComputeResourceLimitsPolicy,
-    Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
+    Gfx11DispatchInterleave, Gfx12Pm4CommandBuffer, Gfx12RmwAcquirePolicy, GpuBatchTiming, GpuDevice, GpuMultiQueueTiming,
     GpuSelector, HeaderPolicy, KernargBuffer, KernargPool, Kernel, LaunchGeometry,
     PhasedMultiQueuePm4Ib, QueuePolicy, Quiescence, RecordedDispatch, Runtime,
     SingleQueueBatchGraph, SingleQueuePm4Ib,
@@ -332,6 +332,13 @@ impl Pm4Commands {
         match self {
             Self::Legacy { commands, .. } if vmem_only => commands.acquire_inter_node_vmem(),
             Self::Legacy { commands, .. } => commands.acquire_inter_node_same_agent(),
+            // Opt-in Radiowave-certified rung: the caller gates `vmem_only`
+            // by architecture (Legacy `HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE`
+            // vs gfx12 `HIPFIRE_REPLAY_PM4_GFX12_VMEM_ACQUIRE`), so reaching
+            // this arm means the consumer is certified VMEM-only on gfx12.
+            Self::Gfx12(commands) if vmem_only => {
+                commands.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::HipLlvmVmemL1);
+            }
             Self::Gfx12(commands) if gfx12_gcr_trim => commands.acquire_inter_node_gfx12(),
             Self::Gfx12(commands) => commands.acquire_system(),
         }
@@ -586,6 +593,35 @@ fn pm4_vmem_acquire_enabled(
 
 fn pm4_vmem_acquire_arch_enabled(architecture: Pm4Architecture, configured: bool) -> bool {
     architecture != Pm4Architecture::Gfx12 && configured
+}
+
+/// Opt-in gate for the gfx12 `HipLlvmVmemL1` RMW rung, mirroring
+/// `HIPFIRE_REPLAY_PM4_GFX11_VMEM_ACQUIRE` but defaulting OFF on every
+/// device: unlike the gfx1151 default, no gfx12 part has yet proven the VMEM
+/// rung exact and non-slower in the harness. `auto` also means off; the rung
+/// stays an explicit operator decision until that evidence lands.
+fn pm4_gfx12_vmem_acquire_from_config() -> bool {
+    pm4_gfx12_vmem_acquire_from_value(hipfire_config::process_value(
+        "HIPFIRE_REPLAY_PM4_GFX12_VMEM_ACQUIRE",
+    ))
+}
+
+fn pm4_gfx12_vmem_acquire_from_value(value: Option<String>) -> bool {
+    match value {
+        Some(raw) if raw != "auto" => matches!(raw.as_str(), "1" | "true" | "on"),
+        _ => false,
+    }
+}
+
+/// Gfx12 counterpart to `pm4_vmem_acquire_enabled`: the same Radiowave
+/// `vmem_only` certification, but gated by the gfx12 opt-in instead of the
+/// Legacy flag (which `pm4_vmem_acquire_arch_enabled` keeps gfx12-excluded).
+fn pm4_gfx12_vmem_acquire_enabled(
+    configured: bool,
+    certifications: &BTreeMap<PathBuf, CodeObjectCertification>,
+    launch: &RecordedHipLaunch,
+) -> bool {
+    configured && radiowave_vmem_only_consumer(certifications, launch)
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -4764,7 +4800,11 @@ impl ReplayController {
                 Some(value) if value != "auto" => matches!(value.as_str(), "1" | "true" | "on"),
                 _ => device.name().eq_ignore_ascii_case("gfx1151"),
             };
-        let radiowave_certifications = if gfx11_vmem_acquire {
+        let gfx12_vmem_acquire = pm4_gfx12_vmem_acquire_from_config();
+        if gfx12_vmem_acquire {
+            eprintln!("[redline] gfx12 PM4 VMEM RMW acquire rung enabled (explicit opt-in)");
+        }
+        let radiowave_certifications = if gfx11_vmem_acquire || gfx12_vmem_acquire {
             radiowave_certifications(&self.recorded, prefix)
         } else {
             BTreeMap::new()
@@ -4967,13 +5007,31 @@ impl ReplayController {
                             .acquire_between(previous, current);
                     if gfx12_pre_dispatch_acquire {
                         dependency_acquires += 1;
-                        boundary.acquire_vmem = true;
-                        commands.gfx12_system_acquire()?;
+                        // Gfx12-only arm, so only the gfx12 opt-in can select
+                        // the VMEM rung here (`pm4_vmem_acquire_enabled` is
+                        // arch-excluded on gfx12 and always false on this path).
+                        boundary.acquire_vmem = pm4_gfx12_vmem_acquire_enabled(
+                            gfx12_vmem_acquire,
+                            &radiowave_certifications,
+                            current_launch,
+                        );
+                        if boundary.acquire_vmem {
+                            commands.acquire_inter_node(gfx12_gcr_trim, true);
+                        } else {
+                            // Baseline default: the pre-dispatch hazard needs
+                            // the system-scope acquire; the weaker inter-node
+                            // rung behind this arm is an explicit opt-in only.
+                            commands.gfx12_system_acquire()?;
+                        }
                     } else if acquire {
                         dependency_acquires += 1;
                         boundary.acquire_vmem = pm4_vmem_acquire_enabled(
                             pm4_architecture,
                             gfx11_vmem_acquire,
+                            &radiowave_certifications,
+                            current_launch,
+                        ) || pm4_gfx12_vmem_acquire_enabled(
+                            gfx12_vmem_acquire,
                             &radiowave_certifications,
                             current_launch,
                         );
@@ -5189,7 +5247,10 @@ impl ReplayController {
                                 {
                                     lane.acquire_inter_node(
                                         gfx12_gcr_trim,
-                                        gfx11_vmem_acquire
+                                        ((pm4_architecture != Pm4Architecture::Gfx12
+                                            && gfx11_vmem_acquire)
+                                            || (pm4_architecture == Pm4Architecture::Gfx12
+                                                && gfx12_vmem_acquire))
                                             && radiowave_vmem_only_consumer(
                                                 &radiowave_certifications,
                                                 current_launch,
@@ -5257,6 +5318,10 @@ impl ReplayController {
                                 pm4_vmem_acquire_enabled(
                                     pm4_architecture,
                                     gfx11_vmem_acquire,
+                                    &radiowave_certifications,
+                                    current_launch,
+                                ) || pm4_gfx12_vmem_acquire_enabled(
+                                    gfx12_vmem_acquire,
                                     &radiowave_certifications,
                                     current_launch,
                                 ),
@@ -6206,6 +6271,26 @@ mod tests {
             Pm4Architecture::Gfx11,
             false
         ));
+    }
+
+    #[test]
+    fn gfx12_vmem_acquire_is_explicit_opt_in() {
+        // Unset and `auto` both mean off: the HipLlvmVmemL1 rung stays an
+        // explicit operator decision until the harness proves it exact and
+        // non-slower. Only an affirmative value enables it.
+        assert!(!pm4_gfx12_vmem_acquire_from_value(None));
+        assert!(!pm4_gfx12_vmem_acquire_from_value(Some("auto".to_owned())));
+        assert!(!pm4_gfx12_vmem_acquire_from_value(Some("0".to_owned())));
+        assert!(!pm4_gfx12_vmem_acquire_from_value(Some("off".to_owned())));
+        for enabled in ["1", "true", "on"] {
+            assert!(
+                pm4_gfx12_vmem_acquire_from_value(Some(enabled.to_owned())),
+                "{enabled}"
+            );
+        }
+        // The Legacy arch gate is untouched: the gfx11 flag path still
+        // reports false on gfx12 even when configured.
+        assert!(!pm4_vmem_acquire_arch_enabled(Pm4Architecture::Gfx12, true));
     }
 
     #[test]
