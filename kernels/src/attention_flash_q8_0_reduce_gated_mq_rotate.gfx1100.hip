@@ -20,6 +20,9 @@ __global__ void HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL(
     const float* __restrict__ partials,
     float* __restrict__ out,
     const float* __restrict__ gate,
+#ifdef HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ
+    const float* __restrict__ awq_scale,
+#endif
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     int n_heads,
@@ -86,14 +89,23 @@ __global__ void HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL(
     if (tid >= 32) return;
     const int lane = tid;
     const int d0 = lane * 8;
-    float v0 = rotate_values[d0]     * signs1[d0];
-    float v1 = rotate_values[d0 + 1] * signs1[d0 + 1];
-    float v2 = rotate_values[d0 + 2] * signs1[d0 + 2];
-    float v3 = rotate_values[d0 + 3] * signs1[d0 + 3];
-    float v4 = rotate_values[d0 + 4] * signs1[d0 + 4];
-    float v5 = rotate_values[d0 + 5] * signs1[d0 + 5];
-    float v6 = rotate_values[d0 + 6] * signs1[d0 + 6];
-    float v7 = rotate_values[d0 + 7] * signs1[d0 + 7];
+#ifdef HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ
+    // AWQ twin: (gated_value / awq_scale) * signs1 before the FWHT, exactly
+    // the standalone sigmoid_mul_f32 -> rotate_x_mq_awq order. awq_scale is
+    // [n_heads * head_dim]; head_dim == 256 is guarded above.
+#define HIPFIRE_ATTN_PRESCALE(v, i) ((v) / awq_scale[h * head_dim + (i)])
+#else
+#define HIPFIRE_ATTN_PRESCALE(v, i) (v)
+#endif
+    float v0 = HIPFIRE_ATTN_PRESCALE(rotate_values[d0], d0) * signs1[d0];
+    float v1 = HIPFIRE_ATTN_PRESCALE(rotate_values[d0 + 1], d0 + 1) * signs1[d0 + 1];
+    float v2 = HIPFIRE_ATTN_PRESCALE(rotate_values[d0 + 2], d0 + 2) * signs1[d0 + 2];
+    float v3 = HIPFIRE_ATTN_PRESCALE(rotate_values[d0 + 3], d0 + 3) * signs1[d0 + 3];
+    float v4 = HIPFIRE_ATTN_PRESCALE(rotate_values[d0 + 4], d0 + 4) * signs1[d0 + 4];
+    float v5 = HIPFIRE_ATTN_PRESCALE(rotate_values[d0 + 5], d0 + 5) * signs1[d0 + 5];
+    float v6 = HIPFIRE_ATTN_PRESCALE(rotate_values[d0 + 6], d0 + 6) * signs1[d0 + 6];
+    float v7 = HIPFIRE_ATTN_PRESCALE(rotate_values[d0 + 7], d0 + 7) * signs1[d0 + 7];
+#undef HIPFIRE_ATTN_PRESCALE
 
     float t;
     t = v0; v0 = v0 + v1; v1 = t - v1;

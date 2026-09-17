@@ -211,6 +211,7 @@ fn decode_step_body(
             block_start: 0,
             block_cols: 0,
             output_gate: None,
+            output_awq_scale: None,
             output: &state.fa_attn_out,
         };
         hipfire_dispatch::pipeline::execute_steps(
@@ -1276,6 +1277,7 @@ fn batched_attend(
         block_start: 0,
         block_cols: 0,
         output_gate: None,
+        output_awq_scale: None,
         output: &state.b_attn_out,
     };
     hipfire_dispatch::pipeline::execute_steps(

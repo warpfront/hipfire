@@ -5399,6 +5399,7 @@ impl Gpu {
             partials,
             window,
             None,
+            None,
         )
     }
 
@@ -5435,6 +5436,46 @@ impl Gpu {
             partials,
             0,
             Some(gate),
+            None,
+        )
+    }
+
+    /// Q8 flash-attention decode AWQ twin of
+    /// `attention_flash_q8_0_gated_mq_rotate_gfx1100`: identical tile pass,
+    /// then the reduce epilogue divides by `awq_scale` after the sigmoid gate
+    /// and before signs/FWHT. Routed only when the WO weight carries a scale.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_q8_0_gated_mq_rotate_awq_gfx1100(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        gate: &GpuTensor,
+        awq_scale: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.attention_flash_q8_0_windowed_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            pos_buf,
+            seq_len_hint,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            partials,
+            0,
+            Some(gate),
+            Some(awq_scale),
         )
     }
 
@@ -5454,6 +5495,7 @@ impl Gpu {
         partials: &GpuTensor,
         window: i32,
         output_gate: Option<&GpuTensor>,
+        output_awq_scale: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
@@ -5575,7 +5617,15 @@ impl Gpu {
             let mt = max_tiles as i32;
             if let Some(gate) = output_gate {
                 self.attention_flash_reduce_gated_mq_rotate_gfx1100(
-                    partials, out, gate, pos_buf, n_heads, head_dim, tile_size, max_tiles,
+                    partials,
+                    out,
+                    gate,
+                    output_awq_scale,
+                    pos_buf,
+                    n_heads,
+                    head_dim,
+                    tile_size,
+                    max_tiles,
                 )?;
             } else {
                 const KERNEL: &str = "attention_flash_q8_0_reduce";
@@ -8118,6 +8168,85 @@ impl Gpu {
         partials: &GpuTensor,
         output_gate: Option<&GpuTensor>,
     ) -> HipResult<()> {
+        self.attention_flash_asym3_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            pos_buf,
+            cos_theta,
+            sin_theta,
+            seq_len_hint,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            partials,
+            output_gate,
+            None,
+        )
+    }
+
+    /// asym3 flash-attention decode AWQ twin: identical tile pass, then the
+    /// reduce epilogue divides by `awq_scale` after the sigmoid gate and
+    /// before signs/FWHT. Routed only when the WO weight carries a scale.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_asym3_gated_mq_rotate_awq(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        gate: &GpuTensor,
+        awq_scale: &GpuTensor,
+    ) -> HipResult<()> {
+        self.attention_flash_asym3_impl(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            pos_buf,
+            cos_theta,
+            sin_theta,
+            seq_len_hint,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            partials,
+            Some(gate),
+            Some(awq_scale),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn attention_flash_asym3_impl(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        cos_theta: &GpuTensor,
+        sin_theta: &GpuTensor,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+        output_gate: Option<&GpuTensor>,
+        output_awq_scale: Option<&GpuTensor>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         const TILE_SIZE: usize = 128;
         let max_tiles = (max_seq + TILE_SIZE - 1) / TILE_SIZE;
@@ -8180,7 +8309,15 @@ impl Gpu {
 
         if let Some(gate) = output_gate {
             return self.attention_flash_reduce_gated_mq_rotate_gfx1100(
-                partials, out, gate, pos_buf, n_heads, head_dim, TILE_SIZE, max_tiles,
+                partials,
+                out,
+                gate,
+                output_awq_scale,
+                pos_buf,
+                n_heads,
+                head_dim,
+                TILE_SIZE,
+                max_tiles,
             );
         }
 
@@ -8227,13 +8364,34 @@ impl Gpu {
         partials: &GpuTensor,
         out: &GpuTensor,
         gate: &GpuTensor,
+        awq_scale: Option<&GpuTensor>,
         pos_buf: &DeviceBuffer,
         n_heads: usize,
         head_dim: usize,
         tile_size: usize,
         max_tiles: usize,
     ) -> HipResult<()> {
-        let (module, src, kernel) = if self.arch_caps.is_gfx1201() {
+        let (module, src, kernel) = if awq_scale.is_some() {
+            if self.arch_caps.is_gfx1201() {
+                (
+                    "attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1201",
+                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1201_SRC,
+                    "attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1201",
+                )
+            } else if self.arch_caps.is_gfx1151() {
+                (
+                    "attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1151",
+                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1151_SRC,
+                    "attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1151",
+                )
+            } else {
+                (
+                    "attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100",
+                    kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1100_SRC,
+                    "attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100",
+                )
+            }
+        } else if self.arch_caps.is_gfx1201() {
             (
                 "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
                 kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC,
@@ -8252,12 +8410,30 @@ impl Gpu {
                 "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1100",
             )
         };
+        if let Some(scale) = awq_scale {
+            let required = n_heads.checked_mul(head_dim).ok_or_else(|| {
+                hip_bridge::HipError::new(1, "gated mq rotate reducer: size overflow")
+            })?;
+            if scale.numel() < required {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    &format!(
+                        "gated mq rotate reducer: undersized awq_scale (got {}, required {})",
+                        scale.numel(),
+                        required,
+                    ),
+                ));
+            }
+        }
         self.ensure_kernel(module, src, kernel)?;
         self.ensure_mq_signs()?;
 
         let p_ptr = partials.buf.as_ptr();
         let o_ptr = out.buf.as_ptr();
         let g_ptr = gate.buf.as_ptr();
+        let aw_ptr_slot: *mut c_void = awq_scale
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let nh = n_heads as i32;
@@ -8269,15 +8445,32 @@ impl Gpu {
             &p_ptr as *const _ as *mut c_void,
             &o_ptr as *const _ as *mut c_void,
             &g_ptr as *const _ as *mut c_void,
-            &s1_ptr as *const _ as *mut c_void,
-            &s2_ptr as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &pos_ptr as *const _ as *mut c_void,
-            &ts as *const _ as *mut c_void,
-            &mt as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(
+        if awq_scale.is_some() {
+            params.push(&aw_ptr_slot as *const _ as *mut c_void);
+        }
+        params.extend(
+            [
+                &s1_ptr as *const _ as *mut c_void,
+                &s2_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
+            ]
+            .into_iter(),
+        );
+        // Profiling receipt only: the hot path pays a single thread-local
+        // check inside begin_timer when profiling is inactive. Without this
+        // the fused producer is invisible to the eager launch census while
+        // its unfused counterparts (rotate, sigmoid) are all counted.
+        let k = n_heads * head_dim;
+        let bytes = n_heads * max_tiles * (2 + head_dim) * 4
+            + k * 4 * 2
+            + if awq_scale.is_some() { k * 4 } else { 0 };
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
+        let result = self.launch_maybe_blob(
             kernel,
             [n_heads as u32, 1, 1],
             [256, 1, 1],
@@ -8288,6 +8481,9 @@ impl Gpu {
                 b.push_ptr(p_ptr);
                 b.push_ptr(o_ptr);
                 b.push_ptr(g_ptr);
+                if awq_scale.is_some() {
+                    b.push_ptr(aw_ptr_slot);
+                }
                 b.push_ptr(s1_ptr);
                 b.push_ptr(s2_ptr);
                 b.push_i32(nh);
@@ -8297,7 +8493,11 @@ impl Gpu {
                 b.push_i32(mt);
                 b
             },
-        )
+        );
+        if let Some(timer) = timer {
+            timer.finish(&self.hip);
+        }
+        result
     }
 
     /// Fused K+V write for asym2: K at givens2 (rotated 2-bit), V at Q8_0 (normal space).

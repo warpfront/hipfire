@@ -4305,6 +4305,11 @@ pub(crate) fn kv_cache_attention_dispatch(
         block_start: 0,
         block_cols: 0,
         output_gate: fused_epilogue.then_some(&s.fa_gate),
+        output_awq_scale: if fused_epilogue {
+            wo.awq_scale.as_ref()
+        } else {
+            None
+        },
         output: &s.fa_attn_out,
     };
     execute_steps(gpu, ctx, &[Step::Attend { plan, io }])
@@ -6402,6 +6407,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 &s.dn_attn_out,
                 &s.dn_z,
                 norm_weight,
+                wo.awq_scale.as_ref(),
                 &s.x_rot,
                 self.n_v_heads,
                 config.linear_value_head_dim,
@@ -7080,7 +7086,6 @@ fn gated_norm_mq_rotate_enabled(
             wo.gpu_dtype,
             DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
         )
-        && wo.awq_scale.is_none()
 }
 
 /// Collapse full-attention Q/gate deinterleave, Q/K RMS normalization, and
@@ -7144,7 +7149,6 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
             wo.gpu_dtype,
             DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
         )
-        && wo.awq_scale.is_none()
 }
 
 /// Exact dense Qwen3.6-27B shape shared by its gfx1100 decode selectors.

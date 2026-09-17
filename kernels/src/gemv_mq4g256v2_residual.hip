@@ -131,7 +131,7 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
         float sc0b, zp0b, sc1b, zp1b, sc2b, zp2b, sc3b, zp3b;
         unsigned int pk0b, pk1b, pk2b, pk3b;
 
-#if defined(__gfx1100__)
+#if defined(__gfx1100__) || defined(HIPFIRE_GFX1151_RESIDUAL_ROW_SERIAL)
         LOAD_W(row_ptr0 + g * 136, row_weight_offset0 + g * 136, sc0a, zp0a, pk0a);
         LOAD_W(row_ptr0 + (g + 1) * 136, row_weight_offset0 + (g + 1) * 136, sc1a, zp1a, pk1a);
         LOAD_W(row_ptr0 + (g + 2) * 136, row_weight_offset0 + (g + 2) * 136, sc2a, zp2a, pk2a);

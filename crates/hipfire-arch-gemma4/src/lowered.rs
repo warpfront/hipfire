@@ -4605,6 +4605,7 @@ fn sliding_layer_decode_impl(
             block_start: 0,
             block_cols: 0,
             output_gate: None,
+            output_awq_scale: None,
             output: &scratch.attn_out,
         };
         execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -5023,6 +5024,7 @@ fn full_layer_decode_impl(
             block_start: 0,
             block_cols: 0,
             output_gate: None,
+            output_awq_scale: None,
             output: &scratch.attn_out,
         };
         execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -5822,6 +5824,7 @@ fn forward_prefill_batch_v2(
                         block_start: 0,
                         block_cols: 0,
                         output_gate: None,
+                        output_awq_scale: None,
                         output: &scratch.attn_out,
                     };
                     let ctx = DispatchCtx::new(gpu);
@@ -6155,6 +6158,7 @@ fn forward_prefill_batch_v2(
                     block_start: 0,
                     block_cols: 0,
                     output_gate: None,
+                    output_awq_scale: None,
                     output: &scratch.pb_attn_q,
                 };
                 let ctx = DispatchCtx::new(gpu);
@@ -6239,6 +6243,7 @@ fn forward_prefill_batch_v2(
                             block_start: 0,
                             block_cols: 0,
                             output_gate: None,
+                            output_awq_scale: None,
                             output: &scratch.attn_out,
                         };
                         let c1 = DispatchCtx::new(gpu);
@@ -7189,6 +7194,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     block_start: 0,
                     block_cols: 0,
                     output_gate: None,
+                    output_awq_scale: None,
                     output: &s.attn_out,
                 };
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -7298,6 +7304,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     block_start: 0,
                     block_cols: 0,
                     output_gate: None,
+                    output_awq_scale: None,
                     output: &s.attn_out,
                 };
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])

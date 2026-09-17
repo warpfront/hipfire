@@ -1170,6 +1170,37 @@ pub const GATED_NORM_MQ_ROTATE_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_gfx1201\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip")
 );
+/// AWQ twin of the DeltaNet gated-norm/MQ rotation producer. Same shared
+/// gfx1100 body compiled with HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ=1; the divide
+/// runs after the LDS handoff and before signs1/FWHT. Per-arch entry symbols
+/// stay distinct so stale HSACO caches cannot alias AWQ/non-AWQ variants.
+pub const GATED_NORM_MQ_ROTATE_AWQ_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_gfx1100\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip")
+);
+pub fn gated_norm_mq_rotate_awq_k6144_gfx1100_src() -> &'static str {
+    static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    SRC.get_or_init(|| {
+        format!(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_k6144_gfx1100\n{}",
+            GATED_NORM_MQ_ROTATE_GFX1100_SRC.replace(
+                "if (n_heads != 32 || head_dim != 128) return;",
+                "if (n_heads != 48 || head_dim != 128) return;",
+            )
+        )
+    })
+}
+pub const GATED_NORM_MQ_ROTATE_AWQ_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_gfx1151\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_gfx1201\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip")
+);
 /// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
 /// post-projection input-rotate path (o_proj / out_proj inputs). Dispatched
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:
@@ -1724,6 +1755,20 @@ pub const GEMV_HFQ4G256_RESIDUAL_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
 );
 pub const GEMV_MQ4G256V2_RESIDUAL_SRC: &str = concat!(
+    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
+    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
+    include_str!("../../../kernels/src/gemv_mq4g256v2_residual.hip")
+);
+/// Exact-gfx1151 row-serialized no-spill twin of
+/// [`GEMV_MQ4G256V2_RESIDUAL_SRC`]: selects the shipped gfx1100
+/// row0-load/FMA, dependency barrier, row1-load/FMA schedule under
+/// `HIPFIRE_GFX1151_RESIDUAL_ROW_SERIAL` with the unique entry
+/// `gemv_mq4g256v2_residual_row_serial_gfx1151`. Arithmetic is bit-identical
+/// to the legacy simultaneous path, which stays the default for every other
+/// architecture.
+pub const GEMV_MQ4G256V2_RESIDUAL_ROW_SERIAL_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_GFX1151_RESIDUAL_ROW_SERIAL 1\n",
+    "#define HIPFIRE_RESIDUAL_KERNEL gemv_mq4g256v2_residual_row_serial_gfx1151\n",
     "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_mq4g256v2_residual.hip")
@@ -4930,12 +4975,17 @@ pub fn gemv_hfq4g256_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'stat
         _ => (GEMV_HFQ4G256_RESIDUAL_SRC, "gemv_hfq4g256_residual"),
     }
 }
+/// MQ4G256V2 residual arch dispatch. The second return value is the actual
+/// C entry symbol in the returned source: exact gfx1151 runs the
+/// row-serialized no-spill twin under its unique source/symbol; every other
+/// architecture keeps the existing source and the default entry symbol.
 pub fn gemv_mq4g256v2_residual_for_arch(caps: &ArchCaps) -> (&'static str, &'static str) {
     let arch = caps.arch();
     match arch {
-        "gfx1100" | "gfx1101" | "gfx1102" => {
-            (GEMV_MQ4G256V2_RESIDUAL_SRC, "gemv_mq4g256v2_residual_rdna3")
-        }
+        "gfx1151" => (
+            GEMV_MQ4G256V2_RESIDUAL_ROW_SERIAL_GFX1151_SRC,
+            "gemv_mq4g256v2_residual_row_serial_gfx1151",
+        ),
         _ => (GEMV_MQ4G256V2_RESIDUAL_SRC, "gemv_mq4g256v2_residual"),
     }
 }
@@ -5813,6 +5863,24 @@ pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC: &str = concat
 /// uses only wave32 ds_swizzle/LDS constructs that compile on RDNA4.
 pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201\n",
+    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip")
+);
+/// AWQ twin of the attention reduce/gate/MQ epilogue. Same shared gfx1100
+/// body compiled with HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ=1; the divide runs
+/// after the reduce+sigmoid-gate LDS value and before signs1/FWHT.
+pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1100_SRC: &str = concat!(
+    "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ 1\n",
+    "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100\n",
+    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip")
+);
+pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1151_SRC: &str = concat!(
+    "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ 1\n",
+    "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1151\n",
+    include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip")
+);
+pub const ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ 1\n",
+    "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1201\n",
     include_str!("../../../kernels/src/attention_flash_q8_0_reduce_gated_mq_rotate.gfx1100.hip")
 );
 
@@ -7870,6 +7938,47 @@ mod dispatch_tests {
             "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_k6144_gfx1100"
         ));
         assert!(k6144.contains("if (n_heads != 48 || head_dim != 128) return;"));
+        assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1100_SRC.contains(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_gfx1100"
+        ));
+        assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1100_SRC
+            .contains("#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1"));
+        assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1151_SRC.starts_with(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1"
+        ));
+        assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1151_SRC.contains(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_gfx1151"
+        ));
+        assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1201_SRC.starts_with(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1"
+        ));
+        assert!(GATED_NORM_MQ_ROTATE_AWQ_GFX1201_SRC.contains(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_gfx1201"
+        ));
+        let awq_k6144 = gated_norm_mq_rotate_awq_k6144_gfx1100_src();
+        assert!(awq_k6144.contains(
+            "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_k6144_gfx1100"
+        ));
+        assert!(awq_k6144.contains("#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1"));
+        assert!(awq_k6144.contains("if (n_heads != 48 || head_dim != 128) return;"));
+        assert!(!awq_k6144.contains("if (n_heads != 32 || head_dim != 128) return;"));
+        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1100_SRC.contains(
+            "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100"
+        ));
+        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1100_SRC
+            .contains("#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ 1"));
+        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1151_SRC.starts_with(
+            "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ 1"
+        ));
+        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1151_SRC.contains(
+            "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1151"
+        ));
+        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1201_SRC.starts_with(
+            "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ 1"
+        ));
+        assert!(ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_AWQ_GFX1201_SRC.contains(
+            "#define HIPFIRE_ATTENTION_REDUCE_GATED_MQ_KERNEL attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1201"
+        ));
         assert!(MOE_DOWN_COMBINE_RMSNORM_MQ_ROTATE_VECSUM_GFX1151_SRC.starts_with(
             "#define HIPFIRE_MOE_COMBINE_RMSNORM_MQ_KERNEL moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151"
         ));

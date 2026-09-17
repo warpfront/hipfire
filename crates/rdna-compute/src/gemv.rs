@@ -3463,6 +3463,7 @@ impl Gpu {
         x: &GpuTensor,
         z: &GpuTensor,
         weight: &GpuTensor,
+        awq_scale: Option<&GpuTensor>,
         x_rot: &GpuTensor,
         n_heads: usize,
         head_dim: usize,
@@ -3477,6 +3478,18 @@ impl Gpu {
                 1,
                 "gated_norm_rotate_mq_gfx1100: expected 32 or 48 heads with head_dim=128",
             ));
+        }
+        if let Some(scale) = awq_scale {
+            if scale.numel() < k {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    &format!(
+                        "gated_norm_rotate_mq_gfx1100: undersized awq_scale (got {}, required {})",
+                        scale.numel(),
+                        k,
+                    ),
+                ));
+            }
         }
         if x.numel() < k || z.numel() < k || weight.numel() < head_dim || x_rot.numel() < k {
             return Err(hip_bridge::HipError::new(
@@ -3500,22 +3513,52 @@ impl Gpu {
                     "48-head gated norm/MQ rotation is certified only on gfx1100",
                 ));
             }
-            (
-                "gated_norm_mq_rotate_k6144_gfx1100",
-                kernels::gated_norm_mq_rotate_k6144_gfx1100_src(),
-                "gated_norm_mq_rotate_k6144_gfx1100",
-            )
+            if awq_scale.is_some() {
+                (
+                    "gated_norm_mq_rotate_awq_k6144_gfx1100",
+                    kernels::gated_norm_mq_rotate_awq_k6144_gfx1100_src(),
+                    "gated_norm_mq_rotate_awq_k6144_gfx1100",
+                )
+            } else {
+                (
+                    "gated_norm_mq_rotate_k6144_gfx1100",
+                    kernels::gated_norm_mq_rotate_k6144_gfx1100_src(),
+                    "gated_norm_mq_rotate_k6144_gfx1100",
+                )
+            }
         } else if self.arch_caps.is_gfx1201() {
-            (
-                "gated_norm_mq_rotate_gfx1201",
-                kernels::GATED_NORM_MQ_ROTATE_GFX1201_SRC,
-                "gated_norm_mq_rotate_gfx1201",
-            )
+            if awq_scale.is_some() {
+                (
+                    "gated_norm_mq_rotate_awq_gfx1201",
+                    kernels::GATED_NORM_MQ_ROTATE_AWQ_GFX1201_SRC,
+                    "gated_norm_mq_rotate_awq_gfx1201",
+                )
+            } else {
+                (
+                    "gated_norm_mq_rotate_gfx1201",
+                    kernels::GATED_NORM_MQ_ROTATE_GFX1201_SRC,
+                    "gated_norm_mq_rotate_gfx1201",
+                )
+            }
         } else if self.arch_caps.is_gfx1151() {
+            if awq_scale.is_some() {
+                (
+                    "gated_norm_mq_rotate_awq_gfx1151",
+                    kernels::GATED_NORM_MQ_ROTATE_AWQ_GFX1151_SRC,
+                    "gated_norm_mq_rotate_awq_gfx1151",
+                )
+            } else {
+                (
+                    "gated_norm_mq_rotate_gfx1151",
+                    kernels::GATED_NORM_MQ_ROTATE_GFX1151_SRC,
+                    "gated_norm_mq_rotate_gfx1151",
+                )
+            }
+        } else if awq_scale.is_some() {
             (
-                "gated_norm_mq_rotate_gfx1151",
-                kernels::GATED_NORM_MQ_ROTATE_GFX1151_SRC,
-                "gated_norm_mq_rotate_gfx1151",
+                "gated_norm_mq_rotate_awq_gfx1100",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_GFX1100_SRC,
+                "gated_norm_mq_rotate_awq_gfx1100",
             )
         } else {
             (
@@ -3529,6 +3572,9 @@ impl Gpu {
         let xp = x.buf.as_ptr();
         let zp = z.buf.as_ptr();
         let wp = weight.buf.as_ptr();
+        let awp_slot: *mut c_void = awq_scale
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let xrp = x_rot.buf.as_ptr();
@@ -3539,14 +3585,24 @@ impl Gpu {
             &xp as *const _ as *mut c_void,
             &zp as *const _ as *mut c_void,
             &wp as *const _ as *mut c_void,
-            &s1 as *const _ as *mut c_void,
-            &s2 as *const _ as *mut c_void,
-            &xrp as *const _ as *mut c_void,
-            &nh as *const _ as *mut c_void,
-            &hd as *const _ as *mut c_void,
-            &ep as *const _ as *mut c_void,
         ];
-        let bytes = crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k);
+        if awq_scale.is_some() {
+            params.push(&awp_slot as *const _ as *mut c_void);
+        }
+        params.extend(
+            [
+                &s1 as *const _ as *mut c_void,
+                &s2 as *const _ as *mut c_void,
+                &xrp as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &ep as *const _ as *mut c_void,
+            ]
+            .into_iter(),
+        );
+        let bytes = crate::profile::gated_norm_bytes(k)
+            + crate::profile::mq_rotate_bytes(k)
+            + if awq_scale.is_some() { k * 4 } else { 0 };
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
@@ -3559,6 +3615,9 @@ impl Gpu {
                 b.push_ptr(xp);
                 b.push_ptr(zp);
                 b.push_ptr(wp);
+                if awq_scale.is_some() {
+                    b.push_ptr(awp_slot);
+                }
                 b.push_ptr(s1);
                 b.push_ptr(s2);
                 b.push_ptr(xrp);
@@ -7785,10 +7844,21 @@ impl Gpu {
         };
         // For gfx1201 minimal dense set, rows=1 and no multirow/wave64 path is taken.
         // Still thread define through the helper rather than bypassing it.
-        let (v2_src, _) = kernels::gemv_mq4g256v2_residual_for_arch(&self.arch_caps);
+        let (v2_src, v2_entry) = kernels::gemv_mq4g256v2_residual_for_arch(&self.arch_caps);
         let (_, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps);
-        let module_v2 = format!("{}_mq4v2", module);
-        let func_name = "gemv_mq4g256v2_residual";
+        // Exact gfx1151 runs the row-serialized no-spill twin under its own
+        // unique module+entry so a stale HSACO cannot alias it; every other
+        // architecture keeps the existing module and the default entry.
+        // Grid stays M (Slice 1 keeps scheduling and grid contraction separate).
+        let module_v2: String;
+        let func_name: &str;
+        if self.arch_caps.is_gfx1151() {
+            module_v2 = v2_entry.to_string();
+            func_name = v2_entry;
+        } else {
+            module_v2 = format!("{}_mq4v2", module);
+            func_name = v2_entry;
+        }
         self.ensure_kernel(&module_v2, v2_src, func_name)?;
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();

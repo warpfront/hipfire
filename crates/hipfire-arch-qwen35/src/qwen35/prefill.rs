@@ -6939,6 +6939,7 @@ fn execute_fa_attend_step(
         block_start,
         block_cols,
         output_gate: None,
+        output_awq_scale: None,
         output,
     };
     execute_steps(gpu, ctx, &[Step::Attend { plan, io }])

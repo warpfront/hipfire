@@ -3110,6 +3110,7 @@ fn forward_prefill_chunk(
                 block_start: 0,
                 block_cols: 0,
                 output_gate: None,
+                output_awq_scale: None,
                 output: &pbs.fa_attn_out_batch,
             };
             attention_family()
@@ -4048,6 +4049,7 @@ fn llama_kv_write_attend(
             block_start: 0,
             block_cols: 0,
             output_gate: None,
+            output_awq_scale: None,
             output: &scratch.attn_out,
         };
         attention_family()
@@ -4431,6 +4433,7 @@ impl crate::arch_spec::DenseArch for LlamaDense<'_> {
             block_start: 0,
             block_cols: 0,
             output_gate: None,
+            output_awq_scale: None,
             output: &s.attn_out,
         };
         Ok(Some((plan, io)))
@@ -4567,6 +4570,7 @@ pub fn forward_scratch_layers(
                 block_start: 0,
                 block_cols: 0,
                 output_gate: None,
+                output_awq_scale: None,
                 output: &scratch.attn_out,
             };
             attention_family()
@@ -5158,6 +5162,7 @@ pub fn forward_scratch_compute_capture(
                 block_start: 0,
                 block_cols: 0,
                 output_gate: None,
+                output_awq_scale: None,
                 output: &scratch.attn_out,
             };
             attention_family()

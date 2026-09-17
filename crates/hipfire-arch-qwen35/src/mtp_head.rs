@@ -1675,6 +1675,7 @@ pub fn mtp_head_forward_block_only_with_pos_buf(
         block_start: 0,
         block_cols: 0,
         output_gate: None,
+        output_awq_scale: None,
         output: &scratch.attn_out,
     };
     hipfire_dispatch::pipeline::execute_steps(

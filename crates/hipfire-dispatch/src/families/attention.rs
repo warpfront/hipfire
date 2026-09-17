@@ -62,6 +62,12 @@ pub struct AttnParams<'a> {
     /// rotation in the flash-reduce epilogue; all other callers leave this
     /// `None`.
     pub output_gate: Option<&'a GpuTensor>,
+    /// AWQ scale for the WO projection following this attention output. Some
+    /// with output_gate None is a dispatch error; (Some gate, Some scale)
+    /// routes to the AWQ producer fusion, (Some, None) to the existing
+    /// non-AWQ producer fusion, (None, None) to the normal reducer. All
+    /// non-Qwen constructors supply None.
+    pub output_awq_scale: Option<&'a GpuTensor>,
     pub output: &'a GpuTensor,
 }
 
@@ -1045,8 +1051,24 @@ fn dispatch_attend(
                 debug_assert_eq!(plan.batch_size, 1);
                 let seq_len = io.pos + 1;
                 let fp = io.flash_partials.unwrap();
-                if let Some(gate) = io.output_gate {
-                    hip!(gpu.attention_flash_q8_0_gated_mq_rotate_gfx1100(
+                match (io.output_gate, io.output_awq_scale) {
+                    (Some(gate), Some(scale)) => hip!(gpu
+                        .attention_flash_q8_0_gated_mq_rotate_awq_gfx1100(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            gate,
+                            scale,
+                            io.pos_buf,
+                            seq_len,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.physical_cap,
+                            fp,
+                        )),
+                    (Some(gate), None) => hip!(gpu.attention_flash_q8_0_gated_mq_rotate_gfx1100(
                         io.q,
                         io.k_cache,
                         io.v_cache,
@@ -1059,9 +1081,8 @@ fn dispatch_attend(
                         io.head_dim,
                         io.physical_cap,
                         fp,
-                    ))
-                } else {
-                    hip!(gpu.attention_flash_q8_0(
+                    )),
+                    (None, None) => hip!(gpu.attention_flash_q8_0(
                         io.q,
                         io.k_cache,
                         io.v_cache,
@@ -1073,7 +1094,12 @@ fn dispatch_attend(
                         io.head_dim,
                         io.physical_cap,
                         fp,
-                    ))
+                    )),
+                    (None, Some(_)) => {
+                        return Err(DispatchError::Hip(
+                            "output_awq_scale without output_gate".into(),
+                        ))
+                    }
                 }
             }
             KernelKey::AttnFlashQ8_0Windowed => {
@@ -1203,22 +1229,62 @@ fn dispatch_attend(
                         fp,
                     ));
                 }
-                hip!(gpu.attention_flash_asym3(
-                    io.q,
-                    io.k_cache,
-                    io.v_cache,
-                    io.output,
-                    io.pos_buf,
-                    ct,
-                    st,
-                    seq_len,
-                    io.n_heads,
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.physical_cap,
-                    fp,
-                    io.output_gate,
-                ))
+                match (io.output_gate, io.output_awq_scale) {
+                    (Some(gate), Some(scale)) => hip!(gpu.attention_flash_asym3_gated_mq_rotate_awq(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        ct,
+                        st,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                        gate,
+                        scale,
+                    )),
+                    (Some(gate), None) => hip!(gpu.attention_flash_asym3(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        ct,
+                        st,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                        Some(gate),
+                    )),
+                    (None, None) => hip!(gpu.attention_flash_asym3(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        ct,
+                        st,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                        None,
+                    )),
+                    (None, Some(_)) => {
+                        return Err(DispatchError::Hip(
+                            "output_awq_scale without output_gate".into(),
+                        ))
+                    }
+                }
             }
             KernelKey::AttnFlashAsym3Fwht => {
                 debug_assert_eq!(plan.batch_size, 1);
