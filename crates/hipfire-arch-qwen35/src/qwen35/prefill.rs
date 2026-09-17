@@ -640,8 +640,339 @@ pub fn prefill_max_batch_tp(gpu: &Gpu, tp: usize) -> usize {
 pub fn prefill_max_batch_ep() -> usize {
     explicit_prefill_max_batch().unwrap_or(512)
 }
-
-/// Effective per-chunk capacity for one prefill call.
+/// gfx1201 widened ordinary prefill: larger contiguous GEMM/PBS chunks with the
+/// DeltaNet kernel still launched once per 512-row commit on views and flash
+/// attention on 512-row tile views. No kernel source changes.
+///
+/// The host change is arch-parameterized: [`widened_arch_admitted`] is the
+/// single arch gate (gfx1201 only until a rung passes; gfx1151/Halo admission
+/// is a follow-on extension with its own static checks — its F2 512-pair path
+/// below is preserved regardless, since wide chunks never equal 512 rows).
+/// Only `None` (legacy cadence) and `Some(512)` are legal commit strides.
+/// `n` continues to mean chunk rows, never commit stride.
+pub(crate) const WIDENED_COMMIT_ROWS: usize = 512;
+///
+/// Staged GEMM-width rungs. Merging powers of two limits new GEMM widths to
+/// these five; a requested ceiling snaps down to the largest rung it covers.
+const WIDENED_RUNGS: [usize; 5] = [512, 1024, 2048, 4096, 8192];
+///
+/// Highest performance-admitted rung. Starts at 512 (behaviour-identical
+/// ship); raised one rung at a time only after that rung's E/M/S/V gates
+/// pass. Provisional final ceiling 4096 is an upper bound, not a per-device
+/// value — memory admission may still select a smaller rung per device.
+const WIDENED_PERF_CEILING: usize = 512;
+///
+/// Uncommitted-VRAM headroom reserved by the per-device capacity admission
+/// (plan §4.2). Conservative policy margin covering remaining state, output,
+/// graph/JIT and ordinary transients — not permission for unaccounted KV.
+const WIDENED_VRAM_HEADROOM_BYTES: usize = 1 << 30;
+///
+/// Arch gate for the widened ordinary route. gfx1201 only for now; extend
+/// here (with that arch's static checks in
+/// [`ordinary_prefill_static_ceiling`]) once a rung passes on gfx1201.
+/// When gfx1151 follows, its FA tiling must pair in 1024-row views where F2
+/// is admitted (F2 is part of the Halo baseline) or record F2-off explicitly.
+#[inline]
+fn widened_arch_admitted(arch: &str) -> bool {
+    arch == "gfx1201"
+}
+///
+/// Exact dense 27B shape the widened route admits: the shared 64-layer
+/// predicate plus the 17408 hidden_dim that fixes the allocation envelope.
+#[inline]
+fn widened_dense_shape_admitted(config: &Qwen35Config) -> bool {
+    config.hidden_dim == 17_408
+        && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
+}
+///
+/// Verbatim truthy predicate of rdna-compute's private `dn_requant_per_token`
+/// (norm.rs): non-empty and non-"0" means per-token requant. Read here
+/// directly so the widened route needs no GDN-wrapper/TU change; per-token
+/// requant inserts 511 extra Q8/EF boundaries per 512 rows and can never
+/// equal the 512-single-end trajectory, so it stays on the legacy path.
+#[inline]
+fn dn_requant_per_token_env() -> bool {
+    hipfire_config::developer_var("HIPFIRE_DN_REQUANT_PER_TOKEN")
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0"
+        })
+        .unwrap_or(false)
+}
+///
+/// Static + perf part of the widened ordinary admission. Pure except for env
+/// reads: no GPU work, no allocation. Returns `None` when the request is not
+/// statically eligible (caller keeps its legacy ceiling unchanged); else the
+/// performance-admitted chunk ceiling in rows.
+///
+/// A requested ceiling below 512 is returned as-is (explicit small values
+/// retain existing behavior); otherwise the ceiling snaps down to the
+/// largest staged rung covered by both the request and
+/// [`WIDENED_PERF_CEILING`].
+fn ordinary_prefill_static_ceiling(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+) -> Option<usize> {
+    if !widened_arch_admitted(gpu.arch.as_str()) {
+        return None;
+    }
+    if !widened_dense_shape_admitted(config) {
+        return None;
+    }
+    if !dense_layers_are_all_mq4v2(weights) {
+        return None;
+    }
+    // All four FP8 projection routes (gate/up, residual, qkvza, FA qkv).
+    // `fp8_chunk512_for_gpu` tests only the first three — legacy getter
+    // retained; the widened route needs the stricter call-local admission.
+    if !(gpu.flags.gfx12_mq4v2_fp8_gateup
+        && gpu.flags.gfx12_mq4v2_fp8_resid
+        && gpu.flags.gfx12_mq4v2_fp8_qkvza
+        && gpu.flags.gfx12_mq4v2_fp8_qkv)
+    {
+        return None;
+    }
+    // Actual Q8 state with a complete EF owner for every LA layer, single
+    // lane, and single-end requant. EF-off changes the global frame schedule
+    // under layer-major grouping (frame enters the arithmetic without EF),
+    // so it resolves to the legacy 512 path even under a larger ceiling.
+    let n_la = config
+        .layer_types
+        .iter()
+        .filter(|t| **t == LayerType::LinearAttention)
+        .count();
+    if dn_state.quant != StateQuant::Q8 || n_la == 0 {
+        return None;
+    }
+    if dn_state.s_ef_residual.len() != n_la
+        || dn_state.s_ef_residual.iter().any(|t| t.numel() == 0)
+    {
+        return None;
+    }
+    let single_lane_s = config.linear_num_value_heads * config.linear_value_head_dim
+        * config.linear_value_head_dim;
+    if dn_state.s_matrices.len() != n_la || dn_state.s_matrices.iter().any(|t| t.numel() != single_lane_s) {
+        return None;
+    }
+    if dn_requant_per_token_env() {
+        return None;
+    }
+    let requested =
+        explicit_prefill_max_batch().unwrap_or_else(|| prefill_max_batch_for_model(gpu, weights));
+    if requested < WIDENED_COMMIT_ROWS {
+        return Some(requested);
+    }
+    let cap = requested.min(WIDENED_PERF_CEILING);
+    // Largest staged rung covered by the request and the perf ceiling.
+    let mut rung = WIDENED_COMMIT_ROWS;
+    for &r in WIDENED_RUNGS.iter() {
+        if r <= cap {
+            rung = r;
+        }
+    }
+    Some(rung)
+}
+///
+/// Steady-state bytes of one dense tape-free [`PrefillBatchScratch`] at
+/// `rows` rows: every unconditional allocation including positions, rope,
+/// tokens, the four F16 sidecars and the 256-byte prologue control plane.
+/// `None` for MoE configs (out of scope) or on arithmetic overflow.
+///
+/// Term-by-term mirror of `PrefillBatchScratch::new_opt(..., false)` for
+/// dense configs: F32 `3D + 4K + 8V + 2H + 3I + 6Q + 2W + 3` elems/row, F16
+/// `D + V + I + Q` elems/row, plus 256 fixed bytes.
+fn dense_prefill_allocation_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
+    if config.num_experts != 0 {
+        return None;
+    }
+    let d = config.dim;
+    let i = config.hidden_dim;
+    let k = config.linear_num_key_heads.checked_mul(config.linear_key_head_dim)?;
+    let v = config
+        .linear_num_value_heads
+        .checked_mul(config.linear_value_head_dim)?;
+    let h = config.linear_num_value_heads;
+    let q = config.n_heads.checked_mul(config.head_dim)?;
+    let w = config.n_kv_heads.checked_mul(config.head_dim)?;
+    let f32_per_row = 3usize
+        .checked_mul(d)?
+        .checked_add(4usize.checked_mul(k)?)?
+        .checked_add(8usize.checked_mul(v)?)?
+        .checked_add(2usize.checked_mul(h)?)?
+        .checked_add(3usize.checked_mul(i)?)?
+        .checked_add(6usize.checked_mul(q)?)?
+        .checked_add(2usize.checked_mul(w)?)?
+        .checked_add(3)?;
+    let f16_per_row = d.checked_add(v)?.checked_add(i)?.checked_add(q)?;
+    rows
+        .checked_mul(f32_per_row)?
+        .checked_mul(4)?
+        .checked_add(rows.checked_mul(f16_per_row)?.checked_mul(2)?)?
+        .checked_add(256)
+}
+///
+/// FP8 pre-pass bytes/row at the conservative `Kmax = hidden_dim` envelope:
+/// E4M3 codes plus `8 * (I/256)` half-sum bytes plus one f32 row scale.
+/// Mirrors `mq4v2_fp8_needed(n, I)` summed over its three slots.
+fn fp8_row_bytes_wide(config: &Qwen35Config) -> Option<usize> {
+    let groups = config.hidden_dim.checked_div(256)?;
+    config
+        .hidden_dim
+        .checked_add(groups.checked_mul(8)?)?
+        .checked_add(4)
+}
+///
+/// Per-device capacity admission (plan §4.2): largest performance-admitted
+/// rung `<= perf_rows` whose full new PBS, per-slot FP8 deficits at Kmax,
+/// missing FA Q16 bytes and 1 GiB headroom fit in current free device bytes.
+/// The query runs after model+KV mapping and request-state allocation, so
+/// free bytes already charge mapped KV and any inactive reuse cache. Falls
+/// back to 512 (legacy route) when no enlarged rung fits — a memory-only
+/// failure selects a smaller rung, never a global rollback.
+fn memory_admitted_rung(gpu: &Gpu, config: &Qwen35Config, perf_rows: usize) -> HipResult<usize> {
+    if perf_rows <= WIDENED_COMMIT_ROWS {
+        return Ok(WIDENED_COMMIT_ROWS.min(perf_rows));
+    }
+    if dense_prefill_allocation_bytes(config, perf_rows).is_none()
+        || fp8_row_bytes_wide(config).is_none()
+    {
+        return Ok(WIDENED_COMMIT_ROWS);
+    }
+    let (free_bytes, _) = gpu.hip.get_vram_info()?;
+    let q_dim = config.n_heads.checked_mul(config.head_dim).unwrap_or(0);
+    let q16_need = WIDENED_COMMIT_ROWS
+        .checked_mul(q_dim)
+        .and_then(|v| v.checked_mul(2))
+        .unwrap_or(usize::MAX);
+    let q16_missing = q16_need.saturating_sub(gpu.scratch.fa2_q16_scratch_bytes);
+    let live_x = gpu.scratch.mq4v2_fp8_x_scratch_bytes;
+    let live_sums = gpu.scratch.mq4v2_fp8_half_sums_scratch_bytes;
+    let live_scales = gpu.scratch.mq4v2_fp8_row_scales_scratch_bytes;
+    let groups = config.hidden_dim / 256;
+    for &rung in WIDENED_RUNGS.iter().rev() {
+        if rung > perf_rows {
+            continue;
+        }
+        if rung <= WIDENED_COMMIT_ROWS {
+            return Ok(WIDENED_COMMIT_ROWS);
+        }
+        let need_pbs = dense_prefill_allocation_bytes(config, rung).unwrap_or(usize::MAX);
+        let x_need = rung.checked_mul(config.hidden_dim).unwrap_or(usize::MAX);
+        let sums_need = rung
+            .checked_mul(groups)
+            .and_then(|v| v.checked_mul(8))
+            .unwrap_or(usize::MAX);
+        let scales_need = rung.checked_mul(4).unwrap_or(usize::MAX);
+        let fp8_deficit = x_need
+            .saturating_sub(live_x)
+            .saturating_add(sums_need.saturating_sub(live_sums))
+            .saturating_add(scales_need.saturating_sub(live_scales));
+        let total = need_pbs
+            .saturating_add(fp8_deficit)
+            .saturating_add(q16_missing)
+            .saturating_add(WIDENED_VRAM_HEADROOM_BYTES);
+        if total <= free_bytes {
+            return Ok(rung);
+        }
+    }
+    Ok(WIDENED_COMMIT_ROWS)
+}
+///
+/// Effective admitted ordinary chunk ceiling for this request: static
+/// eligibility, highest performance-admitted rung, explicit requested
+/// ceiling (`HIPFIRE_PREFILL_MAX_BATCH`), and per-device byte-based capacity.
+///
+/// Public only because hipfire-generate's ordinary AR caller needs the same
+/// decision. Existing generic/TP/EP getters are unchanged. `pbs` denotes an
+/// explicit hard-cap owner: a caller PBS caps the result at its `max_batch`
+/// and is never bypassed here (the ordinary wrappers omit their *implicit*
+/// legacy cache before calling when a wider ceiling is statically admitted).
+pub fn ordinary_prefill_chunk_limit(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+    kv_cache: &llama::KvCache,
+    pbs: Option<&PrefillBatchScratch>,
+) -> HipResult<usize> {
+    let legacy = prefill_max_batch_for_model(gpu, weights);
+    let Some(perf) = ordinary_prefill_static_ceiling(gpu, weights, config, dn_state) else {
+        return Ok(legacy);
+    };
+    if perf <= WIDENED_COMMIT_ROWS {
+        return Ok(perf.min(legacy));
+    }
+    let _ = kv_cache;
+    let mut admitted = memory_admitted_rung(gpu, config, perf)?;
+    if let Some(p) = pbs {
+        admitted = admitted.min(p.max_batch);
+    }
+    // Admission only narrows the legacy explicit request: perf already snaps
+    // the request to rungs, and the sub-512 explicit path returns above.
+    Ok(admitted.min(legacy.max(WIDENED_COMMIT_ROWS)))
+}
+///
+/// Next direct-ordinary chunk under a widened ceiling: group complete
+/// legacy 512-row chunks into the largest power-of-two multiple the ceiling
+/// covers (at least two), else the legacy `<= 512` tail schedule. Preserves
+/// the direct partitioner's singleton avoidance: 513→511+2, 1025→512+511+2,
+/// 1537→1024+511+2, 2049→1024+512+511+2, 4097→2048+1024+512+511+2. Pure.
+fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usize> {
+    if remaining < MIN_BATCH || ceiling < MIN_BATCH {
+        return None;
+    }
+    if ceiling <= WIDENED_COMMIT_ROWS {
+        return next_prefill_chunk_len(remaining, ceiling);
+    }
+    let reserve_two = if remaining % WIDENED_COMMIT_ROWS == 1 { 2 } else { 0 };
+    let full = remaining.saturating_sub(reserve_two) / WIDENED_COMMIT_ROWS;
+    let count = full.min(ceiling / WIDENED_COMMIT_ROWS);
+    if count >= 2 {
+        // Largest power of two ≤ count (count ≥ 2, so the shift is safe).
+        let pow2 = 1usize << (usize::BITS - count.leading_zeros() - 1);
+        Some(WIDENED_COMMIT_ROWS * pow2)
+    } else {
+        next_prefill_chunk_len(remaining, WIDENED_COMMIT_ROWS)
+    }
+}
+///
+/// Serve-caller outer chunk under a widened ceiling: the serve caller
+/// (`ar.rs`) splits with `min(remaining, chunk_max)` and invokes forward
+/// separately per outer chunk, so its tail rule differs from the direct one
+/// — served 1025→1024+1, flattening to old 512+512+1. Pure.
+pub fn ordinary_serve_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usize> {
+    if remaining == 0 || ceiling < MIN_BATCH {
+        return None;
+    }
+    if ceiling <= WIDENED_COMMIT_ROWS || remaining <= WIDENED_COMMIT_ROWS {
+        return Some(remaining.min(ceiling));
+    }
+    let count = (remaining / WIDENED_COMMIT_ROWS).min(ceiling / WIDENED_COMMIT_ROWS);
+    if count >= 2 {
+        let pow2 = 1usize << (usize::BITS - count.leading_zeros() - 1);
+        Some(WIDENED_COMMIT_ROWS * pow2)
+    } else {
+        // Fewer than two full chunks: legacy ≤512 tail (this branch only
+        // runs with a widened ceiling, so the 512 cap is below it).
+        Some(remaining.min(WIDENED_COMMIT_ROWS))
+    }
+}
+///
+/// First-prefill receipt: proves requested-vs-executed rows for the evidence
+/// log. Emitted once per process on the first chunked (multi-token) prefill.
+fn emit_prefill_chunk_receipt(requested: usize, admitted: usize, commit_stride: Option<usize>) {
+    static DONE: std::sync::Once = std::sync::Once::new();
+    DONE.call_once(|| match commit_stride {
+        Some(s) => eprintln!(
+            "prefill_chunk: requested={requested} admitted={admitted} commit_stride={s}"
+        ),
+        None => eprintln!(
+            "prefill_chunk: requested={requested} admitted={admitted} commit_stride=none"
+        ),
+    });
+}
 ///
 /// Never form a chunk larger than the configured/capped max, the PBS
 /// staging owner, or (when present) the hidden-ring staging owner. A
@@ -993,6 +1324,7 @@ pub fn forward_prefill_batch_single_chunk_captured_opts(
         None, // max_layer: single-chunk captured path always runs the full stack
         None, // routed_out: non-EP single-GPU path
         fusion,
+        None, // commit_stride: captured path keeps legacy cadence
     )
 }
 
@@ -1016,6 +1348,16 @@ pub fn forward_prefill_batch(
     gdn_tape: Option<&mut crate::speculative::GdnTape>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
 ) -> HipResult<()> {
+    // Widened ordinary route: omit the implicit ≤512 legacy cache so a fully
+    // admitted request allocates one larger owned PBS in the inner entry.
+    // Explicit small ceilings keep the cache; capped/explicit-PBS callers
+    // never bypass (see `forward_prefill_batch_capped` and the inner entry).
+    let widen = ordinary_prefill_static_ceiling(gpu, weights, config, dn_state)
+        .is_some_and(|c| c > WIDENED_COMMIT_ROWS);
+    let pbs_for_call = match scratch.prefill_batch.as_ref() {
+        Some(_) if widen => None,
+        other => other,
+    };
     forward_prefill_batch_with_pbs(
         gpu,
         weights,
@@ -1029,7 +1371,7 @@ pub fn forward_prefill_batch(
         per_token_hidden_out,
         gdn_tape,
         tree_verify,
-        scratch.prefill_batch.as_ref(),
+        pbs_for_call,
         None, // mask_override: MTP probe is the only consumer; default callers don't override
         None, // max_layer: pflash uses this; non-pflash default is full stack
     )
@@ -1453,26 +1795,68 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             max_batch,
         );
     }
-
+    // Widened ordinary admission. Decided here, after required KV mapping, so
+    // the per-device byte admission charges mapped KV. Only the whole-stack
+    // sequential ordinary entry with no caller PBS/cap can widen: captured,
+    // TP/EP (separate callers), tree/tape, hidden-ring, band-limited, fused,
+    // or caller-capped requests resolve to the legacy path before any wider
+    // allocation or launch. The ordinary wrappers omit their *implicit* ≤512
+    // legacy cache above when a wider ceiling is statically admitted, so
+    // `pbs_in.is_none()` here means the owner decision is ours; an explicit
+    // smaller caller PBS always wins and keeps legacy cadence.
+    let wide_candidate = pbs_in.is_none()
+        && max_batch_cap.is_none()
+        && tree_verify.is_none()
+        && gdn_tape.is_none()
+        && hidden_rb.is_none()
+        && max_layer.is_none()
+        && matches!(fusion, DflashFusionCtx::Off)
+        && !gpu.graphs.capture_mode
+        && !gpu.replay.is_recording();
+    let limit = if wide_candidate {
+        ordinary_prefill_chunk_limit(gpu, weights, config, dn_state, kv_cache, None)?
+    } else {
+        max_batch
+    };
+    emit_prefill_chunk_receipt(
+        explicit_prefill_max_batch().unwrap_or(max_batch),
+        limit,
+        (wide_candidate && limit > WIDENED_COMMIT_ROWS).then_some(WIDENED_COMMIT_ROWS),
+    );
     // Allocate the batch scratch once per call (or reuse a caller-owned one).
     // When `pbs_in` is Some, we neither allocate nor free — the caller retains
     // ownership across DFlash cycles to avoid ~25 per-cycle tensor alloc/free
     // pairs on the hot verify path. When None, size the allocation to this
     // call's largest possible chunk and allocate the DeltaNet S-state tape only
-    // for tree verify. Plain prefill never consumes that tape, and short
-    // prompts should not pay the full configured scratch footprint. Actual
-    // chunk length is min(configured/capped max, pbs.max_batch, hidden_rb
-    // staging) so no write exceeds a staging owner.
+    // for tree verify.
+    // Plain prefill never consumes that tape, and short prompts do not pay
+    // the full configured footprint. Actual chunk length is
+    // min(configured/capped max, pbs.max_batch, hidden_rb staging) so no
+    // write exceeds a staging owner.
     let mut own_pbs: Option<PrefillBatchScratch> = None;
     // F2 pair scratch (second 512-row PBS + 1024-row FA staging), allocated
     // lazily on the first pair and shared by all pairs of this call.
     let mut pair_scratch: Option<(PrefillBatchScratch, FaPairStage)> = None;
     let result = (|| -> HipResult<()> {
+        // On the fully admitted path the implicit undersized cache was already
+        // omitted by the wrapper, so `None` here allocates one larger
+        // tape-free owned PBS sized to the actual largest chunk — short calls
+        // never pay the full ceiling. All small/excluded paths keep their
+        // prior capacity and cadence.
+        let wide = wide_candidate && limit > WIDENED_COMMIT_ROWS;
         let pbs: &PrefillBatchScratch = match pbs_in {
             Some(p) => p,
+            None if wide => {
+                let owned_rows = limit.min(n).max(MIN_BATCH);
+                own_pbs = Some(PrefillBatchScratch::new_opt(gpu, config, owned_rows, false)?);
+                own_pbs.as_ref().unwrap()
+            }
             None => {
+                // `limit == max_batch` on every legacy path; on the admitted
+                // but memory-narrowed path it sizes the owned scratch to the
+                // executed 512 cadence instead of the unadmitted request.
                 let (owned_max_batch, cap_gdn_tape) =
-                    owned_prefill_scratch_plan(n, max_batch, tree_verify.is_some());
+                    owned_prefill_scratch_plan(n, max_batch.min(limit), tree_verify.is_some());
                 own_pbs = Some(PrefillBatchScratch::new_opt(
                     gpu,
                     config,
@@ -1483,7 +1867,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             }
         };
         let chunk_batch = prefill_effective_chunk_batch(
-            max_batch,
+            limit,
             pbs.max_batch,
             hidden_rb.as_ref().map(|rb| rb.max_batch),
         );
@@ -1510,7 +1894,15 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         let mut chunk_start = 0usize;
         while chunk_start < n {
             let remaining = n - chunk_start;
-            let chunk_n = next_prefill_chunk_len(remaining, chunk_batch).ok_or_else(|| {
+            // Widened grouping merges complete 512s into power-of-two chunks;
+            // the legacy tail schedule (and its singleton avoidance) is the
+            // fallback for both the legacy path and widened tails.
+            let chunk_n = if wide {
+                next_exact_prefill_chunk_len(remaining, chunk_batch)
+            } else {
+                next_prefill_chunk_len(remaining, chunk_batch)
+            }
+            .ok_or_else(|| {
                 hip_bridge::HipError::new(
                     0,
                     "forward_prefill_batch: chunk plan cannot satisfy the two-token minimum",
@@ -1620,6 +2012,14 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             #[cfg(feature = "moe-oracle")]
             crate::qwen35::oracle::set_prefill_start(start_pos + chunk_start)
                 .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            // Only the admitted wide path produces `Some(512)`; every other
+            // caller (captured, TP/EP, independent, pair, Halo) passes `None`.
+            // Small tails keep the legacy branch inside the chunk body.
+            let commit_stride = if wide && chunk_n > WIDENED_COMMIT_ROWS {
+                Some(WIDENED_COMMIT_ROWS)
+            } else {
+                None
+            };
             forward_prefill_chunk(
                 gpu,
                 weights,
@@ -1642,6 +2042,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 max_layer,
                 None, // routed_out: non-EP single-GPU path
                 fusion,
+                commit_stride,
             )?;
             if let Some(rb) = hidden_rb.as_mut() {
                 // Scatter fixed-offset staging writes (done inside the chunk)
@@ -4244,7 +4645,12 @@ pub(crate) fn forward_prefill_chunk(
     max_layer: Option<usize>,
     routed_out: Option<&GpuTensor>,
     fusion: DflashFusionCtx,
+    commit_stride: Option<usize>,
 ) -> HipResult<()> {
+    debug_assert!(
+        commit_stride.is_none() || commit_stride == Some(WIDENED_COMMIT_ROWS),
+        "commit_stride admits only None and Some(512)"
+    );
     forward_batch_chunk_impl(
         gpu,
         weights,
@@ -4269,6 +4675,7 @@ pub(crate) fn forward_prefill_chunk(
         routed_out,
         BatchSemantics::Sequential,
         fusion,
+        commit_stride,
     )
 }
 #[allow(clippy::too_many_arguments)]
@@ -5426,6 +5833,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
     arch_has_wmma: bool,
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
+    commit_stride: Option<usize>,
 ) -> HipResult<()> {
     // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
     // activation to match its pre-rotated weights; HFQ4 uses
@@ -5591,6 +5999,45 @@ pub(crate) fn batch_chunk_delta_net_attn(
                             config.linear_value_head_dim,
                             dn_state.ef_residual(delta_layer_idx),
                             active_mask,
+                        )?
+                    }
+                } else if let Some(stride) = commit_stride {
+                    // Widened ordinary chunk: the same wrapper with the same
+                    // 512-row q/k/v/output views and the same unsliced
+                    // S/scales/EF owners, once per legacy segment. Repeats the
+                    // exact dequant→recurrence→EF-fold→requant at every seam;
+                    // no new arithmetic exists. Only the admitted ordinary
+                    // path sets `commit_stride`, so tree/independent/TP/EP
+                    // callers keep their branch above.
+                    assert!(
+                        n % stride == 0,
+                        "widened GDN chunk {n} is not a multiple of commit stride {stride}"
+                    );
+                    for off in (0..n).step_by(stride) {
+                        let q = pbs.dn_q_batch.sub_offset(off * v_dim, stride * v_dim);
+                        let k = pbs.dn_k_batch.sub_offset(off * v_dim, stride * v_dim);
+                        let v = pbs.dn_v_batch.sub_offset(off * v_dim, stride * v_dim);
+                        let alpha = pbs
+                            .dn_alpha_batch
+                            .sub_offset(off * n_v_heads, stride * n_v_heads);
+                        let beta = pbs
+                            .dn_beta_batch
+                            .sub_offset(off * n_v_heads, stride * n_v_heads);
+                        let out =
+                            pbs.dn_attn_out_batch.sub_offset(off * v_dim, stride * v_dim);
+                        gpu.gated_delta_net_q8_batch_seq(
+                            &q,
+                            &k,
+                            &v,
+                            &alpha,
+                            &beta,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &dn_state.s_scales[delta_layer_idx],
+                            &out,
+                            stride,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                            dn_state.ef_residual(delta_layer_idx),
                         )?
                     }
                 } else {
@@ -6789,6 +7236,7 @@ fn batch_chunk_fa_attend(
     tree_verify: Option<TreeVerifyCtx<'_>>,
     layer_idx: usize,
     multirow: bool,
+    commit_stride: Option<usize>,
 ) -> HipResult<()> {
     if let BatchSemantics::Independent {
         lane_capacity,
@@ -6811,7 +7259,47 @@ fn batch_chunk_fa_attend(
     if batch_semantics.is_independent() {
         unreachable!("independent variant must carry active_mask");
     }
-
+    if let Some(stride) = commit_stride {
+        // Widened ordinary chunk: one 512-row write-then-attend tile per
+        // legacy segment, each with its own tile-local context
+        // (`start+o .. start+o+512`). The family writes that tile's KV rows
+        // before attending, so earlier logical prefix is present and no
+        // future tile row is needed — the same kernel route, scalar
+        // arguments and byte operands each legacy 512 request sees.
+        let q_dim = config.n_heads * config.head_dim;
+        let kv_dim = config.n_kv_heads * config.head_dim;
+        assert!(
+            n % stride == 0,
+            "widened FA chunk {n} is not a multiple of commit stride {stride}"
+        );
+        for off in (0..n).step_by(stride) {
+            let q = pbs.fa_q_batch.sub_offset(off * q_dim, stride * q_dim);
+            let k = pbs.fa_k_batch.sub_offset(off * kv_dim, stride * kv_dim);
+            let v = pbs.fa_v_batch.sub_offset(off * kv_dim, stride * kv_dim);
+            let positions = pbs.positions.sub_offset(off, stride);
+            let out = pbs
+                .fa_attn_out_batch
+                .sub_offset(off * q_dim, stride * q_dim);
+            execute_fa_attend_step(
+                gpu,
+                config,
+                &q,
+                &k,
+                &v,
+                &positions,
+                &out,
+                s,
+                kv_cache,
+                stride,
+                start_pos + off,
+                start_pos + off + stride,
+                ctx,
+                tree_verify,
+                layer_idx,
+            )?;
+        }
+        return Ok(());
+    }
     if multirow {
         debug_assert!(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201());
         debug_assert!(kv_cache.quant_q8);
@@ -6967,6 +7455,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
     layer_idx: usize,
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
+    commit_stride: Option<usize>,
 ) -> HipResult<()> {
     // Fully batched FA layer. Mirrors the FA branch of
     // forward_scratch_layers kernel-for-kernel, but every
@@ -7012,6 +7501,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         tree_verify,
         layer_idx,
         fa_attn_multirow,
+        commit_stride,
     )?;
     batch_chunk_full_attn_output_projection(
         gpu,
@@ -8767,6 +9257,7 @@ fn batch_chunk_full_attn_moe_finish(
         tree_verify,
         layer_idx,
         fa_attn_multirow,
+        None, // commit_stride: MoE finish keeps legacy cadence
     )?;
     gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
     // wo + residual. Mirrors the dense FA wo dispatch at
@@ -9507,6 +9998,7 @@ fn forward_prefill_chunk_pair(
                         arch_has_wmma,
                         BatchEpilogue::Residual,
                         fusion,
+                        None, // commit_stride: pair halves keep legacy cadence
                     )?;
                     batch_chunk_delta_net_ffn(
                         gpu,
@@ -9658,6 +10150,7 @@ fn forward_prefill_chunk_pair(
                         layer_idx,
                         BatchEpilogue::Residual,
                         fusion,
+                        None, // commit_stride: pair halves keep legacy cadence
                     )?;
                     batch_chunk_full_attn_ffn(
                         gpu,
@@ -9693,6 +10186,7 @@ fn forward_prefill_chunk_pair(
                         layer_idx,
                         BatchEpilogue::Residual,
                         fusion,
+                        None, // commit_stride: pair halves keep legacy cadence
                     )?;
                     batch_chunk_full_attn_ffn(
                         gpu,
@@ -9965,10 +10459,22 @@ pub(crate) fn forward_batch_chunk_impl(
     routed_out: Option<&GpuTensor>,
     batch_semantics: BatchSemantics<'_>,
     fusion: DflashFusionCtx,
+    commit_stride: Option<usize>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
     debug_assert!(n <= pbs.max_batch);
+    debug_assert!(
+        commit_stride.is_none() || commit_stride == Some(WIDENED_COMMIT_ROWS),
+        "commit_stride admits only None and Some(512)"
+    );
+    // Segmentation applies only above the stride; small tails execute their
+    // old branch. Authority comes from this parameter alone — never inferred
+    // from arch or `n` inside a generic wrapper.
+    let commit_stride = match commit_stride {
+        Some(s) if n > s => Some(s),
+        _ => None,
+    };
     batch_chunk_validate_independent(
         n,
         batch_semantics,
@@ -10126,6 +10632,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     arch_has_wmma,
                     BatchEpilogue::Residual,
                     fusion,
+                    commit_stride,
                 )?;
                 batch_chunk_delta_net_ffn(
                     gpu,
@@ -10170,6 +10677,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     layer_idx,
                     BatchEpilogue::Residual,
                     fusion,
+                    commit_stride,
                 )?;
                 batch_chunk_full_attn_ffn(
                     gpu,
@@ -12487,6 +12995,192 @@ mod tests {
     #[test]
     fn prefill_chunk_plan_refuses_unpartitionable_minimum_batch() {
         assert_eq!(next_prefill_chunk_len(3, 2), None);
+    }
+    #[test]
+    fn widened_direct_grouping_matches_tail_contract() {
+        // Plan §2.3 first-chunk examples at the 4096 ceiling.
+        assert_eq!(next_exact_prefill_chunk_len(513, 4096), Some(511));
+        assert_eq!(next_exact_prefill_chunk_len(1025, 4096), Some(512));
+        assert_eq!(next_exact_prefill_chunk_len(1537, 4096), Some(1024));
+        assert_eq!(next_exact_prefill_chunk_len(2049, 4096), Some(1024));
+        assert_eq!(next_exact_prefill_chunk_len(4097, 4096), Some(2048));
+        // Power-of-two merging: non-power counts snap down (6→4, 7→4).
+        assert_eq!(next_exact_prefill_chunk_len(3072, 4096), Some(2048));
+        assert_eq!(next_exact_prefill_chunk_len(3584, 4096), Some(2048));
+        assert_eq!(next_exact_prefill_chunk_len(1024, 4096), Some(1024));
+        assert_eq!(next_exact_prefill_chunk_len(8192, 8192), Some(8192));
+        // Sub-512 explicit ceilings keep the legacy schedule exactly
+        // (513→256+255+2, like the legacy 256 planner).
+        assert_eq!(next_exact_prefill_chunk_len(513, 256), Some(256));
+        assert_eq!(next_exact_prefill_chunk_len(385, 384), Some(383));
+        // Degenerate inputs refuse like the legacy planner.
+        assert_eq!(next_exact_prefill_chunk_len(1, 4096), None);
+        assert_eq!(next_exact_prefill_chunk_len(3, 2), None);
+    }
+
+    #[test]
+    fn widened_direct_flattened_commits_equal_legacy_schedule() {
+        // Every wide chunk is an exact multiple of 512, so expanding each
+        // wide chunk back into 512-row commits must reproduce the legacy
+        // 512 schedule row-for-row (the plan's partition proof). Deterministic
+        // CPU check over lengths 2..=16385 and every staged ceiling.
+        fn schedule(mut remaining: usize, ceiling: usize, exact: bool) -> Vec<usize> {
+            let mut chunks = Vec::new();
+            while remaining > 0 {
+                let c = if exact {
+                    next_exact_prefill_chunk_len(remaining, ceiling)
+                } else {
+                    next_prefill_chunk_len(remaining, ceiling.min(512))
+                }
+                .expect("valid partition should exist");
+                chunks.push(c);
+                remaining -= c;
+            }
+            chunks
+        }
+        fn commits(schedule: &[usize]) -> Vec<usize> {
+            let mut out = Vec::new();
+            for &c in schedule {
+                if c > 512 {
+                    assert_eq!(c % 512, 0, "wide chunk must be a 512 multiple");
+                    out.extend(std::iter::repeat_n(512, c / 512));
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+        for &ceiling in &[512usize, 1024, 2048, 4096, 8192] {
+            for len in 2..=16385usize {
+                let wide = schedule(len, ceiling, true);
+                assert!(
+                    wide.iter().all(|&c| c <= ceiling),
+                    "len {len} ceiling {ceiling}: chunk exceeds ceiling in {wide:?}"
+                );
+                assert_eq!(
+                    commits(&wide),
+                    schedule(len, 512, false),
+                    "len {len} ceiling {ceiling}: commit sequence diverged from legacy"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn widened_serve_grouping_matches_caller_contract() {
+        // Serve splits outer chunks and invokes forward separately: 1025 →
+        // 1024+1 (flattening to old 512+512+1 inside), 1537 → 1024+512+1.
+        fn plan(mut remaining: usize, ceiling: usize) -> Vec<usize> {
+            let mut chunks = Vec::new();
+            while remaining > 0 {
+                let c = ordinary_serve_prefill_chunk_len(remaining, ceiling)
+                    .expect("valid partition should exist");
+                chunks.push(c);
+                remaining -= c;
+            }
+            chunks
+        }
+        assert_eq!(plan(1025, 4096), vec![1024, 1]);
+        assert_eq!(plan(1537, 4096), vec![1024, 512, 1]);
+        assert_eq!(plan(513, 4096), vec![512, 1]);
+        assert_eq!(plan(2049, 2048), vec![2048, 1]);
+        // At the 512 ceiling the serve split is the legacy min-split.
+        for len in 1..=3000usize {
+            let mut legacy = Vec::new();
+            let mut rem = len;
+            while rem > 0 {
+                let c = rem.min(512);
+                legacy.push(c);
+                rem -= c;
+            }
+            assert_eq!(plan(len, 512), legacy, "len {len}: 512 serve split changed");
+        }
+        assert_eq!(ordinary_serve_prefill_chunk_len(0, 4096), None);
+    }
+
+    /// Dense 27B fixture matching the widened admission shape (48 LA + 16 FA
+    /// layers, D5120/I17408, LA K16/V48/D128, FA H24/KV4/D256).
+    fn widened_test_config() -> Qwen35Config {
+        Qwen35Config {
+            dim: 5120,
+            n_layers: 64,
+            vocab_size: 152064,
+            norm_eps: 1e-6,
+            eos_token: 2,
+            n_heads: 24,
+            n_kv_heads: 4,
+            head_dim: 256,
+            rope_theta: 500000.0,
+            partial_rotary_factor: 0.25,
+            is_vl_text: false,
+            mrope_interleaved: false,
+            mrope_section: [0, 0, 0],
+            linear_num_key_heads: 16,
+            linear_num_value_heads: 48,
+            linear_key_head_dim: 128,
+            linear_value_head_dim: 128,
+            conv_kernel_dim: 4,
+            hidden_dim: 17408,
+            num_experts: 0,
+            num_experts_per_tok: 0,
+            moe_intermediate_size: 0,
+            shared_expert_intermediate_size: 0,
+            has_shared_expert: false,
+            norm_topk_prob: false,
+            layer_types: (0..48)
+                .map(|_| LayerType::LinearAttention)
+                .chain((0..16).map(|_| LayerType::FullAttention))
+                .collect(),
+            paged_experts: false,
+            vram_budget_bytes: u64::MAX,
+            reap_keep: None,
+        }
+    }
+
+    #[test]
+    fn widened_dense_bytes_match_ledger() {
+        // Plan §4.1 steady-state envelope: 725,388 B/row + 256 fixed, FP8
+        // 17,956 B/row, Q16 fixed 6,291,456 B for 24×256×2×512.
+        let config = widened_test_config();
+        assert!(widened_dense_shape_admitted(&config));
+        assert_eq!(fp8_row_bytes_wide(&config), Some(17_956));
+        assert_eq!(dense_prefill_allocation_bytes(&config, 1), Some(725_388 + 256));
+        assert_eq!(
+            dense_prefill_allocation_bytes(&config, 512),
+            Some(371_398_912)
+        );
+        assert_eq!(
+            dense_prefill_allocation_bytes(&config, 1024),
+            Some(742_797_568)
+        );
+        assert_eq!(
+            dense_prefill_allocation_bytes(&config, 2048),
+            Some(1_485_594_880)
+        );
+        assert_eq!(
+            dense_prefill_allocation_bytes(&config, 4096),
+            Some(2_971_189_504)
+        );
+        assert_eq!(
+            dense_prefill_allocation_bytes(&config, 8192),
+            Some(5_942_378_752)
+        );
+        // Deltas vs 512: dense PBS delta plus the FP8-slot growth at Kmax
+        // sum to the ledger's incremental VRAM cost (2,664,144,896 B).
+        let base = dense_prefill_allocation_bytes(&config, 512).unwrap();
+        let dense_delta = dense_prefill_allocation_bytes(&config, 4096).unwrap() - base;
+        assert_eq!(dense_delta, 2_599_790_592);
+        let fp8_delta = (4096 - 512) * fp8_row_bytes_wide(&config).unwrap();
+        assert_eq!(fp8_delta, 64_354_304);
+        assert_eq!(dense_delta + fp8_delta, 2_664_144_896);
+        // MoE configs are out of scope for the byte ledger.
+        let mut moe = widened_test_config();
+        moe.num_experts = 256;
+        assert_eq!(dense_prefill_allocation_bytes(&moe, 512), None);
+        // Wrong hidden_dim breaks the allocation envelope.
+        let mut narrow = widened_test_config();
+        narrow.hidden_dim = 3584;
+        assert!(!widened_dense_shape_admitted(&narrow));
     }
 
     #[test]

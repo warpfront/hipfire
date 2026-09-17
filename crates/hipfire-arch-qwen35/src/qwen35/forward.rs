@@ -1376,12 +1376,24 @@ impl Qwen35Scratch {
                 .as_deref()
                 == Some("1")
             {
-                let max_batch = if gpu.arch == "gfx1151" {
-                    super::prefill::prefill_max_batch(gpu).max(512)
+                // Ordinary reuse cache: tape-free and capped at legacy ≤512
+                // even under a larger requested ceiling — only a fully
+                // admitted request allocates the larger owned PBS, after
+                // Q8+EF/KV/free-VRAM checks in the inner entry. Tree/tape
+                // wrappers use separate owned tape-enabled scratch, never
+                // this cache. Other arches keep their existing sizing and
+                // tape behavior.
+                let (max_batch, cap_tape) = if gpu.arch == "gfx1201" {
+                    (super::prefill::prefill_max_batch(gpu).min(512), false)
+                } else if gpu.arch == "gfx1151" {
+                    (
+                        super::prefill::prefill_max_batch(gpu).max(512),
+                        true,
+                    )
                 } else {
-                    super::prefill::prefill_max_batch(gpu)
+                    (super::prefill::prefill_max_batch(gpu), true)
                 };
-                s.prefill_batch = match PrefillBatchScratch::new(gpu, config, max_batch) {
+                s.prefill_batch = match PrefillBatchScratch::new_opt(gpu, config, max_batch, cap_tape) {
                     Ok(prefill) => Some(prefill),
                     Err(error) => {
                         cleanup_allocations!();
@@ -5504,6 +5516,7 @@ fn forward_prefill_dense_tp_batched(
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
+                                None, // commit_stride: TP ranks keep legacy cadence
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -5636,6 +5649,7 @@ fn forward_prefill_dense_tp_batched(
                                 layer_idx,
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
+                                None, // commit_stride: TP ranks keep legacy cadence
                             ) {
                                 process_res = Err(e);
                                 break;

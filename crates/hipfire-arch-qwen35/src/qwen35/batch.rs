@@ -1799,6 +1799,7 @@ pub fn forward_decode_batch_prepared(
             active_mask,
         },
         DflashFusionCtx::Off,
+        None, // commit_stride: independent lanes keep legacy cadence
     )?;
 
     let logits = state.logits.sub_offset(0, n * config.vocab_size);
