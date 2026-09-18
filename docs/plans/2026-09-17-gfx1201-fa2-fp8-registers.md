@@ -448,3 +448,23 @@ preferably ≥3%; decode ≥36.4 clean rerun). Series decode rows run immediatel
 post-32K (throttle artifact); a standalone decode rerun is still
 owed. Runnable v1 arm left at `wt-fa2v1` (detached `eddc0c571` + fp8.hip
 kernel); disposable harnesses remain as untracked files in both worktrees.
+
+## 12. §11 result (Main, 2026-09-18): stage a REJECTED on performance
+
+Interleaved OFF/ON/OFF/ON on the frozen candidate `eddc0c571` (unrolled QK, 248/244 VGPR, 0 spills,
+G2 bit-identical to v1; binaries `E/Fa2RegR1/bench/binaries.sha256`, ordinal 2, graphs ON, q8 KV):
+
+| arm | pp512 | pp2048 | pp8192 | pp32768 | tg64@128 |
+|---|---:|---:|---:|---:|---:|
+| OFF1 | 1470.3 | 1440.4 | 1334.7 | 1030.1 | 36.42 |
+| ON1  | 1444.7 | 1381.0 | 1182.9 | 760.7  | 36.47 |
+| OFF2 | 1471.4 | 1441.3 | 1337.5 | 1032.0 | 36.45 |
+| ON2  | 1444.1 | 1382.0 | 1183.5 | 761.1  | 36.49 |
+
+ON is −1.8 % / −4.1 % / −11.4 % / **−26.2 %**, reproducible to 0.1 % across arms. This is the same
+curve the rejected rolled-QK build produced (752 @32K), so the rolled loop was never the cause: the
+regression is intrinsic to stage a — per-fragment e4m3→f16 decode in the QK loop costs more issue
+than the halved LDS returns, and occupancy did not move (5 waves/SIMD either way; LDS was not the
+limiter, as §4 already noted). Numerics are certified (KLD −0.00027, bit-identical to v1) but the
+kernel is slower at every row. Stage a is closed. Any further FA2 fp8 work is stage b (fp8 QK/PV
+WMMA operands, which removes the decode entirely) with a fresh KLD gate — it is not scheduled.
