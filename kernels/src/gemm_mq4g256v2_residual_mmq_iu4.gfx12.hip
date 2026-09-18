@@ -201,6 +201,35 @@ typedef unsigned __attribute__((ext_vector_type(2))) u32x2_t;
         const float iu4_fold_term_ = __fmaf_rn(iu4_fold_t2_, (float)(s_i32), iu4_fold_p_); \
         (sum_lvalue) = __fadd_rn((sum_lvalue), iu4_fold_term_); \
     } while (0)
+#if defined(__gfx1201__)
+// IU4_FOLD_RN_PAIR — gfx1201 VOPD fold pairing (exact-arithmetic form 1).
+// Two independent j-components through the pinned IU4_FOLD_RN DAG with
+// stages interleaved pairwise (t1_0,t1_1 then p_0,p_1 ...) so the backend
+// can form V_DUAL_MUL_F32 / V_DUAL_FMAC_F32 / V_DUAL_ADD_F32 packets.
+// Bit-exact by construction: the same RN multiply/FMA/add nodes in the
+// same per-component order, no contraction, no precision change; i32->f32
+// conversions stay scalar (no dual conversion form exists on gfx1201).
+// By-value sums + float2 return (ext_vector elements cannot bind to
+// float&); forceinline keeps acc traffic direct. The gfx1200 path keeps
+// the scalar IU4_FOLD_RN loop below untouched.
+static __device__ __forceinline__ float2 iu4_fold_rn_pair(
+    float sum0, float sum1,
+    float sc0, float sc1, float zp0, float zp1,
+    float d, int c0, int c1, float sf) {
+    const float t1_0 = __fmul_rn(sc0, d);
+    const float t1_1 = __fmul_rn(sc1, d);
+    const float p_0 = __fmul_rn(t1_0, (float)c0);
+    const float p_1 = __fmul_rn(t1_1, (float)c1);
+    const float t2_0 = __fmul_rn(zp0, d);
+    const float t2_1 = __fmul_rn(zp1, d);
+    const float term_0 = __fmaf_rn(t2_0, sf, p_0);
+    const float term_1 = __fmaf_rn(t2_1, sf, p_1);
+    float2 out;
+    out.x = __fadd_rn(sum0, term_0);
+    out.y = __fadd_rn(sum1, term_1);
+    return out;
+}
+#endif
 
 // One K32-sub-block compute bundle: 2 W-frags + 4 A-frags +
 // 8 WMMAs (2 row-groups x 4 column blocks), then a scheduling fence.
@@ -519,10 +548,28 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                         const unsigned tbase = (unsigned)(wave_tok0 + nb * 16 + m_lane) * 8u;
                         const float d_x = *(const float*)(ds_lds + tbase);
                         const int s_x = *(const int*)(ds_lds + tbase + 4u);
+#if defined(__gfx1201__)
+                        // Paired fold: same values, same DAG as IU4_FOLD_RN;
+                        // sf hoisted (the int sum is loop-invariant, the
+                        // compiler CSEs the baseline's per-j conversion to
+                        // one anyway: 4 sf converts per half, unchanged).
+                        const float sf_x = (float)s_x;
+                        #pragma unroll
+                        for (int j = 0; j < 8; j += 2) {
+                            const float2 pair = iu4_fold_rn_pair(
+                                acc[nb][rg][j], acc[nb][rg][j + 1],
+                                sc_row[j], sc_row[j + 1],
+                                zp_row[j], zp_row[j + 1],
+                                d_x, acc_i[j], acc_i[j + 1], sf_x);
+                            acc[nb][rg][j] = pair.x;
+                            acc[nb][rg][j + 1] = pair.y;
+                        }
+#else
                         #pragma unroll
                         for (int j = 0; j < 8; j++) {
                             IU4_FOLD_RN(acc[nb][rg][j], sc_row[j], zp_row[j], d_x, acc_i[j], s_x);
                         }
+#endif
                     }
                 }
                 // B2a: slab-1 A-reads done on every wave, so the single A
