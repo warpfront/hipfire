@@ -46,6 +46,15 @@ pub struct FeatureFlags {
     /// Q8_1 MMQ (gfx11) / fp8 (gfx1201) route.
     /// Expected quality cost ~+0.014 WT2 KLD for the MQ4-XT speed rung.
     pub iu4_prefill: Option<bool>,
+    /// MQ4E8 study slice B: activation-only paired-C4 arm
+    /// (`HIPFIRE_IU4_XMASTER`). Opt-in on the same arches as `iu4_prefill`;
+    /// default off everywhere. When live, the standalone
+    /// `quantize_int4_mmq_ds128` output is post-processed per token: master
+    /// d[token] = max block d / 4 over the full K row, then each 128-block
+    /// requantized at d[token]*2^e with e in 0..2 chosen by half SSE (tie:
+    /// smaller e), storing the decoded scale in the existing f32 d field.
+    /// Unset/`=0` leaves every block byte identical to the incumbent path.
+    pub iu4_xmaster: Option<bool>,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -482,6 +491,7 @@ impl FeatureFlags {
             gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
+            iu4_xmaster: parse_bool("HIPFIRE_IU4_XMASTER"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -758,6 +768,14 @@ impl FeatureFlags {
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
 
+    /// Resolved paired-C4 activation arm: explicit opt-in only, and only on
+    /// the iu4 arches above. Unset/`=0`/other arches keep every block byte
+    /// identical to the incumbent quantizer output.
+    pub fn iu4_xmaster_enabled(&self) -> bool {
+        self.iu4_xmaster.unwrap_or(false)
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
+    }
+
     /// Resolved gfx120x FA2 fp8 route: explicit opt-in only, and only on
     /// exact gfx1200/gfx1201. Unset/`=0`/other arches keep the f16 FA2 body.
     pub fn gfx12_fa2_fp8_enabled(&self) -> bool {
@@ -768,9 +786,13 @@ impl FeatureFlags {
     /// C2 producer-emitted IU4 sidecar route: exact gfx1151 + IU4 opt-in.
     /// When live (and eager + batch/K admission), RMSNorm/FWHT and
     /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
-    /// keep standalone `quantize_int4_mmq_ds128`.
+    /// keep standalone `quantize_int4_mmq_ds128`. The xmaster arm routes
+    /// back through the standalone quantizer so no block silently remains
+    /// outside the per-token master constraint.
     pub fn iu4_producer_sidecar_enabled(&self) -> bool {
-        self.iu4_prefill.unwrap_or(false) && self.arch == "gfx1151"
+        self.iu4_prefill.unwrap_or(false)
+            && self.arch == "gfx1151"
+            && !self.iu4_xmaster_enabled()
     }
 
     pub fn hfq3_mmq_layer_gate_pass(&self) -> bool {
@@ -834,6 +856,7 @@ impl FeatureFlags {
             gfx1151_e8_buffer: None,
             gfx11_mmq_x128: None,
             iu4_prefill: None,
+            iu4_xmaster: None,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,

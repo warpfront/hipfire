@@ -1367,6 +1367,8 @@ impl Gpu {
                 q8_1_mmq_x_scratch_bytes: 0,
                 int4_mmq_x_scratch: None,
                 int4_mmq_x_scratch_bytes: 0,
+                int4_mmq_xmaster_scratch: None,
+                int4_mmq_xmaster_scratch_bytes: 0,
                 int4_mmq_generation: 0,
                 mq4v2_fp8_x_scratch: None,
                 mq4v2_fp8_x_scratch_bytes: 0,
@@ -2961,7 +2963,9 @@ impl Gpu {
     }
     /// Ensure prefill activations are quantized to int4 (`block_i4_128`) for
     /// the iu4-direct MMQ consumer (`HIPFIRE_IU4_PREFILL` path).
-    /// See `scratch.rs::ensure_int4_mmq_x`.
+    /// See `scratch.rs::ensure_int4_mmq_x`. When the MQ4E8 slice-B
+    /// `HIPFIRE_IU4_XMASTER` arm is live, the per-token master reduction +
+    /// requant runs on the same stream after the incumbent launch.
     pub fn ensure_int4_mmq_x(
         &mut self,
         x: &GpuTensor,
@@ -2971,6 +2975,7 @@ impl Gpu {
         // bind_thread: skip — delegated to scratch.rs
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
+        let xmaster = self.flags.iu4_xmaster_enabled();
         {
             let needed = crate::scratch::int4_mmq_x_needed(k, batch_size);
             if crate::scratch::scratch_will_grow(
@@ -2979,6 +2984,16 @@ impl Gpu {
                 needed,
             ) {
                 self.invalidate_for_scratch_growth();
+            }
+            if xmaster {
+                let xm_needed = crate::scratch::int4_mmq_xmaster_needed(batch_size);
+                if crate::scratch::scratch_will_grow(
+                    self.scratch.int4_mmq_xmaster_scratch_bytes,
+                    self.scratch.int4_mmq_xmaster_scratch.is_some(),
+                    xm_needed,
+                ) {
+                    self.invalidate_for_scratch_growth();
+                }
             }
         }
         self.scratch.ensure_int4_mmq_x(
@@ -2995,6 +3010,7 @@ impl Gpu {
             x,
             batch_size,
             k,
+            xmaster,
         )
     }
 

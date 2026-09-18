@@ -172,6 +172,13 @@ pub struct ScratchState {
     /// never writes, so aliasing would corrupt both routes.
     pub int4_mmq_x_scratch: Option<DeviceBuffer>,
     pub int4_mmq_x_scratch_bytes: usize,
+    /// MQ4E8 slice-B paired-C4 arm (`HIPFIRE_IU4_XMASTER`): per-token
+    /// `[batch] f32 master` followed by `[batch] i32 rowzero`, written by
+    /// `int4_mmq_xmaster_reduce` and read by `int4_mmq_xmaster_fixup`.
+    /// Grows-never-shrinks; every cell is written before use on the same
+    /// stream, so no init is needed. Untouched unless the arm is live.
+    pub int4_mmq_xmaster_scratch: Option<DeviceBuffer>,
+    pub int4_mmq_xmaster_scratch_bytes: usize,
     /// Generation bumped on every `reserve_int4_mmq` so a prepared handle
     /// cannot outlive a later re-reservation of the same scratch slot.
     pub int4_mmq_generation: u64,
@@ -536,6 +543,13 @@ pub(crate) fn int4_mmq_x_needed(k: usize, batch_size: usize) -> usize {
     let blocks_k = (k + 127) / 128;
     let block_i4_128_bytes = 72usize;
     blocks_k * batch_size * block_i4_128_bytes
+}
+/// Byte size of the `int4_mmq_xmaster_scratch` slot for `batch_size`: one f32
+/// master plus one i32 rowzero flag per token. Shared by `ensure_int4_mmq_x`
+/// and its `Gpu` caller for the pre-growth invalidation check.
+#[inline]
+pub(crate) fn int4_mmq_xmaster_needed(batch_size: usize) -> usize {
+    batch_size * 8
 }
 
 /// Byte size of the `int4_mmq_x_scratch` slot for a producer reservation
@@ -1434,6 +1448,13 @@ impl ScratchState {
     /// `int4_mmq_x_scratch` buffer — the layouts differ (72 B vs 144 B) and
     /// the iu4 consumer reads nibble headers the Q8_1 prelude never writes.
     /// Bumps `int4_mmq_generation` so any prior prepared handle fails closed.
+    /// When `xmaster` is set (MQ4E8 slice-B `HIPFIRE_IU4_XMASTER` arm, already
+    /// arch-gated by the caller), two extra kernels run on the same stream
+    /// after the incumbent launch: `int4_mmq_xmaster_reduce` (per-token
+    /// master = max block d / 4 over the full K row + exact row-zero flag,
+    /// read from the original f32 X) and `int4_mmq_xmaster_fixup`
+    /// (per-128 requant at master*2^e, e in 0..2 by half SSE). When unset,
+    /// no extra launch happens and every block byte matches the incumbent.
     pub fn ensure_int4_mmq_x(
         &mut self,
         hip: &HipRuntime,
@@ -1449,6 +1470,7 @@ impl ScratchState {
         x: &GpuTensor,
         batch_size: usize,
         k: usize,
+        xmaster: bool,
     ) -> HipResult<*mut c_void> {
         crate::graph::bind_thread(hip, device_id)?;
         compile_and_load_kernel(
@@ -1460,6 +1482,26 @@ impl ScratchState {
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
             "quantize_int4_mmq_ds128",
         )?;
+        if xmaster {
+            compile_and_load_kernel(
+                compiler,
+                hip,
+                modules,
+                functions,
+                "int4_mmq_xmaster_reduce",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
+                "int4_mmq_xmaster_reduce",
+            )?;
+            compile_and_load_kernel(
+                compiler,
+                hip,
+                modules,
+                functions,
+                "int4_mmq_xmaster_fixup",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
+                "int4_mmq_xmaster_fixup",
+            )?;
+        }
 
         let needed = int4_mmq_x_needed(k, batch_size);
         grow_scratch_buffer(
@@ -1472,6 +1514,9 @@ impl ScratchState {
         self.int4_mmq_generation = self.int4_mmq_generation.wrapping_add(1);
 
         let src_ptr = x.buf.as_ptr();
+        let grid_x = ((k + 1023) / 1024) as u32;
+        let grid_y = batch_size as u32;
+        let bytes = batch_size * k * 4 + needed;
         let must_convert = true;
         if must_convert {
             let out_ptr = self.int4_mmq_x_scratch.as_ref().unwrap().as_ptr();
@@ -1485,9 +1530,6 @@ impl ScratchState {
                 &mut k_val as *mut _ as *mut c_void,
                 &mut n_val as *mut _ as *mut c_void,
             ];
-            let grid_x = ((k + 1023) / 1024) as u32;
-            let grid_y = batch_size as u32;
-            let bytes = batch_size * k * 4 + needed;
             let timer =
                 crate::profile::begin_timer(hip, "quantize", "quantize_int4_mmq_ds128", bytes);
             launch_maybe_blob(
@@ -1514,6 +1556,112 @@ impl ScratchState {
                 },
             )?;
             if let Some(t) = timer {
+                t.finish(hip);
+            }
+        }
+
+        // MQ4E8 slice-B arm: same-stream reduction + requant. Skipped entirely
+        // when unset, so the incumbent launch above is the only writer.
+        if xmaster {
+            let xm_needed = int4_mmq_xmaster_needed(batch_size);
+            grow_scratch_buffer(
+                hip,
+                &mut self.int4_mmq_xmaster_scratch,
+                &mut self.int4_mmq_xmaster_scratch_bytes,
+                xm_needed,
+            )?;
+            let base = self.int4_mmq_xmaster_scratch.as_ref().unwrap().as_ptr();
+            let master_ptr = base;
+            // [batch] f32 master followed by [batch] i32 rowzero. Reduce grid
+            // is one wave32 per token ([batch,1,1] x [32,1,1]).
+            let rowzero_ptr = unsafe { base.add(batch_size * 4) };
+            let out_ptr = self.int4_mmq_x_scratch.as_ref().unwrap().as_ptr();
+            let mut xp = src_ptr;
+            let mut yp = out_ptr;
+            let mut mp = master_ptr;
+            let mut zp = rowzero_ptr;
+            let mut k_val = k as i32;
+            let mut n_val = batch_size as i32;
+            let mut rparams: Vec<*mut c_void> = vec![
+                &mut xp as *mut _ as *mut c_void,
+                &mut yp as *mut _ as *mut c_void,
+                &mut mp as *mut _ as *mut c_void,
+                &mut zp as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut n_val as *mut _ as *mut c_void,
+            ];
+            let rgrid_x = batch_size as u32;
+            let rbytes = batch_size * k * 4 + xm_needed;
+            let rtimer = crate::profile::begin_timer(
+                hip,
+                "quantize",
+                "int4_mmq_xmaster_reduce",
+                rbytes,
+            );
+            launch_maybe_blob(
+                hip,
+                Some(&*compiler),
+                functions,
+                stream,
+                capture_blobs,
+                capture_mode,
+                force_blob_path,
+                Some(replay),
+                "int4_mmq_xmaster_reduce",
+                [rgrid_x, 1, 1],
+                [32, 1, 1],
+                0,
+                &mut rparams,
+                || {
+                    let mut b = KernargBlob::new();
+                    b.push_ptr(src_ptr);
+                    b.push_ptr(out_ptr);
+                    b.push_ptr(master_ptr);
+                    b.push_ptr(rowzero_ptr);
+                    b.push_i32(k_val);
+                    b.push_i32(n_val);
+                    b
+                },
+            )?;
+            if let Some(t) = rtimer {
+                t.finish(hip);
+            }
+            let mut fparams: Vec<*mut c_void> = vec![
+                &mut xp as *mut _ as *mut c_void,
+                &mut yp as *mut _ as *mut c_void,
+                &mut mp as *mut _ as *mut c_void,
+                &mut zp as *mut _ as *mut c_void,
+                &mut k_val as *mut _ as *mut c_void,
+                &mut n_val as *mut _ as *mut c_void,
+            ];
+            let ftimer =
+                crate::profile::begin_timer(hip, "quantize", "int4_mmq_xmaster_fixup", bytes);
+            launch_maybe_blob(
+                hip,
+                Some(&*compiler),
+                functions,
+                stream,
+                capture_blobs,
+                capture_mode,
+                force_blob_path,
+                Some(replay),
+                "int4_mmq_xmaster_fixup",
+                [grid_x, grid_y, 1],
+                [256, 1, 1],
+                0,
+                &mut fparams,
+                || {
+                    let mut b = KernargBlob::new();
+                    b.push_ptr(src_ptr);
+                    b.push_ptr(out_ptr);
+                    b.push_ptr(master_ptr);
+                    b.push_ptr(rowzero_ptr);
+                    b.push_i32(k_val);
+                    b.push_i32(n_val);
+                    b
+                },
+            )?;
+            if let Some(t) = ftimer {
                 t.finish(hip);
             }
         }
