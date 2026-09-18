@@ -251,6 +251,10 @@ name = "tokenize_slice"
 required-features = []
 
 [[example]]
+name = "tmp_gemm_v2_oracle"
+required-features = []
+
+[[example]]
 name = "imatrix_collect"
 required-features = []
 

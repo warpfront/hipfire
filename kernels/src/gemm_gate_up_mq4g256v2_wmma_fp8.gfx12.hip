@@ -200,6 +200,478 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 #define HIPFIRE_FP8_SLABS 1
 #endif
 
+#ifndef HIPFIRE_FP8_V2_TILE
+#define HIPFIRE_FP8_V2_TILE 0
+#endif
+
+#if HIPFIRE_FP8_V2_TILE
+
+// gfx1201 staged-tile v2: BM tokens x BN weight rows x BK, WAVES wave32s.
+// Cooperative LDS A/W/S/s/z, expand-once at W staging, half-local P then
+// T = fma(s_h,P,T); T = fma(z_h,S_h,T) at each 128-K half; a[t] at store.
+// Balanced aspects (128x128x64/8w, 64x256x64/8w, 128x64x64/4w control) cut
+// A-slab re-reads at the same 64-accumulator wave footprint; 256x128 stays
+// pruned (no register headroom). U0 skipped: no ds256 path.
+#ifndef HIPFIRE_FP8_V2_BM
+#define HIPFIRE_FP8_V2_BM 256
+#endif
+#ifndef HIPFIRE_FP8_V2_BN
+#define HIPFIRE_FP8_V2_BN 64
+#endif
+#ifndef HIPFIRE_FP8_V2_BK
+#define HIPFIRE_FP8_V2_BK 64
+#endif
+#ifndef HIPFIRE_FP8_V2_WAVES
+#define HIPFIRE_FP8_V2_WAVES 8
+#endif
+
+#ifdef HIPFIRE_FP8_LUT_ARG
+#error "HIPFIRE_FP8_V2_TILE is uniform MQ4V2 only; LUT_ARG is not a v2 candidate"
+#endif
+#if HIPFIRE_FP8_V2_BK != 32 && HIPFIRE_FP8_V2_BK != 64
+#error "HIPFIRE_FP8_V2_BK must be 32 or 64"
+#endif
+#if HIPFIRE_FP8_V2_BN != 32 && HIPFIRE_FP8_V2_BN != 64 && HIPFIRE_FP8_V2_BN != 128 && HIPFIRE_FP8_V2_BN != 256
+#error "HIPFIRE_FP8_V2_BN must be 32, 64, 128 or 256"
+#endif
+#if HIPFIRE_FP8_V2_BM != 64 && HIPFIRE_FP8_V2_BM != 128 && HIPFIRE_FP8_V2_BM != 256
+#error "HIPFIRE_FP8_V2_BM must be 64, 128 or 256"
+#endif
+#if (HIPFIRE_FP8_V2_WAVES * 32) % HIPFIRE_FP8_V2_BN != 0
+#error "HIPFIRE_FP8_V2_WAVES*32 must be a multiple of HIPFIRE_FP8_V2_BN"
+#endif
+#if ((HIPFIRE_FP8_V2_BK / 8) % ((HIPFIRE_FP8_V2_WAVES * 32) / HIPFIRE_FP8_V2_BN)) != 0
+#error "W staging producers must divide BK/8 chunks"
+#endif
+// Balanced-aspect geometries (128x128x64/8w, 64x256x64/8w, 128x64x64/4w):
+// stride stays BK+8 = 72, so the §3.2 bank argument is unchanged — a lane
+// reading 8 contiguous bytes at (r*72 + kstep*16 + kg*8), r = lane&15,
+// touches banks (18*r + 4*kstep + 2*kg + {0,1}) mod 32: all 16 even starts
+// per 16-lane half, every bank once per half, twice per full wave (the
+// width floor, not a conflict). Only the row extents change: A rows
+// 0..BM-1, W rows 0..BN-1. Writer banks: A row = tid (one trip for
+// BM<=NTHREADS in all four aspects); W row = tid%BN, chunk8 =
+// tid/BN + NPROD*it, NPROD = NTHREADS/BN (4/2/1/2), WITER = 8/NPROD.
+
+#define HIPFIRE_FP8_V2_NTHREADS (HIPFIRE_FP8_V2_WAVES * 32)
+#define HIPFIRE_FP8_V2_STRIDE   (HIPFIRE_FP8_V2_BK + 8)
+#define HIPFIRE_FP8_V2_A_OFF    0
+#define HIPFIRE_FP8_V2_A_BYTES  (HIPFIRE_FP8_V2_BM * HIPFIRE_FP8_V2_STRIDE)
+#define HIPFIRE_FP8_V2_W_OFF    HIPFIRE_FP8_V2_A_BYTES
+#define HIPFIRE_FP8_V2_W_BYTES  (HIPFIRE_FP8_V2_BN * HIPFIRE_FP8_V2_STRIDE)
+#define HIPFIRE_FP8_V2_S_OFF    (HIPFIRE_FP8_V2_W_OFF + HIPFIRE_FP8_V2_W_BYTES)
+#define HIPFIRE_FP8_V2_S_BYTES  (HIPFIRE_FP8_V2_BM * 4)
+#define HIPFIRE_FP8_V2_SZ_OFF   (HIPFIRE_FP8_V2_S_OFF + HIPFIRE_FP8_V2_S_BYTES)
+#define HIPFIRE_FP8_V2_SZ_BYTES (HIPFIRE_FP8_V2_BN * 8)
+#define HIPFIRE_FP8_V2_LDS_BYTES (HIPFIRE_FP8_V2_SZ_OFF + HIPFIRE_FP8_V2_SZ_BYTES)
+#define HIPFIRE_FP8_V2_NSLABS   (128 / HIPFIRE_FP8_V2_BK)
+#define HIPFIRE_FP8_V2_K16      (HIPFIRE_FP8_V2_BK / 16)
+#define HIPFIRE_FP8_V2_WCHUNKS  (HIPFIRE_FP8_V2_BK / 8)
+#define HIPFIRE_FP8_V2_NPROD    (HIPFIRE_FP8_V2_NTHREADS / HIPFIRE_FP8_V2_BN)
+#define HIPFIRE_FP8_V2_WITER    (HIPFIRE_FP8_V2_WCHUNKS / HIPFIRE_FP8_V2_NPROD)
+// The T/P[4][2] accumulator footprint is a fixed 64-token x 32-row wave
+// tile (4 token fragments x 2 weight fragments of 8 v8f), so every admitted
+// aspect satisfies BM*BN == NTHREADS*64: 256x64x64/8w, 128x128x64/8w,
+// 64x256x64/8w, 128x64x64/4w. wave_tok = tok_part*64 below relies on this.
+#if (HIPFIRE_FP8_V2_BM * HIPFIRE_FP8_V2_BN) != (HIPFIRE_FP8_V2_NTHREADS * 64)
+#error "HIPFIRE_FP8_V2 BM*BN must equal NTHREADS*64 (fixed 64x32 wave tile)"
+#endif
+// The coalesced store reuses LDS base for a 512-float/wave transpose tile
+// (8 waves = 16 KiB); A/W/S/SZ are dead by then but the tile must fit.
+#if HIPFIRE_FP8_V2_LDS_BYTES < (HIPFIRE_FP8_V2_WAVES * 2048)
+#error "HIPFIRE_FP8_V2 LDS must hold the 512-float/wave store transpose tile"
+#endif
+
+extern "C" __launch_bounds__(HIPFIRE_FP8_V2_NTHREADS, 2) __global__
+#if HIPFIRE_FP8_QKVZA
+void HIPFIRE_FP8_GATEUP_KERNEL(
+    const char* A_qkv,
+    const char* A_z,
+    const char* A_beta,
+    const char* A_alpha,
+    const unsigned char* X_fp8,
+    const float* X_half_sums,
+    const float* X_row_scales,
+    float* Y_qkv,
+    float* Y_z,
+    float* Y_beta,
+    float* Y_alpha,
+    int qkv_m,
+    int z_m,
+    int beta_m,
+    int alpha_m,
+    int K,
+    int N
+) {
+    const int tm = qkv_m + z_m + beta_m + alpha_m;
+#elif HIPFIRE_FP8_RESIDUAL
+void HIPFIRE_FP8_GATEUP_KERNEL(
+    const char* A_w,
+    const unsigned char* X_fp8,
+    const float* X_half_sums,
+    const float* X_row_scales,
+    float* Y_res,
+    int res_m,
+    int K,
+    int N
+) {
+    const int tm = res_m;
+#elif HIPFIRE_FP8_QKV
+void HIPFIRE_FP8_GATEUP_KERNEL(
+    const char* A_q,
+    const char* A_k,
+    const char* A_v,
+    const unsigned char* X_fp8,
+    const float* X_half_sums,
+    const float* X_row_scales,
+    float* Y_q,
+    float* Y_k,
+    float* Y_v,
+    int q_m,
+    int k_m,
+    int v_m,
+    int K,
+    int N
+) {
+    const int tm = q_m + k_m + v_m;
+#else
+void HIPFIRE_FP8_GATEUP_KERNEL(
+    const char* A_gate,
+    const char* A_up,
+    const unsigned char* X_fp8,
+    const float* X_half_sums,
+    const float* X_row_scales,
+    float* Y_gate,
+    float* Y_up,
+    int gate_m,
+    int up_m,
+    int K,
+    int N
+) {
+    const int tm = gate_m + up_m;
+#endif
+    const int rs = (int)blockIdx.x * HIPFIRE_FP8_V2_BN;
+    const int bs = (int)blockIdx.y * HIPFIRE_FP8_V2_BM;
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int ml = lane & 15;
+    const int kg = lane >> 4;
+    const int n_wt_parts = HIPFIRE_FP8_V2_BN / 32;
+    const int tok_part = wave / n_wt_parts;
+    const int wt_part = wave - tok_part * n_wt_parts;
+    const int wave_tok = tok_part * 64;
+    const int wave_wt = wt_part * 32;
+    const int gpr = K / 256;
+
+    extern __shared__ char lds[];
+    char* lds_A = lds + HIPFIRE_FP8_V2_A_OFF;
+    char* lds_W = lds + HIPFIRE_FP8_V2_W_OFF;
+    char* lds_S = lds + HIPFIRE_FP8_V2_S_OFF;
+    char* lds_SZ = lds + HIPFIRE_FP8_V2_SZ_OFF;
+
+    // One W-row producer identity per thread (row = tid % BN). Route once.
+    const int w_row = tid % HIPFIRE_FP8_V2_BN;
+    const int prod = tid / HIPFIRE_FP8_V2_BN;
+    const int gr = rs + w_row;
+    const bool row_ok = (gr < tm);
+    const char* rb = nullptr;
+    if (row_ok) {
+        const char* Asrc;
+        int lr;
+#if HIPFIRE_FP8_QKVZA
+        if (gr < qkv_m) { Asrc = A_qkv; lr = gr; }
+        else if (gr < qkv_m + z_m) { Asrc = A_z; lr = gr - qkv_m; }
+        else if (gr < qkv_m + z_m + beta_m) { Asrc = A_beta; lr = gr - (qkv_m + z_m); }
+        else { Asrc = A_alpha; lr = gr - (qkv_m + z_m + beta_m); }
+#elif HIPFIRE_FP8_RESIDUAL
+        Asrc = A_w;
+        lr = gr;
+#elif HIPFIRE_FP8_QKV
+        if (gr < q_m) { Asrc = A_q; lr = gr; }
+        else if (gr < q_m + k_m) { Asrc = A_k; lr = gr - q_m; }
+        else { Asrc = A_v; lr = gr - (q_m + k_m); }
+#else
+        if (gr < gate_m) { Asrc = A_gate; lr = gr; }
+        else { Asrc = A_up; lr = gr - gate_m; }
+#endif
+        rb = Asrc + (unsigned int)lr * (unsigned int)gpr * 136u;
+    }
+
+    const v8f_t zc = v8f_t{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    v8f_t T[4][2];
+    v8f_t P[4][2];
+    #pragma unroll
+    for (int nb = 0; nb < 4; nb++) {
+        T[nb][0] = zc;
+        T[nb][1] = zc;
+    }
+
+    #pragma nounroll
+    for (int g = 0; g < gpr; g++) {
+        #pragma nounroll
+        for (int h = 0; h < 2; h++) {
+            // Overlap probe (K2 measurement): prologue stages slab 0, then
+            // each iteration issues slab s+1's global loads into registers
+            // BEFORE slab s's compute, so load latency hides under WMMAs.
+            // Expand + LDS publish of s+1 still follow compute (single
+            // buffer); only latency, not execution, is hidden. A_pf holds one
+            // A row (BM<=NTHREADS => single row-loop trip); Wpk_pf holds raw
+            // packs (expand at publish, identical values).
+            v2i_t A_pf[HIPFIRE_FP8_V2_WCHUNKS];
+            unsigned int Wpk_pf[HIPFIRE_FP8_V2_WITER];
+            // Prologue: stage slab 0 fully (S/s/z + A + W).
+            {
+                for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
+                    const int tok = bs + row;
+                    float s = 0.0f;
+                    if (tok < N) {
+                        s = X_half_sums[((unsigned int)tok * (unsigned int)gpr + (unsigned int)g) * 2u + (unsigned int)h];
+                    }
+                    *(float*)(lds_S + (unsigned int)row * 4u) = s;
+                }
+                if (tid < HIPFIRE_FP8_V2_BN) {
+                    float s_h = 0.0f, z_h = 0.0f;
+                    if (row_ok) {
+                        const unsigned int hw = *(const unsigned int*)(rb + (unsigned int)g * 136u + (unsigned int)h * 4u);
+                        s_h = __half2float(__ushort_as_half((unsigned short)(hw & 0xFFFFu)));
+                        z_h = __half2float(__ushort_as_half((unsigned short)(hw >> 16)));
+                    }
+                    float* szp = (float*)(lds_SZ + (unsigned int)tid * 8u);
+                    szp[0] = s_h;
+                    szp[1] = z_h;
+                }
+                for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
+                    const int tok = bs + row;
+                    const bool tok_ok = (tok < N);
+                    const unsigned char* xsrc = tok_ok
+                        ? (X_fp8 + (unsigned int)tok * (unsigned int)K
+                            + (unsigned int)g * 256u + (unsigned int)h * 128u)
+                        : nullptr;
+                    #pragma unroll
+                    for (int c = 0; c < HIPFIRE_FP8_V2_WCHUNKS; c++) {
+                        v2i_t v = tok_ok ? *(const v2i_t*)(xsrc + (unsigned int)c * 8u) : v2i_t{0, 0};
+                        *(v2i_t*)(lds_A + (unsigned int)row * (unsigned int)HIPFIRE_FP8_V2_STRIDE + (unsigned int)c * 8u) = v;
+                    }
+                }
+                {
+                    const unsigned int pack_base = (unsigned int)g * 136u + 8u
+                        + (unsigned int)h * 64u;
+                    #pragma unroll
+                    for (int it = 0; it < HIPFIRE_FP8_V2_WITER; it++) {
+                        const int chunk8 = prod + HIPFIRE_FP8_V2_NPROD * it;
+                        v2i_t e8;
+                        if (row_ok) {
+                            const unsigned int pk = *(const unsigned int*)(rb + pack_base + (unsigned int)chunk8 * 4u);
+                            e8 = mq4_qpk_to_e4m3(pk);
+                        } else {
+                            e8 = v2i_t{0, 0};
+                        }
+                        *(v2i_t*)(lds_W + (unsigned int)w_row * (unsigned int)HIPFIRE_FP8_V2_STRIDE + (unsigned int)chunk8 * 8u) = e8;
+                    }
+                }
+            }
+            __syncthreads();
+            #pragma nounroll
+            for (int slab = 0; slab < HIPFIRE_FP8_V2_NSLABS; slab++) {
+                // Prefetch slab s+1 globals before compute s.
+                if (slab + 1 < HIPFIRE_FP8_V2_NSLABS) {
+                    for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
+                        const int tok = bs + row;
+                        const bool tok_ok = (tok < N);
+                        const unsigned char* xsrc = tok_ok
+                            ? (X_fp8 + (unsigned int)tok * (unsigned int)K
+                                + (unsigned int)g * 256u + (unsigned int)h * 128u
+                                + (unsigned int)(slab + 1) * (unsigned int)HIPFIRE_FP8_V2_BK)
+                            : nullptr;
+                        #pragma unroll
+                        for (int c = 0; c < HIPFIRE_FP8_V2_WCHUNKS; c++) {
+                            A_pf[c] = tok_ok ? *(const v2i_t*)(xsrc + (unsigned int)c * 8u) : v2i_t{0, 0};
+                        }
+                    }
+                    {
+                        const unsigned int pack_base = (unsigned int)g * 136u + 8u
+                            + (unsigned int)h * 64u
+                            + (unsigned int)(slab + 1) * (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
+                        #pragma unroll
+                        for (int it = 0; it < HIPFIRE_FP8_V2_WITER; it++) {
+                            const int chunk8 = prod + HIPFIRE_FP8_V2_NPROD * it;
+                            Wpk_pf[it] = row_ok
+                                ? *(const unsigned int*)(rb + pack_base + (unsigned int)chunk8 * 4u)
+                                : 0u;
+                        }
+                    }
+                    // Pin the prefetched loads above the WMMAs.
+                    __builtin_amdgcn_sched_barrier(0);
+                }
+
+                // Inner loop: ds_read_b64 A/W -> v_wmma fp8 16x16x16. Nothing else.
+                if (slab == 0) {
+                    {
+                        const int off = kg * 8;
+                        const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                        const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                        #pragma unroll
+                        for (int nb = 0; nb < 4; nb++) {
+                            const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                            P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, zc);
+                            P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, zc);
+                        }
+                        __builtin_amdgcn_sched_barrier(0);
+                    }
+                    #pragma unroll
+                    for (int kstep = 1; kstep < HIPFIRE_FP8_V2_K16; kstep++) {
+                        const int off = kstep * 16 + kg * 8;
+                        const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                        const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                        #pragma unroll
+                        for (int nb = 0; nb < 4; nb++) {
+                            const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                            P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, P[nb][0]);
+                            P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, P[nb][1]);
+                        }
+                        __builtin_amdgcn_sched_barrier(0);
+                    }
+                } else {
+                    #pragma unroll
+                    for (int kstep = 0; kstep < HIPFIRE_FP8_V2_K16; kstep++) {
+                        const int off = kstep * 16 + kg * 8;
+                        const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                        const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                        #pragma unroll
+                        for (int nb = 0; nb < 4; nb++) {
+                            const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                            P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, P[nb][0]);
+                            P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, P[nb][1]);
+                        }
+                        __builtin_amdgcn_sched_barrier(0);
+                    }
+                }
+                // Publish prefetched slab s+1 (buffer free: compute s done).
+                // The barrier is REQUIRED: without it fast waves overwrite
+                // slab s while stragglers still read it (K2 race found).
+                // Single buffer: slab selects the GLOBAL source only; the LDS
+                // address is the same slab slot the prologue used.
+                if (slab + 1 < HIPFIRE_FP8_V2_NSLABS) {
+                    __syncthreads();
+                    for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
+                        #pragma unroll
+                        for (int c = 0; c < HIPFIRE_FP8_V2_WCHUNKS; c++) {
+                            *(v2i_t*)(lds_A + (unsigned int)row * (unsigned int)HIPFIRE_FP8_V2_STRIDE
+                                + (unsigned int)c * 8u) = A_pf[c];
+                        }
+                    }
+                    {
+                        const unsigned int pack_base = (unsigned int)g * 136u + 8u
+                            + (unsigned int)h * 64u
+                            + (unsigned int)(slab + 1) * (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
+                        #pragma unroll
+                        for (int it = 0; it < HIPFIRE_FP8_V2_WITER; it++) {
+                            const int chunk8 = prod + HIPFIRE_FP8_V2_NPROD * it;
+                            v2i_t e8 = row_ok ? mq4_qpk_to_e4m3(Wpk_pf[it]) : v2i_t{0, 0};
+                            *(v2i_t*)(lds_W + (unsigned int)w_row * (unsigned int)HIPFIRE_FP8_V2_STRIDE
+                                + (unsigned int)chunk8 * 8u) = e8;
+                        }
+                    }
+                }
+
+                if (slab == HIPFIRE_FP8_V2_NSLABS - 1) {
+                    // Fold at the 128-K half boundary. Stream s/z; S per token frag.
+                    float Sh[4];
+                    #pragma unroll
+                    for (int nb = 0; nb < 4; nb++) {
+                        Sh[nb] = *(const float*)(lds_S + (unsigned int)(wave_tok + nb * 16 + ml) * 4u);
+                    }
+                    #pragma unroll
+                    for (int wf = 0; wf < 2; wf++) {
+                        #pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            const int grow = wave_wt + wf * 16 + 8 * kg + j;
+                            const float* szp = (const float*)(lds_SZ + (unsigned int)grow * 8u);
+                            const float s_h = szp[0];
+                            const float z_h = szp[1];
+                            #pragma unroll
+                            for (int nb = 0; nb < 4; nb++) {
+                                T[nb][wf][j] = fmaf(s_h, P[nb][wf][j], T[nb][wf][j]);
+                                T[nb][wf][j] = fmaf(z_h, Sh[nb], T[nb][wf][j]);
+                            }
+                        }
+                    }
+                }
+
+                __syncthreads();
+            }
+        }
+    }
+
+    // Coalesced store: the WMMA C layout leaves lane (ml,kg) holding
+    // T[nb][wf][j] for token wave_tok+nb*16+ml and rows
+    // wave_wt+wf*16+8*kg+j, so one store instruction touches 16 output rows
+    // at 4 B each (~90 GB/s effective). Transpose each nb's 16x32 wave tile
+    // through LDS instead: lane (ml,kg) dumps its 16 values at tile row ml,
+    // cols wf*16+8*kg+j (the kg pair covers all 32 columns), then all 32
+    // lanes cooperatively stream the 16 token rows with lane tid owning
+    // column tid, so every global store is one contiguous 128 B segment.
+    // Per-element arithmetic is unchanged (y = a[t]*T, one residual add),
+    // hence bit-identical; only the visit order changes. A/W/S/SZ are dead
+    // (all folds complete), so the tile reuses LDS base: 8 waves x 16 x 32
+    // floats = 16 KiB < 24 KiB, no host change.
+    float* lds_tile = (float*)lds;
+    #pragma unroll
+    for (int nb = 0; nb < 4; nb++) {
+        #pragma unroll
+        for (int wf = 0; wf < 2; wf++) {
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                // Row-skew (col+ml)&31: without it all 16 ml lanes hit bank
+                // col%32 on the dump (16-way conflict). Drain undoes it with
+                // (lane+r16)&31, a permutation of the same 128 B line.
+                const int col = (wf * 16 + 8 * kg + j + ml) & 31;
+                lds_tile[(unsigned int)(wave * 512 + ml * 32 + col)] = T[nb][wf][j];
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r16 = 0; r16 < 16; r16++) {
+            const int t = bs + wave_tok + nb * 16 + r16;
+            if (t < N) {
+                const float at = X_row_scales[t];
+                const int r = rs + wave_wt + lane;
+                const float v = lds_tile[(unsigned int)(wave * 512 + r16 * 32 + ((lane + r16) & 31))];
+                const float y = at * v;
+                if (r < tm) {
+#if HIPFIRE_FP8_QKVZA
+                    float* Yp;
+                    int pr, os;
+                    if (r < qkv_m) { Yp = Y_qkv; pr = r; os = qkv_m; }
+                    else if (r < qkv_m + z_m) { Yp = Y_z; pr = r - qkv_m; os = z_m; }
+                    else if (r < qkv_m + z_m + beta_m) { Yp = Y_beta; pr = r - (qkv_m + z_m); os = beta_m; }
+                    else { Yp = Y_alpha; pr = r - (qkv_m + z_m + beta_m); os = alpha_m; }
+                    Yp[(unsigned int)t * (unsigned int)os + (unsigned int)pr] = y;
+#elif HIPFIRE_FP8_RESIDUAL
+                    Y_res[(unsigned int)t * (unsigned int)res_m + (unsigned int)r] += y;
+#elif HIPFIRE_FP8_QKV
+                    float* Yp;
+                    int pr, os;
+                    if (r < q_m) { Yp = Y_q; pr = r; os = q_m; }
+                    else if (r < q_m + k_m) { Yp = Y_k; pr = r - q_m; os = k_m; }
+                    else { Yp = Y_v; pr = r - (q_m + k_m); os = v_m; }
+                    Yp[(unsigned int)t * (unsigned int)os + (unsigned int)pr] = y;
+#else
+                    float* Yp;
+                    int pr, os;
+                    if (r < gate_m) { Yp = Y_gate; pr = r; os = gate_m; }
+                    else { Yp = Y_up; pr = r - gate_m; os = up_m; }
+                    Yp[(unsigned int)t * (unsigned int)os + (unsigned int)pr] = y;
+#endif
+                }
+            }
+        }
+        __syncthreads();
+    }
+}
+
+#else
 extern "C" __launch_bounds__(32, 2) __global__
 #if HIPFIRE_FP8_QKVZA
 void HIPFIRE_FP8_GATEUP_KERNEL(
@@ -768,3 +1240,4 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     }
 #endif
 }
+#endif

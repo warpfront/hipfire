@@ -219,6 +219,12 @@ pub struct FeatureFlags {
     /// FP8-WMMA MQ4v2 3-way QKV (full-attention) prefill candidate. Default ON
     /// on exact gfx1201; `=0` opts out.
     pub gfx12_mq4v2_fp8_qkv: bool,
+    /// Staged-tile v2 selector for the four gfx1201 FP8-WMMA MQ4v2 prefill
+    /// routes (`HIPFIRE_GFX12_MQ4V2_FP8_V2`, `kernel.gfx12_mq4v2_fp8_v2`).
+    /// Default OFF everywhere; `=1` selects the `_v2_gfx1201` symbols at
+    /// N>=256 (smaller batches keep s2bt8/BT). The four family flags remain
+    /// prerequisites; the activation prelude is unchanged.
+    pub gfx12_mq4v2_fp8_v2: bool,
     /// `HIPFIRE_GFX12_FA2_PREFILL=0` opts out of the gfx1201 GQA-fused FA2
     /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
     /// Default ON on exact gfx1201; `=1` forces it on other arches
@@ -595,6 +601,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
                 .unwrap_or(arch == "gfx1201"),
+            gfx12_mq4v2_fp8_v2: value("HIPFIRE_GFX12_MQ4V2_FP8_V2").as_deref() == Ok("1"),
             gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
                 .unwrap_or(arch == "gfx1201"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
@@ -897,6 +904,7 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_resid: false,
             gfx12_mq4v2_fp8_qkvza: false,
             gfx12_mq4v2_fp8_qkv: false,
+            gfx12_mq4v2_fp8_v2: false,
             gfx12_fa2_prefill: false,
             gfx11_fa2_prefill: false,
             gfx12_fa2_fp8: Some(false),
