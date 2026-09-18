@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// MQ4G256V2 iu4-direct MMQ for gfx12 (RDNA4 — gfx1200/gfx1201).
+// MQ4G256V2 iu4-direct MMQ for gfx12 (RDNA4 — gfx1200/gfx1201), v2 LDS tile.
 //
 // Feeds MQ4V2 weight nibbles DIRECTLY to
 // `__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12` (K=32 per call) with
@@ -32,23 +32,32 @@
 //     int32x8 — same C map as the gfx12 iu8 MMQ.
 //   - Per-half MQ4V2 (sc,zp) via __shfl from src_lane = 8*k_grp + j.
 //
-// Tiling: one wave covers a 16-row × 64-column tile (IU4_NB=4 column blocks
-// of 16). Each weight fragment is loaded ONCE per (group, sub-block) into
-// registers and reused across the 4 column blocks — weight/Xq traffic is
-// 4× lower than a 16-column wave tile (the GEMM is weight-traffic bound on
-// gfx1201: a 16-wide tile re-reads weights N/16 times).
+// v2 tiling (restructure of the v1 load-bound kernel):
+//   - Workgroup tile: 16 rows × IU4_TILE_N tokens (256), IU4_NWAVES=4 waves.
+//     Every wave covers the SAME 16 rows and its own 64-column sub-tile
+//     (IU4_NB=4 column blocks of 16, as in v1).
+//   - Weight nibbles for the WG's 16 rows are staged ONCE in LDS per 128-K
+//     half (16 rows × 64 B) and consumed by all 4 waves: each weight fragment
+//     feeds 4 waves × 4 column blocks = 16 WMMAs (v1: 4).
+//   - Xq stays in global (v1 pattern: per-lane direct loads, L2-cached
+//     across row tiles) — bulk LDS staging of the slab cost more in issue
+//     slots (36 scalar iters/kb) than it saved.
+//   - K-loop body = ds_read_b64 (W frag) + global/buffer load (Xq frag) +
+//     v_wmma; the 256-K group scale FMA once per accumulator per group; no
+//     per-fragment VALU beyond addressing. `__builtin_amdgcn_sched_barrier(0)`
+//     per k-step keeps the compiler from hoisting fragments into VGPRs.
+//   - Math is bit-identical to v1: same 4×K32 grouping per 128-K block per
+//     column block, same pinned IU4_FOLD_RN DAG.
 //
-// Compute: per 128-K block and per column block, FOUR K32 iu4 WMMAs
-// accumulate into ONE int32 C, then ONE fold with (d_x, s_x = exact int sum
-// of the 128 x_q). Integer accumulation is exact, so the 4×K32 grouping is
-// bit-identical to gfx11's 8×K16; the fold spells the pinned IU4_FOLD_RN DAG
-// verbatim (same file comment as gfx11: t1=sc*d, p=t1*C, t2=zp*d,
-// term=t2*s+p, sum+=term).
-//
-// Grid: [ceil(M/16), ceil(N/64)]. Block: [32,1,1]. LDS: 0.
+// Grid: [ceil(M/16), ceil(N/256)]. Block: [128,1,1].
+// LDS: 1024 bytes (weight half-slab).
 //
 // Compile gate: gfx1200 / gfx1201 only. Non-gfx12 archs get empty stubs (the
-// gfx11 iu4 kernel lives in its own file / arch guard).
+// Weight half-slab layout (bank-conflict-free): 8 half-slabs chunks of 8 B
+// (one K32 lane fragment), chunk-major: byte (chunk8, row r, byte b) lives at
+// (chunk8*16 + r)*8 + b. The 16 lanes of a k_grp half read 16 consecutive
+// 8 B blocks = 32 distinct banks. (Row-major [r][64] would stride lanes by
+// 64 B = banks {0,16}: an 8-way conflict per A-frag load.)
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -60,9 +69,14 @@
 // (kernels/src/block_i4_128_quant.hip, concatenated by
 // GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SRC).
 
-// Column blocks of 16 per wave (64-column wave tile). Each weight fragment
-// is reused across IU4_NB WMMAs (one per column block).
+// Column blocks of 16 per wave (64-column wave tile). Each LDS-staged weight
+// fragment is reused across IU4_NWAVES waves × IU4_NB column blocks.
 #define IU4_NB 4
+#define IU4_NWAVES 4
+#define IU4_TILE_N (IU4_NB * 16 * IU4_NWAVES)
+// Weight half-slab: 16 rows × 72 B (64 B data + 8 B pad; row stride 72 keeps
+// consecutive m_lanes on distinct LDS banks).
+#define IU4_W_BYTES 1152
 
 typedef int8_t  __attribute__((ext_vector_type(8)))  int8x8_t;
 typedef int32_t __attribute__((ext_vector_type(2)))  int32x2_t;
@@ -97,31 +111,31 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     int M, int K, int N
 ) {
     const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
     const int row_start = blockIdx.x * 16;
-    const int col_start = blockIdx.y * (16 * IU4_NB);
+    const int col_start = blockIdx.y * IU4_TILE_N;
 
     if (row_start >= M || col_start >= N) return;
 
-    const int m_lane = tid & 15;   // 0..15: row within the 16-row tile (A operand)
-    const int k_grp  = tid >> 4;   // 0/1: which K-half this lane carries
+    const int m_lane = lane & 15;  // 0..15: row within the 16-row tile (A operand)
+    const int k_grp  = lane >> 4;  // 0/1: which K-half this lane carries
+    const int wave_col0 = wave * (IU4_NB * 16);
 
-    // Columns (N-dim) handled by THIS lane: one per column block. Both k_grp
-    // halves of the same m_lane access the same int4 columns (different K
-    // halves of qs[]).
+    // Columns (N-dim) handled by THIS lane: one per column block of this
+    // wave's 64-column sub-tile.
     int col_nb[IU4_NB];
     bool col_valid[IU4_NB];
     #pragma unroll
     for (int nb = 0; nb < IU4_NB; nb++) {
-        col_nb[nb] = col_start + nb * 16 + m_lane;
+        col_nb[nb] = col_start + wave_col0 + nb * 16 + m_lane;
         col_valid[nb] = (col_nb[nb] < N);
     }
 
-    // A-row selection: pad OOB rows to the last valid row (M-1). Each lane
-    // (m_lane) owns ONE row of the WMMA A operand; both lane halves (k_grp 0/1)
-    // read from the SAME row (different K halves).
-    const int safe_row = (row_start + m_lane < M) ? (row_start + m_lane) : (M - 1);
     const int groups_per_row = K / 256;
-    const char* row_base = A + (long long)safe_row * groups_per_row * 136;
+
+    extern __shared__ char LDS[];
+    char* __restrict__ w_lds = LDS;                       // IU4_W_BYTES
 
     // Output accumulators (gfx12 wave32 layout):
     // acc[nb][j] = Y[8*k_grp + j][col_nb[nb]].
@@ -131,12 +145,20 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         acc[nb] = (float8_t){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
     }
 
+    const int nthreads = IU4_NWAVES * 32;
+    // Weight half-slab data dwords staged per (group, 128-K half): 16 rows ×
+    // 16 dw (the 8 B pad per row is never written or read).
+    const int W_DWORDS = 256;
+
     for (int g = 0; g < groups_per_row; g++) {
-        const char* gp = row_base + g * 136;
         // MQ4V2 per-group header: word h holds the fp16 (sc, zp) pair for
         // 128-K half h (same contract as the gfx11 iu4 kernel's ksc select).
-        const unsigned int hs0 = *(const unsigned int*)(gp + 0);
-        const unsigned int hs1 = *(const unsigned int*)(gp + 4);
+        // Header read by lane 0 of each wave is scalar-cheap; every lane
+        // loads it (L1 hit) to avoid a shuffle.
+        const int safe_row0 = (row_start + m_lane < M) ? (row_start + m_lane) : (M - 1);
+        const char* row0_gp = A + (long long)safe_row0 * groups_per_row * 136 + g * 136;
+        const unsigned int hs0 = *(const unsigned int*)(row0_gp + 0);
+        const unsigned int hs1 = *(const unsigned int*)(row0_gp + 4);
         const float sc0_self = __half2float(__ushort_as_half((unsigned short)(hs0 & 0xFFFFu)));
         const float zp0_self = __half2float(__ushort_as_half((unsigned short)(hs0 >> 16)));
         const float sc1_self = __half2float(__ushort_as_half((unsigned short)(hs1 & 0xFFFFu)));
@@ -147,6 +169,20 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         for (int kb_in_group = 0; kb_in_group < 2; kb_in_group++) {
             const int kb = 2 * g + kb_in_group;
 
+            // --- Stage weight half-slab: 16 rows × 72 B (64 B data + 8 B pad).
+            // Row stride 72 gives consecutive m_lanes distinct banks
+            // ((r*18)%32 all distinct); the k_grp half (+8 B) costs the
+            // unavoidable 2-way floor. Simple linear addresses. ---
+            for (int i = tid; i < W_DWORDS; i += nthreads) {
+                const int r = i >> 4;       // row 0..15 within tile
+                const int w = i & 15;       // dword 0..15 within the 64 B row half
+                const int row_r = row_start + r;
+                const int src_row = (row_r < M) ? row_r : (M - 1);
+                const char* src = A + (long long)src_row * groups_per_row * 136
+                    + g * 136 + 8 + kb_in_group * 64 + w * 4;
+                ((int*)(w_lds + r * 72))[w] = *(const int*)src;
+            }
+            __syncthreads();
             // Per-half scale rows for the fold below: acc[nb][j] holds output
             // row row_start + 8*k_grp + j, whose (sc,zp) live on the lane with
             // m_lane = 8*k_grp + j. Shared across column blocks (same rows).
@@ -161,7 +197,8 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 zp_row[j] = __shfl(zp_self, src_lane);
             }
 
-            // Pull the int4 block for each column block (null for OOB cols).
+            // Activation blocks per column block, direct from global (v1
+            // pattern; null for OOB cols).
             const unsigned char* qs_nb[IU4_NB];
             float d_x_nb[IU4_NB];
             int s_x_nb[IU4_NB];
@@ -178,23 +215,19 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
             // 4 sub-blocks of 32 K each accumulate into ONE int32 C per column
             // block; then ONE fold with (d_x, s_x). Exact integer arithmetic:
             // grouping into 4×K32 matches gfx11's 8×K16 bit-for-bit. The A
-            // fragment loads ONCE and is reused across the IU4_NB columns.
+            // fragment comes from the LDS half-slab (one b64 read), the B
+            // fragment direct from global (v1 pattern).
             int32x8_t cacc[IU4_NB];
             #pragma unroll
             for (int nb = 0; nb < IU4_NB; nb++) {
                 cacc[nb] = (int32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
             }
-            #pragma unroll
+            #pragma unroll 1
             for (int sb = 0; sb < 4; sb++) {
-                // K-offset within group:
-                //   kb_in_group * 128 (int4 block within group)
-                // + sb * 32            (sub-block)
-                // + k_grp * 16         (lane-group's K half).
-                const int k_off = kb_in_group * 128 + sb * 32 + k_grp * 16;
-                // Weight nibbles: 2 packed words (16 nibbles) per lane.
-                const int* ap = (const int*)(gp + 8 + k_off / 2);
-                const int32x2_t a_i32 = *(const int32x2_t*)ap;
-                // Activations: 8 nibble bytes (16 nibbles) per lane, per column.
+                // Weight fragment for this lane's row from the LDS half-slab.
+                const int32x2_t a_i32 =
+                    *(const int32x2_t*)(w_lds + m_lane * 72 + sb * 16 + k_grp * 8);
+                __builtin_amdgcn_sched_barrier(0);
                 #pragma unroll
                 for (int nb = 0; nb < IU4_NB; nb++) {
                     int32x2_t b_i32;
@@ -219,6 +252,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     IU4_FOLD_RN(acc[nb][j], sc_row[j], zp_row[j], d_x, acc_i[j], s_x);
                 }
             }
+            __syncthreads();
         } // for kb_in_group
     } // for g
 
@@ -243,7 +277,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
 }
 
 // residual: += (the `add` kernarg picks += vs = at runtime).
-extern "C" __global__ __launch_bounds__(32, 2)
+extern "C" __global__ __launch_bounds__(128, 2)
 void gemm_mq4g256v2_residual_mmq_iu4(
     const char*           __restrict__ A,
     const block_i4_128*   __restrict__ Xq,
@@ -257,7 +291,7 @@ void gemm_mq4g256v2_residual_mmq_iu4(
     }
 }
 
-extern "C" __global__ __launch_bounds__(32, 2)
+extern "C" __global__ __launch_bounds__(128, 2)
 void gemm_mq4g256v2_residual_mmq_iu4_full_add(
     const char*           __restrict__ A,
     const block_i4_128*   __restrict__ Xq,
@@ -267,7 +301,7 @@ void gemm_mq4g256v2_residual_mmq_iu4_full_add(
     gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<true>(A, Xq, Y, M, K, N);
 }
 
-extern "C" __global__ __launch_bounds__(32, 2)
+extern "C" __global__ __launch_bounds__(128, 2)
 void gemm_mq4g256v2_residual_mmq_iu4_full_set(
     const char*           __restrict__ A,
     const block_i4_128*   __restrict__ Xq,

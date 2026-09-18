@@ -186,8 +186,10 @@ fn launch_iu4(
     b.push_i32(n as i32);
     b.push_i32(i32::from(add));
     let mut blob = b.into_vec();
-    let grid = [m.div_ceil(16) as u32, n.div_ceil(16) as u32, 1];
-    gpu.launch_kernel_blob(sym, grid, [32, 1, 1], 0, &mut blob)
+    // v2 tile: WG = 16 rows x 256 cols (4 waves), LDS = 1152 B weight slab.
+    let grid = [m.div_ceil(16) as u32, n.div_ceil(256) as u32, 1];
+    let lds: u32 = 1152;
+    gpu.launch_kernel_blob(sym, grid, [128, 1, 1], lds, &mut blob)
         .unwrap_or_else(|e| panic!("launch {sym}: {e}"));
 }
 

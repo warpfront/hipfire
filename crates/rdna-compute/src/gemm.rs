@@ -135,8 +135,6 @@ impl LdsTile {
 /// `residual` (and `addin`) MAY alias `y`: element `(b, m)` is read and written
 /// by the same thread at the same flat index, so the in-place gated update
 /// Task 5 needs is race-free. See the ALIASING note in the kernel source.
-///
-/// Only the five combinations in [`GemmEpilogue::SUPPORTED`] are compiled;
 /// anything else is a launcher error naming the entry that would be needed.
 #[derive(Default, Clone, Copy)]
 pub struct GemmEpilogue<'a> {
@@ -19099,10 +19097,10 @@ impl Gpu {
         }
         self.bind_thread()?;
         if self.arch.as_str() == "gfx1201" {
-            // gfx12 K32 single-wave route: 16-row x 64-col tiles (IU4_NB=4)
-            // handle partial M/N natively (col_valid / out_row guards), so one
-            // symbol per store mode covers full and tail tiles alike. LDS 0,
-            // block [32,1,1].
+            // gfx12 K32 v2 LDS-tile route: 16-row x 256-col workgroups
+            // (4 waves, one 64-col sub-tile each). Xq slab + weight half
+            // staged in LDS once per WG; partial M/N handled natively
+            // (zero-filled slab / guarded writeback). Block [128,1,1].
             let kernel_name = if add {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add"
             } else {
@@ -19131,15 +19129,17 @@ impl Gpu {
                 &mut add_val as *mut _ as *mut c_void,
             ];
             let row_tiles = m.div_ceil(16);
-            // 64-column wave tile (IU4_NB=4 column blocks of 16).
-            let batch_tiles = batch_size.div_ceil(64);
+            // 256-column workgroup tile (4 waves x 64-col sub-tiles).
+            let batch_tiles = batch_size.div_ceil(256);
             let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
             let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+            // LDS: 1152 B weight half-slab (Xq direct from global, v1 pattern).
+            let lds_bytes: u32 = 1152;
             let result = self.launch_maybe_blob(
                 kernel_name,
                 [row_tiles as u32, batch_tiles as u32, 1],
-                [32, 1, 1],
-                0,
+                [128, 1, 1],
+                lds_bytes,
                 &mut params,
                 || {
                     let mut b = hip_bridge::KernargBlob::new();
