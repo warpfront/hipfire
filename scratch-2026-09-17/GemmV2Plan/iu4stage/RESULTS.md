@@ -100,17 +100,62 @@ residual 850.1): gate per-matrix 2x525/1679 = 0.63x; residual 511/850 = 0.60x.
 
 ## Gate 5 — full validation (triggered)
 
-### KLD pins (bit-for-bit)
+### KLD pins (bit-for-bit) — PASS
 
-TODO — commands below when run.
+Ref `/home/kaden/kldrefs/qwen3.8-27b.ref_wt2.bin` (sha256
+`8c545178…a43234a`, HFKLDR v1, 2048 ctx, 24 chunks — the same file every pin
+today was made with). Tree-built eval in wt-iu4, plan §1.2 env
+(`HIPFIRE_GRAPH=0 HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_LLOYD_GFX12=1
+HIPFIRE_GFX11_MQ4V2_IU4=1`, `--kv-mode q8 --kv-v q8 --scoring-mode prefill`).
+Receipts: `iu4stage/kldpin/c{1,2,24}.{kldseq,stdout,stderr}`.
 
-### Interleaved bench OFF/ON/OFF/ON
+| chunks | pin | got | verdict |
+|---|---|---|---|
+| 1 | `032ebad84f2c1dd5e2980fa805215ac0` | `032ebad84f2c1dd5e2980fa805215ac0` | BIT-IDENTICAL |
+| 2 | `dc7e53181662271780374f0a85fd7732` | `dc7e53181662271780374f0a85fd7732` | BIT-IDENTICAL |
+| 24 | KLD `0.063410` | KLD `0.063410` (NLL 1.864044, PPL 6.4498) | EXACT |
+
+### Interleaved bench OFF/ON/OFF/ON — medians (tok/s)
 
 `HIPFIRE_GRAPH=1 HIPFIRE_LLOYD_GFX12=1 [HIPFIRE_GFX11_MQ4V2_IU4=1]
 ./target/release/hipfire bench qwen3.8:27b-mq4-xt --matrix
 --pp 512,2048,8192,32768 --ctx 128 --tg 64 --spec off --runs 3 --warmups 1
---kv-mode q8 --json` (prior ON 1627/1595/1469/1111; >1.5% is real).
+--kv-mode q8 --json`. Receipts: `iu4stage/bench/{off1,on_a,off_b,on_b}.log`
+(`on1.log` DISCARDED — see stale-daemon note).
 
-### decode ≥ 36.4 clean, serve battery ON read
+| row | OFF-1 | ON_a | OFF_b | ON_b | prior ON | ON/OFF |
+|---|---|---|---|---|---|---|
+| pp512 | 1475.3 | 2037.1 | 1472.4 | 2029.3 | 1627 | +38% |
+| pp2048 | 1406.3 | 1977.9 | 1442.7 | 1972.6 | 1595 | +39% |
+| pp8192 | 1298.8 | 1791.2 | 1338.8 | 1786.0 | 1469 | +36% |
+| pp32768 | 1008.4 | 1285.3 | 1033.8 | 1283.9 | 1111 | +26% |
+| tg64@128 | 28.79* | 36.50 | 36.48 | 36.49 | — | — |
 
-TODO.
+ON vs prior-ON: +25% / +24% / +22% / +16% (all >> 1.5% reality threshold).
+ON_a vs ON_b agree to ≤0.4%; OFF pair agrees to ≤3% (session drift on long
+rows). *OFF-1 decode 28.79 is lone-run noise (its pp rows match OFF_b; the
+other three decodes agree at 36.48–36.50).
+
+Stale-daemon note (finding, no data lost): the first ON run (`on1.log`,
+1629/1593/1468/1112) used `target/release/daemon` built 03:04, predating
+Change A — the kernel cache proves it compiled V2 source (no
+`Double-buffered` marker). `hipfire` is NOT the daemon: bench spawns
+`target/release/daemon` via `find_daemon`. Rebuilt post-commit; md5s
+`hipfire 17fcd6b07f141b5451de7a2d628d01db`,
+`daemon 32d48a086ebebc9a380d3e14a13b350d`. Freshness proof: the ON runs hit
+cache entry `….3271eb5c00362293.hip`, byte-identical to the committed TU
+(`st_avoff` marker present). Lesson for the gate: any ON row within 2% of
+1627/1595/1469/1111 is stale — ON_a/ON_b at ~2030/1975 are the real rows.
+Side observation: V2 end-to-end (1629) ≈ A+B (1627) — the overlap work did
+not move prefill; only the staging-width cut did (+25%).
+
+### decode ≥ 36.4 — PASS (36.50 / 36.49, clean logs, 0 errors)
+
+### serve battery ON — read: 7/8, same as OFF
+
+`test-serve.sh --model qwen3.8:27b-mq4-xt` (`serve-on.log`, rerun
+`serve-on2.log`, control `serve-off.log`): 7 passed 1 failed in all three.
+The failure is Test 4 (streaming basic chat: `open think span at end of
+generation` validation) — fails identically with iu4 OFF (fp8 path), so it
+is pre-existing and unrelated (reasoning-model prompt interaction; KLD
+bit-identity rules out a numerics regression).
