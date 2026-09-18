@@ -38,11 +38,11 @@
 //     waves (256 threads). Wave w covers 32 rows x 64 tokens = 2 row-groups
 //     of 16 x 4 column blocks of 16: wt_pair = w>>1 selects the 32-row
 //     group, tok_half = w&1 selects the 64-token half.
-//   - Per 128-K block (kb): the activation slab (128 tokens x 64 K nibbles
-//     = 32 B/row) AND the weight slab (128 rows x 32 B/row) are staged ONCE
-//     in LDS and consumed by all 8 waves. Staged A bytes feed 4 row-pair
-//     waves x 4 (slab,sb) reads; staged W bytes feed 2 token-half waves x
-//     4 nb x 4 reads.
+//   - Per 128-K block (kb): the activation slab (128 tokens x 64 K nibbles)
+//     AND the weight slab (128 rows x 64 K nibbles) are staged ONCE in LDS
+//     in WMMA fragment order (below) and consumed by all 8 waves. Staged A
+//     bytes feed 4 row-pair waves x 4 (slab,sb) reads; staged W bytes feed
+//     2 token-half waves x 4 nb x 4 reads.
 //   - K-loop body per (slab, K32-sub-block) = ds_read_b64 (W frag) +
 //     ds_read_b64 (A frag) + v_wmma_i32_16x16x32_iu4; the per-128-K fold
 //     (IU4_FOLD_RN, once per block after the 2nd slab) is the ONLY other
@@ -65,7 +65,8 @@
 //     slab 0's WMMAs (sched_barrier-pinned, as in v2), next-block W staging
 //     issues above the fold, and next-block A loads issue above compute 1
 //     + fold. Bit-identical: same K order, same pinned IU4_FOLD_RN DAG.
-//     LDS 19456 B keeps 3 WG/CU on gfx1201 (3 x 19456 = 58368 < 65536/CU).
+//     LDS 16384 B keeps 3 WG/CU on gfx1201 (3 x 16384 = 49152 < 65536/CU;
+//     the host still passes 19456 B, a harmless superset, same occupancy).
 //   - Coalesced store (fp8 K2 mechanism): each (rg, nb) phase dumps the
 //     wave's 16x16 f32 sub-tile to an LDS slot ([16][20], stride-20 pad for
 //     bank-clean streaming), then all 256 threads stream 64 rows x 32 cols
@@ -75,36 +76,50 @@
 //     column block (same K order), same pinned IU4_FOLD_RN DAG. Integer MMA:
 //     any oracle difference is a bug.
 //
-// LDS layout (19456 B = 19 KiB on gfx1201; compute planes and store slots
+// LDS layout (16384 B = 16 KiB on gfx1201; compute planes and store slots
 // overlap — A/W/DS/SZ are all dead once folds complete):
-//   A  = [128][40] activation nibbles, 32 data + 8 pad  @ 0      (5120 B)
-//   W0 = [128][40] weight nibbles, 32 data + 8 pad      @ 5120   (5120 B)
-//   W1 = [128][40] second slab buffer                  @ 10240  (5120 B)
-//   DS0 = [128][8] token (d f32, s i32), even halves    @ 15360  (1024 B)
-//   DS1 = [128][8] token (d f32, s i32), odd halves     @ 16384  (1024 B)
-//   SZ0 = [128][8] row (sc f32, zp f32), even halves    @ 17408  (1024 B)
-//   SZ1 = [128][8] row (sc f32, zp f32), odd halves     @ 18432  (1024 B)
-//   end                                                         = 19456 B
-//   store slots = 8 waves x [16][20] f32 @ 0                    (10240 B)
+//   A  = 16 WMMA fragments x 256 B (fragment order, below)  @ 0     (4096 B)
+//   W0 = 16 WMMA fragments x 256 B                         @ 4096  (4096 B)
+//   W1 = 16 WMMA fragments x 256 B (second slab buffer)    @ 8192  (4096 B)
+//   DS0 = [128][8] token (d f32, s i32), even halves        @ 12288 (1024 B)
+//   DS1 = [128][8] token (d f32, s i32), odd halves         @ 13312 (1024 B)
+//   SZ0 = [128][8] row (sc f32, zp f32), even halves        @ 14336 (1024 B)
+//   SZ1 = [128][8] row (sc f32, zp f32), odd halves         @ 15360 (1024 B)
+//   end                                                             = 16384 B
+//   store slots = 8 waves x [16][20] f32 @ 0                        (10240 B)
 //
-// Bank enumeration (32 banks x 4 B; lane reads 8 contiguous bytes at
-// R*40 + C, R = lane row, C = unroll const): bank start = (10*R + C/4)
-// mod 32. 10*R mod 32 over 16 consecutive R is 16 distinct EVEN banks, and
-// the 8 B read covers the adjacent odd bank: every bank exactly once per
-// 16-lane half, twice per full wave (k_grp halves differ by an even
-// constant) = the width floor, no conflict. Applies to A reads (token
-// rows), W reads (weight rows), and 4 B DS/SZ reads (banks 2*R: 16
-// distinct evens). Staging writes are consecutive dwords (sequential
-// banks). Store stream reads: bank = 5*i + x/4, 5 coprime 32 (2-way floor
-// across x-pairs); global stores are 2x64 B segments per wave32.
+// Fragment order (probe-verified on gfx1201, 2026-09-18: the old
+// [128][40] row layout cost a ~19x bank-conflict penalty on fragment
+// reads — 1.8 TB/s aggregate vs 35.5 TB/s contiguous — while the loads
+// alone (no WMMA) took the same time as the full fed loop). Each 64-K
+// slab = 8 row/token groups of 16 x 2 K32 steps = 16 fragments; fragment
+// (g8, sb) = 256 contiguous bytes at slab + (g8*2+sb)*256, holding the
+// exact 8-byte lanes v_wmma_i32_16x16x32_iu4 expects: lane L = tid & 31
+// reads slab + (g8*2+sb)*256 + L*8, i.e. row (g8*16 + (L&15))'s K-half
+// (L>>4) at K offset sb*16 + (L>>4)*8 bytes (low nibble first, as before).
+// The K-loop fragment read is one ds_read_b64 at a hoisted address.
 //
-// Grid: [ceil(M/128), ceil(N/128)]. Block: [256,1,1]. LDS: 19456 bytes.
+// Bank enumeration (32 banks x 4 B; lane L reads 8 bytes at frag*256+L*8):
+// dword addresses frag*64 + 2*L .. +2*L+1 run 0..63 over the wave: 64
+// consecutive dwords = every bank exactly twice = the b64 width floor
+// (unavoidable: 64 dwords over 32 banks), matching the probe's contiguous
+// pattern. Staging writes permute (row R, quad q) to frag (R>>4)*2+(q>>1),
+// lane (R&15)+16*(q&1): bank = 2*(R&15), so each wave's 32 writes cover 8
+// banks x 4 hits (4-way write conflict). Accepted: each slab byte is
+// written once and read 4x (A: 4 waves share a token half) / 2x (W: 2 waves
+// share a row pair), so the conflict-free reads dominate. DS/SZ 4 B reads
+// unchanged (banks 2*R: 16 distinct evens, broadcast within a k_grp half).
+// Store stream reads: bank = 5*i + x/4, 5 coprime 32 (2-way floor across
+// x-pairs); global stores are 2x64 B segments per wave32.
+//
+// Grid: [ceil(M/128), ceil(N/128)]. Block: [256,1,1]. LDS: 16384 bytes
+// (host passes 19456; kernel uses the first 16384).
 //
 // Sweep note: 64x256 / 256x64 aspects need a different wave map (wt_pair /
 // tok_half split) plus matching host grid/LDS; the fold/prefetch/store
 // mechanisms transfer unchanged. Host (gemm.rs launch arm) and the oracle
-// launcher hardcode the same 128/128/256-thread/19456 contract — a geometry
-// change must update all three consistently.
+// launcher hardcode the same 128/128/256-thread contract (19456 B passed;
+// kernel uses 16384) — a geometry change must update all three consistently.
 //
 // Compile gate: gfx1200 / gfx1201 only. Non-gfx12 archs get empty stubs (the
 
@@ -133,13 +148,18 @@
 #define IU4_WAVES 8
 #endif
 #define IU4_NTHREADS (IU4_WAVES * 32)
-// Packed-row stride: BK/2 data bytes (64 nibbles) + 8 pad. Stride 40 gives
-// bank starts 10*r (see bank enumeration above).
-#define IU4_STRIDE (IU4_BK / 2 + 8)
+// Fragment-order slab: each 64-K slab (IU4_BK nibbles/row) holds 8 row/token
+// groups of 16 x 2 K32 steps = 16 fragments of 256 contiguous bytes
+// (32 lanes x 8 B, lane L at frag*256 + L*8). Same 4096 data bytes as the
+// old [128][32] rows, no pad: contiguous-lane b64 reads sit at the b64
+// width floor (see bank enumeration above).
+#define IU4_FRAG_BYTES 256
+#define IU4_A_FRAGS ((IU4_BM / 16) * (IU4_BK / 32))
+#define IU4_W_FRAGS ((IU4_BN / 16) * (IU4_BK / 32))
+#define IU4_A_BYTES (IU4_A_FRAGS * IU4_FRAG_BYTES)
+#define IU4_W_BYTES (IU4_W_FRAGS * IU4_FRAG_BYTES)
 #define IU4_A_OFF 0
-#define IU4_A_BYTES (IU4_BM * IU4_STRIDE)
 #define IU4_W0_OFF (IU4_A_OFF + IU4_A_BYTES)
-#define IU4_W_BYTES (IU4_BN * IU4_STRIDE)
 #define IU4_W1_OFF (IU4_W0_OFF + IU4_W_BYTES)
 #define IU4_DS_OFF (IU4_W1_OFF + IU4_W_BYTES)
 #define IU4_DS_BYTES (IU4_BM * 8)
@@ -148,6 +168,9 @@
 #define IU4_SZ_BYTES (IU4_BN * 8)
 #define IU4_SZ1_OFF (IU4_SZ0_OFF + IU4_SZ_BYTES)
 #define IU4_LDS_BYTES (IU4_SZ1_OFF + IU4_SZ_BYTES)
+// The host launch arm passes 19456 B (must cover the kernel's footprint);
+// fail loudly here if a geometry change outgrows it.
+_Static_assert(IU4_LDS_BYTES <= 19456, "iu4 fragment planes exceed host LDS");
 // Store slots reuse LDS base: 8 waves x [16][20] f32.
 #define IU4_SLOT_COLS 20
 #define IU4_SLOT_FLOATS (16 * IU4_SLOT_COLS)
@@ -182,9 +205,10 @@ typedef unsigned __attribute__((ext_vector_type(2))) u32x2_t;
 // 8 WMMAs (2 row-groups x 4 column blocks), then a scheduling fence.
 // SB is a template constant (folded into LDS immediates); FIRST picks
 // the shared zero C vector for each chain's first step (avoids 64 separate
-// clears per block). Compute reads slab sb of A from the single A plane and
+// Compute reads slab sb of A from the single A plane and
 // of W from Wn (n = sb); the caller re-points w_lds per phase. Both W planes
-// share the [128][40] layout, so the hoisted frA/frW offsets apply to either.
+// share the fragment-order layout, so the hoisted frA/frW offsets apply to
+// either. Each fragment read is one ds_read_b64 at frag*256 + lane*8.
 // K-step VALU: ds_reads + WMMAs only.
 template <int SB, bool FIRST>
 static __device__ __forceinline__ void iu4_bundle(
@@ -256,22 +280,25 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     // the K-step indexes them with unroll constants only.
     unsigned frA[4][2];
     unsigned frW[2][2];
+    // Fragment-order offsets: token group g8 = tok_half*4+nb (A) or row
+    // group g8 = wt_pair*2+rg (W); fragment (g8,sb) lives at (g8*2+sb)*256
+    // and this lane's 8 bytes at +lane8. All loop-invariant (wave/nb/rg/sb
+    // are kernel-top or unroll constants; lane = tid&31 is fixed).
+    const unsigned lane8 = (unsigned)lane * 8u;
     #pragma unroll
     for (int nb = 0; nb < 4; nb++) {
-        const unsigned tok = (unsigned)(wave_tok0 + nb * 16 + m_lane);
+        const unsigned g8a = (unsigned)(tok_half * 4 + nb);
         #pragma unroll
         for (int sb = 0; sb < 2; sb++) {
-            frA[nb][sb] = tok * (unsigned)IU4_STRIDE
-                + (unsigned)sb * 16u + (unsigned)k_grp * 8u;
+            frA[nb][sb] = (g8a * 2u + (unsigned)sb) * (unsigned)IU4_FRAG_BYTES + lane8;
         }
     }
     #pragma unroll
     for (int rg = 0; rg < 2; rg++) {
-        const unsigned row = (unsigned)(wave_row0 + rg * 16 + m_lane);
+        const unsigned g8w = (unsigned)(wt_pair * 2 + rg);
         #pragma unroll
         for (int sb = 0; sb < 2; sb++) {
-            frW[rg][sb] = row * (unsigned)IU4_STRIDE
-                + (unsigned)sb * 16u + (unsigned)k_grp * 8u;
+            frW[rg][sb] = (g8w * 2u + (unsigned)sb) * (unsigned)IU4_FRAG_BYTES + lane8;
         }
     }
 
@@ -279,14 +306,17 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     // acc[nb][rg][j] = Y[wave_tok0 + nb*16 + m_lane][rs + wave_row0 + rg*16 + 8*k_grp + j].
     float8_t acc[4][2];
     // b64-coalesced staging map. Each lane stages 2 rounds; round r covers 64
-    // slab rows (r*64 + (tid>>2)) with quad q = tid&3 (8 contiguous bytes) per
-    // lane: 256 lanes x 2 rounds x 8 B = one 4 KiB slab exactly once. Lanes in
-    // a quad-group share a row, so consecutive lanes read consecutive quads
-    // (coalesced global segments) and write sequential LDS banks (same 2-way
-    // floor as the old map). b64 is the width ceiling, NOT b128: every 16 B
-    // chunk of the Xq (72 B blocks) and W (136 B groups) nibble arrays sits at
-    // 8-mod-16 behind an 8-byte header, and stride-40 LDS rows alternate
-    // 0/8-mod-16 — b128 is alignment-impossible on both sides, b64 is exact.
+    // slab rows (R = r*64 + (tid>>2)) with quad q = tid&3 (8 contiguous
+    // bytes) per lane: 256 lanes x 2 rounds x 8 B = one 4 KiB slab exactly
+    // once. Lanes in a quad-group share a row, so consecutive lanes read
+    // consecutive quads (coalesced global segments). The LDS destination is
+    // the fragment-order slot holding those bytes for the consumer lane:
+    // frag (R>>4)*2+(q>>1), lane (R&15)+16*(q&1) — a bijection, so every
+    // fragment slot is written exactly once per publish (same bytes as the
+    // old row map, hence oracle-safe). b64 is the width ceiling, NOT b128:
+    // every 16 B chunk of the Xq (72 B blocks) and W (136 B groups) nibble
+    // arrays sits at 8-mod-16 behind an 8-byte header — b128 is
+    // alignment-impossible on the global side, b64 is exact.
     // All offsets below are loop-invariant (bs/rs/tid only), computed once at
     // kernel top; per-trip SGPR bases (Xq + kb*N, A + g*136 + ...) carry kb/g/h
     // so the K-loop issues base(SGPR) + offset(VGPR) + imm wide loads/stores
@@ -309,8 +339,10 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         const int src_c = (grow_r < M) ? grow_r : (M - 1);
         st_wvoff[r] = (unsigned)src_c * (unsigned)groups_per_row * 136u
             + (unsigned)(tid & 3) * 8u;
-        st_ldsoff[r] = (unsigned)(r * 64 + (tid >> 2)) * (unsigned)IU4_STRIDE
-            + (unsigned)(tid & 3) * 8u;
+        const unsigned R = (unsigned)(r * 64 + (tid >> 2));
+        const unsigned q = (unsigned)(tid & 3);
+        st_ldsoff[r] = ((R >> 4) * 2u + (q >> 1)) * (unsigned)IU4_FRAG_BYTES
+            + ((R & 15u) + (q & 1u) * 16u) * 8u;
     }
     const u32x2_t z64 = { 0u, 0u };
     for (int nb = 0; nb < 4; nb++) {
