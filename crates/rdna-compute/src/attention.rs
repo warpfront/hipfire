@@ -4561,9 +4561,9 @@ impl Gpu {
             ));
         }
         // Route-N module: `HIPFIRE_FA2_FP8=1` + `HIPFIRE_FA2_KMODE=8`
-        // (§14.3). Entries `attention_fp8_e4m3_fa2_gqa_fp8_gfx1201` +
+        // (§14.3). Entries `attention_fp8_e4m3_fa2_gqa_gfx1201` +
         // `attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201`.
-        const SYMBOL: &str = "attention_fp8_e4m3_fa2_gqa_fp8_gfx1201";
+        const SYMBOL: &str = "attention_fp8_e4m3_fa2_gqa_gfx1201";
         const PRECONVERT: &str = "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201";
         let src = kernels::ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC;
         if !self.functions.contains_key(SYMBOL) || !self.functions.contains_key(PRECONVERT) {
