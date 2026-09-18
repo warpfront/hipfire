@@ -1,0 +1,86 @@
+{
+  "residual": {
+    "hash": "96baa3225992466e",
+    "hash_repeat": "96baa3225992466e",
+    "deterministic": true,
+    "times": {
+      "pack_f32_to_fp8_mq4v2_gfx12": [
+        74.28000122308731,
+        75.00000298023224,
+        74.08099621534348
+      ],
+      "gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201": [
+        1073.4479427337646,
+        1069.2880153656006,
+        1070.4879760742188
+      ]
+    },
+    "medians": {
+      "pack_f32_to_fp8_mq4v2_gfx12": 74.28000122308731,
+      "gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201": 1070.4879760742188
+    }
+  },
+  "gate_up": {
+    "hash": "b02a9dd0ab2c91b5",
+    "hash_repeat": "b02a9dd0ab2c91b5",
+    "deterministic": true,
+    "times": {
+      "pack_f32_to_fp8_mq4v2_gfx12": [
+        27.9999990016222,
+        28.161000460386276,
+        28.24000082910061
+      ],
+      "gemm_gate_up_mq4g256v2_wmma_fp8_v2_gfx1201": [
+        1666.092038154602,
+        1669.1319942474365,
+        1671.571969985962
+      ]
+    },
+    "medians": {
+      "pack_f32_to_fp8_mq4v2_gfx12": 28.161000460386276,
+      "gemm_gate_up_mq4g256v2_wmma_fp8_v2_gfx1201": 1669.1319942474365
+    }
+  },
+  "qkvza": {
+    "hash": "34b8568668b8440c",
+    "hash_repeat": "34b8568668b8440c",
+    "deterministic": true,
+    "times": {
+      "pack_f32_to_fp8_mq4v2_gfx12": [
+        25.839999318122864,
+        25.48000030219555,
+        25.919999927282333
+      ],
+      "gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201": [
+        836.6060256958008,
+        826.8460035324097,
+        806.9660067558289
+      ]
+    },
+    "medians": {
+      "pack_f32_to_fp8_mq4v2_gfx12": 25.839999318122864,
+      "gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201": 826.8460035324097
+    }
+  },
+  "qkv": {
+    "hash": "d2ec9220f240eff2",
+    "hash_repeat": "d2ec9220f240eff2",
+    "deterministic": true,
+    "times": {
+      "gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201": [
+        710.444986820221,
+        707.8049778938293,
+        694.0860152244568
+      ],
+      "pack_f32_to_fp8_mq4v2_gfx12": [
+        23.719999939203262,
+        25.15999972820282,
+        23.760000243782997
+      ]
+    },
+    "medians": {
+      "pack_f32_to_fp8_mq4v2_gfx12": 23.760000243782997,
+      "gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201": 707.8049778938293
+    }
+  }
+}

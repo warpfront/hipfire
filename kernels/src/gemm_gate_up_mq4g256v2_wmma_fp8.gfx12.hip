@@ -388,39 +388,42 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     for (int g = 0; g < gpr; g++) {
         #pragma nounroll
         for (int h = 0; h < 2; h++) {
-            #pragma nounroll
-            for (int slab = 0; slab < HIPFIRE_FP8_V2_NSLABS; slab++) {
-                // Stage current-half S and s/z once per half (slab 0).
-                if (slab == 0) {
-                    for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
-                        const int tok = bs + row;
-                        float s = 0.0f;
-                        if (tok < N) {
-                            s = X_half_sums[((unsigned int)tok * (unsigned int)gpr + (unsigned int)g) * 2u + (unsigned int)h];
-                        }
-                        *(float*)(lds_S + (unsigned int)row * 4u) = s;
+            // Overlap probe (K2 measurement): prologue stages slab 0, then
+            // each iteration issues slab s+1's global loads into registers
+            // BEFORE slab s's compute, so load latency hides under WMMAs.
+            // Expand + LDS publish of s+1 still follow compute (single
+            // buffer); only latency, not execution, is hidden. A_pf holds one
+            // A row (BM<=NTHREADS => single row-loop trip); Wpk_pf holds raw
+            // packs (expand at publish, identical values).
+            v2i_t A_pf[HIPFIRE_FP8_V2_WCHUNKS];
+            unsigned int Wpk_pf[HIPFIRE_FP8_V2_WITER];
+            // Prologue: stage slab 0 fully (S/s/z + A + W).
+            {
+                for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
+                    const int tok = bs + row;
+                    float s = 0.0f;
+                    if (tok < N) {
+                        s = X_half_sums[((unsigned int)tok * (unsigned int)gpr + (unsigned int)g) * 2u + (unsigned int)h];
                     }
-                    if (tid < HIPFIRE_FP8_V2_BN) {
-                        float s_h = 0.0f, z_h = 0.0f;
-                        if (row_ok) {
-                            const unsigned int hw = *(const unsigned int*)(rb + (unsigned int)g * 136u + (unsigned int)h * 4u);
-                            s_h = __half2float(__ushort_as_half((unsigned short)(hw & 0xFFFFu)));
-                            z_h = __half2float(__ushort_as_half((unsigned short)(hw >> 16)));
-                        }
-                        float* szp = (float*)(lds_SZ + (unsigned int)tid * 8u);
-                        szp[0] = s_h;
-                        szp[1] = z_h;
-                    }
+                    *(float*)(lds_S + (unsigned int)row * 4u) = s;
                 }
-
-                // A row = tid (+ nthreads stride); eight/four 8-byte chunks.
+                if (tid < HIPFIRE_FP8_V2_BN) {
+                    float s_h = 0.0f, z_h = 0.0f;
+                    if (row_ok) {
+                        const unsigned int hw = *(const unsigned int*)(rb + (unsigned int)g * 136u + (unsigned int)h * 4u);
+                        s_h = __half2float(__ushort_as_half((unsigned short)(hw & 0xFFFFu)));
+                        z_h = __half2float(__ushort_as_half((unsigned short)(hw >> 16)));
+                    }
+                    float* szp = (float*)(lds_SZ + (unsigned int)tid * 8u);
+                    szp[0] = s_h;
+                    szp[1] = z_h;
+                }
                 for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
                     const int tok = bs + row;
                     const bool tok_ok = (tok < N);
                     const unsigned char* xsrc = tok_ok
                         ? (X_fp8 + (unsigned int)tok * (unsigned int)K
-                            + (unsigned int)g * 256u + (unsigned int)h * 128u
-                            + (unsigned int)slab * (unsigned int)HIPFIRE_FP8_V2_BK)
+                            + (unsigned int)g * 256u + (unsigned int)h * 128u)
                         : nullptr;
                     #pragma unroll
                     for (int c = 0; c < HIPFIRE_FP8_V2_WCHUNKS; c++) {
@@ -428,12 +431,9 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                         *(v2i_t*)(lds_A + (unsigned int)row * (unsigned int)HIPFIRE_FP8_V2_STRIDE + (unsigned int)c * 8u) = v;
                     }
                 }
-
-                // W row = tid%BN; one 4-byte nibble pack -> 8 e4m3 bytes / chunk.
                 {
                     const unsigned int pack_base = (unsigned int)g * 136u + 8u
-                        + (unsigned int)h * 64u
-                        + (unsigned int)slab * (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
+                        + (unsigned int)h * 64u;
                     #pragma unroll
                     for (int it = 0; it < HIPFIRE_FP8_V2_WITER; it++) {
                         const int chunk8 = prod + HIPFIRE_FP8_V2_NPROD * it;
@@ -447,8 +447,40 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                         *(v2i_t*)(lds_W + (unsigned int)w_row * (unsigned int)HIPFIRE_FP8_V2_STRIDE + (unsigned int)chunk8 * 8u) = e8;
                     }
                 }
-
-                __syncthreads();
+            }
+            __syncthreads();
+            #pragma nounroll
+            for (int slab = 0; slab < HIPFIRE_FP8_V2_NSLABS; slab++) {
+                // Prefetch slab s+1 globals before compute s.
+                if (slab + 1 < HIPFIRE_FP8_V2_NSLABS) {
+                    for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
+                        const int tok = bs + row;
+                        const bool tok_ok = (tok < N);
+                        const unsigned char* xsrc = tok_ok
+                            ? (X_fp8 + (unsigned int)tok * (unsigned int)K
+                                + (unsigned int)g * 256u + (unsigned int)h * 128u
+                                + (unsigned int)(slab + 1) * (unsigned int)HIPFIRE_FP8_V2_BK)
+                            : nullptr;
+                        #pragma unroll
+                        for (int c = 0; c < HIPFIRE_FP8_V2_WCHUNKS; c++) {
+                            A_pf[c] = tok_ok ? *(const v2i_t*)(xsrc + (unsigned int)c * 8u) : v2i_t{0, 0};
+                        }
+                    }
+                    {
+                        const unsigned int pack_base = (unsigned int)g * 136u + 8u
+                            + (unsigned int)h * 64u
+                            + (unsigned int)(slab + 1) * (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
+                        #pragma unroll
+                        for (int it = 0; it < HIPFIRE_FP8_V2_WITER; it++) {
+                            const int chunk8 = prod + HIPFIRE_FP8_V2_NPROD * it;
+                            Wpk_pf[it] = row_ok
+                                ? *(const unsigned int*)(rb + pack_base + (unsigned int)chunk8 * 4u)
+                                : 0u;
+                        }
+                    }
+                    // Pin the prefetched loads above the WMMAs.
+                    __builtin_amdgcn_sched_barrier(0);
+                }
 
                 // Inner loop: ds_read_b64 A/W -> v_wmma fp8 16x16x16. Nothing else.
                 if (slab == 0) {
@@ -490,6 +522,33 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                             P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, P[nb][1]);
                         }
                         __builtin_amdgcn_sched_barrier(0);
+                    }
+                }
+                // Publish prefetched slab s+1 (buffer free: compute s done).
+                // The barrier is REQUIRED: without it fast waves overwrite
+                // slab s while stragglers still read it (K2 race found).
+                // Single buffer: slab selects the GLOBAL source only; the LDS
+                // address is the same slab slot the prologue used.
+                if (slab + 1 < HIPFIRE_FP8_V2_NSLABS) {
+                    __syncthreads();
+                    for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
+                        #pragma unroll
+                        for (int c = 0; c < HIPFIRE_FP8_V2_WCHUNKS; c++) {
+                            *(v2i_t*)(lds_A + (unsigned int)row * (unsigned int)HIPFIRE_FP8_V2_STRIDE
+                                + (unsigned int)c * 8u) = A_pf[c];
+                        }
+                    }
+                    {
+                        const unsigned int pack_base = (unsigned int)g * 136u + 8u
+                            + (unsigned int)h * 64u
+                            + (unsigned int)(slab + 1) * (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
+                        #pragma unroll
+                        for (int it = 0; it < HIPFIRE_FP8_V2_WITER; it++) {
+                            const int chunk8 = prod + HIPFIRE_FP8_V2_NPROD * it;
+                            v2i_t e8 = row_ok ? mq4_qpk_to_e4m3(Wpk_pf[it]) : v2i_t{0, 0};
+                            *(v2i_t*)(lds_W + (unsigned int)w_row * (unsigned int)HIPFIRE_FP8_V2_STRIDE
+                                + (unsigned int)chunk8 * 8u) = e8;
+                        }
                     }
                 }
 
