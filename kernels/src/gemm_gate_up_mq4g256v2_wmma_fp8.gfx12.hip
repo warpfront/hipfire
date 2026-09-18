@@ -249,10 +249,9 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 // touches banks (18*r + 4*kstep + 2*kg + {0,1}) mod 32: all 16 even starts
 // per 16-lane half, every bank once per half, twice per full wave (the
 // width floor, not a conflict). Only the row extents change: A rows
-// 0..BM-1, W rows 0..BN-1. Writer banks: A row = tid (one trip for
-// BM<=NTHREADS in all four aspects); W row = tid%BN, chunk8 =
-// tid/BN + NPROD*it, NPROD = NTHREADS/BN (4/2/1/2), WITER = 8/NPROD.
-
+// 0..BM-1, W rows 0..BN-1. Staging writers: every lane is active on every
+// round (row = r*NTHREADS/4 + (tid>>2), quad tid&3); consecutive lanes
+// touch consecutive 8 B chunks (coalesced globals, sequential LDS banks).
 #define HIPFIRE_FP8_V2_NTHREADS (HIPFIRE_FP8_V2_WAVES * 32)
 #define HIPFIRE_FP8_V2_STRIDE   (HIPFIRE_FP8_V2_BK + 8)
 #define HIPFIRE_FP8_V2_A_OFF    0
@@ -370,32 +369,107 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     char* lds_S = lds + HIPFIRE_FP8_V2_S_OFF;
     char* lds_SZ = lds + HIPFIRE_FP8_V2_SZ_OFF;
 
-    // One W-row producer identity per thread (row = tid % BN). Route once.
-    const int w_row = tid % HIPFIRE_FP8_V2_BN;
-    const int prod = tid / HIPFIRE_FP8_V2_BN;
-    const int gr = rs + w_row;
-    const bool row_ok = (gr < tm);
-    const char* rb = nullptr;
-    if (row_ok) {
-        const char* Asrc;
-        int lr;
-#if HIPFIRE_FP8_QKVZA
-        if (gr < qkv_m) { Asrc = A_qkv; lr = gr; }
-        else if (gr < qkv_m + z_m) { Asrc = A_z; lr = gr - qkv_m; }
-        else if (gr < qkv_m + z_m + beta_m) { Asrc = A_beta; lr = gr - (qkv_m + z_m); }
-        else { Asrc = A_alpha; lr = gr - (qkv_m + z_m + beta_m); }
-#elif HIPFIRE_FP8_RESIDUAL
-        Asrc = A_w;
-        lr = gr;
-#elif HIPFIRE_FP8_QKV
-        if (gr < q_m) { Asrc = A_q; lr = gr; }
-        else if (gr < q_m + k_m) { Asrc = A_k; lr = gr - q_m; }
-        else { Asrc = A_v; lr = gr - (q_m + k_m); }
+    // Staged-tile staging map (b64-ideal form; cf. iu4 b64 rewrite): 4 lanes
+    // share a slab row (quad = tid&3 stages 2 packs/chunks per lane per
+    // round); rows/round = NTHREADS/4, so A_ROUNDS/W_ROUNDS cover the BM/BN
+    // extents exactly with every lane active on every round.
+    // Width ceilings (headers rule out anything wider): A global row base is
+    // tok*K+g*256+h*128+slab*BK, 16 B-aligned (256|K), so even-chunk b128
+    // pairs are exact; W packs are 4 B-stepped (b32 ceiling); LDS rows are
+    // stride-72 (8 B-aligned), so all LDS traffic is b64 (dual-issue pairs).
+    // All offsets below are loop-invariant (bs/rs/tid only), computed once
+    // at kernel top; per-trip uniform bases (g/h/slab) stay in SGPRs so the
+    // K-loop issues base+offset wide loads/stores with no per-load address
+    // VALU. OOB clamps to the last valid index with a branch-free
+    // zero-select (exact old ternary semantics); W keeps expand(pk) with a
+    // zero pack (expand(0) is all-zero E4M3, bit-identical to the old zero).
+#define HIPFIRE_FP8_V2_A_ROUNDS (HIPFIRE_FP8_V2_BM * 4 / HIPFIRE_FP8_V2_NTHREADS)
+#define HIPFIRE_FP8_V2_W_ROUNDS (HIPFIRE_FP8_V2_BN * 4 / HIPFIRE_FP8_V2_NTHREADS)
+#define HIPFIRE_FP8_V2_RPR (HIPFIRE_FP8_V2_NTHREADS / 4)
+#if HIPFIRE_FP8_V2_NTHREADS == HIPFIRE_FP8_V2_BM
+#define HIPFIRE_FP8_V2_S_SH 0
+#elif HIPFIRE_FP8_V2_NTHREADS == HIPFIRE_FP8_V2_BM * 2
+#define HIPFIRE_FP8_V2_S_SH 1
+#elif HIPFIRE_FP8_V2_NTHREADS == HIPFIRE_FP8_V2_BM * 4
+#define HIPFIRE_FP8_V2_S_SH 2
 #else
-        if (gr < gate_m) { Asrc = A_gate; lr = gr; }
-        else { Asrc = A_up; lr = gr - gate_m; }
+#error "HIPFIRE_FP8_V2 BM must divide NTHREADS by 1, 2 or 4"
 #endif
-        rb = Asrc + (unsigned int)lr * (unsigned int)gpr * 136u;
+#define HIPFIRE_FP8_V2_SZITER ((HIPFIRE_FP8_V2_BN * 2 + HIPFIRE_FP8_V2_NTHREADS - 1) / HIPFIRE_FP8_V2_NTHREADS)
+    // Route a valid global row GR (< tm) to (ASRC, LR). All matrices cover
+    // [0, tm) exactly as the old single-row router did; callers clamp first.
+#if HIPFIRE_FP8_QKVZA
+#define HIPFIRE_FP8_V2_PICK(GR, ASRC, LR) do { int _v2g = (GR); const char* _v2a = A_qkv; int _v2l = _v2g; if (_v2g >= qkv_m + z_m + beta_m) { _v2a = A_alpha; _v2l = _v2g - (qkv_m + z_m + beta_m); } else if (_v2g >= qkv_m + z_m) { _v2a = A_beta; _v2l = _v2g - (qkv_m + z_m); } else if (_v2g >= qkv_m) { _v2a = A_z; _v2l = _v2g - qkv_m; } (ASRC) = _v2a; (LR) = _v2l; } while (0)
+#elif HIPFIRE_FP8_RESIDUAL
+#define HIPFIRE_FP8_V2_PICK(GR, ASRC, LR) do { (ASRC) = A_w; (LR) = (GR); } while (0)
+#elif HIPFIRE_FP8_QKV
+#define HIPFIRE_FP8_V2_PICK(GR, ASRC, LR) do { int _v2g = (GR); const char* _v2a = A_q; int _v2l = _v2g; if (_v2g >= q_m + k_m) { _v2a = A_v; _v2l = _v2g - (q_m + k_m); } else if (_v2g >= q_m) { _v2a = A_k; _v2l = _v2g - q_m; } (ASRC) = _v2a; (LR) = _v2l; } while (0)
+#else
+#define HIPFIRE_FP8_V2_PICK(GR, ASRC, LR) do { int _v2g = (GR); const char* _v2a = A_gate; int _v2l = _v2g; if (_v2g >= gate_m) { _v2a = A_up; _v2l = _v2g - gate_m; } (ASRC) = _v2a; (LR) = _v2l; } while (0)
+#endif
+    const unsigned st_quad = (unsigned)(tid & 3);
+    const unsigned st_grp = (unsigned)(tid >> 2);
+    const v2i_t st_z64 = {0, 0};
+    // A entries: one b128 pair (2 chunks) per round.
+    unsigned st_agoff[HIPFIRE_FP8_V2_A_ROUNDS];
+    unsigned st_aldsoff[HIPFIRE_FP8_V2_A_ROUNDS];
+    unsigned st_aok[HIPFIRE_FP8_V2_A_ROUNDS];
+    #pragma unroll
+    for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
+        const int a_row = r * HIPFIRE_FP8_V2_RPR + (int)st_grp;
+        const int a_tok = bs + a_row;
+        const int a_tok_c = (a_tok < N) ? a_tok : (N - 1);
+        st_aok[r] = (a_tok < N) ? 1u : 0u;
+        st_agoff[r] = (unsigned)a_tok_c * (unsigned)K + st_quad * 16u;
+        st_aldsoff[r] = (unsigned)a_row * (unsigned)HIPFIRE_FP8_V2_STRIDE + st_quad * 16u;
+    }
+    // W entries: two packs per round, routed per round on the clamped row.
+    const char* st_wbase[HIPFIRE_FP8_V2_W_ROUNDS];
+    unsigned st_wok[HIPFIRE_FP8_V2_W_ROUNDS];
+    unsigned st_wpoff[HIPFIRE_FP8_V2_W_ROUNDS][2];
+    unsigned st_wldsoff[HIPFIRE_FP8_V2_W_ROUNDS][2];
+    #pragma unroll
+    for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+        const int w_row = r * HIPFIRE_FP8_V2_RPR + (int)st_grp;
+        const int w_grow = rs + w_row;
+        const int w_grow_c = (w_grow < tm) ? w_grow : (tm - 1);
+        const char* w_asrc;
+        int w_lr;
+        HIPFIRE_FP8_V2_PICK(w_grow_c, w_asrc, w_lr);
+        st_wbase[r] = w_asrc + (unsigned int)w_lr * (unsigned int)gpr * 136u;
+        st_wok[r] = (w_grow < tm) ? 1u : 0u;
+        #pragma unroll
+        for (int pp = 0; pp < 2; pp++) {
+            const unsigned pk = st_quad * 2u + (unsigned)pp;
+            st_wpoff[r][pp] = pk * 4u;
+            st_wldsoff[r][pp] = (unsigned)w_row * (unsigned)HIPFIRE_FP8_V2_STRIDE + pk * 8u;
+        }
+    }
+    // S entry: one f32 per lane (2^S_SH lanes share a row, dup benign).
+    const int st_srow = tid >> HIPFIRE_FP8_V2_S_SH;
+    const int st_stok = bs + st_srow;
+    const int st_stok_c = (st_stok < N) ? st_stok : (N - 1);
+    const unsigned st_sok = (st_stok < N) ? 1u : 0u;
+    const unsigned st_soff = (unsigned)st_stok_c * (unsigned)gpr * 2u;
+    const unsigned st_slds = (unsigned)st_srow * 4u;
+    // SZ entries: SZITER f32 words per lane (dup benign when BN*2 < NTHREADS).
+    const char* st_szbase[HIPFIRE_FP8_V2_SZITER];
+    unsigned st_szok[HIPFIRE_FP8_V2_SZITER];
+    unsigned st_szword[HIPFIRE_FP8_V2_SZITER];
+    unsigned st_szlds[HIPFIRE_FP8_V2_SZITER];
+    #pragma unroll
+    for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
+        const int sz_idx = tid * HIPFIRE_FP8_V2_SZITER + e;
+        const int sz_row = sz_idx & (HIPFIRE_FP8_V2_BN - 1);
+        const int sz_grow = rs + sz_row;
+        const int sz_grow_c = (sz_grow < tm) ? sz_grow : (tm - 1);
+        const char* sz_asrc;
+        int sz_lr;
+        HIPFIRE_FP8_V2_PICK(sz_grow_c, sz_asrc, sz_lr);
+        st_szbase[e] = sz_asrc + (unsigned int)sz_lr * (unsigned int)gpr * 136u;
+        st_szok[e] = (sz_grow < tm) ? 1u : 0u;
+        st_szword[e] = ((unsigned)sz_idx / (unsigned)HIPFIRE_FP8_V2_BN) & 1u;
+        st_szlds[e] = (unsigned)sz_row * 8u + st_szword[e] * 4u;
     }
 
     const v8f_t zc = v8f_t{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -415,59 +489,63 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
             // each iteration issues slab s+1's global loads into registers
             // BEFORE slab s's compute, so load latency hides under WMMAs.
             // Expand + LDS publish of s+1 still follow compute (single
-            // buffer); only latency, not execution, is hidden. A_pf holds one
-            // A row (BM<=NTHREADS => single row-loop trip); Wpk_pf holds raw
+            // buffer); only latency, not execution, is hidden. A_pf holds the
+            // lane's b64 chunk pairs (A_ROUNDS*2 v2i_t); Wpk_pf holds raw
             // packs (expand at publish, identical values).
-            v2i_t A_pf[HIPFIRE_FP8_V2_WCHUNKS];
-            unsigned int Wpk_pf[HIPFIRE_FP8_V2_WITER];
-            // Prologue: stage slab 0 fully (S/s/z + A + W).
+            v2i_t A_pf[HIPFIRE_FP8_V2_A_ROUNDS * 2];
+            unsigned int Wpk_pf[HIPFIRE_FP8_V2_W_ROUNDS * 2];
+            // Prologue: stage slab 0 fully (S/SZ + A + W). Every lane is
+            // active on every round; OOB clamps to the last valid index with
+            // a branch-free zero-select (exact old ternary semantics).
             {
-                for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
-                    const int tok = bs + row;
-                    float s = 0.0f;
-                    if (tok < N) {
-                        s = X_half_sums[((unsigned int)tok * (unsigned int)gpr + (unsigned int)g) * 2u + (unsigned int)h];
-                    }
-                    *(float*)(lds_S + (unsigned int)row * 4u) = s;
+                // S: one f32 per lane.
+                {
+                    const unsigned int s_idx = st_soff + (unsigned int)g * 2u + (unsigned int)h;
+                    // Unconditional load from the clamped address; the select
+                    // on the value is a cndmask, never an EXEC predicate.
+                    const float s_ld = X_half_sums[s_idx];
+                    const float s_v = st_sok ? s_ld : 0.0f;
+                    *(float*)(lds_S + st_slds) = s_v;
                 }
-                if (tid < HIPFIRE_FP8_V2_BN) {
-                    float s_h = 0.0f, z_h = 0.0f;
-                    if (row_ok) {
-                        const unsigned int hw = *(const unsigned int*)(rb + (unsigned int)g * 136u + (unsigned int)h * 4u);
-                        s_h = __half2float(__ushort_as_half((unsigned short)(hw & 0xFFFFu)));
-                        z_h = __half2float(__ushort_as_half((unsigned short)(hw >> 16)));
-                    }
-                    float* szp = (float*)(lds_SZ + (unsigned int)tid * 8u);
-                    szp[0] = s_h;
-                    szp[1] = z_h;
-                }
-                for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
-                    const int tok = bs + row;
-                    const bool tok_ok = (tok < N);
-                    const unsigned char* xsrc = tok_ok
-                        ? (X_fp8 + (unsigned int)tok * (unsigned int)K
-                            + (unsigned int)g * 256u + (unsigned int)h * 128u)
-                        : nullptr;
+                // SZ: SZITER f32 words per lane.
+                {
+                    const unsigned int hwoff = (unsigned int)g * 136u + (unsigned int)h * 4u;
                     #pragma unroll
-                    for (int c = 0; c < HIPFIRE_FP8_V2_WCHUNKS; c++) {
-                        v2i_t v = tok_ok ? *(const v2i_t*)(xsrc + (unsigned int)c * 8u) : v2i_t{0, 0};
-                        *(v2i_t*)(lds_A + (unsigned int)row * (unsigned int)HIPFIRE_FP8_V2_STRIDE + (unsigned int)c * 8u) = v;
+                    for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
+                        const unsigned int hw = *(const unsigned int*)(st_szbase[e] + hwoff);
+                        const unsigned short h16 = (unsigned short)(st_szword[e] ? (hw >> 16) : (hw & 0xFFFFu));
+                        const float f = __half2float(__ushort_as_half(h16));
+                        *(float*)(lds_SZ + st_szlds[e]) = st_szok[e] ? f : 0.0f;
                     }
                 }
+                // A: one b64 chunk pair per round (even-chunk 16 B alignment
+                // lets the compiler fuse each pair's loads to one b128).
+                {
+                    const unsigned char* xbase = X_fp8 + (unsigned int)g * 256u + (unsigned int)h * 128u;
+                    #pragma unroll
+                    for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
+                        const unsigned char* asrc = xbase + st_agoff[r];
+                        const v2i_t v0l = *(const v2i_t*)asrc;
+                        const v2i_t v1l = *(const v2i_t*)(asrc + 8u);
+                        const v2i_t v0 = st_aok[r] ? v0l : st_z64;
+                        const v2i_t v1 = st_aok[r] ? v1l : st_z64;
+                        char* adst = lds_A + st_aldsoff[r];
+                        *(v2i_t*)adst = v0;
+                        *(v2i_t*)(adst + 8u) = v1;
+                    }
+                }
+                // W: two raw packs per round; expand immediately (bit-exact).
                 {
                     const unsigned int pack_base = (unsigned int)g * 136u + 8u
                         + (unsigned int)h * 64u;
                     #pragma unroll
-                    for (int it = 0; it < HIPFIRE_FP8_V2_WITER; it++) {
-                        const int chunk8 = prod + HIPFIRE_FP8_V2_NPROD * it;
-                        v2i_t e8;
-                        if (row_ok) {
-                            const unsigned int pk = *(const unsigned int*)(rb + pack_base + (unsigned int)chunk8 * 4u);
-                            e8 = mq4_qpk_to_e4m3(pk);
-                        } else {
-                            e8 = v2i_t{0, 0};
+                    for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+                        #pragma unroll
+                        for (int pp = 0; pp < 2; pp++) {
+                            const unsigned int pk = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
+                            const v2i_t e8 = mq4_qpk_to_e4m3(st_wok[r] ? pk : 0u);
+                            *(v2i_t*)(lds_W + st_wldsoff[r][pp]) = e8;
                         }
-                        *(v2i_t*)(lds_W + (unsigned int)w_row * (unsigned int)HIPFIRE_FP8_V2_STRIDE + (unsigned int)chunk8 * 8u) = e8;
                     }
                 }
             }
@@ -476,17 +554,16 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
             for (int slab = 0; slab < HIPFIRE_FP8_V2_NSLABS; slab++) {
                 // Prefetch slab s+1 globals before compute s.
                 if (slab + 1 < HIPFIRE_FP8_V2_NSLABS) {
-                    for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
-                        const int tok = bs + row;
-                        const bool tok_ok = (tok < N);
-                        const unsigned char* xsrc = tok_ok
-                            ? (X_fp8 + (unsigned int)tok * (unsigned int)K
-                                + (unsigned int)g * 256u + (unsigned int)h * 128u
-                                + (unsigned int)(slab + 1) * (unsigned int)HIPFIRE_FP8_V2_BK)
-                            : nullptr;
+                    {
+                        const unsigned char* xbase = X_fp8 + (unsigned int)g * 256u + (unsigned int)h * 128u
+                            + (unsigned int)(slab + 1) * (unsigned int)HIPFIRE_FP8_V2_BK;
                         #pragma unroll
-                        for (int c = 0; c < HIPFIRE_FP8_V2_WCHUNKS; c++) {
-                            A_pf[c] = tok_ok ? *(const v2i_t*)(xsrc + (unsigned int)c * 8u) : v2i_t{0, 0};
+                        for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
+                            const unsigned char* asrc = xbase + st_agoff[r];
+                            const v2i_t v0l = *(const v2i_t*)asrc;
+                            const v2i_t v1l = *(const v2i_t*)(asrc + 8u);
+                            A_pf[r * 2] = st_aok[r] ? v0l : st_z64;
+                            A_pf[r * 2 + 1] = st_aok[r] ? v1l : st_z64;
                         }
                     }
                     {
@@ -494,15 +571,19 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                             + (unsigned int)h * 64u
                             + (unsigned int)(slab + 1) * (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
                         #pragma unroll
-                        for (int it = 0; it < HIPFIRE_FP8_V2_WITER; it++) {
-                            const int chunk8 = prod + HIPFIRE_FP8_V2_NPROD * it;
-                            Wpk_pf[it] = row_ok
-                                ? *(const unsigned int*)(rb + pack_base + (unsigned int)chunk8 * 4u)
-                                : 0u;
+                        for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+                            #pragma unroll
+                            for (int pp = 0; pp < 2; pp++) {
+                                const unsigned int pk = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
+                                Wpk_pf[r * 2 + pp] = st_wok[r] ? pk : 0u;
+                            }
                         }
                     }
-                    // Pin the prefetched loads above the WMMAs.
-                    __builtin_amdgcn_sched_barrier(0);
+                    // No sched pin here (iu4fold v0): the previous trip's fold
+                    // VALU must be free to sink among this trip's WMMAs, and
+                    // the prefetch loads hoist for latency on their own. True
+                    // deps (A_pf/Wpk_pf publish after compute) still order
+                    // what must be ordered.
                 }
 
                 // Inner loop: ds_read_b64 A/W -> v_wmma fp8 16x16x16. Nothing else.
@@ -554,23 +635,25 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                 // address is the same slab slot the prologue used.
                 if (slab + 1 < HIPFIRE_FP8_V2_NSLABS) {
                     __syncthreads();
-                    for (int row = tid; row < HIPFIRE_FP8_V2_BM; row += HIPFIRE_FP8_V2_NTHREADS) {
-                        #pragma unroll
-                        for (int c = 0; c < HIPFIRE_FP8_V2_WCHUNKS; c++) {
-                            *(v2i_t*)(lds_A + (unsigned int)row * (unsigned int)HIPFIRE_FP8_V2_STRIDE
-                                + (unsigned int)c * 8u) = A_pf[c];
-                        }
+                    #pragma unroll
+                    for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
+                        char* adst = lds_A + st_aldsoff[r];
+                        *(v2i_t*)adst = A_pf[r * 2];
+                        *(v2i_t*)(adst + 8u) = A_pf[r * 2 + 1];
                     }
                     {
                         const unsigned int pack_base = (unsigned int)g * 136u + 8u
                             + (unsigned int)h * 64u
                             + (unsigned int)(slab + 1) * (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
                         #pragma unroll
-                        for (int it = 0; it < HIPFIRE_FP8_V2_WITER; it++) {
-                            const int chunk8 = prod + HIPFIRE_FP8_V2_NPROD * it;
-                            v2i_t e8 = row_ok ? mq4_qpk_to_e4m3(Wpk_pf[it]) : v2i_t{0, 0};
-                            *(v2i_t*)(lds_W + (unsigned int)w_row * (unsigned int)HIPFIRE_FP8_V2_STRIDE
-                                + (unsigned int)chunk8 * 8u) = e8;
+                        for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
+                            #pragma unroll
+                            for (int pp = 0; pp < 2; pp++) {
+                                // Wpk is already zero-selected at prefetch;
+                                // expand(0) is all-zero E4M3 (bit-identical).
+                                const v2i_t e8 = mq4_qpk_to_e4m3(Wpk_pf[r * 2 + pp]);
+                                *(v2i_t*)(lds_W + st_wldsoff[r][pp]) = e8;
+                            }
                         }
                     }
                 }
