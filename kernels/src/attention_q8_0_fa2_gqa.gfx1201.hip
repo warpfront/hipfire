@@ -926,11 +926,13 @@ __device__ void fa2_stageb_nfill_dump(
 // oracle fn above), QK as S^T = K8*Q8^T in fp8 WMMA (64 per compute wave
 // per full tile; one b64 per fragment operand; Q streamed from the fp8
 // scratch row), score[j] = (acc[j]*qs)*sk[key_j] at the old scale position
-// (qs = sq[query]*scale_attn once per lane at init; sk for the 8 OWNED keys
-// sub*16+8*kg+j via fa2_scale_n, one subtile lifetime, sharing one
-// 8-register file with sv), PV still f16 (temporary V-expand at the
-// operand load, removed in B3: HW cvt_pk_f32_fp8 x4 + sv mul + f16 pack,
-// bit-exact with the Q0 fill values since f32 mul commutes).
+// (qs formed per tile (qs_tile); sk for the 8 OWNED keys sub*16+8*kg+j via
+// fa2_scale_n, one subtile lifetime, sharing one 8-register file with sv).
+// - PV in fp8 with the bounded changing-unit O (B3): w = e*sv, b_new =
+//   max(wmax/448, 2^-64), p8 = E4M3_RNE(w/b_new), rho = (alpha*b_prev)/b_new
+//   folded into the Ofr rescale; V fragments load codes directly (no
+//   decode); completion stores the physical numerator (direct: Ofr*b_prev/l,
+//   partial: b_prev*Ofr in stride-258 records, merge untouched).
 template <bool PARTIAL>
 __device__ void fa2_stageb_nbody(
     const unsigned char* __restrict__ q8_codes,
@@ -962,6 +964,9 @@ __device__ void fa2_stageb_nbody(
     float8_t Ofr[16];
     float m_old = -INFINITY;
     float l_val = 0.0f;
+    // Changing-unit O state (§5): O_physical = b_prev*Ofr across subtiles
+    // and tiles. b_prev = 1 with zero Ofr is the correct initial unit.
+    float b_prev = 1.0f;
     int h_ml = 0;
     int qr_ml = 0;
     bool qok_ml = false;
@@ -1184,62 +1189,71 @@ __device__ void fa2_stageb_nbody(
                     (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
                 m_old = m_new;
 
-                // Probabilities pack straight into the PV B operand.
-                half8_t prow;
+                // Weighted-P quantization (plan §5): l accumulates
+                // UNWEIGHTED e; w = e*sv enters only the numerator. sacc is
+                // dead after e, so w reuses its registers (no w array).
+                // sv reuses the scale file (sk dead: scores are formed).
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    sc[j] = fa2_scale_n(
+                        v_cache, kt_sub + 8 * kg + j, kv_h, seq_len);
                 float sum = 0.0f;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
                     const float e = (m_new == -INFINITY)
                         ? 0.0f
                         : __expf(sacc[j] - m_new);
-                    prow[j] = (_Float16)e;
                     sum += e;
+                    sacc[j] = e * sc[j];
                 }
                 sum += __shfl_xor(sum, 16, 32);
                 l_val = l_val * alpha + sum;
 
-                // O rescale with the lane's OWN alpha.
-#pragma unroll
-                for (int dc = 0; dc < 16; ++dc)
-                    Ofr[dc] *= alpha;
-
-                // sv reuses the scale file (sk dead: scores are formed).
+                // Block scale over all 16 valid keys (both halves agree):
+                // wmax reduces this lane's 8 w combined with the partner
+                // ml^16 lane. b_new floors at 2^-64; zero-weight rows keep
+                // b_prev with zero P (w = 0 encodes to code 0 exactly).
+                float wmax = 0.0f;
 #pragma unroll
                 for (int j = 0; j < 8; ++j)
-                    sc[j] = fa2_scale_n(
-                        v_cache, kt_sub + 8 * kg + j, kv_h, seq_len);
-                // PV still f16 (temporary V-expand, removed in B3): decode
-                // 8 codes x 1 dim via HW cvt_pk_f32_fp8, mul sv, pack f16.
-                const unsigned long long* Vf =
-                    (const unsigned long long*)V8;
+                    wmax = fmaxf(wmax, sacc[j]);
+                wmax = fmaxf(wmax, __shfl_xor(wmax, 16, 32));
+                float b_new = b_prev;
+                if (wmax > 0.0f)
+                    b_new = fmaxf(wmax / 448.0f, 0x1p-64f);
+                // O invariant O_physical = b_prev*Ofr: fold rho into the
+                // existing 128-value rescale pass (replaces *= alpha).
+                const float rho = (alpha * b_prev) / b_new;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc)
+                    Ofr[dc] *= rho;
+
+                // PV as O^T = V8^T*P8^T in fp8: A = V^T fragment codes
+                // (row ml = dim of the dc tile, one b64, no decode), B =
+                // the packed P8 v2i. Ofr[dc][j] = O[query][dim].
+                const v2i_t* Vf = (const v2i_t*)V8;
 #pragma unroll
                 for (int dc = 0; dc < 16; ++dc) {
-                    const unsigned long long vc =
-                        Vf[vbn + dc * 32];
-                    // Two codes at a time through one decode pair: keeps a
-                    // single float2_t live (temporary, removed in B3).
-                    float2_t dd;
-                    half8_t vf;
-                    dd = __builtin_amdgcn_cvt_pk_f32_fp8(
-                        (unsigned)vc, 0);
-                    vf[0] = (_Float16)(dd[0] * sc[0]);
-                    vf[1] = (_Float16)(dd[1] * sc[1]);
-                    dd = __builtin_amdgcn_cvt_pk_f32_fp8(
-                        (unsigned)vc, 1);
-                    vf[2] = (_Float16)(dd[0] * sc[2]);
-                    vf[3] = (_Float16)(dd[1] * sc[3]);
-                    dd = __builtin_amdgcn_cvt_pk_f32_fp8(
-                        (unsigned)(vc >> 32), 0);
-                    vf[4] = (_Float16)(dd[0] * sc[4]);
-                    vf[5] = (_Float16)(dd[1] * sc[5]);
-                    dd = __builtin_amdgcn_cvt_pk_f32_fp8(
-                        (unsigned)(vc >> 32), 1);
-                    vf[6] = (_Float16)(dd[0] * sc[6]);
-                    vf[7] = (_Float16)(dd[1] * sc[7]);
-                    Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
-                        vf, prow, Ofr[dc]);
+                    // p8 = E4M3_RNE(w/b_new): 8 weights/lane in 2 dwords
+                    // (division matches the host model exactly).
+                    unsigned int p0 = 0u;
+                    p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                        sacc[0] / b_new, sacc[1] / b_new, p0, false);
+                    p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                        sacc[2] / b_new, sacc[3] / b_new, p0, true);
+                    unsigned int p1 = 0u;
+                    p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                        sacc[4] / b_new, sacc[5] / b_new, p1, false);
+                    p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                        sacc[6] / b_new, sacc[7] / b_new, p1, true);
+                    const v2i_t pb = {(int)p0, (int)p1};
+                    const v2i_t va = Vf[vbn + dc * 32];
+                    Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        va, pb, Ofr[dc]);
+                    // Bound V-load hoisting to this chunk.
                     asm volatile("" ::: "memory");
                 }
+                b_prev = b_new;
             }
         }
         // Tile turnover: no wave may overwrite LDS before every PV read
@@ -1259,7 +1273,7 @@ __device__ void fa2_stageb_nbody(
                     const unsigned bd = bo + (unsigned)(dc * 16 + kg * 8);
 #pragma unroll
                     for (int j = 0; j < 8; ++j)
-                        out[bd + (unsigned)j] = Ofr[dc][j] * inv;
+                        out[bd + (unsigned)j] = Ofr[dc][j] * (b_prev * inv);
                 }
             }
         } else {
@@ -1285,7 +1299,7 @@ __device__ void fa2_stageb_nbody(
                     const unsigned rj = rb + 2u + (unsigned)(kg * 8 + j);
 #pragma unroll
                     for (int dc = 0; dc < 16; ++dc)
-                        rec[rj + (unsigned)(dc * 16)] = Ofr[dc][j];
+                        rec[rj + (unsigned)(dc * 16)] = b_prev * Ofr[dc][j];
                 }
             }
         }
