@@ -609,6 +609,8 @@ pub enum ArchPredicate {
     /// Gates the RDNA dot2-F16 codepath used by HFQ3 sdot4 kernels.
     /// Historically named "HasDp4a" — renamed because AMD "dp4a" in the ISA
     /// means `v_dot4_i32_i8` (gfx906-only), while this checks `v_dot2_f32_f16`
+    /// (RDNA1.1+). The two are unrelated ISA features.
+    HasDot2F32F16,
     /// `is_gfx942()` — CDNA3 MI300-series exactly. Gates kernels built from a
     /// `.gfx942.hip` source with no sibling for any other arch, currently the
     /// BF16 MFMA GEMM. Narrower than `is_cdna3()` on purpose: the wrapper

@@ -79,8 +79,9 @@ pub fn classify(
             quant_int8,
             quant_hfq8,
             quant_bf16,
-            quant_fp8
+            quant_fp8,
         ]
+        .iter()
         .filter(|&&b| b)
         .count()
             <= 1,
