@@ -514,6 +514,16 @@ pub enum KernelKey {
     AttnQ8_0KvBatchedMasked,         // P-1 no-LDS-cap tiled kernel
     AttnQ8_0KvBatchedMaskedWindowed, // sliding-window batched Q8 (cohere2moe prefill)
     AttnBf16KvBatchedMaskedWindowed, // sliding-window batched BF16 (maple prefill)
+    // Native fp8 E4M3 KV (gfx1201-only; see attention_table registrations).
+    AttnFp8E4m3Kv, // scalar decode / per-token fallback (Q0 format gate)
+    AttnFlashFp8E4m3, // flash tile decode
+    AttnFp8E4m3KvBatchedMasked, // batched prefill / tree-verify
+    // Flat-BF16 KV for non-windowed (Qwen dense) caches. Maple keeps the
+    // windowed keys above; these lower to the same bf16 tile kernels with
+    // window=0 (== plain causal), so no new device code is required.
+    AttnBf16Kv, // scalar-named decode; lowers to the bf16 flash tile
+    AttnFlashBf16, // flash tile decode, window=0
+    AttnBf16KvBatchedMasked, // batched prefill / tree-verify, window=0
     // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
     // Full attention (no KV cache — vision / dflash cross-attention)
     AttnFullF16,       // F16 K/V, non-causal
@@ -543,6 +553,9 @@ pub enum KernelKey {
     KvWriteAsym2FwhtBatched,
     KvWriteQ8_0Batched,
     KvWriteBf16Batched,
+    // Native fp8 E4M3 KV write (single-token + batched).
+    KvWriteFp8E4m3,
+    KvWriteFp8E4m3Batched,
 }
 
 // ── Shape context for predicate evaluation ───────────
@@ -594,8 +607,15 @@ pub enum ArchPredicate {
     /// Gates the RDNA dot2-F16 codepath used by HFQ3 sdot4 kernels.
     /// Historically named "HasDp4a" — renamed because AMD "dp4a" in the ISA
     /// means `v_dot4_i32_i8` (gfx906-only), while this checks `v_dot2_f32_f16`
-    /// (RDNA1.1+). The two are unrelated ISA features.
-    HasDot2F32F16,
+    /// `is_gfx942()` — CDNA3 MI300-series exactly. Gates kernels built from a
+    /// `.gfx942.hip` source with no sibling for any other arch, currently the
+    /// BF16 MFMA GEMM. Narrower than `is_cdna3()` on purpose: the wrapper
+    /// refuses non-gfx942 outright, so the predicate must match the wrapper.
+    IsGfx942,
+    /// Exact gfx1201 (R9700). Gates the native fp8 E4M3 KV keys whose device
+    /// builtins are gfx1201-guarded: no other arch may resolve them, so an
+    /// fp8 cache fails closed at dispatch outside the admitted target.
+    IsGfx1201,
     HasSdot4,
     HasMmq,
     HasCdna3LdsGemv,
@@ -603,11 +623,6 @@ pub enum ArchPredicate {
     /// Gates the gfx906 wave64 `v_dot4_i32_i8` (sdot4) fused kernels (HFQ6/MQ6).
     /// This IS AMD "dp4a" — `v_dot4_i32_i8` INT8 dot4 accumulate, gfx906/gfx908.
     HasDp4a,
-    /// `is_gfx942()` — CDNA3 MI300-series exactly. Gates kernels built from a
-    /// `.gfx942.hip` source with no sibling for any other arch, currently the
-    /// BF16 MFMA GEMM. Narrower than `is_cdna3()` on purpose: the wrapper
-    /// refuses non-gfx942 outright, so the predicate must match the wrapper.
-    IsGfx942,
 }
 
 #[derive(Clone, Debug)]
