@@ -224,11 +224,11 @@ __device__ __forceinline__ void fa2_gqa_body(
         // Native fp8 K (Q0 fill-time decode): per (position, kv head) the
         // token-local row is [codes: 4*256 bytes, head-major][scales: 4 f16]
         // (stride 1032 = 4*(256+2); Hkv=4/D=256 gated at every entry).
-        // 512 slots (k*8+b) like the Q8 path; slot (k, b) owns dims
-        // b*32..b*32+31 of key ktile+k and dequantizes 32 dims = 16 dwords
-        // straight into the swizzled dword plane (pair p for key k at
-        // K[k][(p + S(k&15)) & 127] — identical layout downstream, so block
-        // b covers pairs b*16..b*16+15 exactly as in the Q8 path). V fill
+        // b*32..b*32+31 of key ktile+k and dequantizes 32 dims = 8 dwords
+        // straight into the fragment-order f16 K plane: dword w covers the
+        // 4-wide dim run at 4-aligned d0 = b*32+w*4, which never crosses an
+        // 8-dim fragment boundary, so all four share one (dc, lane) with
+        // j = d0&7 .. +3 (same addressing as the q8 arm below). V fill
         // below is the native-fp8 twin of the Q8_0 V fill.
         // Decode matches the tiled reference exactly at the f16 rounding
         // point: f16(f32(stored_scale) * decode_e4m3(code)). Out-of-range
@@ -249,9 +249,8 @@ __device__ __forceinline__ void fa2_gqa_body(
                     ((uint16_t)row[1024 + kv_h * 2 + 1] << 8);
             _Float16 s = ((fa2_dw_t){.u = (uint32_t)su}).h[0];
             const float sf = (float)s;
-            const int rot = fa2_swiz(k & 15);
-            const int base = k * 128;
-            const int pb = b * 16;
+            const int sub = k >> 4;
+            const int mlk = k & 15;
             const unsigned char* codes = (row != nullptr)
                 ? row + (unsigned long long)kv_h * 256ULL + (unsigned long long)b * 32ULL
                 : nullptr;
@@ -266,13 +265,15 @@ __device__ __forceinline__ void fa2_gqa_body(
                 const float d1 = fa2_fp8_e4m3_to_f32((unsigned char)(u >> 8));
                 const float d2 = fa2_fp8_e4m3_to_f32((unsigned char)(u >> 16));
                 const float d3 = fa2_fp8_e4m3_to_f32((unsigned char)(u >> 24));
-                fa2_dw_t e0, e1;
-                e0.h[0] = (_Float16)(sf * d0);
-                e0.h[1] = (_Float16)(sf * d1);
-                e1.h[0] = (_Float16)(sf * d2);
-                e1.h[1] = (_Float16)(sf * d3);
-                Kdw[base + ((pb + w * 2 + rot) & 127)] = e0.u;
-                Kdw[base + ((pb + w * 2 + 1 + rot) & 127)] = e1.u;
+                // 4-wide dim run at 4-aligned dd (template K:355-365).
+                const int dd = b * 32 + w * 4;
+                const int dc = dd >> 4;
+                const int ln = 16 * ((dd >> 3) & 1) + mlk;
+                const int o = fa2_koff(sub, dc, ln, dd & 7);
+                K16[o] = (_Float16)(sf * d0);
+                K16[o + 1] = (_Float16)(sf * d1);
+                K16[o + 2] = (_Float16)(sf * d2);
+                K16[o + 3] = (_Float16)(sf * d3);
             }
         }
 #else
@@ -372,12 +373,11 @@ __device__ __forceinline__ void fa2_gqa_body(
         // Native fp8 V (Q0 fill-time decode): 256 key-pairs (m*8+b) like the
         // Q8 path; each slot reads dims b*32..b*32+31 of keys ktile+2m /
         // ktile+2m+1 from their token-local fp8 rows and packs
-        // (V[2m][d], V[2m+1][d]) per output dim into the same swizzled V_T
-        // plane. Same decode/rounding contract as the K fill above.
-        // MERGE NOTE (gfx1201-fp8-kv -> gfx1201-fa2-fragorder): this block and
-        // the KMODE=8 K fill above still target the pre-slice-A swizzled dword
-        // planes (Kdw/Vdw/fa2_swiz) which no longer exist here; StageB1 ports
-        // them onto the fragment-order planes (fa2_koff/fa2_voff).
+        // (V[2m][d], V[2m+1][d]) per output dim into the fragment-order f16
+        // V plane via fa2_voff (same addressing as the q8 arm below):
+        // 2m/2m+1 never straddle a sub/kg boundary, so both halves share
+        // one fragment at consecutive j. Same decode/rounding contract as
+        // the K fill above.
         for (int t = 0; t < 2; ++t) {
             const int pair = tid + t * 128;
             const int m = pair >> 3;
@@ -407,6 +407,9 @@ __device__ __forceinline__ void fa2_gqa_body(
             const unsigned char* vc1 = (row1 != nullptr)
                 ? row1 + (unsigned long long)kv_h * 256ULL + (unsigned long long)b * 32ULL
                 : nullptr;
+            const int sub = (2 * m) >> 4;
+            const int kgm = ((2 * m) >> 3) & 1;
+            const int j0 = (2 * m) & 7;
 #pragma unroll 1
             for (int w = 0; w < 8; ++w) {
                 uint32_t u0 = 0, u1 = 0;
@@ -419,10 +422,11 @@ __device__ __forceinline__ void fa2_gqa_body(
                     const int d = b * 32 + w * 4 + c;
                     const float v0 = fa2_fp8_e4m3_to_f32((unsigned char)(u0 >> (c * 8)));
                     const float v1 = fa2_fp8_e4m3_to_f32((unsigned char)(u1 >> (c * 8)));
-                    fa2_dw_t dw;
-                    dw.h[0] = (_Float16)(sf0 * v0);
-                    dw.h[1] = (_Float16)(sf1 * v1);
-                    Vdw[d * 32 + ((m + fa2_swiz(d & 15)) & 31)] = dw.u;
+                    const int dc = d >> 4;
+                    const int ln = 16 * kgm + (d & 15);
+                    const int o = fa2_voff(sub, dc, ln, j0);
+                    V16[o] = (_Float16)(sf0 * v0);
+                    V16[o + 1] = (_Float16)(sf1 * v1);
                 }
             }
         }
