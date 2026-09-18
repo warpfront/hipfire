@@ -1405,6 +1405,9 @@ fn main() {
             emit(&out_dir, &cpu_tests, &cases, &time_table, "wrong-arch", t0);
             std::process::exit(1);
         }
+        if args.contains_key("bench-canonical") {
+            run_bench_canonical(&mut gpu, &out_dir, repeats);
+        }
         // Small-N sweep exercises BT4/BT8/BT12-exact/masked-BT12/S2BT8 tiles.
         let sweep_ns: Vec<usize> = if quick { vec![512] } else { vec![64, 128, 192, 256, 320, 512] };
         for fam in canonical_shapes() {
@@ -1485,6 +1488,98 @@ fn main() {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Throwaway canonical TIME bench (gate 3): the four canonical N=512 shapes
+/// through the production launchers, 2 untimed hash/det launches + R timed
+/// launches per family under an isolated profile window. Routing (incumbent
+/// vs v2 aspect) comes purely from env. Emits bench.json; no bound checks
+/// (correctness is gated by the sweep). Deleted with this file after proof.
+#[cfg(feature = "deltanet")]
+#[allow(clippy::too_many_arguments)]
+fn run_bench_canonical(gpu: &mut rdna_compute::Gpu, out_dir: &str, timed: usize) {
+    use gpu::canonical_shapes;
+    let n = 512usize;
+    let mut fams = Vec::new();
+    let mut fail = 0;
+    for fam in canonical_shapes() {
+        let ms = fam.splits.clone();
+        let k = fam.k;
+        let blobs: Vec<Vec<u8>> = ms
+            .iter()
+            .enumerate()
+            .map(|(si, &m)| {
+                let w = synth_weights(m, k, si % 2 == 1, 0x1000 + si as u64 * 7919);
+                pack_v2_split(&w, m, k)
+            })
+            .collect();
+        let x = synth_x(n, k, 0xBEEF);
+        let y_olds: Vec<Vec<f32>> = ms
+            .iter()
+            .map(|&m| {
+                let mut rng = 0x0BADu64;
+                (0..n * m).map(|_| prng_f32(&mut rng) * 2.0 - 1.0).collect()
+            })
+            .collect();
+        let shape = modified_shape(&fam, &ms, k);
+        let first = gpu::launch_incumbent(gpu, &shape, &blobs, &x, &y_olds, n);
+        let repeat = gpu::launch_incumbent(gpu, &shape, &blobs, &x, &y_olds, n);
+        let det = first.ys == repeat.ys;
+        let finite = first.ys.iter().all(|y| y.iter().all(|v| v.is_finite()));
+        let hash = format!("{:016x}", hash_f32(&first.ys.concat()));
+        rdna_compute::profile::start();
+        for _ in 0..timed.max(1) {
+            gpu::launch_incumbent(gpu, &shape, &blobs, &x, &y_olds, n);
+        }
+        let mut gemm_us: Vec<f64> = Vec::new();
+        let mut pack_us: Vec<f64> = Vec::new();
+        let mut knames: Vec<String> = first.kernel_names.clone();
+        if let Some(entries) = rdna_compute::profile::stop() {
+            for e in entries {
+                if !knames.contains(&e.kernel.to_string()) {
+                    knames.push(e.kernel.to_string());
+                }
+                if e.kernel.contains("pack_") {
+                    pack_us.push(e.time_us);
+                } else {
+                    gemm_us.push(e.time_us);
+                }
+            }
+        }
+        gemm_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        pack_us.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let med = |v: &Vec<f64>| if v.is_empty() { 0.0 } else { v[v.len() / 2] };
+        let ok = det && finite;
+        if !ok {
+            fail += 1;
+        }
+        println!(
+            "  [{}] {:8} gemm {:9.1}us (n={}) pack {:7.1}us hash={} det={} kernels={:?}",
+            if ok { "ok" } else { "FAIL" },
+            fam.family,
+            med(&gemm_us),
+            gemm_us.len(),
+            med(&pack_us),
+            hash,
+            det,
+            knames,
+        );
+        fams.push(serde_json::json!({
+            "family": fam.family, "n": n, "k": k, "m_total": ms.iter().sum::<usize>(),
+            "hash": hash, "deterministic": det, "finite": finite,
+            "gemm_median_us": med(&gemm_us), "gemm_n": gemm_us.len(),
+            "pack_median_us": med(&pack_us), "kernels": knames,
+        }));
+    }
+    let (_, g_bm, g_bn, g_bk, g_wv) = active_v2_geom();
+    let doc = serde_json::json!({
+        "route": if v2_enabled() { "v2" } else { "s2bt8" },
+        "v2_geometry": {"BM": g_bm, "BN": g_bn, "BK": g_bk, "waves": g_wv},
+        "timed_repeats": timed.max(1),
+        "families": fams,
+    });
+    std::fs::write(format!("{out_dir}/bench.json"), serde_json::to_string_pretty(&doc).unwrap()).unwrap();
+    println!("bench verdict: {}", if fail == 0 { "pass" } else { "FAIL" });
+    std::process::exit(if fail == 0 { 0 } else { 1 });
+}
 #[cfg(feature = "deltanet")]
 fn run_gpu_case(
     gpu: &mut rdna_compute::Gpu,
