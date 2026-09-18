@@ -386,6 +386,58 @@ fn run_case(
     ok
 }
 
+/// GPU-event us/call: warmup then 100 timed launches, median. Returns
+/// (median_us, tops_vs_539.7).
+fn time_case(
+    gpu: &mut Gpu,
+    label: &str,
+    a_bytes: &[u8],
+    m: usize,
+    k: usize,
+    n: usize,
+    add: bool,
+) {
+    let sym = if add { ADD_SYM } else { SET_SYM };
+    for s in [SET_SYM, ADD_SYM] {
+        gpu.ensure_kernel_public(MODULE, IU4_GFX12_SRC, s)
+            .unwrap_or_else(|e| panic!("JIT {s}: {e}"));
+    }
+    // Random X once (timing only; values don't matter).
+    let x: Vec<f32> = (0..n * k).map(|i| prng_f32(i, 0x71E0).mul_add(1.0, 0.0)).collect();
+    let d_x = gpu.upload_f32(&x, &[n, k]).expect("upload X");
+    let xq_ptr =
+        gpu.ensure_int4_mmq_x(&d_x, n, k).expect("ensure_int4_mmq_x") as *mut std::ffi::c_void;
+    let d_a = gpu.upload_raw(a_bytes, &[a_bytes.len()]).expect("upload A");
+    let a_ptr = d_a.buf.as_ptr() as *const std::ffi::c_void;
+    let y0 = vec![0.0f32; n * m];
+    let d_y = gpu.upload_f32(&y0, &[n, m]).expect("upload Y");
+    let y_ptr = d_y.buf.as_ptr() as *const std::ffi::c_void;
+    for _ in 0..10 {
+        launch_iu4(gpu, sym, a_ptr, xq_ptr as *const _, y_ptr, m, k, n, add);
+    }
+    gpu.hip.device_synchronize().expect("sync");
+    // Host-batch timing (GPU events proved unreliable here): 5 batches of
+    // 20 launches, median batch/20.
+    let mut meds = Vec::with_capacity(5);
+    for _ in 0..5 {
+        let t0 = std::time::Instant::now();
+        for _ in 0..20 {
+            launch_iu4(gpu, sym, a_ptr, xq_ptr as *const _, y_ptr, m, k, n, add);
+        }
+        gpu.hip.device_synchronize().expect("sync");
+        meds.push(t0.elapsed().as_secs_f64() * 1e6 / 20.0);
+    }
+    meds.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let med = meds[2];
+    let gflop = 2.0 * m as f64 * k as f64 * n as f64 / 1e9;
+    // 1 GFLOP/us = 1000 TOPS.
+    let tops = gflop / med * 1000.0;
+    eprintln!("TIME {label}: med={med:.1} us/call GFLOP={gflop:.2} -> {tops:.1} TOPS ({:.1}% of 539.7)", tops / 539.7 * 100.0);
+    let _ = gpu.free_tensor(d_x);
+    let _ = gpu.free_tensor(d_a);
+    let _ = gpu.free_tensor(d_y);
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let compile_only = args.iter().any(|a| a == "--compile-only");
@@ -427,6 +479,22 @@ fn main() {
     let (gate_m, gate_k, gate) = load_mq4v2(&hfq, GATE_NAME);
     let (down_m, down_k, down) = load_mq4v2(&hfq, DOWN_NAME);
     eprintln!("loaded gate_proj {gate_m}x{gate_k}  down_proj {down_m}x{down_k}");
+    // TIME=1: per-kernel us/call table on the 4 profile shapes (N=512),
+    // then return (no correctness checks).
+    if std::env::var("TIME").ok().as_deref() == Some("1") {
+        // gate_up row: gate + up (real gate weights stand in for both halves).
+        time_case(&mut gpu, "gate-M17408-K5120-N512/set", &gate, gate_m, gate_k, 512, false);
+        time_case(&mut gpu, "gate-M17408-K5120-N512/add", &gate, gate_m, gate_k, 512, true);
+        // residual row: down.
+        time_case(&mut gpu, "down-M5120-K17408-N512/add", &down, down_m, down_k, 512, true);
+        // qkvza row (M=16480 = 10240+6144+48+48, K=5120) and qkv row
+        // (M=14336 = 12288+1024+1024, K=5120): synthetic weights, same shapes.
+        let aqkvza = pack_mq4g256v2_synth(16480, 5120, 0x71E0_A000);
+        time_case(&mut gpu, "qkvza-M16480-K5120-N512/set", &aqkvza, 16480, 5120, 512, false);
+        let aqkv = pack_mq4g256v2_synth(14336, 5120, 0x71E0_B000);
+        time_case(&mut gpu, "qkv-M14336-K5120-N512/set", &aqkv, 14336, 5120, 512, false);
+        return;
+    }
     drop(hfq);
 
     let mut ok = true;
@@ -444,6 +512,7 @@ fn main() {
     ok &= run_case(&mut gpu, "k256/add", &a256, 256, 256, 512, true, 0xE061, true);
     let apart = pack_mq4g256v2_synth(100, 512, 0xED6E_7000);
     ok &= run_case(&mut gpu, "m100n100/set", &apart, 100, 512, 100, false, 0xE070, true);
+
 
     if ok {
         eprintln!("GFX12-IU4 ORACLE PASS");
