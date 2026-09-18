@@ -2154,7 +2154,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         false,
         "HIPFIRE_GFX12_FA2_FP8",
-        "Enable the gfx120x GQA-fused FA2 fp8 K/V planes route (opt-in on exact gfx1200/gfx1201; default off; set to true or HIPFIRE_GFX12_FA2_FP8=1 to opt in)."
+        "Stage-b fp8 WMMA arithmetic on a native-fp8 KV cache (Q0 f16 arithmetic when off; default off; set to true or HIPFIRE_GFX12_FA2_FP8=1 to opt in; meaningful only with native fp8 KV on exact gfx1201, never selects a KV format)."
     ),
     process_bool_field!(
         "kernel.gfx11_fa2_prefill",

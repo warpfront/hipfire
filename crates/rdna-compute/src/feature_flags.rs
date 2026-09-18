@@ -243,10 +243,13 @@ pub struct FeatureFlags {
     /// Default ON on gfx1100/gfx1151; `=1` forces it on other arches
     /// (launchers stay on the gfx11 allowlist).
     pub gfx11_fa2_prefill: bool,
-    /// gfx120x FA2 fp8 K/V planes (`HIPFIRE_GFX12_FA2_FP8`,
-    /// `kernel.gfx12_fa2_fp8`). Opt-in only (default off everywhere);
-    /// `gfx12_fa2_fp8_enabled()` also requires exact gfx1200/gfx1201.
-    /// Stage U0 scaffold: body still f16; Ua+ changes numerics.
+    /// Stage-b arithmetic switch on NATIVE fp8 KV (`HIPFIRE_GFX12_FA2_FP8`,
+    /// `kernel.gfx12_fa2_fp8`). Opt-in only (default off everywhere). OFF =
+    /// Q0 f16 arithmetic on the same native fp8 cache; ON = fp8 WMMA legs.
+    /// Meaningful only with a native-fp8 (`KTier::Fp8`) cache on exact
+    /// gfx1201 — it never selects a KV format, plane layout, or fallback.
+    /// The gate still admits gfx1200 until the deferred FA2 launcher gating
+    /// (twin-SRC removal) narrows it; see `gfx12_fa2_fp8_enabled`.
     pub gfx12_fa2_fp8: Option<bool>,
     pub gemm_dump: bool,
     pub deterministic: bool,
