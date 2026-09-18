@@ -1815,14 +1815,9 @@ fn dispatch_attend(
                 // (v_mode 8 — lloyd V lives in rotated space FA2 never
                 // inverts). Falls through to the incumbent below otherwise.
                 //
-                // U0 fp8 twin: when `gfx12_fa2_fp8_enabled()` (exact gfx1200/
-                // gfx1201 + `HIPFIRE_GFX12_FA2_FP8=1` / `kernel.gfx12_fa2_fp8`)
-                // the launcher below selects the distinct
-                // `attention_q8_0_fa2_gqa_fwht3k_fp8_gfx1201` entry (body still
-                // f16 until Ua). No separate KernelKey — same exact-gfx1201
-                // predicate as the f16 FA2 arm; symbol swap is inside the
-                // launcher. Direct/partial/merge fp8 twins follow the same
-                // pattern on the Q8 FA2 ingress (`attention_q8_0_flash_prefill_wmma`).
+                // No stage-b fwht3 twin exists (plan §14.3): under
+                // `HIPFIRE_GFX12_FA2_FP8=1` the launcher below keeps the f16
+                // fwht3 body (flag ignored + logged), never an fp8 entry.
                 if gpu.flags.gfx12_fa2_prefill
                     && gpu.arch == "gfx1201"
                     && io.n_heads == 24
@@ -2309,6 +2304,12 @@ fn dispatch_attend(
                 // gfx1201/H24/KV4/D256, 64..=512 rows, %16, 64..=32768 ctx),
                 // plus no tree-verify (FA2 has no tree path). Falls through
                 // to the scalar/tile crossover below otherwise.
+                // S6 stage-b route selection: with `gfx12_fa2_fp8_enabled()`
+                // (exact gfx1200/1201 + `HIPFIRE_GFX12_FA2_FP8=1`) the
+                // FA2-eligible shape runs the stage-b route-N launcher
+                // (fp8 QK + PV WMMA on native fp8 KV, fp8 Q codes + f32 sq
+                // in S4 scratch, 32768 B dynamic LDS). Flag off keeps the
+                // Q0 f16 body bit-identically.
                 if gpu.flags.gfx12_fa2_prefill
                     && gpu.arch == "gfx1201"
                     && io.n_heads == 24
@@ -2319,18 +2320,33 @@ fn dispatch_attend(
                     && (64..=32768).contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                 {
-                    hip!(gpu.attention_fp8_e4m3_fa2_gqa_f16_gfx1201(
-                        io.q,
-                        io.k_cache,
-                        io.v_cache,
-                        io.output,
-                        io.positions(),
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.max_ctx_len,
-                        io.batch_size,
-                    ))?;
+                    if gpu.flags.gfx12_fa2_fp8_enabled() {
+                        hip!(gpu.attention_fp8_e4m3_fa2_gqa_fp8_gfx1201(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ))?;
+                    } else {
+                        hip!(gpu.attention_fp8_e4m3_fa2_gqa_f16_gfx1201(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ))?;
+                    }
                     return Ok(());
                 }
                 // Scalar-batched at short ctx (same gfx12 4096 crossover as

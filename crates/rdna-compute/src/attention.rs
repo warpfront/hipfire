@@ -3641,6 +3641,19 @@ impl Gpu {
             && batch_size % 16 == 0
             && (64..=32768).contains(&max_ctx_len)
         {
+            // S6: route Q (q8 cache + stage-b fp8 arithmetic) is not
+            // implemented (B4 pending). Fail loud under the arithmetic
+            // flag: running the f16 body here while HIPFIRE_GFX12_FA2_FP8=1
+            // claims fp8 would be a silent wrong-mode run.
+            if self.flags.gfx12_fa2_fp8_enabled() {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "attention_q8_0_flash_prefill_wmma: HIPFIRE_GFX12_FA2_FP8=1 \
+                     requests stage-b route-Q fp8 arithmetic on the q8 cache, \
+                     which is not implemented (B4 pending); unset \
+                     HIPFIRE_GFX12_FA2_FP8 or use --kv-mode fp8 (route N)",
+                ));
+            }
             return self.attention_q8_0_fa2_gqa_gfx1201(
                 q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
                 max_ctx_len, batch_size,
@@ -3986,20 +3999,24 @@ impl Gpu {
                 ),
             ));
         }
-        // U0: when gfx12_fa2_fp8_enabled, dispatch the distinct `_fp8_`
-        // entry (same f16 body until Ua). Symbol-keyed cache needs a
-        // separate name; SRC prepends `#define HIPFIRE_FA2_FP8 1`.
-        let use_fp8 = self.flags.gfx12_fa2_fp8_enabled();
-        let symbol = if use_fp8 {
-            "attention_q8_0_fa2_gqa_fp8_gfx1201"
-        } else {
-            "attention_q8_0_fa2_gqa_gfx1201"
-        };
-        let src = if use_fp8 {
-            kernels::ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC
-        } else {
-            kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC
-        };
+        // S6: route Q (q8 cache + stage-b fp8 arithmetic) is not implemented
+        // (B4 pending). The `_fp8_` entry in the KMODE=0+FP8 module still runs
+        // the f16 body, so selecting it under the arithmetic flag would
+        // silently run f16 as fp8 — fail loud instead. The dedicated
+        // stage-b route-Q launcher (`attention_q8_0_fa2_gqa_fp8_gfx1201`)
+        // owns the route-Q symbols for B4; this f16 launcher keeps one
+        // meaning (S5 deleted the "renames symbols only" reading).
+        if self.flags.gfx12_fa2_fp8_enabled() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_fa2_gqa_gfx1201: HIPFIRE_GFX12_FA2_FP8=1 \
+                 requests stage-b route-Q fp8 arithmetic on the q8 cache, \
+                 which is not implemented (B4 pending); unset \
+                 HIPFIRE_GFX12_FA2_FP8 or use --kv-mode fp8 (route N)",
+            ));
+        }
+        let symbol = "attention_q8_0_fa2_gqa_gfx1201";
+        let src = kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC;
         // F4b: the body reads f16 Q from Gpu-owned scratch (pre-converted on
         // the same stream just below); the entry symbol and the pre-convert
         // symbol both resolve out of this module's source.
@@ -4071,13 +4088,13 @@ impl Gpu {
             batch_size,
             0,
         )?;
-        // U0: keep 65536 dynamic LDS for `_fp8_` too (body plane layout
-        // unchanged). Ua: 32768 once e4m3 planes land.
+        // f16 planes: 65536 dynamic LDS. Stage-b entries (32768, fp8 planes)
+        // live in the dedicated route launchers, not here.
         let result = self.launch_maybe_blob(
             symbol,
             [grid_x, 4, 1],
             [128, 1, 1],
-            65536, // Ua: 32768
+            65536,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
