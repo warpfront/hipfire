@@ -358,6 +358,7 @@ static __device__ __forceinline__ float hipfire_fp8_e4m3_to_f32_batched(unsigned
                                   : 256.0f * (1.0f + (float)m * 0.125f);
         return s ? -f : f;
     }
+    return __builtin_bit_cast(float, s | ((e - 7u + 127u) << 23) | (m << 20));
 }
 
 // BF16 → f32 widening: exact shift.
@@ -467,6 +468,7 @@ extern "C" __global__ void attention_fp8_e4m3_kv_batched(
     workspace[tid] = local_sum;
     __syncthreads();
     for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
         __syncthreads();
     }
     float sum_val = workspace[0];
