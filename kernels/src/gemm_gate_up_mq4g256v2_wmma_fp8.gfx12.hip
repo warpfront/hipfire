@@ -579,8 +579,11 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                             }
                         }
                     }
-                    // Pin the prefetched loads above the WMMAs.
-                    __builtin_amdgcn_sched_barrier(0);
+                    // No sched pin here (iu4fold v0): the previous trip's fold
+                    // VALU must be free to sink among this trip's WMMAs, and
+                    // the prefetch loads hoist for latency on their own. True
+                    // deps (A_pf/Wpk_pf publish after compute) still order
+                    // what must be ordered.
                 }
 
                 // Inner loop: ds_read_b64 A/W -> v_wmma fp8 16x16x16. Nothing else.
