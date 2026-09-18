@@ -522,47 +522,70 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         }
     }
 
-    // Masked store: a[t] applied here. Overwrite vs residual-add is per-symbol.
+    // Coalesced store: the WMMA C layout leaves lane (ml,kg) holding
+    // T[nb][wf][j] for token wave_tok+nb*16+ml and rows
+    // wave_wt+wf*16+8*kg+j, so one store instruction touches 16 output rows
+    // at 4 B each (~90 GB/s effective). Transpose each nb's 16x32 wave tile
+    // through LDS instead: lane (ml,kg) dumps its 16 values at tile row ml,
+    // cols wf*16+8*kg+j (the kg pair covers all 32 columns), then all 32
+    // lanes cooperatively stream the 16 token rows with lane tid owning
+    // column tid, so every global store is one contiguous 128 B segment.
+    // Per-element arithmetic is unchanged (y = a[t]*T, one residual add),
+    // hence bit-identical; only the visit order changes. A/W/S/SZ are dead
+    // (all folds complete), so the tile reuses LDS base: 8 waves x 16 x 32
+    // floats = 16 KiB < 24 KiB, no host change.
+    float* lds_tile = (float*)lds;
     #pragma unroll
     for (int nb = 0; nb < 4; nb++) {
-        const int t = bs + wave_tok + nb * 16 + ml;
-        if (t < N) {
-            const float at = X_row_scales[t];
+        #pragma unroll
+        for (int wf = 0; wf < 2; wf++) {
             #pragma unroll
-            for (int wf = 0; wf < 2; wf++) {
-                #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    const int r = rs + wave_wt + wf * 16 + 8 * kg + j;
-                    if (r < tm) {
-                        const float y = at * T[nb][wf][j];
+            for (int j = 0; j < 8; j++) {
+                // Row-skew (col+ml)&31: without it all 16 ml lanes hit bank
+                // col%32 on the dump (16-way conflict). Drain undoes it with
+                // (lane+r16)&31, a permutation of the same 128 B line.
+                const int col = (wf * 16 + 8 * kg + j + ml) & 31;
+                lds_tile[(unsigned int)(wave * 512 + ml * 32 + col)] = T[nb][wf][j];
+            }
+        }
+        __syncthreads();
+        #pragma unroll
+        for (int r16 = 0; r16 < 16; r16++) {
+            const int t = bs + wave_tok + nb * 16 + r16;
+            if (t < N) {
+                const float at = X_row_scales[t];
+                const int r = rs + wave_wt + lane;
+                const float v = lds_tile[(unsigned int)(wave * 512 + r16 * 32 + ((lane + r16) & 31))];
+                const float y = at * v;
+                if (r < tm) {
 #if HIPFIRE_FP8_QKVZA
-                        float* Yp;
-                        int pr, os;
-                        if (r < qkv_m) { Yp = Y_qkv; pr = r; os = qkv_m; }
-                        else if (r < qkv_m + z_m) { Yp = Y_z; pr = r - qkv_m; os = z_m; }
-                        else if (r < qkv_m + z_m + beta_m) { Yp = Y_beta; pr = r - (qkv_m + z_m); os = beta_m; }
-                        else { Yp = Y_alpha; pr = r - (qkv_m + z_m + beta_m); os = alpha_m; }
-                        Yp[(unsigned int)t * (unsigned int)os + (unsigned int)pr] = y;
+                    float* Yp;
+                    int pr, os;
+                    if (r < qkv_m) { Yp = Y_qkv; pr = r; os = qkv_m; }
+                    else if (r < qkv_m + z_m) { Yp = Y_z; pr = r - qkv_m; os = z_m; }
+                    else if (r < qkv_m + z_m + beta_m) { Yp = Y_beta; pr = r - (qkv_m + z_m); os = beta_m; }
+                    else { Yp = Y_alpha; pr = r - (qkv_m + z_m + beta_m); os = alpha_m; }
+                    Yp[(unsigned int)t * (unsigned int)os + (unsigned int)pr] = y;
 #elif HIPFIRE_FP8_RESIDUAL
-                        Y_res[(unsigned int)t * (unsigned int)res_m + (unsigned int)r] += y;
+                    Y_res[(unsigned int)t * (unsigned int)res_m + (unsigned int)r] += y;
 #elif HIPFIRE_FP8_QKV
-                        float* Yp;
-                        int pr, os;
-                        if (r < q_m) { Yp = Y_q; pr = r; os = q_m; }
-                        else if (r < q_m + k_m) { Yp = Y_k; pr = r - q_m; os = k_m; }
-                        else { Yp = Y_v; pr = r - (q_m + k_m); os = v_m; }
-                        Yp[(unsigned int)t * (unsigned int)os + (unsigned int)pr] = y;
+                    float* Yp;
+                    int pr, os;
+                    if (r < q_m) { Yp = Y_q; pr = r; os = q_m; }
+                    else if (r < q_m + k_m) { Yp = Y_k; pr = r - q_m; os = k_m; }
+                    else { Yp = Y_v; pr = r - (q_m + k_m); os = v_m; }
+                    Yp[(unsigned int)t * (unsigned int)os + (unsigned int)pr] = y;
 #else
-                        float* Yp;
-                        int pr, os;
-                        if (r < gate_m) { Yp = Y_gate; pr = r; os = gate_m; }
-                        else { Yp = Y_up; pr = r - gate_m; os = up_m; }
-                        Yp[(unsigned int)t * (unsigned int)os + (unsigned int)pr] = y;
+                    float* Yp;
+                    int pr, os;
+                    if (r < gate_m) { Yp = Y_gate; pr = r; os = gate_m; }
+                    else { Yp = Y_up; pr = r - gate_m; os = up_m; }
+                    Yp[(unsigned int)t * (unsigned int)os + (unsigned int)pr] = y;
 #endif
-                    }
                 }
             }
         }
+        __syncthreads();
     }
 }
 
