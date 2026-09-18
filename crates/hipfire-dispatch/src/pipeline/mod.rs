@@ -3807,17 +3807,17 @@ pub fn dispatch_fused(
     let PipelineParams::Linear(params) = params;
     match key {
         KernelKey::GemvMfp4G32Fused => {
-            gpu.ensure_mq_signs()
-                .map_err(|e| DispatchError::Hip(e.to_string()))?;
-            let x_rot = unsafe {
-                GpuTensor {
-                    buf: gpu.scratch.mq_x_rot.as_ref().unwrap().buf.alias(),
-                    shape: vec![params.k],
-                    dtype: rdna_compute::DType::F32,
-                }
-            };
-            hip!(gpu.gemv_mfp4g32_with_rotate(
-                params.buf, params.x, params.y, &x_rot, params.m, params.k,
+            // Prerotated-contract route: `GemvFamily::run(Prerotated)`
+            // guarantees params.x is ALREADY FWHT-rotated (run_input(Raw)
+            // rotates via RotationFamily; run_input(Rotated) validates the
+            // rotation tag; llama::weight_gemv rotates before calling run).
+            // Route to the no-rotate launcher. `gemv_mfp4g32_with_rotate`
+            // is built for raw-x callers (benches/tests) — calling it here
+            // applied a SECOND FWHT against FWHT-baked weights, which is
+            // silent garbage (double rotation is not the identity), not an
+            // error. Every MFP4G32 GEMV on HasWmma archs was affected.
+            hip!(gpu.gemv_mfp4g32_prerotated(
+                params.buf, params.x, params.y, params.m, params.k,
             ))
         }
         _ => Err(DispatchError::UnsupportedVariant {
