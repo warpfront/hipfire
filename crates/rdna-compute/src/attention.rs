@@ -4280,6 +4280,434 @@ impl Gpu {
         result
     }
 
+    /// gfx1201-only GQA-fused FA2 prefill with stage-b fp8 arithmetic on the
+    /// q8 cache (route Q, research opt-in).
+    ///
+    /// Same frozen kernargs as [`Self::attention_q8_0_fa2_gqa_gfx1201`]
+    /// (fp8-code Q pointer in the old Q slot, `sq` at `+batch*24*256`,
+    /// route-Q scale plane after it, 32768 B dynamic LDS), but the body
+    /// runs fp8 (E4M3) QK + PV WMMA legs with f32 scores/softmax-state/O.
+    /// Requires `gfx12_fa2_fp8_enabled()` (explicit opt-in on exact
+    /// gfx1200/gfx1201): with the flag off this launcher fails loud and
+    /// never falls back to the f16 body. The stage-b Q pre-convert writes
+    /// e4m3 codes + f32 `sq` into Gpu-owned scratch on the same stream;
+    /// `q` is never mutated, so this launcher is replay-idempotent and
+    /// capture-safe. Exact H24/KV4/D256, full causal, eager only.
+    /// `max_ctx_len` is max(positions)+1; the kernel never reads it
+    /// (causal bounds come from `positions[]`); it exists only for profile
+    /// byte attribution, mirroring the incumbent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_q8_0_fa2_gqa_fp8_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fp8_gfx1201 requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fp8_gfx1201 requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        if batch_size == 0 || batch_size > 512 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fp8_gfx1201 requires 1 <= batch <= 512, got {batch_size}"
+                ),
+            ));
+        }
+        if max_ctx_len == 0 || max_ctx_len > 32768 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fp8_gfx1201 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                ),
+            ));
+        }
+        let need_qo = batch_size * n_heads * head_dim;
+        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_q8_0_fa2_gqa_fp8_gfx1201 capacity mismatch: \
+                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        // Fail closed without the arithmetic opt-in: a stage-b entry must
+        // never silently run the f16 body. Before the stage-b arithmetic
+        // lands, the pre-convert symbol below does not resolve and
+        // `ensure_kernel` fails loud for the same reason.
+        if !self.flags.gfx12_fa2_fp8_enabled() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_fa2_gqa_fp8_gfx1201 requires HIPFIRE_GFX12_FA2_FP8=1 \
+                 (no f16 fallback for stage-b entries)",
+            ));
+        }
+        // Route-Q module: `HIPFIRE_FA2_FP8=1` on the q8 source (§14.3).
+        // Entries `attention_q8_0_fa2_gqa_fp8_gfx1201` +
+        // `attention_q8_0_fa2_q_preconvert_fp8_gfx1201`.
+        const SYMBOL: &str = "attention_q8_0_fa2_gqa_fp8_gfx1201";
+        const PRECONVERT: &str = "attention_q8_0_fa2_q_preconvert_fp8_gfx1201";
+        let src = kernels::ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC;
+        if !self.functions.contains_key(SYMBOL) || !self.functions.contains_key(PRECONVERT) {
+            self.ensure_kernel(SYMBOL, src, SYMBOL)?;
+            self.ensure_kernel(SYMBOL, src, PRECONVERT)?;
+        }
+        // Stage-b scratch: e4m3 codes + f32 sq + route-Q scale plane
+        // (n_heads/head_dim validated H24/D256 above), Gpu-owned,
+        // grows-never-shrinks. Direct launch: one split.
+        let (need_fp8_bytes, sq_off, _) =
+            crate::scratch::fa2_fp8_q_needed(batch_size, 1, true);
+        // Same pre-growth invalidation contract as the f16 FA2 scratch:
+        // the body reads this scratch from the captured graph's kernargs.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_fp8_q_scratch_bytes,
+            self.scratch.fa2_fp8_q_scratch.is_some(),
+            need_fp8_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let q8_ptr = self
+            .scratch
+            .ensure_fa2_fp8_q_scratch(&self.hip, need_fp8_bytes)?;
+        let sq_ptr = unsafe { (q8_ptr as *mut u8).add(sq_off) as *mut c_void };
+        let grid_x = batch_size.div_ceil(8) as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q8_arg = q8_ptr;
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q8_arg as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Profile bytes: same analytical upper bound as the incumbent
+        // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
+        // itself remains exact HIP-event timing.
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+        );
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            SYMBOL,
+            bytes,
+        );
+        // Stage-b pre-convert f32 Q -> e4m3 codes + f32 sq on the same
+        // stream, then run the body against the scratch. Both via
+        // launch_maybe_blob so graph capture stays valid. The blob ABI
+        // below is the frozen contract (codes reuse the old f32 Q slot:
+        // same offset 0, same size).
+        self.launch_fa2_q_preconvert_fp8(
+            PRECONVERT,
+            q.buf.as_ptr(),
+            q8_ptr,
+            sq_ptr,
+            batch_size,
+        )?;
+        // Stage-b arms use exactly 32768 B dynamic LDS (fp8 planes); keyed
+        // off the arm, not the flag — the f16 arms above keep 65536.
+        let result = self.launch_maybe_blob(
+            SYMBOL,
+            [grid_x, 4, 1],
+            [128, 1, 1],
+            32768,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q8_arg);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1201-only GQA-fused FA2 prefill with stage-b fp8 arithmetic on
+    /// native fp8 KV (route N, research opt-in).
+    ///
+    /// Same frozen kernargs as
+    /// [`Self::attention_fp8_e4m3_fa2_gqa_f16_gfx1201`] (fp8-code Q pointer
+    /// in the old Q slot, `sq` at `+batch*24*256`, 32768 B dynamic LDS),
+    /// but the body runs fp8 (E4M3) QK + PV WMMA legs with f32
+    /// scores/softmax-state/O, copying codes verbatim from the
+    /// token-local native rows (stride 1032) and reading scales from the
+    /// row header — no scale plane is sized in. Requires
+    /// `gfx12_fa2_fp8_enabled()`: with the flag off this launcher fails
+    /// loud and never falls back to the Q0 f16 body. Exact H24/KV4/D256,
+    /// full causal, eager only. `max_ctx_len` is max(positions)+1; the
+    /// kernel never reads it (causal bounds come from `positions[]`); it
+    /// exists only for profile byte attribution, mirroring the incumbent.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_fp8_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_fp8_gfx1201 requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_fp8_gfx1201 requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        if batch_size == 0 || batch_size > 512 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_fp8_gfx1201 requires 1 <= batch <= 512, got {batch_size}"
+                ),
+            ));
+        }
+        if max_ctx_len == 0 || max_ctx_len > 32768 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_fp8_gfx1201 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                ),
+            ));
+        }
+        let need_qo = batch_size * n_heads * head_dim;
+        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_fp8_gfx1201 capacity mismatch: \
+                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        // Fail closed without the arithmetic opt-in: a stage-b entry must
+        // never silently run the Q0 f16 body.
+        if !self.flags.gfx12_fa2_fp8_enabled() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_fp8_e4m3_fa2_gqa_fp8_gfx1201 requires HIPFIRE_GFX12_FA2_FP8=1 \
+                 (no f16 fallback for stage-b entries)",
+            ));
+        }
+        // Route-N module: `HIPFIRE_FA2_FP8=1` + `HIPFIRE_FA2_KMODE=8`
+        // (§14.3). Entries `attention_fp8_e4m3_fa2_gqa_fp8_gfx1201` +
+        // `attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201`.
+        const SYMBOL: &str = "attention_fp8_e4m3_fa2_gqa_fp8_gfx1201";
+        const PRECONVERT: &str = "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201";
+        let src = kernels::ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC;
+        if !self.functions.contains_key(SYMBOL) || !self.functions.contains_key(PRECONVERT) {
+            self.ensure_kernel(SYMBOL, src, SYMBOL)?;
+            self.ensure_kernel(SYMBOL, src, PRECONVERT)?;
+        }
+        // Stage-b scratch: e4m3 codes + f32 sq, no scale plane (route N
+        // reads scales from the native row header), Gpu-owned,
+        // grows-never-shrinks. Direct launch: one split.
+        let (need_fp8_bytes, sq_off, _) =
+            crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
+        // Same pre-growth invalidation contract as the f16 FA2 scratch.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_fp8_q_scratch_bytes,
+            self.scratch.fa2_fp8_q_scratch.is_some(),
+            need_fp8_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let q8_ptr = self
+            .scratch
+            .ensure_fa2_fp8_q_scratch(&self.hip, need_fp8_bytes)?;
+        let sq_ptr = unsafe { (q8_ptr as *mut u8).add(sq_off) as *mut c_void };
+        let grid_x = batch_size.div_ceil(8) as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q8_arg = q8_ptr;
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q8_arg as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Profile bytes: same analytical upper bound as the incumbent
+        // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
+        // itself remains exact HIP-event timing.
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+        );
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            SYMBOL,
+            bytes,
+        );
+        // Stage-b pre-convert f32 Q -> e4m3 codes + f32 sq on the same
+        // stream, then run the body against the scratch. Both via
+        // launch_maybe_blob so graph capture stays valid.
+        self.launch_fa2_q_preconvert_fp8(
+            PRECONVERT,
+            q.buf.as_ptr(),
+            q8_ptr,
+            sq_ptr,
+            batch_size,
+        )?;
+        // Stage-b arms use exactly 32768 B dynamic LDS (fp8 planes); the
+        // Q0 arm keeps 65536.
+        let result = self.launch_maybe_blob(
+            SYMBOL,
+            [grid_x, 4, 1],
+            [128, 1, 1],
+            32768,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q8_arg);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Stage-b on-device Q pre-convert shared by the FA2 stage-b launchers.
+    ///
+    /// `symbol` selects the route build (`attention_q8_0_fa2_q_preconvert_fp8_gfx1201`
+    /// vs `attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201`): the two modules
+    /// export DIFFERENT symbols on purpose — the function cache is keyed by
+    /// symbol, so a shared name would silently bind whichever module build
+    /// registered first.
+    ///
+    /// Reads f32 Q ([batch, 24, 256] — the exact layout/stride the f16 FA2
+    /// body used to read) and writes e4m3 codes at `codes_ptr` plus the f32
+    /// row scale `sq` at `sq_ptr` (`= codes + batch*24*256`, same
+    /// allocation), leaving the original f32 Q untouched. One wave32 per Q
+    /// row: grid `[(batch*24).div_ceil(4), 1, 1]`, block 128, no LDS, one
+    /// `launch_maybe_blob` so graph capture stays valid; the caller launches
+    /// the stage-b body on the same stream right after (no sync needed).
+    #[allow(clippy::too_many_arguments)]
+    fn launch_fa2_q_preconvert_fp8(
+        &mut self,
+        symbol: &str,
+        q_ptr: *const c_void,
+        codes_ptr: *mut c_void,
+        sq_ptr: *mut c_void,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let grid_x = (batch_size * 24).div_ceil(4) as u32;
+        let mut qp = q_ptr as *mut c_void;
+        let mut cp = codes_ptr;
+        let mut sp = sq_ptr;
+        let mut bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut cp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+        ];
+        // Kernargs: q@0, codes@8, sq@16, batch@24 (32 B).
+        self.launch_maybe_blob(symbol, [grid_x, 1, 1], [128, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(q_ptr);
+            b.push_ptr(codes_ptr);
+            b.push_ptr(sq_ptr);
+            b.push_i32(bs);
+            b
+        })
+    }
+
     /// gfx1201-only GQA-fused FA2 prefill for fwht3 K (research opt-in).
     ///
     /// Same contract as [`Self::attention_q8_0_fa2_gqa_gfx1201`] except K is
@@ -4373,18 +4801,18 @@ impl Gpu {
                 ),
             ));
         }
-        // U0: fp8 twin entry when flag resolves on (body still f16).
-        let use_fp8 = self.flags.gfx12_fa2_fp8_enabled();
-        let symbol = if use_fp8 {
-            "attention_q8_0_fa2_gqa_fwht3k_fp8_gfx1201"
-        } else {
-            "attention_q8_0_fa2_gqa_fwht3k_gfx1201"
-        };
-        let src = if use_fp8 {
-            kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_FP8_GFX1201_SRC
-        } else {
-            kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC
-        };
+        // Stage b defines no fwht3 (KMODE=3) twin (§14.3): selecting the
+        // `_fp8_` entry under the arithmetic flag would run f16 arithmetic
+        // while reporting fp8. Fail closed by routing to the f16 entry with
+        // the flag ignored and logged — flags-off behaviour is unchanged.
+        if self.flags.gfx12_fa2_fp8_enabled() {
+            eprintln!(
+                "attention_q8_0_fa2_gqa_fwht3k_gfx1201: ignoring HIPFIRE_GFX12_FA2_FP8=1 \
+                 (no stage-b fwht3 twin; running the f16 fwht3 body)"
+            );
+        }
+        let symbol = "attention_q8_0_fa2_gqa_fwht3k_gfx1201";
+        let src = kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC;
         // F4b: the body reads pre-rotated, pre-converted f16 Q from
         // Gpu-owned scratch (same stream just below); the entry symbol and
         // the pre-convert symbol both resolve out of this module's source.
