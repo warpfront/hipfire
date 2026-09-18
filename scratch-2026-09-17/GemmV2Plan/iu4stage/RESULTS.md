@@ -151,11 +151,29 @@ not move prefill; only the staging-width cut did (+25%).
 
 ### decode ≥ 36.4 — PASS (36.50 / 36.49, clean logs, 0 errors)
 
-### serve battery ON — read: 7/8, same as OFF
+### serve battery ON (real harness) — 5 turns, 0 empty, 0 attractor
 
-`test-serve.sh --model qwen3.8:27b-mq4-xt` (`serve-on.log`, rerun
-`serve-on2.log`, control `serve-off.log`): 7 passed 1 failed in all three.
-The failure is Test 4 (streaming basic chat: `open think span at end of
-generation` validation) — fails identically with iu4 OFF (fp8 path), so it
-is pre-existing and unrelated (reasoning-model prompt interaction; KLD
-bit-identity rules out a numerics regression).
+`python3 scripts/serve_harness.py --model …/qwen3.8-27b.mq4-xt
+--tag qwen3.8:27b-mq4-xt --kv q8 --mtp off --dflash off --mode battery
+--sampling registry --thinking off --max-tokens 256 --seed 0 … --port 11531`
+with `HIPFIRE_DAEMON_BIN=…/wt-iu4/target/release/daemon` (=md5
+`32d48a08…`, the post-commit rebuild) and `HIPFIRE_GFX11_MQ4V2_IU4=1`.
+Receipts: `iu4stage/serve-battery/battery.{json,log}`,
+`harness.{stdout,stderr}`. (An earlier `test-serve.sh` run is NOT the
+acceptance route and is superseded; its 7/8 (pre-existing Test-4 think-span
+failure, identical with iu4 OFF) is retained only in `serve-on*.log`.)
+
+| turn | finish | gen | think/ans words | decode | flags |
+|---|---|---|---|---|---|
+| t1 code | stop | 175 | 42/47 | 36.4 | — |
+| t2 reason | stop | 156 | 22/45 | 36.4 | — |
+| t3 factual | stop | 171 | 80/42 | 36.5 | — |
+| t4 prose | length | 256 | 150/44 | 36.4 | RUNAWAY* |
+| t5 instruct | stop | 220 | 103/55 | 36.4 | — |
+
+Turns 5, runaway 1 (*t4 hit max-tokens 256 — truncation, text clean),
+empty 0, attractor 0, retrieval_miss 0. Avg prefill 570.6 tok/s, decode 36.4.
+Excerpts: t1 `def merge_sorted(a, b):` — correct two-pointer merge with
+docstring and tail extend; t3 "Seasons are caused by Earth's axial tilt of
+about 23.5 degrees…" — correct. Full texts in `battery.json`
+(`assistant_content` per turn).
