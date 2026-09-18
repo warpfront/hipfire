@@ -1,4 +1,157 @@
 // SPDX-License-Identifier: MIT
+// Copyright (c) 2026 Daniil Markevich
+// hipfire — see LICENSE and NOTICE in the project root.
+//
+// Shared int4 activation block + wave32 MSE-clip quant recipe for the
+// iu4-direct MMQ path. Concatenated by the host JIT into:
+//   - gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip (standalone quantize_int4_mmq_ds128)
+//   - fused RMSNorm/FWHT and SwiGLU/FWHT IU4 producer sidecars (C2)
+//
+// Do not edit a second copy of the amax / 8-candidate MSE / rintf+clamp /
+// integer-sum path. Every consumer of this fragment must remain bit-identical
+// on the 72-byte block_i4_128 layout.
+
+#ifndef HIPFIRE_BLOCK_I4_128_QUANT_HIP
+#define HIPFIRE_BLOCK_I4_128_QUANT_HIP
+
+#include <hip/hip_runtime.h>
+#include <stdint.h>
+#include <math.h>
+
+// int4 activation block: one 128-K group for one token (column).
+// qs: 64 B, even K low nibble / odd K high nibble, two's complement.
+// d: per-128 scale (MSE-clip grid argmin). s: exact int sum of the 128 x_q.
+struct block_i4_128 {
+    float d;
+    int s;
+    unsigned char qs[64];
+};
+static_assert(sizeof(block_i4_128) == 72, "bad block size");
+
+// Wave32-synchronous quant of one 128-element group.
+// Lane l owns elements 4l..4l+3 in xv[4]. Reductions use offsets 16..1
+// (wave64-safe width-32 shuffles). Writes qs for every lane; lane 0 of the
+// group publishes d and s. Arithmetic matches the original standalone body
+// (amax → 8 MSE candidates with strict-`<` → rintf/clamp → exact int sum).
+__device__ __forceinline__ void quantize_block_i4_128_wave(
+    const float xv[4],
+    block_i4_128* __restrict__ out,
+    int lane
+) {
+    float amax = fmaxf(fmaxf(fabsf(xv[0]), fabsf(xv[1])), fmaxf(fabsf(xv[2]), fabsf(xv[3])));
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
+    }
+
+    float best_d = 1.0f;
+    if (amax != 0.0f) {
+        float best_mse = 1.0e30f;
+        for (int j = 0; j < 8; ++j) {
+            const float dj = (amax / 7.0f) * 0.5f * (1.0f + (float)j / 7.0f);
+            float mse = 0.0f;
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                float q = rintf(xv[e] / dj);
+                q = fminf(fmaxf(q, -8.0f), 7.0f);
+                const float err = __fmaf_rn(-q, dj, xv[e]);
+                mse = __fmaf_rn(err, err, mse);
+            }
+            for (int offset = 16; offset > 0; offset >>= 1) {
+                mse += __shfl_xor(mse, offset, 32);
+            }
+            if (mse < best_mse) {
+                best_mse = mse;
+                best_d = dj;
+            }
+        }
+    }
+
+    int q4[4];
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        float q = (amax == 0.0f) ? 0.0f : rintf(xv[e] / best_d);
+        q = fminf(fmaxf(q, -8.0f), 7.0f);
+        q4[e] = (int)q;
+    }
+    int s = q4[0] + q4[1] + q4[2] + q4[3];
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        s += __shfl_xor(s, offset, 32);
+    }
+
+    unsigned char* qb = out->qs;
+    qb[lane * 2 + 0] = (unsigned char)((q4[0] & 15) | ((q4[1] & 15) << 4));
+    qb[lane * 2 + 1] = (unsigned char)((q4[2] & 15) | ((q4[3] & 15) << 4));
+    if (lane == 0) {
+        out->d = best_d;
+        out->s = s;
+    }
+}
+
+// Remap producer-final 8 floats/lane into the standalone quant ownership
+// (lane l owns 4l..4l+3 of each 128-half) and emit two block_i4_128 rows.
+// Producer lane p holds values 8p..8p+7. For half h∈{0,1}:
+//   source lane = 16*h + (l >> 1); even l → first float4, odd l → second.
+// Sidecar index: (2*group + h)*N + token.
+__device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
+    float f0, float f1, float f2, float f3,
+    float f4, float f5, float f6, float f7,
+    block_i4_128* __restrict__ Y,
+    int group,
+    int token,
+    int N,
+    int lane
+) {
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        const int src = 16 * h + (lane >> 1);
+        float s0 = __shfl(f0, src, 32);
+        float s1 = __shfl(f1, src, 32);
+        float s2 = __shfl(f2, src, 32);
+        float s3 = __shfl(f3, src, 32);
+        float s4 = __shfl(f4, src, 32);
+        float s5 = __shfl(f5, src, 32);
+        float s6 = __shfl(f6, src, 32);
+        float s7 = __shfl(f7, src, 32);
+        float xv[4];
+        if ((lane & 1) == 0) {
+            xv[0] = s0; xv[1] = s1; xv[2] = s2; xv[3] = s3;
+        } else {
+            xv[0] = s4; xv[1] = s5; xv[2] = s6; xv[3] = s7;
+        }
+        block_i4_128* out = Y + (long long)(2 * group + h) * N + token;
+        quantize_block_i4_128_wave(xv, out, lane);
+    }
+}
+
+// Standalone quantizer: same (X, Y, K, N) grid contract as
+// quantize_q8_1_mmq_ds4_x128 (block (256,1,1), each thread 4 floats,
+// grid [(K+1023)/1024, N]). One wave32 covers exactly one 128-K group.
+#ifndef HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE
+extern "C" __global__ void quantize_int4_mmq_ds128(
+    const float* __restrict__ X,
+    block_i4_128* __restrict__ Y,
+    int K,
+    int N
+) {
+    const int token = blockIdx.y;
+    const int t = blockIdx.x * blockDim.x + threadIdx.x;
+    const int i0 = t * 4;
+    if (token >= N || i0 >= K) return;
+    const int lane = threadIdx.x & 31;
+
+    const float4 xi = (i0 + 3 < K)
+        ? *(const float4*)(X + (long long)token * K + i0)
+        : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    const float xv[4] = {xi.x, xi.y, xi.z, xi.w};
+
+    const int kblock = i0 / 128;
+    block_i4_128* out = Y + (long long)kblock * N + token;
+    quantize_block_i4_128_wave(xv, out, lane);
+}
+#endif // HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE
+
+#endif // HIPFIRE_BLOCK_I4_128_QUANT_HIP
+// SPDX-License-Identifier: MIT
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
@@ -56,16 +209,15 @@
 //     re-read from the DS plane at fold time (same values, same DAG).
 //     Steady state per block: prefetch slab 1 into A_pf/W_pf, compute slab
 //     0 from (A,W0), B0 (slab-0 A-reads done), publish slab 1 to (A,W1),
-//     B1, then the next-block fetch epoch: all six next-block raw loads
-//     (next A slab 0, next W slab 0, next DS word, next header word) issue
-//     immediately after B1 into private registers. Compute slab 1 from
-//     (A,W1), fold the current block, B2a (slab-1 A-reads done; also
-//     drains the fetch epoch after the useful compute1+fold window),
-//     publish next (masked/converted) to (A,W0,DS[h^1],SZ[h^1]), B2b.
+//     refill A_pf with next block's A slab 0, one barrier, compute slab 1
+//     from (A,W1), cooperatively stage next block's W0/DS/SZ straight to
+//     LDS, B2a (slab-1 A-reads done), publish A_pf to A, one barrier, then
+//     fold (below B2b: the scheduler interleaves this VALU with the next
+//     block's prefetch + WMMA chain — variant 0, no extra registers).
 //     Four barriers per block (vs five before); slab 1 loads issue above
-//     slab 0's WMMAs (sched_barrier-pinned, as in v2) and the fetch epoch
-//     issues above compute 1 + fold. Bit-identical: same K order, same
-//     pinned IU4_FOLD_RN DAG.
+//     slab 0's WMMAs (sched_barrier-pinned, as in v2), next-block W staging
+//     issues above the fold, and next-block A loads issue above compute 1
+//     + fold. Bit-identical: same K order, same pinned IU4_FOLD_RN DAG.
 //     LDS 16384 B keeps 3 WG/CU on gfx1201 (3 x 16384 = 49152 < 65536/CU;
 //     the host still passes 19456 B, a harmless superset, same occupancy).
 //   - Coalesced store (fp8 K2 mechanism): each (rg, nb) phase dumps the
@@ -359,11 +511,6 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     // pairs, same 8 dwords/lane as before (2 rounds x 1 u32x2 per plane).
     u32x2_t A_pf[2];
     u32x2_t W_pf[2];
-    // Next-block raw metadata words for the rescheduled fetch epoch (loaded
-    // after B1, consumed at the publish below B2a): one token DS word and
-    // one packed weight header word per lane.
-    unsigned ds_nx = 0u;
-    unsigned sz_nx = 0u;
 
     // Token (d, s) for this lane's column blocks is re-read from the staged
     // DS plane at fold time (same f32/i32 values, same DAG order) instead of
@@ -431,7 +578,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     W_pf[r] = *(const u32x2_t*)(wB1 + st_wvoff[r]);
                 }
                 // Variant 0: NO pin barrier here. The previous trip's fold
-                // VALU (above its B2a) must be free to sink among this
+                // VALU (below its B2b) must be free to sink among this
                 // trip's WMMAs; a sched_barrier(0) would retire the whole
                 // fold before the chain starts. True deps (cacc WAR per
                 // element, A_pf/W_pf publish after B0) still order what
@@ -446,63 +593,107 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 // the publish below overwrites slab 0 with slab 1). W1 writes
                 // need no fence but share it.
                 __syncthreads();
-                // Publish slab 1 (A_pf -> A plane, W_pf -> W1) and re-point
-                // W at W1 (A is fixed). Nothing next-block is live yet: the
-                // fetch epoch is BELOW B1, never above.
+                // Publish slab 1 (A_pf -> A plane, W_pf -> W1) and refill
+                // A_pf with the next block's A slab 0 (guarded; the loads
+                // issue above compute 1 + fold below and overlap them; the
+                // publish to A waits for B2a). Re-point W at W1 (A is fixed).
                 w_lds = LDS + IU4_W1_OFF;
                 #pragma unroll
                 for (int r = 0; r < 2; r++) {
                     *(u32x2_t*)(a_lds + st_ldsoff[r]) = A_pf[r];
                     *(u32x2_t*)(w_lds + st_ldsoff[r]) = W_pf[r];
                 }
+                if (!last) {
+                    // Next block's A slab 0 (from Xq; only kb_n0 needed).
+                    const int kb_n0 = kb + 1;
+                    const char* __restrict__ xqBn0 = (const char*)(Xq + (long long)kb_n0 * N) + 8;
+                    #pragma unroll
+                    for (int r = 0; r < 2; r++) {
+                        const u32x2_t av = *(const u32x2_t*)(xqBn0 + st_avoff[r]);
+                        A_pf[r] = st_aok[r] ? av : z64;
+                    }
+                }
                 // B1: slab-1 publish visible to all waves before compute 1.
                 __syncthreads();
-                if (!last) {
-                    // Next-block fetch epoch: all six next-block raw loads
-                    // (4 b64 nibble + 1 DS word + 1 packed header word) issue
-                    // here, immediately after B1, into private registers. No
-                    // masks, header conversion, DS stores or first use yet:
-                    // first use is the publish below B2a, so the waits drain
-                    // after compute1 + fold and the epoch overlaps them.
-                    // A_pf/W_pf are dead (slab 1 published above) and reused
-                    // as the next-payload nibble words; ds_nx/sz_nx hold the
-                    // raw next metadata words.
-                    const int kb_nx = kb + 1;
-                    const char* __restrict__ xq_nx = (const char*)(Xq + (long long)kb_nx * N) + 8;
-                    #pragma unroll
-                    for (int r = 0; r < 2; r++) {
-                        A_pf[r] = *(const u32x2_t*)(xq_nx + st_avoff[r]);
-                    }
-                    const int g_nx = g + h;
-                    const int h_nx = h ^ 1;
-                    const char* __restrict__ w_nx = A + (long long)g_nx * 136 + 8 + (long long)h_nx * 64;
-                    #pragma unroll
-                    for (int r = 0; r < 2; r++) {
-                        W_pf[r] = *(const u32x2_t*)(w_nx + st_wvoff[r]);
-                    }
-                    const int tok_ds = bs + (tid >> 1);
-                    const int tok_dsc = (tok_ds < N) ? tok_ds : (N - 1);
-                    ds_nx = ((const unsigned*)(Xq + (long long)kb_nx * N + tok_dsc))[tid & 1];
-                    const int row_sz = rs + (tid >> 1);
-                    const int src_sz = (row_sz < M) ? row_sz : (M - 1);
-                    sz_nx = *(const unsigned*)(A + (long long)src_sz * groups_per_row * 136
-                        + g_nx * 136 + h_nx * 4);
-                }
             }
-            // --- Slab 1 compute (A, W1), current fold, next-block publish. ---
+            // --- Slab 1 compute (A, W1), next-block W/DS/SZ stage, fold below B2b. ---
             {
                 iu4_bundle<0, false>(w_lds, a_lds, frW, frA, cacc, zc);
                 iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
-                // Fold (rescheduled above B2a so the fetch epoch overlaps
-                // compute1 + this VALU): 4 K32 int32 partials per (nb, rg)
-                // through the pinned IU4_FOLD_RN DAG. Reads only cacc plus
-                // the current DS[h]/SZ[h] planes, independent of the private
-                // next payload. Same f32 values, same DAG order: per-half
-                // (sc,zp) straight from the staged SZ plane, (d,s) re-read
-                // from DS. Bank-clean on gfx1201: 8 consecutive rows x 2
-                // words hit 16 distinct banks, identical across the 16 lanes
-                // of a k_grp half (LDS broadcast); the halves cover all 32
-                // banks once.
+                if (!last) {
+                    const int g_n = g + h;
+                    const int h_n = h ^ 1;
+                    // Next block's W slab 0 staged straight to W0
+                    // (cooperative global -> LDS): W0 reads completed at B1
+                    // on every wave; values flow through transient registers
+                    // only. Re-point W at W0. These loads issue above the
+                    // fold below and overlap its VALU. (Next A slab 0 sits
+                    // in A_pf since trip 0; its publish to the single A
+                    // plane waits for B2a below.)
+                    w_lds = LDS + IU4_W0_OFF;
+                    const char* __restrict__ wB0n = A + (long long)g_n * 136 + 8 + (long long)h_n * 64;
+                    #pragma unroll
+                    for (int r = 0; r < 2; r++) {
+                        *(u32x2_t*)(w_lds + st_ldsoff[r]) = *(const u32x2_t*)(wB0n + st_wvoff[r]);
+                    }
+                }
+                if (!last) {
+                    const int g_n2 = g + h;
+                    const int h_n2 = h ^ 1;
+                    const int kb_n2 = kb + 1;
+                    // DS/SZ planes for the next block (opposite parity: the
+                    // fold below reads DS[h]/SZ[h], staged here is [h^1]).
+                    // DS plane for the next block, clamp-not-branch (same
+                    // values as the old ternary: clamped address, zero value).
+                    char* __restrict__ ds_n = LDS + ((h_n2 == 0) ? IU4_DS_OFF : IU4_DS1_OFF);
+                    {
+                        const int tok_ds = bs + (tid >> 1);
+                        const int w_ds = tid & 1;
+                        const int tok_dsc = (tok_ds < N) ? tok_ds : (N - 1);
+                        const unsigned dw = ((const unsigned*)(Xq + (long long)kb_n2 * N + tok_dsc))[w_ds];
+                        ((unsigned*)(ds_n + (tid >> 1) * 8))[w_ds] = (tok_ds < N) ? dw : 0u;
+                    }
+                    // SZ plane for the next block (opposite parity: the fold
+                    // below reads SZ[h], staged here is SZ[h^1]).
+                    // SZ plane for the next block, clamp-not-branch (same
+                    // values: clamped header address, zero value when OOB).
+                    char* __restrict__ sz_n = LDS + ((h_n2 == 0) ? IU4_SZ0_OFF : IU4_SZ1_OFF);
+                    {
+                        const int row_sz = rs + (tid >> 1);
+                        const int w_sz = tid & 1;
+                        const int src_sz = (row_sz < M) ? row_sz : (M - 1);
+                        const unsigned hw = *(const unsigned*)(A + (long long)src_sz * groups_per_row * 136
+                            + g_n2 * 136 + h_n2 * 4);
+                        const float f = (w_sz == 0)
+                            ? __half2float(__ushort_as_half((unsigned short)(hw & 0xFFFFu)))
+                            : __half2float(__ushort_as_half((unsigned short)(hw >> 16)));
+                        ((float*)(sz_n + (tid >> 1) * 8))[w_sz] = (row_sz < M) ? f : 0.0f;
+                    }
+                }
+                // B2a: slab-1 A-reads done on every wave, so the single A
+                // plane may be republished with next slab 0.
+                __syncthreads();
+                if (!last) {
+                    #pragma unroll
+                    for (int r = 0; r < 2; r++) {
+                        *(u32x2_t*)(a_lds + st_ldsoff[r]) = A_pf[r];
+                    }
+                }
+                // B2b: next-block A/W0/DS/SZ publish visible to all waves
+                // (entry condition of the next trip); on the last block it
+                // guards the store-slot reuse of LDS base below.
+                __syncthreads();
+                // Fold (variant 0: scheduled below the publish): 4 K32 int32
+                // partials per (nb, rg) through the pinned IU4_FOLD_RN DAG.
+                // Issues AFTER B2b so the machine scheduler can interleave
+                // this VALU with the next trip's prefetch + WMMA chain (the
+                // fold of half h reads only cacc + DS[h]/SZ[h], independent
+                // of half h+1's accumulators). Same f32 values, same DAG
+                // order: per-half (sc,zp) straight from the staged SZ plane
+                // (Change B narrow LDS reads), (d,s) re-read from DS as in A.
+                // Bank-clean on gfx1201: 8 consecutive rows x 2 words hit 16
+                // distinct banks, identical across the 16 lanes of a k_grp
+                // half (LDS broadcast); the halves cover all 32 banks once.
                 #pragma unroll
                 for (int rg = 0; rg < 2; rg++) {
                     float sc_row[8];
@@ -525,42 +716,6 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                         }
                     }
                 }
-                // B2a: slab-1 A-reads done on every wave, so the single A
-                // plane may be republished with next slab 0. This drain also
-                // completes the fetch epoch's in-flight loads, AFTER the
-                // useful compute1 + fold window above.
-                __syncthreads();
-                if (!last) {
-                    // Publish next block (first use of the fetch epoch):
-                    // original A zero-select, clamped W value, masked DS
-                    // word and converted header word, with the original
-                    // producer map. Re-point W at W0.
-                    w_lds = LDS + IU4_W0_OFF;
-                    #pragma unroll
-                    for (int r = 0; r < 2; r++) {
-                        *(u32x2_t*)(a_lds + st_ldsoff[r]) = st_aok[r] ? A_pf[r] : z64;
-                        *(u32x2_t*)(w_lds + st_ldsoff[r]) = W_pf[r];
-                    }
-                    const int h_np = h ^ 1;
-                    char* __restrict__ ds_n = LDS + ((h_np == 0) ? IU4_DS_OFF : IU4_DS1_OFF);
-                    {
-                        const int tok_dsp = bs + (tid >> 1);
-                        ((unsigned*)(ds_n + (tid >> 1) * 8))[tid & 1] = (tok_dsp < N) ? ds_nx : 0u;
-                    }
-                    char* __restrict__ sz_n = LDS + ((h_np == 0) ? IU4_SZ0_OFF : IU4_SZ1_OFF);
-                    {
-                        const int row_szp = rs + (tid >> 1);
-                        const int w_szp = tid & 1;
-                        const float f = (w_szp == 0)
-                            ? __half2float(__ushort_as_half((unsigned short)(sz_nx & 0xFFFFu)))
-                            : __half2float(__ushort_as_half((unsigned short)(sz_nx >> 16)));
-                        ((float*)(sz_n + (tid >> 1) * 8))[w_szp] = (row_szp < M) ? f : 0.0f;
-                    }
-                }
-                // B2b: next-block A/W0/DS/SZ publish visible to all waves
-                // (entry condition of the next trip); on the last block it
-                // guards the store-slot reuse of LDS base below.
-                __syncthreads();
             }
         } // for h
     } // for g

@@ -1,0 +1,4 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_set [tmp_iu4_attrib_8-singlebuf]
+ATTRIB 8-singlebuf: med=504.3 us/call GFLOP=91.27 -> 181.0 TOPS

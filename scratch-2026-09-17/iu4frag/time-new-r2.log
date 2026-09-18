@@ -1,0 +1,41 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+tmp_iu4_gfx12_oracle on gfx1201
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_set
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_add
+CACHE_PATH /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+  cached: tmp_iu4_gfx12_oracle.4a97ff0309725084.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.6b0ed2b72335273b.hip
+  cached: tmp_iu4_gfx12_oracle.c255224de33ad780.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.b836d576fc809f14.hash
+  cached: tmp_iu4_gfx12_oracle.c1777e9d9fdd8962.hsaco
+  cached: tmp_iu4_gfx12_oracle.569a3622cf403fb2.hsaco
+  cached: tmp_iu4_gfx12_oracle.c1777e9d9fdd8962.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.569a3622cf403fb2.hip
+  cached: tmp_iu4_gfx12_oracle.b836d576fc809f14.hip
+  cached: tmp_iu4_gfx12_oracle.c255224de33ad780.hash
+  cached: tmp_iu4_gfx12_oracle.b836d576fc809f14.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.e3d768429babc59b.hash
+  cached: tmp_iu4_gfx12_oracle.c255224de33ad780.hsaco
+  cached: tmp_iu4_gfx12_oracle.f1fb47b71a687f71.hip
+  cached: tmp_iu4_gfx12_oracle.6b0ed2b72335273b.hsaco
+  cached: tmp_iu4_gfx12_oracle.e3d768429babc59b.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.c255224de33ad780.hip
+  cached: tmp_iu4_gfx12_oracle.b836d576fc809f14.hsaco
+  cached: tmp_iu4_gfx12_oracle.4a97ff0309725084.hsaco
+  cached: tmp_iu4_gfx12_oracle.569a3622cf403fb2.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.c1777e9d9fdd8962.hip
+  cached: tmp_iu4_gfx12_oracle.569a3622cf403fb2.hash
+  cached: tmp_iu4_gfx12_oracle.e3d768429babc59b.hip
+  cached: tmp_iu4_gfx12_oracle.e3d768429babc59b.hsaco
+  cached: tmp_iu4_gfx12_oracle.6b0ed2b72335273b.hash
+  cached: tmp_iu4_gfx12_oracle.6b0ed2b72335273b.radiowave.json
+  cached: tmp_iu4_gfx12_oracle.4a97ff0309725084.hash
+  cached: tmp_iu4_gfx12_oracle.c1777e9d9fdd8962.hash
+  cached: tmp_iu4_gfx12_oracle.4a97ff0309725084.hip
+loaded gate_proj 17408x5120  down_proj 5120x17408
+TIME gate-M17408-K5120-N512/set: med=504.8 us/call GFLOP=91.27 -> 180.8 TOPS (33.5% of 539.7)
+TIME gate-M17408-K5120-N512/add: med=508.3 us/call GFLOP=91.27 -> 179.5 TOPS (33.3% of 539.7)
+TIME down-M5120-K17408-N512/add: med=517.8 us/call GFLOP=91.27 -> 176.3 TOPS (32.7% of 539.7)
+TIME qkvza-M16480-K5120-N512/set: med=497.7 us/call GFLOP=86.40 -> 173.6 TOPS (32.2% of 539.7)
+TIME qkv-M14336-K5120-N512/set: med=416.8 us/call GFLOP=75.16 -> 180.3 TOPS (33.4% of 539.7)
