@@ -5886,17 +5886,6 @@ pub const ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_FP8 1\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
-
-/// fwht3-K + FP8 twin (`HIPFIRE_FA2_FP8=1` + `HIPFIRE_FA2_KMODE=3`).
-/// Entry `attention_q8_0_fa2_gqa_fwht3k_fp8_gfx1201`. Same F4b pre-convert
-/// / turbo_common prepend pattern as the f16 fwht3 module.
-pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_FP8_GFX1201_SRC: &str = concat!(
-    "#define HIPFIRE_FA2_FP8 1\n",
-    "#define HIPFIRE_FA2_KMODE 3\n",
-    include_str!("../../../kernels/src/turbo_common.h"),
-    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
-);
-
 /// Partial-split entry twin of [`ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC`]
 /// (same source; hosts the `attention_q8_0_fa2_gqa_partial_fp8_gfx1201`
 /// symbol). Kept as its own constant so launchers name the module they own.
