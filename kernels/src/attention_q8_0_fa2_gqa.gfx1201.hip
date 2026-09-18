@@ -1231,22 +1231,24 @@ __device__ void fa2_stageb_nbody(
                 // PV as O^T = V8^T*P8^T in fp8: A = V^T fragment codes
                 // (row ml = dim of the dc tile, one b64, no decode), B =
                 // the packed P8 v2i. Ofr[dc][j] = O[query][dim].
+                // p8 = E4M3_RNE(w/b_new): 8 weights/lane in 2 dwords,
+                // packed ONCE per subtile (division matches the host model
+                // exactly); the dc loop only streams V fragments. Packing
+                // inside the loop would redo 8 divs + 4 cvts 16 times.
+                unsigned int p0 = 0u;
+                p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[0] / b_new, sacc[1] / b_new, p0, false);
+                p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[2] / b_new, sacc[3] / b_new, p0, true);
+                unsigned int p1 = 0u;
+                p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[4] / b_new, sacc[5] / b_new, p1, false);
+                p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[6] / b_new, sacc[7] / b_new, p1, true);
+                const v2i_t pb = {(int)p0, (int)p1};
                 const v2i_t* Vf = (const v2i_t*)V8;
 #pragma unroll
                 for (int dc = 0; dc < 16; ++dc) {
-                    // p8 = E4M3_RNE(w/b_new): 8 weights/lane in 2 dwords
-                    // (division matches the host model exactly).
-                    unsigned int p0 = 0u;
-                    p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
-                        sacc[0] / b_new, sacc[1] / b_new, p0, false);
-                    p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
-                        sacc[2] / b_new, sacc[3] / b_new, p0, true);
-                    unsigned int p1 = 0u;
-                    p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
-                        sacc[4] / b_new, sacc[5] / b_new, p1, false);
-                    p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
-                        sacc[6] / b_new, sacc[7] / b_new, p1, true);
-                    const v2i_t pb = {(int)p0, (int)p1};
                     const v2i_t va = Vf[vbn + dc * 32];
                     Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
                         va, pb, Ofr[dc]);
