@@ -5901,6 +5901,22 @@ pub const ATTENTION_Q8_0_FA2_GQA_PARTIAL_FP8_GFX1201_SRC: &str =
 /// (same source; hosts `attention_q8_0_fa2_gqa_merge_fp8_gfx1201`).
 pub const ATTENTION_Q8_0_FA2_GQA_MERGE_FP8_GFX1201_SRC: &str =
     ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC;
+
+/// Native-fp8-KV Q0 variant of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`]
+/// (`HIPFIRE_FA2_KMODE=8`): same f16 FA2 body and 65,536 B LDS planes, but
+/// the cooperative fill decodes native E4M3 rows (1032 B/token/side: 256
+/// codes + f16 scale per token per KV head) via
+/// `f16(f32(scale) * decode_e4m3(code))` — the tiled reference's exact
+/// rounding. Distinct entry symbols `attention_fp8_e4m3_fa2_gqa_f16_gfx1201`
+/// (+ `_partial_` / `_merge_`) and
+/// `attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201` so the symbol-keyed
+/// host function cache never collides with the q8/fwht3 modules.
+/// JIT-only via the fp8 FA2 launcher on exact gfx1201.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_F16_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
+
 /// gfx11 (RDNA3) sister of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`]
 /// (research opt-in). One workgroup per KV head x 8 positions; K/V
 /// dequantized once per KT32 tile into two swizzled f16 LDS planes

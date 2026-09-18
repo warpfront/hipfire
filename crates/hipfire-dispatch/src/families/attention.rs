@@ -2294,6 +2294,40 @@ fn dispatch_attend(
                 ))
             }
             KernelKey::AttnFp8E4m3KvBatchedMasked => {
+                // gfx1201 FA2 prefill on native fp8 KV, Q0 (slice-B; default
+                // on; `HIPFIRE_GFX12_FA2_PREFILL=0` opts out). F4b: the
+                // launcher pre-converts Q into f16 scratch (Q never mutated)
+                // and the fill decodes native E4M3 rows into its f16 planes,
+                // so like the q8/fwht3 FA2 ingresses this arm is
+                // replay-idempotent and capture-safe — no recorder/capture
+                // gates. Same shape predicates as those ingresses (exact
+                // gfx1201/H24/KV4/D256, 64..=512 rows, %16, 64..=32768 ctx),
+                // plus no tree-verify (FA2 has no tree path). Falls through
+                // to the scalar/tile crossover below otherwise.
+                if gpu.flags.gfx12_fa2_prefill
+                    && gpu.arch == "gfx1201"
+                    && io.n_heads == 24
+                    && io.n_kv_heads == 4
+                    && io.head_dim == 256
+                    && (64..=512).contains(&io.batch_size)
+                    && io.batch_size % 16 == 0
+                    && (64..=32768).contains(&io.max_ctx_len)
+                    && io.tree_bias.is_none()
+                {
+                    hip!(gpu.attention_fp8_e4m3_fa2_gqa_f16_gfx1201(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ))?;
+                    return Ok(());
+                }
                 // Scalar-batched at short ctx (same gfx12 4096 crossover as
                 // q8: LDS holds occupancy), flash-tile-batched above it.
                 // tree_bias passes through to whichever backend runs; noslots
