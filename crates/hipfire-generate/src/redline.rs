@@ -2586,6 +2586,32 @@ fn redline_append_dn_parts(
     Ok((s, scales, conv, ef))
 }
 
+/// Native per-token KV row stride (bytes) for one K or V plane.
+///
+/// q8_0 (and every other legacy tier) keeps the historical
+/// `n_kv * (D/32) * 34` row; native fp8 (E4M3FN codes + inline f16 scale
+/// per token/head) and unscaled bf16 use F's `fp8_row_bytes` /
+/// `bf16_row_bytes`. The fp8/bf16 branches are selected by the cache's own
+/// tier flags, never by geometry. (Asymmetric K planes — e.g. asym3's
+/// 100 B/head K beside a 272 B/head Q8 V — keep the legacy branch
+/// byte-for-byte: re-spanning their guard window is outside this unit.)
+fn redline_kv_token_stride(
+    n_kv_heads: usize,
+    head_dim: usize,
+    quant_fp8: bool,
+    quant_bf16: bool,
+) -> Result<usize, String> {
+    if quant_fp8 {
+        hipfire_runtime::llama::KvCache::fp8_row_bytes(n_kv_heads, head_dim)
+            .map_err(|error| format!("DFlash KV guard: fp8 stride: {error}"))
+    } else if quant_bf16 {
+        hipfire_runtime::llama::KvCache::bf16_row_bytes(n_kv_heads, head_dim)
+            .map_err(|error| format!("DFlash KV guard: bf16 stride: {error}"))
+    } else {
+        Ok(n_kv_heads.max(1) * (head_dim.max(1) / 32).max(1) * 34)
+    }
+}
+
 fn redline_dflash_kv_regions(
     gpu: &rdna_compute::Gpu,
     slot: &ModelSlot,
@@ -2594,15 +2620,42 @@ fn redline_dflash_kv_regions(
 ) -> Result<(u64, Vec<u8>), String> {
     let mut mix = 0xcbf2_9ce4_8422_2325u64;
     let mut guard = Vec::new();
-    let n_kv = slot.config.n_kv_heads.max(1);
-    let head_dim = slot.config.head_dim.max(1);
-    let blocks = (head_dim / 32).max(1);
-    let bytes_per_pos = n_kv * blocks * 34;
+    // Validated native token stride: the old q8-only `n_kv*(D/32)*34`
+    // formula silently read the wrong guard bytes on fp8/bf16 caches.
+    // The stride comes from the cache's own tier flags + F's row math;
+    // on fp8/bf16 planes it is checked against physical_cap * stride
+    // below (allocations round up to whole f32 elems: +0..3 B). The legacy
+    // branch is intentionally unchecked and byte-identical.
+    let bytes_per_pos = redline_kv_token_stride(
+        slot.kv_cache.n_kv_heads,
+        slot.kv_cache.head_dim,
+        slot.kv_cache.quant_fp8,
+        slot.kv_cache.quant_bf16,
+    )?;
+    let validate = slot.kv_cache.quant_fp8 || slot.kv_cache.quant_bf16;
     for tensor in slot.kv_cache.k_gpu.iter().chain(slot.kv_cache.v_gpu.iter()) {
         let mut bytes = Vec::new();
         redline_append_buffer(gpu, &mut bytes, &tensor.buf)?;
         mix ^= redline_hash(&bytes);
         mix = mix.wrapping_mul(0x0000_0100_0000_01b3);
+        // 1-element placeholders stand in for non-KV layers (see
+        // alloc_k_v_filtered): hashed above, skipped for guard purposes.
+        if bytes.len() <= 4 {
+            continue;
+        }
+        if validate {
+            let expect = slot
+                .kv_cache
+                .physical_cap
+                .saturating_mul(bytes_per_pos);
+            if bytes.len() < expect || bytes.len() > expect + 3 {
+                return Err(format!(
+                    "DFlash KV guard: plane bytes {} != physical_cap {} * native stride {bytes_per_pos}",
+                    bytes.len(),
+                    slot.kv_cache.physical_cap,
+                ));
+            }
+        }
         let start = start_pos.saturating_mul(bytes_per_pos);
         let active_end = start.saturating_add(batch.saturating_mul(bytes_per_pos));
         let guard_end = active_end.saturating_add(bytes_per_pos).min(bytes.len());
@@ -4773,7 +4826,9 @@ pub fn handle_redline_prefix_shadow(
 
 #[cfg(test)]
 mod redline_snapshot_tests {
-    use super::{redline_snapshots_bit_exact, RedlineQwenSnapshot, RedlineSnapshot};
+    use super::{
+        redline_kv_token_stride, redline_snapshots_bit_exact, RedlineQwenSnapshot, RedlineSnapshot,
+    };
 
     fn qwen_snapshot(gdn_frame: u32) -> RedlineSnapshot {
         RedlineSnapshot::Qwen(RedlineQwenSnapshot {
@@ -4794,5 +4849,20 @@ mod redline_snapshot_tests {
             &qwen_snapshot(17),
             &qwen_snapshot(18)
         ));
+    }
+    #[test]
+    fn kv_token_stride_covers_q8_fp8_bf16() {
+        // All arms are per-plane strides (one K or V plane): callers walk
+        // k_gpu and v_gpu separately. q8_0: 4 heads * 8 blocks * 34 B.
+        assert_eq!(redline_kv_token_stride(4, 256, false, false), Ok(1088));
+        // native fp8: 4 * (256 codes + 2 scale bytes).
+        assert_eq!(redline_kv_token_stride(4, 256, true, false), Ok(1032));
+        // unscaled bf16: 4 * 256 * 2 B.
+        assert_eq!(redline_kv_token_stride(4, 256, false, true), Ok(2048));
+        // fp8 checked math rejects degenerate geometry.
+        assert!(redline_kv_token_stride(0, 256, true, false).is_err());
+        // legacy branch degrades gracefully on zeros (unreachable: every
+        // real cache has n_kv_heads >= 1).
+        assert_eq!(redline_kv_token_stride(0, 0, false, false), Ok(34));
     }
 }

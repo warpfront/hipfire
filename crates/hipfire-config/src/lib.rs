@@ -482,10 +482,11 @@ fn expand_tilde(value: &str) -> PathBuf {
 // schema's allow-list only — it is NOT a promise that a given model supports a
 // mode. Per-site acceptance lives in `hipfire_runtime::kv_mode`'s policies,
 // which warn and fall back for anything they cannot allocate. `bf16` is
-// currently maple-only (arch 15).
+// maple's default plus the Qwen quality-control arm; `fp8` is admitted at
+// the single-GPU Qwen sites under the carrier's exact gfx1201/geometry guards.
 const KV_MODES: &[&str] = &[
     "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
-    "turbo", "turbo4", "turbo3", "turbo2",
+    "turbo", "turbo4", "turbo3", "turbo2", "fp8",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
@@ -2154,7 +2155,7 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         false,
         "HIPFIRE_GFX12_FA2_FP8",
-        "Enable the gfx120x GQA-fused FA2 fp8 K/V planes route (opt-in on exact gfx1200/gfx1201; default off; set to true or HIPFIRE_GFX12_FA2_FP8=1 to opt in)."
+        "Stage-b fp8 WMMA arithmetic on a native-fp8 KV cache (Q0 f16 arithmetic when off; default off; set to true or HIPFIRE_GFX12_FA2_FP8=1 to opt in; meaningful only with native fp8 KV on exact gfx1201, never selects a KV format)."
     ),
     process_bool_field!(
         "kernel.gfx11_fa2_prefill",

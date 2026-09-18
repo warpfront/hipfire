@@ -42,6 +42,13 @@ pub fn populate(registry: &mut KernelRegistry) {
             ArchPredicate::Always,
             Some(ShapePredicate::BatchEq(1)),
         ),
+        // Native fp8 E4M3 write (gfx1201-only: device builtins are
+        // gfx1201-guarded; any other arch fails closed at resolve).
+        (
+            KernelKey::KvWriteFp8E4m3,
+            ArchPredicate::IsGfx1201,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
         (
             KernelKey::KvWriteBf16,
             ArchPredicate::Always,
@@ -122,6 +129,12 @@ pub fn populate(registry: &mut KernelRegistry) {
             ArchPredicate::Always,
             Some(ShapePredicate::BatchGt(1)),
         ),
+        // Native fp8 E4M3 batched write (gfx1201-only).
+        (
+            KernelKey::KvWriteFp8E4m3Batched,
+            ArchPredicate::IsGfx1201,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
         (
             KernelKey::KvWriteBf16Batched,
             ArchPredicate::Always,
@@ -188,6 +201,29 @@ pub fn populate(registry: &mut KernelRegistry) {
         ),
         (
             KernelKey::AttnQ8_0Kv,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        // Native fp8 E4M3 decode (gfx1201-only).
+        (
+            KernelKey::AttnFp8E4m3Kv,
+            ArchPredicate::IsGfx1201,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashFp8E4m3,
+            ArchPredicate::IsGfx1201,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        // Flat-bf16 non-windowed (Qwen dense): same portable tile kernels as
+        // maple's windowed keys, hence `Always` like those registrations.
+        (
+            KernelKey::AttnBf16Kv,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchEq(1)),
+        ),
+        (
+            KernelKey::AttnFlashBf16,
             ArchPredicate::Always,
             Some(ShapePredicate::BatchEq(1)),
         ),
@@ -336,6 +372,18 @@ pub fn populate(registry: &mut KernelRegistry) {
         ),
         (
             KernelKey::AttnBf16KvBatchedMaskedWindowed,
+            ArchPredicate::Always,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        // Native fp8 E4M3 batched prefill / tree-verify (gfx1201-only).
+        (
+            KernelKey::AttnFp8E4m3KvBatchedMasked,
+            ArchPredicate::IsGfx1201,
+            Some(ShapePredicate::BatchGt(1)),
+        ),
+        // Flat-bf16 non-windowed batched (Qwen dense, window=0).
+        (
+            KernelKey::AttnBf16KvBatchedMasked,
             ArchPredicate::Always,
             Some(ShapePredicate::BatchGt(1)),
         ),

@@ -114,6 +114,7 @@ impl ArchPredicate {
             Self::HasCdna3LdsGemv => ctx.arch.has_cdna3_lds_gemv(),
             Self::HasDp4a => ctx.arch.gemv_dp4a_enabled(),
             Self::IsGfx942 => ctx.arch.is_gfx942(),
+            Self::IsGfx1201 => ctx.arch.is_gfx1201(),
         }
     }
 }

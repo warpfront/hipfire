@@ -5742,6 +5742,23 @@ pub const KV_CACHE_WRITE_Q8_0_BATCHED_SRC: &str =
 /// Layout: [max_seq × n_kv_heads × blocks_per_head × 34].
 pub const KV_CACHE_WRITE_Q8_0_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_q8_0.hip");
+/// Native fp8-E4M3 KV write (F slice, gfx1201-only): same TU as
+/// [`KV_CACHE_WRITE_Q8_0_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`, exposing
+/// `kv_cache_write_fp8_e4m3`. Grid [n_kv_heads,1,1], block [32,1,1], one
+/// wave/head. Token-local rows: Hkv*D codes + Hkv f16 scales (1032 B/side
+/// at Hkv=4,D=256).
+pub const KV_CACHE_WRITE_FP8_E4M3_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/kv_cache_write_q8_0.hip")
+);
+/// Batched twin: `kv_cache_write_fp8_e4m3_batched`, grid [n_kv_heads,
+/// batch_size, 1]. Same TU as [`KV_CACHE_WRITE_Q8_0_BATCHED_SRC`]; launchers
+/// strip-and-prepend `KV_SLOT_DESC_H` exactly like the Q8 sibling because
+/// the runtime hipcc compile has no -I to kernels/src.
+pub const KV_CACHE_WRITE_FP8_E4M3_BATCHED_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/kv_cache_write_q8_0_batched.hip")
+);
 
 /// Flat BF16 KV write (maple). 2 bytes per element, no blocks and no scales.
 /// Layout: [max_seq × n_kv_heads × head_dim] bf16. Holds both the decode
@@ -5777,6 +5794,35 @@ pub const ATTENTION_Q8_0_KV_SWA_SRC: &str =
 /// one launch with per-row causal windows from a positions[] array.
 pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip");
+/// Native fp8-E4M3 scalar decode (`attention_fp8_e4m3_kv`): same TU as
+/// [`ATTENTION_Q8_0_KV_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`. Same 10-arg ABI
+/// and [n_heads,1,1]/256 launch as the Q8 sibling; only the K/V
+/// load/address decode differs.
+pub const ATTENTION_FP8_E4M3_KV_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/attention_q8_0_kv.hip")
+);
+/// Native flat-bf16 scalar decode (`attention_bf16_kv`): same TU with
+/// `HIPFIRE_KV_BF16=1`. Same ABI/launch; bf16-to-f32 widening at fill.
+pub const ATTENTION_BF16_KV_SRC: &str = concat!(
+    "#define HIPFIRE_KV_BF16 1\n",
+    include_str!("../../../kernels/src/attention_q8_0_kv.hip")
+);
+/// Batched fp8 (`attention_fp8_e4m3_kv_batched`): same TU as
+/// [`ATTENTION_Q8_0_KV_BATCHED_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`. Same
+/// 15-arg ABI (tree_bias/block_start/block_cols + slot_descs/row_slot
+/// tail); launchers strip-and-prepend `KV_SLOT_DESC_H` like the Q8 sibling.
+pub const ATTENTION_FP8_E4M3_KV_BATCHED_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip")
+);
+/// Batched bf16 (`attention_bf16_kv_batched`): same TU with
+/// `HIPFIRE_KV_BF16=1`. Same ABI; Qwen dense passes null descriptors
+/// (noslots) and window=0 semantics (no window arg on this ABI).
+pub const ATTENTION_BF16_KV_BATCHED_SRC: &str = concat!(
+    "#define HIPFIRE_KV_BF16 1\n",
+    include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip")
+);
 
 /// Query-tiled Q8_0 flash prefill attention. LDS depends only on BR/BC,
 /// never on context length, so one kernel serves every sequence length.
@@ -5825,26 +5871,21 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
 
-/// FP8 twin of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] (`HIPFIRE_FA2_FP8=1`):
-/// same f16 body at U0 (Ua+ rewrites planes/legs). Distinct entry symbols
-/// `attention_q8_0_fa2_gqa_fp8_gfx1201` / `_partial_fp8_` / `_merge_fp8_` so
-/// the symbol-keyed host function cache never collides with the f16 module.
-/// JIT-only via the FA2 launchers when `gfx12_fa2_fp8_enabled()`.
+/// Route-Q stage-b source ([`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] +
+/// `HIPFIRE_FA2_FP8=1`, i.e. `KMODE=0` + `FA2_FP8`): fp8 (E4M3) QK + PV
+/// arithmetic on the fragment layout (§14.3 of the stage-b plan), 32768 B
+/// dynamic LDS. Entry symbols `attention_q8_0_fa2_gqa_fp8_gfx1201` /
+/// `_partial_fp8_` / `_merge_fp8_` plus the new stage-b Q pre-convert
+/// `attention_q8_0_fa2_q_preconvert_fp8_gfx1201` (fp8 codes + f32 `sq`,
+/// never f16 Q), so the symbol-keyed host function cache never collides
+/// with the f16/q8 modules. The old U0 "renamed entries, same f16 body"
+/// meaning is deleted: exactly one (arithmetic) meaning per symbol.
+/// JIT-only via the route-Q stage-b launcher when
+/// `gfx12_fa2_fp8_enabled()`.
 pub const ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_FP8 1\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
-
-/// fwht3-K + FP8 twin (`HIPFIRE_FA2_FP8=1` + `HIPFIRE_FA2_KMODE=3`).
-/// Entry `attention_q8_0_fa2_gqa_fwht3k_fp8_gfx1201`. Same F4b pre-convert
-/// / turbo_common prepend pattern as the f16 fwht3 module.
-pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_FP8_GFX1201_SRC: &str = concat!(
-    "#define HIPFIRE_FA2_FP8 1\n",
-    "#define HIPFIRE_FA2_KMODE 3\n",
-    include_str!("../../../kernels/src/turbo_common.h"),
-    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
-);
-
 /// Partial-split entry twin of [`ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC`]
 /// (same source; hosts the `attention_q8_0_fa2_gqa_partial_fp8_gfx1201`
 /// symbol). Kept as its own constant so launchers name the module they own.
@@ -5855,6 +5896,38 @@ pub const ATTENTION_Q8_0_FA2_GQA_PARTIAL_FP8_GFX1201_SRC: &str =
 /// (same source; hosts `attention_q8_0_fa2_gqa_merge_fp8_gfx1201`).
 pub const ATTENTION_Q8_0_FA2_GQA_MERGE_FP8_GFX1201_SRC: &str =
     ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC;
+
+/// Native-fp8-KV Q0 variant of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`]
+/// (`HIPFIRE_FA2_KMODE=8`): same f16 FA2 body and 65,536 B LDS planes, but
+/// the cooperative fill decodes native E4M3 rows (1032 B/token/side: 256
+/// codes + f16 scale per token per KV head) via
+/// `f16(f32(scale) * decode_e4m3(code))` — the tiled reference's exact
+/// rounding. Distinct entry symbols `attention_fp8_e4m3_fa2_gqa_f16_gfx1201`
+/// (+ `_partial_f16_` / `_merge_f16_`) and
+/// `attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201` so the symbol-keyed
+/// host function cache never collides with the q8/fwht3 modules.
+/// JIT-only via the fp8 FA2 launcher on exact gfx1201.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_F16_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
+/// Route-N stage-b source ([`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] +
+/// `HIPFIRE_FA2_FP8=1` + `HIPFIRE_FA2_KMODE=8`): fp8 (E4M3) QK + PV
+/// arithmetic on native-fp8 KV rows (codes copied verbatim, scales from
+/// the row header — no fill decode), 32768 B dynamic LDS. Entry symbols
+/// `attention_fp8_e4m3_fa2_gqa_gfx1201` / `_partial_` / `_merge_` plus
+/// the new stage-b Q pre-convert
+/// `attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201` (§14.3 of the
+/// stage-b plan; the pre-convert symbols resolve only once the stage-b
+/// arithmetic lands — before that the stage-b launchers fail loud,
+/// never fall back). JIT-only via the route-N stage-b launcher when
+/// `gfx12_fa2_fp8_enabled()`.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_FP8 1\n",
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
+
 /// gfx11 (RDNA3) sister of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`]
 /// (research opt-in). One workgroup per KV head x 8 positions; K/V
 /// dequantized once per KT32 tile into two swizzled f16 LDS planes
@@ -6048,6 +6121,24 @@ pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip");
 pub const ATTENTION_FLASH_BF16_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_bf16_tile_batched.hip");
+/// Native fp8-E4M3 flash tile (`attention_flash_fp8_e4m3_tile`): same TU as
+/// [`ATTENTION_FLASH_Q8_0_TILE_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`. Same
+/// 13-arg ABI (incl. trailing effective_seq_len); the reduce is the shared
+/// `attention_flash_q8_0_reduce`, which only touches f32 partials.
+pub const ATTENTION_FLASH_FP8_E4M3_TILE_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile.hip")
+);
+/// Batched fp8 flash tile (`attention_flash_fp8_e4m3_tile_batched`): same TU
+/// as [`ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`.
+/// Same full asym ABI (cos/sin dummies, tree_bias, v_mode_bits, window,
+/// slot_descs/row_slot tail), so it routes through `launch_asym_flash_batched`
+/// with the shared batched reduce; the shared launcher's
+/// `ensure_givens4_kernel` already strip-and-prepends `KV_SLOT_DESC_H`.
+pub const ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip")
+);
 pub const ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_rows.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =

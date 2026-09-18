@@ -403,3 +403,449 @@ __global__ void attention_flash_q8_0_tile(
         p[2 + d_base + 3] = out3;
     }
 }
+
+#ifdef HIPFIRE_KV_FP8_E4M3
+// Native-fp8 flash tile. Load/address/decode differ from
+// attention_flash_q8_0_tile; masks, wave cooperation, FMA order, online
+// order, the partials layout and the shared reduce contract are unchanged
+// (partials stay `[2 + head_dim]` f32, so the q8 reduce kernel is reused
+// unmodified). Codes are byte-contiguous (no 34-byte blocks), so each lane
+// loads 4 codes per half with one dword load; the single per-head f16 scale
+// is loaded once per token and folded once per token/key (KLD-gated).
+// Stage B decode: on gfx1201 the branchy software decoder below is replaced
+// by __builtin_amdgcn_cvt_pk_f32_fp8 (2 codes/VALU, bit-exact for all 256
+// codes). This TU compiles for gfx1201 only (see the #error below); the
+// software decoder stays as the documented reference.
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+typedef float hipfire_fp8_tile_f32x2_t __attribute__((ext_vector_type(2)));
+#define HIPFIRE_FP8_TILE_HAVE_HW_DECODE 1
+#endif
+//
+// Grid: [n_heads, n_tiles, 1]. Block: [32, 1, 1] (one WAVE32).
+// LDS: tile_size floats for scores + head_dim floats for Q.
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1201__)
+#error "attention_flash_fp8_e4m3_tile requires --offload-arch=gfx1201"
+#endif
+static __device__ __forceinline__ float hipfire_fp8_e4m3_to_f32_tile(unsigned char b) {
+    const unsigned int u = b;
+    const unsigned int s = (u & 0x80u) << 24;
+    const unsigned int e = (u >> 3) & 0x0fu;
+    const unsigned int m = u & 0x07u;
+    if (e == 0u) {
+        const float f = (float)m * 1.953125e-3f;  // m * 2^-9, exact
+        return s ? -f : f;
+    }
+    if (e == 15u) {
+        const float f = (m == 7u) ? __builtin_bit_cast(float, 0x7fc00000u)
+                                  : 256.0f * (1.0f + (float)m * 0.125f);
+        return s ? -f : f;
+    }
+    return __builtin_bit_cast(float, s | ((e - 7u + 127u) << 23) | (m << 20));
+}
+
+extern "C" __launch_bounds__(32, 16)
+__global__ void attention_flash_fp8_e4m3_tile(
+    const float* __restrict__ q,         // [n_heads, head_dim]
+    const unsigned char* __restrict__ k_cache,  // token-local fp8 rows
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials,        // [n_heads, max_tiles, 2 + head_dim]
+    const int* __restrict__ pos_buf,     // pos_buf[0] = last position
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn,
+    int tile_size,
+    int window,                          // sliding-window span; <= 0 = full causal
+    int effective_seq_len                // retained ABI; dynamic length comes from pos_buf
+) {
+    (void)effective_seq_len;
+    const int logical_seq_len = pos_buf[0] + 1;
+    const int seq_len = (window > 0) ? min(logical_seq_len, max_seq) : logical_seq_len;
+    // Sliding-window lower bound: keys at t < win_lo are outside the window
+    // [seq_len-window, seq_len) and masked. window <= 0 = full causal.
+    const int win_lo = (window > 0) ? (seq_len - window) : 0;
+    const int h = blockIdx.x;
+    if (h >= n_heads) return;
+    const int tile_id = blockIdx.y;
+    const int tile_start = tile_id * tile_size;
+    const int tile_end = min(tile_start + tile_size, seq_len);
+    if (tile_start >= seq_len) return;
+    const int tile_len = tile_end - tile_start;
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+
+    const size_t row_stride = (size_t)n_kv_heads * (head_dim + 2);
+    const size_t codes_len = (size_t)n_kv_heads * head_dim;
+    const size_t k_head_off = (size_t)kv_h * head_dim;
+    const size_t scale_off = codes_len + (size_t)kv_h * 2;
+    // Number of 128-element halves spanning head_dim. One pass per half
+    // in Phase A (Q·K) and Phase D (V) so a 32-thread wave covers the
+    // full head_dim regardless of size.
+    const int n_halves = (head_dim + 127) / 128;
+
+    // LDS layout: [tile_size scores][head_dim Q values]
+    extern __shared__ float sdata[];
+    float* scores = sdata;
+    float* q_lds  = sdata + tile_size;
+
+    // Load Q into LDS. 32 threads × 4 values × n_halves = head_dim values.
+    const float* q_head = q + h * head_dim;
+    for (int half = 0; half < n_halves; half++) {
+        const int d_base = half * 128 + tid * 4;
+        q_lds[d_base + 0] = q_head[d_base + 0];
+        q_lds[d_base + 1] = q_head[d_base + 1];
+        q_lds[d_base + 2] = q_head[d_base + 2];
+        q_lds[d_base + 3] = q_head[d_base + 3];
+    }
+    __syncthreads();
+
+    // ═══ Phase A: compute tile_len dot products (wave-cooperative) ═══
+    // Thread assignment within a half: bi_k = tid/8, offset = (tid%8)*4.
+    // Block index across halves: half*4 + bi_k. The per-head fp8 scale is
+    // loop-invariant over halves and loaded once per token.
+    const int k_off = (tid % 8) * 4;
+
+    int valid_start = win_lo - tile_start;
+    if (valid_start < 0) valid_start = 0;
+    if (valid_start > tile_len) valid_start = tile_len;
+    for (int t_local = 0; t_local < valid_start; t_local++) {
+        if (tid == 0) scores[t_local] = -INFINITY;
+    }
+
+    int t_local = valid_start;
+    for (; t_local + 3 < tile_len; t_local += 4) {
+        const int t0 = tile_start + t_local + 0;
+        const int t1 = tile_start + t_local + 1;
+        const int t2 = tile_start + t_local + 2;
+        const int t3 = tile_start + t_local + 3;
+        const int s0 = (window > 0) ? (t0 % max_seq) : t0;
+        const int s1 = (window > 0) ? (t1 % max_seq) : t1;
+        const int s2 = (window > 0) ? (t2 % max_seq) : t2;
+        const int s3 = (window > 0) ? (t3 % max_seq) : t3;
+        const unsigned char* kr0 = k_cache + (size_t)s0 * row_stride;
+        const unsigned char* kr1 = k_cache + (size_t)s1 * row_stride;
+        const unsigned char* kr2 = k_cache + (size_t)s2 * row_stride;
+        const unsigned char* kr3 = k_cache + (size_t)s3 * row_stride;
+        const float ks0 = (float)*((const _Float16*)(kr0 + scale_off));
+        const float ks1 = (float)*((const _Float16*)(kr1 + scale_off));
+        const float ks2 = (float)*((const _Float16*)(kr2 + scale_off));
+        const float ks3 = (float)*((const _Float16*)(kr3 + scale_off));
+        float partial0 = 0.0f;
+        float partial1 = 0.0f;
+        float partial2 = 0.0f;
+        float partial3 = 0.0f;
+        // Dword code loads: kbN = krN + k_head_off + k_bi*32 + k_off with
+        // row_stride = 1032 = 0 (mod 4) at Hkv4/D256, k_head_off = kv_h*256,
+        // k_bi*32, k_off = (tid%8)*4 all 0 (mod 4), cache base >=256 B
+        // aligned: every kbN is dword-aligned. ks folds once per token
+        // after the half loop (KLD-gated rounding change vs per-element).
+        for (int half = 0; half < n_halves; half++) {
+            const int k_bi = half * 4 + tid / 8;
+            const unsigned char* kb0 = kr0 + k_head_off + k_bi * 32 + k_off;
+            const unsigned char* kb1 = kr1 + k_head_off + k_bi * 32 + k_off;
+            const unsigned char* kb2 = kr2 + k_head_off + k_bi * 32 + k_off;
+            const unsigned char* kb3 = kr3 + k_head_off + k_bi * 32 + k_off;
+            const float* qb_thread = q_lds + k_bi * 32 + k_off;
+#if defined(HIPFIRE_FP8_TILE_HAVE_HW_DECODE)
+            const unsigned int w0 = *(const unsigned int*)kb0;
+            const unsigned int w1 = *(const unsigned int*)kb1;
+            const unsigned int w2 = *(const unsigned int*)kb2;
+            const unsigned int w3 = *(const unsigned int*)kb3;
+            const hipfire_fp8_tile_f32x2_t a0 = __builtin_amdgcn_cvt_pk_f32_fp8(w0, 0);
+            const hipfire_fp8_tile_f32x2_t b0 = __builtin_amdgcn_cvt_pk_f32_fp8(w0, 1);
+            const hipfire_fp8_tile_f32x2_t a1 = __builtin_amdgcn_cvt_pk_f32_fp8(w1, 0);
+            const hipfire_fp8_tile_f32x2_t b1 = __builtin_amdgcn_cvt_pk_f32_fp8(w1, 1);
+            const hipfire_fp8_tile_f32x2_t a2 = __builtin_amdgcn_cvt_pk_f32_fp8(w2, 0);
+            const hipfire_fp8_tile_f32x2_t b2 = __builtin_amdgcn_cvt_pk_f32_fp8(w2, 1);
+            const hipfire_fp8_tile_f32x2_t a3 = __builtin_amdgcn_cvt_pk_f32_fp8(w3, 0);
+            const hipfire_fp8_tile_f32x2_t b3 = __builtin_amdgcn_cvt_pk_f32_fp8(w3, 1);
+            partial0 += qb_thread[0] * a0[0] + qb_thread[1] * a0[1]
+                      + qb_thread[2] * b0[0] + qb_thread[3] * b0[1];
+            partial1 += qb_thread[0] * a1[0] + qb_thread[1] * a1[1]
+                      + qb_thread[2] * b1[0] + qb_thread[3] * b1[1];
+            partial2 += qb_thread[0] * a2[0] + qb_thread[1] * a2[1]
+                      + qb_thread[2] * b2[0] + qb_thread[3] * b2[1];
+            partial3 += qb_thread[0] * a3[0] + qb_thread[1] * a3[1]
+                      + qb_thread[2] * b3[0] + qb_thread[3] * b3[1];
+#else
+            partial0 += qb_thread[0] * (ks0 * hipfire_fp8_e4m3_to_f32_tile(kb0[0]))
+                      + qb_thread[1] * (ks0 * hipfire_fp8_e4m3_to_f32_tile(kb0[1]))
+                      + qb_thread[2] * (ks0 * hipfire_fp8_e4m3_to_f32_tile(kb0[2]))
+                      + qb_thread[3] * (ks0 * hipfire_fp8_e4m3_to_f32_tile(kb0[3]));
+            partial1 += qb_thread[0] * (ks1 * hipfire_fp8_e4m3_to_f32_tile(kb1[0]))
+                      + qb_thread[1] * (ks1 * hipfire_fp8_e4m3_to_f32_tile(kb1[1]))
+                      + qb_thread[2] * (ks1 * hipfire_fp8_e4m3_to_f32_tile(kb1[2]))
+                      + qb_thread[3] * (ks1 * hipfire_fp8_e4m3_to_f32_tile(kb1[3]));
+            partial2 += qb_thread[0] * (ks2 * hipfire_fp8_e4m3_to_f32_tile(kb2[0]))
+                      + qb_thread[1] * (ks2 * hipfire_fp8_e4m3_to_f32_tile(kb2[1]))
+                      + qb_thread[2] * (ks2 * hipfire_fp8_e4m3_to_f32_tile(kb2[2]))
+                      + qb_thread[3] * (ks2 * hipfire_fp8_e4m3_to_f32_tile(kb2[3]));
+            partial3 += qb_thread[0] * (ks3 * hipfire_fp8_e4m3_to_f32_tile(kb3[0]))
+                      + qb_thread[1] * (ks3 * hipfire_fp8_e4m3_to_f32_tile(kb3[1]))
+                      + qb_thread[2] * (ks3 * hipfire_fp8_e4m3_to_f32_tile(kb3[2]))
+                      + qb_thread[3] * (ks3 * hipfire_fp8_e4m3_to_f32_tile(kb3[3]));
+#endif
+        }
+#if defined(HIPFIRE_FP8_TILE_HAVE_HW_DECODE)
+        partial0 *= ks0;
+        partial1 *= ks1;
+        partial2 *= ks2;
+        partial3 *= ks3;
+#endif
+#if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
+        partial0 = hipfire_attention_reduce_sum_xor(partial0);
+        partial1 = hipfire_attention_reduce_sum_xor(partial1);
+        partial2 = hipfire_attention_reduce_sum_xor(partial2);
+        partial3 = hipfire_attention_reduce_sum_xor(partial3);
+#else
+        for (int off = 16; off > 0; off >>= 1) {
+            partial0 += __shfl_xor(partial0, off);
+            partial1 += __shfl_xor(partial1, off);
+            partial2 += __shfl_xor(partial2, off);
+            partial3 += __shfl_xor(partial3, off);
+        }
+#endif
+        if (tid == 0) {
+            scores[t_local + 0] = partial0 * scale_attn;
+            scores[t_local + 1] = partial1 * scale_attn;
+            scores[t_local + 2] = partial2 * scale_attn;
+            scores[t_local + 3] = partial3 * scale_attn;
+        }
+    }
+    for (; t_local < tile_len; t_local++) {
+        int t = tile_start + t_local;
+        const int slot = (window > 0) ? (t % max_seq) : t;
+        const unsigned char* kr = k_cache + (size_t)slot * row_stride;
+        const float ks = (float)*((const _Float16*)(kr + scale_off));
+        float partial = 0.0f;
+        for (int half = 0; half < n_halves; half++) {
+            const int k_bi = half * 4 + tid / 8;
+            const unsigned char* kb = kr + k_head_off + k_bi * 32 + k_off;
+            const float* qb_thread = q_lds + k_bi * 32 + k_off;
+#if defined(HIPFIRE_FP8_TILE_HAVE_HW_DECODE)
+            const unsigned int w = *(const unsigned int*)kb;
+            const hipfire_fp8_tile_f32x2_t alo = __builtin_amdgcn_cvt_pk_f32_fp8(w, 0);
+            const hipfire_fp8_tile_f32x2_t ahi = __builtin_amdgcn_cvt_pk_f32_fp8(w, 1);
+            partial += qb_thread[0] * alo[0] + qb_thread[1] * alo[1]
+                     + qb_thread[2] * ahi[0] + qb_thread[3] * ahi[1];
+#else
+            partial += qb_thread[0] * (ks * hipfire_fp8_e4m3_to_f32_tile(kb[0]))
+                     + qb_thread[1] * (ks * hipfire_fp8_e4m3_to_f32_tile(kb[1]))
+                     + qb_thread[2] * (ks * hipfire_fp8_e4m3_to_f32_tile(kb[2]))
+                     + qb_thread[3] * (ks * hipfire_fp8_e4m3_to_f32_tile(kb[3]));
+#endif
+        }
+#if defined(HIPFIRE_FP8_TILE_HAVE_HW_DECODE)
+        partial *= ks;
+#endif
+#if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
+        partial = hipfire_attention_reduce_sum_xor(partial);
+#else
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_xor(partial, off);
+#endif
+        if (tid == 0)
+            scores[t_local] = partial * scale_attn;
+    }
+    __syncthreads();
+
+    // ═══ Phase B: find tile max ═══
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += 32)
+        local_max = fmaxf(local_max, scores[i]);
+#if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
+    local_max = hipfire_attention_reduce_max_xor(local_max);
+#else
+    for (int off = 16; off > 0; off >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+#endif
+    float tile_max = local_max;
+
+    // ═══ Phase C: exp + sum ═══
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += 32) {
+        float e = expf(scores[i] - tile_max);
+        scores[i] = e;
+        local_sum += e;
+    }
+#if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
+    local_sum = hipfire_attention_reduce_sum_xor(local_sum);
+#else
+    for (int off = 16; off > 0; off >>= 1)
+        local_sum += __shfl_xor(local_sum, off);
+#endif
+    float tile_sum = local_sum;
+    __syncthreads();
+
+    // ═══ Write tile partials ═══
+    //
+    // Same max_tiles row stride as the q8 tile so the shared
+    // attention_flash_q8_0_reduce kernel consumes these partials unmodified.
+    const int max_tiles = (max_seq + tile_size - 1) / tile_size;
+    float* p = partials + (h * max_tiles + tile_id) * (2 + head_dim);
+    if (tid == 0) {
+        p[0] = tile_max;
+        p[1] = tile_sum;
+    }
+
+    // ═══ Phase D: V-weighted accumulation (loops over halves so all
+    //              head_dim output dims are written, not just first 128) ═══
+    for (int half = 0; half < n_halves; half++) {
+        const int d_base = half * 128 + tid * 4;
+        float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
+        int t_local = 0;
+        #define ACCUM_V4_FP8(tl) do { \
+            float w0 = scores[(tl) + 0]; \
+            float w1 = scores[(tl) + 1]; \
+            float w2 = scores[(tl) + 2]; \
+            float w3 = scores[(tl) + 3]; \
+            int t0 = tile_start + (tl) + 0; \
+            int t1 = tile_start + (tl) + 1; \
+            int t2 = tile_start + (tl) + 2; \
+            int t3 = tile_start + (tl) + 3; \
+            int s0 = (window > 0) ? (t0 % max_seq) : t0; \
+            int s1 = (window > 0) ? (t1 % max_seq) : t1; \
+            int s2 = (window > 0) ? (t2 % max_seq) : t2; \
+            int s3 = (window > 0) ? (t3 % max_seq) : t3; \
+            const unsigned char* vr0 = v_cache + (size_t)s0 * row_stride; \
+            const unsigned char* vr1 = v_cache + (size_t)s1 * row_stride; \
+            const unsigned char* vr2 = v_cache + (size_t)s2 * row_stride; \
+            const unsigned char* vr3 = v_cache + (size_t)s3 * row_stride; \
+            float vs0 = (float)*((const _Float16*)(vr0 + scale_off)); \
+            float vs1 = (float)*((const _Float16*)(vr1 + scale_off)); \
+            float vs2 = (float)*((const _Float16*)(vr2 + scale_off)); \
+            float vs3 = (float)*((const _Float16*)(vr3 + scale_off)); \
+            const unsigned char* v0 = vr0 + k_head_off + d_base; \
+            const unsigned char* v1 = vr1 + k_head_off + d_base; \
+            const unsigned char* v2 = vr2 + k_head_off + d_base; \
+            const unsigned char* v3 = vr3 + k_head_off + d_base; \
+            out0 += w0 * (vs0 * hipfire_fp8_e4m3_to_f32_tile(v0[0])); \
+            out1 += w0 * (vs0 * hipfire_fp8_e4m3_to_f32_tile(v0[1])); \
+            out2 += w0 * (vs0 * hipfire_fp8_e4m3_to_f32_tile(v0[2])); \
+            out3 += w0 * (vs0 * hipfire_fp8_e4m3_to_f32_tile(v0[3])); \
+            out0 += w1 * (vs1 * hipfire_fp8_e4m3_to_f32_tile(v1[0])); \
+            out1 += w1 * (vs1 * hipfire_fp8_e4m3_to_f32_tile(v1[1])); \
+            out2 += w1 * (vs1 * hipfire_fp8_e4m3_to_f32_tile(v1[2])); \
+            out3 += w1 * (vs1 * hipfire_fp8_e4m3_to_f32_tile(v1[3])); \
+            out0 += w2 * (vs2 * hipfire_fp8_e4m3_to_f32_tile(v2[0])); \
+            out1 += w2 * (vs2 * hipfire_fp8_e4m3_to_f32_tile(v2[1])); \
+            out2 += w2 * (vs2 * hipfire_fp8_e4m3_to_f32_tile(v2[2])); \
+            out3 += w2 * (vs2 * hipfire_fp8_e4m3_to_f32_tile(v2[3])); \
+            out0 += w3 * (vs3 * hipfire_fp8_e4m3_to_f32_tile(v3[0])); \
+            out1 += w3 * (vs3 * hipfire_fp8_e4m3_to_f32_tile(v3[1])); \
+            out2 += w3 * (vs3 * hipfire_fp8_e4m3_to_f32_tile(v3[2])); \
+            out3 += w3 * (vs3 * hipfire_fp8_e4m3_to_f32_tile(v3[3])); \
+        } while (0)
+        #define ACCUM_V_FP8(tl) do { \
+            float w = scores[(tl)]; \
+            int t = tile_start + (tl); \
+            int slot = (window > 0) ? (t % max_seq) : t; \
+            const unsigned char* vr = v_cache + (size_t)slot * row_stride; \
+            float vs = (float)*((const _Float16*)(vr + scale_off)); \
+            const unsigned char* vv = vr + k_head_off + d_base; \
+            out0 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vv[0])); \
+            out1 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vv[1])); \
+            out2 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vv[2])); \
+            out3 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vv[3])); \
+        } while (0)
+        // Stage B V path (gfx1201): one dword load per key (d_base =
+        // half*128 + tid*4 is 0 (mod 4); same row argument as Phase A),
+        // hardware pair-decode, vs folded into the weight once per key.
+        #define ACCUM_V4_FP8_HW(tl) do { \
+            float w0 = scores[(tl) + 0]; \
+            float w1 = scores[(tl) + 1]; \
+            float w2 = scores[(tl) + 2]; \
+            float w3 = scores[(tl) + 3]; \
+            int t0 = tile_start + (tl) + 0; \
+            int t1 = tile_start + (tl) + 1; \
+            int t2 = tile_start + (tl) + 2; \
+            int t3 = tile_start + (tl) + 3; \
+            int s0 = (window > 0) ? (t0 % max_seq) : t0; \
+            int s1 = (window > 0) ? (t1 % max_seq) : t1; \
+            int s2 = (window > 0) ? (t2 % max_seq) : t2; \
+            int s3 = (window > 0) ? (t3 % max_seq) : t3; \
+            const unsigned char* vr0 = v_cache + (size_t)s0 * row_stride; \
+            const unsigned char* vr1 = v_cache + (size_t)s1 * row_stride; \
+            const unsigned char* vr2 = v_cache + (size_t)s2 * row_stride; \
+            const unsigned char* vr3 = v_cache + (size_t)s3 * row_stride; \
+            float vs0 = (float)*((const _Float16*)(vr0 + scale_off)); \
+            float vs1 = (float)*((const _Float16*)(vr1 + scale_off)); \
+            float vs2 = (float)*((const _Float16*)(vr2 + scale_off)); \
+            float vs3 = (float)*((const _Float16*)(vr3 + scale_off)); \
+            const unsigned int vw0 = *(const unsigned int*)(vr0 + k_head_off + d_base); \
+            const unsigned int vw1 = *(const unsigned int*)(vr1 + k_head_off + d_base); \
+            const unsigned int vw2 = *(const unsigned int*)(vr2 + k_head_off + d_base); \
+            const unsigned int vw3 = *(const unsigned int*)(vr3 + k_head_off + d_base); \
+            const float w0s = w0 * vs0; \
+            const float w1s = w1 * vs1; \
+            const float w2s = w2 * vs2; \
+            const float w3s = w3 * vs3; \
+            const hipfire_fp8_tile_f32x2_t c0lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw0, 0); \
+            const hipfire_fp8_tile_f32x2_t c0hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw0, 1); \
+            const hipfire_fp8_tile_f32x2_t c1lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw1, 0); \
+            const hipfire_fp8_tile_f32x2_t c1hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw1, 1); \
+            const hipfire_fp8_tile_f32x2_t c2lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw2, 0); \
+            const hipfire_fp8_tile_f32x2_t c2hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw2, 1); \
+            const hipfire_fp8_tile_f32x2_t c3lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw3, 0); \
+            const hipfire_fp8_tile_f32x2_t c3hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw3, 1); \
+            out0 += w0s * c0lo[0]; out1 += w0s * c0lo[1]; \
+            out2 += w0s * c0hi[0]; out3 += w0s * c0hi[1]; \
+            out0 += w1s * c1lo[0]; out1 += w1s * c1lo[1]; \
+            out2 += w1s * c1hi[0]; out3 += w1s * c1hi[1]; \
+            out0 += w2s * c2lo[0]; out1 += w2s * c2lo[1]; \
+            out2 += w2s * c2hi[0]; out3 += w2s * c2hi[1]; \
+            out0 += w3s * c3lo[0]; out1 += w3s * c3lo[1]; \
+            out2 += w3s * c3hi[0]; out3 += w3s * c3hi[1]; \
+        } while (0)
+        #define ACCUM_V_FP8_HW(tl) do { \
+            float w = scores[(tl)]; \
+            int t = tile_start + (tl); \
+            int slot = (window > 0) ? (t % max_seq) : t; \
+            const unsigned char* vr = v_cache + (size_t)slot * row_stride; \
+            float vs = (float)*((const _Float16*)(vr + scale_off)); \
+            const unsigned int vw = *(const unsigned int*)(vr + k_head_off + d_base); \
+            const float ws = w * vs; \
+            const hipfire_fp8_tile_f32x2_t clo = __builtin_amdgcn_cvt_pk_f32_fp8(vw, 0); \
+            const hipfire_fp8_tile_f32x2_t chi = __builtin_amdgcn_cvt_pk_f32_fp8(vw, 1); \
+            out0 += ws * clo[0]; out1 += ws * clo[1]; \
+            out2 += ws * chi[0]; out3 += ws * chi[1]; \
+         } while (0)
+#if defined(HIPFIRE_FP8_TILE_HAVE_HW_DECODE)
+        for (; t_local + 7 < tile_len; t_local += 8) {
+            ACCUM_V4_FP8_HW(t_local + 0);
+            asm volatile("" : "+v"(out0), "+v"(out1), "+v"(out2), "+v"(out3) :: "memory");
+            ACCUM_V4_FP8_HW(t_local + 4);
+        }
+        for (; t_local + 3 < tile_len; t_local += 4) {
+            ACCUM_V4_FP8_HW(t_local);
+        }
+        for (; t_local < tile_len; t_local++) {
+            ACCUM_V_FP8_HW(t_local);
+        }
+        #undef ACCUM_V4_FP8_HW
+        #undef ACCUM_V_FP8_HW
+#else
+        for (; t_local + 7 < tile_len; t_local += 8) {
+            ACCUM_V4_FP8(t_local + 0);
+            asm volatile("" : "+v"(out0), "+v"(out1), "+v"(out2), "+v"(out3) :: "memory");
+            ACCUM_V4_FP8(t_local + 4);
+        }
+        for (; t_local + 3 < tile_len; t_local += 4) {
+            ACCUM_V4_FP8(t_local);
+        }
+        for (; t_local < tile_len; t_local++) {
+            ACCUM_V_FP8(t_local);
+        }
+        #undef ACCUM_V4_FP8
+        #undef ACCUM_V_FP8
+#endif
+        p[2 + d_base + 0] = out0;
+        p[2 + d_base + 1] = out1;
+        p[2 + d_base + 2] = out2;
+        p[2 + d_base + 3] = out3;
+    }
+}
+#endif

@@ -9672,6 +9672,7 @@ fn fa_pair_env_admitted(
         tier_inputs.quant_hfq8,
         tier_inputs.quant_fwht,
         tier_inputs.quant_bf16,
+        tier_inputs.quant_fp8,
     ) {
         hipfire_dispatch::families::kv_tier::KTier::Q8 => {
             // The halves take the WMMA/flash-prefill route into ingress;
@@ -9980,10 +9981,14 @@ fn forward_prefill_chunk_pair(
     let fa_arch = gpu.arch.as_str();
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
     let arch_has_wmma = q8_wmma_arch;
+    // Slice-B (FA2 fp8 fill) admission: native fp8 KV has complete batched
+    // write/attend keys (KvWriteFp8E4m3Batched/AttnFp8E4m3KvBatchedMasked),
+    // so it takes the batched FA path like the other tiers. BF16 stays out.
     let fa_batched_ok = (kv_cache.quant_q8
         || kv_cache.quant_asym4
         || kv_cache.quant_asym3
-        || kv_cache.quant_asym2)
+        || kv_cache.quant_asym2
+        || kv_cache.quant_fp8)
         && weights.layers.iter().all(|lw| match lw {
             LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_) => {
                 qwen35_layer_batch_admissible(lw, config, fa_arch).is_ok()
@@ -10610,8 +10615,9 @@ pub(crate) fn forward_batch_chunk_impl(
     let fa_arch = gpu.arch.as_str();
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
     let arch_has_wmma = q8_wmma_arch;
+    // Slice-B admission (see above): native fp8 KV takes the batched FA path.
     let fa_batched_ok =
-        (kv_cache.quant_q8 || kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2)
+        (kv_cache.quant_q8 || kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 || kv_cache.quant_fp8)
             && weights.layers.iter().all(|lw| match lw {
                 LayerWeights::FullAttn(_) | LayerWeights::FullAttnMoe(_) => {
                     qwen35_layer_batch_admissible(lw, config, fa_arch).is_ok()

@@ -86,3 +86,73 @@ extern "C" __global__ void kv_cache_write_q8_0_ring(
     if (tid == 0) *((_Float16*)(out)) = (_Float16)scale;
     out[2 + tid] = (unsigned char)(signed char)q;
 }
+
+#ifdef HIPFIRE_KV_FP8_E4M3
+// Native E4M3FN KV write (stage-b Q0 format, §2.1). Distinct symbol; the q8
+// kernels above are byte-unchanged.
+//
+// Layout per token row, per side: [codes: n_kv_heads × head_dim bytes,
+// head-major][scales: n_kv_heads little-endian f16]. stride =
+// n_kv_heads * (head_dim + 2) (1032 at Hkv=4/D=256).
+//
+// Grid: [n_kv_heads, 1, 1]. Block: [32, 1, 1]. One wave per head, 8 floats
+// per lane, full-head absmax → one f16 scale, RNE E4M3 codes, contiguous
+// packed code stores. Admitted geometry is D256 (enforced host-side).
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1201__)
+#error "kv_cache_write_fp8_e4m3 requires --offload-arch=gfx1201 (OCP E4M3FN cvt)"
+#endif
+extern "C" __global__ void kv_cache_write_fp8_e4m3(
+    unsigned char* __restrict__ dst,     // fp8 cache, token-local rows
+    const float* __restrict__ src,       // [n_kv_heads * head_dim] f32 KV vector
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int head = blockIdx.x;
+    const int tid = threadIdx.x;  // 0..31
+    if (head >= n_kv_heads) return;
+    const int pos = pos_buf[0];
+
+    float v[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        v[i] = src[(size_t)head * head_dim + tid * 8 + i];
+
+    // Full-head absmax (uniform across the wave afterwards).
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) amax = fmaxf(amax, fabsf(v[i]));
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, offset));
+
+    // Scale: smallest f16 s >= amax/448, floor 2^-24, zero row → 1.0, with
+    // the upward-half next-up bump when 448*f32(s) < amax. The f32→f16
+    // conversion is RNE; the ==0.0f floor check also catches any FTZ zero.
+    // In-domain inputs never reach f16 infinity (oracle rejects the rest).
+    _Float16 s16 = (amax == 0.0f) ? (_Float16)1.0f : (_Float16)(amax / 448.0f);
+    if (amax > 0.0f && s16 == (_Float16)0.0f)
+        s16 = __builtin_bit_cast(_Float16, (unsigned short)0x0001);
+    float sf = (float)s16;
+    if (amax > 0.0f && 448.0f * sf < amax) {
+        unsigned short bits = __builtin_bit_cast(unsigned short, s16);
+        bits = (bits >= 0x7bff) ? (unsigned short)0x7bff : (unsigned short)(bits + 1u);
+        s16 = __builtin_bit_cast(_Float16, bits);
+        sf = (float)s16;
+    }
+
+    // Quantize against the STORED scale (divide, not reciprocal multiply).
+    unsigned w0 = 0u;
+    w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v[0] / sf, v[1] / sf, w0, false);
+    w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v[2] / sf, v[3] / sf, w0, true);
+    unsigned w1 = 0u;
+    w1 = __builtin_amdgcn_cvt_pk_fp8_f32(v[4] / sf, v[5] / sf, w1, false);
+    w1 = __builtin_amdgcn_cvt_pk_fp8_f32(v[6] / sf, v[7] / sf, w1, true);
+
+    const size_t stride = (size_t)n_kv_heads * (head_dim + 2);
+    unsigned char* codes = dst + (size_t)pos * stride + (size_t)head * head_dim + tid * 8;
+    __builtin_memcpy(codes + 0, &w0, 4);
+    __builtin_memcpy(codes + 4, &w1, 4);
+    if (tid == 0)
+        *((_Float16*)(dst + (size_t)pos * stride + (size_t)n_kv_heads * head_dim + (size_t)head * 2)) = s16;
+}
+#endif

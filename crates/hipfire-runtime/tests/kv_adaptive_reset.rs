@@ -34,6 +34,7 @@ fn flag_standin(mode: KvMode, v_mode: VMode, n_kv_heads: usize, head_dim: usize)
         quant_asym2: a2,
         quant_fwht: fwht,
         quant_bf16: false,
+        quant_fp8: false,
         boundary_layers: 0,
         givens_cos: None,
         givens_sin: None,
