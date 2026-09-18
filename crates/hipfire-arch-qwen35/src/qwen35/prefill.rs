@@ -5489,6 +5489,56 @@ fn batch_chunk_delta_net_pre_gdn<'a>(
             }
         }
     }
+    // Slice-P fused preamble (gfx1201): sigmoid(beta) + alpha gate + conv1d +
+    // SiLU + split + Q/K norm + scale + interleave in ONE launch. Admission is
+    // the kernel header's exact list: flag opt-in, exact gfx1201, sequential
+    // semantics, no tree parents, no DFlash tape (tape writes stay on the old
+    // path), the GQA interleave branch with exact head division, HD 128, and
+    // n >= 1 (ragged tails run with a short last group). The MoE sibling
+    // (`batch_chunk_delta_net_moe`) keeps the 3-launch sequence. q_raw/k_raw
+    // stores are kept by the fused kernel (v1).
+    {
+        let no_tree_parents = tree_verify
+            .as_ref()
+            .and_then(|c| c.parent_indices)
+            .is_none();
+        let n_key_heads = config.linear_num_key_heads;
+        if gpu.flags.gfx12_gdn_pre_fused
+            && gpu.arch_caps.is_gfx1201()
+            && matches!(batch_semantics, BatchSemantics::Sequential)
+            && no_tree_parents
+            && gdn_tape.is_none()
+            && n_key_heads < n_v_heads
+            && n_v_heads % n_key_heads == 0
+            && hd == 128
+            && n >= 1
+        {
+            let ratio = n_v_heads / n_key_heads;
+            gpu.gdn_pre_batched_gfx1201(
+                &pbs.dn_beta_batch,
+                &pbs.dn_alpha_batch,
+                &layer.dt_bias,
+                &layer.a_log,
+                &pbs.dn_qkv_batch,
+                &layer.conv_weight,
+                &dn_state.conv_states[delta_layer_idx],
+                &pbs.dn_q_raw_batch,
+                &pbs.dn_k_raw_batch,
+                &pbs.dn_v_batch,
+                &pbs.dn_q_batch,
+                &pbs.dn_k_batch,
+                n_v_heads,
+                n_key_heads,
+                ratio,
+                k_dim,
+                v_dim,
+                n,
+                1.0 / (hd as f32).sqrt(),
+                config.norm_eps,
+            )?;
+            return Ok(None);
+        }
+    }
     // Fused sigmoid(beta) + alpha_gate(alpha) — [N × n_v_heads] each.
     gpu.fused_sigmoid_alpha_gate_f32_batched(
         &pbs.dn_beta_batch,

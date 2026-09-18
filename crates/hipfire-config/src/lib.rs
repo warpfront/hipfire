@@ -2130,6 +2130,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx1201 MQ4v2 FP8 WMMA staged-tile v2 prefill route (default off; set to true or HIPFIRE_GFX12_MQ4V2_FP8_V2=1 to opt in; selects the _v2_gfx1201 symbols at N>=256, the four family flags remain prerequisites)."
     ),
     process_bool_field!(
+        "kernel.gfx12_gdn_pre_fused",
+        "gfx12_gdn_pre_fused",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX12_GDN_PRE_FUSED",
+        "Enable the gfx1201 batched prefill GDN preamble fusion (default off; set to true or HIPFIRE_GFX12_GDN_PRE_FUSED=1 to opt in; fuses sigmoid+conv+qknorm into gdn_pre_batched_gfx1201, byte-exact)."
+    ),
+    process_bool_field!(
         "kernel.gfx12_fa2_prefill",
         "gfx12_fa2_prefill",
         Kernel,

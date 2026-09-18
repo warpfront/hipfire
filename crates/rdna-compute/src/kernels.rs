@@ -6671,6 +6671,16 @@ pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
     include_str!("../../../kernels/src/conv1d_silu_split_qknorm.gfx1201.hip")
 );
 
+/// gfx1201 batched prefill GDN preamble fusion (slice P): sigmoid(beta) +
+/// alpha gate + 4-tap causal conv + SiLU + split + Q/K L2-norm + scale +
+/// repeat-interleave in ONE launch. Row-group tiled (R=32) so the token axis
+/// is parallel across groups; byte-exact vs the 3-launch sequence by the
+/// fmaf/shfl/order recipe in the source header. Default OFF behind
+/// `HIPFIRE_GFX12_GDN_PRE_FUSED`.
+#[cfg(feature = "deltanet")]
+pub const GDN_PRE_BATCHED_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/gdn_pre_batched.gfx1201.hip");
+
 /// Tree-aware variant of conv1d_silu_split. Each in-block token walks its
 /// ancestor chain via parent_indices[] for the 3-tap causal window, falling
 /// back to pre-block conv_state when the chain exits the block. Leaves

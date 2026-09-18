@@ -51,6 +51,11 @@ path = "examples/test_dflash_gdn_pre_gfx1100.rs"
 required-features = ["deltanet"]
 
 [[example]]
+name = "test_gdn_pre_batched_gfx1201"
+path = "examples/test_gdn_pre_batched_gfx1201.rs"
+required-features = ["deltanet"]
+
+[[example]]
 name = "test_dflash_draft_collapse_gfx1100"
 path = "examples/test_dflash_draft_collapse_gfx1100.rs"
 required-features = ["deltanet"]
