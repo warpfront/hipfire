@@ -13364,9 +13364,9 @@ mod tests {
     /// fixture, snapshots the live gate/up activations, replays both paths
     /// on device, and demands byte-identical `block_i4_128` streams.
     ///
-    /// Requires a real HIP GPU + the fixture (default
-    /// `$HOME/.hipfire/models/qwen3.8-27b.mq4-xt`, override with
-    /// `HIPFIRE_SILU_ORACLE_MODEL`). Ignored by default; run under the GPU
+    /// Requires a real HIP GPU + the fixture
+    /// `$HIPFIRE_MODELS_DIR/qwen3.8-27b.mq4-xt` (default dir
+    /// `/home/kaden/.hipfire/models`). Ignored by default; run under the GPU
     /// flock with `--test-threads=1`:
     /// `cargo test -p hipfire-arch-qwen35 --lib -- --ignored
     /// gfx12_silu_quant_fused_oracle_matches_standalone --test-threads=1 --nocapture`
@@ -13391,11 +13391,11 @@ mod tests {
                 return;
             }
         };
-        let model = std::env::var("HIPFIRE_SILU_ORACLE_MODEL").unwrap_or_else(|_| {
-            let dir = std::env::var("HIPFIRE_MODELS_DIR")
-                .unwrap_or_else(|_| "/home/kaden/.hipfire/models".to_string());
-            format!("{dir}/qwen3.8-27b.mq4-xt")
-        });
+        // Fixture path from the bootstrap-exempt HIPFIRE_MODELS_DIR only;
+        // production HIPFIRE_* reads must stay config-owned (check-env-docs).
+        let models_dir = std::env::var("HIPFIRE_MODELS_DIR")
+            .unwrap_or_else(|_| "/home/kaden/.hipfire/models".to_string());
+        let model = format!("{models_dir}/qwen3.8-27b.mq4-xt");
         if !std::path::Path::new(&model).exists() {
             eprintln!("skip: fixture {model} missing");
             return;
