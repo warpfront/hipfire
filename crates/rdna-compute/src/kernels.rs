@@ -1244,6 +1244,28 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_gfx1201\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate.gfx1100.hip")
 );
+/// gfx1201 slices-4 IU4 producer: batched gated RMSNorm + FWHT + in-register
+/// `block_i4_128` emit for the LA post-GDN `wo` input, replacing
+/// `gated_norm_f32_batched` + `rotate_x_mq[_awq]_batched` +
+/// `quantize_int4_mmq_ds128` with one launch. Grid [(K/256), N], block 64,
+/// only the incumbent 1024-B LDS handoff. Gated by
+/// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`.
+pub const GATED_NORM_MQ_ROTATE_I4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+/// gfx1201 slices-4 IU4 AWQ producer: AWQ divide folded into the LDS staging
+/// (same expression order as the standalone gated_norm → rotate_x_mq_awq
+/// chain), then FWHT + in-register `block_i4_128` emit.
+pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
 /// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the
 /// post-projection input-rotate path (o_proj / out_proj inputs). Dispatched
 /// when the upcoming linear carries an `awq_scale` sidecar. Math:
