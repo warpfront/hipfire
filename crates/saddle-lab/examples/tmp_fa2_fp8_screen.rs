@@ -2,13 +2,12 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Stage-b real-data screen: native fp8 KV (E4M3FN + f16/token/head) with
-//! online KT16 order and P*sv block scaling.
+//! Stage-b real-data screen: fp8 (E4M3FN) QK + PV on raw pre-quant taps.
 //!
-//! Plan of record: `docs/plans/2026-09-18-gfx1201-fp8-kv-stage-b.md` §6.
-//! This REPLACES the old `tmp_fa2_fp8_screen` staged math, which normalized
-//! P over the whole sequence and used q8-dequantized V — its 31.8 %
-//! underflow is not a stage-b predictor. Do not cite the old screen.
+//! Plan of record: `docs/plans/2026-09-18-gfx1201-fa2-stage-b.md` (§8, §10/S7).
+//! This REPLACES the old screen staged math, which normalized P over the whole
+//! sequence and used q8-dequantized V — its 31.8 % underflow is not a stage-b
+//! predictor. Do not cite the old screen.
 //!
 //! # Data provenance
 //!
@@ -19,53 +18,81 @@
 //! f32 rows the writer consumes, so concatenating all chunks gives raw
 //! pre-quant K/V for every attended prefix row — never reconstructed by
 //! dequantizing q8. The stored q8 cache is downloaded too, but only to
-//! prove the taps (self-check A), never as screen input.
+//! prove the taps (self-check A) and to feed the route-Q requant arm —
+//! never as stage-b operand input.
 //!
 //! Per layer: raw Q/K/V (f32), positions, gate logits, engine O, and a
-//! kernel differential (the CURRENT q8 FA2 kernel re-run on the tapped
+//! kernel differential (the CURRENT q8/f16 FA2 kernel re-run on the tapped
 //! operands; must match the engine O bit-for-bit — same kernel, same
 //! inputs — which proves the taps are the true kernel inputs).
 //!
-//! # CPU paths (all online KT16 order, f32 state/round points)
+//! # Arms (all online KT16 order, f32 state/round points unless noted)
 //!
-//! - path0 (f64ref): raw f32 Q/K/V widened to f64, exact softmax/PV. For
-//!   attribution only — never a kernel substitute.
-//! - path1 (q8ref): production q8/f16 route — stored-q8 blocks decoded to
-//!   f16 round points, f16 Q pre-convert, f16 P. Must track the kernel
-//!   differential to WMMA-tolerance (self-check B).
-//! - path2 (q0): native fp8 KV + f16 arithmetic — K/V decoded as
-//!   `f16(f32(s)*e4m3(code))`, otherwise path1's round points. Format-only
+//! - arm1 (kernel q8/f16): the production slice-A kernel re-run on the taps.
+//!   Bit-identity gate: `--kernel-out DIR` writes its raw O + gate f32 files
+//!   for the md5 check against the retained reference (raw-O
+//!   `1f7a1183a751de7555066bcf5a1ca11c`, gate
+//!   `8c0287afddd1a3aef7f43496c3127c23` on layer 35 / 4224 tokens /
+//!   qstride 4). Arm 1 is the reference every other arm reports against.
+//! - arm2 (cpu-q8ref): production q8/f16 route — stored-q8 blocks decoded to
+//!   f16 round points, f16 Q pre-convert, f16 P. Must track arm 1 to
+//!   WMMA-tolerance (self-check B).
+//! - arm3 (q0): native fp8 KV + f16 arithmetic — K/V decoded as
+//!   `f16(f32(s)*e4m3(code))`, otherwise arm2's round points. Format-only
 //!   error; the Q0 predictor.
-//! - path3 (qkdiag): stage-b fp8 QK legs (`dot(Q8,K8)*sk*(sq*attn)`) with
+//! - arm4 (qkdiag): stage-b fp8 QK legs (`dot(Q8,K8)*sk*(sq*attn)`) with
 //!   exact-f32 weighted PV (no P quant, no changing unit). Isolates QK
 //!   error from PV error.
-//! - path4 (stageb): both fp8 legs with the bounded changing-unit O
+//! - arm5 (stageb-N): both fp8 legs with the bounded changing-unit O
 //!   recurrence (`w=e*sv`, `bnew=max(max(w)/448,2^-64)`, `p8=RNE(w/bnew)`,
-//!   `rho=(alpha*bprev)/bnew`, `Ofr*=rho; Ofr+=WMMA(P8,V8)`).
+//!   `rho=(alpha*bprev)/bnew`, `Ofr*=rho; Ofr+=P8*V8`), route-N operands
+//!   (native codes + row scales, plan §2.1 rule).
+//! - arm6 (stageb-Q): same recurrence on route-Q operands: stored q8 blocks
+//!   requantized per §2.3 (`s_row` = smallest f16 >= 127*max_b sf_b/448,
+//!   floor 2^-24, all-zero row -> 1; code' = E4M3_RNE(c*(sf_b/s_row))),
+//!   with the `448*f32(s_row) >= amax_row` invariant asserted per row.
+//!   Q->e4m3 with f32 `sq` is shared by arms 4-6.
 //!
 //! Gate: the engine buffer may be pre- or post-gate at this HEAD, so a
 //! probe compares the kernel differential against the engine O with and
-//! without one sigmoid, and every CPU O path is compared pre-gate (against
-//! the kernel differential) plus gated-iff-engine-is-gated.
+//! without one sigmoid, and every CPU O arm is compared pre-gate (against
+//! arm 1) plus gated-iff-engine-is-gated.
+//!
+//! # Tap census (plan §8.1(B) attribution tool)
+//!
+//! Per FA layer over the raw pre-quant taps: K/V `amax`, p99.9 of |x|, and
+//! the fraction of dims clipped below the e4m3 subnormal floor under the
+//! per-256 row scale (lost-to-zero and subnormal fractions separately).
+//! `--census-only` runs taps + census without the CPU arms (also usable on
+//! non-FA layers, where it reports taps as unpopulated).
 //!
 //! # Offline dump / replay
 //!
 //! `--dump DIR` writes per-layer operand bundles (raw Q/K/V, gate,
 //! engine O, kernel O, stored q8 bytes, positions, manifest). `--replay DIR`
-//! re-runs the codec self-test, edge cases, all CPU paths and metrics with
+//! re-runs the codec self-test, edge cases, all CPU arms and metrics with
 //! NO GPU and NO model. Replay a single layer dir or a parent of several.
 //!
-//! Usage (ordinal-2 convention for this unit):
-//!   HOME=/home/kaden/.hipfire-homes/ab2 ROCR_VISIBLE_DEVICES=2 \
+//! Usage (ordinal-1 convention for this unit):
+//!   HOME=/home/kaden/.hipfire-homes/ab1 ROCR_VISIBLE_DEVICES=1 \
 //!   HIPFIRE_KERNEL_CACHE=$HOME/.hipfire_kernels \
 //!   cargo run -p saddle-lab --example tmp_fa2_fp8_screen -- \
 //!     --model /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt \
 //!     [--tokens 4224] [--layer 35] [--qstride 4] [--dump DIR]
+//!     [--kernel-out DIR] [--census-only]
+//!     [--prompt-ids FILE | --prompt-range START]
 //!   cargo run -p saddle-lab --example tmp_fa2_fp8_screen -- --replay DIR \
 //!     [--qstride 4]
 //!
-//! Stop gate (§6): path4 P underflow <= 0.1 % of positive valid weighted
-//! entries (count AND lost mass reported). Informational; KLD admits.
+//! Prompt: default token ids are 0..N (the WT2-style screen prompt). The
+//! screen accepts no text prompt (no tokenizer on this path); `--prompt-ids`
+//! loads whitespace-separated u32 ids from a file, `--prompt-range START`
+//! uses START..START+N. There is no ag-corpus token file in the receipts,
+//! so an ag-corpus-faithful prompt cannot be run from here — reported as-is.
+//!
+//! Stop gate (plan §8.1/§11): stage-b P underflow <= 0.1 % of positive valid
+//! weighted entries (count AND lost mass reported, per route). Informational;
+//! KLD admits.
 
 #[cfg(not(all(feature = "deltanet", feature = "arch-qwen35")))]
 fn main() {
@@ -90,6 +117,10 @@ fn main() {
     let mut qstride: usize = 4; // sample every 4th final-chunk query (96 queries)
     let mut dump_dir: Option<PathBuf> = None;
     let mut replay_dir: Option<PathBuf> = None;
+    let mut kernel_out: Option<PathBuf> = None;
+    let mut prompt_ids: Option<PathBuf> = None;
+    let mut prompt_range: Option<u32> = None;
+    let mut census_only = false;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -117,9 +148,25 @@ fn main() {
                 replay_dir = Some(PathBuf::from(&argv[i + 1]));
                 i += 2;
             }
+            "--kernel-out" => {
+                kernel_out = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--prompt-ids" => {
+                prompt_ids = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
+            "--prompt-range" => {
+                prompt_range = Some(argv[i + 1].parse().expect("--prompt-range"));
+                i += 2;
+            }
+            "--census-only" => {
+                census_only = true;
+                i += 1;
+            }
             "-h" | "--help" => {
                 eprintln!(
-                    "Usage: tmp_fa2_fp8_screen [--model path] [--tokens N] [--layer 35|early|mid|late|CSV] [--qstride S] [--dump DIR] | --replay DIR [--qstride S]"
+                    "Usage: tmp_fa2_fp8_screen [--model path] [--tokens N] [--layer 35|early|mid|late|CSV] [--qstride S] [--dump DIR] [--kernel-out DIR] [--census-only] [--prompt-ids FILE | --prompt-range START] | --replay DIR [--qstride S]"
                 );
                 std::process::exit(0);
             }
@@ -173,8 +220,16 @@ fn main() {
         .collect();
     eprintln!("full-attention layers: {fa_layers:?}");
     assert!(!fa_layers.is_empty(), "no FullAttention layers");
-    let layers = resolve_layers(&layer_arg, &fa_layers);
-    eprintln!("screen layers: {layers:?}");
+    let layers = resolve_layers(&layer_arg, &fa_layers, census_only);
+    if census_only {
+        for &l in &layers {
+            assert!(
+                l < config.n_layers,
+                "layer {l} out of range (0..{})",
+                config.n_layers
+            );
+        }
+    }
 
     let (nh, nkv, hd) = (config.n_heads, config.n_kv_heads, config.head_dim);
     assert_eq!((nh, nkv, hd), (24, 4, 256), "FA2 gfx1201 needs H24/KV4/D256");
@@ -193,25 +248,52 @@ fn main() {
     }
     .expect("weights");
 
-    let tokens: Vec<u32> = (0..n_tokens as u32).collect();
+    // Prompt token ids: default 0..N (WT2-style); --prompt-ids loads u32 ids
+    // from a file; --prompt-range START uses START..START+N. No text prompt:
+    // no tokenizer exists on this path.
+    let prompt_desc: String = if let Some(p) = &prompt_ids {
+        assert!(prompt_range.is_none(), "--prompt-ids with --prompt-range");
+        let txt = std::fs::read_to_string(p).expect("read prompt-ids");
+        let ids: Vec<u32> = txt
+            .split_whitespace()
+            .map(|s| s.parse().unwrap_or_else(|_| panic!("bad prompt id: {s}")))
+            .collect();
+        assert!(ids.len() >= n_tokens, "prompt file has {} ids, need {n_tokens}", ids.len());
+        eprintln!("prompt: {} ids from {}", ids.len(), p.display());
+        format!("file:{}[..{n_tokens}]", p.display())
+    } else if let Some(s) = prompt_range {
+        eprintln!("prompt: range {s}..{}", s as usize + n_tokens);
+        format!("range:{s}..{}", s as usize + n_tokens)
+    } else {
+        eprintln!("prompt: default 0..{n_tokens}");
+        format!("range:0..{n_tokens}")
+    };
+    let tokens: Vec<u32> = if let Some(p) = &prompt_ids {
+        let txt = std::fs::read_to_string(p).expect("read prompt-ids");
+        txt.split_whitespace()
+            .map(|s| s.parse().expect("prompt id"))
+            .take(n_tokens)
+            .collect()
+    } else if let Some(s) = prompt_range {
+        (s..s + n_tokens as u32).collect()
+    } else {
+        (0..n_tokens as u32).collect()
+    };
     let kv_max = n_tokens + 16;
     let n_chunk = n_tokens / CHUNK;
 
     for &want in &layers {
-        match &weights.layers[want] {
-            LayerWeights::FullAttn(_) => {}
-            other => {
-                let tag = match other {
-                    LayerWeights::DeltaNet(_) => "DeltaNet",
-                    LayerWeights::DeltaNetMoe(_) => "DeltaNetMoe",
-                    LayerWeights::FullAttnMoe(_) => "FullAttnMoe",
-                    LayerWeights::FullAttn(_) => unreachable!(),
-                };
-                eprintln!("layer {want} weights are {tag}, need dense FullAttn; skipping");
-                continue;
-            }
+        // FA membership: arms need dense FullAttn; census-only tolerates other
+        // layer types (taps then report as unpopulated — see below).
+        let is_fa = matches!(&weights.layers[want], LayerWeights::FullAttn(_));
+        if !is_fa && !census_only {
+            eprintln!("layer {want} is not dense FullAttn; skipping (use --census-only to tap it)");
+            continue;
         }
-        eprintln!("=== screen layer L={want} (dense FullAttn) ===");
+        eprintln!(
+            "=== screen layer L={want} ({}; prompt {prompt_desc}) ===",
+            if is_fa { "dense FullAttn" } else { "non-FA, census-only" }
+        );
 
         // Fresh cache + DN state per layer so layers never see each other.
         let mut kv_cache =
@@ -274,6 +356,22 @@ fn main() {
             "prefill tapped (layers 0..={want}, {n_chunk} chunks) in {:.1}s",
             t0.elapsed().as_secs_f64()
         );
+        if !is_fa {
+            // Non-FA layer under --census-only: this layer writes no FA K/V
+            // taps (linear layers project into dn_qkv_batch instead). The
+            // buffers below hold stale rows from the last FA layer <= want
+            // in the truncated prefix — NOT this layer's K/V.
+            let knz = k_all.iter().filter(|x| **x != 0.0).count();
+            let vnz = v_all.iter().filter(|x| **x != 0.0).count();
+            let kamax = k_all.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let vamax = v_all.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            eprintln!(
+                "layer {want} is not FullAttention: no own FA K/V taps (buffers hold stale FA rows: K nonzero {knz}/{} amax={kamax:.3e}; V nonzero {vnz}/{} amax={vamax:.3e}); census N/A — use an FA layer for the §8.1(B) census",
+                k_all.len(),
+                v_all.len()
+            );
+            continue;
+        }
         for (name, v) in [
             ("Q", &q_all),
             ("K", &k_all),
@@ -282,6 +380,12 @@ fn main() {
             ("gate", &g_all),
         ] {
             assert!(v.iter().all(|x| x.is_finite()), "non-finite in tapped {name}");
+        }
+        // §8.1(B) attribution census on the raw pre-quant taps (K and V).
+        tap_census("K", &k_all, n_tokens, nkv, hd, kv_dim);
+        tap_census("V", &v_all, n_tokens, nkv, hd, kv_dim);
+        if census_only {
+            continue;
         }
         let k_stored = dtoh_bytes(
             &gpu,
@@ -295,7 +399,6 @@ fn main() {
             n_tokens * row_stride,
             "v_cache",
         );
-
         // Self-check A: stored-q8 blocks vs raw taps (proves block parse AND
         // that fa_k/fa_v are the true pre-writer rows).
         self_check_a(&k_all, &v_all, &k_stored, &v_stored, n_tokens, nkv, hd, kv_dim, row_stride);
@@ -342,6 +445,21 @@ fn main() {
             "engine buffer is {} (tap gap {tap_gap:.3e}; bit-exact=0 required for tap proof)",
             if engine_post_gate { "POST-gate" } else { "PRE-gate" }
         );
+        // Arm-1 bit-identity bundle: raw kernel O + gate for the md5 gate.
+        if let Some(kdir) = &kernel_out {
+            let ldir = kdir.join(format!("layer{want}"));
+            std::fs::create_dir_all(&ldir).expect("kernel-out layer dir");
+            write_f32(&ldir.join("kern.O.f32"), &o_kern);
+            write_f32(&ldir.join("kern.gate.f32"), &g_all[fin0..fin0 + CHUNK * q_dim]);
+            std::fs::write(
+                ldir.join("kern.meta.txt"),
+                format!(
+                    "layer={want} n_tokens={n_tokens} chunk={CHUNK} nh={nh} nkv={nkv} hd={hd} prompt={prompt_desc} engine_post_gate={engine_post_gate} tap_gap={tap_gap:.6e}\n"
+                ),
+            )
+            .expect("kernel-out meta");
+            eprintln!("arm-1 bundle (layer {want}) in {} — md5 against 1f7a1183a751de7555066bcf5a1ca11c / 8c0287afddd1a3aef7f43496c3127c23", ldir.display());
+        }
 
         // Optional offline bundle.
         if let Some(ddir) = &dump_dir {
@@ -373,9 +491,9 @@ fn main() {
                     "nkv": nkv,
                     "hd": hd,
                     "qstride": qstride,
+                    "prompt": prompt_desc,
                     "engine_post_gate": engine_post_gate,
                     "tap_gap": tap_gap,
-                    "arch": gpu.arch,
                 })
                 .to_string(),
             )
@@ -437,7 +555,7 @@ fn main() {
         };
         std::fs::write(path, b).expect("write f32 blob");
     }
-    fn resolve_layers(arg: &str, fa_layers: &[usize]) -> Vec<usize> {
+    fn resolve_layers(arg: &str, fa_layers: &[usize], allow_any: bool) -> Vec<usize> {
         let mut out = Vec::new();
         for item in arg.split(',') {
             let item = item.trim();
@@ -447,10 +565,12 @@ fn main() {
                 "late" => fa_layers[fa_layers.len() - 1],
                 _ => item.parse().unwrap_or_else(|_| panic!("bad --layer item: {item}")),
             };
-            assert!(
-                fa_layers.contains(&l),
-                "layer {l} is not FullAttention per config"
-            );
+            if !allow_any {
+                assert!(
+                    fa_layers.contains(&l),
+                    "layer {l} is not FullAttention per config"
+                );
+            }
             if !out.contains(&l) {
                 out.push(l);
             }
@@ -458,6 +578,9 @@ fn main() {
         assert!(!out.is_empty(), "--layer selected nothing");
         out
     }
+}
+
+#[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
     /// Self-check A: stored q8_0 blocks vs raw pre-writer taps, over every
     /// prefix row. Tolerance accounts for the write kernel's f32
     /// `val*(127/amax)` vs stored f16(amax/127) tie ambiguity (half-ULP of
@@ -509,8 +632,6 @@ fn main() {
         }
         eprintln!("self-check A (stored-q8 vs raw taps, all {n_tokens} rows): worst |diff|={worst:.3e} tie-adjacent={tie_n} — taps OK");
     }
-}
-
 // ================= replay (GPU-free) =================
 #[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
 fn run_replay(dir: &std::path::Path, qstride: usize) {
@@ -570,10 +691,11 @@ fn run_replay(dir: &std::path::Path, qstride: usize) {
             k_stored: std::fs::read(ldir.join("k_q8.bin")).expect("read k_q8"),
             v_stored: std::fs::read(ldir.join("v_q8.bin")).expect("read v_q8"),
         };
+        self_check_a(&bundle.k_raw, &bundle.v_raw, &bundle.k_stored, &bundle.v_stored, n_tokens, nkv, hd, kv_dim, bundle.row_stride);
         assert_eq!(bundle.q_final.len(), chunk * q_dim, "q_final shape");
-        assert_eq!(bundle.k_raw.len(), n_tokens * kv_dim, "k_raw shape");
-        assert_eq!(bundle.o_kern.len(), chunk * q_dim, "o_kern shape");
         eprintln!("--- replay {} (layer {want}) ---", ldir.display());
+        tap_census("K", &bundle.k_raw, n_tokens, nkv, hd, kv_dim);
+        tap_census("V", &bundle.v_raw, n_tokens, nkv, hd, kv_dim);
         run_cpu_screen(&bundle);
     }
 }
@@ -603,7 +725,7 @@ struct CpuBundle {
     v_stored: Vec<u8>,
 }
 
-/// Full CPU screen: planes, five paths, metrics, underflow census.
+/// Full CPU screen: planes, six arms, metrics, underflow censuses.
 #[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
 fn run_cpu_screen(b: &CpuBundle) {
     let t1 = std::time::Instant::now();
@@ -616,12 +738,12 @@ fn run_cpu_screen(b: &CpuBundle) {
     );
 
     // ---- planes ----
-    // path1: stored-q8 blocks -> f16 round points (production operands).
+    // arm2: stored-q8 blocks -> f16 round points (production operands).
     let mut k1 = vec![0.0f64; b.n_tokens * b.kv_dim];
     let mut v1 = vec![0.0f64; b.n_tokens * b.kv_dim];
     parse_q8_plane(&b.k_stored, &mut k1, b.n_tokens, b.nkv, b.hd, b.kv_dim, b.row_stride);
     parse_q8_plane(&b.v_stored, &mut v1, b.n_tokens, b.nkv, b.hd, b.kv_dim, b.row_stride);
-    // paths 2-4: native fp8 from RAW taps (F's §2.1 rule, f32-faithful).
+    // arms 3-5: native fp8 from RAW taps (plan §2 smallest-f16->= rule, f32-faithful).
     let mut k_codes = vec![0u8; b.n_tokens * b.kv_dim];
     let mut k_sc = vec![0.0f32; b.n_tokens * b.nkv];
     let mut v_codes = vec![0u8; b.n_tokens * b.kv_dim];
@@ -638,6 +760,45 @@ fn run_cpu_screen(b: &CpuBundle) {
             v_codes[p * b.kv_dim + h * b.hd..p * b.kv_dim + (h + 1) * b.hd].copy_from_slice(&c);
         }
     }
+    // arm6 (route Q): stored q8 blocks -> e4m3 requant per §2.3 (header-only
+    // s_row; 448*f32(s_row) >= amax_row asserted per row inside).
+    let mut qk_codes = vec![0u8; b.n_tokens * b.kv_dim];
+    let mut qk_sc = vec![0.0f32; b.n_tokens * b.nkv];
+    let mut qv_codes = vec![0u8; b.n_tokens * b.kv_dim];
+    let mut qv_sc = vec![0.0f32; b.n_tokens * b.nkv];
+    {
+        let blks = b.hd / 32;
+        let mut smin = f32::INFINITY;
+        let mut smax = 0.0f32;
+        for (stored, codes, sc, tag) in [
+            (&b.k_stored, &mut qk_codes, &mut qk_sc, "K"),
+            (&b.v_stored, &mut qv_codes, &mut qv_sc, "V"),
+        ] {
+            for p in 0..b.n_tokens {
+                for h in 0..b.nkv {
+                    let base = p * b.row_stride + h * blks * 34;
+                    let mut scales = [0.0f32; 8];
+                    let mut icodes = [0i8; 256];
+                    for blk in 0..blks {
+                        let ko = base + blk * 34;
+                        scales[blk] =
+                            f16_to_f32(u16::from_le_bytes([stored[ko], stored[ko + 1]]));
+                        for j in 0..32 {
+                            icodes[blk * 32 + j] = stored[ko + 2 + j] as i8;
+                        }
+                    }
+                    let (s, c) = requant_q8_row(&scales, &icodes)
+                        .unwrap_or_else(|e| panic!("{tag} requant p={p} h={h}: {e}"));
+                    smin = smin.min(s);
+                    smax = smax.max(s);
+                    sc[p * b.nkv + h] = s;
+                    codes[p * b.kv_dim + h * b.hd..p * b.kv_dim + (h + 1) * b.hd]
+                        .copy_from_slice(&c);
+                }
+            }
+        }
+        eprintln!("route-Q s_row range over {n} rows x {g} heads: [{smin:.3e}, {smax:.3e}] (f16 grid, 448*s covers amax_row per-row asserted)", n = b.n_tokens, g = b.nkv);
+    }
     // Q planes per sampled query/head: f16 (paths 1-2) and fp8+sq (paths 3-4).
     let mut q1 = vec![0.0f64; nq * b.nh * b.hd];
     let mut q_codes = vec![0u8; nq * b.nh * b.hd];
@@ -651,7 +812,7 @@ fn run_cpu_screen(b: &CpuBundle) {
                     f16_to_f64(f32_to_f16_bits(qv));
                 am = am.max(qv.abs());
             }
-            // §5.1: sq = amax/448 in f32, zero row sq=1 (NOT f16-snapped).
+            // §3: sq = amax/448 in f32, zero row sq=1 (NOT f16-snapped).
             let sq = if am == 0.0 { 1.0 } else { am / 448.0 };
             q_sq[qi * b.nh + h] = sq;
             for d in 0..b.hd {
@@ -661,20 +822,27 @@ fn run_cpu_screen(b: &CpuBundle) {
         }
     }
 
-    // ---- per-(query,head) online paths ----
+    // ---- per-(query,head) online arms ----
     let mut o_ref = vec![0.0f64; nq * b.nh * b.hd];
     let mut o_q8 = vec![0.0f64; nq * b.nh * b.hd];
     let mut o_q0 = vec![0.0f64; nq * b.nh * b.hd];
     let mut o_qk = vec![0.0f64; nq * b.nh * b.hd];
     let mut o_sb = vec![0.0f64; nq * b.nh * b.hd];
+    let mut o_rq = vec![0.0f64; nq * b.nh * b.hd];
     let mut s_err_q0 = 0.0f64;
     let mut s_err_qk = 0.0f64;
     let mut s_err_sb = 0.0f64;
-    // path4 P-underflow census over valid keys.
+    let mut s_err_rq = 0.0f64;
+    // arm5 (route N) P-underflow census over valid keys.
     let mut w_pos: u64 = 0;
     let mut w_zero: u64 = 0;
     let mut w_mass: f64 = 0.0;
     let mut w_lost: f64 = 0.0;
+    // arm6 (route Q) P-underflow census over valid keys.
+    let mut q_pos: u64 = 0;
+    let mut q_zero: u64 = 0;
+    let mut q_mass: f64 = 0.0;
+    let mut q_lost: f64 = 0.0;
     let mut exp_zero: u64 = 0; // true f32 exp zeros (e underflows f32)
     let mut zero_v_heads: u64 = 0; // (q,h) with all-zero V codes on valid keys
     let mut per_q_worst = vec![0.0f64; nq];
@@ -719,11 +887,17 @@ fn run_cpu_screen(b: &CpuBundle) {
             let mut o1 = vec![0.0f64; b.hd];
             let mut o2 = vec![0.0f64; b.hd];
             let mut o3 = vec![0.0f64; b.hd];
-            // path4 changing-unit state.
+            // arm5 changing-unit state.
             let mut ofr = vec![0.0f32; b.hd];
             let mut bprev = 1.0f32;
+            // arm6 (route Q) state: same recurrence on requantized operands.
+            let mut m5 = f32::NEG_INFINITY as f64;
+            let mut l5 = 0.0f64;
+            let mut o5 = vec![0.0f64; b.hd];
+            let mut ofrq = vec![0.0f32; b.hd];
+            let mut bprevq = 1.0f32;
             let sq = q_sq[qi * b.nh + h];
-            let t_q = (sq * b.scale_attn as f32) as f64; // sq*attn in f32 (§5.1)
+            let t_q = (sq * b.scale_attn as f32) as f64; // sq*attn in f32 (§3)
             for blk in 0..nblk {
                 let ks = blk * 16;
                 let ke = (ks + 16).min(nk);
@@ -733,13 +907,14 @@ fn run_cpu_screen(b: &CpuBundle) {
                 let mut s2 = vec![0.0f64; ke - ks];
                 let mut s3 = vec![0.0f64; ke - ks];
                 let mut s4 = vec![0.0f64; ke - ks];
+                let mut s5 = vec![0.0f64; ke - ks];
                 for (j, k) in (ks..ke).enumerate() {
                     let ko = k * b.kv_dim + kh * b.hd;
-                    // path0: exact f64 from raw.
+                    // arm1: exact f64 from raw.
                     let mut d0 = 0.0;
-                    // path1: f16 Q/K.
+                    // arm2: f16 Q/K.
                     let mut d1 = 0.0;
-                    // path2/4 K: f16(s*code).
+                    // arm3/5 K: f16(s*code).
                     let sk = k_sc[k * b.nkv + kh];
                     let mut d2 = 0.0;
                     // path3/4 QK leg: integer-grid dot.
@@ -756,10 +931,20 @@ fn run_cpu_screen(b: &CpuBundle) {
                     s0[j] = d0 * b.scale_attn;
                     s1[j] = f32r(d1 * b.scale_attn);
                     s2[j] = f32r(d2 * b.scale_attn);
-                    // §5.1: score = acc * sk * (sq * attn), left-assoc f32.
+                    // §3: score = acc * sk * (sq * attn), left-assoc f32.
                     let s3v = f32r(f32r(acc * (sk as f64)) * t_q);
                     s3[j] = s3v;
                     s4[j] = s3v;
+                    // arm6 (route Q): same QK leg on requantized operands.
+                    let skq = qk_sc[k * b.nkv + kh];
+                    let mut accq: f64 = 0.0;
+                    for d in 0..b.hd {
+                        accq += e4m3_decode(q_codes[qo + d])
+                            * e4m3_decode(qk_codes[ko + d]);
+                    }
+                    let s5v = f32r(f32r(accq * (skq as f64)) * t_q);
+                    s5[j] = s5v;
+                    s_err_rq = s_err_rq.max((s5[j] - s0[j]).abs());
                     s_err_q0 = s_err_q0.max((s2[j] - s0[j]).abs());
                     s_err_qk = s_err_qk.max((s3[j] - s0[j]).abs());
                     s_err_sb = s_err_sb.max((s4[j] - s0[j]).abs());
@@ -770,10 +955,11 @@ fn run_cpu_screen(b: &CpuBundle) {
                 let bmax2 = s2.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let bmax3 = s3.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
                 let bmax4 = s4.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-                // path0 exact.
+                let bmax5 = s5.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+                // arm1 exact.
                 let (nm0, a0) = online_step(m0, bmax0);
                 let mut nl0 = a0 * l0;
-                // f32-rounded paths.
+                // f32-rounded arms.
                 let (nm1, a1) = online_step_f32(m1, bmax1);
                 let mut nl1 = f32r(a1 * l1);
                 let (nm2, a2) = online_step_f32(m2, bmax2);
@@ -781,8 +967,9 @@ fn run_cpu_screen(b: &CpuBundle) {
                 let (nm3, a3) = online_step_f32(m3, bmax3);
                 let mut nl3 = f32r(a3 * l3);
                 let (nm4, a4) = online_step_f32(m4, bmax4);
-                // path4: w = e*sv per key, block bnew, rho, Ofr update.
-                // l's denominator sums UNWEIGHTED e (§5.2); accumulate it here.
+                let (nm5, a5) = online_step_f32(m5, bmax5);
+                // arm5: w = e*sv per key, block bnew, rho, Ofr update.
+                // l's denominator sums UNWEIGHTED e (§5); accumulate it here.
                 let mut w4 = vec![0.0f32; ke - ks];
                 let mut emax = 0.0f32;
                 let mut l4e = 0.0f64;
@@ -801,6 +988,21 @@ fn run_cpu_screen(b: &CpuBundle) {
                 let bnew = (emax / 448.0f32).max(2.0f32.powi(-64));
                 let rho = f32r(((a4 as f32 * bprev) / bnew) as f64);
                 let rho = f32r(rho);
+                // arm6: wq = eq*svq per key, block bnewq, rhoq.
+                let mut w5 = vec![0.0f32; ke - ks];
+                let mut emaxq = 0.0f32;
+                let mut l5e = 0.0f64;
+                for (j, k) in (ks..ke).enumerate() {
+                    let e5 = f32r((s5[j] - nm5).exp()) as f32;
+                    l5e = f32r(l5e + e5 as f64);
+                    let svq = qv_sc[k * b.nkv + kh];
+                    let wq = e5 * svq;
+                    w5[j] = wq;
+                    emaxq = emaxq.max(wq);
+                }
+                let bnewq = (emaxq / 448.0f32).max(2.0f32.powi(-64));
+                let rhoq = f32r(((a5 as f32 * bprevq) / bnewq) as f64);
+                let rhoq = f32r(rhoq);
                 // rescale + PV per path.
                 for d in 0..b.hd {
                     o0[d] = o0[d] * a0;
@@ -810,6 +1012,12 @@ fn run_cpu_screen(b: &CpuBundle) {
                 }
                 for d in 0..b.hd {
                     ofr[d] *= rho as f32;
+                }
+                for d in 0..b.hd {
+                    o5[d] = f32r(o5[d] * a5);
+                }
+                for d in 0..b.hd {
+                    ofrq[d] *= rhoq as f32;
                 }
                 for (j, k) in (ks..ke).enumerate() {
                     let ko = k * b.kv_dim + kh * b.hd;
@@ -824,9 +1032,9 @@ fn run_cpu_screen(b: &CpuBundle) {
                     let p0 = e0;
                     let p1 = rne_f16_f64(e1);
                     let p2 = rne_f16_f64(e2);
-                    // path3: exact-f32 weighted PV (no P quant).
+                    // arm4: exact-f32 weighted PV (no P quant).
                     let sv3 = v_sc[k * b.nkv + kh] as f64;
-                    // path4: p8 grid.
+                    // arm5: p8 grid.
                     let p8 = e4m3_decode(e4m3_encode((w4[j] / bnew) as f64));
                     // underflow census: positive finite w -> zero p8.
                     if w4[j] > 0.0 && w4[j].is_finite() {
@@ -837,18 +1045,37 @@ fn run_cpu_screen(b: &CpuBundle) {
                             w_lost += w4[j] as f64;
                         }
                     }
+                    // arm6: e5/p8q on the route-Q recurrence.
+                    let e5 = f32r((s5[j] - nm5).exp());
+                    let svq5 = qv_sc[k * b.nkv + kh] as f64;
+                    let p8q = e4m3_decode(e4m3_encode((w5[j] / bnewq) as f64));
+                    // arm6 underflow census: positive finite wq -> zero p8q.
+                    if w5[j] > 0.0 && w5[j].is_finite() {
+                        q_pos += 1;
+                        q_mass += w5[j] as f64;
+                        if p8q == 0.0 {
+                            q_zero += 1;
+                            q_lost += w5[j] as f64;
+                        }
+                    }
                     for d in 0..b.hd {
                         o0[d] += p0 * (b.v_raw[ko + d] as f64);
                         o1[d] = f32r(o1[d] + p1 * v1[ko + d]);
                         o2[d] = f32r(o2[d] + p2 * fp8_decode_q0(v_sc[k * b.nkv + kh], v_codes[ko + d]));
                         let vdiag = sv3 * e4m3_decode(v_codes[ko + d]);
                         o3[d] = f32r(o3[d] + e3 * vdiag);
+                        let vdiagq = svq5 * e4m3_decode(qv_codes[ko + d]);
+                        o5[d] = f32r(o5[d] + e5 * vdiagq);
+                        ofrq[d] += (p8q * e4m3_decode(qv_codes[ko + d])) as f32;
                         ofr[d] += (p8 * e4m3_decode(v_codes[ko + d])) as f32;
                     }
                 }
                 // round Ofr block accumulation to f32 (documented point).
                 for d in 0..b.hd {
                     ofr[d] = f32r(ofr[d] as f64) as f32;
+                }
+                for d in 0..b.hd {
+                    ofrq[d] = f32r(ofrq[d] as f64) as f32;
                 }
                 m0 = nm0;
                 l0 = nl0;
@@ -861,8 +1088,11 @@ fn run_cpu_screen(b: &CpuBundle) {
                 m4 = nm4;
                 l4 = f32r(a4 * l4 + l4e);
                 bprev = bnew;
+                m5 = nm5;
+                l5 = f32r(a5 * l5 + l5e);
+                bprevq = bnewq;
             }
-            // completion: divide by l (paths 0-3); path4: Ofr*(bprev/l).
+            // completion: divide by l (arms 1-4); arms 5-6: Ofr*(bprev/l).
             for d in 0..b.hd {
                 o_ref[qo + d] = if l0 == 0.0 { 0.0 } else { o0[d] / l0 };
                 o_q8[qo + d] = if l1 == 0.0 { 0.0 } else { f32r(o1[d] / l1) };
@@ -874,12 +1104,18 @@ fn run_cpu_screen(b: &CpuBundle) {
                     f32r((ofr[d] * (bprev / l4 as f32)) as f64)
                 };
                 o_sb[qo + d] = osb;
+                let orq = if l5 == 0.0 {
+                    0.0
+                } else {
+                    f32r((ofrq[d] * (bprevq / l5 as f32)) as f64)
+                };
+                o_rq[qo + d] = orq;
             }
         }
     }
     eprintln!("CPU math done in {:.1}s", t1.elapsed().as_secs_f64());
 
-    // ---- self-check B: path1 (q8/f16 online) vs kernel differential ----
+    // ---- self-check B: arm2 (q8/f16 online) vs arm 1 (kernel differential) ----
     // Both pre-gate. Tolerance covers WMMA-f32 vs host-f64 reduction order.
     let mut bmax = 0.0f64;
     for (qi, &r) in qrows.iter().enumerate() {
@@ -893,12 +1129,12 @@ fn run_cpu_screen(b: &CpuBundle) {
     }
     eprintln!("self-check B (CPU-q8ref O vs kernel differential, pre-gate): max-abs={bmax:.3e}");
 
-    // ---- metrics vs f64ref and vs kernel (pre-gate) ----
+    // ---- metrics vs arm 1 (kernel differential, pre-gate) and vs exact ----
     let mut mags: Vec<f64> = o_ref.iter().map(|x| x.abs()).collect();
     mags.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let t99 = mags[(mags.len() as f64 * 0.99) as usize];
     eprintln!("|O_ref|: p99 threshold T={t99:.6e}, max={:.6e}", mags[mags.len() - 1]);
-    // per-query worst (path4 vs ref) for outlier triage.
+    // per-query worst (arm5 vs ref) for outlier triage.
     for qi in 0..nq {
         let mut w = 0.0f64;
         for h in 0..b.nh {
@@ -908,23 +1144,8 @@ fn run_cpu_screen(b: &CpuBundle) {
         }
         per_q_worst[qi] = w;
     }
-    let metric = |o: &[f64]| -> (f64, f64) {
-        let mut max_abs: f64 = 0.0;
-        let mut tail_sum = 0.0;
-        let mut tail_n = 0u64;
-        for (idx, &x) in o.iter().enumerate() {
-            let e = (x - o_ref[idx]).abs();
-            max_abs = max_abs.max(e);
-            if o_ref[idx].abs() >= t99 {
-                tail_sum += e;
-                tail_n += 1;
-            }
-        }
-        (max_abs, tail_sum / (tail_n.max(1) as f64))
-    };
-    // kernel differential vs f64ref (how far production is from exact).
-    let kern_f64: Vec<f64> = b.o_kern.iter().map(|x| *x as f64).collect();
     // kernel O covers the final chunk densely; compare on sampled rows only.
+    let kern_f64: Vec<f64> = b.o_kern.iter().map(|x| *x as f64).collect();
     let mut kern_sampled = vec![0.0f64; nq * b.nh * b.hd];
     for (qi, &r) in qrows.iter().enumerate() {
         for h in 0..b.nh {
@@ -934,34 +1155,69 @@ fn run_cpu_screen(b: &CpuBundle) {
             }
         }
     }
-    // path1 output is sampled-only already.
-    let (q8_max, q8_tail) = metric(&o_q8);
-    let (q0_max, q0_tail) = metric(&o_q0);
-    let (qk_max, qk_tail) = metric(&o_qk);
-    let (sb_max, sb_tail) = metric(&o_sb);
-    let (kk_max, kk_tail) = metric(&kern_sampled);
+    // All CPU arms are sampled-only already; tail-1% keys off |O_ref| >= t99.
+    let metric_vs = |o: &[f64], rf: &[f64]| -> (f64, f64) {
+        let mut max_abs: f64 = 0.0;
+        let mut tail_sum = 0.0;
+        let mut tail_n = 0u64;
+        for (idx, &x) in o.iter().enumerate() {
+            let e = (x - rf[idx]).abs();
+            max_abs = max_abs.max(e);
+            if o_ref[idx].abs() >= t99 {
+                tail_sum += e;
+                tail_n += 1;
+            }
+        }
+        (max_abs, tail_sum / (tail_n.max(1) as f64))
+    };
+    let (q8_a1, q8_a1t) = metric_vs(&o_q8, &kern_sampled);
+    let (q0_a1, q0_a1t) = metric_vs(&o_q0, &kern_sampled);
+    let (qk_a1, qk_a1t) = metric_vs(&o_qk, &kern_sampled);
+    let (sb_a1, sb_a1t) = metric_vs(&o_sb, &kern_sampled);
+    let (rq_a1, rq_a1t) = metric_vs(&o_rq, &kern_sampled);
+    let (kk_ex, kk_ext) = metric_vs(&kern_sampled, &o_ref);
+    let (q8_ex, q8_ext) = metric_vs(&o_q8, &o_ref);
+    let (q0_ex, q0_ext) = metric_vs(&o_q0, &o_ref);
+    let (qk_ex, qk_ext) = metric_vs(&o_qk, &o_ref);
+    let (sb_ex, sb_ext) = metric_vs(&o_sb, &o_ref);
+    let (rq_ex, rq_ext) = metric_vs(&o_rq, &o_ref);
     let u_pct = 100.0 * w_zero as f64 / (w_pos.max(1) as f64);
     let lost_pct = 100.0 * w_lost / w_mass.max(1e-30);
+    let uq_pct = 100.0 * q_zero as f64 / (q_pos.max(1) as f64);
+    let lostq_pct = 100.0 * q_lost / q_mass.max(1e-30);
     println!();
     println!(
         "=== stage-b screen: L={} N={} queries={nq} heads={} hd={} p99(|O|)={t99:.4e} ===",
         b.want, b.n_tokens, b.nh, b.hd
     );
-    println!("{:<10} {:>12} {:>12}  note", "path", "max-abs", "tail-1%");
-    println!("{:<10} {:>12.3e} {:>12.3e}  q8-kernel vs exact (production gap)", "kern", kk_max, kk_tail);
-    println!("{:<10} {:>12.3e} {:>12.3e}  cpu-q8ref vs exact (self-check-B mate)", "q8ref", q8_max, q8_tail);
-    println!("{:<10} {:>12.3e} {:>12.3e}  Q0 format-only (the Q0 predictor)", "q0", q0_max, q0_tail);
-    println!("{:<10} {:>12.3e} {:>12.3e}  fp8-QK + exact weighted PV", "qkdiag", qk_max, qk_tail);
-    println!("{:<10} {:>12.3e} {:>12.3e}  full stage-b (changing-unit O)", "stageb", sb_max, sb_tail);
+    println!("--- per-arm vs ARM 1 (kernel q8/f16 differential, pre-gate) ---");
+    println!("{:<10} {:>12} {:>12}  note", "arm", "max-abs", "tail-1%");
+    println!("{:<10} {:>12.3e} {:>12.3e}  cpu-q8ref vs arm1 (self-check-B mate)", "arm2", q8_a1, q8_a1t);
+    println!("{:<10} {:>12.3e} {:>12.3e}  Q0 format-only (the Q0 predictor)", "arm3", q0_a1, q0_a1t);
+    println!("{:<10} {:>12.3e} {:>12.3e}  fp8-QK + exact weighted PV", "arm4", qk_a1, qk_a1t);
+    println!("{:<10} {:>12.3e} {:>12.3e}  full stage-b route N (changing-unit O)", "arm5", sb_a1, sb_a1t);
+    println!("{:<10} {:>12.3e} {:>12.3e}  full stage-b route Q (changing-unit O)", "arm6", rq_a1, rq_a1t);
+    println!("--- per-arm vs EXACT (f64 reference) ---");
+    println!("{:<10} {:>12} {:>12}  note", "arm", "max-abs", "tail-1%");
+    println!("{:<10} {:>12.3e} {:>12.3e}  arm1 production gap (kernel vs exact)", "arm1", kk_ex, kk_ext);
+    println!("{:<10} {:>12.3e} {:>12.3e}  cpu-q8ref", "arm2", q8_ex, q8_ext);
+    println!("{:<10} {:>12.3e} {:>12.3e}  Q0", "arm3", q0_ex, q0_ext);
+    println!("{:<10} {:>12.3e} {:>12.3e}  qkdiag", "arm4", qk_ex, qk_ext);
+    println!("{:<10} {:>12.3e} {:>12.3e}  stageb-N", "arm5", sb_ex, sb_ext);
+    println!("{:<10} {:>12.3e} {:>12.3e}  stageb-Q", "arm6", rq_ex, rq_ext);
     println!();
-    println!("score max|Δ| vs exact: q0={s_err_q0:.3e} qk={s_err_qk:.3e} sb={s_err_sb:.3e}");
+    println!("score max|Δ| vs exact: q0={s_err_q0:.3e} qk={s_err_qk:.3e} sb={s_err_sb:.3e} rq={s_err_rq:.3e}");
     println!(
-        "P underflow (path4, valid keys): {w_zero}/{w_pos} = {u_pct:.4}% entries, lost mass {lost_pct:.4}%"
+        "P underflow route N (arm5, valid keys): {w_zero}/{w_pos} = {u_pct:.4}% entries, lost mass {lost_pct:.4}%"
+    );
+    println!(
+        "P underflow route Q (arm6, valid keys): {q_zero}/{q_pos} = {uq_pct:.4}% entries, lost mass {lostq_pct:.4}%"
     );
     println!("true-f32-exp zeros: {exp_zero}; (q,h) with all-zero V codes: {zero_v_heads}");
     println!(
-        "STOP GATE (§6: underflow <= 0.1% of positive valid weighted entries): {}",
-        if u_pct <= 0.1 { "PASS" } else { "FAIL — stop the two-fp8-leg plan" }
+        "STOP GATE (plan §8.1/§11: underflow <= 0.1% of positive valid weighted entries, per route): N={} Q={}",
+        if u_pct <= 0.1 { "PASS" } else { "FAIL — stop the two-fp8-leg plan" },
+        if uq_pct <= 0.1 { "PASS" } else { "FAIL — stop the two-fp8-leg plan" }
     );
     println!("engine buffer: {}", if b.engine_post_gate { "POST-gate (CPU O gated-iff compared)" } else { "PRE-gate" });
     // worst-3 sampled queries (absolute row in final chunk) for triage.
@@ -974,7 +1230,7 @@ fn run_cpu_screen(b: &CpuBundle) {
     println!();
 }
 
-// Online softmax step, exact (path0).
+// Online softmax step, exact (arm1).
 #[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
 fn online_step(mold: f64, bmax: f64) -> (f64, f64) {
     let nm = mold.max(bmax);
@@ -982,7 +1238,7 @@ fn online_step(mold: f64, bmax: f64) -> (f64, f64) {
     (nm, a)
 }
 
-// Online softmax step, f32 state (paths 1-4): max/exp/alpha rounded to f32.
+// Online softmax step, f32 state (arms 2-6): max/exp/alpha rounded to f32.
 #[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
 fn online_step_f32(mold: f64, bmax: f64) -> (f64, f64) {
     let nm = f32r(mold.max(bmax));
@@ -1000,7 +1256,7 @@ fn f32r(x: f64) -> f64 {
     (x as f32) as f64
 }
 
-// Parse stored q8_0 blocks into f16 round-point values (path1 operands).
+// Parse stored q8_0 blocks into f16 round-point values (arm2 operands).
 #[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
 fn parse_q8_plane(
     stored: &[u8],
@@ -1033,10 +1289,10 @@ fn fp8_decode_q0(scale: f32, code: u8) -> f64 {
     f16_to_f64(f32_to_f16_bits(v))
 }
 
-// Native fp8 row encode: F's §2.1 rule, f32-faithful.
-// Smallest positive f16 s >= a/448 (min 2^-24); code = E4M3_RNE(x/f32(s))
-// with an upward-half increment when 448*f32(s) < a; all-zero row writes
-// s=1 and zero codes. Nonfinite input is rejected (oracle must not admit it).
+// Native fp8 row encode (route-N operand rule, plan §2): smallest f16
+// s >= a/448 (min 2^-24); code = E4M3_RNE(x/f32(s)) with an upward-half
+// increment when 448*f32(s) < a; all-zero row writes s=1 and zero codes.
+// Nonfinite input is rejected (oracle must not admit it).
 #[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
 fn fp8_encode_row(x: &[f32]) -> Result<(f32, Vec<u8>), String> {
     if x.iter().any(|v| !v.is_finite()) {
@@ -1074,8 +1330,124 @@ fn fp8_encode_row(x: &[f32]) -> Result<(f32, Vec<u8>), String> {
     let codes = x.iter().map(|v| e4m3_encode((*v / s) as f64)).collect();
     Ok((s, codes))
 }
-// Codec + scale-selection self-test (GPU-free). Vectors pin F's §2.1 rule,
-// including half-subnormal scales and the upward-half bump.
+// Smallest f16 grid value >= need (need finite, >= 0). need == 0 maps to
+// +0.0; the zero-row s=1 rule lives in the callers. Rounding up off the grid
+// can only land on a subnormal-or-larger f16, so the 2^-24 floor is automatic.
+#[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
+fn f16_ceil_pos(need: f32) -> f32 {
+    assert!(need.is_finite() && need >= 0.0, "bad ceil need {need}");
+    if need == 0.0 {
+        return 0.0;
+    }
+    let mut bits = f32_to_f16_bits(need);
+    if bits == 0x7C00 {
+        panic!("unrepresentable ceil need {need:.6e}");
+    }
+    if f16_to_f32(bits) < need {
+        bits += 1;
+        if bits == 0x7C00 {
+            panic!("unrepresentable ceil need (bump) {need:.6e}");
+        }
+    }
+    f16_to_f32(bits)
+}
+
+// Route-Q requantize, plan §2.3: eight q8_0 block scales + 256 int8 codes ->
+// one f16 row scale s_row + 256 e4m3 codes. s_row = smallest f16 >=
+// (127*max_b sf_b)/448 (floor 2^-24; all-zero row -> s_row = 1);
+// code' = E4M3_RNE(c * (sf_b / f32(s_row))) with the f32 ratio the kernel
+// forms. Asserts the 448*f32(s_row) >= amax_row invariant per row, where
+// amax_row is measured from the actual stored codes.
+#[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
+fn requant_q8_row(scales: &[f32; 8], codes: &[i8; 256]) -> Result<(f32, Vec<u8>), String> {
+    let mut maxsf = 0.0f32;
+    for &s in scales.iter() {
+        if !s.is_finite() || s < 0.0 {
+            return Err(format!("non-finite/negative block scale {s}"));
+        }
+        maxsf = maxsf.max(s);
+    }
+    if maxsf == 0.0 {
+        // All-zero row (all scales zero => all codes must be zero).
+        if codes.iter().any(|&c| c != 0) {
+            return Err("zero scales with nonzero codes".to_string());
+        }
+        return Ok((1.0, vec![0u8; 256]));
+    }
+    let need = 127.0f32 * maxsf / 448.0f32;
+    let mut s = f16_ceil_pos(need).max(5.9604645e-8);
+    // Upward-half increment: f32 rounding of the ceil can sit below need.
+    if 448.0f32 * s < 127.0f32 * maxsf {
+        let b2 = f32_to_f16_bits(s) + 1;
+        if b2 == 0x7C00 {
+            return Err("unrepresentable s_row (half bump overflow)".to_string());
+        }
+        s = f16_to_f32(b2);
+    }
+    let mut amax = 0.0f32;
+    for b in 0..8 {
+        for j in 0..32 {
+            amax = amax.max((scales[b] * codes[b * 32 + j] as f32).abs());
+        }
+    }
+    if !(448.0f32 * s >= amax) {
+        return Err(format!("s_row invariant fails: 448*{s:.6e} < amax {amax:.6e}"));
+    }
+    let mut out = Vec::with_capacity(256);
+    for b in 0..8 {
+        let ratio = scales[b] / s;
+        for j in 0..32 {
+            out.push(e4m3_encode((codes[b * 32 + j] as f32 * ratio) as f64));
+        }
+    }
+    Ok((s, out))
+}
+
+// §8.1(B) attribution census over raw pre-quant taps: amax, p99.9 of |x|,
+// and the fraction of dims clipped below the e4m3 subnormal floor under the
+// per-256 row scale (lost-to-zero and subnormal fractions separately).
+// The row scale follows the native rule (smallest f16 >= amax/448, floor
+// 2^-24, zero row -> 1); a dim "clips" when its scaled value encodes to
+// code 0 while |x| > 0.
+#[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
+fn tap_census(tag: &str, raw: &[f32], n_tokens: usize, nkv: usize, hd: usize, kv_dim: usize) {
+    assert_eq!(raw.len(), n_tokens * kv_dim, "{tag} tap shape");
+    assert!(raw.iter().all(|x| x.is_finite()), "{tag} taps non-finite");
+    let n = raw.len();
+    let mut mags: Vec<f32> = raw.iter().map(|x| x.abs()).collect();
+    mags.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    let amax = mags[n - 1];
+    let p999 = mags[(n * 999 / 1000).min(n - 1)];
+    let p99 = mags[(n * 99 / 100).min(n - 1)];
+    let mut denom = 0u64;
+    let mut lost_zero = 0u64;
+    let mut subnormal = 0u64;
+    for p in 0..n_tokens {
+        for h in 0..nkv {
+            let row = &raw[p * kv_dim + h * hd..p * kv_dim + (h + 1) * hd];
+            let a = row.iter().fold(0.0f32, |m, x| m.max(x.abs()));
+            let s = if a == 0.0 { 1.0 } else { f16_ceil_pos(a / 448.0).max(5.9604645e-8) };
+            for &x in row {
+                denom += 1;
+                if x != 0.0 {
+                    let c = e4m3_encode((x / s) as f64) & 0x7F;
+                    if c == 0 {
+                        lost_zero += 1;
+                    } else if c <= 0x07 {
+                        subnormal += 1;
+                    }
+                }
+            }
+        }
+    }
+    eprintln!(
+        "tap census {tag}: n={n} amax={amax:.6e} p99.9={p999:.6e} p99={p99:.6e} | clipped-to-zero {lost_zero}/{denom}={:.4}% subnormal {subnormal}/{denom}={:.4}%",
+        100.0 * lost_zero as f64 / denom as f64,
+        100.0 * subnormal as f64 / denom as f64
+    );
+}
+// Codec + scale-selection self-test (GPU-free). Vectors pin the native §2
+// rule and the route-Q §2.3 rule, half-subnormal scales, upward-half bumps.
 #[cfg(all(feature = "deltanet", feature = "arch-qwen35"))]
 fn codec_self_test() {
     for i in -127..=127i32 {
@@ -1148,7 +1520,32 @@ fn codec_self_test() {
     row[0] = 448.01;
     let (s, _) = fp8_encode_row(&row).expect("bump row");
     assert_eq!(f32_to_f16_bits(s), 0x3C01); // 1.0 fails 448*1<448.01 -> next-up
-    eprintln!("codec self-test OK (e4m3 grid, §2.1 scale rule, subnormal floors, nonfinite rejection)");
+    // Route-Q §2.3 vectors: s_row = smallest f16 >= 127*maxsf/448.
+    {
+        // All-zero row -> s_row = 1, zero codes.
+        let (s, c) = requant_q8_row(&[0.0f32; 8], &[0i8; 256]).expect("zero requant");
+        assert_eq!(s, 1.0);
+        assert!(c.iter().all(|&x| x == 0));
+        // Uniform scales sf, codes ±127 -> need = 127*sf/448 exactly.
+        let mut codes = [0i8; 256];
+        for (i, c) in codes.iter_mut().enumerate() {
+            *c = if i % 2 == 0 { 127 } else { -127 };
+        }
+        let (s, c) = requant_q8_row(&[0.5f32; 8], &codes).expect("uniform requant");
+        let need = 127.0f32 * 0.5 / 448.0;
+        assert_eq!(s, f16_ceil_pos(need).max(5.9604645e-8));
+        assert!(448.0 * s >= 127.0 * 0.5, "s_row covers 127*maxsf");
+        assert_eq!(c[0], e4m3_encode((127.0f32 * (0.5 / s)) as f64));
+        assert_eq!(c[1], e4m3_encode((-127.0f32 * (0.5 / s)) as f64));
+        // Skewed scales: argmax block dominates; maxsf = 2.0.
+        let mut scales = [0.25f32; 8];
+        scales[3] = 2.0;
+        let (s, _) = requant_q8_row(&scales, &[1i8; 256]).expect("skewed requant");
+        assert_eq!(s, f16_ceil_pos(127.0 * 2.0 / 448.0).max(5.9604645e-8));
+        // Zero scales with nonzero codes is rejected, never silently mapped.
+        assert!(requant_q8_row(&[0.0f32; 8], &[1i8; 256]).is_err());
+    }
+    eprintln!("codec self-test OK (e4m3 grid, native §2 + route-Q §2.3 scale rules, subnormal floors, nonfinite rejection)");
 }
 
 // Pure-CPU recurrence edge cases: zero/one/masked rows, tiny and strongly
@@ -1172,7 +1569,7 @@ fn edge_case_self_test() {
             assert!(rho.is_finite() && rho > 0.0, "rho finite for sv {sv_prev}->{sv_new}");
         }
     }
-    // 2^-64 floor contribution bound (§5.2): 32768*448*16*2^-64 ≈ 1.3e-11.
+    // 2^-64 floor contribution bound (§5): 32768*448*16*2^-64 ≈ 1.3e-11.
     let bound = 32768.0 * 448.0 * 16.0 * 2.0f64.powi(-64);
     assert!(bound < 1.3e-11, "floor bound {bound:.3e}");
     // f16 subnormal scales decode exactly on host (device FTZ counterpart is
