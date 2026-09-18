@@ -19134,8 +19134,9 @@ impl Gpu {
             let batch_tiles = batch_size.div_ceil(128);
             let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
             let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-            // LDS: 12288 B (A/W slabs + DS/SZ metadata; store slots overlap).
-            let lds_bytes: u32 = 12288;
+            // LDS: 19456 B (W double-buffered + ping-pong DS/SZ, A single;
+            // store slots overlap).
+            let lds_bytes: u32 = 19456;
             let result = self.launch_maybe_blob(
                 kernel_name,
                 [row_tiles as u32, batch_tiles as u32, 1],
