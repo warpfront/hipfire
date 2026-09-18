@@ -519,11 +519,13 @@ pub enum KernelKey {
     AttnFlashFp8E4m3, // flash tile decode
     AttnFp8E4m3KvBatchedMasked, // batched prefill / tree-verify
     // Flat-BF16 KV for non-windowed (Qwen dense) caches. Maple keeps the
-    // windowed keys above; these lower to the same bf16 tile kernels with
-    // window=0 (== plain causal), so no new device code is required.
-    AttnBf16Kv, // scalar-named decode; lowers to the bf16 flash tile
-    AttnFlashBf16, // flash tile decode, window=0
-    AttnBf16KvBatchedMasked, // batched prefill / tree-verify, window=0
+    // windowed keys above. `AttnBf16Kv{,_BatchedMasked}` lower to F's NEW
+    // native bf16 kernels `attention_bf16_kv{,_batched}` (HIPFIRE_KV_BF16=1
+    // in attention_q8_0_kv{,_batched}.hip); only `AttnFlashBf16` reuses the
+    // existing `attention_flash_bf16_windowed` launcher with window=0.
+    AttnBf16Kv, // scalar decode; launches attention_bf16_kv
+    AttnFlashBf16, // flash tile decode via attention_flash_bf16_windowed, window=0
+    AttnBf16KvBatchedMasked, // batched prefill / tree-verify; launches attention_bf16_kv_batched
     // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
     // Full attention (no KV cache — vision / dflash cross-attention)
     AttnFullF16,       // F16 K/V, non-causal

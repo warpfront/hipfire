@@ -475,10 +475,10 @@ fn fp8_attend_key(pos: usize, flash_mode: usize, capture_mode: bool) -> KernelKe
         KernelKey::AttnFp8E4m3Kv
     }
 }
-/// Flat-bf16 (Qwen dense) attend-key heuristic. Both keys lower to the bf16
-/// flash tile today (window=0); the split preserves the q8-shaped selection
-/// so a future scalar bf16 kernel can take over `AttnBf16Kv` without touching
-/// derive, the table, or callers.
+/// Flat-bf16 (Qwen dense) attend-key heuristic. `AttnBf16Kv` launches F's new
+/// native scalar `attention_bf16_kv` (HIPFIRE_KV_BF16=1); `AttnFlashBf16`
+/// reuses the existing `attention_flash_bf16_windowed` launcher with
+/// window=0. The split preserves the q8-shaped selection.
 fn bf16_attend_key(pos: usize, flash_mode: usize, capture_mode: bool) -> KernelKey {
     let use_flash = capture_mode || flash_mode == 2 || (flash_mode == 1 && pos + 1 >= 2048);
     if use_flash {
