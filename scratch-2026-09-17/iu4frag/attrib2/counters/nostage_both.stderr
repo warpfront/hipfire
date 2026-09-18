@@ -1,0 +1,30 @@
+W0918 08:34:23.530242 1877277 simple_timer.cpp:55] [rocprofv3] tool initialization ::     0.115171 sec
+W0918 08:34:23.530495 1877277 simple_timer.cpp:55] [rocprofv3] './target/release/examples/tmp_iu4_attrib /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt scratch-2026-09-17/iu4frag/attrib2/tu-2-nostage.hip 2-nostage' ::     0.000000 sec
+W0918 08:34:23.555433 1877277 tool.cpp:3348] HSA version 1.21.0 initialized (instance=0)
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+JIT OK: gemm_mq4g256v2_residual_mmq_iu4_full_set [tmp_iu4_attrib_2-nostage]
+W0918 08:34:24.828715 1877277 queue_controller.cpp:170] [queue-intercept] device-memory ring-buffer requested but profiling requires system-memory InterceptQueue; falling back to system-memory ring for agent 111296333543632 (priority and CU-mask from the descriptor are not preserved)
+ATTRIB 2-nostage: med=482.4 us/call GFLOP=91.27 -> 189.2 TOPS
+W0918 08:34:24.908593 1877277 simple_timer.cpp:55] [rocprofv3] './target/release/examples/tmp_iu4_attrib /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt scratch-2026-09-17/iu4frag/attrib2/tu-2-nostage.hip 2-nostage' ::     1.378097 sec
+W0918 08:34:24.920986 1877277 generateRocpd.cpp:1062] writing SQL database for process 1877277 on node 1165781284
+E0918 08:34:24.921483 1877277 generateRocpd.cpp:1086] Opened result file: scratch-2026-09-17/iu4frag/attrib2/counters/nostage_both_results.db (UUID=000043da-10b6-70b6-b43f-18eb0848bba0)
+W0918 08:34:25.392085 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_string             ::     0.008302 sec
+W0918 08:34:25.392120 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_node          ::     0.000005 sec
+W0918 08:34:25.392544 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_process       ::     0.000420 sec
+W0918 08:34:25.393083 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_agent         ::     0.000530 sec
+W0918 08:34:25.400226 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_pmc           ::     0.007140 sec
+W0918 08:34:25.407724 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd kernel info        ::     0.007485 sec
+W0918 08:34:25.407762 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_region             ::     0.000031 sec
+W0918 08:34:25.418521 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_kernel_dispatch    ::     0.010755 sec
+W0918 08:34:25.430485 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_pmc_event          ::     0.011946 sec
+W0918 08:34:25.430505 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_copy        ::     0.000003 sec
+W0918 08:34:25.430508 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_graph_launch       ::     0.000001 sec
+W0918 08:34:25.430512 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_memory_allocate    ::     0.000003 sec
+W0918 08:34:25.430523 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_info_pmc: kfd      ::     0.000010 sec
+W0918 08:34:25.430525 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_pmc_event: kfd     ::     0.000000 sec
+W0918 08:34:25.431352 1877277 simple_timer.cpp:55] SQLite3 generation :: rocpd_flush_pending      ::     0.000825 sec
+W0918 08:34:25.431619 1877277 simple_timer.cpp:55] SQLite3 generation :: SQL indexing             ::     0.000262 sec
+W0918 08:34:25.438931 1877277 simple_timer.cpp:55] SQLite3 generation :: total                    ::     0.517951 sec
+W0918 08:34:25.440261 1877277 simple_timer.cpp:55] [rocprofv3] output generation ::     0.531068 sec
+W0918 08:34:25.440293 1877277 simple_timer.cpp:55] [rocprofv3] tool finalization ::     0.531104 sec
