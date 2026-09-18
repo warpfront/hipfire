@@ -32,6 +32,7 @@ use crate::quant_e8::*;
 use crate::quant_fwht::*;
 use crate::quant_hfp4::*;
 use crate::quant_mq::*;
+use crate::quant_mq4e8::{mq4e8_suffix, quantize_mq4g256v2_constrained, Mq4HeaderConstraint};
 use crate::quant_mq4v2_lloyd::{
     lloyd_levels_sidecar_name, lloyd_levels_to_f32_bytes, lloyd_v2_stats_print,
     lloyd_v2_stats_record, lloyd_v2_stats_reset, quantize_mq4g256v2_lloyd,
@@ -109,6 +110,7 @@ struct MainQuantFlags {
     use_q4k_all: bool,
     use_q4k_q8embed: bool,
     use_q8: bool,
+    mq4e8: Option<Mq4HeaderConstraint>,
     use_q8hfq: bool,
     is_gemma4_family: bool,
     q8_conv1d_default: bool,
@@ -318,6 +320,18 @@ pub(crate) fn run() {
         || format == "mq4l"
         || format == "mq4g256v2l"
         || format == "mq4g256v2-lloyd";
+    // MQ4E8 header study (slice A): constrained qt44 encoders routed only at
+    // the primary dense dispatch; arch-gated to qwen3_5 below.
+    let use_mq4e8 = match format {
+        "mq4e8-c0" => Some(Mq4HeaderConstraint::Unconstrained),
+        "mq4e8-c1" => Some(Mq4HeaderConstraint::HalfPow2),
+        "mq4e8-c2" => Some(Mq4HeaderConstraint::HalfInt16),
+        "mq4e8-c3" => Some(Mq4HeaderConstraint::GroupShared),
+        "mq4e8-c4" => Some(Mq4HeaderConstraint::RowPow2),
+        "mq4e8-c4z" => Some(Mq4HeaderConstraint::RowPow2IntZero),
+        "mq4e8-c4s" => Some(Mq4HeaderConstraint::RowPow2KMinus8),
+        _ => None,
+    };
     let use_mq4c = format == "mq4c" || format == "mq4cg256" || format == "mq4g256c";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4" || format == "hf4";
     let use_hfq3g256 = format == "hfq3g256";
@@ -1121,6 +1135,18 @@ pub(crate) fn run() {
         eprintln!(
             "error: --format mq2lloyd-anchored is dense-only (Qwen 3.8 Lloyd rescue); MoE model (arch_id={arch_id}) is not supported with this format. Use --format mq2lloyd for MoE routed experts or a dense checkpoint."
         );
+        std::process::exit(2);
+    }
+    // MQ4E8 header study (slice A): dense qwen3_5 only (arch_id=5). Any other
+    // arch (MoE included) is rejected fail-fast here, before weights load.
+    if use_mq4e8.is_some() && arch_id != 5 {
+        eprintln!(
+            "error: --format mq4e8-c* is dense-qwen3_5-only (arch_id=5); got arch_id={arch_id}. Study routing covers only the dense qt44 census."
+        );
+        std::process::exit(2);
+    }
+    if format.starts_with("mq4e8-") && use_mq4e8.is_none() {
+        eprintln!("error: --format '{format}' not recognized (expected mq4e8-c0/c1/c2/c3/c4/c4z/c4s)");
         std::process::exit(2);
     }
     // Gemma4 (arch_id 13) defaults to kmap_mode=3 (typed-gemma4): promote down_proj,
@@ -2679,6 +2705,7 @@ pub(crate) fn run() {
                 use_mq4g256: use_mq4g256,
                 use_mq4v2: use_mq4v2,
                 use_mq4v2_lloyd: use_mq4v2_lloyd,
+                mq4e8: use_mq4e8,
                 use_mq4c: use_mq4c,
                 use_mq4g256_lloyd: use_mq4g256_lloyd,
                 use_mq5g256: use_mq5g256,
@@ -2886,6 +2913,12 @@ pub(crate) fn run() {
                 );
             }
             obj.insert("hipfire_base_format".to_string(), format.to_string().into());
+            if format.starts_with("mq4e8-") {
+                obj.insert(
+                    "hipfire_mq4e8_study".to_string(),
+                    "constrained-header quality study; standard qt44 lowering".into(),
+                );
+            }
             metadata_json = serde_json::to_string(&meta_val).unwrap_or(metadata_json);
         }
     }
@@ -5764,6 +5797,7 @@ fn handle_main_quant(
                     }
                 } else if (flags.use_mq4g256
                     || flags.use_mq4v2
+                    || flags.mq4e8.is_some()
                     || flags.use_mq4v2_lloyd
                     || flags.use_mq4c
                     || flags.use_mq4_mq6exp
@@ -5859,6 +5893,80 @@ fn handle_main_quant(
                         };
                         (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
                     }
+                } else if let Some(mq4e8_constraint) = flags.mq4e8 {
+                    // MQ4E8 header study (slice A): dense qwen3_5 qt44 census
+                    // only (arch pre-gated above). Same AWQ recipe as the pinned
+                    // fixture; constrained scales + fixed-scale Lloyd via
+                    // quantize_mq4g256v2_constrained. Emits standard qt44 bytes
+                    // under QuantType::MQ4G256V2 (census unchanged); the format
+                    // distinction is recorded in hipfire_base_format metadata.
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 != 0 {
+                        eprintln!(
+                            "error: --format mq4e8-* requires K%256==0 for {name} (K={k_dim}); study covers only the aligned dense qt44 census"
+                        );
+                        std::process::exit(2);
+                    }
+                    let suf = mq4e8_suffix(mq4e8_constraint);
+                    let signs1 = gen_fwht_signs(42, 256);
+                    let signs2 = gen_fwht_signs(1042, 256);
+                    let encode = |data: &[f32], m_dim: usize| -> Vec<u8> {
+                        match quantize_mq4g256v2_constrained(
+                            data,
+                            m_dim,
+                            k_dim,
+                            &signs1,
+                            &signs2,
+                            mq4e8_constraint,
+                        ) {
+                            Ok((bytes, st)) => {
+                                eprintln!(
+                                    "  MQ4E8-{suf}: {name} c2clamp[{}/{}] master_floor={} zero_master_rows={} zscale_halves={}",
+                                    st.c2_clamp_lo,
+                                    st.c2_clamp_hi,
+                                    st.master_floor,
+                                    st.zero_master_rows.len(),
+                                    st.zero_scale_halves
+                                );
+                                if !st.zero_master_rows.is_empty() {
+                                    let shown: Vec<_> =
+                                        st.zero_master_rows.iter().take(16).collect();
+                                    eprintln!(
+                                        "    zero-master rows (first {}): {shown:?}",
+                                        shown.len()
+                                    );
+                                }
+                                bytes
+                            }
+                            Err(e) => {
+                                eprintln!("error: mq4e8-{suf} encode failed for {name}: {e}");
+                                std::process::exit(2);
+                            }
+                        }
+                    };
+                    let q = if let (Some(alpha), Some(im_weights)) =
+                        (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                    {
+                        if awq_eligible(name) {
+                            let scales = compute_awq_scales(im_weights, alpha);
+                            awq_sidecar_scales = Some(scales.clone());
+                            let m_dim = meta.shape[0];
+                            let mut scaled = f32_data.clone();
+                            awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                            encode(&scaled, m_dim)
+                        } else {
+                            let m_dim = meta.shape[0];
+                            encode(&f32_data, m_dim)
+                        }
+                    } else {
+                        let m_dim = meta.shape[0];
+                        encode(&f32_data, m_dim)
+                    };
+                    (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                 } else if flags.use_mq4v2 {
                     let k_dim = if meta.shape.len() == 2 {
                         meta.shape[1]
@@ -7040,6 +7148,7 @@ mod handle_main_quant_f16_fallback_tests {
             use_mq4g256: true,
             use_mq4v2: false,
             use_mq4v2_lloyd: false,
+            mq4e8: None,
             use_mq4c: false,
             use_mq4g256_lloyd: false,
             use_mq5g256: false,
