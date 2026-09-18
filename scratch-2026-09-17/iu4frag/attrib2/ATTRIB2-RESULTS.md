@@ -75,9 +75,30 @@ WGP count; `hip_mp_count_to_cu_count` ×2). rocminfo: CU 64, SIMDs/CU 2.
   matches Sol's serial-wait ISA finding. Double-buffer: 9µs.
 - Store epilogue is NOT a limiter: removing it costs 24µs (tail cover).
 - Main's "~200µs outside the K-loop": staging 43 + barrier epochs ~54 +
-  Sol's prologue/tail/drain + unassigned waits (~111) ≈ 208. Reconciled.
+  Sol's prologue/tail/drain + unassigned waits (~111) ≈ 208 as an
+  upper-bound envelope (NOT a sum — see Cautions).
 - Biggest single removable item is the compute+fold issue chain itself
   (~175µs); no ≥100µs non-compute overhead stands alone.
+
+## Cautions — Sol review (read before quoting marginals)
+
+- v3 sink cost is NOT sub-µs. Verified in `tu-3-nofold.dis.txt` (full_set
+  CBC4..CD38): the checksum is UNROLLED — 1× `v_xor_b32` + 31× `v_xor3_b32`
+  per trip (my static census grepped only `v_xor_b32` and missed the xor3s),
+  ≈ 14.85µs issue-only @2.93GHz across 40 trips plus dependent-chain delays,
+  with a `flat_store_b32 SCOPE_SYS` + `s_wait_storecnt` every trip (added
+  serialization), and all-WG aliasing on `Y[tid]`.
+- Corrected reading: v3's 53µs is a contaminated fold-removal net
+  (fold − ~15µs+ sink), not comparable to modeled fold arithmetic. Fold true
+  cost is higher by the sink. v5's once-per-WG sink (≈0.5 MB) is negligible
+  — v5's +24 stands as an observed combined-intervention effect, not causal
+  proof of tail cover. The clean v3 fix (not run — Sol: no rerun needed):
+  accumulate the XOR across trips in a register, store once per WG to a
+  WG-exclusive slot.
+- The "≈208 reconciled" line in the Limiter section is REJECTED as a sum:
+  43/54/111 share effects (staging waits cover fold issue and vice versa).
+  Upper-bound envelope only, not an addition. All rows are combined
+  interventions; none is an additive phase time.
 
 ## Files
 
