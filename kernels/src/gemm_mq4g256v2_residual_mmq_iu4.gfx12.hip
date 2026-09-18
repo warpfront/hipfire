@@ -2,7 +2,7 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// MQ4G256V2 iu4-direct MMQ for gfx12 (RDNA4 — gfx1200/gfx1201), v2 LDS tile.
+// MQ4G256V2 iu4-direct MMQ for gfx12 (RDNA4 — gfx1200/gfx1201), v2 staged tile.
 //
 // Feeds MQ4V2 weight nibbles DIRECTLY to
 // `__builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12` (K=32 per call) with
@@ -32,32 +32,66 @@
 //     int32x8 — same C map as the gfx12 iu8 MMQ.
 //   - Per-half MQ4V2 (sc,zp) via __shfl from src_lane = 8*k_grp + j.
 //
-// v2 tiling (restructure of the v1 load-bound kernel):
-//   - Workgroup tile: 16 rows × IU4_TILE_N tokens (256), IU4_NWAVES=4 waves.
-//     Every wave covers the SAME 16 rows and its own 64-column sub-tile
-//     (IU4_NB=4 column blocks of 16, as in v1).
-//   - Weight nibbles for the WG's 16 rows are staged ONCE in LDS per 128-K
-//     half (16 rows × 64 B) and consumed by all 4 waves: each weight fragment
-//     feeds 4 waves × 4 column blocks = 16 WMMAs (v1: 4).
-//   - Xq stays in global (v1 pattern: per-lane direct loads, L2-cached
-//     across row tiles) — bulk LDS staging of the slab cost more in issue
-//     slots (36 scalar iters/kb) than it saved.
-//   - K-loop body = ds_read_b64 (W frag) + global/buffer load (Xq frag) +
-//     v_wmma; the 256-K group scale FMA once per accumulator per group; no
-//     per-fragment VALU beyond addressing. `__builtin_amdgcn_sched_barrier(0)`
-//     per k-step keeps the compiler from hoisting fragments into VGPRs.
-//   - Math is bit-identical to v1: same 4×K32 grouping per 128-K block per
-//     column block, same pinned IU4_FOLD_RN DAG.
+// v2 staged tile (port of the fp8 256x64x64 cooperative structure to the
+// iu4 K32 contract; integer math is bit-identical to v1):
+//   - Workgroup tile: IU4_BN rows x IU4_BM tokens (128x128), IU4_WAVES=8
+//     waves (256 threads). Wave w covers 32 rows x 64 tokens = 2 row-groups
+//     of 16 x 4 column blocks of 16: wt_pair = w>>1 selects the 32-row
+//     group, tok_half = w&1 selects the 64-token half.
+//   - Per 128-K block (kb): the activation slab (128 tokens x 64 K nibbles
+//     = 32 B/row) AND the weight slab (128 rows x 32 B/row) are staged ONCE
+//     in LDS and consumed by all 8 waves. Staged A bytes feed 4 row-pair
+//     waves x 4 (slab,sb) reads; staged W bytes feed 2 token-half waves x
+//     4 nb x 4 reads.
+//   - K-loop body per (slab, K32-sub-block) = ds_read_b64 (W frag) +
+//     ds_read_b64 (A frag) + v_wmma_i32_16x16x32_iu4; the per-128-K fold
+//     (IU4_FOLD_RN, once per block after the 2nd slab) is the ONLY other
+//     K-loop VALU. All fragment addresses are hoisted to kernel top
+//     (frA/frW tables); slab/sb/nb/rg are unroll constants, so the K-step
+//     carries no dynamic address math.
+//   - Register prefetch (fp8 K2 mechanism, re-implemented for packed
+//     dwords): prologue stages slab 0; trip 0 issues slab-1 globals into
+//     A_pf/W_pf BEFORE trip-0 compute (sched_barrier-pinned), publishes
+//     after compute under a publish barrier (fast-wave clobber guard).
+//     Single LDS buffer; compute byte-identical.
+//   - Coalesced store (fp8 K2 mechanism): each (rg, nb) phase dumps the
+//     wave's 16x16 f32 sub-tile to an LDS slot ([16][20], stride-20 pad for
+//     bank-clean streaming), then all 256 threads stream 64 rows x 32 cols
+//     with consecutive threads on consecutive rows (128 B segments).
+//     Per-element arithmetic is unchanged, hence bit-identical.
+//   - Math is bit-identical to v1: same 4xK32 grouping per 128-K block per
+//     column block (same K order), same pinned IU4_FOLD_RN DAG. Integer MMA:
+//     any oracle difference is a bug.
 //
-// Grid: [ceil(M/16), ceil(N/256)]. Block: [128,1,1].
-// LDS: 1024 bytes (weight half-slab).
+// LDS layout (12 KiB; compute_ws and store slots overlap — A/W/DS/SZ are
+// all dead once folds complete):
+//   A  = [128][40] activation nibbles, 32 data + 8 pad  @ 0      (5120 B)
+//   W  = [128][40] weight nibbles, 32 data + 8 pad      @ 5120   (5120 B)
+//   DS = [128][8]  token (d f32, s i32) per kb block    @ 10240  (1024 B)
+//   SZ = [128][8]  row (sc f32, zp f32) per half        @ 11264  (1024 B)
+//   end                                                         = 12288 B
+//   store slots = 8 waves x [16][20] f32 @ 0                    (10240 B)
+//
+// Bank enumeration (32 banks x 4 B; lane reads 8 contiguous bytes at
+// R*40 + C, R = lane row, C = unroll const): bank start = (10*R + C/4)
+// mod 32. 10*R mod 32 over 16 consecutive R is 16 distinct EVEN banks, and
+// the 8 B read covers the adjacent odd bank: every bank exactly once per
+// 16-lane half, twice per full wave (k_grp halves differ by an even
+// constant) = the width floor, no conflict. Applies to A reads (token
+// rows), W reads (weight rows), and 4 B DS/SZ reads (banks 2*R: 16
+// distinct evens). Staging writes are consecutive dwords (sequential
+// banks). Store stream reads: bank = 5*i + x/4, 5 coprime 32 (2-way floor
+// across x-pairs); global stores are 2x64 B segments per wave32.
+//
+// Grid: [ceil(M/128), ceil(N/128)]. Block: [256,1,1]. LDS: 12288 bytes.
+//
+// Sweep note: 64x256 / 256x64 aspects need a different wave map (wt_pair /
+// tok_half split) plus matching host grid/LDS; the fold/prefetch/store
+// mechanisms transfer unchanged. Host (gemm.rs launch arm) and the oracle
+// launcher hardcode the same 128/128/256-thread/12288 contract — a geometry
+// change must update all three consistently.
 //
 // Compile gate: gfx1200 / gfx1201 only. Non-gfx12 archs get empty stubs (the
-// Weight half-slab layout (bank-conflict-free): 8 half-slabs chunks of 8 B
-// (one K32 lane fragment), chunk-major: byte (chunk8, row r, byte b) lives at
-// (chunk8*16 + r)*8 + b. The 16 lanes of a k_grp half read 16 consecutive
-// 8 B blocks = 32 distinct banks. (Row-major [r][64] would stride lanes by
-// 64 B = banks {0,16}: an 8-way conflict per A-frag load.)
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -69,14 +103,36 @@
 // (kernels/src/block_i4_128_quant.hip, concatenated by
 // GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SRC).
 
-// Column blocks of 16 per wave (64-column wave tile). Each LDS-staged weight
-// fragment is reused across IU4_NWAVES waves × IU4_NB column blocks.
-#define IU4_NB 4
-#define IU4_NWAVES 4
-#define IU4_TILE_N (IU4_NB * 16 * IU4_NWAVES)
-// Weight half-slab: 16 rows × 72 B (64 B data + 8 B pad; row stride 72 keeps
-// consecutive m_lanes on distinct LDS banks).
-#define IU4_W_BYTES 1152
+// Workgroup tile geometry (tokens x rows x staged-K, waves). Overridable
+// for sweeps; host + oracle must match.
+#ifndef IU4_BM
+#define IU4_BM 128
+#endif
+#ifndef IU4_BN
+#define IU4_BN 128
+#endif
+#ifndef IU4_BK
+#define IU4_BK 64
+#endif
+#ifndef IU4_WAVES
+#define IU4_WAVES 8
+#endif
+#define IU4_NTHREADS (IU4_WAVES * 32)
+// Packed-row stride: BK/2 data bytes (64 nibbles) + 8 pad. Stride 40 gives
+// bank starts 10*r (see bank enumeration above).
+#define IU4_STRIDE (IU4_BK / 2 + 8)
+#define IU4_A_OFF 0
+#define IU4_A_BYTES (IU4_BM * IU4_STRIDE)
+#define IU4_W_OFF (IU4_A_BYTES)
+#define IU4_W_BYTES (IU4_BN * IU4_STRIDE)
+#define IU4_DS_OFF (IU4_W_OFF + IU4_W_BYTES)
+#define IU4_DS_BYTES (IU4_BM * 8)
+#define IU4_SZ_OFF (IU4_DS_OFF + IU4_DS_BYTES)
+#define IU4_SZ_BYTES (IU4_BN * 8)
+#define IU4_LDS_BYTES (IU4_SZ_OFF + IU4_SZ_BYTES)
+// Store slots reuse LDS base: 8 waves x [16][20] f32.
+#define IU4_SLOT_COLS 20
+#define IU4_SLOT_FLOATS (16 * IU4_SLOT_COLS)
 
 typedef int8_t  __attribute__((ext_vector_type(8)))  int8x8_t;
 typedef int32_t __attribute__((ext_vector_type(2)))  int32x2_t;
@@ -101,6 +157,47 @@ typedef float   __attribute__((ext_vector_type(8)))  float8_t;
         (sum_lvalue) = __fadd_rn((sum_lvalue), iu4_fold_term_); \
     } while (0)
 
+// One K32-sub-block compute bundle: 2 W-frags + 4 A-frags +
+// 8 WMMAs (2 row-groups x 4 column blocks), then a scheduling fence.
+// SB is a template constant (folded into LDS immediates); FIRST picks
+// the shared zero C vector for each chain's first step (avoids 64 separate
+// clears per block). Single LDS slot: slab 1 overwrites slab 0 on publish,
+// so both trips share these addresses. K-step VALU: ds_reads + WMMAs only.
+template <int SB, bool FIRST>
+static __device__ __forceinline__ void iu4_bundle(
+    const char* __restrict__ w_lds,
+    const char* __restrict__ a_lds,
+    const unsigned (&frW)[2][2],
+    const unsigned (&frA)[4][2],
+    int32x8_t cacc[4][2],
+    const int32x8_t& zc
+) {
+    const int32x2_t af0 = *(const int32x2_t*)(w_lds + frW[0][SB]);
+    const int32x2_t af1 = *(const int32x2_t*)(w_lds + frW[1][SB]);
+    const int32x2_t bf0 = *(const int32x2_t*)(a_lds + frA[0][SB]);
+    const int32x2_t bf1 = *(const int32x2_t*)(a_lds + frA[1][SB]);
+    const int32x2_t bf2 = *(const int32x2_t*)(a_lds + frA[2][SB]);
+    const int32x2_t bf3 = *(const int32x2_t*)(a_lds + frA[3][SB]);
+    #pragma unroll
+    for (int rg = 0; rg < 2; rg++) {
+        const int32x2_t a = (rg == 0) ? af0 : af1;
+        #pragma unroll
+        for (int nb = 0; nb < 4; nb++) {
+            const int32x2_t b = (nb == 0) ? bf0 : (nb == 1) ? bf1 : (nb == 2) ? bf2 : bf3;
+            if constexpr (FIRST) {
+                cacc[nb][rg] = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(
+                    false, a, true, b, zc, false
+                );
+            } else {
+                cacc[nb][rg] = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(
+                    false, a, true, b, cacc[nb][rg], false
+                );
+            }
+        }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+}
+
 // Shared compute body for residual / full_add / full_set. `ADD` selects
 // += (residual) vs = (set) writeback.
 template <bool ADD>
@@ -113,171 +210,253 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     const int tid = threadIdx.x;
     const int wave = tid >> 5;
     const int lane = tid & 31;
-    const int row_start = blockIdx.x * 16;
-    const int col_start = blockIdx.y * IU4_TILE_N;
+    const int rs = blockIdx.x * IU4_BN;
+    const int bs = blockIdx.y * IU4_BM;
 
-    if (row_start >= M || col_start >= N) return;
+    if (rs >= M || bs >= N) return;
 
-    const int m_lane = lane & 15;  // 0..15: row within the 16-row tile (A operand)
+    const int m_lane = lane & 15;  // 0..15: row within a 16-row group
     const int k_grp  = lane >> 4;  // 0/1: which K-half this lane carries
-    const int wave_col0 = wave * (IU4_NB * 16);
-
-    // Columns (N-dim) handled by THIS lane: one per column block of this
-    // wave's 64-column sub-tile.
-    int col_nb[IU4_NB];
-    bool col_valid[IU4_NB];
-    #pragma unroll
-    for (int nb = 0; nb < IU4_NB; nb++) {
-        col_nb[nb] = col_start + wave_col0 + nb * 16 + m_lane;
-        col_valid[nb] = (col_nb[nb] < N);
-    }
+    const int wt_pair = wave >> 1;     // 0..3: which 32-row group
+    const int tok_half = wave & 1;     // 0/1: which 64-token half
+    const int wave_row0 = wt_pair * 32;
+    const int wave_tok0 = tok_half * 64;
 
     const int groups_per_row = K / 256;
 
     extern __shared__ char LDS[];
-    char* __restrict__ w_lds = LDS;                       // IU4_W_BYTES
+    char* __restrict__ a_lds = LDS + IU4_A_OFF;
+    char* __restrict__ w_lds = LDS + IU4_W_OFF;
+    char* __restrict__ ds_lds = LDS + IU4_DS_OFF;
+    char* __restrict__ sz_lds = LDS + IU4_SZ_OFF;
 
-    // Output accumulators (gfx12 wave32 layout):
-    // acc[nb][j] = Y[8*k_grp + j][col_nb[nb]].
-    float8_t acc[IU4_NB];
+    // Hoisted K-loop addresses: full LDS byte offsets of every fragment this
+    // lane will ever read. Computed once at kernel top (outside ALL loops);
+    // the K-step indexes them with unroll constants only.
+    unsigned frA[4][2];
+    unsigned frW[2][2];
     #pragma unroll
-    for (int nb = 0; nb < IU4_NB; nb++) {
-        acc[nb] = (float8_t){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+    for (int nb = 0; nb < 4; nb++) {
+        const unsigned tok = (unsigned)(wave_tok0 + nb * 16 + m_lane);
+        #pragma unroll
+        for (int sb = 0; sb < 2; sb++) {
+            frA[nb][sb] = tok * (unsigned)IU4_STRIDE
+                + (unsigned)sb * 16u + (unsigned)k_grp * 8u;
+        }
+    }
+    #pragma unroll
+    for (int rg = 0; rg < 2; rg++) {
+        const unsigned row = (unsigned)(wave_row0 + rg * 16 + m_lane);
+        #pragma unroll
+        for (int sb = 0; sb < 2; sb++) {
+            frW[rg][sb] = row * (unsigned)IU4_STRIDE
+                + (unsigned)sb * 16u + (unsigned)k_grp * 8u;
+        }
     }
 
-    const int nthreads = IU4_NWAVES * 32;
-    // Weight half-slab data dwords staged per (group, 128-K half): 16 rows ×
-    // 16 dw (the 8 B pad per row is never written or read).
-    const int W_DWORDS = 256;
+    // Output accumulators (gfx12 wave32 layout):
+    // acc[nb][rg][j] = Y[wave_tok0 + nb*16 + m_lane][rs + wave_row0 + rg*16 + 8*k_grp + j].
+    float8_t acc[4][2];
+    #pragma unroll
+    for (int nb = 0; nb < 4; nb++) {
+        #pragma unroll
+        for (int rg = 0; rg < 2; rg++) {
+            acc[nb][rg] = (float8_t){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+        }
+    }
+    // One reusable zero C vector for each chain's first WMMA.
+    const int32x8_t zc = (int32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
+    int32x8_t cacc[4][2];
+    // Slab prefetch registers (slab s+1 globals while computing slab s).
+    unsigned A_pf[IU4_BM * 8 / IU4_NTHREADS];
+    unsigned W_pf[IU4_BN * 8 / IU4_NTHREADS];
+
+    // Token (d, s) for this lane's 4 column blocks, per kb block (live
+    // across both slabs; loaded from the staged DS plane, not global).
+    float td_x[4];
+    int ts_x[4];
 
     for (int g = 0; g < groups_per_row; g++) {
-        // MQ4V2 per-group header: word h holds the fp16 (sc, zp) pair for
-        // 128-K half h (same contract as the gfx11 iu4 kernel's ksc select).
-        // Header read by lane 0 of each wave is scalar-cheap; every lane
-        // loads it (L1 hit) to avoid a shuffle.
-        const int safe_row0 = (row_start + m_lane < M) ? (row_start + m_lane) : (M - 1);
-        const char* row0_gp = A + (long long)safe_row0 * groups_per_row * 136 + g * 136;
-        const unsigned int hs0 = *(const unsigned int*)(row0_gp + 0);
-        const unsigned int hs1 = *(const unsigned int*)(row0_gp + 4);
-        const float sc0_self = __half2float(__ushort_as_half((unsigned short)(hs0 & 0xFFFFu)));
-        const float zp0_self = __half2float(__ushort_as_half((unsigned short)(hs0 >> 16)));
-        const float sc1_self = __half2float(__ushort_as_half((unsigned short)(hs1 & 0xFFFFu)));
-        const float zp1_self = __half2float(__ushort_as_half((unsigned short)(hs1 >> 16)));
+        for (int h = 0; h < 2; h++) {
+            const int kb = 2 * g + h;
 
-        // 2 int4 blocks per group (256 K-elements / 128 = 2). Each block holds
-        // 4 sub-blocks of 32 K covered by ONE K32 WMMA each, per column block.
-        for (int kb_in_group = 0; kb_in_group < 2; kb_in_group++) {
-            const int kb = 2 * g + kb_in_group;
-
-            // --- Stage weight half-slab: 16 rows × 72 B (64 B data + 8 B pad).
-            // Row stride 72 gives consecutive m_lanes distinct banks
-            // ((r*18)%32 all distinct); the k_grp half (+8 B) costs the
-            // unavoidable 2-way floor. Simple linear addresses. ---
-            for (int i = tid; i < W_DWORDS; i += nthreads) {
-                const int r = i >> 4;       // row 0..15 within tile
-                const int w = i & 15;       // dword 0..15 within the 64 B row half
-                const int row_r = row_start + r;
-                const int src_row = (row_r < M) ? row_r : (M - 1);
-                const char* src = A + (long long)src_row * groups_per_row * 136
-                    + g * 136 + 8 + kb_in_group * 64 + w * 4;
-                ((int*)(w_lds + r * 72))[w] = *(const int*)src;
+            // --- Stage metadata: DS (token d/s for kb) + SZ (row sc/zp). ---
+            for (int i = tid; i < IU4_BM * 2; i += IU4_NTHREADS) {
+                const int tok_idx = i >> 1;
+                const int w = i & 1;
+                const int tok = bs + tok_idx;
+                const unsigned dw = (tok < N)
+                    ? ((const unsigned*)(Xq + (long long)kb * N + tok))[w]
+                    : 0u;
+                ((unsigned*)(ds_lds + tok_idx * 8))[w] = dw;
+            }
+            for (int i = tid; i < IU4_BN * 2; i += IU4_NTHREADS) {
+                const int row_idx = i >> 1;
+                const int w = i & 1;
+                const int grow = rs + row_idx;
+                const int src_row = (grow < M) ? grow : (M - 1);
+                const unsigned hw = *(const unsigned*)(A + (long long)src_row * groups_per_row * 136
+                    + g * 136 + h * 4);
+                const float f = (w == 0)
+                    ? __half2float(__ushort_as_half((unsigned short)(hw & 0xFFFFu)))
+                    : __half2float(__ushort_as_half((unsigned short)(hw >> 16)));
+                ((float*)(sz_lds + row_idx * 8))[w] = (grow < M) ? f : 0.0f;
             }
             __syncthreads();
-            // Per-half scale rows for the fold below: acc[nb][j] holds output
-            // row row_start + 8*k_grp + j, whose (sc,zp) live on the lane with
-            // m_lane = 8*k_grp + j. Shared across column blocks (same rows).
-            const float sc_self = (kb_in_group == 0) ? sc0_self : sc1_self;
-            const float zp_self = (kb_in_group == 0) ? zp0_self : zp1_self;
-            float sc_row[8];
-            float zp_row[8];
+            // Lane token metadata for the fold (from LDS, live over slabs).
             #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                const int src_lane = 8 * k_grp + j;
-                sc_row[j] = __shfl(sc_self, src_lane);
-                zp_row[j] = __shfl(zp_self, src_lane);
+            for (int nb = 0; nb < 4; nb++) {
+                const unsigned tbase = (unsigned)(wave_tok0 + nb * 16 + m_lane) * 8u;
+                td_x[nb] = *(const float*)(ds_lds + tbase);
+                ts_x[nb] = *(const int*)(ds_lds + tbase + 4u);
             }
 
-            // Activation blocks per column block, direct from global (v1
-            // pattern; null for OOB cols).
-            const unsigned char* qs_nb[IU4_NB];
-            float d_x_nb[IU4_NB];
-            int s_x_nb[IU4_NB];
-            #pragma unroll
-            for (int nb = 0; nb < IU4_NB; nb++) {
-                const block_i4_128* xb = col_valid[nb]
-                    ? (Xq + (long long)kb * N + col_nb[nb])
-                    : nullptr;
-                d_x_nb[nb] = (xb != nullptr) ? xb->d : 0.0f;
-                s_x_nb[nb] = (xb != nullptr) ? xb->s : 0;
-                qs_nb[nb]  = (xb != nullptr) ? xb->qs : nullptr;
+            // --- Prologue: stage slab 0 (A + W). ---
+            for (int i = tid; i < IU4_BM * 8; i += IU4_NTHREADS) {
+                const int row = i >> 3;
+                const int dw = i & 7;
+                const int tok = bs + row;
+                unsigned v = 0u;
+                if (tok < N) {
+                    const block_i4_128* xb = Xq + (long long)kb * N + tok;
+                    v = ((const unsigned*)(xb->qs))[dw];
+                }
+                ((unsigned*)(a_lds + row * IU4_STRIDE))[dw] = v;
             }
+            for (int i = tid; i < IU4_BN * 8; i += IU4_NTHREADS) {
+                const int row = i >> 3;
+                const int dw = i & 7;
+                const int grow = rs + row;
+                const int src_row = (grow < M) ? grow : (M - 1);
+                const unsigned v = *(const unsigned*)(A + (long long)src_row * groups_per_row * 136
+                    + g * 136 + 8 + h * 64 + dw * 4);
+                ((unsigned*)(w_lds + row * IU4_STRIDE))[dw] = v;
+            }
+            __syncthreads();
 
-            // 4 sub-blocks of 32 K each accumulate into ONE int32 C per column
-            // block; then ONE fold with (d_x, s_x). Exact integer arithmetic:
-            // grouping into 4×K32 matches gfx11's 8×K16 bit-for-bit. The A
-            // fragment comes from the LDS half-slab (one b64 read), the B
-            // fragment direct from global (v1 pattern).
-            int32x8_t cacc[IU4_NB];
-            #pragma unroll
-            for (int nb = 0; nb < IU4_NB; nb++) {
-                cacc[nb] = (int32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
-            }
-            #pragma unroll 1
-            for (int sb = 0; sb < 4; sb++) {
-                // Weight fragment for this lane's row from the LDS half-slab.
-                const int32x2_t a_i32 =
-                    *(const int32x2_t*)(w_lds + m_lane * 72 + sb * 16 + k_grp * 8);
+            // --- Trip 0: prefetch slab 1, compute slab 0, publish. ---
+            {
+                #pragma unroll
+                for (int t = 0; t < IU4_BM * 8 / IU4_NTHREADS; t++) {
+                    const int i = tid + IU4_NTHREADS * t;
+                    const int row = i >> 3;
+                    const int dw = i & 7;
+                    const int tok = bs + row;
+                    unsigned av = 0u;
+                    if (tok < N) {
+                        const block_i4_128* xb = Xq + (long long)kb * N + tok;
+                        av = ((const unsigned*)(xb->qs + 32))[dw];
+                    }
+                    A_pf[t] = av;
+                    const int grow = rs + row;
+                    const int src_row = (grow < M) ? grow : (M - 1);
+                    W_pf[t] = *(const unsigned*)(A + (long long)src_row * groups_per_row * 136
+                        + g * 136 + 8 + h * 64 + 32 + dw * 4);
+                }
+                // Pin the prefetched loads above the WMMAs.
+      
                 __builtin_amdgcn_sched_barrier(0);
+                iu4_bundle<0, true>(w_lds, a_lds, frW, frA, cacc, zc);
+                iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
+                __syncthreads();
+                // Publish slab 1 over slab 0's slot (buffer free: trip-0
+                // compute done; single LDS buffer, same addresses).
                 #pragma unroll
-                for (int nb = 0; nb < IU4_NB; nb++) {
-                    int32x2_t b_i32;
-                    if (qs_nb[nb] != nullptr) {
-                        b_i32 = *(const int32x2_t*)(qs_nb[nb] + sb * 16 + k_grp * 8);
-                    } else {
-                        b_i32 = (int32x2_t){0, 0};
-                    }
-                    cacc[nb] = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(
-                        false, a_i32, true, b_i32, cacc[nb], false
-                    );
+                for (int t = 0; t < IU4_BM * 8 / IU4_NTHREADS; t++) {
+                    const int i = tid + IU4_NTHREADS * t;
+                    const int row = i >> 3;
+                    const int dw = i & 7;
+                    ((unsigned*)(a_lds + row * IU4_STRIDE))[dw] = A_pf[t];
+                    ((unsigned*)(w_lds + row * IU4_STRIDE))[dw] = W_pf[t];
                 }
+                __syncthreads();
             }
-
-            #pragma unroll
-            for (int nb = 0; nb < IU4_NB; nb++) {
-                const int* acc_i = (const int*)&cacc[nb];
-                const float d_x = d_x_nb[nb];
-                const int s_x = s_x_nb[nb];
+            // --- Trip 1: compute slab 1, fold at the 128-K boundary. ---
+            {
+                iu4_bundle<0, false>(w_lds, a_lds, frW, frA, cacc, zc);
+                iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
+                // Fold: 4 K32 int32 partials per (nb, rg) through the pinned
+                // IU4_FOLD_RN DAG. Per-half (sc,zp) via intra-wave shuffle
+                // from the lane owning each output row; (d,s) streamed from
+                // the staged DS plane.
                 #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    IU4_FOLD_RN(acc[nb][j], sc_row[j], zp_row[j], d_x, acc_i[j], s_x);
+                for (int rg = 0; rg < 2; rg++) {
+                    const unsigned rbase = (unsigned)(wave_row0 + rg * 16 + m_lane) * 8u;
+                    const float sc_rg = *(const float*)(sz_lds + rbase);
+                    const float zp_rg = *(const float*)(sz_lds + rbase + 4u);
+                    float sc_row[8];
+                    float zp_row[8];
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const int src_lane = 8 * k_grp + j;
+                        sc_row[j] = __shfl(sc_rg, src_lane);
+                        zp_row[j] = __shfl(zp_rg, src_lane);
+                    }
+                    #pragma unroll
+                    for (int nb = 0; nb < 4; nb++) {
+                        int* acc_i = (int*)&cacc[nb][rg];
+                        const float d_x = td_x[nb];
+                        const int s_x = ts_x[nb];
+                        #pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            IU4_FOLD_RN(acc[nb][rg][j], sc_row[j], zp_row[j], d_x, acc_i[j], s_x);
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+        } // for h
+    } // for g
+    // Coalesced store: the WMMA C layout leaves lane (m_lane,k_grp) holding
+    // acc[nb][rg][j] for token wave_tok0+nb*16+m_lane and rows
+    // wave_row0+rg*16+8*k_grp+j, so one store instruction touches 16 output
+    // rows at 4 B each. Transpose each (rg,nb) 16x16 wave tile through LDS
+    // instead: all 8 waves dump in parallel (one [16][20] slot each; the
+    // stride-20 pad keeps streaming reads bank-clean), then all 256 threads
+    // stream the 64x32 phase tile with thread (i=tid&15, x=(tid>>4)&15)
+    // covering rows (consecutive threads = consecutive rows = 128 B global
+    // segments) and k covering 4 row-pairs x 2 token-halves. Per-element
+    // arithmetic is unchanged (one residual add), hence bit-identical; only
+    // the visit order changes. A/W/DS/SZ are dead (all folds complete), so
+    // the slots reuse LDS base: 8 x 320 floats = 10240 B < 12288 B.
+    float* slots = (float*)LDS;
+    #pragma unroll
+    for (int rg = 0; rg < 2; rg++) {
+        #pragma unroll
+        for (int nb = 0; nb < 4; nb++) {
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                slots[(unsigned)(wave * 320 + (8 * k_grp + j) * 20 + m_lane)] = acc[nb][rg][j];
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                const int p = k >> 1;    // row-pair 0..3
+                const int h = k & 1;     // token-half 0..1
+                const int i = tid & 15;
+                const int x = (tid >> 4) & 15;
+                const int row_rel = p * 32 + rg * 16 + i;
+                const int col_rel = h * 64 + nb * 16 + x;
+                const int owner = (p << 1) | h;
+                const float v = slots[(unsigned)(owner * 320 + i * 20 + x)];
+                const int row = rs + row_rel;
+                const int col = bs + col_rel;
+                if (row < M && col < N) {
+                    float* yp = Y + (long long)col * M + row;
+                    if constexpr (ADD) {
+                        *yp += v;
+                    } else {
+                        *yp = v;
+                    }
                 }
             }
             __syncthreads();
-        } // for kb_in_group
-    } // for g
-
-    // gfx12 wave32 WMMA C-mapping: acc[nb][j] = C[8*k_grp + j][col_nb[nb]].
-    #pragma unroll
-    for (int nb = 0; nb < IU4_NB; nb++) {
-        if (col_valid[nb]) {
-            #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                const int out_row = row_start + 8 * k_grp + j;
-                if (out_row < M) {
-                    float* yp = Y + (long long)col_nb[nb] * M + out_row;
-                    if constexpr (ADD) {
-                        *yp += acc[nb][j];
-                    } else {
-                        *yp = acc[nb][j];
-                    }
-                }
-            }
         }
     }
 }
 
 // residual: += (the `add` kernarg picks += vs = at runtime).
-extern "C" __global__ __launch_bounds__(128, 2)
+extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
 void gemm_mq4g256v2_residual_mmq_iu4(
     const char*           __restrict__ A,
     const block_i4_128*   __restrict__ Xq,
@@ -291,7 +470,7 @@ void gemm_mq4g256v2_residual_mmq_iu4(
     }
 }
 
-extern "C" __global__ __launch_bounds__(128, 2)
+extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
 void gemm_mq4g256v2_residual_mmq_iu4_full_add(
     const char*           __restrict__ A,
     const block_i4_128*   __restrict__ Xq,
@@ -301,7 +480,7 @@ void gemm_mq4g256v2_residual_mmq_iu4_full_add(
     gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<true>(A, Xq, Y, M, K, N);
 }
 
-extern "C" __global__ __launch_bounds__(128, 2)
+extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
 void gemm_mq4g256v2_residual_mmq_iu4_full_set(
     const char*           __restrict__ A,
     const block_i4_128*   __restrict__ Xq,

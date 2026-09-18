@@ -2649,6 +2649,24 @@ impl Gpu {
         }
         .map_err(|e| e.with_kernel(func_name))
     }
+    /// Occupancy probe for a pre-loaded kernel by name (oracle metadata gate).
+    pub fn occupancy_max_active_blocks(
+        &self,
+        func_name: &str,
+        block: [u32; 3],
+        shared_mem: u32,
+    ) -> HipResult<i32> {
+        self.bind_thread()?;
+        let func = self.functions.get(func_name).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("occupancy_max_active_blocks: function '{func_name}' not loaded"),
+            )
+        })?;
+        let block_size = block[0] * block[1] * block[2];
+        self.hip
+            .occupancy_max_active_blocks(func, block_size, shared_mem as usize)
+    }
 
     /// Compile and load a kernel, caching the result.
     pub(crate) fn ensure_kernel(

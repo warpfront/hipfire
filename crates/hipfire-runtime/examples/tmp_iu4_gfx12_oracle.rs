@@ -3,7 +3,7 @@
 //! Loads real qt=44 gate_proj (17408x5120) and down_proj (5120x17408) from an
 //! MQ4-XT HFQ, quantizes X via `ensure_int4_mmq_x`, and raw-launches the
 //! gfx12 `gemm_mq4g256v2_residual_mmq_iu4_full_{set,add}` symbols (grid
-//! [M/16, N/16], block [32,1,1], LDS 0) on identical inputs. Checks:
+//! [M/128, N/128], block [256,1,1], LDS 12288) on identical inputs. Checks:
 //!   1. bitwise equality vs a CPU f32 reference with the pinned IU4_FOLD_RN
 //!      DAG (full for small cases, edge stripes for the big real ones);
 //!   2. bit-identical repeat (same inputs twice);
@@ -186,10 +186,11 @@ fn launch_iu4(
     b.push_i32(n as i32);
     b.push_i32(i32::from(add));
     let mut blob = b.into_vec();
-    // v2 tile: WG = 16 rows x 256 cols (4 waves), LDS = 1152 B weight slab.
-    let grid = [m.div_ceil(16) as u32, n.div_ceil(256) as u32, 1];
-    let lds: u32 = 1152;
-    gpu.launch_kernel_blob(sym, grid, [128, 1, 1], lds, &mut blob)
+    // v2 staged tile: WG = 128 rows x 128 cols (8 waves), LDS = 12288 B
+    // (A/W slabs + DS/SZ metadata planes).
+    let grid = [m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1];
+    let lds: u32 = 12288;
+    gpu.launch_kernel_blob(sym, grid, [256, 1, 1], lds, &mut blob)
         .unwrap_or_else(|e| panic!("launch {sym}: {e}"));
 }
 
@@ -495,6 +496,16 @@ fn main() {
         time_case(&mut gpu, "qkvza-M16480-K5120-N512/set", &aqkvza, 16480, 5120, 512, false);
         let aqkv = pack_mq4g256v2_synth(14336, 5120, 0x71E0_B000);
         time_case(&mut gpu, "qkv-M14336-K5120-N512/set", &aqkv, 14336, 5120, 512, false);
+        return;
+    }
+    // OCC=1: occupancy probe (block 256, LDS 12288) for gate 2, then return.
+    if std::env::var("OCC").ok().as_deref() == Some("1") {
+        for s in [SET_SYM, ADD_SYM] {
+            match gpu.occupancy_max_active_blocks(s, [256, 1, 1], 12288) {
+                Ok(n) => eprintln!("OCC {s}: max_active_blocks_per_CU={n} (block 256, lds 12288)"),
+                Err(e) => eprintln!("OCC {s}: ERROR {e}"),
+            }
+        }
         return;
     }
     drop(hfq);
