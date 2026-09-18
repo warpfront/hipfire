@@ -1,0 +1,76 @@
+{
+  "route": "v2",
+  "v2_geometry": {
+    "BM": 64,
+    "BN": 256,
+    "BK": 64,
+    "waves": 8
+  },
+  "timed_repeats": 11,
+  "families": [
+    {
+      "family": "gate_up",
+      "n": 512,
+      "k": 5120,
+      "m_total": 34816,
+      "hash": "2adf7620c1d722e1",
+      "deterministic": true,
+      "finite": true,
+      "gemm_median_us": 2221.345901489258,
+      "gemm_n": 11,
+      "pack_median_us": 52.320998162031174,
+      "kernels": [
+        "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201",
+        "pack_f32_to_fp8_mq4v2_gfx12"
+      ]
+    },
+    {
+      "family": "qkv",
+      "n": 512,
+      "k": 5120,
+      "m_total": 14336,
+      "hash": "09726b10ba1eb1b2",
+      "deterministic": true,
+      "finite": true,
+      "gemm_median_us": 850.7699966430664,
+      "gemm_n": 11,
+      "pack_median_us": 29.08100001513958,
+      "kernels": [
+        "gemm_qkv_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201",
+        "pack_f32_to_fp8_mq4v2_gfx12"
+      ]
+    },
+    {
+      "family": "qkvza",
+      "n": 512,
+      "k": 5120,
+      "m_total": 16480,
+      "hash": "082a7b24def26f75",
+      "deterministic": true,
+      "finite": true,
+      "gemm_median_us": 999.813973903656,
+      "gemm_n": 11,
+      "pack_median_us": 29.079999774694443,
+      "kernels": [
+        "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201",
+        "pack_f32_to_fp8_mq4v2_gfx12"
+      ]
+    },
+    {
+      "family": "residual",
+      "n": 512,
+      "k": 17408,
+      "m_total": 5120,
+      "hash": "373cb087fb519b9e",
+      "deterministic": true,
+      "finite": true,
+      "gemm_median_us": 1062.6120567321777,
+      "gemm_n": 11,
+      "pack_median_us": 76.80100202560425,
+      "kernels": [
+        "gemm_mq4g256v2_residual_wmma_fp8_v2_b64x256_gfx1201",
+        "pack_f32_to_fp8_mq4v2_gfx12"
+      ]
+    }
+  ]
+}

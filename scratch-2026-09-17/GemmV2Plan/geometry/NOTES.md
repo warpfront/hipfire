@@ -39,8 +39,26 @@ bound re-derivation needed.
 
 - sweep-b128x128: 36/36 pass, 36/36 bit-identical.
 - sweep-b64x256: 36/36 pass, 36/36 bit-identical.
-- sweep-b128x64w4: running.
+- sweep-b128x64w4: 36/36 pass, 36/36 bit-identical.
 
-## TIME (bench-canonical, canonical N=512 shapes, same session)
+## TIME (bench-canonical, canonical N=512, same session, 11 timed reps)
 
-Pending. Admission <=0.60 on all four vs remeasured same-session s2bt8.
+| fam | incumbent s2bt8 | v2 256x64 | 128x128 | 64x256 | 128x64w4 | best/inc |
+|---|---|---|---|---|---|---|
+| gate_up | 1985.7 | 2012.5 | 1720.7 | 2221.3 | 2367.4 | 0.867 |
+| qkv | 814.9 | 842.5 | 709.8 | 850.8 | 997.3 | 0.871 |
+| qkvza | 884.9 | 971.7 | 836.1 | 999.8 | 1153.9 | 0.945 |
+| residual | 1010.7 | 1262.5 | 901.6 | 1062.6 | 1463.8 | 0.892 |
+
+L2-traffic estimate alongside (GB/staging ratio): gate_up
+1.783/1.426(0.80)/1.783(1.00)/2.139(1.20); qkv 0.734/0.587/0.734/0.881;
+qkvza 0.845/0.676/0.852/1.014; residual 0.891/0.713/0.891/1.070.
+128x128 beats its 0.80 traffic ratio on residual (0.892 vs 0.80 comes with
+grid/occupancy effects; still far from admission).
+
+ADMISSION VERDICT: FAIL — best 128x128 rows 0.867/0.871/0.945/0.892,
+all above the 0.60 cap. 64x256 is at/above parity (1.04-1.13x),
+confirming the traffic model (1.00x staging). Per stop rules: STOP after
+the bounded sweep. No KLD / interleave / decode / serve phase (gated on
+admission). Bench hashes equal oracle hashes cross-harness; det=true all.
+Winner reported even though it misses: 128x128x64/8w.
