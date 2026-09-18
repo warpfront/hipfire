@@ -45,8 +45,7 @@
 //     4 nb x 4 reads.
 //   - K-loop body per (slab, K32-sub-block) = ds_read_b64 (W frag) +
 //     ds_read_b64 (A frag) + v_wmma_i32_16x16x32_iu4; the per-128-K fold
-//     (IU4_FOLD_RN, 4 chunks of the PREVIOUS half delayed one half and
-//     pair-ordered among this half's slab-0 bundles) is the ONLY other
+//     (IU4_FOLD_RN, once per block after the 2nd slab) is the ONLY other
 //     K-loop VALU. All fragment addresses are hoisted to kernel top
 //     (frA/frW tables); slab/sb/nb/rg are unroll constants, so the K-step
 //     carries no dynamic address math.
@@ -55,20 +54,18 @@
 //     single-buffered (A) with v2's publish fence. DS and SZ metadata
 //     ping-pong per half-block (plane[h], kb = 2g+h) while token (d,s) is
 //     re-read from the DS plane at fold time (same values, same DAG).
-//     Steady state per half: prefetch slab 1 into A_pf/W_pf, delayed fold
-//     of the previous half's rg0 pairs, rg-split slab-0 bundles for rg0
-//     (FIRST restart), delayed fold of the previous half's rg1 pairs,
-//     rg-split slab-0 bundles for rg1, B0 (slab-0 A-reads done), publish
-//     slab 1 to (A,W1), refill A_pf with next half's A slab 0, one barrier,
-//     full slab-1 bundles, cooperatively stage next half's W0/DS/SZ
-//     straight to LDS, B2a (slab-1 A-reads done), publish A_pf to A, one
-//     barrier (B2b). The last half's fold drains after the loop (no next
-//     half to overlap with). Four barriers per half; slab 1 loads issue
-//     above slab 0's WMMAs (sched_barrier-pinned, as in v2). Bit-identical:
-//     same K order, same pinned IU4_FOLD_RN DAG. Single cacc bank (a
-//     runtime-selected dual bank cndmasks every access and spills); the
-//     pair order is correctness by construction (same-bank WAR), needing
-//     no scheduler pinning. LDS 19456 B keeps 3 WG/CU on gfx1201.
+//     Steady state per block: prefetch slab 1 into A_pf/W_pf, compute slab
+//     0 from (A,W0), B0 (slab-0 A-reads done), publish slab 1 to (A,W1),
+//     refill A_pf with next block's A slab 0, one barrier, compute slab 1
+//     from (A,W1), cooperatively stage next block's W0/DS/SZ straight to
+//     LDS, B2a (slab-1 A-reads done), publish A_pf to A, one barrier, then
+//     fold (below B2b: the scheduler interleaves this VALU with the next
+//     block's prefetch + WMMA chain — variant 0, no extra registers).
+//     Four barriers per block (vs five before); slab 1 loads issue above
+//     slab 0's WMMAs (sched_barrier-pinned, as in v2), next-block W staging
+//     issues above the fold, and next-block A loads issue above compute 1
+//     + fold. Bit-identical: same K order, same pinned IU4_FOLD_RN DAG.
+//     LDS 19456 B keeps 3 WG/CU on gfx1201 (3 x 19456 = 58368 < 65536/CU).
 //   - Coalesced store (fp8 K2 mechanism): each (rg, nb) phase dumps the
 //     wave's 16x16 f32 sub-tile to an LDS slot ([16][20], stride-20 pad for
 //     bank-clean streaming), then all 256 threads stream 64 rows x 32 cols
@@ -224,85 +221,6 @@ static __device__ __forceinline__ void iu4_bundle(
     __builtin_amdgcn_sched_barrier(0);
 }
 
-// One row-group slice of a compute bundle: the 4 column blocks of RG for one
-// K32 sub-block (4 WMMAs). Lets the K-loop order each rg's fold strictly
-// before the bundles that overwrite that rg (same-bank WAR), while the other
-// rg's fold overlaps freely around them. Same fragments, same chain order
-// per pair as iu4_bundle (FIRST restarts the pair from zc); only the rg loop
-// is hoisted to the caller. Adds one W-frag reload per rg half (the shared
-// af load is per-call now) — LDS broadcast traffic, no extra live values.
-template <int SB, bool FIRST, int RG>
-static __device__ __forceinline__ void iu4_bundle_rg(
-    const char* __restrict__ w_lds,
-    const char* __restrict__ a_lds,
-    const unsigned (&frW)[2][2],
-    const unsigned (&frA)[4][2],
-    int32x8_t cacc[4][2],
-    const int32x8_t& zc
-) {
-    const int32x2_t a = *(const int32x2_t*)(w_lds + frW[RG][SB]);
-    const int32x2_t bf0 = *(const int32x2_t*)(a_lds + frA[0][SB]);
-    const int32x2_t bf1 = *(const int32x2_t*)(a_lds + frA[1][SB]);
-    const int32x2_t bf2 = *(const int32x2_t*)(a_lds + frA[2][SB]);
-    const int32x2_t bf3 = *(const int32x2_t*)(a_lds + frA[3][SB]);
-    #pragma unroll
-    for (int nb = 0; nb < 4; nb++) {
-        const int32x2_t b = (nb == 0) ? bf0 : (nb == 1) ? bf1 : (nb == 2) ? bf2 : bf3;
-        if constexpr (FIRST) {
-            cacc[nb][RG] = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(
-                false, a, true, b, zc, false
-            );
-        } else {
-            cacc[nb][RG] = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(
-                false, a, true, b, cacc[nb][RG], false
-            );
-        }
-    }
-    __builtin_amdgcn_sched_barrier(0);
-}
-
-// One fold chunk: row-group RG, column blocks [NB0, NB1) of the single cacc
-// bank through the pinned IU4_FOLD_RN DAG (bit-identical to the inline fold
-// it replaces: same values, same per-element DAG order). The full per-half
-// fold is 4 chunks (2 RG x 2 nb-pairs); the K-loop issues each rg's chunks
-// delayed by one half, strictly before the bundles that overwrite that rg —
-// so the rg0 fold overlaps the previous half's tail/prefetch and the rg1
-// fold overlaps this half's rg0 WMMAs. Planes/acc come by pointer/reference
-// (no copies); every index is an unroll constant.
-template <int RG, int NB0, int NB1>
-static __device__ __forceinline__ void iu4_fold_chunk(
-    const int32x8_t (&bank)[4][2],
-    const char* __restrict__ ds_lds,
-    const char* __restrict__ sz_lds,
-    float8_t (&acc)[4][2],
-    int wave_tok0,
-    int wave_row0,
-    int m_lane,
-    int k_grp
-) {
-    // Per-rg (sc,zp) row arrays, shared across the chunk's nb-pair (same
-    // addresses/values/DAG order as the original inline fold).
-    float sc_row[8];
-    float zp_row[8];
-    #pragma unroll
-    for (int j = 0; j < 8; j++) {
-        const unsigned jbase = (unsigned)(wave_row0 + RG * 16 + 8 * k_grp + j) * 8u;
-        sc_row[j] = *(const float*)(sz_lds + jbase);
-        zp_row[j] = *(const float*)(sz_lds + jbase + 4u);
-    }
-    #pragma unroll
-    for (int nb = NB0; nb < NB1; nb++) {
-        const int* acc_i = (const int*)&bank[nb][RG];
-        const unsigned tbase = (unsigned)(wave_tok0 + nb * 16 + m_lane) * 8u;
-        const float d_x = *(const float*)(ds_lds + tbase);
-        const int s_x = *(const int*)(ds_lds + tbase + 4u);
-        #pragma unroll
-        for (int j = 0; j < 8; j++) {
-            IU4_FOLD_RN(acc[nb][RG][j], sc_row[j], zp_row[j], d_x, acc_i[j], s_x);
-        }
-    }
-}
-
 // Shared compute body for residual / full_add / full_set. `ADD` selects
 // += (residual) vs = (set) writeback.
 template <bool ADD>
@@ -403,12 +321,6 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     }
     // One reusable zero C vector for each chain's first WMMA.
     const int32x8_t zc = (int32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
-    // Single int32 accumulator bank: the fold of pair-group rg is ordered
-    // strictly before the bundles that overwrite rg (same-bank WAR the
-    // scheduler must respect), while the other rg's fold overlaps freely.
-    // Pair-ordered delayed fold gives WMMA/VALU overlap with no ping-pong
-    // bank (a runtime-selected VGPR bank cndmasks every access) and no
-    // scheduler pinning.
     int32x8_t cacc[4][2];
     // Slab prefetch registers (slab s+1 globals while computing slab s): b64
     // pairs, same 8 dwords/lane as before (2 rounds x 1 u32x2 per plane).
@@ -453,30 +365,25 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         }
     }
     __syncthreads();
-    // g/h rolled (unroll_count(1)): unrolling keeps block k's staging+fold
-    // temporaries live across blocks and blows VGPRs past 256 with spills
-    // (the scheduler overlaps the whole unrolled window). Rolled, only
-    // cacc/acc carry across iterations. Pair order inside is still manual
-    // (chunk/bundle adjacency in program order); the small rolled window
-    // keeps pressure low so the scheduler can actually overlap them.
-    #pragma clang loop unroll_count(1)
+
     for (int g = 0; g < groups_per_row; g++) {
+        // Rolled (not unrolled: unroll_count(1)): the unrolled h x 2 body
+        // keeps block k's staging+fold temporaries live across block k+1's
+        // prefetch+compute and blows VGPRs past 256 with spills. Rolled, only
+        // cacc/acc carry across iterations.
         #pragma clang loop unroll_count(1)
         for (int h = 0; h < 2; h++) {
             const int kb = 2 * g + h;
             const bool last = (h == 1) && (g + 1 == groups_per_row);
-            const bool have_prev = !(g == 0 && h == 0);
-            // Prev-half DS/SZ planes (half h^1). NOTE: this trip's own
-            // staging targets these same planes, so the folds below must
-            // complete their reads first — guaranteed: folds sit in slab 0,
-            // staging sits after slab-1 compute, with B1 between.
-            char* __restrict__ ds_prev = LDS + ((h == 0) ? IU4_DS1_OFF : IU4_DS_OFF);
-            char* __restrict__ sz_prev = LDS + ((h == 0) ? IU4_SZ1_OFF : IU4_SZ0_OFF);
+            // DS/SZ planes for this half-block (kb parity = h); the next
+            // block stages the opposite planes, so its writes never race
+            // this block's compute+fold reads.
+            char* __restrict__ ds_lds = LDS + ((h == 0) ? IU4_DS_OFF : IU4_DS1_OFF);
+            char* __restrict__ sz_lds = LDS + ((h == 0) ? IU4_SZ0_OFF : IU4_SZ1_OFF);
             // --- Slab 0 compute (A, W0) with slab 1 prefetch as producer. ---
             {
                 // Slab 1 prefetch, b64-coalesced: uniform SGPR bases carry
                 // kb/g/h, lane VGPR offsets were hoisted to kernel top.
-                // Issues first so the rg0 fold below covers its latency.
                 const char* __restrict__ xqB1 = (const char*)(Xq + (long long)kb * N) + 8 + 32;
                 const char* __restrict__ wB1 = A + (long long)g * 136 + 8 + (long long)h * 64 + 32;
                 #pragma unroll
@@ -485,39 +392,26 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     A_pf[r] = st_aok[r] ? av : z64;
                     W_pf[r] = *(const u32x2_t*)(wB1 + st_wvoff[r]);
                 }
-                // Delayed fold of the previous half's rg0 pairs. Strictly
-                // before the rg0 bundles below (same-bank WAR the scheduler
-                // must respect); overlaps the prefetch above. Every 128-K
-                // half restarts its int32 accumulation from zero (each half
-                // folds independently): FIRST=true on slab 0 of every half.
-                if (have_prev) {
-                    iu4_fold_chunk<0, 0, 2>(cacc, ds_prev, sz_prev, acc, wave_tok0, wave_row0, m_lane, k_grp);
-                    iu4_fold_chunk<0, 2, 4>(cacc, ds_prev, sz_prev, acc, wave_tok0, wave_row0, m_lane, k_grp);
-                    __builtin_amdgcn_sched_group_barrier(2, 64, 0);
-                }
-                iu4_bundle_rg<0, true, 0>(w_lds, a_lds, frW, frA, cacc, zc);
-                iu4_bundle_rg<1, false, 0>(w_lds, a_lds, frW, frA, cacc, zc);
-                __builtin_amdgcn_sched_group_barrier(8, 8, 0);
-                // Delayed fold of the previous half's rg1 pairs. Independent
-                // of the rg0 bundles above (different pairs) so it overlaps
-                // them; strictly before the rg1 bundles below (same-bank WAR).
-                if (have_prev) {
-                    iu4_fold_chunk<1, 0, 2>(cacc, ds_prev, sz_prev, acc, wave_tok0, wave_row0, m_lane, k_grp);
-                    iu4_fold_chunk<1, 2, 4>(cacc, ds_prev, sz_prev, acc, wave_tok0, wave_row0, m_lane, k_grp);
-                    __builtin_amdgcn_sched_group_barrier(2, 64, 0);
-                }
-                iu4_bundle_rg<0, true, 1>(w_lds, a_lds, frW, frA, cacc, zc);
-                iu4_bundle_rg<1, false, 1>(w_lds, a_lds, frW, frA, cacc, zc);
-                __builtin_amdgcn_sched_group_barrier(8, 8, 0);
+                // Variant 0: NO pin barrier here. The previous trip's fold
+                // VALU (below its B2b) must be free to sink among this
+                // trip's WMMAs; a sched_barrier(0) would retire the whole
+                // fold before the chain starts. True deps (cacc WAR per
+                // element, A_pf/W_pf publish after B0) still order what
+                // must be ordered; the scheduler hoists the prefetch loads
+                // for latency on its own.
+                // Every 128-K block restarts its int32 accumulation from zero
+                // (each block folds independently): FIRST=true on slab 0 of
+                // every (g,h), exactly as in v2. No h-dependence here.
+                iu4_bundle<0, true>(w_lds, a_lds, frW, frA, cacc, zc);
+                iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
                 // B0: slab-0 A-reads done on every wave (A is single-buffered:
                 // the publish below overwrites slab 0 with slab 1). W1 writes
                 // need no fence but share it.
                 __syncthreads();
                 // Publish slab 1 (A_pf -> A plane, W_pf -> W1) and refill
-                // A_pf with the next half's A slab 0 (guarded; the loads
-                // issue above compute 1 + the next half's fold chunks and
-                // overlap them; the publish to A waits for B2a). Re-point
-                // W at W1 (A is fixed).
+                // A_pf with the next block's A slab 0 (guarded; the loads
+                // issue above compute 1 + fold below and overlap them; the
+                // publish to A waits for B2a). Re-point W at W1 (A is fixed).
                 w_lds = LDS + IU4_W1_OFF;
                 #pragma unroll
                 for (int r = 0; r < 2; r++) {
@@ -525,7 +419,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     *(u32x2_t*)(w_lds + st_ldsoff[r]) = W_pf[r];
                 }
                 if (!last) {
-                    // Next half's A slab 0 (from Xq; only kb_n0 needed).
+                    // Next block's A slab 0 (from Xq; only kb_n0 needed).
                     const int kb_n0 = kb + 1;
                     const char* __restrict__ xqBn0 = (const char*)(Xq + (long long)kb_n0 * N) + 8;
                     #pragma unroll
@@ -535,23 +429,22 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     }
                 }
                 // B1: slab-1 publish visible to all waves before compute 1.
-                // Also separates the folds above from the staging below (the
-                // folds read planes h^1, staging writes planes h^1).
                 __syncthreads();
             }
-            // --- Slab 1 compute (A, W1), next-half stage. ---
-            // Previous half fully folded in slab 0 above; these bundles are
-            // unconstrained.
+            // --- Slab 1 compute (A, W1), next-block W/DS/SZ stage, fold below B2b. ---
             {
                 iu4_bundle<0, false>(w_lds, a_lds, frW, frA, cacc, zc);
                 iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
                 if (!last) {
                     const int g_n = g + h;
                     const int h_n = h ^ 1;
-                    // Next half's W slab 0 staged straight to W0
+                    // Next block's W slab 0 staged straight to W0
                     // (cooperative global -> LDS): W0 reads completed at B1
                     // on every wave; values flow through transient registers
-                    // only. Re-point W at W0.
+                    // only. Re-point W at W0. These loads issue above the
+                    // fold below and overlap its VALU. (Next A slab 0 sits
+                    // in A_pf since trip 0; its publish to the single A
+                    // plane waits for B2a below.)
                     w_lds = LDS + IU4_W0_OFF;
                     const char* __restrict__ wB0n = A + (long long)g_n * 136 + 8 + (long long)h_n * 64;
                     #pragma unroll
@@ -563,10 +456,9 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     const int g_n2 = g + h;
                     const int h_n2 = h ^ 1;
                     const int kb_n2 = kb + 1;
-                    // DS/SZ planes for the next half (opposite parity: plane
-                    // h^1 — folded at the next half's slab 0, separated from
-                    // these writes by B1 and the fold-before-need order).
-                    // DS plane for the next half, clamp-not-branch (same
+                    // DS/SZ planes for the next block (opposite parity: the
+                    // fold below reads DS[h]/SZ[h], staged here is [h^1]).
+                    // DS plane for the next block, clamp-not-branch (same
                     // values as the old ternary: clamped address, zero value).
                     char* __restrict__ ds_n = LDS + ((h_n2 == 0) ? IU4_DS_OFF : IU4_DS1_OFF);
                     {
@@ -576,8 +468,10 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                         const unsigned dw = ((const unsigned*)(Xq + (long long)kb_n2 * N + tok_dsc))[w_ds];
                         ((unsigned*)(ds_n + (tid >> 1) * 8))[w_ds] = (tok_ds < N) ? dw : 0u;
                     }
-                    // SZ plane for the next half (opposite parity, same
-                    // separation as DS above), clamp-not-branch.
+                    // SZ plane for the next block (opposite parity: the fold
+                    // below reads SZ[h], staged here is SZ[h^1]).
+                    // SZ plane for the next block, clamp-not-branch (same
+                    // values: clamped header address, zero value when OOB).
                     char* __restrict__ sz_n = LDS + ((h_n2 == 0) ? IU4_SZ0_OFF : IU4_SZ1_OFF);
                     {
                         const int row_sz = rs + (tid >> 1);
@@ -600,26 +494,46 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                         *(u32x2_t*)(a_lds + st_ldsoff[r]) = A_pf[r];
                     }
                 }
-                // B2b: next-half A/W0/DS/SZ publish visible to all waves
-                // (entry condition of the next half); on the last half it
+                // B2b: next-block A/W0/DS/SZ publish visible to all waves
+                // (entry condition of the next trip); on the last block it
                 // guards the store-slot reuse of LDS base below.
                 __syncthreads();
+                // Fold (variant 0: scheduled below the publish): 4 K32 int32
+                // partials per (nb, rg) through the pinned IU4_FOLD_RN DAG.
+                // Issues AFTER B2b so the machine scheduler can interleave
+                // this VALU with the next trip's prefetch + WMMA chain (the
+                // fold of half h reads only cacc + DS[h]/SZ[h], independent
+                // of half h+1's accumulators). Same f32 values, same DAG
+                // order: per-half (sc,zp) straight from the staged SZ plane
+                // (Change B narrow LDS reads), (d,s) re-read from DS as in A.
+                // Bank-clean on gfx1201: 8 consecutive rows x 2 words hit 16
+                // distinct banks, identical across the 16 lanes of a k_grp
+                // half (LDS broadcast); the halves cover all 32 banks once.
+                #pragma unroll
+                for (int rg = 0; rg < 2; rg++) {
+                    float sc_row[8];
+                    float zp_row[8];
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const unsigned jbase = (unsigned)(wave_row0 + rg * 16 + 8 * k_grp + j) * 8u;
+                        sc_row[j] = *(const float*)(sz_lds + jbase);
+                        zp_row[j] = *(const float*)(sz_lds + jbase + 4u);
+                    }
+                    #pragma unroll
+                    for (int nb = 0; nb < 4; nb++) {
+                        int* acc_i = (int*)&cacc[nb][rg];
+                        const unsigned tbase = (unsigned)(wave_tok0 + nb * 16 + m_lane) * 8u;
+                        const float d_x = *(const float*)(ds_lds + tbase);
+                        const int s_x = *(const int*)(ds_lds + tbase + 4u);
+                        #pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            IU4_FOLD_RN(acc[nb][rg][j], sc_row[j], zp_row[j], d_x, acc_i[j], s_x);
+                        }
+                    }
+                }
             }
         } // for h
     } // for g
-    // Drain: fold of the last half-block (always h=1, planes 1). Every
-    // earlier half folded at the next half's slab 0; this one has no next
-    // half. Guarded for groups_per_row == 0 (loop skipped, cacc unwritten
-    // — acc stays zero exactly as before). Before the store-slot LDS reuse
-    // below (B2b-last already ordered the planes).
-    if (groups_per_row > 0) {
-        char* __restrict__ ds_d = LDS + IU4_DS1_OFF;
-        char* __restrict__ sz_d = LDS + IU4_SZ1_OFF;
-        iu4_fold_chunk<0, 0, 2>(cacc, ds_d, sz_d, acc, wave_tok0, wave_row0, m_lane, k_grp);
-        iu4_fold_chunk<0, 2, 4>(cacc, ds_d, sz_d, acc, wave_tok0, wave_row0, m_lane, k_grp);
-        iu4_fold_chunk<1, 0, 2>(cacc, ds_d, sz_d, acc, wave_tok0, wave_row0, m_lane, k_grp);
-        iu4_fold_chunk<1, 2, 4>(cacc, ds_d, sz_d, acc, wave_tok0, wave_row0, m_lane, k_grp);
-    }
     // Coalesced store: the WMMA C layout leaves lane (m_lane,k_grp) holding
     // acc[nb][rg][j] for token wave_tok0+nb*16+m_lane and rows
     // rows at 4 B each. Transpose each (rg,nb) 16x16 wave tile through LDS
