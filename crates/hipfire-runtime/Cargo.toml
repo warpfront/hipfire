@@ -196,6 +196,10 @@ required-features = ["lab"]
 [[example]]
 name = "tmp_fa2_attrib"
 required-features = ["lab"]
+# Stage-a tolerance oracle: fp8-plane FA2 vs f16 FA2 (throwaway).
+[[example]]
+name = "tmp_fa2_fp8_oracle"
+required-features = ["lab"]
 
 [[example]]
 name = "calib_sweep"
