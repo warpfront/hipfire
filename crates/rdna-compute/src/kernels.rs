@@ -3766,6 +3766,29 @@ pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_LUT_SRC: &str = concat!(
     "#define HIPFIRE_FP8_LUT_ARG 1\n#define HIPFIRE_FP8_SLABS 2\n#define HIPFIRE_FP8_QKV 1\n#define HIPFIRE_FP8_BV 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_gfx12_s2bt8_lut\n",
     include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
 );
+/// Staged-tile v2 (BM256 x BN64 x BK64, 8 waves) gate/up twin:
+/// `HIPFIRE_FP8_V2_TILE=1` selects the staged-LDS/affine-fold path in the
+/// shared TU; same positional ABI as the s2bt8 symbol, distinct symbol/cache
+/// identity. Host-selected only via `kernel.gfx12_mq4v2_fp8_v2` at N>=256.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_V2_TILE 1\n#define HIPFIRE_FP8_V2_BM 256\n#define HIPFIRE_FP8_V2_BN 64\n#define HIPFIRE_FP8_V2_BK 64\n#define HIPFIRE_FP8_V2_WAVES 8\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_v2_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+/// Staged-tile v2 residual twin (`HIPFIRE_FP8_RESIDUAL` family selector).
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_V2_TILE 1\n#define HIPFIRE_FP8_V2_BM 256\n#define HIPFIRE_FP8_V2_BN 64\n#define HIPFIRE_FP8_V2_BK 64\n#define HIPFIRE_FP8_V2_WAVES 8\n#define HIPFIRE_FP8_RESIDUAL 1\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+/// Staged-tile v2 4-way QKVZA twin (`HIPFIRE_FP8_QKVZA` family selector).
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_V2_TILE 1\n#define HIPFIRE_FP8_V2_BM 256\n#define HIPFIRE_FP8_V2_BN 64\n#define HIPFIRE_FP8_V2_BK 64\n#define HIPFIRE_FP8_V2_WAVES 8\n#define HIPFIRE_FP8_QKVZA 1\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
+/// Staged-tile v2 3-way QKV twin (`HIPFIRE_FP8_QKV` family selector).
+pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_V2_TILE 1\n#define HIPFIRE_FP8_V2_BM 256\n#define HIPFIRE_FP8_V2_BN 64\n#define HIPFIRE_FP8_V2_BK 64\n#define HIPFIRE_FP8_V2_WAVES 8\n#define HIPFIRE_FP8_QKV 1\n#define HIPFIRE_FP8_GATEUP_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201\n",
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+);
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma_gfx12_bt.hip");
 pub const GEMM_GATE_UP_MQ6G256V2_WMMA_GFX12_BT_SRC: &str =
