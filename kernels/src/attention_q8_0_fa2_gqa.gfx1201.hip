@@ -77,6 +77,104 @@ __device__ __forceinline__ int fa2_swiz(int c)
 {
     return 8 * (c >> 2) + (c & 3);
 }
+#ifdef HIPFIRE_FA2_FP8
+// ---- Stage-a fp8 planes (OCP e4m3, gfx120x-only) ----
+// K: 64 keys x 256 dims, one byte per dim, dword-packed. Key k's byte row
+// is swizzled by the 4-aligned byte swizzle S8(c) = 32*(c>>2)+4*(c&3)
+// (c = k&15); dword w of key k at Kdw8[k*64 + ((b*8+w+S(c))&63)] with
+// S(c) = fa2_swiz(c) (S8>>2, same spread as the f16 plane, mod 64).
+// V: even/odd byte planes (2 x 256 dims x 32 pairs), addressed as bytes
+// through Vedw/Vodw. Pair m at dim d lives in quad qq = ((m>>2)+S(d&15))&7,
+// byte lane m&3. Reads are one dword per plane (ps is always 4-aligned);
+// fills use byte stores (no RMW races).
+// Total: 4096 + 2048 + 2048 = 8192 dwords = 32,768 B dynamic LDS.
+// q8_0 block scales are NOT stored (no budget left): they are reloaded
+// from the KV-cache block headers (2 B, L1-served) at fragment-build time
+// and applied per fragment in f32, RNE to f16 — the fill-order rounding.
+// (A post-accumulation scale would be inexact: scales are per 32-dim
+// block, 8 distinct scales per key, so no single epilogue multiply is
+// exact; per-block partial accumulators would cost +8 VGPR. The screen's
+// stage-a model (per-block partial dots scaled in f32) agrees with this
+// placement to f16-input rounding, inside the tolerance gate.)
+typedef float __attribute__((ext_vector_type(2))) fa2_f2_t;
+
+// K fragment: 8 dims [dc*16+kg*8, +8) of key `key`, e4m3 -> f16 in-register
+// (one cvt per byte-pair) then the q8 block scale in f32. KMODE=3 bakes
+// cnorm at fill, so the load is a pure cvt there. One reused f32x2 temp
+// keeps the transient live set small (register budget is the gate).
+//
+// Address construction only: the caller passes key_row_dw = key*64 and an
+// opaque group-local byte coordinate
+//   group_byte = dg*64 + kg*8 + 4*fa2_swiz(ml)
+// established at the start of each executed (dg,sub) group with a
+// dependency on the preceding score state (see QK loop). The byte offset
+//   x = (group_byte + 16*u) & 255
+// reproduces the historical dc*16+kg*8+swizzle expansion (dc = dg*4+u)
+// exactly, including row wrapping, but the two expanded word addresses
+// are rematerialized inside the group and die with it instead of living
+// across the whole KT64 tile. The scale header still uses the original
+// dc = dg*4+u and dc>>1 at the call site.
+__device__ __forceinline__ half8_t fa2_kfrag_fp8(const uint32_t* __restrict__ Kdw8,
+    unsigned key_row_dw, unsigned group_byte, int u, float sf)
+{
+    const unsigned x = (group_byte + 16u * (unsigned)u) & 255u;
+    const unsigned xi = x >> 2;
+    const uint32_t w0 = Kdw8[key_row_dw + xi];
+    const uint32_t w1 = Kdw8[key_row_dw + ((xi + 1u) & 63u)];
+    half8_t kf;
+    // Scheduling barriers between pairs: without them LLVM batches all
+    // four decodes ahead of the converts, holding 12 decoded floats live
+    // at once (measured: +11 spills). Each pair is consumed into kf before
+    // the next decode begins, so at most one f32x2 is live.
+    fa2_f2_t dd = __builtin_amdgcn_cvt_pk_f32_fp8(w0, 0);
+#if HIPFIRE_FA2_KMODE == 3
+    (void)sf;
+    kf[0] = (_Float16)dd[0]; kf[1] = (_Float16)dd[1];
+    asm volatile("" : "+v"(dd));
+    dd = __builtin_amdgcn_cvt_pk_f32_fp8(w0, 1);
+    kf[2] = (_Float16)dd[0]; kf[3] = (_Float16)dd[1];
+    asm volatile("" : "+v"(dd));
+    dd = __builtin_amdgcn_cvt_pk_f32_fp8(w1, 0);
+    kf[4] = (_Float16)dd[0]; kf[5] = (_Float16)dd[1];
+    asm volatile("" : "+v"(dd));
+    dd = __builtin_amdgcn_cvt_pk_f32_fp8(w1, 1);
+    kf[6] = (_Float16)dd[0]; kf[7] = (_Float16)dd[1];
+#else
+    kf[0] = (_Float16)(sf * dd[0]); kf[1] = (_Float16)(sf * dd[1]);
+    asm volatile("" : "+v"(dd));
+    dd = __builtin_amdgcn_cvt_pk_f32_fp8(w0, 1);
+    kf[2] = (_Float16)(sf * dd[0]); kf[3] = (_Float16)(sf * dd[1]);
+    asm volatile("" : "+v"(dd));
+    dd = __builtin_amdgcn_cvt_pk_f32_fp8(w1, 0);
+    kf[4] = (_Float16)(sf * dd[0]); kf[5] = (_Float16)(sf * dd[1]);
+    asm volatile("" : "+v"(dd));
+    dd = __builtin_amdgcn_cvt_pk_f32_fp8(w1, 1);
+    kf[6] = (_Float16)(sf * dd[0]); kf[7] = (_Float16)(sf * dd[1]);
+#endif
+    return kf;
+}
+
+// V fragment: 8 keys (4 pairs ps..ps+3, even/odd) at dim `d`. se/so hold
+// the 4 pairs' even/odd block scales (f16, staged by the caller).
+__device__ __forceinline__ half8_t fa2_vfrag_fp8(const uint32_t* __restrict__ Vedw,
+    const uint32_t* __restrict__ Vodw, int d, int ps,
+    const _Float16* __restrict__ se, const _Float16* __restrict__ so)
+{
+    const int qq = ((ps >> 2) + fa2_swiz(d & 15)) & 7;
+    const uint32_t E = Vedw[d * 8 + qq];
+    const uint32_t O = Vodw[d * 8 + qq];
+    half8_t vf;
+    fa2_f2_t ee = __builtin_amdgcn_cvt_pk_f32_fp8(E, 0);
+    fa2_f2_t oo = __builtin_amdgcn_cvt_pk_f32_fp8(O, 0);
+    vf[0] = (_Float16)((float)se[0] * ee[0]); vf[1] = (_Float16)((float)so[0] * oo[0]);
+    vf[2] = (_Float16)((float)se[1] * ee[1]); vf[3] = (_Float16)((float)so[1] * oo[1]);
+    ee = __builtin_amdgcn_cvt_pk_f32_fp8(E, 1);
+    oo = __builtin_amdgcn_cvt_pk_f32_fp8(O, 1);
+    vf[4] = (_Float16)((float)se[2] * ee[0]); vf[5] = (_Float16)((float)so[2] * oo[0]);
+    vf[6] = (_Float16)((float)se[3] * ee[1]); vf[7] = (_Float16)((float)so[3] * oo[1]);
+    return vf;
+}
+#endif
 
 // Shared workgroup body. PARTIAL=false writes normalized O to `out`;
 // PARTIAL=true writes [m, l, O_unnormalized[256]] records (stride 258) to
@@ -111,10 +209,17 @@ __device__ __forceinline__ void fa2_gqa_body(
     const int q_stride = 24 * 256;
     const int row_stride = 4 * (256 / 32) * 34;
     const int kv_blk = kv_h * (256 / 32);
-
     extern __shared__ uint32_t LDS[];
+#ifdef HIPFIRE_FA2_FP8
+    // Three live LDS views (V byte stores address Vedw/Vodw directly;
+    // separate byte pointers would cost 2 whole-function VGPRs).
+    uint32_t* Kdw8 = LDS;
+    uint32_t* Vedw = LDS + 4096;
+    uint32_t* Vodw = LDS + 6144;
+#else
     uint32_t* Kdw = LDS;
     uint32_t* Vdw = LDS + 8192;
+#endif
 
     // ---- Transition 1: online state init (compute waves) ----
     // Q arrives f16 pre-converted (see attention_fa2_q_preconvert_gfx1201);
@@ -164,14 +269,25 @@ __device__ __forceinline__ void fa2_gqa_body(
     wmn = min(wmn, __shfl_xor(wmn, 2, 32));
     wmn = min(wmn, __shfl_xor(wmn, 1, 32));
     if (tid == 0) {
+#ifdef HIPFIRE_FA2_FP8
+        // Top 2 dwords of the odd V plane (overwritten by the first V fill).
+        LDS[8190] = (uint32_t)wmx;
+        LDS[8191] = (uint32_t)wmn;
+#else
         LDS[16382] = (uint32_t)wmx;
         LDS[16383] = (uint32_t)wmn;
+#endif
     }
     __syncthreads();
     // Uniformize through lane 0: every lane loaded the same mailbox
     // dwords, but that uniformity is invisible through LDS.
+#ifdef HIPFIRE_FA2_FP8
+    const int gmax = __builtin_amdgcn_readfirstlane((int)LDS[8190]);
+    const int gmin = __builtin_amdgcn_readfirstlane((int)LDS[8191]);
+#else
     const int gmax = __builtin_amdgcn_readfirstlane((int)LDS[16382]);
     const int gmin = __builtin_amdgcn_readfirstlane((int)LDS[16383]);
+#endif
     const int seq_len = gmax + 1;
 
     // ---- Transitions 2-4: KT64 tiles ----
@@ -212,6 +328,35 @@ __device__ __forceinline__ void fa2_gqa_body(
                 uint32_t packed = 0;
                 if (rec != nullptr)
                     __builtin_memcpy(&packed, rec + 4 + (b * 4 + m) * 3, 3);
+#ifdef HIPFIRE_FA2_FP8
+                // e4m3 bytes, cnorm baked (per-key single scale needs no
+                // fragment-time scale): dims Q..Q+7, Q=(b*4+m)*8, at bytes
+                // (Q+j+S8)&255, S8 4-aligned -> 2 dwords, wrap-safe via &63.
+                const int Q = (b * 4 + m) * 8;
+                const int s8 = 32 * ((k & 15) >> 2) + 4 * ((k & 15) & 3);
+                const int dwA = ((Q + s8) & 255) >> 2;
+                unsigned accA = 0, accB = 0;
+#pragma unroll
+                for (int i = 0; i < 4; ++i) {
+                    const int code0 = (packed >> (6 * i)) & 7;
+                    const int code1 = (packed >> (6 * i + 3)) & 7;
+                    const float v0 = cnorm * TURBO_C3_256[code0];
+                    const float v1 = cnorm * TURBO_C3_256[code1];
+                    if (i < 2) {
+                        if (i == 0)
+                            accA = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, accA, false);
+                        else
+                            accA = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, accA, true);
+                    } else {
+                        if (i == 2)
+                            accB = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, accB, false);
+                        else
+                            accB = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, accB, true);
+                    }
+                }
+                Kdw8[k * 64 + dwA] = accA;
+                Kdw8[k * 64 + ((dwA + 1) & 63)] = accB;
+#else
                 const int p0 = (b * 4 + m) * 4;
 #pragma unroll
                 for (int i = 0; i < 4; ++i) {
@@ -222,6 +367,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                     dw.h[1] = (_Float16)(cnorm * TURBO_C3_256[code1]);
                     Kdw[base + ((p0 + i + rot) & 127)] = dw.u;
                 }
+#endif
             }
         }
 #else
@@ -252,6 +398,17 @@ __device__ __forceinline__ void fa2_gqa_body(
                 uint32_t u = 0;
                 if (blk != nullptr)
                     __builtin_memcpy(&u, blk + 2 + w * 4, 4);
+#ifdef HIPFIRE_FA2_FP8
+                // e4m3 codes, one byte per dim (RNE of the raw int8 code,
+                // exactly once); the block scale stays in the cache header
+                // for fragment-time application. Dword w of slot (k,b).
+                unsigned acc = 0;
+                acc = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    (float)(int8_t)u, (float)(int8_t)(u >> 8), acc, false);
+                acc = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    (float)(int8_t)(u >> 16), (float)(int8_t)(u >> 24), acc, true);
+                Kdw8[k * 64 + ((b * 8 + w + fa2_swiz(k & 15)) & 63)] = acc;
+#else
                 const float c0 = (float)(int8_t)u;
                 const float c1 = (float)(int8_t)(u >> 8);
                 const float c2 = (float)(int8_t)(u >> 16);
@@ -263,6 +420,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                 d1.h[1] = (_Float16)(sf * c3);
                 Kdw[base + ((pb + w * 2 + rot) & 127)] = d0.u;
                 Kdw[base + ((pb + w * 2 + 1 + rot) & 127)] = d1.u;
+#endif
             }
         }
 #endif
@@ -302,12 +460,26 @@ __device__ __forceinline__ void fa2_gqa_body(
 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
                     const int d = b * 32 + w * 4 + c;
+#ifdef HIPFIRE_FA2_FP8
+                    // e4m3 bytes into the even/odd planes (RNE of the raw
+                    // int8 code, exactly once); scales stay in the headers.
+                    // Byte stores: every slot owns distinct bytes, no races.
+                    const float c0 = (float)(int8_t)(u0 >> (c * 8));
+                    const float c1 = (float)(int8_t)(u1 >> (c * 8));
+                    unsigned e = 0, o = 0;
+                    e = __builtin_amdgcn_cvt_pk_fp8_f32(c0, 0.0f, e, false);
+                    o = __builtin_amdgcn_cvt_pk_fp8_f32(c1, 0.0f, o, false);
+                    const int qq = (((m >> 2) + fa2_swiz(d & 15)) & 7) * 4 + (m & 3);
+                    ((unsigned char*)Vedw)[d * 32 + qq] = (unsigned char)(e & 0xFFu);
+                    ((unsigned char*)Vodw)[d * 32 + qq] = (unsigned char)(o & 0xFFu);
+#else
                     const float c0 = (float)(int8_t)(u0 >> (c * 8));
                     const float c1 = (float)(int8_t)(u1 >> (c * 8));
                     fa2_dw_t dw;
                     dw.h[0] = (_Float16)(sf0 * c0);
                     dw.h[1] = (_Float16)(sf1 * c1);
                     Vdw[d * 32 + ((m + fa2_swiz(d & 15)) & 31)] = dw.u;
+#endif
                 }
             }
         }
@@ -344,6 +516,12 @@ __device__ __forceinline__ void fa2_gqa_body(
 #pragma unroll
                 for (int dg = 0; dg < 4; ++dg) {
                     half8_t qfa[4];
+#ifdef HIPFIRE_FA2_FP8
+                    // fp8 path loads Q per fragment inside the fused
+                    // build+WMMA loops below: staging all four here would
+                    // hold 16 VGPR live across the QK peak (the spill
+                    // gate). qfa is dead in this instantiation.
+#else
 #pragma unroll
                     for (int u = 0; u < 4; ++u) {
                         const int dc = dg * 4 + u;
@@ -359,9 +537,56 @@ __device__ __forceinline__ void fa2_gqa_body(
                             qf = qd[kg];
                         qfa[u] = qf;
                     }
-                    if (do0) {
-                        half8_t kfa[4];
+#endif
+                    if (do0
+#ifdef HIPFIRE_FA2_FP8
+                        && qok_ml
+#endif
+                    ) {
                         const int key = ml;
+#ifdef HIPFIRE_FA2_FP8
+                        // Fused build+WMMA (no kfa[4] staging): the q8 row
+                        // offset is 32-bit and clamped; OOB fragments get a
+                        // zero scale (softmax-masked). Accumulation order
+                        // matches the f16 path exactly (u=0..3 into sacc).
+                        // Fully unrolled u=0..3: each step's K addresses
+                        // rematerialize from the group seed above, so only
+                        // one group's addresses are live between steps.
+                        const int gk = ktile + key;
+                        const bool gkok = gk < seq_len;
+                        const unsigned koff = gkok
+                            ? (unsigned)gk * (unsigned)row_stride
+                            : 0u;
+                        const unsigned key_row_dw = (unsigned)key * 64u;
+                        // Group-local K-address seed: opaque to
+                        // loop-invariant expansion below. The tied asm
+                        // input keeps this group's expanded addresses
+                        // from hoisting above the preceding score state;
+                        // the seed and its addresses die with the group.
+                        unsigned group_byte = (unsigned)dg * 64u
+                            + (unsigned)kg * 8u
+                            + 4u * (unsigned)fa2_swiz(ml);
+                        asm volatile("" : "+v"(group_byte)
+                                         : "v"(sacc0), "v"(sacc1),
+                                           "v"(sacc2), "v"(sacc3));
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const int dc = dg * 4 + u;
+                            // Q fragment on demand (no qfa staging here;
+                            // qok_ml guards the sub-block, so the load
+                            // is unconditional and always in bounds).
+                            half8_t qf = ((const half8_t*)(q16 + qb + (unsigned)(dc * 16)))[kg];
+                            const unsigned hbo = koff + (unsigned)(kv_blk + (dc >> 1)) * 34u;
+                            const unsigned char* hb = k_cache + (unsigned long long)hbo;
+                            const float ksf = gkok
+                                ? (float)((fa2_dw_t){.u = (uint32_t)((uint16_t)hb[0] | ((uint16_t)hb[1] << 8))}).h[0]
+                                : 0.0f;
+                            half8_t kf = fa2_kfrag_fp8(Kdw8, key_row_dw, group_byte, u, ksf);
+                            sacc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                                kf, qf, sacc0);
+                        }
+#else
+                        half8_t kfa[4];
                         const int rot = fa2_swiz(key & 15);
                         const int base = key * 128;
 #pragma unroll
@@ -382,10 +607,57 @@ __device__ __forceinline__ void fa2_gqa_body(
                         for (int u = 0; u < 4; ++u)
                             sacc0 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
                                 kfa[u], qfa[u], sacc0);
+#endif
                     }
-                    if (do1) {
-                        half8_t kfa[4];
+                    if (do1
+#ifdef HIPFIRE_FA2_FP8
+                        && qok_ml
+#endif
+                    ) {
                         const int key = 16 + ml;
+#ifdef HIPFIRE_FA2_FP8
+                        // Fused build+WMMA (no kfa[4] staging): the q8 row
+                        // offset is 32-bit and clamped; OOB fragments get a
+                        // zero scale (softmax-masked). Accumulation order
+                        // matches the f16 path exactly (u=0..3 into sacc).
+                        // Fully unrolled u=0..3: each step's K addresses
+                        // rematerialize from the group seed above, so only
+                        // one group's addresses are live between steps.
+                        const int gk = ktile + key;
+                        const bool gkok = gk < seq_len;
+                        const unsigned koff = gkok
+                            ? (unsigned)gk * (unsigned)row_stride
+                            : 0u;
+                        const unsigned key_row_dw = (unsigned)key * 64u;
+                        // Group-local K-address seed: opaque to
+                        // loop-invariant expansion below. The tied asm
+                        // input keeps this group's expanded addresses
+                        // from hoisting above the preceding score state;
+                        // the seed and its addresses die with the group.
+                        unsigned group_byte = (unsigned)dg * 64u
+                            + (unsigned)kg * 8u
+                            + 4u * (unsigned)fa2_swiz(ml);
+                        asm volatile("" : "+v"(group_byte)
+                                         : "v"(sacc0), "v"(sacc1),
+                                           "v"(sacc2), "v"(sacc3));
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const int dc = dg * 4 + u;
+                            // Q fragment on demand (no qfa staging here;
+                            // qok_ml guards the sub-block, so the load
+                            // is unconditional and always in bounds).
+                            half8_t qf = ((const half8_t*)(q16 + qb + (unsigned)(dc * 16)))[kg];
+                            const unsigned hbo = koff + (unsigned)(kv_blk + (dc >> 1)) * 34u;
+                            const unsigned char* hb = k_cache + (unsigned long long)hbo;
+                            const float ksf = gkok
+                                ? (float)((fa2_dw_t){.u = (uint32_t)((uint16_t)hb[0] | ((uint16_t)hb[1] << 8))}).h[0]
+                                : 0.0f;
+                            half8_t kf = fa2_kfrag_fp8(Kdw8, key_row_dw, group_byte, u, ksf);
+                            sacc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                                kf, qf, sacc1);
+                        }
+#else
+                        half8_t kfa[4];
                         const int rot = fa2_swiz(key & 15);
                         const int base = key * 128;
 #pragma unroll
@@ -406,10 +678,57 @@ __device__ __forceinline__ void fa2_gqa_body(
                         for (int u = 0; u < 4; ++u)
                             sacc1 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
                                 kfa[u], qfa[u], sacc1);
+#endif
                     }
-                    if (do2) {
-                        half8_t kfa[4];
+                    if (do2
+#ifdef HIPFIRE_FA2_FP8
+                        && qok_ml
+#endif
+                    ) {
                         const int key = 32 + ml;
+#ifdef HIPFIRE_FA2_FP8
+                        // Fused build+WMMA (no kfa[4] staging): the q8 row
+                        // offset is 32-bit and clamped; OOB fragments get a
+                        // zero scale (softmax-masked). Accumulation order
+                        // matches the f16 path exactly (u=0..3 into sacc).
+                        // Fully unrolled u=0..3: each step's K addresses
+                        // rematerialize from the group seed above, so only
+                        // one group's addresses are live between steps.
+                        const int gk = ktile + key;
+                        const bool gkok = gk < seq_len;
+                        const unsigned koff = gkok
+                            ? (unsigned)gk * (unsigned)row_stride
+                            : 0u;
+                        const unsigned key_row_dw = (unsigned)key * 64u;
+                        // Group-local K-address seed: opaque to
+                        // loop-invariant expansion below. The tied asm
+                        // input keeps this group's expanded addresses
+                        // from hoisting above the preceding score state;
+                        // the seed and its addresses die with the group.
+                        unsigned group_byte = (unsigned)dg * 64u
+                            + (unsigned)kg * 8u
+                            + 4u * (unsigned)fa2_swiz(ml);
+                        asm volatile("" : "+v"(group_byte)
+                                         : "v"(sacc0), "v"(sacc1),
+                                           "v"(sacc2), "v"(sacc3));
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const int dc = dg * 4 + u;
+                            // Q fragment on demand (no qfa staging here;
+                            // qok_ml guards the sub-block, so the load
+                            // is unconditional and always in bounds).
+                            half8_t qf = ((const half8_t*)(q16 + qb + (unsigned)(dc * 16)))[kg];
+                            const unsigned hbo = koff + (unsigned)(kv_blk + (dc >> 1)) * 34u;
+                            const unsigned char* hb = k_cache + (unsigned long long)hbo;
+                            const float ksf = gkok
+                                ? (float)((fa2_dw_t){.u = (uint32_t)((uint16_t)hb[0] | ((uint16_t)hb[1] << 8))}).h[0]
+                                : 0.0f;
+                            half8_t kf = fa2_kfrag_fp8(Kdw8, key_row_dw, group_byte, u, ksf);
+                            sacc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                                kf, qf, sacc2);
+                        }
+#else
+                        half8_t kfa[4];
                         const int rot = fa2_swiz(key & 15);
                         const int base = key * 128;
 #pragma unroll
@@ -430,10 +749,57 @@ __device__ __forceinline__ void fa2_gqa_body(
                         for (int u = 0; u < 4; ++u)
                             sacc2 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
                                 kfa[u], qfa[u], sacc2);
+#endif
                     }
-                    if (do3) {
-                        half8_t kfa[4];
+                    if (do3
+#ifdef HIPFIRE_FA2_FP8
+                        && qok_ml
+#endif
+                    ) {
                         const int key = 48 + ml;
+#ifdef HIPFIRE_FA2_FP8
+                        // Fused build+WMMA (no kfa[4] staging): the q8 row
+                        // offset is 32-bit and clamped; OOB fragments get a
+                        // zero scale (softmax-masked). Accumulation order
+                        // matches the f16 path exactly (u=0..3 into sacc).
+                        // Fully unrolled u=0..3: each step's K addresses
+                        // rematerialize from the group seed above, so only
+                        // one group's addresses are live between steps.
+                        const int gk = ktile + key;
+                        const bool gkok = gk < seq_len;
+                        const unsigned koff = gkok
+                            ? (unsigned)gk * (unsigned)row_stride
+                            : 0u;
+                        const unsigned key_row_dw = (unsigned)key * 64u;
+                        // Group-local K-address seed: opaque to
+                        // loop-invariant expansion below. The tied asm
+                        // input keeps this group's expanded addresses
+                        // from hoisting above the preceding score state;
+                        // the seed and its addresses die with the group.
+                        unsigned group_byte = (unsigned)dg * 64u
+                            + (unsigned)kg * 8u
+                            + 4u * (unsigned)fa2_swiz(ml);
+                        asm volatile("" : "+v"(group_byte)
+                                         : "v"(sacc0), "v"(sacc1),
+                                           "v"(sacc2), "v"(sacc3));
+#pragma unroll
+                        for (int u = 0; u < 4; ++u) {
+                            const int dc = dg * 4 + u;
+                            // Q fragment on demand (no qfa staging here;
+                            // qok_ml guards the sub-block, so the load
+                            // is unconditional and always in bounds).
+                            half8_t qf = ((const half8_t*)(q16 + qb + (unsigned)(dc * 16)))[kg];
+                            const unsigned hbo = koff + (unsigned)(kv_blk + (dc >> 1)) * 34u;
+                            const unsigned char* hb = k_cache + (unsigned long long)hbo;
+                            const float ksf = gkok
+                                ? (float)((fa2_dw_t){.u = (uint32_t)((uint16_t)hb[0] | ((uint16_t)hb[1] << 8))}).h[0]
+                                : 0.0f;
+                            half8_t kf = fa2_kfrag_fp8(Kdw8, key_row_dw, group_byte, u, ksf);
+                            sacc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                                kf, qf, sacc3);
+                        }
+#else
+                        half8_t kfa[4];
                         const int rot = fa2_swiz(key & 15);
                         const int base = key * 128;
 #pragma unroll
@@ -454,6 +820,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                         for (int u = 0; u < 4; ++u)
                             sacc3 = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
                                 kfa[u], qfa[u], sacc3);
+#endif
                     }
                     asm volatile("" ::: "memory");
                 }
@@ -520,6 +887,31 @@ __device__ __forceinline__ void fa2_gqa_body(
 #pragma unroll
                 for (int dc = 0; dc < 16; ++dc) {
                     const int d = dc * 16 + ml;
+#ifdef HIPFIRE_FA2_FP8
+                    // e4m3 even/odd planes -> f16 fragment in-register; the
+                    // pair scales (f16, staged) multiply per element in f32.
+                    const int ps = sub * 8 + kg * 4;
+                    const int vbb = d >> 5;
+                    _Float16 vse[4], vso[4];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int gk0 = ktile + 2 * (ps + i);
+                        _Float16 e = (_Float16)0.0f, o = (_Float16)0.0f;
+                        if (gk0 < seq_len) {
+                            uint16_t t;
+                            __builtin_memcpy(&t, v_cache + (unsigned long long)gk0 * (unsigned long long)row_stride + (unsigned long long)(kv_blk + vbb) * 34ULL, 2);
+                            e = ((fa2_dw_t){.u = (uint32_t)t}).h[0];
+                        }
+                        if (gk0 + 1 < seq_len) {
+                            uint16_t t;
+                            __builtin_memcpy(&t, v_cache + (unsigned long long)(gk0 + 1) * (unsigned long long)row_stride + (unsigned long long)(kv_blk + vbb) * 34ULL, 2);
+                            o = ((fa2_dw_t){.u = (uint32_t)t}).h[0];
+                        }
+                        vse[i] = e;
+                        vso[i] = o;
+                    }
+                    half8_t vf = fa2_vfrag_fp8(Vedw, Vodw, d, ps, vse, vso);
+#else
                     const int rot = fa2_swiz(d & 15);
                     const int vbase = d * 32;
                     const int ps = sub * 8 + kg * 4;
@@ -531,6 +923,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                         vf[2 * i] = dw.h[0];
                         vf[2 * i + 1] = dw.h[1];
                     }
+#endif
                     Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
                         vf, prow, Ofr[dc]);
                     // Bound V-load hoisting to this chunk.
@@ -600,7 +993,7 @@ __device__ __forceinline__ void fa2_gqa_body(
 // Body entries take pre-converted f16 Q at kernarg offset 0 (same slot, same
 // size as the old f32 Q pointer, so the pointer-array blob ABI is unchanged).
 #ifdef HIPFIRE_FA2_FP8
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fp8_gfx1201(
+extern "C" __global__ __launch_bounds__(128, 2) void attention_q8_0_fa2_gqa_fp8_gfx1201(
 #else
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1201(
 #endif
@@ -710,7 +1103,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
 // capture-safe.
 #if HIPFIRE_FA2_KMODE == 3
 #ifdef HIPFIRE_FA2_FP8
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_fp8_gfx1201(
+extern "C" __global__ __launch_bounds__(128, 2) void attention_q8_0_fa2_gqa_fwht3k_fp8_gfx1201(
 #else
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht3k_gfx1201(
 #endif
@@ -739,7 +1132,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
 #endif
 
 #ifdef HIPFIRE_FA2_FP8
-extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_partial_fp8_gfx1201(
+extern "C" __global__ __launch_bounds__(128, 2) void attention_q8_0_fa2_gqa_partial_fp8_gfx1201(
 #else
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_partial_gfx1201(
 #endif
