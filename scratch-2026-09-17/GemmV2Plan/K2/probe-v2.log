@@ -1,8 +1,0 @@
-GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
-  pre-compiled kernels: /home/kaden/.hipfire-homes/ab0/.hipfire_kernels/gfx1201
-GPU arch=gfx1201 v2flag=Ok("1")
-FAM gate_up  hash=2adf7620c1d722e1 repeat=2adf7620c1d722e1 det=true medians={"gemm_gate_up_mq4g256v2_wmma_fp8_v2_gfx1201": 2004.615068435669, "pack_f32_to_fp8_mq4v2_gfx12": 56.68000131845474}
-FAM qkv      hash=09726b10ba1eb1b2 repeat=09726b10ba1eb1b2 det=true medians={"pack_f32_to_fp8_mq4v2_gfx12": 34.47999805212021, "gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201": 747.8449940681458}
-FAM qkvza    hash=082a7b24def26f75 repeat=082a7b24def26f75 det=true medians={"gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201": 962.5269770622253, "pack_f32_to_fp8_mq4v2_gfx12": 34.7599983215332}
-FAM residual hash=373cb087fb519b9e repeat=373cb087fb519b9e det=true medians={"pack_f32_to_fp8_mq4v2_gfx12": 95.63999623060226, "gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201": 1313.289999961853}
-wrote scratch-2026-09-17/GemmV2Plan/K2/probe-v2.json
