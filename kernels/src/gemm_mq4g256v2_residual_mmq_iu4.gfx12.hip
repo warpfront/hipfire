@@ -439,21 +439,23 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     }
                 }
                 // Fold: 4 K32 int32 partials per (nb, rg) through the pinned
-                // IU4_FOLD_RN DAG. Per-half (sc,zp) via intra-wave shuffle
-                // from the lane owning each output row; (d,s) re-read here
-                // from the staged DS plane (identical values, identical DAG).
+                // IU4_FOLD_RN DAG. Per-half (sc,zp) come straight from the
+                // staged SZ plane (Change B): each lane reads its 8 rows'
+                // (sc,zp) with narrow LDS reads instead of 16 __shfl per rg.
+                // Same f32 values (the shuffle source lane's value IS
+                // SZ[row]), same DAG order; (d,s) re-read from DS as in A.
+                // Bank-clean on gfx1201: 8 consecutive rows x 2 words hit 16
+                // distinct banks, identical across the 16 lanes of a k_grp
+                // half (LDS broadcast); the halves cover all 32 banks once.
                 #pragma unroll
                 for (int rg = 0; rg < 2; rg++) {
-                    const unsigned rbase = (unsigned)(wave_row0 + rg * 16 + m_lane) * 8u;
-                    const float sc_rg = *(const float*)(sz_lds + rbase);
-                    const float zp_rg = *(const float*)(sz_lds + rbase + 4u);
                     float sc_row[8];
                     float zp_row[8];
                     #pragma unroll
                     for (int j = 0; j < 8; j++) {
-                        const int src_lane = 8 * k_grp + j;
-                        sc_row[j] = __shfl(sc_rg, src_lane);
-                        zp_row[j] = __shfl(zp_rg, src_lane);
+                        const unsigned jbase = (unsigned)(wave_row0 + rg * 16 + 8 * k_grp + j) * 8u;
+                        sc_row[j] = *(const float*)(sz_lds + jbase);
+                        zp_row[j] = *(const float*)(sz_lds + jbase + 4u);
                     }
                     #pragma unroll
                     for (int nb = 0; nb < 4; nb++) {
