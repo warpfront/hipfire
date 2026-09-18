@@ -442,6 +442,18 @@ static __device__ __forceinline__ float hipfire_fp8_e4m3_to_f32_tile(unsigned ch
     }
     return __builtin_bit_cast(float, s | ((e - 7u + 127u) << 23) | (m << 20));
 }
+// Vfill grouped-fragment V code address: (head kv_h, 8-key group g, dim d) is
+// one contiguous b64 at group_base + kv_h*D*8 + d*8; byte j = slot&7. Scales
+// stay token-local (unchanged). `slot` is the physical row index (== token
+// for fp8's windowless contiguous layout). K addressing is untouched.
+static __device__ __forceinline__ const unsigned char* hipfire_fp8_vgroup_ptr(
+    const unsigned char* __restrict__ v_cache, int slot, size_t row_stride,
+    int kv_h, int head_dim, int d)
+{
+    return v_cache + (size_t)(slot >> 3) * row_stride * 8u
+        + (size_t)kv_h * (size_t)head_dim * 8u + (size_t)d * 8u
+        + (size_t)(slot & 7);
+}
 
 extern "C" __launch_bounds__(32, 16)
 __global__ void attention_flash_fp8_e4m3_tile(
@@ -718,26 +730,26 @@ __global__ void attention_flash_fp8_e4m3_tile(
             float vs1 = (float)*((const _Float16*)(vr1 + scale_off)); \
             float vs2 = (float)*((const _Float16*)(vr2 + scale_off)); \
             float vs3 = (float)*((const _Float16*)(vr3 + scale_off)); \
-            const unsigned char* v0 = vr0 + k_head_off + d_base; \
-            const unsigned char* v1 = vr1 + k_head_off + d_base; \
-            const unsigned char* v2 = vr2 + k_head_off + d_base; \
-            const unsigned char* v3 = vr3 + k_head_off + d_base; \
-            out0 += w0 * (vs0 * hipfire_fp8_e4m3_to_f32_tile(v0[0])); \
-            out1 += w0 * (vs0 * hipfire_fp8_e4m3_to_f32_tile(v0[1])); \
-            out2 += w0 * (vs0 * hipfire_fp8_e4m3_to_f32_tile(v0[2])); \
-            out3 += w0 * (vs0 * hipfire_fp8_e4m3_to_f32_tile(v0[3])); \
-            out0 += w1 * (vs1 * hipfire_fp8_e4m3_to_f32_tile(v1[0])); \
-            out1 += w1 * (vs1 * hipfire_fp8_e4m3_to_f32_tile(v1[1])); \
-            out2 += w1 * (vs1 * hipfire_fp8_e4m3_to_f32_tile(v1[2])); \
-            out3 += w1 * (vs1 * hipfire_fp8_e4m3_to_f32_tile(v1[3])); \
-            out0 += w2 * (vs2 * hipfire_fp8_e4m3_to_f32_tile(v2[0])); \
-            out1 += w2 * (vs2 * hipfire_fp8_e4m3_to_f32_tile(v2[1])); \
-            out2 += w2 * (vs2 * hipfire_fp8_e4m3_to_f32_tile(v2[2])); \
-            out3 += w2 * (vs2 * hipfire_fp8_e4m3_to_f32_tile(v2[3])); \
-            out0 += w3 * (vs3 * hipfire_fp8_e4m3_to_f32_tile(v3[0])); \
-            out1 += w3 * (vs3 * hipfire_fp8_e4m3_to_f32_tile(v3[1])); \
-            out2 += w3 * (vs3 * hipfire_fp8_e4m3_to_f32_tile(v3[2])); \
-            out3 += w3 * (vs3 * hipfire_fp8_e4m3_to_f32_tile(v3[3])); \
+            const unsigned char* vg0 = hipfire_fp8_vgroup_ptr(v_cache, s0, row_stride, kv_h, head_dim, d_base); \
+            const unsigned char* vg1 = hipfire_fp8_vgroup_ptr(v_cache, s1, row_stride, kv_h, head_dim, d_base); \
+            const unsigned char* vg2 = hipfire_fp8_vgroup_ptr(v_cache, s2, row_stride, kv_h, head_dim, d_base); \
+            const unsigned char* vg3 = hipfire_fp8_vgroup_ptr(v_cache, s3, row_stride, kv_h, head_dim, d_base); \
+            out0 += w0 * (vs0 * hipfire_fp8_e4m3_to_f32_tile(vg0[0])); \
+            out1 += w0 * (vs0 * hipfire_fp8_e4m3_to_f32_tile(vg0[8])); \
+            out2 += w0 * (vs0 * hipfire_fp8_e4m3_to_f32_tile(vg0[16])); \
+            out3 += w0 * (vs0 * hipfire_fp8_e4m3_to_f32_tile(vg0[24])); \
+            out0 += w1 * (vs1 * hipfire_fp8_e4m3_to_f32_tile(vg1[0])); \
+            out1 += w1 * (vs1 * hipfire_fp8_e4m3_to_f32_tile(vg1[1 * 8])); \
+            out2 += w1 * (vs1 * hipfire_fp8_e4m3_to_f32_tile(vg1[2 * 8])); \
+            out3 += w1 * (vs1 * hipfire_fp8_e4m3_to_f32_tile(vg1[3 * 8])); \
+            out0 += w2 * (vs2 * hipfire_fp8_e4m3_to_f32_tile(vg2[0])); \
+            out1 += w2 * (vs2 * hipfire_fp8_e4m3_to_f32_tile(vg2[8])); \
+            out2 += w2 * (vs2 * hipfire_fp8_e4m3_to_f32_tile(vg2[16])); \
+            out3 += w2 * (vs2 * hipfire_fp8_e4m3_to_f32_tile(vg2[24])); \
+            out0 += w3 * (vs3 * hipfire_fp8_e4m3_to_f32_tile(vg3[0])); \
+            out1 += w3 * (vs3 * hipfire_fp8_e4m3_to_f32_tile(vg3[1 * 8])); \
+            out2 += w3 * (vs3 * hipfire_fp8_e4m3_to_f32_tile(vg3[2 * 8])); \
+            out3 += w3 * (vs3 * hipfire_fp8_e4m3_to_f32_tile(vg3[3 * 8])); \
         } while (0)
         #define ACCUM_V_FP8(tl) do { \
             float w = scores[(tl)]; \
@@ -745,15 +757,18 @@ __global__ void attention_flash_fp8_e4m3_tile(
             int slot = (window > 0) ? (t % max_seq) : t; \
             const unsigned char* vr = v_cache + (size_t)slot * row_stride; \
             float vs = (float)*((const _Float16*)(vr + scale_off)); \
-            const unsigned char* vv = vr + k_head_off + d_base; \
-            out0 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vv[0])); \
-            out1 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vv[1])); \
-            out2 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vv[2])); \
-            out3 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vv[3])); \
+            const unsigned char* vg = hipfire_fp8_vgroup_ptr(v_cache, slot, row_stride, kv_h, head_dim, d_base); \
+            out0 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vg[0])); \
+            out1 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vg[8])); \
+            out2 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vg[16])); \
+            out3 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vg[24])); \
         } while (0)
-        // Stage B V path (gfx1201): one dword load per key (d_base =
-        // half*128 + tid*4 is 0 (mod 4); same row argument as Phase A),
-        // hardware pair-decode, vs folded into the weight once per key.
+        // Stage B V path (gfx1201): one byte load per dim from the Vfill
+        // grouped-fragment layout (grouped dims for one key are 8-strided, so
+        // no dword load exists); software decode is bit-exact for all 256
+        // codes. vs is folded into the weight once per key exactly as before
+        // (wNs = wN*vsN), so rounding is bit-identical to the dword path:
+        // only the byte addresses moved.
         #define ACCUM_V4_FP8_HW(tl) do { \
             float w0 = scores[(tl) + 0]; \
             float w1 = scores[(tl) + 1]; \
@@ -775,30 +790,30 @@ __global__ void attention_flash_fp8_e4m3_tile(
             float vs1 = (float)*((const _Float16*)(vr1 + scale_off)); \
             float vs2 = (float)*((const _Float16*)(vr2 + scale_off)); \
             float vs3 = (float)*((const _Float16*)(vr3 + scale_off)); \
-            const unsigned int vw0 = *(const unsigned int*)(vr0 + k_head_off + d_base); \
-            const unsigned int vw1 = *(const unsigned int*)(vr1 + k_head_off + d_base); \
-            const unsigned int vw2 = *(const unsigned int*)(vr2 + k_head_off + d_base); \
-            const unsigned int vw3 = *(const unsigned int*)(vr3 + k_head_off + d_base); \
+            const unsigned char* vg0 = hipfire_fp8_vgroup_ptr(v_cache, s0, row_stride, kv_h, head_dim, d_base); \
+            const unsigned char* vg1 = hipfire_fp8_vgroup_ptr(v_cache, s1, row_stride, kv_h, head_dim, d_base); \
+            const unsigned char* vg2 = hipfire_fp8_vgroup_ptr(v_cache, s2, row_stride, kv_h, head_dim, d_base); \
+            const unsigned char* vg3 = hipfire_fp8_vgroup_ptr(v_cache, s3, row_stride, kv_h, head_dim, d_base); \
             const float w0s = w0 * vs0; \
             const float w1s = w1 * vs1; \
             const float w2s = w2 * vs2; \
             const float w3s = w3 * vs3; \
-            const hipfire_fp8_tile_f32x2_t c0lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw0, 0); \
-            const hipfire_fp8_tile_f32x2_t c0hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw0, 1); \
-            const hipfire_fp8_tile_f32x2_t c1lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw1, 0); \
-            const hipfire_fp8_tile_f32x2_t c1hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw1, 1); \
-            const hipfire_fp8_tile_f32x2_t c2lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw2, 0); \
-            const hipfire_fp8_tile_f32x2_t c2hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw2, 1); \
-            const hipfire_fp8_tile_f32x2_t c3lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw3, 0); \
-            const hipfire_fp8_tile_f32x2_t c3hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw3, 1); \
-            out0 += w0s * c0lo[0]; out1 += w0s * c0lo[1]; \
-            out2 += w0s * c0hi[0]; out3 += w0s * c0hi[1]; \
-            out0 += w1s * c1lo[0]; out1 += w1s * c1lo[1]; \
-            out2 += w1s * c1hi[0]; out3 += w1s * c1hi[1]; \
-            out0 += w2s * c2lo[0]; out1 += w2s * c2lo[1]; \
-            out2 += w2s * c2hi[0]; out3 += w2s * c2hi[1]; \
-            out0 += w3s * c3lo[0]; out1 += w3s * c3lo[1]; \
-            out2 += w3s * c3hi[0]; out3 += w3s * c3hi[1]; \
+            out0 += w0s * hipfire_fp8_e4m3_to_f32_tile(vg0[0]); \
+            out1 += w0s * hipfire_fp8_e4m3_to_f32_tile(vg0[8]); \
+            out2 += w0s * hipfire_fp8_e4m3_to_f32_tile(vg0[16]); \
+            out3 += w0s * hipfire_fp8_e4m3_to_f32_tile(vg0[24]); \
+            out0 += w1s * hipfire_fp8_e4m3_to_f32_tile(vg1[0]); \
+            out1 += w1s * hipfire_fp8_e4m3_to_f32_tile(vg1[8]); \
+            out2 += w1s * hipfire_fp8_e4m3_to_f32_tile(vg1[16]); \
+            out3 += w1s * hipfire_fp8_e4m3_to_f32_tile(vg1[24]); \
+            out0 += w2s * hipfire_fp8_e4m3_to_f32_tile(vg2[0]); \
+            out1 += w2s * hipfire_fp8_e4m3_to_f32_tile(vg2[8]); \
+            out2 += w2s * hipfire_fp8_e4m3_to_f32_tile(vg2[16]); \
+            out3 += w2s * hipfire_fp8_e4m3_to_f32_tile(vg2[24]); \
+            out0 += w3s * hipfire_fp8_e4m3_to_f32_tile(vg3[0]); \
+            out1 += w3s * hipfire_fp8_e4m3_to_f32_tile(vg3[8]); \
+            out2 += w3s * hipfire_fp8_e4m3_to_f32_tile(vg3[16]); \
+            out3 += w3s * hipfire_fp8_e4m3_to_f32_tile(vg3[24]); \
         } while (0)
         #define ACCUM_V_FP8_HW(tl) do { \
             float w = scores[(tl)]; \
@@ -806,12 +821,12 @@ __global__ void attention_flash_fp8_e4m3_tile(
             int slot = (window > 0) ? (t % max_seq) : t; \
             const unsigned char* vr = v_cache + (size_t)slot * row_stride; \
             float vs = (float)*((const _Float16*)(vr + scale_off)); \
-            const unsigned int vw = *(const unsigned int*)(vr + k_head_off + d_base); \
+            const unsigned char* vg = hipfire_fp8_vgroup_ptr(v_cache, slot, row_stride, kv_h, head_dim, d_base); \
             const float ws = w * vs; \
-            const hipfire_fp8_tile_f32x2_t clo = __builtin_amdgcn_cvt_pk_f32_fp8(vw, 0); \
-            const hipfire_fp8_tile_f32x2_t chi = __builtin_amdgcn_cvt_pk_f32_fp8(vw, 1); \
-            out0 += ws * clo[0]; out1 += ws * clo[1]; \
-            out2 += ws * chi[0]; out3 += ws * chi[1]; \
+            out0 += ws * hipfire_fp8_e4m3_to_f32_tile(vg[0]); \
+            out1 += ws * hipfire_fp8_e4m3_to_f32_tile(vg[8]); \
+            out2 += ws * hipfire_fp8_e4m3_to_f32_tile(vg[16]); \
+            out3 += ws * hipfire_fp8_e4m3_to_f32_tile(vg[24]); \
          } while (0)
 #if defined(HIPFIRE_FP8_TILE_HAVE_HW_DECODE)
         for (; t_local + 7 < tile_len; t_local += 8) {

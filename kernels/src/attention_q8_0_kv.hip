@@ -326,14 +326,20 @@ extern "C" __global__ void attention_fp8_e4m3_kv(
         // Phase B: V-weighted accumulation for this tile.
         // Each thread owns dims d = tid + i*nthreads and must fold every
         // position's softmax weight into its private acc (no position stride).
-        // gfx1201: vs folded into the weight once per key (was: once per
-        // (key, dim)), hardware e4m3 decode of the dword containing vc[d].
+        // Vfill grouped-fragment codes: (head, group, dim) is one contiguous
+        // b64 at group_base + kv_h*D*8 + d*8; byte j = key&7 of the group.
+        // Scales stay token-local (unchanged addressing). gfx1201 keeps the
+        // hardware-decode folding order (wv = w*vs, then acc += wv*decode) so
+        // rounding is bit-identical to the old dword path: only the software
+        // decoder feeds it now (bit-exact for all 256 codes), since grouped
+        // dims for one key are 8-strided, not dword-contiguous.
         for (int t = 0; t < tile_len; t++) {
             const float w = scores[t];
             const int pos = tile_start + t;
             const unsigned char* vrow = v_cache + (size_t)pos * row_stride;
             const float vs = (float)*((const _Float16*)(vrow + codes_len + (size_t)kv_h * 2));
-            const unsigned char* vc = vrow + k_head_off;
+            const unsigned char* vg = v_cache + (size_t)(pos >> 3) * row_stride * 8u
+                + (size_t)kv_h * (size_t)head_dim * 8u + (size_t)(pos & 7);
 #if defined(HIPFIRE_FP8_HAVE_HW_DECODE)
             const float wv = w * vs;
 #endif
@@ -341,16 +347,9 @@ extern "C" __global__ void attention_fp8_e4m3_kv(
                 const int d = tid + i * nthreads;
                 if (d >= head_dim) break;
 #if defined(HIPFIRE_FP8_HAVE_HW_DECODE)
-                // Dword at (d & ~3) is 4-aligned by the Phase-A argument;
-                // bytes past head_dim (tail lane only) still land inside the
-                // row's code area or the following scale bytes: no OOB.
-                const unsigned int w4 = *(const unsigned int*)(vc + (d & ~3));
-                const hipfire_fp8_f32x2_t p = ((d & 2) != 0)
-                    ? __builtin_amdgcn_cvt_pk_f32_fp8(w4, 1)
-                    : __builtin_amdgcn_cvt_pk_f32_fp8(w4, 0);
-                acc[i] += wv * (((d & 1) != 0) ? p[1] : p[0]);
+                acc[i] += wv * hipfire_fp8_e4m3_to_f32(vg[(size_t)d * 8u]);
 #else
-                acc[i] += w * (vs * hipfire_fp8_e4m3_to_f32(vc[d]));
+                acc[i] += w * (vs * hipfire_fp8_e4m3_to_f32(vg[(size_t)d * 8u]));
 #endif
             }
         }

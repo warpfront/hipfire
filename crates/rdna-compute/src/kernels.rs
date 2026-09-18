@@ -5779,6 +5779,20 @@ pub const KV_CACHE_WRITE_FP8_E4M3_BATCHED_SRC: &str = concat!(
     "#define HIPFIRE_KV_FP8_E4M3 1\n",
     include_str!("../../../kernels/src/kv_cache_write_q8_0_batched.hip")
 );
+/// V-side grouped-fragment fp8 writer (`kv_cache_write_fp8_e4m3_v`): same TU
+/// as [`KV_CACHE_WRITE_FP8_E4M3_SRC`]; values bit-identical to the K writer,
+/// codes dim-major within each 8-key group, scales home. K keeps the K writer;
+/// ONLY V call sites route here.
+pub const KV_CACHE_WRITE_FP8_E4M3_V_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/kv_cache_write_q8_0.hip")
+);
+/// Batched V twin (`kv_cache_write_fp8_e4m3_v_batched`): same TU as
+/// [`KV_CACHE_WRITE_FP8_E4M3_BATCHED_SRC`].
+pub const KV_CACHE_WRITE_FP8_E4M3_V_BATCHED_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/kv_cache_write_q8_0_batched.hip")
+);
 
 /// Flat BF16 KV write (maple). 2 bytes per element, no blocks and no scales.
 /// Layout: [max_seq × n_kv_heads × head_dim] bf16. Holds both the decode

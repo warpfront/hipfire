@@ -376,12 +376,14 @@ __device__ __forceinline__ void fa2_gqa_body(
 #if HIPFIRE_FA2_KMODE == 8
         // Native fp8 V (Q0 fill-time decode): 256 key-pairs (m*8+b) like the
         // Q8 path; each slot reads dims b*32..b*32+31 of keys ktile+2m /
-        // ktile+2m+1 from their token-local fp8 rows and packs
+        // ktile+2m+1 from the Vfill grouped-fragment layout and packs
         // (V[2m][d], V[2m+1][d]) per output dim into the fragment-order f16
         // V plane via fa2_voff (same addressing as the q8 arm below):
         // 2m/2m+1 never straddle a sub/kg boundary, so both halves share
-        // one fragment at consecutive j. Same decode/rounding contract as
-        // the K fill above.
+        // one fragment at consecutive j. Grouped codes for (head, group, dim)
+        // are one contiguous b64 at group_base + kv_h*D*8 + d*8; the pair's
+        // two bytes are adjacent (u16) unless 2m ends a group (j0 == 7).
+        // Same decode/rounding contract as the K fill above.
         for (int t = 0; t < 2; ++t) {
             const int pair = tid + t * 128;
             const int m = pair >> 3;
@@ -405,30 +407,46 @@ __device__ __forceinline__ void fa2_gqa_body(
             _Float16 s1 = ((fa2_dw_t){.u = (uint32_t)s1u}).h[0];
             const float sf0 = (float)s0;
             const float sf1 = (float)s1;
-            const unsigned char* vc0 = (row0 != nullptr)
-                ? row0 + (unsigned long long)kv_h * 256ULL + (unsigned long long)b * 32ULL
+            // Scales stay token-local (home rows above); codes are grouped.
+            const int j0 = k0 & 7;
+            const int j1 = (k0 + 1) & 7;
+            const unsigned char* gb0 = (k0 < seq_len)
+                ? v_cache + (unsigned long long)(k0 >> 3) * (1032ULL * 8ULL)
+                    + (unsigned long long)kv_h * 256ULL * 8ULL
                 : nullptr;
-            const unsigned char* vc1 = (row1 != nullptr)
-                ? row1 + (unsigned long long)kv_h * 256ULL + (unsigned long long)b * 32ULL
+            const unsigned char* gb1 = (k0 + 1 < seq_len)
+                ? v_cache + (unsigned long long)((k0 + 1) >> 3) * (1032ULL * 8ULL)
+                    + (unsigned long long)kv_h * 256ULL * 8ULL
                 : nullptr;
+            const bool same = (j0 != 7);
             const int sub = (2 * m) >> 4;
             const int kgm = ((2 * m) >> 3) & 1;
-            const int j0 = (2 * m) & 7;
+            const int jpair = (2 * m) & 7;
 #pragma unroll 1
             for (int w = 0; w < 8; ++w) {
-                uint32_t u0 = 0, u1 = 0;
-                if (vc0 != nullptr)
-                    __builtin_memcpy(&u0, vc0 + w * 4, 4);
-                if (vc1 != nullptr)
-                    __builtin_memcpy(&u1, vc1 + w * 4, 4);
+                // 4 dims per step (same trip count as the old dword loop).
 #pragma unroll
                 for (int c = 0; c < 4; ++c) {
                     const int d = b * 32 + w * 4 + c;
-                    const float v0 = fa2_fp8_e4m3_to_f32((unsigned char)(u0 >> (c * 8)));
-                    const float v1 = fa2_fp8_e4m3_to_f32((unsigned char)(u1 >> (c * 8)));
+                    unsigned char c0 = 0, c1 = 0;
+                    if (same) {
+                        // Adjacent bytes of one group b64: one u16 load.
+                        unsigned short p = 0;
+                        if (gb0 != nullptr)
+                            __builtin_memcpy(&p, gb0 + (size_t)d * 8u + (size_t)j0, 2);
+                        c0 = (unsigned char)(p & 0xffu);
+                        c1 = (unsigned char)(p >> 8);
+                    } else {
+                        if (gb0 != nullptr)
+                            c0 = *(gb0 + (size_t)d * 8u + (size_t)j0);
+                        if (gb1 != nullptr)
+                            c1 = *(gb1 + (size_t)d * 8u + (size_t)j1);
+                    }
+                    const float v0 = fa2_fp8_e4m3_to_f32(c0);
+                    const float v1 = fa2_fp8_e4m3_to_f32(c1);
                     const int dc = d >> 4;
                     const int ln = 16 * kgm + (d & 15);
-                    const int o = fa2_voff(sub, dc, ln, j0);
+                    const int o = fa2_voff(sub, dc, ln, jpair);
                     V16[o] = (_Float16)(sf0 * v0);
                     V16[o + 1] = (_Float16)(sf1 * v1);
                 }
@@ -738,7 +756,8 @@ __device__ __forceinline__ void fa2_gqa_body(
 //      one global_load_b128 + two ds_store_b64 (dims dc*16+0..7 and +8..15
 //      land in Kfrag(sub,dc,ml) and Kfrag(sub,dc,16+ml), 128 bytes apart).
 //   V: one lane per (sub, dc, lane) fragment (2048/tile, 512/wave, 16/lane):
-//      8 global_load_u8 (8 keys at one dim, 1032-strided) + one ds_store_b64.
+//      one global_load_b64 (the Vfill grouped-fragment layout stores the 8
+//      keys at one dim contiguously) + one ds_store_b64, mirroring the K fill.
 // Out-of-range keys (gk >= seq_len) write code 0. Scales are NEVER staged:
 // route N reads them header-direct through fa2_scale_n below (S3 sizes no
 // scale plane; Main ruling). The dump writes LDS planes + accessor-read
@@ -850,9 +869,12 @@ __device__ void fa2_stageb_nfill_dump(
         }
 
         // ---- Route-N V fill: 2048 fragments, 16 per lane ----
-        // Fast path (all 8 keys in range): 8 byte loads off ONE row base
-        // with constant stride offsets (1032) + one b64 store. Edge
-        // fragments fall back to per-byte predication; all-OOR writes zero.
+        // Vfill grouped-fragment layout: kbase is 8-aligned (ktile % 64 == 0,
+        // sub*16, kg*8), so the fragment is one contiguous b64 at group_base
+        // + kv_h*D*8 + dim*8. Fast path: one global_load_b64 + one
+        // ds_store_b64. Edge fragments fall back to per-byte predication off
+        // the same base; all-OOR writes zero. (gbase is address math only and
+        // never dereferenced unless its group is in range.)
         for (int t = 0; t < 16; ++t) {
             const int idx = tid + t * 128;
             const int sub = idx >> 9;
@@ -865,31 +887,19 @@ __device__ void fa2_stageb_nfill_dump(
             const int kbase = ktile + sub * 16 + kg * 8;
             unsigned char* dst = V8
                 + (unsigned)(((sub * 16 + dc) * 32 + vlane) * 8);
+            const unsigned char* gbase = v_cache
+                + (unsigned long long)(kbase >> 3) * (1032ULL * 8ULL)
+                + (unsigned long long)kv_h * 256ULL * 8ULL
+                + (unsigned long long)dim * 8ULL;
             unsigned long long w = 0;
             if (kbase + 7 < seq_len) {
-                const unsigned char* r0 = v_cache
-                    + (unsigned long long)kbase * 1032ULL
-                    + (unsigned long long)kv_h * 256ULL
-                    + (unsigned long long)dim;
-                w = (unsigned long long)r0[0]
-                    | ((unsigned long long)r0[1032] << 8)
-                    | ((unsigned long long)r0[2064] << 16)
-                    | ((unsigned long long)r0[3096] << 24)
-                    | ((unsigned long long)r0[4128] << 32)
-                    | ((unsigned long long)r0[5160] << 40)
-                    | ((unsigned long long)r0[6192] << 48)
-                    | ((unsigned long long)r0[7224] << 56);
+                w = *(const unsigned long long*)gbase;
             } else if (kbase < seq_len) {
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    const int gkey = kbase + j;
                     unsigned char c = 0;
-                    if (gkey < seq_len)
-                        c = *(v_cache + (unsigned long long)gkey * 1032ULL
-                            + (unsigned long long)kv_h * 256ULL
-                            + (unsigned long long)dim);
-                    // j-th byte of the fragment word (token-major rows are
-                    // 1032 apart: no vector load exists for a V fragment).
+                    if (kbase + j < seq_len)
+                        c = *(gbase + j);
                     w |= (unsigned long long)c
                         << (unsigned long long)(j * 8);
                 }
@@ -1058,29 +1068,20 @@ __device__ void fa2_stageb_nbody(
             const int kbase = ktile + sub * 16 + kgv * 8;
             unsigned char* dst = V8
                 + (unsigned)(((sub * 16 + dc) * 32 + vlane) * 8);
+            // Same grouped-fragment b64 as the oracle fill above.
+            const unsigned char* gbase = v_cache
+                + (unsigned long long)(kbase >> 3) * (1032ULL * 8ULL)
+                + (unsigned long long)kv_h * 256ULL * 8ULL
+                + (unsigned long long)dim * 8ULL;
             unsigned long long w = 0;
             if (kbase + 7 < seq_len) {
-                const unsigned char* r0 = v_cache
-                    + (unsigned long long)kbase * 1032ULL
-                    + (unsigned long long)kv_h * 256ULL
-                    + (unsigned long long)dim;
-                w = (unsigned long long)r0[0]
-                    | ((unsigned long long)r0[1032] << 8)
-                    | ((unsigned long long)r0[2064] << 16)
-                    | ((unsigned long long)r0[3096] << 24)
-                    | ((unsigned long long)r0[4128] << 32)
-                    | ((unsigned long long)r0[5160] << 40)
-                    | ((unsigned long long)r0[6192] << 48)
-                    | ((unsigned long long)r0[7224] << 56);
+                w = *(const unsigned long long*)gbase;
             } else if (kbase < seq_len) {
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    const int gkey = kbase + j;
                     unsigned char c = 0;
-                    if (gkey < seq_len)
-                        c = *(v_cache + (unsigned long long)gkey * 1032ULL
-                            + (unsigned long long)kv_h * 256ULL
-                            + (unsigned long long)dim);
+                    if (kbase + j < seq_len)
+                        c = *(gbase + j);
                     w |= (unsigned long long)c
                         << (unsigned long long)(j * 8);
                 }

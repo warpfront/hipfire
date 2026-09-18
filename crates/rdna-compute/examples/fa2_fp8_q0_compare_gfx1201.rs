@@ -1,10 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Slice-B gate-2 device oracle (throwaway): FA2-KMODE8 Q0 output vs the
 // native-fp8 scalar-batched reference on the SAME native K/V.
-// Both kernels read one shared fp8 cache written by
-// kv_cache_write_fp8_e4m3_batched; the only difference is fill-time f16
-// rounding + f16 WMMA (FA2) vs f32 arithmetic (reference). Reports
-// max-abs / mean-abs / tail-1% mean-abs — informational; KLD admits.
+// K via kv_cache_write_fp8_e4m3_batched (token-major), V via
+// kv_cache_write_fp8_e4m3_v_batched (Vfill grouped-fragment); the only
+// difference is fill-time f16 rounding + f16 WMMA (FA2) vs f32 arithmetic
+// (reference). Reports max-abs / mean-abs / tail-1% mean-abs — informational;
+// KLD admits.
 use rdna_compute::{DType, Gpu};
 
 fn bytes_of_f32(v: &[f32]) -> &[u8] {
@@ -71,7 +72,7 @@ fn main() {
     let v_cache = gpu.alloc_tensor(&[CAP * ROW], DType::Raw).unwrap();
     gpu.kv_cache_write_fp8_e4m3_batched(&k_cache, &k, &positions, NKV, HD, BATCH)
         .unwrap();
-    gpu.kv_cache_write_fp8_e4m3_batched(&v_cache, &v, &positions, NKV, HD, BATCH)
+    gpu.kv_cache_write_fp8_e4m3_v_batched(&v_cache, &v, &positions, NKV, HD, BATCH)
         .unwrap();
 
     let out_ref = gpu.alloc_tensor(&[BATCH * NH * HD], DType::F32).unwrap();

@@ -497,17 +497,23 @@ __global__ void attention_flash_fp8_e4m3_tile_batched(
     float tile_sum = local_sum;
     __syncthreads();
 
-    // Phase D: V-weighted accumulation with fp8 decode.
+    // Phase D: V-weighted accumulation with fp8 decode. Vfill
+    // grouped-fragment codes (one contiguous b64 per (head, group, dim));
+    // scales stay token-local via the slot descriptor (fp8 is noslots).
+    // Arithmetic order unchanged: only the code addresses moved.
     float out_vec[16] = { 0.0f };
     for (int t_local = 0; t_local < tile_len; t_local++) {
         const float w = scores[t_local];
         const int t = tile_start + t_local;
         const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
         const float vs = (float)*((const _Float16*)(vrow + scale_off));
-        const unsigned char* vc = vrow + k_head_off + d0;
+        const unsigned char* vg = v_cache + desc.v_base
+            + (unsigned long long)(t >> 3) * (unsigned long long)per_pos_bytes * 8ULL
+            + (unsigned long long)kv_h * (unsigned long long)head_dim * 8ULL
+            + (unsigned long long)d0 * 8ULL + (unsigned long long)(t & 7);
         #pragma unroll
         for (int i = 0; i < dpt; i++)
-            out_vec[i] += w * (vs * hipfire_fp8_e4m3_to_f32_tile_b(vc[i]));
+            out_vec[i] += w * (vs * hipfire_fp8_e4m3_to_f32_tile_b(vg[(size_t)i * 8ULL]));
     }
 
     float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)

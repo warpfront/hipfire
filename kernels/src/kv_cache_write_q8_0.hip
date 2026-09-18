@@ -155,4 +155,76 @@ extern "C" __global__ void kv_cache_write_fp8_e4m3(
     if (tid == 0)
         *((_Float16*)(dst + (size_t)pos * stride + (size_t)n_kv_heads * head_dim + (size_t)head * 2)) = s16;
 }
+#ifdef HIPFIRE_KV_FP8_E4M3
+// V-side grouped-fragment write (Vfill layout). Values are bit-identical to
+// kv_cache_write_fp8_e4m3 above (same amax/scale/cvt rule); only the code
+// placement differs. Codes for (head, dim) land dim-major within the token's
+// 8-key group: byte for dim tid*8+i at group_base + head*D*8 + (tid*8+i)*8
+// + (pos&7), where group_base = (pos>>3)*8*stride. The 8 codes of one
+// (head, group, dim) fragment are contiguous (one b64) for the FA2 route-N V
+// fill. Scales stay home (same token-local address as the K writer). K keeps
+// the token-major writer above; ONLY V call sites route here.
+//
+// Grid/block/ABI identical to kv_cache_write_fp8_e4m3.
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1201__)
+#error "kv_cache_write_fp8_e4m3_v requires --offload-arch=gfx1201 (OCP E4M3FN cvt)"
+#endif
+extern "C" __global__ void kv_cache_write_fp8_e4m3_v(
+    unsigned char* __restrict__ dst,     // fp8 V cache, grouped-fragment codes
+    const float* __restrict__ src,       // [n_kv_heads * head_dim] f32 V vector
+    const int* __restrict__ pos_buf,
+    int n_kv_heads,
+    int head_dim
+) {
+    const int head = blockIdx.x;
+    const int tid = threadIdx.x;  // 0..31
+    if (head >= n_kv_heads) return;
+    const int pos = pos_buf[0];
+
+    float v[8];
+    #pragma unroll
+    for (int i = 0; i < 8; i++)
+        v[i] = src[(size_t)head * head_dim + tid * 8 + i];
+
+    // Full-head absmax (uniform across the wave afterwards).
+    float amax = 0.0f;
+    #pragma unroll
+    for (int i = 0; i < 8; i++) amax = fmaxf(amax, fabsf(v[i]));
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, offset));
+
+    // Scale rule identical to the K writer (stored-scale divide below).
+    _Float16 s16 = (amax == 0.0f) ? (_Float16)1.0f : (_Float16)(amax / 448.0f);
+    if (amax > 0.0f && s16 == (_Float16)0.0f)
+        s16 = __builtin_bit_cast(_Float16, (unsigned short)0x0001);
+    float sf = (float)s16;
+    if (amax > 0.0f && 448.0f * sf < amax) {
+        unsigned short bits = __builtin_bit_cast(unsigned short, s16);
+        bits = (bits >= 0x7bff) ? (unsigned short)0x7bff : (unsigned short)(bits + 1u);
+        s16 = __builtin_bit_cast(_Float16, bits);
+        sf = (float)s16;
+    }
+
+    // Quantize against the STORED scale (divide, not reciprocal multiply).
+    unsigned w0 = 0u;
+    w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v[0] / sf, v[1] / sf, w0, false);
+    w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v[2] / sf, v[3] / sf, w0, true);
+    unsigned w1 = 0u;
+    w1 = __builtin_amdgcn_cvt_pk_fp8_f32(v[4] / sf, v[5] / sf, w1, false);
+    w1 = __builtin_amdgcn_cvt_pk_fp8_f32(v[6] / sf, v[7] / sf, w1, true);
+
+    // Grouped-fragment scatter: lane tid owns dims tid*8..tid*8+7; dim d of
+    // this head lives at group_base + head*D*8 + d*8 + j (stride 8 between
+    // dims, byte-exact single-lane stores so neighbours are undisturbed).
+    const size_t stride = (size_t)n_kv_heads * (head_dim + 2);
+    const unsigned char* w0b = (const unsigned char*)&w0;
+    const unsigned char* w1b = (const unsigned char*)&w1;
+    unsigned char* base = dst + (size_t)(pos >> 3) * stride * 8u
+        + (size_t)head * (size_t)head_dim * 8u + (size_t)tid * 64u + (size_t)(pos & 7);
+    base[0] = w0b[0]; base[8] = w0b[1]; base[16] = w0b[2]; base[24] = w0b[3];
+    base[32] = w1b[0]; base[40] = w1b[1]; base[48] = w1b[2]; base[56] = w1b[3];
+    if (tid == 0)
+        *((_Float16*)(dst + (size_t)pos * stride + (size_t)n_kv_heads * head_dim + (size_t)head * 2)) = s16;
+}
+#endif
 #endif

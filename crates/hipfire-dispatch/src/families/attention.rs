@@ -449,9 +449,10 @@ fn dispatch_kv_write(
         }
         KernelKey::KvWriteFp8E4m3 => {
             debug_assert_eq!(plan.batch_size, 1);
-            // Native fp8: two launches, K then V (same shape as the Q8
-            // non-pair branch). No pair kernel, no ring variant: fp8 has no
-            // sliding-window or fused-gate route.
+            // Native fp8: two launches, K token-major then V grouped-fragment
+            // (Vfill layout; values bit-identical, only placement differs).
+            // No pair kernel, no ring variant: fp8 has no sliding-window or
+            // fused-gate route.
             hip!(gpu.kv_cache_write_fp8_e4m3(
                 io.k_cache,
                 io.k,
@@ -459,7 +460,7 @@ fn dispatch_kv_write(
                 io.n_kv_heads,
                 io.head_dim
             ))?;
-            hip!(gpu.kv_cache_write_fp8_e4m3(
+            hip!(gpu.kv_cache_write_fp8_e4m3_v(
                 io.v_cache,
                 io.v,
                 io.pos_buf,
@@ -733,8 +734,9 @@ fn dispatch_kv_write(
         }
         KernelKey::KvWriteFp8E4m3Batched => {
             // No gfx1100 pair fold, no slot descriptors: fp8 is contiguous,
-            // single-GPU, noslots. The writer overwrites every code and scale
-            // of each requested physical row before the paired attend reads.
+            // single-GPU, noslots. K token-major, V grouped-fragment (Vfill);
+            // the writer overwrites every code and scale of each requested
+            // physical row before the paired attend reads.
             let pos = io.positions();
             hip!(gpu.kv_cache_write_fp8_e4m3_batched(
                 io.k_cache,
@@ -744,7 +746,7 @@ fn dispatch_kv_write(
                 io.head_dim,
                 io.batch_size,
             ))?;
-            hip!(gpu.kv_cache_write_fp8_e4m3_batched(
+            hip!(gpu.kv_cache_write_fp8_e4m3_v_batched(
                 io.v_cache,
                 io.v,
                 pos,

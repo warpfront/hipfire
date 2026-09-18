@@ -1760,6 +1760,76 @@ impl Gpu {
         }
         result
     }
+    /// Batched V-side grouped-fragment fp8 write (Vfill layout, gfx1201-only):
+    /// same grid/block/ABI as [`Self::kv_cache_write_fp8_e4m3_batched`];
+    /// values bit-identical, codes dim-major within each 8-key group, scales
+    /// home. ONLY V call sites route here.
+    pub fn kv_cache_write_fp8_e4m3_v_batched(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        positions: &GpuTensor,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let row = fp8_e4m3_row_bytes(n_kv_heads, head_dim);
+        check_native_kv_capacity(dst, 1, row, "kv_cache_write_fp8_e4m3_v_batched")?;
+        if !self.functions.contains_key("kv_cache_write_fp8_e4m3_v_batched") {
+            let stripped = kernels::KV_CACHE_WRITE_FP8_E4M3_V_BATCHED_SRC
+                .replace("#include \"kv_slot_desc.h\"", "");
+            let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
+            self.ensure_kernel(
+                "kv_cache_write_fp8_e4m3_v_batched",
+                &src,
+                "kv_cache_write_fp8_e4m3_v_batched",
+            )?;
+        }
+        let d = dst.buf.as_ptr();
+        let s = src.buf.as_ptr();
+        let p = positions.buf.as_ptr();
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &d as *const _ as *mut c_void,
+            &s as *const _ as *mut c_void,
+            &p as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::kv_cache_write_fp8_e4m3_bytes(n_kv_heads, head_dim)
+            * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "kv_write",
+            "kv_cache_write_fp8_e4m3_v_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "kv_cache_write_fp8_e4m3_v_batched",
+            [n_kv_heads as u32, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(d);
+                b.push_ptr(s);
+                b.push_ptr(p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
 
     /// Lane-major Q8 KV write for independent-sequence decode.
     pub fn kv_cache_write_q8_0_independent(
@@ -2014,6 +2084,62 @@ impl Gpu {
             crate::profile::begin_timer(&self.hip, "kv_write", "kv_cache_write_fp8_e4m3", bytes);
         let result = self.launch_maybe_blob(
             "kv_cache_write_fp8_e4m3",
+            [n_kv_heads as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(d);
+                b.push_ptr(s);
+                b.push_ptr(p);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// V-side grouped-fragment fp8 write (Vfill layout, gfx1201-only): same
+    /// grid/block/ABI as [`Self::kv_cache_write_fp8_e4m3`]; values
+    /// bit-identical, codes dim-major within each 8-key group, scales home.
+    /// ONLY V call sites route here; K keeps the token-major writer.
+    pub fn kv_cache_write_fp8_e4m3_v(
+        &mut self,
+        dst: &GpuTensor,
+        src: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let row = fp8_e4m3_row_bytes(n_kv_heads, head_dim);
+        check_native_kv_capacity(dst, 1, row, "kv_cache_write_fp8_e4m3_v")?;
+        self.ensure_kernel(
+            "kv_cache_write_fp8_e4m3_v",
+            kernels::KV_CACHE_WRITE_FP8_E4M3_V_SRC,
+            "kv_cache_write_fp8_e4m3_v",
+        )?;
+        let d = dst.buf.as_ptr();
+        let s = src.buf.as_ptr();
+        let p = pos_buf.as_ptr();
+        let nkv = n_kv_heads as i32;
+        let hd = head_dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &d as *const _ as *mut c_void,
+            &s as *const _ as *mut c_void,
+            &p as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &hd as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::kv_cache_write_fp8_e4m3_bytes(n_kv_heads, head_dim);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "kv_write", "kv_cache_write_fp8_e4m3_v", bytes);
+        let result = self.launch_maybe_blob(
+            "kv_cache_write_fp8_e4m3_v",
             [n_kv_heads as u32, 1, 1],
             [32, 1, 1],
             0,

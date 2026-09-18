@@ -636,8 +636,11 @@ impl KvCache {
         }
         let kv_dim = Self::checked_vmm_product("logical", &[n_kv_heads, head_dim])?;
         let k_bytes_per_head = Self::vmm_k_bytes_per_head(mode, head_dim)?;
-        // FP8/BF16 are K/V-indivisible: V shares K's exact row layout and
-        // v_mode carries the ignored Q8 default (never read on these paths).
+        // BF16 is K/V-indivisible: V shares K's exact row layout and v_mode
+        // carries the ignored Q8 default (never read on these paths). Fp8
+        // shares the stride and home-row scales, but V codes are
+        // grouped-fragment (whole-group reserve sized below); v_mode is
+        // likewise ignored there.
         let v_bytes_per_head = match mode {
             KvMode::Fp8 | KvMode::Bf16 => k_bytes_per_head,
             _ => Self::vmm_v_bytes_per_head(v_mode, head_dim)?,
@@ -648,8 +651,19 @@ impl KvCache {
             Self::checked_vmm_product("V token stride", &[n_kv_heads, v_bytes_per_head])?;
         let k_reserve_bytes =
             Self::checked_vmm_product("K reserve", &[physical_cap, k_bytes_per_token])?;
-        let v_reserve_bytes =
-            Self::checked_vmm_product("V reserve", &[physical_cap, v_bytes_per_token])?;
+        // Fp8 V codes are grouped-fragment: reserve whole 8-key groups so a
+        // trailing partial group has backing store (== cap*stride when the
+        // cap is a multiple of 8). The mapping stride stays token-local;
+        // capacity math floors through the unchanged K side and physical_cap.
+        let v_reserve_bytes = if matches!(mode, KvMode::Fp8) {
+            let groups = physical_cap.div_ceil(8);
+            let tokens = groups.checked_mul(8).ok_or_else(|| {
+                hip_bridge::HipError::new(0, "VMM fp8 V reserve overflowed")
+            })?;
+            Self::checked_vmm_product("V reserve", &[tokens, v_bytes_per_token])?
+        } else {
+            Self::checked_vmm_product("V reserve", &[physical_cap, v_bytes_per_token])?
+        };
         let rotation_table_len = match mode {
             KvMode::Q8 => 0,
             // Unrotated, like Q8. Neither tier uses a rotation table, so 0 is
@@ -2853,9 +2867,17 @@ impl KvCache {
     /// to this value. All-zero rows use scale 1.0 with zero codes.
     pub const FP8_KV_MIN_SCALE_F32: f32 = 5.9604645e-8;
 
-    /// Checked bytes-per-token-row per side for the native fp8 layout:
-    /// `[Hkv x D codes, head-major][Hkv little-endian f16 scales]`.
+    /// Checked bytes-per-token-row per side for the native fp8 layout.
     /// Exactly 1032 at Hkv=4/D=256. Pure math, no GPU.
+    ///
+    /// K is token-major: `[Hkv x D codes, head-major][Hkv little-endian f16
+    /// scales]`, stride `Hkv * (D + 2)`. V shares the stride and the home-row
+    /// scales, but its codes are grouped-fragment (Vfill): 8-key groups with
+    /// dim-major codes, so one (head, group, dim) fragment is a contiguous
+    /// b64 at `group_base + head*D*8 + dim*8`. A whole 8-group block is
+    /// exactly `8 * stride` bytes (codes `Hkv*D*8` + home-row scales),
+    /// therefore the stride value itself is unchanged: only V's allocation
+    /// rounds up to whole groups (see [`Self::fp8_v_reserve_bytes`]).
     pub fn fp8_row_bytes(n_kv_heads: usize, head_dim: usize) -> HipResult<usize> {
         if n_kv_heads == 0 || head_dim == 0 {
             return Err(hip_bridge::HipError::new(
@@ -2874,6 +2896,23 @@ impl KvCache {
         codes.checked_add(scales).ok_or_else(|| {
             hip_bridge::HipError::new(0, "fp8 KV row bytes overflowed")
         })
+    }
+
+    /// Checked V-side reserve bytes for grouped-fragment fp8 V: whole 8-key
+    /// groups (`8 * stride` bytes each), so a trailing partial group still
+    /// has backing store. Equals `physical_cap * stride` whenever the cap is
+    /// a multiple of 8 (every real geometry). Pure math, no GPU.
+    pub fn fp8_v_reserve_bytes(
+        n_kv_heads: usize,
+        head_dim: usize,
+        physical_cap: usize,
+    ) -> HipResult<usize> {
+        let row = Self::fp8_row_bytes(n_kv_heads, head_dim)?;
+        let groups = physical_cap.div_ceil(8);
+        groups
+            .checked_mul(8)
+            .and_then(|tokens| tokens.checked_mul(row))
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 V reserve byte size overflowed"))
     }
 
     /// This cache's fp8 bytes-per-token-row per side. Rejects non-fp8
@@ -2973,7 +3012,11 @@ impl KvCache {
         // Allocator is typed F32; rows are 8-byte aligned by construction
         // (Hkv*(D+2) is even for every real geometry) so the ceil is exact.
         let cache_elems = cache_bytes.div_ceil(4);
-        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
+        // V codes are grouped-fragment: the V side reserves whole 8-key
+        // groups (== K size whenever physical_cap % 8 == 0). K stays put.
+        let v_reserve = Self::fp8_v_reserve_bytes(n_kv_heads, head_dim, physical_cap)?;
+        let v_elems = v_reserve.div_ceil(4);
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, v_elems, is_kv_layer)?;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
             "KV cache: fp8-e4m3 ({n_kv}/{} layers carry KV, others placeholder)",
