@@ -926,4 +926,66 @@ mod tests {
         let s2 = gen_fwht_signs(1042, 256);
         assert!(quantize_mq4g256v2_constrained(&w, 2, 100, &s1, &s2, Mq4HeaderConstraint::HalfPow2).is_err());
     }
+
+    /// Study helper: dump the EXACT f32 AWQ scales the requant recipe applies
+    /// per qt44 tensor (same condition as the dispatch: AWQ_ALPHA +
+    /// imatrix_weights_for + awq_eligible), for exact gate-4 references.
+    /// Input census comes from the fixture index (quant-a/qt44_names.json).
+    /// Skips when study files are absent. Output: quant-a/awq_scales.bin
+    /// {u32 n, per record: u16 namelen, name, u32 m, u32 k, u8 awq,
+    /// [u32 K, K x f32 le] if awq}.
+    #[test]
+    fn dump_awq_reference_scales() {
+        use crate::calibration::{
+            awq_eligible, compute_awq_scales, imatrix_weights_for, load_imatrix,
+            AWQ_ALPHA, IMATRIX,
+        };
+        let root = "/home/kaden/ClaudeCode/warpfront/wt-mq4e8/scratch-2026-09-17/Mq4e8Study/quant-a";
+        let Ok(names_json) = std::fs::read_to_string(format!("{root}/qt44_names.json")) else {
+            eprintln!("dump_awq: census missing, skipping");
+            return;
+        };
+        let im_path = "/home/kaden/qcal/imatrix/Qwen3.8-27B-imatrix.gguf";
+        if !std::path::Path::new(im_path).exists() {
+            eprintln!("dump_awq: imatrix missing, skipping");
+            return;
+        }
+        let names: Vec<(String, usize, usize)> =
+            serde_json::from_str(&names_json).expect("census json");
+        assert_eq!(names.len(), 497, "qt44 census size");
+        let _ = IMATRIX.set(load_imatrix(std::path::Path::new(im_path)));
+        let _ = AWQ_ALPHA.set(0.55f32);
+        let out_path = format!("{root}/awq_scales.bin");
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&(names.len() as u32).to_le_bytes());
+        let mut n_awq = 0usize;
+        for (name, m, k) in &names {
+            let nb = name.as_bytes();
+            buf.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+            buf.extend_from_slice(nb);
+            buf.extend_from_slice(&(*m as u32).to_le_bytes());
+            buf.extend_from_slice(&(*k as u32).to_le_bytes());
+            let scales = match (AWQ_ALPHA.get().copied(), imatrix_weights_for(name)) {
+                (Some(a), Some(w)) if awq_eligible(name) => {
+                    let s = compute_awq_scales(w, a);
+                    assert_eq!(s.len(), *k, "imatrix len != K for {name}");
+                    Some(s)
+                }
+                _ => None,
+            };
+            match scales {
+                Some(s) => {
+                    n_awq += 1;
+                    buf.push(1u8);
+                    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+                    for &v in &s {
+                        buf.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                None => buf.push(0u8),
+            }
+        }
+        std::fs::write(&out_path, &buf).expect("write scales dump");
+        eprintln!("dump_awq: {} tensors, {} AWQ -> {out_path}", names.len(), n_awq);
+    }
 }
