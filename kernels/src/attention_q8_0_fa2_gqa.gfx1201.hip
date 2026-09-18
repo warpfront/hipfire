@@ -77,6 +77,10 @@ typedef union {
     uint32_t u;
     _Float16 h[2];
 } fa2_dw_t;
+// fp8 WMMA operand (8 bytes = one fragment) and HW e4m3 decode pair. Types
+// only: no code, no object impact on any translation unit.
+typedef int __attribute__((ext_vector_type(2))) v2i_t;
+typedef float __attribute__((ext_vector_type(2))) float2_t;
 
 // Frozen fragment-offset helpers (half-element units; one fragment = 8).
 // lane = 16*kg+ml. K plane starts at half 0, V plane at half 16384.
@@ -915,6 +919,379 @@ __device__ void fa2_stageb_nfill_dump(
         __syncthreads();
     }
 }
+// ---- Stage-b route-N body with fp8 QK leg (B2) ----
+// Separate template so the f16 objects stay identical. Skeleton (bounds,
+// tile loop, softmax order, O/partial records, barriers) mirrors
+// fa2_gqa_body; differences: route-N byte-copy fill (same loops as the B1b
+// oracle fn above), QK as S^T = K8*Q8^T in fp8 WMMA (64 per compute wave
+// per full tile; one b64 per fragment operand; Q streamed from the fp8
+// scratch row), score[j] = (acc[j]*qs)*sk[key_j] at the old scale position
+// (qs = sq[query]*scale_attn once per lane at init; sk for the 8 OWNED keys
+// sub*16+8*kg+j via fa2_scale_n, one subtile lifetime, sharing one
+// 8-register file with sv), PV still f16 (temporary V-expand at the
+// operand load, removed in B3: HW cvt_pk_f32_fp8 x4 + sv mul + f16 pack,
+// bit-exact with the Q0 fill values since f32 mul commutes).
+template <bool PARTIAL>
+__device__ void fa2_stageb_nbody(
+    const unsigned char* __restrict__ q8_codes,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int batch_size,
+    float scale_attn,
+    int kv_h,
+    int q_base,
+    int tile0,
+    int tile1,
+    int split,
+    int n_splits)
+{
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int ml = lane & 15;
+    const int kg = lane >> 4;
+    const bool compute = wave < 3;
+
+    extern __shared__ uint32_t LDS[];
+    // fp8 fragment planes: K at byte 0, V at byte 16384 (32768 LDS).
+    unsigned char* K8 = (unsigned char*)LDS;
+    unsigned char* V8 = (unsigned char*)LDS + 16384;
+
+    float8_t Ofr[16];
+    float m_old = -INFINITY;
+    float l_val = 0.0f;
+    int h_ml = 0;
+    int qr_ml = 0;
+    bool qok_ml = false;
+    unsigned qb = 0;
+    if (compute) {
+        h_ml = 6 * kv_h + (wave << 1) + (ml >> 3);
+        qr_ml = q_base + (ml & 7);
+        qok_ml = qr_ml < batch_size;
+        qb = ((unsigned)qr_ml * 24u + (unsigned)h_ml) * 256u;
+#pragma unroll
+        for (int dc = 0; dc < 16; ++dc)
+            Ofr[dc] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    }
+
+    // ---- Per-WG causal bounds (positions[] is authoritative) ----
+    // Wave-local: each wave's lanes 0..7 read the same eight positions and
+    // reduce them with the identical integer min/max graph, so all four
+    // waves derive the same gmin/gmax/seq_len with no mailbox and no
+    // barrier. Other lanes keep the existing sentinel values.
+    int wmx = -1;
+    int wmn = 0x7fffffff;
+    if (lane < 8) {
+        const int qr = q_base + lane;
+        if (qr < batch_size) {
+            const int p = positions[qr];
+            wmx = p;
+            wmn = p;
+        }
+    }
+    wmx = max(wmx, __shfl_xor(wmx, 16, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 8, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 4, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 2, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 1, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 16, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 8, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 4, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 2, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 1, 32));
+    const int gmax = __builtin_amdgcn_readfirstlane(wmx);
+    const int gmin = __builtin_amdgcn_readfirstlane(wmn);
+    const int seq_len = gmax + 1;
+
+    // ---- KT64 tiles ----
+    for (int tile = tile0; tile < tile1; ++tile) {
+        const int ktile = tile * 64;
+        if (ktile >= seq_len)
+            break;
+
+        // ---- Route-N byte-copy fill (same loops as the B1b oracle) ----
+        // Rolled (unlike the oracle copy): rolling serializes the 24 slot
+        // copies so their temps reuse instead of overlapping in scheduling
+        // (saves ~80 VGPR); dynamic work is identical, plus loop latches.
+#pragma unroll 1
+        for (int t = 0; t < 8; ++t) {
+            const int idx = tid + t * 128;
+            const int k = idx >> 4;
+            const int dc = idx & 15;
+            const int gk = ktile + k;
+            const int sub = k >> 4;
+            const int mlk = k & 15;
+            unsigned char* dst =
+                K8 + (unsigned)(((dc * 4 + sub) * 32 + mlk) * 8);
+            if (gk < seq_len) {
+                const unsigned char* src = k_cache
+                    + (unsigned long long)gk * 1032ULL
+                    + (unsigned long long)kv_h * 256ULL
+                    + (unsigned long long)dc * 16ULL;
+                uint4 v = *(const uint4*)src;
+                *(unsigned long long*)dst =
+                    ((unsigned long long)v.y << 32) | v.x;
+                *(unsigned long long*)(dst + 128) =
+                    ((unsigned long long)v.w << 32) | v.z;
+            } else {
+                *(unsigned long long*)dst = 0ULL;
+                *(unsigned long long*)(dst + 128) = 0ULL;
+            }
+        }
+#pragma unroll 1
+        for (int t = 0; t < 16; ++t) {
+            const int idx = tid + t * 128;
+            const int sub = idx >> 9;
+            const int r = idx & 511;
+            const int dc = r >> 5;
+            const int vlane = r & 31;
+            const int mlv = vlane & 15;
+            const int kgv = vlane >> 4;
+            const int dim = dc * 16 + mlv;
+            const int kbase = ktile + sub * 16 + kgv * 8;
+            unsigned char* dst = V8
+                + (unsigned)(((sub * 16 + dc) * 32 + vlane) * 8);
+            unsigned long long w = 0;
+            if (kbase + 7 < seq_len) {
+                const unsigned char* r0 = v_cache
+                    + (unsigned long long)kbase * 1032ULL
+                    + (unsigned long long)kv_h * 256ULL
+                    + (unsigned long long)dim;
+                w = (unsigned long long)r0[0]
+                    | ((unsigned long long)r0[1032] << 8)
+                    | ((unsigned long long)r0[2064] << 16)
+                    | ((unsigned long long)r0[3096] << 24)
+                    | ((unsigned long long)r0[4128] << 32)
+                    | ((unsigned long long)r0[5160] << 40)
+                    | ((unsigned long long)r0[6192] << 48)
+                    | ((unsigned long long)r0[7224] << 56);
+            } else if (kbase < seq_len) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int gkey = kbase + j;
+                    unsigned char c = 0;
+                    if (gkey < seq_len)
+                        c = *(v_cache + (unsigned long long)gkey * 1032ULL
+                            + (unsigned long long)kv_h * 256ULL
+                            + (unsigned long long)dim);
+                    w |= (unsigned long long)c
+                        << (unsigned long long)(j * 8);
+                }
+            }
+            *(unsigned long long*)dst = w;
+        }
+        __syncthreads();
+
+        // ---- Four KT16 QK/softmax/PV subtiles (online order kept) ----
+        // Fused per subtile (B2 VGPR tradeoff): each live subtile runs its
+        // own QK dg groups into one sacc, then mask/softmax/PV in order, so
+        // online-softmax order and PV accumulation are unchanged.
+        if (compute) {
+            const bool do0 = ktile <= gmax;
+            const bool do1 = ktile + 16 <= gmax;
+            const bool do2 = ktile + 32 <= gmax;
+            const bool do3 = ktile + 48 <= gmax;
+            // qs formed per tile (not per call): sq is constant for the
+            // query, so holding qb/sqp/sqv across the fill only wastes
+            // VGPRs. One f32 load + mul per tile; negligible packets.
+            float qs_tile = 0.0f;
+            {
+                const unsigned qrow =
+                    (unsigned)qr_ml * 24u + (unsigned)h_ml;
+                const float* sqp = (const float*)(
+                    q8_codes + (unsigned)batch_size * 24u * 256u);
+                float sqv = 1.0f;
+                if (qok_ml)
+                    sqv = sqp[qrow];
+                qs_tile = sqv * scale_attn;
+            }
+#pragma unroll 1
+            for (int sub = 0; sub < 4; ++sub) {
+                const bool dos = (sub == 0) ? do0
+                    : (sub == 1) ? do1 : (sub == 2) ? do2 : do3;
+                if (!dos)
+                    continue;
+                // QK for this subtile only (fused: one sacc instead of four
+                // saves 24 VGPR; Q reloaded per live subtile — L1-served —
+                // while K/WMMA counts are unchanged). S^T = K8*Q8^T in fp8.
+                float8_t sacc =
+                    (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+                // K base in v2i units (sub factored once per subtile; dc
+                // below is unrolled-const, so every fragment load is a base
+                // VGPR + immediate offset — the slice-A addressing idiom.
+                // Dynamic fa2_kfrag8 indexing here cost ~100 packets/tile in
+                // index math + spill reloads; never do that again.)
+                const unsigned kbn = (unsigned)(sub * 32) + (unsigned)lane;
+                const v2i_t* Kf = (const v2i_t*)K8;
+                // V base in u64 units for the expand below (same idiom).
+                const unsigned vbn = (unsigned)(sub * 512) + (unsigned)lane;
+                // OOR-query clamp (per subtile): row 0 always exists, and
+                // below are unconditionally valid.
+                const unsigned qbb = qok_ml ? qb : 0u;
+#pragma unroll 1
+                for (int dg = 0; dg < 4; ++dg) {
+                    // Q base per group (dg*64 unrolled-const → immediate).
+                    // OOR lanes clamp to row 0 (valid: batch >= 1): their
+                    // scores are fully discarded by the mask below, so all
+                    // lanes issue straight-line loads (no diamonds).
+#pragma unroll
+                    for (int u = 0; u < 4; ++u) {
+                        const int dc = dg * 4 + u;
+                        // One aligned 8-byte load: Q codes for this lane's
+                        // query at dims dc*16+kg*8..+8.
+                        const v2i_t* qd = (const v2i_t*)(
+                            q8_codes + qbb + (unsigned)(dc * 16));
+                        v2i_t qf = qd[kg];
+                        // One aligned 8-byte load = Kfrag(sub, dc, lane):
+                        // static immediate kbn + dc*128 (dc unrolled-const).
+                        v2i_t kf = Kf[kbn + dc * 128];
+                        sacc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                            kf, qf, sacc);
+                    }
+                    // Bound the in-flight fragments to this group.
+                    asm volatile("" ::: "memory");
+                }
+                const int kt_sub = ktile + sub * 16;
+                const bool full = (kt_sub + 15) <= gmin;
+                const int pos_ml =
+                    (!full && qok_ml) ? positions[qr_ml] : 0;
+                // sk for the 8 OWNED keys (transposed ownership: this lane
+                // supplies K row ml but owns acc keys sub*16+8*kg+j, never
+                // ml). One subtile lifetime, sharing one 8-register file
+                // with sv below (sk is dead once scores are formed).
+                float sc[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    sc[j] = fa2_scale_n(
+                        k_cache, kt_sub + 8 * kg + j, kv_h, seq_len);
+                // Mask + row max, scale folded at the old position.
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int key_g = kt_sub + 8 * kg + j;
+                    const bool ok = qok_ml && (full || key_g <= pos_ml);
+                    const float x = ok ? (sacc[j] * qs_tile) * sc[j] : -INFINITY;
+                    sacc[j] = x;
+                }
+                float mx = -INFINITY;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    mx = fmaxf(mx, sacc[j]);
+                mx = fmaxf(mx, __shfl_xor(mx, 16, 32));
+                const float m_new = fmaxf(m_old, mx);
+                const float alpha =
+                    (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+                m_old = m_new;
+
+                // Probabilities pack straight into the PV B operand.
+                half8_t prow;
+                float sum = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float e = (m_new == -INFINITY)
+                        ? 0.0f
+                        : __expf(sacc[j] - m_new);
+                    prow[j] = (_Float16)e;
+                    sum += e;
+                }
+                sum += __shfl_xor(sum, 16, 32);
+                l_val = l_val * alpha + sum;
+
+                // O rescale with the lane's OWN alpha.
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc)
+                    Ofr[dc] *= alpha;
+
+                // sv reuses the scale file (sk dead: scores are formed).
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    sc[j] = fa2_scale_n(
+                        v_cache, kt_sub + 8 * kg + j, kv_h, seq_len);
+                // PV still f16 (temporary V-expand, removed in B3): decode
+                // 8 codes x 1 dim via HW cvt_pk_f32_fp8, mul sv, pack f16.
+                const unsigned long long* Vf =
+                    (const unsigned long long*)V8;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc) {
+                    const unsigned long long vc =
+                        Vf[vbn + dc * 32];
+                    // Two codes at a time through one decode pair: keeps a
+                    // single float2_t live (temporary, removed in B3).
+                    float2_t dd;
+                    half8_t vf;
+                    dd = __builtin_amdgcn_cvt_pk_f32_fp8(
+                        (unsigned)vc, 0);
+                    vf[0] = (_Float16)(dd[0] * sc[0]);
+                    vf[1] = (_Float16)(dd[1] * sc[1]);
+                    dd = __builtin_amdgcn_cvt_pk_f32_fp8(
+                        (unsigned)vc, 1);
+                    vf[2] = (_Float16)(dd[0] * sc[2]);
+                    vf[3] = (_Float16)(dd[1] * sc[3]);
+                    dd = __builtin_amdgcn_cvt_pk_f32_fp8(
+                        (unsigned)(vc >> 32), 0);
+                    vf[4] = (_Float16)(dd[0] * sc[4]);
+                    vf[5] = (_Float16)(dd[1] * sc[5]);
+                    dd = __builtin_amdgcn_cvt_pk_f32_fp8(
+                        (unsigned)(vc >> 32), 1);
+                    vf[6] = (_Float16)(dd[0] * sc[6]);
+                    vf[7] = (_Float16)(dd[1] * sc[7]);
+                    Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                        vf, prow, Ofr[dc]);
+                    asm volatile("" ::: "memory");
+                }
+            }
+        }
+        // Tile turnover: no wave may overwrite LDS before every PV read
+        // has finished.
+        __syncthreads();
+    }
+
+    // ---- Completion (same records as the f16 body) ----
+    if (compute) {
+        if (!PARTIAL) {
+            if (qok_ml) {
+                const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
+                const unsigned bo =
+                    (unsigned)qr_ml * 6144u + (unsigned)h_ml * 256u;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc) {
+                    const unsigned bd = bo + (unsigned)(dc * 16 + kg * 8);
+#pragma unroll
+                    for (int j = 0; j < 8; ++j)
+                        out[bd + (unsigned)j] = Ofr[dc][j] * inv;
+                }
+            }
+        } else {
+            if (kg == 0) {
+                if (qok_ml) {
+                    const unsigned rb =
+                        (((unsigned)qr_ml * 24u + (unsigned)h_ml)
+                             * (unsigned)n_splits + (unsigned)split)
+                        * 258u;
+                    float* rec = out + rb;
+                    rec[0] = m_old;
+                    rec[1] = l_val;
+                }
+            }
+            if (qok_ml) {
+                const unsigned rb =
+                    (((unsigned)qr_ml * 24u + (unsigned)h_ml)
+                         * (unsigned)n_splits + (unsigned)split)
+                        * 258u;
+                float* rec = out + rb;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const unsigned rj = rb + 2u + (unsigned)(kg * 8 + j);
+#pragma unroll
+                    for (int dc = 0; dc < 16; ++dc)
+                        rec[rj + (unsigned)(dc * 16)] = Ofr[dc][j];
+                }
+            }
+        }
+    }
+}
+
 
 // Body entries take pre-converted f16 Q at kernarg offset 0 (same slot, same
 // size as the old f32 Q pointer, so the pointer-array blob ABI is unchanged).
@@ -937,8 +1314,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_
     int batch_size,
     float scale_attn)
 {
-    (void)q8_codes;
-    (void)scale_attn;
+    // B2: the fp8-QK body consumes the planes in place (dump retired).
     if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
         return;
     const int kv_h = blockIdx.y;
@@ -947,8 +1323,9 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_
     const int q_base = blockIdx.x * 8;
     if (q_base >= batch_size)
         return;
-    fa2_stageb_nfill_dump<false>(k_cache, v_cache, out, positions, batch_size,
-                                 kv_h, q_base, 0, 0x3fffffff, 0, 1);
+    fa2_stageb_nbody<false>(q8_codes, k_cache, v_cache, out, positions,
+                            batch_size, scale_attn, kv_h, q_base, 0,
+                            0x3fffffff, 0, 1);
 }
 #else
 #if HIPFIRE_FA2_KMODE == 8
@@ -1172,8 +1549,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_
     float scale_attn,
     int n_splits)
 {
-    (void)q8_codes;
-    (void)scale_attn;
+    // B2: the fp8-QK body consumes the planes in place (dump retired).
     if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
         return;
     if (n_splits < 1 || n_splits > 8)
@@ -1190,8 +1566,9 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_
     const int per = (512 + n_splits - 1) / n_splits;
     const int t0 = split * per;
     const int t1 = t0 + per;
-    fa2_stageb_nfill_dump<true>(k_cache, v_cache, out, positions, batch_size,
-                                kv_h, q_base, t0, t1, split, n_splits);
+    fa2_stageb_nbody<true>(q8_codes, k_cache, v_cache, out, positions,
+                           batch_size, scale_attn, kv_h, q_base, t0, t1,
+                           split, n_splits);
 }
 #else
 #if HIPFIRE_FA2_KMODE == 8
