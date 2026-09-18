@@ -9672,6 +9672,7 @@ fn fa_pair_env_admitted(
         tier_inputs.quant_hfq8,
         tier_inputs.quant_fwht,
         tier_inputs.quant_bf16,
+        tier_inputs.quant_fp8,
     ) {
         hipfire_dispatch::families::kv_tier::KTier::Q8 => {
             // The halves take the WMMA/flash-prefill route into ingress;
