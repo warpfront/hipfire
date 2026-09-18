@@ -3458,7 +3458,7 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_LUT_PERM_SRC: &str = concat!(
 // MQ4V2 (qt44) iu4-direct MMQ sister (W4A4 prefill): weight nibbles feed
 // wmma_i32_16x16x16_iu4 directly, activations are int4 via the shared
 // block_i4_128 quant recipe (standalone quantize_int4_mmq_ds128 + C2
-// producer sidecars). Opt-in through HIPFIRE_GFX11_MQ4V2_IU4 on gfx1100/gfx1151.
+// producer sidecars). Opt-in through HIPFIRE_IU4_PREFILL on gfx1100/gfx1151.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
@@ -3467,7 +3467,7 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC: &str = concat!(
 // wmma_i32_16x16x32_iu4_w32_gfx12 directly (K=32/call, int32x2/lane,
 // k_grp=tid>>4 lane split, contiguous-row C — same conventions as the gfx12
 // iu8 MMQ). Same 7-arg ABI and block_i4_128 activations as the gfx11 iu4
-// kernel. Opt-in through HIPFIRE_GFX11_MQ4V2_IU4 on gfx1201 (default off).
+// kernel. Opt-in through HIPFIRE_IU4_PREFILL on gfx1201 (default off).
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip")

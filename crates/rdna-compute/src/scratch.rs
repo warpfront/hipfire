@@ -1429,7 +1429,7 @@ impl ScratchState {
     /// Ensure prefill activations are quantized to int4 (`block_i4_128`, 72 B
     /// per [K/128 block, batch]: f32 d, i32 s, 64 B nibbles) for the
     /// iu4-direct MMQ consumer (`gemm_mq4g256v2_mmq_prequant_iu4`), gated by
-    /// `HIPFIRE_GFX11_MQ4V2_IU4`. Same [K/128, batch] order and always-launch
+    /// `HIPFIRE_IU4_PREFILL`. Same [K/128, batch] order and always-launch
     /// lifetime contract as [`Self::ensure_q8_1_mmq_x128`], but a dedicated
     /// `int4_mmq_x_scratch` buffer — the layouts differ (72 B vs 144 B) and
     /// the iu4 consumer reads nibble headers the Q8_1 prelude never writes.

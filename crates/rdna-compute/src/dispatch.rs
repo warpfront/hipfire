@@ -2960,7 +2960,7 @@ impl Gpu {
         )
     }
     /// Ensure prefill activations are quantized to int4 (`block_i4_128`) for
-    /// the iu4-direct MMQ consumer (`HIPFIRE_GFX11_MQ4V2_IU4` path).
+    /// the iu4-direct MMQ consumer (`HIPFIRE_IU4_PREFILL` path).
     /// See `scratch.rs::ensure_int4_mmq_x`.
     pub fn ensure_int4_mmq_x(
         &mut self,

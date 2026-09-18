@@ -9778,7 +9778,7 @@ impl Gpu {
         // gfx12 iu4-direct MMQ (W4A4 prefill) opt-in: intercepts before the
         // fp8/production path. Same shape predicate as the fp8 intercept;
         // flag off leaves every byte unchanged.
-        if self.flags.gfx11_mmq_iu4_enabled()
+        if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -19158,7 +19158,7 @@ impl Gpu {
     /// int4 `block_i4_128` prelude from `ensure_int4_mmq_x`, feeds weight
     /// nibbles straight to `wmma_i32_16x16x16_iu4` on gfx1100/gfx1151 or
     /// `wmma_i32_16x16x32_iu4` on gfx1201 (halved A-side traffic, no expand).
-    /// Opt-in via `HIPFIRE_GFX11_MQ4V2_IU4` on gfx1100/gfx1151/gfx1201; same grid,
+    /// Opt-in via `HIPFIRE_IU4_PREFILL` on gfx1100/gfx1151/gfx1201; same grid,
     /// block, and full/add/base symbol structure as
     /// `gemm_mq4g256v2_mmq_prequant` on gfx11. Full tiles use the `_occ3` entries
     /// (`__launch_bounds__(256,3)`; measured not-slower than occ2 on XTX),
@@ -28729,7 +28729,7 @@ impl Gpu {
         {
             // iu4-direct MMQ (W4A4 prefill) opt-in: same batch predicate as
             // the Q8_1 MMQ route below; flag off leaves every byte unchanged.
-            if self.flags.gfx11_mmq_iu4_enabled() {
+            if self.flags.iu4_prefill_enabled() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_z, xq, y_z, z_m, k, batch_size)?;
@@ -29186,7 +29186,7 @@ impl Gpu {
         // gfx12 iu4-direct MMQ (W4A4 prefill) opt-in: intercepts before the
         // fp8/production path. Same shape predicate as the fp8 intercept;
         // flag off leaves every byte unchanged.
-        if self.flags.gfx11_mmq_iu4_enabled()
+        if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -29334,7 +29334,7 @@ impl Gpu {
             && batch_size % 128 == 0
         {
             // iu4-direct MMQ (W4A4 prefill) opt-in; flag off is unchanged.
-            if self.flags.gfx11_mmq_iu4_enabled() {
+            if self.flags.iu4_prefill_enabled() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_q, xq, y_q, q_m, k, batch_size)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_k, xq, y_k, k_m, k, batch_size)?;
@@ -29813,7 +29813,7 @@ impl Gpu {
         // gfx12 iu4-direct MMQ (W4A4 prefill) opt-in: intercepts before the
         // ldsstage/fp8/production path. Same shape predicate as the fp8
         // intercept; flag off leaves every byte unchanged.
-        if self.flags.gfx11_mmq_iu4_enabled()
+        if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -30523,7 +30523,7 @@ impl Gpu {
             && batch_size % 128 == 0
         {
             // iu4-direct MMQ (W4A4 prefill) opt-in; flag off is unchanged.
-            if self.flags.gfx11_mmq_iu4_enabled() {
+            if self.flags.iu4_prefill_enabled() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(
                     a_gate, xq, y_gate, gate_m, k, batch_size,
@@ -31938,7 +31938,7 @@ impl Gpu {
         // gfx12 iu4-direct MMQ (W4A4 prefill) opt-in: intercepts before the
         // ldsstage/fp8/production path. Same shape predicate as the fp8
         // intercept; flag off leaves every byte unchanged.
-        if self.flags.gfx11_mmq_iu4_enabled()
+        if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -32126,7 +32126,7 @@ impl Gpu {
             && batch_size % 128 == 0
         {
             // iu4-direct MMQ (W4A4 prefill) opt-in; flag off is unchanged.
-            if self.flags.gfx11_mmq_iu4_enabled() {
+            if self.flags.iu4_prefill_enabled() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)?;
                 return Ok(());

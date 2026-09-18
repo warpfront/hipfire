@@ -596,7 +596,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_GFX11_FA2_PREFILL` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/attention.rs, crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX11_MMQ_X128` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
-| `HIPFIRE_GFX11_MQ4V2_IU4` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/scratch.rs, crates/rdna-compute/src/dispatch.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_IU4_PREFILL` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/scratch.rs, crates/rdna-compute/src/dispatch.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX1151_CUMODE_MODULES` | crates/rdna-compute/src/compiler.rs |

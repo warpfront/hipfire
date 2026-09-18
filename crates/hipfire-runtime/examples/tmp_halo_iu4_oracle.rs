@@ -13,7 +13,7 @@
 //!
 //! Halo (hipx device 1):
 //!   HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 \
-//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-lf HIPFIRE_GFX11_MQ4V2_IU4=1 \
+//!     HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-lf HIPFIRE_IU4_PREFILL=1 \
 //!     cargo run --release -p hipfire-runtime --example tmp_halo_iu4_oracle --features lab -- \
 //!       /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt [--compile-only]
 //!
