@@ -1261,11 +1261,14 @@ fn dispatch_attend(
             }
             KernelKey::AttnFlashFp8E4m3 => {
                 debug_assert_eq!(plan.batch_size, 1);
-                // No gated/AWQ reduce exists for the fp8 tile: gate/AWQ
-                // routes stay on their q8 kernels, never silently ungated.
-                if io.output_gate.is_some() || io.output_awq_scale.is_some() {
+                // StageB S6: the fp8 tile writes the same [2+head_dim] f32
+                // partials as the q8 tile, so the shared q8 gated MQ-rotate
+                // reducer consumes them unmodified (format-neutral). Gate/AWQ
+                // route to the fused epilogue; scale-without-gate is a
+                // dispatch error, same as the q8 arm.
+                if io.output_gate.is_none() && io.output_awq_scale.is_some() {
                     return Err(DispatchError::Hip(
-                        "AttnFlashFp8E4m3 has no gated/AWQ reduce epilogue".into(),
+                        "output_awq_scale without output_gate".into(),
                     ));
                 }
                 let seq_len = io.pos + 1;
@@ -1282,6 +1285,8 @@ fn dispatch_attend(
                     io.head_dim,
                     io.physical_cap,
                     fp,
+                    io.output_gate,
+                    io.output_awq_scale,
                 ))
             }
             KernelKey::AttnFlashAsym4 => {

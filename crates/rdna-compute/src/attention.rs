@@ -6760,9 +6760,11 @@ impl Gpu {
     /// Native fp8-E4M3 flash decode (F slice, gfx1201-only): tile + shared
     /// f32 reduce, mirroring `attention_flash_q8_0_windowed_impl` at window=0
     /// (Qwen dense has no sliding window; fp8 has no ring variant, so the
-    /// effective-seq scan is the plain seq_len_hint). Gate/AWQ are rejected
-    /// at the dispatch arm — no gated fp8 reduce exists. The reduce is the
-    /// shared `attention_flash_q8_0_reduce`, which only touches f32 partials.
+    /// effective-seq scan is the plain seq_len_hint).
+    /// StageB S6: `output_gate`/`output_awq_scale` route the tile's
+    /// `[2+head_dim]` f32 partials into the shared q8 gated MQ-rotate
+    /// reducer, which only touches f32 partials/gate/scales and is therefore
+    /// KV-format-neutral. `None` keeps the plain shared reduce.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_flash_fp8_e4m3_tile(
         &mut self,
@@ -6777,6 +6779,8 @@ impl Gpu {
         head_dim: usize,
         max_seq: usize,
         partials: &GpuTensor,
+        output_gate: Option<&GpuTensor>,
+        output_awq_scale: Option<&GpuTensor>,
     ) -> HipResult<()> {
         self.bind_thread()?;
         check_native_kv_capacity(
@@ -6871,6 +6875,22 @@ impl Gpu {
             )?;
         }
         // ── Reduce kernel (shared f32 reduce; reads seq_len from pos_buf) ──
+        // With a gate, the shared q8 gated MQ-rotate reducer consumes the
+        // tile's [2+head_dim] f32 partials unmodified (format-neutral).
+        if let Some(gate) = output_gate {
+            self.attention_flash_reduce_gated_mq_rotate_gfx1100(
+                partials,
+                out,
+                gate,
+                output_awq_scale,
+                pos_buf,
+                n_heads,
+                head_dim,
+                tile_size,
+                max_tiles,
+            )?;
+            return Ok(());
+        }
         {
             let p_ptr = partials.buf.as_ptr();
             let o_ptr = out.buf.as_ptr();

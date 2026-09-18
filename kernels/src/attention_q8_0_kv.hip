@@ -180,7 +180,17 @@ static __device__ __forceinline__ float hipfire_bf16_to_f32_scalar(unsigned shor
     return __builtin_bit_cast(float, ((unsigned int)b) << 16);
 }
 #endif
-
+#ifdef HIPFIRE_KV_FP8_E4M3
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+// Hardware OCP E4M3FN decode on gfx1201: 2 codes per VALU via
+// __builtin_amdgcn_cvt_pk_f32_fp8(dword, sel) with sel = 0/1 selecting
+// bytes [1:0]/[3:2]. Bit-exact vs hipfire_fp8_e4m3_to_f32 for all 256
+// codes (StageB/decode probe_decode_rt: 0 mismatches). Non-gfx1201 keeps
+// the software decoder above as the reference arm.
+typedef float hipfire_fp8_f32x2_t __attribute__((ext_vector_type(2)));
+#define HIPFIRE_FP8_HAVE_HW_DECODE 1
+#endif
+#endif
 #ifdef HIPFIRE_KV_FP8_E4M3
 // Native-fp8 single-token decode. Load/address/decode differ from
 // attention_q8_0_kv; masks, online-softmax order, reduction order and the
@@ -240,15 +250,40 @@ extern "C" __global__ void attention_fp8_e4m3_kv(
                                  : ATT_Q8_TILE;
 
         // Phase A: Q @ K^T for this tile -> LDS scores.
+        // gfx1201: dword code loads + hardware e4m3 decode, ks factored out
+        // of the dot (one scale per (token, head): dot = ks * S q.code).
+        // Dword alignment: cache base is >=256 B aligned, row_stride =
+        // n_kv_heads*(head_dim+2) = 1032 = 0 (mod 4) at Hkv4/D256,
+        // k_head_off = kv_h*256 = 0 (mod 4), j steps by 4.
         for (int t = tid; t < tile_len; t += nthreads) {
             const int pos = tile_start + t;
             const unsigned char* krow = k_cache + (size_t)pos * row_stride;
             const float ks = (float)*((const _Float16*)(krow + codes_len + (size_t)kv_h * 2));
             const unsigned char* kc = krow + k_head_off;
+#if defined(HIPFIRE_FP8_HAVE_HW_DECODE)
+            float rdot = 0.0f;
+            int j = 0;
+            for (; j + 3 < head_dim; j += 4) {
+                const unsigned int w = *(const unsigned int*)(kc + j);
+                const hipfire_fp8_f32x2_t lo = __builtin_amdgcn_cvt_pk_f32_fp8(w, 0);
+                const hipfire_fp8_f32x2_t hi = __builtin_amdgcn_cvt_pk_f32_fp8(w, 1);
+                // Sequential per-element accumulation in j order: same FMA
+                // chain as the reference loop, so with ks = 1 the dot is
+                // bit-identical and only the scale factoring changes rounding.
+                rdot += q_shared[j + 0] * lo[0];
+                rdot += q_shared[j + 1] * lo[1];
+                rdot += q_shared[j + 2] * hi[0];
+                rdot += q_shared[j + 3] * hi[1];
+            }
+            for (; j < head_dim; j++)
+                rdot += q_shared[j] * hipfire_fp8_e4m3_to_f32(kc[j]);
+            scores[t] = rdot * ks * scale_attn;
+#else
             float dot = 0.0f;
             for (int j = 0; j < head_dim; j++)
                 dot += q_shared[j] * (ks * hipfire_fp8_e4m3_to_f32(kc[j]));
             scores[t] = dot * scale_attn;
+#endif
         }
         __syncthreads();
 
@@ -291,16 +326,32 @@ extern "C" __global__ void attention_fp8_e4m3_kv(
         // Phase B: V-weighted accumulation for this tile.
         // Each thread owns dims d = tid + i*nthreads and must fold every
         // position's softmax weight into its private acc (no position stride).
+        // gfx1201: vs folded into the weight once per key (was: once per
+        // (key, dim)), hardware e4m3 decode of the dword containing vc[d].
         for (int t = 0; t < tile_len; t++) {
             const float w = scores[t];
             const int pos = tile_start + t;
             const unsigned char* vrow = v_cache + (size_t)pos * row_stride;
             const float vs = (float)*((const _Float16*)(vrow + codes_len + (size_t)kv_h * 2));
             const unsigned char* vc = vrow + k_head_off;
+#if defined(HIPFIRE_FP8_HAVE_HW_DECODE)
+            const float wv = w * vs;
+#endif
             for (int i = 0; i < n_acc && i < ATT_Q8_ACC_MAX; i++) {
                 const int d = tid + i * nthreads;
                 if (d >= head_dim) break;
+#if defined(HIPFIRE_FP8_HAVE_HW_DECODE)
+                // Dword at (d & ~3) is 4-aligned by the Phase-A argument;
+                // bytes past head_dim (tail lane only) still land inside the
+                // row's code area or the following scale bytes: no OOB.
+                const unsigned int w4 = *(const unsigned int*)(vc + (d & ~3));
+                const hipfire_fp8_f32x2_t p = ((d & 2) != 0)
+                    ? __builtin_amdgcn_cvt_pk_f32_fp8(w4, 1)
+                    : __builtin_amdgcn_cvt_pk_f32_fp8(w4, 0);
+                acc[i] += wv * (((d & 1) != 0) ? p[1] : p[0]);
+#else
                 acc[i] += w * (vs * hipfire_fp8_e4m3_to_f32(vc[d]));
+#endif
             }
         }
         __syncthreads(); // protect LDS scores before the next tile overwrites

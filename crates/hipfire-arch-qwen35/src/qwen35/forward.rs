@@ -4264,8 +4264,17 @@ fn triattn_tap(
     Ok(())
 }
 
-fn qwen35_fa_epilogue_route_supported(is_gfx1201: bool, q8_route: bool, asym3_route: bool) -> bool {
-    q8_route || (!is_gfx1201 && asym3_route)
+fn qwen35_fa_epilogue_route_supported(
+    is_gfx1201: bool,
+    q8_route: bool,
+    asym3_route: bool,
+    fp8_route: bool,
+) -> bool {
+    // fp8: admitted only for the flash-tile attend key whose [2+head_dim] f32
+    // partials the shared q8 gated reducer consumes unmodified (StageB S6).
+    // The scalar fp8 reader writes final output directly and has no fused
+    // path, so it must never set output_gate.
+    q8_route || fp8_route || (!is_gfx1201 && asym3_route)
 }
 
 /// KV cache write + attention dispatch. Inline from original.
@@ -4290,8 +4299,14 @@ pub(crate) fn kv_cache_attention_dispatch(
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashQ8_0;
     let asym3_route = plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteAsym3
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashAsym3;
-    let fused_epilogue_route =
-        qwen35_fa_epilogue_route_supported(gpu.arch_caps.is_gfx1201(), q8_route, asym3_route);
+    let fp8_route = plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteFp8E4m3
+        && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashFp8E4m3;
+    let fused_epilogue_route = qwen35_fa_epilogue_route_supported(
+        gpu.arch_caps.is_gfx1201(),
+        q8_route,
+        asym3_route,
+        fp8_route,
+    );
     let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo) && fused_epilogue_route;
     let io = AttnParams {
         q: &s.fa_q,
@@ -7474,12 +7489,13 @@ mod tests {
         assert_eq!(qwen35_x_rot_len(2048, 0, 4096), 4096);
         assert_eq!(qwen35_x_rot_len(2048, 8192, 4096), 8192);
     }
-
     #[test]
-    fn gfx1201_fa_epilogue_is_q8_only() {
-        assert!(qwen35_fa_epilogue_route_supported(true, true, false));
-        assert!(!qwen35_fa_epilogue_route_supported(true, false, true));
-        assert!(qwen35_fa_epilogue_route_supported(false, false, true));
+    fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {
+        assert!(qwen35_fa_epilogue_route_supported(true, true, false, false));
+        assert!(qwen35_fa_epilogue_route_supported(true, false, false, true));
+        assert!(!qwen35_fa_epilogue_route_supported(true, false, true, false));
+        assert!(qwen35_fa_epilogue_route_supported(false, false, true, false));
+        assert!(!qwen35_fa_epilogue_route_supported(true, false, false, false));
     }
 
     // ── #397 Ship 6 — lowered decode super-op program shapes ──────────────

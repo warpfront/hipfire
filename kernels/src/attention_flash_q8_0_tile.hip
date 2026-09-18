@@ -410,8 +410,16 @@ __global__ void attention_flash_q8_0_tile(
 // order, the partials layout and the shared reduce contract are unchanged
 // (partials stay `[2 + head_dim]` f32, so the q8 reduce kernel is reused
 // unmodified). Codes are byte-contiguous (no 34-byte blocks), so each lane
-// loads 4 code bytes per half directly; the single per-head f16 scale is
-// loaded once per token and reused across halves. f32 decode throughout.
+// loads 4 codes per half with one dword load; the single per-head f16 scale
+// is loaded once per token and folded once per token/key (KLD-gated).
+// Stage B decode: on gfx1201 the branchy software decoder below is replaced
+// by __builtin_amdgcn_cvt_pk_f32_fp8 (2 codes/VALU, bit-exact for all 256
+// codes). This TU compiles for gfx1201 only (see the #error below); the
+// software decoder stays as the documented reference.
+#if defined(__HIP_DEVICE_COMPILE__) && defined(__gfx1201__)
+typedef float hipfire_fp8_tile_f32x2_t __attribute__((ext_vector_type(2)));
+#define HIPFIRE_FP8_TILE_HAVE_HW_DECODE 1
+#endif
 //
 // Grid: [n_heads, n_tiles, 1]. Block: [32, 1, 1] (one WAVE32).
 // LDS: tile_size floats for scores + head_dim floats for Q.
@@ -529,6 +537,11 @@ __global__ void attention_flash_fp8_e4m3_tile(
         float partial1 = 0.0f;
         float partial2 = 0.0f;
         float partial3 = 0.0f;
+        // Dword code loads: kbN = krN + k_head_off + k_bi*32 + k_off with
+        // row_stride = 1032 = 0 (mod 4) at Hkv4/D256, k_head_off = kv_h*256,
+        // k_bi*32, k_off = (tid%8)*4 all 0 (mod 4), cache base >=256 B
+        // aligned: every kbN is dword-aligned. ks folds once per token
+        // after the half loop (KLD-gated rounding change vs per-element).
         for (int half = 0; half < n_halves; half++) {
             const int k_bi = half * 4 + tid / 8;
             const unsigned char* kb0 = kr0 + k_head_off + k_bi * 32 + k_off;
@@ -536,6 +549,28 @@ __global__ void attention_flash_fp8_e4m3_tile(
             const unsigned char* kb2 = kr2 + k_head_off + k_bi * 32 + k_off;
             const unsigned char* kb3 = kr3 + k_head_off + k_bi * 32 + k_off;
             const float* qb_thread = q_lds + k_bi * 32 + k_off;
+#if defined(HIPFIRE_FP8_TILE_HAVE_HW_DECODE)
+            const unsigned int w0 = *(const unsigned int*)kb0;
+            const unsigned int w1 = *(const unsigned int*)kb1;
+            const unsigned int w2 = *(const unsigned int*)kb2;
+            const unsigned int w3 = *(const unsigned int*)kb3;
+            const hipfire_fp8_tile_f32x2_t a0 = __builtin_amdgcn_cvt_pk_f32_fp8(w0, 0);
+            const hipfire_fp8_tile_f32x2_t b0 = __builtin_amdgcn_cvt_pk_f32_fp8(w0, 1);
+            const hipfire_fp8_tile_f32x2_t a1 = __builtin_amdgcn_cvt_pk_f32_fp8(w1, 0);
+            const hipfire_fp8_tile_f32x2_t b1 = __builtin_amdgcn_cvt_pk_f32_fp8(w1, 1);
+            const hipfire_fp8_tile_f32x2_t a2 = __builtin_amdgcn_cvt_pk_f32_fp8(w2, 0);
+            const hipfire_fp8_tile_f32x2_t b2 = __builtin_amdgcn_cvt_pk_f32_fp8(w2, 1);
+            const hipfire_fp8_tile_f32x2_t a3 = __builtin_amdgcn_cvt_pk_f32_fp8(w3, 0);
+            const hipfire_fp8_tile_f32x2_t b3 = __builtin_amdgcn_cvt_pk_f32_fp8(w3, 1);
+            partial0 += qb_thread[0] * a0[0] + qb_thread[1] * a0[1]
+                      + qb_thread[2] * b0[0] + qb_thread[3] * b0[1];
+            partial1 += qb_thread[0] * a1[0] + qb_thread[1] * a1[1]
+                      + qb_thread[2] * b1[0] + qb_thread[3] * b1[1];
+            partial2 += qb_thread[0] * a2[0] + qb_thread[1] * a2[1]
+                      + qb_thread[2] * b2[0] + qb_thread[3] * b2[1];
+            partial3 += qb_thread[0] * a3[0] + qb_thread[1] * a3[1]
+                      + qb_thread[2] * b3[0] + qb_thread[3] * b3[1];
+#else
             partial0 += qb_thread[0] * (ks0 * hipfire_fp8_e4m3_to_f32_tile(kb0[0]))
                       + qb_thread[1] * (ks0 * hipfire_fp8_e4m3_to_f32_tile(kb0[1]))
                       + qb_thread[2] * (ks0 * hipfire_fp8_e4m3_to_f32_tile(kb0[2]))
@@ -552,7 +587,14 @@ __global__ void attention_flash_fp8_e4m3_tile(
                       + qb_thread[1] * (ks3 * hipfire_fp8_e4m3_to_f32_tile(kb3[1]))
                       + qb_thread[2] * (ks3 * hipfire_fp8_e4m3_to_f32_tile(kb3[2]))
                       + qb_thread[3] * (ks3 * hipfire_fp8_e4m3_to_f32_tile(kb3[3]));
+#endif
         }
+#if defined(HIPFIRE_FP8_TILE_HAVE_HW_DECODE)
+        partial0 *= ks0;
+        partial1 *= ks1;
+        partial2 *= ks2;
+        partial3 *= ks3;
+#endif
 #if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
         partial0 = hipfire_attention_reduce_sum_xor(partial0);
         partial1 = hipfire_attention_reduce_sum_xor(partial1);
@@ -583,11 +625,22 @@ __global__ void attention_flash_fp8_e4m3_tile(
             const int k_bi = half * 4 + tid / 8;
             const unsigned char* kb = kr + k_head_off + k_bi * 32 + k_off;
             const float* qb_thread = q_lds + k_bi * 32 + k_off;
+#if defined(HIPFIRE_FP8_TILE_HAVE_HW_DECODE)
+            const unsigned int w = *(const unsigned int*)kb;
+            const hipfire_fp8_tile_f32x2_t alo = __builtin_amdgcn_cvt_pk_f32_fp8(w, 0);
+            const hipfire_fp8_tile_f32x2_t ahi = __builtin_amdgcn_cvt_pk_f32_fp8(w, 1);
+            partial += qb_thread[0] * alo[0] + qb_thread[1] * alo[1]
+                     + qb_thread[2] * ahi[0] + qb_thread[3] * ahi[1];
+#else
             partial += qb_thread[0] * (ks * hipfire_fp8_e4m3_to_f32_tile(kb[0]))
                      + qb_thread[1] * (ks * hipfire_fp8_e4m3_to_f32_tile(kb[1]))
                      + qb_thread[2] * (ks * hipfire_fp8_e4m3_to_f32_tile(kb[2]))
                      + qb_thread[3] * (ks * hipfire_fp8_e4m3_to_f32_tile(kb[3]));
+#endif
         }
+#if defined(HIPFIRE_FP8_TILE_HAVE_HW_DECODE)
+        partial *= ks;
+#endif
 #if defined(HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE)
         partial = hipfire_attention_reduce_sum_xor(partial);
 #else
@@ -698,6 +751,83 @@ __global__ void attention_flash_fp8_e4m3_tile(
             out2 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vv[2])); \
             out3 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vv[3])); \
         } while (0)
+        // Stage B V path (gfx1201): one dword load per key (d_base =
+        // half*128 + tid*4 is 0 (mod 4); same row argument as Phase A),
+        // hardware pair-decode, vs folded into the weight once per key.
+        #define ACCUM_V4_FP8_HW(tl) do { \
+            float w0 = scores[(tl) + 0]; \
+            float w1 = scores[(tl) + 1]; \
+            float w2 = scores[(tl) + 2]; \
+            float w3 = scores[(tl) + 3]; \
+            int t0 = tile_start + (tl) + 0; \
+            int t1 = tile_start + (tl) + 1; \
+            int t2 = tile_start + (tl) + 2; \
+            int t3 = tile_start + (tl) + 3; \
+            int s0 = (window > 0) ? (t0 % max_seq) : t0; \
+            int s1 = (window > 0) ? (t1 % max_seq) : t1; \
+            int s2 = (window > 0) ? (t2 % max_seq) : t2; \
+            int s3 = (window > 0) ? (t3 % max_seq) : t3; \
+            const unsigned char* vr0 = v_cache + (size_t)s0 * row_stride; \
+            const unsigned char* vr1 = v_cache + (size_t)s1 * row_stride; \
+            const unsigned char* vr2 = v_cache + (size_t)s2 * row_stride; \
+            const unsigned char* vr3 = v_cache + (size_t)s3 * row_stride; \
+            float vs0 = (float)*((const _Float16*)(vr0 + scale_off)); \
+            float vs1 = (float)*((const _Float16*)(vr1 + scale_off)); \
+            float vs2 = (float)*((const _Float16*)(vr2 + scale_off)); \
+            float vs3 = (float)*((const _Float16*)(vr3 + scale_off)); \
+            const unsigned int vw0 = *(const unsigned int*)(vr0 + k_head_off + d_base); \
+            const unsigned int vw1 = *(const unsigned int*)(vr1 + k_head_off + d_base); \
+            const unsigned int vw2 = *(const unsigned int*)(vr2 + k_head_off + d_base); \
+            const unsigned int vw3 = *(const unsigned int*)(vr3 + k_head_off + d_base); \
+            const float w0s = w0 * vs0; \
+            const float w1s = w1 * vs1; \
+            const float w2s = w2 * vs2; \
+            const float w3s = w3 * vs3; \
+            const hipfire_fp8_tile_f32x2_t c0lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw0, 0); \
+            const hipfire_fp8_tile_f32x2_t c0hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw0, 1); \
+            const hipfire_fp8_tile_f32x2_t c1lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw1, 0); \
+            const hipfire_fp8_tile_f32x2_t c1hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw1, 1); \
+            const hipfire_fp8_tile_f32x2_t c2lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw2, 0); \
+            const hipfire_fp8_tile_f32x2_t c2hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw2, 1); \
+            const hipfire_fp8_tile_f32x2_t c3lo = __builtin_amdgcn_cvt_pk_f32_fp8(vw3, 0); \
+            const hipfire_fp8_tile_f32x2_t c3hi = __builtin_amdgcn_cvt_pk_f32_fp8(vw3, 1); \
+            out0 += w0s * c0lo[0]; out1 += w0s * c0lo[1]; \
+            out2 += w0s * c0hi[0]; out3 += w0s * c0hi[1]; \
+            out0 += w1s * c1lo[0]; out1 += w1s * c1lo[1]; \
+            out2 += w1s * c1hi[0]; out3 += w1s * c1hi[1]; \
+            out0 += w2s * c2lo[0]; out1 += w2s * c2lo[1]; \
+            out2 += w2s * c2hi[0]; out3 += w2s * c2hi[1]; \
+            out0 += w3s * c3lo[0]; out1 += w3s * c3lo[1]; \
+            out2 += w3s * c3hi[0]; out3 += w3s * c3hi[1]; \
+        } while (0)
+        #define ACCUM_V_FP8_HW(tl) do { \
+            float w = scores[(tl)]; \
+            int t = tile_start + (tl); \
+            int slot = (window > 0) ? (t % max_seq) : t; \
+            const unsigned char* vr = v_cache + (size_t)slot * row_stride; \
+            float vs = (float)*((const _Float16*)(vr + scale_off)); \
+            const unsigned int vw = *(const unsigned int*)(vr + k_head_off + d_base); \
+            const float ws = w * vs; \
+            const hipfire_fp8_tile_f32x2_t clo = __builtin_amdgcn_cvt_pk_f32_fp8(vw, 0); \
+            const hipfire_fp8_tile_f32x2_t chi = __builtin_amdgcn_cvt_pk_f32_fp8(vw, 1); \
+            out0 += ws * clo[0]; out1 += ws * clo[1]; \
+            out2 += ws * chi[0]; out3 += ws * chi[1]; \
+         } while (0)
+#if defined(HIPFIRE_FP8_TILE_HAVE_HW_DECODE)
+        for (; t_local + 7 < tile_len; t_local += 8) {
+            ACCUM_V4_FP8_HW(t_local + 0);
+            asm volatile("" : "+v"(out0), "+v"(out1), "+v"(out2), "+v"(out3) :: "memory");
+            ACCUM_V4_FP8_HW(t_local + 4);
+        }
+        for (; t_local + 3 < tile_len; t_local += 4) {
+            ACCUM_V4_FP8_HW(t_local);
+        }
+        for (; t_local < tile_len; t_local++) {
+            ACCUM_V_FP8_HW(t_local);
+        }
+        #undef ACCUM_V4_FP8_HW
+        #undef ACCUM_V_FP8_HW
+#else
         for (; t_local + 7 < tile_len; t_local += 8) {
             ACCUM_V4_FP8(t_local + 0);
             asm volatile("" : "+v"(out0), "+v"(out1), "+v"(out2), "+v"(out3) :: "memory");
@@ -711,6 +841,7 @@ __global__ void attention_flash_fp8_e4m3_tile(
         }
         #undef ACCUM_V4_FP8
         #undef ACCUM_V_FP8
+#endif
         p[2 + d_base + 0] = out0;
         p[2 + d_base + 1] = out1;
         p[2 + d_base + 2] = out2;
