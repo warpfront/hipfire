@@ -469,18 +469,32 @@ fn construct_kv_cache(
             .expect("Qwen3.5 KV plan always resolves physical_cap");
         let kv = match (ctx.kv_backend, static_v) {
             (KvBackend::Vmm, vm) => {
-                // Unified VMM constructor: reserve == current; never post-alloc realloc.
-                KvCache::new_gpu_vmm_capped_filtered(
-                    ctx.gpu,
-                    &plan.is_kv_layer,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    ctx.max_seq,
-                    physical_cap,
-                    mode,
-                    vm,
-                )
-                .map_err(|e| format!("{e}"))?
+                // fp8/bf16 have no 5-flag VMM bundle representation (the
+                // generic constructor panics on them by design): route via
+                // the dedicated constructors, like from_mode_single_vmm.
+                // Neutral V is enforced at admission for both.
+                if matches!(mode, kv_mode::KvMode::Fp8 | kv_mode::KvMode::Bf16) {
+                    <KvCache as KvCacheExt>::from_mode_with_backend(
+                        mode,
+                        KvBackend::Vmm,
+                        KvTarget::Single(ctx.gpu),
+                        &plan.dims,
+                    )
+                    .map_err(|e| format!("{e}"))?
+                } else {
+                    // Unified VMM constructor: reserve == current; never post-alloc realloc.
+                    KvCache::new_gpu_vmm_capped_filtered(
+                        ctx.gpu,
+                        &plan.is_kv_layer,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        ctx.max_seq,
+                        physical_cap,
+                        mode,
+                        vm,
+                    )
+                    .map_err(|e| format!("{e}"))?
+                }
             }
             (KvBackend::Contiguous, llama::VMode::Q8) => <KvCache as KvCacheExt>::from_mode_with_backend(
                 mode,
