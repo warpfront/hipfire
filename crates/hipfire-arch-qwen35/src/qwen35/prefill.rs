@@ -105,6 +105,38 @@ fn try_iu4_silu_prepared(
     )?;
     Ok(Some(prep))
 }
+/// gfx1201 slice-1: SwiGLU/FWHT + in-register `block_i4_128` producer for
+/// w_down. `None` → caller keeps the incumbent silu + standalone-quantizer
+/// path. Same contract as [`try_iu4_silu_prepared`] (uniform MQ4G256V2 only,
+/// Residual-only at the call sites) but gated by
+/// `HIPFIRE_GFX12_SILU_QUANT_FUSED` on exact gfx1201 instead of the
+/// gfx1151-only C2 sidecar gate. Every other caller keeps the standalone
+/// `quantize_int4_mmq_ds128` path untouched.
+fn try_gfx12_silu_quant_fused_prepared(
+    gpu: &mut Gpu,
+    w_down: &hipfire_runtime::llama::WeightTensor,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+    n: usize,
+    emit_f32: bool,
+) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
+    if w_down.gpu_dtype != DType::MQ4G256V2 || !gpu.iu4_silu_quant_fused_active(n, k) {
+        return Ok(None);
+    }
+    let res = gpu.reserve_int4_mmq(k, n)?;
+    let prep = gpu.fused_silu_mul_rotate_mq_i4_gfx12_batched(
+        gate,
+        up,
+        w_down.awq_scale.as_ref(),
+        if emit_f32 { Some(x_rot) } else { None },
+        res,
+        k,
+        n,
+    )?;
+    Ok(Some(prep))
+}
 
 /// T-B: FWHT-rotate + `block_i4_128` IU4 producer for wo (residual) inputs.
 /// The wo input is a gated_norm/sigmoid output (never an rmsnorm output),
@@ -6508,6 +6540,19 @@ fn batch_chunk_delta_net_ffn_down(
                 n,
                 false,
             )?;
+            if iu4_prep.is_none() {
+                // gfx1201 slice-1: fused silu+quant producer (bit-identical).
+                iu4_prep = try_gfx12_silu_quant_fused_prepared(
+                    gpu,
+                    &layer.w_down,
+                    &pbs.gate_ffn_batch,
+                    &pbs.up_batch,
+                    &pbs.ffn_hidden_batch,
+                    hidden_dim,
+                    n,
+                    false,
+                )?;
+            }
         }
         if iu4_prep.is_none() {
             // F2: AWQ-aware silu_mul+rotate for w_down input.
@@ -7923,6 +7968,19 @@ fn batch_chunk_full_attn_ffn_down(
                 n,
                 false,
             )?;
+            if iu4_prep.is_none() {
+                // gfx1201 slice-1: fused silu+quant producer (bit-identical).
+                iu4_prep = try_gfx12_silu_quant_fused_prepared(
+                    gpu,
+                    &layer.w_down,
+                    &pbs.gate_ffn_batch,
+                    &pbs.up_batch,
+                    &pbs.ffn_hidden_batch,
+                    hidden_dim,
+                    n,
+                    false,
+                )?;
+            }
         }
         if iu4_prep.is_none() {
             fused_silu_mul_rotate_mq_batched_for(

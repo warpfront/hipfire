@@ -233,6 +233,13 @@ pub struct FeatureFlags {
     /// `gdn_pre_batched_gfx1201` on the sequential dense prefill route.
     /// Byte-exact vs the 3-launch sequence; any byte difference kills it.
     pub gfx12_gdn_pre_fused: bool,
+    /// gfx1201 down-proj SwiGLU/FWHT + int4 quant fusion (slice 1:
+    /// `HIPFIRE_GFX12_SILU_QUANT_FUSED`, `kernel.gfx12_silu_quant_fused`).
+    /// Default OFF everywhere; `=1` emits `block_i4_128` in-register from
+    /// the AWQ silu producer on exact gfx1201, removing the standalone
+    /// `quantize_int4_mmq_ds128` launch for the down-proj input.
+    /// Bit-identical vs the silu+quantizer chain; any byte difference kills it.
+    pub gfx12_silu_quant_fused: bool,
     /// `HIPFIRE_GFX12_FA2_PREFILL=0` opts out of the gfx1201 GQA-fused FA2
     /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
     /// Default ON on exact gfx1201; `=1` forces it on other arches
@@ -617,6 +624,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_v2: value("HIPFIRE_GFX12_MQ4V2_FP8_V2").as_deref() == Ok("1"),
             gfx12_gdn_pre_fused: value("HIPFIRE_GFX12_GDN_PRE_FUSED").as_deref() == Ok("1"),
+            gfx12_silu_quant_fused: value("HIPFIRE_GFX12_SILU_QUANT_FUSED").as_deref() == Ok("1"),
             gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
                 .unwrap_or(arch == "gfx1201"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
@@ -782,6 +790,12 @@ impl FeatureFlags {
     pub fn iu4_producer_sidecar_enabled(&self) -> bool {
         self.iu4_prefill.unwrap_or(false) && self.arch == "gfx1151"
     }
+    /// True only on exact gfx1201 with the opt-in set. The producer emits
+    /// the shared `block_i4_128` recipe, so output is bit-identical to the
+    /// standalone `quantize_int4_mmq_ds128` chain on the same f32 row.
+    pub fn gfx12_silu_quant_fused_enabled(&self) -> bool {
+        self.gfx12_silu_quant_fused && self.arch == "gfx1201"
+    }
 
     pub fn hfq3_mmq_layer_gate_pass(&self) -> bool {
         let lo = self.hfq3_mmq_layer_min;
@@ -919,6 +933,7 @@ impl FeatureFlags {
             force_blob_path: false,
             residual_ksplit_off: false,
             gfx12_gdn_pre_fused: false,
+            gfx12_silu_quant_fused: false,
             residual_ldsstage: false,
             gate_up_ldsstage: false,
             gfx12_mq4v2_fp8_gateup: false,
