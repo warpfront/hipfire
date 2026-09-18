@@ -393,3 +393,58 @@ so no same-mechanism correction can credibly close the gap and the one-correctio
 budget was deliberately unspent.
 G2 and §11 run below under the relaxation; the admission verdict and raw numbers
 will be appended here. Branch keeps the candidate commit for stage b regardless.
+
+### G2 verdict, 2026-09-18 — PASS with documented path conditions (agent Fa2RegR1)
+
+Two isolated arms, same inputs: v1 worktree `wt-fa2v1` (kernel =
+`E/fa2c/fp8.hip`, unrolled v1 + brace fix) vs candidate worktree `wt-fa2`
+(commit `eddc0c571`). Separate builds, separate kernel caches
+(`gfx1201-g2v1`, `gfx1201-g2cand`), ordinal 2. Disposable harnesses (copies
+under each worktree; originals in `E/Fa2RegR1/` provenance): `fa2_fp8_g2`
+(screen through kernel-out + Q/Kraw/Vraw/pos dumps), `fa2_fp8_g2split`
+(direct + split-bench partials/merge dumps).
+
+* Real-data screen (layer 35 / 4224 tok / 384-chunk, H24/KV4/D256):
+input sha256 equal across arms for Q, raw K, raw V, positions, gate
+(`E/Fa2RegR1/g2/`); `cmp` clean on the 9,437,184-byte pre-gate `O.f32`
+(2,359,296 f32, all finite, maxabs 13.56) and on `gate.f32`: **zero
+differing bits**. Meta identical (`fp8=true` both).
+* 7 synthetic shapes `(4,256)..(512,32768)` via oracle, both arms flag-ON:
+all 7 files `cmp`-identical; shapes 1–6 fully finite (maxabs ~9.0).
+(Oracle needed a one-line `wrapping_mul` seed fix for debug overflow panics;
+applied identically to both arms — release-wrap-equivalent seeds.)
+* Truncated causal tiles (b4: ctx 15/16/17/31/32/33/63/64/65; b12/c33) and
+split-1 partials+merged at b8/c512, b32/c2048 (fully finite): direct,
+split1-merged, split1-partials **all bit-identical** v1-vs-candidate.
+* Pre-existing v1 path conditions, identical in both arms (fault/behavior
+parity, not candidate divergence): (i) batch tails (batch%8!=0) yield
+all-NaN direct output in v1 itself (proven: v1-only b8/c256 finite vs
+b4/c512 NaN) — v1-vs-candidate NaN bits identical; (ii) split-8 with
+ctx>=31 hard-faults inside `attention_q8_0_fa2_gqa_partial_fp8_gfx1201`
+(HSA hang analysis names that kernel; HipError 700; both arms wedge
+identically, SIGKILL required); (iii) tiny-shape split records carry
+run-varying garbage m-slots/NaN payloads (proven arm-independent: v1-vs-v1
+and cand-vs-cand both vary; deterministic outputs stable). No valid
+split-8 output-identity signal exists; split-1 + fault parity is the
+split-path evidence. All nondeterministic bytes excluded with justification.
+
+### §11 status, 2026-09-18 — first series INVALID, fresh series running
+
+First OFF/ON/OFF/ON series on `target/release/hipfire e44f90a9` is VOID for
+ON: `hipfire bench` serves kernels through `target/release/daemon`, which was
+stale (Sep-17 build, embedded the rejected rolled source — proven via the
+bench kernel cache: 0×`group_byte`, 4×`#pragma unroll 1`). Its ON numbers
+(1443/1379/1178/**752.0** @32K) reproduce the rolled kernel, not the
+candidate. OFF rows from that series (f16 path, proven .text-identical):
+off1 1480.8/1411.6/1299.7/1004.6, off2 1462.3/1436.2/1331.7/1026.9,
+decode 28.77/36.37 (post-32K throttle artifact per §11: rerun, don't average).
+Fresh daemon rebuilt (`fb204842`, candidate strings verified: 48×
+`key_row_dw`, 0×rolled) and a fresh full series relaunched supervised
+(`fa2bench2`, `E/Fa2RegR1/bench/run_series.sh`, wiped kernel cache
+`gfx1201-bench`, frozen pair CLI `e44f90a9` + daemon `fb204842` recorded in
+`binaries.sha256`). PENDING at handover: on1/off2/on2 + admission verdict
+(no >1.5% regression any pp row; reproducible >1.5% gain at 32K,
+preferably ≥3%; decode ≥36.4 clean rerun). Series decode rows run immediately
+post-32K (throttle artifact); a standalone decode rerun is still
+owed. Runnable v1 arm left at `wt-fa2v1` (detached `eddc0c571` + fp8.hip
+kernel); disposable harnesses remain as untracked files in both worktrees.
