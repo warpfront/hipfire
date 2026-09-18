@@ -243,13 +243,16 @@ pub struct FeatureFlags {
     /// Default ON on gfx1100/gfx1151; `=1` forces it on other arches
     /// (launchers stay on the gfx11 allowlist).
     pub gfx11_fa2_prefill: bool,
-    /// Stage-b arithmetic switch on NATIVE fp8 KV (`HIPFIRE_GFX12_FA2_FP8`,
-    /// `kernel.gfx12_fa2_fp8`). Opt-in only (default off everywhere). OFF =
-    /// Q0 f16 arithmetic on the same native fp8 cache; ON = fp8 WMMA legs.
-    /// Meaningful only with a native-fp8 (`KTier::Fp8`) cache on exact
-    /// gfx1201 — it never selects a KV format, plane layout, or fallback.
-    /// The gate still admits gfx1200 until the deferred FA2 launcher gating
-    /// (twin-SRC removal) narrows it; see `gfx12_fa2_fp8_enabled`.
+    /// Stage-b arithmetic switch (`HIPFIRE_GFX12_FA2_FP8`,
+    /// `kernel.gfx12_fa2_fp8`): fp8 (OCP E4M3FN) QK + PV WMMA legs with f32
+    /// scores/softmax-state/O, on exact gfx1200/gfx1201 only. Opt-in only
+    /// (default off everywhere). OFF = f16 FA2 body on either cache; ON =
+    /// stage-b arithmetic, with the KV source selected by the cache route
+    /// (q8 cache = route Q requantizing fill, native-fp8 `KTier::Fp8`
+    /// cache = route N verbatim fill). It never selects a KV format, plane
+    /// layout, or fallback: outside the admitted envelope an explicit
+    /// fp8-arithmetic request must fail before allocation, never fall
+    /// through to a q8 reader. See `gfx12_fa2_fp8_enabled`.
     pub gfx12_fa2_fp8: Option<bool>,
     pub gemm_dump: bool,
     pub deterministic: bool,
@@ -761,8 +764,12 @@ impl FeatureFlags {
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
 
-    /// Resolved gfx120x FA2 fp8 route: explicit opt-in only, and only on
-    /// exact gfx1200/gfx1201. Unset/`=0`/other arches keep the f16 FA2 body.
+    /// Resolved gfx120x FA2 fp8 arithmetic switch: explicit opt-in only,
+    /// and only on exact gfx1200/gfx1201. Unset/`=0`/other arches keep the
+    /// f16 FA2 body. This is the flag's single meaning (no symbol-rename
+    /// mode): when it resolves on, the stage-b launchers run fp8 WMMA
+    /// arithmetic for the cache-selected route; when off, every existing
+    /// arm is bit-identical.
     pub fn gfx12_fa2_fp8_enabled(&self) -> bool {
         self.gfx12_fa2_fp8.unwrap_or(false)
             && matches!(self.arch.as_str(), "gfx1200" | "gfx1201")
