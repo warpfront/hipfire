@@ -7,9 +7,11 @@
 // One workgroup owns one KV head and eight token positions: 48 live rows
 // (8 positions x 6 query heads, H=24/Hkv=4/D=256) packed into three 16-row
 // WMMA tiles, plus one loader/helper wave. K and V are each dequantized
-// exactly once per 64-key tile into two swizzled f16 LDS planes (32 KiB
-// each), then reused by all six query heads. Scores, online-softmax state
-// (m, l), and f32 O remain in VGPRs; dynamic LDS is exactly 65,536 B.
+// exactly once per 64-key tile into two fragment-major f16 LDS planes
+// (32 KiB each: 2048 aligned half8 fragments per plane, one b128 load per
+// fragment at the consumers), then reused by all six query heads. Scores,
+// online-softmax state (m, l), and f32 O remain in VGPRs; dynamic LDS is
+// exactly 65,536 B.
 //
 // Grid:  [ceil(batch/8), 4, 1] direct (x=batch tiles, y=KV head),
 //        [ceil(batch/8), 4, n_splits] partial.
@@ -30,13 +32,12 @@
 //   PV computes O^T = V^T*P^T: A = V^T fragment (row ml = dim 0..15 of the
 //     dc tile), B = the packed P half8, Ofr[dc][j] = O[query=ml][dim].
 //     O rows are the lane's OWN softmax query, so rescale/normalization
-//     use the lane's own alpha/l scalars: zero shuffles anywhere.
-//
-// LDS swizzle (f16 pairs as dwords, S(c) = 8*(c>>2) + (c&3)):
-//   K store/read: dword pair p for key k at K[k][(p + S(k&15)) & 127].
-//   V store/read: key-pair p for dim d at V_T[d][(p + S(d&15)) & 31].
-// Loads are four explicit uint32_t reads unpacked to half8_t; the circular
-// row wrap is intentional.
+// LDS fragment layout (frozen; F = 8 f16 = 16 B, lane = 16*kg+ml):
+//   Kfrag(sub,dc,lane) = ((dc*4+sub)*32+lane)*F, K at byte 0;
+//   Vfrag(sub,dc,lane) = ((sub*16+dc)*32+lane)*F, V at byte 32768.
+//   K fragment j = K[key=sub*16+ml][dim=dc*16+kg*8+j];
+//   V fragment j = V[key=sub*16+kg*8+j][dim=dc*16+ml].
+// Consumers issue one aligned half8 (b128) load per fragment; no wrap.
 //
 // Q f16 rounding matches the incumbent (Q/K/V/P operands f16,
 // accumulators/state/O f32). No slots, no windows, no FP8, no other arch.
@@ -51,8 +52,8 @@
 //       pre-convert kernel below (fwht_shfl_forward_256 from
 //       turbo_common.h — prepended by the launcher, NOT #included here: the
 //       runtime compile has no -I to kernels/src), applied to the f32 row
-//       BEFORE the cast. Everything downstream of the K plane (layout,
-//       swizzle, QK/PV, softmax, epilogue) is untouched.
+//       BEFORE the cast. Everything downstream of the K plane (fragment
+//       layout, QK/PV, softmax, epilogue) is untouched.
 #ifndef HIPFIRE_FA2_KMODE
 #define HIPFIRE_FA2_KMODE 0
 #endif
@@ -73,9 +74,23 @@ typedef union {
     _Float16 h[2];
 } fa2_dw_t;
 
-__device__ __forceinline__ int fa2_swiz(int c)
+// Frozen fragment-offset helpers (half-element units; one fragment = 8).
+// lane = 16*kg+ml. K plane starts at half 0, V plane at half 16384.
+__device__ __forceinline__ int fa2_koff(int sub, int dc, int lane, int j)
 {
-    return 8 * (c >> 2) + (c & 3);
+    return ((dc * 4 + sub) * 32 + lane) * 8 + j;
+}
+__device__ __forceinline__ int fa2_voff(int sub, int dc, int lane, int j)
+{
+    return ((sub * 16 + dc) * 32 + lane) * 8 + j;
+}
+__device__ __forceinline__ int fa2_kfrag8(int sub, int dc, int lane)
+{
+    return (dc * 4 + sub) * 32 + lane;
+}
+__device__ __forceinline__ int fa2_vfrag8(int sub, int dc, int lane)
+{
+    return (sub * 16 + dc) * 32 + lane;
 }
 
 // Shared workgroup body. PARTIAL=false writes normalized O to `out`;
@@ -113,8 +128,9 @@ __device__ __forceinline__ void fa2_gqa_body(
     const int kv_blk = kv_h * (256 / 32);
 
     extern __shared__ uint32_t LDS[];
-    uint32_t* Kdw = LDS;
-    uint32_t* Vdw = LDS + 8192;
+    // Fragment-major f16 planes: K at byte 0, V at byte 32768.
+    _Float16* K16 = (_Float16*)LDS;
+    _Float16* V16 = (_Float16*)(LDS + 8192);
 
     // ---- Transition 1: online state init (compute waves) ----
     // Q arrives f16 pre-converted (see attention_fa2_q_preconvert_gfx1201);
@@ -140,13 +156,14 @@ __device__ __forceinline__ void fa2_gqa_body(
     }
 
     // ---- Per-WG causal bounds (positions[] is authoritative) ----
-    // Lanes 0..7 read the tile's eight positions; wave 0 reduces; lane 0
-    // publishes via two transient LDS mailbox dwords (overwritten by the
-    // first V fill, so the 64 KiB plane budget is unaffected).
+    // Wave-local: each wave's lanes 0..7 read the same eight positions and
+    // reduce them with the identical integer min/max graph, so all four
+    // waves derive the same gmin/gmax/seq_len with no mailbox and no
+    // barrier. Other lanes keep the existing sentinel values.
     int wmx = -1;
     int wmn = 0x7fffffff;
-    if (tid < 8) {
-        const int qr = q_base + tid;
+    if (lane < 8) {
+        const int qr = q_base + lane;
         if (qr < batch_size) {
             const int p = positions[qr];
             wmx = p;
@@ -163,15 +180,10 @@ __device__ __forceinline__ void fa2_gqa_body(
     wmn = min(wmn, __shfl_xor(wmn, 4, 32));
     wmn = min(wmn, __shfl_xor(wmn, 2, 32));
     wmn = min(wmn, __shfl_xor(wmn, 1, 32));
-    if (tid == 0) {
-        LDS[16382] = (uint32_t)wmx;
-        LDS[16383] = (uint32_t)wmn;
-    }
-    __syncthreads();
-    // Uniformize through lane 0: every lane loaded the same mailbox
-    // dwords, but that uniformity is invisible through LDS.
-    const int gmax = __builtin_amdgcn_readfirstlane((int)LDS[16382]);
-    const int gmin = __builtin_amdgcn_readfirstlane((int)LDS[16383]);
+    // Uniformize through lane 0 of this wave; every wave reduced the same
+    // eight positions, so every wave's lane 0 holds the same values.
+    const int gmax = __builtin_amdgcn_readfirstlane(wmx);
+    const int gmin = __builtin_amdgcn_readfirstlane(wmn);
     const int seq_len = gmax + 1;
 
     // ---- Transitions 2-4: KT64 tiles ----
@@ -188,11 +200,10 @@ __device__ __forceinline__ void fa2_gqa_body(
         // and kv_cache_write_asym_k_fwht3*). 512 slots (k*8+b, like the Q8
         // path); slot (k, b) owns lanes b*4..b*4+3 (lane l owns dims l*8..+8
         // via 3 bytes at +4+l*3, code (packed >> 3*i) & 7, value cnorm *
-        // TURBO_C3_256[code]) and dequantizes 32 dims = 16 dwords straight
-        // into the swizzled dword plane (pair p for key k at
-        // K[k][(p + S(k&15)) & 127] — identical layout downstream, so block
-        // b covers pairs b*16..b*16+15 exactly as in the Q8 path). V fill
-        // below is unchanged (Q8_0).
+        // TURBO_C3_256[code]). Arithmetic is unchanged; the two halves of
+        // each dword pair land in their Kfrag(sub=k>>4, dc, lane) fragment
+        // via fa2_koff instead of the old swizzled dword plane, so block b
+        // covers the same dims b*32..b*32+31. V fill below is unchanged.
         for (int t = 0; t < 4; ++t) {
             const int s = tid + t * 128;
             const int k = s >> 3;
@@ -205,8 +216,8 @@ __device__ __forceinline__ void fa2_gqa_body(
             float cnorm = 0.0f;
             if (rec != nullptr)
                 __builtin_memcpy(&cnorm, rec, 4);
-            const int rot = fa2_swiz(k & 15);
-            const int base = k * 128;
+            const int sub = k >> 4;
+            const int mlk = k & 15;
 #pragma unroll 1
             for (int m = 0; m < 4; ++m) {
                 uint32_t packed = 0;
@@ -217,17 +228,24 @@ __device__ __forceinline__ void fa2_gqa_body(
                 for (int i = 0; i < 4; ++i) {
                     const int code0 = (packed >> (6 * i)) & 7;
                     const int code1 = (packed >> (6 * i + 3)) & 7;
-                    fa2_dw_t dw;
-                    dw.h[0] = (_Float16)(cnorm * TURBO_C3_256[code0]);
-                    dw.h[1] = (_Float16)(cnorm * TURBO_C3_256[code1]);
-                    Kdw[base + ((p0 + i + rot) & 127)] = dw.u;
+                    // Pair p0+i holds dims 2*(p0+i), 2*(p0+i)+1; d0 is
+                    // even, so both halves share one fragment.
+                    const int d0 = (p0 + i) * 2;
+                    const int dc = d0 >> 4;
+                    const int ln = 16 * ((d0 >> 3) & 1) + mlk;
+                    const int o = fa2_koff(sub, dc, ln, d0 & 7);
+                    K16[o] = (_Float16)(cnorm * TURBO_C3_256[code0]);
+                    K16[o + 1] = (_Float16)(cnorm * TURBO_C3_256[code1]);
                 }
             }
         }
 #else
         // K: 512 blocks (k*8+b), one block per slot. Codes are loaded on
-        // demand per pair (no staging array) and dequantized straight
-        // into the swizzled dword plane.
+        // demand per pair (no staging array); dequant arithmetic is
+        // unchanged and the four halves land in their Kfrag(sub=k>>4, dc,
+        // lane) fragment via fa2_koff. The 4-wide dim run at 4-aligned d0
+        // never crosses an 8-dim fragment boundary, so all four share one
+        // (dc, lane) with j = d0&7 .. +3.
         for (int t = 0; t < 4; ++t) {
             const int idx = tid + t * 128;
             const int k = idx >> 3;
@@ -242,11 +260,10 @@ __device__ __forceinline__ void fa2_gqa_body(
                 su = (uint16_t)blk[0] | ((uint16_t)blk[1] << 8);
             _Float16 s = ((fa2_dw_t){.u = (uint32_t)su}).h[0];
             const float sf = (float)s;
-            const int rot = fa2_swiz(k & 15);
-            const int base = k * 128;
-            const int pb = b * 16;
+            const int sub = k >> 4;
+            const int mlk = k & 15;
 #pragma unroll 1
-            // 8 dwords cover the 32 codes (blk+2 may be 2-mod-4;
+            // 8 quads cover the 32 codes (blk+2 may be 2-mod-4;
             // memcpy emits a correct unaligned load either way).
             for (int w = 0; w < 8; ++w) {
                 uint32_t u = 0;
@@ -256,19 +273,23 @@ __device__ __forceinline__ void fa2_gqa_body(
                 const float c1 = (float)(int8_t)(u >> 8);
                 const float c2 = (float)(int8_t)(u >> 16);
                 const float c3 = (float)(int8_t)(u >> 24);
-                fa2_dw_t d0, d1;
-                d0.h[0] = (_Float16)(sf * c0);
-                d0.h[1] = (_Float16)(sf * c1);
-                d1.h[0] = (_Float16)(sf * c2);
-                d1.h[1] = (_Float16)(sf * c3);
-                Kdw[base + ((pb + w * 2 + rot) & 127)] = d0.u;
-                Kdw[base + ((pb + w * 2 + 1 + rot) & 127)] = d1.u;
+                const int d0 = b * 32 + w * 4;
+                const int dc = d0 >> 4;
+                const int ln = 16 * ((d0 >> 3) & 1) + mlk;
+                const int o = fa2_koff(sub, dc, ln, d0 & 7);
+                K16[o] = (_Float16)(sf * c0);
+                K16[o + 1] = (_Float16)(sf * c1);
+                K16[o + 2] = (_Float16)(sf * c2);
+                K16[o + 3] = (_Float16)(sf * c3);
             }
         }
 #endif
-        // V: 256 key-pairs (m*8+b); each slot reads the even and odd block
-        // and packs (V[2m][d], V[2m+1][d]) per output dim. Codes are loaded
-        // on demand per dim (no staging array).
+        // V: 256 key-pairs (m*8+b); each slot reads the even and odd block.
+        // Dequant arithmetic is unchanged; the pair (V[2m][d], V[2m+1][d])
+        // lands in its Vfrag(sub=(2m)>>4, dc, lane) fragment via fa2_voff.
+        // 2m/2m+1 never straddle a sub/kg boundary, so both halves share
+        // one fragment at consecutive j. Codes are loaded on demand per dim
+        // (no staging array).
         for (int t = 0; t < 2; ++t) {
             const int pair = tid + t * 128;
             const int m = pair >> 3;
@@ -292,6 +313,9 @@ __device__ __forceinline__ void fa2_gqa_body(
             _Float16 s1 = ((fa2_dw_t){.u = (uint32_t)s1u}).h[0];
             const float sf0 = (float)s0;
             const float sf1 = (float)s1;
+            const int sub = (2 * m) >> 4;
+            const int kgm = ((2 * m) >> 3) & 1;
+            const int j0 = (2 * m) & 7;
 #pragma unroll 1
             for (int w = 0; w < 8; ++w) {
                 uint32_t u0 = 0, u1 = 0;
@@ -304,10 +328,11 @@ __device__ __forceinline__ void fa2_gqa_body(
                     const int d = b * 32 + w * 4 + c;
                     const float c0 = (float)(int8_t)(u0 >> (c * 8));
                     const float c1 = (float)(int8_t)(u1 >> (c * 8));
-                    fa2_dw_t dw;
-                    dw.h[0] = (_Float16)(sf0 * c0);
-                    dw.h[1] = (_Float16)(sf1 * c1);
-                    Vdw[d * 32 + ((m + fa2_swiz(d & 15)) & 31)] = dw.u;
+                    const int dc = d >> 4;
+                    const int ln = 16 * kgm + (d & 15);
+                    const int o = fa2_voff(sub, dc, ln, j0);
+                    V16[o] = (_Float16)(sf0 * c0);
+                    V16[o + 1] = (_Float16)(sf1 * c1);
                 }
             }
         }
@@ -361,22 +386,13 @@ __device__ __forceinline__ void fa2_gqa_body(
                     }
                     if (do0) {
                         half8_t kfa[4];
-                        const int key = ml;
-                        const int rot = fa2_swiz(key & 15);
-                        const int base = key * 128;
+                        const half8_t* Kf = (const half8_t*)K16;
 #pragma unroll
                         for (int u = 0; u < 4; ++u) {
                             const int dc = dg * 4 + u;
-                            half8_t kf;
-#pragma unroll
-                            for (int i = 0; i < 4; ++i) {
-                                fa2_dw_t dw;
-                                dw.u = Kdw[base
-                                    + ((dc * 8 + kg * 4 + i + rot) & 127)];
-                                kf[2 * i] = dw.h[0];
-                                kf[2 * i + 1] = dw.h[1];
-                            }
-                            kfa[u] = kf;
+                            // One aligned half8 load = Kfrag(sub=0, dc,
+                            // lane): K[key=ml][dim=dc*16+kg*8..+8].
+                            kfa[u] = Kf[fa2_kfrag8(0, dc, lane)];
                         }
 #pragma unroll
                         for (int u = 0; u < 4; ++u)
@@ -385,22 +401,13 @@ __device__ __forceinline__ void fa2_gqa_body(
                     }
                     if (do1) {
                         half8_t kfa[4];
-                        const int key = 16 + ml;
-                        const int rot = fa2_swiz(key & 15);
-                        const int base = key * 128;
+                        const half8_t* Kf = (const half8_t*)K16;
 #pragma unroll
                         for (int u = 0; u < 4; ++u) {
                             const int dc = dg * 4 + u;
-                            half8_t kf;
-#pragma unroll
-                            for (int i = 0; i < 4; ++i) {
-                                fa2_dw_t dw;
-                                dw.u = Kdw[base
-                                    + ((dc * 8 + kg * 4 + i + rot) & 127)];
-                                kf[2 * i] = dw.h[0];
-                                kf[2 * i + 1] = dw.h[1];
-                            }
-                            kfa[u] = kf;
+                            // One aligned half8 load = Kfrag(sub=1, dc,
+                            // lane): K[key=16+ml][dim=dc*16+kg*8..+8].
+                            kfa[u] = Kf[fa2_kfrag8(1, dc, lane)];
                         }
 #pragma unroll
                         for (int u = 0; u < 4; ++u)
@@ -409,22 +416,13 @@ __device__ __forceinline__ void fa2_gqa_body(
                     }
                     if (do2) {
                         half8_t kfa[4];
-                        const int key = 32 + ml;
-                        const int rot = fa2_swiz(key & 15);
-                        const int base = key * 128;
+                        const half8_t* Kf = (const half8_t*)K16;
 #pragma unroll
                         for (int u = 0; u < 4; ++u) {
                             const int dc = dg * 4 + u;
-                            half8_t kf;
-#pragma unroll
-                            for (int i = 0; i < 4; ++i) {
-                                fa2_dw_t dw;
-                                dw.u = Kdw[base
-                                    + ((dc * 8 + kg * 4 + i + rot) & 127)];
-                                kf[2 * i] = dw.h[0];
-                                kf[2 * i + 1] = dw.h[1];
-                            }
-                            kfa[u] = kf;
+                            // One aligned half8 load = Kfrag(sub=2, dc,
+                            // lane): K[key=32+ml][dim=dc*16+kg*8..+8].
+                            kfa[u] = Kf[fa2_kfrag8(2, dc, lane)];
                         }
 #pragma unroll
                         for (int u = 0; u < 4; ++u)
@@ -433,22 +431,13 @@ __device__ __forceinline__ void fa2_gqa_body(
                     }
                     if (do3) {
                         half8_t kfa[4];
-                        const int key = 48 + ml;
-                        const int rot = fa2_swiz(key & 15);
-                        const int base = key * 128;
+                        const half8_t* Kf = (const half8_t*)K16;
 #pragma unroll
                         for (int u = 0; u < 4; ++u) {
                             const int dc = dg * 4 + u;
-                            half8_t kf;
-#pragma unroll
-                            for (int i = 0; i < 4; ++i) {
-                                fa2_dw_t dw;
-                                dw.u = Kdw[base
-                                    + ((dc * 8 + kg * 4 + i + rot) & 127)];
-                                kf[2 * i] = dw.h[0];
-                                kf[2 * i + 1] = dw.h[1];
-                            }
-                            kfa[u] = kf;
+                            // One aligned half8 load = Kfrag(sub=3, dc,
+                            // lane): K[key=48+ml][dim=dc*16+kg*8..+8].
+                            kfa[u] = Kf[fa2_kfrag8(3, dc, lane)];
                         }
 #pragma unroll
                         for (int u = 0; u < 4; ++u)
@@ -517,20 +506,12 @@ __device__ __forceinline__ void fa2_gqa_body(
 
                 // PV as O^T = V^T*P^T: A = V^T fragment (row ml = dim of
                 // the dc tile), B = prow. Ofr[dc][j] = O[query][dim].
+                // One aligned half8 load = Vfrag(sub, dc, lane):
+                // V[key=sub*16+kg*8..+8][dim=dc*16+ml].
+                const half8_t* Vf = (const half8_t*)V16;
 #pragma unroll
                 for (int dc = 0; dc < 16; ++dc) {
-                    const int d = dc * 16 + ml;
-                    const int rot = fa2_swiz(d & 15);
-                    const int vbase = d * 32;
-                    const int ps = sub * 8 + kg * 4;
-                    half8_t vf;
-#pragma unroll
-                    for (int i = 0; i < 4; ++i) {
-                        fa2_dw_t dw;
-                        dw.u = Vdw[vbase + ((ps + i + rot) & 31)];
-                        vf[2 * i] = dw.h[0];
-                        vf[2 * i + 1] = dw.h[1];
-                    }
+                    const half8_t vf = Vf[fa2_vfrag8(sub, dc, lane)];
                     Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
                         vf, prow, Ofr[dc]);
                     // Bound V-load hoisting to this chunk.
