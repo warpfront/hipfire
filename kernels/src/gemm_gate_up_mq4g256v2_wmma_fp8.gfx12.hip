@@ -243,21 +243,31 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 #if ((HIPFIRE_FP8_V2_BK / 8) % ((HIPFIRE_FP8_V2_WAVES * 32) / HIPFIRE_FP8_V2_BN)) != 0
 #error "W staging producers must divide BK/8 chunks"
 #endif
-// Balanced-aspect geometries (128x128x64/8w, 64x256x64/8w, 128x64x64/4w):
-// stride stays BK+8 = 72, so the §3.2 bank argument is unchanged — a lane
-// reading 8 contiguous bytes at (r*72 + kstep*16 + kg*8), r = lane&15,
-// touches banks (18*r + 4*kstep + 2*kg + {0,1}) mod 32: all 16 even starts
-// per 16-lane half, every bank once per half, twice per full wave (the
-// width floor, not a conflict). Only the row extents change: A rows
-// 0..BM-1, W rows 0..BN-1. Staging writers: every lane is active on every
-// round (row = r*NTHREADS/4 + (tid>>2), quad tid&3); consecutive lanes
-// touch consecutive 8 B chunks (coalesced globals, sequential LDS banks).
+// Fragment-order LDS (fold-probe result): A/W planes are stored in WMMA
+// fragment order — each (16-row block, K16 step) fragment is 256 contiguous
+// bytes with lane L's 8 operand bytes at frag + L*8 (lane (ml,kg): row ml,
+// cols kg*8, exactly what v_wmma_f32_16x16x16_fp8_fp8 consumes). The K-loop
+// read is one ds_read_b64 at (wave-uniform frag base) + lane*8 with the
+// (nb/wf, kstep) frag offset in the immediate — no address VALU in the loop.
+// K-step bank shift: frag F lives at F*288, not F*256. Consecutive ksteps of
+// a block sit 288 B apart (8 banks apart), so the four staging quads (one
+// kstep each) never collide on writes; reads stay at the width floor (each
+// bank twice per wave = the 256 B minimum). Enumerated per-issue worst = 2
+// (floor) for every A/W store issue on all four admitted aspects; the old
+// stride-(BK+8) row layout measured a ~19x bank-conflict penalty on the K-loop
+// reads (loads alone cost the same as loads+WMMA). Plane sizes are
+// (rows/16)*(BK/16)*288 — identical totals to the old rows*B*(BK+8), so the
+// host vlds formula is untouched.
 #define HIPFIRE_FP8_V2_NTHREADS (HIPFIRE_FP8_V2_WAVES * 32)
-#define HIPFIRE_FP8_V2_STRIDE   (HIPFIRE_FP8_V2_BK + 8)
+#define HIPFIRE_FP8_V2_FRAG     288
 #define HIPFIRE_FP8_V2_A_OFF    0
-#define HIPFIRE_FP8_V2_A_BYTES  (HIPFIRE_FP8_V2_BM * HIPFIRE_FP8_V2_STRIDE)
+#define HIPFIRE_FP8_V2_A_BYTES  ((HIPFIRE_FP8_V2_BM / 16) * (HIPFIRE_FP8_V2_BK / 16) * HIPFIRE_FP8_V2_FRAG)
 #define HIPFIRE_FP8_V2_W_OFF    HIPFIRE_FP8_V2_A_BYTES
-#define HIPFIRE_FP8_V2_W_BYTES  (HIPFIRE_FP8_V2_BN * HIPFIRE_FP8_V2_STRIDE)
+#define HIPFIRE_FP8_V2_W_BYTES  ((HIPFIRE_FP8_V2_BN / 16) * (HIPFIRE_FP8_V2_BK / 16) * HIPFIRE_FP8_V2_FRAG)
+// Frag byte offset of (16-row block nb/wf, kstep ks) from the wave's frag-0
+// base pointer (a_fptr/w_fptr). Unrolled indices only: always an immediate.
+#define HIPFIRE_FP8_V2_AFRAG(nb, ks) (((nb) * HIPFIRE_FP8_V2_K16 + (ks)) * HIPFIRE_FP8_V2_FRAG)
+#define HIPFIRE_FP8_V2_WFRAG(wf, ks) (((wf) * HIPFIRE_FP8_V2_K16 + (ks)) * HIPFIRE_FP8_V2_FRAG)
 #define HIPFIRE_FP8_V2_S_OFF    (HIPFIRE_FP8_V2_W_OFF + HIPFIRE_FP8_V2_W_BYTES)
 #define HIPFIRE_FP8_V2_S_BYTES  (HIPFIRE_FP8_V2_BM * 4)
 #define HIPFIRE_FP8_V2_SZ_OFF   (HIPFIRE_FP8_V2_S_OFF + HIPFIRE_FP8_V2_S_BYTES)
@@ -368,15 +378,28 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     char* lds_W = lds + HIPFIRE_FP8_V2_W_OFF;
     char* lds_S = lds + HIPFIRE_FP8_V2_S_OFF;
     char* lds_SZ = lds + HIPFIRE_FP8_V2_SZ_OFF;
-
-    // Staged-tile staging map (b64-ideal form; cf. iu4 b64 rewrite): 4 lanes
-    // share a slab row (quad = tid&3 stages 2 packs/chunks per lane per
-    // round); rows/round = NTHREADS/4, so A_ROUNDS/W_ROUNDS cover the BM/BN
-    // extents exactly with every lane active on every round.
+    // Fragment-order K-loop read pointers: one VGPR each, fully
+    // loop-invariant (wave-uniform frag base + lane*8). Every K-loop LDS read
+    // is *(v2i_t*)(ptr + IMM) with the (nb/wf, kstep) frag offset — at most
+    // 15*288 = 4320 — folded into the ds immediate: no address VALU in the
+    // loop. wave_tok/wave_wt are multiples of 16, so >>4 is the frag block.
+    const unsigned lane8 = (unsigned)lane * 8u;
+    const char* a_fptr = lds_A + (unsigned)(wave_tok >> 4)
+        * (unsigned)HIPFIRE_FP8_V2_K16 * (unsigned)HIPFIRE_FP8_V2_FRAG + lane8;
+    const char* w_fptr = lds_W + (unsigned)(wave_wt >> 4)
+        * (unsigned)HIPFIRE_FP8_V2_K16 * (unsigned)HIPFIRE_FP8_V2_FRAG + lane8;
+    // Staged-tile staging map (fragment order): 4 lanes share a slab row
+    // (quad = tid&3 stages 2 packs/chunks per lane per round); rows/round =
+    // NTHREADS/4, so A_ROUNDS/W_ROUNDS cover the BM/BN extents exactly with
+    // every lane active on every round.
+    // Each producer thread owns row a_row/w_row's 16 bytes at quad*16 (kstep
+    // quad): block = row>>4, frag F = block*K16+quad, slot = (row&15)*8.
+    // The 16 B scatter as two b64 frag slots (F*288+slot, +128); W packs as
+    // one b64 each at (F*288+(ml+16*pp)*8). All store issues enumerate at the
+    // width floor (see the layout note above).
     // Width ceilings (headers rule out anything wider): A global row base is
     // tok*K+g*256+h*128+slab*BK, 16 B-aligned (256|K), so even-chunk b128
-    // pairs are exact; W packs are 4 B-stepped (b32 ceiling); LDS rows are
-    // stride-72 (8 B-aligned), so all LDS traffic is b64 (dual-issue pairs).
+    // pairs are exact; W packs are 4 B-stepped (b32 ceiling).
     // All offsets below are loop-invariant (bs/rs/tid only), computed once
     // at kernel top; per-trip uniform bases (g/h/slab) stay in SGPRs so the
     // K-loop issues base+offset wide loads/stores with no per-load address
@@ -410,9 +433,10 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     const unsigned st_quad = (unsigned)(tid & 3);
     const unsigned st_grp = (unsigned)(tid >> 2);
     const v2i_t st_z64 = {0, 0};
-    // A entries: one b128 pair (2 chunks) per round.
+    // A entries: one b128 pair (2 chunks) per round -> two frag slots.
+    // Combined slot-0 address (F*288 + ml*8); slot 1 is +128 (immediate).
     unsigned st_agoff[HIPFIRE_FP8_V2_A_ROUNDS];
-    unsigned st_aldsoff[HIPFIRE_FP8_V2_A_ROUNDS];
+    unsigned st_ab0[HIPFIRE_FP8_V2_A_ROUNDS];
     unsigned st_aok[HIPFIRE_FP8_V2_A_ROUNDS];
     #pragma unroll
     for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
@@ -421,13 +445,16 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         const int a_tok_c = (a_tok < N) ? a_tok : (N - 1);
         st_aok[r] = (a_tok < N) ? 1u : 0u;
         st_agoff[r] = (unsigned)a_tok_c * (unsigned)K + st_quad * 16u;
-        st_aldsoff[r] = (unsigned)a_row * (unsigned)HIPFIRE_FP8_V2_STRIDE + st_quad * 16u;
+        st_ab0[r] = ((unsigned)(a_row >> 4) * (unsigned)HIPFIRE_FP8_V2_K16 + st_quad)
+            * (unsigned)HIPFIRE_FP8_V2_FRAG + (unsigned)(a_row & 15) * 8u;
     }
     // W entries: two packs per round, routed per round on the clamped row.
+    // Combined frag-slot address (F*288 + (ml+16*pp)*8); pack pk = quad*2+pp
+    // covers kstep quad, kg-half pp — the slot lane (ml,pp) reads.
     const char* st_wbase[HIPFIRE_FP8_V2_W_ROUNDS];
     unsigned st_wok[HIPFIRE_FP8_V2_W_ROUNDS];
     unsigned st_wpoff[HIPFIRE_FP8_V2_W_ROUNDS][2];
-    unsigned st_wldsoff[HIPFIRE_FP8_V2_W_ROUNDS][2];
+    unsigned st_wslot[HIPFIRE_FP8_V2_W_ROUNDS][2];
     #pragma unroll
     for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
         const int w_row = r * HIPFIRE_FP8_V2_RPR + (int)st_grp;
@@ -442,7 +469,8 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         for (int pp = 0; pp < 2; pp++) {
             const unsigned pk = st_quad * 2u + (unsigned)pp;
             st_wpoff[r][pp] = pk * 4u;
-            st_wldsoff[r][pp] = (unsigned)w_row * (unsigned)HIPFIRE_FP8_V2_STRIDE + pk * 8u;
+            st_wslot[r][pp] = ((unsigned)(w_row >> 4) * (unsigned)HIPFIRE_FP8_V2_K16 + st_quad)
+                * (unsigned)HIPFIRE_FP8_V2_FRAG + (unsigned)((w_row & 15) + pp * 16) * 8u;
         }
     }
     // S entry: one f32 per lane (2^S_SH lanes share a row, dup benign).
@@ -529,9 +557,9 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                         const v2i_t v1l = *(const v2i_t*)(asrc + 8u);
                         const v2i_t v0 = st_aok[r] ? v0l : st_z64;
                         const v2i_t v1 = st_aok[r] ? v1l : st_z64;
-                        char* adst = lds_A + st_aldsoff[r];
+                        char* adst = lds_A + st_ab0[r];
                         *(v2i_t*)adst = v0;
-                        *(v2i_t*)(adst + 8u) = v1;
+                        *(v2i_t*)(adst + 128u) = v1;
                     }
                 }
                 // W: two raw packs per round; expand immediately (bit-exact).
@@ -544,7 +572,7 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                         for (int pp = 0; pp < 2; pp++) {
                             const unsigned int pk = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
                             const v2i_t e8 = mq4_qpk_to_e4m3(st_wok[r] ? pk : 0u);
-                            *(v2i_t*)(lds_W + st_wldsoff[r][pp]) = e8;
+                            *(v2i_t*)(lds_W + st_wslot[r][pp]) = e8;
                         }
                     }
                 }
@@ -586,15 +614,15 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                     // what must be ordered.
                 }
 
-                // Inner loop: ds_read_b64 A/W -> v_wmma fp8 16x16x16. Nothing else.
+                // Inner loop: ds_read_b64 A/W (frag immediates off a_fptr/w_fptr)
+                // -> v_wmma fp8 16x16x16. Nothing else; no address VALU.
                 if (slab == 0) {
                     {
-                        const int off = kg * 8;
-                        const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
-                        const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                        const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, 0));
+                        const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, 0));
                         #pragma unroll
                         for (int nb = 0; nb < 4; nb++) {
-                            const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                            const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, 0));
                             P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, zc);
                             P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, zc);
                         }
@@ -602,12 +630,11 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                     }
                     #pragma unroll
                     for (int kstep = 1; kstep < HIPFIRE_FP8_V2_K16; kstep++) {
-                        const int off = kstep * 16 + kg * 8;
-                        const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
-                        const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                        const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, kstep));
+                        const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, kstep));
                         #pragma unroll
                         for (int nb = 0; nb < 4; nb++) {
-                            const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                            const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, kstep));
                             P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, P[nb][0]);
                             P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, P[nb][1]);
                         }
@@ -616,12 +643,11 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                 } else {
                     #pragma unroll
                     for (int kstep = 0; kstep < HIPFIRE_FP8_V2_K16; kstep++) {
-                        const int off = kstep * 16 + kg * 8;
-                        const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
-                        const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                        const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, kstep));
+                        const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, kstep));
                         #pragma unroll
                         for (int nb = 0; nb < 4; nb++) {
-                            const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
+                            const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, kstep));
                             P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, P[nb][0]);
                             P[nb][1] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w1, a, P[nb][1]);
                         }
@@ -632,14 +658,14 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                 // The barrier is REQUIRED: without it fast waves overwrite
                 // slab s while stragglers still read it (K2 race found).
                 // Single buffer: slab selects the GLOBAL source only; the LDS
-                // address is the same slab slot the prologue used.
+                // address is the same frag slot the prologue used.
                 if (slab + 1 < HIPFIRE_FP8_V2_NSLABS) {
                     __syncthreads();
                     #pragma unroll
                     for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
-                        char* adst = lds_A + st_aldsoff[r];
+                        char* adst = lds_A + st_ab0[r];
                         *(v2i_t*)adst = A_pf[r * 2];
-                        *(v2i_t*)(adst + 8u) = A_pf[r * 2 + 1];
+                        *(v2i_t*)(adst + 128u) = A_pf[r * 2 + 1];
                     }
                     {
                         const unsigned int pack_base = (unsigned int)g * 136u + 8u
@@ -652,7 +678,7 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                                 // Wpk is already zero-selected at prefetch;
                                 // expand(0) is all-zero E4M3 (bit-identical).
                                 const v2i_t e8 = mq4_qpk_to_e4m3(Wpk_pf[r * 2 + pp]);
-                                *(v2i_t*)(lds_W + st_wldsoff[r][pp]) = e8;
+                                *(v2i_t*)(lds_W + st_wslot[r][pp]) = e8;
                             }
                         }
                     }
