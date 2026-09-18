@@ -72,11 +72,14 @@ typedef float __attribute__((ext_vector_type(8))) v8f_t;
 // two nibble bits; the low two bits pick the byte offset. No LDS/global
 // lookup table.
 // Spread the 4 nibbles of a 16-bit value into 4 byte lanes (nibble i ->
-// byte i), so v_perm_b32 can use them as byte selectors.
+// byte i), so v_perm_b32 can use them as byte selectors. LUT-arg path only;
+// the uniform path below uses the cheaper even/odd split + gather instead.
+#ifdef HIPFIRE_FP8_LUT_ARG
 __device__ static inline unsigned int mq4_spread4(unsigned int x16) {
     const unsigned int a = (x16 & 0x00FFu) | ((x16 & 0xFF00u) << 8);
     return (a & 0x000F000Fu) | ((a & 0x00F000F0u) << 4);
 }
+#endif // HIPFIRE_FP8_LUT_ARG
 
 // Table lookup of 8 nibbles: byte i of out[0] = E4M3(nibble i), byte i of
 // out[1] = E4M3(nibble i+4). Same operand order as the scalar reference.
@@ -137,13 +140,24 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk,
 }
 #else
 __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
+    // Even/odd nibble split + gather. pk byte i holds nibbles (2i+1, 2i),
+    // so ev/od isolate them into per-byte slots (values 0..15, high nibble
+    // clear) and one v_perm each gathers consecutive nibbles [n0..n3] /
+    // [n4..n7] — bit-identical inputs to what mq4_spread4 produced above,
+    // hence bit-identical E4M3 bytes out of the shared mq4_lut8 (pure
+    // integer byte routing, no arithmetic anywhere). Per 8 nibbles this is
+    // 3 (split) + 2 (gather) VALU vs 2x spread4 (~16 as compiled).
+    // v_perm_b32(hi, lo, s): result byte i = {lo,hi} byte s_i.
+    const unsigned int ev = pk & 0x0F0F0F0Fu;
+    const unsigned int od = (pk >> 4) & 0x0F0F0F0Fu;
+    const unsigned int g0 = __builtin_amdgcn_perm(od, ev, 0x05010400u);
+    const unsigned int g1 = __builtin_amdgcn_perm(od, ev, 0x07030602u);
     v2i_t out;
-    out[0] = (int)mq4_lut8(mq4_spread4(pk & 0xFFFFu));
-    out[1] = (int)mq4_lut8(mq4_spread4(pk >> 16));
+    out[0] = (int)mq4_lut8(g0);
+    out[1] = (int)mq4_lut8(g1);
     return out;
 }
 #endif
-
 // Batch-tile width (chains per wave). Host selects the symbol by N:
 // N%192==0 -> BV=12, N%128==0 -> BV=8, N%64==0 -> BV=4.
 #ifndef HIPFIRE_FP8_BV
