@@ -3463,6 +3463,15 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
 );
+// gfx12 (RDNA4) iu4-direct MMQ sister: weight nibbles feed
+// wmma_i32_16x16x32_iu4_w32_gfx12 directly (K=32/call, int32x2/lane,
+// k_grp=tid>>4 lane split, contiguous-row C — same conventions as the gfx12
+// iu8 MMQ). Same 7-arg ABI and block_i4_128 activations as the gfx11 iu4
+// kernel. Opt-in through HIPFIRE_GFX11_MQ4V2_IU4 on gfx1201 (default off).
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip")
+);
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.
 pub const GEMM_HFQ4G256_RESIDUAL_MMQ_GFX12_SRC: &str =

@@ -297,7 +297,9 @@ pub struct HipRuntime {
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> u32,
-
+    fn_module_occupancy_max_active_blocks: Option<
+        unsafe extern "C" fn(*mut c_int, HipFunction, c_int, usize) -> u32
+    >,
     // Events
     fn_event_create: unsafe extern "C" fn(*mut HipEvent) -> u32,
     fn_event_create_with_flags: unsafe extern "C" fn(*mut HipEvent, c_uint) -> u32,
@@ -596,6 +598,11 @@ impl HipRuntime {
                         *mut *mut c_void,
                         *mut *mut c_void,
                     ) -> u32
+                ),
+                fn_module_occupancy_max_active_blocks: load_optional_fn!(
+                    lib,
+                    "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor",
+                    unsafe extern "C" fn(*mut c_int, HipFunction, c_int, usize) -> u32
                 ),
                 fn_event_create: load_fn!(
                     lib,
@@ -1450,6 +1457,25 @@ impl HipRuntime {
         );
         crate::ffi::launch_counters::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipModuleLaunchKernel(extra blob)")
+    }
+    /// Max active blocks per multiprocessor for a loaded module function
+    /// (oracle/occupancy probe; `dynamic_smem` = launch-time LDS bytes).
+    pub fn occupancy_max_active_blocks(
+        &self,
+        func: &Function,
+        block_size: u32,
+        dynamic_smem: usize,
+    ) -> HipResult<i32> {
+        let Some(occ) = self.fn_module_occupancy_max_active_blocks else {
+            return Err(HipError::new(
+                0,
+                "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor unavailable",
+            ));
+        };
+        let mut n: c_int = 0;
+        let code = unsafe { occ(&mut n as *mut c_int, func.0, block_size as c_int, dynamic_smem) };
+        self.check(code, "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor")?;
+        Ok(n)
     }
 
     // ── Events ──────────────────────────────────────────────────
