@@ -5871,11 +5871,17 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC: &str = concat!(
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
 
-/// FP8 twin of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] (`HIPFIRE_FA2_FP8=1`):
-/// same f16 body at U0 (Ua+ rewrites planes/legs). Distinct entry symbols
-/// `attention_q8_0_fa2_gqa_fp8_gfx1201` / `_partial_fp8_` / `_merge_fp8_` so
-/// the symbol-keyed host function cache never collides with the f16 module.
-/// JIT-only via the FA2 launchers when `gfx12_fa2_fp8_enabled()`.
+/// Route-Q stage-b source ([`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] +
+/// `HIPFIRE_FA2_FP8=1`, i.e. `KMODE=0` + `FA2_FP8`): fp8 (E4M3) QK + PV
+/// arithmetic on the fragment layout (§14.3 of the stage-b plan), 32768 B
+/// dynamic LDS. Entry symbols `attention_q8_0_fa2_gqa_fp8_gfx1201` /
+/// `_partial_fp8_` / `_merge_fp8_` plus the new stage-b Q pre-convert
+/// `attention_q8_0_fa2_q_preconvert_fp8_gfx1201` (fp8 codes + f32 `sq`,
+/// never f16 Q), so the symbol-keyed host function cache never collides
+/// with the f16/q8 modules. The old U0 "renamed entries, same f16 body"
+/// meaning is deleted: exactly one (arithmetic) meaning per symbol.
+/// JIT-only via the route-Q stage-b launcher when
+/// `gfx12_fa2_fp8_enabled()`.
 pub const ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_FP8 1\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
@@ -5908,11 +5914,27 @@ pub const ATTENTION_Q8_0_FA2_GQA_MERGE_FP8_GFX1201_SRC: &str =
 /// codes + f16 scale per token per KV head) via
 /// `f16(f32(scale) * decode_e4m3(code))` — the tiled reference's exact
 /// rounding. Distinct entry symbols `attention_fp8_e4m3_fa2_gqa_f16_gfx1201`
-/// (+ `_partial_` / `_merge_`) and
+/// (+ `_partial_f16_` / `_merge_f16_`) and
 /// `attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201` so the symbol-keyed
 /// host function cache never collides with the q8/fwht3 modules.
 /// JIT-only via the fp8 FA2 launcher on exact gfx1201.
 pub const ATTENTION_FP8_E4M3_FA2_GQA_F16_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
+/// Route-N stage-b source ([`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] +
+/// `HIPFIRE_FA2_FP8=1` + `HIPFIRE_FA2_KMODE=8`): fp8 (E4M3) QK + PV
+/// arithmetic on native-fp8 KV rows (codes copied verbatim, scales from
+/// the row header — no fill decode), 32768 B dynamic LDS. Entry symbols
+/// `attention_fp8_e4m3_fa2_gqa_gfx1201` / `_partial_` / `_merge_` plus
+/// the new stage-b Q pre-convert
+/// `attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201` (§14.3 of the
+/// stage-b plan; the pre-convert symbols resolve only once the stage-b
+/// arithmetic lands — before that the stage-b launchers fail loud,
+/// never fall back). JIT-only via the route-N stage-b launcher when
+/// `gfx12_fa2_fp8_enabled()`.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_FP8 1\n",
     "#define HIPFIRE_FA2_KMODE 8\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
