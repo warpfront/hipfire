@@ -1,0 +1,14 @@
+[
+  {
+    "variant": "qwen3.8-27b-iu4v2",
+    "arch": "gfx1201",
+    "scoring_mode": "prefill",
+    "n_chunks": 24,
+    "mean_kld": 0.06341008486075864,
+    "mean_kld_ci_lo": 0.05253759950096242,
+    "mean_kld_ci_hi": 0.07695942284707591,
+    "p99_kld": 1.418386844270969,
+    "ppl": 6.44976989480565,
+    "notes": ""
+  }
+]

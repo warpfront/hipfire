@@ -1,0 +1,728 @@
+{
+  "schema_version": 4,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1789699648,
+  "source": "/home/kaden/ClaudeCode/warpfront/wt-iu4/scratch-2026-09-17/GemmV2Plan/iu4port/kld-cache-c2/gfx1201/gemm_mq4g256v2_residual_mmq_iu4.b4075147dbefcf35.hip",
+  "output": "/home/kaden/ClaudeCode/warpfront/wt-iu4/scratch-2026-09-17/GemmV2Plan/iu4port/kld-cache-c2/gfx1201/gemm_mq4g256v2_residual_mmq_iu4.b4075147dbefcf35.hsaco",
+  "arch": "gfx1201",
+  "wavefront": "wave32",
+  "scheduler_profile": "default",
+  "hipcc": "/opt/rocm/core/bin/hipcc",
+  "hipcc_version": "HIP version: 7.15.26333-0000000\nAMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 8f497e0992fb7513f7f78a6f6b6f1056c375e961)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-10.0/lib/llvm/bin",
+  "command": [
+    "/opt/rocm/core/bin/hipcc",
+    "hipfire-kernel-cache",
+    "gemm_mq4g256v2_residual_mmq_iu4"
+  ],
+  "source_sha256": "3297db8a1a5d46256b772212125aacf7c4bdfb3e70f54cda7b48e3bdf8337675",
+  "support_header_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+  "output_sha256": "b632a8ed5f0f11c5ccf0dd1d833aa46a507978f839718fa7896d97b92e2e4233",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1201",
+    "identity": {
+      "architecture": "gfx1201",
+      "elf_machine_id": 78,
+      "isa": {
+        "major": 12,
+        "minor": 0,
+        "stepping": 1
+      }
+    },
+    "kernels": [
+      {
+        "name": "quantize_int4_mmq_ds128",
+        "wavefront_size": 32,
+        "vgpr_count": 36,
+        "sgpr_count": 14,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "read_only"
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": "write_only"
+          },
+          {
+            "offset": 16,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 20,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 4,
+            "value_kind": "hidden_block_count_x",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 28,
+            "size": 4,
+            "value_kind": "hidden_block_count_y",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 4,
+            "value_kind": "hidden_block_count_z",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 36,
+            "size": 2,
+            "value_kind": "hidden_group_size_x",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 38,
+            "size": 2,
+            "value_kind": "hidden_group_size_y",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 40,
+            "size": 2,
+            "value_kind": "hidden_group_size_z",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 42,
+            "size": 2,
+            "value_kind": "hidden_remainder_x",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 44,
+            "size": 2,
+            "value_kind": "hidden_remainder_y",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 46,
+            "size": 2,
+            "value_kind": "hidden_remainder_z",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 64,
+            "size": 8,
+            "value_kind": "hidden_global_offset_x",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 72,
+            "size": 8,
+            "value_kind": "hidden_global_offset_y",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 80,
+            "size": 8,
+            "value_kind": "hidden_global_offset_z",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 88,
+            "size": 2,
+            "value_kind": "hidden_grid_dims",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 408,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 1,
+          "global_stores": 2,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 3,
+          "kernarg_scalar_loads": 3,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 121,
+          "delay_alu_instructions": 70,
+          "memory_clause_instructions": 1,
+          "max_consecutive_vmem_instructions": 1
+        }
+      },
+      {
+        "name": "gemm_mq4g256v2_residual_mmq_iu4",
+        "wavefront_size": 32,
+        "vgpr_count": 0,
+        "sgpr_count": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 28,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 36,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 1,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 0,
+          "global_stores": 0,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 0,
+          "kernarg_scalar_loads": 0,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 0,
+          "delay_alu_instructions": 0,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 0
+        }
+      },
+      {
+        "name": "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+        "wavefront_size": 32,
+        "vgpr_count": 0,
+        "sgpr_count": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 28,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 36,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 1,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 0,
+          "global_stores": 0,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 0,
+          "kernarg_scalar_loads": 0,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 0,
+          "delay_alu_instructions": 0,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 0
+        }
+      },
+      {
+        "name": "gemm_mq4g256v2_residual_mmq_iu4_full_set",
+        "wavefront_size": 32,
+        "vgpr_count": 0,
+        "sgpr_count": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 28,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 36,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 1,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 0,
+          "global_stores": 0,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 0,
+          "kernarg_scalar_loads": 0,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 0,
+          "delay_alu_instructions": 0,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 0
+        }
+      },
+      {
+        "name": "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
+        "wavefront_size": 32,
+        "vgpr_count": 0,
+        "sgpr_count": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 28,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 36,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 1,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 0,
+          "global_stores": 0,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 0,
+          "kernarg_scalar_loads": 0,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 0,
+          "delay_alu_instructions": 0,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 0
+        }
+      },
+      {
+        "name": "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
+        "wavefront_size": 32,
+        "vgpr_count": 0,
+        "sgpr_count": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 28,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 36,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 1,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 0,
+          "global_stores": 0,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 0,
+          "kernarg_scalar_loads": 0,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 0,
+          "delay_alu_instructions": 0,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 0
+        }
+      },
+      {
+        "name": "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151",
+        "wavefront_size": 32,
+        "vgpr_count": 0,
+        "sgpr_count": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 28,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 36,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 1,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 0,
+          "global_stores": 0,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 0,
+          "kernarg_scalar_loads": 0,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 0,
+          "delay_alu_instructions": 0,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 0
+        }
+      },
+      {
+        "name": "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151",
+        "wavefront_size": 32,
+        "vgpr_count": 0,
+        "sgpr_count": 0,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "arguments": [
+          {
+            "offset": 0,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 8,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 16,
+            "size": 8,
+            "value_kind": "global_buffer",
+            "address_space": "global",
+            "actual_access": null
+          },
+          {
+            "offset": 24,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 28,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 32,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          },
+          {
+            "offset": 36,
+            "size": 4,
+            "value_kind": "by_value",
+            "address_space": null,
+            "actual_access": null
+          }
+        ],
+        "instructions": {
+          "static_instructions": 1,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 0,
+          "global_stores": 0,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 0,
+          "kernarg_scalar_loads": 0,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 0,
+          "delay_alu_instructions": 0,
+          "memory_clause_instructions": 0,
+          "max_consecutive_vmem_instructions": 0
+        }
+      }
+    ]
+  }
+}
