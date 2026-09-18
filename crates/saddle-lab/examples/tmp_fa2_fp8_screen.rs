@@ -936,6 +936,7 @@ fn run_cpu_screen(b: &CpuBundle) {
     }
     // path1 output is sampled-only already.
     let (q8_max, q8_tail) = metric(&o_q8);
+    let (q0_max, q0_tail) = metric(&o_q0);
     let (qk_max, qk_tail) = metric(&o_qk);
     let (sb_max, sb_tail) = metric(&o_sb);
     let (kk_max, kk_tail) = metric(&kern_sampled);
@@ -1045,7 +1046,7 @@ fn fp8_encode_row(x: &[f32]) -> Result<(f32, Vec<u8>), String> {
     if a == 0.0 {
         return Ok((1.0, vec![0u8; x.len()]));
     }
-    let need = a / 448.0;
+    let need = a / 448.0f32;
     // Round UP to the f16 grid.
     let mut bits = f32_to_f16_bits(need);
     if bits == 0x7C00 {
@@ -1140,8 +1141,13 @@ fn codec_self_test() {
     assert!(fp8_encode_row(&row).is_err());
     row[0] = f32::NAN;
     assert!(fp8_encode_row(&row).is_err());
-    // Q sq rule (§5.1): plain f32 amax/448, zero row 1.
-    assert_eq!((0.0f32 / 448.0), 0.0);
+    // Cross-pins with F's `fp8_bf16_format_tests` (kv.rs): RNE tie and the
+    // upward-half scale bump on real magnitudes.
+    assert_eq!(e4m3_encode(1.0625), 0x38); // tie 1.0|1.125 -> even (1.0)
+    let mut row = [0.0f32; 256];
+    row[0] = 448.01;
+    let (s, _) = fp8_encode_row(&row).expect("bump row");
+    assert_eq!(f32_to_f16_bits(s), 0x3C01); // 1.0 fails 448*1<448.01 -> next-up
     eprintln!("codec self-test OK (e4m3 grid, §2.1 scale rule, subnormal floors, nonfinite rejection)");
 }
 
@@ -1160,8 +1166,8 @@ fn edge_case_self_test() {
     // rho sweep: alpha in (0,1], bprev/bnew spanning 2^-24..65504 scales.
     for &sv_prev in &[5.9604645e-8f32, 1.0, 65504.0] {
         for &sv_new in &[5.9604645e-8f32, 1.0, 65504.0] {
-            let bprev = (10.0f32 / 448.0).max(2.0f32.powi(-64)) * sv_prev.max(1e-30);
-            let bnew = (10.0f32 / 448.0).max(2.0f32.powi(-64)) * sv_new.max(1e-30);
+            let bprev = (10.0f32 / 448.0f32).max(2.0f32.powi(-64)) * sv_prev.max(1e-30);
+            let bnew = (10.0f32 / 448.0f32).max(2.0f32.powi(-64)) * sv_new.max(1e-30);
             let rho = (0.5f32 * bprev) / bnew;
             assert!(rho.is_finite() && rho > 0.0, "rho finite for sv {sv_prev}->{sv_new}");
         }

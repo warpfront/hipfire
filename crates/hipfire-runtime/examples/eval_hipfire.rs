@@ -526,9 +526,9 @@ fn main() {
                     std::process::exit(1);
                 }
                 eprintln!("eval_hipfire: bf16/bf16 unscaled KV (quality control)");
-                KvCache::new_gpu_bf16(
+                KvCache::new_gpu_bf16_filtered(
                     &mut gpu,
-                    config.n_layers,
+                    &is_kv_layer,
                     config.n_kv_heads,
                     config.head_dim,
                     kv_max,
