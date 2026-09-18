@@ -3389,7 +3389,8 @@ impl Gpu {
     /// to the `fused_silu_mul_rotate_mq_*_batched` + standalone
     /// `quantize_int4_mmq_ds128` chain: same producer arithmetic, same shared
     /// wave quant recipe. Seals `reservation` into a prepared handle — never
-    /// calls `ensure_int4_mmq_x`. Gated by `HIPFIRE_GFX12_SILU_QUANT_FUSED`.
+    /// calls `ensure_int4_mmq_x`. Selected by `HIPFIRE_GFX12_SILU_QUANT_FUSED`
+    /// (default on for exact-gfx1201 IU4; `=0` opts out).
     pub fn fused_silu_mul_rotate_mq_i4_gfx12_batched(
         &mut self,
         gate: &GpuTensor,

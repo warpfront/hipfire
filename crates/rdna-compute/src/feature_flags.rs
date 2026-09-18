@@ -235,8 +235,7 @@ pub struct FeatureFlags {
     pub gfx12_gdn_pre_fused: bool,
     /// gfx1201 down-proj SwiGLU/FWHT + int4 quant fusion (slice 1:
     /// `HIPFIRE_GFX12_SILU_QUANT_FUSED`, `kernel.gfx12_silu_quant_fused`).
-    /// Default OFF everywhere; `=1` emits `block_i4_128` in-register from
-    /// the AWQ silu producer on exact gfx1201, removing the standalone
+    /// Default ON on exact gfx1201; `=0` opts out to the standalone
     /// `quantize_int4_mmq_ds128` launch for the down-proj input.
     /// Bit-identical vs the silu+quantizer chain; any byte difference kills it.
     pub gfx12_silu_quant_fused: bool,
@@ -624,7 +623,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_v2: value("HIPFIRE_GFX12_MQ4V2_FP8_V2").as_deref() == Ok("1"),
             gfx12_gdn_pre_fused: value("HIPFIRE_GFX12_GDN_PRE_FUSED").as_deref() == Ok("1"),
-            gfx12_silu_quant_fused: value("HIPFIRE_GFX12_SILU_QUANT_FUSED").as_deref() == Ok("1"),
+            gfx12_silu_quant_fused: parse_bool("HIPFIRE_GFX12_SILU_QUANT_FUSED")
+                .unwrap_or(arch == "gfx1201"),
             gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
                 .unwrap_or(arch == "gfx1201"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
@@ -1094,6 +1094,42 @@ mod tests {
             let test_flags = FeatureFlags::for_test(arch);
             assert!(!test_flags.gfx12_fa2_prefill, "arch={arch}");
             assert!(!test_flags.gfx11_fa2_prefill, "arch={arch}");
+        }
+    }
+    #[test]
+    fn gfx12_silu_quant_fused_default_on_gfx1201_with_opt_out() {
+        // Default process policy: the exact-gfx1201 silu+quant fusion admits
+        // on gfx1201 (bit-identical to the standalone quantizer chain);
+        // explicit `=0` restores the incumbent producer+quantizer launches.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gfx12_silu_quant_fused);
+        assert!(gfx1201.gfx12_silu_quant_fused_enabled());
+        for arch in ["gfx1100", "gfx1151", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_silu_quant_fused, "arch={arch}");
+            assert!(!flags.gfx12_silu_quant_fused_enabled(), "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx12_silu_quant_fused", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(!opted_out.gfx12_silu_quant_fused);
+        assert!(!opted_out.gfx12_silu_quant_fused_enabled());
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx12_silu_quant_fused, "arch={arch}");
         }
     }
     #[test]

@@ -108,9 +108,9 @@ fn try_iu4_silu_prepared(
 /// gfx1201 slice-1: SwiGLU/FWHT + in-register `block_i4_128` producer for
 /// w_down. `None` → caller keeps the incumbent silu + standalone-quantizer
 /// path. Same contract as [`try_iu4_silu_prepared`] (uniform MQ4G256V2 only,
-/// Residual-only at the call sites) but gated by
-/// `HIPFIRE_GFX12_SILU_QUANT_FUSED` on exact gfx1201 instead of the
-/// gfx1151-only C2 sidecar gate. Every other caller keeps the standalone
+/// Residual-only at the call sites) but routed by `iu4_silu_quant_fused_active`
+/// (default on for exact-gfx1201 IU4; `HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts
+/// out) instead of the gfx1151-only C2 sidecar gate. Every other caller keeps
 /// `quantize_int4_mmq_ds128` path untouched.
 fn try_gfx12_silu_quant_fused_prepared(
     gpu: &mut Gpu,

@@ -3034,8 +3034,9 @@ impl Gpu {
             && k % 256 == 0
     }
     /// True when the gfx1201 slice-1 silu+quant fusion is live for this call:
-    /// IU4 + `HIPFIRE_GFX12_SILU_QUANT_FUSED` on exact gfx1201 + eager
-    /// (no replay/capture) + batch and K constraints of the iu4 MMQ consumer.
+    /// IU4 + exact gfx1201 + eager (no replay/capture) + batch and K
+    /// constraints of the iu4 MMQ consumer. Default on for the IU4 route
+    /// (`HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts out).
     /// Mirrors `iu4_producer_sidecar_active` minus the gfx1151-only C2 gate.
     pub fn iu4_silu_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_silu_quant_fused_enabled()
