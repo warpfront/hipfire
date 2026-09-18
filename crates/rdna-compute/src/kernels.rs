@@ -1220,6 +1220,26 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_SRC: &str = concat!(
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
 );
+/// gfx1201 slice-1 IU4 producer: SwiGLU/FWHT + in-register `block_i4_128` emit.
+/// Same shared quant recipe as the C2 sidecars, but distinct entry symbols so
+/// gfx1151 HSACO caches and profiler rows cannot alias the gfx1201 fusion.
+/// Selected by `HIPFIRE_GFX12_SILU_QUANT_FUSED` (default on for exact-gfx1201 IU4; `=0` opts out); old symbols stay untouched.
+pub const FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_i4_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip")
+);
+/// gfx1201 slice-1 IU4 AWQ producer: AWQ divide + SwiGLU/FWHT + in-register
+/// `block_i4_128` emit for the down-proj input (K=17408 in flight).
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
+);
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq_indexed.hip");
 

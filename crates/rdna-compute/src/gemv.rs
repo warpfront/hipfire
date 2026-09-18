@@ -3383,6 +3383,126 @@ impl Gpu {
         result?;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
+    /// gfx1201 slice-1 IU4 producer: SwiGLU/FWHT + in-register `block_i4_128`
+    /// sidecar for the down-proj input. `x_rot = None` skips the f32 store
+    /// (emit_f32=false). `awq = Some` selects the AWQ twin symbol. Bit-identical
+    /// to the `fused_silu_mul_rotate_mq_*_batched` + standalone
+    /// `quantize_int4_mmq_ds128` chain: same producer arithmetic, same shared
+    /// wave quant recipe. Seals `reservation` into a prepared handle — never
+    /// calls `ensure_int4_mmq_x`. Selected by `HIPFIRE_GFX12_SILU_QUANT_FUSED`
+    /// (default on for exact-gfx1201 IU4; `=0` opts out).
+    pub fn fused_silu_mul_rotate_mq_i4_gfx12_batched(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.bind_thread()?;
+        if reservation.k() != k || reservation.n() != batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused_silu_mul_rotate_mq_i4_gfx12_batched: reservation (k,n) mismatch",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        let (module, source, kernel) = match awq {
+            Some(_) => (
+                "fused_silu_mul_mq_rotate_awq_i4_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_awq_i4_gfx12",
+            ),
+            None => (
+                "fused_silu_mul_mq_rotate_i4_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_i4_gfx12",
+            ),
+        };
+        self.ensure_kernel(module, source, kernel)?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = (k / 256) as u32;
+        let mut gp = gate.buf.as_ptr();
+        let mut up_p = up.buf.as_ptr();
+        let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut i4p = reservation.ptr();
+        let mut kv = k as i32;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = if awq.is_some() {
+            vec![
+                &mut gp as *mut _ as *mut c_void,
+                &mut up_p as *mut _ as *mut c_void,
+                &mut awp as *mut _ as *mut c_void,
+                &mut s1 as *mut _ as *mut c_void,
+                &mut s2 as *mut _ as *mut c_void,
+                &mut xrp as *mut _ as *mut c_void,
+                &mut i4p as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+                &mut nv as *mut _ as *mut c_void,
+            ]
+        } else {
+            vec![
+                &mut gp as *mut _ as *mut c_void,
+                &mut up_p as *mut _ as *mut c_void,
+                &mut s1 as *mut _ as *mut c_void,
+                &mut s2 as *mut _ as *mut c_void,
+                &mut xrp as *mut _ as *mut c_void,
+                &mut i4p as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+                &mut nv as *mut _ as *mut c_void,
+            ]
+        };
+        let blocks_k = k / 128;
+        let bytes = (k * 4 * 3 + 2 * 256 * 4 + blocks_k * 72) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fused",
+            if awq.is_some() {
+                "fused_silu_mul_mq_rotate_awq_i4_gfx12_batched"
+            } else {
+                "fused_silu_mul_mq_rotate_i4_gfx12_batched"
+            },
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel,
+            [n_groups, batch_size as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(up_p);
+                if awq.is_some() {
+                    b.push_ptr(awp);
+                }
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(i4p);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
+        result?;
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+    }
 
     /// Route A MoE-AWQ — per-routed-expert variant of
     /// `fused_silu_mul_rotate_mq_awq_batched`. Each batch row (routed-expert

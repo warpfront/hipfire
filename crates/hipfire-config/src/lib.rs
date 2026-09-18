@@ -2140,6 +2140,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx1201 batched prefill GDN preamble fusion (default off; set to true or HIPFIRE_GFX12_GDN_PRE_FUSED=1 to opt in; fuses sigmoid+conv+qknorm into gdn_pre_batched_gfx1201, byte-exact)."
     ),
     process_bool_field!(
+        "kernel.gfx12_silu_quant_fused",
+        "gfx12_silu_quant_fused",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_SILU_QUANT_FUSED",
+        "Fuse the int4 activation quantiser into fused_silu_mul_mq_rotate_awq on gfx1201 (default on exact gfx1201; set to false or HIPFIRE_GFX12_SILU_QUANT_FUSED=0 to opt out; emits block_i4_128 from the down-proj SwiGLU/FWHT producer so the standalone quantize_int4_mmq_ds128 launch disappears, bit-identical)."
+    ),
+    process_bool_field!(
         "kernel.gfx12_fa2_prefill",
         "gfx12_fa2_prefill",
         Kernel,
