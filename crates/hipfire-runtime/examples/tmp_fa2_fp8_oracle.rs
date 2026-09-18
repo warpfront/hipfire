@@ -1,11 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Temporary stage-a tolerance oracle: fp8-plane FA2 vs f16 FA2, gated O.
-// Two processes (HIPFIRE_GFX12_FA2_FP8=0/1), deterministic inputs per shape,
-// gated O written to files; compared offline in f64.
-//
-//   cargo run --release -p hipfire-runtime --features lab --example tmp_fa2_fp8_oracle -- --all --out /tmp/fa2_ora/f16
-//   HIPFIRE_GFX12_FA2_FP8=1 ... --out /tmp/fa2_ora/fp8
-//
+// Stage b is now the default on gfx1201 FA2-eligible shapes (the
+// HIPFIRE_GFX12_FA2_FP8 switch is deleted); this oracle dumps the Q0 f16
+// entry for offline f64 comparison against the archived stage-a tapes.
 // Shapes (batch,ctx): (4,256),(8,512),(32,2048),(64,4096),(128,8192),(256,16384),(512,32768).
 
 use rdna_compute::{DType, Gpu};
@@ -78,10 +75,7 @@ fn main() {
     ];
     std::fs::create_dir_all(&outdir).unwrap();
     let mut gpu = Gpu::init().expect("gpu init");
-    eprintln!(
-        "fa2_fp8 flag on: {}",
-        gpu.flags.gfx12_fa2_fp8_enabled()
-    );
+    eprintln!("fa2 stage-b route N is the default on gfx1201 FA2-eligible shapes (no flag)");
     for (si, &(batch, ctx)) in shapes.iter().enumerate() {
         if let Some(o) = only {
             if o != si {

@@ -628,7 +628,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_KV_MODE"),
-        "KV cache format; auto inherits the registry recommendation, then q8. DeepSeek V4 currently supports f32 and f16."
+        "KV cache format; auto inherits the registry recommendation, then q8 — except single-GPU Qwen on exact gfx1201, where auto means native fp8 (stage-b FA2 arithmetic). DeepSeek V4 currently supports f32 and f16."
     ),
     field!(
         "memory.kv_adaptive",
@@ -1911,6 +1911,16 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PREFILL_BATCHED",
         "Use batched prefill kernels when eligible."
     ),
+    process_field!(
+        "prefill.chunk_rows",
+        "prefill_chunk_rows",
+        Kernel,
+        DefaultValue::Integer(512),
+        ValueRule::Integer { min: 2, max: 1048576 },
+        false,
+        "HIPFIRE_PREFILL_CHUNK_ROWS",
+        "Widened ordinary-prefill chunk ceiling in rows (default 4096 on exact gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH stays the explicit override; per-device VRAM admission may still select a smaller rung)."
+    ),
     process_bool_field!(
         "speculation.draft_f16",
         "draft_f16",
@@ -2125,19 +2135,19 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.gfx12_mq4v2_fp8_v2",
         "gfx12_mq4v2_fp8_v2",
         Kernel,
-        false,
         true,
+        false,
         "HIPFIRE_GFX12_MQ4V2_FP8_V2",
-        "Enable the gfx1201 MQ4v2 FP8 WMMA staged-tile v2 prefill route (default off; set to true or HIPFIRE_GFX12_MQ4V2_FP8_V2=1 to opt in; selects the _v2_gfx1201 symbols at N>=256, the four family flags remain prerequisites)."
+        "Enable the gfx1201 MQ4v2 FP8 WMMA staged-tile v2 prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_V2=0 to opt out; selects the _v2_gfx1201 symbols at N>=256 with 128x128 geometry and 2 slabs unless HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM/_SLABS override, the four family flags remain prerequisites)."
     ),
     process_bool_field!(
         "kernel.gfx12_gdn_pre_fused",
         "gfx12_gdn_pre_fused",
         Kernel,
-        false,
         true,
+        false,
         "HIPFIRE_GFX12_GDN_PRE_FUSED",
-        "Enable the gfx1201 batched prefill GDN preamble fusion (default off; set to true or HIPFIRE_GFX12_GDN_PRE_FUSED=1 to opt in; fuses sigmoid+conv+qknorm into gdn_pre_batched_gfx1201, byte-exact)."
+        "Enable the gfx1201 batched prefill GDN preamble fusion (default on exact gfx1201; set to false or HIPFIRE_GFX12_GDN_PRE_FUSED=0 to opt out; fuses sigmoid+conv+qknorm into gdn_pre_batched_gfx1201, byte-exact)."
     ),
     process_bool_field!(
         "kernel.gfx12_silu_quant_fused",
@@ -2156,15 +2166,6 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_GFX12_FA2_PREFILL",
         "Enable the gfx1201 GQA-fused FA2 prefill attention route (default on exact gfx1201; set to false or HIPFIRE_GFX12_FA2_PREFILL=0 to opt out)."
-    ),
-    process_bool_field!(
-        "kernel.gfx12_fa2_fp8",
-        "gfx12_fa2_fp8",
-        Kernel,
-        false,
-        false,
-        "HIPFIRE_GFX12_FA2_FP8",
-        "Stage-b fp8 WMMA arithmetic on a native-fp8 KV cache (Q0 f16 arithmetic when off; default off; set to true or HIPFIRE_GFX12_FA2_FP8=1 to opt in; meaningful only with native fp8 KV on exact gfx1201, never selects a KV format)."
     ),
     process_bool_field!(
         "kernel.gfx11_fa2_prefill",

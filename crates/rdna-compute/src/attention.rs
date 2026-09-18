@@ -3641,19 +3641,9 @@ impl Gpu {
             && batch_size % 16 == 0
             && (64..=32768).contains(&max_ctx_len)
         {
-            // S6: route Q (q8 cache + stage-b fp8 arithmetic) is not
-            // implemented (B4 pending). Fail loud under the arithmetic
-            // flag: running the f16 body here while HIPFIRE_GFX12_FA2_FP8=1
-            // claims fp8 would be a silent wrong-mode run.
-            if self.flags.gfx12_fa2_fp8_enabled() {
-                return Err(hip_bridge::HipError::new(
-                    0,
-                    "attention_q8_0_flash_prefill_wmma: HIPFIRE_GFX12_FA2_FP8=1 \
-                     requests stage-b route-Q fp8 arithmetic on the q8 cache, \
-                     which is not implemented (B4 pending); unset \
-                     HIPFIRE_GFX12_FA2_FP8 or use --kv-mode fp8 (route N)",
-                ));
-            }
+            // q8 cache always runs the f16 FA2 body: stage-b route-Q
+            // arithmetic does not exist (B4 pending), so there is nothing to
+            // select here.
             return self.attention_q8_0_fa2_gqa_gfx1201(
                 q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
                 max_ctx_len, batch_size,
@@ -3999,22 +3989,10 @@ impl Gpu {
                 ),
             ));
         }
-        // S6: route Q (q8 cache + stage-b fp8 arithmetic) is not implemented
-        // (B4 pending). The `_fp8_` entry in the KMODE=0+FP8 module still runs
-        // the f16 body, so selecting it under the arithmetic flag would
-        // silently run f16 as fp8 — fail loud instead. The dedicated
-        // stage-b route-Q launcher (`attention_q8_0_fa2_gqa_fp8_gfx1201`)
-        // owns the route-Q symbols for B4; this f16 launcher keeps one
-        // meaning (S5 deleted the "renames symbols only" reading).
-        if self.flags.gfx12_fa2_fp8_enabled() {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "attention_q8_0_fa2_gqa_gfx1201: HIPFIRE_GFX12_FA2_FP8=1 \
-                 requests stage-b route-Q fp8 arithmetic on the q8 cache, \
-                 which is not implemented (B4 pending); unset \
-                 HIPFIRE_GFX12_FA2_FP8 or use --kv-mode fp8 (route N)",
-            ));
-        }
+        // No stage-b route-Q arithmetic exists (B4 pending): the q8 cache
+        // always runs this f16 body. The dedicated stage-b route-Q launcher
+        // (`attention_q8_0_fa2_gqa_fp8_gfx1201`) owns the route-Q symbols for
+        // B4; this f16 launcher keeps one meaning.
         let symbol = "attention_q8_0_fa2_gqa_gfx1201";
         let src = kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC;
         // F4b: the body reads f16 Q from Gpu-owned scratch (pre-converted on
@@ -4298,15 +4276,14 @@ impl Gpu {
     }
 
     /// gfx1201-only GQA-fused FA2 prefill with stage-b fp8 arithmetic on the
-    /// q8 cache (route Q, research opt-in).
+    /// q8 cache (route Q, research path — no dispatch arm selects it).
     ///
     /// Same frozen kernargs as [`Self::attention_q8_0_fa2_gqa_gfx1201`]
     /// (fp8-code Q pointer in the old Q slot, `sq` at `+batch*24*256`,
     /// route-Q scale plane after it, 32768 B dynamic LDS), but the body
     /// runs fp8 (E4M3) QK + PV WMMA legs with f32 scores/softmax-state/O.
-    /// Requires `gfx12_fa2_fp8_enabled()` (explicit opt-in on exact
-    /// gfx1200/gfx1201): with the flag off this launcher fails loud and
-    /// never falls back to the f16 body. The stage-b Q pre-convert writes
+    /// Route Q is unvalidated (B4 pending): production q8 traffic always runs
+    /// the f16 body above. The stage-b Q pre-convert writes
     /// e4m3 codes + f32 `sq` into Gpu-owned scratch on the same stream;
     /// `q` is never mutated, so this launcher is replay-idempotent and
     /// capture-safe. Exact H24/KV4/D256, full causal, eager only.
@@ -4373,17 +4350,6 @@ impl Gpu {
                     out.numel(),
                     positions.numel()
                 ),
-            ));
-        }
-        // Fail closed without the arithmetic opt-in: a stage-b entry must
-        // never silently run the f16 body. Before the stage-b arithmetic
-        // lands, the pre-convert symbol below does not resolve and
-        // `ensure_kernel` fails loud for the same reason.
-        if !self.flags.gfx12_fa2_fp8_enabled() {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "attention_q8_0_fa2_gqa_fp8_gfx1201 requires HIPFIRE_GFX12_FA2_FP8=1 \
-                 (no f16 fallback for stage-b entries)",
             ));
         }
         // Route-Q module: `HIPFIRE_FA2_FP8=1` on the q8 source (§14.3).
@@ -4492,7 +4458,7 @@ impl Gpu {
     }
 
     /// gfx1201-only GQA-fused FA2 prefill with stage-b fp8 arithmetic on
-    /// native fp8 KV (route N, research opt-in).
+    /// native fp8 KV (route N, default on FA2-eligible shapes).
     ///
     /// Same frozen kernargs as
     /// [`Self::attention_fp8_e4m3_fa2_gqa_f16_gfx1201`] (fp8-code Q pointer
@@ -4500,9 +4466,8 @@ impl Gpu {
     /// but the body runs fp8 (E4M3) QK + PV WMMA legs with f32
     /// scores/softmax-state/O, copying codes verbatim from the
     /// token-local native rows (stride 1032) and reading scales from the
-    /// row header — no scale plane is sized in. Requires
-    /// `gfx12_fa2_fp8_enabled()`: with the flag off this launcher fails
-    /// loud and never falls back to the Q0 f16 body. Exact H24/KV4/D256,
+    /// row header — no scale plane is sized in. It never falls back to the
+    /// Q0 f16 body. Exact H24/KV4/D256,
     /// full causal, eager only. `max_ctx_len` is max(positions)+1; the
     /// kernel never reads it (causal bounds come from `positions[]`); it
     /// exists only for profile byte attribution, mirroring the incumbent.
@@ -4566,15 +4531,6 @@ impl Gpu {
                     out.numel(),
                     positions.numel()
                 ),
-            ));
-        }
-        // Fail closed without the arithmetic opt-in: a stage-b entry must
-        // never silently run the Q0 f16 body.
-        if !self.flags.gfx12_fa2_fp8_enabled() {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "attention_fp8_e4m3_fa2_gqa_fp8_gfx1201 requires HIPFIRE_GFX12_FA2_FP8=1 \
-                 (no f16 fallback for stage-b entries)",
             ));
         }
         // Route-N module: `HIPFIRE_FA2_FP8=1` + `HIPFIRE_FA2_KMODE=8`
@@ -4818,16 +4774,8 @@ impl Gpu {
                 ),
             ));
         }
-        // Stage b defines no fwht3 (KMODE=3) twin (§14.3): selecting the
-        // `_fp8_` entry under the arithmetic flag would run f16 arithmetic
-        // while reporting fp8. Fail closed by routing to the f16 entry with
-        // the flag ignored and logged — flags-off behaviour is unchanged.
-        if self.flags.gfx12_fa2_fp8_enabled() {
-            eprintln!(
-                "attention_q8_0_fa2_gqa_fwht3k_gfx1201: ignoring HIPFIRE_GFX12_FA2_FP8=1 \
-                 (no stage-b fwht3 twin; running the f16 fwht3 body)"
-            );
-        }
+        // Stage b defines no fwht3 (KMODE=3) twin (§14.3): fwht3-K always
+        // runs this f16 body.
         let symbol = "attention_q8_0_fa2_gqa_fwht3k_gfx1201";
         let src = kernels::ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC;
         // F4b: the body reads pre-rotated, pre-converted f16 Q from
@@ -5441,28 +5389,12 @@ impl Gpu {
                 ),
             ));
         }
-        // U0: fp8 twin partial/merge entries when flag resolves on.
-        let use_fp8 = self.flags.gfx12_fa2_fp8_enabled();
-        let partial = if use_fp8 {
-            "attention_q8_0_fa2_gqa_partial_fp8_gfx1201"
-        } else {
-            "attention_q8_0_fa2_gqa_partial_gfx1201"
-        };
-        let merge = if use_fp8 {
-            "attention_q8_0_fa2_gqa_merge_fp8_gfx1201"
-        } else {
-            "attention_q8_0_fa2_gqa_merge_gfx1201"
-        };
-        let src = if use_fp8 {
-            kernels::ATTENTION_Q8_0_FA2_GQA_PARTIAL_FP8_GFX1201_SRC
-        } else {
-            kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC
-        };
-        let merge_src = if use_fp8 {
-            kernels::ATTENTION_Q8_0_FA2_GQA_MERGE_FP8_GFX1201_SRC
-        } else {
-            kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC
-        };
+        // No stage-b route-Q twin for the bench split path (B4 pending):
+        // the split bench always runs the f16 partial/merge entries.
+        let partial = "attention_q8_0_fa2_gqa_partial_gfx1201";
+        let merge = "attention_q8_0_fa2_gqa_merge_gfx1201";
+        let src = kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC;
+        let merge_src = kernels::ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC;
         // F4b: the partial body reads f16 Q from Gpu-owned scratch
         // (pre-converted on the same stream just below); the pre-convert
         // symbol resolves out of this same Q8 module object, so a
