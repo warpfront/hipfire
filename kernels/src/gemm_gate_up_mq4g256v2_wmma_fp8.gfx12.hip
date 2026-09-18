@@ -209,7 +209,9 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 // gfx1201 staged-tile v2: BM tokens x BN weight rows x BK, WAVES wave32s.
 // Cooperative LDS A/W/S/s/z, expand-once at W staging, half-local P then
 // T = fma(s_h,P,T); T = fma(z_h,S_h,T) at each 128-K half; a[t] at store.
-// 256x128 is pruned (no register headroom). U0 skipped: no ds256 path.
+// Balanced aspects (128x128x64/8w, 64x256x64/8w, 128x64x64/4w control) cut
+// A-slab re-reads at the same 64-accumulator wave footprint; 256x128 stays
+// pruned (no register headroom). U0 skipped: no ds256 path.
 #ifndef HIPFIRE_FP8_V2_BM
 #define HIPFIRE_FP8_V2_BM 256
 #endif
@@ -229,11 +231,11 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 #if HIPFIRE_FP8_V2_BK != 32 && HIPFIRE_FP8_V2_BK != 64
 #error "HIPFIRE_FP8_V2_BK must be 32 or 64"
 #endif
-#if HIPFIRE_FP8_V2_BN != 32 && HIPFIRE_FP8_V2_BN != 64
-#error "HIPFIRE_FP8_V2_BN must be 32 or 64"
+#if HIPFIRE_FP8_V2_BN != 32 && HIPFIRE_FP8_V2_BN != 64 && HIPFIRE_FP8_V2_BN != 128 && HIPFIRE_FP8_V2_BN != 256
+#error "HIPFIRE_FP8_V2_BN must be 32, 64, 128 or 256"
 #endif
-#if HIPFIRE_FP8_V2_BM != 128 && HIPFIRE_FP8_V2_BM != 256
-#error "HIPFIRE_FP8_V2_BM must be 128 or 256"
+#if HIPFIRE_FP8_V2_BM != 64 && HIPFIRE_FP8_V2_BM != 128 && HIPFIRE_FP8_V2_BM != 256
+#error "HIPFIRE_FP8_V2_BM must be 64, 128 or 256"
 #endif
 #if (HIPFIRE_FP8_V2_WAVES * 32) % HIPFIRE_FP8_V2_BN != 0
 #error "HIPFIRE_FP8_V2_WAVES*32 must be a multiple of HIPFIRE_FP8_V2_BN"
@@ -241,6 +243,15 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 #if ((HIPFIRE_FP8_V2_BK / 8) % ((HIPFIRE_FP8_V2_WAVES * 32) / HIPFIRE_FP8_V2_BN)) != 0
 #error "W staging producers must divide BK/8 chunks"
 #endif
+// Balanced-aspect geometries (128x128x64/8w, 64x256x64/8w, 128x64x64/4w):
+// stride stays BK+8 = 72, so the §3.2 bank argument is unchanged — a lane
+// reading 8 contiguous bytes at (r*72 + kstep*16 + kg*8), r = lane&15,
+// touches banks (18*r + 4*kstep + 2*kg + {0,1}) mod 32: all 16 even starts
+// per 16-lane half, every bank once per half, twice per full wave (the
+// width floor, not a conflict). Only the row extents change: A rows
+// 0..BM-1, W rows 0..BN-1. Writer banks: A row = tid (one trip for
+// BM<=NTHREADS in all four aspects); W row = tid%BN, chunk8 =
+// tid/BN + NPROD*it, NPROD = NTHREADS/BN (4/2/1/2), WITER = 8/NPROD.
 
 #define HIPFIRE_FP8_V2_NTHREADS (HIPFIRE_FP8_V2_WAVES * 32)
 #define HIPFIRE_FP8_V2_STRIDE   (HIPFIRE_FP8_V2_BK + 8)
@@ -258,6 +269,18 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 #define HIPFIRE_FP8_V2_WCHUNKS  (HIPFIRE_FP8_V2_BK / 8)
 #define HIPFIRE_FP8_V2_NPROD    (HIPFIRE_FP8_V2_NTHREADS / HIPFIRE_FP8_V2_BN)
 #define HIPFIRE_FP8_V2_WITER    (HIPFIRE_FP8_V2_WCHUNKS / HIPFIRE_FP8_V2_NPROD)
+// The T/P[4][2] accumulator footprint is a fixed 64-token x 32-row wave
+// tile (4 token fragments x 2 weight fragments of 8 v8f), so every admitted
+// aspect satisfies BM*BN == NTHREADS*64: 256x64x64/8w, 128x128x64/8w,
+// 64x256x64/8w, 128x64x64/4w. wave_tok = tok_part*64 below relies on this.
+#if (HIPFIRE_FP8_V2_BM * HIPFIRE_FP8_V2_BN) != (HIPFIRE_FP8_V2_NTHREADS * 64)
+#error "HIPFIRE_FP8_V2 BM*BN must equal NTHREADS*64 (fixed 64x32 wave tile)"
+#endif
+// The coalesced store reuses LDS base for a 512-float/wave transpose tile
+// (8 waves = 16 KiB); A/W/S/SZ are dead by then but the tile must fit.
+#if HIPFIRE_FP8_V2_LDS_BYTES < (HIPFIRE_FP8_V2_WAVES * 2048)
+#error "HIPFIRE_FP8_V2 LDS must hold the 512-float/wave store transpose tile"
+#endif
 
 extern "C" __launch_bounds__(HIPFIRE_FP8_V2_NTHREADS, 2) __global__
 #if HIPFIRE_FP8_QKVZA

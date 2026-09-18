@@ -53,6 +53,34 @@ const V2_BM: usize = 256;
 const V2_BN: usize = 64;
 const V2_BK: usize = 64;
 const V2_WAVES: usize = 8;
+/// Active v2 geometry from the host selector env (mirrors `fp8_v2_geom` in
+/// rdna-compute/src/gemm.rs): (symbol suffix, BM, BN, BK, WAVES).
+fn active_v2_geom() -> (&'static str, usize, usize, usize, usize) {
+    match std::env::var("HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM").as_deref() {
+        Ok("128x128") => ("_b128x128", 128, 128, 64, 8),
+        Ok("64x256") => ("_b64x256", 64, 256, 64, 8),
+        Ok("128x64") => ("_b128x64w4", 128, 64, 64, 4),
+        _ => ("", 256, 64, 64, 8),
+    }
+}
+fn v2_enabled() -> bool {
+    std::env::var("HIPFIRE_GFX12_MQ4V2_FP8_V2").as_deref() == Ok("1")
+}
+/// Resolved kernel identity for a case: the v2 symbol (with geometry suffix)
+/// when the v2 route is enabled, else the incumbent s2bt8 symbol.
+fn kernel_label(family: &str, s2bt8: &str) -> String {
+    if !v2_enabled() {
+        return s2bt8.to_string();
+    }
+    let (sfx, _, _, _, _) = active_v2_geom();
+    match family {
+        "gate_up" => format!("gemm_gate_up_mq4g256v2_wmma_fp8_v2{sfx}_gfx1201"),
+        "qkv" => format!("gemm_qkv_mq4g256v2_wmma_fp8_v2{sfx}_gfx1201"),
+        "qkvza" => format!("gemm_qkvza_mq4g256v2_wmma_fp8_v2{sfx}_gfx1201"),
+        "residual" => format!("gemm_mq4g256v2_residual_wmma_fp8_v2{sfx}_gfx1201"),
+        _ => s2bt8.to_string(),
+    }
+}
 
 // Incumbent s2bt8 symbols under test (same-session control).
 const S2BT8_SYMBOLS: [&str; 4] = [
@@ -1213,7 +1241,7 @@ mod gpu {
                 gpu.hip.device_synchronize().unwrap();
                 ys.push(gpu.download_f32(&y_g).unwrap());
                 ys.push(gpu.download_f32(&y_u).unwrap());
-                kernel_names.push(fam.s2bt8.to_string());
+                kernel_names.push(kernel_label(fam.family, fam.s2bt8));
             }
             "residual" => {
                 let a = gpu.upload_raw(&blobs[0], &[blobs[0].len()]).unwrap();
@@ -1224,7 +1252,7 @@ mod gpu {
                 .unwrap();
                 gpu.hip.device_synchronize().unwrap();
                 ys.push(gpu.download_f32(&y).unwrap());
-                kernel_names.push(fam.s2bt8.to_string());
+                kernel_names.push(kernel_label(fam.family, fam.s2bt8));
             }
             "qkvza" => {
                 let a: Vec<GpuTensor> = blobs
@@ -1245,7 +1273,7 @@ mod gpu {
                 for t in y.iter() {
                     ys.push(gpu.download_f32(t).unwrap());
                 }
-                kernel_names.push(fam.s2bt8.to_string());
+                kernel_names.push(kernel_label(fam.family, fam.s2bt8));
             }
             "qkv" => {
                 let a: Vec<GpuTensor> = blobs
@@ -1266,7 +1294,7 @@ mod gpu {
                 for t in y.iter() {
                     ys.push(gpu.download_f32(t).unwrap());
                 }
-                kernel_names.push(fam.s2bt8.to_string());
+                kernel_names.push(kernel_label(fam.family, fam.s2bt8));
             }
             _ => unreachable!(),
         }
@@ -1338,14 +1366,25 @@ fn main() {
         println!("  [{}] {} — {}", if t.pass { "ok" } else { "FAIL" }, t.name, t.detail);
     }
 
-    // ── Frozen v2 symbol readiness ──
-    println!("v2 symbols (frozen §6.1, BM{V2_BM}xBN{V2_BN}xBK{V2_BK}/{V2_WAVES}w):");
-    for s in V2_SYMBOLS {
-        println!("  pending K/H: {s}");
-    }
-    if expect_v2 {
-        eprintln!("expect-v2 set but K/H have not landed: v2 GPU comparison unavailable");
-        std::process::exit(2);
+    // ── Resolved route: incumbent s2bt8, or the staged-tile v2 aspect ──
+    let (_sfx, gbm, gbn, gbk, gvw) = active_v2_geom();
+    if v2_enabled() {
+        println!("v2 route ACTIVE (BM{gbm}xBN{gbn}xBK{gbk}/{gvw}w):");
+        for s in V2_SYMBOLS {
+            println!("  compiled: {s}");
+        }
+        if expect_v2 {
+            println!("  expect-v2 satisfied by the active v2 route");
+        }
+    } else {
+        println!("v2 symbols (frozen §6.1, BM{V2_BM}xBN{V2_BN}xBK{V2_BK}/{V2_WAVES}w):");
+        for s in V2_SYMBOLS {
+            println!("  pending K/H: {s}");
+        }
+        if expect_v2 {
+            eprintln!("expect-v2 set but the v2 route is off: v2 GPU comparison unavailable");
+            std::process::exit(2);
+        }
     }
 
     // ── GPU suite (incumbent s2bt8 vs CPU reference) ──
@@ -1638,7 +1677,7 @@ fn run_gpu_case(
         n,
         k,
         m_total: ms.iter().sum(),
-        kernel: fam.s2bt8.to_string(),
+        kernel: kernel_label(fam.family, fam.s2bt8),
         kernels_seen,
         max_abs: worst.max_abs,
         tail_mse: worst.tail_mse,
@@ -1686,11 +1725,13 @@ fn emit(
         let med = if s.is_empty() { 0.0 } else { s[s.len() / 2] };
         times.insert(k.clone(), serde_json::json!({"median_us": med, "n": s.len()}));
     }
+    let (_, g_bm, g_bn, g_bk, g_wv) = active_v2_geom();
+    let g_route = if v2_enabled() { "v2" } else { "s2bt8" };
     let doc = serde_json::json!({
         "status": status,
         "elapsed_s": t0.elapsed().as_secs_f64(),
         "v2_symbols": V2_SYMBOLS,
-        "v2_geometry": {"BM": V2_BM, "BN": V2_BN, "BK": V2_BK, "waves": V2_WAVES},
+        "v2_geometry": {"BM": g_bm, "BN": g_bn, "BK": g_bk, "waves": g_wv, "route": g_route},
         "s2bt8_hist_us_N512": {"gate_up": S2BT8_HIST_US[0], "qkv": S2BT8_HIST_US[1],
                                 "qkvza": S2BT8_HIST_US[2], "residual": S2BT8_HIST_US[3]},
         "cpu_tests": cpu.iter().map(|t| serde_json::json!({
