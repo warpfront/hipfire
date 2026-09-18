@@ -726,11 +726,231 @@ __device__ __forceinline__ void fa2_gqa_body(
     }
 }
 
+// ---- Stage-b route-N byte-copy fill + dump (B1b diagnostic) ----
+// KMODE=8 + HIPFIRE_FA2_FP8 only. The fill copies native e4m3 codes verbatim
+// into the fragment-order fp8 planes (F = 8 bytes, K at byte 0, V at byte
+// 16384; dynamic LDS 32768) with NO decode, NO VALU, NO f16 rounding:
+//   K: one lane per (key, dc16) pair (1024/tile, 256/wave, 8/lane):
+//      one global_load_b128 + two ds_store_b64 (dims dc*16+0..7 and +8..15
+//      land in Kfrag(sub,dc,ml) and Kfrag(sub,dc,16+ml), 128 bytes apart).
+//   V: one lane per (sub, dc, lane) fragment (2048/tile, 512/wave, 16/lane):
+//      8 global_load_u8 (8 keys at one dim, 1032-strided) + one ds_store_b64.
+// Out-of-range keys (gk >= seq_len) write code 0. Scales are NEVER staged:
+// route N reads them header-direct through fa2_scale_n below (S3 sizes no
+// scale plane; Main ruling). The dump writes LDS planes + accessor-read
+// scales to `out` for the host oracle, then returns: with 32768 LDS the f16
+// body cannot run here (its V plane at byte 32768 is out of bounds), so B2
+// replaces dump+return with the fp8 body while keeping this fill.
+//
+// Route-N scale accessor (header-direct). B4 gives route Q the same
+// signature backed by its scratch scale plane, so the B2/B3 epilogue calls
+// only this and the body stays source-agnostic. OOR keys read scale 0,
+// matching the code-0 rule (§2: zero fragments contribute exactly zero).
+static __device__ __forceinline__ float fa2_scale_n(
+    const unsigned char* __restrict__ cache, int gkey, int kv_h, int seq_len)
+{
+    uint16_t u = 0;
+    if (gkey < seq_len) {
+        const unsigned char* row =
+            cache + (unsigned long long)gkey * 1032ULL;
+        u = (uint16_t)row[1024 + kv_h * 2] |
+            ((uint16_t)row[1024 + kv_h * 2 + 1] << 8);
+    }
+    return (float)((fa2_dw_t){.u = (uint32_t)u}).h[0];
+}
+
+// B1b fill+dump. Dump layout per (blockIdx.x, kv_h, split, tile), in u32
+// words at out + ((((bx*4+kv_h)*S+s)*512+t)*8320): K plane (4096) | V plane
+// (4096) | K scales as f32 via fa2_scale_n (64) | V scales (64). T_MAX=512
+// mirrors the partial tile convention; S=1/s=0 on direct.
+template <bool PARTIAL>
+__device__ void fa2_stageb_nfill_dump(
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int batch_size,
+    int kv_h,
+    int q_base,
+    int tile0,
+    int tile1,
+    int split,
+    int n_splits)
+{
+    const int tid = (int)threadIdx.x;
+    const int lane = tid & 31;
+
+    // Wave-local causal bounds (same mailbox-free graph as the body: every
+    // wave reduces the same eight positions).
+    int wmx = -1;
+    int wmn = 0x7fffffff;
+    if (lane < 8) {
+        const int qr = q_base + lane;
+        if (qr < batch_size) {
+            const int p = positions[qr];
+            wmx = p;
+            wmn = p;
+        }
+    }
+    wmx = max(wmx, __shfl_xor(wmx, 16, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 8, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 4, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 2, 32));
+    wmx = max(wmx, __shfl_xor(wmx, 1, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 16, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 8, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 4, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 2, 32));
+    wmn = min(wmn, __shfl_xor(wmn, 1, 32));
+    const int gmax = __builtin_amdgcn_readfirstlane(wmx);
+    const int gmin = __builtin_amdgcn_readfirstlane(wmn);
+    (void)gmin;
+    const int seq_len = gmax + 1;
+
+    extern __shared__ uint32_t LDS[];
+    unsigned char* K8 = (unsigned char*)LDS;
+    unsigned char* V8 = (unsigned char*)LDS + 16384;
+
+    for (int tile = tile0; tile < tile1; ++tile) {
+        const int ktile = tile * 64;
+        if (ktile >= seq_len)
+            break;
+
+        // ---- Route-N K fill: 1024 (key, dc) pairs, 8 per lane ----
+        // Fast path (key in range) is straight-line: one b128 + two b64
+        // per pair. Edge keys take the zeroing path. Full tiles never
+        // diverge, so the steady-state census sees only the fast path.
+        for (int t = 0; t < 8; ++t) {
+            const int idx = tid + t * 128;
+            const int k = idx >> 4;
+            const int dc = idx & 15;
+            const int gk = ktile + k;
+            const int sub = k >> 4;
+            const int ml = k & 15;
+            unsigned char* dst =
+                K8 + (unsigned)(((dc * 4 + sub) * 32 + ml) * 8);
+            if (gk < seq_len) {
+                const unsigned char* src = k_cache
+                    + (unsigned long long)gk * 1032ULL
+                    + (unsigned long long)kv_h * 256ULL
+                    + (unsigned long long)dc * 16ULL;
+                uint4 v = *(const uint4*)src;
+                *(unsigned long long*)dst =
+                    ((unsigned long long)v.y << 32) | v.x;
+                *(unsigned long long*)(dst + 128) =
+                    ((unsigned long long)v.w << 32) | v.z;
+            } else {
+                *(unsigned long long*)dst = 0ULL;
+                *(unsigned long long*)(dst + 128) = 0ULL;
+            }
+        }
+
+        // ---- Route-N V fill: 2048 fragments, 16 per lane ----
+        // Fast path (all 8 keys in range): 8 byte loads off ONE row base
+        // with constant stride offsets (1032) + one b64 store. Edge
+        // fragments fall back to per-byte predication; all-OOR writes zero.
+        for (int t = 0; t < 16; ++t) {
+            const int idx = tid + t * 128;
+            const int sub = idx >> 9;
+            const int r = idx & 511;
+            const int dc = r >> 5;
+            const int vlane = r & 31;
+            const int ml = vlane & 15;
+            const int kg = vlane >> 4;
+            const int dim = dc * 16 + ml;
+            const int kbase = ktile + sub * 16 + kg * 8;
+            unsigned char* dst = V8
+                + (unsigned)(((sub * 16 + dc) * 32 + vlane) * 8);
+            unsigned long long w = 0;
+            if (kbase + 7 < seq_len) {
+                const unsigned char* r0 = v_cache
+                    + (unsigned long long)kbase * 1032ULL
+                    + (unsigned long long)kv_h * 256ULL
+                    + (unsigned long long)dim;
+                w = (unsigned long long)r0[0]
+                    | ((unsigned long long)r0[1032] << 8)
+                    | ((unsigned long long)r0[2064] << 16)
+                    | ((unsigned long long)r0[3096] << 24)
+                    | ((unsigned long long)r0[4128] << 32)
+                    | ((unsigned long long)r0[5160] << 40)
+                    | ((unsigned long long)r0[6192] << 48)
+                    | ((unsigned long long)r0[7224] << 56);
+            } else if (kbase < seq_len) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int gkey = kbase + j;
+                    unsigned char c = 0;
+                    if (gkey < seq_len)
+                        c = *(v_cache + (unsigned long long)gkey * 1032ULL
+                            + (unsigned long long)kv_h * 256ULL
+                            + (unsigned long long)dim);
+                    // j-th byte of the fragment word (token-major rows are
+                    // 1032 apart: no vector load exists for a V fragment).
+                    w |= (unsigned long long)c
+                        << (unsigned long long)(j * 8);
+                }
+            }
+            *(unsigned long long*)dst = w;
+        }
+        __syncthreads();
+
+        // ---- Dump: planes + accessor-read scales ----
+        const unsigned long long dump =
+            (((((unsigned long long)(int)blockIdx.x * 4u
+                 + (unsigned long long)kv_h)
+                * (unsigned long long)n_splits + (unsigned long long)split)
+               * 512ULL + (unsigned long long)tile)
+              * 8320ULL);
+        uint32_t* D = (uint32_t*)out + dump;
+        for (int i = 0; i < 16; ++i)
+            ((uint4*)D)[tid * 16 + i] =
+                ((const uint4*)LDS)[tid * 16 + i];
+        if (tid < 64) {
+            const int gk = ktile + tid;
+            ((float*)D)[8192 + tid] =
+                fa2_scale_n(k_cache, gk, kv_h, seq_len);
+            ((float*)D)[8256 + tid] =
+                fa2_scale_n(v_cache, gk, kv_h, seq_len);
+        }
+        __syncthreads();
+    }
+}
+
 // Body entries take pre-converted f16 Q at kernarg offset 0 (same slot, same
 // size as the old f32 Q pointer, so the pointer-array blob ABI is unchanged).
 // Q0 (slice-B) entry: KMODE=8 selects `attention_fp8_e4m3_fa2_gqa_f16_gfx1201`
 // (native-fp8 fill, f16 body). Stage-b arithmetic, when it lands, gets its
 // own symbol; the f16 name stays Q0-only. KMODE=0/3 arms below are untouched.
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8)
+// B1b diagnostic (§14.2/§14.3): route-N byte-copy fill + plane dump; the fp8
+// body lands in B2. Kernargs frozen: fp8-code Q in the old Q slot (unused by
+// the fill), sq at +batch*24*256, out is the plane dump buffer, 32768 LDS.
+extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_gfx1201(
+    const unsigned char* __restrict__ q8_codes,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    (void)q8_codes;
+    (void)scale_attn;
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    fa2_stageb_nfill_dump<false>(k_cache, v_cache, out, positions, batch_size,
+                                 kv_h, q_base, 0, 0x3fffffff, 0, 1);
+}
+#else
 #if HIPFIRE_FA2_KMODE == 8
 extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_f16_gfx1201(
 #elif defined(HIPFIRE_FA2_FP8)
@@ -760,6 +980,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1
     fa2_gqa_body<false>(q16, k_cache, v_cache, out, positions, batch_size,
                         scale_attn, kv_h, q_base, 0, 0x3fffffff, 0, 1);
 }
+#endif
 
 // ---- F4b: on-device Q pre-convert (f32 -> f16, optional FWHT-256) ----
 // Launch once per FA2 call before the body below, on the same stream (no
@@ -837,6 +1058,65 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
     *(half8_t*)(wp + lane * 8) = o;
 }
 
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8)
+// ---- Stage-b Q pre-convert (f32 -> e4m3 codes + f32 sq, plan §3) ----
+// One wave32 per Q row (same grid convention as the f16 pre-convert:
+// r = blockIdx.x*4+wave, grid [(batch*24).div_ceil(4)], block 128, no LDS;
+// the launcher in attention.rs owns the grid). amax = wave_max(|q|) over a
+// 5-step shfl_xor tree; sq = (amax == 0) ? 1 : amax/448 in f32 (never
+// rounded: sq is an epilogue multiplier, not a WMMA operand); cq =
+// E4M3_RNE(q/sq) via __builtin_amdgcn_cvt_pk_fp8_f32 — the same instruction
+// the native fp8 writer uses. 8 codes/lane in one aligned u64 store; sq by
+// lane 0. Zero rows yield zero codes with sq=1. Q never mutated. B2 gates
+// the numerics; B1b gates compile + resources.
+extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201(
+    const float* __restrict__ q,
+    unsigned char* __restrict__ codes,
+    float* __restrict__ sq,
+    int batch_size)
+{
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int r = (int)blockIdx.x * 4 + wave;
+    if (r >= batch_size * 24)
+        return;
+    const int qr = r / 24;
+    const int h = r % 24;
+    const float* rp = q + (unsigned)qr * 6144u + (unsigned)h * 256u;
+    const float v0 = rp[lane * 8 + 0], v1 = rp[lane * 8 + 1];
+    const float v2 = rp[lane * 8 + 2], v3 = rp[lane * 8 + 3];
+    const float v4 = rp[lane * 8 + 4], v5 = rp[lane * 8 + 5];
+    const float v6 = rp[lane * 8 + 6], v7 = rp[lane * 8 + 7];
+    float a = fabsf(v0);
+    a = fmaxf(a, fabsf(v1));
+    a = fmaxf(a, fabsf(v2));
+    a = fmaxf(a, fabsf(v3));
+    a = fmaxf(a, fabsf(v4));
+    a = fmaxf(a, fabsf(v5));
+    a = fmaxf(a, fabsf(v6));
+    a = fmaxf(a, fabsf(v7));
+    a = fmaxf(a, __shfl_xor(a, 16, 32));
+    a = fmaxf(a, __shfl_xor(a, 8, 32));
+    a = fmaxf(a, __shfl_xor(a, 4, 32));
+    a = fmaxf(a, __shfl_xor(a, 2, 32));
+    a = fmaxf(a, __shfl_xor(a, 1, 32));
+    const float s = (a == 0.0f) ? 1.0f : a / 448.0f;
+    unsigned int w0 = 0u;
+    w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v0 / s, v1 / s, w0, false);
+    w0 = __builtin_amdgcn_cvt_pk_fp8_f32(v2 / s, v3 / s, w0, true);
+    unsigned int w1 = 0u;
+    w1 = __builtin_amdgcn_cvt_pk_fp8_f32(v4 / s, v5 / s, w1, false);
+    w1 = __builtin_amdgcn_cvt_pk_fp8_f32(v6 / s, v7 / s, w1, true);
+    unsigned char* wp = codes + ((unsigned)qr * 24u + (unsigned)h) * 256u
+        + (unsigned)lane * 8u;
+    *(unsigned int*)wp = w0;
+    *(unsigned int*)(wp + 4) = w1;
+    if (lane == 0)
+        sq[(unsigned)qr * 24u + (unsigned)h] = s;
+}
+#endif
+
 // ---- KMODE=3 entry: fwht3 K, pre-rotated + pre-converted f16 Q ----
 // K is stored FWHT-rotated, so Q must be rotated before QK (orthogonal
 // transform: dot products preserved; fwht_shfl_forward_256 is normalized
@@ -876,6 +1156,44 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
 }
 #endif
 
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8)
+// B1b diagnostic partial twin: same tile partition as the f16 partial; the
+// dump index carries the split so split dumps never alias.
+extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_partial_gfx1201(
+    const unsigned char* __restrict__ q8_codes,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn,
+    int n_splits)
+{
+    (void)q8_codes;
+    (void)scale_attn;
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    if (n_splits < 1 || n_splits > 8)
+        return;
+    const int kv_h = blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int q_base = blockIdx.x * 8;
+    if (q_base >= batch_size)
+        return;
+    const int split = blockIdx.z;
+    if (split >= n_splits)
+        return;
+    const int per = (512 + n_splits - 1) / n_splits;
+    const int t0 = split * per;
+    const int t1 = t0 + per;
+    fa2_stageb_nfill_dump<true>(k_cache, v_cache, out, positions, batch_size,
+                                kv_h, q_base, t0, t1, split, n_splits);
+}
+#else
 #if HIPFIRE_FA2_KMODE == 8
 extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_partial_f16_gfx1201(
 #elif defined(HIPFIRE_FA2_FP8)
@@ -920,7 +1238,52 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_part
     fa2_gqa_body<true>(q16, k_cache, v_cache, partials, positions, batch_size,
                        scale_attn, kv_h, q_base, t0, t1, split, n_splits);
 }
+#endif
 
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8)
+// Stage-b merge (§14.3): record format is scale-free (physical numerator in
+// the 258-float record), so this is the f16 merge body under the stage-b
+// symbol. Duplicated rather than shared so the Q0 object stays identical.
+extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_merge_gfx1201(
+    const float* __restrict__ partials,
+    float* __restrict__ out,
+    int batch_size,
+    int n_heads,
+    int head_dim,
+    int n_splits)
+{
+    if (n_heads != 24 || head_dim != 256)
+        return;
+    if (n_splits < 1 || n_splits > 8)
+        return;
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int rec = blockIdx.x * 8 + wave;
+    if (rec >= batch_size * n_heads)
+        return;
+    float m = -INFINITY;
+    for (int s = 0; s < n_splits; ++s) {
+        const float* pr =
+            partials + ((long long)rec * n_splits + s) * 258;
+        m = fmaxf(m, pr[0]);
+    }
+    for (int d = lane; d < head_dim; d += 32) {
+        float num = 0.0f;
+        float den = 0.0f;
+        for (int s = 0; s < n_splits; ++s) {
+            const float* pr =
+                partials + ((long long)rec * n_splits + s) * 258;
+            const float w =
+                (pr[1] > 0.0f) ? __expf(pr[0] - m) : 0.0f;
+            den += w * pr[1];
+            num += w * pr[2 + d];
+        }
+        out[(long long)rec * head_dim + d] =
+            (den > 0.0f) ? num / den : 0.0f;
+    }
+}
+#else
 #if HIPFIRE_FA2_KMODE == 8
 extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_merge_f16_gfx1201(
 #elif defined(HIPFIRE_FA2_FP8)
@@ -966,3 +1329,4 @@ extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_g
             (den > 0.0f) ? num / den : 0.0f;
     }
 }
+#endif
