@@ -45,7 +45,7 @@ pub struct FeatureFlags {
     /// activations; default off everywhere); unset/`=0` keeps the incumbent
     /// Q8_1 MMQ (gfx11) / fp8 (gfx1201) route.
     /// Expected quality cost ~+0.014 WT2 KLD for the MQ4-XT speed rung.
-    pub gfx11_mmq_iu4: Option<bool>,
+    pub iu4_prefill: Option<bool>,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -475,7 +475,7 @@ impl FeatureFlags {
             gemv_dp4a: parse_bool("HIPFIRE_GEMV_DP4A"),
             gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
-            gfx11_mmq_iu4: parse_bool("HIPFIRE_IU4_PREFILL"),
+            iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -747,7 +747,7 @@ impl FeatureFlags {
     /// exact gfx1100/gfx1151 (K16 kernel) or gfx1201 (K32 kernel).
     /// Unset/`=0`/other arches keep the incumbent.
     pub fn iu4_prefill_enabled(&self) -> bool {
-        self.gfx11_mmq_iu4.unwrap_or(false)
+        self.iu4_prefill.unwrap_or(false)
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
 
@@ -763,7 +763,7 @@ impl FeatureFlags {
     /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
     /// keep standalone `quantize_int4_mmq_ds128`.
     pub fn iu4_producer_sidecar_enabled(&self) -> bool {
-        self.gfx11_mmq_iu4.unwrap_or(false) && self.arch == "gfx1151"
+        self.iu4_prefill.unwrap_or(false) && self.arch == "gfx1151"
     }
 
     pub fn hfq3_mmq_layer_gate_pass(&self) -> bool {
@@ -826,7 +826,7 @@ impl FeatureFlags {
             gemv_dp4a: None,
             gfx1151_e8_buffer: None,
             gfx11_mmq_x128: None,
-            gfx11_mmq_iu4: None,
+            iu4_prefill: None,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,
