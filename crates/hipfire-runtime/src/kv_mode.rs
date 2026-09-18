@@ -50,6 +50,7 @@ fn normalize_full(raw: &str) -> Option<KvMode> {
         "q8" => Some(Q8),
         "asym2" | "turbo2" => Some(Asym2),
         "asym3" => Some(Asym3),
+        "auto" | "turbo" | "turbo3" => Some(Fwht3),
         "asym4" | "turbo4" => Some(Asym4),
         "fwht2" => Some(Fwht2),
         "fwht3" => Some(Fwht3),
@@ -135,6 +136,10 @@ fn normalize_pp(raw: &str) -> Option<KvMode> {
         "asym3" | "turbo3" | "turbo" => Some(Asym3),
         "fwht3" => Some(Fwht3),
         "fwht2" => Some(Fwht2),
+        // Recognized so `resolve` carries them forward WITH a warning (fail
+        // closed downstream) instead of silently defaulting to q8.
+        "fp8" => Some(Fp8),
+        "bf16" => Some(Bf16),
         _ => None, // incl. asym2/asym4 → default (+warn "for pp>1")
     }
 }

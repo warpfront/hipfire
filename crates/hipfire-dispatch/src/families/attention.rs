@@ -2547,6 +2547,18 @@ mod tests {
     fn dispatch_kv_write_has_arms_for_all_registered_keys() {
         let family = AttentionFamily::new();
         let ctx = DispatchCtx::for_test("gfx1100");
+        // Native fp8 keys are IsGfx1201-gated: they only resolve on gfx1201.
+        let ctx_fp8 = DispatchCtx::for_test("gfx1201");
+        let ctx_for = |key: KernelKey| {
+            if matches!(
+                key,
+                KernelKey::KvWriteFp8E4m3 | KernelKey::KvWriteFp8E4m3Batched
+            ) {
+                &ctx_fp8
+            } else {
+                &ctx
+            }
+        };
 
         let dispatched_set: std::collections::HashSet<KernelKey> =
             DISPATCHED_KV_WRITE_KEYS.iter().copied().collect();
@@ -2561,7 +2573,7 @@ mod tests {
                 is_tree: false,
             };
             assert!(
-                family.resolve(key, &ctx, Some(&shape)).is_ok(),
+                family.resolve(key, ctx_for(key), Some(&shape)).is_ok(),
                 "DISPATCHED_KV_WRITE_KEYS contains {:?} but it is NOT registered — stale entry",
                 key
             );
@@ -2579,7 +2591,7 @@ mod tests {
                 m: 0,
                 is_tree: false,
             };
-            if family.resolve(key, &ctx, Some(&shape)).is_ok() {
+            if family.resolve(key, ctx_for(key), Some(&shape)).is_ok() {
                 assert!(
                     dispatched_set.contains(&key),
                     "registered KV write key {:?} is not in DISPATCHED_KV_WRITE_KEYS — missing dispatch arm",
@@ -2652,6 +2664,20 @@ mod tests {
     fn dispatch_attend_has_arms_for_all_registered_keys() {
         let family = AttentionFamily::new();
         let ctx = DispatchCtx::for_test("gfx1100");
+        // Native fp8 attend keys are IsGfx1201-gated: they only resolve on gfx1201.
+        let ctx_fp8 = DispatchCtx::for_test("gfx1201");
+        let ctx_for = |key: KernelKey| {
+            if matches!(
+                key,
+                KernelKey::AttnFp8E4m3Kv
+                    | KernelKey::AttnFlashFp8E4m3
+                    | KernelKey::AttnFp8E4m3KvBatchedMasked
+            ) {
+                &ctx_fp8
+            } else {
+                &ctx
+            }
+        };
 
         let dispatched_set: std::collections::HashSet<KernelKey> =
             DISPATCHED_ATTEND_KEYS.iter().copied().collect();
@@ -2667,7 +2693,7 @@ mod tests {
                 is_tree: false,
             };
             assert!(
-                family.resolve(key, &ctx, Some(&shape)).is_ok(),
+                family.resolve(key, ctx_for(key), Some(&shape)).is_ok(),
                 "DISPATCHED_ATTEND_KEYS contains {:?} but it is NOT registered — stale entry",
                 key
             );
@@ -2688,7 +2714,7 @@ mod tests {
                 m: 0,
                 is_tree: false,
             };
-            if family.resolve(key, &ctx, Some(&shape)).is_ok() {
+            if family.resolve(key, ctx_for(key), Some(&shape)).is_ok() {
                 assert!(
                     dispatched_set.contains(&key),
                     "registered attend key {:?} is not in DISPATCHED_ATTEND_KEYS — missing dispatch arm",

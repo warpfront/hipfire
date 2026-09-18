@@ -4852,8 +4852,9 @@ mod redline_snapshot_tests {
     }
     #[test]
     fn kv_token_stride_covers_q8_fp8_bf16() {
-        // q8_0: 4 heads * 8 blocks * 34 B.
-        assert_eq!(redline_kv_token_stride(4, 256, false, false), Ok(2176));
+        // All arms are per-plane strides (one K or V plane): callers walk
+        // k_gpu and v_gpu separately. q8_0: 4 heads * 8 blocks * 34 B.
+        assert_eq!(redline_kv_token_stride(4, 256, false, false), Ok(1088));
         // native fp8: 4 * (256 codes + 2 scale bytes).
         assert_eq!(redline_kv_token_stride(4, 256, true, false), Ok(1032));
         // unscaled bf16: 4 * 256 * 2 B.
