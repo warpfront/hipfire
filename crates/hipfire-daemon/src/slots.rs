@@ -208,11 +208,16 @@ impl PendingToolBroker {
 
 impl SlotBackend {
     /// CPU preflight then GPU load. Called only when experimental_multi_slot load is requested.
+    /// `kv_mode`/`kv_backend` are the effective per-load values (already gated by
+    /// `validate_load_caps` to q8/contiguous); they ride into `EngineConfig`
+    /// so `Rig::build` fails closed if a non-q8/non-contiguous value arrives.
     pub fn load(
         model_path: &str,
         n_slots: usize,
         cap_tokens: usize,
         prefill_chunk: usize,
+        kv_mode: &str,
+        kv_backend: &str,
     ) -> Result<Self, String> {
         // CPU preflight: open HFQ, arch, VL, config, tokenizer.
         let preflight = cpu_preflight(model_path)?;
@@ -241,6 +246,8 @@ impl SlotBackend {
                 prefill_chunk,
                 host_budget_bytes: 16 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
+                kv_mode: kv_mode.to_string(),
+                kv_backend: kv_backend.to_string(),
             },
         )
         .map_err(|e| format!("SlotEngine spawn: {e}"))?;
