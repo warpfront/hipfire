@@ -457,6 +457,40 @@ pub fn kv_cache_write_q8_0_bytes(n_kv_heads: usize, head_dim: usize) -> usize {
     let dst = n_kv_heads * (head_dim + 4); // int8 + scale
     src + dst
 }
+/// KV cache write (native fp8-E4M3 flavor, per token position): f32 source
+/// vector + one token-local row (Hkv*D codes + Hkv f16 scales).
+pub fn kv_cache_write_fp8_e4m3_bytes(n_kv_heads: usize, head_dim: usize) -> usize {
+    let src = n_kv_heads * head_dim * 4;
+    let dst = n_kv_heads * (head_dim + 2);
+    src + dst
+}
+/// Native fp8-E4M3 KV attention: read Q, read K+V caches, write output.
+/// `kv_len` = current sequence length.
+pub fn attention_fp8_e4m3_kv_bytes(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+) -> usize {
+    let q_bytes = n_heads * head_dim * 4;
+    let kv_bytes_per_pos = n_kv_heads * (head_dim + 2);
+    let kv_bytes = 2 * kv_len * kv_bytes_per_pos;
+    let out_bytes = n_heads * head_dim * 4;
+    q_bytes + kv_bytes + out_bytes
+}
+/// Native flat-bf16 KV attention: same shape, 2 bytes/element, no scales.
+pub fn attention_bf16_kv_bytes(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    kv_len: usize,
+) -> usize {
+    let q_bytes = n_heads * head_dim * 4;
+    let kv_bytes_per_pos = n_kv_heads * head_dim * 2;
+    let kv_bytes = 2 * kv_len * kv_bytes_per_pos;
+    let out_bytes = n_heads * head_dim * 4;
+    q_bytes + kv_bytes + out_bytes
+}
 
 /// Gated norm (L2 + affine): similar bandwidth profile to rmsnorm but with an
 /// extra z gate input.

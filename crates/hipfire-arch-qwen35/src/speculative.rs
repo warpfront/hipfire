@@ -728,8 +728,15 @@ pub enum KvMode {
     /// leverage tier — Asym2 is doc'd "most lossy" and 2-bit centroid quant
     /// suffers most from outliers. Opt-in via `--kv-mode fwht2`.
     Fwht2,
+    /// Native fp8 E4M3 KV (gfx1201 Qwen dense only). ModelSlot::load rejects
+    /// this mode: single-slot speculative assembly goes through the carrier
+    /// path, never the slot constructors below. Present so `--kv-mode fp8`
+    /// fails closed here instead of parsing as a neighboring mode.
+    Fp8,
+    /// Flat native bf16 KV quality-control arm. Same rejection contract as
+    /// Fp8 above: ModelSlot::load refuses, carrier path owns admission.
+    Bf16,
 }
-
 impl Default for KvMode {
     fn default() -> Self {
         KvMode::Q8
@@ -952,6 +959,13 @@ impl ModelSlot {
                 config.head_dim,
                 slot_config.max_seq,
             )?,
+            KvMode::Fp8 | KvMode::Bf16 => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "ModelSlot::load rejects fp8/bf16 KV: single-slot speculative assembly \
+                     has no native-format slot constructors; load through the carrier path",
+                ));
+            }
         };
 
         let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;

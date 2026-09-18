@@ -3672,6 +3672,14 @@ fn load_model_ep_qwen35(
     let kv_raw = kv_mode.unwrap_or("");
     let kv_trim = kv_raw.trim();
     let kv_lower = kv_trim.to_ascii_lowercase();
+    // Native tiers are single-GPU only: refuse explicitly before resolve,
+    // which would otherwise admit fp8/bf16 under the HFQ policy and let MoE
+    // EP construct a distributed native cache.
+    if kv_lower == "fp8" || kv_lower == "bf16" {
+        return Err(format!(
+            "kv_mode '{kv_trim}' is single-GPU only (MoE EP never allocates native fp8/bf16 tiers)"
+        ));
+    }
     let kv_mode_resolved = if kv_lower.is_empty() {
         kv_mode::resolve("", &kv_mode::QWEN35_HFQ_POLICY).mode
     } else {
@@ -3919,6 +3927,14 @@ fn load_model_tp_qwen35_dense(
     let kv_backend_resolved: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     let kv_trim = kv_raw.trim();
     let kv_lower = kv_trim.to_ascii_lowercase();
+    // Native tiers are single-GPU only: refuse explicitly before resolve,
+    // which would otherwise admit fp8/bf16 under the HFQ policy and let
+    // dense-TP construct per-rank native caches.
+    if kv_lower == "fp8" || kv_lower == "bf16" {
+        return Err(format!(
+            "kv_mode '{kv_trim}' is single-GPU only (dense-TP never allocates native fp8/bf16 tiers)"
+        ));
+    }
     let kv_mode_resolved = if kv_lower.is_empty() {
         kv_mode::resolve("", &kv_mode::QWEN35_HFQ_POLICY).mode
     } else {

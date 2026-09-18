@@ -1124,7 +1124,27 @@ fn main() {
                         .and_then(|p| p.get("experimental_multi_slot_prefill_chunk"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
-                    match slots::SlotBackend::load(path, n_slots, cap_tokens, prefill_chunk) {
+                    // Effective KV selection for the slot engine. The capability
+                    // gate above already refused anything but q8/contiguous;
+                    // these ride into EngineConfig so Rig::build fails closed.
+                    let slot_kv_mode = msg
+                        .get("params")
+                        .and_then(|p| p.get("kv_mode"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("q8");
+                    let slot_kv_backend = msg
+                        .get("params")
+                        .and_then(|p| p.get("kv_backend"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("contiguous");
+                    match slots::SlotBackend::load(
+                        path,
+                        n_slots,
+                        cap_tokens,
+                        prefill_chunk,
+                        slot_kv_mode,
+                        slot_kv_backend,
+                    ) {
                         Ok(backend) => {
                             let arch = backend.arch_str().to_string();
                             let dim = backend.dim();
