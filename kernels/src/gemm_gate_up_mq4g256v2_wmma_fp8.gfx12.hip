@@ -209,9 +209,12 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 // gfx1201 staged-tile v2: BM tokens x BN weight rows x BK, WAVES wave32s.
 // Cooperative LDS A/W/S/s/z, expand-once at W staging, half-local P then
 // T = fma(s_h,P,T); T = fma(z_h,S_h,T) at each 128-K half; a[t] at store.
-// Balanced aspects (128x128x64/8w, 64x256x64/8w, 128x64x64/4w control) cut
-// A-slab re-reads at the same 64-accumulator wave footprint; 256x128 stays
-// pruned (no register headroom). U0 skipped: no ds256 path.
+// Full aspects (256x64x64/8w default, 128x128x64/8w, 64x256x64/8w,
+// 128x64x64/4w control) keep the 64-token x 32-row wave tile (4 token frags
+// x 2 row frags, 64+64 acc VGPR). Half aspects (128x64x64/8w, 64x128x64/8w)
+// halve the wave tile to 32x32 (NB=2 token frags, 32+32 acc VGPR) so the
+// allocation fits <=128 VGPR (4 waves/SIMD, two 8-wave WGs per WGP).
+// 256x128 stays pruned (no register headroom). U0 skipped: no ds256 path.
 #ifndef HIPFIRE_FP8_V2_BM
 #define HIPFIRE_FP8_V2_BM 256
 #endif
@@ -280,15 +283,16 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 #define HIPFIRE_FP8_V2_AFRAG(nb, ks) (((nb) * HIPFIRE_FP8_V2_K16 + (ks)) * HIPFIRE_FP8_V2_FRAG)
 #define HIPFIRE_FP8_V2_WFRAG(wf, ks) (((wf) * HIPFIRE_FP8_V2_K16 + (ks)) * HIPFIRE_FP8_V2_FRAG)
 #else
-// Balanced-aspect geometries (128x128x64/8w, 64x256x64/8w, 128x64x64/4w):
-// stride stays BK+8 = 72, so the §3.2 bank argument is unchanged — a lane
-// reading 8 contiguous bytes at (r*72 + kstep*16 + kg*8), r = lane&15,
-// touches banks (18*r + 4*kstep + 2*kg + {0,1}) mod 32: all 16 even starts
-// per 16-lane half, every bank once per half, twice per full wave (the
-// width floor, not a conflict). Only the row extents change: A rows
-// 0..BM-1, W rows 0..BN-1. Staging writers: every lane is active on every
-// round (row = r*NTHREADS/4 + (tid>>2), quad tid&3); consecutive lanes
-// touch consecutive 8 B chunks (coalesced globals, sequential LDS banks).
+// Full aspects (128x128x64/8w, 64x256x64/8w, 128x64x64/4w) and half aspects
+// (128x64x64/8w, 64x128x64/8w): stride stays BK+8 = 72, so the §3.2 bank
+// argument is unchanged — a lane reading 8 contiguous bytes at
+// (r*72 + kstep*16 + kg*8), r = lane&15, touches banks
+// (18*r + 4*kstep + 2*kg + {0,1}) mod 32: all 16 even starts per 16-lane
+// half, every bank once per half, twice per full wave (the width floor, not
+// a conflict). Only the row extents change: A rows 0..BM-1, W rows
+// 0..BN-1. Staging writers: every lane is active on every round
+// (row = r*NTHREADS/4 + (tid>>2), quad tid&3); consecutive lanes touch
+// consecutive 8 B chunks (coalesced globals, sequential LDS banks).
 #define HIPFIRE_FP8_V2_NTHREADS (HIPFIRE_FP8_V2_WAVES * 32)
 #define HIPFIRE_FP8_V2_STRIDE   (HIPFIRE_FP8_V2_BK + 8)
 #define HIPFIRE_FP8_V2_A_OFF    0
@@ -300,23 +304,34 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 #define HIPFIRE_FP8_V2_S_BYTES  (HIPFIRE_FP8_V2_BM * 4)
 #define HIPFIRE_FP8_V2_SZ_OFF   (HIPFIRE_FP8_V2_S_OFF + HIPFIRE_FP8_V2_S_BYTES)
 #define HIPFIRE_FP8_V2_SZ_BYTES (HIPFIRE_FP8_V2_BN * 8)
-#define HIPFIRE_FP8_V2_LDS_BYTES (HIPFIRE_FP8_V2_SZ_OFF + HIPFIRE_FP8_V2_SZ_BYTES)
 #define HIPFIRE_FP8_V2_NSLABS   (128 / HIPFIRE_FP8_V2_BK)
 #define HIPFIRE_FP8_V2_K16      (HIPFIRE_FP8_V2_BK / 16)
 #define HIPFIRE_FP8_V2_WCHUNKS  (HIPFIRE_FP8_V2_BK / 8)
 #define HIPFIRE_FP8_V2_NPROD    (HIPFIRE_FP8_V2_NTHREADS / HIPFIRE_FP8_V2_BN)
 #define HIPFIRE_FP8_V2_WITER    (HIPFIRE_FP8_V2_WCHUNKS / HIPFIRE_FP8_V2_NPROD)
-// The T/P[4][2] accumulator footprint is a fixed 64-token x 32-row wave
-// tile (4 token fragments x 2 weight fragments of 8 v8f), so every admitted
-// aspect satisfies BM*BN == NTHREADS*64: 256x64x64/8w, 128x128x64/8w,
-// 64x256x64/8w, 128x64x64/4w. wave_tok = tok_part*64 below relies on this.
-#if (HIPFIRE_FP8_V2_BM * HIPFIRE_FP8_V2_BN) != (HIPFIRE_FP8_V2_NTHREADS * 64)
-#error "HIPFIRE_FP8_V2 BM*BN must equal NTHREADS*64 (fixed 64x32 wave tile)"
+// The T/P accumulator footprint is a 64-token x 32-row wave tile (4 token
+// fragments x 2 weight fragments of 8 v8f) on full aspects
+// (BM*BN == NTHREADS*64: 256x64x64/8w, 128x128x64/8w, 64x256x64/8w,
+// 128x64x64/4w), or a 32x32 half tile (NB=2 token frags, 32+32 acc VGPR) on
+// half aspects (BM*BN == NTHREADS*32: 128x64x64/8w, 64x128x64/8w).
+// wave_tok = tok_part*WTOK below relies on this.
+#if (HIPFIRE_FP8_V2_BM * HIPFIRE_FP8_V2_BN) == (HIPFIRE_FP8_V2_NTHREADS * 64)
+#define HIPFIRE_FP8_V2_NB 4
+#elif (HIPFIRE_FP8_V2_BM * HIPFIRE_FP8_V2_BN) == (HIPFIRE_FP8_V2_NTHREADS * 32)
+#define HIPFIRE_FP8_V2_NB 2
+#else
+#error "HIPFIRE_FP8_V2 BM*BN must equal NTHREADS*64 (full tile) or NTHREADS*32 (half tile)"
 #endif
+#define HIPFIRE_FP8_V2_WTOK (HIPFIRE_FP8_V2_NB * 16)
 // The coalesced store reuses LDS base for a 512-float/wave transpose tile
 // (8 waves = 16 KiB); A/W/S/SZ are dead by then but the tile must fit.
-#if HIPFIRE_FP8_V2_LDS_BYTES < (HIPFIRE_FP8_V2_WAVES * 2048)
-#error "HIPFIRE_FP8_V2 LDS must hold the 512-float/wave store transpose tile"
+// Half aspects stage only 14848 B but still need the full 16 KiB store
+// tile, so LDS_BYTES is the max (host vlds matches this formula).
+#define HIPFIRE_FP8_V2_STAGE_BYTES (HIPFIRE_FP8_V2_SZ_OFF + HIPFIRE_FP8_V2_SZ_BYTES)
+#if HIPFIRE_FP8_V2_STAGE_BYTES < (HIPFIRE_FP8_V2_WAVES * 2048)
+#define HIPFIRE_FP8_V2_LDS_BYTES (HIPFIRE_FP8_V2_WAVES * 2048)
+#else
+#define HIPFIRE_FP8_V2_LDS_BYTES HIPFIRE_FP8_V2_STAGE_BYTES
 #endif
 
 extern "C" __launch_bounds__(HIPFIRE_FP8_V2_NTHREADS, 2) __global__
@@ -397,7 +412,7 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     const int n_wt_parts = HIPFIRE_FP8_V2_BN / 32;
     const int tok_part = wave / n_wt_parts;
     const int wt_part = wave - tok_part * n_wt_parts;
-    const int wave_tok = tok_part * 64;
+    const int wave_tok = tok_part * HIPFIRE_FP8_V2_WTOK;
     const int wave_wt = wt_part * 32;
     const int gpr = K / 256;
 
@@ -554,10 +569,10 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     }
 
     const v8f_t zc = v8f_t{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
-    v8f_t T[4][2];
-    v8f_t P[4][2];
+    v8f_t T[HIPFIRE_FP8_V2_NB][2];
+    v8f_t P[HIPFIRE_FP8_V2_NB][2];
     #pragma unroll
-    for (int nb = 0; nb < 4; nb++) {
+    for (int nb = 0; nb < HIPFIRE_FP8_V2_NB; nb++) {
         T[nb][0] = zc;
         T[nb][1] = zc;
     }
@@ -567,14 +582,22 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         #pragma nounroll
         for (int h = 0; h < 2; h++) {
             // Overlap probe (K2 measurement): prologue stages slab 0, then
-            // each iteration issues slab s+1's global loads into registers
+            // each iteration issues slab s+1's A globals into registers
             // BEFORE slab s's compute, so load latency hides under WMMAs.
             // Expand + LDS publish of s+1 still follow compute (single
             // buffer); only latency, not execution, is hidden. A_pf holds the
-            // lane's b64 chunk pairs (A_ROUNDS*2 v2i_t); Wpk_pf holds raw
-            // packs (expand at publish, identical values).
-            v2i_t A_pf[HIPFIRE_FP8_V2_A_ROUNDS * 2];
+            // lane's b64 chunk pairs (A_ROUNDS*2 v2i_t).
+#if HIPFIRE_FP8_V2_NB == 2
+            // Half tiles (NB==2) skip the W prefetch: its Wpk regs would break
+            // the <=128 VGPR gate, and W is 1/5 of the staged bytes. W for
+            // slab s+1 stages post-compute from globals (identical values);
+            // the A prefetch — the latency that matters — is unchanged.
+            // Full tiles (NB==4) keep both prefetches, textually identical.
+#else
+            // Wpk_pf holds raw packs (expand at publish, identical values).
             unsigned int Wpk_pf[HIPFIRE_FP8_V2_W_ROUNDS * 2];
+#endif
+            v2i_t A_pf[HIPFIRE_FP8_V2_A_ROUNDS * 2];
             // Prologue: stage slab 0 fully (S/SZ + A + W). Every lane is
             // active on every round; OOB clamps to the last valid index with
             // a branch-free zero-select (exact old ternary semantics).
@@ -659,6 +682,8 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                             A_pf[r * 2 + 1] = st_aok[r] ? v1l : st_z64;
                         }
                     }
+                    // NB==2 half tiles: no W prefetch (stages post-compute).
+#if HIPFIRE_FP8_V2_NB != 2
                     {
                         const unsigned int pack_base = (unsigned int)g * 136u + 8u
                             + (unsigned int)h * 64u
@@ -672,6 +697,7 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                             }
                         }
                     }
+#endif
                     // No sched pin here (iu4fold v0): the previous trip's fold
                     // VALU must be free to sink among this trip's WMMAs, and
                     // the prefetch loads hoist for latency on their own. True
@@ -687,14 +713,14 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                         const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, 0));
                         const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, 0));
                         #pragma unroll
-                        for (int nb = 0; nb < 4; nb++) {
+                        for (int nb = 0; nb < HIPFIRE_FP8_V2_NB; nb++) {
                             const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, 0));
 #else
                         const int off = kg * 8;
                         const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
                         const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
                         #pragma unroll
-                        for (int nb = 0; nb < 4; nb++) {
+                        for (int nb = 0; nb < HIPFIRE_FP8_V2_NB; nb++) {
                             const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
 #endif
                             P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, zc);
@@ -708,14 +734,14 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                         const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, kstep));
                         const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, kstep));
                         #pragma unroll
-                        for (int nb = 0; nb < 4; nb++) {
+                        for (int nb = 0; nb < HIPFIRE_FP8_V2_NB; nb++) {
                             const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, kstep));
 #else
                         const int off = kstep * 16 + kg * 8;
                         const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
                         const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
                         #pragma unroll
-                        for (int nb = 0; nb < 4; nb++) {
+                        for (int nb = 0; nb < HIPFIRE_FP8_V2_NB; nb++) {
                             const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
 #endif
                             P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, P[nb][0]);
@@ -730,14 +756,14 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                         const v2i_t w0 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(0, kstep));
                         const v2i_t w1 = *(const v2i_t*)(w_fptr + HIPFIRE_FP8_V2_WFRAG(1, kstep));
                         #pragma unroll
-                        for (int nb = 0; nb < 4; nb++) {
+                        for (int nb = 0; nb < HIPFIRE_FP8_V2_NB; nb++) {
                             const v2i_t a = *(const v2i_t*)(a_fptr + HIPFIRE_FP8_V2_AFRAG(nb, kstep));
 #else
                         const int off = kstep * 16 + kg * 8;
                         const v2i_t w0 = *(const v2i_t*)(lds_W + (wave_wt + ml) * HIPFIRE_FP8_V2_STRIDE + off);
                         const v2i_t w1 = *(const v2i_t*)(lds_W + (wave_wt + 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
                         #pragma unroll
-                        for (int nb = 0; nb < 4; nb++) {
+                        for (int nb = 0; nb < HIPFIRE_FP8_V2_NB; nb++) {
                             const v2i_t a = *(const v2i_t*)(lds_A + (wave_tok + nb * 16 + ml) * HIPFIRE_FP8_V2_STRIDE + off);
 #endif
                             P[nb][0] = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(w0, a, P[nb][0]);
@@ -778,9 +804,16 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                         for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
                             #pragma unroll
                             for (int pp = 0; pp < 2; pp++) {
+#if HIPFIRE_FP8_V2_NB == 2
+                                // No W prefetch on half tiles: zero-select here;
+                                // expand(0) is all-zero E4M3 (bit-identical).
+                                const unsigned int pk = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
+                                const v2i_t e8 = mq4_qpk_to_e4m3(st_wok[r] ? pk : 0u);
+#else
                                 // Wpk is already zero-selected at prefetch;
                                 // expand(0) is all-zero E4M3 (bit-identical).
                                 const v2i_t e8 = mq4_qpk_to_e4m3(Wpk_pf[r * 2 + pp]);
+#endif
                                 *(v2i_t*)(lds_W +
 #if HIPFIRE_FP8_V2_FRAG_ORDER
                                     st_wslot[r][pp]) = e8;
@@ -794,9 +827,9 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
 
                 if (slab == HIPFIRE_FP8_V2_NSLABS - 1) {
                     // Fold at the 128-K half boundary. Stream s/z; S per token frag.
-                    float Sh[4];
+                    float Sh[HIPFIRE_FP8_V2_NB];
                     #pragma unroll
-                    for (int nb = 0; nb < 4; nb++) {
+                    for (int nb = 0; nb < HIPFIRE_FP8_V2_NB; nb++) {
                         Sh[nb] = *(const float*)(lds_S + (unsigned int)(wave_tok + nb * 16 + ml) * 4u);
                     }
                     #pragma unroll
@@ -808,7 +841,7 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                             const float s_h = szp[0];
                             const float z_h = szp[1];
                             #pragma unroll
-                            for (int nb = 0; nb < 4; nb++) {
+                            for (int nb = 0; nb < HIPFIRE_FP8_V2_NB; nb++) {
                                 T[nb][wf][j] = fmaf(s_h, P[nb][wf][j], T[nb][wf][j]);
                                 T[nb][wf][j] = fmaf(z_h, Sh[nb], T[nb][wf][j]);
                             }
@@ -832,10 +865,11 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     // Per-element arithmetic is unchanged (y = a[t]*T, one residual add),
     // hence bit-identical; only the visit order changes. A/W/S/SZ are dead
     // (all folds complete), so the tile reuses LDS base: 8 waves x 16 x 32
-    // floats = 16 KiB < 24 KiB, no host change.
+    // floats = 16 KiB. Full tiles stage >= 16 KiB already; half tiles pad
+    // stage LDS to 16 KiB (host vlds = max(stage, WAVES*2048)).
     float* lds_tile = (float*)lds;
     #pragma unroll
-    for (int nb = 0; nb < 4; nb++) {
+    for (int nb = 0; nb < HIPFIRE_FP8_V2_NB; nb++) {
         #pragma unroll
         for (int wf = 0; wf < 2; wf++) {
             #pragma unroll
