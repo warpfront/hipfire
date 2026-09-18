@@ -2743,6 +2743,204 @@ impl Gpu {
             None,
         )
     }
+    /// Batched native fp8-E4M3 decode/prefill (F slice, gfx1201-only): same
+    /// 15-arg ABI, grid [n_heads,batch_size,1] and LDS as
+    /// `attention_q8_0_kv_batched_masked`; tree_bias passes through, slot
+    /// descriptors stay null (noslots — fp8 is contiguous single-arena).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_kv_batched(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.attention_native_kv_batched_impl(
+            "attention_fp8_e4m3_kv_batched",
+            kernels::ATTENTION_FP8_E4M3_KV_BATCHED_SRC,
+            fp8_e4m3_row_bytes(n_kv_heads, head_dim),
+            "attention_fp8_e4m3_kv_batched",
+            crate::profile::attention_fp8_e4m3_kv_bytes,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            tree_bias,
+            block_start,
+            block_cols,
+        )
+    }
+    /// Batched native flat-bf16 decode/prefill (F slice): same shape as the
+    /// fp8 twin with 2048 B flat rows; plain causal (no window arg on this
+    /// ABI — Qwen dense window=0 semantics).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_bf16_kv_batched(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.attention_native_kv_batched_impl(
+            "attention_bf16_kv_batched",
+            kernels::ATTENTION_BF16_KV_BATCHED_SRC,
+            bf16_row_bytes(n_kv_heads, head_dim),
+            "attention_bf16_kv_batched",
+            crate::profile::attention_bf16_kv_bytes,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            tree_bias,
+            block_start,
+            block_cols,
+        )
+    }
+    /// Shared batched native-KV body (fp8 + bf16): mirrors
+    /// `attention_q8_0_kv_batched_masked_slots` with null slot descriptors.
+    /// The TU's `#include "kv_slot_desc.h"` is strip-and-prepended like the
+    /// Q8 sibling (runtime hipcc has no -I to kernels/src).
+    #[allow(clippy::too_many_arguments)]
+    fn attention_native_kv_batched_impl(
+        &mut self,
+        kernel: &'static str,
+        src: &'static str,
+        row_bytes: usize,
+        profile_name: &'static str,
+        byte_fn: fn(usize, usize, usize, usize) -> usize,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        check_native_kv_capacity(k_cache, max_seq, row_bytes, kernel)?;
+        check_native_kv_capacity(v_cache, max_seq, row_bytes, kernel)?;
+        if !self.functions.contains_key(kernel) {
+            let stripped = src.replace("#include \"kv_slot_desc.h\"", "");
+            let full_src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
+            self.ensure_kernel(kernel, &full_src, kernel)?;
+        }
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut bias_ptr: *mut std::ffi::c_void = match tree_bias {
+            Some(t) => t.buf.as_ptr(),
+            None => std::ptr::null_mut(),
+        };
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ms = max_seq as i32;
+        let mut sc = scale;
+        let mut bs = block_start as i32;
+        let mut bc = block_cols as i32;
+        let mut desc_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut rs_ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut bias_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut bc as *mut _ as *mut c_void,
+            &mut desc_ptr as *mut _ as *mut c_void,
+            &mut rs_ptr as *mut _ as *mut c_void,
+        ];
+        let block_size = (max_ctx_len.max(head_dim) as u32)
+            .next_power_of_two()
+            .min(256);
+        let shared_mem = ((max_ctx_len + block_size as usize + head_dim) * 4) as u32;
+        let bytes = byte_fn(n_heads, n_kv_heads, head_dim, max_ctx_len) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "attention", profile_name, bytes);
+        let bias_raw = bias_ptr;
+        let desc_raw = desc_ptr;
+        let rs_raw = rs_ptr;
+        let result = self.launch_maybe_blob(
+            kernel,
+            [n_heads as u32, batch_size as u32, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_ptr(bias_raw);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b.push_i32(bs);
+                b.push_i32(bc);
+                b.push_ptr(desc_raw);
+                b.push_ptr(rs_raw);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
 
     /// Q8 attention for a batch of independent decode sequences. Every row
     /// reads a private lane-major KV slice of `lane_capacity` positions.
@@ -5271,6 +5469,72 @@ impl Gpu {
             None,
         )
     }
+    /// Batched native fp8-E4M3 flash prefill (F slice, gfx1201-only): routes
+    /// through the shared `launch_asym_flash_batched` dispatcher with the
+    /// shared f32 batched reduce (partials-only, KV-dtype-agnostic).
+    /// tree_bias passes through; slot descriptors stay null (noslots).
+    /// `V_MODE_Q8` keeps the kernarg blob shape identical to the Q8 path the
+    /// shared launcher was written for (consumed-but-unused by the tile).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_fp8_e4m3_tile_batched(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        check_native_kv_capacity(
+            k_cache,
+            max_seq,
+            fp8_e4m3_row_bytes(n_kv_heads, head_dim),
+            "attention_flash_fp8_e4m3_tile_batched",
+        )?;
+        check_native_kv_capacity(
+            v_cache,
+            max_seq,
+            fp8_e4m3_row_bytes(n_kv_heads, head_dim),
+            "attention_flash_fp8_e4m3_tile_batched",
+        )?;
+        self.launch_asym_flash_batched(
+            "attention_flash_fp8_e4m3_tile_batched",
+            kernels::ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC,
+            "attention_flash_fp8_e4m3_tile_batched",
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            q, // cos_theta dummy — kernel ignores
+            q, // sin_theta dummy — kernel ignores
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            max_ctx_len,
+            batch_size,
+            partials,
+            tree_bias,
+            block_start,
+            block_cols,
+            V_MODE_Q8,
+            /*window=*/ 0,
+            /*force_wmma_grid=*/ false,
+            None,
+            None,
+        )
+    }
 
     /// One KV scan for `batch_size` query rows; `Ok(false)` = out of scope, caller must fall back.
     #[allow(clippy::too_many_arguments)]
@@ -5882,6 +6146,160 @@ impl Gpu {
                     },
                 )?;
             }
+        }
+        Ok(())
+    }
+    /// Native fp8-E4M3 flash decode (F slice, gfx1201-only): tile + shared
+    /// f32 reduce, mirroring `attention_flash_q8_0_windowed_impl` at window=0
+    /// (Qwen dense has no sliding window; fp8 has no ring variant, so the
+    /// effective-seq scan is the plain seq_len_hint). Gate/AWQ are rejected
+    /// at the dispatch arm — no gated fp8 reduce exists. The reduce is the
+    /// shared `attention_flash_q8_0_reduce`, which only touches f32 partials.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_flash_fp8_e4m3_tile(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        partials: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        check_native_kv_capacity(
+            k_cache,
+            max_seq,
+            fp8_e4m3_row_bytes(n_kv_heads, head_dim),
+            "attention_flash_fp8_e4m3_tile",
+        )?;
+        check_native_kv_capacity(
+            v_cache,
+            max_seq,
+            fp8_e4m3_row_bytes(n_kv_heads, head_dim),
+            "attention_flash_fp8_e4m3_tile",
+        )?;
+        // Same tile-size policy as the Q8 path, so a partials buffer sized
+        // from max_tiles stays correct whichever tier the caller picked.
+        let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
+        let max_tiles = (max_seq + tile_size - 1) / tile_size;
+        let actual_tiles = (seq_len_hint + tile_size - 1) / tile_size;
+        // Graph/Redline-safe: capture the max_tiles superset so replay never
+        // needs a grid larger than the recorded one.
+        let launch_tiles = replay_stable_tile_count(
+            actual_tiles,
+            max_tiles,
+            self.graphs.capture_mode,
+            self.replay.is_recording(),
+        );
+        // ── Tile kernel ──
+        self.ensure_kernel(
+            "attention_flash_fp8_e4m3_tile",
+            kernels::ATTENTION_FLASH_FP8_E4M3_TILE_SRC,
+            "attention_flash_fp8_e4m3_tile",
+        )?;
+        {
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let q_ptr = q.buf.as_ptr();
+            let k_ptr = k_cache.buf.as_ptr();
+            let v_ptr = v_cache.buf.as_ptr();
+            let p_ptr = partials.buf.as_ptr();
+            let pos_ptr = pos_buf.as_ptr();
+            let nh = n_heads as i32;
+            let nkv = n_kv_heads as i32;
+            let hd = head_dim as i32;
+            let ms = max_seq as i32;
+            let sc = scale;
+            let ts = tile_size as i32;
+            let wn = 0i32;
+            let es = 0i32;
+            let grid = [n_heads as u32, launch_tiles as u32, 1];
+            let shared = ((tile_size + head_dim) * 4) as u32;
+            let mut params: Vec<*mut c_void> = vec![
+                &q_ptr as *const _ as *mut c_void,
+                &k_ptr as *const _ as *mut c_void,
+                &v_ptr as *const _ as *mut c_void,
+                &p_ptr as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &nkv as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &ms as *const _ as *mut c_void,
+                &sc as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &wn as *const _ as *mut c_void,
+                &es as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob_position_grid(
+                "attention_flash_fp8_e4m3_tile",
+                grid,
+                [32, 1, 1],
+                shared,
+                &mut params,
+                1,
+                1,
+                tile_size as u32,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(q_ptr);
+                    b.push_ptr(k_ptr);
+                    b.push_ptr(v_ptr);
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(pos_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(nkv);
+                    b.push_i32(hd);
+                    b.push_i32(ms);
+                    b.push_f32(sc);
+                    b.push_i32(ts);
+                    b.push_i32(wn);
+                    b.push_i32(es);
+                    b
+                },
+            )?;
+        }
+        // ── Reduce kernel (shared f32 reduce; reads seq_len from pos_buf) ──
+        {
+            let p_ptr = partials.buf.as_ptr();
+            let o_ptr = out.buf.as_ptr();
+            let nh = n_heads as i32;
+            let hd = head_dim as i32;
+            let pos_ptr = pos_buf.as_ptr();
+            let ts = tile_size as i32;
+            let mt = max_tiles as i32;
+            const KERNEL: &str = "attention_flash_q8_0_reduce";
+            self.ensure_kernel(KERNEL, kernels::ATTENTION_FLASH_Q8_0_REDUCE_SRC, KERNEL)?;
+            let mut params: Vec<*mut c_void> = vec![
+                &p_ptr as *const _ as *mut c_void,
+                &o_ptr as *const _ as *mut c_void,
+                &nh as *const _ as *mut c_void,
+                &hd as *const _ as *mut c_void,
+                &pos_ptr as *const _ as *mut c_void,
+                &ts as *const _ as *mut c_void,
+                &mt as *const _ as *mut c_void,
+            ];
+            self.launch_maybe_blob(
+                KERNEL,
+                [n_heads as u32, 1, 1],
+                [256, 1, 1],
+                (max_tiles * 4) as u32,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(p_ptr);
+                    b.push_ptr(o_ptr);
+                    b.push_i32(nh);
+                    b.push_i32(hd);
+                    b.push_ptr(pos_ptr);
+                    b.push_i32(ts);
+                    b.push_i32(mt);
+                    b
+                },
+            )?;
         }
         Ok(())
     }
@@ -9353,6 +9771,154 @@ impl Gpu {
         let timer = crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_kv", bytes);
         let result = self.launch_maybe_blob(
             "attention_q8_0_kv",
+            [n_heads as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_ptr);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(ms);
+                b.push_f32(sc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Native fp8-E4M3 scalar decode (F slice, gfx1201-only): same 10-arg ABI,
+    /// grid [n_heads,1,1], block 256 and LDS as `attention_q8_0_kv`; only the
+    /// K/V load/address decode reads token-local fp8 rows. Capacity guard
+    /// skips VMM owners (mapped prefix, not logical capacity).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_kv(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+    ) -> HipResult<()> {
+        self.attention_native_kv_impl(
+            "attention_fp8_e4m3_kv",
+            kernels::ATTENTION_FP8_E4M3_KV_SRC,
+            fp8_e4m3_row_bytes(n_kv_heads, head_dim),
+            "attention_fp8_e4m3_kv",
+            crate::profile::attention_fp8_e4m3_kv_bytes,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            pos_buf,
+            seq_len_hint,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+        )
+    }
+    /// Native flat-bf16 scalar decode (F slice): same shape as the fp8 twin,
+    /// bf16-to-f32 widening at the cooperative LDS fill, 2048 B rows/side.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_bf16_kv(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+    ) -> HipResult<()> {
+        self.attention_native_kv_impl(
+            "attention_bf16_kv",
+            kernels::ATTENTION_BF16_KV_SRC,
+            bf16_row_bytes(n_kv_heads, head_dim),
+            "attention_bf16_kv",
+            crate::profile::attention_bf16_kv_bytes,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            pos_buf,
+            seq_len_hint,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+        )
+    }
+    fn attention_native_kv_impl(
+        &mut self,
+        kernel: &'static str,
+        src: &'static str,
+        row_bytes: usize,
+        profile_name: &'static str,
+        byte_fn: fn(usize, usize, usize, usize) -> usize,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        pos_buf: &DeviceBuffer,
+        seq_len_hint: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        check_native_kv_capacity(k_cache, max_seq, row_bytes, kernel)?;
+        check_native_kv_capacity(v_cache, max_seq, row_bytes, kernel)?;
+        self.ensure_kernel(kernel, src, kernel)?;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_ptr = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = pos_buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ms = max_seq as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_ptr as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ms as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Same fixed geometry as attention_q8_0_kv: block 256, LDS tiled over
+        // positions with online softmax (no O(seq_len) fault past ~15.9k).
+        const ATT_NATIVE_KV_TILE: usize = 2048;
+        let block_size: u32 = 256;
+        let shared_mem = ((ATT_NATIVE_KV_TILE + head_dim + block_size as usize) * 4) as u32;
+        let bytes = byte_fn(n_heads, n_kv_heads, head_dim, seq_len_hint);
+        let timer = crate::profile::begin_timer(&self.hip, "attention", profile_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
             [n_heads as u32, 1, 1],
             [block_size, 1, 1],
             shared_mem,

@@ -5742,6 +5742,23 @@ pub const KV_CACHE_WRITE_Q8_0_BATCHED_SRC: &str =
 /// Layout: [max_seq × n_kv_heads × blocks_per_head × 34].
 pub const KV_CACHE_WRITE_Q8_0_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_q8_0.hip");
+/// Native fp8-E4M3 KV write (F slice, gfx1201-only): same TU as
+/// [`KV_CACHE_WRITE_Q8_0_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`, exposing
+/// `kv_cache_write_fp8_e4m3`. Grid [n_kv_heads,1,1], block [32,1,1], one
+/// wave/head. Token-local rows: Hkv*D codes + Hkv f16 scales (1032 B/side
+/// at Hkv=4,D=256).
+pub const KV_CACHE_WRITE_FP8_E4M3_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/kv_cache_write_q8_0.hip")
+);
+/// Batched twin: `kv_cache_write_fp8_e4m3_batched`, grid [n_kv_heads,
+/// batch_size, 1]. Same TU as [`KV_CACHE_WRITE_Q8_0_BATCHED_SRC`]; launchers
+/// strip-and-prepend `KV_SLOT_DESC_H` exactly like the Q8 sibling because
+/// the runtime hipcc compile has no -I to kernels/src.
+pub const KV_CACHE_WRITE_FP8_E4M3_BATCHED_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/kv_cache_write_q8_0_batched.hip")
+);
 
 /// Flat BF16 KV write (maple). 2 bytes per element, no blocks and no scales.
 /// Layout: [max_seq × n_kv_heads × head_dim] bf16. Holds both the decode
@@ -5777,6 +5794,35 @@ pub const ATTENTION_Q8_0_KV_SWA_SRC: &str =
 /// one launch with per-row causal windows from a positions[] array.
 pub const ATTENTION_Q8_0_KV_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip");
+/// Native fp8-E4M3 scalar decode (`attention_fp8_e4m3_kv`): same TU as
+/// [`ATTENTION_Q8_0_KV_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`. Same 10-arg ABI
+/// and [n_heads,1,1]/256 launch as the Q8 sibling; only the K/V
+/// load/address decode differs.
+pub const ATTENTION_FP8_E4M3_KV_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/attention_q8_0_kv.hip")
+);
+/// Native flat-bf16 scalar decode (`attention_bf16_kv`): same TU with
+/// `HIPFIRE_KV_BF16=1`. Same ABI/launch; bf16-to-f32 widening at fill.
+pub const ATTENTION_BF16_KV_SRC: &str = concat!(
+    "#define HIPFIRE_KV_BF16 1\n",
+    include_str!("../../../kernels/src/attention_q8_0_kv.hip")
+);
+/// Batched fp8 (`attention_fp8_e4m3_kv_batched`): same TU as
+/// [`ATTENTION_Q8_0_KV_BATCHED_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`. Same
+/// 15-arg ABI (tree_bias/block_start/block_cols + slot_descs/row_slot
+/// tail); launchers strip-and-prepend `KV_SLOT_DESC_H` like the Q8 sibling.
+pub const ATTENTION_FP8_E4M3_KV_BATCHED_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip")
+);
+/// Batched bf16 (`attention_bf16_kv_batched`): same TU with
+/// `HIPFIRE_KV_BF16=1`. Same ABI; Qwen dense passes null descriptors
+/// (noslots) and window=0 semantics (no window arg on this ABI).
+pub const ATTENTION_BF16_KV_BATCHED_SRC: &str = concat!(
+    "#define HIPFIRE_KV_BF16 1\n",
+    include_str!("../../../kernels/src/attention_q8_0_kv_batched.hip")
+);
 
 /// Query-tiled Q8_0 flash prefill attention. LDS depends only on BR/BC,
 /// never on context length, so one kernel serves every sequence length.
@@ -6048,6 +6094,24 @@ pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip");
 pub const ATTENTION_FLASH_BF16_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_bf16_tile_batched.hip");
+/// Native fp8-E4M3 flash tile (`attention_flash_fp8_e4m3_tile`): same TU as
+/// [`ATTENTION_FLASH_Q8_0_TILE_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`. Same
+/// 13-arg ABI (incl. trailing effective_seq_len); the reduce is the shared
+/// `attention_flash_q8_0_reduce`, which only touches f32 partials.
+pub const ATTENTION_FLASH_FP8_E4M3_TILE_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile.hip")
+);
+/// Batched fp8 flash tile (`attention_flash_fp8_e4m3_tile_batched`): same TU
+/// as [`ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC`] with `HIPFIRE_KV_FP8_E4M3=1`.
+/// Same full asym ABI (cos/sin dummies, tree_bias, v_mode_bits, window,
+/// slot_descs/row_slot tail), so it routes through `launch_asym_flash_batched`
+/// with the shared batched reduce; the shared launcher's
+/// `ensure_givens4_kernel` already strip-and-prepends `KV_SLOT_DESC_H`.
+pub const ATTENTION_FLASH_FP8_E4M3_TILE_BATCHED_SRC: &str = concat!(
+    "#define HIPFIRE_KV_FP8_E4M3 1\n",
+    include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip")
+);
 pub const ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_rows.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
