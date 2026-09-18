@@ -201,6 +201,17 @@ pub struct ScratchState {
     /// it (same-stream ordering), so no init is needed.
     pub fa2_q16_scratch: Option<DeviceBuffer>,
     pub fa2_q16_scratch_bytes: usize,
+    /// Stage-b fp8 Q scratch (the stage-b Q pre-convert writes it, the
+    /// stage-b FA2 body reads it): [batch, 24, 256] e4m3 codes followed by
+    /// [batch, 24] f32 `sq`, followed (route Q only) by the 64-key scale
+    /// plane (256 B per (blockIdx.x, kv_h, split) slot: 64 f16 K scales +
+    /// 64 f16 V scales). Grows-never-shrinks with the same pre-growth
+    /// capture invalidation as `fa2_q16_scratch`. Route N never sizes the
+    /// scale plane (it reads scales from the native row header). Every
+    /// valid cell is written by the pre-convert/fill before the body reads
+    /// it (same-stream ordering), so no init is needed.
+    pub fa2_fp8_q_scratch: Option<DeviceBuffer>,
+    pub fa2_fp8_q_scratch_bytes: usize,
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────
@@ -527,6 +538,35 @@ pub(crate) fn q8_1_mmq_x_needed(k: usize, batch_size: usize) -> usize {
     let block_q8_1_mmq_bytes = 144usize;
     blocks_k * batch_size * block_q8_1_mmq_bytes
 }
+/// Byte geometry of the stage-b fp8 Q scratch slot for
+/// `(batch_size, n_splits, with_scale_plane)`: returns
+/// `(total_bytes, sq_offset, scale_offset)` where `sq_offset` starts the
+/// `[batch, 24]` f32 `sq` section after the `[batch, 24, 256]` e4m3 codes,
+/// and `scale_offset` starts the route-Q 64-key scale plane (256 B per
+/// `(blockIdx.x, kv_h, split)` slot: 64 f16 K scales + 64 f16 V scales).
+/// Route N passes `with_scale_plane = false` (scales come from the native
+/// row header, never sized in). All three sections are 16-byte aligned at
+/// every admitted batch (codes are batch*6144 B, sq batch*96 B, plane
+/// slots*256 B). Shared by `ensure_fa2_fp8_q_scratch` and the stage-b
+/// launchers, which need the same number for the pre-growth invalidation
+/// check. Callers must have validated `batch_size`/`n_splits` first.
+#[inline]
+pub(crate) fn fa2_fp8_q_needed(
+    batch_size: usize,
+    n_splits: usize,
+    with_scale_plane: bool,
+) -> (usize, usize, usize) {
+    let codes_bytes = batch_size * 24 * 256;
+    let sq_bytes = batch_size * 24 * 4;
+    let sq_offset = codes_bytes;
+    let scale_offset = codes_bytes + sq_bytes;
+    let scale_bytes = if with_scale_plane {
+        batch_size.div_ceil(8) * 4 * n_splits * 256
+    } else {
+        0
+    };
+    (scale_offset + scale_bytes, sq_offset, scale_offset)
+}
 
 /// Byte size of the `int4_mmq_x_scratch` slot for `(k, batch_size)`: one 72 B
 /// `block_i4_128` per [K/128 block, batch]. Shared by `ensure_int4_mmq_x`
@@ -619,6 +659,25 @@ impl ScratchState {
             n_bytes,
         )?;
         Ok(self.fa2_q16_scratch.as_ref().unwrap().as_ptr())
+    }
+    /// Ensure the stage-b FA2 fp8 Q scratch holds at least `n_bytes`
+    /// (`fa2_fp8_q_needed(batch, n_splits, with_scale_plane).0`), growing
+    /// (never shrinking). Returns the device base pointer: e4m3 codes at
+    /// +0, f32 `sq` at +batch*24*256, route-Q scale plane after that.
+    /// No init needed: the stage-b pre-convert/fill writes every valid
+    /// cell before the stage-b body reads it (same-stream ordering).
+    pub fn ensure_fa2_fp8_q_scratch(
+        &mut self,
+        hip: &HipRuntime,
+        n_bytes: usize,
+    ) -> HipResult<*mut c_void> {
+        grow_scratch_buffer(
+            hip,
+            &mut self.fa2_fp8_q_scratch,
+            &mut self.fa2_fp8_q_scratch_bytes,
+            n_bytes,
+        )?;
+        Ok(self.fa2_fp8_q_scratch.as_ref().unwrap().as_ptr())
     }
 
     /// Ensure the dedicated GEMV-residual temporary can hold at least
@@ -2161,5 +2220,60 @@ mod scratch_growth_tests {
         assert_eq!(int4_mmq_reserve_needed(2048, 1024), 16 * 1024 * 72);
         // mq4v2 fp8: n*k bytes, n*(k/256)*2 f32 half-sums, n f32 row scales.
         assert_eq!(mq4v2_fp8_needed(32, 2048), (65536, 32 * 8 * 2 * 4, 32 * 4));
+    }
+    /// Stage-b fp8 Q scratch layout (§3–§4 of the stage-b plan): sections
+    /// 16-byte aligned and mutually disjoint for every admitted
+    /// batch × splits combination, with the route-Q scale plane never
+    /// aliasing `sq` and route N sizing no plane at all.
+    #[test]
+    fn fa2_fp8_q_layout_aligned_and_disjoint() {
+        for &batch in &[1usize, 7, 8, 9, 512] {
+            for &splits in &[1usize, 8] {
+                for &with_plane in &[false, true] {
+                    let (total, sq_off, scale_off) =
+                        fa2_fp8_q_needed(batch, splits, with_plane);
+                    let codes_bytes = batch * 24 * 256;
+                    let sq_bytes = batch * 24 * 4;
+                    // Sections tile the buffer exactly, in order.
+                    assert_eq!(sq_off, codes_bytes, "b={batch} s={splits}");
+                    assert_eq!(scale_off, codes_bytes + sq_bytes, "b={batch} s={splits}");
+                    // Every section start (and the end) is 16-byte aligned.
+                    assert_eq!(sq_off % 16, 0, "b={batch}");
+                    assert_eq!(scale_off % 16, 0, "b={batch}");
+                    assert_eq!(total % 16, 0, "b={batch} s={splits}");
+                    // Non-empty codes/sq for every admitted batch.
+                    assert!(codes_bytes > 0 && sq_bytes > 0);
+                    let grid_x = batch.div_ceil(8);
+                    let n_slots = grid_x * 4 * splits;
+                    if with_plane {
+                        // 256 B per (blockIdx.x, kv_h, split) slot: 64 f16
+                        // K scales + 64 f16 V scales.
+                        assert_eq!(total - scale_off, n_slots * 256);
+                        // First and last slots' K/V halves are disjoint and
+                        // inside the plane.
+                        for &slot in &[0, n_slots - 1] {
+                            let base = scale_off + slot * 256;
+                            let k_end = base + 128;
+                            let v_end = base + 256;
+                            assert!(base >= scale_off && v_end <= total);
+                            assert!(k_end <= base + 128 && base + 128 < v_end);
+                        }
+                    } else {
+                        // Route N: no scale plane sized in, nothing aliases sq.
+                        assert_eq!(total, scale_off);
+                    }
+                }
+                // Route N never pays for the route-Q plane.
+                let (with, _, _) = fa2_fp8_q_needed(batch, splits, true);
+                let (without, _, _) = fa2_fp8_q_needed(batch, splits, false);
+                assert!(with > without);
+            }
+        }
+        // Pin the §13 total: batch 512 / 8 splits with plane = 3,719,168 B.
+        assert_eq!(fa2_fp8_q_needed(512, 8, true).0, 3_719_168);
+        assert_eq!(
+            fa2_fp8_q_needed(512, 8, true),
+            (3_719_168, 512 * 24 * 256, 512 * 24 * 256 + 512 * 24 * 4)
+        );
     }
 }
