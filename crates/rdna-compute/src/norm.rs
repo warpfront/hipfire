@@ -4654,6 +4654,136 @@ impl Gpu {
         result
     }
 
+    /// gfx1201 batched prefill GDN preamble fusion (slice P): sigmoid(beta) +
+    /// alpha gate + conv1d + SiLU + split + Q/K norm + scale + interleave in
+    /// ONE launch (`gdn_pre_batched_gfx1201`). Byte-exact vs the 3-launch
+    /// sequence; the launcher gates every admission condition the kernel
+    /// header requires (exact gfx1201 is checked at the dispatch site).
+    /// `q_raw`/`k_raw` stores are kept (v1).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_pre_batched_gfx1201(
+        &mut self,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        qkv_in: &GpuTensor,
+        conv_w: &GpuTensor,
+        conv_state: &GpuTensor,
+        q_raw: &GpuTensor,
+        k_raw: &GpuTensor,
+        v_out: &GpuTensor,
+        q_dst: &GpuTensor,
+        k_dst: &GpuTensor,
+        n_v_heads: usize,
+        n_key_heads: usize,
+        ratio: usize,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const KERNEL: &str = "gdn_pre_batched_gfx1201";
+        const BLOCK: u32 = 256;
+        const R: usize = 32;
+        self.ensure_kernel(KERNEL, kernels::GDN_PRE_BATCHED_GFX1201_SRC, KERNEL)?;
+        let bp = beta.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let dtp = dt_bias.buf.as_ptr();
+        let alp = a_log.buf.as_ptr();
+        let ip = qkv_in.buf.as_ptr();
+        let wp = conv_w.buf.as_ptr();
+        let sp = conv_state.buf.as_ptr();
+        let qrp = q_raw.buf.as_ptr();
+        let krp = k_raw.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let qdp = q_dst.buf.as_ptr();
+        let kdp = k_dst.buf.as_ptr();
+        let nvh = n_v_heads as i32;
+        let nkh = n_key_heads as i32;
+        let ra = ratio as i32;
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let qkv = (2 * k_dim + v_dim) as i32;
+        let nt = n_tokens as i32;
+        let qs = q_scale;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &bp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &dtp as *const _ as *mut c_void,
+            &alp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &qrp as *const _ as *mut c_void,
+            &krp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &qdp as *const _ as *mut c_void,
+            &kdp as *const _ as *mut c_void,
+            &nvh as *const _ as *mut c_void,
+            &nkh as *const _ as *mut c_void,
+            &ra as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &qkv as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        let n_groups = (n_tokens + R - 1) / R;
+        let qk_blocks = n_key_heads * n_groups;
+        let v_blocks = (v_dim + BLOCK as usize - 1) / BLOCK as usize;
+        let grid = (qk_blocks + v_blocks * n_groups + n_groups) as u32;
+        // Distinct DRAM: qkv read + raw write + normed q/k write +
+        // beta/alpha read+write (weights/ring negligible, L2-resident).
+        let n = n_tokens;
+        let bytes = n * (2 * k_dim + v_dim) * 4
+            + n * (2 * k_dim + v_dim) * 4
+            + 2 * n * n_v_heads * 128 * 4
+            + 4 * n * n_v_heads * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [grid, 1, 1],
+            [BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(bp);
+                b.push_ptr(ap);
+                b.push_ptr(dtp);
+                b.push_ptr(alp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(qrp);
+                b.push_ptr(krp);
+                b.push_ptr(vp);
+                b.push_ptr(qdp);
+                b.push_ptr(kdp);
+                b.push_i32(nvh);
+                b.push_i32(nkh);
+                b.push_i32(ra);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(qkv);
+                b.push_i32(nt);
+                b.push_f32(qs);
+                b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Independent-sequence decode variant of [`Self::conv1d_silu_split_f32_n`].
     /// Each row owns a distinct convolution ring; no token in one lane can
     /// advance another lane's state.

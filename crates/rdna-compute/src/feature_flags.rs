@@ -227,6 +227,12 @@ pub struct FeatureFlags {
     /// N>=256 (smaller batches keep s2bt8/BT). The four family flags remain
     /// prerequisites; the activation prelude is unchanged.
     pub gfx12_mq4v2_fp8_v2: bool,
+    /// gfx1201 batched prefill GDN preamble fusion (slice P:
+    /// `HIPFIRE_GFX12_GDN_PRE_FUSED`, `kernel.gfx12_gdn_pre_fused`).
+    /// Default OFF everywhere; `=1` fuses sigmoid+conv+qknorm into
+    /// `gdn_pre_batched_gfx1201` on the sequential dense prefill route.
+    /// Byte-exact vs the 3-launch sequence; any byte difference kills it.
+    pub gfx12_gdn_pre_fused: bool,
     /// `HIPFIRE_GFX12_FA2_PREFILL=0` opts out of the gfx1201 GQA-fused FA2
     /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
     /// Default ON on exact gfx1201; `=1` forces it on other arches
@@ -604,6 +610,7 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_v2: value("HIPFIRE_GFX12_MQ4V2_FP8_V2").as_deref() == Ok("1"),
+            gfx12_gdn_pre_fused: value("HIPFIRE_GFX12_GDN_PRE_FUSED").as_deref() == Ok("1"),
             gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
                 .unwrap_or(arch == "gfx1201"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
@@ -901,6 +908,7 @@ impl FeatureFlags {
             graph_moe: true,
             force_blob_path: false,
             residual_ksplit_off: false,
+            gfx12_gdn_pre_fused: false,
             residual_ldsstage: false,
             gate_up_ldsstage: false,
             gfx12_mq4v2_fp8_gateup: false,
