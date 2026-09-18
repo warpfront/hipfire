@@ -335,6 +335,24 @@ The honest present conclusion is **not “f16 stage a is proven impossible”**:
 
 ### R1 verdict, 2026-09-18 — ABANDONED at G1 (agent Fa2RegR1)
 
+### UPDATE 2026-09-18 — Main's relaxation: CONTINUE to G2/§11 (supersedes the abandon above)
+
+Main's explicit decision per G1.2: the ≤240 figure was headroom, not the contract.
+The contract is 0 spills / 0 scratch with the QK loop fully unrolled and the 56
+whole-tile addresses gone — met at 248/244. Relaxation to ≤256 granted for THIS
+candidate only, conditional on (a) and (b), both verified below. Recorded as
+Main's decision, not a silent pass.
+
+(a) Occupancy remark (exact lines, `E/Fa2RegR1/compile_fp8.log`):
+`attention_q8_0_fa2_gqa_fp8_gfx1201`: VGPRs 248, `Occupancy [waves/SIMD]: 5`;
+`attention_q8_0_fa2_gqa_partial_fp8_gfx1201`: VGPRs 244, `Occupancy: 5`.
+Both ≥ 4 as §4 requires (four-WG/WGP = two-WG/CU capacity at 32 KiB dynamic LDS).
+
+(b) ISA lifetime check holds: 80 WMMAs/entry (64 QK + 16 PV), 0
+`scratch_load/store` in the whole object, 0/0 spills, ScratchSize 0 on every
+entry. The K-specific `&63` wrap idiom occurs 68× in the direct body, all at or
+before the last QK WMMA (line 4209), zero after — no group address survives into
+PV. Reconstructed PV-peak storage 239 (v1: 284). No new PV/store spills.
 Candidate: wt-fa2 branch `gfx12-fa2-fp8-a`, commit `eddc0c571`
 (`kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip` sha256
 `92e90dfd105a4937bb7c8c6cda923987ebe6c2136986da4b182a3bac319c0d4e`).
@@ -371,8 +389,7 @@ diagnostic copy (`E/Fa2RegR1/exp_nobarrier.hip`, score inputs stripped) emits
 byte-identical 248/244: the score-tied boundary costs 0 VGPR. The KMODE=3 module
 at 239/239/240 + 6 waves proves the address mechanism met its budget; the
 remaining ~8 VGPR in KMODE=0 are the per-fragment Q8 scale-multiply transients
-inherent to the v1 arithmetic contract. Removing them is scale movement under a
-new certification, explicitly out of scope — so no same-mechanism correction can
-credibly close the gap and the one-correction budget was deliberately unspent.
-G2 and §11 did not run (stop at first failure). Return to the stage-b plan and
-fresh KLD; do not land this candidate. Branch left with the candidate commit.
+so no same-mechanism correction can credibly close the gap and the one-correction
+budget was deliberately unspent.
+G2 and §11 run below under the relaxation; the admission verdict and raw numbers
+will be appended here. Branch keeps the candidate commit for stage b regardless.
