@@ -3269,6 +3269,131 @@ impl Gpu {
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
 
+    /// gfx1201 slices-2 IU4 producer: RMSNorm/FWHT + in-register `block_i4_128`
+    /// sidecar under the `_gfx12` entry symbols. `x_rot = None` skips the f32
+    /// store (emit_f32=false). `awq = Some` selects the AWQ twin symbol.
+    /// Seals `reservation` into a prepared handle — never calls
+    /// `ensure_int4_mmq_x`. Gated by `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`.
+    pub fn fused_rmsnorm_rotate_mq_i4_gfx12_batched(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.bind_thread()?;
+        if reservation.k() != k || reservation.n() != batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused_rmsnorm_rotate_mq_i4_gfx12_batched: reservation (k,n) mismatch",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        let (module, source, kernel) = match awq {
+            Some(_) => (
+                "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
+            ),
+            None => (
+                "fused_rmsnorm_mq_rotate_i4_gfx12",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_i4_gfx12",
+            ),
+        };
+        self.ensure_kernel(module, source, kernel)?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut i4p = reservation.ptr();
+        let mut kv = k as i32;
+        let mut eps_v = eps;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = if awq.is_some() {
+            vec![
+                &mut xp as *mut _ as *mut c_void,
+                &mut wp as *mut _ as *mut c_void,
+                &mut awp as *mut _ as *mut c_void,
+                &mut s1 as *mut _ as *mut c_void,
+                &mut s2 as *mut _ as *mut c_void,
+                &mut xrp as *mut _ as *mut c_void,
+                &mut i4p as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+                &mut eps_v as *mut _ as *mut c_void,
+                &mut nv as *mut _ as *mut c_void,
+            ]
+        } else {
+            vec![
+                &mut xp as *mut _ as *mut c_void,
+                &mut wp as *mut _ as *mut c_void,
+                &mut s1 as *mut _ as *mut c_void,
+                &mut s2 as *mut _ as *mut c_void,
+                &mut xrp as *mut _ as *mut c_void,
+                &mut i4p as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+                &mut eps_v as *mut _ as *mut c_void,
+                &mut nv as *mut _ as *mut c_void,
+            ]
+        };
+        let block_size = 256u32;
+        let shared_mem = ((k + 256) * 4) as u32;
+        let blocks_k = k / 128;
+        let bytes = (k * 4 * 3 + 2 * 256 * 4 + blocks_k * 72) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fused",
+            if awq.is_some() {
+                "fused_rmsnorm_mq_rotate_awq_i4_gfx12_batched"
+            } else {
+                "fused_rmsnorm_mq_rotate_i4_gfx12_batched"
+            },
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel,
+            [batch_size as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                if awq.is_some() {
+                    b.push_ptr(awp);
+                }
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(i4p);
+                b.push_i32(kv);
+                b.push_f32(eps_v);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
+        result?;
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+    }
+
+
     /// C2 IU4 producer: SwiGLU/FWHT + in-register `block_i4_128` sidecar.
     /// `x_rot = None` skips the f32 store. `awq = Some` selects the AWQ twin.
     pub fn fused_silu_mul_rotate_mq_i4_batched(
@@ -4018,6 +4143,116 @@ impl Gpu {
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
 
+    /// gfx1201 slices-3 IU4 producer: standalone FWHT rotate + in-register
+    /// `block_i4_128` emit for the attention out-proj input under the
+    /// `_gfx12` entry symbols. `awq = Some` selects the AWQ twin. The f32
+    /// `x_out` store is always written (byte-identical for every downstream
+    /// reader); the sidecar additionally seals `reservation` into a prepared
+    /// handle — never calls `ensure_int4_mmq_x`. Gated by
+    /// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`.
+    pub fn rotate_x_mq_i4_gfx12_batched(
+        &mut self,
+        x_in: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_out: &GpuTensor,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.bind_thread()?;
+        if reservation.k() != k || reservation.n() != batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rotate_x_mq_i4_gfx12_batched: reservation (k,n) mismatch",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        let (module, source, kernel) = match awq {
+            Some(_) => (
+                "mq_rotate_x_awq_i4_gfx12",
+                kernels::MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
+                "rotate_x_mq_awq_i4_gfx12",
+            ),
+            None => (
+                "mq_rotate_x_i4_gfx12",
+                kernels::MQ_ROTATE_X_I4_GFX12_SRC,
+                "mq_rotate_x_i4_gfx12",
+            ),
+        };
+        self.ensure_kernel(module, source, kernel)?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut xp = x_in.buf.as_ptr();
+        let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_out.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut i4p = reservation.ptr();
+        let mut kv = k as i32;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = if awq.is_some() {
+            vec![
+                &mut xp as *mut _ as *mut c_void,
+                &mut awp as *mut _ as *mut c_void,
+                &mut xrp as *mut _ as *mut c_void,
+                &mut s1 as *mut _ as *mut c_void,
+                &mut s2 as *mut _ as *mut c_void,
+                &mut i4p as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+                &mut nv as *mut _ as *mut c_void,
+            ]
+        } else {
+            vec![
+                &mut xp as *mut _ as *mut c_void,
+                &mut xrp as *mut _ as *mut c_void,
+                &mut s1 as *mut _ as *mut c_void,
+                &mut s2 as *mut _ as *mut c_void,
+                &mut i4p as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+                &mut nv as *mut _ as *mut c_void,
+            ]
+        };
+        let blocks_k = k / 128;
+        let bytes =
+            (k * 4 * 2 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fwht",
+            if awq.is_some() {
+                "rotate_x_mq_awq_i4_gfx12_batched"
+            } else {
+                "mq_rotate_x_i4_gfx12_batched"
+            },
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel,
+            [((k / 256) * batch_size) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                if awq.is_some() {
+                    b.push_ptr(awp);
+                }
+                b.push_ptr(xrp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(i4p);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result?;
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+    }
 
     /// FWHT-128 standalone rotation for MQ4G128 activations.
     ///
