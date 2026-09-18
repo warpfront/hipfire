@@ -407,38 +407,6 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
 #else
 #define HIPFIRE_FP8_V2_PICK(GR, ASRC, LR) do { int _v2g = (GR); const char* _v2a = A_gate; int _v2l = _v2g; if (_v2g >= gate_m) { _v2a = A_up; _v2l = _v2g - gate_m; } (ASRC) = _v2a; (LR) = _v2l; } while (0)
 #endif
-    // Slab-0 payload loads for trip (GG, HH) into nx_s/nx_sz (S/SZ) and the
-    // A_pf/Wpk_pf registers (shared with the slab-1 prefetch: lifetimes are
-    // disjoint). Raw packs for W (expand at publish). Used for the cold fill
-    // and for the peeled next-trip loads on slab 1 (program-ordered before
-    // compute slab 1, so latency hides under its WMMAs). Bit-identical to
-    // the old in-prologue loads: same addresses, same zero-selects.
-#define HIPFIRE_FP8_V2_PROLOGUE_LOAD(GG, HH) do { \
-        { const unsigned int _s_idx = st_soff + (unsigned int)(GG) * 2u + (unsigned int)(HH); \
-          const float _s_ld = X_half_sums[_s_idx]; \
-          nx_s = st_sok ? _s_ld : 0.0f; } \
-        { const unsigned int _hwoff = (unsigned int)(GG) * 136u + (unsigned int)(HH) * 4u; \
-          _Pragma("unroll") \
-          for (int _e = 0; _e < HIPFIRE_FP8_V2_SZITER; _e++) { \
-            const unsigned int _hw = *(const unsigned int*)(st_szbase[_e] + _hwoff); \
-            const unsigned short _h16 = (unsigned short)(st_szword[_e] ? (_hw >> 16) : (_hw & 0xFFFFu)); \
-            nx_sz[_e] = st_szok[_e] ? __half2float(__ushort_as_half(_h16)) : 0.0f; } } \
-        { const unsigned char* _xbase = X_fp8 + (unsigned int)(GG) * 256u + (unsigned int)(HH) * 128u; \
-          _Pragma("unroll") \
-          for (int _r = 0; _r < HIPFIRE_FP8_V2_A_ROUNDS; _r++) { \
-            const unsigned char* _asrc = _xbase + st_agoff[_r]; \
-            const v2i_t _v0l = *(const v2i_t*)_asrc; \
-            const v2i_t _v1l = *(const v2i_t*)(_asrc + 8u); \
-            A_pf[_r * 2] = st_aok[_r] ? _v0l : st_z64; \
-            A_pf[_r * 2 + 1] = st_aok[_r] ? _v1l : st_z64; } } \
-        { const unsigned int _pack_base = (unsigned int)(GG) * 136u + 8u + (unsigned int)(HH) * 64u; \
-          _Pragma("unroll") \
-          for (int _r = 0; _r < HIPFIRE_FP8_V2_W_ROUNDS; _r++) { \
-            _Pragma("unroll") \
-            for (int _pp = 0; _pp < 2; _pp++) { \
-              const unsigned int _pk = *(const unsigned int*)(st_wbase[_r] + _pack_base + st_wpoff[_r][_pp]); \
-              Wpk_pf[_r * 2 + _pp] = st_wok[_r] ? _pk : 0u; } } } \
-    } while (0)
     const unsigned st_quad = (unsigned)(tid & 3);
     const unsigned st_grp = (unsigned)(tid >> 2);
     const v2i_t st_z64 = {0, 0};
@@ -513,40 +481,60 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         T[nb][1] = zc;
     }
 
-    // Trip payload registers: A_pf/Wpk_pf double as slab-0 payload and
-    // slab-1 prefetch (disjoint lifetimes); nx_s/nx_sz carry the S/SZ
-    // payload across the trip. All live across compute — sized for it.
-    v2i_t A_pf[HIPFIRE_FP8_V2_A_ROUNDS * 2];
-    unsigned int Wpk_pf[HIPFIRE_FP8_V2_W_ROUNDS * 2];
-    float nx_s;
-    float nx_sz[HIPFIRE_FP8_V2_SZITER];
-    // Cold fill for trip (0,0); every later trip's payload is peeled from
-    // the end of slab 1 of the previous trip (below its fold).
-    HIPFIRE_FP8_V2_PROLOGUE_LOAD(0, 0);
-
     #pragma nounroll
     for (int g = 0; g < gpr; g++) {
         #pragma nounroll
         for (int h = 0; h < 2; h++) {
-            // Overlap: slab s+1's globals prefetch into A_pf/Wpk_pf BEFORE
-            // slab s's compute (latency under WMMAs); the trip's slab-0
-            // payload arrives in nx_s/nx_sz/A_pf/Wpk_pf from the previous
-            // trip's peel (cold-filled for trip (0,0)). Expand at publish,
-            // identical values.
-            // Prologue: publish this trip's slab-0 payload from registers
-            // (cold-filled / peeled). Stores only — no globals here.
+            // Overlap probe (K2 measurement): prologue stages slab 0, then
+            // each iteration issues slab s+1's global loads into registers
+            // BEFORE slab s's compute, so load latency hides under WMMAs.
+            // Expand + LDS publish of s+1 still follow compute (single
+            // buffer); only latency, not execution, is hidden. A_pf holds the
+            // lane's b64 chunk pairs (A_ROUNDS*2 v2i_t); Wpk_pf holds raw
+            // packs (expand at publish, identical values).
+            v2i_t A_pf[HIPFIRE_FP8_V2_A_ROUNDS * 2];
+            unsigned int Wpk_pf[HIPFIRE_FP8_V2_W_ROUNDS * 2];
+            // Prologue: stage slab 0 fully (S/SZ + A + W). Every lane is
+            // active on every round; OOB clamps to the last valid index with
+            // a branch-free zero-select (exact old ternary semantics).
             {
-                *(float*)(lds_S + st_slds) = nx_s;
-                #pragma unroll
-                for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
-                    *(float*)(lds_SZ + st_szlds[e]) = nx_sz[e];
+                // S: one f32 per lane.
+                {
+                    const unsigned int s_idx = st_soff + (unsigned int)g * 2u + (unsigned int)h;
+                    // Unconditional load from the clamped address; the select
+                    // on the value is a cndmask, never an EXEC predicate.
+                    const float s_ld = X_half_sums[s_idx];
+                    const float s_v = st_sok ? s_ld : 0.0f;
+                    *(float*)(lds_S + st_slds) = s_v;
                 }
-                #pragma unroll
-                for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
-                    char* adst = lds_A + st_aldsoff[r];
-                    *(v2i_t*)adst = A_pf[r * 2];
-                    *(v2i_t*)(adst + 8u) = A_pf[r * 2 + 1];
+                // SZ: SZITER f32 words per lane.
+                {
+                    const unsigned int hwoff = (unsigned int)g * 136u + (unsigned int)h * 4u;
+                    #pragma unroll
+                    for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
+                        const unsigned int hw = *(const unsigned int*)(st_szbase[e] + hwoff);
+                        const unsigned short h16 = (unsigned short)(st_szword[e] ? (hw >> 16) : (hw & 0xFFFFu));
+                        const float f = __half2float(__ushort_as_half(h16));
+                        *(float*)(lds_SZ + st_szlds[e]) = st_szok[e] ? f : 0.0f;
+                    }
                 }
+                // A: one b64 chunk pair per round (even-chunk 16 B alignment
+                // lets the compiler fuse each pair's loads to one b128).
+                {
+                    const unsigned char* xbase = X_fp8 + (unsigned int)g * 256u + (unsigned int)h * 128u;
+                    #pragma unroll
+                    for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS; r++) {
+                        const unsigned char* asrc = xbase + st_agoff[r];
+                        const v2i_t v0l = *(const v2i_t*)asrc;
+                        const v2i_t v1l = *(const v2i_t*)(asrc + 8u);
+                        const v2i_t v0 = st_aok[r] ? v0l : st_z64;
+                        const v2i_t v1 = st_aok[r] ? v1l : st_z64;
+                        char* adst = lds_A + st_aldsoff[r];
+                        *(v2i_t*)adst = v0;
+                        *(v2i_t*)(adst + 8u) = v1;
+                    }
+                }
+                // W: two raw packs per round; expand immediately (bit-exact).
                 {
                     const unsigned int pack_base = (unsigned int)g * 136u + 8u
                         + (unsigned int)h * 64u;
@@ -554,9 +542,8 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                     for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
                         #pragma unroll
                         for (int pp = 0; pp < 2; pp++) {
-                            // Wpk already zero-selected at load; expand(0) is
-                            // all-zero E4M3 (bit-identical).
-                            const v2i_t e8 = mq4_qpk_to_e4m3(Wpk_pf[r * 2 + pp]);
+                            const unsigned int pk = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
+                            const v2i_t e8 = mq4_qpk_to_e4m3(st_wok[r] ? pk : 0u);
                             *(v2i_t*)(lds_W + st_wldsoff[r][pp]) = e8;
                         }
                     }
@@ -597,19 +584,6 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                     // the prefetch loads hoist for latency on their own. True
                     // deps (A_pf/Wpk_pf publish after compute) still order
                     // what must be ordered.
-                }
-                else {
-                    // Peel: next trip's slab-0 payload loads here, program-
-                    // ordered before compute slab 1 so latency hides under
-                    // its WMMAs. A_pf/Wpk_pf are dead (slab-1 payload already
-                    // published); nx_s/nx_sz are trip payload registers.
-                    // Uniform control (g/h uniform): no EXEC divergence.
-                    const int h_n = h ^ 1;
-                    const int g_n = g + h;
-                    const bool last = (h == 1) && (g + 1 == gpr);
-                    if (!last) {
-                        HIPFIRE_FP8_V2_PROLOGUE_LOAD(g_n, h_n);
-                    }
                 }
 
                 // Inner loop: ds_read_b64 A/W -> v_wmma fp8 16x16x16. Nothing else.
