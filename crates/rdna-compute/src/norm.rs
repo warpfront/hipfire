@@ -83,6 +83,58 @@ pub fn gdn_chunk_size() -> usize {
     cs.clamp(1, 32)
 }
 
+/// Use the chunked-scan Q8 GDN kernel (`gated_delta_net_q8_scan_gfx1201`) on
+/// the multi-token sequential Q8+EF prefill arm instead of the serial
+/// `gated_delta_net_q8_fast`. DEFAULT OFF. Single launch per segment; the
+/// token axis loops on-device in chunks (serial across chunks, S carried in
+/// LDS); intra-chunk KK/QK Grams run on f16 WMMA. Inexact vs serial (f16
+/// Gram inputs regroup the trajectory): KLD-gated, never md5-pinned.
+/// Admission (checked at the dispatch site, mirrored here for tests):
+/// gfx1201, StateQuant::Q8, EF present, !per-token-requant, sequential
+/// semantics, non-tree, n_tokens >= 64. Decode (n=1) always stays serial.
+pub fn gdn_q8_scan_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_GFX12_GDN_CHUNKED")
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0"
+        })
+        .unwrap_or(false)
+}
+
+/// On-device chunk size CS for the Q8 scan kernel. Default 32 (= CS_MAX).
+/// Clamped to [1, 32]; CS=16 halves the C^2 Gram/solve overhead at the cost
+/// of twice as many serial chunk rounds. Sweep {16, 32} on measured time.
+pub fn gdn_q8_scan_chunk_size() -> usize {
+    let cs = hipfire_config::developer_var("HIPFIRE_GFX12_GDN_SCAN_CS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(32);
+    cs.clamp(1, 32)
+}
+
+/// WMMA leg for the scan kernel's intra-chunk Grams. Default ON (1); =0
+/// selects the f32-VALU Gram build (same f16 tiles, A/B vehicle).
+pub fn gdn_q8_scan_wmma() -> bool {
+    hipfire_config::developer_var("HIPFIRE_GFX12_GDN_SCAN_WMMA")
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0"
+        })
+        .unwrap_or(true)
+}
+
+/// Dispatch predicate for the chunked Q8 scan. True iff the flag is set, the
+/// segment is long enough to amortise the chunk machinery, EF is present
+/// (the scan refuses the stochastic non-EF requant), and the single-end
+/// requant cadence holds. Arch/tree/semantics guards live at the call site
+/// (StateQuant::Q8 sequential arm only); decode (n=1) fails the length bar.
+pub fn gdn_q8_scan_admitted(n_tokens: usize, has_ef: bool) -> bool {
+    gdn_q8_scan_enabled()
+        && n_tokens >= 64
+        && has_ef
+        && !dn_requant_per_token()
+}
+
 impl Gpu {
     /// out = rmsnorm(x, weight, eps)
     pub fn rmsnorm_f32(
@@ -3827,6 +3879,117 @@ impl Gpu {
                 b.push_i32(nt);
                 b.push_i32(nh);
                 b.push_i32(hd);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Chunked-scan Q8 GDN (`gated_delta_net_q8_scan_gfx1201`). Same buffers
+    /// and single-512-segment commit contract as `gated_delta_net_q8_batch_seq`
+    /// on the EF arm (EF folded once at segment end, scale = max/127, rint,
+    /// EF residual rewrite); the trajectory is INEXACT vs serial (f16 Gram
+    /// inputs), so this is KLD-gated, never md5-pinned. Single launch with
+    /// grid [n_heads, 2] (two value-row halves), block 256.
+    /// Caller guarantees: EF present, !dn_requant_per_token, n_tokens >= 64.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_q8_scan(
+        &mut self,
+        q_batch: &GpuTensor,
+        k_batch: &GpuTensor,
+        v_batch: &GpuTensor,
+        gate_batch: &GpuTensor,
+        beta_batch: &GpuTensor,
+        s_q8: &GpuTensor,
+        s_scales: &GpuTensor,
+        output_batch: &GpuTensor,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        ef_residual: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let use_wmma = gdn_q8_scan_wmma();
+        let (kernel_name, kernel_src) = if use_wmma {
+            (
+                "gated_delta_net_q8_scan_gfx1201",
+                kernels::GATED_DELTA_NET_Q8_SCAN_GFX1201_SRC,
+            )
+        } else {
+            (
+                "gated_delta_net_q8_scan_gfx1201_nowmma",
+                kernels::GATED_DELTA_NET_Q8_SCAN_GFX1201_NOWMMA_SRC,
+            )
+        };
+        self.ensure_kernel(kernel_name, kernel_src, "gated_delta_net_q8_scan_gfx1201")?;
+
+        let cs = gdn_q8_scan_chunk_size().clamp(1, 32);
+        let mut qp = q_batch.buf.as_ptr();
+        let mut kp = k_batch.buf.as_ptr();
+        let mut vp = v_batch.buf.as_ptr();
+        let mut gp = gate_batch.buf.as_ptr();
+        let mut bp = beta_batch.buf.as_ptr();
+        let mut sp = s_q8.buf.as_ptr();
+        let mut scp = s_scales.buf.as_ptr();
+        let mut op = output_batch.buf.as_ptr();
+        let mut nt = n_tokens as i32;
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        // Same frame reservation as the serial path so the process-global
+        // stochastic-seed stream stays aligned (the EF kernel ignores it,
+        // like the serial EF arm).
+        let mut fr = reserve_gdn_requant_frames(n_tokens as u32) as i32;
+        let mut efp: *mut c_void = ef_residual.buf.as_ptr();
+        let mut cs_i = cs as i32;
+        let bytes = crate::profile::gated_delta_net_q8_bytes(n_tokens, n_heads, head_dim);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "deltanet",
+            "gated_delta_net_q8_scan",
+            bytes,
+        );
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut bp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut scp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut nt as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut fr as *mut _ as *mut c_void,
+            &mut efp as *mut _ as *mut c_void,
+            &mut cs_i as *mut _ as *mut c_void,
+        ];
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [n_heads as u32, 2, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(sp);
+                b.push_ptr(scp);
+                b.push_ptr(op);
+                b.push_i32(nt);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(fr);
+                b.push_ptr(efp);
+                b.push_i32(cs_i);
                 b
             },
         );

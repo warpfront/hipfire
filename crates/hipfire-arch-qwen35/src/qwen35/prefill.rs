@@ -6306,36 +6306,79 @@ pub(crate) fn batch_chunk_delta_net_attn(
                             .sub_offset(off * n_v_heads, stride * n_v_heads);
                         let out =
                             pbs.dn_attn_out_batch.sub_offset(off * v_dim, stride * v_dim);
-                        gpu.gated_delta_net_q8_batch_seq(
-                            &q,
-                            &k,
-                            &v,
-                            &alpha,
-                            &beta,
-                            &dn_state.s_matrices[delta_layer_idx],
-                            &dn_state.s_scales[delta_layer_idx],
-                            &out,
-                            stride,
-                            n_v_heads,
-                            config.linear_value_head_dim,
-                            dn_state.ef_residual(delta_layer_idx),
-                        )?
+                        let ef = dn_state.ef_residual(delta_layer_idx);
+                        // gfx1201 chunked Q8 scan (HIPFIRE_GFX12_GDN_CHUNKED,
+                        // default OFF): same buffers and per-segment commit
+                        // contract as the serial kernel; the trajectory is
+                        // inexact (f16 Grams), so this arm is KLD-gated.
+                        // Refusals (short segment, no EF, per-token requant)
+                        // fall through to the serial kernel below.
+                        if rdna_compute::norm::gdn_q8_scan_admitted(stride, ef.is_some()) {
+                            gpu.gated_delta_net_q8_scan(
+                                &q,
+                                &k,
+                                &v,
+                                &alpha,
+                                &beta,
+                                &dn_state.s_matrices[delta_layer_idx],
+                                &dn_state.s_scales[delta_layer_idx],
+                                &out,
+                                stride,
+                                n_v_heads,
+                                config.linear_value_head_dim,
+                                ef.expect("scan admitted only with EF"),
+                            )?
+                        } else {
+                            gpu.gated_delta_net_q8_batch_seq(
+                                &q,
+                                &k,
+                                &v,
+                                &alpha,
+                                &beta,
+                                &dn_state.s_matrices[delta_layer_idx],
+                                &dn_state.s_scales[delta_layer_idx],
+                                &out,
+                                stride,
+                                n_v_heads,
+                                config.linear_value_head_dim,
+                                ef,
+                            )?
+                        }
                     }
                 } else {
-                    gpu.gated_delta_net_q8_batch_seq(
-                        &pbs.dn_q_batch,
-                        &pbs.dn_k_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_alpha_batch,
-                        &pbs.dn_beta_batch,
-                        &dn_state.s_matrices[delta_layer_idx],
-                        &dn_state.s_scales[delta_layer_idx],
-                        &pbs.dn_attn_out_batch,
-                        n,
-                        n_v_heads,
-                        config.linear_value_head_dim,
-                        dn_state.ef_residual(delta_layer_idx),
-                    )?
+                    let ef = dn_state.ef_residual(delta_layer_idx);
+                    // Same scan arm as the widened-segment branch above.
+                    if rdna_compute::norm::gdn_q8_scan_admitted(n, ef.is_some()) {
+                        gpu.gated_delta_net_q8_scan(
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_alpha_batch,
+                            &pbs.dn_beta_batch,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &dn_state.s_scales[delta_layer_idx],
+                            &pbs.dn_attn_out_batch,
+                            n,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                            ef.expect("scan admitted only with EF"),
+                        )?
+                    } else {
+                        gpu.gated_delta_net_q8_batch_seq(
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_alpha_batch,
+                            &pbs.dn_beta_batch,
+                            &dn_state.s_matrices[delta_layer_idx],
+                            &dn_state.s_scales[delta_layer_idx],
+                            &pbs.dn_attn_out_batch,
+                            n,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                            ef,
+                        )?
+                    }
                 }
             }
             StateQuant::Q4 => gpu.gated_delta_net_q4(

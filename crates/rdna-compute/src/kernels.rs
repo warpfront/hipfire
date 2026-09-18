@@ -6789,6 +6789,24 @@ pub const GATED_DELTA_NET_F32_BATCH_SEQ_SRC: &str =
 pub const GATED_DELTA_NET_F32_CHUNKED_SRC: &str =
     include_str!("../../../kernels/src/gated_delta_net_f32_chunked.hip");
 
+/// Chunked-scan Q8 GDN for gfx1201 prefill (`gdn_chunk_scan_q8.gfx1201.hip`).
+/// One 256-thread workgroup per (head, value-row half); the 64x128 f32 state
+/// half-tile stays LDS-resident for the whole segment while the token axis
+/// loops on-device in chunks of CS<=32 (serial across chunks). Intra-chunk
+/// KK/QK Grams run on f16 WMMA (f32 accumulate); all state products stay f32
+/// VALU; the 512 commit boundary (EF fold + scale=max/127 + rint) is verbatim
+/// from the serial fast kernel. Grid: [n_heads, 2]. Block: [256].
+/// Default OFF (`HIPFIRE_GFX12_GDN_CHUNKED`); WMMA leg selectable at compile
+/// time via `HIPFIRE_GDN_SCAN_WMMA` (wrapper picks by env, default ON).
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_Q8_SCAN_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_scan_q8.gfx1201.hip");
+#[cfg(feature = "deltanet")]
+pub const GATED_DELTA_NET_Q8_SCAN_GFX1201_NOWMMA_SRC: &str = concat!(
+    "#define HIPFIRE_GDN_SCAN_WMMA 0\n",
+    include_str!("../../../kernels/src/gdn_chunk_scan_q8.gfx1201.hip")
+);
+
 /// GDN recurrence with Q4-quantized S state in VRAM.
 /// State layout: unsigned char s_q4[n_heads][HD*HD/2] (nibble-packed) + float s_scales[n_heads*HD].
 /// Symmetric 4-bit: values -8..+7, scale = absmax/7. Per-row scale.
