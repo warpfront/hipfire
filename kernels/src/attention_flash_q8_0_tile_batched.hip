@@ -499,14 +499,18 @@ __global__ void attention_flash_fp8_e4m3_tile_batched(
 
     // Phase D: V-weighted accumulation with fp8 decode. Vfill
     // grouped-fragment codes (one contiguous b64 per (head, group, dim));
-    // scales stay token-local via the slot descriptor (fp8 is noslots).
+    // V scales at the group block end (slot-relative; fp8 is noslots).
     // Arithmetic order unchanged: only the code addresses moved.
     float out_vec[16] = { 0.0f };
     for (int t_local = 0; t_local < tile_len; t_local++) {
         const float w = scores[t_local];
         const int t = tile_start + t_local;
-        const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
-        const float vs = (float)*((const _Float16*)(vrow + scale_off));
+        // V scales at the group block end (slot-relative; fp8 noslots).
+        const float vs = (float)*((const _Float16*)(v_cache + desc.v_base
+            + (unsigned long long)(t >> 3) * (unsigned long long)per_pos_bytes * 8ULL
+            + (unsigned long long)n_kv_heads * (unsigned long long)head_dim * 8ULL
+            + (unsigned long long)(t & 7) * (unsigned long long)n_kv_heads * 2ULL
+            + (unsigned long long)kv_h * 2ULL));
         const unsigned char* vg = v_cache + desc.v_base
             + (unsigned long long)(t >> 3) * (unsigned long long)per_pos_bytes * 8ULL
             + (unsigned long long)kv_h * (unsigned long long)head_dim * 8ULL

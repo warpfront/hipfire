@@ -480,15 +480,19 @@ extern "C" __global__ void attention_fp8_e4m3_kv_batched(
     __syncthreads();
 
     // Phase 2: weighted V sum with fp8 decode. Vfill grouped-fragment codes:
-    // (head, group, dim) is one contiguous b64; scales stay token-local via
-    // the slot descriptor (fp8 is noslots: v_base is the shared-cache base).
+    // (head, group, dim) is one contiguous b64; scales at the group block
+    // end (slot-relative; fp8 is noslots: v_base is the shared-cache base).
     // Arithmetic order unchanged (w * (vs * decode)): only placement moved.
     float* out_head = out + (long long)b * q_stride + h * head_dim;
     for (int d = tid; d < head_dim; d += nthreads) {
         float val = 0.0f;
         for (int t = 0; t < eff_seq_len; t++) {
-            const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
-            const float vs = (float)*((const _Float16*)(vrow + scale_off));
+            // V scales at the group block end (slot-relative; fp8 noslots).
+            const float vs = (float)*((const _Float16*)(v_cache + desc.v_base
+                + (unsigned long long)(t >> 3) * (unsigned long long)per_pos_bytes * 8ULL
+                + (unsigned long long)n_kv_heads * (unsigned long long)head_dim * 8ULL
+                + (unsigned long long)(t & 7) * (unsigned long long)n_kv_heads * 2ULL
+                + (unsigned long long)kv_h * 2ULL));
             const unsigned char* vg = v_cache + desc.v_base
                 + (unsigned long long)(t >> 3) * (unsigned long long)per_pos_bytes * 8ULL
                 + (unsigned long long)kv_h * (unsigned long long)head_dim * 8ULL

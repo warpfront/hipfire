@@ -454,6 +454,14 @@ static __device__ __forceinline__ const unsigned char* hipfire_fp8_vgroup_ptr(
         + (size_t)kv_h * (size_t)head_dim * 8u + (size_t)d * 8u
         + (size_t)(slot & 7);
 }
+static __device__ __forceinline__ const _Float16* hipfire_fp8_vscale_ptr(
+    const unsigned char* __restrict__ v_cache, int slot, size_t row_stride,
+    int n_kv_heads, int head_dim, int kv_h)
+{
+    return (const _Float16*)(v_cache + (size_t)(slot >> 3) * row_stride * 8u
+        + (size_t)n_kv_heads * (size_t)head_dim * 8u
+        + (size_t)(slot & 7) * (size_t)n_kv_heads * 2u + (size_t)kv_h * 2u);
+}
 
 extern "C" __launch_bounds__(32, 16)
 __global__ void attention_flash_fp8_e4m3_tile(
@@ -722,14 +730,10 @@ __global__ void attention_flash_fp8_e4m3_tile(
             int s1 = (window > 0) ? (t1 % max_seq) : t1; \
             int s2 = (window > 0) ? (t2 % max_seq) : t2; \
             int s3 = (window > 0) ? (t3 % max_seq) : t3; \
-            const unsigned char* vr0 = v_cache + (size_t)s0 * row_stride; \
-            const unsigned char* vr1 = v_cache + (size_t)s1 * row_stride; \
-            const unsigned char* vr2 = v_cache + (size_t)s2 * row_stride; \
-            const unsigned char* vr3 = v_cache + (size_t)s3 * row_stride; \
-            float vs0 = (float)*((const _Float16*)(vr0 + scale_off)); \
-            float vs1 = (float)*((const _Float16*)(vr1 + scale_off)); \
-            float vs2 = (float)*((const _Float16*)(vr2 + scale_off)); \
-            float vs3 = (float)*((const _Float16*)(vr3 + scale_off)); \
+            float vs0 = (float)*hipfire_fp8_vscale_ptr(v_cache, s0, row_stride, n_kv_heads, head_dim, kv_h); \
+            float vs1 = (float)*hipfire_fp8_vscale_ptr(v_cache, s1, row_stride, n_kv_heads, head_dim, kv_h); \
+            float vs2 = (float)*hipfire_fp8_vscale_ptr(v_cache, s2, row_stride, n_kv_heads, head_dim, kv_h); \
+            float vs3 = (float)*hipfire_fp8_vscale_ptr(v_cache, s3, row_stride, n_kv_heads, head_dim, kv_h); \
             const unsigned char* vg0 = hipfire_fp8_vgroup_ptr(v_cache, s0, row_stride, kv_h, head_dim, d_base); \
             const unsigned char* vg1 = hipfire_fp8_vgroup_ptr(v_cache, s1, row_stride, kv_h, head_dim, d_base); \
             const unsigned char* vg2 = hipfire_fp8_vgroup_ptr(v_cache, s2, row_stride, kv_h, head_dim, d_base); \
@@ -755,8 +759,7 @@ __global__ void attention_flash_fp8_e4m3_tile(
             float w = scores[(tl)]; \
             int t = tile_start + (tl); \
             int slot = (window > 0) ? (t % max_seq) : t; \
-            const unsigned char* vr = v_cache + (size_t)slot * row_stride; \
-            float vs = (float)*((const _Float16*)(vr + scale_off)); \
+            float vs = (float)*hipfire_fp8_vscale_ptr(v_cache, slot, row_stride, n_kv_heads, head_dim, kv_h); \
             const unsigned char* vg = hipfire_fp8_vgroup_ptr(v_cache, slot, row_stride, kv_h, head_dim, d_base); \
             out0 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vg[0])); \
             out1 += w * (vs * hipfire_fp8_e4m3_to_f32_tile(vg[8])); \
@@ -782,14 +785,10 @@ __global__ void attention_flash_fp8_e4m3_tile(
             int s1 = (window > 0) ? (t1 % max_seq) : t1; \
             int s2 = (window > 0) ? (t2 % max_seq) : t2; \
             int s3 = (window > 0) ? (t3 % max_seq) : t3; \
-            const unsigned char* vr0 = v_cache + (size_t)s0 * row_stride; \
-            const unsigned char* vr1 = v_cache + (size_t)s1 * row_stride; \
-            const unsigned char* vr2 = v_cache + (size_t)s2 * row_stride; \
-            const unsigned char* vr3 = v_cache + (size_t)s3 * row_stride; \
-            float vs0 = (float)*((const _Float16*)(vr0 + scale_off)); \
-            float vs1 = (float)*((const _Float16*)(vr1 + scale_off)); \
-            float vs2 = (float)*((const _Float16*)(vr2 + scale_off)); \
-            float vs3 = (float)*((const _Float16*)(vr3 + scale_off)); \
+            float vs0 = (float)*hipfire_fp8_vscale_ptr(v_cache, s0, row_stride, n_kv_heads, head_dim, kv_h); \
+            float vs1 = (float)*hipfire_fp8_vscale_ptr(v_cache, s1, row_stride, n_kv_heads, head_dim, kv_h); \
+            float vs2 = (float)*hipfire_fp8_vscale_ptr(v_cache, s2, row_stride, n_kv_heads, head_dim, kv_h); \
+            float vs3 = (float)*hipfire_fp8_vscale_ptr(v_cache, s3, row_stride, n_kv_heads, head_dim, kv_h); \
             const unsigned char* vg0 = hipfire_fp8_vgroup_ptr(v_cache, s0, row_stride, kv_h, head_dim, d_base); \
             const unsigned char* vg1 = hipfire_fp8_vgroup_ptr(v_cache, s1, row_stride, kv_h, head_dim, d_base); \
             const unsigned char* vg2 = hipfire_fp8_vgroup_ptr(v_cache, s2, row_stride, kv_h, head_dim, d_base); \
@@ -819,8 +818,7 @@ __global__ void attention_flash_fp8_e4m3_tile(
             float w = scores[(tl)]; \
             int t = tile_start + (tl); \
             int slot = (window > 0) ? (t % max_seq) : t; \
-            const unsigned char* vr = v_cache + (size_t)slot * row_stride; \
-            float vs = (float)*((const _Float16*)(vr + scale_off)); \
+            float vs = (float)*hipfire_fp8_vscale_ptr(v_cache, slot, row_stride, n_kv_heads, head_dim, kv_h); \
             const unsigned char* vg = hipfire_fp8_vgroup_ptr(v_cache, slot, row_stride, kv_h, head_dim, d_base); \
             const float ws = w * vs; \
             out0 += ws * hipfire_fp8_e4m3_to_f32_tile(vg[0]); \

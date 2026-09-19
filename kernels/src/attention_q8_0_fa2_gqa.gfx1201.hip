@@ -389,25 +389,8 @@ __device__ __forceinline__ void fa2_gqa_body(
             const int m = pair >> 3;
             const int b = pair & 7;
             const int k0 = ktile + 2 * m;
-            const unsigned char* row0 = (k0 < seq_len)
-                ? v_cache + (unsigned long long)k0 * 1032ULL
-                : nullptr;
-            const unsigned char* row1 = (k0 + 1 < seq_len)
-                ? v_cache + (unsigned long long)(k0 + 1) * 1032ULL
-                : nullptr;
-            uint16_t s0u = 0;
-            uint16_t s1u = 0;
-            if (row0 != nullptr)
-                s0u = (uint16_t)row0[1024 + kv_h * 2] |
-                    ((uint16_t)row0[1024 + kv_h * 2 + 1] << 8);
-            if (row1 != nullptr)
-                s1u = (uint16_t)row1[1024 + kv_h * 2] |
-                    ((uint16_t)row1[1024 + kv_h * 2 + 1] << 8);
-            _Float16 s0 = ((fa2_dw_t){.u = (uint32_t)s0u}).h[0];
-            _Float16 s1 = ((fa2_dw_t){.u = (uint32_t)s1u}).h[0];
-            const float sf0 = (float)s0;
-            const float sf1 = (float)s1;
-            // Scales stay token-local (home rows above); codes are grouped.
+            // Scales at the group block end (home rows are aliased by grouped
+            // codes); codes via the grouped bases below.
             const int j0 = k0 & 7;
             const int j1 = (k0 + 1) & 7;
             const unsigned char* gb0 = (k0 < seq_len)
@@ -418,6 +401,24 @@ __device__ __forceinline__ void fa2_gqa_body(
                 ? v_cache + (unsigned long long)((k0 + 1) >> 3) * (1032ULL * 8ULL)
                     + (unsigned long long)kv_h * 256ULL * 8ULL
                 : nullptr;
+            uint16_t s0u = 0;
+            uint16_t s1u = 0;
+            if (gb0 != nullptr) {
+                const unsigned char* s0p = gb0 + 8192ULL
+                    + (unsigned long long)j0 * 8ULL
+                    + (unsigned long long)kv_h * 2ULL;
+                s0u = (uint16_t)s0p[0] | ((uint16_t)s0p[1] << 8);
+            }
+            if (gb1 != nullptr) {
+                const unsigned char* s1p = gb1 + 8192ULL
+                    + (unsigned long long)j1 * 8ULL
+                    + (unsigned long long)kv_h * 2ULL;
+                s1u = (uint16_t)s1p[0] | ((uint16_t)s1p[1] << 8);
+            }
+            _Float16 s0 = ((fa2_dw_t){.u = (uint32_t)s0u}).h[0];
+            _Float16 s1 = ((fa2_dw_t){.u = (uint32_t)s1u}).h[0];
+            const float sf0 = (float)s0;
+            const float sf1 = (float)s1;
             const bool same = (j0 != 7);
             const int sub = (2 * m) >> 4;
             const int kgm = ((2 * m) >> 3) & 1;
@@ -758,13 +759,30 @@ __device__ __forceinline__ void fa2_gqa_body(
 //   V: one lane per (sub, dc, lane) fragment (2048/tile, 512/wave, 16/lane):
 //      one global_load_b64 (the Vfill grouped-fragment layout stores the 8
 //      keys at one dim contiguously) + one ds_store_b64, mirroring the K fill.
-// Out-of-range keys (gk >= seq_len) write code 0. Scales are NEVER staged:
+// Out-of-range keys (gk >= seq_len) write code 0. K scales are NEVER staged:
 // route N reads them header-direct through fa2_scale_n below (S3 sizes no
-// scale plane; Main ruling). The dump writes LDS planes + accessor-read
+// scale plane; Main ruling); V scales come from the group block end via
+// fa2_scale_n_v. The dump writes LDS planes + accessor-read
 // scales to `out` for the host oracle, then returns: with 32768 LDS the f16
 // body cannot run here (its V plane at byte 32768 is out of bounds), so B2
 // replaces dump+return with the fp8 body while keeping this fill.
-//
+// Route-N V scale accessor (group block end). Vfill grouped codes alias
+// home-row bytes, so V scales live past the 8192 code bytes of each 8-key
+// group block: scale for (gkey, kv_h) at group_base + Hkv*D*8 + (gkey&7)*8 +
+// kv_h*2 (Hkv=4/D=256 literals, same style as fa2_scale_n). OOR reads 0.
+static __device__ __forceinline__ float fa2_scale_n_v(
+    const unsigned char* __restrict__ cache, int gkey, int kv_h, int seq_len)
+{
+    uint16_t u = 0;
+    if (gkey < seq_len) {
+        const unsigned char* s = cache
+            + (unsigned long long)(gkey >> 3) * (1032ULL * 8ULL) + 8192ULL
+            + (unsigned long long)(gkey & 7) * 8ULL
+            + (unsigned long long)kv_h * 2ULL;
+        u = (uint16_t)s[0] | ((uint16_t)s[1] << 8);
+    }
+    return (float)((fa2_dw_t){.u = (uint32_t)u}).h[0];
+}
 // Route-N scale accessor (header-direct). B4 gives route Q the same
 // signature backed by its scratch scale plane, so the B2/B3 epilogue calls
 // only this and the body stays source-agnostic. OOR keys read scale 0,
@@ -924,7 +942,7 @@ __device__ void fa2_stageb_nfill_dump(
             ((float*)D)[8192 + tid] =
                 fa2_scale_n(k_cache, gk, kv_h, seq_len);
             ((float*)D)[8256 + tid] =
-                fa2_scale_n(v_cache, gk, kv_h, seq_len);
+                fa2_scale_n_v(v_cache, gk, kv_h, seq_len);
         }
         __syncthreads();
     }
@@ -1196,7 +1214,7 @@ __device__ void fa2_stageb_nbody(
                 // sv reuses the scale file (sk dead: scores are formed).
 #pragma unroll
                 for (int j = 0; j < 8; ++j)
-                    sc[j] = fa2_scale_n(
+                    sc[j] = fa2_scale_n_v(
                         v_cache, kt_sub + 8 * kg + j, kv_h, seq_len);
                 float sum = 0.0f;
 #pragma unroll

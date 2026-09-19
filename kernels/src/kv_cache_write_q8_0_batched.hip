@@ -44,7 +44,7 @@ extern "C" __global__ void kv_cache_write_q8_0_batched(
     // Warp max absolute value
     float amax = fabsf(val);
     for (int offset = 16; offset > 0; offset >>= 1)
-        amax = fmaxf(amax, __shfl_xor(amax, offset));
+        amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
 
     float scale = amax / 127.0f;
     float inv_scale = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
@@ -85,7 +85,7 @@ extern "C" __global__ void kv_cache_write_q8_0_independent(
 
     float amax = fabsf(val);
     for (int offset = 16; offset > 0; offset >>= 1)
-        amax = fmaxf(amax, __shfl_xor(amax, offset));
+        amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
 
     float scale = amax / 127.0f;
     float inv_scale = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
@@ -134,7 +134,7 @@ extern "C" __global__ void kv_cache_write_q8_0_independent_masked(
 
     float amax = fabsf(val);
     for (int offset = 16; offset > 0; offset >>= 1)
-        amax = fmaxf(amax, __shfl_xor(amax, offset));
+        amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
 
     float scale = amax / 127.0f;
     float inv_scale = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
@@ -181,7 +181,7 @@ extern "C" __global__ void kv_cache_write_fp8_e4m3_batched(
     #pragma unroll
     for (int i = 0; i < 8; i++) amax = fmaxf(amax, fabsf(v[i]));
     for (int offset = 16; offset > 0; offset >>= 1)
-        amax = fmaxf(amax, __shfl_xor(amax, offset));
+        amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
 
     _Float16 s16 = (amax == 0.0f) ? (_Float16)1.0f : (_Float16)(amax / 448.0f);
     if (amax > 0.0f && s16 == (_Float16)0.0f)
@@ -241,7 +241,7 @@ extern "C" __global__ void kv_cache_write_fp8_e4m3_v_batched(
     #pragma unroll
     for (int i = 0; i < 8; i++) amax = fmaxf(amax, fabsf(v[i]));
     for (int offset = 16; offset > 0; offset >>= 1)
-        amax = fmaxf(amax, __shfl_xor(amax, offset));
+        amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
 
     _Float16 s16 = (amax == 0.0f) ? (_Float16)1.0f : (_Float16)(amax / 448.0f);
     if (amax > 0.0f && s16 == (_Float16)0.0f)
@@ -263,14 +263,24 @@ extern "C" __global__ void kv_cache_write_fp8_e4m3_v_batched(
 
     const int pos = positions[bid];
     const size_t stride = (size_t)n_kv_heads * (head_dim + 2);
-    const unsigned char* w0b = (const unsigned char*)&w0;
-    const unsigned char* w1b = (const unsigned char*)&w1;
+    // Shift-extract (never address-taken: the packed-cvt result must stay in
+    // registers through both cvt calls).
     unsigned char* base = dst + (size_t)(pos >> 3) * stride * 8u
         + (size_t)head * (size_t)head_dim * 8u + (size_t)tid * 64u + (size_t)(pos & 7);
-    base[0] = w0b[0]; base[8] = w0b[1]; base[16] = w0b[2]; base[24] = w0b[3];
-    base[32] = w1b[0]; base[40] = w1b[1]; base[48] = w1b[2]; base[56] = w1b[3];
+    base[0] = (unsigned char)(w0 & 0xffu);
+    base[8] = (unsigned char)((w0 >> 8) & 0xffu);
+    base[16] = (unsigned char)((w0 >> 16) & 0xffu);
+    base[24] = (unsigned char)((w0 >> 24) & 0xffu);
+    base[32] = (unsigned char)(w1 & 0xffu);
+    base[40] = (unsigned char)((w1 >> 8) & 0xffu);
+    base[48] = (unsigned char)((w1 >> 16) & 0xffu);
+    base[56] = (unsigned char)((w1 >> 24) & 0xffu);
+    // V scales at the group block end (see the single writer): home rows are
+    // aliased by grouped codes.
     if (tid == 0)
-        *((_Float16*)(dst + (size_t)pos * stride + (size_t)n_kv_heads * head_dim + (size_t)head * 2)) = s16;
+        *((_Float16*)(dst + (size_t)(pos >> 3) * stride * 8u
+            + (size_t)n_kv_heads * (size_t)head_dim * 8u
+            + (size_t)(pos & 7) * (size_t)n_kv_heads * 2u + (size_t)head * 2u)) = s16;
 }
 #endif
 #endif
