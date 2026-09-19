@@ -39,12 +39,13 @@ pub struct FeatureFlags {
     /// Default on gfx1100/gfx1151 (WT2 KLD +0.000186 <= +0.0005 gate passed);
     /// `=0` restores the per-32 MMQ route. Other arches stay per-32.
     pub gfx11_mmq_x128: Option<bool>,
-    /// gfx11 iu4-direct MMQ prefill (W4A4, `HIPFIRE_IU4_PREFILL`,
-    /// `kernel.iu4_prefill`). Opt-in on gfx1100/gfx1151 (K16 iu4 kernel)
+    /// iu4-direct MMQ prefill (W4A4, `HIPFIRE_IU4_PREFILL`,
+    /// `kernel.iu4_prefill`). Default ON for gfx1100/gfx1151 (K16 iu4 kernel)
     /// and gfx1201 (K32 iu4 kernel, standalone `quantize_int4_mmq_ds128`
-    /// activations; default off everywhere); unset/`=0` keeps the incumbent
-    /// Q8_1 MMQ (gfx11) / fp8 (gfx1201) route.
-    /// Expected quality cost ~+0.014 WT2 KLD for the MQ4-XT speed rung.
+    /// activations); `=0`/`false` keeps the incumbent Q8_1 MMQ (gfx11) /
+    /// fp8 (gfx1201) route. Other arches have no iu4 route and ignore it.
+    /// Quality cost ~+0.016 WT2-24 KLD on the MQ4-XT speed rung
+    /// (gfx1201: 0.048028 -> 0.063890).
     pub iu4_prefill: Option<bool>,
 
     // ── Quant / format toggles ────────────────────────────────────
@@ -782,11 +783,11 @@ impl FeatureFlags {
             .unwrap_or(matches!(self.arch.as_str(), "gfx1100" | "gfx1151"))
     }
 
-    /// Resolved iu4-direct MMQ route: explicit opt-in only, and only on
-    /// exact gfx1100/gfx1151 (K16 kernel) or gfx1201 (K32 kernel).
-    /// Unset/`=0`/other arches keep the incumbent.
+    /// Resolved iu4-direct MMQ route: on unless explicitly disabled, and only
+    /// on exact gfx1100/gfx1151 (K16 kernel) or gfx1201 (K32 kernel).
+    /// `=0`/other arches keep the incumbent.
     pub fn iu4_prefill_enabled(&self) -> bool {
-        self.iu4_prefill.unwrap_or(false)
+        self.iu4_prefill.unwrap_or(true)
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
 
@@ -795,7 +796,7 @@ impl FeatureFlags {
     /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
     /// keep standalone `quantize_int4_mmq_ds128`.
     pub fn iu4_producer_sidecar_enabled(&self) -> bool {
-        self.iu4_prefill.unwrap_or(false) && self.arch == "gfx1151"
+        self.iu4_prefill.unwrap_or(true) && self.arch == "gfx1151"
     }
     /// True only on exact gfx1201 with the opt-in set. The producer emits
     /// the shared `block_i4_128` recipe, so output is bit-identical to the
@@ -877,7 +878,9 @@ impl FeatureFlags {
             gemv_dp4a: None,
             gfx1151_e8_buffer: None,
             gfx11_mmq_x128: None,
-            iu4_prefill: None,
+            // Deterministic unit-test baseline: the iu4 route stays off here
+            // even though the process default is on.
+            iu4_prefill: Some(false),
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,
@@ -1276,20 +1279,24 @@ mod tests {
     }
 
     #[test]
-    fn iu4_prefill_opt_in_on_gfx11_and_gfx1201() {
-        // Default process policy: the iu4-direct MMQ prefill route stays off
-        // everywhere until `kernel.iu4_prefill=true` (or
-        // `HIPFIRE_IU4_PREFILL=1`); the opt-in admits only exact
-        // gfx1100/gfx1151 (K16 kernel) and gfx1201 (K32 kernel).
+    fn iu4_prefill_default_on_gfx11_and_gfx1201() {
+        // Default process policy: the iu4-direct MMQ prefill route is on for
+        // exact gfx1100/gfx1151 (K16 kernel) and gfx1201 (K32 kernel) and
+        // nowhere else; `kernel.iu4_prefill=false` (or
+        // `HIPFIRE_IU4_PREFILL=0`) opts out.
         let resolved = resolve([]).unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
-        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(flags.iu4_prefill_enabled(), "arch={arch}");
+        }
+        for arch in ["gfx1101", "gfx1150", "gfx942"] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(!flags.iu4_prefill_enabled(), "arch={arch}");
         }
 
         let mut layer = ConfigLayer::default();
-        layer.set_cli("kernel.iu4_prefill", "true").unwrap();
+        layer.set_cli("kernel.iu4_prefill", "false").unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: "config.toml".into(),
@@ -1298,11 +1305,7 @@ mod tests {
         }])
         .unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
-        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
-            let flags = FeatureFlags::from_process_config(arch, &process);
-            assert!(flags.iu4_prefill_enabled(), "arch={arch}");
-        }
-        for arch in ["gfx1101", "gfx1150", "gfx942"] {
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(!flags.iu4_prefill_enabled(), "arch={arch}");
         }
