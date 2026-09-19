@@ -265,7 +265,11 @@ impl PrefillBatchScratch {
         let i_dn_z_batch = alloc!(&[max_batch * v_dim], DType::F32);
         let i_dn_alpha_batch = alloc!(&[max_batch * n_v_heads], DType::F32);
         let i_dn_beta_batch = alloc!(&[max_batch * n_v_heads], DType::F32);
-        let i_dn_q_raw_batch = alloc!(&[max_batch * k_dim], DType::F32);
+        // dn_q_raw_batch doubles as the GDN chunk scan's A workspace, which is
+        // viewed at rows padded to the 64-row chunk (prefill.rs a_rows); size it
+        // for that padding so short requests (e.g. 112 rows) do not fail the
+        // "A scratch undersized" check.
+        let i_dn_q_raw_batch = alloc!(&[max_batch.div_ceil(64) * 64 * k_dim], DType::F32);
         let i_dn_k_raw_batch = alloc!(&[max_batch * k_dim], DType::F32);
         let i_dn_v_batch = alloc!(&[max_batch * v_dim], DType::F32);
         let i_dn_q_batch = alloc!(&[max_batch * v_dim], DType::F32);
@@ -1277,7 +1281,7 @@ impl PrefillBatchScratch {
         add(cm(n, v_dim)?, 4)?;
         add(cm(n, v_heads)?, 4)?;
         add(cm(n, v_heads)?, 4)?;
-        add(cm(n, k_dim)?, 4)?;
+        add(cm(n.div_ceil(64) * 64, k_dim)?, 4)?;
         add(cm(n, k_dim)?, 4)?;
         add(cm(n, v_dim)?, 4)?;
         add(cm(n, v_dim)?, 4)?;
