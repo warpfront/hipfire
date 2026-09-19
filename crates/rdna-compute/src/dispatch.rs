@@ -3048,6 +3048,22 @@ impl Gpu {
             && k > 0
             && k % 256 == 0
     }
+    /// True when a gfx1201 slices-2-4 producer+quant fusion is live for this
+    /// call: IU4 + `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` on exact gfx1201 +
+    /// eager (no replay/capture) + batch and K constraints of the iu4 MMQ
+    /// consumer. Same admission as `iu4_silu_quant_fused_active`; the
+    /// GDN fused producer additionally requires head_dim == 128 at its
+    /// callsite helper.
+    pub fn iu4_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
+        self.flags.gfx12_producer_quant_fused_enabled()
+            && self.flags.iu4_prefill_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && batch >= 128
+            && batch % 128 == 0
+            && k > 0
+            && k % 256 == 0
+    }
 
     /// Validate a prepared IU4 handle against the live scratch generation.
     pub fn int4_mmq_prepared_ptr(

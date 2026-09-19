@@ -680,6 +680,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX12_MQ4V2_FP8_SLABS` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX12_SILU_QUANT_FUSED` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/dispatch.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/dispatch.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX12_WEIGHT_CPOL_AUX` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS` | crates/rdna-compute/src/feature_flags.rs |
