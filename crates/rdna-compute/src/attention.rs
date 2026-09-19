@@ -3653,7 +3653,9 @@ impl Gpu {
         // arch/shape/eager gates; everything else falls through to the
         // byte-identical incumbent path below. Arch-disjoint from the
         // gfx1201 arm above (gfx11 allowlist only); the two flags are
-        // independent. Opt out with `HIPFIRE_GFX11_FA2_PREFILL=0`.
+        // independent. The fixed 16-row query tile zero-fills and guards its
+        // final partial tile, so every admitted batch >=64 is valid. Opt out
+        // with `HIPFIRE_GFX11_FA2_PREFILL=0`.
         if self.flags.gfx11_fa2_prefill
             && matches!(
                 self.arch.as_str(),
@@ -3665,7 +3667,6 @@ impl Gpu {
             && n_kv_heads == 4
             && head_dim == 256
             && self.fa2_gfx11_batch_admitted(batch_size)
-            && batch_size % 16 == 0
             && (64..=32768).contains(&max_ctx_len)
         {
             return self.attention_q8_0_fa2_gqa_gfx11(

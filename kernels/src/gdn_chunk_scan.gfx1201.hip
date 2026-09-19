@@ -109,7 +109,7 @@ __global__ void gdn_chunk_scan(
    St[t][e]=h0[((unsigned long long)head*GS_D+vv)*GS_D+key];
 #else
    const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+key;
-   St[t][e]=(float)sq[off]*sc[head*GS_D+vv];
+   St[t][e]=(float)sq[off]*sc[head*GS_D+vv]+(float)ef[off];
 #endif
   }}
  auto stage_state=[&](){
@@ -187,15 +187,16 @@ __global__ void gdn_chunk_scan(
 #pragma unroll
   for(int e=0;e<8;++e)ht[((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e)]=St[t][e];}
 #else
- // Fold the old EF exactly once, reduce a full 128-key absmax per value row,
- // then let every state owner write its disjoint code/residual elements.
+ // The old EF was folded into St before the scan so it participates in every
+ // output and decay. Reduce a full 128-key absmax per value row, then let
+ // every state owner write its disjoint code/residual elements.
  float vmax[2]={0,0};
 #pragma unroll
  for(int vi=0;vi<2;++vi){int vv=vbase+(vt0+vi)*16+lo;
 #pragma unroll
   for(int ki=0;ki<2;++ki){int t=ki*2+vi;
 #pragma unroll
-   for(int e=0;e<8;++e){const unsigned long long off=((unsigned long long)head*GS_D+vv)*GS_D+(kt0+ki)*16+gs_acc_row(lane,e);St[t][e]+=(float)ef[off];vmax[vi]=fmaxf(vmax[vi],fabsf(St[t][e]));}}
+   for(int e=0;e<8;++e)vmax[vi]=fmaxf(vmax[vi],fabsf(St[t][e]));}
   vmax[vi]=fmaxf(vmax[vi],__shfl_xor(vmax[vi],16));if(hi==0)sm.ctrl[wave>>1][vv-vbase]=vmax[vi];}
  GS_BAR();
 #pragma unroll
