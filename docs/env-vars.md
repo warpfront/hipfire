@@ -158,7 +158,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_GFX12_MQ4V2_FP8_V2` | gfx1201 FP8-WMMA MQ4v2 staged-tile v2 route — default ON on exact gfx1201 (`kernel.gfx12_mq4v2_fp8_v2`); `=0` restores the s2bt8/BT symbols. The four family flags remain prerequisites |
 | `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` | v2 tile geometry: `128x128` (default on exact gfx1201, the measured pin), `64x256`, `128x64`, `256x64` (prior default, still selectable) |
 | `HIPFIRE_GFX12_GDN_PRE_FUSED` | gfx1201 batched-prefill GDN preamble fusion (sigmoid+conv+qknorm 3→1, byte-exact) — default ON on exact gfx1201 (`kernel.gfx12_gdn_pre_fused`); `=0` restores the 3-launch sequence |
-| `HIPFIRE_GFX12_FP8_STREAM` | gfx1201 RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion (byte-identical `prepare_mq4v2_fp8_x_f32` outputs for the qkvza/gate_up/qkv inputs; standalone pack launch disappears) — default OFF (`kernel.gfx12_fp8_stream`); `=1` opts in on exact gfx1201 only |
+| `HIPFIRE_GFX12_FP8_STREAM` | gfx1201 RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion (byte-identical `prepare_mq4v2_fp8_x_f32` outputs for the qkvza/gate_up/qkv inputs; standalone pack launch disappears) — default ON on exact gfx1201 (`kernel.gfx12_fp8_stream`); `=0` opts out; other arches off |
 | `HIPFIRE_PREFILL_CHUNK_ROWS` | Widened ordinary-prefill chunk ceiling (`prefill.chunk_rows`; default 4096 on exact gfx1201, 512 elsewhere; explicit `HIPFIRE_PREFILL_MAX_BATCH` wins; VRAM admission may admit a smaller rung) |
 
 ### LFM (arch 11) — branch-scoped optimized prefill

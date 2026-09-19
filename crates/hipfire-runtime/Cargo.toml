@@ -682,3 +682,8 @@ required-features = ["lab"]
 [[example]]
 name = "tmp_iu4_gfx12_oracle"
 required-features = ["lab"]
+
+
+[[example]]
+name = "fp8stream_producer_oracle"
+required-features = ["lab"]

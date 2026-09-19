@@ -635,7 +635,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_producer_quant_fused: parse_bool("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED")
                 .unwrap_or(arch == "gfx1201"),
-            gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM").unwrap_or(false),
+            gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM")
+                .unwrap_or(arch == "gfx1201"),
             gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
                 .unwrap_or(arch == "gfx1201"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
@@ -1220,18 +1221,29 @@ mod tests {
         }
     }
     #[test]
-    fn gfx12_fp8_stream_default_off_with_opt_in() {
+    fn gfx12_fp8_stream_default_on_gfx1201_with_opt_out() {
         // Default process policy: the exact-gfx1201 RMSNorm+rotate → FP8
-        // pre-pass fusion stays OFF everywhere until
-        // `kernel.gfx12_fp8_stream=true` (or `HIPFIRE_GFX12_FP8_STREAM=1`);
-        // the opt-in admits only exact gfx1201.
+        // pre-pass fusion is ON on exact gfx1201 only (bit-identical, prepare
+        // launches removed); `kernel.gfx12_fp8_stream=false` (or
+        // `HIPFIRE_GFX12_FP8_STREAM=0`) opts out; other arches stay off.
         let resolved = resolve([]).unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
-        for arch in ["gfx1201", "gfx1100", "gfx1151", "gfx1200", "gfx942"] {
+        let on = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(on.gfx12_fp8_stream && on.gfx12_fp8_stream_enabled());
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942"] {
             let flags = FeatureFlags::from_process_config(arch, &process);
             assert!(!flags.gfx12_fp8_stream, "arch={arch}");
             assert!(!flags.gfx12_fp8_stream_enabled(), "arch={arch}");
         }
+        let mut off = ConfigLayer::default();
+        off.set_cli("kernel.gfx12_fp8_stream", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser { path: "config.toml".into() },
+            layer: off,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        assert!(!FeatureFlags::from_process_config("gfx1201", &process).gfx12_fp8_stream_enabled());
         let mut layer = ConfigLayer::default();
         layer.set_cli("kernel.gfx12_fp8_stream", "true").unwrap();
         let resolved = resolve([NamedLayer {

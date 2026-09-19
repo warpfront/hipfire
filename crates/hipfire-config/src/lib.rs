@@ -2171,10 +2171,10 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.gfx12_fp8_stream",
         "gfx12_fp8_stream",
         Kernel,
-        false,
+        true,
         false,
         "HIPFIRE_GFX12_FP8_STREAM",
-        "Fuse the MQ4v2 FP8 activation pre-pass into the gfx1201 RMSNorm/rotate producers (default off; set to true or HIPFIRE_GFX12_FP8_STREAM=1 to opt in on exact gfx1201; emits byte-identical prepare_mq4v2_fp8_x_f32 outputs for the qkvza/gate_up/qkv inputs so the standalone pack_f32_to_fp8_mq4v2_gfx12 launch disappears at each admitted site)."
+        "Fuse the MQ4v2 FP8 activation pre-pass into the gfx1201 RMSNorm/rotate producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_FP8_STREAM=0 to opt out; emits byte-identical prepare_mq4v2_fp8_x_f32 outputs for the qkvza/gate_up/qkv inputs so the standalone pack_f32_to_fp8_mq4v2_gfx12 launch disappears at each admitted site)."
     ),
     process_bool_field!(
         "kernel.gfx12_fa2_prefill",
