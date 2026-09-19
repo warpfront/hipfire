@@ -2303,22 +2303,18 @@ fn dispatch_attend(
                 // gfx1201/H24/KV4/D256, 64..=512 rows, 64..=32768 ctx),
                 // plus no tree-verify (FA2 has no tree path). Falls through
                 // to the scalar/tile crossover below otherwise.
-                // Stage-b route N: native fp8 KV on an FA2-eligible shape
-                // always runs the stage-b launcher (fp8 QK + PV WMMA on
-                // native fp8 KV, fp8 Q codes + f32 sq in S4 scratch,
-                // 32768 B dynamic LDS). The Q0 f16 entry is retained for
-                // oracles only.
-                // Packet-minimal Q128 route (`HIPFIRE_GFX12_FA_PACKET=0` /
-                // `kernel.gfx12_fa_packet=false` opts out): same FA2-eligible
-                // shape predicates as route-N below, dense 128-row ownership
-                // over eight compute waves, 49408 B dynamic LDS. Exact
-                // stage-b arithmetic.
+                // Stage-b route N retains its separate Q pre-convert for the
+                // oracle-only fallback. The packet route instead converts Q
+                // in-kernel. Batches above 512 are equal-length 512-row runs:
+                // one 3-D launch uses z for the run while x restarts the exact
+                // former per-step ownership and causal-bound grouping.
                 if gpu.flags.gfx12_fa_packet
                     && gpu.arch == "gfx1201"
                     && io.n_heads == 24
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
-                    && (64..=512).contains(&io.batch_size)
+                    && (64..=32768).contains(&io.batch_size)
+                    && (io.batch_size <= 512 || io.batch_size % 512 == 0)
                     && (64..=32768).contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                 {
