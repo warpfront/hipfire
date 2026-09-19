@@ -1298,7 +1298,7 @@ __device__ void fa2_stageb_nbody(
                 float* rec = out + rb;
 #pragma unroll
                 for (int j = 0; j < 8; ++j) {
-                    const unsigned rj = rb + 2u + (unsigned)(kg * 8 + j);
+                    const unsigned rj = 2u + (unsigned)(kg * 8 + j);
 #pragma unroll
                     for (int dc = 0; dc < 16; ++dc)
                         rec[rj + (unsigned)(dc * 16)] = b_prev * Ofr[dc][j];
@@ -1731,8 +1731,8 @@ extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_g
 // Fill is the T-verified paired mechanism (b128 K/V pairs, wave-private 2
 // KiB transpose scratch, shared native-scale headers). Arithmetic graph is
 // the stage-b recurrence unchanged (true divisions, serial sum, rho fold);
-// reductions use the fixed permlanex16 partner idiom. Resident Q (16 fp8
-// fragments + sq) is held once per call with compile-time indices.
+// reductions use the fixed permlanex16 partner idiom. Q fragments reload in
+// four-fragment groups during QK so the exact transpose remains spill-free.
 #if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8) && defined(HIPFIRE_FA2_PACKET)
 static __device__ __forceinline__ float fa2_pkt_xor16(float v)
 {
@@ -1784,19 +1784,10 @@ __device__ void fa2_stageb_packet_body(
     float m_old = -INFINITY;
     float l_val = 0.0f;
     float b_prev = 1.0f;
-    // Resident Q: 16 fp8 fragments (two dwords each) + scale. One-time load
-    // with compile-time indices; OOR lanes clamp to row 0 (fully masked).
-    v2i_t Qf[16];
-    {
-        const unsigned qb =
-            (qok ? (unsigned)query * 24u + (unsigned)head : 0u) * 256u;
-#pragma unroll
-        for (int dc = 0; dc < 16; ++dc) {
-            const v2i_t* qd =
-                (const v2i_t*)(q8_codes + qb + (unsigned)(dc * 16));
-            Qf[dc] = qd[kg];
-        }
-    }
+    // Q row base. Fragments are loaded in bounded groups during QK so the
+    // transpose can reuse their registers and remain spill-free.
+    const unsigned qb =
+        (qok ? (unsigned)query * 24u + (unsigned)head : 0u) * 256u;
     // WG bounds: lanes 0..21 load the same guarded prefix (<=22 positions)
     // and reduce with the identical integer graph on every wave.
     int wmx = -1;
@@ -1899,6 +1890,11 @@ __device__ void fa2_stageb_packet_body(
                         e0 = __builtin_amdgcn_perm(e0, d0, sel1);
                         uint32_t e1 = (uint32_t)__shfl_xor((int)d1, 1, 32);
                         e1 = __builtin_amdgcn_perm(e1, d1, sel1);
+                        uint32_t f0 = (uint32_t)__shfl_xor((int)e0, 2, 32);
+                        s32[h * 2] = __builtin_amdgcn_perm(f0, e0, sel2);
+                        uint32_t f1 = (uint32_t)__shfl_xor((int)e1, 2, 32);
+                        s32[h * 2 + 1] =
+                            __builtin_amdgcn_perm(f1, e1, sel2);
                     }
                     *(uint4*)(V8 +
                               (unsigned)(((sub * 8 + p) * 32 + lane) * 16)) =
@@ -1950,21 +1946,34 @@ __device__ void fa2_stageb_packet_body(
                     continue;
                 float8_t sacc =
                     (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
-                // QK with resident Q: one paired b128 per p supplies the
-                // two WMMA operands for dc=2p,2p+1 in dc order. Fully
-                // unrolled so every Qf index is compile-time constant.
+                // QK: one paired b128 K load supplies two dc operands.
+                // Q loads stay bounded to four fragments per dg group;
+                // retaining all sixteen across the fill forces spills once
+                // the exact V transpose is present.
+#pragma unroll 1
+                for (int dg = 0; dg < 4; ++dg) {
 #pragma unroll
-                for (int p = 0; p < 8; ++p) {
-                    const uint4* kp =
-                        (const uint4*)(K8 + (unsigned)(((p * 4 + sub) * 32 +
-                                                      lane) * 16));
-                    const uint4 kv = *kp;
-                    const v2i_t kf0 = {(int)kv.x, (int)kv.y};
-                    const v2i_t kf1 = {(int)kv.z, (int)kv.w};
-                    sacc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
-                        kf0, Qf[2 * p], sacc);
-                    sacc = __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
-                        kf1, Qf[2 * p + 1], sacc);
+                    for (int u = 0; u < 2; ++u) {
+                        const int p = 2 * dg + u;
+                        const uint4* kp =
+                            (const uint4*)(K8 +
+                                (unsigned)(((p * 4 + sub) * 32 + lane) * 16));
+                        const uint4 kv = *kp;
+                        const v2i_t kf0 = {(int)kv.x, (int)kv.y};
+                        const v2i_t kf1 = {(int)kv.z, (int)kv.w};
+                        const v2i_t* qd0 = (const v2i_t*)(
+                            q8_codes + qb + (unsigned)(2 * p * 16));
+                        const v2i_t* qd1 = (const v2i_t*)(
+                            q8_codes + qb + (unsigned)((2 * p + 1) * 16));
+                        const v2i_t qf0 = qd0[kg];
+                        const v2i_t qf1 = qd1[kg];
+                        sacc =
+                            __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                                kf0, qf0, sacc);
+                        sacc =
+                            __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                                kf1, qf1, sacc);
+                    }
                     asm volatile("" ::: "memory");
                 }
                 (void)kbn;
@@ -2087,7 +2096,7 @@ __device__ void fa2_stageb_packet_body(
             float* rec = out + rb;
 #pragma unroll
             for (int j = 0; j < 8; ++j) {
-                const unsigned rj = rb + 2u + (unsigned)(kg * 8 + j);
+                const unsigned rj = 2u + (unsigned)(kg * 8 + j);
 #pragma unroll
                 for (int dc = 0; dc < 16; ++dc)
                     rec[rj + (unsigned)(dc * 16)] = b_prev * Ofr[dc][j];

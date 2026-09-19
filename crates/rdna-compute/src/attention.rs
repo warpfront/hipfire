@@ -4639,7 +4639,7 @@ impl Gpu {
     /// arithmetic; FaPacket K1). Dense ownership: one workgroup owns 128
     /// query-head rows (`row = 128*bx + 16*wave + ml`, `query = row/6`,
     /// `head = 6*kv_h + row%6`) over eight compute waves, KT64 tiles,
-    /// paired b128 fragments, resident fp8 Q. Grid
+    /// paired b128 fragments, and bounded-group fp8 Q loads. Grid
     /// `[(batch*6).div_ceil(128), 4, 1]`, block 256, 49408 B dynamic LDS.
     /// Same kernargs/ABI/scratch contract as the route-N launcher (codes+sq
     /// via the shared stage-b pre-convert; separate module: the packet

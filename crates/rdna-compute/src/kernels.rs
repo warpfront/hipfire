@@ -6031,7 +6031,7 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC: &str = concat!(
 /// Packet-minimal Q128 twin of [`ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC`]
 /// (+ `HIPFIRE_FA2_PACKET=1`): dense 128-row ownership over eight compute
 /// waves, paired b128 K/V fragments, wave-private V transpose, shared LDS
-/// scale headers, resident fp8 Q, 49408 B dynamic LDS. Entry symbols
+/// scale headers, bounded-group fp8 Q loads, 49408 B dynamic LDS. Entry symbols
 /// `attention_fp8_e4m3_fa2_gqa_packet_gfx1201` / `_packet_partial_` /
 /// `_packet_merge_gfx1201` (duplicated merge: the symbol-keyed host function
 /// cache never collides with the route-N module). Exact stage-b arithmetic.
