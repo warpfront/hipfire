@@ -6028,6 +6028,22 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_KMODE 8\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
+/// Packet-minimal Q128 twin of [`ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC`]
+/// (+ `HIPFIRE_FA2_PACKET=1`): dense 128-row ownership over eight compute
+/// waves, paired b128 K/V fragments, wave-private V transpose, shared LDS
+/// scale headers, bounded-group fp8 Q loads, 49408 B dynamic LDS. Entry symbols
+/// `attention_fp8_e4m3_fa2_gqa_packet_gfx1201` / `_packet_partial_` /
+/// `_packet_merge_gfx1201` (duplicated merge: the symbol-keyed host function
+/// cache never collides with the route-N module). Exact stage-b arithmetic.
+/// JIT-only via the packet launcher behind `kernel.gfx12_fa_packet` (default
+/// on exact gfx1201; `false` opts out). The route-N/Q0/fwht3 objects are
+/// unaffected: the packet region preprocesses away without `HIPFIRE_FA2_PACKET`.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_PACKET_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_PACKET 1\n",
+    "#define HIPFIRE_FA2_FP8 1\n",
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
 
 /// gfx11 (RDNA3) sister of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`]
 /// (research opt-in). One workgroup per KV head x 8 positions; K/V

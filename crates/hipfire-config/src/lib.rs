@@ -2186,6 +2186,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx1201 GQA-fused FA2 prefill attention route (default on exact gfx1201; set to false or HIPFIRE_GFX12_FA2_PREFILL=0 to opt out)."
     ),
     process_bool_field!(
+        "kernel.gfx12_fa_packet",
+        "gfx12_fa_packet",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_FA_PACKET",
+        "Enable the gfx1201 packet-minimal Q128 FA2 attention body (default on exact gfx1201; set to false or HIPFIRE_GFX12_FA_PACKET=0 to opt out to route-N; exact stage-b arithmetic)."
+    ),
+    process_bool_field!(
         "kernel.gfx11_fa2_prefill",
         "gfx11_fa2_prefill",
         Kernel,

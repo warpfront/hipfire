@@ -21,7 +21,7 @@
 //! wall time that fusing into one kernel is worth the engineering.
 //!
 //! Usage:
-//!   profile_prefill_qwen35 <model.hfq> [--prefill N] [--warmup N] [--kv-mode asym3|q8]
+//!   profile_prefill_qwen35 <model.hfq> [--prefill N] [--warmup N] [--kv-mode asym3|q8|fp8]
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -40,7 +40,7 @@ fn main() {
 
     let args: Vec<String> = std::env::args().collect();
     if args.len() < 2 {
-        eprintln!("Usage: profile_prefill_qwen35 <model.hfq> [--prefill N] [--warmup N] [--kv-mode asym3|q8]");
+        eprintln!("Usage: profile_prefill_qwen35 <model.hfq> [--prefill N] [--warmup N] [--kv-mode asym3|q8|fp8]");
         std::process::exit(1);
     }
     let model_path = &args[1];
@@ -112,8 +112,39 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
+        "fp8" => {
+            if gpu.arch != "gfx1201"
+                || config.num_experts != 0
+                || config.n_heads != 24
+                || config.n_kv_heads != 4
+                || config.head_dim != 256
+            {
+                eprintln!(
+                    "fp8 KV requires dense gfx1201 H24/Hkv4/D256 (got arch={} experts={} H{}/Hkv{}/D{})",
+                    gpu.arch,
+                    config.num_experts,
+                    config.n_heads,
+                    config.n_kv_heads,
+                    config.head_dim
+                );
+                std::process::exit(1);
+            }
+            let is_kv_layer: Vec<bool> = config
+                .layer_types
+                .iter()
+                .map(|t| *t == qwen35::LayerType::FullAttention)
+                .collect();
+            KvCache::new_gpu_fp8_filtered(
+                &mut gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            )
+            .unwrap()
+        }
         other => {
-            eprintln!("unknown --kv-mode {other}; use asym3 or q8");
+            eprintln!("unknown --kv-mode {other}; use asym3, q8, or fp8");
             std::process::exit(1);
         }
     };
