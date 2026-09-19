@@ -2207,10 +2207,10 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.iu4_prefill",
         "iu4_prefill",
         Kernel,
-        false,
         true,
+        false,
         "HIPFIRE_IU4_PREFILL",
-        "Enable the W4A4 iu4-direct MMQ prefill route (opt-in on exact gfx1100/gfx1151/gfx1201; set to true or HIPFIRE_IU4_PREFILL=1 to opt in)."
+        "Enable the W4A4 iu4-direct MMQ prefill route (default on exact gfx1100/gfx1151/gfx1201, other arches keep their incumbent route; set to false or HIPFIRE_IU4_PREFILL=0 to opt out)."
     ),
     process_bool_field!(
         "kernel.npu_spillover",
