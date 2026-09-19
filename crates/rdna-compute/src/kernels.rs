@@ -6043,10 +6043,11 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC: &str = concat!(
 /// Packet-minimal Q128 twin of [`ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC`]
 /// (+ `HIPFIRE_FA2_PACKET=1`): dense 128-row ownership over eight compute
 /// waves, paired b128 K/V fragments, wave-private V transpose, shared LDS
-/// scale headers, bounded-group fp8 Q loads, 49408 B dynamic LDS. Entry symbols
-/// `attention_fp8_e4m3_fa2_gqa_packet_gfx1201` / `_packet_partial_` /
-/// `_packet_merge_gfx1201` (duplicated merge: the symbol-keyed host function
-/// cache never collides with the route-N module). Exact stage-b arithmetic.
+/// scale headers, and exact in-kernel f32->E4M3 Q conversion. Widened batches
+/// use grid.z for equal-length 512-row runs, eliminating both the standalone
+/// Q pre-convert and per-run body dispatches. Entry symbols include the direct
+/// packet plus benchmark-only partial/merge twins; the partial retains the
+/// shared pre-convert so the split oracle stays independent.
 /// JIT-only via the packet launcher behind `kernel.gfx12_fa_packet` (default
 /// on exact gfx1201; `false` opts out). The route-N/Q0/fwht3 objects are
 /// unaffected: the packet region preprocesses away without `HIPFIRE_FA2_PACKET`.

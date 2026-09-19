@@ -4636,14 +4636,14 @@ impl Gpu {
     }
     /// Packet-minimal Q128 twin of
     /// [`Self::attention_fp8_e4m3_fa2_gqa_fp8_gfx1201`] (exact stage-b
-    /// arithmetic; FaPacket K1). Dense ownership: one workgroup owns 128
+    /// arithmetic; AttnR4d S1). Dense ownership: one workgroup owns 128
     /// query-head rows (`row = 128*bx + 16*wave + ml`, `query = row/6`,
-    /// `head = 6*kv_h + row%6`) over eight compute waves, KT64 tiles,
-    /// paired b128 fragments, and bounded-group fp8 Q loads. Grid
-    /// `[(batch*6).div_ceil(128), 4, 1]`, block 256, 49408 B dynamic LDS.
-    /// Same kernargs/ABI/scratch contract as the route-N launcher (codes+sq
-    /// via the shared stage-b pre-convert; separate module: the packet
-    /// entry symbols never collide in the symbol-keyed function cache).
+    /// `head = 6*kv_h + row%6`) over eight compute waves and KT64 tiles.
+    /// Q f32->E4M3 conversion is fused into each owned row with the same
+    /// amax, scale and `cvt_pk_fp8_f32` grouping as the removed pre-convert,
+    /// writing the existing Q scratch once before the KT64 loop consumes it.
+    /// Widened batches use a 3-D grid: z enumerates equal-length 512-row
+    /// runs and x restarts inside each run. Block 256, 49408 B dynamic LDS.
     /// Default route on exact gfx1201; `kernel.gfx12_fa_packet=false` opts out.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
@@ -4678,11 +4678,11 @@ impl Gpu {
                 ),
             ));
         }
-        if batch_size == 0 || batch_size > 512 {
+        if batch_size == 0 || batch_size > 32768 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_fp8_e4m3_fa2_gqa_packet_gfx1201 requires 1 <= batch <= 512, got {batch_size}"
+                    "attention_fp8_e4m3_fa2_gqa_packet_gfx1201 requires 1 <= batch <= 32768, got {batch_size}"
                 ),
             ));
         }
@@ -4707,23 +4707,16 @@ impl Gpu {
                 ),
             ));
         }
-        // Packet module: `HIPFIRE_FA2_PACKET=1` + `HIPFIRE_FA2_FP8=1` +
-        // `HIPFIRE_FA2_KMODE=8`. Entries
-        // `attention_fp8_e4m3_fa2_gqa_packet_gfx1201` (+ `_partial_` /
-        // `_merge_`) plus the shared stage-b Q pre-convert
-        // `attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201` (same symbol as
-        // route-N: identical pre-convert body, resolved out of the packet
-        // module object so the oracle compares separate modules).
+        // The direct packet symbol performs the exact row conversion in its
+        // prologue and writes the existing q8+scale scratch. Each workgroup
+        // owns every scratch row it consumes, so no cross-grid barrier is
+        // required and the separate pre-convert launch disappears.
         const SYMBOL: &str = "attention_fp8_e4m3_fa2_gqa_packet_gfx1201";
-        const PRECONVERT: &str = "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201";
         let src = kernels::ATTENTION_FP8_E4M3_FA2_GQA_PACKET_GFX1201_SRC;
-        if !self.functions.contains_key(SYMBOL) || !self.functions.contains_key(PRECONVERT) {
+        if !self.functions.contains_key(SYMBOL) {
             self.ensure_kernel(SYMBOL, src, SYMBOL)?;
-            self.ensure_kernel(SYMBOL, src, PRECONVERT)?;
         }
-        // Same stage-b scratch contract as route-N (e4m3 codes + f32 sq,
-        // Gpu-owned, grows-never-shrinks, same pre-growth invalidation).
-        let (need_fp8_bytes, sq_off, _) =
+        let (need_fp8_bytes, _, _) =
             crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
         if crate::scratch::scratch_will_grow(
             self.scratch.fa2_fp8_q_scratch_bytes,
@@ -4735,9 +4728,11 @@ impl Gpu {
         let q8_ptr = self
             .scratch
             .ensure_fa2_fp8_q_scratch(&self.hip, need_fp8_bytes)?;
-        let sq_ptr = unsafe { (q8_ptr as *mut u8).add(sq_off) as *mut c_void };
-        let grid_x = (batch_size * 6).div_ceil(128) as u32;
+        let run_rows = batch_size.min(512);
+        let grid_x = (run_rows * 6).div_ceil(128) as u32;
+        let grid_z = batch_size.div_ceil(512) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_arg = q.buf.as_ptr();
         let mut q8_arg = q8_ptr;
         let mut k_ptr = k_cache.buf.as_ptr();
         let mut v_ptr = v_cache.buf.as_ptr();
@@ -4749,6 +4744,7 @@ impl Gpu {
         let mut bs = batch_size as i32;
         let mut sc = scale;
         let mut params: Vec<*mut c_void> = vec![
+            &mut q_arg as *mut _ as *mut c_void,
             &mut q8_arg as *mut _ as *mut c_void,
             &mut k_ptr as *mut _ as *mut c_void,
             &mut v_ptr as *mut _ as *mut c_void,
@@ -4769,23 +4765,17 @@ impl Gpu {
             SYMBOL,
             bytes,
         );
-        self.launch_fa2_q_preconvert_fp8(
-            PRECONVERT,
-            q.buf.as_ptr(),
-            q8_ptr,
-            sq_ptr,
-            batch_size,
-        )?;
         // Packet arms use exactly 49408 B dynamic LDS (paired planes +
         // transpose scratch + shared scale headers); block 256.
         let result = self.launch_maybe_blob(
             SYMBOL,
-            [grid_x, 4, 1],
+            [grid_x, 4, grid_z],
             [256, 1, 1],
             49408,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_arg);
                 b.push_ptr(q8_arg);
                 b.push_ptr(k_ptr);
                 b.push_ptr(v_ptr);

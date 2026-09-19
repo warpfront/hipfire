@@ -10180,16 +10180,14 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // gfx12 iu4-direct MMQ (W4A4 prefill) opt-in: intercepts before the
-        // fp8/production path. Same shape predicate as the fp8 intercept;
-        // flag off leaves every byte unchanged.
+        // gfx12 iu4-direct MMQ handles partial 128-row tiles natively, so odd
+        // prefill batches stay on the W4A4 path without host padding.
         if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
             && batch_size >= 64
-            && batch_size % 64 == 0
         {
             let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
@@ -19773,6 +19771,7 @@ impl Gpu {
     ) -> HipResult<()> {
         self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, true)
     }
+
 
     /// WMMA-accelerated batched HFQ4-G256 GEMM with residual add.
     /// gfx1100+ only. 16×16 output tiles via wave32 WMMA.
@@ -29593,16 +29592,13 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        // gfx12 iu4-direct MMQ (W4A4 prefill) opt-in: intercepts before the
-        // fp8/production path. Same shape predicate as the fp8 intercept;
-        // flag off leaves every byte unchanged.
+        // gfx12 iu4-direct MMQ handles partial 128-row tiles natively.
         if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
             && batch_size >= 64
-            && batch_size % 64 == 0
         {
             let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_q, xq, y_q, q_m, k, batch_size)?;
@@ -30220,16 +30216,13 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // gfx12 iu4-direct MMQ (W4A4 prefill) opt-in: intercepts before the
-        // ldsstage/fp8/production path. Same shape predicate as the fp8
-        // intercept; flag off leaves every byte unchanged.
+        // gfx12 iu4-direct MMQ handles partial 128-row tiles natively.
         if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
             && batch_size >= 64
-            && batch_size % 64 == 0
         {
             let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_set_prequant_iu4(
@@ -32345,16 +32338,13 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // gfx12 iu4-direct MMQ (W4A4 prefill) opt-in: intercepts before the
-        // ldsstage/fp8/production path. Same shape predicate as the fp8
-        // intercept; flag off leaves every byte unchanged.
+        // gfx12 iu4-direct MMQ handles partial 128-row tiles natively.
         if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
             && batch_size >= 64
-            && batch_size % 64 == 0
         {
             let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
             self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)?;
