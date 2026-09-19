@@ -6747,6 +6747,21 @@ pub const GATED_DELTA_NET_Q8_FAST_SRC: &str = concat!(
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
 
+/// fused chunked gated-delta-net prefill scan, WMMA-resident state (hipfire design; structure informed by public FLA/AITER chunk decomposition).
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_PREP_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_scan_prep.gfx1201.hip");
+
+/// Shared-Gram KKT solve for the GDN chunk scan on gfx1100/gfx1151/gfx1201.
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_KKT_SOLVE_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip");
+
+/// Fused GDN chunk scan and Q8+EF state commit on gfx1100/gfx1151/gfx1201.
+#[cfg(feature = "deltanet")]
+pub const GDN_CHUNK_SCAN_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip");
+
 /// Decode-only compact-QK variants for Qwen3.5 DeltaNet GQA (16 Q/K heads,
 /// 32 value/state heads). Each pair of state heads reads one normalized Q/K
 /// head directly, eliminating the materializing repeat-interleave launch.

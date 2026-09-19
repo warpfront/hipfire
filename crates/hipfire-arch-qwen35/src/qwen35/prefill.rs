@@ -110,7 +110,7 @@ fn try_iu4_silu_prepared(
 /// path. Same contract as [`try_iu4_silu_prepared`] (uniform MQ4G256V2 only,
 /// Residual-only at the call sites) but routed by `iu4_silu_quant_fused_active`
 /// (default on for exact-gfx1201 IU4; `HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts
-/// out) instead of the gfx1151-only C2 sidecar gate. Every other caller keeps
+/// out) instead of the portable gfx11 sidecar gate. Every other caller keeps
 /// `quantize_int4_mmq_ds128` path untouched.
 fn try_gfx12_silu_quant_fused_prepared(
     gpu: &mut Gpu,
@@ -143,7 +143,7 @@ fn try_gfx12_silu_quant_fused_prepared(
 /// rmsnorm+rotate + standalone-quantizer path. Same contract as
 /// [`try_iu4_rmsnorm_prepared`] (uniform MQ4G256V2 only) but gated by
 /// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` on exact gfx1201 instead of the
-/// gfx1151-only C2 sidecar gate.
+/// portable gfx11 sidecar gate.
 fn try_gfx12_rmsnorm_quant_fused_prepared(
     gpu: &mut Gpu,
     x: &GpuTensor,
@@ -777,10 +777,10 @@ fn explicit_prefill_max_batch() -> Option<usize> {
 }
 
 /// Architecture default for the widened ordinary-prefill chunk ceiling
-/// (`prefill.chunk_rows`): 8192 on exact gfx1201, 512 elsewhere.
+/// (`prefill.chunk_rows`): 8192 on gfx1100/gfx1151/gfx1201, 512 elsewhere.
 #[inline]
 fn prefill_chunk_rows_default(arch: &str) -> usize {
-    if arch == "gfx1201" { 8192 } else { 512 }
+    if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201") { 8192 } else { 512 }
 }
 
 /// Requested widened chunk ceiling: explicit `HIPFIRE_PREFILL_MAX_BATCH`
@@ -881,14 +881,13 @@ pub fn prefill_max_batch_tp(gpu: &Gpu, tp: usize) -> usize {
 pub fn prefill_max_batch_ep() -> usize {
     explicit_prefill_max_batch().unwrap_or(512)
 }
-/// gfx1201 widened ordinary prefill: larger contiguous GEMM/PBS chunks with the
+/// Widened ordinary prefill: larger contiguous GEMM/PBS chunks with the
 /// DeltaNet kernel still launched once per 512-row commit on views and flash
 /// attention on 512-row tile views. No kernel source changes.
 ///
-/// The host change is arch-parameterized: [`widened_arch_admitted`] is the
-/// single arch gate (gfx1201 only until a rung passes; gfx1151/Halo admission
-/// is a follow-on extension with its own static checks — its F2 512-pair path
-/// below is preserved regardless, since wide chunks never equal 512 rows).
+/// gfx1201 keeps its FP8 projection route. gfx1100/gfx1151 use their existing
+/// IU4 K16 projection route and Q8 FA2 cache route; no gfx12 FP8 kernel is
+/// admitted on gfx11.
 /// Only `None` (legacy cadence) and `Some(512)` are legal commit strides.
 /// `n` continues to mean chunk rows, never commit stride.
 pub(crate) const WIDENED_COMMIT_ROWS: usize = 512;
@@ -898,24 +897,21 @@ pub(crate) const WIDENED_COMMIT_ROWS: usize = 512;
 const WIDENED_RUNGS: [usize; 5] = [512, 1024, 2048, 4096, 8192];
 ///
 /// Performance ceiling for the staged rungs above: `prefill.chunk_rows`
-/// (config file or `HIPFIRE_PREFILL_CHUNK_ROWS`, default 4096 on exact
-/// gfx1201 and 512 elsewhere; explicit `HIPFIRE_PREFILL_MAX_BATCH` wins).
-/// See [`prefill_chunk_rows_requested`]. Memory admission may still select a
-/// smaller rung per device.
+/// (config file or `HIPFIRE_PREFILL_CHUNK_ROWS`, default 8192 on
+/// gfx1100/gfx1151/gfx1201 and 512 elsewhere; explicit
+/// `HIPFIRE_PREFILL_MAX_BATCH` wins). See [`prefill_chunk_rows_requested`].
+/// Memory admission may still select a smaller rung per device.
 ///
 /// Uncommitted-VRAM headroom reserved by the per-device capacity admission
 /// (plan §4.2). Conservative policy margin covering remaining state, output,
 /// graph/JIT and ordinary transients — not permission for unaccounted KV.
 const WIDENED_VRAM_HEADROOM_BYTES: usize = 1 << 30;
 ///
-/// Arch gate for the widened ordinary route. gfx1201 only for now; extend
-/// here (with that arch's static checks in
-/// [`ordinary_prefill_static_ceiling`]) once a rung passes on gfx1201.
-/// When gfx1151 follows, its FA tiling must pair in 1024-row views where F2
-/// is admitted (F2 is part of the Halo baseline) or record F2-off explicitly.
+/// Arch gate for the widened ordinary route. gfx1201 uses FP8 projections;
+/// gfx1100/gfx1151 use the existing IU4 K16 projections and Q8 FA2 path.
 #[inline]
 fn widened_arch_admitted(arch: &str) -> bool {
-    arch == "gfx1201"
+    matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
 }
 ///
 /// Exact dense 27B shape the widened route admits: the shared 64-layer
@@ -950,7 +946,7 @@ fn dn_requant_per_token_env() -> bool {
 /// retain existing behavior); otherwise the ceiling snaps down to the
 /// largest staged rung the request covers. The request is
 /// [`prefill_chunk_rows_requested`] (explicit override, then
-/// `prefill.chunk_rows` config, then the 4096/512 arch default).
+/// `prefill.chunk_rows` config, then the 8192/512 arch default).
 fn ordinary_prefill_static_ceiling(
     gpu: &Gpu,
     weights: &Qwen35Weights,
@@ -966,14 +962,18 @@ fn ordinary_prefill_static_ceiling(
     if !dense_layers_are_all_mq4v2(weights) {
         return None;
     }
-    // All four FP8 projection routes (gate/up, residual, qkvza, FA qkv).
-    // `fp8_chunk512_for_gpu` tests only the first three — legacy getter
-    // retained; the widened route needs the stricter call-local admission.
-    if !(gpu.flags.gfx12_mq4v2_fp8_gateup
-        && gpu.flags.gfx12_mq4v2_fp8_resid
-        && gpu.flags.gfx12_mq4v2_fp8_qkvza
-        && gpu.flags.gfx12_mq4v2_fp8_qkv)
-    {
+    // gfx1201 keeps all four FP8 projection routes. gfx11 substitutes the
+    // existing IU4 K16 projection route; its full-attention layers remain on
+    // Q8 FA2 because the packet kernel and FP8 KV format are gfx1201-only.
+    let projection_route_admitted = if gpu.arch == "gfx1201" {
+        gpu.flags.gfx12_mq4v2_fp8_gateup
+            && gpu.flags.gfx12_mq4v2_fp8_resid
+            && gpu.flags.gfx12_mq4v2_fp8_qkvza
+            && gpu.flags.gfx12_mq4v2_fp8_qkv
+    } else {
+        gpu.flags.iu4_prefill_enabled()
+    };
+    if !projection_route_admitted {
         return None;
     }
     // Actual Q8 state with a complete EF owner for every LA layer, single
@@ -1064,19 +1064,27 @@ fn fp8_row_bytes_wide(config: &Qwen35Config) -> Option<usize> {
         .checked_add(4)
 }
 ///
-/// Per-device capacity admission (plan §4.2): largest performance-admitted
-/// rung `<= perf_rows` whose full new PBS, per-slot FP8 deficits at Kmax,
-/// missing FA Q16 bytes and 1 GiB headroom fit in current free device bytes.
+/// IU4 K16 prelude bytes/row at the conservative `Kmax = hidden_dim`
+/// envelope: one 72-byte `block_i4_128` per K/128 block.
+fn iu4_row_bytes_wide(config: &Qwen35Config) -> Option<usize> {
+    config.hidden_dim.checked_add(127)?.checked_div(128)?.checked_mul(72)
+}
+///
+/// Per-device capacity admission: largest performance-admitted rung
+/// `<= perf_rows` whose full new PBS, projection-prelude deficit, missing FA
+/// Q16 bytes and 1 GiB headroom fit in current free device bytes. The
+/// projection charge is FP8 on gfx1201 and IU4 K16 on gfx1100/gfx1151.
 /// The query runs after model+KV mapping and request-state allocation, so
 /// free bytes already charge mapped KV and any inactive reuse cache. Falls
-/// back to 512 (legacy route) when no enlarged rung fits — a memory-only
-/// failure selects a smaller rung, never a global rollback.
+/// back to 512 when no enlarged rung fits.
 fn memory_admitted_rung(gpu: &Gpu, config: &Qwen35Config, perf_rows: usize) -> HipResult<usize> {
     if perf_rows <= WIDENED_COMMIT_ROWS {
         return Ok(WIDENED_COMMIT_ROWS.min(perf_rows));
     }
+    let fp8_projection = gpu.arch == "gfx1201";
     if dense_prefill_allocation_bytes(config, perf_rows).is_none()
-        || fp8_row_bytes_wide(config).is_none()
+        || (fp8_projection && fp8_row_bytes_wide(config).is_none())
+        || (!fp8_projection && iu4_row_bytes_wide(config).is_none())
     {
         return Ok(WIDENED_COMMIT_ROWS);
     }
@@ -1087,10 +1095,12 @@ fn memory_admitted_rung(gpu: &Gpu, config: &Qwen35Config, perf_rows: usize) -> H
         .and_then(|v| v.checked_mul(2))
         .unwrap_or(usize::MAX);
     let q16_missing = q16_need.saturating_sub(gpu.scratch.fa2_q16_scratch_bytes);
-    let live_x = gpu.scratch.mq4v2_fp8_x_scratch_bytes;
-    let live_sums = gpu.scratch.mq4v2_fp8_half_sums_scratch_bytes;
-    let live_scales = gpu.scratch.mq4v2_fp8_row_scales_scratch_bytes;
-    let groups = config.hidden_dim / 256;
+    let live_fp8_x = gpu.scratch.mq4v2_fp8_x_scratch_bytes;
+    let live_fp8_sums = gpu.scratch.mq4v2_fp8_half_sums_scratch_bytes;
+    let live_fp8_scales = gpu.scratch.mq4v2_fp8_row_scales_scratch_bytes;
+    let live_iu4 = gpu.scratch.int4_mmq_x_scratch_bytes;
+    let fp8_groups = config.hidden_dim / 256;
+    let iu4_bytes_per_row = iu4_row_bytes_wide(config).unwrap_or(usize::MAX);
     for &rung in WIDENED_RUNGS.iter().rev() {
         if rung > perf_rows {
             continue;
@@ -1099,18 +1109,24 @@ fn memory_admitted_rung(gpu: &Gpu, config: &Qwen35Config, perf_rows: usize) -> H
             return Ok(WIDENED_COMMIT_ROWS);
         }
         let need_pbs = dense_prefill_allocation_bytes(config, rung).unwrap_or(usize::MAX);
-        let x_need = rung.checked_mul(config.hidden_dim).unwrap_or(usize::MAX);
-        let sums_need = rung
-            .checked_mul(groups)
-            .and_then(|v| v.checked_mul(8))
-            .unwrap_or(usize::MAX);
-        let scales_need = rung.checked_mul(4).unwrap_or(usize::MAX);
-        let fp8_deficit = x_need
-            .saturating_sub(live_x)
-            .saturating_add(sums_need.saturating_sub(live_sums))
-            .saturating_add(scales_need.saturating_sub(live_scales));
+        let projection_deficit = if fp8_projection {
+            let x_need = rung.checked_mul(config.hidden_dim).unwrap_or(usize::MAX);
+            let sums_need = rung
+                .checked_mul(fp8_groups)
+                .and_then(|v| v.checked_mul(8))
+                .unwrap_or(usize::MAX);
+            let scales_need = rung.checked_mul(4).unwrap_or(usize::MAX);
+            x_need
+                .saturating_sub(live_fp8_x)
+                .saturating_add(sums_need.saturating_sub(live_fp8_sums))
+                .saturating_add(scales_need.saturating_sub(live_fp8_scales))
+        } else {
+            rung.checked_mul(iu4_bytes_per_row)
+                .unwrap_or(usize::MAX)
+                .saturating_sub(live_iu4)
+        };
         let total = need_pbs
-            .saturating_add(fp8_deficit)
+            .saturating_add(projection_deficit)
             .saturating_add(q16_missing)
             .saturating_add(WIDENED_VRAM_HEADROOM_BYTES);
         if total <= free_bytes {
@@ -1154,9 +1170,10 @@ pub fn ordinary_prefill_chunk_limit(
 ///
 /// Next direct-ordinary chunk under a widened ceiling. Keep all valid rows in
 /// the largest admitted chunk so non-rung tails ride the padded multi-row GEMM
-/// path instead of becoming a separate small-M request. A chunk whose final
-/// 512-row commit would be a singleton is shortened by two rows, preserving
-/// the legacy two-token minimum at the state/KV seam.
+/// path instead of becoming a separate small-M request. Do not leave a
+/// singleton after a full ceiling: shorten that chunk by one row so the
+/// 512-row recurrent segments end in a 511-row partial and the final chunk has
+/// two rows. The same rule maps a final in-ceiling 513 rows to 511 + 2.
 fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usize> {
     if remaining < MIN_BATCH || ceiling < MIN_BATCH {
         return None;
@@ -1165,7 +1182,9 @@ fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usiz
         return next_prefill_chunk_len(remaining, ceiling);
     }
     let mut chunk = remaining.min(ceiling);
-    if chunk > WIDENED_COMMIT_ROWS && chunk % WIDENED_COMMIT_ROWS == 1 {
+    if remaining - chunk == 1 && chunk > WIDENED_COMMIT_ROWS {
+        chunk -= 1;
+    } else if chunk > WIDENED_COMMIT_ROWS && chunk % WIDENED_COMMIT_ROWS == 1 {
         chunk -= MIN_BATCH;
     }
     Some(chunk)
@@ -6227,6 +6246,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
     commit_stride: Option<usize>,
+    gdn_chunk_scan_admitted: bool,
 ) -> HipResult<()> {
     // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
     // activation to match its pre-rotated weights; HFQ4 uses
@@ -6241,7 +6261,161 @@ pub(crate) fn batch_chunk_delta_net_attn(
     // together (the all-together corruption-prevention rule from
     // docs/plans/mq-lloyd-batched-prefill-followup.md). MQ4-Lloyd
     // is wired in a separate PR (issue #182).
+    let gdn_chunk_scan_views = if gdn_chunk_scan_admitted {
+        let segment_rows = commit_stride.unwrap_or(n);
+        let tail_rows = n % segment_rows;
+        if !(64..=512).contains(&segment_rows)
+            || (tail_rows != 0 && !(64..segment_rows).contains(&tail_rows))
+        {
+            return Err(HipError::new(0, "invalid admitted GDN chunk scan segment geometry"));
+        }
+
+        let checked_bytes = |rows: usize, width: usize, elem: usize| -> HipResult<usize> {
+            rows.checked_mul(width)
+                .and_then(|v| v.checked_mul(elem))
+                .ok_or_else(|| HipError::new(0, "GDN chunk scan byte extent overflow"))
+        };
+        let raw_view = |tensor: &GpuTensor, need: usize, name: &str| -> HipResult<GpuTensor> {
+            if tensor.buf.size() < need {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "GDN chunk scan {name} scratch undersized: have {}, need {need}",
+                        tensor.buf.size()
+                    ),
+                ));
+            }
+            Ok(GpuTensor {
+                buf: unsafe {
+                    hip_bridge::DeviceBuffer::from_raw(tensor.buf.as_ptr(), need)
+                },
+                shape: vec![need],
+                dtype: DType::Raw,
+            })
+        };
+        let require_bytes = |tensor: &GpuTensor, need: usize, name: &str| -> HipResult<()> {
+            if tensor.buf.size() < need {
+                Err(HipError::new(
+                    0,
+                    &format!(
+                        "GDN chunk scan {name} undersized: have {}, need {need}",
+                        tensor.buf.size()
+                    ),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        let q_bytes = checked_bytes(n, 16 * 128, 2)?;
+        let v_bytes = checked_bytes(n, 48 * 128, 2)?;
+        let a_rows = (segment_rows + 63) / 64 * 64;
+        let a_bytes = checked_bytes(a_rows, 48 * 64, 2)?;
+        let q = raw_view(&pbs.dn_q_batch, q_bytes, "q")?;
+        let k = raw_view(&pbs.dn_k_batch, q_bytes, "k")?;
+        let v = raw_view(&pbs.dn_v_batch, v_bytes, "v")?;
+        let a = raw_view(&pbs.dn_q_raw_batch, a_bytes, "A")?;
+
+        require_bytes(
+            &pbs.dn_qkv_batch,
+            checked_bytes(n, 2 * k_dim + v_dim, 4)?,
+            "projected input",
+        )?;
+        require_bytes(
+            &pbs.dn_alpha_batch,
+            checked_bytes(n, n_v_heads, 4)?,
+            "G",
+        )?;
+        require_bytes(
+            &pbs.dn_beta_batch,
+            checked_bytes(n, n_v_heads, 4)?,
+            "beta",
+        )?;
+        require_bytes(
+            &pbs.dn_attn_out_batch,
+            checked_bytes(n, v_dim, 4)?,
+            "output",
+        )?;
+        require_bytes(
+            &dn_state.s_matrices[delta_layer_idx],
+            48 * 128 * 128,
+            "Q8 state",
+        )?;
+        require_bytes(
+            &dn_state.s_scales[delta_layer_idx],
+            48 * 128 * 4,
+            "state scales",
+        )?;
+        let ef = dn_state
+            .ef_residual(delta_layer_idx)
+            .ok_or_else(|| HipError::new(0, "GDN chunk scan requires complete EF state"))?;
+        require_bytes(ef, 48 * 128 * 128 * 2, "EF state")?;
+        require_bytes(
+            &dn_state.conv_states[delta_layer_idx],
+            (2 * k_dim + v_dim) * (config.conv_kernel_dim - 1) * 4,
+            "conv state",
+        )?;
+
+        // JIT/load failure must occur before input projection or persistent
+        // preamble mutation; no legacy retry is valid after this point.
+        gpu.gdn_chunk_prepare()?;
+        Some((q, k, v, a, segment_rows))
+    } else {
+        None
+    };
+
     batch_chunk_delta_net_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
+
+    if let Some((q, k, v, a, segment_rows)) = gdn_chunk_scan_views {
+        gpu.gdn_chunk_prep(
+            &pbs.dn_qkv_batch,
+            &layer.conv_weight,
+            &dn_state.conv_states[delta_layer_idx],
+            &pbs.dn_alpha_batch,
+            &pbs.dn_beta_batch,
+            &layer.dt_bias,
+            &layer.a_log,
+            &q,
+            &k,
+            &v,
+            n,
+            1.0 / (hd as f32).sqrt(),
+            config.norm_eps,
+        )?;
+        let ef = dn_state
+            .ef_residual(delta_layer_idx)
+            .expect("GDN chunk scan admission prevalidated EF state");
+        for row0 in (0..n).step_by(segment_rows) {
+            let rows = (n - row0).min(segment_rows);
+            gpu.gdn_chunk_scan_segment(
+                &q,
+                &k,
+                &v,
+                &a,
+                &pbs.dn_alpha_batch,
+                &pbs.dn_beta_batch,
+                &dn_state.s_matrices[delta_layer_idx],
+                &dn_state.s_scales[delta_layer_idx],
+                ef,
+                &pbs.dn_attn_out_batch,
+                row0,
+                rows,
+            )?;
+        }
+        batch_chunk_delta_net_output_projection(
+            gpu,
+            layer,
+            config,
+            pbs,
+            n,
+            n_v_heads,
+            q8_wmma_arch,
+            arch_has_wmma,
+            epilogue,
+            fusion,
+        )?;
+        return Ok(());
+    }
 
     let tree_parents = batch_chunk_delta_net_pre_gdn(
         gpu,
@@ -10711,6 +10885,7 @@ fn forward_prefill_chunk_pair(
                         BatchEpilogue::Residual,
                         fusion,
                         None, // commit_stride: pair halves keep legacy cadence
+                        false, // Paired halves retain the incumbent route
                     )?;
                     batch_chunk_delta_net_ffn(
                         gpu,
@@ -11319,11 +11494,50 @@ pub(crate) fn forward_batch_chunk_impl(
 
     let mut delta_layer_idx = band.map(|b| b.delta_layer_offset).unwrap_or(0);
     let mut kv_layer_idx = band.map(|b| b.kv_layer_offset).unwrap_or(0);
+    let gdn_chunk_scan_common_admitted = gpu.flags.gfx12_gdn_chunk_scan
+        && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
+        && config.num_experts == 0
+        && config.linear_num_key_heads == 16
+        && config.linear_num_value_heads == 48
+        && config.linear_key_head_dim == 128
+        && config.linear_value_head_dim == 128
+        && config.conv_kernel_dim == 4
+        && dense_layers_are_all_mq4v2(weights)
+        && gpu.flags.iu4_prefill_enabled()
+        // Native FP8 KV is gfx1201-only; gfx11 runs this scan with its supported Q8 KV tier.
+        && (kv_cache.quant_fp8 || (gpu.arch != "gfx1201" && kv_cache.quant_q8))
+        && dn_state.quant == StateQuant::Q8
+        && !dn_state.s_matrices.is_empty()
+        && dn_state.s_matrices.len() == dn_state.s_scales.len()
+        && dn_state.s_matrices.len() == dn_state.conv_states.len()
+        && dn_state.s_matrices.len() == dn_state.s_ef_residual.len()
+        && matches!(batch_semantics, BatchSemantics::Sequential)
+        && tree_verify.is_none()
+        && gdn_tape.is_none()
+        && fusion == DflashFusionCtx::Off
+        && !gpu.graphs.capture_mode
+        && !gpu.replay.is_enabled()
+        && hidden_rb.is_none()
+        && per_token_hidden_out.is_none()
+        && band.is_none()
+        && max_layer.is_none()
+        && routed_out.is_none()
+        && mask_override.is_none()
+        && n >= 64
+        && (n <= 512
+            || (commit_stride == Some(512)
+                && (n % 512 == 0 || (64..512).contains(&(n % 512)))));
     let ctx = DispatchCtx::new(gpu).with_workload(dispatch_workload);
 
     for layer_idx in layer_start..layer_end {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                let gdn_chunk_scan_admitted = gdn_chunk_scan_common_admitted
+                    && layer.wqkv.gpu_dtype == DType::MQ4G256V2
+                    && layer.wz.gpu_dtype == DType::MQ4G256V2
+                    && layer.w_beta.gpu_dtype == DType::MQ4G256V2
+                    && layer.w_alpha.gpu_dtype == DType::MQ4G256V2
+                    && delta_layer_idx < dn_state.s_ef_residual.len();
                 batch_chunk_delta_net_attn(
                     gpu,
                     layer,
@@ -11346,6 +11560,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     BatchEpilogue::Residual,
                     fusion,
                     commit_stride,
+                    gdn_chunk_scan_admitted,
                 )?;
                 batch_chunk_delta_net_ffn(
                     gpu,

@@ -543,6 +543,17 @@ impl KernelCompiler {
         // Radiowave-selected spill-free RM2/BV6 schedule.
         if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
             vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned()]
+        } else if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
+            && matches!(
+                name,
+                "gdn_chunk_prep" | "gdn_chunk_kkt_solve" | "gdn_chunk_scan"
+            )
+        {
+            let mut flags = vec!["-ffp-contract=off".to_owned()];
+            if arch == "gfx1201" && name == "gdn_chunk_scan" {
+                flags.push("-mcumode".to_owned());
+            }
+            flags
         } else if arch == "gfx1151" && gfx1151_cumode_modules.contains(name) {
             vec!["-mcumode".to_owned()]
         } else {
