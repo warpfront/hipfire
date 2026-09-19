@@ -122,6 +122,19 @@
 // launcher hardcode the same 128/128/256-thread contract (19456 B passed;
 // kernel uses 16384) — a geometry change must update all three consistently.
 //
+// HIPFIRE_IU4_SINGLE_ACC is an evidence-only rounding-order probe.  The
+// shipped path remains the default.  For each 128-K half-block it evaluates
+// (with every arrow denoting an explicit RN node):
+//   p[r,t] = RN(sc_w[r] * d_x[t])
+//   acc[r,t] = RN(p[r,t] * float(C_k32[r,t]) + acc[r,t])  (four K32s)
+//   z[r,t] = RN(zp_w[r] * d_x[t])
+//   acc[r,t] = RN(z[r,t] * float(s_x[t]) + acc[r,t])      (once per K128)
+// Thus the int32 WMMA result is never accumulated across K32 calls; only the
+// f32 acc persists.  A once-per-K128 p matrix exactly replaces cacc and was
+// compile-screened out for spilling; the retained bounded probe rematerializes
+// the identical rounded p at each K32 use.  This deliberately changes rounding
+// order and is gated by WT2 KLD after the zero-spill resource gate.
+//
 // Compile gate: gfx1200 / gfx1201 only. Non-gfx12 archs get empty stubs (the
 
 #include <hip/hip_runtime.h>
@@ -275,6 +288,69 @@ static __device__ __forceinline__ void iu4_bundle(
     __builtin_amdgcn_sched_barrier(0);
 }
 
+#if defined(HIPFIRE_IU4_SINGLE_ACC) && HIPFIRE_IU4_SINGLE_ACC
+// Single-f32-accumulator probe: each WMMA starts from integer zero and its K32
+// partial is folded immediately into acc.  The rounded RN(sc*d) coefficient is
+// rematerialized at each K32 use; retaining all 64 once-per-K128 coefficients
+// exactly replaces cacc and forces spills with the unchanged synchronization.
+
+template <int SB>
+static __device__ __forceinline__ void iu4_bundle_single_acc(
+    const char* __restrict__ w_lds,
+    const char* __restrict__ a_lds,
+    const char* __restrict__ ds_lds,
+    const char* __restrict__ sz_lds,
+    const unsigned (&frW)[2][2],
+    const unsigned (&frA)[4][2],
+    float8_t acc[4][2],
+    int wave_row0, int wave_tok0, int k_grp, int m_lane,
+    const int32x8_t& zc,
+    int& fold_chain
+) {
+    #pragma unroll
+    for (int rg = 0; rg < 2; rg++) {
+        const int32x2_t a_raw =
+            *(const int32x2_t*)(w_lds + frW[rg][SB]);
+        float8_t scale_w;
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const unsigned jbase =
+                (unsigned)(wave_row0 + rg * 16 + 8 * k_grp + j) * 8u;
+            scale_w[j] = *(const float*)(sz_lds + jbase);
+        }
+        #pragma unroll
+        for (int nb = 0; nb < 4; nb++) {
+            const int32x2_t b =
+                *(const int32x2_t*)(a_lds + frA[nb][SB]);
+            int a0 = a_raw[0];
+            asm volatile("v_xor_b32 %0, %0, %1"
+                : "+v"(a0) : "v"(fold_chain));
+            const int32x2_t a = (int32x2_t){a0, a_raw[1]};
+            const int32x8_t partial =
+                __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(
+                    false, a, true, b, zc, false);
+            __builtin_amdgcn_sched_barrier(0);
+            const unsigned tbase =
+                (unsigned)(wave_tok0 + nb * 16 + m_lane) * 8u;
+            const float scale_x = *(const float*)(ds_lds + tbase);
+            const float8_t product = scale_w * scale_x;
+            const float8_t partial_f =
+                __builtin_convertvector(partial, float8_t);
+            acc[nb][rg] =
+                __builtin_elementwise_fma(product, partial_f, acc[nb][rg]);
+            // Carry scalar integer zero through the completed f32 fold, then
+            // XOR it into the next WMMA's A operand.  Both values remain
+            // unchanged, but the true dependency prevents LLVM from retaining
+            // four complete sets of independent K32 partials.
+            asm volatile("v_xor_b32 %0, %1, %1"
+                : "=v"(fold_chain) : "v"(acc[nb][rg][0]));
+            __builtin_amdgcn_sched_barrier(0);
+        }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+}
+#endif
+
 // Shared compute body for residual / full_add / full_set. `ADD` selects
 // += (residual) vs = (set) writeback.
 template <bool ADD>
@@ -381,9 +457,15 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
             acc[nb][rg] = (float8_t){0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
         }
     }
-    // One reusable zero C vector for each chain's first WMMA.
+    // One reusable zero C vector.  The shipped path uses it only for each
+    // chain's first WMMA; the single-acc probe carries a scalar zero through
+    // each preceding fold to keep K32 partials short-lived.
     const int32x8_t zc = (int32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
+#if defined(HIPFIRE_IU4_SINGLE_ACC) && HIPFIRE_IU4_SINGLE_ACC
+    int fold_chain = 0;
+#else
     int32x8_t cacc[4][2];
+#endif
     // Slab prefetch registers (slab s+1 globals while computing slab s): b64
     // pairs, same 8 dwords/lane as before (2 rounds x 1 u32x2 per plane).
     u32x2_t A_pf[2];
@@ -447,6 +529,14 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
             // this block's compute+fold reads.
             char* __restrict__ ds_lds = LDS + ((h == 0) ? IU4_DS_OFF : IU4_DS1_OFF);
             char* __restrict__ sz_lds = LDS + ((h == 0) ? IU4_SZ0_OFF : IU4_SZ1_OFF);
+#if defined(HIPFIRE_IU4_SINGLE_ACC) && HIPFIRE_IU4_SINGLE_ACC
+            // A 64-dword persistent RN(sc*d) matrix exactly replaces cacc
+            // and compiled at 256 VGPR with ~1 KiB scratch.  This lower-spill
+            // diagnostic reloads the K128 factors at each K32 fold and
+            // rematerializes the same RN product, but still fails the
+            // zero-spill resource gate.  The ISA census captures its
+            // conservative fold-cost upper bound.
+#endif
             // --- Slab 0 compute (A, W0) with slab 1 prefetch as producer. ---
             {
                 // Slab 1 prefetch, b64-coalesced: uniform SGPR bases carry
@@ -469,8 +559,17 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 // Every 128-K block restarts its int32 accumulation from zero
                 // (each block folds independently): FIRST=true on slab 0 of
                 // every (g,h), exactly as in v2. No h-dependence here.
+#if defined(HIPFIRE_IU4_SINGLE_ACC) && HIPFIRE_IU4_SINGLE_ACC
+                iu4_bundle_single_acc<0>(
+                    w_lds, a_lds, ds_lds, sz_lds, frW, frA, acc,
+                    wave_row0, wave_tok0, k_grp, m_lane, zc, fold_chain);
+                iu4_bundle_single_acc<1>(
+                    w_lds, a_lds, ds_lds, sz_lds, frW, frA, acc,
+                    wave_row0, wave_tok0, k_grp, m_lane, zc, fold_chain);
+#else
                 iu4_bundle<0, true>(w_lds, a_lds, frW, frA, cacc, zc);
                 iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
+#endif
                 // B0: slab-0 A-reads done on every wave (A is single-buffered:
                 // the publish below overwrites slab 0 with slab 1). W1 writes
                 // need no fence but share it.
@@ -520,8 +619,46 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
             }
             // --- Slab 1 compute (A, W1), current fold, next-block publish. ---
             {
+#if defined(HIPFIRE_IU4_SINGLE_ACC) && HIPFIRE_IU4_SINGLE_ACC
+                iu4_bundle_single_acc<0>(
+                    w_lds, a_lds, ds_lds, sz_lds, frW, frA, acc,
+                    wave_row0, wave_tok0, k_grp, m_lane, zc, fold_chain);
+                iu4_bundle_single_acc<1>(
+                    w_lds, a_lds, ds_lds, sz_lds, frW, frA, acc,
+                    wave_row0, wave_tok0, k_grp, m_lane, zc, fold_chain);
+#else
                 iu4_bundle<0, false>(w_lds, a_lds, frW, frA, cacc, zc);
                 iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
+#endif
+#if defined(HIPFIRE_IU4_SINGLE_ACC) && HIPFIRE_IU4_SINGLE_ACC
+                // The four scaled K32 partials are already in acc.  Apply
+                // only the independent zero correction once per K128:
+                // acc <- RN(RN(zp*d) * float(s) + acc).
+                #pragma unroll
+                for (int rg = 0; rg < 2; rg++) {
+                    float8_t zp_row;
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        const unsigned jbase =
+                            (unsigned)(wave_row0 + rg * 16 + 8 * k_grp + j) * 8u;
+                        zp_row[j] = *(const float*)(sz_lds + jbase + 4u);
+                    }
+                    #pragma unroll
+                    for (int nb = 0; nb < 4; nb++) {
+                        const unsigned tbase =
+                            (unsigned)(wave_tok0 + nb * 16 + m_lane) * 8u;
+                        const float d_x = *(const float*)(ds_lds + tbase);
+                        const float sf_x =
+                            (float)*(const int*)(ds_lds + tbase + 4u);
+                        const float8_t z = zp_row * d_x;
+                        const float8_t sf =
+                            (float8_t){sf_x, sf_x, sf_x, sf_x,
+                                       sf_x, sf_x, sf_x, sf_x};
+                        acc[nb][rg] =
+                            __builtin_elementwise_fma(z, sf, acc[nb][rg]);
+                    }
+                }
+#else
                 // Fold (rescheduled above B2a so the fetch epoch overlaps
                 // compute1 + this VALU): 4 K32 int32 partials per (nb, rg)
                 // through the pinned IU4_FOLD_RN DAG. Reads only cacc plus
@@ -572,6 +709,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
 #endif
                     }
                 }
+#endif
                 // B2a: slab-1 A-reads done on every wave, so the single A
                 // plane may be republished with next slab 0. This drain also
                 // completes the fetch epoch's in-flight loads, AFTER the
