@@ -4634,6 +4634,420 @@ impl Gpu {
         }
         result
     }
+    /// Packet-minimal Q128 twin of
+    /// [`Self::attention_fp8_e4m3_fa2_gqa_fp8_gfx1201`] (exact stage-b
+    /// arithmetic; FaPacket K1). Dense ownership: one workgroup owns 128
+    /// query-head rows (`row = 128*bx + 16*wave + ml`, `query = row/6`,
+    /// `head = 6*kv_h + row%6`) over eight compute waves, KT64 tiles,
+    /// paired b128 fragments, resident fp8 Q. Grid
+    /// `[(batch*6).div_ceil(128), 4, 1]`, block 256, 49408 B dynamic LDS.
+    /// Same kernargs/ABI/scratch contract as the route-N launcher (codes+sq
+    /// via the shared stage-b pre-convert; separate module: the packet
+    /// entry symbols never collide in the symbol-keyed function cache).
+    /// Opt-in only via `kernel.gfx12_fa_packet` dispatch (default off).
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_packet_gfx1201 requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_packet_gfx1201 requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        if batch_size == 0 || batch_size > 512 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_packet_gfx1201 requires 1 <= batch <= 512, got {batch_size}"
+                ),
+            ));
+        }
+        if max_ctx_len == 0 || max_ctx_len > 32768 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_packet_gfx1201 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                ),
+            ));
+        }
+        let need_qo = batch_size * n_heads * head_dim;
+        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_packet_gfx1201 capacity mismatch: \
+                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        // Packet module: `HIPFIRE_FA2_PACKET=1` + `HIPFIRE_FA2_FP8=1` +
+        // `HIPFIRE_FA2_KMODE=8`. Entries
+        // `attention_fp8_e4m3_fa2_gqa_packet_gfx1201` (+ `_partial_` /
+        // `_merge_`) plus the shared stage-b Q pre-convert
+        // `attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201` (same symbol as
+        // route-N: identical pre-convert body, resolved out of the packet
+        // module object so the oracle compares separate modules).
+        const SYMBOL: &str = "attention_fp8_e4m3_fa2_gqa_packet_gfx1201";
+        const PRECONVERT: &str = "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201";
+        let src = kernels::ATTENTION_FP8_E4M3_FA2_GQA_PACKET_GFX1201_SRC;
+        if !self.functions.contains_key(SYMBOL) || !self.functions.contains_key(PRECONVERT) {
+            self.ensure_kernel(SYMBOL, src, SYMBOL)?;
+            self.ensure_kernel(SYMBOL, src, PRECONVERT)?;
+        }
+        // Same stage-b scratch contract as route-N (e4m3 codes + f32 sq,
+        // Gpu-owned, grows-never-shrinks, same pre-growth invalidation).
+        let (need_fp8_bytes, sq_off, _) =
+            crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_fp8_q_scratch_bytes,
+            self.scratch.fa2_fp8_q_scratch.is_some(),
+            need_fp8_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let q8_ptr = self
+            .scratch
+            .ensure_fa2_fp8_q_scratch(&self.hip, need_fp8_bytes)?;
+        let sq_ptr = unsafe { (q8_ptr as *mut u8).add(sq_off) as *mut c_void };
+        let grid_x = (batch_size * 6).div_ceil(128) as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q8_arg = q8_ptr;
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q8_arg as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+        );
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            SYMBOL,
+            bytes,
+        );
+        self.launch_fa2_q_preconvert_fp8(
+            PRECONVERT,
+            q.buf.as_ptr(),
+            q8_ptr,
+            sq_ptr,
+            batch_size,
+        )?;
+        // Packet arms use exactly 49408 B dynamic LDS (paired planes +
+        // transpose scratch + shared scale headers); block 256.
+        let result = self.launch_maybe_blob(
+            SYMBOL,
+            [grid_x, 4, 1],
+            [256, 1, 1],
+            49408,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q8_arg);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// Benchmark/oracle-only split-KV stage-b route-N path (S partitions +
+    /// stable merge). `partials` is caller-owned F32 scratch of at least
+    /// `n_splits * batch_size * n_heads * (head_dim + 2)` elements; this
+    /// method never allocates. Partial grid is `[ceil(batch/8), 4,
+    /// n_splits]` (block 128, LDS 32768); merge grid is
+    /// `[ceil(batch*n_heads/8), 1, 1]` (block 256, LDS 0). No profile
+    /// timer: the harness times the whole call with GPU events. Exists so
+    /// the packet oracle can compare partial records bit-for-bit at matched
+    /// split counts; no production route-N partial caller exists.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_stageb_split_gfx1201_bench(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        partials: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        n_splits: usize,
+    ) -> HipResult<()> {
+        self.stageb_split_impl(
+            q, k_cache, v_cache, out, positions, partials, n_heads,
+            n_kv_heads, head_dim, batch_size, n_splits, false,
+        )
+    }
+    /// Benchmark/oracle-only split-KV packet path (S partitions + stable
+    /// merge). Same contract as
+    /// [`Self::attention_fp8_e4m3_fa2_gqa_stageb_split_gfx1201_bench`] with
+    /// packet geometry: partial grid `[(batch*6).div_ceil(128), 4,
+    /// n_splits]` (block 256, LDS 49408). Exists for the packet oracle.
+    #[doc(hidden)]
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_packet_split_gfx1201_bench(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        partials: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        n_splits: usize,
+    ) -> HipResult<()> {
+        self.stageb_split_impl(
+            q, k_cache, v_cache, out, positions, partials, n_heads,
+            n_kv_heads, head_dim, batch_size, n_splits, true,
+        )
+    }
+    #[allow(clippy::too_many_arguments)]
+    fn stageb_split_impl(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        partials: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        batch_size: usize,
+        n_splits: usize,
+        packet: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let tag = if packet { "packet_split" } else { "stageb_split" };
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("attention_fp8_e4m3_fa2_gqa_{tag}_gfx1201_bench requires gfx1201, got {}", self.arch),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_{tag}_gfx1201_bench requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        if batch_size == 0 || batch_size > 512 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_{tag}_gfx1201_bench requires 1 <= batch <= 512, got {batch_size}"
+                ),
+            ));
+        }
+        if n_splits < 1 || n_splits > 8 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_{tag}_gfx1201_bench requires 1 <= n_splits <= 8, got {n_splits}"
+                ),
+            ));
+        }
+        let need_partials = n_splits * batch_size * n_heads * (head_dim + 2);
+        if partials.numel() < need_partials {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_{tag}_gfx1201_bench scratch too small: \
+                     partials={} (need>={need_partials})",
+                    partials.numel()
+                ),
+            ));
+        }
+        const OLD_PARTIAL: &str = "attention_fp8_e4m3_fa2_gqa_partial_gfx1201";
+        const OLD_MERGE: &str = "attention_fp8_e4m3_fa2_gqa_merge_gfx1201";
+        const PKT_PARTIAL: &str = "attention_fp8_e4m3_fa2_gqa_packet_partial_gfx1201";
+        const PKT_MERGE: &str = "attention_fp8_e4m3_fa2_gqa_packet_merge_gfx1201";
+        const PRECONVERT: &str = "attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201";
+        let (partial, merge, src) = if packet {
+            (
+                PKT_PARTIAL,
+                PKT_MERGE,
+                kernels::ATTENTION_FP8_E4M3_FA2_GQA_PACKET_GFX1201_SRC,
+            )
+        } else {
+            (
+                OLD_PARTIAL,
+                OLD_MERGE,
+                kernels::ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC,
+            )
+        };
+        if !self.functions.contains_key(partial) {
+            self.ensure_kernel(partial, src, partial)?;
+        }
+        if !self.functions.contains_key(PRECONVERT) {
+            self.ensure_kernel(partial, src, PRECONVERT)?;
+        }
+        if !self.functions.contains_key(merge) {
+            self.ensure_kernel(merge, src, merge)?;
+        }
+        // Stage-b scratch: e4m3 codes + f32 sq (same contract as direct).
+        let (need_fp8_bytes, sq_off, _) =
+            crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fa2_fp8_q_scratch_bytes,
+            self.scratch.fa2_fp8_q_scratch.is_some(),
+            need_fp8_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
+        let q8_ptr = self
+            .scratch
+            .ensure_fa2_fp8_q_scratch(&self.hip, need_fp8_bytes)?;
+        let sq_ptr = unsafe { (q8_ptr as *mut u8).add(sq_off) as *mut c_void };
+        let grid_x = if packet {
+            (batch_size * 6).div_ceil(128) as u32
+        } else {
+            batch_size.div_ceil(8) as u32
+        };
+        let (block, lds) = if packet { (256, 49408) } else { (128, 32768) };
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q8_arg = q8_ptr;
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut p_ptr = partials.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut ns = n_splits as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q8_arg as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut p_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut ns as *mut _ as *mut c_void,
+        ];
+        self.launch_fa2_q_preconvert_fp8(
+            PRECONVERT,
+            q.buf.as_ptr(),
+            q8_ptr,
+            sq_ptr,
+            batch_size,
+        )?;
+        self.launch_maybe_blob(
+            partial,
+            [grid_x, 4, n_splits as u32],
+            [block, 1, 1],
+            lds,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q8_arg);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(p_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b.push_i32(ns);
+                b
+            },
+        )?;
+        let mut pp_ptr = partials.buf.as_ptr();
+        let mut o_ptr = out.buf.as_ptr();
+        let mut mbs = batch_size as i32;
+        let mut mnh = n_heads as i32;
+        let mut mhd = head_dim as i32;
+        let mut mns = n_splits as i32;
+        let mut mparams: Vec<*mut c_void> = vec![
+            &mut pp_ptr as *mut _ as *mut c_void,
+            &mut o_ptr as *mut _ as *mut c_void,
+            &mut mbs as *mut _ as *mut c_void,
+            &mut mnh as *mut _ as *mut c_void,
+            &mut mhd as *mut _ as *mut c_void,
+            &mut mns as *mut _ as *mut c_void,
+        ];
+        let n_rec = batch_size * n_heads;
+        let merge_grid_x = n_rec.div_ceil(8) as u32;
+        self.launch_maybe_blob(merge, [merge_grid_x, 1, 1], [256, 1, 1], 0, &mut mparams, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pp_ptr);
+            b.push_ptr(o_ptr);
+            b.push_i32(mbs);
+            b.push_i32(mnh);
+            b.push_i32(mhd);
+            b.push_i32(mns);
+            b
+        })
+    }
 
     /// Stage-b on-device Q pre-convert shared by the FA2 stage-b launchers.
     ///

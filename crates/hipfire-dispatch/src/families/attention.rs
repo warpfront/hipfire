@@ -2308,6 +2308,35 @@ fn dispatch_attend(
                 // native fp8 KV, fp8 Q codes + f32 sq in S4 scratch,
                 // 32768 B dynamic LDS). The Q0 f16 entry is retained for
                 // oracles only.
+                // Packet-minimal Q128 opt-in (`HIPFIRE_GFX12_FA_PACKET=1` /
+                // `kernel.gfx12_fa_packet`; default off): same FA2-eligible
+                // shape predicates as route-N below, dense 128-row ownership
+                // over eight compute waves, 49408 B dynamic LDS. Exact
+                // stage-b arithmetic; flag-free behavior is unchanged.
+                if gpu.flags.gfx12_fa_packet
+                    && gpu.arch == "gfx1201"
+                    && io.n_heads == 24
+                    && io.n_kv_heads == 4
+                    && io.head_dim == 256
+                    && (64..=512).contains(&io.batch_size)
+                    && io.batch_size % 16 == 0
+                    && (64..=32768).contains(&io.max_ctx_len)
+                    && io.tree_bias.is_none()
+                {
+                    hip!(gpu.attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ))?;
+                    return Ok(());
+                }
                 if gpu.flags.gfx12_fa2_prefill
                     && gpu.arch == "gfx1201"
                     && io.n_heads == 24
