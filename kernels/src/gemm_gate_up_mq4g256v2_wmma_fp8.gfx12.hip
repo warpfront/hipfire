@@ -566,13 +566,16 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     for (int g = 0; g < gpr; g++) {
         #pragma nounroll
         for (int h = 0; h < 2; h++) {
-            // Overlap probe (K2 measurement): prologue stages slab 0, then
-            // each iteration issues slab s+1's global loads into registers
-            // BEFORE slab s's compute, so load latency hides under WMMAs.
-            // Expand + LDS publish of s+1 still follow compute (single
-            // buffer); only latency, not execution, is hidden. A_pf holds the
-            // lane's b64 chunk pairs (A_ROUNDS*2 v2i_t); Wpk_pf holds raw
-            // packs (expand at publish, identical values).
+            // Raw prefetch (R1): prologue stages slab 0, then each iteration
+            // issues slab s+1's global loads into registers BEFORE slab s's
+            // compute, and they stay RAW there: the OOB zero-selects consume
+            // A_pf/Wpk_pf only at publication after compute, behind an opaque
+            // register pin, so no loadcnt wait sits between the future loads
+            // and the current slab's first WMMA. Expand + LDS publish of s+1
+            // still follow compute (single buffer); only latency, not
+            // execution, is hidden. A_pf holds the lane's raw b64 chunk pairs
+            // (A_ROUNDS*2 v2i_t); Wpk_pf holds raw packs (mask + expand at
+            // publish, identical values).
             v2i_t A_pf[HIPFIRE_FP8_V2_A_ROUNDS * 2];
             unsigned int Wpk_pf[HIPFIRE_FP8_V2_W_ROUNDS * 2];
             // Prologue: stage slab 0 fully (S/SZ + A + W). Every lane is
@@ -655,8 +658,8 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                             const unsigned char* asrc = xbase + st_agoff[r];
                             const v2i_t v0l = *(const v2i_t*)asrc;
                             const v2i_t v1l = *(const v2i_t*)(asrc + 8u);
-                            A_pf[r * 2] = st_aok[r] ? v0l : st_z64;
-                            A_pf[r * 2 + 1] = st_aok[r] ? v1l : st_z64;
+                            A_pf[r * 2] = v0l;
+                            A_pf[r * 2 + 1] = v1l;
                         }
                     }
                     {
@@ -668,7 +671,8 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                             #pragma unroll
                             for (int pp = 0; pp < 2; pp++) {
                                 const unsigned int pk = *(const unsigned int*)(st_wbase[r] + pack_base + st_wpoff[r][pp]);
-                                Wpk_pf[r * 2 + pp] = st_wok[r] ? pk : 0u;
+                                // Raw bits only (R1): zero-select moves to publication.
+                                Wpk_pf[r * 2 + pp] = pk;
                             }
                         }
                     }
@@ -746,6 +750,21 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                         __builtin_amdgcn_sched_barrier(0);
                     }
                 }
+                // R1 pin: opaque register-only identity on the raw future
+                // slab. The zero-selects below must consume A_pf/Wpk_pf only
+                // here, after current-slab compute; without this the compiler
+                // hoists the cndmasks (and their loadcnt waits) above the
+                // current slab's first WMMA. No memory effect, no fence.
+                if (slab + 1 < HIPFIRE_FP8_V2_NSLABS) {
+                    #pragma unroll
+                    for (int r = 0; r < HIPFIRE_FP8_V2_A_ROUNDS * 2; r++) {
+                        asm volatile("" : "+v"(A_pf[r][0]), "+v"(A_pf[r][1]));
+                    }
+                    #pragma unroll
+                    for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS * 2; r++) {
+                        asm volatile("" : "+v"(Wpk_pf[r]));
+                    }
+                }
                 // Publish prefetched slab s+1 (buffer free: compute s done).
                 // The barrier is REQUIRED: without it fast waves overwrite
                 // slab s while stragglers still read it (K2 race found).
@@ -762,12 +781,12 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                         char* adst = lds_A +
 #if HIPFIRE_FP8_V2_FRAG_ORDER
                             st_ab0[r];
-                        *(v2i_t*)adst = A_pf[r * 2];
-                        *(v2i_t*)(adst + 128u) = A_pf[r * 2 + 1];
+                        *(v2i_t*)adst = st_aok[r] ? A_pf[r * 2] : st_z64;
+                        *(v2i_t*)(adst + 128u) = st_aok[r] ? A_pf[r * 2 + 1] : st_z64;
 #else
                             st_aldsoff[r];
-                        *(v2i_t*)adst = A_pf[r * 2];
-                        *(v2i_t*)(adst + 8u) = A_pf[r * 2 + 1];
+                        *(v2i_t*)adst = st_aok[r] ? A_pf[r * 2] : st_z64;
+                        *(v2i_t*)(adst + 8u) = st_aok[r] ? A_pf[r * 2 + 1] : st_z64;
 #endif
                     }
                     {
@@ -778,9 +797,9 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                         for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
                             #pragma unroll
                             for (int pp = 0; pp < 2; pp++) {
-                                // Wpk is already zero-selected at prefetch;
+                                // Raw Wpk zero-selected here at publication;
                                 // expand(0) is all-zero E4M3 (bit-identical).
-                                const v2i_t e8 = mq4_qpk_to_e4m3(Wpk_pf[r * 2 + pp]);
+                                const v2i_t e8 = mq4_qpk_to_e4m3(st_wok[r] ? Wpk_pf[r * 2 + pp] : 0u);
                                 *(v2i_t*)(lds_W +
 #if HIPFIRE_FP8_V2_FRAG_ORDER
                                     st_wslot[r][pp]) = e8;
