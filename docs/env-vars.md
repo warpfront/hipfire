@@ -158,6 +158,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_GFX12_MQ4V2_FP8_V2` | gfx1201 FP8-WMMA MQ4v2 staged-tile v2 route — default ON on exact gfx1201 (`kernel.gfx12_mq4v2_fp8_v2`); `=0` restores the s2bt8/BT symbols. The four family flags remain prerequisites |
 | `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` | v2 tile geometry: `128x128` (default on exact gfx1201, the measured pin), `64x256`, `128x64`, `256x64` (prior default, still selectable) |
 | `HIPFIRE_GFX12_GDN_PRE_FUSED` | gfx1201 batched-prefill GDN preamble fusion (sigmoid+conv+qknorm 3→1, byte-exact) — default ON on exact gfx1201 (`kernel.gfx12_gdn_pre_fused`); `=0` restores the 3-launch sequence |
+| `HIPFIRE_GFX12_FP8_STREAM` | gfx1201 RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion (byte-identical `prepare_mq4v2_fp8_x_f32` outputs for the qkvza/gate_up/qkv inputs; standalone pack launch disappears) — default OFF (`kernel.gfx12_fp8_stream`); `=1` opts in on exact gfx1201 only |
 | `HIPFIRE_PREFILL_CHUNK_ROWS` | Widened ordinary-prefill chunk ceiling (`prefill.chunk_rows`; default 4096 on exact gfx1201, 512 elsewhere; explicit `HIPFIRE_PREFILL_MAX_BATCH` wins; VRAM admission may admit a smaller rung) |
 
 ### LFM (arch 11) — branch-scoped optimized prefill
@@ -671,6 +672,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GFX11_WEIGHT_LOAD_POLICY` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX1201_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_GFX12_FA2_PREFILL` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/attention.rs, crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_FP8_STREAM` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/scratch.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX12_GDN_PRE_FUSED` | crates/rdna-compute/src/feature_flags.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX12_MQ4V2_FP8_QKV` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/hipfire-config/src/lib.rs |

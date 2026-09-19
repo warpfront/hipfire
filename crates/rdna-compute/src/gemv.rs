@@ -3392,6 +3392,177 @@ impl Gpu {
         result?;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
+    /// gfx1201 FP8-stream producer: RMSNorm/FWHT + whole-row scale + E4M3
+    /// pack under the `_mq4v2_fp8_gfx12` entry symbols. `x_rot` is always
+    /// written (v1 keeps the F32 store, so every downstream reader is
+    /// preserved byte-for-byte). `awq = Some` selects the AWQ twin symbol.
+    /// Grows the three MQ4v2 FP8 scratch planes (with pre-growth capture
+    /// invalidation, mirroring `prepare_mq4v2_fp8_x`), launches the fused
+    /// producer, and seals the pointers into [`crate::scratch::Mq4v2Fp8Prepared`]
+    /// — never calls `prepare_mq4v2_fp8_x`. Gated by
+    /// `HIPFIRE_GFX12_FP8_STREAM`.
+    pub fn fused_rmsnorm_rotate_mq_fp8_gfx12_batched(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: &GpuTensor,
+        k: usize,
+        eps: f32,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Mq4v2Fp8Prepared> {
+        self.bind_thread()?;
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused_rmsnorm_rotate_mq_fp8_gfx12_batched: eager-only (capture/replay rejected)",
+            ));
+        }
+        if k == 0 || batch_size == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused_rmsnorm_rotate_mq_fp8_gfx12_batched: need k%256==0 and n>0",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        let (module, source, kernel) = match awq {
+            Some(_) => (
+                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12",
+            ),
+            None => (
+                "fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_FP8_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12",
+            ),
+        };
+        self.ensure_kernel(module, source, kernel)?;
+        // All three MQ4v2 FP8 buffers grow below; invalidate first if any of
+        // them will (mirrors `prepare_mq4v2_fp8_x`; eager-only above).
+        let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) =
+            crate::scratch::mq4v2_fp8_needed(batch_size, k);
+        {
+            let s = &self.scratch;
+            if crate::scratch::scratch_will_grow(
+                s.mq4v2_fp8_x_scratch_bytes,
+                s.mq4v2_fp8_x_scratch.is_some(),
+                x_fp8_bytes,
+            ) || crate::scratch::scratch_will_grow(
+                s.mq4v2_fp8_half_sums_scratch_bytes,
+                s.mq4v2_fp8_half_sums_scratch.is_some(),
+                half_sums_bytes,
+            ) || crate::scratch::scratch_will_grow(
+                s.mq4v2_fp8_row_scales_scratch_bytes,
+                s.mq4v2_fp8_row_scales_scratch.is_some(),
+                row_scales_bytes,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
+        let (x_fp8_ptr, half_sums_ptr, row_scales_ptr) = self
+            .scratch
+            .grow_mq4v2_fp8_for_producer(&self.hip, batch_size, k)?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut xrp = x_rot.buf.as_ptr();
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut x8p = x_fp8_ptr;
+        let mut sump = half_sums_ptr;
+        let mut sclp = row_scales_ptr;
+        let mut kv = k as i32;
+        let mut eps_v = eps;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = if awq.is_some() {
+            vec![
+                &mut xp as *mut _ as *mut c_void,
+                &mut wp as *mut _ as *mut c_void,
+                &mut awp as *mut _ as *mut c_void,
+                &mut s1 as *mut _ as *mut c_void,
+                &mut s2 as *mut _ as *mut c_void,
+                &mut xrp as *mut _ as *mut c_void,
+                &mut x8p as *mut _ as *mut c_void,
+                &mut sump as *mut _ as *mut c_void,
+                &mut sclp as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+                &mut eps_v as *mut _ as *mut c_void,
+                &mut nv as *mut _ as *mut c_void,
+            ]
+        } else {
+            vec![
+                &mut xp as *mut _ as *mut c_void,
+                &mut wp as *mut _ as *mut c_void,
+                &mut s1 as *mut _ as *mut c_void,
+                &mut s2 as *mut _ as *mut c_void,
+                &mut xrp as *mut _ as *mut c_void,
+                &mut x8p as *mut _ as *mut c_void,
+                &mut sump as *mut _ as *mut c_void,
+                &mut sclp as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+                &mut eps_v as *mut _ as *mut c_void,
+                &mut nv as *mut _ as *mut c_void,
+            ]
+        };
+        let block_size = 256u32;
+        let shared_mem = ((k + 256) * 4) as u32;
+        let groups = k / 256;
+        let bytes = (k * 4 * 3 + k + groups * 2 * 4 + 4) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fused",
+            if awq.is_some() {
+                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12_batched"
+            } else {
+                "fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12_batched"
+            },
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel,
+            [batch_size as u32, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                if awq.is_some() {
+                    b.push_ptr(awp);
+                }
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(x8p);
+                b.push_ptr(sump);
+                b.push_ptr(sclp);
+                b.push_i32(kv);
+                b.push_f32(eps_v);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result?;
+        Ok(crate::scratch::Mq4v2Fp8Prepared {
+            x_fp8: x_fp8_ptr,
+            half_sums: half_sums_ptr,
+            row_scales: row_scales_ptr,
+            x_fp8_bytes,
+            half_sums_bytes,
+            row_scales_bytes,
+            n: batch_size,
+            k,
+            scale_mode: 1,
+        })
+    }
 
 
     /// C2 IU4 producer: SwiGLU/FWHT + in-register `block_i4_128` sidecar.

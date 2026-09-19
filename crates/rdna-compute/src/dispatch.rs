@@ -3064,6 +3064,21 @@ impl Gpu {
             && k > 0
             && k % 256 == 0
     }
+    /// True when the gfx1201 FP8-stream producer fusion is live for this
+    /// call: `HIPFIRE_GFX12_FP8_STREAM=1` on exact gfx1201 + eager (no
+    /// replay/capture) + batch and K constraints of the MQ4v2 FP8 prepared
+    /// consumer (`batch % 64 == 0`, `k % 256 == 0`). The callsite
+    /// additionally requires Lloyd weights and scale_mode == 1. Default OFF.
+    pub fn fp8_stream_active(&self, batch: usize, k: usize) -> bool {
+        self.flags.gfx12_fp8_stream_enabled()
+            && self.arch == "gfx1201"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && batch >= 64
+            && batch % 64 == 0
+            && k > 0
+            && k % 256 == 0
+    }
 
     /// Validate a prepared IU4 handle against the live scratch generation.
     pub fn int4_mmq_prepared_ptr(

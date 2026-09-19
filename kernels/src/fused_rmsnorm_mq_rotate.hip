@@ -30,6 +30,10 @@
 // unchanged.
 #ifdef HIPFIRE_RMSNORM_KERNEL
 /* caller (host JIT concat) already named the symbol */
+#elif defined(HIPFIRE_RMSNORM_AWQ) && defined(HIPFIRE_FP8_STREAM)
+#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12
+#elif defined(HIPFIRE_FP8_STREAM)
+#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12
 #elif defined(HIPFIRE_RMSNORM_AWQ) && defined(HIPFIRE_IU4_SIDECAR)
 #define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4
 #elif defined(HIPFIRE_IU4_SIDECAR)
@@ -52,6 +56,14 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
 #ifdef HIPFIRE_IU4_SIDECAR
     float* __restrict__ x_rot,          // nullable when emit_f32=false
     block_i4_128* __restrict__ x_i4,    // [K/128, N] block_i4_128
+    int K,
+    float eps,
+    int N
+#elif defined(HIPFIRE_FP8_STREAM)
+    float* __restrict__ x_rot,          // [N, K] f32, always written (v1)
+    unsigned char* __restrict__ x_fp8,  // [N, K] E4M3, standalone-pack layout
+    float* __restrict__ fp8_half_sums,  // [N, K/256, 2] f32 decoded-code sums
+    float* __restrict__ fp8_row_scales, // [N] f32 power-of-two-to-224 scales
     int K,
     float eps,
     int N
@@ -136,6 +148,9 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     }
     __syncthreads();
     const float rms = reduce[0];
+#ifdef HIPFIRE_FP8_STREAM
+    float row_amax = 0.0f;
+#endif
 
     // Phase 2: FWHT. First group uses prefetched x/w; later groups (if any)
     // load as before. signs already in registers.
@@ -231,6 +246,16 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         float f5 = v5 * s * s21.y;
         float f6 = v6 * s * s21.z;
         float f7 = v7 * s * s21.w;
+#ifdef HIPFIRE_FP8_STREAM
+        row_amax = fmaxf(row_amax, fabsf(f0));
+        row_amax = fmaxf(row_amax, fabsf(f1));
+        row_amax = fmaxf(row_amax, fabsf(f2));
+        row_amax = fmaxf(row_amax, fabsf(f3));
+        row_amax = fmaxf(row_amax, fabsf(f4));
+        row_amax = fmaxf(row_amax, fabsf(f5));
+        row_amax = fmaxf(row_amax, fabsf(f6));
+        row_amax = fmaxf(row_amax, fabsf(f7));
+#endif
 #ifdef HIPFIRE_IU4_SIDECAR
         if (x_rot != nullptr) {
             float4 out0, out1;
@@ -258,4 +283,25 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         *reinterpret_cast<float4*>(x_rot_b + base + 4) = out1;
 #endif
     }
+    #ifdef HIPFIRE_FP8_STREAM
+    // FP8 stream: whole-row scale + pack from the just-written F32 row
+    // (L1-resident re-read). Byte-identical to pack_f32_to_fp8_mq4v2_gfx12
+    // with scale_mode=1 on finite rows; reuses the reduction smem.
+    {
+        const int token = (int)blockIdx.x;
+        const long long frow = (long long)token * K;
+        const int gpr = K >> 8;
+        fp8stream_pack_row_from_f32(
+            x_rot_b,
+            x_fp8 + frow,
+            fp8_half_sums + (long long)token * gpr * 2,
+            fp8_row_scales + token,
+            row_amax,
+            reduce,
+            K,
+            tid,
+            lane_id,
+            warp_id);
+    }
+    #endif
 }
