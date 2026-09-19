@@ -9356,16 +9356,22 @@ impl Gpu {
         result
     }
     /// Staged-tile v2 geometry selector (`HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM`).
-    /// Returns `(BM, BN, BK, WAVES)`; absent/unknown values keep the frozen
-    /// default 256x64x64/8w. All four v2 launch arms derive block (`WAVES*32`),
+    /// Returns `(BM, BN, BK, WAVES)`; absent/unknown values keep 128x128x64/8w
+    /// on exact gfx1201 (measured pin) and the frozen 256x64x64/8w elsewhere.
+    /// All four v2 launch arms derive block (`WAVES*32`),
     /// dynamic LDS (`BM*(BK+8) + BN*(BK+8) + BM*4 + BN*8`) and grid
     /// (`ceil(rows/BN)`, `ceil(N/BM)`) from this one tuple, so geometry stays
     /// consistent between the compiled SRC constant and the launch.
-    fn fp8_v2_geom() -> (usize, usize, usize, usize) {
+    fn fp8_v2_geom(arch: &str) -> (usize, usize, usize, usize) {
         match hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM").as_deref() {
             Ok("128x128") => (128, 128, 64, 8),
             Ok("64x256") => (64, 256, 64, 8),
             Ok("128x64") => (128, 64, 64, 4),
+            Ok("256x64") => (256, 64, 64, 8),
+            // Default: measured 128x128 pin on exact gfx1201; frozen 256x64
+            // elsewhere (the v2 launchers are gfx1201-only, so this arm is
+            // documentation-grade for other arches).
+            _ if arch == "gfx1201" => (128, 128, 64, 8),
             _ => (256, 64, 64, 8),
         }
     }
@@ -9407,9 +9413,9 @@ impl Gpu {
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
-        // Staged-tile v2 candidate (default OFF): geometry from
-        // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM256 x BN64 x BK64,
-        // block 256, dynamic LDS 24 KiB). Admitted only on the
+        // Staged-tile v2 candidate (default ON on gfx1201): geometry from
+        // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
+        // block 256, dynamic LDS ~20 KiB). Admitted only on the
         // already-guarded uniform route above (exact gfx1201, eager, K%256,
         // N%64) plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
@@ -9418,7 +9424,7 @@ impl Gpu {
             && batch_size >= 256;
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
-        let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom();
+        let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
         let vblock = [(vwaves * 32) as u32, 1, 1];
         let vlds = (vbm * (vbk + 8) + vbn * (vbk + 8) + vbm * 4 + vbn * 8) as u32;
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
@@ -9603,9 +9609,9 @@ impl Gpu {
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
-        // Staged-tile v2 candidate (default OFF): geometry from
-        // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM256 x BN64 x BK64,
-        // block 256, dynamic LDS 24 KiB). Admitted only on the
+        // Staged-tile v2 candidate (default ON on gfx1201): geometry from
+        // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
+        // block 256, dynamic LDS ~20 KiB). Admitted only on the
         // already-guarded uniform route above (exact gfx1201, eager, K%256,
         // N%64) plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
@@ -9614,7 +9620,7 @@ impl Gpu {
             && batch_size >= 256;
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
-        let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom();
+        let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
         let vblock = [(vwaves * 32) as u32, 1, 1];
         let vlds = (vbm * (vbk + 8) + vbn * (vbk + 8) + vbm * 4 + vbn * 8) as u32;
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
@@ -30060,9 +30066,9 @@ impl Gpu {
                 "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt12: prepared (n,k) mismatch",
             ));
         }
-        // Staged-tile v2 candidate (default OFF): geometry from
-        // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM256 x BN64 x BK64,
-        // block 256, dynamic LDS 24 KiB). Admitted only on the
+        // Staged-tile v2 candidate (default ON on gfx1201): geometry from
+        // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
+        // block 256, dynamic LDS ~20 KiB). Admitted only on the
         // already-guarded uniform route above (exact gfx1201, eager, K%256,
         // N%64) plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
@@ -30071,7 +30077,7 @@ impl Gpu {
             && batch_size >= 256;
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
-        let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom();
+        let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
         let vblock = [(vwaves * 32) as u32, 1, 1];
         let vlds = (vbm * (vbk + 8) + vbn * (vbk + 8) + vbm * 4 + vbn * 8) as u32;
         // Two-slab S2BT8 form by default (`HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
@@ -31792,9 +31798,9 @@ impl Gpu {
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
-        // Staged-tile v2 candidate (default OFF): geometry from
-        // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM256 x BN64 x BK64,
-        // block 256, dynamic LDS 24 KiB). Admitted only on the
+        // Staged-tile v2 candidate (default ON on gfx1201): geometry from
+        // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
+        // block 256, dynamic LDS ~20 KiB). Admitted only on the
         // already-guarded uniform route above (exact gfx1201, eager, M>0,
         // K%256, N%64) plus N>=256; the family flag stays a prerequisite and
         // smaller batches keep s2bt8/BT. Params/blob layout below is the
@@ -31804,7 +31810,7 @@ impl Gpu {
             && batch_size >= 256;
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
-        let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom();
+        let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
         let vblock = [(vwaves * 32) as u32, 1, 1];
         let vlds = (vbm * (vbk + 8) + vbn * (vbk + 8) + vbm * 4 + vbn * 8) as u32;
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`

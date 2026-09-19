@@ -592,6 +592,31 @@ fn explicit_prefill_max_batch() -> Option<usize> {
         .filter(|&v| v >= MIN_BATCH)
 }
 
+/// Architecture default for the widened ordinary-prefill chunk ceiling
+/// (`prefill.chunk_rows`): 4096 on exact gfx1201, 512 elsewhere.
+#[inline]
+fn prefill_chunk_rows_default(arch: &str) -> usize {
+    if arch == "gfx1201" { 4096 } else { 512 }
+}
+
+/// Requested widened chunk ceiling: explicit `HIPFIRE_PREFILL_MAX_BATCH`
+/// wins, then `prefill.chunk_rows` (config file or
+/// `HIPFIRE_PREFILL_CHUNK_ROWS`), then the arch default above. Values below
+/// `WIDENED_COMMIT_ROWS` keep legacy behavior downstream.
+fn prefill_chunk_rows_requested(gpu: &Gpu) -> usize {
+    if let Some(explicit) = explicit_prefill_max_batch() {
+        return explicit;
+    }
+    if let Ok(s) = hipfire_config::developer_var("HIPFIRE_PREFILL_CHUNK_ROWS") {
+        if let Ok(v) = s.parse::<usize>() {
+            if v >= MIN_BATCH {
+                return v;
+            }
+        }
+    }
+    prefill_chunk_rows_default(gpu.arch.as_str())
+}
+
 fn dense_layers_are_all_mq4v2(weights: &Qwen35Weights) -> bool {
     !weights.layers.is_empty()
         && weights.layers.iter().all(|layer| match layer {
@@ -688,11 +713,11 @@ pub(crate) const WIDENED_COMMIT_ROWS: usize = 512;
 /// these five; a requested ceiling snaps down to the largest rung it covers.
 const WIDENED_RUNGS: [usize; 5] = [512, 1024, 2048, 4096, 8192];
 ///
-/// Highest performance-admitted rung. Starts at 512 (behaviour-identical
-/// ship); raised one rung at a time only after that rung's E/M/S/V gates
-/// pass. Provisional final ceiling 4096 is an upper bound, not a per-device
-/// value — memory admission may still select a smaller rung per device.
-const WIDENED_PERF_CEILING: usize = 4096;
+/// Performance ceiling for the staged rungs above: `prefill.chunk_rows`
+/// (config file or `HIPFIRE_PREFILL_CHUNK_ROWS`, default 4096 on exact
+/// gfx1201 and 512 elsewhere; explicit `HIPFIRE_PREFILL_MAX_BATCH` wins).
+/// See [`prefill_chunk_rows_requested`]. Memory admission may still select a
+/// smaller rung per device.
 ///
 /// Uncommitted-VRAM headroom reserved by the per-device capacity admission
 /// (plan §4.2). Conservative policy margin covering remaining state, output,
@@ -739,8 +764,9 @@ fn dn_requant_per_token_env() -> bool {
 ///
 /// A requested ceiling below 512 is returned as-is (explicit small values
 /// retain existing behavior); otherwise the ceiling snaps down to the
-/// largest staged rung covered by both the request and
-/// [`WIDENED_PERF_CEILING`].
+/// largest staged rung the request covers. The request is
+/// [`prefill_chunk_rows_requested`] (explicit override, then
+/// `prefill.chunk_rows` config, then the 4096/512 arch default).
 fn ordinary_prefill_static_ceiling(
     gpu: &Gpu,
     weights: &Qwen35Weights,
@@ -791,16 +817,14 @@ fn ordinary_prefill_static_ceiling(
     if dn_requant_per_token_env() {
         return None;
     }
-    let requested =
-        explicit_prefill_max_batch().unwrap_or_else(|| prefill_max_batch_for_model(gpu, weights));
+    let requested = prefill_chunk_rows_requested(gpu);
     if requested < WIDENED_COMMIT_ROWS {
         return Some(requested);
     }
-    let cap = requested.min(WIDENED_PERF_CEILING);
-    // Largest staged rung covered by the request and the perf ceiling.
+    // Largest staged rung the request covers.
     let mut rung = WIDENED_COMMIT_ROWS;
     for &r in WIDENED_RUNGS.iter() {
-        if r <= cap {
+        if r <= requested {
             rung = r;
         }
     }
@@ -914,13 +938,11 @@ fn memory_admitted_rung(gpu: &Gpu, config: &Qwen35Config, perf_rows: usize) -> H
 ///
 /// Effective admitted ordinary chunk ceiling for this request: static
 /// eligibility, highest performance-admitted rung, explicit requested
-/// ceiling (`HIPFIRE_PREFILL_MAX_BATCH`), and per-device byte-based capacity.
+/// ceiling (`HIPFIRE_PREFILL_MAX_BATCH` over `prefill.chunk_rows`), and
+/// per-device byte-based capacity.
 ///
 /// Public only because hipfire-generate's ordinary AR caller needs the same
 /// decision. Existing generic/TP/EP getters are unchanged. `pbs` denotes an
-/// explicit hard-cap owner: a caller PBS caps the result at its `max_batch`
-/// and is never bypassed here (the ordinary wrappers omit their *implicit*
-/// legacy cache before calling when a wider ceiling is statically admitted).
 pub fn ordinary_prefill_chunk_limit(
     gpu: &Gpu,
     weights: &Qwen35Weights,
@@ -941,9 +963,9 @@ pub fn ordinary_prefill_chunk_limit(
     if let Some(p) = pbs {
         admitted = admitted.min(p.max_batch);
     }
-    // Admission only narrows the legacy explicit request: perf already snaps
-    // the request to rungs, and the sub-512 explicit path returns above.
-    Ok(admitted.min(legacy.max(WIDENED_COMMIT_ROWS)))
+    // Admission only narrows the requested ceiling: perf already snaps the
+    // request to rungs, and the sub-512 explicit path returns above.
+    Ok(admitted.min(prefill_chunk_rows_requested(gpu).max(WIDENED_COMMIT_ROWS)))
 }
 ///
 /// Next direct-ordinary chunk under a widened ceiling: group complete
@@ -1850,10 +1872,15 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     } else {
         max_batch
     };
+    let wide_admitted = wide_candidate && limit > WIDENED_COMMIT_ROWS;
     emit_prefill_chunk_receipt(
-        explicit_prefill_max_batch().unwrap_or(max_batch),
+        if wide_admitted {
+            prefill_chunk_rows_requested(gpu)
+        } else {
+            explicit_prefill_max_batch().unwrap_or(max_batch)
+        },
         limit,
-        (wide_candidate && limit > WIDENED_COMMIT_ROWS).then_some(WIDENED_COMMIT_ROWS),
+        wide_admitted.then_some(WIDENED_COMMIT_ROWS),
     );
     // Allocate the batch scratch once per call (or reuse a caller-owned one).
     // When `pbs_in` is Some, we neither allocate nor free — the caller retains

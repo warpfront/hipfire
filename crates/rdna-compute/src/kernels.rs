@@ -5900,8 +5900,7 @@ pub const ATTENTION_Q8_0_FA2_GQA_FWHT3K_GFX1201_SRC: &str = concat!(
 /// never f16 Q), so the symbol-keyed host function cache never collides
 /// with the f16/q8 modules. The old U0 "renamed entries, same f16 body"
 /// meaning is deleted: exactly one (arithmetic) meaning per symbol.
-/// JIT-only via the route-Q stage-b launcher when
-/// `gfx12_fa2_fp8_enabled()`.
+/// JIT-only via the route-Q stage-b launcher.
 pub const ATTENTION_Q8_0_FA2_GQA_FP8_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_FP8 1\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
@@ -5938,10 +5937,8 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_F16_GFX1201_SRC: &str = concat!(
 /// `attention_fp8_e4m3_fa2_gqa_gfx1201` / `_partial_` / `_merge_` plus
 /// the new stage-b Q pre-convert
 /// `attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201` (§14.3 of the
-/// stage-b plan; the pre-convert symbols resolve only once the stage-b
-/// arithmetic lands — before that the stage-b launchers fail loud,
-/// never fall back). JIT-only via the route-N stage-b launcher when
-/// `gfx12_fa2_fp8_enabled()`.
+/// stage-b plan). JIT-only via the route-N stage-b launcher, which the
+/// fp8-KV dispatch arm selects unconditionally on FA2-eligible shapes.
 pub const ATTENTION_FP8_E4M3_FA2_GQA_FP8_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_FP8 1\n",
     "#define HIPFIRE_FA2_KMODE 8\n",
@@ -6786,8 +6783,8 @@ pub const CONV1D_SILU_SPLIT_QKNORM_B512_SRC: &str = concat!(
 /// alpha gate + 4-tap causal conv + SiLU + split + Q/K L2-norm + scale +
 /// repeat-interleave in ONE launch. Row-group tiled (R=32) so the token axis
 /// is parallel across groups; byte-exact vs the 3-launch sequence by the
-/// fmaf/shfl/order recipe in the source header. Default OFF behind
-/// `HIPFIRE_GFX12_GDN_PRE_FUSED`.
+/// fmaf/shfl/order recipe in the source header. Default ON on exact gfx1201
+/// behind `HIPFIRE_GFX12_GDN_PRE_FUSED` (`=0` restores the 3-launch sequence).
 #[cfg(feature = "deltanet")]
 pub const GDN_PRE_BATCHED_GFX1201_SRC: &str =
     include_str!("../../../kernels/src/gdn_pre_batched.gfx1201.hip");

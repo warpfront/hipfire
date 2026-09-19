@@ -219,8 +219,17 @@ fn resolve_kv_mode(
     policy: &hipfire_runtime::kv_mode::KvModePolicy,
 ) -> Result<hipfire_runtime::kv_mode::KvMode, String> {
     let kv_mode = kv_mode_from_ctx(ctx);
+    // Single-GPU Qwen default: unset/auto means native fp8 on exact gfx1201.
+    // The pp>1 site is excluded (it never constructs native tiers and refuses
+    // explicit fp8/bf16 below, so a substituted default must never reach it).
+    let raw = if policy.site == hipfire_runtime::kv_mode::QWEN35_PP_POLICY.site {
+        kv_mode.clone()
+    } else {
+        hipfire_runtime::kv_mode::qwen35_auto_for_arch(&kv_mode, ctx.gpu.arch.as_str())
+            .to_string()
+    };
     let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
-        hipfire_runtime::kv_mode::resolve(&kv_mode, policy);
+        hipfire_runtime::kv_mode::resolve(&raw, policy);
     if let Some(w) = warning {
         eprintln!("  KV cache: {w} (site {})", policy.site);
     }

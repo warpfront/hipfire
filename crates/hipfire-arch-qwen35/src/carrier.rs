@@ -136,7 +136,8 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         .map(|t| *t == LayerType::FullAttention)
         .collect();
 
-    let ResolveResult { mode, warning } = kv_mode::resolve(&kv_mode, &kv_mode::QWEN35_HFQ_POLICY);
+    let raw = kv_mode::qwen35_auto_for_arch(&kv_mode, ctx.gpu.arch.as_str());
+    let ResolveResult { mode, warning } = kv_mode::resolve(raw, &kv_mode::QWEN35_HFQ_POLICY);
     if let Some(w) = warning {
         eprintln!("  KV cache: {w} (site {})", kv_mode::QWEN35_HFQ_POLICY.site);
     }
