@@ -69,6 +69,7 @@ mod ora {
         let a: Vec<String> = std::env::args().collect();
         let mut model: Option<PathBuf> = None;
         let mut out_dir = PathBuf::from("scratch-2026-09-17/PrefillGraph");
+        let mut single = false;
         let mut i = 1;
         while i < a.len() {
             match a[i].as_str() {
@@ -80,8 +81,12 @@ mod ora {
                     out_dir = PathBuf::from(&a[i + 1]);
                     i += 2;
                 }
+                "--single" => {
+                    single = true;
+                    i += 1;
+                }
                 h => {
-                    eprintln!("unknown flag {h}; want --model --out-dir");
+                    eprintln!("unknown flag {h}; want --model --out-dir [--single]");
                     std::process::exit(2);
                 }
             }
@@ -205,12 +210,17 @@ mod ora {
                 .expect("kv fresh");
         let mut dn = DeltaNetState::new(&mut gpu, &config).expect("dn fresh");
 
-        // NOTE: each call below owns its PBS, so pbs-relative pointers slide
-        // between the halves and are clustered in analysis.
+        // Two-call mode: two consecutive 4096 calls (resume; per-call PBS, so
+        // pbs pointers slide between halves). Single mode: ONE 8192 call
+        // (production layout: shared PBS, continued GDN frames); the recording
+        // is split at the chunk boundary by kernel-sequence repetition.
+        let drives: Vec<(&[u32], usize)> = if single {
+            vec![(&toks[..], 0)]
+        } else {
+            vec![(&toks[..4096], 0), (&toks[4096..], 4096)]
+        };
         let mut recs = Vec::new();
-        for (ci, (toks_c, start)) in [(&toks[..4096], 0usize), (&toks[4096..], 4096usize)]
-            .iter()
-            .enumerate()
+        for (ci, (toks_c, start)) in drives.iter().enumerate()
         {
             hip_bridge::launch_counters::reset();
             gpu.replay.set_forward_eligible(true);
@@ -254,8 +264,28 @@ mod ora {
             ));
             recs.push(gpu.replay.recorded_launches().to_vec());
         }
-        let rec: &Vec<rdna_compute::replay::RecordedHipLaunch> = &recs[0];
-        let rec1: &Vec<rdna_compute::replay::RecordedHipLaunch> = &recs[1];
+        // Single mode: split the one recording at the chunk boundary (kernel
+        // sequence must repeat exactly; production-true frames + shared PBS).
+        let halves;
+        if single {
+            let full = &recs[0];
+            let n = full.len();
+            let mut m = 0usize;
+            if n % 2 == 0 && (0..n / 2).all(|k| full[k].kernel == full[k + n / 2].kernel) {
+                m = n / 2;
+            }
+            if m == 0 {
+                log(&format!("single: NO clean 2x kernel repetition over {n} launches"));
+                std::fs::write(out_dir.join("census.txt"), &out).ok();
+                std::process::exit(1);
+            }
+            log(&format!("single: split M={m} (shared PBS, continued frames)"));
+            halves = vec![full[..m].to_vec(), full[m..].to_vec()];
+        } else {
+            halves = std::mem::take(&mut recs);
+        }
+        let rec: &Vec<rdna_compute::replay::RecordedHipLaunch> = &halves[0];
+        let rec1: &Vec<rdna_compute::replay::RecordedHipLaunch> = &halves[1];
         // Histogram.
         let mut hist: BTreeMap<&str, usize> = BTreeMap::new();
         let mut typed = 0usize;
@@ -308,6 +338,7 @@ mod ora {
             count: usize,
             a0: Vec<u8>,
             b0: Vec<u8>,
+            idx0: usize,
         }
         let mut aggs: BTreeMap<Key, Agg> = BTreeMap::new();
         let mut grid_mismatch = 0usize;
@@ -355,6 +386,7 @@ mod ora {
                         count: 0,
                         a0: a[o..e].to_vec(),
                         b0: b[o..e].to_vec(),
+                        idx0: k,
                     }).count += 1;
                     o = e;
                 } else {
@@ -390,7 +422,7 @@ mod ora {
                 String::new()
             };
             log(&format!(
-                "  n={:4}  {:64} off={:3} len={:2} A={:#x} B={:#x} d={:+} {fa}",
+                "  n={:4}  {:64} off={:3} len={:2} A={:#x} B={:#x} d={:+} idx0={} {fa}",
                 ag.count,
                 key.kernel,
                 key.off,
@@ -398,6 +430,7 @@ mod ora {
                 va,
                 vb,
                 vb as i128 - va as i128,
+                ag.idx0,
             ));
         }
         log(&format!("pointer-like variant slots: {n_ptr} in {} distinct deltas", ptr_deltas.len()));
