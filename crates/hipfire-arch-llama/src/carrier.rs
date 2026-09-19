@@ -395,6 +395,9 @@ fn resident_weight(
         row_stride: dtype.row_stride(k),
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     }
 }
 
@@ -1165,6 +1168,7 @@ mod tests {
             gpu,
             gemma4_drafter_path: None,
             gemma4_draft_len: 3,
+            xdna: None,
         }
     }
 

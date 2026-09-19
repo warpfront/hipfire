@@ -39,13 +39,16 @@ Under standard MQ/HF/HFP/MFP recipes, embeddings are forced to `Q8F16`
 (Q4-grade embedding error compounds). 1D norms / scales stay F16. Direct
 recipes such as `q4k-all` intentionally bypass that embedding rule.
 
-### Magnum V2 family (qt 44 / 47–50) and MQ4C (qt 45)
+### Magnum V2 family (qt 44 / 47–50 / 52) and MQ4C (qt 45)
 
 Magnum V2 uses a neutral-size **8 B dual half `fp16 scale + fp16 zero` header
 per 128 weights**, with payload packing unchanged from the matching v1 bit
 width. Group strides: bits **2/3/4/5/6 → 72/104/136/168/200** B per 256
 elements. MQ4C is separate: one per-256 fp16 scale+zero pair at `[0..4)`,
-zero padding at `[4..8)`, and the 4-bit payload at `+8`.
+zero padding at `[4..8)`, and the 4-bit payload at `+8`. qt=52
+`MQ4G256V2L` / `DType::MQ4G256V2Lloyd` keeps the qt=44 136 B group container
+and adds a per-tensor F32[16] `lloyd_levels` sidecar (see
+[mq4-v2.md](quant-formats/mq4-v2.md) Lloyd section).
 
 | `--format` | qt | `DType` | B/group | Product note |
 |---|---:|---|---:|---|
@@ -55,6 +58,7 @@ zero padding at `[4..8)`, and the 4-bit payload at `+8`.
 | `mq5v2` | **48** | `MQ5G256V2` | 168 | Dense product candidate (ladder) |
 | `mq3v2` | **49** | `MQ3G256V2` | 104 | Dense product candidate (ladder) |
 | `mq2v2` | **50** | `MQ2G256V2` | 72 | **Wire + runtime supported; product quality-rejected** |
+| `mq4v2lloyd` / tiers `mq4l-xt` · `mq4l` · `mq4l-pro` | **52** | `MQ4G256V2Lloyd` | 136 + `lloyd_levels` | V2 wire + per-tensor 16-level Lloyd codebook; product tiers vs AWQ'd uniform |
 
 **Wire implementation ≠ product admission.** MQ2V2 loads, decodes, and passes
 parity, but measured Qwen3.8 ladder KLD is catastrophic (~12–14 nats WT2/v6sel).
@@ -173,7 +177,7 @@ Per 256 elements, 8-byte header + packed payload. HFQ4 and MQ4 v1 both store an
 - zero / min: f32
 - data: `bitwidth × 256 / 8` bytes (128 for 4-bit, 96 for 3-bit, 192 for 6-bit, …)
 
-### V2 (qt 44 / 47–50) and MQ4C (qt 45)
+### V2 (qt 44 / 47–50 / 52) and MQ4C (qt 45)
 
 Same 8-byte header budget and payload offset **+8**, different header encoding:
 
@@ -181,10 +185,14 @@ Same 8-byte header budget and payload offset **+8**, different header encoding:
   at `[4..8)`; payload packing identical to the matching v1 bit width.
 - **MQ4CG256:** one packed fp16 scale+zero at `[0..4)`, mandatory zero pad
   `[4..8)`, 128 B nibbles at `[8..136)` (v1-compatible geometry).
+- **MQ4G256V2L (qt 52):** byte-identical 136 B group to qt=44; nibble `q`
+  decodes through a per-tensor F32[16] Lloyd codebook sidecar
+  (`<tensor>.lloyd_levels`), with loader zero-point rewrite
+  `zp' = f16(zp + 7.5·sc)` and centered levels `C = L − 7.5`.
 
-Lloyd variants replace the uniform grid with a per-block (or per-tensor) fp16
-codebook plus packed indices; byte sizes differ (e.g. MQ3-Lloyd 112 B/group,
-MQ4-Lloyd 160 B/group).
+Legacy Lloyd variants (qt 19/20/30) replace the uniform grid with a per-block
+(or per-tensor) fp16 codebook plus packed indices; byte sizes differ (e.g.
+MQ3-Lloyd 112 B/group, MQ4-Lloyd 160 B/group).
 
 ## KV cache
 
@@ -290,6 +298,8 @@ Source of truth: [`quant-formats/qt-register.txt`](quant-formats/qt-register.txt
 | 48 | MQ5G256V2 | Magnum 5-bit V2 — 168 B |
 | 49 | MQ3G256V2 | Magnum 3-bit V2 — 104 B |
 | 50 | MQ2G256V2 | Magnum 2-bit V2 — 72 B; **wire OK, product rejected** |
+| 51 | MQ2G256LloydU | Maple Lloyd-U passthrough (register) |
+| 52 | MQ4G256V2L | **MQ4 V2 + per-tensor Lloyd codebook** — 136 B group + `lloyd_levels` F32[16] sidecar; product tiers `mq4l-xt` / `mq4l` / `mq4l-pro` |
 
 **Current reserved wire IDs:** 23 and 25–27 only. IDs **22, 29, and 30 were
 reassigned** (TidI32, PARO4G128T, MQ4G256Lloyd). qt **42–43 and 46** are not

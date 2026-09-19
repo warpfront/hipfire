@@ -32,6 +32,10 @@ use crate::quant_e8::*;
 use crate::quant_fwht::*;
 use crate::quant_hfp4::*;
 use crate::quant_mq::*;
+use crate::quant_mq4v2_lloyd::{
+    lloyd_levels_sidecar_name, lloyd_levels_to_f32_bytes, lloyd_v2_stats_print,
+    lloyd_v2_stats_record, lloyd_v2_stats_reset, quantize_mq4g256v2_lloyd,
+};
 use crate::quant_q4::*;
 use crate::reap_overlay;
 use clap::Parser;
@@ -92,6 +96,7 @@ struct MainQuantFlags {
     use_mq4_mqlloyd_tiered: bool,
     use_mq4g256: bool,
     use_mq4v2: bool,
+    use_mq4v2_lloyd: bool,
     use_mq4c: bool,
     use_mq4g256_lloyd: bool,
     use_mq5g256: bool,
@@ -308,6 +313,11 @@ pub(crate) fn run() {
     let use_mtp_precise = format == "deepseek4-mtp-precise";
     let use_mq4g256 = format == "mq4v1" || format == "mq4g256" || format == "magnum";
     let use_mq4v2 = format == "mq4v2" || format == "mq4" || format == "mq4g256v2";
+    let use_mq4v2_lloyd = format == "mq4v2-lloyd"
+        || format == "mq4v2l"
+        || format == "mq4l"
+        || format == "mq4g256v2l"
+        || format == "mq4g256v2-lloyd";
     let use_mq4c = format == "mq4c" || format == "mq4cg256" || format == "mq4g256c";
     let use_hfq4g256 = format == "hfq4g256" || format == "hfq4" || format == "hf4";
     let use_hfq3g256 = format == "hfq3g256";
@@ -1694,6 +1704,9 @@ pub(crate) fn run() {
             .iter()
             .any(|(n, _)| n.starts_with("model.language_model."));
 
+    if use_mq4v2_lloyd {
+        lloyd_v2_stats_reset();
+    }
     for (name, file_idx) in &all_tensors {
         // --include-prefix filter (highest priority — runs before mtp/vision skips).
         if !passes_include_prefix(name, include_prefix) {
@@ -2665,6 +2678,7 @@ pub(crate) fn run() {
                 use_mq4_mqlloyd_tiered: use_mq4_mqlloyd_tiered,
                 use_mq4g256: use_mq4g256,
                 use_mq4v2: use_mq4v2,
+                use_mq4v2_lloyd: use_mq4v2_lloyd,
                 use_mq4c: use_mq4c,
                 use_mq4g256_lloyd: use_mq4g256_lloyd,
                 use_mq5g256: use_mq5g256,
@@ -2816,6 +2830,18 @@ pub(crate) fn run() {
              Tensors were silently dropped; refusing to write a model that cannot load."
         );
         std::process::exit(2);
+    }
+
+    if use_mq4v2_lloyd {
+        let ok = lloyd_v2_stats_print(12.0);
+        if !ok {
+            eprintln!(
+                "\nERROR: MQ4V2-Lloyd E4M3-constrained weighted-MSE gain is below the 12% floor on one or more families.\n  \
+                 Unconstrained target ~15-20%; constrained+polish expected ~13-14% (see E4M3 snap).\n  \
+                 Refusing to write the artifact."
+            );
+            std::process::exit(2);
+        }
     }
 
     // ── Deterministic recipe census/metadata ─────────────────────────────
@@ -5072,6 +5098,7 @@ fn handle_main_quant(
             // the runtime can apply `x / s` before the rotation kernel at
             // inference time.
             let mut awq_sidecar_scales: Option<Vec<f32>> = None;
+            let mut lloyd_sidecar_levels: Option<[f32; 16]> = None;
 
             let (quantized, qt, gs, label) = if flags.q8_conv1d_default && is_conv1d_tensor(name) {
                 // DeltaNet conv1d defaults to Q8 (see --no-q8-conv1d to disable).
@@ -5097,6 +5124,7 @@ fn handle_main_quant(
                 };
                 if (flags.use_mq4g256
                     || flags.use_mq4v2
+                    || flags.use_mq4v2_lloyd
                     || flags.use_mq4c
                     || flags.use_mq4_mq6exp
                     || flags.use_mq4_mq2lloydexp
@@ -5219,6 +5247,27 @@ fn handle_main_quant(
                                 quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2)
                             };
                             (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                        }
+                        GgufFormat::Mq4V2Lloyd => {
+                            let m = meta.shape[0];
+                            let r = if let (Some(alpha), Some(im_weights)) =
+                                (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                            {
+                                if awq_eligible(name) {
+                                    let scales = compute_awq_scales(im_weights, alpha);
+                                    awq_sidecar_scales = Some(scales.clone());
+                                    let mut scaled = f32_data.clone();
+                                    awq_pre_scale_weights(&mut scaled, m, k_dim, &scales);
+                                    quantize_mq4g256v2_lloyd(&scaled, m, k_dim, &signs1, &signs2)
+                                } else {
+                                    quantize_mq4g256v2_lloyd(&f32_data, m, k_dim, &signs1, &signs2)
+                                }
+                            } else {
+                                quantize_mq4g256v2_lloyd(&f32_data, m, k_dim, &signs1, &signs2)
+                            };
+                            lloyd_v2_stats_record(name, &r);
+                            lloyd_sidecar_levels = Some(r.levels);
+                            (r.data, QuantType::MQ4G256V2L, 256u32, "MQ4G256V2L")
                         }
                         GgufFormat::Mq4C => {
                             let q = if let (Some(alpha), Some(im_weights)) =
@@ -5470,7 +5519,16 @@ fn handle_main_quant(
                         let m = meta.shape[0];
                         let k = meta.shape[1];
                         if k % 256 != 0
-                            && matches!(dt, "mq2v2" | "mq3v2" | "mq4v2" | "mq5v2" | "mq6v2")
+                            && matches!(
+                                dt,
+                                "mq2v2"
+                                    | "mq3v2"
+                                    | "mq4v2"
+                                    | "mq4v2-lloyd"
+                                    | "mq4l"
+                                    | "mq5v2"
+                                    | "mq6v2"
+                            )
                         {
                             eprintln!(
                                 "error: fixed-tier dtype {dt} requires K%256==0 for {name} (K={k})"
@@ -5491,6 +5549,12 @@ fn handle_main_quant(
                             "mq4v2" => {
                                 let q = quantize_mq4g256v2(&f32_data, m, k, &s1, &s2);
                                 (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                            }
+                            "mq4v2-lloyd" | "mq4l" | "mq4v2l" => {
+                                let r = quantize_mq4g256v2_lloyd(&f32_data, m, k, &s1, &s2);
+                                lloyd_v2_stats_record(name, &r);
+                                lloyd_sidecar_levels = Some(r.levels);
+                                (r.data, QuantType::MQ4G256V2L, 256u32, "MQ4G256V2L")
                             }
                             "mq3v2" => {
                                 let q = quantize_mq3g256v2(&f32_data, m, k, &s1, &s2);
@@ -5630,7 +5694,16 @@ fn handle_main_quant(
                             let m = meta.shape[0];
                             let k = meta.shape[1];
                             if k % 256 != 0
-                                && matches!(dt, "mq2v2" | "mq3v2" | "mq4v2" | "mq5v2" | "mq6v2")
+                                && matches!(
+                                    dt,
+                                    "mq2v2"
+                                        | "mq3v2"
+                                        | "mq4v2"
+                                        | "mq4v2-lloyd"
+                                        | "mq4l"
+                                        | "mq5v2"
+                                        | "mq6v2"
+                                )
                             {
                                 eprintln!("error: fixed-tier dtype {dt} requires K%256==0 for {name} (K={k})");
                                 std::process::exit(2);
@@ -5660,6 +5733,12 @@ fn handle_main_quant(
                                     let q = quantize_mq4g256v2(&f32_data, m, k, &s1, &s2);
                                     (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                                 }
+                                "mq4v2-lloyd" | "mq4l" | "mq4v2l" => {
+                                    let r = quantize_mq4g256v2_lloyd(&f32_data, m, k, &s1, &s2);
+                                    lloyd_v2_stats_record(name, &r);
+                                    lloyd_sidecar_levels = Some(r.levels);
+                                    (r.data, QuantType::MQ4G256V2L, 256u32, "MQ4G256V2L")
+                                }
                                 "mq3v2" => {
                                     let q = quantize_mq3g256v2(&f32_data, m, k, &s1, &s2);
                                     (q, QuantType::MQ3G256V2, 256u32, "MQ3G256V2")
@@ -5685,6 +5764,7 @@ fn handle_main_quant(
                     }
                 } else if (flags.use_mq4g256
                     || flags.use_mq4v2
+                    || flags.use_mq4v2_lloyd
                     || flags.use_mq4c
                     || flags.use_mq4_mq6exp
                     || flags.use_mq4_mq2lloydexp
@@ -5809,6 +5889,44 @@ fn handle_main_quant(
                             quantize_mq4g256v2(&f32_data, m_dim, k, &signs1, &signs2)
                         };
                         (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
+                    } else {
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
+                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    }
+                } else if flags.use_mq4v2_lloyd {
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let m_dim = meta.shape[0];
+                        let r = if let (Some(alpha), Some(im_weights)) =
+                            (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
+                        {
+                            if awq_eligible(name) {
+                                let scales = compute_awq_scales(im_weights, alpha);
+                                awq_sidecar_scales = Some(scales.clone());
+                                let mut scaled = f32_data.clone();
+                                awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
+                                quantize_mq4g256v2_lloyd(&scaled, m_dim, k_dim, &signs1, &signs2)
+                            } else {
+                                quantize_mq4g256v2_lloyd(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                            }
+                        } else {
+                            quantize_mq4g256v2_lloyd(&f32_data, m_dim, k_dim, &signs1, &signs2)
+                        };
+                        lloyd_v2_stats_record(name, &r);
+                        lloyd_sidecar_levels = Some(r.levels);
+                        (r.data, QuantType::MQ4G256V2L, 256u32, "MQ4G256V2L")
                     } else {
                         let q = if meta.shape.len() == 2 {
                             let m = meta.shape[0];
@@ -6649,6 +6767,7 @@ fn handle_main_quant(
                 if !is_q4_opt_in
                     && (flags.use_mq4g256
                         || flags.use_mq4v2
+                        || flags.use_mq4v2_lloyd
                         || flags.use_mq4c
                         || flags.use_mq5g256
                         || flags.use_mq6g256)
@@ -6660,10 +6779,11 @@ fn handle_main_quant(
                     };
                     eprintln!(
                             "error: tensor '{}' fell through to QuantType::Q4F16G64 (qt=0, G64 \
-                             legacy fallback) with mq4 family flags: use_mq4v2={} use_mq4g256={} use_mq4c={}.\n  \
+                             legacy fallback) with mq4 family flags: use_mq4v2={} use_mq4v2_lloyd={} use_mq4g256={} use_mq4c={}.\n  \
                              shape={:?} k_dim={} k%256={} kmap_level={:?} is_embed={}",
                             name,
                             flags.use_mq4v2,
+                            flags.use_mq4v2_lloyd,
                             flags.use_mq4g256,
                             flags.use_mq4c,
                             meta.shape,
@@ -6795,6 +6915,23 @@ fn handle_main_quant(
                     spilled_len: 0,
                 });
             }
+            if let Some(levels) = lloyd_sidecar_levels.take() {
+                let sidecar_name = lloyd_levels_sidecar_name(name);
+                let bytes = lloyd_levels_to_f32_bytes(&levels);
+                eprintln!(
+                    "    Lloyd:  {} [16] (1D F32 levels, {} B)",
+                    sidecar_name,
+                    bytes.len()
+                );
+                state.hfq_tensors.push(HfqTensor {
+                    name: sidecar_name,
+                    quant_type: QuantType::F32,
+                    shape: vec![16],
+                    group_size: 0,
+                    data: bytes,
+                    spilled_len: 0,
+                });
+            }
         } // end else (non-Q8HFQ path)
     } else {
         // Vision-sidecar dtype policy (F32 norms/biases/pos-embed) takes
@@ -6902,6 +7039,7 @@ mod handle_main_quant_f16_fallback_tests {
             use_mq4_mqlloyd_tiered: false,
             use_mq4g256: true,
             use_mq4v2: false,
+            use_mq4v2_lloyd: false,
             use_mq4c: false,
             use_mq4g256_lloyd: false,
             use_mq5g256: false,

@@ -3794,15 +3794,26 @@ pub fn generate(
             }
         } else {
             // Manually chunk the no-eviction prefill so the abort check fires
-            // between batches. Outer chunks must agree with internal chunk /
-            // PBS capacity via `prefill_max_batch` (gfx1201 defaults 384;
-            // gfx11/CDNA stay 256; HIPFIRE_PREFILL_MAX_BATCH>=2 overrides).
+            // between batches. Outer chunks follow the admitted ordinary
+            // ceiling (the same decision the forward below enforces) with the
+            // serve tail rule (1025→1024+1); the inner forward re-admits per
+            // chunk, so a smaller memory admission only narrows chunks, never
+            // breaks them. At the 512 ceiling this is `min(remaining, 512),
+            // identical to the legacy split.
             // Adaptive-KV keeps the hard `PREFILL_MAX_BATCH` (256) cap so the
             // controller's margin and maybe_downshift boundaries stay exact.
             let chunk_max = if m.kv_adaptive.is_some() {
                 qwen35::PREFILL_MAX_BATCH
             } else {
-                qwen35::prefill_max_batch(gpu)
+                match qwen35::ordinary_prefill_chunk_limit(gpu, weights, config, dn, kv, None) {
+                    Ok(limit) => limit,
+                    Err(e) => {
+                        eprintln!(
+                            "ar prefill: chunk-limit query failed ({e}); keeping legacy ceiling"
+                        );
+                        qwen35::prefill_max_batch(gpu)
+                    }
+                }
             };
             let mut start = 0usize;
             while start < new_tokens.len() {
@@ -3810,7 +3821,10 @@ pub fn generate(
                     prefill_aborted = true;
                     break;
                 }
-                let end = (start + chunk_max).min(new_tokens.len());
+                let remaining = new_tokens.len() - start;
+                let outer = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
+                    .unwrap_or(remaining.min(chunk_max).max(1));
+                let end = (start + outer).min(new_tokens.len());
                 let chunk = &new_tokens[start..end];
                 if let Err(e) = qwen35::forward_prefill_batch(
                     gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,

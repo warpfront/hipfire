@@ -2421,6 +2421,9 @@ pub fn load_model_with_kv_backend(
         gpu,
         gemma4_drafter_path: None,
         gemma4_draft_len: GEMMA4_EAGLE_DRAFT_LEN,
+        // Slice 4 (integration) populates this from the daemon `xdna` param
+        // after flag + exact-gfx1151 admission; until then loads stay GPU-only.
+        xdna: None,
     };
 
     // Carrier registry dispatch. Collect all matches so an overlap between
@@ -2586,6 +2589,9 @@ pub fn load_admitted_with_gemma4_drafter(
         gpu,
         gemma4_drafter_path,
         gemma4_draft_len,
+        // Slice 4 (integration) populates this from the daemon `xdna` param
+        // after flag + exact-gfx1151 admission; until then loads stay GPU-only.
+        xdna: None,
     };
     let mut result = carrier.load(source, &mut ctx)?;
     if result.pp > 1 && result.pp_gpus.is_none() {
@@ -3666,6 +3672,14 @@ fn load_model_ep_qwen35(
     let kv_raw = kv_mode.unwrap_or("");
     let kv_trim = kv_raw.trim();
     let kv_lower = kv_trim.to_ascii_lowercase();
+    // Native tiers are single-GPU only: refuse explicitly before resolve,
+    // which would otherwise admit fp8/bf16 under the HFQ policy and let MoE
+    // EP construct a distributed native cache.
+    if kv_lower == "fp8" || kv_lower == "bf16" {
+        return Err(format!(
+            "kv_mode '{kv_trim}' is single-GPU only (MoE EP never allocates native fp8/bf16 tiers)"
+        ));
+    }
     let kv_mode_resolved = if kv_lower.is_empty() {
         kv_mode::resolve("", &kv_mode::QWEN35_HFQ_POLICY).mode
     } else {
@@ -3913,6 +3927,14 @@ fn load_model_tp_qwen35_dense(
     let kv_backend_resolved: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     let kv_trim = kv_raw.trim();
     let kv_lower = kv_trim.to_ascii_lowercase();
+    // Native tiers are single-GPU only: refuse explicitly before resolve,
+    // which would otherwise admit fp8/bf16 under the HFQ policy and let
+    // dense-TP construct per-rank native caches.
+    if kv_lower == "fp8" || kv_lower == "bf16" {
+        return Err(format!(
+            "kv_mode '{kv_trim}' is single-GPU only (dense-TP never allocates native fp8/bf16 tiers)"
+        ));
+    }
     let kv_mode_resolved = if kv_lower.is_empty() {
         kv_mode::resolve("", &kv_mode::QWEN35_HFQ_POLICY).mode
     } else {

@@ -755,6 +755,7 @@ impl KernelCompiler {
         // matching hash certifies it. Hashless/mismatched nonempty blobs may be
         // used only when hipcc is unavailable (packaged install), with warning.
         // See: https://github.com/warpfront/hipfire/issues/2
+        let mut stale_precompiled = false;
         if let Some(dir) = &self.precompiled_dir {
             let precompiled = dir.join(format!("{name}.hsaco"));
             let hash_file = dir.join(format!("{name}.hash"));
@@ -779,7 +780,9 @@ impl KernelCompiler {
                     self.compiled.insert(name.to_string(), precompiled);
                     return Ok(&self.compiled[name]);
                 }
-                eprintln!("  {name}: pre-compiled blob has no hash file, recompiling");
+                // Stale legacy pair; a content-keyed hot entry may still hit
+                // below, so report the recompile only once that is ruled out.
+                stale_precompiled = true;
             }
         }
 
@@ -839,6 +842,9 @@ impl KernelCompiler {
             );
         }
 
+        if stale_precompiled {
+            eprintln!("  {name}: pre-compiled blob hash is stale and no cached build matches; recompiling");
+        }
         Self::hipcc_compile_publish(
             &self.hipcc_bin,
             self.rocm_env_root.as_deref(),

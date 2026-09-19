@@ -221,6 +221,9 @@ pub fn load_paro_weight(
                 is_alias: false,
             }),
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         })
     })();
 
@@ -347,6 +350,9 @@ pub fn load_fp16_weight_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 

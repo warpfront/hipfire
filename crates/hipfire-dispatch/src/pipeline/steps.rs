@@ -158,10 +158,42 @@ pub(crate) fn guard_qkv_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool 
     steps.len() == 4 && gemv_steps_uniform(steps, DType::MQ4G256Lloyd, true)
 }
 
-/// Exact MQ4G256V2 scalar fusion is fail-closed to gfx1100 + gfx1201 only.
+/// Exact MQ4G256V2 scalar fusion is fail-closed to gfx1100 + gfx1151 + gfx1201.
 /// Keep `force_unfused` first so the global kill-switch still wins.
 fn mq4g256v2_scalar_fusion_ok(ctx: &DispatchCtx) -> bool {
-    !ctx.flags.force_unfused && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1201())
+    !ctx.flags.force_unfused
+        && (ctx.arch.is_gfx1100() || ctx.arch.is_gfx1151() || ctx.arch.is_gfx1201())
+}
+
+/// True if all Gemv steps in the window (indices 1..) are MQ4G256V2-Lloyd
+/// (qt=52) with a decode LUT attached, Prerotated input, and no AWQ on the
+/// weight ref (AWQ is applied in the RmsnormAutomatic step). A Lloyd tensor
+/// without its LUT must never fuse onto the uniform decode grid.
+fn gemv_steps_uniform_mq4g256v2_lloyd(steps: &[Step]) -> bool {
+    steps[1..].iter().all(|s| match s {
+        Step::Gemv {
+            w,
+            input: GemvInput::Prerotated(_),
+            ..
+        } => w.dtype == DType::MQ4G256V2Lloyd && w.awq_scale.is_none() && w.lloyd_lut_f16.is_some(),
+        _ => false,
+    })
+}
+
+/// MQ4G256V2-Lloyd (qt=52) QKV decode fusion: same arch set as the uniform
+/// V2 guard; the family arm passes the three per-tensor codebooks.
+pub(crate) fn guard_qkv_mq4g256v2_lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    mq4g256v2_scalar_fusion_ok(ctx) && steps.len() == 4 && gemv_steps_uniform_mq4g256v2_lloyd(steps)
+}
+
+/// MQ4G256V2-Lloyd (qt=52) QKVZA decode fusion (four codebooks).
+pub(crate) fn guard_qkvza_mq4g256v2_lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    mq4g256v2_scalar_fusion_ok(ctx) && steps.len() == 5 && gemv_steps_uniform_mq4g256v2_lloyd(steps)
+}
+
+/// MQ4G256V2-Lloyd (qt=52) gate+up decode fusion (two codebooks).
+pub(crate) fn guard_gate_up_mq4g256v2_lloyd(steps: &[Step], ctx: &DispatchCtx) -> bool {
+    mq4g256v2_scalar_fusion_ok(ctx) && steps.len() == 3 && gemv_steps_uniform_mq4g256v2_lloyd(steps)
 }
 
 /// Exact MQ4G256V2 (qt44) QKV decode fusion. Official Ornith is all-qt44;
@@ -224,7 +256,7 @@ pub(crate) fn guard_qkvza_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> boo
 }
 
 /// Exact MQ4G256V2 (qt44) QKVZA decode fusion.
-/// Fail-closed to gfx1100/gfx1201; other arches keep per-projection V2 GEMVs.
+/// Fail-closed to gfx1100/gfx1151/gfx1201; other arches keep per-projection V2 GEMVs.
 pub(crate) fn guard_qkvza_mq4g256v2(steps: &[Step], ctx: &DispatchCtx) -> bool {
     mq4g256v2_scalar_fusion_ok(ctx)
         && steps.len() == 5
@@ -281,7 +313,7 @@ pub(crate) fn guard_gate_up_mq4g256lloyd(steps: &[Step], ctx: &DispatchCtx) -> b
 }
 
 /// Exact MQ4G256V2 (qt44) gate+up decode fusion.
-/// Fail-closed to gfx1100/gfx1201; other arches keep per-projection V2 GEMVs.
+/// Fail-closed to gfx1100/gfx1151/gfx1201; other arches keep per-projection V2 GEMVs.
 pub(crate) fn guard_gate_up_mq4g256v2(steps: &[Step], ctx: &DispatchCtx) -> bool {
     mq4g256v2_scalar_fusion_ok(ctx)
         && steps.len() == 3
@@ -531,6 +563,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
     },
     FusedPattern {
         ops: QKV3,
+        key: KernelKey::FusedQkvMq4G256V2Lloyd,
+        guard: guard_qkv_mq4g256v2_lloyd,
+    },
+    FusedPattern {
+        ops: QKV3,
         key: KernelKey::FusedQkvHfq4G256,
         guard: guard_qkv_hfq4g256,
     },
@@ -555,6 +592,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
         ops: QKVZA4,
         key: KernelKey::FusedQkvzaMq4G256V2,
         guard: guard_qkvza_mq4g256v2,
+    },
+    FusedPattern {
+        ops: QKVZA4,
+        key: KernelKey::FusedQkvzaMq4G256V2Lloyd,
+        guard: guard_qkvza_mq4g256v2_lloyd,
     },
     FusedPattern {
         ops: QKVZA4,
@@ -588,6 +630,11 @@ const FUSED_TABLE: &[FusedPattern] = &[
         ops: GATE_UP2,
         key: KernelKey::FusedGateUpMq4G256V2,
         guard: guard_gate_up_mq4g256v2,
+    },
+    FusedPattern {
+        ops: GATE_UP2,
+        key: KernelKey::FusedGateUpMq4G256V2Lloyd,
+        guard: guard_gate_up_mq4g256v2_lloyd,
     },
     FusedPattern {
         ops: GATE_UP2,
@@ -1039,6 +1086,14 @@ fn gemv_weight_out<'a>(step: &'a Step<'a>) -> (&'a WeightRef<'a>, &'a rdna_compu
     }
 }
 
+/// The decode f16 codebook of a qt=52 weight ref; the fused-Lloyd guards
+/// already required it, so a miss here is a programming error, not a route.
+fn lloyd_lut(w: &WeightRef<'_>) -> Result<[u32; 8], DispatchError> {
+    w.lloyd_lut_f16.ok_or_else(|| {
+        DispatchError::Hip("MQ4G256V2Lloyd fused decode: weight ref has no lloyd_lut_f16".into())
+    })
+}
+
 fn launch_fused(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
@@ -1051,6 +1106,46 @@ fn launch_fused(
     let fused_qkv = FUSED_QKV.get_or_init(FusedQkvFamily::new);
 
     match key {
+        // ── MQ4G256V2-Lloyd (qt=52) decode fusions ──
+        // Launched here rather than through `FusedQkvFamily`: the LUT lives on
+        // the `WeightRef`s (the guard proved every one is `Some`), and these
+        // keys are decode-only (batched prefill takes the FP8-LUT GEMMs).
+        KernelKey::FusedQkvMq4G256V2Lloyd => {
+            let (wq, q) = gemv_weight_out(&steps[1]);
+            let (wk, k) = gemv_weight_out(&steps[2]);
+            let (wv, v) = gemv_weight_out(&steps[3]);
+            let luts = [lloyd_lut(wq)?, lloyd_lut(wk)?, lloyd_lut(wv)?];
+            gpu.fused_qkv_mq4g256v2_lloyd(
+                wq.buf, wk.buf, wv.buf, activated, q, k, v, wq.m, wk.m, wv.m, wq.k, luts,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+        KernelKey::FusedGateUpMq4G256V2Lloyd => {
+            let (wg, gate) = gemv_weight_out(&steps[1]);
+            let (wu, up) = gemv_weight_out(&steps[2]);
+            let (lg, lu) = (lloyd_lut(wg)?, lloyd_lut(wu)?);
+            gpu.fused_gate_up_mq4g256v2_lloyd(
+                wg.buf, wu.buf, activated, gate, up, wg.m, wu.m, wg.k, lg, lu,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
+        KernelKey::FusedQkvzaMq4G256V2Lloyd => {
+            let (wqkv, qkv) = gemv_weight_out(&steps[1]);
+            let (wz, z) = gemv_weight_out(&steps[2]);
+            let (wb, beta) = gemv_weight_out(&steps[3]);
+            let (wa, alpha) = gemv_weight_out(&steps[4]);
+            let luts = [
+                lloyd_lut(wqkv)?,
+                lloyd_lut(wz)?,
+                lloyd_lut(wb)?,
+                lloyd_lut(wa)?,
+            ];
+            gpu.fused_qkvza_mq4g256v2_lloyd(
+                wqkv.buf, wz.buf, wb.buf, wa.buf, activated, qkv, z, beta, alpha, wqkv.m, wz.m,
+                wb.m, wa.m, wqkv.k, luts,
+            )
+            .map_err(|e| DispatchError::Hip(e.to_string()))
+        }
         KernelKey::FusedQkvMq4G256Lloyd
         | KernelKey::FusedQkvMq4G256V2
         | KernelKey::FusedQkvMq3G256Lloyd
@@ -1571,6 +1666,252 @@ mod tests {
         assert!(
             keys.contains(&KernelKey::FusedGateUpQ8_0),
             "FusedGateUpQ8_0 missing from FUSED_TABLE"
+        );
+    }
+
+    // ── MQ4G256V2 / Lloyd scalar-fusion arch admission (T1 gfx1151) ──
+
+    fn weight_ref_v2<'a>(
+        dummy: &'a GpuTensor,
+        dtype: DType,
+        lut: Option<[u32; 8]>,
+    ) -> WeightRef<'a> {
+        WeightRef {
+            buf: dummy,
+            dtype,
+            m: 4096,
+            k: 4096,
+            row_stride: 0,
+            rotation: None,
+            awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: lut,
+            lloyd_lut_c16: None,
+        }
+    }
+
+    fn make_qkv3_window<'a>(dummy: &'a GpuTensor, wr: &'a WeightRef<'a>) -> [Step<'a>; 4] {
+        [
+            Step::RmsnormAutomatic {
+                x: dummy,
+                norm_weight: dummy,
+                x_plain: dummy,
+                out: dummy,
+                awq_scale: None,
+                k: 4096,
+                eps: 1e-6,
+                rotation: RotationPlan::FwhtG256,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+        ]
+    }
+
+    fn make_gate_up_window<'a>(dummy: &'a GpuTensor, wr: &'a WeightRef<'a>) -> [Step<'a>; 3] {
+        [
+            Step::RmsnormAutomatic {
+                x: dummy,
+                norm_weight: dummy,
+                x_plain: dummy,
+                out: dummy,
+                awq_scale: None,
+                k: 4096,
+                eps: 1e-6,
+                rotation: RotationPlan::FwhtG256,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+        ]
+    }
+
+    fn make_qkvza_window<'a>(dummy: &'a GpuTensor, wr: &'a WeightRef<'a>) -> [Step<'a>; 5] {
+        [
+            Step::RmsnormAutomatic {
+                x: dummy,
+                norm_weight: dummy,
+                x_plain: dummy,
+                out: dummy,
+                awq_scale: None,
+                k: 4096,
+                eps: 1e-6,
+                rotation: RotationPlan::FwhtG256,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+            Step::Gemv {
+                w: wr,
+                input: GemvInput::Prerotated(dummy),
+                out: dummy,
+            },
+        ]
+    }
+
+    #[test]
+    fn mq4g256v2_lloyd_guards_admit_gfx1151() {
+        // Fused Lloyd decode kernels are scalar wave32; gfx1151 (Strix Halo)
+        // shares the same TU as gfx1100/gfx1201 once the scalar-fusion gate opens.
+        let dummy = GpuTensor::null_for_test();
+        let lut = [0u32; 8];
+        let wr = weight_ref_v2(&dummy, DType::MQ4G256V2Lloyd, Some(lut));
+        let ctx = DispatchCtx::for_test("gfx1151");
+        let qkv = make_qkv3_window(&dummy, &wr);
+        let qkvza = make_qkvza_window(&dummy, &wr);
+        let gate_up = make_gate_up_window(&dummy, &wr);
+        assert!(
+            guard_qkv_mq4g256v2_lloyd(&qkv, &ctx),
+            "gfx1151 must admit guard_qkv_mq4g256v2_lloyd"
+        );
+        assert!(
+            guard_qkvza_mq4g256v2_lloyd(&qkvza, &ctx),
+            "gfx1151 must admit guard_qkvza_mq4g256v2_lloyd"
+        );
+        assert!(
+            guard_gate_up_mq4g256v2_lloyd(&gate_up, &ctx),
+            "gfx1151 must admit guard_gate_up_mq4g256v2_lloyd"
+        );
+        // Same predicate governs uniform V2 fusion.
+        let wr_v2 = weight_ref_v2(&dummy, DType::MQ4G256V2, None);
+        let qkv_v2 = make_qkv3_window(&dummy, &wr_v2);
+        let qkvza_v2 = make_qkvza_window(&dummy, &wr_v2);
+        let gate_up_v2 = make_gate_up_window(&dummy, &wr_v2);
+        assert!(
+            guard_qkv_mq4g256v2(&qkv_v2, &ctx),
+            "gfx1151 must admit guard_qkv_mq4g256v2"
+        );
+        assert!(
+            guard_qkvza_mq4g256v2(&qkvza_v2, &ctx),
+            "gfx1151 must admit guard_qkvza_mq4g256v2"
+        );
+        assert!(
+            guard_gate_up_mq4g256v2(&gate_up_v2, &ctx),
+            "gfx1151 must admit guard_gate_up_mq4g256v2"
+        );
+    }
+
+    #[test]
+    fn mq4g256v2_lloyd_guards_still_admit_gfx1100_and_gfx1201() {
+        let dummy = GpuTensor::null_for_test();
+        let lut = [0u32; 8];
+        let wr = weight_ref_v2(&dummy, DType::MQ4G256V2Lloyd, Some(lut));
+        let qkv = make_qkv3_window(&dummy, &wr);
+        let qkvza = make_qkvza_window(&dummy, &wr);
+        let gate_up = make_gate_up_window(&dummy, &wr);
+        for arch in ["gfx1100", "gfx1201"] {
+            let ctx = DispatchCtx::for_test(arch);
+            assert!(
+                guard_qkv_mq4g256v2_lloyd(&qkv, &ctx),
+                "{arch} must keep admitting Lloyd QKV fusion"
+            );
+            assert!(
+                guard_qkvza_mq4g256v2_lloyd(&qkvza, &ctx),
+                "{arch} must keep admitting Lloyd QKVZA fusion"
+            );
+            assert!(
+                guard_gate_up_mq4g256v2_lloyd(&gate_up, &ctx),
+                "{arch} must keep admitting Lloyd gate+up fusion"
+            );
+        }
+    }
+
+    #[test]
+    fn mq4g256v2_lloyd_guards_refuse_gfx1150_and_gfx1152() {
+        // Near-miss RDNA3.5 siblings stay fail-closed (no kernels selected /
+        // no hardware to validate in this plan).
+        let dummy = GpuTensor::null_for_test();
+        let lut = [0u32; 8];
+        let wr = weight_ref_v2(&dummy, DType::MQ4G256V2Lloyd, Some(lut));
+        let wr_v2 = weight_ref_v2(&dummy, DType::MQ4G256V2, None);
+        let qkv = make_qkv3_window(&dummy, &wr);
+        let qkvza = make_qkvza_window(&dummy, &wr);
+        let gate_up = make_gate_up_window(&dummy, &wr);
+        let qkv_v2 = make_qkv3_window(&dummy, &wr_v2);
+        let qkvza_v2 = make_qkvza_window(&dummy, &wr_v2);
+        let gate_up_v2 = make_gate_up_window(&dummy, &wr_v2);
+        for arch in ["gfx1150", "gfx1152"] {
+            let ctx = DispatchCtx::for_test(arch);
+            assert!(
+                !guard_qkv_mq4g256v2_lloyd(&qkv, &ctx),
+                "{arch} must refuse Lloyd QKV fusion"
+            );
+            assert!(
+                !guard_qkvza_mq4g256v2_lloyd(&qkvza, &ctx),
+                "{arch} must refuse Lloyd QKVZA fusion"
+            );
+            assert!(
+                !guard_gate_up_mq4g256v2_lloyd(&gate_up, &ctx),
+                "{arch} must refuse Lloyd gate+up fusion"
+            );
+            assert!(
+                !guard_qkv_mq4g256v2(&qkv_v2, &ctx),
+                "{arch} must refuse uniform V2 QKV fusion"
+            );
+            assert!(
+                !guard_qkvza_mq4g256v2(&qkvza_v2, &ctx),
+                "{arch} must refuse uniform V2 QKVZA fusion"
+            );
+            assert!(
+                !guard_gate_up_mq4g256v2(&gate_up_v2, &ctx),
+                "{arch} must refuse uniform V2 gate+up fusion"
+            );
+        }
+    }
+
+    #[test]
+    fn mq4g256v2_lloyd_guards_force_unfused_still_wins_on_gfx1151() {
+        use rdna_compute::feature_flags::FeatureFlags;
+        use std::sync::Arc;
+        let dummy = GpuTensor::null_for_test();
+        let lut = [0u32; 8];
+        let wr = weight_ref_v2(&dummy, DType::MQ4G256V2Lloyd, Some(lut));
+        let qkv = make_qkv3_window(&dummy, &wr);
+        let mut flags = FeatureFlags::for_test("gfx1151");
+        flags.force_unfused = true;
+        let ctx = DispatchCtx {
+            arch: rdna_compute::arch_caps::ArchCaps::new(
+                "gfx1151",
+                Arc::new(FeatureFlags::for_test("gfx1151")),
+            ),
+            flags: Arc::new(flags),
+            resources: crate::resource::ResourceManager::for_test(),
+            workload: crate::context::DispatchWorkload::Standard,
+        };
+        assert!(
+            !guard_qkv_mq4g256v2_lloyd(&qkv, &ctx),
+            "force_unfused must still win on gfx1151"
         );
     }
 }

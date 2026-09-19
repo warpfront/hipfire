@@ -57,6 +57,7 @@ fn dn_requant_per_token() -> bool {
         .unwrap_or(false)
 }
 
+
 /// Use the chunked (parallel) FP32 GDN kernel on the multi-token (n>1) linear
 /// arm instead of the sequential batch_seq. DEFAULT OFF. Correctness-first
 /// PoC: each chunk is a separate host-side launch (cross-chunk is serial).
@@ -2133,6 +2134,85 @@ impl Gpu {
         result
     }
 
+    /// T-C Halo prefill fusion: batched deinterleave with the FullAttention Q
+    /// RMSNorm folded in. Bit-identical q_out/gate_out to the
+    /// `deinterleave_f32_batched` + in-place `rmsnorm_batched(q)` sequence;
+    /// the Q global-memory round trip is gone. Uses the same blockDim the
+    /// unfused `rmsnorm_batched` would pick (min(256, head_dim)) so the
+    /// reduction order matches exactly. `q_out` must not alias `interleaved`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deinterleave_q_rmsnorm_f32_batched(
+        &mut self,
+        interleaved: &GpuTensor,
+        q_out: &GpuTensor,
+        gate_out: &GpuTensor,
+        q_norm: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        n: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let block = 256u32.min(head_dim as u32);
+        if head_dim > 8 * block as usize {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "deinterleave+qnorm fusion requires head_dim<=2048",
+            ));
+        }
+        const KERNEL: &str = "deinterleave_q_rmsnorm_f32_batched";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC,
+            KERNEL,
+        )?;
+        let mut inp = interleaved.buf.as_ptr();
+        let mut qp = q_out.buf.as_ptr();
+        let mut gp = gate_out.buf.as_ptr();
+        let mut wp = q_norm.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut nn = n as i32;
+        let mut ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut inp as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+        ];
+        // Fused traffic: interleaved read + Q/gate writes + norm weight;
+        // the Q store+reload round trip is gone.
+        let bytes = n * n_heads * head_dim * 4 * 4 + head_dim * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [n_heads as u32, n as u32, 1],
+            [block, 1, 1],
+            block * 4,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(inp);
+                b.push_ptr(qp);
+                b.push_ptr(gp);
+                b.push_ptr(wp);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(nn);
+                b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     #[cfg(feature = "deltanet")]
     pub fn sigmoid_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
@@ -2266,6 +2346,10 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        // `out` is a stable batched scratch rewritten every layer; drop any
+        // pointer-keyed F16/FP8 conversion cached from its previous contents
+        // (the Q8 residual WMMA consumer would otherwise reuse stale X).
+        self.invalidate_x_caches_for(out.buf.as_ptr());
         result
     }
 
@@ -2547,6 +2631,10 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        // `out` is a stable batched scratch rewritten every layer; drop any
+        // pointer-keyed F16/FP8 conversion cached from its previous contents
+        // (the Q8 residual WMMA consumer would otherwise reuse stale X).
+        self.invalidate_x_caches_for(out.buf.as_ptr());
         result
     }
 
@@ -2990,20 +3078,18 @@ impl Gpu {
         self.bind_thread()?;
 
         let use_fast = !dn_requant_per_token();
-        let kernel_name = if use_fast {
-            "gated_delta_net_q8_fast"
+        let (kernel_name, kernel_src, kernel_fn) = if use_fast {
+            (
+                "gated_delta_net_q8_fast",
+                kernels::GATED_DELTA_NET_Q8_FAST_SRC,
+                "gated_delta_net_q8_fast",
+            )
         } else {
-            "gated_delta_net_q8"
-        };
-        let kernel_src = if use_fast {
-            kernels::GATED_DELTA_NET_Q8_FAST_SRC
-        } else {
-            kernels::GATED_DELTA_NET_Q8_SRC
-        };
-        let kernel_fn = if use_fast {
-            "gated_delta_net_q8_fast"
-        } else {
-            "gated_delta_net_q8"
+            (
+                "gated_delta_net_q8",
+                kernels::GATED_DELTA_NET_Q8_SRC,
+                "gated_delta_net_q8",
+            )
         };
         self.ensure_kernel(kernel_name, kernel_src, kernel_fn)?;
 
@@ -3054,7 +3140,7 @@ impl Gpu {
                 &mut efp as *mut _ as *mut c_void,
             ];
             self.launch_maybe_blob(
-                "gated_delta_net_q8_fast",
+                kernel_name,
                 [n_heads as u32, n_tiles, 1],
                 [32, 1, 1],
                 0,
@@ -3125,6 +3211,8 @@ impl Gpu {
         }
         result
     }
+
+
 
     /// One-token recurrent update for several independent sequence lanes.
     /// State tensors are lane-major; the kernel uses grid.z as the lane id.
@@ -4557,6 +4645,136 @@ impl Gpu {
                 b.push_i32(kd);
                 b.push_i32(vd);
                 b.push_i32(nt);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1201 batched prefill GDN preamble fusion (slice P): sigmoid(beta) +
+    /// alpha gate + conv1d + SiLU + split + Q/K norm + scale + interleave in
+    /// ONE launch (`gdn_pre_batched_gfx1201`). Byte-exact vs the 3-launch
+    /// sequence; the launcher gates every admission condition the kernel
+    /// header requires (exact gfx1201 is checked at the dispatch site).
+    /// `q_raw`/`k_raw` stores are kept (v1).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_pre_batched_gfx1201(
+        &mut self,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        qkv_in: &GpuTensor,
+        conv_w: &GpuTensor,
+        conv_state: &GpuTensor,
+        q_raw: &GpuTensor,
+        k_raw: &GpuTensor,
+        v_out: &GpuTensor,
+        q_dst: &GpuTensor,
+        k_dst: &GpuTensor,
+        n_v_heads: usize,
+        n_key_heads: usize,
+        ratio: usize,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const KERNEL: &str = "gdn_pre_batched_gfx1201";
+        const BLOCK: u32 = 256;
+        const R: usize = 32;
+        self.ensure_kernel(KERNEL, kernels::GDN_PRE_BATCHED_GFX1201_SRC, KERNEL)?;
+        let bp = beta.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let dtp = dt_bias.buf.as_ptr();
+        let alp = a_log.buf.as_ptr();
+        let ip = qkv_in.buf.as_ptr();
+        let wp = conv_w.buf.as_ptr();
+        let sp = conv_state.buf.as_ptr();
+        let qrp = q_raw.buf.as_ptr();
+        let krp = k_raw.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let qdp = q_dst.buf.as_ptr();
+        let kdp = k_dst.buf.as_ptr();
+        let nvh = n_v_heads as i32;
+        let nkh = n_key_heads as i32;
+        let ra = ratio as i32;
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let qkv = (2 * k_dim + v_dim) as i32;
+        let nt = n_tokens as i32;
+        let qs = q_scale;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &bp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &dtp as *const _ as *mut c_void,
+            &alp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &qrp as *const _ as *mut c_void,
+            &krp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &qdp as *const _ as *mut c_void,
+            &kdp as *const _ as *mut c_void,
+            &nvh as *const _ as *mut c_void,
+            &nkh as *const _ as *mut c_void,
+            &ra as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &qkv as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        let n_groups = (n_tokens + R - 1) / R;
+        let qk_blocks = n_key_heads * n_groups;
+        let v_blocks = (v_dim + BLOCK as usize - 1) / BLOCK as usize;
+        let grid = (qk_blocks + v_blocks * n_groups + n_groups) as u32;
+        // Distinct DRAM: qkv read + raw write + normed q/k write +
+        // beta/alpha read+write (weights/ring negligible, L2-resident).
+        let n = n_tokens;
+        let bytes = n * (2 * k_dim + v_dim) * 4
+            + n * (2 * k_dim + v_dim) * 4
+            + 2 * n * n_v_heads * 128 * 4
+            + 4 * n * n_v_heads * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [grid, 1, 1],
+            [BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(bp);
+                b.push_ptr(ap);
+                b.push_ptr(dtp);
+                b.push_ptr(alp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(qrp);
+                b.push_ptr(krp);
+                b.push_ptr(vp);
+                b.push_ptr(qdp);
+                b.push_ptr(kdp);
+                b.push_i32(nvh);
+                b.push_i32(nkh);
+                b.push_i32(ra);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(qkv);
+                b.push_i32(nt);
+                b.push_f32(qs);
+                b.push_f32(ep);
                 b
             },
         );

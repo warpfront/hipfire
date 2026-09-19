@@ -17,26 +17,26 @@
 //! speculative decode serializes draft-generate then target-verify).
 
 use crate::carrier::Qwen35Bundle;
+use crate::dflash_spec::DenseTpDflashRankState;
 use crate::dflash_verify_pm4::{
     fingerprint_u64, DflashVerifyBinding, DflashVerifyPm4, DflashVerifyPm4Phase, DflashVerifyRoute,
     DflashVerifyWindow,
 };
-use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
-use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
-use crate::dflash_spec::DenseTpDflashRankState;
-use hipfire_dispatch::families::kv_tier::KTier;
-use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use crate::qwen35::forward::{
     forward_prefill_dense_tp, forward_prefill_dense_tp_with_pbs_capture, DenseTpDflashCapture,
 };
+use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
+use hip_bridge::{DeviceBuffer, HipError, HipResult, Stream};
+use hipfire_dispatch::families::kv_tier::KTier;
+use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{self, KvCache};
+use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::tokenizer::{Tokenizer, TokenizerError};
+use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::dflash_state_copy::{DflashStateCopyDesc, DFLASH_STATE_BULK_COPY_MAX_ITEMS};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
-use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::tp_shard::ShardConfig;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// #397 Ship 5.3: route a single spec-decode (DFlash) batched GEMM through
@@ -95,6 +95,9 @@ fn run_spec_gemm_key(
         row_stride: k,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let params = GemmParams {
         w: &w,
@@ -725,8 +728,15 @@ pub enum KvMode {
     /// leverage tier — Asym2 is doc'd "most lossy" and 2-bit centroid quant
     /// suffers most from outliers. Opt-in via `--kv-mode fwht2`.
     Fwht2,
+    /// Native fp8 E4M3 KV (gfx1201 Qwen dense only). ModelSlot::load rejects
+    /// this mode: single-slot speculative assembly goes through the carrier
+    /// path, never the slot constructors below. Present so `--kv-mode fp8`
+    /// fails closed here instead of parsing as a neighboring mode.
+    Fp8,
+    /// Flat native bf16 KV quality-control arm. Same rejection contract as
+    /// Fp8 above: ModelSlot::load refuses, carrier path owns admission.
+    Bf16,
 }
-
 impl Default for KvMode {
     fn default() -> Self {
         KvMode::Q8
@@ -949,6 +959,13 @@ impl ModelSlot {
                 config.head_dim,
                 slot_config.max_seq,
             )?,
+            KvMode::Fp8 | KvMode::Bf16 => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "ModelSlot::load rejects fp8/bf16 KV: single-slot speculative assembly \
+                     has no native-format slot constructors; load through the carrier path",
+                ));
+            }
         };
 
         let dn_state = DeltaNetState::new_with_quant(gpu, &config, slot_config.state_quant)?;
@@ -5894,7 +5911,9 @@ fn dense_tp_dflash_gates(
     let dim = target.configs[0].dim;
     let n_layers = target.configs[0].n_layers;
     for cfg in target.configs.iter() {
-        if cfg.dim != dim || cfg.n_layers != n_layers || cfg.layer_types != target.configs[0].layer_types
+        if cfg.dim != dim
+            || cfg.n_layers != n_layers
+            || cfg.layer_types != target.configs[0].layer_types
         {
             return Err("dense TP DFlash configs diverge on global shape".into());
         }
@@ -5910,9 +5929,7 @@ fn dense_tp_dflash_gates(
         if !s.dflash.draft_config.all_layers_sliding
             || !s.dflash.draft_weights.has_candidate_selector()
         {
-            return Err(
-                "dense TP DFlash requires a DFlash2 all-sliding selector draft".into(),
-            );
+            return Err("dense TP DFlash requires a DFlash2 all-sliding selector draft".into());
         }
         if s.dflash.draft_config.target_layer_ids.len() != s.dflash.hidden_rb.extract_layers.len() {
             return Err("dense TP DFlash rank hidden ring disagrees with draft layers".into());
@@ -6026,13 +6043,8 @@ pub fn seed_target_hidden_dense_tp2_abortable(
         }
     }
     // All CPU gates passed — now mutate device state.
-    reset_dense_tp_dflash_ranks(
-        gpus,
-        &mut *target.kv_caches,
-        &mut *target.dn_states,
-        states,
-    )
-    .map_err(|e| e.to_string())?;
+    reset_dense_tp_dflash_ranks(gpus, &mut *target.kv_caches, &mut *target.dn_states, states)
+        .map_err(|e| e.to_string())?;
     let mut off = 0usize;
     let mut last_n = 0usize;
     while off < prompt.len() {
@@ -6051,12 +6063,18 @@ pub fn seed_target_hidden_dense_tp2_abortable(
             let [s0, s1] = states else {
                 return Err("dense TP DFlash seed lost a rank".into());
             };
-            let pbs0 = s0.dflash.verify_scratch.prefill_batch.as_ref().ok_or(
-                "dense TP DFlash rank 0 lost its persistent PBS",
-            )?;
-            let pbs1 = s1.dflash.verify_scratch.prefill_batch.as_ref().ok_or(
-                "dense TP DFlash rank 1 lost its persistent PBS",
-            )?;
+            let pbs0 = s0
+                .dflash
+                .verify_scratch
+                .prefill_batch
+                .as_ref()
+                .ok_or("dense TP DFlash rank 0 lost its persistent PBS")?;
+            let pbs1 = s1
+                .dflash
+                .verify_scratch
+                .prefill_batch
+                .as_ref()
+                .ok_or("dense TP DFlash rank 1 lost its persistent PBS")?;
             let fh = s0.dflash.verify_scratch.final_hidden.sub_offset(0, n * dim);
             let mut caps = [
                 DenseTpDflashCapture {
@@ -6090,7 +6108,9 @@ pub fn seed_target_hidden_dense_tp2_abortable(
     // Prime each rank's draft target-hidden cache + upload log, and keep a
     // host shadow for the (all-sliding no-op) backfill call below.
     for rank in 0..2 {
-        gpus.devices[rank].bind_thread().map_err(|e| e.to_string())?;
+        gpus.devices[rank]
+            .bind_thread()
+            .map_err(|e| e.to_string())?;
         let modulus = states[rank].dflash.draft_scratch.ctx_modulus();
         scatter_hidden_block_to_interleaved(
             &gpus.devices[rank],
@@ -6102,9 +6122,16 @@ pub fn seed_target_hidden_dense_tp2_abortable(
             modulus,
         )
         .map_err(|e| e.to_string())?;
-        let host = download_hidden_block(&gpus.devices[rank], &states[rank].dflash.hidden_rb, prompt.len())
-            .map_err(|e| e.to_string())?;
-        states[rank].dflash.target_hidden_host.extend_from_slice(&host);
+        let host = download_hidden_block(
+            &gpus.devices[rank],
+            &states[rank].dflash.hidden_rb,
+            prompt.len(),
+        )
+        .map_err(|e| e.to_string())?;
+        states[rank]
+            .dflash
+            .target_hidden_host
+            .extend_from_slice(&host);
         hipfire_runtime::dflash::draft_seed_backfill(
             &mut gpus.devices[rank],
             &states[rank].dflash.draft_weights,
@@ -6114,7 +6141,11 @@ pub fn seed_target_hidden_dense_tp2_abortable(
             prompt.len(),
         )
         .map_err(|e| e.to_string())?;
-        states[rank].dflash.draft_scratch.thlog.seed_prompt(prompt.len());
+        states[rank]
+            .dflash
+            .draft_scratch
+            .thlog
+            .seed_prompt(prompt.len());
         states[rank].logical_pos = prompt.len();
         states[rank].receipt_generation = u64::MAX;
     }
@@ -6150,7 +6181,11 @@ pub fn seed_target_hidden_dense_tp2_abortable(
         row.iter()
             .enumerate()
             .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
-                if v > bv { (i as u32, v) } else { (best, bv) }
+                if v > bv {
+                    (i as u32, v)
+                } else {
+                    (best, bv)
+                }
             })
             .0
     };
@@ -6171,7 +6206,10 @@ pub fn verify_dflash_block_dense_tp2(
 ) -> HipResult<Vec<u32>> {
     let b = dense_tp_dflash_gates(gpus, &target, states).map_err(|e| HipError::new(0, &e))?;
     if block.len() != b {
-        return Err(HipError::new(0, "dense TP DFlash verify block must be B rows"));
+        return Err(HipError::new(
+            0,
+            "dense TP DFlash verify block must be B rows",
+        ));
     }
     for s in states.iter() {
         if s.logical_pos != position {
@@ -6274,7 +6312,11 @@ pub fn verify_dflash_block_dense_tp2(
     let w_out = &target.weights[0].output;
     let mut argmax_per_pos: Vec<u32> = Vec::with_capacity(b);
     if dflash_batched_lm_head_supported(w_out.gpu_dtype) {
-        let fh = states[0].dflash.verify_scratch.final_hidden.sub_offset(0, b * dim);
+        let fh = states[0]
+            .dflash
+            .verify_scratch
+            .final_hidden
+            .sub_offset(0, b * dim);
         dflash_enqueue_verify_lm_head(
             &mut gpus.devices[0],
             w_out,
@@ -6285,12 +6327,17 @@ pub fn verify_dflash_block_dense_tp2(
         )?;
         let argmax_buf = states[0].dflash.verify_scratch.argmax.sub_offset(0, b);
         gpus.devices[0].argmax_f32_batched(
-            &states[0].dflash.verify_scratch.logits.sub_offset(0, b * vocab),
+            &states[0]
+                .dflash
+                .verify_scratch
+                .logits
+                .sub_offset(0, b * vocab),
             &argmax_buf,
             vocab,
             b,
         )?;
-        argmax_per_pos = dflash_download_verify_argmax(&gpus.devices[0], &states[0].dflash.verify_scratch, b)?;
+        argmax_per_pos =
+            dflash_download_verify_argmax(&gpus.devices[0], &states[0].dflash.verify_scratch, b)?;
     } else {
         for i in 0..b {
             let hidden_row = states[0]
@@ -6298,7 +6345,11 @@ pub fn verify_dflash_block_dense_tp2(
                 .verify_scratch
                 .final_hidden
                 .sub_offset(i * dim, dim);
-            let logits_row = states[0].dflash.verify_scratch.logits.sub_offset(i * vocab, vocab);
+            let logits_row = states[0]
+                .dflash
+                .verify_scratch
+                .logits
+                .sub_offset(i * vocab, vocab);
             llama::weight_gemv(
                 &mut gpus.devices[0],
                 &target.weights[0].output,
@@ -6397,7 +6448,10 @@ pub fn spec_step_dflash_dense_tp2(
             "dense TP DFlash rank draft candidates diverge — mesh reset, no tokens published",
         ));
     }
-    let drafted = drafted_per_rank.into_iter().next().expect("two rank drafts");
+    let drafted = drafted_per_rank
+        .into_iter()
+        .next()
+        .expect("two rank drafts");
     for i in 1..b {
         block[i] = drafted[i];
     }

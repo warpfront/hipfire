@@ -1552,6 +1552,7 @@ dependencies = [
  "libc",
  "libloading",
  "memmap2",
+ "parking_lot",
  "rayon",
  "rdna-compute",
  "safetensors",
@@ -1577,6 +1578,7 @@ dependencies = [
  "hipfire-config",
  "serde",
  "serde_json",
+ "sha2",
  "thiserror 2.0.18",
  "ureq",
 ]
@@ -1606,6 +1608,7 @@ dependencies = [
  "hipfire-engine",
  "hipfire-loader",
  "hipfire-pflash",
+ "hipfire-registry",
  "image",
  "libc",
  "libjpeg-turbo-rs",
@@ -1640,6 +1643,14 @@ dependencies = [
  "serde",
  "serde_json",
  "ureq",
+]
+
+[[package]]
+name = "hipfire-xdna"
+version = "0.3.1"
+dependencies = [
+ "libc",
+ "parking_lot",
 ]
 
 [[package]]

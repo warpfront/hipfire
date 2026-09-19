@@ -37,9 +37,14 @@ pub struct ResolveResult {
 
 use KvMode::*;
 
-/// Shared alias table for the two single-GPU full-ladder sites (1 & 2).
+/// Shared alias table for the single-GPU Qwen sites (1 & 2) plus the
+/// warn-and-default sites that share it (4 & 5).
 /// "auto"/"turbo"/"turbo3" mean fwht3: Fwht3 supersedes Asym3 as the default
 /// tier. Explicit `"asym3"` still maps to `Asym3` unchanged.
+/// `"fp8"`/`"bf16"` normalize here so an explicit request is never silently
+/// folded into a default: sites whose `accepted` set admits them honor the
+/// request, and every other site carries the requested mode forward WITH a
+/// warning so downstream construction fails closed instead of allocating q8.
 fn normalize_full(raw: &str) -> Option<KvMode> {
     match raw {
         "q8" => Some(Q8),
@@ -50,12 +55,31 @@ fn normalize_full(raw: &str) -> Option<KvMode> {
         "fwht2" => Some(Fwht2),
         "fwht3" => Some(Fwht3),
         "fwht4" => Some(Fwht4),
+        "fp8" => Some(Fp8),
+        "bf16" => Some(Bf16),
         _ => None, // "" → default (silent); unrecognized → default (+warn)
     }
 }
+/// gfx1201 single-GPU Qwen default: an unset or `auto` KV request means native
+/// fp8 on exact gfx1201 (fp8 KV + stage-b FA2 arithmetic); every other arch
+/// keeps the site default, and any explicit mode (including explicit `q8`)
+/// passes through untouched. Pure over the raw string + arch so unit tests
+/// pin it without a GPU. Multi-GPU (pp) sites must NOT use this: they never
+/// construct native tiers.
+pub fn qwen35_auto_for_arch<'a>(raw: &'a str, arch: &str) -> &'a str {
+    let trimmed = raw.trim();
+    if (trimmed.is_empty() || trimmed == "auto") && arch == "gfx1201" {
+        "fp8"
+    } else {
+        raw
+    }
+}
 
-const FULL_LADDER: &[KvMode] = &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4];
+const FULL_LADDER: &[KvMode] = &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, Fp8, Bf16];
 /// Site 1 — qwen35 HFQ in-place carrier (pp=1). carrier.rs:65. Default fwht3.
+/// Admits the native fp8 and flat bf16 tiers; the carrier's exact
+/// gfx1201/dense-H24/Hkv4/D256/contiguous-or-VMM/noslots guards decide whether
+/// an admitted request constructs.
 pub const QWEN35_HFQ_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen35-hfq",
     normalize_alias: normalize_full,
@@ -67,10 +91,11 @@ pub const QWEN35_HFQ_POLICY: KvModePolicy = KvModePolicy {
 /// `Asym3` is deliberately ABSENT from `accepted`: the real ladder has no bare
 /// `"asym3"` arm, so `HIPFIRE_KV_MODE=asym3` yields q8 here. `normalize_full`
 /// maps the string to `Some(Asym3)`, the accept check fails, default = q8.
+/// Fp8/Bf16 are admitted under the same carrier-side guards as site 1.
 pub const QWEN35_PARO_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen35-paro",
     normalize_alias: normalize_full,
-    accepted: &[Q8, Asym2, Asym4, Fwht2, Fwht3, Fwht4],
+    accepted: &[Q8, Asym2, Asym4, Fwht2, Fwht3, Fwht4, Fp8, Bf16],
     default: Q8,
 };
 
@@ -125,6 +150,10 @@ fn normalize_pp(raw: &str) -> Option<KvMode> {
         "asym3" | "turbo3" | "turbo" => Some(Asym3),
         "fwht3" => Some(Fwht3),
         "fwht2" => Some(Fwht2),
+        // Recognized so `resolve` carries them forward WITH a warning (fail
+        // closed downstream) instead of silently defaulting to q8.
+        "fp8" => Some(Fp8),
+        "bf16" => Some(Bf16),
         _ => None, // incl. asym2/asym4 → default (+warn "for pp>1")
     }
 }
@@ -177,11 +206,18 @@ pub fn resolve(raw: &str, policy: &KvModePolicy) -> ResolveResult {
     let requested: Option<KvMode> = (policy.normalize_alias)(raw);
 
     // 2. accept only if the site supports it; else fall to the site's
-    //    (unconditional) default. A non-empty raw that normalize rejected
-    //    (None) OR that normalized to an unaccepted mode is a request the
-    //    operator made but won't get — warn. Unset ("") defaults silently.
+    //    (unconditional) default — EXCEPT an explicit fp8/bf16 request, which
+    //    is carried forward WITH a warning so no unsupported site can silently
+    //    resolve it to q8/fwht3. Downstream construction fails closed on a
+    //    mode it cannot build. Any other non-empty raw that normalize rejected
+    //    (None) or that normalized to an unaccepted mode warns and defaults;
+    //    unset ("") defaults silently.
     let (mode, warning) = match requested {
         Some(m) if policy.accepted.contains(&m) => (m, None),
+        Some(m @ (Fp8 | Bf16)) => (
+            m,
+            Some("explicit fp8/bf16 KV requested but unsupported at this site; load will fail closed"),
+        ),
         _ => {
             let warning = if raw.is_empty() {
                 None
@@ -219,7 +255,7 @@ mod tests {
         // one would make Maple's sliding layers attend the full context and be
         // wrong past 512 tokens rather than merely slower.
         for m in [
-            "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo",
+            "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo", "fp8",
         ] {
             let r = resolve(m, p);
             assert_eq!(r.mode, KvMode::Bf16, "{m} must fall back to the default");
@@ -231,28 +267,68 @@ mod tests {
     }
 
     #[test]
-    fn bf16_is_maple_only() {
-        // NEGATIVE CONTROL: "bf16" must not be a globally-known alias. No other
-        // site can allocate a bf16 cache, so if `normalize_full` learned the
-        // name, HIPFIRE_KV_MODE=bf16 on qwen35 would normalize fine and then
-        // silently fall to that site's default. It must warn instead.
-        for p in [
-            &QWEN35_HFQ_POLICY,
-            &QWEN35_PARO_POLICY,
-            &LLAMA_HFQ_POLICY,
-            &QWEN35_PP_POLICY,
-            &DIR_SAFETENSORS_POLICY,
-        ] {
-            let r = resolve("bf16", p);
-            assert_ne!(r.mode, KvMode::Bf16, "site {} must not accept bf16", p.site);
-            assert!(
-                r.warning.is_some(),
-                "site {} must WARN on bf16, not silently default",
-                p.site
-            );
+    fn qwen35_auto_means_fp8_on_exact_gfx1201_only() {
+        for raw in ["", "auto"] {
+            assert_eq!(qwen35_auto_for_arch(raw, "gfx1201"), "fp8");
+            for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", "gfx906"] {
+                assert_eq!(qwen35_auto_for_arch(raw, arch), raw, "arch={arch}");
+            }
+        }
+        // Explicit modes pass through untouched on every arch, including
+        // gfx1201 (explicit q8 stays q8 — the default never overrides it).
+        for raw in ["q8", "fwht3", "fp8", "bf16", "turbo", "garbage"] {
+            for arch in ["gfx1201", "gfx1100", "gfx942"] {
+                assert_eq!(qwen35_auto_for_arch(raw, arch), raw, "raw={raw} arch={arch}");
+            }
+        }
+        // End-to-end through the single-GPU Qwen policies: unset/auto on
+        // gfx1201 resolves fp8 silently; elsewhere the site default holds.
+        for p in [&QWEN35_HFQ_POLICY, &QWEN35_PARO_POLICY] {
+            for raw in ["", "auto"] {
+                let r = resolve(qwen35_auto_for_arch(raw, "gfx1201"), p);
+                assert_eq!(r.mode, KvMode::Fp8, "site {}", p.site);
+                assert!(r.warning.is_none(), "site {}", p.site);
+            }
+            let r = resolve(qwen35_auto_for_arch("q8", "gfx1201"), p);
+            assert_eq!(r.mode, KvMode::Q8, "site {}", p.site);
         }
     }
 
+    #[test]
+    fn native_modes_admitted_only_at_qwen_single_gpu_sites() {
+        // fp8/bf16 are honored SILENTLY at the two single-GPU Qwen sites;
+        // carrier-side geometry guards decide whether they construct.
+        for p in [&QWEN35_HFQ_POLICY, &QWEN35_PARO_POLICY] {
+            for (raw, want) in [("fp8", KvMode::Fp8), ("bf16", KvMode::Bf16)] {
+                let r = resolve(raw, p);
+                assert_eq!(r.mode, want, "site {} must honor {raw}", p.site);
+                assert!(r.warning.is_none(), "site {} must not warn on {raw}", p.site);
+            }
+        }
+        // Everywhere else an explicit fp8/bf16 request is carried forward WITH
+        // a warning — never silently resolved to q8/fwht3/bf16-default — so
+        // downstream construction fails closed.
+        for p in [&LLAMA_HFQ_POLICY, &QWEN35_PP_POLICY, &DIR_SAFETENSORS_POLICY] {
+            for (raw, want) in [("fp8", KvMode::Fp8), ("bf16", KvMode::Bf16)] {
+                // NOTE: dir-safetensors does not recognize either name, so it
+                // keeps the legacy warn-and-default shape there.
+                if p.site == "dir-safetensors" {
+                    let r = resolve(raw, p);
+                    assert_eq!(r.mode, KvMode::Q8, "site {} must default on {raw}", p.site);
+                    assert!(r.warning.is_some(), "site {} must warn on {raw}", p.site);
+                    continue;
+                }
+                let r = resolve(raw, p);
+                assert_eq!(r.mode, want, "site {} must carry {raw} forward", p.site);
+                assert!(r.warning.is_some(), "site {} must warn on {raw}", p.site);
+            }
+        }
+        // Maple admits bf16 (its default) but not fp8: fp8 warns and keeps the
+        // bf16 default; it must never become q8.
+        let r = resolve("fp8", &MAPLE_POLICY);
+        assert_eq!(r.mode, KvMode::Bf16);
+        assert!(r.warning.is_some());
+    }
     #[test]
     fn truth_table_qwen35_hfq() {
         let p = &QWEN35_HFQ_POLICY;
@@ -277,6 +353,12 @@ mod tests {
         assert!(resolve("", p).warning.is_none());
         assert_eq!(resolve("garbage", p).mode, KvMode::Fwht3); // unrecognized → default
         assert!(resolve("garbage", p).warning.is_some()); // ...and WARNS
+        // Native tiers admitted at this site: honored silently; the carrier's
+        // exact gfx1201/geometry guards decide whether they construct.
+        assert_eq!(resolve("fp8", p).mode, KvMode::Fp8);
+        assert!(resolve("fp8", p).warning.is_none());
+        assert_eq!(resolve("bf16", p).mode, KvMode::Bf16);
+        assert!(resolve("bf16", p).warning.is_none());
     }
 
     #[test]
@@ -295,6 +377,11 @@ mod tests {
         assert_eq!(resolve("fwht2", p).mode, KvMode::Fwht2);
         assert_eq!(resolve("fwht3", p).mode, KvMode::Fwht3);
         assert_eq!(resolve("fwht4", p).mode, KvMode::Fwht4);
+        // Native tiers admitted here too (same carrier-side guards as site 1).
+        assert_eq!(resolve("fp8", p).mode, KvMode::Fp8);
+        assert!(resolve("fp8", p).warning.is_none());
+        assert_eq!(resolve("bf16", p).mode, KvMode::Bf16);
+        assert!(resolve("bf16", p).warning.is_none());
         assert_eq!(resolve("", p).mode, KvMode::Q8); // default
     }
 

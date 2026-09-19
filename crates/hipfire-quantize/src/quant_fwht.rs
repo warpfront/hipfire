@@ -711,6 +711,11 @@ mod tests {
         use crate::pipeline_gguf::GgufFormat;
         assert_eq!(GgufFormat::from_flag("mq4"), Some(GgufFormat::Mq4V2));
         assert_eq!(GgufFormat::from_flag("mq4v2"), Some(GgufFormat::Mq4V2));
+        assert_eq!(
+            GgufFormat::from_flag("mq4v2-lloyd"),
+            Some(GgufFormat::Mq4V2Lloyd)
+        );
+        assert_eq!(GgufFormat::from_flag("mq4l"), Some(GgufFormat::Mq4V2Lloyd));
         assert_eq!(GgufFormat::from_flag("mq4c"), Some(GgufFormat::Mq4C));
         assert_eq!(GgufFormat::from_flag("mq4v1"), Some(GgufFormat::Mq4));
         assert_eq!(GgufFormat::from_flag("mq4g256v2"), Some(GgufFormat::Mq4V2));
@@ -738,9 +743,11 @@ mod tests {
         // ternary), claimed 2026-08-22. This line previously pinned 51 as free.
         assert_eq!(QuantType::from_u8(51), Some(QuantType::MQ2G256LloydU));
         assert_eq!(QuantType::MQ2G256LloydU as u8, 51);
-        // unknown remains rejected — 46 and 52 are the next genuinely free ids
+        // 52 = MQ4G256V2L (MQ4v2 + per-tensor Lloyd codebook). Claimed with this PR.
+        assert_eq!(QuantType::from_u8(52), Some(QuantType::MQ4G256V2L));
+        assert_eq!(QuantType::MQ4G256V2L as u8, 52);
+        // unknown remains rejected — 46 is the next genuinely free id
         assert_eq!(QuantType::from_u8(46), None);
-        assert_eq!(QuantType::from_u8(52), None);
         assert_eq!(QuantType::from_u8(255), None);
     }
 

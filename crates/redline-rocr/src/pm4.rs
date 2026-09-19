@@ -38,6 +38,52 @@ const ENABLE_WAVEFRONT_SIZE32: u16 = 1 << 10;
 const SUPPORTED_KERNEL_PROPERTIES: u16 = ENABLE_SGPR_KERNARG_SEGMENT_PTR | ENABLE_WAVEFRONT_SIZE32;
 const DISPATCH_INITIATOR_BASE: u32 = (1 << 0) | (1 << 2) | (1 << 5);
 const DISPATCH_INITIATOR_CS_W32_EN: u32 = 1 << 15;
+const GCR_GLK_INV: u32 = 1 << 7;
+const GCR_GLV_INV: u32 = 1 << 8;
+const GCR_GL1_INV: u32 = 1 << 9;
+const GCR_GL2_INV: u32 = 1 << 14;
+const GCR_GL2_WB: u32 = 1 << 15;
+const GCR_SEQ_FORWARD: u32 = 1 << 16;
+
+/// Cache actions to pair with a compute-idle wait between dependent gfx12
+/// dispatches in one retained PM4 stream.
+///
+/// Ported from upstream redline-rocr pm4.rs. CurrentSequential is the rung
+/// hipfire already ships: its gcr_cntl (0x10180) is exactly what
+/// acquire_inter_node_gfx12 emits, so default-rung tapes are byte-identical
+/// before and after this port.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum Gfx12RmwAcquirePolicy {
+    /// Existing hipfire policy: invalidate scalar/vector read caches and
+    /// force forward cache sequencing.
+    CurrentSequential,
+    /// Conservative global-cache experiment, heavier than the Mesa RADV
+    /// 25.2 coherent-buffer compute barrier: it also writes back and
+    /// invalidates L2.
+    RadvGlobal,
+    /// Same-agent candidate: retain scalar, vector, and merged L1
+    /// invalidation, but omit the global L2 action and forward sequencing.
+    SameAgentParallelL1,
+    /// Earlier scalar/vector-L0 experiment, retained for measurement
+    /// compatibility rather than as the generic default.
+    SameAgentParallelL0,
+    /// Radiowave-certified HIP/LLVM consumer: mutable resources are read only
+    /// through VMEM, so invalidate vector L0 and merged L1 while retaining the
+    /// unrelated scalar cache and coherent L2/MALL.
+    HipLlvmVmemL1,
+}
+
+impl Gfx12RmwAcquirePolicy {
+    const fn gcr_cntl(self) -> u32 {
+        match self {
+            Self::CurrentSequential => GCR_GLK_INV | GCR_GLV_INV | GCR_SEQ_FORWARD,
+            Self::RadvGlobal => GCR_GLK_INV | GCR_GLV_INV | GCR_GL1_INV | GCR_GL2_INV | GCR_GL2_WB,
+            Self::SameAgentParallelL1 => GCR_GLK_INV | GCR_GLV_INV | GCR_GL1_INV,
+            Self::SameAgentParallelL0 => GCR_GLK_INV | GCR_GLV_INV,
+            Self::HipLlvmVmemL1 => GCR_GLV_INV | GCR_GL1_INV,
+        }
+    }
+}
 
 /// Retained GFX12 PM4 command words suitable for one PM4 indirect buffer.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
@@ -251,11 +297,74 @@ impl Gfx12Pm4CommandBuffer {
     /// Same-agent inter-node acquire for one retained gfx12 tape. Kernel code
     /// is immutable and L2/MALL remains coherent, so only scalar/vector read
     /// caches plus forward sequencing are invalidated.
+    ///
+    /// This is the `CurrentSequential` rung of the RMW ladder below; routing
+    /// through `acquire_rmw_gfx12` keeps the default encoding byte-identical
+    /// by construction.
     pub fn acquire_inter_node_gfx12(&mut self) {
-        self.emit_acquire_gcr(0x10180);
+        self.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::CurrentSequential);
+    }
+
+    /// Generic same-agent GFX12 shader-write to shader-read/write boundary.
+    ///
+    /// `CS_PARTIAL_FLUSH` prevents a later dispatch from overlapping its
+    /// producer. The acquire then invalidates scalar, vector, and merged L1
+    /// shader read caches while retaining coherent L2/MALL contents. This is
+    /// the fail-closed path for consumers whose scalar-memory behavior is not
+    /// certified.
+    ///
+    /// This boundary is valid only when producer and consumer execute on the
+    /// same gfx12 agent and the resource remains a coherent shader buffer.
+    /// Host/device ownership changes or non-coherent resources require the
+    /// broader system/global acquire path.
+    pub fn dependency_rmw_same_agent_gfx12(&mut self) {
+        self.wait_compute_idle();
+        self.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::SameAgentParallelL1);
+    }
+
+    /// Same-agent boundary for a HIP/LLVM consumer certified to read mutable
+    /// resources through VMEM only.
+    ///
+    /// The completion edge remains identical to the generic boundary. Only
+    /// the unrelated scalar-cache invalidation is omitted; vector L0 and the
+    /// merged L1 are still invalidated. Unknown or scalar-reading consumers
+    /// must use `dependency_rmw_same_agent_gfx12`.
+    pub fn dependency_rmw_hip_llvm_vmem_gfx12(&mut self) {
+        self.wait_compute_idle();
+        self.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::HipLlvmVmemL1);
+    }
+
+    /// Emit the cache half of a gfx12 read-modify-write dependency boundary.
+    /// Callers must emit `wait_compute_idle` first when the later dispatch
+    /// reads or overwrites memory written by the earlier dispatch.
+    ///
+    /// Ported from upstream redline-rocr pm4.rs. The `CurrentSequential` rung
+    /// routes through the pre-existing hipfire emitter so current tapes are
+    /// byte-identical by default; the remaining rungs use the RADV-shaped
+    /// emitter, whose mask/coop words already match hipfire's encoding.
+    pub fn acquire_rmw_gfx12(&mut self, policy: Gfx12RmwAcquirePolicy) {
+        match policy {
+            Gfx12RmwAcquirePolicy::CurrentSequential => {
+                self.emit_acquire_gcr(policy.gcr_cntl());
+            }
+            _ => self.emit_acquire_gcr_radv(policy.gcr_cntl()),
+        }
     }
 
     fn emit_acquire_gcr(&mut self, gcr_cntl: u32) {
+        self.dwords.extend_from_slice(&[
+            packet3(PACKET3_ACQUIRE_MEM, 7, false),
+            0,
+            u32::MAX,
+            0x00ff_ffff,
+            0,
+            0,
+            0x0000_000a,
+            gcr_cntl,
+        ]);
+    }
+
+    fn emit_acquire_gcr_radv(&mut self, gcr_cntl: u32) {
         self.dwords.extend_from_slice(&[
             packet3(PACKET3_ACQUIRE_MEM, 7, false),
             0,
@@ -695,6 +804,60 @@ mod tests {
             assert_eq!(commands.dwords()[base + 6], 0x0000_000a);
         }
         assert_eq!(&commands.dwords()[24..], &[0xc000_4600, 0x407]);
+    }
+
+    #[test]
+    fn rmw_acquire_ladder_encodings_are_stable() {
+        assert_eq!(
+            Gfx12RmwAcquirePolicy::CurrentSequential.gcr_cntl(),
+            0x10180
+        );
+        assert_eq!(
+            Gfx12RmwAcquirePolicy::RadvGlobal.gcr_cntl(),
+            (1 << 7) | (1 << 8) | (1 << 9) | (1 << 14) | (1 << 15)
+        );
+        assert_eq!(
+            Gfx12RmwAcquirePolicy::SameAgentParallelL1.gcr_cntl(),
+            (1 << 7) | (1 << 8) | (1 << 9)
+        );
+        assert_eq!(
+            Gfx12RmwAcquirePolicy::SameAgentParallelL0.gcr_cntl(),
+            (1 << 7) | (1 << 8)
+        );
+        assert_eq!(
+            Gfx12RmwAcquirePolicy::HipLlvmVmemL1.gcr_cntl(),
+            (1 << 8) | (1 << 9)
+        );
+
+        // The default rung is byte-identical to the pre-ladder inter-node
+        // acquire: same GCR word through the same packet shape.
+        let mut legacy = Gfx12Pm4CommandBuffer::new();
+        legacy.acquire_inter_node_gfx12();
+        let mut rung = Gfx12Pm4CommandBuffer::new();
+        rung.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::CurrentSequential);
+        assert_eq!(rung.dwords(), legacy.dwords());
+        assert_eq!(rung.dwords()[7], 0x10180);
+
+        // The Radiowave VMEM rung keeps the packet shape and differs only in
+        // the GCR word: scalar invalidate dropped, L1 invalidate kept.
+        let mut vmem = Gfx12Pm4CommandBuffer::new();
+        vmem.acquire_rmw_gfx12(Gfx12RmwAcquirePolicy::HipLlvmVmemL1);
+        assert_eq!(vmem.dwords().len(), legacy.dwords().len());
+        assert_eq!(&vmem.dwords()[..7], &legacy.dwords()[..7]);
+        assert_eq!(vmem.dwords()[7], (1 << 8) | (1 << 9));
+
+        // The full dependency boundary is wait-then-acquire with the VMEM
+        // GCR word.
+        let mut boundary = Gfx12Pm4CommandBuffer::new();
+        boundary.dependency_rmw_hip_llvm_vmem_gfx12();
+        assert_eq!(
+            &boundary.dwords()[..2],
+            &[0xc000_4600, 0x407]
+        );
+        assert_eq!(
+            &boundary.dwords()[2..],
+            vmem.dwords()
+        );
     }
 
     #[test]

@@ -98,6 +98,14 @@ pub struct LoadCtx<'a> {
     /// load time via `gemma4_eagle_spec_len` (1..=5, default 3). Meaningful
     /// only when `gemma4_drafter_path` is `Some`.
     pub gemma4_draft_len: usize,
+    /// Opt-in gfx1151 XDNA NPU spillover sidecar, verified at load time
+    /// (`XdnaSidecarDescriptor::load_verified`) and admitted only when the
+    /// `kernel.npu_spillover` process flag is on AND the host arch is exactly
+    /// `gfx1151` (see `admit_for_arch`). `None` = GPU-only; carriers must not
+    /// open `/dev/accel`, allocate NPU mirrors, or change numerics when this
+    /// is `None`. Populated by the loader from the daemon `xdna` load param;
+    /// projected CLI-side by `load_params` from the registry `xdna` slot.
+    pub xdna: Option<hipfire_registry::XdnaSidecarDescriptor>,
 }
 
 /// Per-load model-free n-gram speculator settings, resolved by the CLI through

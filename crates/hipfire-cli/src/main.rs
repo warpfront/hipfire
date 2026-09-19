@@ -499,6 +499,12 @@ pub(crate) struct BenchArgs {
     /// Run deterministic synthetic prefill/decode rows.
     #[arg(long)]
     matrix: bool,
+    /// Client-side time-to-first-token: per run, generate one token on the
+    /// standard prompt and time request-send to first streamed token.
+    /// Reports prompt_tokens / TTFT, the competitor-comparable prefill
+    /// number. Standard generate path only (not --matrix).
+    #[arg(long)]
+    ttft: bool,
     #[arg(
         long,
         value_delimiter = ',',
@@ -1723,6 +1729,7 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         ("MTP", entry.mtp.as_ref()),
         ("DSpark", entry.dspark.as_ref()),
         ("DFlash", entry.dflash.as_ref()),
+        ("XDNA", entry.xdna.as_ref()),
         ("Vision", entry.vision.as_ref()),
         ("T5", entry.t5.as_ref()),
         ("CLIP", entry.clip.as_ref()),
@@ -1956,6 +1963,10 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
     // tier declares `qwen3.8-27b-vision.hfq`, so the keeper check is copied
     // from DFlash exactly.
     let mut kept_vision: Option<(String, String)> = None;
+    // An XDNA spillover archive under the same shared-keeper rule: archives
+    // bind their model hash, so sharing across entries is unlikely, but a
+    // shared file must survive exactly like a shared DFlash draft.
+    let mut kept_xdna: Option<(String, String)> = None;
     if let Some((tag, entry)) = resolved {
         targets.extend(
             [
@@ -2021,6 +2032,31 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
                 }
             }
         }
+        if let Some(sidecar) = entry.xdna.as_ref() {
+            let sidecar_path = paths.models.join(&sidecar.file);
+            if sidecar_path.is_file() {
+                // `models` is a BTreeMap, so keepers list in sorted tag order.
+                let keepers: Vec<&str> = registry
+                    .models
+                    .iter()
+                    .filter(|(other_tag, other)| {
+                        other_tag.as_str() != tag
+                            && other.file != entry.file
+                            && other
+                                .xdna
+                                .as_ref()
+                                .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
+                            && paths.models.join(&other.file).is_file()
+                    })
+                    .map(|(other_tag, _)| other_tag.as_str())
+                    .collect();
+                if keepers.is_empty() {
+                    targets.insert(sidecar_path);
+                } else {
+                    kept_xdna = Some((sidecar.file.clone(), keepers.join(", ")));
+                }
+            }
+        }
         targets.extend(
             entry
                 .heads
@@ -2076,6 +2112,9 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
     }
     if let Some((file, keepers)) = kept_vision {
         eprintln!("keeping Vision sidecar {file}: still declared by {keepers}");
+    }
+    if let Some((file, keepers)) = kept_xdna {
+        eprintln!("keeping XDNA sidecar {file}: still declared by {keepers}");
     }
     Ok(())
 }
@@ -3137,6 +3176,7 @@ pub(crate) fn load_params(
         resolve_dflash_sidecar(&mut params, entry, models_dir, model_path, tag)?;
     }
     resolve_vision_sidecar(&mut params, entry, models_dir, model_path, tag)?;
+    resolve_xdna_sidecar(&mut params, resolved, entry, models_dir, model_path, tag)?;
     Ok(params)
 }
 
@@ -3200,6 +3240,67 @@ fn resolve_dflash_sidecar(
         "[hipfire] DFlash draft {} not pulled; running AR — `hipfire pull {tag}`",
         sidecar.file
     );
+    Ok(())
+}
+
+/// Resolve a registry-declared XDNA spillover archive into `params["xdna"]`.
+///
+/// The `kernel.npu_spillover` process flag is the opt-in: when it is off this
+/// is a no-op and no `xdna` param is projected, so flag-off loads can never
+/// observe an NPU path. When it is on, the entry's `xdna` slot must name a
+/// pulled `.xdna.zip` whose manifest verifies (`load_verified` checks shape,
+/// exact `gfx1151`/`npu5` identity, and every payload hash); the verified
+/// archive path is projected as `params["xdna"]` for the daemon, which
+/// re-verifies at load and admits it into `LoadCtx.xdna` only on an exact
+/// `gfx1151` host (see `admit_for_arch`).
+///
+/// Fail-closed only where an explicit opt-in names an artifact: flag on plus
+/// a declared-but-missing or corrupt archive bails with a `hipfire pull`
+/// hint. Flag on with no entry (a bare path that merely shares a basename)
+/// or no `xdna` slot logs one line and stays GPU-only — erroring there would
+/// make a process-global opt-in unusable for models that simply have no NPU
+/// artifact. Lookup order (models dir, then beside the target) mirrors the
+/// DFlash draft resolution, including the symlinked-target rationale.
+fn resolve_xdna_sidecar(
+    params: &mut serde_json::Value,
+    resolved: &hipfire_config::ResolvedConfig,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    tag: Option<&str>,
+) -> Result<()> {
+    if !config_bool(resolved, "kernel.npu_spillover")? {
+        return Ok(());
+    }
+    let Some(sidecar) = entry.and_then(|entry| entry.xdna.as_ref()) else {
+        let what = tag
+            .map(str::to_owned)
+            .unwrap_or_else(|| model_path.display().to_string());
+        eprintln!(
+            "[hipfire] NPU spillover opted in but {what} declares no xdna sidecar; staying GPU-only",
+        );
+        return Ok(());
+    };
+    let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let candidate = [models_dir, beside_target]
+        .into_iter()
+        .map(|dir| dir.join(&sidecar.file))
+        .find(|candidate| candidate.is_file());
+    let Some(candidate) = candidate else {
+        bail!(
+            "NPU spillover opted in but {} is not pulled; run `hipfire pull {}` (or turn kernel.npu_spillover off)",
+            sidecar.file,
+            tag.unwrap_or("<model>"),
+        );
+    };
+    if let Err(error) = hipfire_registry::XdnaSidecarDescriptor::load_verified(&candidate) {
+        bail!(
+            "NPU spillover archive {} failed verification ({error:#}); re-pull with `hipfire pull {}`",
+            candidate.display(),
+            tag.unwrap_or("<model>"),
+        );
+    }
+    params["xdna"] = serde_json::json!(candidate.display().to_string());
     Ok(())
 }
 
@@ -4393,6 +4494,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && (args.matrix || args.redline) {
         bail!("--exp cannot be combined with matrix or Redline options");
     }
+    if args.ttft && args.matrix {
+        bail!("--ttft cannot be combined with --matrix (it measures the standard generate path)");
+    }
     if args.exp && args.json {
         bail!("--json is not supported with --exp");
     }
@@ -4461,6 +4565,16 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     eprintln!("  prompt_chars: {prompt_chars}");
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
+    } else if args.ttft {
+        bench_ttft(
+            &mut engine,
+            &args,
+            &prompt,
+            &prompt_md5,
+            prompt_chars,
+            &loaded,
+            &post_diag,
+        )
     } else {
         // The warmup exists to populate kernel caches and its output is
         // discarded, so it stays in answer mode even under --reasoning-on: a
@@ -4917,6 +5031,95 @@ fn bench_probe(
     }
 }
 
+/// Client-side TTFT on the standard generate path: per run, generate a
+/// single token with thinking off and time wall clock from request send to
+/// the first streamed `token` event. `pp_tok_s = prompt_tokens / ttft_s` is
+/// the competitor-comparable prefill number (radiance reports
+/// prompt_tokens/TTFT p50 at an HTTP client). Warmups run the same shape
+/// and are discarded. `--reasoning-on` is intentionally ignored here: the
+/// metric is defined with thinking off.
+fn bench_ttft(
+    engine: &mut Engine,
+    args: &BenchArgs,
+    prompt: &str,
+    prompt_md5: &str,
+    prompt_chars: u64,
+    loaded: &serde_json::Value,
+    diag: &serde_json::Value,
+) -> Result<()> {
+    // The shared bench banner prints args.max_tokens; the ttft path always
+    // generates exactly one token with thinking off, so say so explicitly.
+    eprintln!("  ttft shape: max_tokens=1, thinking off");
+    for _ in 0..args.warmups {
+        let _ = bench_generate(engine, prompt, 1)?;
+    }
+    let mut ttft_ms_samples = Vec::new();
+    let mut prompt_tokens: Option<u64> = None;
+    for _ in 0..args.runs {
+        let start = Instant::now();
+        let mut first: Option<Duration> = None;
+        let request = bench_generate_request(prompt, 1);
+        let done = engine.generate(&request, |event| {
+            if first.is_none()
+                && event.get("type").and_then(serde_json::Value::as_str) == Some("token")
+            {
+                first = Some(start.elapsed());
+            }
+            Ok(())
+        })?;
+        let elapsed =
+            first.ok_or_else(|| anyhow!("no streamed token observed; cannot measure client-side TTFT"))?;
+        ttft_ms_samples.push(elapsed.as_secs_f64() * 1000.0);
+        if prompt_tokens.is_none() {
+            prompt_tokens = bench_prompt_tokens_from_done(&done);
+        }
+        eprint!(".");
+        std::io::stderr().flush()?;
+    }
+    eprintln!();
+    if let Some(tokens) = prompt_tokens {
+        eprintln!("  prompt_tokens: {tokens}");
+    }
+    let pp_samples: Vec<f64> = match prompt_tokens {
+        Some(tokens) if tokens > 0 => ttft_ms_samples
+            .iter()
+            .map(|ms| tokens as f64 / (ms / 1000.0))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let ttft_stats = sample_stats(&ttft_ms_samples);
+    let pp_stats = sample_stats(&pp_samples);
+    let report = serde_json::json!({
+        "protocol": "client-ttft-v1",
+        "model": args.model,
+        "loaded": loaded,
+        "gpu": diag,
+        "max_tokens": 1,
+        "runs": args.runs,
+        "warmups": args.warmups,
+        "batch": 1,
+        "prompt_tokens": prompt_tokens,
+        "prompt_md5": prompt_md5,
+        "prompt_chars": prompt_chars,
+        "ttft": {
+            "samples": ttft_ms_samples,
+            "median": ttft_stats.map(|stats| stats.median),
+            "stdev": ttft_stats.map(|stats| stats.stdev),
+            "prompt_tokens": prompt_tokens,
+            "prompt_md5": prompt_md5,
+        },
+        "pp_tok_s": pp_stats,
+        "pp_tok_s_samples": pp_samples,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_sample_row("ttft ms", ttft_stats);
+        print_sample_row("pp tok/s", pp_stats);
+    }
+    Ok(())
+}
+
 fn bench_matrix(
     engine: &mut Engine,
     args: &BenchArgs,
@@ -5089,6 +5292,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             json: false,
             exp: false,
             matrix: false,
+            ttft: false,
             pp: vec![128],
             ctx: vec![128],
             tg: 1,
@@ -7714,6 +7918,140 @@ mod tests {
             ..Default::default()
         }
     }
+    fn xdna_sidecar_entry(xdna_file: &str) -> ModelEntry {
+        ModelEntry {
+            repo: "hipfire-models/qwen3.8-27b".into(),
+            file: "qwen3.8-27b.mq4".into(),
+            size_gb: 15.66,
+            min_vram_gb: 17.0,
+            desc: "test target".into(),
+            xdna: Some(hipfire_registry::Sidecar {
+                file: xdna_file.into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn resolved_with_npu_spillover(on: bool) -> hipfire_config::ResolvedConfig {
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("kernel.npu_spillover", if on { "true" } else { "false" })
+            .unwrap();
+        resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("kernel.npu_spillover={on}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap()
+    }
+
+    /// Minimal stored-ZIP writer for XDNA sidecar fixtures (local headers +
+    /// central directory + EOCD, method 0 throughout).
+    fn write_stored_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        fn u16le(out: &mut Vec<u8>, value: u16) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        fn u32le(out: &mut Vec<u8>, value: u32) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut bytes = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let local_offset = bytes.len() as u32;
+            bytes.extend_from_slice(b"PK\x03\x04");
+            u16le(&mut bytes, 20);
+            u16le(&mut bytes, 0);
+            u16le(&mut bytes, 0);
+            u16le(&mut bytes, 0);
+            u16le(&mut bytes, 0);
+            u32le(&mut bytes, 0);
+            u32le(&mut bytes, data.len() as u32);
+            u32le(&mut bytes, data.len() as u32);
+            u16le(&mut bytes, name.len() as u16);
+            u16le(&mut bytes, 0);
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(data);
+            central.extend_from_slice(b"PK\x01\x02");
+            u16le(&mut central, 20);
+            u16le(&mut central, 20);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u32le(&mut central, 0);
+            u32le(&mut central, data.len() as u32);
+            u32le(&mut central, data.len() as u32);
+            u16le(&mut central, name.len() as u16);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u32le(&mut central, 0);
+            u32le(&mut central, local_offset);
+            central.extend_from_slice(name.as_bytes());
+        }
+        let central_offset = bytes.len() as u32;
+        bytes.extend_from_slice(&central);
+        let central_size = central.len() as u32;
+        bytes.extend_from_slice(b"PK\x05\x06");
+        u16le(&mut bytes, 0);
+        u16le(&mut bytes, 0);
+        u16le(&mut bytes, entries.len() as u16);
+        u16le(&mut bytes, entries.len() as u16);
+        u32le(&mut bytes, central_size);
+        u32le(&mut bytes, central_offset);
+        u16le(&mut bytes, 0);
+        fs::write(path, &bytes).unwrap();
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        digest.iter().fold(String::with_capacity(64), |mut out, byte| {
+            out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+            out.push(char::from_digit((byte & 0x0F) as u32, 16).unwrap());
+            out
+        })
+    }
+
+    /// A manifest-v1 `.xdna.zip` binding the given payloads, written to the
+    /// models dir. Returns the archive path.
+    fn write_xdna_fixture(models_dir: &Path, file: &str) -> PathBuf {
+        let pdi = b"fixture-pdi-bytes";
+        let insts = b"fixture-insts-bytes";
+        let manifest = serde_json::json!({
+            "version": 1,
+            "model_sha256": "c".repeat(64),
+            "quant": "mq4g256v2",
+            "arch": "gfx1151",
+            "npu": "npu5",
+            "toolchain": {"mlir_aie": "f50bef7", "peano": "22.0.0.2026090701"},
+            "profiles": [{
+                "tensor_role": "gate_up",
+                "M": 1024, "K": 5120, "N": 512, "row_count": 1024,
+                "tile_m": 128, "tile_k": 64, "tile_n": 64,
+                "cols": 8, "k_mt": 512,
+                "pdi": "profiles/gate_up/main.pdi",
+                "insts": "profiles/gate_up/insts.bin",
+                "arg_layout": [{"name": "a", "offset": 0, "size": 64}],
+                "sha256_pdi": sha256_hex(pdi),
+                "sha256_insts": sha256_hex(insts)
+            }]
+        })
+        .to_string();
+        let path = models_dir.join(file);
+        write_stored_zip(
+            &path,
+            &[
+                ("manifest.json", manifest.as_bytes()),
+                ("profiles/gate_up/main.pdi", pdi),
+                ("profiles/gate_up/insts.bin", insts),
+            ],
+        );
+        path
+    }
 
     fn resolved_with_dflash_mode(
         mode: &str,
@@ -8013,6 +8351,115 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["vision"], vision_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+    #[test]
+    pub(crate) fn load_params_xdna_off_by_default_projects_nothing() {
+        // Default-off: even a declared AND pulled archive must not surface.
+        let paths = test_paths("xdna-sidecar-off-default");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        write_xdna_fixture(&paths.models, "qwen38-27b.xdna.zip");
+        let entry = xdna_sidecar_entry("qwen38-27b.xdna.zip");
+        let resolved = resolved_with_npu_spillover(false);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(params.get("xdna").is_none(), "flag-off must not project xdna");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_xdna_on_projects_verified_archive() {
+        // Flag on + pulled verified archive → params["xdna"] carries the path
+        // for the daemon (which re-verifies and arch-gates into LoadCtx.xdna).
+        let paths = test_paths("xdna-sidecar-on-present");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let xdna_path = write_xdna_fixture(&paths.models, "qwen38-27b.xdna.zip");
+        let entry = xdna_sidecar_entry("qwen38-27b.xdna.zip");
+        let resolved = resolved_with_npu_spillover(true);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["xdna"], xdna_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_xdna_on_fails_closed_when_sidecar_missing() {
+        // Flag on + declared but unpulled archive fails with a pull hint —
+        // an explicit opt-in must not silently run GPU-only.
+        let paths = test_paths("xdna-sidecar-on-missing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = xdna_sidecar_entry("qwen38-27b.xdna.zip");
+        let resolved = resolved_with_npu_spillover(true);
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .expect_err("missing xdna archive must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("qwen38-27b.xdna.zip"), "{message}");
+        assert!(message.contains("hipfire pull qwen3.8:27b"), "{message}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_xdna_on_without_entry_stays_gpu_only() {
+        // Flag on with a bare (non-registry) artifact logs one line and stays
+        // GPU-only instead of failing every load for models with no artifact.
+        let paths = test_paths("xdna-sidecar-on-no-entry");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let resolved = resolved_with_npu_spillover(true);
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(params.get("xdna").is_none());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -10985,6 +11432,7 @@ mod tests {
             json: true,
             exp: false,
             matrix: false,
+            ttft: false,
             pp: vec![128],
             ctx: vec![128],
             tg: 128,
@@ -11815,7 +12263,7 @@ mod tests {
     }
 
     #[test]
-    fn load_params_preserves_auto_for_direct_path_and_registry() {
+    fn load_params_preserves_auto_for_direct_path_and_lowers_registry_bf16() {
         // Direct-path load: no registry entry, config is auto -> must stay auto.
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         assert_eq!(config_string(&defaults, "memory.kv_cache").unwrap(), "auto");
@@ -11837,8 +12285,9 @@ mod tests {
             params["kv_mode"], "auto",
             "direct-path auto must survive to architecture"
         );
-        // Registry path with default_kv_mode=bf16 must also preserve auto when
-        // no explicit --kv-mode is given; architecture picks BF16.
+
+        // A non-q8 registry default is a model-specific opinion and must lower
+        // into the resolved config before load parameters are built.
         let raw = r#"{
             "schema_version":1,
             "generated_at":"2099-01-01T00:00:00Z",
@@ -11849,8 +12298,16 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
         let (_, entry) = registry.model("maple-preview").unwrap();
+        let resolved = resolve(vec![NamedLayer {
+            source: ConfigSource::RegistryModel {
+                tag: "maple-preview".into(),
+                revision: "test".into(),
+            },
+            layer: entry.config_layer().unwrap(),
+        }])
+        .unwrap();
         let params2 = load_params(
-            &defaults,
+            &resolved,
             Some(entry),
             &direct_path.parent().unwrap(),
             &direct_path,
@@ -11863,12 +12320,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            params2["kv_mode"], "auto",
-            "registry auto must survive even when entry has bf16 default"
+            params2["kv_mode"], "bf16",
+            "non-q8 registry default must resolve to BF16"
         );
-        // Explicit override still wins
+
+        // Explicit override still wins.
         let params3 = load_params(
-            &defaults,
+            &resolved,
             Some(entry),
             &direct_path.parent().unwrap(),
             &direct_path,

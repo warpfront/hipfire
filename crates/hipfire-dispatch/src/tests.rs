@@ -1608,6 +1608,9 @@ fn dummy_wr<'a>(t: &'a rdna_compute::GpuTensor) -> WeightRef<'a> {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     }
 }
 
@@ -1809,6 +1812,9 @@ fn guard_qkv_mq4g256lloyd_fires() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
@@ -1825,6 +1831,9 @@ fn guard_qkv_mq4g256lloyd_rejects_wrong_dtype() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::None);
     assert!(!guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
@@ -1841,6 +1850,9 @@ fn guard_qkv_mq4g256lloyd_rejects_awq_scale() {
         row_stride: 0,
         rotation: None,
         awq_scale: Some(&dummy),
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     }; // AWQ present → reject
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(!guard_qkv_mq4g256lloyd(&steps, &ctx_rdna3()));
@@ -1857,6 +1869,9 @@ fn guard_qkv_mq4g256lloyd_rejects_force_unfused() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     let mut ctx = ctx_rdna3();
@@ -1875,6 +1890,9 @@ fn guard_qkv_hfq4g256_covers_mq4g256() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_qkv_hfq4g256(&steps, &ctx_rdna3()));
@@ -1891,6 +1909,9 @@ fn guard_qkv_hfq4g256_covers_hfq4g256() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::None);
     assert!(guard_qkv_hfq4g256(&steps, &ctx_rdna3()));
@@ -1913,6 +1934,9 @@ fn guard_qkv_hfq6g256_dp4a_decoupled() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let wr_mq6 = WeightRef {
         buf: &dummy,
@@ -1922,6 +1946,9 @@ fn guard_qkv_hfq6g256_dp4a_decoupled() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps_hfq6 = make_qkv3_steps(&dummy, &wr_hfq6, RotationPlan::FwhtG256);
     let steps_mq6 = make_qkv3_steps(&dummy, &wr_mq6, RotationPlan::FwhtG256);
@@ -1948,6 +1975,9 @@ fn guard_qkv_rejects_mixed_gemv_input() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = vec![
         Step::RmsnormAutomatic {
@@ -1990,6 +2020,9 @@ fn guard_gate_up_mq4g256lloyd_fires() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_gate_up_mq4g256lloyd(&steps, &ctx_rdna3()));
@@ -2006,6 +2039,9 @@ fn match_fused_prefix_admits_exact_mq4g256v2_qkv() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_qkv_mq4g256v2(&steps, &ctx_rdna3()));
@@ -2026,6 +2062,9 @@ fn match_fused_prefix_admits_exact_mq4g256v2_qkvza() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     // QKVZA = QKV3 window + one extra Gemv (reuse builder, no new abstraction).
     let mut steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
@@ -2052,6 +2091,9 @@ fn match_fused_prefix_admits_exact_mq4g256v2_gate_up() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_gate_up_mq4g256v2(&steps, &ctx_rdna3()));
@@ -2073,6 +2115,9 @@ fn match_fused_prefix_rejects_mixed_v1_v2_mq4_window() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let wr_v1 = WeightRef {
         buf: &dummy,
@@ -2082,6 +2127,9 @@ fn match_fused_prefix_rejects_mixed_v1_v2_mq4_window() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let steps = vec![
         Step::RmsnormAutomatic {
@@ -2139,6 +2187,9 @@ fn match_fused_prefix_rejects_mq4g256v2_on_unsupported_arch() {
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let ctx = ctx_rdna4(); // gfx1200 — not gfx1201
     let qkv = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);

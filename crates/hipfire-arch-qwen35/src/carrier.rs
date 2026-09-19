@@ -136,7 +136,8 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         .map(|t| *t == LayerType::FullAttention)
         .collect();
 
-    let ResolveResult { mode, warning } = kv_mode::resolve(&kv_mode, &kv_mode::QWEN35_HFQ_POLICY);
+    let raw = kv_mode::qwen35_auto_for_arch(&kv_mode, ctx.gpu.arch.as_str());
+    let ResolveResult { mode, warning } = kv_mode::resolve(raw, &kv_mode::QWEN35_HFQ_POLICY);
     if let Some(w) = warning {
         eprintln!("  KV cache: {w} (site {})", kv_mode::QWEN35_HFQ_POLICY.site);
     }
@@ -160,6 +161,7 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         .map(|s| s.to_string())
         .unwrap_or_else(|| hipfire_runtime::config::get().kv_adaptive.clone());
     let adaptive_req = parse_kv_adaptive(&kv_adaptive_spec)?;
+    validate_native_kv_admission(mode, config, ctx, adaptive_req.is_some(), v_mode_override)?;
     validate_adaptive_cask_handoff(
         adaptive_req.is_some(),
         ctx.cask.sidecar.is_some(),
@@ -263,6 +265,66 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
             kv_v_env,
         })
     }
+}
+/// Admission for native fp8-E4M3 / flat-bf16 KV on the Qwen dense route.
+/// Exact gfx1201, H24/Hkv4/D256, pp==1, contiguous-or-VMM, non-adaptive,
+/// no CASK eviction, neutral (q8) V. Anything else fails before allocation —
+/// never a silent q8 fallback. VMM is allowed (same target, production
+/// backend); slots are rejected by the backend arm.
+pub fn validate_native_kv_admission(
+    mode: hipfire_runtime::kv_mode::KvMode,
+    config: &Qwen35Config,
+    ctx: &LoadCtx,
+    adaptive: bool,
+    v_mode_override: Option<llama::VMode>,
+) -> Result<(), String> {
+    use hipfire_runtime::kv_mode::KvMode;
+    if !matches!(mode, KvMode::Fp8 | KvMode::Bf16) {
+        return Ok(());
+    }
+    if ctx.gpu.arch.as_str() != "gfx1201" {
+        return Err(format!(
+            "kv_mode {mode:?} requires exact gfx1201 (got {})",
+            ctx.gpu.arch
+        ));
+    }
+    if config.n_heads != 24 || config.n_kv_heads != 4 || config.head_dim != 256 {
+        return Err(format!(
+            "kv_mode {mode:?} requires H24/Hkv4/D256 (got H{}/Hkv{}/D{})",
+            config.n_heads, config.n_kv_heads, config.head_dim
+        ));
+    }
+    if ctx.pp != 1 {
+        return Err(format!(
+            "kv_mode {mode:?} requires single-GPU (pp==1, got pp={})",
+            ctx.pp
+        ));
+    }
+    if !matches!(
+        ctx.kv_backend,
+        KvBackend::Contiguous | KvBackend::Vmm
+    ) {
+        return Err(format!(
+            "kv_mode {mode:?} requires contiguous or vmm backend (got {:?})",
+            ctx.kv_backend
+        ));
+    }
+    if adaptive {
+        return Err(format!(
+            "kv_mode {mode:?} is incompatible with kv_adaptive (static native tiers only)"
+        ));
+    }
+    if ctx.cask.sidecar.is_some() {
+        return Err(format!(
+            "kv_mode {mode:?} is incompatible with CASK eviction (noslots static cache only)"
+        ));
+    }
+    if v_mode_override.is_some() {
+        return Err(format!(
+            "kv_mode {mode:?} requires neutral V (HIPFIRE_KV_V must be unset/q8; nondefault V cannot override native V storage)"
+        ));
+    }
+    Ok(())
 }
 
 fn validate_adaptive_cask_handoff(
@@ -408,18 +470,32 @@ fn construct_kv_cache(
             .expect("Qwen3.5 KV plan always resolves physical_cap");
         let kv = match (ctx.kv_backend, static_v) {
             (KvBackend::Vmm, vm) => {
-                // Unified VMM constructor: reserve == current; never post-alloc realloc.
-                KvCache::new_gpu_vmm_capped_filtered(
-                    ctx.gpu,
-                    &plan.is_kv_layer,
-                    config.n_kv_heads,
-                    config.head_dim,
-                    ctx.max_seq,
-                    physical_cap,
-                    mode,
-                    vm,
-                )
-                .map_err(|e| format!("{e}"))?
+                // fp8/bf16 have no 5-flag VMM bundle representation (the
+                // generic constructor panics on them by design): route via
+                // the dedicated constructors, like from_mode_single_vmm.
+                // Neutral V is enforced at admission for both.
+                if matches!(mode, kv_mode::KvMode::Fp8 | kv_mode::KvMode::Bf16) {
+                    <KvCache as KvCacheExt>::from_mode_with_backend(
+                        mode,
+                        KvBackend::Vmm,
+                        KvTarget::Single(ctx.gpu),
+                        &plan.dims,
+                    )
+                    .map_err(|e| format!("{e}"))?
+                } else {
+                    // Unified VMM constructor: reserve == current; never post-alloc realloc.
+                    KvCache::new_gpu_vmm_capped_filtered(
+                        ctx.gpu,
+                        &plan.is_kv_layer,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        ctx.max_seq,
+                        physical_cap,
+                        mode,
+                        vm,
+                    )
+                    .map_err(|e| format!("{e}"))?
+                }
             }
             (KvBackend::Contiguous, llama::VMode::Q8) => <KvCache as KvCacheExt>::from_mode_with_backend(
                 mode,

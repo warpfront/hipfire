@@ -556,8 +556,8 @@ The canonical dense trunk is whichever local artifact byte-matches
 
 - HF repo: `hipfire-models/qwen3.8-27b`
 - HF / local file: `qwen3.8-27b.mq4-xt`
-- File size: `14980361216`
-- SHA-256: `9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7`
+- File size: `14987185152` (re-issued 2026-09-15 with AWQ sidecars; the prior `14980361216` / `9f91556f…` upload lacked them, WT2 KLD 0.057 vs 0.048)
+- SHA-256: `80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3`
 - Paired draft (measured with the canonical fixture identity):
   `~/qcal/ladder-v2/drafts/qwen3.8-27b-dflash.mq4v2.hfq`
   (sha256 `d0a74a232a0e2166d889f823e91e0fbf778d21dd9668d7de055cdecb065401bc`)

@@ -15,6 +15,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // cross-arch availability (mirrors the FusedQkvQ4K row).
         (KernelKey::FusedQkvHfq4G256, ArchPredicate::Always),
         (KernelKey::FusedQkvMq4G256V2, ArchPredicate::Always),
+        (KernelKey::FusedQkvMq4G256V2Lloyd, ArchPredicate::Always),
         (KernelKey::FusedQkvMq5G256V2, ArchPredicate::Always),
         (KernelKey::FusedQkvMq6G256V2, ArchPredicate::Always),
         (KernelKey::FusedQkvMq3G256V2, ArchPredicate::Always),
@@ -80,6 +81,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // and FusedGateUpHfq4G256 rows above).
         (KernelKey::FusedQkvzaHfq4G256, ArchPredicate::Always),
         (KernelKey::FusedQkvzaMq4G256V2, ArchPredicate::Always),
+        (KernelKey::FusedQkvzaMq4G256V2Lloyd, ArchPredicate::Always),
         (KernelKey::FusedQkvzaMq5G256V2, ArchPredicate::Always),
         (KernelKey::FusedQkvzaMq6G256V2, ArchPredicate::Always),
         (KernelKey::FusedQkvzaMq3G256V2, ArchPredicate::Always),
@@ -146,6 +148,7 @@ pub fn populate(registry: &mut KernelRegistry) {
         // and FusedGateUpQ4K rows).
         (KernelKey::FusedGateUpHfq4G256, ArchPredicate::Always),
         (KernelKey::FusedGateUpMq4G256V2, ArchPredicate::Always),
+        (KernelKey::FusedGateUpMq4G256V2Lloyd, ArchPredicate::Always),
         (KernelKey::FusedGateUpMq5G256V2, ArchPredicate::Always),
         (KernelKey::FusedGateUpMq6G256V2, ArchPredicate::Always),
         (KernelKey::FusedGateUpMq3G256V2, ArchPredicate::Always),

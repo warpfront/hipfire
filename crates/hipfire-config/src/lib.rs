@@ -482,10 +482,11 @@ fn expand_tilde(value: &str) -> PathBuf {
 // schema's allow-list only — it is NOT a promise that a given model supports a
 // mode. Per-site acceptance lives in `hipfire_runtime::kv_mode`'s policies,
 // which warn and fall back for anything they cannot allocate. `bf16` is
-// currently maple-only (arch 15).
+// maple's default plus the Qwen quality-control arm; `fp8` is admitted at
+// the single-GPU Qwen sites under the carrier's exact gfx1201/geometry guards.
 const KV_MODES: &[&str] = &[
     "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
-    "turbo", "turbo4", "turbo3", "turbo2",
+    "turbo", "turbo4", "turbo3", "turbo2", "fp8",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
@@ -627,7 +628,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_KV_MODE"),
-        "KV cache format; auto inherits the registry recommendation, then q8. DeepSeek V4 currently supports f32 and f16."
+        "KV cache format; auto inherits the registry recommendation, then q8 — except single-GPU Qwen on exact gfx1201, where auto means native fp8 (stage-b FA2 arithmetic). DeepSeek V4 currently supports f32 and f16."
     ),
     field!(
         "memory.kv_adaptive",
@@ -1910,6 +1911,16 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PREFILL_BATCHED",
         "Use batched prefill kernels when eligible."
     ),
+    process_field!(
+        "prefill.chunk_rows",
+        "prefill_chunk_rows",
+        Kernel,
+        DefaultValue::Integer(512),
+        ValueRule::Integer { min: 2, max: 1048576 },
+        false,
+        "HIPFIRE_PREFILL_CHUNK_ROWS",
+        "Widened ordinary-prefill chunk ceiling in rows (default 4096 on exact gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH stays the explicit override; per-device VRAM admission may still select a smaller rung)."
+    ),
     process_bool_field!(
         "speculation.draft_f16",
         "draft_f16",
@@ -2121,6 +2132,51 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx1201 MQ4v2 FP8 WMMA 3-way QKV prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_QKV=0 to opt out)."
     ),
     process_bool_field!(
+        "kernel.gfx12_mq4v2_fp8_v2",
+        "gfx12_mq4v2_fp8_v2",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_MQ4V2_FP8_V2",
+        "Enable the gfx1201 MQ4v2 FP8 WMMA staged-tile v2 prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_V2=0 to opt out; selects the _v2_gfx1201 symbols at N>=256 with 128x128 geometry and 2 slabs unless HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM/_SLABS override, the four family flags remain prerequisites)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_gdn_pre_fused",
+        "gfx12_gdn_pre_fused",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_GDN_PRE_FUSED",
+        "Enable the gfx1201 batched prefill GDN preamble fusion (default on exact gfx1201; set to false or HIPFIRE_GFX12_GDN_PRE_FUSED=0 to opt out; fuses sigmoid+conv+qknorm into gdn_pre_batched_gfx1201, byte-exact)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_silu_quant_fused",
+        "gfx12_silu_quant_fused",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_SILU_QUANT_FUSED",
+        "Fuse the int4 activation quantiser into fused_silu_mul_mq_rotate_awq on gfx1201 (default on exact gfx1201; set to false or HIPFIRE_GFX12_SILU_QUANT_FUSED=0 to opt out; emits block_i4_128 from the down-proj SwiGLU/FWHT producer so the standalone quantize_int4_mmq_ds128 launch disappears, bit-identical)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_producer_quant_fused",
+        "gfx12_producer_quant_fused",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_PRODUCER_QUANT_FUSED",
+        "Fuse the int4 activation quantiser into the gfx1201 RMSNorm/rotate/gated-norm producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx12 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_fp8_stream",
+        "gfx12_fp8_stream",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_FP8_STREAM",
+        "Fuse the MQ4v2 FP8 activation pre-pass into the gfx1201 RMSNorm/rotate producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_FP8_STREAM=0 to opt out; emits byte-identical prepare_mq4v2_fp8_x_f32 outputs for the qkvza/gate_up/qkv inputs so the standalone pack_f32_to_fp8_mq4v2_gfx12 launch disappears at each admitted site)."
+    ),
+    process_bool_field!(
         "kernel.gfx12_fa2_prefill",
         "gfx12_fa2_prefill",
         Kernel,
@@ -2128,6 +2184,15 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_GFX12_FA2_PREFILL",
         "Enable the gfx1201 GQA-fused FA2 prefill attention route (default on exact gfx1201; set to false or HIPFIRE_GFX12_FA2_PREFILL=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_fa_packet",
+        "gfx12_fa_packet",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_FA_PACKET",
+        "Enable the gfx1201 packet-minimal Q128 FA2 attention body (default on exact gfx1201; set to false or HIPFIRE_GFX12_FA_PACKET=0 to opt out to route-N; exact stage-b arithmetic)."
     ),
     process_bool_field!(
         "kernel.gfx11_fa2_prefill",
@@ -2139,13 +2204,22 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx11 GQA-fused FA2 prefill attention route (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_FA2_PREFILL=0 to opt out)."
     ),
     process_bool_field!(
-        "kernel.gfx11_mq4v2_iu4",
-        "gfx11_mq4v2_iu4",
+        "kernel.iu4_prefill",
+        "iu4_prefill",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_IU4_PREFILL",
+        "Enable the W4A4 iu4-direct MMQ prefill route (default on exact gfx1100/gfx1151/gfx1201, other arches keep their incumbent route; set to false or HIPFIRE_IU4_PREFILL=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.npu_spillover",
+        "npu_spillover",
         Kernel,
         false,
         true,
-        "HIPFIRE_GFX11_MQ4V2_IU4",
-        "Enable the gfx11 iu4-direct MMQ prefill route (opt-in on gfx1100/gfx1151; set to true or HIPFIRE_GFX11_MQ4V2_IU4=1 to opt in)."
+        "HIPFIRE_NPU_SPILLOVER",
+        "Enable the opt-in gfx1151-only XDNA NPU spillover sidecar (requires a verified .xdna.zip registry sidecar; default off, never active on other architectures)."
     ),
     process_bool_field!(
         "kernel.dot2_gemv",
@@ -4997,6 +5071,40 @@ mod tests {
             );
         }
         assert!(field.parse_cli("sometimes").is_err());
+    }
+    #[test]
+    fn npu_spillover_defaults_off_with_env_parse() {
+        let field = field("kernel.npu_spillover").expect("npu_spillover schema field");
+        assert_eq!(field.legacy_key, "npu_spillover");
+        assert_eq!(field.env_compat, Some("HIPFIRE_NPU_SPILLOVER"));
+        assert_eq!(field.default.to_value(), ConfigValue::Bool(false));
+        assert_eq!(field.parse_cli("1").unwrap(), ConfigValue::Bool(true));
+        assert_eq!(field.parse_cli("0").unwrap(), ConfigValue::Bool(false));
+        // Default-off snapshot: an empty resolve leaves the bridge default
+        // absent (same as other default-false kernel flags), which the
+        // runtime parses as off.
+        let process =
+            ProcessConfig::from_resolved(&resolve([]).expect("empty resolve")).expect("process");
+        assert_eq!(process.legacy_value("HIPFIRE_NPU_SPILLOVER"), None);
+        // Env spelling flows through the env layer into the same snapshot.
+        // HIPFIRE_NPU_SPILLOVER is unique to this test; no other test reads it.
+        std::env::set_var("HIPFIRE_NPU_SPILLOVER", "1");
+        let env_layer = load_env_layer().expect("env layer");
+        std::env::remove_var("HIPFIRE_NPU_SPILLOVER");
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::LegacyEnv {
+                    name: "HIPFIRE_NPU_SPILLOVER".into(),
+                },
+                layer: env_layer,
+            }])
+            .expect("env resolve"),
+        )
+        .expect("process");
+        assert_eq!(
+            process.legacy_value("HIPFIRE_NPU_SPILLOVER").as_deref(),
+            Some("1")
+        );
     }
     #[test]
     fn image_decode_defaults_cpu_with_cpu_vcn_auto_values() {

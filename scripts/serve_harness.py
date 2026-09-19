@@ -1958,7 +1958,14 @@ def spawn_serve(cfg, home, log):
     # Honor a caller-provided per-GPU daemon binary (a renamed copy → distinct
     # process comm → the CLI's reapOrphans `pkill -x <name>` stays scoped to THIS
     # instance). HIPFIRE_DAEMON_NAME/ID pass through from os.environ untouched.
-    env = dict(os.environ, HOME=home, HIPFIRE_HOME=os.path.join(home, ".hipfire"), HIP_VISIBLE_DEVICES=os.environ.get("HIP_VISIBLE_DEVICES","0"),
+    # GPU selection: honour whichever selector the caller set. Injecting
+    # HIP_VISIBLE_DEVICES=0 when the parent only set ROCR_VISIBLE_DEVICES made
+    # the child carry both (they remap differently); default to GPU 0 only
+    # when the caller set neither.
+    gpu_env = {}
+    if "HIP_VISIBLE_DEVICES" not in os.environ and "ROCR_VISIBLE_DEVICES" not in os.environ:
+        gpu_env["HIP_VISIBLE_DEVICES"] = "0"
+    env = dict(os.environ, HOME=home, HIPFIRE_HOME=os.path.join(home, ".hipfire"), **gpu_env,
                HIPFIRE_DAEMON_BIN=os.environ.get(
                    "HIPFIRE_DAEMON_BIN",
                    os.path.join(REPO, "target", "release", "daemon" + (".exe" if os.name == "nt" else ""))),

@@ -160,6 +160,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         7 => {
@@ -172,6 +175,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         8 => {
@@ -184,6 +190,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         11 => {
@@ -196,6 +205,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         12 => {
@@ -208,6 +220,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         13 => {
@@ -221,6 +236,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         14 => {
@@ -234,6 +252,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         15 => {
@@ -247,6 +268,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         17 => {
@@ -260,6 +284,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         18 => {
@@ -273,6 +300,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         19 => {
@@ -286,6 +316,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         20 => {
@@ -299,6 +332,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         30 => {
@@ -313,6 +349,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         31 => {
@@ -329,6 +368,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         21 => {
@@ -349,6 +391,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         24 => {
@@ -367,6 +412,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         32 => {
@@ -384,6 +432,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         33 => {
@@ -402,6 +453,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         34 => {
@@ -420,6 +474,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         36 => {
@@ -438,6 +495,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         37 => {
@@ -456,6 +516,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         44 => {
@@ -487,6 +550,33 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
+            })
+        }
+        52 => {
+            // MQ4-G256 v2 Lloyd (qt=52): wire layout byte-identical to qt=44
+            // (136 B/group, dual fp16 half-grids + 128 B nibbles — the stale
+            // +32B-prefix prototype layout is rejected). Headers are centered
+            // (zp → zp') on an owned copy BEFORE upload; the per-tensor
+            // codebook LUTs are attached by the caller from the lloyd_levels
+            // sidecar (same pattern as AWQ).
+            let mut centered = data.to_vec();
+            hipfire_runtime::lloyd_lut::apply_lloyd_centering(&mut centered, m, k)
+                .map_err(|e| HipError::new(0, &e))?;
+            let buf = gpu.upload_raw(&centered, &[centered.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G256V2Lloyd,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         45 => {
@@ -526,6 +616,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         47 => {
@@ -560,6 +653,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         48 => {
@@ -592,6 +688,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         49 => {
@@ -624,6 +723,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         50 => {
@@ -656,6 +758,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         38 => {
@@ -684,6 +789,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         39 => {
@@ -703,6 +811,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         40 => {
@@ -715,6 +826,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         41 => {
@@ -727,6 +841,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         3 => {
@@ -739,6 +856,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         1 => match f16_lm_head_mode_from_config() {
@@ -760,6 +880,9 @@ fn load_weight_tensor_raw(
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 })
             }
         },
@@ -777,6 +900,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         16 => {
@@ -792,6 +918,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         35 => {
@@ -809,6 +938,9 @@ fn load_weight_tensor_raw(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             })
         }
         _ => dequant_weight_raw(gpu, quant_type, data, m, k),
@@ -881,6 +1013,27 @@ pub(crate) fn load_weight_tensor(
                 wt.awq_scale = load_awq_scale_for(hfq, gpu, name, k);
             }
         }
+        // MQ4V2-Lloyd codebook: fail CLOSED when a qt=52 tensor has no valid
+        // sidecar. `load_lloyd_lut` errors; `?` propagates (no silent uniform).
+        if wt.gpu_dtype == DType::MQ4G256V2Lloyd {
+            let lutted = |n: &str| hipfire_runtime::hfq::load_lloyd_lut(hfq, n).ok();
+            let luts = matched
+                .as_deref()
+                .and_then(lutted)
+                .or_else(|| lutted(name))
+                .ok_or_else(|| {
+                    HipError::new(
+                        0,
+                        &format!(
+                            "MQ4G256V2Lloyd weight {name} has no codebook sidecar: \
+                             re-quantize with a build that emits lloyd_levels (F32 [16])"
+                        ),
+                    )
+                })?;
+            wt.lloyd_lut_e4m3 = Some(luts.0);
+            wt.lloyd_lut_f16 = Some(luts.1);
+            wt.lloyd_lut_c16 = Some(luts.2);
+        }
         return Ok(wt);
     }
     #[cfg(not(unix))]
@@ -899,6 +1052,19 @@ pub(crate) fn load_weight_tensor(
         if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
+        }
+        if wt.gpu_dtype == DType::MQ4G256V2Lloyd {
+            let (e4m3, f16, c16) = hipfire_runtime::hfq::load_lloyd_lut(hfq, &matched_name)
+                .or_else(|_| hipfire_runtime::hfq::load_lloyd_lut(hfq, name))
+                .map_err(|e| {
+                    HipError::new(
+                        0,
+                        &format!("MQ4G256V2Lloyd weight {name} has no codebook sidecar: {e}"),
+                    )
+                })?;
+            wt.lloyd_lut_e4m3 = Some(e4m3);
+            wt.lloyd_lut_f16 = Some(f16);
+            wt.lloyd_lut_c16 = Some(c16);
         }
         Ok(wt)
     }
@@ -1194,6 +1360,9 @@ pub(crate) fn load_paroquant_weight(
             is_alias: false,
         }),
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -1233,6 +1402,9 @@ fn load_fp16_weight_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -2518,6 +2690,29 @@ impl WeightSource for HfqSource<'_> {
             },
         )?;
         attach_lm_head_awq_sidecar(self.hfq, gpu, &mut output, c.dim);
+        // MQ4V2-Lloyd lm_head (qt=52): attach the per-tensor codebook LUTs
+        // fail-closed, same rule as layer weights in `load_weight_tensor`.
+        // Without them the lm_head GEMV fails at dispatch with
+        // lloyd_lut_f16=None (never decode on the uniform grid).
+        if output.gpu_dtype == DType::MQ4G256V2Lloyd {
+            let mut luts = None;
+            for n in qwen35_tensor_name_candidates("lm_head.weight") {
+                if let Ok(l) = hipfire_runtime::hfq::load_lloyd_lut(self.hfq, &n) {
+                    luts = Some(l);
+                    break;
+                }
+            }
+            let (e4m3, f16, c16) = luts.ok_or_else(|| {
+                HipError::new(
+                    0,
+                    "MQ4G256V2Lloyd lm_head.weight has no codebook sidecar: \
+                     re-quantize with a build that emits lloyd_levels (F32 [16])",
+                )
+            })?;
+            output.lloyd_lut_e4m3 = Some(e4m3);
+            output.lloyd_lut_f16 = Some(f16);
+            output.lloyd_lut_c16 = Some(c16);
+        }
         Ok((output, aliases))
     }
 
@@ -4437,6 +4632,9 @@ fn try_load_packed_mq4_experts(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         gate_up.awq_scale = load_awq_scale_for(hfq, gpu, &spec.gate_up_name, dim);
         let mut down = WeightTensor {
@@ -4447,6 +4645,9 @@ fn try_load_packed_mq4_experts(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         down.awq_scale = load_awq_scale_for(hfq, gpu, &spec.down_name, mi);
         experts.push(ExpertWeights { gate_up, down });
@@ -6190,6 +6391,9 @@ mod sealed_ep_tests {
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 },
                 down: WeightTensor {
                     buf: down_buf.shallow_clone(),
@@ -6199,6 +6403,9 @@ mod sealed_ep_tests {
                     row_stride: 0,
                     paro: None,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 },
             });
             owned_buffers.push(gate_buf);

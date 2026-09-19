@@ -341,3 +341,275 @@ extern "C" __global__ void attention_q8_0_kv_independent_masked_windowed(
         out_head[d] = val;
     }
 }
+
+#if defined(HIPFIRE_KV_FP8_E4M3) || defined(HIPFIRE_KV_BF16)
+// Exact OCP E4M3FN → f32 (bias 7, no infinities). Bit-exact, no table.
+static __device__ __forceinline__ float hipfire_fp8_e4m3_to_f32_batched(unsigned char b) {
+    const unsigned int u = b;
+    const unsigned int s = (u & 0x80u) << 24;
+    const unsigned int e = (u >> 3) & 0x0fu;
+    const unsigned int m = u & 0x07u;
+    if (e == 0u) {
+        const float f = (float)m * 1.953125e-3f;  // m * 2^-9, exact
+        return s ? -f : f;
+    }
+    if (e == 15u) {
+        const float f = (m == 7u) ? __builtin_bit_cast(float, 0x7fc00000u)
+                                  : 256.0f * (1.0f + (float)m * 0.125f);
+        return s ? -f : f;
+    }
+    return __builtin_bit_cast(float, s | ((e - 7u + 127u) << 23) | (m << 20));
+}
+
+// BF16 → f32 widening: exact shift.
+static __device__ __forceinline__ float hipfire_bf16_to_f32_batched(unsigned short b) {
+    return __builtin_bit_cast(float, ((unsigned int)b) << 16);
+}
+#endif
+
+#ifdef HIPFIRE_KV_FP8_E4M3
+// Batched causal/tree attention over native-fp8 KV. Counterpart of
+// attention_q8_0_kv_batched: same grid, same tree-bias and graph-safe
+// block_start handling, same legacy/independent slot-descriptor plumbing
+// with the fp8 per-position stride. Handles both tree verify (native
+// reference reader, never FA2) and the >32K fallback path.
+//
+// Grid: [n_heads, batch_size, 1]. LDS: (max_seq + nthreads + head_dim)*4.
+extern "C" __global__ void attention_fp8_e4m3_kv_batched(
+    const float* __restrict__ q,            // [batch_size × n_heads × head_dim]
+    const unsigned char* __restrict__ k_cache,  // token-local fp8 rows
+    const unsigned char* __restrict__ v_cache,  // same layout
+    float* __restrict__ out,                // [batch_size × n_heads × head_dim]
+    const int* __restrict__ positions,      // [batch_size]
+    const float* __restrict__ tree_bias,    // optional [batch_size × block_cols] or nullptr
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn,
+    int block_start,                        // ignored when tree_bias == nullptr
+    int block_cols,                         // ignored when tree_bias == nullptr
+    const KvSlotDesc* __restrict__ slot_descs,  // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot            // [batch_size] or nullptr = legacy
+) {
+    const int h = blockIdx.x;
+    const int b = blockIdx.y;
+    if (h >= n_heads) return;
+
+    const bool tree_mode = (tree_bias != nullptr);
+    const bool full_context_bias = tree_mode && block_start < 0;
+    const int eff_block_start = tree_mode
+        ? (full_context_bias ? 0 : positions[0])
+        : block_start;
+    const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[b] + 1);
+
+    const int slot = (row_slot != nullptr) ? row_slot[b] : 0;
+    const int per_pos_bytes = n_kv_heads * (head_dim + 2);
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy_lane(seq_len, max_seq, b, per_pos_bytes);
+    const int eff_seq_len = seq_len;
+
+    extern __shared__ float sdata[];
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int q_stride = n_heads * head_dim;
+    const float* q_head = q + (long long)b * q_stride + h * head_dim;
+
+    const size_t codes_len = (size_t)n_kv_heads * head_dim;
+    const size_t k_head_off = (size_t)kv_h * head_dim;
+    const size_t scale_off = codes_len + (size_t)kv_h * 2;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+    float* q_shared = workspace + nthreads;
+
+    // Preload this batch row's Q head into shared memory.
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_shared[d] = q_head[d];
+    __syncthreads();
+
+    // Phase 1: Q @ K^T with fp8 decode.
+    float local_max = -1e30f;
+    for (int t = tid; t < eff_seq_len; t += nthreads) {
+        const unsigned char* krow = k_cache + kv_offset_for_k(desc, t, per_pos_bytes);
+        const float ks = (float)*((const _Float16*)(krow + scale_off));
+        const unsigned char* kc = krow + k_head_off;
+        float dot = 0.0f;
+        for (int j = 0; j < head_dim; j++)
+            dot += q_shared[j] * (ks * hipfire_fp8_e4m3_to_f32_batched(kc[j]));
+        float s = dot * scale_attn;
+        if (tree_mode && t >= eff_block_start) {
+            s += tree_bias[b * block_cols + (t - eff_block_start)];
+        }
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < eff_seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < eff_seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted V sum with fp8 decode.
+    float* out_head = out + (long long)b * q_stride + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int t = 0; t < eff_seq_len; t++) {
+            const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
+            const float vs = (float)*((const _Float16*)(vrow + scale_off));
+            val += scores[t] * (vs * hipfire_fp8_e4m3_to_f32_batched(vrow[k_head_off + d]));
+        }
+        out_head[d] = val;
+    }
+}
+#endif
+
+#ifdef HIPFIRE_KV_BF16
+// Batched causal/tree attention over flat-bf16 KV. Same grid, tree-bias
+// and descriptor plumbing as attention_q8_0_kv_batched with the flat
+// `[pos][kv_head][d]` bf16 stride.
+//
+// Grid: [n_heads, batch_size, 1]. LDS: (max_seq + nthreads + head_dim)*4.
+extern "C" __global__ void attention_bf16_kv_batched(
+    const float* __restrict__ q,            // [batch_size × n_heads × head_dim]
+    const unsigned char* __restrict__ k_cache,  // flat bf16 rows
+    const unsigned char* __restrict__ v_cache,  // same layout
+    float* __restrict__ out,                // [batch_size × n_heads × head_dim]
+    const int* __restrict__ positions,      // [batch_size]
+    const float* __restrict__ tree_bias,    // optional [batch_size × block_cols] or nullptr
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn,
+    int block_start,                        // ignored when tree_bias == nullptr
+    int block_cols,                         // ignored when tree_bias == nullptr
+    const KvSlotDesc* __restrict__ slot_descs,  // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot            // [batch_size] or nullptr = legacy
+) {
+    const int h = blockIdx.x;
+    const int b = blockIdx.y;
+    if (h >= n_heads) return;
+
+    const bool tree_mode = (tree_bias != nullptr);
+    const bool full_context_bias = tree_mode && block_start < 0;
+    const int eff_block_start = tree_mode
+        ? (full_context_bias ? 0 : positions[0])
+        : block_start;
+    const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[b] + 1);
+
+    const int slot = (row_slot != nullptr) ? row_slot[b] : 0;
+    const int per_pos_bytes = n_kv_heads * head_dim * 2;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy_lane(seq_len, max_seq, b, per_pos_bytes);
+    const int eff_seq_len = seq_len;
+
+    extern __shared__ float sdata[];
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+
+    const int q_stride = n_heads * head_dim;
+    const float* q_head = q + (long long)b * q_stride + h * head_dim;
+
+    const size_t k_head_off = (size_t)kv_h * head_dim;
+
+    float* scores = sdata;
+    float* workspace = sdata + seq_len;
+    float* q_shared = workspace + nthreads;
+
+    // Preload this batch row's Q head into shared memory.
+    for (int d = tid; d < head_dim; d += nthreads)
+        q_shared[d] = q_head[d];
+    __syncthreads();
+
+    // Phase 1: Q @ K^T with bf16 widening.
+    float local_max = -1e30f;
+    for (int t = tid; t < eff_seq_len; t += nthreads) {
+        const unsigned short* kc =
+            (const unsigned short*)(k_cache + kv_offset_for_k(desc, t, per_pos_bytes)) + k_head_off;
+        float dot = 0.0f;
+        for (int j = 0; j < head_dim; j++)
+            dot += q_shared[j] * hipfire_bf16_to_f32_batched(kc[j]);
+        float s = dot * scale_attn;
+        if (tree_mode && t >= eff_block_start) {
+            s += tree_bias[b * block_cols + (t - eff_block_start)];
+        }
+        scores[t] = s;
+        local_max = fmaxf(local_max, s);
+    }
+
+    workspace[tid] = local_max;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+        __syncthreads();
+    }
+    float max_val = workspace[0];
+    __syncthreads();
+
+    float local_sum = 0.0f;
+    for (int t = tid; t < eff_seq_len; t += nthreads) {
+        float e = expf(scores[t] - max_val);
+        scores[t] = e;
+        local_sum += e;
+    }
+    workspace[tid] = local_sum;
+    __syncthreads();
+    for (int s = nthreads / 2; s > 0; s >>= 1) {
+        if (tid < s) workspace[tid] += workspace[tid + s];
+        __syncthreads();
+    }
+    float sum_val = workspace[0];
+    __syncthreads();
+
+    for (int t = tid; t < eff_seq_len; t += nthreads) {
+        scores[t] /= sum_val;
+    }
+    __syncthreads();
+
+    // Phase 2: weighted V sum with bf16 widening.
+    float* out_head = out + (long long)b * q_stride + h * head_dim;
+    for (int d = tid; d < head_dim; d += nthreads) {
+        float val = 0.0f;
+        for (int t = 0; t < eff_seq_len; t++) {
+            const unsigned short* vc =
+                (const unsigned short*)(v_cache + kv_offset_for_v(desc, t, per_pos_bytes)) + k_head_off;
+            val += scores[t] * hipfire_bf16_to_f32_batched(vc[d]);
+        }
+        out_head[d] = val;
+    }
+}
+#endif

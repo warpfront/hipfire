@@ -246,6 +246,7 @@ pub(crate) fn dtype_from_quant_type(qt: u8) -> HipResult<DType> {
         40 => Ok(DType::TQ2G128),
         41 => Ok(DType::BQ1G128),
         44 => Ok(DType::MQ4G256V2),
+        52 => Ok(DType::MQ4G256V2Lloyd),
         45 => Ok(DType::MQ4CG256),
         // Neutral-size Magnum V2 family (qt47-50): preserve qtype distinction
         // through WeightTensor/GpuTensor; do not map to legacy MQ2/3/5/6.
@@ -1064,6 +1065,9 @@ pub(crate) fn alloc_ep_dummies(
             row_stride: spec.gate_stride,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         let down = WeightTensor {
             buf: down_owner.shallow_clone(),
@@ -1073,6 +1077,9 @@ pub(crate) fn alloc_ep_dummies(
             row_stride: spec.down_stride,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         owners.push(gate_owner);
         owners.push(down_owner);

@@ -1099,6 +1099,9 @@ fn load_wt(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         });
     }
     if info.quant_type == 16 {
@@ -1117,6 +1120,9 @@ fn load_wt(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             });
         }
         let f32_data: Vec<f32> = data
@@ -1134,6 +1140,9 @@ fn load_wt(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         });
     }
     let dtype = match info.quant_type {
@@ -1153,6 +1162,9 @@ fn load_wt(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             });
         }
         3 => DType::Q8_0,
@@ -1184,6 +1196,9 @@ fn load_wt(
         row_stride: 0,
         paro: None,
         awq_scale,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 

@@ -1,0 +1,524 @@
+# Halo XDNA2 maximum-throughput and bare-dispatch investigation
+
+Date: 2026-09-16. Coordinator/research: HaloNpuMax. Execution is delegated through Main. Source worktree is `/home/kaden/ClaudeCode/warpfront/wt-lloyd`; all device artifacts belong under `hipx:/home/kaden/npu-screen`. No production wiring or commits. This document is updated as executable evidence arrives; unmeasured entries are not performance claims.
+
+> **SIDECAR WAVE 1 RESULT (2026-09-16).** Landed on the branch: `hipfire-xdna`
+> raw-ioctl crate (libc-only, kernel 7.0 uapi, ERT golden tests),
+> `kernel.npu_spillover` (default off), registry `ModelEntry.xdna` + manifest v1
+> stored-zip parser, `load_params` → `LoadCtx.xdna`. Artifact: the bit-exact
+> **i32 K128-partials** kernel passes parity on all three gate profiles but
+> runs at **2.8–2.9 TOPS** (M1024 1.93 ms, M2048 3.70, M4096 7.52) because
+> the 40× output volume (335 MB/call at M4096) is writeback-bound — no static
+> split beats the GPU's 1.86 ms full gate. Zip published as a parity-verified
+> research artifact only (hipx:/home/kaden/npu-screen/sidecar/
+> qwen3.8-27b.mq4-xt.xdna.zip, sha256 5934086e…); no registry entry, no
+> admission. Coarser partials cannot preserve the per-128-half fold.
+> Remaining path: hardware-precision f32 rows on the AIE (slice C spec,
+> `2026-09-16-xdna-f32-fold-slice-c.md`, not dispatched): analytical ceiling
+> ≈ −6 % gate / −4 % pp2048 at M2048 under a ≤ 1.64 ms complete-path gate and
+> a KLD/serve admission — user decision pending. Integration (slice 4) not
+> started; nothing NPU-related runs unless the flag is on.
+
+> **UPDATE 2026-09-16 (NpuZeroCopy2, hipx:/home/kaden/npu-screen/zero-copy2/):
+> one-direction zero-copy WORKS with no driver change — GPU-owned
+> hipMalloc/finegrained buffers PRIME-imported into xdna are READ and WRITTEN
+> by an NPU kernel bit-exactly (control 6/6, import-read 12/12, import-write
+> 36/36 across CPU-mmap / on-GPU / DtoH verify; dmesg clean). GPU bandwidth
+> on the shared buffers stays hipMalloc-class (147–176 R / 122–189 W GB/s);
+> import setup 0.8–3.9 ms once. Hazards: packet BO must be CMD-type;
+> SYNC_BO on an imported handle kernel-oopses (use clflush +
+> hipDeviceSynchronize). The earlier "unproven" was a broken control. With
+> the staged-copy tax gone, at the measured 13 TOPS a ~20 % gate row slice
+> hides under the GPU (≈ −20 % gate ≈ −6 % pp2048) before any tuning of
+> placement/k_mt. Park line now depends only on sustained TOPS.
+
+> **STATUS 2026-09-16 (parent, final for this session) — FEASIBLE, PARKED.**
+> Measured: bare `amdxdna` ioctl dispatch works (libc-only, bit-for-bit vs XRT,
+> ~103 µs submit→complete, no overhead); NPU↔GPU contention ≤ 2 %; tuned
+> int8→i32 GEMM best **13.09 TOPS** gate (128/64/64 single-C, cols 8; stock 5.6)
+> and 6.82 TOPS down (B refetch 34×, ~0.9 ms host/call); slices scale linearly
+> (gate M4096 1612 µs ⇒ ≈ 23 % of rows in the GPU's window, ≈ −13 % gate
+> *before* copies). Down spillover is dead (smallest legal 1024-row slice
+> 2714 µs > GPU full 2155 µs). AIE fold is not bit-exact on the pinned Peano
+> (fmaf unlinkable; softfloat muls; vector mul −0/min-normal misses; vector
+> mac returns zeros) ⇒ NPU rows would need a KLD/serve gate. **No zero-copy**:
+> NPU→GPU import is refused by KFD (`amdgpu_amdkfd_get_dmabuf_info`: non-amdgpu
+> dma-bufs rejected — upstream kernel limit); GPU→NPU import is CPU-visible but
+> NPU reads unproven; staged copies ~231 + 267 µs/call (CPU memcpy bench) wipe
+> out the gate gain at 13 TOPS. CPU spillover killed (GPU −14 % at 4 threads).
+> Park line: ≥ 15–18 TOPS sustained AND copy overlap/zero-copy. Product shape
+> if revived: opt-in, exact-gfx1151-only registry sidecar (xclbin PDI + insts)
+> consuming existing MQ4G256V2/block_i4_128 quants via an int8 slice copy,
+> `hipfire-xdna` raw-ioctl crate, off by default, never in gfx1201/gfx1100
+> paths. Artifacts: hipx:/home/kaden/npu-screen/{max-tune,raw-dispatch,
+> fold-probe,zero-copy,cpu-probe}/README.md|RESULTS.md. Open experiments:
+> explicit Tile placement (B column-local), k_mt layout composition, A5
+> write-only BW, hardware traces (routing-saturated at 8 cols).
+
+## 1. Findings, scope, and evidence discipline
+
+This investigation separates (A) the throughput of a properly tuned **int8→int32** dense GEMM, (B) direct amdxdna submission without XRT userspace, and (C) the additional contract required to replace hipfire IU4 rows. Success in A or B is not proof of C.
+
+Existing measured evidence, inherited from `2026-09-16-halo-npu-probe-results.md` and `history://HaloNpuProbe`:
+
+| M×K×N | stock tile m/k/n; columns | NPU average µs | minimum / maximum µs | average TOPS | unique-payload GB/s | validation |
+|---|---|---:|---:|---:|---:|---|
+| 2048×2048×2048 | 64/64/32; 8 | 4018.3 | 3704.0 / 4307.4 | 4.28 | 6.26 | NumPy int64 reference PASS |
+| 17408×5120×512 | 64/64/32; 8 | 16099.4 | 15735.6 / 16819.9 | 5.67 | 7.91 | NumPy int64 reference PASS |
+| 5120×17408×512 | 64/64/32; 8 | 18956.9 | 18476.9 / 19614.8 | 4.81 | 5.72 | NumPy int64 reference PASS |
+
+These are **averages, not medians**, 10 warmups and 20 timed samples. Raw logs: `/home/kaden/npu-screen/logs/sanity_2048.log`, `gateup_17408x5120x512.log`, and `down_5120x17408x512.log`. End-to-end averages were 4828.5, 16976.6 and 19802.0 µs respectively. The inherited down log was read directly; its 5.72 GB/s is computed from 108,527,616 unique payload bytes divided by the measured average.
+
+Fresh A1 resident-buffer baseline (`max-tune/cfg-stock-64x64x32/results.jsonl`, read directly): gate/up, 10 warmups + 50 timed samples, NumPy int64 PASS, median 16300.5 / p90 16699.7 / mean 16345.1 / min 15974.6 / max 16940.9 µs; median 5.60 TOPS and 7.82 unique-payload GB/s. True per-call end-to-end median is 17155.5 µs, with approximately 855 µs outside the timed `kernel()+wait()` window. An initial report of a ~3.3 s per-call gap was corrected: the ~190 s CPU compilation occurred once during `specialize().as_mlir()`, not every dispatch. The harness also corrected a stdout line that reprinted NPU timings as end-to-end; the JSONL contains the distinct sample arrays and correct statistics.
+
+Hardware/software inherited state: Ubuntu 26.04, kernel 7.0.0-31, amdxdna, `/dev/accel/accel0`, RyzenAI-npu5, firmware 1.1.2.65; distro XRT 2.21.75. mlir-aie f50bef7 / wheel 1.4.4.dev3 and Peano 22.0.0.2026090701. Plain SSH still has 8 MiB memlock; run device programs in `sudo -n -u kaden -i` login shells. The previous probe recorded the limits.d and systemd memlock changes. No new system changes are required for research.
+
+**Corrections to the preceding screen:** a slower NPU on the *whole* matrix does not imply that a concurrent row-slice loses; ideal split throughput adds. Activations are indexed by K and N and are reused by **every** M-slice, not row-partitioned with weights. A single full-K i32 output is insufficient for IU4: each 128-K half needs its own dot before a differently scaled fold. Finally, the paper's 450.6 MAC/core/cycle and 38 TOPS headline concern narrowed i8 output, not automatically i32 output.
+
+## 2. Throughput ceiling (A), tuning, tracing, and standalone bandwidth
+
+Primary source: [Taka et al., arXiv:2512.13282v1](https://arxiv.org/html/2512.13282v1), particularly §§4.2–4.5 and Tables 1–3. It reports **384 MAC/core/cycle for int8→int32** (48×280×48 single-core tile), versus 450.6 for int8→int8. It uses xchesscc, hardware traces, turbo mode, and a Krackan Point DDR5 mini-PC—not this Halo/Peano system.
+
+Table 3's best displayed int8→int32 point is **24.74 TOPS** at 4224×4224×4608, tile 96/64/96 and 256 MAC/core/cycle. The 37.35 TOPS point is i8→i8. Thus 30+ TOPS for full-precision output is an aspiration here, not a result already established by the cited comparison.
+
+Read source on hipx:
+
+- `mlir-aie/programming_examples/basic/matrix_multiplication/whole_array/whole_array.py`: `_build_design`, `_device_for`, `core_fn`, `sequence`, `_validate_shape_args`, `_numpy_reference`, `_run_and_verify`.
+- `mlir-aie/aie_kernels/aie2p/mm.cc`: `matmul_vectorized_2x2_mmul`; four independent accumulators, explicit `event0()`/`event1()` delimiters, reload/store C per k-tile. Verify the emitted kernel uses this AIE2P source, not the AIE2 version.
+- `mlir-aie/python/utils/trace/__init__.py`: `configure_trace`, `start_trace`, `parse_trace`, `TraceConfig`; `Program.enable_trace` is the IRON frontend.
+
+Source facts: npu2 uses the unrestricted eight-column device. `Worker.grid(4,n_aie_cols,...)` creates 32 workers at cols=8. All FIFO depths are currently 2; L2 input tiles are only m×k and k×n, so merely increasing FIFO depth does not implement the paper's independent large k_mt contiguous transfers. Stock stack allocation is 0xD00 bytes per core. CLI additionally requires M/(4m) even. A/B in L1, C in L1, all simultaneous, must fit including stack, alignment, and bank placement.
+
+For this output-stationary mapping, distinguish unique payload bytes `MK+KN+4MN` from scheduled DMA bytes:
+
+`A_read = MKN/(n*cols); B_read = MKN/(m*4); C_write = 4MN`.
+
+The stock gate shape schedules A twice and B 68 times. Its 7.91 GB/s unique-payload rate is **not a measured DDR ceiling**. TAP-derived byte totals and actual bus/cache traffic must not be conflated either.
+
+### Executable composer slice A: tuning and profiler evidence
+
+**Ownership:** only `hipx:/home/kaden/npu-screen/max-tune/` (copy the original design and any changed kernel there), outputs under that directory. Do not modify the pinned upstream source, production worktree, or other workers' artifacts. Skip formatters, linters, and project suites. Coordinate CPU-heavy build phases and all device phases through Main; no builds during GPU timings. Builds may proceed while the direct-dispatch worker performs source/host-only work; NPU execution must be serialized between workers.
+
+**Frozen artifact interface:** each passing configuration directory contains `design.xclbin`, `insts.txt` (32-bit hexadecimal words), `insts.bin` (little-endian u32), generated/lowered MLIR, AIE ELF/object and disassembly, build log, deterministic `a.bin`, `b.bin`, `c_xrt.bin`, plus `manifest.json`. Manifest fields: `M,K,N,m,k,n,cols,dtype_in,dtype_out,b_col_maj,c_col_maj,l1_a_depth,l1_b_depth,l1_c_depth,l2_a_depth,l2_b_depth,l2_c_depth,k_mt,stack_bytes,compiler,source_revision,kernel_name,artifact_sha256,argument_sizes,argument_offsets`. Record extra fields if required, never silently assume argument ABI. `results.jsonl` stores config id, every timed sample in ns, warm count, timed count, median/p90/mean/min/max µs, logical operations, unique payload bytes, TAP-derived DMA bytes, correctness status, power/clocks, and trace paths. The raw-dispatch worker consumes this directory, without rebuilding the GEMM.
+
+**Commands / starting point:** under a `sudo -n -u kaden -i` shell, source `/home/kaden/npu-screen/mlir-aie/ironenv/bin/activate` and upstream `utils/env_setup.sh`; use the copied `whole_array.py --dtype_in i8 --dtype_out i32 --dev npu2 --n-aie-cols 8 -M 17408 -K 5120 -N 512 -m 64 -k 64 -n 32 -w 10 -i 50`. Ahead-of-time flags supported by the source are `--xclbin-path=<file> --insts-path=<file>`. Build offline, then benchmark cached artifacts with no CPU reference computation during timing. Generate/reference input outside the measurement phase. Save full command lines. Do not label narrowed i8/i16 output results as satisfying this contract.
+
+**Step A1, bounded legal sweep:** retain stock baseline; then at cols=8 try m/k/n = 64/128/64, 64/128/32, 128/64/32, 32/256/64, 64/256/32, and 64/64/64 (all input/output FIFO depths initially 2). Test B row-major and column-major on the best two. Try cols=4 and cols=2 with the best legal tile, allowing n=64 or 128 where N divisibility and L1 capacity permit. Reject before compilation if `dA*m*k + dB*k*n + dC*4*m*n + 0xD00 > 65536`; physical bank allocation remains a further gate. For example 64/256/32 with double C is 65536 bytes *before* stack, so it must use single C or be rejected. Preserve exact-shape legality; padding results must separately report payload and padded operations.
+
+**Step A2, paper-derived changes (not just flags):** decouple A/B/C L1 depths and L2 depths; single-buffer C at L1 to free capacity, double-buffer A/B, try 64/256/32 and 128/64/64 when legal. Keep L2 C aggregation by four rows. Add an independent `k_mt` at multiples of k, initially 256,512,1024, constrained by each 512 KiB MemTile and neighbors. L2 A m×k_mt and B k_mt×n for column-major B; L2→L1 emits consecutive k-sized subtiles with the paper's split MemTile-MM2S and CompTile-S2MM transformation. Merely widening a FIFO without adjusting the DMA transforms is invalid. Compare buffering depths 2 and 3 only where real allocation fits. Keep A broadcast across M rows and B across columns. Inspect whether A stream placement uses the intended even-column/neighbor capacity mapping for the asymmetric 4×8 array.
+
+**Step A3, compute and DMA diagnosis:** retain untraced performance numbers. For stock and winner, build a traced artifact. Use `Program.enable_trace` before resolve; consult the pinned method signature. Trace representative first/last columns, not all 32 cores at maximal event rate. Existing `event0/event1` around matmul provide exact compute-call duration; report `m*k*n/cycles` MAC/cycle. Select named AIE2P events for INSTR_EVENT_0, INSTR_EVENT_1, INSTR_VECTOR, LOCK_STALL, STREAM_STALL, memory stalls, and selected DMA port RUNNING/STALLED events (max eight per trace unit). Port selectors must match lowered physical DMA channels, not guessed defaults. Parse with `aie.utils.trace.parse_trace(raw, lowered_mlir)` and summarize with `get_cycles_summary`, `get_vector_time`; save raw buffer and parsed Perfetto JSON. Attribute time to core active / input-lock wait / output backpressure / transfer gaps, detect trace overflow, and compare traced versus untraced time to bound perturbation. Do not call INSTR_VECTOR a direct MAC counter; combine event0/1 duration with known logical MAC count. If compute low, inspect Peano software pipeline and intrinsic instruction selection; test kernel unrolling/accumulator layout variants only against measured active-cycle evidence. If DMA low, compare contiguous vs strided transfers and k_mt, and then the paper's rolling BD reuse (up to 15 of 16 descriptors/shim) against the stock two transfer-block TaskGroup schedule. Reconfigure only retired BDs; no DMA or FIFO ownership violation.
+
+**Step A4, actual dispatch shapes:** measure winner at gate full 17408×5120×512 and down full 5120×17408×512; measure M slices 1024,2048,3072,4096 for K=5120,N=512 and K=17408,N=512 (omit only genuinely illegal sizes with reason; also a 512-row down slice if legal). At least ten warm and fifty timed resident-buffer samples, medians/p90. Export winner artifacts promptly so raw-dispatch can work independently.
+
+**Step A5, NPU→DDR only:** build a stream-out microbenchmark in the owned directory. Initialize a known pattern on AIE/L2 before the timed interval, then repeatedly S2MM to disjoint contiguous output ranges across 1,2,4,8 shims, large enough to amortize start/finish and avoid mistaking a warm tiny buffer for sustained DRAM traffic. Cover ≥4,16,64 MiB written where allocation permits. No matmul and no paired DDR input reads in the timed region. Validate the full output, record bytes/time GB/s plus dispatch and cache-sync times separately; do not call memcpy or BO SYNC_BO timing NPU→DDR bandwidth. A copy benchmark may be supplemental but is explicitly bidirectional. For a generated constant pattern, core generation can bound throughput; disclose/measure that ceiling or use replayed on-chip contents.
+
+**Acceptance/abandon:** output every attempted config and precise compiler/runtime failures, best full and slice measurements, standalone write bandwidth, traces for stock/winner or the exact trace-tool failure and successfully attempted alternatives. Reach 30+ TOPS **for i32** or establish a measured active-core/DMA/command-gap bound, not 'stock was slow'. Stop an individual novel kernel idea after controlled paired trials show no repeatable gain and counters do not support its proposed bottleneck; retain the best passing implementation, not speculative complexity. No unmeasured universal throughput-ceiling claim is accepted.
+
+### Source-grounded placement and contiguous-k_mt candidates
+
+The trace routing dump revealed that default placement is **not** the logical 4×8 grid: `Worker.grid` (`python/iron/worker.py:207–232`) only constructs a nested list, and the constructor defaults to `AnyComputeTile`. In `max-tune/cfg-trace-eg7/build.log`, logical A-row 0's eight consumers occupy physical columns 0–1, rows 2–5; logical B-column 0 spans physical columns 0,2,4,6. The paired placement experiment is `Worker(..., tile=Tile(col, row + 2))`, importing `Tile` from `aie.iron.device`, while preserving every logical FIFO connection. This puts B broadcast and C gathering within their intended physical column. Reduced routing pressure or faster execution is a hypothesis, not an observed result. Require exact output and paired untraced timings; trace routing success alone is not a speedup.
+
+**Contiguous batching must change the actual input stream.** A shim BD already covers the whole K sweep, so k_mt increasing from 64 to 512 reduces L2 batches from 80 to 10 at K=5120, not necessarily the number of shim BDs. Likewise n=32→64 halves scheduled A reads and changes kernel geometry; its speedup does not isolate BD overhead. Paper §4.3/Fig.4 describes contiguous shim bursts, MemTile receive reordering, and split MemTile/core transforms to avoid a five-dimensional DMA description.
+
+For the **eight-column, one-A-row-per-shim, row-major-B** winner, a simpler address-equivalent A-only candidate is available. Keep B and the existing core kernel unchanged. Let `q=k_mt/k`; receive the shim's row-major m×k_mt tile into chunk-major L2 storage, then merge the adjacent chunk and m/r dimensions during transmission:
+
+```text
+A_L2 type:       m*k_mt int8 elements; A_L1 remains m*k.
+Shim A tiler:    (m,k_mt) tiles grouped over K/k_mt; contiguous run k_mt.
+L2 receive:     [(m,k), (q,m*k), (k,1)]
+L2 transmit:    [(q*(m/r),r*k), (k/s,s), (r,k), (s,1)]
+Core receive:   unchanged, linear m*k elements per acquired object.
+```
+
+Dimension pairs above are `(size,stride)` in int8 elements, highest to lowest. L2 receive writes input `(row,kk)` to `(kk/k)*m*k + row*k + kk%k`. L2 transmit emits each k chunk in exactly the current `(m/r,k/s,r,s)` core layout. Use `a_l3l2.cons(dims_from_stream=receive).split(..., dims_to_stream=[transmit])`; for cols=8 its single child keeps offset zero. Source support: `ObjectFifo.cons`/`split` in `python/iron/dataflow/objectfifo.py:309–346,977–1072`; `AIEObjectFifoSplitPass::createLinkPools` (`lib/Dialect/AIE/Transforms/AIEObjectFifoSplit.cpp:474–552`) selects the larger input as pool owner and the complete owner extent for a one-to-one link; `emitDescriptor` in `AIEObjectFifoLowerDMAs.cpp:169–179` uses that segment length. Thus the candidate sends a whole large L2 segment into multiple unchanged small core objects, rather than silently dropping all but its first k chunk.
+
+**Host proof run:** exhaustive address enumeration for m∈{64,128}, k=64, k_mt∈{128,256,512}, r∈{4,8}, s=8 checked 12 configurations / 344,064 elements. Both maps were bijective and every emitted element matched the existing core layout (zero mismatches). At m128/k64/k_mt512/r4/s8 the receive dimensions are `[(128,64),(8,8192),(64,1)]`, transmit `[(256,256),(8,8),(4,64),(8,1)]`. This establishes the abstract address composition only. The worker must still prove the installed compiler's byte/word normalization, dimension bounds, linked-FIFO lock counts, AIE execution parity, and measured performance; abandon this spelling if those device gates fail and use the paper's split transform instead. No performance result or broader column-count/B-column-major support is claimed.
+
+After the A-only gate passes, the same composition has a source-grounded **column-major-B** extension: replace `(m,r)` by `(n,t)` in both receive/transmit maps, change the B shim tiler to contiguous `(n,k_mt)` tiles of physical `(N,K)`, and retain the existing `b_col_maj=True` core kernel. Its current B transform is exactly `[(n/t,t*k),(k/s,s),(t,k),(s,1)]` (`whole_array.py:178–181`), so the same host proof applies to this tiled input layout; it does not prove the core's transpose cost or device behavior. Apply the receive map on `b_l3l2.cons(dims_from_stream=...)` before forwarding, and the transmit map on the existing forward FIFO. At m128/n64/k64/k_mt512, double A/B L2 plus double C aggregation costs nominally 128+64+256=448 KiB per busy MemTile, before alignment/placement constraints. Compare A-only row-major-B against this paired A+B column-major-B configuration; do not assume the paper's B layout wins merely because it enables longer contiguous bursts.
+
+### A1 tile sweep observed so far
+
+Fresh worker-reported gate/up medians, 10 warmups + 50 timed samples per config, NumPy int64 PASS for each successful build. These are **exploratory**: small raw/CPU probe builds overlapped parts of A1. Final winner/full/slice/trace/write-only measurements require a CPU-quiet interval and recorded power/clock mode; they supersede this table for a ceiling claim.
+
+| m/k/n; columns | median µs | median TOPS | status |
+|---|---:|---:|---|
+| 64/64/32; 8 | 16300.5 | 5.60 | baseline; raw JSONL read |
+| 64/128/32; 8 | 16828.3 | 5.42 | slower |
+| 128/64/32; 8 | 13359.6 | 6.83 | improved |
+| 64/64/64; 8 | 9058.9 | 10.07 | A1 leader; 44.4% latency reduction / 79.9% throughput increase |
+
+Three double-C variants failed compilation with `aie.tile allocated buffers exceeded available memory`; their physical allocation maps are retained by the worker. Single-C variants and independent L2 k_mt / layout / column sweeps remain separate experiments. A1 demonstrates that the stock example was not the ceiling; it does **not** establish the final tuned ceiling. Non-stock raw sample artifacts are to be read with the final sweep report.
+
+A2 worker-reported single-C medians subsequently improved the gate shape: 64/128/64 → 8964.4 µs / 10.18 TOPS; 64/256/32 → 15954.3 µs / 5.72; 32/256/64 → 15058.4 µs / 6.06; **128/64/64 → 6974.5 µs / 13.09 TOPS** (10 warm, 50 timed, NumPy PASS). All of those still have k_mt=k. The winner schedules exactly 213,909,504 bytes per gate invocation, or 30.7 GB/s scheduled payload divided by wall time—not a counter-measured fabric/DRAM rate. Full-array trace variants failed legal routing even with one traced core and alternate egress columns; failure IR is retained in `build.log` operation dumps, not the cleaned `design.prj` directories. Physical-grid pinning, independent contiguous k_mt, actual slices/down, final quiet timings and contention are the remaining Tune evidence; this intermediate 13.09 TOPS is not the final ceiling.
+
+## 3. Contention: GPU and NPU slowdown
+
+Not yet measured in this followup. The definitive comparison must use the tuned winner, not only the stock loop. The prebuilt GPU oracle is:
+
+`HOME=/tmp/home-lloyd-hipx HIPFIRE_GRAPH=0 ROCR_VISIBLE_DEVICES=1 HIPFIRE_KERNEL_CACHE=/tmp/kc-halo-lf4 HIPFIRE_GFX11_MQ4V2_IU4=1 TIME=1 /home/kaden/wt-lloyd/target/release/examples/tmp_halo_iu4_oracle /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt`
+
+Reserve a build-free measurement phase with Main and HaloLF7. Perform GPU-alone, NPU-alone, overlapped, then GPU-alone again; preserve per-sample timestamps and prove actual overlap. Report gate and down GPU medians separately and NPU medians for the overlap window, not a long NPU loop average dominated by GPU idle intervals. No NumPy verification, compiler, decompressor, or unrelated heavy CPU work during this phase. Kill if GPU median slowdown exceeds 20%; report environmental drift and clocks, not just one aggregate percentage.
+
+Main pinned the current remote checkout (“halo LF admitted”) and prebuilt oracle for every contention run; no checkout or rebuild is permitted until windows complete. The cache is **lf4**, superseding the original lf3 command. Record binary SHA256 and emitted kernel names. Parent-reported alone reference is gate SET ref 2140 / LF16 1856 µs, down ADD ref 2153 / LF16 2248 µs. The admitted production choice is LF16 SET and the retained eight-wave ADD, so the indicative per-shape denominator is 1856/2153 µs, not LF16 for both. Actual same-window before/after medians govern the final contention claim.
+
+`HaloNpuTune` owns the definitive NPU windows and coordinates with Main and `HaloCpuProbe`; add a GPU+CPU+NPU window when evaluating three-way splits. Pairwise timings alone do not establish three-way power sharing. NPU sample timestamps must select actual GPU-overlapped intervals, not a long-loop mean that includes GPU idle time.
+
+## 4. Direct dispatch (B): source-grounded ABI and proof
+
+The header path in the assignment has moved: current AMD repository provides [`src/include/uapi/drm_local/amdxdna_accel.h`](https://github.com/amd/xdna-driver/blob/main/src/include/uapi/drm_local/amdxdna_accel.h) and a separate in-tree UAPI copy. Runtime compatibility must be checked against the installed Ubuntu driver/shim revision, not assumed from latest main.
+
+[`src/shim/host/platform_host.cpp`](https://github.com/amd/xdna-driver/blob/main/src/shim/host/platform_host.cpp) directly implements `create_ctx`, `config_ctx_cu_config`, `create_drm_bo`, `sync_bo`, `submit_cmd`, `wait_cmd_ioctl`, and timeline-syncobj wait. It shows XRT is a userspace policy/encoding layer over public ioctls. The independent libc-only execution proof below now confirms that no XRT userspace stage is required for the exercised artifacts.
+
+Critical known ABI details: CREATE_HWCTX receives QoS pointer, tile count and maximum operations/cycle, and returns context and timeline-syncobj handles; PDI CU configuration is a separate CONFIG_HWCTX(CU) operation, not an xclbin pointer passed to CREATE_HWCTX. CREATE_BO and GET_BO_INFO supply mmap offset and device address. Single-command EXEC_CMD puts the **command handle itself** in `cmd_handles` (not a pointer), while `args` points to an array of u32 BO handles and `cmd_count=1`. WAIT_CMD takes context, timeout in milliseconds (zero=infinite), and returned u64 sequence. Generic GEM_CLOSE and SYNCOBJ_DESTROY manage resources. PRIME import/export exists in the shim but its success for GPU BOs is a separate driver/memory-type gate.
+
+### Flat offline artifact generation and exact initialization
+
+The pinned `programming_guide/compilation_stages.md` documents that every JIT cache directory keeps `main.pdi`, `insts.bin`, `main_aie_partition.json`, `main_kernels.json`, `main_mem_topology.json`, lowered `input_with_addresses.mlir`, `main_core_<col>_<row>.elf`, the CDO init/ELF/enable blobs, and `main_design.bif`. The PDI is therefore **already a flat file**, not locked inside XRT. `specialized_design.compile(xclbin_path=...,inst_path=...,pdi_path=...)` explicitly emits the three files; in cache mode `specialized_design.get_pdi_path()` finds the PDI without recompilation. The old `.txt` path is hexadecimal words; distinguish it from binary `insts.bin` by content, not by filename alone.
+
+Observed example metadata in `hipx:/home/kaden/.npu/cache/280360844a039cedca472303` (illustrates the actual toolchain ABI; do not claim this one-core artifact is the full-array winner): AIE partition `column_width=8`, `operations_per_cycle=2048`; CU `MLIR_AIE:MLIRAIE`, functional=0, kernel id 0x901 mapped through PDI cdo_groups. Kernel argument byte offsets in the CU payload: opcode u64 at 0x00, instr u64 address at 0x08, ninstr u32 at 0x10, bo0 u64 at 0x14, bo1 at 0x1c, bo2 at 0x24, bo3 at 0x2c, bo4 at 0x34. The last pointers are **not naturally u64-aligned**; write bytes/u32 words, not an ordinary padded C struct. The metadata floors the BO count for firmware command-chain requirements; preserve zeroed unused argument slots.
+
+`src/shim/hwctx.cpp::xclbin_parser` maps each kernel's `kernel_id` through AIE-partition PDI CDO groups, records `functional`, `ops_per_cycle`, and column count. `hwctx::ctx::create` passes `num_tiles=column_count*device_core_rows` to CREATE_HWCTX. `src/shim/kmq/hwctx.cpp::hwctx_kmq` allocates cacheable/device PDI BOs, copies and syncs the PDI, and submits CONFIG_HWCTX(CU) with the handle and functional byte. `src/shim/kmq/pcidev.cpp::pdev_kmq::on_first_open` creates the device heap (initial 64 MiB, 64 MiB alignment; latest shim can grow it). `src/shim/buffer.cpp::bo_flags_to_type` selects DEV for CACHEABLE when that heap exists, SHARE for host-only data, CMD for execute buffers.
+
+Important version distinction: upstream Linux **v7.0 has no WAIT_CMD ioctl** (slot 9 is absent), whereas AMD's private header declares it. The installed in-tree path should wait on the CREATE_HWCTX timeline syncobj with `DRM_IOCTL_SYNCOBJ_TIMELINE_WAIT`, point=`EXEC_CMD.seq`. A WAIT_CMD ENOTTY on this driver would be an ABI difference, **not an XRT dependency**. Probe/record which wait actually works.
+
+### Executable composer slice B: raw-ioctl proof, no XRT at runtime
+
+**Ownership:** Main assigned `hipx:/home/kaden/npu-screen/raw-dispatch/` (supersedes the initial `raw-ioctl/` path; C was selected for a minimal self-contained ABI proof), optionally copied into a new standalone `wt-lloyd/tools/npu-probe/` outside workspace members. Do not edit production or the tuning worker's files. Skip formatters/linters/project suites. Obtain a device-time reservation through Main; host-side source reading and C compilation are independent of the expensive tuning build, but no NPU overlap and no CPU build during GPU timing.
+
+**Input/output contract:** consume the config-directory manifest and flat artifacts from slice A (§2); start using existing cached stock artifacts while A tunes, then re-run against the actual winner. Produce `raw_npu.c`, vendored minimal UAPI definitions or version-pinned header, an offline-only metadata exporter if necessary, binary, complete build/ldd/readelf logs, per-ioctl trace, deterministic input and both output files, SHA256/byte comparison, raw timing JSON with every sample. Extend the manifest with PDI filename/hash, `column_width`, `ops_per_cycle`, CU index/function/kernel id, payload byte span and typed argument offsets. The runtime binary must not dlopen XRT and must not launch Python or an XRT helper.
+
+**Exact structs on x86_64:** use fixed-width members, zero reserved fields, and `_Static_assert(sizeof/offsetof)`:
+
+| ioctl (DRM command-base + id) | structure size | field order |
+|---|---:|---|
+| CREATE_HWCTX (0) | 56 | u64 ext,ext_flags,qos_p; u32 umq_bo,log_buf_bo,max_opc,num_tiles,mem_size,umq_doorbell,handle,syncobj_handle |
+| DESTROY_HWCTX (1) | 8 | u32 handle,pad |
+| CONFIG_HWCTX (2) | 24 | u32 handle,param_type; u64 param_val; u32 param_val_size,pad |
+| CREATE_BO (3) | 32 | u64 flags,vaddr,size; u32 type,handle |
+| GET_BO_INFO (4) | 48 | u64 ext,ext_flags; u32 handle,pad; u64 map_offset,vaddr,xdna_addr |
+| SYNC_BO (5) | 24 | u32 handle,direction; u64 offset,size |
+| EXEC_CMD (6) | 56 | u64 ext,ext_flags; u32 hwctx,type; u64 cmd_handles,args; u32 cmd_count,arg_count; u64 seq |
+| WAIT_CMD (AMD private id 9 only) | 16 | u32 hwctx,timeout_ms; u64 seq |
+
+Mainline v7.0 QoS is six u32 values: gops,fps,dma_bandwidth,latency,frame_exec_time,priority. Latest private header adds user_start_col/reserved; use the installed driver's contract, with no speculative nonzero extension. CU config payload is `u16 num_cus; u16 pad[3];` then each `{u32 cu_bo; u8 cu_func; u8 pad[3];}`; size 16 bytes for one CU. BO types are SHARE/SHMEM=1, DEV_HEAP=2, DEV=3, CMD=4; direction TO=0/FROM=1. IOCTL encoding is DRM_IOWR, type 'd', base 0x40; calculate with the vendored macros rather than unchecked magic numbers.
+
+**Initialization and execution sequence:**
+
+1. `open("/dev/accel/accel0",O_RDWR|O_CLOEXEC)`; query DRM version/device metadata/firmware and identify KMQ. Read artifact manifest and flat PDI/instructions, validate byte sizes and hashes offline before device writes. All arrays/pointers and the device fd remain alive through completion.
+2. CREATE_BO(DEV_HEAP,64 MiB), GET_BO_INFO, reserve an appropriately 64-MiB-aligned CPU range and map the returned fake offset `MAP_SHARED|MAP_LOCKED` as the installed shim does. This must precede DEV BO allocations and context setup if the driver requires an existing heap. Do not put 89-MB weights in the 64-MB heap: A/B/C are SHARE BOs; PDI and instructions are small DEV allocations.
+3. CREATE_HWCTX with zeroed ext/UMQ/log/mem fields, QoS matching reference, max_opc from manifest, num_tiles=column_width*queried_core_rows (32 for eight columns/four compute rows). Keep returned context handle and syncobj. Do not call a PM4 doorbell or invent an UMQ for npu5/KMQ.
+4. CREATE_BO(DEV) for PDI, GET_BO_INFO; if map_offset is invalid, derive CPU pointer as heap_cpu+(pdi_xdna_addr-heap_xdna_addr), exactly as `buffer::vaddr`. Copy PDI, SYNC_BO TO (or explicitly replicate the installed shim's fenced cache-line flush if driver sync is unsupported; report which). CONFIG_HWCTX with CU record {pdi handle,function=manifest}.
+5. CREATE_BO(DEV) for instruction words and CREATE_BO(SHARE) for A/B/C; GET_BO_INFO and mmap SHARE BOs. Device arguments use xdna_addr when valid; SHARE may return INVALID_ADDR and then use the actual pinned user mapping VA, as `buffer::paddr` does. The CPU VA is not necessarily a raw physical address. Fill deterministic A/B; initialize C with a changing sentinel, **flush C before execution** so later CPU dirty-line eviction cannot corrupt device output; flush/sync A/B/instructions. Keep heap, PDI, instruction, input/output BOs resident throughout repetitions.
+6. CREATE_BO(CMD) and mmap the ERT command. Build `ert_start_kernel_cmd` with state NEW=1, opcode ERT_START_CU=0, type ERT_CU=3, extra_cu_masks=0, cu_mask=`1<<cu_index`. Real bit positions from installed `/usr/include/xrt/detail/ert.h`: state bits0–3, stat_enabled4, extra masks10–11, count12–22, opcode23–27, type28–31 (the header's comment says 27–31, but its actual 4-bit field starts at 28). Count is number of u32 words **after the 4-byte header**, including CU mask; not bytes and not `sizeof(struct)`. Populate the CU payload at manifest offsets: runtime opcode=3 for the ordinary mlir-aie transaction path, instr address, ninstr in **bytes for the pinned f50bef7 Python runtime**, A/B/C addresses, zero unused slots. Source `python/utils/hostruntime/xrtruntime/hostruntime.py:299–311` uses `insts.nbytes` and calls `kernel(3,insts_bo,insts_bytes,*buffers)`; older examples may pass words, so capture the exact working reference packet rather than infer the unit from the argument name. ERT_START_NPU=20 is a different instruction-data packet, not an interchangeable replacement.
+7. EXEC_CMD with hwctx, type=0, cmd_handles=the CMD BO handle value, cmd_count=1, args=pointer to u32 list of all used data/instruction BO handles, arg_count=list length; these handles ensure pinning/lifetime, while addresses live in the ERT payload. Save returned sequence.
+8. WAIT_CMD only if supported; otherwise generic timeline wait on returned syncobj/sequence, with a finite absolute monotonic deadline and WAIT_FOR_SUBMIT as needed. Record the exact wait flags. Check the ERT state for COMPLETED, not merely a successful wait syscall. SYNC_BO FROM C / installed equivalent cache invalidation, then byte-compare the **entire** C buffer with `c_xrt.bin`. A successful wait with ERROR/TIMEOUT is failure.
+9. For reuse, only after successful completion/read ownership restore: reset command state NEW, restore changing sentinel/output ownership if that is the test phase, update inputs if desired, repeat. Do not remap/allocate/reconfigure PDI inside the hot timing loop. Teardown after quiescence: destroy syncobj/context in driver-supported order (shim destroys syncobj then context), GEM_CLOSE buffers, unmap, close fd. Failed/timeout work must be quiesced by context teardown before freeing backing storage; never continue timing on a poisoned context.
+
+**Proof and timing commands:** compile a C binary using `cc -O2 -std=c11 ... -o raw_npu` with libc and headers only, no `-lxrt*`; save `ldd raw_npu`, `readelf -d raw_npu`, and while it runs verify `/proc/<pid>/maps` contains no libxrt. Run inside the fixed-memlock login shell. Use `CLOCK_MONOTONIC_RAW` before EXEC_CMD through completion-state check, excluding configuration/allocation and input/output sync; also separately report host-visible call including required output sync. At least ten warmups and 100 samples for full GEMM, ≥1000 for small/empty. Build a real minimal valid empty transaction or smallest known-good GEMM separately; report which, its operation count, and do **not** call a small GEMM time pure ioctl overhead. No arbitrary malformed 'empty' packet.
+
+Reference path may use Python/XRT only to generate/check `c_xrt.bin` offline. Compare raw→XRT bit-for-bit at both full shapes and the winner's slice; verify multiple deterministic inputs, change sentinels between correctness runs, and repeat after destroy/recreate to rule out stale output. Time from the same artifacts/layout as XRT. If a stage fails, preserve errno, ioctl fields, dmesg/firmware result if authorized, and contrast a captured same-artifact XRT sequence; work around private-WAIT absence with standard syncobj. A claim that XRT is fundamentally required needs a specific unreplicable signed/encrypted/init dependency; no such dependency is apparent in these sources.
+
+**Firmware boundary:** driver `aie2_message.c::aie2_config_cu` encodes CU function plus shifted PDI device address into MSG_OP_CONFIG_CU. `aie2_init_exec_cu_req` copies ERT CU payload and CU index to MSG_OP_EXECUTE_BUFFER_CF; current drivers may use a firmware command-list wrapper selected by feature bits. Driver owns mailbox, PASID binding, firmware loading/security and scheduling. Bare userspace reproduces the **UAPI command**, not those kernel-internal firmware packets.
+
+**Acceptance:** probe source exists, no-libxrt linkage/maps evidence, exact whole-output match, measured small and full/slice timings, reproducible commands and artifact hashes; or a stage-specific experimentally isolated blocker despite testing standard timeline wait and matching the installed source version. CPU reference generation and build work must never overlap GPU timing.
+
+### B result: direct public-ioctl dispatch works
+
+**Yes for the runtime feasibility question.** The standalone C proof `hipx:/home/kaden/npu-screen/raw-dispatch/raw_npu.c` executes the same flat PDI/instructions as XRT using libc and raw DRM ioctls only. This proves the OS/firmware path needed by Rust exists; it does not claim a Rust wrapper or production ownership integration has been implemented. `build.log` was read directly: `ldd` lists libc/loader/vDSO only and `readelf -d` has only `NEEDED libc.so.6`. Source inspection found no runtime Python/helper launch or XRT `dlopen`; the worker additionally observed zero XRT mappings in the running process.
+
+The successful lifecycle is DEV_HEAP 64 MiB/aligned CPU mapping → CREATE_HWCTX(QoS zero, max_opc 2048, num_tiles 32) → DEV PDI plus CONFIG_HWCTX(CU,16 bytes) → DEV instructions → SHARE A/B/C and CMD mappings → ERT_START_CU header **0x30010001**, CU mask1, opcode3, instruction **byte count**, three addresses and unused zero slots → EXEC_CMD → timeline SYNCOBJ wait with WAIT_FOR_SUBMIT → ERT COMPLETED. CREATE_HWCTX returned a syncobj; metadata query showed eight columns, four compute rows starting at row2. No WAIT_CMD ioctl was needed. Stock and A1-leader validation repeatedly matched all **35,651,584 output bytes**, including changed C sentinels and full context destroy/recreate; `winner/validate.log` was read directly.
+
+The flat artifact metadata and complete hashes are retained under the probe/tuning directories. Stock gate insts=142,544 bytes/PDI=105,072 bytes; A1 leader insts=142,544/PDI=105,584. The A1 leader's deterministic A/B and exact C matched the stock outputs. The tiny artifact is an actual **512×64×256 GEMM: 16,777,216 integer operations and 524,288 output bytes**, not an empty transaction.
+
+| artifact | warm / timed | raw submit→COMPLETED median / p90 µs | XRT-path median µs | whole-output result |
+|---|---:|---:|---:|---|
+| stock gate 17408×5120×512, 64/64/32 | 10 / 50 | 16345.271 / 17238.374 | 16300.5 | PASS, recreate PASS |
+| tiny 512×64×256 | 10 / 100 | 102.737 / 111.788 | 166.4, different harness batch | PASS, recreate PASS |
+| A1 leader gate, 64/64/64 | 10 / 50 | 8907.570 / 8989.913 | 9058.9 | PASS, recreate PASS |
+
+Raw sample JSONs `full/timed.json`, `tiny/timed.json` and `winner/timed.json` were read directly. The approximately +0.3% stock / -1.7% leader median differences are observations from separate batches, not a controlled causal claim that raw dispatch is faster. The tiny number includes real GEMM/data movement; do not call 102.7 µs pure ioctl overhead or an empty-dispatch floor. A first tiny submission after context recreation was about 2.5 ms, excluded from steady-state timing.
+
+**Observed synchronization deviation:** SHARE output `SYNC_BO FROM_DEVICE` returns EINVAL on this installed driver, while TO succeeds. The probe explicitly uses the installed shim's noncoherent cache-line flush + MFENCE path and then obtains exact output; FROM's failure is not ignored without an implemented visibility operation. In `raw_npu.c::run_cycle`, `sync_extra` measures readback flush, attempted FROM and diagnostic output for **warmups plus timed iterations**. Correct means are stock 88,511,784 ns/60 = **1.475 ms**, leader 83,747,115 ns/60 = **1.396 ms**, tiny 1,907,917 ns/110 = **17.345 µs**. An initial division by timed-only count was corrected. These are all-iteration readback means, not steady-state medians and not total host-visible invocation cost; input preparation, pre-submit sentinel/flush and configuration are also outside submit timing. GPU-consumer visibility for imported BOs is a separate C gate.
+
+The executed proof uses 50 full and 100 tiny timed samples as Main assigned, rather than the larger exploratory counts in the slice specification. It covers stock and A1-leader **gate** artifacts plus the tiny GEMM; raw down, later A2 winner and exact half-partial artifacts have not been asserted tested. This scope is sufficient to answer whether public ioctls can replace XRT userspace for execution, but does not validate a future different ABI/layout or import path. Existing command/BO lifecycle and sequence correctness must carry into any eventual Rust implementation; no production wiring is authorized.
+
+## 5. Bit-exact slice contract and ownership
+
+Read-only source: `kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip`, `IU4_FOLD_RN` (182–190), `vec_dot_i4_x128` (194 onward), `gemm_iu4_body` (246 onward). The integer dot is reset for each 128-K half. Unsigned weight codes 0..15 times signed activation codes -8..7 fit exact i32 (`|C_half| ≤ 15360`); float conversion of C_half and exact code sum is exact. Half headers convert exactly to f32, subject to the device's exceptional/subnormal rules.
+
+Required DAG, h0 then h1 in increasing 256-K group order:
+
+`t1=RN(sc*d); p=RN(t1*float(C_half)); t2=RN(zp*d); term=RN_FMA(t2,float(s),p); sum=RN(sum+term)`.
+
+No full-K integer reduction may replace these half dots. No reassociation, alternative FMA contraction, bf16 fold, or tolerance policy is authorized. The residual add/set output behavior must also match the chosen GPU entry exactly.
+
+**Pinned GPU floating-point mode was inspected offline.** The actual lf4 oracle bundle `/tmp/kc-halo-lf4/gfx1151/tmp_halo_iu4_lf_oracle.394ef4f2d727382c.hsaco` has SHA256 `f7088839fa8ac35fea63fea9a5985b322b84d000b97c2334ed22bff52c7d81e1`. `clang-offload-bundler --unbundle --type=o --targets=hipv4-amdgcn-amd-amdhsa--gfx1151` yielded a 122,032-byte ELF; its 64-byte `.kd` descriptors were decoded at `compute_pgm_rsrc1` offset48, matching `crates/redline/src/hsaco.rs`. LF16 SET has rsrc1 `0xe0af000b`; retained ADD occ3 has `0xe0af0017`. Every IU4 descriptor has round32 bits13:12=0, denorm32 bits17:16=3, denorm16/64 bits19:18=3, IEEE bit23=1. Per [LLVM's AMDGPU descriptor definitions](https://llvm.org/docs/AMDGPUUsage.html#kernel-descriptor), these mean **RNE, no input/output denormal flushing, IEEE mode enabled**. Full object disassembly had zero `s_setreg`, `s_setround` or `s_setdenorm` instructions. No GPU was executed for this inspection.
+
+Consequently zero and finite-subnormal cases cannot be dismissed as “diagnostic only” when admitting an exact AIE fold: the inspected GPU artifact preserves them. Keep normal, zero/signed-zero, subnormal and nonfinite result buckets distinct; no finite mismatch is excused merely because it is rare in a model. This static descriptor/ISA evidence strengthens the reference contract but is still not a direct same-input CPU/AIE-versus-GPU output comparison.
+
+Each call is a transaction: weights and activation codes/headers are immutable while either device reads them; GPU and NPU own disjoint output rows; NPU raw partials are private until all half data are complete and synchronized; downstream consumers may observe Y only after both row owners and the required epilogue complete. A timeout is not permission to reuse a BO or overwrite NPU-owned output while the device may still write it. No production fallback/replay design is introduced by this probe.
+
+Compiler/API source references: [Xilinx/llvm-aie](https://github.com/Xilinx/llvm-aie), `llvm/test/CodeGen/AIE/GlobalISel/legalize-float-binop.mir`; [Xilinx/aie_api](https://github.com/Xilinx/aie_api), `include/aie_api/detail/aie2p/mmul_fp32_fp32.hpp`. Their upstream source findings motivate the pinned Peano microprobe, not a substitution for it. Artifact/runtime source is [mlir-aie f50bef7](https://github.com/Xilinx/mlir-aie/tree/f50bef713297b7c5287a3ebbce964944354be11f), specifically `programming_guide/compilation_stages.md` and `python/utils/hostruntime/xrtruntime/hostruntime.py::XRTHostRuntime.run`.
+
+The preferred exact design is **GPU epilogue folding of per-128-half i32 partials**, not a full-K i32 GEMM and not an assumed hardware-f32 AIE fold. Xilinx/llvm-aie `llvm/test/CodeGen/AIE/GlobalISel/legalize-float-binop.mir` lowers AIE2P scalar `fmul` through `__mulsf3`; Xilinx/aie_api `include/aie_api/detail/aie2p/mmul_fp32_fp32.hpp` gates vector FP32 matrix operations behind `__AIE_API_FP32_EMULATION__`. These sources establish emulation paths, not IEEE FMA equivalence or measured throughput. A software-exact AIE fold is not impossible, but it must independently pass both numerical and critical-path gates. The GPU already supplies the pinned RN/FMA DAG. Its cost is transporting and reading the half-partial stream, not one ordinary GEMM C matrix.
+
+### Executable composer slice C: fold semantics and memory visibility
+
+**Owner and frozen interface.** Main assigned the sole root `hipx:/home/kaden/npu-screen/fold-probe/`, using `fold/` and `memory/` subdirectories (supersedes the initial `max-fold`/`max-memory` path names). Do not modify the production tree or A/B probe directories. Read A's manifest format from `max-tune` and B's raw-ioctl ABI contract above; consume a completed artifact, never one being regenerated. Coordinate NPU access with A/B through Main, and perform CPU-heavy compilation only in an explicitly announced CPU-build phase. No GPU execution is authorized in C's ordinary phase. A GPU-exported BO import check, if needed, belongs to the separately announced contention window and must be coordinated with Main.
+
+**C1: executable numerical microprobe.** Build an AIE2P kernel that reads tuples `(sc_bits,zp_bits,d_bits,C_half,s)` and emits bit patterns for `t1,p,t2,term,sum` after every half. Test (a) the ordinary scalar C++ f32 multiply/add and explicit FMA path supported by the pinned compiler, and (b) an API-supported vector f32 multiply/FMA path, if one exists on this target. Do not substitute bf16 matrix multiply, or silently call multiply-plus-add an FMA. If a spelling fails, inspect emitted LLVM/assembly and supported intrinsics; record the exact unavailable operation/link symbol instead of presenting a compile failure as a numerical result. Retain source, compiler command, LLVM IR, disassembly, ELF/PDI/instructions, input vectors, output bits and comparison JSON under `fold-probe/fold/`. Record effective rounding, saturation and denormal controls; disassemble to identify runtime helper calls and extra intermediate rounds.
+
+The host reference must be independent of AIE output: explicit IEEE round-to-nearest-even f32 multiply and add separated by volatile stores (or a verified software-float implementation), `std::fma` for the one fused operation, `-fno-fast-math -ffp-contract=off`, `FE_TONEAREST`, and CPU FTZ/DAZ disabled. Assert the host control state before generating expected bits. Convert f16 headers exactly, sign-extend activation nibbles, and compute C/s with scalar integer arithmetic. Exercise actual admissible code bounds (`C ∈ [-15360,13440]`, `s ∈ [-1024,896]`), zeros and signed zeros, cancellation, products at rounding boundaries, tiny/subnormal intermediates, and exponent-separated FMA operands that distinguish fused from unfused results; include 40-half and 136-half ordered accumulations. Separate production-valid finite-header cases from NaN/infinity diagnostics so a diagnostic-only mismatch is not falsely called a model-path failure. Use fixed-seed generated integer-code/scale vectors plus a small adversarial corpus, not output-size/nonempty assertions. Compare every emitted stage bitwise and record the first mismatch operands and expected/actual bits, counts by case class, and final-sum equality. A tolerance PASS does not satisfy this contract.
+
+For any bit-exact candidate, measure a resident-buffer repeated-fold kernel with 40 and 136 halves and at least the full 512-token tile width, retaining trace/clock evidence or explicit whole-dispatch timing. Separate software helper, vector math and data movement costs where supported; no simulated or extrapolated “AIE fold TOPS” claim. An exact scalar microprobe is not proof of an efficient GEMM-integrated fold. Abandon on-AIE folding as the primary design if any production-valid operand class differs, a necessary operation is unsupported, or the measured compute/dataflow cost cannot beat the GPU-epilogue critical path. Preserve results even when it is rejected.
+
+**C2: supported memory import and visibility probe.** First inspect the installed driver and run B's ordinary SHARE BO allocation/mmap/sync/dispatch path. Then export a small supported XDNA BO with `DRM_IOCTL_PRIME_HANDLE_TO_FD`, import it through a second independently opened accel fd using `DRM_IOCTL_PRIME_FD_TO_HANDLE`, establish supported CPU mappings, and pass the imported handle/address in a tiny real NPU read/write command. Use a deterministic CPU-written pattern and a device-produced transformation; verify the transformed bytes after terminal wait and FROM_DEVICE visibility. A successful fd import alone is not a data-coherence PASS. Record exporter/importer BO types, sizes, `GET_BO_INFO` addresses/map offsets, import errno, mmap errno, sync direction/results and actual bytes. Test supported `CREATE_BO.vaddr` host registration only after pinning the installed `va_tbl` ABI; never pass a raw CPU pointer using an ABI that expects a table. If no supported host-registration entry exists, report that separately, not as a failure of PRIME.
+
+Ownership sequence is CPU write → TO_DEVICE visibility → NPU access → terminal sequence completion → FROM_DEVICE visibility → CPU read; retain both BO handles, mapping, exported fd and context until device quiescence. A second round with new input patterns detects stale cache visibility. Imported PRIME mappings may require page faults before HMM validation; use the installed driver's intended mapping path. The mainline driver's `SYNC_BO` implementation may flush an entire normal BO even for a subrange: measure small and slice-sized buffers outside kernel time instead of assuming range-cost proportionality. Do not depend on coherent physical RAM or implicit reservation-fence synchronization without proving the actual producer/consumer API path.
+
+If Main schedules a GPU import check inside the contention phase, expose the supported libdrm `amdgpu_bo_export` operation in the standalone probe (Redline's current `DrmLib`/`GpuBuffer` do not expose an export wrapper), PRIME-import the resulting dma-buf into XDNA, and exercise both GPU-write→NPU-read and NPU-write→GPU-read with explicit completion and cache visibility; output a separate interoperability verdict. A CPU-mapped XDNA→XDNA export/import PASS is not evidence for amdgpu→XDNA mapping support. Unsupported GPU BO import leaves a staged copy path with measured bytes/cost, not a fake zero-copy claim. No production integration, graph capture, persistent replay, fallback or global synchronization abstraction is authorized.
+
+**Acceptance.** Deliver `fold-probe/fold/results.json` and `fold-probe/memory/results.json` with exact commands/artifact hashes, bitwise numeric findings (or precise compiler/runtime blockers), observed timing scope, import/coherence outcomes by producer/consumer pair, and explicitly untested paths. C is complete with a measured rejection of AIE folding and/or precise unsupported import behavior; it must not block the preferred GPU-epilogue design waiting for an unmeasured optimization. Skip all project suites, linters and formatters.
+
+### C scalar-path result: pinned FMA spelling does not link
+
+The host-side result was read from `fold-probe/README.md`. On pinned Peano 22.0.0.2026090701 targeting `aie2p-none-unknown-elf`, model version11500 and FP32_EMULATION enabled, the ordinary scalar fold lowers as follows:
+
+| per-half operation | observed lowering | evidence scope |
+|---|---|---|
+| t1, p, t2 multiplies | three `__mulsf3` softfloat calls | executable unfused probe matched sampled RN products, including ties/subnormals |
+| C and s int→f32 | two `__floatsisf` calls | exact admitted integer range; cost not isolated |
+| term FMA | external `fmaf`, undefined at AIE ELF link | no `fmaf` definition found in builtins/libc/libm archives |
+| final sum add | native `vadd.f` | sampled RN-even ties match; signed-zero differences observed |
+
+There are **six calls per half total**, not six multiply-helper calls: three multiplies, two conversions and the missing FMA. Object relocation counts double because the probe contains two entry points. The scalar entry has 132 static instructions with spills in this volatile-separated spelling. No dynamic cycle count or full-fold NPU throughput is claimed from that static count.
+
+The independent host reference asserts RNE and MXCSR0x1f80, passed 200,363 self-checks, and generated 650 tuples in 24 classes including 40/136-half chains. An integer-exact FMA mirror passed two million host comparisons against libm `fmaf`. Final device evidence is in `fold-probe/fold/results.json`: the correct aiecc `<aie_api/aie.hpp>` flow links both vector variants, but both tested `aie::mac(accfloat,f32,f32)` lowerings return zero output with ERT completed. Separate add/mul/broadcast variants return correct nonzero patterns. This rejects those generated MAC implementations, not every possible exact AIE algorithm.
+
+The executable unfused scalar/vector paths differ from the pinned fused DAG. The scalar multiply helpers match the sampled RN products; native add loses some negative-zero signs. Vector mul/add additionally loses mantissa bits near the smallest normal exponent (seven reported cases, e.g. `0x00c0be66`→`0x00c00000`) and has NaN payload/quiet-bit differences. Negative zero and finite subnormals remain contract cases; NaN diagnostics are not Infinity evidence (`0x7f800001` has exponent 255 and nonzero mantissa). Full chain sums also distinguish unfused accumulation from the fused reference. No executable candidate passed the exact gate.
+
+The reported unfused-chain timing has roughly 300 µs fixed dispatch and 0.3–0.5 µs per-half slope in that stage-writing microprobe. It is **not** an integrated GEMM-fold throughput measurement. The intended resident 136×512 repeated-fold experiment timed out even after removing events and baking counts; repeated same-design launches also needed a one-dispatch-per-process workaround for alternating correct/zero drains. Preserve these precise execution limitations: neither linked code nor one successful cold invocation proves a reusable runtime kernel.
+
+### C memory result and its accounting boundary
+
+`fold-probe/memory/results.json` reports successful XDNA→XDNA imported-handle execution with two fresh patterns: 35 benign tuples bitmatched, then 73 zero-class tuples had no stale fill residue. Verification used the **exporter's** CPU mapping/sync; imported-BO mmap returned EINVAL and importer-side sync/direct dma-buf mmap killed the probe session. These are observed failures, not a diagnosed driver root cause.
+
+The five-class UMA experiment found large-buffer GPU reads around 105–112 GB/s for hipMalloc/finegrained allocations, versus roughly 44–80 GB/s for host-coherent/noncoherent/managed classes; GPU writes were about 232–281 versus 140–228 GB/s. CPU reads on the device allocations were effectively unusable (0.01–0.10 GB/s), versus 6–9 GB/s single-thread and 38–55 GB/s at 16 threads for large host-visible buffers. These are measured microkernels, not memory-controller peak bandwidth. Keep GPU weights in their current fast allocation class; moving the full weight set to a slower shared class is not admitted.
+
+GPU→XDNA PRIME import succeeded at handle level only for hipMalloc/finegrained, but no usable CPU VA was provided and the executed read used address zero, producing no bitmatches. Host-visible classes failed export with return code 1. **No working GPU/NPU zero-copy path was demonstrated by this experiment.** INVALID is normal for an ordinary XDNA SHARE BO using CPU-VA arguments (§4), so INVALID by itself is not a universal proof of impossibility. The reverse XDNA-SHARE→GPU import direction was not exercised by C; Main assigned that separately to `HaloZeroCopy`. Admit a conditional zero-copy row only if real producer/consumer pattern and lifetime checks succeed in both needed directions.
+
+The quoted Xq 2.5 MiB **231.3 µs** and Y 8 MiB **266.5 µs** numbers are a **16-thread CPU `memcpy` benchmark between aligned host allocations**, not DMA or an end-to-end GPU↔NPU staging path. Their 497.8 µs sum is a reference copy-tax scenario, not a measured sidecar-transfer latency. Single-thread rates imply 69.4/310.6 µs for those same host-copy sizes. Actual GPU→staging→XDNA and return transfers, cache maintenance, expanded-activation preparation, and strided final-row publication must be charged separately. In particular down requires 8.5 MiB of expanded activations, not gate's 2.5 MiB. Do not overlap the measured CPU copy loop for free; only proven asynchronous DMA-engine transfers may enter the overlap model.
+
+### Layout and traffic contract for the preferred GPU epilogue
+
+For a tail slice `[row_start, row_start+M_slice)`, retain the existing GPU MQ4 allocation. A load-time NPU weight mirror is row-major `A_i8[local_row*K+k]`, obtained by unpacking unsigned MQ4 nibbles to nonnegative int8; its additional size is `M_slice*K` bytes. The immutable MQ4 headers remain the reference: each 256-K group is 136 bytes, with two f16 `(scale,zero)` pairs followed by 128 packed bytes. Extracted f32 header mirrors are optional and must be charged as extra storage rather than counted as free.
+
+Activations remain the already prepared `block_i4_128` values, not a second quantization: 72-byte records at `Xq[half*N+token]`, f32 d, exact i32 s, 64 signed packed-nibble bytes. The NPU-expanded B is column-major `B_i8[token*K+k]`, size `K*N`; both devices consume the same quantization generation. A one-time f32→int8 quantizer on the CPU is not a bit-exact substitute for the producer's codes. Reuse the prepared source, unpack on a measured path, and account for expansion plus visibility before NPU submission.
+
+Freeze the partial stream as i32 `P[(half*N+token)*M_slice+local_row]`, with `half=0..K/128` in ascending order. This gives contiguous row loads for a GPU epilogue and permits tilewise DMA scatter into a fixed half/token/row layout. A and B are reread as required by the actual AIE schedule, but the kernel must reset C every 128 K and publish **all** half dots; ordinary full-K GEMM timing is only a dense-compute reference. NPU weight zero headers and activation d/s are not applied to those integers.
+
+The GPU epilogue reads P in increasing half order and the original MQ4/Xq headers, initializes sum to +0, executes `IU4_FOLD_RN` once per half, and writes `Y[token*full_M+row_start+local_row]`. SET writes the final folded sum. ADD performs exactly one f32 residual addition to the previous Y **after** all folds; it must not initialize the fold accumulator from Y or add a residual per half. The remaining GPU row kernel also requires `full_M` as the output leading dimension; its current `m` parameter doubles as both row count and leading dimension, so simply shrinking m and offsetting Y would corrupt token strides.
+
+At N=512, exact i32 partial bytes are `4*M_slice*N*(K/128) = M_slice*K*N/32`. They are 40× the final f32 output for gate/up and 136× for down. The table uses decimal MB; the final column is only a **hypothetical** 50 GB/s write-only lower bound, not measured Halo bandwidth.
+
+| shape; M_slice | int8 weight mirror MB | partial stream MB | final f32 slice MB | partial write at 50 GB/s, ms |
+|---|---:|---:|---:|---:|
+| gate/up; 512 | 2.621 | 41.943 | 1.049 | 0.839 |
+| gate/up; 1024 | 5.243 | 83.886 | 2.097 | 1.678 |
+| gate/up; 2048 | 10.486 | 167.772 | 4.194 | 3.355 |
+| gate/up; 4096 | 20.972 | 335.544 | 8.389 | 6.711 |
+| down; 512 | 8.913 | 142.606 | 1.049 | 2.852 |
+| down; 1024 | 17.826 | 285.213 | 2.097 | 5.704 |
+| down; 2048 | 35.652 | 570.425 | 4.194 | 11.409 |
+| down; 4096 | 71.303 | 1140.851 | 8.389 | 22.817 |
+
+Either full shape has 91,268,055,040 integer operations and 1,426,063,360 bytes of exact partial output, or just **64 equivalent GEMM operations per partial-output byte**. Thus measured NPU write bandwidth `B_write` GB/s bounds this route by `0.064*B_write` equivalent TOPS before input traffic, submission, GPU reads or folding. A GPU epilogue physically reads the same partial bytes again even with successful zero-copy import; zero-copy avoids an extra staging copy, not these DDR writes/reads. The ordinary stock full-K GEMM's unique payload is only 127.402 MB gate/up and 108.528 MB down; its tiled schedule estimates 392.167 and 367.002 MB of DDR A/B/C traffic respectively, so unique-payload GB/s is not a DRAM throughput counter.
+
+For a same-stream GPU epilogue, an additional useful abandon test is the *saved GPU time*. With illustrative G_gate=2.0 ms, a 1024/17408 tail saves at most 0.11765 ms under ideal linear scaling; reading its 83.886 MB of partials within that budget alone would require 713.03 GB/s, before arithmetic or metadata. Down with G_down=2.2 ms requires 648.21 GB/s by the same calculation. These thresholds are independent of slice size under that linear model and are not measured device capabilities. If measured fold/read cost exceeds the actual measured GPU time saved, that split loses even if dense NPU GEMM is fast. Concurrent GPU epilogue/remaining-GEMM scheduling is a separate unmeasured design, not a free overlap assumption.
+
+Using Main's newer admitted 1856/2153 µs baseline from §3 instead of the illustrative 2.0/2.2 ms values raises these idealized serial-epilogue read thresholds to **768.35 GB/s gate/up and 662.36 GB/s down**. These are `full_partial_bytes/G_full`, derived arithmetic rather than a memory-bandwidth measurement. Final same-window GPU medians replace the indicative baseline in the decision table.
+
+### Exact source touchpoints for a conditional later implementation
+
+These are a plan, **not authorization to edit production**. Source positions are from the inspected worktree and may shift with the independently running LF16 work. The LSP server was rooted at `hipfire-beta` and returned no references for the external `wt-lloyd` file despite visible same-file calls; that tooling mismatch was reported. The lexical callsite list below is grounded, but a composer must obtain a correctly rooted LSP reference set before changing exported signatures.
+
+| existing owner/symbol | current callsites and required boundary |
+|---|---|
+| `kernels/src/block_i4_128_quant.hip::block_i4_128` / quantization helpers | Keep the 72-byte layout, signed-nibble codes, d and exact s unchanged. Expansion consumes producer output; it does not change quantizer selection or thresholds. |
+| CPU spillover probe `hipx:/home/kaden/npu-screen/cpu-probe/` | Main additionally assigned AVX-512 VNNI exact-half dots plus native f32 fold. No production API exists yet. Standalone CPU-array access is not proof of a CPU mapping of the runtime's actual GPU buffer allocation. |
+| `kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip::IU4_FOLD_RN`, `vec_dot_i4_x128`, `gemm_iu4_body` | Preserve per-half reset/order/DAG. Current `Y[col*M+row]` requires an independent full-output stride for a row-limited GPU launch. The epilogue uses the same fold definition, not a copied approximation. |
+| `crates/rdna-compute/src/gemm.rs::gemm_mq4g256v2_mmq_prequant_iu4` (19039) | Private common launcher; SET wrapper (19156→19165) and ADD wrapper (19168→19177) call it. Current full gfx1151 SET selects `_full_set_lf16_col_gfx1151`; ADD remains `_full_add_occ3_col_gfx1151`. Do not silently replace this newly measured GPU baseline with the old stock entry. |
+| `gemm_gate_up_mq4g256v2_wmma` (30240) | IU4 branch prepares once and invokes SET for both gate and up (30259 onward). Scope the split to gate/up selection, not every generic IU4 caller. |
+| `gemm_gate_up_mq4g256v2_wmma_iu4_prepared` (30398) | Calls `int4_mmq_prepared_ptr` then SET twice (30410–30414). Must consume the same prepared generation without launching the standalone quantizer. |
+| `gemm_mq4g256v2_residual_wmma` (31786) | Eager IU4 branch `ensure_int4_mmq_x` then ADD at 31803–31804 is the down/residual integration boundary. ADD commits residual exactly once, with no retry after partial output mutation. |
+| `crates/rdna-compute/src/dispatch.rs::ensure_int4_mmq_x`, `reserve_int4_mmq`, `int4_mmq_prepared_ptr` | Existing thin wrappers (2863,2891,2913) delegate scratch ownership. Reuse these APIs; do not introduce a second “ready activation” convention. |
+| `crates/rdna-compute/src/scratch.rs::Int4MmqReservation`, `Int4MmqPrepared::checked_ptr`, `ScratchState::ensure_int4_mmq_x`, `reserve_int4_mmq` | Prepared validity checks pointer, K, N and generation. Both reserve and standalone quantization bump generation. A raw pointer retained by NPU would escape this lifetime check unless the synchronous split transaction prevents scratch reuse through NPU completion. |
+| `crates/redline/src/drm.rs::DrmLib`, `device.rs::GpuBuffer` | Existing repr(C)/dynamic-libdrm style is useful precedent, not XDNA support. No current BO-export wrapper was found. The probe must first prove the actual allocation backend's export/import/coherence support; GPU VA cannot be passed to XDNA merely because both chips share LPDDR. |
+
+Generic IU4 users include other small/QKV projection paths around `gemm.rs` 28540 and 29128. They remain GPU-only. Do not route them through a generic launcher-wide NPU selector or change their scratch/replay contract while targeting the two measured shapes.
+
+### Transaction ownership and invariants
+
+Use the existing synchronous eager call as the ownership boundary, not a background NPU worker that outlives the activation reservation. Artifacts/weight mirrors are immutable per model/device generation; the command, instruction/PDI BOs, input mapping and partial output have explicit in-flight ownership. A minimal first integration could overlap NPU execution with the remaining GPU GEMM within one host call, while waiting for NPU completion before enqueueing the GPU epilogue; that blocks the host and its cost must be measured.
+
+| transition | invariant before | invariant after / release condition |
+|---|---|---|
+| unloaded → artifact ready | No device may reference absent or regenerating artifact bytes. | Hash-matched manifest/PDI/instructions and resident immutable weight slice; device identity, ABI and layout fixed. No runtime Python/XRT artifact generation. |
+| scratch reserved → producer ready | Prepared generation is owned by the active producer; CPU/NPU must not read in-flight GPU writes. | Existing GPU producer completion/visibility is observed, K/N/pointer/generation validated, and exact expanded B plus needed headers are published. Host waits/expansion are charged. |
+| ready → split submitted | Input codes, headers and weights cannot mutate; full output stride and disjoint ranges are known. | GPU owns rows `[0,row_start)`; NPU owns private P for `[row_start,full_M)`, not final Y. Inputs/BOs/mappings/context remain pinned. Each device has its own completion token. |
+| NPU submitted → partial ready | A successful submit or signaled wait alone does not prove valid output. | Correct terminal ERT state and sequence plus FROM_DEVICE/consumer visibility; all P halves valid. Command may be reused only after terminal retirement. NPU input ownership can be released after completion, but GPU/epilogue still retain headers. |
+| partial ready → epilogue queued | Remaining GPU GEMM may be in flight; same-stream ordering protects prefix completion. | GPU epilogue owns only tail Y and reads immutable P/MQ4/Xq. It executes the pinned ordered fold and one final SET/ADD operation. P and headers remain alive through the GPU epilogue fence. |
+| epilogue complete → publish | Downstream consumers must not observe a partially assembled tensor. | Prefix and tail are both valid; ordinary GPU stream dependencies can expose Y. Scratch, partials and command buffers may be reused only after their final reader/writer completes. |
+| submit/wait/epilogue error → poisoned | Either device may have partially written output; ADD prefix may already include residual. | Suppress downstream use of Y, report the error and retain resources until proven device quiescence. Do not automatically rerun whole ADD, free timed-out storage, or overwrite rows still owned by hardware. Context teardown is a release path only when its actual driver semantics prove quiescence. |
+
+No change to KV cache or GDN recurrent state is needed or permitted: only the projection output transaction is in scope. A later graph/replay design would need captured external completion and resource-lifetime semantics; until separately designed and measured, `replay.is_recording()` and `graphs.capture_mode` keep the existing GPU-only path. Exact gfx1151 plus the observed npu5 device and supported eager shapes are the only admission set; gfx1100, gfx12, missing/unsupported NPU, decode, FA2, GDN and bandwidth-bound kernels remain unchanged. An unsupported device is selected away **before** output mutation, not handled by a post-submit fallback.
+
+### Frozen later composer slices and gates
+
+If and only if §6's measured decision justifies production work, the following slices can start independently from the frozen layout above. Their shared integration owner is the runtime composer; no sibling edits `gemm.rs`, `dispatch.rs` or `scratch.rs` concurrently.
+
+1. **Half-dot artifact composer:** own only offline NPU kernel/artifact inputs. Accept row-major `A_i8`, column-major `B_i8`, fixed M_slice/K/N and produce `P[(half*N+token)*M_slice+row]` exact i32. Reset every 128 K, retain all halves, emit manifest offsets and artifact hashes, and validate against scalar integer dot including extreme signed-code cases. Measure this actual partial-output kernel; full-K dense timing cannot substitute. No runtime interface changes.
+2. **GPU kernel composer:** own only the existing IU4 HIP module. Separate output leading dimension from dispatched rows without altering untouched full-M behavior; add a tail epilogue consuming the frozen P layout and original headers. Keep one shared `IU4_FOLD_RN`, exact h/group order and SET/ADD contract. Observable gate is bitwise whole-Y equivalence on both shapes, nonzero row offsets, distinct token strides, zero/extreme code cases and a nonzero ADD residual. Existing relevant regression tests may change only if contract changes; otherwise use a throwaway executable oracle.
+3. **Raw backend composer:** only after B proves ABI and C proves required memory path, translate the minimal measured lifecycle into a bounded Rust owner with resident artifacts/BOs, command sequence and terminal-state handling. Frozen operation is submit an already prepared A/B/P transaction → wait for its exact sequence → expose completed P; it does not own quantization, GPU scheduling, shape policy or fallback. Validate no-XRT linkage/maps and output parity with the same P artifact; stress destroy/recreate and stale-output sentinels. This slice does not invent a generic heterogeneous executor.
+4. **Runtime integration composer (dependent on 1–3):** sole owner of the runtime callsites above. Preserve prepared-handle generation checks and eager-only architecture guards; prepare once, publish, launch disjoint GPU/NPU work, join, enqueue epilogue, and retain P through the last GPU reader. Choose only measured legal slices using measured critical-path costs. Verify full operation including preparation/sync and output parity, then pp2048 if explicitly authorized; no optimistic linear extrapolation accepted as a runtime win.
+
+Reviewers own the final veto gate: artifact ABI/version fidelity, bitwise numerical parity, scratch/input/output lifetime, timeout quiescence, actual two-device visibility, untouched cross-architecture/replay behavior, and performance claims scoped to measured phases. An unmeasured kernel/dataflow idea is abandoned rather than promoted if it cannot produce a supported artifact, a distinguishable bottleneck improvement, or a measured split critical-path win after preparation and fold. This does not turn a bounded experiment's rejection into a universal theorem about all future kernels.
+
+## 6. Verdict, projection, and ordered implementation gates
+
+**Feasibility: yes—bare public-ioctl NPU dispatch is proved for the exercised artifacts (§4). Shipping: not now.** Measured sustained CPU spillover is rejected below, and no bit-exact AIE fold candidate passed C. The user-approved design direction is an **off-by-default gfx1151-only hardware-precision sidecar** with its own KLD and `serve_harness` gate (§7), not replacement of the GPU reference. Tune's final quiet A2/A4/contention report determines the dense-throughput park line; the 13.09 TOPS intermediate result is not a final tuned ceiling.
+
+### Exactness is a decision boundary, not a tuning parameter
+
+The default remains the pinned bit-exact GPU IU4 contract. Dense NPU TOPS does not admit a numerically different projection. No bit-exact NPU spillover path is justified for deployment: per-half i32 output has the quantified DDR/read/fold cost, while the tested on-AIE exact fold spellings failed. The explicitly opt-in hardware-precision design in §7 is a separate numerical policy; it must never silently change GPU-owned rows, other devices, or flag-off behavior.
+
+| option | numeric contract | costs that must be paid | admission gate |
+|---|---|---|---|
+| GPU-only current IU4 | pinned DAG | existing measured GPU work | present reference/default |
+| NPU half dots → GPU epilogue | exact i32 halves and existing GPU DAG | expanded A/B, half-partial DDR write, GPU reread, ordered fold, host/device visibility and join | real partial-output kernel and total split critical path must beat the actual GPU baseline; the ~713/648 GB/s serial-epilogue read thresholds are strong rejection tests, not measured NPU bandwidth |
+| NPU half dots + software-exact AIE fold | potentially exact, not proved | scalar/emulated FP32 helpers, header transfer, per-half ordered dependency, AIE local memory and final f32 output | C bitwise parity on admitted operand classes, then integrated fold/kernel timing; scalar microprobe PASS alone is insufficient |
+| NPU hardware-precision/emulated-vector fold | explicitly separate from pinned GPU DAG | metadata, local fold compute, final f32 output, expanded inputs, copies/visibility and final GPU scatter/ADD | user approved this opt-in design direction; still requires reusable actual kernel, per-model KLD + serve_harness certification and measured net speedup |
+| CPU VNNI half dots + native FP32 fold | exact DAG is representable using non-saturating i32 dot, separate RN multiplies/add and native FMA | integer/FP instruction issue, headers/cache traffic, expansion, CPU mapping/visibility, final output, plus shared APU power/bandwidth | bitwise probe and actual GPU contention at 4/8/16 threads; native FMA removes AIE emulation but does not make the fold cost zero |
+
+The relaxed NPU option is **approved as a design, not implemented or certified**; no KLD or serving-quality result exists. Hardware precision is not synonymous with IEEE FP32 FMA. The sidecar must identify the actual arithmetic policy/artifact hash, consume the existing quantization rather than introduce another quant, and fail admission without its model-specific numerical certificate. A future candidate that proves the exact contract can be classified as exact; present hardware-precision results cannot inherit that label.
+
+### Measured CPU spillover: reject for this implementation
+
+Evidence read directly: `hipx:/home/kaden/npu-screen/cpu-probe/README.md` and `cpu_gemm.cpp`. Standalone AVX-512 VNNI (`_mm512_dpbusd_epi32`, unsigned weights × signed activations), scalar RN multiplies/add and one `fmaf` per half matched its scalar-DAG reference bitwise on three synthetic seeds, SET/ADD/nonzero row slices, zero/max/negative-d cases. Runtime MXCSR was `0x1f80` (RNE, FTZ/DAZ off). This does **not** directly compare the same CPU output against a GPU output, and runtime GPU↔CPU allocation mapping/visibility remains untested.
+
+Resident compute medians (fold included, preparation excluded) were gate full 156.25/89.93/55.45 ms at 4/8/16 threads, or 0.584/1.015/1.646 TOPS; down full at 16 threads was 51.88 ms / 1.759 TOPS. Small-slice medians below preserve full-M output stride. They include per-call sysfs topology discovery, thread creation/join and worker scratch allocation; they are not an intrinsic CPU arithmetic floor or a tuned persistent-thread-pool ceiling.
+
+| shape; CPU rows | 4 threads, ms | 8 threads, ms | 16 threads, ms |
+|---|---:|---:|---:|
+| gate/up; 128 | 2.14 | 0.90 | 0.71 |
+| gate/up; 256 | 3.20 | 1.88 | 1.27 |
+| gate/up; 512 | 5.46 | 2.75 | 1.92 |
+| down; 128 | 4.38 | 2.71 | 2.38 |
+| down; 256 | 7.92 | 4.63 | 2.99 |
+| down; 512 | 20.43 | 8.34 | 5.52 |
+
+The clean contention window used the pinned oracle SHA256 `da87a0bce21f5663838e5a02e433aff5bf7894b978f20943e2ff2c1afd4970db`, cache lf4, and emitted the ref/lf16 SET/ADD kernel names. Before/after alone gate LF16 SET was **1855 µs**, down retained ADD **2155 µs**. GPU timings below are three-oracle medians inside a sustained full-gate CPU loop; CPU rates come from loop heartbeats during that window.
+
+| CPU threads | GPU gate LF16 µs (slowdown) | GPU down ADD µs (slowdown) | concurrent CPU TOPS | optimistic combined gate µs | loss vs GPU-alone 1855 µs |
+|---|---:|---:|---:|---:|---:|
+| 2 | ~1989 (+7.2%) | ~2277 (+5.7%) | ~0.30 | 1976 | +6.5% |
+| 4 | 2122 (+14.4%) | 2410 (+11.8%) | ~0.48 | 2099 | +13.1% |
+| 8 | 2361 (+27.3%) | 2675 (+24.2%) | ~0.85 | 2310 | +24.5% |
+| 16 | 2786 (+50.2%) | 3188 (+47.9%) | ~1.43 | 2669 | +43.9% |
+
+The optimistic combined column adds the measured concurrent gate GPU+CPU rates and ignores preparation, finite row tiles, dispatch and visibility. Even that favorable model loses: GPU throughput lost is about **11.0–12.9×** the CPU throughput gained. Comparing 1976 µs against the already-throttled 1989 µs instead of the real 1855 µs baseline would falsely report a benefit; that error in the initial worker README was identified and sent back for correction. Recommended CPU row count is **zero for both shapes** in this measured design, not “up to two threads.” This is a sustained shared-APU contention result; attribution specifically to power rather than bandwidth/clocks requires corresponding counters, and untested transient/persistent-pool kernels are not universally disproved.
+
+Preparation accounting was corrected after source review: the original `run_bench` called `unpack_all` once for both W and X and mislabeled `median + pack_ms/iters` as “e2e.” The revised README calls that repeated-same-X value `TOPS_amort`. A separate two-iteration measurement charged fresh X each invocation with static W resident: gate full 16t W=61.43 ms, X=12.88 ms, compute=56.61 ms, steady=69.49 ms / 1.313 TOPS; down full 16t W=42.72 ms, X=32.01 ms, compute=53.05 ms, steady=85.06 ms / 1.073 TOPS. At Ms512/4t, X expansion was 8.95 ms gate and 45.69 ms down, with complete compute+X 14.36 and 61.31 ms. These are this scalar expansion implementation, not a memory-bandwidth ceiling. Excluding preparation already rejects CPU spillover; corrected accounting makes it worse. The worker README now also correctly compares the projected split to GPU-alone and recommends CPU rows=0.
+
+### Three-way static split including CPU
+
+Main assigned `HaloCpuProbe` the standalone AVX-512 VNNI/FP32 probe under `cpu-probe/`; its measured 2/4/8/16-thread sustained-contention results above reject CPU participation for this design. The three-way choice therefore collapses to **GPU+NPU with `M_c=0`**, or GPU-only if the selected exact/opt-in NPU candidate fails its gates. `HaloNpuTune` owns definitive tuned NPU contention. A new proposal that re-admits CPU would require actual three-way measurements: pairwise slowdown percentages cannot establish three-way behavior.
+
+Freeze row ownership for a three-way candidate: GPU `[0,M_g)`, CPU `[M_g,M_g+M_c)`, NPU `[M_g+M_c,M)`, with `M_g+M_c+M_n=M` and each device's measured tile constraints. CPU executes the same h/group ordered fold and writes only its final row slice using the full output leading dimension. CPU ADD reads the original residual only after its producer is visible and adds it once after folding. Shared A/B/header preparation is charged once only if the actual layouts and ownership permit sharing; distinct CPU-packed and NPU-expanded mirrors are separate costs.
+
+For each shape and fixed CPU thread count, enumerate the measured legal row allocations, including `M_c=0` and `M_n=0`. Let `T_g(M_g; c,n)`, `T_c(M_c;g,n)` and `T_n(M_n;g,c)` be observed concurrent times, not ideal full-shape fractions. The critical path is `T_prepare_nonoverlap + max(T_g,T_c,T_n) + T_join_nonoverlap + T_NPU_epilogue_nonoverlap`, with dependencies explicitly scheduled rather than overlapping a consumer with unpublished inputs. CPU timing includes its final fold; the preferred NPU timing includes partial output and its GPU epilogue separately. If any exact NPU candidate fails its measured gate, the optimum is evaluated with `M_n=0` rather than forcing all three devices active.
+
+Report a per-shape table with selected `(M_g,M_c,M_n)`, CPU threads, preparation/visibility, measured concurrent device times, NPU fold/read cost if present, complete critical-path time, GPU-only baseline and uncertainty/drift. Use zero CPU or NPU rows when that wins. A shared 700 tok/s projection is conditional on these kernel-level times; it is not a measured pp2048 result, and a static split selected from synthetic resident-array probes is not yet a proven runtime configuration.
+
+For a preliminary linear model only, let G be full GPU time, D full-equivalent NPU time, s_g GPU slowdown fraction, s_n NPU slowdown fraction, H fixed publish/submit/join cost, and f NPU row fraction. Then `T(f)=max((1-f)*G*(1+s_g), f*D*(1+s_n))+H` before non-overlapped fold/copy cost, with `f*=G*(1+s_g)/(G*(1+s_g)+D*(1+s_n))`. Real choices must enumerate legal M-slices and measured NPU times, not rely on linearity.
+
+For supplied 700 tok/s pp2048 and 78% GEMM share, use `R=700/(0.22+0.78*q)`, where `q=(1088*T_gate_new+512*T_down_new)/(1088*T_gate_old+512*T_down_old)` uses consistent baseline units. Oracle timings from another run are not an absolute reconstruction of the 700 tok/s campaign; report the normalization explicitly. FA2, GDN recurrence, bandwidth-bound kernels, decode, other architectures and production flags remain non-goals.
+
+Implementation remains contingent on measured gates and reviewer veto. The exact alternative's source mappings/interfaces remain in §5; the selected opt-in hardware-precision design is frozen below. This investigation makes no production edits and does not authorize automatic NPU enablement.
+
+## 7. Selected future design: opt-in gfx1151 XDNA sidecar
+
+### Admission, artifacts, and existing-code boundaries
+
+**Hard scope:** exact GPU architecture string `gfx1151`, detected compatible npu5/XDNA2 ABI, single GPU/model (`pp=tp=1`), admitted eager MQ4G256V2/block_i4_128 prefill gate/up and down shapes only. No gfx1201 or gfx1100 NPU dispatch path, no FA2/GDN/bandwidth kernels, decode, QKV generalization, graph capture or retained replay. The default path must not open `/dev/accel`, load PDI, allocate mirrors, or expand an extra activation stream. An explicit opt-in on an unsupported device/model fails admission with a useful reason rather than silently selecting a different numeric policy.
+
+1. **Use the existing config schema.** Add process-scoped experimental `kernel.npu_spillover`, compatibility spelling `npu_spillover`, env `HIPFIRE_NPU_SPILLOVER`, default false, using `process_bool_field!` in `crates/hipfire-config/src/lib.rs` beside the existing IU4 opt-in (macro 547, `FIELDS` 619, IU4 entry 2141). Snapshot it through `ProcessConfig::legacy_value` (3206) and `RuntimeConfig::from_process_config/from_lookup` (`crates/hipfire-runtime/src/config.rs:114–118`), never by hot-path environment reads. A registry artifact declaration is capability data, not permission to switch this process flag on. Require the admitted IU4 prepared-activation route for participating GPU rows.
+2. **Reuse registry `Sidecar`.** Add `ModelEntry.xdna: Option<Sidecar>` beside existing optional carriers in `crates/hipfire-registry/src/lib.rs:178`; extend `RegistryV1::validate`'s sidecar walk (398–416), existing CLI pull walk (`crates/hipfire-cli/src/main.rs:1721`), shared-file-aware removal (`rm_with_registry`, 1945), and model identity resolution (`registry_entry_for_path`, 2894). Declare only certified model entries in `registry/v1.json`; do not basename-match arbitrary external files. For XDNA admission, require verified model and sidecar hashes even though the generic `Sidecar.sha256` type is optional.
+3. **Freeze one offline archive interface.** A `.xdna.zip` sidecar uses stored ZIP entries: `manifest.json`, per-profile `main.pdi`, `insts.bin`, plus the source xclbin as provenance if retained. Runtime consumes the flat PDI/insts, not XRT's xclbin APIs. Manifest version 1 binds model/quant hashes; `gfx1151`/npu5/ABI/toolchain identity; arithmetic-policy id; tensor role and layer/tensor identity; `(M,K,N,row_start,row_count)`; core/L2 geometry; exact argument byte sizes/offsets; payload hashes; and model-specific quality/performance certificate ids. All offsets/ranges and payload sizes are checked once at load. Artifact presence does not prove quality or speed.
+4. **Carry admission through the existing load transaction.** `load_params` (`hipfire-cli/src/main.rs:3000`) resolves the registry sidecar using the established model-dir/canonical-identity rules, then the daemon projects it with other load parameters. `hipfire_loader::admission::admit_source`/`SourceAdmission` (`admission.rs:453/28`) perform CPU-only identity/policy checks before prior-model destruction. Pass the admitted descriptor through `LoadCtx` (`hipfire-runtime/src/loader_api.rs:61`) and `load_admitted_with_gemma4_drafter` (`hipfire-loader/src/lib.rs:2541`). `Qwen35Carrier` and the free function `load_bundle` (`hipfire-arch-qwen35/src/carrier.rs:49`, constructing `Qwen35Bundle`) are the current model-load integration boundary, not a new daemon architecture switch.
+
+**Quant/data contract:** immutable GPU weights remain MQ4G256V2 in their existing fast allocation. At model load, unpack only certified NPU-owned weight rows to int8 codes 0…15 and extract exact scale/zero headers; this is a slice copy of the existing quant, not re-quantization or an alternate model file. Activations are dynamic: consume each newly prepared `block_i4_128`, expand the same signed codes −8…7 and preserve its d/s headers per call, once for a shared gate/up preparation. Do not describe activation copying as load-time-only. The NPU performs exact bounded i32 dot segments over 128 K, then its declared hardware-precision fold in h0/h1/kb order and emits only final f32 projections. A working unfused mul/add spelling is a candidate—not the failed MAC lowering. SET scatters those projections into its tail rows; ADD performs one residual addition after the completed projection, preferably in the final GPU scatter, never by initializing the fold from residual Y.
+
+The dense winner is **not yet this quantized fold kernel**. Persistent f32 accumulation plus an i32 half-dot tile doubles C storage; at m128/n64 those two arrays alone consume 64 KiB, leaving no L1 room for A/B/stack. Re-tile or reuse storage only with a proven data-lifetime schedule, include metadata and conversions, and remeasure. Neither the 13.09 TOPS dense result nor a scalar 136-half microprobe prices this integrated kernel.
+
+### Rust crate and transaction ownership
+
+The future `crates/hipfire-xdna` crate is the narrow Linux raw-ioctl boundary: `XdnaDevice` owns accel fd/context/timeline; `LoadedKernel` owns validated PDI/instruction BOs; `Bo` owns handle/mapping/visibility rules; `Submission` owns a sequence and pins all participating allocations until terminal completion. Frozen operations are `open`, `load_kernel`, `allocate`, `publish`, `submit`, `wait`, and explicit quiescent teardown, implementing §4's installed ABI/ERT layout. It depends on neither XRT nor Python, contains no runtime compilation, and does not know transformer/KV/GDN semantics. Its result is completion plus readable output ownership, not a HIP event fabricated from an unrelated syncobj.
+
+Use a single model-bound `XdnaModelSession` owned by `rdna_compute::Gpu` (`dispatch.rs:648`) only on admitted gfx1151 loads. It owns immutable row mirrors, registered tensor identities and model generation, reusable submission BOs and bounded staging slots; no per-GEMM heap allocation or thread creation. The loader installs it only after successful model construction and detaches/quiesces it before freeing its weights in `hipfire_loader::unload_model` (lib.rs:4081); failed load construction drops the new owner through the existing rollback path. It must never survive into a different model merely because a GPU pointer was reused. Model/layer/tensor identity plus generation, not a raw pointer alone, selects a row mirror.
+
+| transition | owner and invariant |
+|---|---|
+| Disabled → admitted asset | CPU loader validates opt-in, exact architecture, registry/model/artifact hashes, shape and numeric certificate; GPU model still owns all normal state |
+| Asset → model ready | session owns all PDI/BO/mirror allocations and successful configuration; failure frees only the new transaction, never publishes a partial model |
+| Prepared → submitted | exact prepared-X generation pinned; weight/header mirrors immutable; input copy/visibility complete before NPU consumption; GPU and NPU row ranges disjoint |
+| Submitted → NPU complete | `Submission` retains every BO/address until terminal sequence and ERT completion; CPU cannot overwrite X/staging or reuse command memory |
+| NPU complete → GPU visible | charge output synchronization and real transfer; stage f32 projection and scatter/ADD only its rows using full-M stride; original residual producer must be complete |
+| Both outputs → published | downstream gate/up activation or next layer sees a complete operation only after both row owners finish; shared gate/up X remains pinned through both projections |
+| Error/unload → quiescent | poison the active invocation; no overlapping GPU retry or stale-output publication; resolve/cancel/reset through supported driver semantics before unmapping BOs and clearing the model generation |
+
+The exact source callsites in §5 remain the integration points: gate/up eager and prepared entrypoints plus residual-down, with their existing prepared-handle checks. Keep the full-M output stride fix even though row ownership is smaller. There is no capture/replay support by implication: that is a separate state-machine admission and remains out of scope.
+
+### Copy-charged static row split and park line
+
+For each artifact-supported shape define `O=2MKN`, `G` as the **GPU-alone** full-shape time, `a=G*(1+s_g)` as GPU full-equivalent time under measured overlap, `D=O/R_n` as measured NPU full-equivalent service time, and `f=M_n/M`; include NPU slowdown in `D`, never add headline independent rates. `H` covers remaining non-overlapped publish/join/final-scatter time. Let `C_x(K,N)` and `C_y(M_n,N)` be the actual path's copy/visibility costs.
+
+| memory path | critical-path model | admission |
+|---|---|---|
+| staged copies, no proven overlap (default) | `C_x+C_y+max(a*(1-f),D*f)+H` | charge CPU work and its interference; host memcpy microbench is not a complete transfer measurement |
+| staged via proven independent DMA engines | `max(a*(1-f),C_x+D*f+C_y)+H` | only after actual async dependency/engine and contention measurements; never grant CPU memcpy free overlap |
+| conditional shared Xq/Y-slice only | `max(T_gpu_rows,T_npu_rows)+T_visibility+T_scatter/join` | requires successful HaloZeroCopy producer/consumer and lifetime proof; GPU weight placement stays unchanged |
+
+With zero copy tax and linear rates only, `f*=a/(a+D)`; with a fixed tax C inside a proven DMA-overlapped NPU chain, `f*=(a-C)/(a+D)` clamped to [0,1]. Real scheduling enumerates the **measured legal artifact row counts**, including zero; it does not round a formula to an unbuilt/unmeasured profile. Use measured A4 gate/down curves separately. Dense rates are an upper bound until the integrated hardware-fold service curve exists.
+
+For illustration only, with no contention and GPU baselines gate1855/down2155 µs, dense NPU rates 15/20/25/30 TOPS imply no-copy ideal gate rows 4067/5031/5865/6594 and down rows 1339/1642/1900/2123, before legal-row rounding. The 497.8 µs **host-copy reference** reduces gate's ideal DMA-overlapped rows to 2976/3681/4291/4824. These are analytical design points, not selected runtime splits.
+
+**Hard park line:** sustained tuned dense throughput **below 15 TOPS at the target shapes ⇒ park this sidecar direction**, retain GPU-only behavior and the raw-dispatch feasibility result. At or above 15 TOPS, still park any profile whose complete copy/fold/contention critical path fails to beat GPU-alone beyond drift. For serial fixed copy tax C and zero other overhead, the continuous model additionally requires `R_n > O*C/[G*(G-C)]` when there is no slowdown. Gate's 497.8 µs reference tax raises that lower bound to **18.05 TOPS**; 15 TOPS predicts 1.919 ms versus GPU-alone1.855 ms even before extra fold/scatter cost. This is a conditional arithmetic bound using a host-copy proxy, not measured DMA or a universal hardware threshold. Down's larger activation transfer and each actual output-slice size require their own measured costs.
+
+### Future independently executable composer slices (not dispatched here)
+
+The contracts above are frozen before implementation. Every composer skips formatters/linters/project suites; Main owns shared validation and reviewers own final veto.
+
+1. **Artifact/kernel owner:** offline sources and `.xdna.zip` only; consumes existing quant codes/headers, produces final f32 NPU-owned projections under named hardware policy and manifest v1. Prove integer segment parity, actual hardware-fold behavior, repeated warm reuse and full service time. Do not substitute the dense i32 artifact or the timing microprobe.
+2. **Raw Rust owner:** new `hipfire-xdna` only; implement the typed lifetime/API boundary above against the measured ABI. Reproduce real output bytes, fresh contexts and repeated submissions with libc/libdrm only; test timeout ownership without assuming that closing a handle instantly quiesces hardware. No model or GPU dispatch edits.
+3. **Control-plane owner:** `hipfire-config`, runtime config, `hipfire-registry`, `registry/v1.json`, CLI sidecar pull/remove/identity and load-parameter projection only. Consumes manifest v1 and exposes an admitted sidecar descriptor; preserves process-snapshot precedence, default-off behavior and existing sidecar conventions. No NPU execution.
+4. **Integration owner, after 1–3:** sole owner of admission/load lifecycle, `Gpu` session, preparation/staging/scatter and the exact gate/up/down callsites. Prove no stale prepared generation, complete row coverage, full-M stride, single residual add, failure non-publication, unload quiescence and untouched gfx1201/gfx1100/flag-off paths. Uses measured transport capabilities, never a fictitious zero-copy handle.
+
+**Numeric gate:** evaluate NPU-owned rows separately and the final model against the same GPU baseline, artifact, prompts/tokens and serving settings. Record per-layer finite/error diagnostics, output/logit mean/p99/max KLD and existing model-release quality criteria; run `scripts/serve_harness.py --model <same-model>` with the same prompt battery/config on both paths, including long-prefill/reuse cases. The artifact certificate binds the predeclared per-model numeric limits and both reports; absent limits/report or any failed limit blocks opt-in admission. No KLD tolerance or serving PASS is invented here, and no runtime quality reclassification occurs automatically.
+
+**Performance/claim gate:** repeat quiet GPU-alone→NPU-alone→overlap→GPU-alone with the pinned binary/cache; include fresh X expansion, real copies/cache maintenance, integrated fold, output scatter/ADD and all waits. Require a sustained per-shape net win and no unbounded power/clock drift; the 700 tok/s formula in §6 remains a projection until an actual pp2048 run. Stop unsupported or non-winning kernel/layout ideas at their measured abandon gate. No production implementation, shipping claim, or additional experiment dispatch is made by this document.
+
+### Slice B status (2026-09-16): i32-partials sidecar packaged, performance-negative
+
+This artifact is int8→i32 K128 partials (40× dense i32 output volume), not the future f32 hardware fold designed above. Performance-negative research artifact: sustained ~2.8–2.9 TOPS sits far below the §7 15 TOPS park line, so this direction stays parked; GPU read/fold cost of the partial volume remains unmeasured. No registry publication, no runtime admission, no gfx1201/gfx1100 behavior certified.
+
+Per-profile exact-AOT execution (10 warm + n=50 timed, K5120/N512, validation PASS plus changed-input/sentinel replay PASS; NPU timer is submit+wait host service µs):
+
+| M | NPU service med/p90 | e2e med/p90 | TOPS=2MKN/(med·1e6) | extra DDR vs dense |
+|---:|---|---|---|---:|
+| 1024 | 1925.2/1934.1 | 2066.0/2083.0 | 2.79 | 81788928 |
+| 2048 | 3696.3/3963.5 | 3837.5/4349.2 | 2.90 | 163577856 |
+| 4096 | 7520.6/7872.8 | 7891.7/8240.6 | 2.86 | 327155712 |
+
+P layout (manifest arg name): `P:i32le[pair=M/1024][kg=K/512][col=8][rb=2][h4=4][r=512][c=64]`; A/B plain. Row=`pair*1024+rb*512+r`, half=`kg*4+h4`, column=`col*64+c`; value sums exactly K indices. ZIP `/home/kaden/npu-screen/sidecar/qwen3.8-27b.mq4-xt.xdna.zip` (968153 B, sha256 `5934086e6e313eabd261aa589211feca5e11fbb799ef252bec2657d6ca7466ca`): 7 stored entries (manifest.json + per-M main.pdi/insts.bin); PDI bytes sliced from the executed xclbins (record-bound SHA256), source xclbin SHAs in beside-zip provenance. `XdnaSidecarDescriptor::load_verified` accepts the published bytes (verified=true, 3 profiles); gfx1151 admits, gfx1201/gfx1100 reject. Root cause fixed en route: wrong decoder order + stale JIT cache artifact + premature live-BD reuse.

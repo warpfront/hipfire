@@ -92,6 +92,10 @@ pub struct RuntimeConfig {
     pub uniform_vram_tolerance_gb: Option<f32>,
     pub mtp_mode: String,
     pub mtp_k: usize,
+    /// Opt-in gfx1151 XDNA NPU spillover (`kernel.npu_spillover`,
+    /// `HIPFIRE_NPU_SPILLOVER`). Default false; snapshotted once here, never
+    /// re-read from the environment on hot paths.
+    pub npu_spillover: bool,
 }
 
 static CONFIG: OnceLock<RuntimeConfig> = OnceLock::new();
@@ -200,6 +204,7 @@ impl RuntimeConfig {
             mtp_k: value("HIPFIRE_MTP_K")
                 .and_then(|value| value.parse().ok())
                 .unwrap_or(3),
+            npu_spillover: value("HIPFIRE_NPU_SPILLOVER").as_deref() == Some("1"),
         }
     }
 }
@@ -209,6 +214,26 @@ mod tests {
     use super::{mq4r_redline_default, retained_redline_default, RuntimeConfig};
     use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer, ProcessConfig};
 
+    #[test]
+    fn npu_spillover_is_off_unless_process_snapshot_enables_it() {
+        let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        let cfg = RuntimeConfig::from_process_config(&process);
+        assert!(!cfg.npu_spillover);
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.npu_spillover", "true").unwrap();
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::GlobalUser {
+                    path: "config.toml".into(),
+                },
+                layer,
+            }])
+            .unwrap(),
+        )
+        .unwrap();
+        let cfg = RuntimeConfig::from_process_config(&process);
+        assert!(cfg.npu_spillover);
+    }
     #[test]
     fn ngram_loop_guard_is_off_by_default() {
         let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();

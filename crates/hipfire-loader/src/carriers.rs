@@ -210,17 +210,39 @@ fn kv_mode_from_ctx(ctx: &LoadCtx) -> String {
         .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone())
 }
 
+/// Resolve `--kv-mode` under `policy`, printing the site's warning. Returns
+/// `Err` (instead of warn-and-defaulting) when the pp>1 multi-GPU site gets
+/// an explicit native-tier request: multi-GPU never constructs fp8/bf16, so
+/// failing closed beats a silent q8 downgrade.
 fn resolve_kv_mode(
     ctx: &LoadCtx,
     policy: &hipfire_runtime::kv_mode::KvModePolicy,
-) -> hipfire_runtime::kv_mode::KvMode {
+) -> Result<hipfire_runtime::kv_mode::KvMode, String> {
     let kv_mode = kv_mode_from_ctx(ctx);
+    // Single-GPU Qwen default: unset/auto means native fp8 on exact gfx1201.
+    // The pp>1 site is excluded (it never constructs native tiers and refuses
+    // explicit fp8/bf16 below, so a substituted default must never reach it).
+    let raw = if policy.site == hipfire_runtime::kv_mode::QWEN35_PP_POLICY.site {
+        kv_mode.clone()
+    } else {
+        hipfire_runtime::kv_mode::qwen35_auto_for_arch(&kv_mode, ctx.gpu.arch.as_str())
+            .to_string()
+    };
     let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
-        hipfire_runtime::kv_mode::resolve(&kv_mode, policy);
+        hipfire_runtime::kv_mode::resolve(&raw, policy);
     if let Some(w) = warning {
         eprintln!("  KV cache: {w} (site {})", policy.site);
     }
-    mode
+    if policy.site == hipfire_runtime::kv_mode::QWEN35_PP_POLICY.site {
+        let raw = kv_mode.trim().to_ascii_lowercase();
+        if raw == "fp8" || raw == "bf16" {
+            return Err(format!(
+                "--kv-mode {raw} is single-GPU only (site {}); pp>1 never allocates native tiers",
+                policy.site
+            ));
+        }
+    }
+    Ok(mode)
 }
 
 fn arch_default_template(arch_id: u32) -> Option<String> {
@@ -291,7 +313,7 @@ fn load_qwen35_pp(
         .iter()
         .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
         .collect();
-    let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PP_POLICY);
+    let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PP_POLICY)?;
     let dims = hipfire_runtime::llama::KvDims {
         layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
         n_kv_heads: config.n_kv_heads,
@@ -419,7 +441,7 @@ impl Carrier for Qwen35Carrier {
         gpu: &mut rdna_compute::Gpu,
         synthetic: &[u32],
         _n: usize,
-        _prefill_err: &mut Option<String>,
+        prefill_err: &mut Option<String>,
     ) -> Option<bool> {
         let b = m.qwen35_mut().unwrap();
         let config = &b.config;
@@ -427,12 +449,15 @@ impl Carrier for Qwen35Carrier {
         let scratch = &b.scratch;
         let kv = &mut b.kv_cache;
         let dn = &mut b.dn_state;
-        Some(
-            hipfire_arch_qwen35::qwen35::forward_prefill_batch(
-                gpu, weights, config, synthetic, 0, kv, dn, scratch, None, None, None, None,
-            )
-            .is_ok(),
-        )
+        match hipfire_arch_qwen35::qwen35::forward_prefill_batch(
+            gpu, weights, config, synthetic, 0, kv, dn, scratch, None, None, None, None,
+        ) {
+            Ok(()) => Some(true),
+            Err(e) => {
+                *prefill_err = Some(format!("{e:?}"));
+                Some(false)
+            }
+        }
     }
     fn bench_decode_prime(
         &self,
@@ -653,7 +678,15 @@ impl Carrier for Qwen35Carrier {
                     .iter()
                     .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                     .collect();
-                let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY);
+                let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY)?;
+                // Same native-tier admission as the HFQ carrier site: exact
+                // gfx1201/dense/contiguous-or-VMM. The Dir path ignores
+                // adaptive/CASK/V overrides by construction, so those arms
+                // pass their permissive values (VMM stays allowed; slots are
+                // rejected by the backend arm, not here).
+                hipfire_arch_qwen35::carrier::validate_native_kv_admission(
+                    mode, &config, ctx, false, None,
+                )?;
                 let dims = hipfire_runtime::llama::KvDims {
                     layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
                     n_kv_heads: config.n_kv_heads,

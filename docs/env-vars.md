@@ -90,7 +90,7 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 
 | Variable | Default / sense | Source |
 |---|---|---|
-| `HIPFIRE_KV_MODE` | From config; **`auto` → registry `default_kv_mode` else `q8`** | CLI `resolveKvMode`; **not** a legacy hard-coded fwht-per-arch table |
+| `HIPFIRE_KV_MODE` | From config; **`auto` → registry `default_kv_mode` else `q8` — except single-GPU Qwen on exact gfx1201, where `auto`/unset means native `fp8`** (stage-b FA2 arithmetic; explicit `--kv-mode q8` still honored) | CLI `resolveKvMode`; **not** a legacy hard-coded fwht-per-arch table |
 | `HIPFIRE_KV_ADAPTIVE` | off unless set / param | Loader/CLI |
 | `HIPFIRE_KV_PHYSICAL_CAP` | optional physical slot cap | Daemon |
 | `HIPFIRE_ATTN_FLASH` | from `flash_mode` (`auto`/`always`/`never`) | CLI → daemon |
@@ -152,9 +152,15 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_FLASH_PREFILL_PREFETCH_V` | Developer ablation: gfx12 V prefetch is on unless `0`. |
 | `HIPFIRE_GFX11_FA2_PREFILL` | GQA-fused FA2 prefill on gfx1100/gfx1151 (Qwen NH24/NKV4/HD256, N 64..512 step 16, ctx 64..32768) — default ON (`kernel.gfx11_fa2_prefill`); `=0` opts out toward the byte-identical incumbent |
 | `HIPFIRE_GFX12_FA2_PREFILL` | GQA-fused FA2 prefill on exact gfx1201 (same Qwen NH24/NKV4/HD256 envelope) — default ON (`kernel.gfx12_fa2_prefill`); `=0` opts out toward the byte-identical incumbent |
+| `HIPFIRE_GFX12_FA_PACKET` | Packet-minimal Q128 FA2 body on exact gfx1201 (same Qwen envelope as `HIPFIRE_GFX12_FA2_PREFILL`) — default ON (`kernel.gfx12_fa_packet`); `=0` opts out to the byte-identical route-N body |
 | `HIPFIRE_CALIB_BF16` | Calibration-only: keep native-BF16 teachers in BF16 (`kernel.calib_force_bf16`, default off; shipped inference unaffected) |
-| `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` / `_RESID` / `_QKVZA` / `_QKV` | gfx1201 FP8-WMMA MQ4v2 prefill route — default ON on exact gfx1201 (prefill chunk 512); `=0` on any one opts out toward the F16 path (chunk 384). `=1` forces on; launchers stay exact-gfx1201-only, so other arches are unchanged |
+| `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` / `_RESID` / `_QKVZA` / `_QKV` | gfx1201 FP8-WMMA MQ4v2 prefill route — default ON on exact gfx1201 (widened prefill chunk 4096 via `prefill.chunk_rows`); `=0` on any one opts out toward the F16 path (chunk 384). `=1` forces on; launchers stay exact-gfx1201-only, so other arches are unchanged |
 | `HIPFIRE_GFX12_MQ4V2_FP8_SLABS` | Two-slab S2BT8 FP8 symbols by default; `=1` selects the single-slab symbols |
+| `HIPFIRE_GFX12_MQ4V2_FP8_V2` | gfx1201 FP8-WMMA MQ4v2 staged-tile v2 route — default ON on exact gfx1201 (`kernel.gfx12_mq4v2_fp8_v2`); `=0` restores the s2bt8/BT symbols. The four family flags remain prerequisites |
+| `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` | v2 tile geometry: `128x128` (default on exact gfx1201, the measured pin), `64x256`, `128x64`, `256x64` (prior default, still selectable) |
+| `HIPFIRE_GFX12_GDN_PRE_FUSED` | gfx1201 batched-prefill GDN preamble fusion (sigmoid+conv+qknorm 3→1, byte-exact) — default ON on exact gfx1201 (`kernel.gfx12_gdn_pre_fused`); `=0` restores the 3-launch sequence |
+| `HIPFIRE_GFX12_FP8_STREAM` | gfx1201 RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion (byte-identical `prepare_mq4v2_fp8_x_f32` outputs for the qkvza/gate_up/qkv inputs; standalone pack launch disappears) — default ON on exact gfx1201 (`kernel.gfx12_fp8_stream`); `=0` opts out; other arches off |
+| `HIPFIRE_PREFILL_CHUNK_ROWS` | Widened ordinary-prefill chunk ceiling (`prefill.chunk_rows`; default 4096 on exact gfx1201, 512 elsewhere; explicit `HIPFIRE_PREFILL_MAX_BATCH` wins; VRAM admission may admit a smaller rung) |
 
 ### LFM (arch 11) — branch-scoped optimized prefill
 
@@ -585,7 +591,6 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GEMV_ROWS` | crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GEN` | crates/hipfire-runtime/examples/a3b_multiturn_oneshot.rs |
 | `HIPFIRE_GEN_STEPS` | crates/hipfire-runtime/examples/oracle_xcheck.rs |
-| `HIPFIRE_GFX1100_AWQ_NORM_DIRECT` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_GFX1100_ASYM3_Q8_PAIR` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS` | crates/rdna-compute/src/gemm.rs |
@@ -597,7 +602,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_GFX11_FA2_PREFILL` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/attention.rs, crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX11_MMQ_X128` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs |
-| `HIPFIRE_GFX11_MQ4V2_IU4` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/scratch.rs, crates/rdna-compute/src/dispatch.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_IU4_PREFILL` | Developer override for default-on `kernel.iu4_prefill`; `=0` opts out. Exact gfx1100/gfx1151/gfx1201 admit IU4; unsupported architectures fall through. Sources: crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/scratch.rs, crates/rdna-compute/src/dispatch.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP` | crates/rdna-compute/src/attention.rs |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX1151_CUMODE_MODULES` | crates/rdna-compute/src/compiler.rs |
@@ -668,11 +673,18 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_GFX11_WEIGHT_LOAD_POLICY` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX1201_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/mod.rs |
 | `HIPFIRE_GFX12_FA2_PREFILL` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/attention.rs, crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_FA_PACKET` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/attention.rs, crates/rdna-compute/src/kernels.rs, kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip, crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_FP8_STREAM` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/dispatch.rs, crates/rdna-compute/src/scratch.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_GDN_PRE_FUSED` | crates/rdna-compute/src/feature_flags.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX12_MQ4V2_FP8_GATEUP` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX12_MQ4V2_FP8_QKV` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX12_MQ4V2_FP8_QKVZA` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX12_MQ4V2_FP8_RESID` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_MQ4V2_FP8_V2` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` | crates/rdna-compute/src/gemm.rs |
 | `HIPFIRE_GFX12_MQ4V2_FP8_SLABS` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs |
+| `HIPFIRE_GFX12_SILU_QUANT_FUSED` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/dispatch.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs |
+| `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs, crates/rdna-compute/src/dispatch.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE` | crates/rdna-compute/src/kernels.rs |
 | `HIPFIRE_GFX12_WEIGHT_CPOL_AUX` | crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS` | crates/rdna-compute/src/feature_flags.rs |
@@ -844,6 +856,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_NORMALIZE_PROMPT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/build_kld_ref_native.rs |
 | `HIPFIRE_NO_REGISTRY_FETCH` | crates/hipfire-registry/src/lib.rs |
 | `HIPFIRE_NO_SPILL` | crates/hipfire-quantize/src/main.rs |
+| `HIPFIRE_NPU_SPILLOVER` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs, crates/hipfire-cli/src/main.rs |
 | `HIPFIRE_ORACLE_MAX` | scripts/seed_oracle_collect.sh |
 | `HIPFIRE_PARITY_MAX_TOK` | scripts/forward-lowered-parity.sh |
 | `HIPFIRE_PARITY_OUT` | scripts/forward-lowered-parity.sh |
@@ -870,10 +883,11 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_PREFILL_BATCHED` | crates/hipfire-arch-qwen35/src/mtp_spec.rs, crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_PREFILL_BLOCK` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PREFILL_CHUNK` | crates/hipfire-runtime/examples/ep_decode_parity.rs |
+| `HIPFIRE_PREFILL_CHUNK_ROWS` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/hipfire-config/src/lib.rs |
 | `HIPFIRE_PREFILL_COMPRESSION` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PREFILL_DRAFTER` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PREFILL_KEEP_RATIO` | crates/hipfire-arch-qwen35/src/pflash.rs |
-| `HIPFIRE_PREFILL_MAX_BATCH` | crates/hipfire-arch-qwen35/src/qwen35.rs |
+| `HIPFIRE_PREFILL_MAX_BATCH` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs (explicit override over `prefill.chunk_rows` / `HIPFIRE_PREFILL_CHUNK_ROWS`) |
 | `HIPFIRE_PREFILL_MIN_KEEP` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PREFILL_PROFILE` | crates/hipfire-arch-qwen35/src/pflash.rs |
 | `HIPFIRE_PREFILL_RECENT` | crates/hipfire-arch-qwen35/src/pflash.rs |

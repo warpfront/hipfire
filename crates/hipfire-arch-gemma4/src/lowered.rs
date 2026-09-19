@@ -134,6 +134,9 @@ fn run_prefill_gemm_inner(
                 row_stride: w.k,
                 rotation: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             };
             let ctx = DispatchCtx::new(gpu);
             let params = GemmParams {
@@ -169,6 +172,9 @@ fn run_prefill_gemm_inner(
                 row_stride: w.k,
                 rotation: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             };
             let ctx = DispatchCtx::new(gpu);
             let params = GemmParams {
@@ -199,6 +205,9 @@ fn run_prefill_gemm_inner(
             row_stride: w.k,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         let ctx = DispatchCtx::new(gpu);
         let params = GemmParams {
@@ -228,6 +237,9 @@ fn run_prefill_gemm_inner(
         row_stride: w.k,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let params = GemmParams {
         w: &w_ref,
@@ -1048,6 +1060,9 @@ fn load_gemma4_weight_impl(
                 k,
                 row_stride: 0,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
                 paro: None,
             });
         }
@@ -1063,6 +1078,9 @@ fn load_gemma4_weight_impl(
                     k,
                     row_stride: 0,
                     awq_scale: None,
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                     paro: None,
                 });
             }
@@ -1082,6 +1100,9 @@ fn load_gemma4_weight_impl(
                 k,
                 row_stride: 0,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
                 paro: None,
             });
         }
@@ -1095,6 +1116,9 @@ fn load_gemma4_weight_impl(
                 k,
                 row_stride: 0,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
                 paro: None,
             });
         }
@@ -1155,6 +1179,9 @@ fn load_gemma4_weight_impl(
         k,
         row_stride: 0,
         awq_scale,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
         paro: None,
     })
 }
@@ -1403,6 +1430,9 @@ fn load_moe_layer_extras(
                 k: dim,
                 row_stride: 0,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
                 paro: None,
             },
             down_proj: WeightTensor {
@@ -1412,6 +1442,9 @@ fn load_moe_layer_extras(
                 k: mi,
                 row_stride: 0,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
                 paro: None,
             },
         });
@@ -1672,6 +1705,9 @@ fn load_weights_impl(
             k: config.dim,
             row_stride: 0,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
             paro: None,
         }
     };
@@ -4532,6 +4568,7 @@ fn sliding_layer_decode_impl(
             quant_int8: false,
             quant_hfq8: false,
             quant_bf16: false,
+            quant_fp8: false,
             f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv_cache.v_mode_bits(),
             pos,
@@ -4569,6 +4606,7 @@ fn sliding_layer_decode_impl(
             block_start: 0,
             block_cols: 0,
             output_gate: None,
+            output_awq_scale: None,
             output: &scratch.attn_out,
         };
         execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -4950,6 +4988,7 @@ fn full_layer_decode_impl(
             quant_int8: false,
             quant_hfq8: false,
             quant_bf16: false,
+            quant_fp8: false,
             f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
             v_mode_bits: kv_cache.v_mode_bits(),
             pos,
@@ -4987,6 +5026,7 @@ fn full_layer_decode_impl(
             block_start: 0,
             block_cols: 0,
             output_gate: None,
+            output_awq_scale: None,
             output: &scratch.attn_out,
         };
         execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -5749,6 +5789,7 @@ fn forward_prefill_batch_v2(
                         quant_int8: false,
                         quant_hfq8: false,
                         quant_bf16: false,
+                        quant_fp8: false,
                         f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                         v_mode_bits: kv_sliding.v_mode_bits(),
                         pos,
@@ -5786,6 +5827,7 @@ fn forward_prefill_batch_v2(
                         block_start: 0,
                         block_cols: 0,
                         output_gate: None,
+                        output_awq_scale: None,
                         output: &scratch.attn_out,
                     };
                     let ctx = DispatchCtx::new(gpu);
@@ -6082,6 +6124,7 @@ fn forward_prefill_batch_v2(
                     quant_int8: false,
                     quant_hfq8: false,
                     quant_bf16: false,
+                    quant_fp8: false,
                     f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                     v_mode_bits: kv_full.v_mode_bits(),
                     pos: start_pos + n_batch - 1,
@@ -6119,6 +6162,7 @@ fn forward_prefill_batch_v2(
                     block_start: 0,
                     block_cols: 0,
                     output_gate: None,
+                    output_awq_scale: None,
                     output: &scratch.pb_attn_q,
                 };
                 let ctx = DispatchCtx::new(gpu);
@@ -6166,6 +6210,7 @@ fn forward_prefill_batch_v2(
                             quant_int8: false,
                             quant_hfq8: false,
                             quant_bf16: false,
+                            quant_fp8: false,
                             f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                             v_mode_bits: kv_full.v_mode_bits(),
                             pos,
@@ -6203,6 +6248,7 @@ fn forward_prefill_batch_v2(
                             block_start: 0,
                             block_cols: 0,
                             output_gate: None,
+                            output_awq_scale: None,
                             output: &scratch.attn_out,
                         };
                         let c1 = DispatchCtx::new(gpu);
@@ -7116,6 +7162,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     quant_int8: false,
                     quant_hfq8: false,
                     quant_bf16: false,
+                    quant_fp8: false,
                     f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                     v_mode_bits: kv.v_mode_bits(),
                     pos,
@@ -7153,6 +7200,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     block_start: 0,
                     block_cols: 0,
                     output_gate: None,
+                    output_awq_scale: None,
                     output: &s.attn_out,
                 };
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
@@ -7225,6 +7273,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     quant_int8: false,
                     quant_hfq8: false,
                     quant_bf16: false,
+                    quant_fp8: false,
                     f32_policy: hipfire_dispatch::families::kv_tier::F32AttnPolicy::Simple,
                     v_mode_bits: kv.v_mode_bits(),
                     pos,
@@ -7262,6 +7311,7 @@ impl<'a> ForwardBindings for Gemma4Bindings<'a> {
                     block_start: 0,
                     block_cols: 0,
                     output_gate: None,
+                    output_awq_scale: None,
                     output: &s.attn_out,
                 };
                 execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])

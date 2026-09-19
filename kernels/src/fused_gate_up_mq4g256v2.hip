@@ -37,6 +37,14 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
     float* __restrict__ y_gate,
     float* __restrict__ y_up,
     int gate_m, int up_m, int K
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    // Lloyd (qt=52): per-tensor centered f16 codebooks, 8 dwords each
+    // (gate then up); the block picks one by row source below.
+    , const unsigned int G0, const unsigned int G1, const unsigned int G2, const unsigned int G3,
+    const unsigned int G4, const unsigned int G5, const unsigned int G6, const unsigned int G7,
+    const unsigned int U0, const unsigned int U1, const unsigned int U2, const unsigned int U3,
+    const unsigned int U4, const unsigned int U5, const unsigned int U6, const unsigned int U7
+#endif
 ) {
     const int gid = blockIdx.x;
     const int tid = threadIdx.x;
@@ -49,6 +57,24 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
     } else {
         A = A_up; y = y_up; local_row = gid - gate_m;
     }
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    // Stage this row-source's 16 f16 levels to LDS (lanes 0..7, one dword
+    // each), then decode nibbles through them. See gemv_mq4g256v2.hip.
+    __shared__ unsigned short LUT_SMEM[16];
+    {
+        const bool is_gate = gid < gate_m;
+        unsigned int d;
+        if (tid == 0) d = is_gate ? G0 : U0; else if (tid == 1) d = is_gate ? G1 : U1;
+        else if (tid == 2) d = is_gate ? G2 : U2; else if (tid == 3) d = is_gate ? G3 : U3;
+        else if (tid == 4) d = is_gate ? G4 : U4; else if (tid == 5) d = is_gate ? G5 : U5;
+        else if (tid == 6) d = is_gate ? G6 : U6; else d = is_gate ? G7 : U7;
+        if (tid < 8) ((unsigned int*)LUT_SMEM)[tid] = d;
+    }
+    __syncthreads();
+    #define MQ4V2_DEQ(q) (__half2float(__ushort_as_half(LUT_SMEM[(q)])))
+#else
+    #define MQ4V2_DEQ(q) ((float)(q))
+#endif
 
 #if defined(HIPFIRE_FUSED_GATE_UP_K1024)
     const int groups_per_row = 4;
@@ -106,14 +132,14 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
         int base = g * 256 + tid * 8;
 
         #define DOG(pk, sc, zp, b, a) \
-            (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
-                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
-                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
-                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
-                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
-                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
-                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
-                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+            (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)        + zp) * x[(b)]     \
+                 + (sc * MQ4V2_DEQ(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
 
         DOG(pk0, sc0, zp0, base, acc0);
         DOG(pk1, sc1, zp1, base + 256, acc1);
@@ -125,14 +151,14 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
     // Tail groups must accumulate into acc[g % 4] — see
     // gemv_hfq4g256.gfx1100.hip for the full bug explanation.
     #define TAIL_DOG(pk, sc, zp, b, a) \
-        (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
-             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
-             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
-             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
-             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
-             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
-             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
-             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+        (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)        + zp) * x[(b)]     \
+             + (sc * MQ4V2_DEQ(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+             + (sc * MQ4V2_DEQ(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+             + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+             + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+             + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+             + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+             + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
 
     if (tail >= 1) {
         const int g = quads << 2;
@@ -171,6 +197,7 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
         TAIL_DOG(pk, sc, zp, base, acc2);
     }
     #undef TAIL_DOG
+    #undef MQ4V2_DEQ
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)
