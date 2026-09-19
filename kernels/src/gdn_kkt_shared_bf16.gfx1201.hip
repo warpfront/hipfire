@@ -3,30 +3,30 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 // Fixed Qwen3.5-27B GDN KKT solve: C64, K128, 16 key heads and three
 // value heads per key head.  A workgroup forms one Gram matrix and applies
-// three independent gate/beta systems.  Only the final BF16 inverses leave it.
+// three independent gate/beta systems.  Only the final FP16 inverses leave it.
 #define GK_C 64
 #define GK_D 128
 #define GK_PITCH 68
 #define GK_B 16
 
-typedef __bf16 gk_b8 __attribute__((ext_vector_type(8)));
+typedef _Float16 gk_b8 __attribute__((ext_vector_type(8)));
 typedef float gk_f8 __attribute__((ext_vector_type(8)));
 
 __device__ __forceinline__ float gk_from_bf(unsigned short x) {
-    return __builtin_bit_cast(float, (unsigned)x << 16);
+    return __half2float(__ushort_as_half(x));
 }
 __device__ __forceinline__ unsigned short gk_to_bf(float x) {
-    const __bf16 y = (__bf16)x;
-    return __builtin_bit_cast(unsigned short, y);
+    return __half_as_ushort(__float2half_rn(x));
 }
 __device__ __forceinline__ gk_f8 gk_zero() {
     return (gk_f8){0,0,0,0,0,0,0,0};
 }
 __device__ __forceinline__ gk_f8 gk_mma(gk_b8 a, gk_b8 b, gk_f8 c) {
-    return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a,b,c);
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a,b,c);
 }
 __device__ __forceinline__ gk_b8 gk_frag_shared(
     const unsigned short* p, int pitch, int row0, int k0, int lane) {

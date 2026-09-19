@@ -4784,6 +4784,218 @@ impl Gpu {
         result
     }
 
+    /// Resolve all exact-gfx1201 R4D modules before any admitted route mutates
+    /// its input scratch or persistent convolution state.
+    #[cfg(feature = "deltanet")]
+    pub fn prepare_gdn_r4d_gfx1201(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gdn_conv_prep_bf16_gfx1201",
+            kernels::GDN_CONV_PREP_BF16_GFX1201_SRC,
+            "gdn_conv_prep_bf16_gfx1201",
+        )?;
+        self.ensure_kernel(
+            "gdn_kkt_shared_bf16_gfx1201",
+            kernels::GDN_KKT_SHARED_BF16_GFX1201_SRC,
+            "gdn_kkt_shared_bf16_gfx1201",
+        )?;
+        self.ensure_kernel(
+            "gdn_chunk_scan_bf16_q8_gfx1201",
+            kernels::GDN_CHUNK_SCAN_BF16_Q8_GFX1201_SRC,
+            "gdn_chunk_scan_bf16_q8_gfx1201",
+        )
+    }
+    /// Exact-gfx1201 R4D parent preamble. The compact Q/K/V buffers are BF16
+    /// byte views borrowed from the ordinary prefill scratch.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_conv_prep_bf16_gfx1201(
+        &mut self,
+        input: &GpuTensor,
+        conv_weight: &GpuTensor,
+        conv_state: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.prepare_gdn_r4d_gfx1201()?;
+        const PREP_MODULE: &str = "gdn_conv_prep_bf16_gfx1201";
+
+        let xp = input.buf.as_ptr();
+        let wp = conv_weight.buf.as_ptr();
+        let sp = conv_state.buf.as_ptr();
+        let gp = g.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let dtp = dt_bias.buf.as_ptr();
+        let alp = a_log.buf.as_ptr();
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let nt = n_tokens as i32;
+        let qs = q_scale;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &dtp as *const _ as *mut c_void,
+            &alp as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            PREP_MODULE,
+            [((n_tokens + 63) / 64) as u32, 10, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(dtp);
+                b.push_ptr(alp);
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_i32(nt);
+                b.push_f32(qs);
+                b.push_f32(ep);
+                b
+            },
+        )
+    }
+
+    /// Exact-gfx1201 R4D KKT → fused scan for one legacy segment. All parent
+    /// arrays remain unsliced; `row0` selects the segment and state stays the
+    /// single unsliced persistent owner.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_delta_net_q8_r4d_segment_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        a: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        state_q8: &GpuTensor,
+        state_scales: &GpuTensor,
+        ef_residual: &GpuTensor,
+        out: &GpuTensor,
+        row0: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const KKT_MODULE: &str = "gdn_kkt_shared_bf16_gfx1201";
+        const SCAN_MODULE: &str = "gdn_chunk_scan_bf16_q8_gfx1201";
+        self.ensure_kernel(
+            KKT_MODULE,
+            kernels::GDN_KKT_SHARED_BF16_GFX1201_SRC,
+            KKT_MODULE,
+        )?;
+        self.ensure_kernel(
+            SCAN_MODULE,
+            kernels::GDN_CHUNK_SCAN_BF16_Q8_GFX1201_SRC,
+            SCAN_MODULE,
+        )?;
+
+        let kp = k.buf.as_ptr();
+        let gp = g.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let ap = a.buf.as_ptr();
+        let r0 = row0 as i32;
+        let nt = n_tokens as i32;
+        let mut kkt_params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &r0 as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            KKT_MODULE,
+            [((n_tokens + 63) / 64) as u32, 16, 1],
+            [128, 1, 1],
+            0,
+            &mut kkt_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(ap);
+                b.push_i32(r0);
+                b.push_i32(nt);
+                b
+            },
+        )?;
+
+        // Preserve the incumbent deterministic frame cadence even though the
+        // required EF path does not consume the stochastic seed.
+        let _frame = reserve_gdn_requant_frames(n_tokens as u32);
+        let qp = q.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let sqp = state_q8.buf.as_ptr();
+        let scp = state_scales.buf.as_ptr();
+        let efp = ef_residual.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut scan_params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sqp as *const _ as *mut c_void,
+            &scp as *const _ as *mut c_void,
+            &efp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &r0 as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            SCAN_MODULE,
+            [2, 48, 1],
+            [256, 1, 1],
+            0,
+            &mut scan_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ap);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(sqp);
+                b.push_ptr(scp);
+                b.push_ptr(efp);
+                b.push_ptr(op);
+                b.push_i32(r0);
+                b.push_i32(nt);
+                b
+            },
+        )
+    }
+
     /// Independent-sequence decode variant of [`Self::conv1d_silu_split_f32_n`].
     /// Each row owns a distinct convolution ring; no token in one lane can
     /// advance another lane's state.

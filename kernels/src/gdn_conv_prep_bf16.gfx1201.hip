@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 #include <hip/hip_bfloat16.h>
 
 // Fixed Qwen3.5-27B GDN preparation geometry.
@@ -23,8 +24,7 @@ __device__ __forceinline__ float gdn_r4d_softplus(float x) {
 }
 
 __device__ __forceinline__ unsigned short gdn_r4d_bf16(float x) {
-    const __bf16 b = (__bf16)x;
-    return __builtin_bit_cast(unsigned short, b);
+    return __half_as_ushort(__float2half_rn(x));
 }
 
 extern "C" __launch_bounds__(256)

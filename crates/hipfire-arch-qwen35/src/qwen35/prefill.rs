@@ -6248,6 +6248,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
     commit_stride: Option<usize>,
+    r4d_admitted: bool,
 ) -> HipResult<()> {
     // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
     // activation to match its pre-rotated weights; HFQ4 uses
@@ -6262,7 +6263,159 @@ pub(crate) fn batch_chunk_delta_net_attn(
     // together (the all-together corruption-prevention rule from
     // docs/plans/mq-lloyd-batched-prefill-followup.md). MQ4-Lloyd
     // is wired in a separate PR (issue #182).
+    let r4d_views = if r4d_admitted {
+        let segment_rows = commit_stride.unwrap_or(n);
+        if !(64..=512).contains(&segment_rows)
+            || (commit_stride.is_some() && n % segment_rows != 0)
+        {
+            return Err(HipError::new(0, "invalid admitted R4D GDN segment geometry"));
+        }
+
+        let checked_bytes = |rows: usize, width: usize, elem: usize| -> HipResult<usize> {
+            rows.checked_mul(width)
+                .and_then(|v| v.checked_mul(elem))
+                .ok_or_else(|| HipError::new(0, "R4D GDN byte extent overflow"))
+        };
+        let raw_view = |tensor: &GpuTensor, need: usize, name: &str| -> HipResult<GpuTensor> {
+            if tensor.buf.size() < need {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "R4D GDN {name} scratch undersized: have {}, need {need}",
+                        tensor.buf.size()
+                    ),
+                ));
+            }
+            Ok(GpuTensor {
+                buf: unsafe {
+                    hip_bridge::DeviceBuffer::from_raw(tensor.buf.as_ptr(), need)
+                },
+                shape: vec![need],
+                dtype: DType::Raw,
+            })
+        };
+        let require_bytes = |tensor: &GpuTensor, need: usize, name: &str| -> HipResult<()> {
+            if tensor.buf.size() < need {
+                Err(HipError::new(
+                    0,
+                    &format!(
+                        "R4D GDN {name} undersized: have {}, need {need}",
+                        tensor.buf.size()
+                    ),
+                ))
+            } else {
+                Ok(())
+            }
+        };
+
+        let q_bytes = checked_bytes(n, 16 * 128, 2)?;
+        let v_bytes = checked_bytes(n, 48 * 128, 2)?;
+        let a_rows = (segment_rows + 63) / 64 * 64;
+        let a_bytes = checked_bytes(a_rows, 48 * 64, 2)?;
+        let q = raw_view(&pbs.dn_q_batch, q_bytes, "q")?;
+        let k = raw_view(&pbs.dn_k_batch, q_bytes, "k")?;
+        let v = raw_view(&pbs.dn_v_batch, v_bytes, "v")?;
+        let a = raw_view(&pbs.dn_q_raw_batch, a_bytes, "A")?;
+
+        require_bytes(
+            &pbs.dn_qkv_batch,
+            checked_bytes(n, 2 * k_dim + v_dim, 4)?,
+            "projected input",
+        )?;
+        require_bytes(
+            &pbs.dn_alpha_batch,
+            checked_bytes(n, n_v_heads, 4)?,
+            "G",
+        )?;
+        require_bytes(
+            &pbs.dn_beta_batch,
+            checked_bytes(n, n_v_heads, 4)?,
+            "beta",
+        )?;
+        require_bytes(
+            &pbs.dn_attn_out_batch,
+            checked_bytes(n, v_dim, 4)?,
+            "output",
+        )?;
+        require_bytes(
+            &dn_state.s_matrices[delta_layer_idx],
+            48 * 128 * 128,
+            "Q8 state",
+        )?;
+        require_bytes(
+            &dn_state.s_scales[delta_layer_idx],
+            48 * 128 * 4,
+            "state scales",
+        )?;
+        let ef = dn_state
+            .ef_residual(delta_layer_idx)
+            .ok_or_else(|| HipError::new(0, "R4D GDN requires complete EF state"))?;
+        require_bytes(ef, 48 * 128 * 128 * 2, "EF state")?;
+        require_bytes(
+            &dn_state.conv_states[delta_layer_idx],
+            (2 * k_dim + v_dim) * (config.conv_kernel_dim - 1) * 4,
+            "conv state",
+        )?;
+
+        // JIT/load failure must occur before input projection or persistent
+        // preamble mutation; no legacy retry is valid after this point.
+        gpu.prepare_gdn_r4d_gfx1201()?;
+        Some((q, k, v, a, segment_rows))
+    } else {
+        None
+    };
+
     batch_chunk_delta_net_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
+
+    if let Some((q, k, v, a, segment_rows)) = r4d_views {
+        gpu.gdn_conv_prep_bf16_gfx1201(
+            &pbs.dn_qkv_batch,
+            &layer.conv_weight,
+            &dn_state.conv_states[delta_layer_idx],
+            &pbs.dn_alpha_batch,
+            &pbs.dn_beta_batch,
+            &layer.dt_bias,
+            &layer.a_log,
+            &q,
+            &k,
+            &v,
+            n,
+            1.0 / (hd as f32).sqrt(),
+            config.norm_eps,
+        )?;
+        let ef = dn_state
+            .ef_residual(delta_layer_idx)
+            .expect("R4D admission prevalidated EF state");
+        for row0 in (0..n).step_by(segment_rows) {
+            gpu.gated_delta_net_q8_r4d_segment_gfx1201(
+                &q,
+                &k,
+                &v,
+                &a,
+                &pbs.dn_alpha_batch,
+                &pbs.dn_beta_batch,
+                &dn_state.s_matrices[delta_layer_idx],
+                &dn_state.s_scales[delta_layer_idx],
+                ef,
+                &pbs.dn_attn_out_batch,
+                row0,
+                segment_rows,
+            )?;
+        }
+        batch_chunk_delta_net_output_projection(
+            gpu,
+            layer,
+            config,
+            pbs,
+            n,
+            n_v_heads,
+            q8_wmma_arch,
+            arch_has_wmma,
+            epilogue,
+            fusion,
+        )?;
+        return Ok(());
+    }
 
     let tree_parents = batch_chunk_delta_net_pre_gdn(
         gpu,
@@ -10705,6 +10858,7 @@ fn forward_prefill_chunk_pair(
                         BatchEpilogue::Residual,
                         fusion,
                         None, // commit_stride: pair halves keep legacy cadence
+                        false, // R4D: paired halves retain the incumbent route
                     )?;
                     batch_chunk_delta_net_ffn(
                         gpu,
@@ -11313,11 +11467,48 @@ pub(crate) fn forward_batch_chunk_impl(
 
     let mut delta_layer_idx = band.map(|b| b.delta_layer_offset).unwrap_or(0);
     let mut kv_layer_idx = band.map(|b| b.kv_layer_offset).unwrap_or(0);
+    let r4d_common_admitted = gpu.flags.gfx12_gdn_r4d
+        && gpu.arch == "gfx1201"
+        && config.num_experts == 0
+        && config.linear_num_key_heads == 16
+        && config.linear_num_value_heads == 48
+        && config.linear_key_head_dim == 128
+        && config.linear_value_head_dim == 128
+        && config.conv_kernel_dim == 4
+        && dense_layers_are_all_mq4v2(weights)
+        && (gpu.iu4_producer_sidecar_active(n, dim)
+            || gpu.iu4_producer_quant_fused_active(n, dim))
+        && kv_cache.quant_fp8
+        && dn_state.quant == StateQuant::Q8
+        && !dn_state.s_matrices.is_empty()
+        && dn_state.s_matrices.len() == dn_state.s_scales.len()
+        && dn_state.s_matrices.len() == dn_state.conv_states.len()
+        && dn_state.s_matrices.len() == dn_state.s_ef_residual.len()
+        && matches!(batch_semantics, BatchSemantics::Sequential)
+        && tree_verify.is_none()
+        && gdn_tape.is_none()
+        && fusion == DflashFusionCtx::Off
+        && !gpu.graphs.capture_mode
+        && !gpu.replay.is_enabled()
+        && hidden_rb.is_none()
+        && per_token_hidden_out.is_none()
+        && band.is_none()
+        && max_layer.is_none()
+        && routed_out.is_none()
+        && mask_override.is_none()
+        && n >= 64
+        && (n <= 512 || (commit_stride == Some(512) && n % 512 == 0));
     let ctx = DispatchCtx::new(gpu).with_workload(dispatch_workload);
 
     for layer_idx in layer_start..layer_end {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
+                let r4d_admitted = r4d_common_admitted
+                    && layer.wqkv.gpu_dtype == DType::MQ4G256V2
+                    && layer.wz.gpu_dtype == DType::MQ4G256V2
+                    && layer.w_beta.gpu_dtype == DType::MQ4G256V2
+                    && layer.w_alpha.gpu_dtype == DType::MQ4G256V2
+                    && delta_layer_idx < dn_state.s_ef_residual.len();
                 batch_chunk_delta_net_attn(
                     gpu,
                     layer,
@@ -11340,6 +11531,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     BatchEpilogue::Residual,
                     fusion,
                     commit_stride,
+                    r4d_admitted,
                 )?;
                 batch_chunk_delta_net_ffn(
                     gpu,

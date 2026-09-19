@@ -146,6 +146,20 @@ for arch in "${ARCHS[@]}"; do
         out="$out_dir/${name}.hsaco"
         printf '%s|%s|%s|%s\n' "$arch" "$name" "$src" "$out" >> "$JOB_FILE"
     done
+
+    # The R4D sources are exact-gfx1201-only variant files with no generic
+    # parent. Give their runtime module names explicit packaging jobs.
+    if [ "$arch" = "gfx1201" ]; then
+        for name in \
+            gdn_conv_prep_bf16_gfx1201 \
+            gdn_kkt_shared_bf16_gfx1201 \
+            gdn_chunk_scan_bf16_q8_gfx1201; do
+            stem="${name%_gfx1201}"
+            src="$SRC_DIR/${stem}.gfx1201.hip"
+            out="$out_dir/${name}.hsaco"
+            printf '%s|%s|%s|%s\n' "$arch" "$name" "$src" "$out" >> "$JOB_FILE"
+        done
+    fi
 done
 
 TOTAL=$(wc -l < "$JOB_FILE")
@@ -160,10 +174,19 @@ echo "=== Compiling $TOTAL jobs across $JOBS workers... ==="
 worker() {
     local job="$1"
     local arch name src out
+    local -a module_flags=()
     IFS='|' read -r arch name src out <<< "$job"
+    case "$name" in
+        gdn_conv_prep_bf16_gfx1201|gdn_kkt_shared_bf16_gfx1201)
+            module_flags+=("-ffp-contract=off")
+            ;;
+        gdn_chunk_scan_bf16_q8_gfx1201)
+            module_flags+=("-ffp-contract=off" "-mcumode")
+            ;;
+    esac
 
     if ROCM_PATH="$SELECTED_ROCM_ROOT" "$HIPCC_BIN" \
-        --genco --offload-arch="$arch" -O3 \
+        --genco --offload-arch="$arch" -O3 "${module_flags[@]}" \
         --rocm-path="$SELECTED_ROCM_ROOT" --hip-path="$SELECTED_ROCM_ROOT" \
         -I "$SELECTED_ROCM_ROOT/include" -I "$SCRIPT_DIR/kernels/src" \
         -o "$out" "$src" 2>/dev/null; then

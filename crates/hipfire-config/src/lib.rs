@@ -2150,6 +2150,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx1201 batched prefill GDN preamble fusion (default on exact gfx1201; set to false or HIPFIRE_GFX12_GDN_PRE_FUSED=0 to opt out; fuses sigmoid+conv+qknorm into gdn_pre_batched_gfx1201, byte-exact)."
     ),
     process_bool_field!(
+        "kernel.gfx12_gdn_r4d",
+        "gfx12_gdn_r4d",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX12_GDN_R4D",
+        "Enable the opt-in gfx1201 compact-BF16 R4D GDN chunk route (default off; exact-shape ordinary prefill only)."
+    ),
+    process_bool_field!(
         "kernel.gfx12_silu_quant_fused",
         "gfx12_silu_quant_fused",
         Kernel,

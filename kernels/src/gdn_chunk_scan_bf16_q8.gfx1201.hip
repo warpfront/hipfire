@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
 
 #define GS_C 64
 #define GS_D 128
@@ -10,13 +11,13 @@
 #define GS_KP 132
 #define GS_AP 68
 
-typedef __bf16 gs_b8 __attribute__((ext_vector_type(8)));
+typedef _Float16 gs_b8 __attribute__((ext_vector_type(8)));
 typedef float gs_f8 __attribute__((ext_vector_type(8)));
 
-__device__ __forceinline__ float gs_bf(unsigned short x){return __builtin_bit_cast(float,(unsigned)x<<16);}
-__device__ __forceinline__ unsigned short gs_b16(float x){const __bf16 y=(__bf16)x;return __builtin_bit_cast(unsigned short,y);}
+__device__ __forceinline__ float gs_bf(unsigned short x){return __half2float(__ushort_as_half(x));}
+__device__ __forceinline__ unsigned short gs_b16(float x){return __half_as_ushort(__float2half_rn(x));}
 __device__ __forceinline__ gs_f8 gs_z8(){return (gs_f8){0,0,0,0,0,0,0,0};}
-__device__ __forceinline__ gs_f8 gs_mma(gs_b8 a,gs_b8 b,gs_f8 c){return __builtin_amdgcn_wmma_f32_16x16x16_bf16_w32_gfx12(a,b,c);}
+__device__ __forceinline__ gs_f8 gs_mma(gs_b8 a,gs_b8 b,gs_f8 c){return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a,b,c);}
 __device__ __forceinline__ gs_b8 gs_frag(const unsigned short*p,int pitch,int row0,int k0,int lane){union{unsigned short h[8];gs_b8 v;}u;int r=row0+(lane&15),k=k0+4*(lane>>4);
 #pragma unroll
  for(int e=0;e<4;++e){u.h[e]=p[r*pitch+k+e];u.h[e+4]=p[r*pitch+k+8+e];}return u.v;}
@@ -74,7 +75,6 @@ __global__ void gdn_chunk_scan_bf16_q8_gfx1201(
  auto stage_state=[&](){
 #pragma unroll
   for(int ki=0;ki<2;++ki)for(int vi=0;vi<2;++vi){int t=ki*2+vi;int kval=(kt0+ki)*16+8*hi;int vv=(vt0+vi)*16+lo;
-#pragma unroll
    for(int e=0;e<8;++e)sm.state[vv][kval+e]=gs_b16(St[t][e]);}
  };
  stage_state();GS_BAR();
@@ -93,7 +93,6 @@ __global__ void gdn_chunk_scan_bf16_q8_gfx1201(
   const unsigned short*qbase=q+((unsigned long long)parent0*16+keyhead)*GS_D;
 #pragma unroll
   for(int kk=0;kk<8;++kk){gs_b8 km=gs_frag(&sm.k[0][0],GS_KP,mt*16,kk*16,lane);gs_b8 qq=gs_frag_g(qbase,16*GS_D,mt*16,last,kk*16,lane);
-#pragma unroll
    for(int j=0;j<2;++j){gs_b8 st=gs_frag(&sm.state[0][0],GS_KP,(ntb+j)*16,kk*16,lane);gs_b8 kn=gs_frag(&sm.k[0][0],GS_KP,(ntb+j)*16,kk*16,lane);U[j]=gs_mma(km,st,U[j]);O[j]=gs_mma(st,qq,O[j]);P[j]=gs_mma(kn,qq,P[j]);}}
   const float oge=sm.ctrl[0][mt*16+lo];
 #pragma unroll
