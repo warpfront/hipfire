@@ -33,17 +33,33 @@ fn main() {
     const H: usize = 4;
     const TIMING_H: usize = 48;
 
+    // NOTE: HIPFIRE_GFX12_GDN_SCAN_CS / _WMMA are read from the
+    // process-start snapshot (ACTIVE_PROCESS_CONFIG): mid-process set_var
+    // is invisible. Sweep variants via separate processes with the env
+    // exported at launch. T is data-only and loops freely in-process.
+    let cs = rdna_compute::norm::gdn_q8_scan_chunk_size();
+    let wmma = rdna_compute::norm::gdn_q8_scan_wmma();
+    let tol: f32 = std::env::var("HIPFIRE_GDN_SCAN_ORACLE_TOL")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1e-2);
+
     let mut gpu = rdna_compute::Gpu::init().expect("GPU init");
 
-    let configs: &[(usize, usize)] = &[(512, 32), (512, 16), (100, 32), (64, 16)];
+    let t_list: &[usize] = &[512, 100, 64];
     let mut overall_ok = true;
     println!(
-        "{:>4} {:>3} {:>12} {:>12} {:>10} {:>10} {:>10} {:>9}  notes",
-        "T", "CS", "out_max", "out_p99", "dev_ser", "dev_wmma", "dev_valu", "cond"
+        "scan leg: {} CS={} tol={:.1e}",
+        if wmma { "wmma" } else { "valu" },
+        cs,
+        tol
+    );
+    println!(
+        "{:>4} {:>3} {:>12} {:>12} {:>10} {:>10} {:>9}  notes",
+        "T", "CS", "out_max", "out_p99", "dev_ser", "dev_scan", "cond"
     );
 
-    for &(t_tokens, cs) in configs {
-        std::env::set_var("HIPFIRE_GFX12_GDN_SCAN_CS", cs.to_string());
+    for &t_tokens in t_list {
         let (q, k, v, gate, beta, s0) = gen_inputs(t_tokens, H, HD, t_tokens, cs);
         let (s_q8, s_scales, s_ef) = quantize_s_q8_ef(&s0, H, HD);
 
@@ -62,8 +78,7 @@ fn main() {
         )
         .unwrap();
 
-        // Scan arms.
-        std::env::set_var("HIPFIRE_GFX12_GDN_SCAN_WMMA", "1");
+        // Scan arm (snapshot leg) + repeat for bit-determinism.
         let out_w = gpu.zeros(&[t_tokens, H * HD], DType::F32).unwrap();
         let (sq_w, sc_w, ef_w) = dev_state(&mut gpu, &s_q8, &s_scales, &s_ef, H, HD);
         gpu.gated_delta_net_q8_scan(
@@ -71,7 +86,6 @@ fn main() {
             t_tokens, H, HD, &ef_w,
         )
         .unwrap();
-        // Repeat for bit-determinism.
         let out_w2 = gpu.zeros(&[t_tokens, H * HD], DType::F32).unwrap();
         let (sq_w2, sc_w2, ef_w2) = dev_state(&mut gpu, &s_q8, &s_scales, &s_ef, H, HD);
         gpu.gated_delta_net_q8_scan(
@@ -79,24 +93,13 @@ fn main() {
             t_tokens, H, HD, &ef_w2,
         )
         .unwrap();
-
-        std::env::set_var("HIPFIRE_GFX12_GDN_SCAN_WMMA", "0");
-        let out_v = gpu.zeros(&[t_tokens, H * HD], DType::F32).unwrap();
-        let (sq_v, sc_v, ef_v) = dev_state(&mut gpu, &s_q8, &s_scales, &s_ef, H, HD);
-        gpu.gated_delta_net_q8_scan(
-            &q_gpu, &k_gpu, &v_gpu, &g_gpu, &b_gpu, &sq_v, &sc_v, &out_v,
-            t_tokens, H, HD, &ef_v,
-        )
-        .unwrap();
         gpu.hip.device_synchronize().unwrap();
 
         let out_s_h = gpu.download_f32(&out_s).unwrap();
         let out_w_h = gpu.download_f32(&out_w).unwrap();
         let out_w2_h = gpu.download_f32(&out_w2).unwrap();
-        let out_v_h = gpu.download_f32(&out_v).unwrap();
         let codes_s = download_i8(&gpu, &sq_s);
         let codes_w = download_i8(&gpu, &sq_w);
-        let codes_v = download_i8(&gpu, &sq_v);
         let sc_s_h = gpu.download_f32(&sc_s).unwrap();
         let sc_w_h = gpu.download_f32(&sc_w).unwrap();
         let ef_s_h = download_u16(&gpu, &ef_s);
@@ -107,58 +110,115 @@ fn main() {
         let out_f64 = serial_f64(&q, &k, &v, &gate, &beta, &s0_dq, t_tokens, H, HD);
         let dev_s = max_abs_diff_f(&out_s_h, &out_f64);
         let dev_w = max_abs_diff_f(&out_w_h, &out_f64);
-        let dev_v = max_abs_diff_f(&out_v_h, &out_f64);
         let cond = max_t_rowsum(&k, &gate, &beta, t_tokens, H, HD, cs);
 
         let out_max = max_abs_diff(&out_s_h, &out_w_h);
         let out_p99 = tail_p99(&out_s_h, &out_w_h);
-        let out_max_v = max_abs_diff(&out_s_h, &out_v_h);
         let det = max_abs_diff(&out_w_h, &out_w2_h);
         let code_diff = frac_diff_i8(&codes_s, &codes_w);
-        let code_diff_v = frac_diff_i8(&codes_s, &codes_v);
         let sc_max = max_abs_diff(&sc_s_h, &sc_w_h);
         let ef_diff = frac_diff_u16(&ef_s_h, &ef_w_h);
         let commit_ok = commit_invariants(&codes_w, &sc_w_h, &ef_w_h, &out_w_h);
 
-        let ok = dev_w <= dev_s
-            && dev_v <= dev_s
+        let ok = out_max <= tol
             && det == 0.0
             && cond <= 10.0
             && commit_ok;
         overall_ok &= ok;
         println!(
-            "{:>4} {:>3} {:>12.3e} {:>12.3e} {:>10.3e} {:>10.3e} {:>10.3e} {:>9.3}  {}",
+            "{:>4} {:>3} {:>12.3e} {:>12.3e} {:>10.3e} {:>10.3e} {:>9.3}  {}",
             t_tokens,
             cs,
             out_max,
             out_p99,
             dev_s,
             dev_w,
-            dev_v,
             cond,
             if ok { "OK" } else { "FAIL" }
         );
         println!(
-            "      valu_max={:.3e} det_max={:.3e} codes_diff={:.4} codes_diff_v={:.4} sc_max={:.3e} ef_diff={:.4} commit={}",
-            out_max_v, det, code_diff, code_diff_v, sc_max, ef_diff,
+            "      det_max={:.3e} codes_diff={:.4} sc_max={:.3e} ef_diff={:.4} commit={}",
+            det, code_diff, sc_max, ef_diff,
             if commit_ok { "ok" } else { "BAD" }
         );
 
         for tns in [q_gpu, k_gpu, v_gpu, g_gpu, b_gpu] {
             gpu.free_tensor(tns).unwrap();
         }
-        for tns in [out_s, out_w, out_w2, out_v] {
+        for tns in [out_s, out_w, out_w2] {
             gpu.free_tensor(tns).unwrap();
         }
-        for (a, b, c) in [(sq_s, sc_s, ef_s), (sq_w, sc_w, ef_w), (sq_w2, sc_w2, ef_w2), (sq_v, sc_v, ef_v)] {
+        for (a, b, c) in [(sq_s, sc_s, ef_s), (sq_w, sc_w, ef_w), (sq_w2, sc_w2, ef_w2)] {
             gpu.free_tensor(a).unwrap();
             gpu.free_tensor(b).unwrap();
             gpu.free_tensor(c).unwrap();
         }
     }
 
-    // Info-only timing at production width.
-    std::env::set_var("HIPFIRE_GFX12_GDN_SCAN_CS", "32");
+    // One-hot fixtures: q=k=e0, v=e1, gate=0, beta=1, S0=0.
+    // Exact expectation: out dim1 all-ones; scan must be BIT-EXACT vs
+    // serial (all values 0/1, exact in f16 and f32).
+    for &t_tokens in &[8usize, 64] {
+        let mut q = vec![0f32; t_tokens * H * HD];
+        let mut k = vec![0f32; t_tokens * H * HD];
+        let mut v = vec![0f32; t_tokens * H * HD];
+        for t in 0..t_tokens {
+            for h in 0..H {
+                q[(t * H + h) * HD] = 1.0;
+                k[(t * H + h) * HD] = 1.0;
+                v[(t * H + h) * HD + 1] = 1.0;
+            }
+        }
+        let gate = vec![0f32; t_tokens * H];
+        let beta = vec![1f32; t_tokens * H];
+        let s_q8 = vec![0i8; H * HD * HD];
+        let s_scales = vec![1f32; H * HD];
+        let s_ef = vec![0u16; H * HD * HD];
+
+        let q_gpu = gpu.upload_f32(&q, &[t_tokens, H * HD]).unwrap();
+        let k_gpu = gpu.upload_f32(&k, &[t_tokens, H * HD]).unwrap();
+        let v_gpu = gpu.upload_f32(&v, &[t_tokens, H * HD]).unwrap();
+        let g_gpu = gpu.upload_f32(&gate, &[t_tokens, H]).unwrap();
+        let b_gpu = gpu.upload_f32(&beta, &[t_tokens, H]).unwrap();
+        let out_s = gpu.zeros(&[t_tokens, H * HD], DType::F32).unwrap();
+        let (sq_s, sc_s, ef_s) = dev_state(&mut gpu, &s_q8, &s_scales, &s_ef, H, HD);
+        gpu.gated_delta_net_q8_batch_seq(
+            &q_gpu, &k_gpu, &v_gpu, &g_gpu, &b_gpu, &sq_s, &sc_s, &out_s,
+            t_tokens, H, HD, Some(&ef_s),
+        )
+        .unwrap();
+        let out_w = gpu.zeros(&[t_tokens, H * HD], DType::F32).unwrap();
+        let (sq_w, sc_w, ef_w) = dev_state(&mut gpu, &s_q8, &s_scales, &s_ef, H, HD);
+        gpu.gated_delta_net_q8_scan(
+            &q_gpu, &k_gpu, &v_gpu, &g_gpu, &b_gpu, &sq_w, &sc_w, &out_w,
+            t_tokens, H, HD, &ef_w,
+        )
+        .unwrap();
+        gpu.hip.device_synchronize().unwrap();
+        let out_s_h = gpu.download_f32(&out_s).unwrap();
+        let out_w_h = gpu.download_f32(&out_w).unwrap();
+        let d = max_abs_diff(&out_s_h, &out_w_h);
+        let traj_w: Vec<f32> = (0..t_tokens).map(|t| out_w_h[(t * H) * HD + 1]).collect();
+        let traj_s: Vec<f32> = (0..t_tokens).map(|t| out_s_h[(t * H) * HD + 1]).collect();
+        let ok = d == 0.0;
+        overall_ok &= ok;
+        println!(
+            "onehot T={} CS={} max_abs={:.3e} {}",
+            t_tokens, cs, d, if ok { "OK" } else { "FAIL" }
+        );
+        println!("   serial traj[1]: {:?}", traj_s);
+        println!("   scan   traj[1]: {:?}", traj_w);
+        for tns in [q_gpu, k_gpu, v_gpu, g_gpu, b_gpu, out_s, out_w] {
+            gpu.free_tensor(tns).unwrap();
+        }
+        for (a, b, c) in [(sq_s, sc_s, ef_s), (sq_w, sc_w, ef_w)] {
+            gpu.free_tensor(a).unwrap();
+            gpu.free_tensor(b).unwrap();
+            gpu.free_tensor(c).unwrap();
+        }
+    }
+
+    // Info-only timing at production width (serial + snapshot scan leg).
     let t = 512;
     let (q, k, v, gate, beta, s0) = gen_inputs(t, TIMING_H, HD, t, 0);
     let (s_q8, s_scales, s_ef) = quantize_s_q8_ef(&s0, TIMING_H, HD);
@@ -168,13 +228,13 @@ fn main() {
     let g_gpu = gpu.upload_f32(&gate, &[t, TIMING_H]).unwrap();
     let b_gpu = gpu.upload_f32(&beta, &[t, TIMING_H]).unwrap();
     let out = gpu.zeros(&[t, TIMING_H * HD], DType::F32).unwrap();
-    let time_arm = |gpu: &mut rdna_compute::Gpu, wmma: &str| -> f64 {
+    let time_arm = |gpu: &mut rdna_compute::Gpu, serial: bool| -> f64 {
         let mut us = Vec::with_capacity(21);
         for _ in 0..21 {
             let (sq, sc, ef) = dev_state(gpu, &s_q8, &s_scales, &s_ef, TIMING_H, HD);
             gpu.hip.device_synchronize().unwrap();
             let t0 = Instant::now();
-            if wmma == "serial" {
+            if serial {
                 gpu.gated_delta_net_q8_batch_seq(
                     &q_gpu, &k_gpu, &v_gpu, &g_gpu, &b_gpu, &sq, &sc, &out,
                     t, TIMING_H, HD, Some(&ef),
@@ -197,13 +257,12 @@ fn main() {
         us[10]
     };
     // Warmup compiles (untimed).
-    time_arm(&mut gpu, "serial");
-    let m_ser = time_arm(&mut gpu, "serial");
-    let m_wmma = time_arm(&mut gpu, "1");
-    let m_valu = time_arm(&mut gpu, "0");
+    time_arm(&mut gpu, true);
+    let m_ser = time_arm(&mut gpu, true);
+    let m_scan = time_arm(&mut gpu, false);
     println!(
-        "\ninfo-only warm medians us/launch H=48 T=512: serial={:.1} scan_wmma={:.1} scan_valu={:.1}",
-        m_ser, m_wmma, m_valu
+        "\ninfo-only warm medians us/launch H=48 T=512: serial={:.1} scan_{}={:.1}",
+        m_ser, if wmma { "wmma" } else { "valu" }, m_scan
     );
 
     if !overall_ok {

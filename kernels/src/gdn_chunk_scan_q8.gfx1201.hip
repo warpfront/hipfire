@@ -243,24 +243,10 @@ __global__ void HIPFIRE_GDN_SCAN_KERNEL(
         }
         __syncthreads();
 
-        // ── 3. invert (I+L) in place in TM_buf (wave 0; C<=32, tiny). ──
-        if (wave == 0 && lane < 32) {
-            for (int i = 0; i < C; i++) {
-                // T[i,j] = -sum_{l=j}^{i-1} L[i,l]*T[l,j] (j<i); T[i,i]=1.
-                // Row i of L is intact (only rows <i rewritten so far).
-                if (lane < i) {
-                    float acc = 0.0f;
-                    for (int l = lane; l < i; l++)
-                        acc += TM_buf[i * SCAN_CS_MAX + l] * TM_buf[l * SCAN_CS_MAX + lane];
-                    TM_buf[i * SCAN_CS_MAX + lane] = -acc;
-                } else if (lane == i) {
-                    TM_buf[i * SCAN_CS_MAX + lane] = 1.0f;
-                }
-                // lanes > i idle this row; sync each row (wave-level).
-                __syncthreads();
-            }
-        }
-        __syncthreads();
+        // ── 3. (deleted: was an in-place (I+L) inverse that step 4 then
+        // treated as L again — a double transform. TM_buf keeps L and step 4
+        // solves (I+L) delta = rhs directly by forward substitution. This
+        // also removes a wave-0-only __syncthreads, which is UB. ──
 
         // ── 4. rhs = beta o (v - w), then fwd-subst in place in Dlt. ──
         {
