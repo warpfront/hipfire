@@ -338,16 +338,22 @@ extern "C" __global__ void attention_fp8_e4m3_kv(
         // (wv = w*vs, then acc += wv*decode): packed-pair hardware decode
         // (my byte + neighbor dim's byte, one cvt builtin) is bit-exact
         // for all 256 codes, so rounding matches the old dword path.
+        // Group-base hoist: tile_start is 2048-aligned so 8-key groups never
+        // straddle the t-loop; vg0 is recomputed once per group (uniform
+        // predicate, no divergence) and each key adds only its j byte.
+        const unsigned char* vg0 = nullptr;
         for (int t = 0; t < tile_len; t++) {
             const float w = scores[t];
             const int pos = tile_start + t;
+            if ((pos & 7) == 0)
+                vg0 = v_cache + (size_t)(pos >> 3) * row_stride * 8u
+                    + (size_t)kv_h * (size_t)head_dim * 8u;
+            const unsigned char* vg = vg0 + (size_t)(pos & 7);
             // V scales at the group block end (past the codes); K-style home
             // rows are aliased by grouped codes.
             const float vs = (float)*((const _Float16*)(v_cache
                 + (size_t)(pos >> 3) * row_stride * 8u + codes_len * 8u
                 + (size_t)(pos & 7) * (size_t)n_kv_heads * 2u + (size_t)kv_h * 2u));
-            const unsigned char* vg = v_cache + (size_t)(pos >> 3) * row_stride * 8u
-                + (size_t)kv_h * (size_t)head_dim * 8u + (size_t)(pos & 7);
 #if defined(HIPFIRE_FP8_HAVE_HW_DECODE)
             const float wv = w * vs;
 #endif
