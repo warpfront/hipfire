@@ -324,6 +324,10 @@ name = "gdn_q8_scan_oracle"
 required-features = ["lab"]
 
 [[example]]
+name = "gdn_scan_dbg"
+required-features = ["lab"]
+
+[[example]]
 name = "gfx11_generic_smoke"
 required-features = ["lab"]
 

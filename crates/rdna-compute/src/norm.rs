@@ -3914,18 +3914,20 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         let use_wmma = gdn_q8_scan_wmma();
-        let (kernel_name, kernel_src) = if use_wmma {
+        let (kernel_name, kernel_src, kernel_fn) = if use_wmma {
             (
                 "gated_delta_net_q8_scan_gfx1201",
                 kernels::GATED_DELTA_NET_Q8_SCAN_GFX1201_SRC,
+                "gated_delta_net_q8_scan_gfx1201",
             )
         } else {
             (
                 "gated_delta_net_q8_scan_gfx1201_nowmma",
                 kernels::GATED_DELTA_NET_Q8_SCAN_GFX1201_NOWMMA_SRC,
+                "gated_delta_net_q8_scan_gfx1201_nowmma",
             )
         };
-        self.ensure_kernel(kernel_name, kernel_src, "gated_delta_net_q8_scan_gfx1201")?;
+        self.ensure_kernel(kernel_name, kernel_src, kernel_fn)?;
 
         let cs = gdn_q8_scan_chunk_size().clamp(1, 32);
         let mut qp = q_batch.buf.as_ptr();

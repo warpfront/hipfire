@@ -6804,6 +6804,7 @@ pub const GATED_DELTA_NET_Q8_SCAN_GFX1201_SRC: &str =
 #[cfg(feature = "deltanet")]
 pub const GATED_DELTA_NET_Q8_SCAN_GFX1201_NOWMMA_SRC: &str = concat!(
     "#define HIPFIRE_GDN_SCAN_WMMA 0\n",
+    "#define HIPFIRE_GDN_SCAN_KERNEL gated_delta_net_q8_scan_gfx1201_nowmma\n",
     include_str!("../../../kernels/src/gdn_chunk_scan_q8.gfx1201.hip")
 );
 

@@ -66,6 +66,10 @@ typedef float __attribute__((ext_vector_type(8))) scan_float8_t;
 #define HIPFIRE_GDN_QK_HEAD_DIV 1
 #endif
 
+#ifndef HIPFIRE_GDN_SCAN_KERNEL
+#define HIPFIRE_GDN_SCAN_KERNEL gated_delta_net_q8_scan_gfx1201
+#endif
+
 typedef _Float16 __attribute__((ext_vector_type(8))) scan_half8_t;
 typedef float __attribute__((ext_vector_type(8))) scan_float8_t;
 
@@ -80,7 +84,7 @@ __shared__ float Decay_buf[SCAN_CS_MAX];
 __shared__ float Beta_buf[SCAN_CS_MAX];
 
 extern "C" __launch_bounds__(256, 1)
-__global__ void gated_delta_net_q8_scan_gfx1201(
+__global__ void HIPFIRE_GDN_SCAN_KERNEL(
     const float* __restrict__ q,
     const float* __restrict__ k,
     const float* __restrict__ v,
