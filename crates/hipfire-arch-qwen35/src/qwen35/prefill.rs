@@ -234,7 +234,7 @@ fn try_gfx12_rotate_quant_fused_prepared(
     let prep = gpu.rotate_x_mq_i4_gfx12_batched(
         x,
         wo.awq_scale.as_ref(),
-        x_rot,
+        None,
         res,
         k,
         n,
@@ -281,7 +281,7 @@ fn try_gfx12_gdn_quant_fused_prepared(
         z,
         norm_weight,
         wo.awq_scale.as_ref(),
-        x_rot,
+        None,
         res,
         n_heads,
         head_dim,
@@ -5348,7 +5348,7 @@ fn batch_chunk_delta_net_input_projection(
                 dim,
                 config.norm_eps,
                 n,
-                true,
+                false,
             )?;
         }
         if iu4_prep.is_none() {
@@ -14392,7 +14392,7 @@ mod tests {
             .expect("alloc x_rot fused");
         let res = gpu.reserve_int4_mmq(k, N).expect("reserve");
         let prep = gpu
-            .rotate_x_mq_i4_gfx12_batched(&x_t, wo.awq_scale.as_ref(), &x_rot_fused, res, k, N)
+            .rotate_x_mq_i4_gfx12_batched(&x_t, wo.awq_scale.as_ref(), Some(&x_rot_fused), res, k, N)
             .expect("fused rotate+quant");
         gpu.sync_with_deadline(Duration::from_secs(60)).expect("sync fused");
         let f32_fused = gpu.download_f32(&x_rot_fused).expect("dl fused f32");
@@ -14596,7 +14596,7 @@ mod tests {
                 &z_t,
                 norm_weight,
                 wo.awq_scale.as_ref(),
-                &x_rot_fused,
+                Some(&x_rot_fused),
                 res,
                 n_heads,
                 head_dim,

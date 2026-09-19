@@ -20,8 +20,8 @@
 // waves per 256-group — the batched form of the decode
 // gated_norm_mq_rotate_gfx1100 kernel). Phase B is mq_rotate_x's original
 // lane ownership and butterfly verbatim, with the final F32 values held in
-// registers: always stored to x_rot (byte-identical for every downstream
-// reader) and additionally remapped through `emit_iu4_sidecar_from_producer8`
+// registers: optionally stored to x_rot (byte-identical for surviving F32
+// readers) and always remapped through `emit_iu4_sidecar_from_producer8`
 // (prepended by the host JIT with
 // `HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE=1`, same as the C2 producers).
 //
@@ -50,7 +50,7 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
 #endif
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
-    float* __restrict__ x_rot,             // [N, K] f32, always written
+    float* __restrict__ x_rot,             // nullable when emit_f32=false
     block_i4_128* __restrict__ x_i4,       // [K/128, N] block_i4_128
     int n_heads,
     int head_dim,
@@ -165,15 +165,17 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     float f6 = v6 * scale * s21.z;
     float f7 = v7 * scale * s21.w;
 
-    float* out_b = x_rot + batch_off + (long long)group * 256;
-    out_b[d0]     = f0;
-    out_b[d0 + 1] = f1;
-    out_b[d0 + 2] = f2;
-    out_b[d0 + 3] = f3;
-    out_b[d0 + 4] = f4;
-    out_b[d0 + 5] = f5;
-    out_b[d0 + 6] = f6;
-    out_b[d0 + 7] = f7;
+    if (x_rot != nullptr) {
+        float* out_b = x_rot + batch_off + (long long)group * 256;
+        out_b[d0]     = f0;
+        out_b[d0 + 1] = f1;
+        out_b[d0 + 2] = f2;
+        out_b[d0 + 3] = f3;
+        out_b[d0 + 4] = f4;
+        out_b[d0 + 5] = f5;
+        out_b[d0 + 6] = f6;
+        out_b[d0 + 7] = f7;
+    }
 
     // IU4 sidecar: remap this wave's 8-floats/lane into the standalone
     // quant ownership and emit two block_i4_128 rows for this 256-group.

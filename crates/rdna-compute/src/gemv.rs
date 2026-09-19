@@ -3347,7 +3347,11 @@ impl Gpu {
             ]
         };
         let block_size = 256u32;
-        let shared_mem = ((k + 256) * 4) as u32;
+        let shared_mem = if x_rot.is_some() {
+            ((k + 256) * std::mem::size_of::<f32>()) as u32
+        } else {
+            (256 * std::mem::size_of::<f32>()) as u32
+        };
         let blocks_k = k / 128;
         let bytes = (k * 4 * 3 + 2 * 256 * 4 + blocks_k * 72) * batch_size;
         let timer = crate::profile::begin_timer(
@@ -4090,7 +4094,7 @@ impl Gpu {
         z: &GpuTensor,
         weight: &GpuTensor,
         awq: Option<&GpuTensor>,
-        x_rot: &GpuTensor,
+        x_rot: Option<&GpuTensor>,
         reservation: crate::scratch::Int4MmqReservation,
         n_heads: usize,
         head_dim: usize,
@@ -4147,7 +4151,7 @@ impl Gpu {
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
-        let mut xrp = x_rot.buf.as_ptr();
+        let mut xrp = x_rot.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut i4p = reservation.ptr();
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
@@ -4219,7 +4223,9 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
-        self.invalidate_x_caches_for(xrp);
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
         result?;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
@@ -4474,7 +4480,7 @@ impl Gpu {
         &mut self,
         x_in: &GpuTensor,
         awq: Option<&GpuTensor>,
-        x_out: &GpuTensor,
+        x_out: Option<&GpuTensor>,
         reservation: crate::scratch::Int4MmqReservation,
         k: usize,
         batch_size: usize,
@@ -4504,7 +4510,7 @@ impl Gpu {
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut xp = x_in.buf.as_ptr();
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
-        let mut xrp = x_out.buf.as_ptr();
+        let mut xrp = x_out.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
         let mut i4p = reservation.ptr();
@@ -4569,7 +4575,9 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
-        self.invalidate_x_caches_for(xrp);
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
         result?;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }

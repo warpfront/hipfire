@@ -14,10 +14,8 @@
 //   2. `quantize_int4_mmq_ds128` (inside the IU4 residual GEMM via
 //      `ensure_int4_mmq_x`): x_rot f32 → `block_i4_128` Xq, single consumer.
 //
-// This kernel keeps the f32 store (every downstream reader is preserved
-// byte-for-byte) and additionally emits the Xq sidecar in-register, so the
-// IU4 residual consumer takes an `Int4MmqPrepared` and the quantize launch
-// disappears.
+// `x_out` may be null when the prepared IU4 consumer is the only downstream
+// reader. The sidecar still receives the same register values and bytes.
 //
 // -DHIPFIRE_ROTATE_AWQ=1 builds the AWQ twin `rotate_x_mq_awq_i4` (extra
 // `awq_scale[K]` argument, divided BEFORE the FWHT — same formation as
@@ -50,7 +48,7 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
 #ifdef HIPFIRE_ROTATE_AWQ
     const float* __restrict__ awq_scale,   // [K], FP32
 #endif
-    float* __restrict__ x_out,             // [N, K] f32, always written
+    float* __restrict__ x_out,             // nullable when emit_f32=false
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     block_i4_128* __restrict__ x_i4,       // [K/128, N] block_i4_128
@@ -67,7 +65,7 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
 
     const long long batch_off = (long long)batch * K;
     const float* x_in_b  = x_in  + batch_off;
-          float* x_out_b = x_out + batch_off;
+          float* x_out_b = (x_out != nullptr) ? (x_out + batch_off) : nullptr;
 
     int d0 = tid * 8;
     int base = group * 256 + d0;
@@ -138,14 +136,16 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
     float f6 = v6 * s * signs2[d0 + 6];
     float f7 = v7 * s * signs2[d0 + 7];
 
-    x_out_b[base    ] = f0;
-    x_out_b[base + 1] = f1;
-    x_out_b[base + 2] = f2;
-    x_out_b[base + 3] = f3;
-    x_out_b[base + 4] = f4;
-    x_out_b[base + 5] = f5;
-    x_out_b[base + 6] = f6;
-    x_out_b[base + 7] = f7;
+    if (x_out_b != nullptr) {
+        x_out_b[base    ] = f0;
+        x_out_b[base + 1] = f1;
+        x_out_b[base + 2] = f2;
+        x_out_b[base + 3] = f3;
+        x_out_b[base + 4] = f4;
+        x_out_b[base + 5] = f5;
+        x_out_b[base + 6] = f6;
+        x_out_b[base + 7] = f7;
+    }
 
     // IU4 sidecar: remap this wave's 8-floats/lane into the standalone
     // quant ownership and emit two block_i4_128 rows for this 256-group.
