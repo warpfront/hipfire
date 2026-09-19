@@ -9573,6 +9573,211 @@ impl Gpu {
         }
         result
     }
+    /// MQ4 v2 (qt 44) — gfx1201 FP8-WMMA 4-way QKVZA prefill, prepared-X form.
+    /// Launch twin of [`Self::gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8`]:
+    /// identical guards (exact gfx1201, eager, K%256, N%64), staged-v2 /
+    /// S2BT8 / BT kernel selection, grid/block/LDS and kernargs — only the
+    /// `prepare_mq4v2_fp8_x` launch is skipped. The caller (fp8-stream fused
+    /// producer) guarantees `prepared` holds byte-identical standalone-pack
+    /// outputs for (n, k). Fail-closed on (n, k) mismatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared(
+        &mut self,
+        a_qkv: &GpuTensor,
+        a_z: &GpuTensor,
+        a_beta: &GpuTensor,
+        a_alpha: &GpuTensor,
+        prepared: &crate::scratch::Mq4v2Fp8Prepared,
+        y_qkv: &GpuTensor,
+        y_z: &GpuTensor,
+        y_beta: &GpuTensor,
+        y_alpha: &GpuTensor,
+        qkv_m: usize,
+        z_m: usize,
+        beta_m: usize,
+        alpha_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" || self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12: exact gfx1201 eager-only",
+            ));
+        }
+        if batch_size == 0 || k % 256 != 0 || batch_size % 64 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12: need N%64==0, K%256==0",
+            ));
+        }
+        if prepared.n != batch_size || prepared.k != k {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12: prepared (n,k) mismatch",
+            ));
+        }
+        // Staged-tile v2 candidate (default ON on gfx1201): geometry from
+        // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
+        // block 256, dynamic LDS ~20 KiB). Admitted only on the
+        // already-guarded uniform route above (exact gfx1201, eager, K%256,
+        // N%64) plus N>=256; the family flag stays a prerequisite and smaller
+        // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
+        let v2 = self.flags.gfx12_mq4v2_fp8_v2
+            && self.flags.gfx12_mq4v2_fp8_qkvza
+            && batch_size >= 256;
+        // Balanced-aspect launch: block/LDS/grid follow the selected geometry
+        // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
+        let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
+        let vblock = [(vwaves * 32) as u32, 1, 1];
+        let vlds = (vbm * (vbk + 8) + vbn * (vbk + 8) + vbm * 4 + vbn * 8) as u32;
+        // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
+        // selects the single-slab symbols (see gate_up launcher).
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
+            && batch_size % 128 == 0;
+        // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
+        // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
+        let (func_name, ksrc, bv): (&str, &str, usize) = if v2 {
+            match (vbm, vbn) {
+                (128, 128) => (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SRC,
+                    8,
+                ),
+                (64, 256) => (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B64X256_SRC,
+                    4,
+                ),
+                (128, 64) => (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X64W4_SRC,
+                    8,
+                ),
+                _ => (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_SRC,
+                    16,
+                ),
+            }
+        } else if slabs2 {
+            (
+                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_s2bt8",
+                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_SRC,
+                8,
+            )
+        } else if batch_size % 192 == 0 {
+            (
+                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt12",
+                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC,
+                12,
+            )
+        } else if batch_size % 128 == 0 && batch_size <= 256 {
+            (
+                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt8",
+                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT8_SRC,
+                8,
+            )
+        } else if batch_size <= 256 {
+            (
+                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt4",
+                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC,
+                4,
+            )
+        } else {
+            // Masked BT12 tail: measured faster than the exact-divisor BT8/BT4.
+            (
+                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12_bt12",
+                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC,
+                12,
+            )
+        };
+        self.ensure_kernel(func_name, ksrc, func_name)?;
+        let mut aq = a_qkv.buf.as_ptr();
+        let mut az = a_z.buf.as_ptr();
+        let mut ab = a_beta.buf.as_ptr();
+        let mut aa = a_alpha.buf.as_ptr();
+        let mut xf = prepared.x_fp8;
+        let mut hs = prepared.half_sums;
+        let mut rsc = prepared.row_scales;
+        let mut yq = y_qkv.buf.as_ptr();
+        let mut yz = y_z.buf.as_ptr();
+        let mut yb = y_beta.buf.as_ptr();
+        let mut ya = y_alpha.buf.as_ptr();
+        let mut q_m = qkv_m as i32;
+        let mut z_m_val = z_m as i32;
+        let mut b_m = beta_m as i32;
+        let mut a_m = alpha_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut az as *mut _ as *mut c_void,
+            &mut ab as *mut _ as *mut c_void,
+            &mut aa as *mut _ as *mut c_void,
+            &mut xf as *mut _ as *mut c_void,
+            &mut hs as *mut _ as *mut c_void,
+            &mut rsc as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yz as *mut _ as *mut c_void,
+            &mut yb as *mut _ as *mut c_void,
+            &mut ya as *mut _ as *mut c_void,
+            &mut q_m as *mut _ as *mut c_void,
+            &mut z_m_val as *mut _ as *mut c_void,
+            &mut b_m as *mut _ as *mut c_void,
+            &mut a_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let total_m = qkv_m + z_m + beta_m + alpha_m;
+        let row_tiles = if v2 {
+            (total_m + vbn - 1) / vbn
+        } else if slabs2 {
+            (total_m + 31) / 32
+        } else {
+            (total_m + 15) / 16
+        };
+        // bv = BM/16 under v2 gives batch_tiles = ceil(N/BM), matching the grid.
+        let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
+        let bytes = crate::profile::gemv_hfq4g256_bytes(total_m, k)
+            + batch_size * k
+            + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            if v2 { vblock } else { [32, 1, 1] },
+            if v2 { vlds } else { 0 },
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(az);
+                b.push_ptr(ab);
+                b.push_ptr(aa);
+                b.push_ptr(xf);
+                b.push_ptr(hs);
+                b.push_ptr(rsc);
+                b.push_ptr(yq);
+                b.push_ptr(yz);
+                b.push_ptr(yb);
+                b.push_ptr(ya);
+                b.push_i32(q_m);
+                b.push_i32(z_m_val);
+                b.push_i32(b_m);
+                b.push_i32(a_m);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// MQ4 v2 (qt 44) — gfx1201 FP8-WMMA 3-way fused QKV (full-attention)
     /// candidate, default-OFF behind `HIPFIRE_GFX12_MQ4V2_FP8_QKV`; eager-only,
     /// exact gfx1201, K%256, N%64. Shares the FP8 X preparation with gate/up.
@@ -9609,6 +9814,200 @@ impl Gpu {
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
+        // Staged-tile v2 candidate (default ON on gfx1201): geometry from
+        // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
+        // block 256, dynamic LDS ~20 KiB). Admitted only on the
+        // already-guarded uniform route above (exact gfx1201, eager, K%256,
+        // N%64) plus N>=256; the family flag stays a prerequisite and smaller
+        // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
+        let v2 = self.flags.gfx12_mq4v2_fp8_v2
+            && self.flags.gfx12_mq4v2_fp8_qkv
+            && batch_size >= 256;
+        // Balanced-aspect launch: block/LDS/grid follow the selected geometry
+        // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
+        let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
+        let vblock = [(vwaves * 32) as u32, 1, 1];
+        let vlds = (vbm * (vbk + 8) + vbn * (vbk + 8) + vbm * 4 + vbn * 8) as u32;
+        // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
+        // selects the single-slab symbols (see gate_up launcher).
+        let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
+            != Ok("1")
+            && batch_size % 128 == 0;
+        // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
+        // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
+        let (func_name, ksrc, bv): (&str, &str, usize) = if v2 {
+            match (vbm, vbn) {
+                (128, 128) => (
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201",
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SRC,
+                    8,
+                ),
+                (64, 256) => (
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201",
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B64X256_SRC,
+                    4,
+                ),
+                (128, 64) => (
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201",
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X64W4_SRC,
+                    8,
+                ),
+                _ => (
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201",
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_SRC,
+                    16,
+                ),
+            }
+        } else if slabs2 {
+            (
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_s2bt8",
+                kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_S2BT8_SRC,
+                8,
+            )
+        } else if batch_size % 192 == 0 {
+            (
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt12",
+                kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC,
+                12,
+            )
+        } else if batch_size % 128 == 0 && batch_size <= 256 {
+            (
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt8",
+                kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT8_SRC,
+                8,
+            )
+        } else if batch_size <= 256 {
+            (
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt4",
+                kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT4_SRC,
+                4,
+            )
+        } else {
+            // Masked BT12 tail: measured faster than the exact-divisor BT8/BT4.
+            (
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12_bt12",
+                kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_BT12_SRC,
+                12,
+            )
+        };
+        self.ensure_kernel(func_name, ksrc, func_name)?;
+        let mut aq = a_q.buf.as_ptr();
+        let mut ak = a_k.buf.as_ptr();
+        let mut av = a_v.buf.as_ptr();
+        let mut xf = prepared.x_fp8;
+        let mut hs = prepared.half_sums;
+        let mut rsc = prepared.row_scales;
+        let mut yq = y_q.buf.as_ptr();
+        let mut yk = y_k.buf.as_ptr();
+        let mut yv = y_v.buf.as_ptr();
+        let mut q_m_val = q_m as i32;
+        let mut k_m_val = k_m as i32;
+        let mut v_m_val = v_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut aq as *mut _ as *mut c_void,
+            &mut ak as *mut _ as *mut c_void,
+            &mut av as *mut _ as *mut c_void,
+            &mut xf as *mut _ as *mut c_void,
+            &mut hs as *mut _ as *mut c_void,
+            &mut rsc as *mut _ as *mut c_void,
+            &mut yq as *mut _ as *mut c_void,
+            &mut yk as *mut _ as *mut c_void,
+            &mut yv as *mut _ as *mut c_void,
+            &mut q_m_val as *mut _ as *mut c_void,
+            &mut k_m_val as *mut _ as *mut c_void,
+            &mut v_m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let total_m = q_m + k_m + v_m;
+        let row_tiles = if v2 {
+            (total_m + vbn - 1) / vbn
+        } else if slabs2 {
+            (total_m + 31) / 32
+        } else {
+            (total_m + 15) / 16
+        };
+        // bv = BM/16 under v2 gives batch_tiles = ceil(N/BM), matching the grid.
+        let batch_tiles = (batch_size + 16 * bv - 1) / (16 * bv);
+        let bytes = crate::profile::gemv_hfq4g256_bytes(total_m, k)
+            + batch_size * k
+            + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, bytes);
+        let result = self.launch_maybe_blob(
+            func_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            if v2 { vblock } else { [32, 1, 1] },
+            if v2 { vlds } else { 0 },
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(aq);
+                b.push_ptr(ak);
+                b.push_ptr(av);
+                b.push_ptr(xf);
+                b.push_ptr(hs);
+                b.push_ptr(rsc);
+                b.push_ptr(yq);
+                b.push_ptr(yk);
+                b.push_ptr(yv);
+                b.push_i32(q_m_val);
+                b.push_i32(k_m_val);
+                b.push_i32(v_m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+    /// MQ4 v2 (qt 44) — gfx1201 FP8-WMMA 3-way fused QKV (full-attention),
+    /// prepared-X form. Launch twin of
+    /// [`Self::gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8`]: identical guards
+    /// (exact gfx1201, eager, K%256, N%64), staged-v2 / S2BT8 / BT kernel
+    /// selection, grid/block/LDS and kernargs — only the
+    /// `prepare_mq4v2_fp8_x` launch is skipped. The caller (fp8-stream fused
+    /// producer) guarantees `prepared` holds byte-identical standalone-pack
+    /// outputs for (n, k). Fail-closed on (n, k) mismatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared(
+        &mut self,
+        a_q: &GpuTensor,
+        a_k: &GpuTensor,
+        a_v: &GpuTensor,
+        prepared: &crate::scratch::Mq4v2Fp8Prepared,
+        y_q: &GpuTensor,
+        y_k: &GpuTensor,
+        y_v: &GpuTensor,
+        q_m: usize,
+        k_m: usize,
+        v_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" || self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12: exact gfx1201 eager-only",
+            ));
+        }
+        if batch_size == 0 || k % 256 != 0 || batch_size % 64 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12: need N%64==0, K%256==0",
+            ));
+        }
+        if prepared.n != batch_size || prepared.k != k {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12: prepared (n,k) mismatch",
+            ));
+        }
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
         // block 256, dynamic LDS ~20 KiB). Admitted only on the

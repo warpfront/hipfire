@@ -190,7 +190,10 @@ fn try_gfx12_fp8_stream_rmsnorm_prepared(
     eps: f32,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
-    if next_linear.gpu_dtype != DType::MQ4G256V2Lloyd || !gpu.fp8_stream_active(n, k) {
+    if !matches!(
+        next_linear.gpu_dtype,
+        DType::MQ4G256V2 | DType::MQ4G256V2Lloyd
+    ) || !gpu.fp8_stream_active(n, k) {
         return Ok(None);
     }
     let prep = gpu.fused_rmsnorm_rotate_mq_fp8_gfx12_batched(
@@ -5658,7 +5661,36 @@ fn batch_chunk_delta_net_input_projection(
             0,
             "batch_chunk_delta_net_input_projection: mixed MQ4G256V2Lloyd/uniform LA projections — refusing (quantize all four or none)",
         ));
-    } else {
+        } else if layer.wqkv.gpu_dtype == DType::MQ4G256V2
+            && layer.wz.gpu_dtype == DType::MQ4G256V2
+            && layer.w_beta.gpu_dtype == DType::MQ4G256V2
+            && layer.w_alpha.gpu_dtype == DType::MQ4G256V2
+            && gpu.flags.gfx12_mq4v2_fp8_qkvza
+            && fp8_prep.is_some()
+        {
+            // gfx1201 FP8-stream (uniform): the producer already emitted the
+            // fp8 pre-pass planes; consume them directly with the launch twin
+            // of the family's fp8 route — no pack launch. Same fp8 intercept
+            // conditions as the uniform router (iu4 divergence excluded by
+            // producer-side ordering: fp8_prep implies iu4_prep is None).
+            gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared(
+                &layer.wqkv.buf,
+                &layer.wz.buf,
+                &layer.w_beta.buf,
+                &layer.w_alpha.buf,
+                fp8_prep.as_ref().unwrap(),
+                &pbs.dn_qkv_batch,
+                &pbs.dn_z_batch,
+                &pbs.dn_beta_batch,
+                &pbs.dn_alpha_batch,
+                layer.wqkv.m,
+                layer.wz.m,
+                layer.w_beta.m,
+                layer.w_alpha.m,
+                layer.wqkv.k,
+                n,
+            )?;
+        } else {
         run_fused_qkvza_key(
             gpu,
             crate::forward_slots::fused_qkvza_key_for(layer.wqkv.gpu_dtype),
@@ -6757,7 +6789,29 @@ fn batch_chunk_delta_net_ffn_gate_up(
             0,
             "batch_chunk_delta_net_ffn_gate_up: mixed MQ4G256V2Lloyd/uniform gate/up — refusing (quantize both or neither)",
         ));
-    } else {
+        } else if layer.w_gate.gpu_dtype == DType::MQ4G256V2
+            && layer.w_up.gpu_dtype == DType::MQ4G256V2
+            && gpu.flags.gfx12_mq4v2_fp8_gateup
+            && !gpu.flags.hfq4g256_ldsstage_wmma
+            && fp8_prep.is_some()
+        {
+            // gfx1201 FP8-stream (uniform): the producer already emitted the
+            // fp8 pre-pass planes; consume them directly with the launch twin
+            // of the family's fp8 route — no pack launch. Same fp8 intercept
+            // conditions as the uniform router (iu4 divergence excluded by
+            // producer-side ordering: fp8_prep implies iu4_prep is None).
+            gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                fp8_prep.as_ref().unwrap(),
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+            )?;
+        } else {
         run_fused_gate_up_key(
             gpu,
             crate::forward_slots::fused_gate_up_key_for(layer.w_gate.gpu_dtype),
@@ -7318,7 +7372,32 @@ fn batch_chunk_full_attn_input_projection(
             0,
             "batch_chunk_full_attn_input_projection: mixed MQ4G256V2Lloyd/uniform FA qkv — refusing (quantize all three or none)",
         ));
-    } else if qkv_same_dtype {
+        } else if layer.wq.gpu_dtype == DType::MQ4G256V2
+            && layer.wk.gpu_dtype == DType::MQ4G256V2
+            && layer.wv.gpu_dtype == DType::MQ4G256V2
+            && gpu.flags.gfx12_mq4v2_fp8_qkv
+            && fp8_prep.is_some()
+        {
+            // gfx1201 FP8-stream (uniform): the producer already emitted the
+            // fp8 pre-pass planes; consume them directly with the launch twin
+            // of the family's fp8 route — no pack launch. Same fp8 intercept
+            // conditions as the uniform router (iu4 divergence excluded by
+            // producer-side ordering: fp8_prep implies iu4_prep is None).
+            gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared(
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                fp8_prep.as_ref().unwrap(),
+                &pbs.fa_q_full_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+                n,
+            )?;
+        } else if qkv_same_dtype {
         run_fused_qkv_key(
             gpu,
             crate::forward_slots::fused_qkv_key_for(layer.wq.gpu_dtype),
@@ -8301,7 +8380,29 @@ fn batch_chunk_full_attn_ffn_gate_up(
             0,
             "batch_chunk_full_attn_ffn_gate_up: mixed MQ4G256V2Lloyd/uniform gate/up — refusing (quantize both or neither)",
         ));
-    } else {
+        } else if layer.w_gate.gpu_dtype == DType::MQ4G256V2
+            && layer.w_up.gpu_dtype == DType::MQ4G256V2
+            && gpu.flags.gfx12_mq4v2_fp8_gateup
+            && !gpu.flags.hfq4g256_ldsstage_wmma
+            && fp8_prep.is_some()
+        {
+            // gfx1201 FP8-stream (uniform): the producer already emitted the
+            // fp8 pre-pass planes; consume them directly with the launch twin
+            // of the family's fp8 route — no pack launch. Same fp8 intercept
+            // conditions as the uniform router (iu4 divergence excluded by
+            // producer-side ordering: fp8_prep implies iu4_prep is None).
+            gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                fp8_prep.as_ref().unwrap(),
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+            )?;
+        } else {
         run_fused_gate_up_key(
             gpu,
             crate::forward_slots::fused_gate_up_key_for(layer.w_gate.gpu_dtype),
