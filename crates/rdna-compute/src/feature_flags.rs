@@ -241,11 +241,10 @@ pub struct FeatureFlags {
     pub gfx12_silu_quant_fused: bool,
     /// gfx1201 RMSNorm/rotate/gated-norm + int4 quant fusions (slices 2-4:
     /// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`, `kernel.gfx12_producer_quant_fused`).
-    /// Default OFF everywhere; `=1` emits `block_i4_128` in-register from
-    /// the `_gfx12` RMSNorm/rotate/gated-norm producers on exact gfx1201,
-    /// removing the standalone `quantize_int4_mmq_ds128` launch at each
-    /// admitted site. Bit-identical vs the producer+quantizer chain; any
-    /// byte difference kills it.
+    /// Default ON on exact gfx1201; `=0` opts out to the standalone
+    /// `quantize_int4_mmq_ds128` launch at each admitted site.
+    /// Bit-identical vs the producer+quantizer chain; any byte difference
+    /// kills it.
     pub gfx12_producer_quant_fused: bool,
     /// `HIPFIRE_GFX12_FA2_PREFILL=0` opts out of the gfx1201 GQA-fused FA2
     /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
@@ -633,7 +632,8 @@ impl FeatureFlags {
             gfx12_gdn_pre_fused: value("HIPFIRE_GFX12_GDN_PRE_FUSED").as_deref() == Ok("1"),
             gfx12_silu_quant_fused: parse_bool("HIPFIRE_GFX12_SILU_QUANT_FUSED")
                 .unwrap_or(arch == "gfx1201"),
-            gfx12_producer_quant_fused: value("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED").as_deref() == Ok("1"),
+            gfx12_producer_quant_fused: parse_bool("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED")
+                .unwrap_or(arch == "gfx1201"),
             gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
                 .unwrap_or(arch == "gfx1201"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
@@ -1149,6 +1149,44 @@ mod tests {
             assert!(!test_flags.gfx12_silu_quant_fused, "arch={arch}");
         }
     }
+    #[test]
+    fn gfx12_producer_quant_fused_default_on_gfx1201_with_opt_out() {
+        // Default process policy: the exact-gfx1201 RMSNorm/rotate/gated-norm
+        // +quant fusions admit on gfx1201 (bit-identical to the standalone
+        // quantizer chains); explicit `=0` restores the incumbent
+        // producer+quantizer launches.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let gfx1201 = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(gfx1201.gfx12_producer_quant_fused);
+        assert!(gfx1201.gfx12_producer_quant_fused_enabled());
+        for arch in ["gfx1100", "gfx1151", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_producer_quant_fused, "arch={arch}");
+            assert!(!flags.gfx12_producer_quant_fused_enabled(), "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx12_producer_quant_fused", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(!opted_out.gfx12_producer_quant_fused);
+        assert!(!opted_out.gfx12_producer_quant_fused_enabled());
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx12_producer_quant_fused, "arch={arch}");
+        }
+    }
+
     #[test]
     fn iu4_prefill_opt_in_on_gfx11_and_gfx1201() {
         // Default process policy: the iu4-direct MMQ prefill route stays off
