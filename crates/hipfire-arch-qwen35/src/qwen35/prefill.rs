@@ -777,10 +777,10 @@ fn explicit_prefill_max_batch() -> Option<usize> {
 }
 
 /// Architecture default for the widened ordinary-prefill chunk ceiling
-/// (`prefill.chunk_rows`): 4096 on exact gfx1201, 512 elsewhere.
+/// (`prefill.chunk_rows`): 8192 on exact gfx1201, 512 elsewhere.
 #[inline]
 fn prefill_chunk_rows_default(arch: &str) -> usize {
-    if arch == "gfx1201" { 4096 } else { 512 }
+    if arch == "gfx1201" { 8192 } else { 512 }
 }
 
 /// Requested widened chunk ceiling: explicit `HIPFIRE_PREFILL_MAX_BATCH`
