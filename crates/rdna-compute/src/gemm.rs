@@ -9378,7 +9378,8 @@ impl Gpu {
     /// MQ4 v2 (qt 44) — dedicated v2 source `GEMM_QKVZA_MQ4G256V2_*_SRC`.
     /// MQ4 v2 (qt 44) — gfx1201 FP8-WMMA 4-way fused QKVZA candidate,
     /// default-OFF behind `HIPFIRE_GFX12_MQ4V2_FP8_QKVZA`; eager-only, exact
-    /// gfx1201, K%256, N%64. Shares the FP8 X preparation with gate/up.
+    /// gfx1201, K%256. Partial N tiles are masked in-kernel (clamped loads,
+    /// `oc < N` guarded stores). Shares the FP8 X preparation with gate/up.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8(
         &mut self,
@@ -9406,18 +9407,18 @@ impl Gpu {
                 "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12: exact gfx1201 eager-only",
             ));
         }
-        if batch_size == 0 || k % 256 != 0 || batch_size % 64 != 0 {
+        if batch_size == 0 || k % 256 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12: need N%64==0, K%256==0",
+                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12: need N>0, K%256==0",
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
         // block 256, dynamic LDS ~20 KiB). Admitted only on the
-        // already-guarded uniform route above (exact gfx1201, eager, K%256,
-        // N%64) plus N>=256; the family flag stays a prerequisite and smaller
+        // already-guarded uniform route above (exact gfx1201, eager, K%256)
+        // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 = self.flags.gfx12_mq4v2_fp8_v2
             && self.flags.gfx12_mq4v2_fp8_qkvza
@@ -9575,7 +9576,7 @@ impl Gpu {
     }
     /// MQ4 v2 (qt 44) — gfx1201 FP8-WMMA 4-way QKVZA prefill, prepared-X form.
     /// Launch twin of [`Self::gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8`]:
-    /// identical guards (exact gfx1201, eager, K%256, N%64), staged-v2 /
+    /// identical guards (exact gfx1201, eager, K%256), staged-v2 /
     /// S2BT8 / BT kernel selection, grid/block/LDS and kernargs — only the
     /// `prepare_mq4v2_fp8_x` launch is skipped. The caller (fp8-stream fused
     /// producer) guarantees `prepared` holds byte-identical standalone-pack
@@ -9606,10 +9607,10 @@ impl Gpu {
                 "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12: exact gfx1201 eager-only",
             ));
         }
-        if batch_size == 0 || k % 256 != 0 || batch_size % 64 != 0 {
+        if batch_size == 0 || k % 256 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12: need N%64==0, K%256==0",
+                "gemm_qkvza_mq4g256v2_wmma_fp8_gfx12: need N>0, K%256==0",
             ));
         }
         if prepared.n != batch_size || prepared.k != k {
@@ -9621,8 +9622,8 @@ impl Gpu {
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
         // block 256, dynamic LDS ~20 KiB). Admitted only on the
-        // already-guarded uniform route above (exact gfx1201, eager, K%256,
-        // N%64) plus N>=256; the family flag stays a prerequisite and smaller
+        // already-guarded uniform route above (exact gfx1201, eager, K%256)
+        // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 = self.flags.gfx12_mq4v2_fp8_v2
             && self.flags.gfx12_mq4v2_fp8_qkvza
@@ -9780,8 +9781,9 @@ impl Gpu {
     }
     /// MQ4 v2 (qt 44) — gfx1201 FP8-WMMA 3-way fused QKV (full-attention)
     /// candidate, default-OFF behind `HIPFIRE_GFX12_MQ4V2_FP8_QKV`; eager-only,
-    /// exact gfx1201, K%256, N%64. Shares the FP8 X preparation with gate/up.
-    /// ABI mirrors the F16 gfx1201 BT kernel (3 weights, 3 outputs, 3 row
+    /// exact gfx1201, K%256. Shares the FP8 X preparation with gate/up.
+    /// Partial N tiles are masked in-kernel (clamped loads, `oc < N` guarded
+    /// stores). ABI mirrors the F16 gfx1201 BT kernel (3 weights, 3 outputs,
     /// counts); overwrite semantics.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8(
@@ -9807,18 +9809,18 @@ impl Gpu {
                 "gemm_qkv_mq4g256v2_wmma_fp8_gfx12: exact gfx1201 eager-only",
             ));
         }
-        if batch_size == 0 || k % 256 != 0 || batch_size % 64 != 0 {
+        if batch_size == 0 || k % 256 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12: need N%64==0, K%256==0",
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12: need N>0, K%256==0",
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
         // block 256, dynamic LDS ~20 KiB). Admitted only on the
-        // already-guarded uniform route above (exact gfx1201, eager, K%256,
-        // N%64) plus N>=256; the family flag stays a prerequisite and smaller
+        // already-guarded uniform route above (exact gfx1201, eager, K%256)
+        // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 = self.flags.gfx12_mq4v2_fp8_v2
             && self.flags.gfx12_mq4v2_fp8_qkv
@@ -9968,7 +9970,7 @@ impl Gpu {
     /// MQ4 v2 (qt 44) — gfx1201 FP8-WMMA 3-way fused QKV (full-attention),
     /// prepared-X form. Launch twin of
     /// [`Self::gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8`]: identical guards
-    /// (exact gfx1201, eager, K%256, N%64), staged-v2 / S2BT8 / BT kernel
+    /// (exact gfx1201, eager, K%256), staged-v2 / S2BT8 / BT kernel
     /// selection, grid/block/LDS and kernargs — only the
     /// `prepare_mq4v2_fp8_x` launch is skipped. The caller (fp8-stream fused
     /// producer) guarantees `prepared` holds byte-identical standalone-pack
@@ -9996,10 +9998,10 @@ impl Gpu {
                 "gemm_qkv_mq4g256v2_wmma_fp8_gfx12: exact gfx1201 eager-only",
             ));
         }
-        if batch_size == 0 || k % 256 != 0 || batch_size % 64 != 0 {
+        if batch_size == 0 || k % 256 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12: need N%64==0, K%256==0",
+                "gemm_qkv_mq4g256v2_wmma_fp8_gfx12: need N>0, K%256==0",
             ));
         }
         if prepared.n != batch_size || prepared.k != k {
@@ -10011,8 +10013,8 @@ impl Gpu {
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
         // block 256, dynamic LDS ~20 KiB). Admitted only on the
-        // already-guarded uniform route above (exact gfx1201, eager, K%256,
-        // N%64) plus N>=256; the family flag stays a prerequisite and smaller
+        // already-guarded uniform route above (exact gfx1201, eager, K%256)
+        // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 = self.flags.gfx12_mq4v2_fp8_v2
             && self.flags.gfx12_mq4v2_fp8_qkv
@@ -10218,7 +10220,6 @@ impl Gpu {
             && !self.graphs.capture_mode
             && k % 256 == 0
             && batch_size >= 64
-            && batch_size % 64 == 0
         {
             return self.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8(
                 a_qkv, a_z, a_beta, a_alpha, x, y_qkv, y_z, y_beta, y_alpha, qkv_m, z_m, beta_m,
@@ -29615,7 +29616,6 @@ impl Gpu {
             && !self.graphs.capture_mode
             && k % 256 == 0
             && batch_size >= 64
-            && batch_size % 64 == 0
         {
             return self.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8(
                 a_q, a_k, a_v, x, y_q, y_k, y_v, q_m, k_m, v_m, k, batch_size, 1,
@@ -30302,7 +30302,6 @@ impl Gpu {
             && !self.graphs.capture_mode
             && k % 256 == 0
             && batch_size >= 64
-            && batch_size % 64 == 0
         {
             return self.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12(
                 a_gate, a_up, x, y_gate, y_up, gate_m, up_m, k, batch_size, 1,
@@ -30451,12 +30450,6 @@ impl Gpu {
                 "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12_bt12: K divisible by 256 required",
             ));
         }
-        if batch_size % 64 != 0 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "gemm_gate_up_mq4g256v2_wmma_fp8_gfx12: batch divisible by 64 required",
-            ));
-        }
         if prepared.n != batch_size || prepared.k != k {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -30466,8 +30459,8 @@ impl Gpu {
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
         // block 256, dynamic LDS ~20 KiB). Admitted only on the
-        // already-guarded uniform route above (exact gfx1201, eager, K%256,
-        // N%64) plus N>=256; the family flag stays a prerequisite and smaller
+        // already-guarded uniform route above (exact gfx1201, eager, K%256)
+        // plus N>=256; the family flag stays a prerequisite and smaller
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 = self.flags.gfx12_mq4v2_fp8_v2
             && self.flags.gfx12_mq4v2_fp8_gateup
@@ -30702,12 +30695,6 @@ impl Gpu {
             return Err(hip_bridge::HipError::new(
                 0,
                 "mq4v2-lloyd gate/up FP8 prefill: K divisible by 256 required",
-            ));
-        }
-        if batch_size % 64 != 0 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "mq4v2-lloyd gate/up FP8 prefill: batch divisible by 64 required (pad upstream)",
             ));
         }
         // The LUT kernels key the per-slab codebook on the slab start row
@@ -31667,12 +31654,6 @@ impl Gpu {
                 "mq4v2-lloyd qkvza FP8 prefill: K divisible by 256 required",
             ));
         }
-        if batch_size % 64 != 0 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "mq4v2-lloyd qkvza FP8 prefill: batch divisible by 64 required (pad upstream)",
-            ));
-        }
         if prepared.n != batch_size || prepared.k != k {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -31962,12 +31943,6 @@ impl Gpu {
                 "mq4v2-lloyd qkv FP8 prefill: K divisible by 256 required",
             ));
         }
-        if batch_size % 64 != 0 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "mq4v2-lloyd qkv FP8 prefill: batch divisible by 64 required (pad upstream)",
-            ));
-        }
         // The LUT kernels key the per-slab codebook on the slab start row
         // (wave-uniform -> SGPR), which requires every 16-row slab to lie in one
         // source: q_m, k_m, and v_m must all be multiples of 16 (hence tm too, so the
@@ -32188,10 +32163,10 @@ impl Gpu {
                 "gemm_mq4g256v2_residual_wmma_fp8_gfx12: exact gfx1201 eager-only",
             ));
         }
-        if m == 0 || batch_size == 0 || k % 256 != 0 || batch_size % 64 != 0 {
+        if m == 0 || batch_size == 0 || k % 256 != 0 {
             return Err(hip_bridge::HipError::new(
                 0,
-                "gemm_mq4g256v2_residual_wmma_fp8_gfx12: need M>0, N%64==0, K%256==0",
+                "gemm_mq4g256v2_residual_wmma_fp8_gfx12: need M>0, N>0, K%256==0",
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
@@ -32199,7 +32174,7 @@ impl Gpu {
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
         // block 256, dynamic LDS ~20 KiB). Admitted only on the
         // already-guarded uniform route above (exact gfx1201, eager, M>0,
-        // K%256, N%64) plus N>=256; the family flag stays a prerequisite and
+        // K%256) plus N>=256; the family flag stays a prerequisite and
         // smaller batches keep s2bt8/BT. Params/blob layout below is the
         // frozen v2 ABI.
         let v2 = self.flags.gfx12_mq4v2_fp8_v2
@@ -32404,13 +32379,15 @@ impl Gpu {
             }
             return result;
         }
+        // gfx12 MQ4v2-FP8 kernels mask partial N tiles in-kernel (clamped
+        // loads, `oc < N` guarded stores), so odd prefill batches stay on
+        // the fp8 path without host-side fallback.
         if self.flags.gfx12_mq4v2_fp8_resid
             && self.arch == "gfx1201"
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
             && k % 256 == 0
             && batch_size >= 64
-            && batch_size % 64 == 0
         {
             return self
                 .gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8(a_raw, x, y, m, k, batch_size, 1);
