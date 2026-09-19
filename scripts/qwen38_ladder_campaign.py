@@ -29,7 +29,7 @@ Contract recap (see task description):
             every artifact must satisfy model bpw ∈ [N, N+1)
   drafts    dflash_convert --mqNv2 same-bit from incoai/Qwen3.8-27B-DFlash2
             (mq4 control always included; 5 drafts total)
-  KLD       env HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_LLOYD_GFX12=1
+  KLD       env HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0
             24 chunks, q8/q8, prefill, both refs
   perf      hipfire bench <model> "<prompt bytes as one arg>" --runs 5 --warmups 3
             --max-tokens 128 --backend noslots --workload stateless --json
@@ -469,7 +469,7 @@ def build_manifest(args: argparse.Namespace) -> Dict[str, Any]:
         ],
         # KLD/Perf contract
         "kld": {
-            "env": {"HIPFIRE_NORMALIZE_PROMPT": "0", "HIPFIRE_GRAPH": "0", "HIPFIRE_LLOYD_GFX12": "1"},
+            "env": {"HIPFIRE_NORMALIZE_PROMPT": "0", "HIPFIRE_GRAPH": "0"},
             "chunks": DEFAULT_KLD_CHUNKS,
             "kv_mode": "q8",
             "kv_v": "q8",
@@ -582,7 +582,6 @@ def kld_argv(cell: Dict[str, Any], ref_kind: str, ref_path: str, output_path: st
     env = {
         "HIPFIRE_NORMALIZE_PROMPT": "0",
         "HIPFIRE_GRAPH": "0",
-        "HIPFIRE_LLOYD_GFX12": "1",
     }
     return argv, env
 
@@ -1046,7 +1045,7 @@ def do_kld(args: argparse.Namespace) -> int:
                 "kv_mode": "q8",
                 "kv_v": "q8",
                 "scoring_mode": "prefill",
-                "env": {"HIPFIRE_NORMALIZE_PROMPT": "0", "HIPFIRE_GRAPH": "0", "HIPFIRE_LLOYD_GFX12": "1"},
+                "env": {"HIPFIRE_NORMALIZE_PROMPT": "0", "HIPFIRE_GRAPH": "0"},
             }
             # Add prompt/bins etc. later via results
             rp = results_path(args)

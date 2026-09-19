@@ -247,7 +247,7 @@ The kernels iterate `K/32` blocks per row; any K not a multiple of 32 silently d
 
 ## 7. Out of scope (and why)
 
-- **gfx12 (RDNA4) WMMA siblings.** Reclassified to Experimental / Blind Port. `v_wmma_*_w32_gfx12` has different lane layout than RDNA3 and the gfx11 builtin fails at codegen on gfx12. When a gfx12 user with hardware materializes, port via the `gemm_*_hfq4g256_wmma.gfx12.hip` precedent, guard behind `HIPFIRE_LLOYD_GFX12`-style env, require hardware-verified coherence-gate before default.
+- **gfx12 (RDNA4) WMMA siblings.** Reclassified to Experimental / Blind Port. `v_wmma_*_w32_gfx12` has different lane layout than RDNA3 and the gfx11 builtin fails at codegen on gfx12. When a gfx12 user with hardware materializes, port via the `gemm_*_hfq4g256_wmma.gfx12.hip` precedent, guard behind `OBSOLETE_GFX12_LLOYD_GATE`-style env, require hardware-verified coherence-gate before default.
 - **gfx906 (CDNA1, MI50) wave64 + dp4a Q8 path.** Same precedent as `docs/plans/hfp4-mfp4-rdna3-accel.md`'s gfx906 carve-out. Reference kernel for this family would be the residual variant `gemm_hfq4g256_residual_wave64_dp4a.hip`. Defer until gfx906 user materializes; Tier 2 substrate is the current fallback there.
 - **MoE+Q8 batched dispatch.** Needs ~4+ fused kernels for the MoE FFN routing path + relaxation of the MoE eligibility filter (see §5.2). Out of scope for this plan; gated on user request.
 - **lm_head Q8 batched dedicated kernel** (`gemm_lm_head_q8_0`). The Q8 lm_head per-position fan-out is the eval bottleneck (§4.3). Pattern is the F16 batched fan-out in PR #242 (`gemm_f16_batched_lmhead`); a Q8 sibling would need its own batched kernel. M = vocab = 248K is the difficult shape. Separate workstream.

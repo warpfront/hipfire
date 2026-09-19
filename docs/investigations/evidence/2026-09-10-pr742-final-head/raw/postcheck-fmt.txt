@@ -24193,11 +24193,11 @@ Diff in /home/bjoern/hipfire/.claude/worktrees/g4-next-integration/crates/hipfir
 +        model.display()
 +    );
      if gpu.arch.starts_with("gfx12") {
--        unsafe { std::env::set_var("HIPFIRE_LLOYD_GFX12", "1"); }
+-        unsafe { std::env::set_var("OBSOLETE_GFX12_LLOYD_GATE", "1"); }
 +        unsafe {
-+            std::env::set_var("HIPFIRE_LLOYD_GFX12", "1");
++            std::env::set_var("OBSOLETE_GFX12_LLOYD_GATE", "1");
 +        }
-         eprintln!("eval_hipfire_glimmer: arch is gfx12; set HIPFIRE_LLOYD_GFX12=1");
+         eprintln!("eval_hipfire_glimmer: arch is gfx12; set OBSOLETE_GFX12_LLOYD_GATE=1");
      }
      let hfq = HfqFile::open(&model).expect("open model");
 Diff in /home/bjoern/hipfire/.claude/worktrees/g4-next-integration/crates/hipfire-runtime/examples/eval_hipfire_glimmer.rs:123:
