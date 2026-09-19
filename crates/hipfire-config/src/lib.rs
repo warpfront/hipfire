@@ -2153,10 +2153,10 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.gfx12_gdn_r4d",
         "gfx12_gdn_r4d",
         Kernel,
-        false,
         true,
+        false,
         "HIPFIRE_GFX12_GDN_R4D",
-        "Enable the opt-in gfx1201 compact-BF16 R4D GDN chunk route (default off; exact-shape ordinary prefill only)."
+        "Enable the gfx1201 compact-F16 R4D GDN chunk route (default on exact gfx1201; set to false or HIPFIRE_GFX12_GDN_R4D=0 to opt out; exact-shape ordinary prefill only)."
     ),
     process_bool_field!(
         "kernel.gfx12_silu_quant_fused",
