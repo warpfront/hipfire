@@ -4636,7 +4636,7 @@ impl Gpu {
     }
     /// Packet-minimal Q128 twin of
     /// [`Self::attention_fp8_e4m3_fa2_gqa_fp8_gfx1201`] (exact stage-b
-    /// arithmetic; fused Q-preconvert + multi-run launch). Dense ownership: one workgroup owns 128
+    /// arithmetic; attention S1). Dense ownership: one workgroup owns 128
     /// query-head rows (`row = 128*bx + 16*wave + ml`, `query = row/6`,
     /// `head = 6*kv_h + row%6`) over eight compute waves and KT64 tiles.
     /// Q f32->E4M3 conversion is fused into each owned row with the same

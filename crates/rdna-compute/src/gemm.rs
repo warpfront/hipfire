@@ -29128,11 +29128,10 @@ impl Gpu {
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && batch_size >= 128
-            && batch_size % 128 == 0
+            && batch_size >= 64
         {
-            // iu4-direct MMQ (W4A4 prefill) opt-in: same batch predicate as
-            // the Q8_1 MMQ route below; flag off leaves every byte unchanged.
+            // The gfx11 IU4 base entry handles partial 128-row tiles, so odd
+            // prefill batches stay on the W4A4 path without host padding.
             if self.flags.iu4_prefill_enabled() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
@@ -29736,10 +29735,10 @@ impl Gpu {
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && batch_size >= 128
-            && batch_size % 128 == 0
+            && batch_size >= 64
         {
-            // iu4-direct MMQ (W4A4 prefill) opt-in; flag off is unchanged.
+            // iu4-direct MMQ handles partial 128-row tiles; flag off keeps
+            // the incumbent full-tile Q8_1 route and odd-batch fallback.
             if self.flags.iu4_prefill_enabled() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_q, xq, y_q, q_m, k, batch_size)?;
@@ -30922,10 +30921,10 @@ impl Gpu {
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && batch_size >= 128
-            && batch_size % 128 == 0
+            && batch_size >= 64
         {
-            // iu4-direct MMQ (W4A4 prefill) opt-in; flag off is unchanged.
+            // iu4-direct MMQ handles partial 128-row tiles; flag off keeps
+            // the incumbent full-tile Q8_1 route and odd-batch fallback.
             if self.flags.iu4_prefill_enabled() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_set_prequant_iu4(
@@ -32522,10 +32521,10 @@ impl Gpu {
         if !self.replay.is_recording()
             && !self.graphs.capture_mode
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
-            && batch_size >= 128
-            && batch_size % 128 == 0
+            && batch_size >= 64
         {
-            // iu4-direct MMQ (W4A4 prefill) opt-in; flag off is unchanged.
+            // iu4-direct MMQ handles partial 128-row tiles; flag off keeps
+            // the incumbent full-tile Q8_1 route and odd-batch fallback.
             if self.flags.iu4_prefill_enabled() {
                 let xq = self.ensure_int4_mmq_x(x, batch_size, k)?;
                 self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)?;

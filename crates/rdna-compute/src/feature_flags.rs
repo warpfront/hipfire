@@ -236,6 +236,9 @@ pub struct FeatureFlags {
     /// sequential dense prefill route. Byte-exact vs the 3-launch sequence;
     /// any byte difference kills it.
     pub gfx12_gdn_pre_fused: bool,
+    /// fused chunked gated-delta-net prefill scan, WMMA-resident state (hipfire design; structure informed by public FLA/AITER chunk decomposition).
+    /// Enabled by default on gfx1100/gfx1151/gfx1201; `HIPFIRE_GFX12_GDN_CHUNK_SCAN=0` opts out.
+    pub gfx12_gdn_chunk_scan: bool,
     /// gfx1201 down-proj SwiGLU/FWHT + int4 quant fusion (slice 1:
     /// `HIPFIRE_GFX12_SILU_QUANT_FUSED`, `kernel.gfx12_silu_quant_fused`).
     /// Default ON on exact gfx1201; `=0` opts out to the standalone
@@ -637,6 +640,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_gdn_pre_fused: parse_bool("HIPFIRE_GFX12_GDN_PRE_FUSED")
                 .unwrap_or(arch == "gfx1201"),
+            gfx12_gdn_chunk_scan: parse_bool("HIPFIRE_GFX12_GDN_CHUNK_SCAN")
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")),
             gfx12_silu_quant_fused: parse_bool("HIPFIRE_GFX12_SILU_QUANT_FUSED")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_producer_quant_fused: parse_bool("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED")
@@ -791,12 +796,13 @@ impl FeatureFlags {
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
 
-    /// C2 producer-emitted IU4 sidecar route: exact gfx1151 + IU4 opt-in.
+    /// Producer-emitted IU4 sidecar route on gfx1100/gfx1151 + IU4 opt-in.
     /// When live (and eager + batch/K admission), RMSNorm/FWHT and
     /// SwiGLU/FWHT emit `block_i4_128` in-register; otherwise consumers
     /// keep standalone `quantize_int4_mmq_ds128`.
     pub fn iu4_producer_sidecar_enabled(&self) -> bool {
-        self.iu4_prefill.unwrap_or(true) && self.arch == "gfx1151"
+        self.iu4_prefill.unwrap_or(true)
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
     }
     /// True only on exact gfx1201 with the opt-in set. The producer emits
     /// the shared `block_i4_128` recipe, so output is bit-identical to the
@@ -956,6 +962,7 @@ impl FeatureFlags {
             force_blob_path: false,
             residual_ksplit_off: false,
             gfx12_gdn_pre_fused: false,
+            gfx12_gdn_chunk_scan: false,
             gfx12_silu_quant_fused: false,
             gfx12_producer_quant_fused: false,
             gfx12_fp8_stream: false,
