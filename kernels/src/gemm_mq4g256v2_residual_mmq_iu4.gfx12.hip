@@ -595,47 +595,89 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         } // for h
     } // for g
     // Coalesced store: the WMMA C layout leaves lane (m_lane,k_grp) holding
-    // acc[nb][rg][j] for token wave_tok0+nb*16+m_lane and rows
-    // rows at 4 B each. Transpose each (rg,nb) 16x16 wave tile through LDS
-    // instead: all 8 waves dump in parallel (one [16][20] slot each; the
-    // stride-20 pad keeps streaming reads bank-clean), then all 256 threads
-    // stream the 64x32 phase tile with thread (i=tid&15, x=(tid>>4)&15)
-    // covering rows (consecutive threads = consecutive rows = 128 B global
-    // segments) and k covering 4 row-pairs x 2 token-halves. Per-element
-    // arithmetic is unchanged (one residual add), hence bit-identical; only
-    // the slots reuse LDS base: 8 x 320 floats = 10240 B < 19456 B.
+    // acc[nb][rg][j] for token wave_tok0+nb*16+m_lane and rows at 4 B each.
+    // Transpose each (rg,nb) 16x16 wave tile through LDS instead: all 8 waves
+    // dump in parallel, then all 256 threads stream the 64x32 phase tile.
+    //
+    // Full tiles use one tile-relative buffer descriptor. Its base and each
+    // phase stride stay uniform in SGPRs; the only vector byte offset is the
+    // lane's (x*M+i), formed once here instead of rebuilding a 64-bit global
+    // address for every store. Edge tiles retain the original checked path.
     float* slots = (float*)LDS;
-    #pragma unroll
-    for (int rg = 0; rg < 2; rg++) {
+    const int store_i = tid & 15;
+    const int store_x = (tid >> 4) & 15;
+    const unsigned store_lane_off =
+        ((unsigned)store_x * (unsigned)M + (unsigned)store_i) * sizeof(float);
+    float* const y_tile = Y + (long long)bs * M + rs;
+    const auto y_tile_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        y_tile, 0, 0xffffffffu, 0x31004000u);
+    const bool full_tile = rs + IU4_BN <= M && bs + IU4_BM <= N;
+    if (full_tile) {
         #pragma unroll
-        for (int nb = 0; nb < 4; nb++) {
+        for (int rg = 0; rg < 2; rg++) {
             #pragma unroll
-            for (int j = 0; j < 8; j++) {
-                slots[(unsigned)(wave * 320 + (8 * k_grp + j) * 20 + m_lane)] = acc[nb][rg][j];
-            }
-            __syncthreads();
-            #pragma unroll
-            for (int k = 0; k < 8; k++) {
-                const int p = k >> 1;    // row-pair 0..3
-                const int h = k & 1;     // token-half 0..1
-                const int i = tid & 15;
-                const int x = (tid >> 4) & 15;
-                const int row_rel = p * 32 + rg * 16 + i;
-                const int col_rel = h * 64 + nb * 16 + x;
-                const int owner = (p << 1) | h;
-                const float v = slots[(unsigned)(owner * 320 + i * 20 + x)];
-                const int row = rs + row_rel;
-                const int col = bs + col_rel;
-                if (row < M && col < N) {
-                    float* yp = Y + (long long)col * M + row;
+            for (int nb = 0; nb < 4; nb++) {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    slots[(unsigned)(wave * 320 + (8 * k_grp + j) * 20 + m_lane)] = acc[nb][rg][j];
+                }
+                __syncthreads();
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    const int p = k >> 1;
+                    const int h = k & 1;
+                    const int owner = (p << 1) | h;
+                    const float v = slots[(unsigned)(owner * 320 + store_i * 20 + store_x)];
+                    const unsigned phase_off =
+                        ((unsigned)(h * 64 + nb * 16) * (unsigned)M
+                            + (unsigned)(p * 32 + rg * 16)) * sizeof(float);
                     if constexpr (ADD) {
-                        *yp += v;
+                        const unsigned old_bits = __builtin_amdgcn_raw_buffer_load_b32(
+                            y_tile_rsrc, store_lane_off, phase_off, 0);
+                        const float out = __builtin_bit_cast(float, old_bits) + v;
+                        __builtin_amdgcn_raw_buffer_store_b32(
+                            __builtin_bit_cast(unsigned, out),
+                            y_tile_rsrc, store_lane_off, phase_off, 0);
                     } else {
-                        *yp = v;
+                        __builtin_amdgcn_raw_buffer_store_b32(
+                            __builtin_bit_cast(unsigned, v),
+                            y_tile_rsrc, store_lane_off, phase_off, 0);
                     }
                 }
+                __syncthreads();
             }
-            __syncthreads();
+        }
+    } else {
+        #pragma unroll
+        for (int rg = 0; rg < 2; rg++) {
+            #pragma unroll
+            for (int nb = 0; nb < 4; nb++) {
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    slots[(unsigned)(wave * 320 + (8 * k_grp + j) * 20 + m_lane)] = acc[nb][rg][j];
+                }
+                __syncthreads();
+                #pragma unroll
+                for (int k = 0; k < 8; k++) {
+                    const int p = k >> 1;    // row-pair 0..3
+                    const int h = k & 1;     // token-half 0..1
+                    const int row_rel = p * 32 + rg * 16 + store_i;
+                    const int col_rel = h * 64 + nb * 16 + store_x;
+                    const int owner = (p << 1) | h;
+                    const float v = slots[(unsigned)(owner * 320 + store_i * 20 + store_x)];
+                    const int row = rs + row_rel;
+                    const int col = bs + col_rel;
+                    if (row < M && col < N) {
+                        float* yp = Y + (long long)col * M + row;
+                        if constexpr (ADD) {
+                            *yp += v;
+                        } else {
+                            *yp = v;
+                        }
+                    }
+                }
+                __syncthreads();
+            }
         }
     }
 }
