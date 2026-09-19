@@ -448,9 +448,10 @@ static __device__ __forceinline__ float hipfire_fp8_e4m3_to_f32_tile(unsigned ch
     return __builtin_bit_cast(float, __builtin_bit_cast(unsigned int, mag) | s);
 }
 // Vfill grouped-fragment V code address: (head kv_h, 8-key group g, dim d) is
-// one contiguous b64 at group_base + kv_h*D*8 + d*8; byte j = slot&7. Scales
-// stay token-local (unchanged). `slot` is the physical row index (== token
-// for fp8's windowless contiguous layout). K addressing is untouched.
+// one contiguous b64 at group_base + kv_h*D*8 + d*8; byte j = slot&7. V
+// scales at the group block end (home rows are aliased by grouped codes).
+// `slot` is the physical row index (== token for fp8's windowless contiguous
+// layout). K addressing is untouched.
 static __device__ __forceinline__ const unsigned char* hipfire_fp8_vgroup_ptr(
     const unsigned char* __restrict__ v_cache, int slot, size_t row_stride,
     int kv_h, int head_dim, int d)

@@ -324,20 +324,20 @@ extern "C" __global__ void attention_fp8_e4m3_kv(
             __syncthreads();
         }
         tsum = workspace[0];
+        __syncthreads();
         l += tsum;
         m = new_m;
         __syncthreads();  // protect LDS scores before Phase B reads
-
         // Phase B: V-weighted accumulation for this tile.
         // Each thread owns dims d = tid + i*nthreads and must fold every
         // position's softmax weight into its private acc (no position stride).
         // Vfill grouped-fragment codes: (head, group, dim) is one contiguous
         // b64 at group_base + kv_h*D*8 + d*8; byte j = key&7 of the group.
-        // Scales stay token-local (unchanged addressing). gfx1201 keeps the
-        // hardware-decode folding order (wv = w*vs, then acc += wv*decode) so
-        // rounding is bit-identical to the old dword path: only the software
-        // decoder feeds it now (bit-exact for all 256 codes), since grouped
-        // dims for one key are 8-strided, not dword-contiguous.
+        // V scales at the group block end (home rows are aliased by grouped
+        // codes). gfx1201 keeps the hardware-decode folding order
+        // (wv = w*vs, then acc += wv*decode): packed-pair hardware decode
+        // (my byte + neighbor dim's byte, one cvt builtin) is bit-exact
+        // for all 256 codes, so rounding matches the old dword path.
         for (int t = 0; t < tile_len; t++) {
             const float w = scores[t];
             const int pos = tile_start + t;
@@ -355,7 +355,16 @@ extern "C" __global__ void attention_fp8_e4m3_kv(
                 const int d = tid + i * nthreads;
                 if (d >= head_dim) break;
 #if defined(HIPFIRE_FP8_HAVE_HW_DECODE)
-                acc[i] += wv * hipfire_fp8_e4m3_to_f32(vg[(size_t)d * 8u]);
+                // Packed-pair hardware decode: my byte + neighbor dim's byte
+                // (same key, always in bounds via d^1) into one dword, one
+                // cvt builtin serves my lane (bit-exact for all 256 codes).
+                // ~2 loads + 1 builtin per dim vs ~12 branchless ALU.
+                const int dn = d ^ 1;
+                const unsigned int wp = (unsigned int)vg[(size_t)d * 8u]
+                    | ((unsigned int)vg[(size_t)dn * 8u] << 8);
+                const hipfire_fp8_f32x2_t p =
+                    __builtin_amdgcn_cvt_pk_f32_fp8(wp, 0);
+                acc[i] += wv * p[0];
 #else
                 acc[i] += w * (vs * hipfire_fp8_e4m3_to_f32(vg[(size_t)d * 8u]));
 #endif
