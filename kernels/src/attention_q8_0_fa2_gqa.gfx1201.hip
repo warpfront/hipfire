@@ -374,16 +374,21 @@ __device__ __forceinline__ void fa2_gqa_body(
 #endif
 #endif
 #if HIPFIRE_FA2_KMODE == 8
-        // Native fp8 V (Q0 fill-time decode): 256 key-pairs (m*8+b) like the
-        // Q8 path; each slot reads dims b*32..b*32+31 of keys ktile+2m /
-        // ktile+2m+1 from the Vfill grouped-fragment layout and packs
-        // (V[2m][d], V[2m+1][d]) per output dim into the fragment-order f16
-        // V plane via fa2_voff (same addressing as the q8 arm below):
+        // Native fp8 V (Q0 fill-time decode): ORACLE-ONLY (the Q0 f16 entry
+        // is retained for oracles; shipped configs always take stage-b
+        // route-N). KNOWN DEFECT (gfx1201-vfill, 2026-09-19): emits NaN for
+        // kv_h >= 1 (kv_h == 0 is bitwise exact vs the old layout); writer
+        // placement for those heads is proven correct, so the defect is in
+        // this fill's per-head addressing. Do not ship without fixing.
+        // 256 key-pairs (m*8+b) like the Q8 path; each slot reads dims
+        // b*32..b*32+31 of keys ktile+2m / ktile+2m+1 from the Vfill
+        // grouped-fragment layout and packs (V[2m][d], V[2m+1][d]) per output
+        // dim into the fragment-order f16 V plane via fa2_voff (same
+        // addressing as the q8 arm below):
         // 2m/2m+1 never straddle a sub/kg boundary, so both halves share
         // one fragment at consecutive j. Grouped codes for (head, group, dim)
         // are one contiguous b64 at group_base + kv_h*D*8 + d*8; the pair's
         // two bytes are adjacent (u16) unless 2m ends a group (j0 == 7).
-        // Same decode/rounding contract as the K fill above.
         for (int t = 0; t < 2; ++t) {
             const int pair = tid + t * 128;
             const int m = pair >> 3;
