@@ -2300,7 +2300,7 @@ fn dispatch_attend(
                 // so like the q8/fwht3 FA2 ingresses this arm is
                 // replay-idempotent and capture-safe — no recorder/capture
                 // gates. Same shape predicates as those ingresses (exact
-                // gfx1201/H24/KV4/D256, 64..=512 rows, %16, 64..=32768 ctx),
+                // gfx1201/H24/KV4/D256, 64..=512 rows, 64..=32768 ctx),
                 // plus no tree-verify (FA2 has no tree path). Falls through
                 // to the scalar/tile crossover below otherwise.
                 // Stage-b route N: native fp8 KV on an FA2-eligible shape
@@ -2319,7 +2319,6 @@ fn dispatch_attend(
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
                     && (64..=512).contains(&io.batch_size)
-                    && io.batch_size % 16 == 0
                     && (64..=32768).contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                 {
@@ -2343,7 +2342,6 @@ fn dispatch_attend(
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
                     && (64..=512).contains(&io.batch_size)
-                    && io.batch_size % 16 == 0
                     && (64..=32768).contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                 {

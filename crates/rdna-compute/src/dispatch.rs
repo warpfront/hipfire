@@ -3034,33 +3034,33 @@ impl Gpu {
             && k % 256 == 0
     }
     /// True when the gfx1201 slice-1 silu+quant fusion is live for this call:
-    /// IU4 + exact gfx1201 + eager (no replay/capture) + batch and K
-    /// constraints of the iu4 MMQ consumer. Default on for the IU4 route
-    /// (`HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts out).
-    /// Mirrors `iu4_producer_sidecar_active` minus the gfx1151-only C2 gate.
+    /// IU4 + exact gfx1201 + eager (no replay/capture) + K constraint of the
+    /// iu4 MMQ consumer. Any batch >= 64: every producer grid is row-parallel
+    /// in batch (one row per workgroup), and the gfx1201 iu4 MMQ consumer
+    /// handles partial 128-row tiles natively (zero-filled slab / guarded
+    /// writeback), so the old %128 multiple was grid convenience only.
+    /// Default on for the IU4 route (`HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts out).
     pub fn iu4_silu_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_silu_quant_fused_enabled()
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 128
-            && batch % 128 == 0
+            && batch >= 64
             && k > 0
             && k % 256 == 0
     }
     /// True when a gfx1201 slices-2-4 producer+quant fusion is live for this
     /// call: IU4 + `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` on exact gfx1201 +
-    /// eager (no replay/capture) + batch and K constraints of the iu4 MMQ
-    /// consumer. Same admission as `iu4_silu_quant_fused_active`; the
-    /// GDN fused producer additionally requires head_dim == 128 at its
-    /// callsite helper.
+    /// eager (no replay/capture) + K constraint of the iu4 MMQ consumer. Any
+    /// batch >= 64, same row-parallel justification as
+    /// `iu4_silu_quant_fused_active`; the GDN fused producer additionally
+    /// requires head_dim == 128 at its callsite helper.
     pub fn iu4_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
         self.flags.gfx12_producer_quant_fused_enabled()
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 128
-            && batch % 128 == 0
+            && batch >= 64
             && k > 0
             && k % 256 == 0
     }
