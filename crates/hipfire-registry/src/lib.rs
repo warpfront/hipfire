@@ -270,18 +270,22 @@ impl ModelEntry {
     /// Lower this entry's load/sampling defaults into a sparse config layer.
     ///
     /// Starts from [`RecommendedSettings::config_layer`] when present (sampling
-    /// and reasoning only), then overlays the entry-level load defaults onto
-    /// their canonical keys. Callers merge this under `RegistryModel` precedence
-    /// so global/model/one-shot user config still wins.
+    /// and reasoning only), then overlays model-specific load defaults onto
+    /// their canonical keys. `default_kv_mode = "q8"` is the universal fallback,
+    /// not a model-specific opinion, so it is left for `auto` resolution rather
+    /// than lowered here. Callers merge this under `RegistryModel` precedence so
+    /// global/model/one-shot user config still wins.
     pub fn config_layer(&self) -> std::result::Result<ConfigLayer, String> {
         let mut layer = match &self.recommended_settings {
             Some(settings) => settings.config_layer()?,
             None => ConfigLayer::default(),
         };
         if let Some(mode) = &self.default_kv_mode {
-            layer
-                .set("memory.kv_cache", ConfigValue::String(mode.clone()))
-                .map_err(|error| error.to_string())?;
+            if mode != "q8" {
+                layer
+                    .set("memory.kv_cache", ConfigValue::String(mode.clone()))
+                    .map_err(|error| error.to_string())?;
+            }
         }
         Ok(layer)
     }
@@ -902,6 +906,29 @@ fn epoch_millis() -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn config_layer_omits_universal_q8_fallback_but_lowers_model_opinions() {
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2026-09-01T00:00:00Z",
+            "models":{
+                "fallback":{"repo":"r","file":"fallback.mq4","size_gb":1,"min_vram_gb":1,"desc":"d","default_kv_mode":"q8"},
+                "opinion":{"repo":"r","file":"opinion.mq4","size_gb":1,"min_vram_gb":1,"desc":"d","default_kv_mode":"fwht3"}
+            },
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "test").unwrap();
+
+        let fallback = registry.model("fallback").unwrap().1.config_layer().unwrap();
+        assert!(fallback.get("memory.kv_cache").is_none());
+
+        let opinion = registry.model("opinion").unwrap().1.config_layer().unwrap();
+        assert_eq!(
+            opinion.get("memory.kv_cache"),
+            Some(&ConfigValue::String("fwht3".into()))
+        );
+    }
+
     /// The `heads` map must be VALIDATED, not merely parsed.
     ///
     /// Adding a field to the struct makes it round-trip; it does not make the
@@ -1228,10 +1255,7 @@ mod tests {
         // Tag policy provides VMM + 262K + 81920 for Qwen3.8 canonical tags.
         let layer =
             config_layer_for_tag(tag, model).expect("qwen3.8:27b tag policy lowers cleanly");
-        assert_eq!(
-            layer.get("memory.kv_cache"),
-            Some(&ConfigValue::String("q8".into()))
-        );
+        assert!(layer.get("memory.kv_cache").is_none());
         assert_eq!(
             layer.get("memory.kv_backend"),
             Some(&ConfigValue::String("vmm".into()))
@@ -1274,10 +1298,7 @@ mod tests {
         let qwen3_registry = RegistryV1::parse(qwen3_raw, "test").unwrap();
         let (q3_tag, q3_entry) = qwen3_registry.model("qwen3:8b").unwrap();
         let q3_layer = config_layer_for_tag(q3_tag, q3_entry).unwrap();
-        assert_eq!(
-            q3_layer.get("memory.kv_cache"),
-            Some(&ConfigValue::String("q8".into()))
-        );
+        assert!(q3_layer.get("memory.kv_cache").is_none());
         assert!(q3_layer.get("memory.kv_backend").is_none());
         assert!(q3_layer.get("memory.max_seq").is_none());
         assert!(q3_layer.get("generation.max_tokens").is_none());

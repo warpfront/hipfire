@@ -67,9 +67,9 @@ pub const KNOBS: &[KnobInfo] = &[
         effect: "Lower precision saves VRAM and can speed decode, at some quality risk. Higher keeps fidelity.",
         default: "auto",
         when: "Leave on auto unless you need to fit a larger context or are A/B-testing precision.",
-        note: Some("auto is the inherit sentinel — it resolves to the model's registry default_kv_mode if set, else q8 (the universal default; near-reference and DFlash-safe). A model can ship a compressed default via the registry; it's no longer guessed from the GPU arch."),
+        note: Some("auto resolves to a non-q8 registry default_kv_mode when present, else the architecture default (fp8 on exact single-GPU gfx1201 Qwen), else q8."),
         options: &[
-            ("auto", "Inherit: registry default_kv_mode, else q8."),
+            ("auto", "Non-q8 registry default, else architecture default, else q8."),
             ("q8", "Near-reference, ~2x vs fp16. The default. DFlash-safe."),
             ("fwht4", "4-bit FWHT-rotated K + Q8 V. DFlash-safe."),
             ("fwht3", "3-bit FWHT-rotated, ~5.5x. Best compressed-yet-DFlash-safe."),

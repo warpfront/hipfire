@@ -12153,7 +12153,7 @@ mod tests {
     }
 
     #[test]
-    fn load_params_preserves_auto_for_direct_path_and_registry() {
+    fn load_params_preserves_auto_for_direct_path_and_lowers_registry_bf16() {
         // Direct-path load: no registry entry, config is auto -> must stay auto.
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         assert_eq!(config_string(&defaults, "memory.kv_cache").unwrap(), "auto");
@@ -12175,8 +12175,9 @@ mod tests {
             params["kv_mode"], "auto",
             "direct-path auto must survive to architecture"
         );
-        // Registry path with default_kv_mode=bf16 must also preserve auto when
-        // no explicit --kv-mode is given; architecture picks BF16.
+
+        // A non-q8 registry default is a model-specific opinion and must lower
+        // into the resolved config before load parameters are built.
         let raw = r#"{
             "schema_version":1,
             "generated_at":"2099-01-01T00:00:00Z",
@@ -12187,8 +12188,16 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
         let (_, entry) = registry.model("maple-preview").unwrap();
+        let resolved = resolve(vec![NamedLayer {
+            source: ConfigSource::RegistryModel {
+                tag: "maple-preview".into(),
+                revision: "test".into(),
+            },
+            layer: entry.config_layer().unwrap(),
+        }])
+        .unwrap();
         let params2 = load_params(
-            &defaults,
+            &resolved,
             Some(entry),
             &direct_path.parent().unwrap(),
             &direct_path,
@@ -12201,12 +12210,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            params2["kv_mode"], "auto",
-            "registry auto must survive even when entry has bf16 default"
+            params2["kv_mode"], "bf16",
+            "non-q8 registry default must resolve to BF16"
         );
-        // Explicit override still wins
+
+        // Explicit override still wins.
         let params3 = load_params(
-            &defaults,
+            &resolved,
             Some(entry),
             &direct_path.parent().unwrap(),
             &direct_path,
