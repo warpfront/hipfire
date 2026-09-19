@@ -59,7 +59,7 @@ emulator path for WMMA/MFMA lane mapping.
    `kernels.rs` / `gemm.rs` / `attention.rs` branches; do not trust old issue
    text.
 3. Env-gated paths stay gated until parity is earned (example:
-   `HIPFIRE_LLOYD_GFX12=1` for Lloyd MQ3/MQ4 WMMA on gfx1200/gfx1201). Default-off
+   `` for Lloyd MQ3/MQ4 WMMA on gfx1200/gfx1201). Default-off
    is not “shipped default-on.”
 4. If no path-specific parity oracle exists for the surface → **blocked** on
    numerical/state claims (`VALIDATION.md`).

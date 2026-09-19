@@ -114,10 +114,6 @@ fn main() {
     // -------- load model --------
     let mut gpu = rdna_compute::Gpu::init().expect("gpu init");
     eprintln!("eval_hipfire_glimmer: arch={} model={}", gpu.arch, model.display());
-    if gpu.arch.starts_with("gfx12") {
-        unsafe { std::env::set_var("HIPFIRE_LLOYD_GFX12", "1"); }
-        eprintln!("eval_hipfire_glimmer: arch is gfx12; set HIPFIRE_LLOYD_GFX12=1");
-    }
     let hfq = HfqFile::open(&model).expect("open model");
     let config = GlimmerConfig::from_hfq(&hfq).expect("read config");
     // Vocab cross-check BEFORE the weight upload — a mismatched reference is a

@@ -42,7 +42,7 @@ off-the-shelf beats native by 1.98x at identical size and identical decode speed
 
 Scoring: `--ref <kldref> --max-chunks 24 --kv-mode q8 --kv-v q8
 --scoring-mode prefill`, with `HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0
-HIPFIRE_LLOYD_GFX12=1`.
+`.
 
 **Harness validation:** the freshly-built `mq4` arm (md5 `da5b877ea9a8`) scored
 `KLD 0.043776 / NLL 1.857666 / PPL 6.4088`, reproducing the previously-recorded
@@ -136,7 +136,7 @@ not score at all.
 | `mq4lloyd`, `mq8` | — | did not complete scoring; cause not yet established |
 
 The 8–16 tok/s figures are the documented per-token GEMV fallback. They were
-initially mistaken here for a missing `HIPFIRE_LLOYD_GFX12=1` flag; setting that
+initially mistaken here for a missing `` flag; setting that
 flag fixed `mq3lloyd` (which then scored at full speed) but **not** `mq2`,
 `mq2lloyd` or `mq5`, which is what establishes those as genuine kernel gaps
 rather than configuration errors.

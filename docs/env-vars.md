@@ -747,7 +747,6 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_LFM2_CAPTURE_POSTMIXER` | crates/hipfire-arch-lfm2moe/examples/dump_lfm2moe_hidden_states.rs, crates/hipfire-arch-lfm2moe/src/forward.rs |
 | `HIPFIRE_LFM2_GRAPH` | crates/hipfire-arch-lfm2moe/examples/graph_parity_lfm2moe.rs, crates/hipfire-arch-lfm2moe/src/forward.rs |
 | `HIPFIRE_LLOYD_FORCE_BASELINE` | crates/rdna-compute/examples/test_gemv_mq4g256_lloyd_tail.rs, crates/rdna-compute/examples/test_mq4g256_lloyd_fused_parity.rs |
-| `HIPFIRE_LLOYD_GFX12` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/examples/eval_hipfire.rs |
 | `HIPFIRE_LLOYD_K3` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_LLOYD_MB4` | crates/rdna-compute/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs, crates/rdna-compute/src/feature_flags.rs |
 | `HIPFIRE_LM_HEAD_F16` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/src/config.rs |

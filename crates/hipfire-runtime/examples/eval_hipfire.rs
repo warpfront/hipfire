@@ -202,14 +202,6 @@ fn main() {
         gpu.arch,
         args.model.display()
     );
-    // gfx12 Lloyd kernels are gated by HIPFIRE_LLOYD_GFX12 (see PR #195).
-    // Set if running on gfx12; harmless on other arches.
-    if gpu.arch.starts_with("gfx12") {
-        unsafe {
-            std::env::set_var("HIPFIRE_LLOYD_GFX12", "1");
-        }
-        eprintln!("eval_hipfire: arch is gfx12; set HIPFIRE_LLOYD_GFX12=1");
-    }
 
     // -------- arch detection (mirrors calib_sweep.rs:654-658) --------
     // HFQ header is authoritative for file models; for safetensors dirs we

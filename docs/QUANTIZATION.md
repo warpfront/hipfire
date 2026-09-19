@@ -127,8 +127,8 @@ the PARO probe path.)
 |---|---|---|
 | `MQ3G256` | WMMA on gfx1100/1101/1102/1150/1151/1200/1201; scalar batched on gfx101x/103x; else not | Same plus **gfx1103** and **gfx1152** on the WMMA set; same gfx10 scalar set |
 | `HFP4G32`, `MFP4G32` | WMMA arches only (llama set above) | WMMA arches only (qwen35 set, includes gfx1103/1152) |
-| `MQ3G256Lloyd` | **Not** batch-eligible | WMMA on gfx1100/1101/1102/1150/1151; gfx1200/1201 only with `HIPFIRE_LLOYD_GFX12=1` |
-| `MQ4G256Lloyd` | **Not** batch-eligible | WMMA on gfx1100/1101/1102/1151 (no gfx1150); gfx1200/1201 only with `HIPFIRE_LLOYD_GFX12=1` |
+| `MQ3G256Lloyd` | **Not** batch-eligible | WMMA on gfx1100/1101/1102/1150/1151/1200/1201 |
+| `MQ4G256Lloyd` | **Not** batch-eligible | WMMA on gfx1100/1101/1102/1151/1200/1201 (no gfx1150) |
 | Other Lloyd / E8 / research dtypes | Not batch-eligible here | Additional arms (e.g. E8) may exist behind their own env gates — see source |
 
 Uniform MQ3 ships WMMA residual / fused GEMM kernels on RDNA3+ and is

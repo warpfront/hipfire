@@ -141,12 +141,6 @@ fn main() {
         gpu.arch,
         args.model.display()
     );
-    if gpu.arch.starts_with("gfx12") {
-        unsafe {
-            std::env::set_var("HIPFIRE_LLOYD_GFX12", "1");
-        }
-        eprintln!("eval_hipfire_llama: arch is gfx12; set HIPFIRE_LLOYD_GFX12=1");
-    }
     let weights =
         <Llama as Architecture>::load_weights(&mut hfq, &config, &mut gpu).expect("load weights");
 

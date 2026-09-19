@@ -118,7 +118,7 @@ claiming a chip is in or out of a family.
 4. Channel-test on **real** target silicon (`test_kernels` and/or
    `test_wmma_*_gfx12` examples). Wrong C-map is silent corruption.
 5. Env-gated experimental families stay gated until parity is earned
-   (e.g. `HIPFIRE_LLOYD_GFX12` for Lloyd WMMA on gfx12).
+   (e.g. `OBSOLETE_GFX12_LLOYD_GATE` for Lloyd WMMA on gfx12).
 6. Validation routes: `validation.md` → `docs/VALIDATION.md`.
 
 ## Verify headers on the build machine
