@@ -109,7 +109,7 @@ Each arm was scored on the first **3 of 24 chunks** from both references:
 - `scoring_mode=prefill`;
 - `kv_mode=q8`, `kv_v=q8`;
 - `HIPFIRE_GRAPH=0`, `HIPFIRE_NORMALIZE_PROMPT=0`,
-  ``;
+  `HIPFIRE_LLOYD_GFX12=1`;
 - reference geometry: `n_ctx=2048`, `n_vocab=248320`, `top_k=256`,
   1023 scored tokens/chunk, **3069 scored tokens** per run;
 - predeclared promotion rule: an arm must reach **KLD <= 1.0 on both short

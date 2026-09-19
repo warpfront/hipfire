@@ -378,7 +378,7 @@ CI work.
 
   **Resolved (2026-05-08, post-review):** option (a)-flavoured runtime
   env gate. `is_batchable_la` only returns true for `MQ3G256Lloyd` on
-  gfx1200/1201 when ``; default behaviour falls
+  gfx1200/1201 when `HIPFIRE_LLOYD_GFX12=1`; default behaviour falls
   through to per-token `forward_scratch` (correct, ~14× slower; matches
   pre-Phase-B2 baseline). RDNA4 reviewers set the env var to exercise
   the gfx12 WMMA path. The captured-prefill entry point has a parallel

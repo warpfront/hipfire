@@ -283,7 +283,7 @@ Canonical shape is layer35,4224 tokens,384-row final chunk. For each isolated re
 ```
 R=/home/kaden/ClaudeCode/warpfront/wt-lloyd/.codeinsight+research/scratch-2026-09-17/Fa2RegPlan
 ARM=v1  # repeat with ARM=candidate and its isolated executable/cache
-env HIPFIRE_GFX12_FA2_FP8=1 HIPFIRE_GFX12_FA2_PREFILL=1  \
+env HIPFIRE_GFX12_FA2_FP8=1 HIPFIRE_GFX12_FA2_PREFILL=1 HIPFIRE_LLOYD_GFX12=1 \
   fa2_fp8_screen --model /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt \
   --layer 35 --tokens 4224 --qstride 4 --kernel-out "$R/$ARM"
 ```

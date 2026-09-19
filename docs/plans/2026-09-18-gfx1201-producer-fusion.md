@@ -385,7 +385,7 @@ export ROCR_VISIBLE_DEVICES=1
 export HIPFIRE_MODELS_DIR=/home/kaden/.hipfire/models
 export HIPFIRE_KERNEL_CACHE=/home/kaden/.hipfire-homes/ab1/.hipfire_kernels
 export HIPFIRE_GRAPH=0
-export 
+export HIPFIRE_LLOYD_GFX12=1
 export HIPFIRE_GFX12_MQ4V2_FP8_V2=1
 export HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM=128x128
 export HIPFIRE_GFX12_MQ4V2_FP8_SLABS=2

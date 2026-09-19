@@ -32,7 +32,7 @@ not a research path.
   with `HIPFIRE_Q8_CLASSES=""`
 - references: `qwen3.8-27b.ref_wt2.bin`, `qwen3.8-27b.ref_v6sel-814d8fd.bin`
 - scoring: `eval_hipfire --max-chunks 24 --kv-mode q8 --kv-v q8 --scoring-mode prefill`,
-  `HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 `
+  `HIPFIRE_NORMALIZE_PROMPT=0 HIPFIRE_GRAPH=0 HIPFIRE_LLOYD_GFX12=1`
 - commit `a6ccc922e`
 
 ## Format

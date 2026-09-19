@@ -380,7 +380,7 @@ marked **V** are validated and incorporated into the plan body above;
 | 7 | Performance floor definition | **V** | Quantified in Step 3.6: ≥0.7× MQ4 decode tok/s on gfx1031. Prefill not gated. |
 | Minor 1 | If branch closes, Step 0.3 still lands standalone | **V** | Implicit in the recommendation order: Scope C ships only if Scope A is infeasible; the safety refusal lands either way. |
 | Minor 2 | Regression quantified at <1% delta | **V** | Step 3.4 specifies probe_commits.sh + canonical PEP-8 prompt. |
-| Minor 3 | Gfx12 opt-in pattern (`OBSOLETE_GFX12_LLOYD_GATE`) as a template for gfx10 MQ3 during development | **V** | Step 1.3's `HIPFIRE_MQ3_UNSTABLE_ARCH=1` mirrors this exact pattern. |
+| Minor 3 | Gfx12 opt-in pattern (`HIPFIRE_LLOYD_GFX12`) as a template for gfx10 MQ3 during development | **V** | Step 1.3's `HIPFIRE_MQ3_UNSTABLE_ARCH=1` mirrors this exact pattern. |
 
 ### Self-review findings (claude rev)
 

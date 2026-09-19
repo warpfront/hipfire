@@ -84,7 +84,7 @@ bench-dflash / drafts.
 - Binary: `eval_hipfire`
 - Refs: WT2 tripwire + v6 conversation selector (24 chunks each)
 - `scoring_mode=prefill`, `kv_mode=q8`, `kv_v=q8`, `--max-chunks 24`
-- Env: `HIPFIRE_GRAPH=0`, `HIPFIRE_NORMALIZE_PROMPT=0`, ``
+- Env: `HIPFIRE_GRAPH=0`, `HIPFIRE_NORMALIZE_PROMPT=0`, `HIPFIRE_LLOYD_GFX12=1`
 - Ref geometry (from scorer): `n_ctx=2048`, `n_vocab=248320`, `n_chunk=24`,
   `top_k=256`, scored/chunk=1023, **total_scored=24,552**
 - Outputs: `/home/kaden/qcal/ladder-v2/kld/<cell>.{wt2,v6sel}.kldseq` +

@@ -180,7 +180,7 @@ V1 (gfx1100 MQ4 full slice, 1175 chunks, 2026-05-11) measured a **−6.75% mean-
 |---|---|---|---|
 | Q8 / MQ4 / MQ6 / HFQ4-G256 / HFQ6-G256 | prefill | prefill | prefill |
 | MQ3 (uniform) | prefill (gfx11 WMMA) | prefill (gfx12 WMMA) | per-token fallback |
-| MQ3-Lloyd | prefill (gfx11) | prefill if `` | per-token fallback |
+| MQ3-Lloyd | prefill (gfx11) | prefill if `HIPFIRE_LLOYD_GFX12=1` | per-token fallback |
 | MQ4-Lloyd | per-token (issue #182 not yet in batchable set) | per-token | per-token |
 | HFP4G32 | per-token (no GEMM kernel; PR #224 v2 deferred) | per-token | per-token |
 | MFP4G32 | per-token (same kernel family as HFP4G32) | per-token | per-token |
@@ -215,10 +215,10 @@ References are arch-independent (just bytes); a quant scored on either arch comp
 `eval_hipfire` always sets the following so future replays match byte-for-byte:
 
 ```
-HIPFIRE_NORMALIZE_PROMPT=0 # raw byte-stream-through; eval is byte-deterministic
+HIPFIRE_NORMALIZE_PROMPT=0     # raw byte-stream-through; eval is byte-deterministic
 HIPFIRE_GRAPH=0                # capture-mode adds capture-illegal paths; eval doesn't need it
 HIPFIRE_KV_MODE=asym3          # canonical KV-mode for ship benches
-          # if running on gfx1200/1201 — PR #195 gate
+HIPFIRE_LLOYD_GFX12=1          # if running on gfx1200/1201 — PR #195 gate
 HIPFIRE_PREFILL_REUSE_PBS=1    # set automatically by --scoring-mode prefill
 ```
 
