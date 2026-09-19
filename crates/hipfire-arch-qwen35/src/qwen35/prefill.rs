@@ -7854,12 +7854,43 @@ fn batch_chunk_fa_attend(
         unreachable!("independent variant must carry active_mask");
     }
     if let Some(stride) = commit_stride {
-        // Widened ordinary chunk: one 512-row write-then-attend tile per
-        // legacy segment, each with its own tile-local context
-        // (`start+o .. start+o+512`). The family writes that tile's KV rows
-        // before attending, so earlier logical prefix is present and no
-        // future tile row is needed — the same kernel route, scalar
-        // arguments and byte operands each legacy 512 request sees.
+        // Exact gfx1201 native-fp8 packet path: write the whole widened
+        // chunk once, then let packet grid.z enumerate the equal-length
+        // legacy runs in one launch. Every row keeps its absolute position;
+        // pre-writing later K/V rows is unobservable under the causal mask,
+        // while x restarts per run so each workgroup sees the same query set
+        // and max/min bounds as the former per-step launch.
+        let packet_runs = gpu.arch == "gfx1201"
+            && gpu.flags.gfx12_fa_packet
+            && kv_cache.quant_fp8
+            && config.n_heads == 24
+            && config.n_kv_heads == 4
+            && config.head_dim == 256
+            && stride == WIDENED_COMMIT_ROWS
+            && n <= 32768
+            && max_ctx_len <= 32768
+            && tree_verify.is_none();
+        if packet_runs {
+            execute_fa_attend_step(
+                gpu,
+                config,
+                &pbs.fa_q_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                &pbs.positions,
+                &pbs.fa_attn_out_batch,
+                s,
+                kv_cache,
+                n,
+                start_pos,
+                max_ctx_len,
+                ctx,
+                None,
+                layer_idx,
+            )?;
+            return Ok(());
+        }
+        // Other tiers retain one write-then-attend step per legacy segment.
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
         assert!(

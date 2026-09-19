@@ -1745,14 +1745,16 @@ static __device__ __forceinline__ float fa2_pkt_f16(uint16_t u)
 {
     return (float)((fa2_dw_t){.u = (uint32_t)u}).h[0];
 }
-template <bool PARTIAL>
+template <bool PARTIAL, bool FUSED_Q>
 __device__ void fa2_stageb_packet_body(
-    const unsigned char* __restrict__ q8_codes,
+    const float* __restrict__ q,
+    unsigned char* __restrict__ q8_codes,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
     float* __restrict__ out,
     const int* __restrict__ positions,
     int batch_size,
+    int query_offset,
     float scale_attn,
     int kv_h,
     int row_base,
@@ -1774,7 +1776,8 @@ __device__ void fa2_stageb_packet_body(
     const uint16_t* SV = (const uint16_t*)((const unsigned char*)LDS + 49280);
     // Dense ownership: each (query, head_local) has exactly one owner.
     const int row = row_base + 16 * wave + ml;
-    const int query = row / 6;
+    const int query_local = row / 6;
+    const int query = query_offset + query_local;
     const int head = 6 * kv_h + row % 6;
     const bool qok = row < 6 * batch_size;
     float8_t Ofr[16];
@@ -1784,17 +1787,66 @@ __device__ void fa2_stageb_packet_body(
     float m_old = -INFINITY;
     float l_val = 0.0f;
     float b_prev = 1.0f;
-    // Q row base. Fragments are loaded in bounded groups during QK so the
-    // transpose can reuse their registers and remain spill-free.
-    const unsigned qb =
-        (qok ? (unsigned)query * 24u + (unsigned)head : 0u) * 256u;
+    const unsigned qrow =
+        (qok ? (unsigned)query * 24u + (unsigned)head : 0u);
+    // The direct packet entry folds the old one-wave-per-row Q converter.
+    // Lanes ml and ml+16 own the same Q row and scan disjoint 128-element
+    // halves; xor16 reproduces the converter's row amax. A second pass writes
+    // the same eight-code groups to the existing Q scratch once per row; the
+    // KT16 body then keeps its original bounded global fp8 loads instead of
+    // repeating conversion for every key tile.
+    float q_row_scale = 1.0f;
+    if constexpr (FUSED_Q) {
+        if (qok) {
+            const float* qp = q + (unsigned long long)qrow * 256ULL;
+            float a = 0.0f;
+#pragma unroll
+            for (int frag = 0; frag < 16; ++frag) {
+                const float8_t v = *(const float8_t*)(
+                    qp + (unsigned)(frag * 16 + kg * 8));
+                a = fmaxf(a, fabsf(v[0]));
+                a = fmaxf(a, fabsf(v[1]));
+                a = fmaxf(a, fabsf(v[2]));
+                a = fmaxf(a, fabsf(v[3]));
+                a = fmaxf(a, fabsf(v[4]));
+                a = fmaxf(a, fabsf(v[5]));
+                a = fmaxf(a, fabsf(v[6]));
+                a = fmaxf(a, fabsf(v[7]));
+            }
+            a = fmaxf(a, fa2_pkt_xor16(a));
+            q_row_scale = (a == 0.0f) ? 1.0f : a / 448.0f;
+#pragma unroll 1
+            for (int frag = 0; frag < 16; ++frag) {
+                const float8_t v = *(const float8_t*)(
+                    qp + (unsigned)(frag * 16 + kg * 8));
+                unsigned int w0 = 0u;
+                w0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    v[0] / q_row_scale, v[1] / q_row_scale, w0, false);
+                w0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    v[2] / q_row_scale, v[3] / q_row_scale, w0, true);
+                unsigned int w1 = 0u;
+                w1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    v[4] / q_row_scale, v[5] / q_row_scale, w1, false);
+                w1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    v[6] / q_row_scale, v[7] / q_row_scale, w1, true);
+                unsigned char* wp = q8_codes + qrow * 256u
+                    + (unsigned)(frag * 16 + kg * 8);
+                *(unsigned int*)wp = w0;
+                *(unsigned int*)(wp + 4) = w1;
+            }
+        }
+    } else if (qok) {
+        const float* q_scales = (const float*)(
+            q8_codes + (unsigned)batch_size * 24u * 256u);
+        q_row_scale = q_scales[qrow];
+    }
     // WG bounds: lanes 0..21 load the same guarded prefix (<=22 positions)
     // and reduce with the identical integer graph on every wave.
     int wmx = -1;
     int wmn = 0x7fffffff;
     if (lane < 22) {
-        const int qr = row_base / 6 + lane;
-        if (qr < batch_size) {
+        const int qr = query_offset + row_base / 6 + lane;
+        if (qr < query_offset + batch_size) {
             const int p = positions[qr];
             wmx = p;
             wmn = p;
@@ -1814,8 +1866,6 @@ __device__ void fa2_stageb_packet_body(
     const int gmin = __builtin_amdgcn_readfirstlane(wmn);
     const int seq_len = gmax + 1;
     const bool qok_all = (row_base + 127 < 6 * batch_size);
-    const float* sqp = (const float*)(q8_codes + (unsigned)batch_size * 24u * 256u);
-    const unsigned qrow = (qok ? (unsigned)query * 24u + (unsigned)head : 0u);
     for (int tile = tile0; tile < tile1; ++tile) {
         const int ktile = tile * 64;
         if (ktile >= seq_len)
@@ -1926,13 +1976,7 @@ __device__ void fa2_stageb_packet_body(
             const bool do1 = ktile + 16 <= gmax;
             const bool do2 = ktile + 32 <= gmax;
             const bool do3 = ktile + 48 <= gmax;
-            float qs_tile = 0.0f;
-            {
-                float sqv = 1.0f;
-                if (qok)
-                    sqv = sqp[qrow];
-                qs_tile = sqv * scale_attn;
-            }
+            const float qs_tile = q_row_scale * scale_attn;
             const int pos = (!full && qok) ? positions[query] : 0;
             const v2i_t* Kf = (const v2i_t*)K8;
             const v2i_t* Vf = (const v2i_t*)V8;
@@ -1961,6 +2005,7 @@ __device__ void fa2_stageb_packet_body(
                         const uint4 kv = *kp;
                         const v2i_t kf0 = {(int)kv.x, (int)kv.y};
                         const v2i_t kf1 = {(int)kv.z, (int)kv.w};
+                        const unsigned qb = qrow * 256u;
                         const v2i_t* qd0 = (const v2i_t*)(
                             q8_codes + qb + (unsigned)(2 * p * 16));
                         const v2i_t* qd1 = (const v2i_t*)(
@@ -2104,13 +2149,15 @@ __device__ void fa2_stageb_packet_body(
         }
     }
 }
-// Packet direct entry: native-fp8 fill, fp8 body, dense Q128 ownership.
-// Grid [(batch*6).div_ceil(128), 4, 1], block 256, 49408 B dynamic LDS.
-// Public kernargs/names match the stage-b convention (codes+sq in, out);
-// only the entry SYMBOL is new so the symbol-keyed host function cache
-// never collides with the route-N module.
+// Packet direct entry: native-fp8 fill, fused f32->E4M3 Q, dense Q128
+// ownership. For widened prefill, z enumerates equal-length 512-row runs;
+// x restarts within each run so the row grouping and causal bounds are
+// identical to the former per-step launches.
+// Grid [ceil(min(batch,512)*6/128), 4, ceil(batch/512)], block 256,
+// 49408 B dynamic LDS.
 extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
-    const unsigned char* __restrict__ q8_codes,
+    const float* __restrict__ q,
+    unsigned char* __restrict__ q8_codes,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
     float* __restrict__ out,
@@ -2126,12 +2173,16 @@ extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_
     const int kv_h = blockIdx.y;
     if (kv_h >= 4)
         return;
-    const int row_base = 128 * (int)blockIdx.x;
-    if (row_base >= 6 * batch_size)
+    const int query_offset = batch_size > 512 ? 512 * (int)blockIdx.z : 0;
+    if (query_offset >= batch_size)
         return;
-    fa2_stageb_packet_body<false>(q8_codes, k_cache, v_cache, out, positions,
-                                  batch_size, scale_attn, kv_h, row_base, 0,
-                                  0x3fffffff, 0, 1);
+    const int run_rows = min(512, batch_size - query_offset);
+    const int row_base = 128 * (int)blockIdx.x;
+    if (row_base >= 6 * run_rows)
+        return;
+    fa2_stageb_packet_body<false, true>(
+        q, q8_codes, k_cache, v_cache, out, positions, run_rows, query_offset,
+        scale_attn, kv_h, row_base, 0, 0x3fffffff, 0, 1);
 }
 // Packet partial twin: same KT64 tile partition as the stage-b partial.
 extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_packet_partial_gfx1201(
@@ -2163,9 +2214,9 @@ extern "C" __global__ __launch_bounds__(256, 1) void attention_fp8_e4m3_fa2_gqa_
     const int per = (512 + n_splits - 1) / n_splits;
     const int t0 = split * per;
     const int t1 = t0 + per;
-    fa2_stageb_packet_body<true>(q8_codes, k_cache, v_cache, out, positions,
-                                 batch_size, scale_attn, kv_h, row_base, t0,
-                                 t1, split, n_splits);
+    fa2_stageb_packet_body<true, false>(
+        nullptr, (unsigned char*)q8_codes, k_cache, v_cache, out, positions,
+        batch_size, 0, scale_attn, kv_h, row_base, t0, t1, split, n_splits);
 }
 // Packet merge: scale-free 258-float records, same body as stage-b merge
 // under its own symbol (duplicated so the route-N object stays identical).
