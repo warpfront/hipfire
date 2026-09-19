@@ -29309,6 +29309,11 @@ impl Gpu {
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_z, xq, y_z, z_m, k, batch_size)?;
+        if self.arch == "gfx1201" {
+            self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_beta, xq, y_beta, beta_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_alpha, xq, y_alpha, alpha_m, k, batch_size)?;
+            return Ok(());
+        }
         if beta_m < 128 {
             self.gemm_mq4g256v2_small_tail_set_iu4(
                 a_beta, x, xq, y_beta, beta_m, k, batch_size,

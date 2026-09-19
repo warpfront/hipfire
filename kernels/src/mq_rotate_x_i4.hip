@@ -14,14 +14,15 @@
 //   2. `quantize_int4_mmq_ds128` (inside the IU4 residual GEMM via
 //      `ensure_int4_mmq_x`): x_rot f32 → `block_i4_128` Xq, single consumer.
 //
-// This kernel keeps the f32 store (every downstream reader is preserved
-// byte-for-byte) and additionally emits the Xq sidecar in-register, so the
-// IU4 residual consumer takes an `Int4MmqPrepared` and the quantize launch
-// disappears.
+// `x_out` may be null when the prepared IU4 consumer is the only downstream
+// reader. The sidecar still receives the same register values and bytes.
 //
 // -DHIPFIRE_ROTATE_AWQ=1 builds the AWQ twin `rotate_x_mq_awq_i4` (extra
 // `awq_scale[K]` argument, divided BEFORE the FWHT — same formation as
 // `rotate_x_mq_awq`, completing `(W·s)·(x/s)`).
+// -DHIPFIRE_ROTATE_SIGMOID_GATE=1 adds a read-only gate input and forms
+// `x_in[i] * sigmoid(gate[i])` with the exact `sigmoid_mul_f32` expression
+// before the AWQ divide/FWHT. The original input remains unmodified.
 //
 // Bit-exactness: the FWHT body is a verbatim copy of `mq_rotate_x` /
 // `rotate_x_mq_awq` (same grid, same multiply order, same butterfly, same
@@ -47,10 +48,13 @@
 __launch_bounds__(32, 16)
 extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
     const float* __restrict__ x_in,
+#ifdef HIPFIRE_ROTATE_SIGMOID_GATE
+    const float* __restrict__ gate,        // [N, K], FP32
+#endif
 #ifdef HIPFIRE_ROTATE_AWQ
     const float* __restrict__ awq_scale,   // [K], FP32
 #endif
-    float* __restrict__ x_out,             // [N, K] f32, always written
+    float* __restrict__ x_out,             // nullable when emit_f32=false
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     block_i4_128* __restrict__ x_i4,       // [K/128, N] block_i4_128
@@ -67,30 +71,62 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
 
     const long long batch_off = (long long)batch * K;
     const float* x_in_b  = x_in  + batch_off;
-          float* x_out_b = x_out + batch_off;
+#ifdef HIPFIRE_ROTATE_SIGMOID_GATE
+    const float* gate_b = gate + batch_off;
+#endif
+          float* x_out_b = (x_out != nullptr) ? (x_out + batch_off) : nullptr;
 
     int d0 = tid * 8;
     int base = group * 256 + d0;
 
+    float x0 = x_in_b[base    ];
+    float x1 = x_in_b[base + 1];
+    float x2 = x_in_b[base + 2];
+    float x3 = x_in_b[base + 3];
+    float x4 = x_in_b[base + 4];
+    float x5 = x_in_b[base + 5];
+    float x6 = x_in_b[base + 6];
+    float x7 = x_in_b[base + 7];
+#ifdef HIPFIRE_ROTATE_SIGMOID_GATE
+    // Exact `sigmoid_mul_f32` expression and operation order. The old global
+    // store/reload is lossless for f32, so these registers are identical.
+    float s0 = 1.0f / (1.0f + expf(-gate_b[base    ]));
+    float s1 = 1.0f / (1.0f + expf(-gate_b[base + 1]));
+    float s2 = 1.0f / (1.0f + expf(-gate_b[base + 2]));
+    float s3 = 1.0f / (1.0f + expf(-gate_b[base + 3]));
+    float s4 = 1.0f / (1.0f + expf(-gate_b[base + 4]));
+    float s5 = 1.0f / (1.0f + expf(-gate_b[base + 5]));
+    float s6 = 1.0f / (1.0f + expf(-gate_b[base + 6]));
+    float s7 = 1.0f / (1.0f + expf(-gate_b[base + 7]));
+    x0 = x0 * s0;
+    x1 = x1 * s1;
+    x2 = x2 * s2;
+    x3 = x3 * s3;
+    x4 = x4 * s4;
+    x5 = x5 * s5;
+    x6 = x6 * s6;
+    x7 = x7 * s7;
+#endif
+
 #ifdef HIPFIRE_ROTATE_AWQ
     // Exact order of `rotate_x_mq_awq`: (x / awq_scale) * sign.
-    float v0 = (x_in_b[base    ] / awq_scale[base    ]) * signs1[d0    ];
-    float v1 = (x_in_b[base + 1] / awq_scale[base + 1]) * signs1[d0 + 1];
-    float v2 = (x_in_b[base + 2] / awq_scale[base + 2]) * signs1[d0 + 2];
-    float v3 = (x_in_b[base + 3] / awq_scale[base + 3]) * signs1[d0 + 3];
-    float v4 = (x_in_b[base + 4] / awq_scale[base + 4]) * signs1[d0 + 4];
-    float v5 = (x_in_b[base + 5] / awq_scale[base + 5]) * signs1[d0 + 5];
-    float v6 = (x_in_b[base + 6] / awq_scale[base + 6]) * signs1[d0 + 6];
-    float v7 = (x_in_b[base + 7] / awq_scale[base + 7]) * signs1[d0 + 7];
+    float v0 = (x0 / awq_scale[base    ]) * signs1[d0    ];
+    float v1 = (x1 / awq_scale[base + 1]) * signs1[d0 + 1];
+    float v2 = (x2 / awq_scale[base + 2]) * signs1[d0 + 2];
+    float v3 = (x3 / awq_scale[base + 3]) * signs1[d0 + 3];
+    float v4 = (x4 / awq_scale[base + 4]) * signs1[d0 + 4];
+    float v5 = (x5 / awq_scale[base + 5]) * signs1[d0 + 5];
+    float v6 = (x6 / awq_scale[base + 6]) * signs1[d0 + 6];
+    float v7 = (x7 / awq_scale[base + 7]) * signs1[d0 + 7];
 #else
-    float v0 = x_in_b[base    ] * signs1[d0    ];
-    float v1 = x_in_b[base + 1] * signs1[d0 + 1];
-    float v2 = x_in_b[base + 2] * signs1[d0 + 2];
-    float v3 = x_in_b[base + 3] * signs1[d0 + 3];
-    float v4 = x_in_b[base + 4] * signs1[d0 + 4];
-    float v5 = x_in_b[base + 5] * signs1[d0 + 5];
-    float v6 = x_in_b[base + 6] * signs1[d0 + 6];
-    float v7 = x_in_b[base + 7] * signs1[d0 + 7];
+    float v0 = x0 * signs1[d0    ];
+    float v1 = x1 * signs1[d0 + 1];
+    float v2 = x2 * signs1[d0 + 2];
+    float v3 = x3 * signs1[d0 + 3];
+    float v4 = x4 * signs1[d0 + 4];
+    float v5 = x5 * signs1[d0 + 5];
+    float v6 = x6 * signs1[d0 + 6];
+    float v7 = x7 * signs1[d0 + 7];
 #endif
 
     // Local butterfly: strides 1, 2, 4.
@@ -138,14 +174,16 @@ extern "C" __global__ void HIPFIRE_ROTATE_KERNEL(
     float f6 = v6 * s * signs2[d0 + 6];
     float f7 = v7 * s * signs2[d0 + 7];
 
-    x_out_b[base    ] = f0;
-    x_out_b[base + 1] = f1;
-    x_out_b[base + 2] = f2;
-    x_out_b[base + 3] = f3;
-    x_out_b[base + 4] = f4;
-    x_out_b[base + 5] = f5;
-    x_out_b[base + 6] = f6;
-    x_out_b[base + 7] = f7;
+    if (x_out_b != nullptr) {
+        x_out_b[base    ] = f0;
+        x_out_b[base + 1] = f1;
+        x_out_b[base + 2] = f2;
+        x_out_b[base + 3] = f3;
+        x_out_b[base + 4] = f4;
+        x_out_b[base + 5] = f5;
+        x_out_b[base + 6] = f6;
+        x_out_b[base + 7] = f7;
+    }
 
     // IU4 sidecar: remap this wave's 8-floats/lane into the standalone
     // quant ownership and emit two block_i4_128 rows for this 256-group.

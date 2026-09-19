@@ -3347,7 +3347,11 @@ impl Gpu {
             ]
         };
         let block_size = 256u32;
-        let shared_mem = ((k + 256) * 4) as u32;
+        let shared_mem = if x_rot.is_some() {
+            ((k + 256) * std::mem::size_of::<f32>()) as u32
+        } else {
+            (256 * std::mem::size_of::<f32>()) as u32
+        };
         let blocks_k = k / 128;
         let bytes = (k * 4 * 3 + 2 * 256 * 4 + blocks_k * 72) * batch_size;
         let timer = crate::profile::begin_timer(
@@ -4090,7 +4094,7 @@ impl Gpu {
         z: &GpuTensor,
         weight: &GpuTensor,
         awq: Option<&GpuTensor>,
-        x_rot: &GpuTensor,
+        x_rot: Option<&GpuTensor>,
         reservation: crate::scratch::Int4MmqReservation,
         n_heads: usize,
         head_dim: usize,
@@ -4147,7 +4151,7 @@ impl Gpu {
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
-        let mut xrp = x_rot.buf.as_ptr();
+        let mut xrp = x_rot.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut i4p = reservation.ptr();
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
@@ -4219,7 +4223,9 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
-        self.invalidate_x_caches_for(xrp);
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
         result?;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
@@ -4474,7 +4480,7 @@ impl Gpu {
         &mut self,
         x_in: &GpuTensor,
         awq: Option<&GpuTensor>,
-        x_out: &GpuTensor,
+        x_out: Option<&GpuTensor>,
         reservation: crate::scratch::Int4MmqReservation,
         k: usize,
         batch_size: usize,
@@ -4504,7 +4510,7 @@ impl Gpu {
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut xp = x_in.buf.as_ptr();
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
-        let mut xrp = x_out.buf.as_ptr();
+        let mut xrp = x_out.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
         let mut i4p = reservation.ptr();
@@ -4569,10 +4575,100 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
-        self.invalidate_x_caches_for(xrp);
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
         result?;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
+    /// gfx1201 FA output producer: exact sigmoid multiply + AWQ/FWHT rotate +
+    /// in-register `block_i4_128`. The old path stored the sigmoided attention
+    /// row to f32 and immediately reloaded it in `rotate_x_mq_awq_i4_gfx12`;
+    /// this entry keeps that f32 value in-register and leaves `attn` unmodified.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched(
+        &mut self,
+        attn: &GpuTensor,
+        gate: &GpuTensor,
+        awq: &GpuTensor,
+        x_out: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.bind_thread()?;
+        if reservation.k() != k || reservation.n() != batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched: reservation (k,n) mismatch",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        const MODULE: &str = "sigmoid_mul_rotate_x_mq_awq_i4_gfx12";
+        const KERNEL: &str = "sigmoid_mul_rotate_x_mq_awq_i4_gfx12";
+        self.ensure_kernel(
+            MODULE,
+            kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
+            KERNEL,
+        )?;
+        let mut ap = attn.buf.as_ptr();
+        let mut gp = gate.buf.as_ptr();
+        let mut awp = awq.buf.as_ptr();
+        let mut xrp = x_out.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut i4p = reservation.ptr();
+        let mut kv = k as i32;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut awp as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut i4p as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let blocks_k = k / 128;
+        let bytes = (k * 4 * 3 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fwht",
+            "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [((k / 256) * batch_size) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(gp);
+                b.push_ptr(awp);
+                b.push_ptr(xrp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(i4p);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
+        result?;
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+    }
+
 
     /// FWHT-128 standalone rotation for MQ4G128 activations.
     ///

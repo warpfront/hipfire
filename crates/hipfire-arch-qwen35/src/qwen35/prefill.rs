@@ -234,13 +234,43 @@ fn try_gfx12_rotate_quant_fused_prepared(
     let prep = gpu.rotate_x_mq_i4_gfx12_batched(
         x,
         wo.awq_scale.as_ref(),
-        x_rot,
+        None,
         res,
         k,
         n,
     )?;
     Ok(Some(prep))
 }
+/// gfx1201 FA out-proj producer: fuse the still-standalone
+/// `sigmoid_mul_f32` into the AWQ rotate+IU4 sidecar. This is deliberately
+/// AWQ-only: the arm of record has AWQ sidecars, while every failed predicate
+/// keeps the established sigmoid → rotate/quant chain byte-for-byte.
+fn try_gfx12_sigmoid_rotate_quant_fused_prepared(
+    gpu: &mut Gpu,
+    wo: &hipfire_runtime::llama::WeightTensor,
+    attn: &GpuTensor,
+    gate: &GpuTensor,
+    k: usize,
+    n: usize,
+    epilogue: &BatchEpilogue<'_>,
+) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
+    let Some(awq) = wo.awq_scale.as_ref() else {
+        return Ok(None);
+    };
+    if wo.gpu_dtype != DType::MQ4G256V2
+        || !matches!(epilogue, BatchEpilogue::Residual)
+        || awq.numel() < k
+        || !gpu.iu4_producer_quant_fused_active(n, k)
+    {
+        return Ok(None);
+    }
+    let res = gpu.reserve_int4_mmq(k, n)?;
+    let prep = gpu.sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched(
+        attn, gate, awq, None, res, k, n,
+    )?;
+    Ok(Some(prep))
+}
+
 
 /// gfx1201 slices-4: gated RMSNorm + FWHT + `block_i4_128` IU4 producer for
 /// the LA post-GDN `wo` input. `None` → caller keeps the incumbent
@@ -281,7 +311,7 @@ fn try_gfx12_gdn_quant_fused_prepared(
         z,
         norm_weight,
         wo.awq_scale.as_ref(),
-        x_rot,
+        None,
         res,
         n_heads,
         head_dim,
@@ -747,10 +777,10 @@ fn explicit_prefill_max_batch() -> Option<usize> {
 }
 
 /// Architecture default for the widened ordinary-prefill chunk ceiling
-/// (`prefill.chunk_rows`): 4096 on exact gfx1201, 512 elsewhere.
+/// (`prefill.chunk_rows`): 8192 on exact gfx1201, 512 elsewhere.
 #[inline]
 fn prefill_chunk_rows_default(arch: &str) -> usize {
-    if arch == "gfx1201" { 4096 } else { 512 }
+    if arch == "gfx1201" { 8192 } else { 512 }
 }
 
 /// Requested widened chunk ceiling: explicit `HIPFIRE_PREFILL_MAX_BATCH`
@@ -5348,7 +5378,7 @@ fn batch_chunk_delta_net_input_projection(
                 dim,
                 config.norm_eps,
                 n,
-                true,
+                false,
             )?;
         }
         if iu4_prep.is_none() {
@@ -7649,9 +7679,9 @@ fn batch_chunk_full_attn_output_projection(
             }
         }
     }
-    // 8. Fused sigmoid(gate) * attn_out, element-wise over the
-    // full [N × q_dim] tensor.
-    gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+    // The gfx1201 IU4 AWQ fast route below folds this sigmoid multiply into
+    // its rotate+quant producer. Every fallback still executes the established
+    // in-place launch before selecting its rotate/GEMM route.
 
     // 9. wo residual: x_batch += wo · (optional rotate)(fa_attn_out_batch).
     // Same MQ rotation requirement as the LA wo path.
@@ -7671,19 +7701,20 @@ fn batch_chunk_full_attn_output_projection(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    // T-B: fused rotate+quantize — x_rot feeds only the IU4 residual GEMM.
-    let mut iu4_wo_prep = try_iu4_rotate_prepared(
+    let mut iu4_wo_prep = try_gfx12_sigmoid_rotate_quant_fused_prepared(
         gpu,
         &layer.wo,
         &pbs.fa_attn_out_batch,
-        &pbs.fa_attn_out_rot_batch,
+        &pbs.fa_gate_batch,
         layer.wo.k,
         n,
         &epilogue,
     )?;
     if iu4_wo_prep.is_none() {
-        // gfx1201 slices-3: fused rotate+quant producer (bit-identical).
-        iu4_wo_prep = try_gfx12_rotate_quant_fused_prepared(
+        gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+        // T-B / slices-3: rotate+quantize once the standalone sigmoid has
+        // produced the f32 input. All non-admitted routes remain unchanged.
+        iu4_wo_prep = try_iu4_rotate_prepared(
             gpu,
             &layer.wo,
             &pbs.fa_attn_out_batch,
@@ -7692,6 +7723,17 @@ fn batch_chunk_full_attn_output_projection(
             n,
             &epilogue,
         )?;
+        if iu4_wo_prep.is_none() {
+            iu4_wo_prep = try_gfx12_rotate_quant_fused_prepared(
+                gpu,
+                &layer.wo,
+                &pbs.fa_attn_out_batch,
+                &pbs.fa_attn_out_rot_batch,
+                layer.wo.k,
+                n,
+                &epilogue,
+            )?;
+        }
     }
     let fa_wo_input = if iu4_wo_prep.is_some() {
         &pbs.fa_attn_out_rot_batch
@@ -14392,7 +14434,7 @@ mod tests {
             .expect("alloc x_rot fused");
         let res = gpu.reserve_int4_mmq(k, N).expect("reserve");
         let prep = gpu
-            .rotate_x_mq_i4_gfx12_batched(&x_t, wo.awq_scale.as_ref(), &x_rot_fused, res, k, N)
+            .rotate_x_mq_i4_gfx12_batched(&x_t, wo.awq_scale.as_ref(), Some(&x_rot_fused), res, k, N)
             .expect("fused rotate+quant");
         gpu.sync_with_deadline(Duration::from_secs(60)).expect("sync fused");
         let f32_fused = gpu.download_f32(&x_rot_fused).expect("dl fused f32");
@@ -14596,7 +14638,7 @@ mod tests {
                 &z_t,
                 norm_weight,
                 wo.awq_scale.as_ref(),
-                &x_rot_fused,
+                Some(&x_rot_fused),
                 res,
                 n_heads,
                 head_dim,
