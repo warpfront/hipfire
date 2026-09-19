@@ -1611,6 +1611,51 @@ impl ScratchState {
             generation: self.int4_mmq_generation,
         })
     }
+    /// Grow the three MQ4v2 FP8 pre-pass buffers for a producer-emitted FP8
+    /// stream and return their device pointers `(x_fp8, half_sums,
+    /// row_scales)`. Does **not** launch `pack_f32_to_fp8_mq4v2_gfx12` — the
+    /// fused `_mq4v2_fp8_gfx12` producer writes all three planes in place
+    /// with byte-identical outputs. Same always-overwrite contract as
+    /// `prepare_mq4v2_fp8_x_impl` (never pointer-cached); the caller seals
+    /// the pointers into [`Mq4v2Fp8Prepared`] only after a successful
+    /// producer launch.
+    pub fn grow_mq4v2_fp8_for_producer(
+        &mut self,
+        hip: &HipRuntime,
+        n: usize,
+        k: usize,
+    ) -> HipResult<(*mut c_void, *mut c_void, *mut c_void)> {
+        if k == 0 || n == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "grow_mq4v2_fp8_for_producer: need k%256==0 and n>0",
+            ));
+        }
+        let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) = mq4v2_fp8_needed(n, k);
+        grow_scratch_buffer(
+            hip,
+            &mut self.mq4v2_fp8_x_scratch,
+            &mut self.mq4v2_fp8_x_scratch_bytes,
+            x_fp8_bytes,
+        )?;
+        grow_scratch_buffer(
+            hip,
+            &mut self.mq4v2_fp8_half_sums_scratch,
+            &mut self.mq4v2_fp8_half_sums_scratch_bytes,
+            half_sums_bytes,
+        )?;
+        grow_scratch_buffer(
+            hip,
+            &mut self.mq4v2_fp8_row_scales_scratch,
+            &mut self.mq4v2_fp8_row_scales_scratch_bytes,
+            row_scales_bytes,
+        )?;
+        Ok((
+            self.mq4v2_fp8_x_scratch.as_ref().unwrap().as_ptr(),
+            self.mq4v2_fp8_half_sums_scratch.as_ref().unwrap().as_ptr(),
+            self.mq4v2_fp8_row_scales_scratch.as_ref().unwrap().as_ptr(),
+        ))
+    }
 
     /// Live generation + pointer for [`Int4MmqPrepared::checked_ptr`].
     #[inline]

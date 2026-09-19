@@ -1130,6 +1130,25 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+/// gfx1201 FP8-stream producer: RMSNorm/FWHT + in-register whole-row scale +
+/// E4M3 pack under distinct entry symbols so HSACO caches and profiler rows
+/// cannot alias any other fusion. Emits byte-identical
+/// `prepare_mq4v2_fp8_x_f32` (scale_mode=1) outputs on finite rows; the F32
+/// `x_rot` store is always written. Gated by `HIPFIRE_GFX12_FP8_STREAM`.
+pub const FUSED_RMSNORM_MQ_ROTATE_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_FP8_STREAM 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+/// gfx1201 FP8-stream AWQ producer twin for the qkvza/gate_up inputs.
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_FP8_STREAM 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
 /// T-B IU4 producer sidecar: standalone FWHT rotate + in-register
 /// `block_i4_128` emit for wo (residual) inputs. Prepends the shared quant
 /// recipe; the old `mq_rotate_x` / `rotate_x_mq_awq` symbols stay untouched.

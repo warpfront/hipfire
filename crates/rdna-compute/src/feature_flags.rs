@@ -248,6 +248,14 @@ pub struct FeatureFlags {
     /// Bit-identical vs the producer+quantizer chain; any byte difference
     /// kills it.
     pub gfx12_producer_quant_fused: bool,
+    /// gfx1201 RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion
+    /// (`HIPFIRE_GFX12_FP8_STREAM`, `kernel.gfx12_fp8_stream`). Default OFF;
+    /// `=1` opts in on exact gfx1201. The `_mq4v2_fp8_gfx12` producer twins
+    /// emit byte-identical `prepare_mq4v2_fp8_x_f32` (scale_mode=1) outputs
+    /// for the qkvza/gate_up/qkv inputs, so the standalone
+    /// `pack_f32_to_fp8_mq4v2_gfx12` launch disappears at each admitted site.
+    /// Any byte difference kills it.
+    pub gfx12_fp8_stream: bool,
     /// `HIPFIRE_GFX12_FA2_PREFILL=0` opts out of the gfx1201 GQA-fused FA2
     /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
     /// Default ON on exact gfx1201; `=1` forces it on other arches
@@ -627,6 +635,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_producer_quant_fused: parse_bool("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED")
                 .unwrap_or(arch == "gfx1201"),
+            gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM")
+                .unwrap_or(arch == "gfx1201"),
             gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
                 .unwrap_or(arch == "gfx1201"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
@@ -793,6 +803,12 @@ impl FeatureFlags {
     pub fn gfx12_producer_quant_fused_enabled(&self) -> bool {
         self.gfx12_producer_quant_fused && self.arch == "gfx1201"
     }
+    /// True only on exact gfx1201 with the opt-in set. The `_mq4v2_fp8_gfx12`
+    /// RMSNorm/rotate producers emit byte-identical standalone-pack outputs,
+    /// so the fused route is exact on finite rows.
+    pub fn gfx12_fp8_stream_enabled(&self) -> bool {
+        self.gfx12_fp8_stream && self.arch == "gfx1201"
+    }
 
     pub fn hfq3_mmq_layer_gate_pass(&self) -> bool {
         let lo = self.hfq3_mmq_layer_min;
@@ -932,6 +948,7 @@ impl FeatureFlags {
             gfx12_gdn_pre_fused: false,
             gfx12_silu_quant_fused: false,
             gfx12_producer_quant_fused: false,
+            gfx12_fp8_stream: false,
             residual_ldsstage: false,
             gate_up_ldsstage: false,
             gfx12_mq4v2_fp8_gateup: false,
@@ -1201,6 +1218,52 @@ mod tests {
         for arch in ["gfx1201", "gfx1100", "gfx1151"] {
             let test_flags = FeatureFlags::for_test(arch);
             assert!(!test_flags.gfx12_producer_quant_fused, "arch={arch}");
+        }
+    }
+    #[test]
+    fn gfx12_fp8_stream_default_on_gfx1201_with_opt_out() {
+        // Default process policy: the exact-gfx1201 RMSNorm+rotate → FP8
+        // pre-pass fusion is ON on exact gfx1201 only (bit-identical, prepare
+        // launches removed); `kernel.gfx12_fp8_stream=false` (or
+        // `HIPFIRE_GFX12_FP8_STREAM=0`) opts out; other arches stay off.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let on = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(on.gfx12_fp8_stream && on.gfx12_fp8_stream_enabled());
+        for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx12_fp8_stream, "arch={arch}");
+            assert!(!flags.gfx12_fp8_stream_enabled(), "arch={arch}");
+        }
+        let mut off = ConfigLayer::default();
+        off.set_cli("kernel.gfx12_fp8_stream", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser { path: "config.toml".into() },
+            layer: off,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        assert!(!FeatureFlags::from_process_config("gfx1201", &process).gfx12_fp8_stream_enabled());
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx12_fp8_stream", "true").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_in = FeatureFlags::from_process_config("gfx1201", &process);
+        assert!(opted_in.gfx12_fp8_stream);
+        assert!(opted_in.gfx12_fp8_stream_enabled());
+        let other = FeatureFlags::from_process_config("gfx1151", &process);
+        assert!(other.gfx12_fp8_stream);
+        assert!(!other.gfx12_fp8_stream_enabled());
+        // The unit-test constructor stays fully off (deterministic baseline).
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx12_fp8_stream, "arch={arch}");
         }
     }
 

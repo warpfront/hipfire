@@ -173,6 +173,40 @@ fn try_gfx12_rmsnorm_quant_fused_prepared(
     )?;
     Ok(Some(prep))
 }
+/// gfx1201 FP8-stream: RMSNorm/FWHT producer that emits byte-identical
+/// `prepare_mq4v2_fp8_x_f32` (scale_mode=1) planes for Lloyd-weight fp8
+/// GEMMs. `None` → caller keeps the incumbent producer + standalone-pack
+/// path. Admission is uniform `MQ4G256V2Lloyd` next-linear plus the shared
+/// `fp8_stream_active` gate (exact gfx1201, eager, batch % 64 == 0,
+/// K % 256 == 0). The F32 `x_rot` store is always written, so every
+/// downstream reader is preserved byte-for-byte.
+fn try_gfx12_fp8_stream_rmsnorm_prepared(
+    gpu: &mut Gpu,
+    x: &GpuTensor,
+    norm_weight: &GpuTensor,
+    next_linear: &hipfire_runtime::llama::WeightTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+    eps: f32,
+    n: usize,
+) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
+    if !matches!(
+        next_linear.gpu_dtype,
+        DType::MQ4G256V2 | DType::MQ4G256V2Lloyd
+    ) || !gpu.fp8_stream_active(n, k) {
+        return Ok(None);
+    }
+    let prep = gpu.fused_rmsnorm_rotate_mq_fp8_gfx12_batched(
+        x,
+        norm_weight,
+        next_linear.awq_scale.as_ref(),
+        x_rot,
+        k,
+        eps,
+        n,
+    )?;
+    Ok(Some(prep))
+}
 
 /// gfx1201 slices-3: FWHT-rotate + `block_i4_128` IU4 producer for the
 /// attention out-proj input. `None` → caller keeps the incumbent rotate +
@@ -5289,6 +5323,7 @@ fn batch_chunk_delta_net_input_projection(
     // we reuse x_rot_batch as the "normed, unrotated" output
     // so the subsequent GEMM can read it the same way.
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
+    let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if is_mq {
         // C2: MQ4V2 IU4 producer sidecar (emit_f32=true for beta/alpha tails).
         iu4_prep = try_iu4_rmsnorm_prepared(
@@ -5317,6 +5352,21 @@ fn batch_chunk_delta_net_input_projection(
             )?;
         }
         if iu4_prep.is_none() {
+            // gfx1201 FP8-stream: RMSNorm/FWHT producer emits the fp8
+            // pre-pass planes directly (byte-identical prepare outputs);
+            // the standalone pack launch disappears. Lloyd weights only.
+            fp8_prep = try_gfx12_fp8_stream_rmsnorm_prepared(
+                gpu,
+                &pbs.x_batch,
+                &layer.attn_norm,
+                &layer.wqkv,
+                &pbs.x_rot_batch,
+                dim,
+                config.norm_eps,
+                n,
+            )?;
+        }
+        if iu4_prep.is_none() && fp8_prep.is_none() {
             // AWQ-aware: next linear is LA's fused wqkv.
             fused_rmsnorm_rotate_mq_batched_for(
                 gpu,
@@ -5553,6 +5603,30 @@ fn batch_chunk_delta_net_input_projection(
                 lloyd_c16_or_fail(&layer.w_beta, "batch_chunk_delta_net_input_projection")?,
                 lloyd_c16_or_fail(&layer.w_alpha, "batch_chunk_delta_net_input_projection")?,
             )?;
+        } else if let Some(prep) = &fp8_prep {
+            // gfx1201 FP8-stream: the producer already emitted the fp8
+            // pre-pass planes; consume them directly, no pack launch.
+            gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd(
+                &layer.wqkv.buf,
+                &layer.wz.buf,
+                &layer.w_beta.buf,
+                &layer.w_alpha.buf,
+                prep,
+                &pbs.dn_qkv_batch,
+                &pbs.dn_z_batch,
+                &pbs.dn_beta_batch,
+                &pbs.dn_alpha_batch,
+                layer.wqkv.m,
+                layer.wz.m,
+                layer.w_beta.m,
+                layer.w_alpha.m,
+                layer.wqkv.k,
+                n,
+                lloyd_e4m3_or_fail(&layer.wqkv, "batch_chunk_delta_net_input_projection")?,
+                lloyd_e4m3_or_fail(&layer.wz, "batch_chunk_delta_net_input_projection")?,
+                lloyd_e4m3_or_fail(&layer.w_beta, "batch_chunk_delta_net_input_projection")?,
+                lloyd_e4m3_or_fail(&layer.w_alpha, "batch_chunk_delta_net_input_projection")?,
+            )?;
         } else {
             gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
                 &layer.wqkv.buf,
@@ -5587,7 +5661,36 @@ fn batch_chunk_delta_net_input_projection(
             0,
             "batch_chunk_delta_net_input_projection: mixed MQ4G256V2Lloyd/uniform LA projections — refusing (quantize all four or none)",
         ));
-    } else {
+        } else if layer.wqkv.gpu_dtype == DType::MQ4G256V2
+            && layer.wz.gpu_dtype == DType::MQ4G256V2
+            && layer.w_beta.gpu_dtype == DType::MQ4G256V2
+            && layer.w_alpha.gpu_dtype == DType::MQ4G256V2
+            && gpu.flags.gfx12_mq4v2_fp8_qkvza
+            && fp8_prep.is_some()
+        {
+            // gfx1201 FP8-stream (uniform): the producer already emitted the
+            // fp8 pre-pass planes; consume them directly with the launch twin
+            // of the family's fp8 route — no pack launch. Same fp8 intercept
+            // conditions as the uniform router (iu4 divergence excluded by
+            // producer-side ordering: fp8_prep implies iu4_prep is None).
+            gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared(
+                &layer.wqkv.buf,
+                &layer.wz.buf,
+                &layer.w_beta.buf,
+                &layer.w_alpha.buf,
+                fp8_prep.as_ref().unwrap(),
+                &pbs.dn_qkv_batch,
+                &pbs.dn_z_batch,
+                &pbs.dn_beta_batch,
+                &pbs.dn_alpha_batch,
+                layer.wqkv.m,
+                layer.wz.m,
+                layer.w_beta.m,
+                layer.w_alpha.m,
+                layer.wqkv.k,
+                n,
+            )?;
+        } else {
         run_fused_qkvza_key(
             gpu,
             crate::forward_slots::fused_qkvza_key_for(layer.wqkv.gpu_dtype),
@@ -6447,6 +6550,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
     // qt=52 re-arm anchor: gate+up both Lloyd → FP8-LUT launcher.
     let ffn_is_mq4v2_lloyd = all_mq4v2_lloyd(&[layer.w_gate.gpu_dtype, layer.w_up.gpu_dtype]);
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
+    let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if ffn_is_mq {
         // C2: MQ4V2 IU4 producer (emit_f32=false — gate_up has no f32 small tails).
         iu4_prep = try_iu4_rmsnorm_prepared(
@@ -6475,6 +6579,21 @@ fn batch_chunk_delta_net_ffn_gate_up(
             )?;
         }
         if iu4_prep.is_none() {
+            // gfx1201 FP8-stream: RMSNorm/FWHT producer emits the fp8
+            // pre-pass planes directly (byte-identical prepare outputs);
+            // the standalone pack launch disappears. Lloyd weights only.
+            fp8_prep = try_gfx12_fp8_stream_rmsnorm_prepared(
+                gpu,
+                &pbs.x_batch,
+                &layer.ffn_norm,
+                &layer.w_gate,
+                &pbs.x_rot_batch,
+                dim,
+                config.norm_eps,
+                n,
+            )?;
+        }
+        if iu4_prep.is_none() && fp8_prep.is_none() {
             // AWQ-aware: next linear is w_gate (gate/up share input → same AWQ scale).
             fused_rmsnorm_rotate_mq_batched_for(
                 gpu,
@@ -6630,6 +6749,22 @@ fn batch_chunk_delta_net_ffn_gate_up(
                 lloyd_c16_or_fail(&layer.w_gate, "batch_chunk_delta_net_ffn_gate_up")?,
                 lloyd_c16_or_fail(&layer.w_up, "batch_chunk_delta_net_ffn_gate_up")?,
             )?;
+        } else if let Some(prep) = &fp8_prep {
+            // gfx1201 FP8-stream: the producer already emitted the fp8
+            // pre-pass planes; consume them directly, no pack launch.
+            gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared_lloyd(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                prep,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+                lloyd_e4m3_or_fail(&layer.w_gate, "batch_chunk_delta_net_ffn_gate_up")?,
+                lloyd_e4m3_or_fail(&layer.w_up, "batch_chunk_delta_net_ffn_gate_up")?,
+            )?;
         } else {
             gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
                 &layer.w_gate.buf,
@@ -6654,7 +6789,29 @@ fn batch_chunk_delta_net_ffn_gate_up(
             0,
             "batch_chunk_delta_net_ffn_gate_up: mixed MQ4G256V2Lloyd/uniform gate/up — refusing (quantize both or neither)",
         ));
-    } else {
+        } else if layer.w_gate.gpu_dtype == DType::MQ4G256V2
+            && layer.w_up.gpu_dtype == DType::MQ4G256V2
+            && gpu.flags.gfx12_mq4v2_fp8_gateup
+            && !gpu.flags.hfq4g256_ldsstage_wmma
+            && fp8_prep.is_some()
+        {
+            // gfx1201 FP8-stream (uniform): the producer already emitted the
+            // fp8 pre-pass planes; consume them directly with the launch twin
+            // of the family's fp8 route — no pack launch. Same fp8 intercept
+            // conditions as the uniform router (iu4 divergence excluded by
+            // producer-side ordering: fp8_prep implies iu4_prep is None).
+            gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                fp8_prep.as_ref().unwrap(),
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+            )?;
+        } else {
         run_fused_gate_up_key(
             gpu,
             crate::forward_slots::fused_gate_up_key_for(layer.w_gate.gpu_dtype),
@@ -6932,6 +7089,7 @@ fn batch_chunk_full_attn_input_projection(
 
     // 1. rmsnorm (+ rotate for MQ) for the attn preamble.
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
+    let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if qkv_is_mq {
         // C2: MQ4V2 IU4 producer (emit_f32=false — FA qkv has no f32 small tails).
         iu4_prep = try_iu4_rmsnorm_prepared(
@@ -6960,6 +7118,21 @@ fn batch_chunk_full_attn_input_projection(
             )?;
         }
         if iu4_prep.is_none() {
+            // gfx1201 FP8-stream: RMSNorm/FWHT producer emits the fp8
+            // pre-pass planes directly (byte-identical prepare outputs);
+            // the standalone pack launch disappears. Lloyd weights only.
+            fp8_prep = try_gfx12_fp8_stream_rmsnorm_prepared(
+                gpu,
+                &pbs.x_batch,
+                &layer.attn_norm,
+                &layer.wq,
+                &pbs.x_rot_batch,
+                dim,
+                config.norm_eps,
+                n,
+            )?;
+        }
+        if iu4_prep.is_none() && fp8_prep.is_none() {
             // AWQ-aware: next linear is wq (Q/K/V share input → same AWQ scale).
             fused_rmsnorm_rotate_mq_batched_for(
                 gpu,
@@ -7150,6 +7323,26 @@ fn batch_chunk_full_attn_input_projection(
                 lloyd_c16_or_fail(&layer.wk, "batch_chunk_full_attn_input_projection")?,
                 lloyd_c16_or_fail(&layer.wv, "batch_chunk_full_attn_input_projection")?,
             )?;
+        } else if let Some(prep) = &fp8_prep {
+            // gfx1201 FP8-stream: the producer already emitted the fp8
+            // pre-pass planes; consume them directly, no pack launch.
+            gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared_lloyd(
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                prep,
+                &pbs.fa_q_full_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+                n,
+                lloyd_e4m3_or_fail(&layer.wq, "batch_chunk_full_attn_input_projection")?,
+                lloyd_e4m3_or_fail(&layer.wk, "batch_chunk_full_attn_input_projection")?,
+                lloyd_e4m3_or_fail(&layer.wv, "batch_chunk_full_attn_input_projection")?,
+            )?;
         } else {
             gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
                 &layer.wq.buf,
@@ -7179,7 +7372,32 @@ fn batch_chunk_full_attn_input_projection(
             0,
             "batch_chunk_full_attn_input_projection: mixed MQ4G256V2Lloyd/uniform FA qkv — refusing (quantize all three or none)",
         ));
-    } else if qkv_same_dtype {
+        } else if layer.wq.gpu_dtype == DType::MQ4G256V2
+            && layer.wk.gpu_dtype == DType::MQ4G256V2
+            && layer.wv.gpu_dtype == DType::MQ4G256V2
+            && gpu.flags.gfx12_mq4v2_fp8_qkv
+            && fp8_prep.is_some()
+        {
+            // gfx1201 FP8-stream (uniform): the producer already emitted the
+            // fp8 pre-pass planes; consume them directly with the launch twin
+            // of the family's fp8 route — no pack launch. Same fp8 intercept
+            // conditions as the uniform router (iu4 divergence excluded by
+            // producer-side ordering: fp8_prep implies iu4_prep is None).
+            gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_prepared(
+                &layer.wq.buf,
+                &layer.wk.buf,
+                &layer.wv.buf,
+                fp8_prep.as_ref().unwrap(),
+                &pbs.fa_q_full_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                layer.wq.m,
+                layer.wk.m,
+                layer.wv.m,
+                layer.wq.k,
+                n,
+            )?;
+        } else if qkv_same_dtype {
         run_fused_qkv_key(
             gpu,
             crate::forward_slots::fused_qkv_key_for(layer.wq.gpu_dtype),
@@ -7928,6 +8146,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
     // qt=52 re-arm anchor: gate+up both Lloyd → FP8-LUT launcher.
     let fa_ffn_is_mq4v2_lloyd = all_mq4v2_lloyd(&[layer.w_gate.gpu_dtype, layer.w_up.gpu_dtype]);
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
+    let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if fa_ffn_is_mq {
         iu4_prep = try_iu4_rmsnorm_prepared(
             gpu,
@@ -7955,6 +8174,21 @@ fn batch_chunk_full_attn_ffn_gate_up(
             )?;
         }
         if iu4_prep.is_none() {
+            // gfx1201 FP8-stream: RMSNorm/FWHT producer emits the fp8
+            // pre-pass planes directly (byte-identical prepare outputs);
+            // the standalone pack launch disappears. Lloyd weights only.
+            fp8_prep = try_gfx12_fp8_stream_rmsnorm_prepared(
+                gpu,
+                &pbs.x_batch,
+                &layer.ffn_norm,
+                &layer.w_gate,
+                &pbs.x_rot_batch,
+                dim,
+                config.norm_eps,
+                n,
+            )?;
+        }
+        if iu4_prep.is_none() && fp8_prep.is_none() {
             // AWQ-aware: next linear is w_gate (FA-FFN, gate/up share input).
             fused_rmsnorm_rotate_mq_batched_for(
                 gpu,
@@ -8106,6 +8340,22 @@ fn batch_chunk_full_attn_ffn_gate_up(
                 lloyd_c16_or_fail(&layer.w_gate, "batch_chunk_full_attn_ffn_gate_up")?,
                 lloyd_c16_or_fail(&layer.w_up, "batch_chunk_full_attn_ffn_gate_up")?,
             )?;
+        } else if let Some(prep) = &fp8_prep {
+            // gfx1201 FP8-stream: the producer already emitted the fp8
+            // pre-pass planes; consume them directly, no pack launch.
+            gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared_lloyd(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                prep,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+                lloyd_e4m3_or_fail(&layer.w_gate, "batch_chunk_full_attn_ffn_gate_up")?,
+                lloyd_e4m3_or_fail(&layer.w_up, "batch_chunk_full_attn_ffn_gate_up")?,
+            )?;
         } else {
             gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
                 &layer.w_gate.buf,
@@ -8130,7 +8380,29 @@ fn batch_chunk_full_attn_ffn_gate_up(
             0,
             "batch_chunk_full_attn_ffn_gate_up: mixed MQ4G256V2Lloyd/uniform gate/up — refusing (quantize both or neither)",
         ));
-    } else {
+        } else if layer.w_gate.gpu_dtype == DType::MQ4G256V2
+            && layer.w_up.gpu_dtype == DType::MQ4G256V2
+            && gpu.flags.gfx12_mq4v2_fp8_gateup
+            && !gpu.flags.hfq4g256_ldsstage_wmma
+            && fp8_prep.is_some()
+        {
+            // gfx1201 FP8-stream (uniform): the producer already emitted the
+            // fp8 pre-pass planes; consume them directly with the launch twin
+            // of the family's fp8 route — no pack launch. Same fp8 intercept
+            // conditions as the uniform router (iu4 divergence excluded by
+            // producer-side ordering: fp8_prep implies iu4_prep is None).
+            gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                fp8_prep.as_ref().unwrap(),
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+            )?;
+        } else {
         run_fused_gate_up_key(
             gpu,
             crate::forward_slots::fused_gate_up_key_for(layer.w_gate.gpu_dtype),
