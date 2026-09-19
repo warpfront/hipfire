@@ -7827,9 +7827,48 @@ fn batch_chunk_fa_attend(
         unreachable!("independent variant must carry active_mask");
     }
     if let Some(stride) = commit_stride {
-        // Widened ordinary chunk: commit every full 512-row write/attend tile,
-        // then the final valid partial tile. Padded projection rows never
-        // enter KV; each context ends at the last valid row in its segment.
+        // Exact gfx1201 native-fp8 packet path: write the whole widened
+        // chunk once, then let packet grid.z enumerate the equal-length
+        // legacy runs in one launch. Every row keeps its absolute position;
+        // pre-writing later K/V rows is unobservable under the causal mask,
+        // while x restarts per run so each workgroup sees the same query set
+        // and max/min bounds as the former per-step launch. Only whole-run
+        // chunks qualify; an odd tail takes the per-segment loop below.
+        let packet_runs = gpu.arch == "gfx1201"
+            && gpu.flags.gfx12_fa_packet
+            && kv_cache.quant_fp8
+            && config.n_heads == 24
+            && config.n_kv_heads == 4
+            && config.head_dim == 256
+            && stride == WIDENED_COMMIT_ROWS
+            && n % WIDENED_COMMIT_ROWS == 0
+            && n <= 32768
+            && max_ctx_len <= 32768
+            && tree_verify.is_none();
+        if packet_runs {
+            execute_fa_attend_step(
+                gpu,
+                config,
+                &pbs.fa_q_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                &pbs.positions,
+                &pbs.fa_attn_out_batch,
+                s,
+                kv_cache,
+                n,
+                start_pos,
+                max_ctx_len,
+                ctx,
+                None,
+                layer_idx,
+            )?;
+            return Ok(());
+        }
+        // Other tiers, and odd-length chunks, retain one write-then-attend
+        // step per legacy segment, then the final valid partial tile. Padded
+        // projection rows never enter KV; each context ends at the last valid
+        // row in its segment.
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
         for off in (0..n).step_by(stride) {
