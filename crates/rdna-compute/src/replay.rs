@@ -4320,6 +4320,15 @@ impl ReplayController {
         controller.max_recorded_launches = 8_192;
         controller
     }
+    /// Raise the record capacity for wide retained bodies (one 4096-row
+    /// widened prefill chunk records 1828 launches; multi-chunk or wider
+    /// bodies exceed the default 4k / manual 8k decode-sized caps). Builder
+    /// style so secondary controllers stay explicit about their footprint
+    /// at the call site.
+    pub fn with_max_recorded_launches(mut self, cap: usize) -> Self {
+        self.max_recorded_launches = cap;
+        self
+    }
 
     /// Apply the daemon's model-scoped replay default after a successful load.
     ///

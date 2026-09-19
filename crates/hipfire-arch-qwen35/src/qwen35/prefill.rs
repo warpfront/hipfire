@@ -910,6 +910,21 @@ fn dn_requant_per_token_env() -> bool {
         })
         .unwrap_or(false)
 }
+/// Prefill-graph replay gate (`HIPFIRE_GFX12_PREFILL_GRAPH`,
+/// `kernel.gfx12_prefill_graph`). Default OFF until the 4096-chunk capture /
+/// replay admits on exact gfx1201 (>1.5% on pp8192/32768, bit-exact).
+/// When set, tape recording observes the widened launch stream instead of
+/// forcing legacy cadence; the capture/replay driver itself keys off this
+/// same predicate.
+#[inline]
+pub(crate) fn gfx12_prefill_graph_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_GFX12_PREFILL_GRAPH")
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0"
+        })
+        .unwrap_or(false)
+}
 ///
 /// Static + perf part of the widened ordinary admission. Pure except for env
 /// reads: no GPU work, no allocation. Returns `None` when the request is not
@@ -2012,6 +2027,11 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // legacy cache above when a wider ceiling is statically admitted, so
     // `pbs_in.is_none()` here means the owner decision is ours; an explicit
     // smaller caller PBS always wins and keeps legacy cadence.
+    // Prefill-graph replay (HIPFIRE_GFX12_PREFILL_GRAPH): the retained tape
+    // (and, later, hipGraph capture) must observe the widened launch stream,
+    // so recording alone no longer narrows to legacy cadence when the flag
+    // is set. hipGraph stream capture still narrows (capture_mode below):
+    // captured H2D/sync nodes need the pre-upload work first. Default off.
     let wide_candidate = pbs_in.is_none()
         && max_batch_cap.is_none()
         && tree_verify.is_none()
@@ -2020,7 +2040,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         && max_layer.is_none()
         && matches!(fusion, DflashFusionCtx::Off)
         && !gpu.graphs.capture_mode
-        && !gpu.replay.is_recording();
+        && (!gpu.replay.is_recording() || gfx12_prefill_graph_enabled());
     let limit = if wide_candidate {
         ordinary_prefill_chunk_limit(gpu, weights, config, dn_state, kv_cache, None)?
     } else {
