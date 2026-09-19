@@ -4784,32 +4784,32 @@ impl Gpu {
         result
     }
 
-    /// Resolve all exact-gfx1201 R4D modules before any admitted route mutates
-    /// its input scratch or persistent convolution state.
+    /// Resolve the gfx1100/gfx1151/gfx1201 chunk scan modules before any
+    /// admitted route mutates its input scratch or persistent convolution state.
     #[cfg(feature = "deltanet")]
-    pub fn prepare_gdn_r4d_gfx1201(&mut self) -> HipResult<()> {
+    pub fn gdn_chunk_prepare(&mut self) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
-            "gdn_conv_prep_bf16_gfx1201",
-            kernels::GDN_CONV_PREP_BF16_GFX1201_SRC,
-            "gdn_conv_prep_bf16_gfx1201",
+            "gdn_chunk_prep",
+            kernels::GDN_CHUNK_PREP_SRC,
+            "gdn_chunk_prep",
         )?;
         self.ensure_kernel(
-            "gdn_kkt_shared_bf16_gfx1201",
-            kernels::GDN_KKT_SHARED_BF16_GFX1201_SRC,
-            "gdn_kkt_shared_bf16_gfx1201",
+            "gdn_chunk_kkt_solve",
+            kernels::GDN_CHUNK_KKT_SOLVE_SRC,
+            "gdn_chunk_kkt_solve",
         )?;
         self.ensure_kernel(
-            "gdn_chunk_scan_bf16_q8_gfx1201",
-            kernels::GDN_CHUNK_SCAN_BF16_Q8_GFX1201_SRC,
-            "gdn_chunk_scan_bf16_q8_gfx1201",
+            "gdn_chunk_scan",
+            kernels::GDN_CHUNK_SCAN_SRC,
+            "gdn_chunk_scan",
         )
     }
-    /// Exact-gfx1201 R4D parent preamble. The compact Q/K/V buffers are BF16
-    /// byte views borrowed from the ordinary prefill scratch.
+    /// GDN chunk scan preamble for gfx1100/gfx1151/gfx1201. The compact Q/K/V
+    /// buffers are BF16 byte views borrowed from the ordinary prefill scratch.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
-    pub fn gdn_conv_prep_bf16_gfx1201(
+    pub fn gdn_chunk_prep(
         &mut self,
         input: &GpuTensor,
         conv_weight: &GpuTensor,
@@ -4825,8 +4825,8 @@ impl Gpu {
         q_scale: f32,
         eps: f32,
     ) -> HipResult<()> {
-        self.prepare_gdn_r4d_gfx1201()?;
-        const PREP_MODULE: &str = "gdn_conv_prep_bf16_gfx1201";
+        self.gdn_chunk_prepare()?;
+        const PREP_MODULE: &str = "gdn_chunk_prep";
 
         let xp = input.buf.as_ptr();
         let wp = conv_weight.buf.as_ptr();
@@ -4882,12 +4882,12 @@ impl Gpu {
         )
     }
 
-    /// Exact-gfx1201 R4D KKT → fused scan for one legacy segment. All parent
-    /// arrays remain unsliced; `row0` selects the segment and state stays the
-    /// single unsliced persistent owner.
+    /// GDN KKT solve and fused scan for one legacy segment.
+    /// All parent arrays remain unsliced; `row0` selects the segment and state
+    /// stays the single unsliced persistent owner.
     #[cfg(feature = "deltanet")]
     #[allow(clippy::too_many_arguments)]
-    pub fn gated_delta_net_q8_r4d_segment_gfx1201(
+    pub fn gdn_chunk_scan_segment(
         &mut self,
         q: &GpuTensor,
         k: &GpuTensor,
@@ -4903,16 +4903,16 @@ impl Gpu {
         n_tokens: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        const KKT_MODULE: &str = "gdn_kkt_shared_bf16_gfx1201";
-        const SCAN_MODULE: &str = "gdn_chunk_scan_bf16_q8_gfx1201";
+        const KKT_MODULE: &str = "gdn_chunk_kkt_solve";
+        const SCAN_MODULE: &str = "gdn_chunk_scan";
         self.ensure_kernel(
             KKT_MODULE,
-            kernels::GDN_KKT_SHARED_BF16_GFX1201_SRC,
+            kernels::GDN_CHUNK_KKT_SOLVE_SRC,
             KKT_MODULE,
         )?;
         self.ensure_kernel(
             SCAN_MODULE,
-            kernels::GDN_CHUNK_SCAN_BF16_Q8_GFX1201_SRC,
+            kernels::GDN_CHUNK_SCAN_SRC,
             SCAN_MODULE,
         )?;
 

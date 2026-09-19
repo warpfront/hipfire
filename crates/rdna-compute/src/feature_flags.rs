@@ -236,9 +236,9 @@ pub struct FeatureFlags {
     /// sequential dense prefill route. Byte-exact vs the 3-launch sequence;
     /// any byte difference kills it.
     pub gfx12_gdn_pre_fused: bool,
-    /// Compact-F16 R4D GDN chunk scan on exact gfx1201
-    /// (`HIPFIRE_GFX12_GDN_R4D`, `kernel.gfx12_gdn_r4d`). Default ON; `=0` opts out.
-    pub gfx12_gdn_r4d: bool,
+    /// fused chunked gated-delta-net prefill scan, WMMA-resident state (hipfire design; structure informed by public FLA/AITER chunk decomposition).
+    /// Enabled by default on gfx1100/gfx1151/gfx1201; `HIPFIRE_GFX12_GDN_CHUNK_SCAN=0` opts out.
+    pub gfx12_gdn_chunk_scan: bool,
     /// gfx1201 down-proj SwiGLU/FWHT + int4 quant fusion (slice 1:
     /// `HIPFIRE_GFX12_SILU_QUANT_FUSED`, `kernel.gfx12_silu_quant_fused`).
     /// Default ON on exact gfx1201; `=0` opts out to the standalone
@@ -640,8 +640,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_gdn_pre_fused: parse_bool("HIPFIRE_GFX12_GDN_PRE_FUSED")
                 .unwrap_or(arch == "gfx1201"),
-            gfx12_gdn_r4d: parse_bool("HIPFIRE_GFX12_GDN_R4D")
-                .unwrap_or(arch == "gfx1201"),
+            gfx12_gdn_chunk_scan: parse_bool("HIPFIRE_GFX12_GDN_CHUNK_SCAN")
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")),
             gfx12_silu_quant_fused: parse_bool("HIPFIRE_GFX12_SILU_QUANT_FUSED")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_producer_quant_fused: parse_bool("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED")
@@ -961,7 +961,7 @@ impl FeatureFlags {
             force_blob_path: false,
             residual_ksplit_off: false,
             gfx12_gdn_pre_fused: false,
-            gfx12_gdn_r4d: false,
+            gfx12_gdn_chunk_scan: false,
             gfx12_silu_quant_fused: false,
             gfx12_producer_quant_fused: false,
             gfx12_fp8_stream: false,

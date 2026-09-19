@@ -5532,7 +5532,7 @@ fn forward_prefill_dense_tp_batched(
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
                                 None, // commit_stride: TP ranks keep legacy cadence
-                                false, // R4D is single-GPU ordinary prefill only
+                                false, // Chunk scan is single-GPU ordinary prefill only
                             ) {
                                 process_res = Err(e);
                                 break;

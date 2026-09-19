@@ -147,19 +147,17 @@ for arch in "${ARCHS[@]}"; do
         printf '%s|%s|%s|%s\n' "$arch" "$name" "$src" "$out" >> "$JOB_FILE"
     done
 
-    # The R4D sources are exact-gfx1201-only variant files with no generic
-    # parent. Give their runtime module names explicit packaging jobs.
-    if [ "$arch" = "gfx1201" ]; then
-        for name in \
-            gdn_conv_prep_bf16_gfx1201 \
-            gdn_kkt_shared_bf16_gfx1201 \
-            gdn_chunk_scan_bf16_q8_gfx1201; do
-            stem="${name%_gfx1201}"
-            src="$SRC_DIR/${stem}.gfx1201.hip"
-            out="$out_dir/${name}.hsaco"
-            printf '%s|%s|%s|%s\n' "$arch" "$name" "$src" "$out" >> "$JOB_FILE"
-        done
-    fi
+    # These portable chunk scan sources use a gfx1201-tagged origin filename
+    # and explicit runtime module names on every WMMA-capable target.
+    for spec in \
+        "gdn_chunk_prep:gdn_chunk_scan_prep.gfx1201.hip" \
+        "gdn_chunk_kkt_solve:gdn_chunk_scan_kkt_solve.gfx1201.hip" \
+        "gdn_chunk_scan:gdn_chunk_scan.gfx1201.hip"; do
+        name="${spec%%:*}"
+        src="$SRC_DIR/${spec#*:}"
+        out="$out_dir/${name}.hsaco"
+        printf '%s|%s|%s|%s\n' "$arch" "$name" "$src" "$out" >> "$JOB_FILE"
+    done
 done
 
 TOTAL=$(wc -l < "$JOB_FILE")
@@ -177,11 +175,12 @@ worker() {
     local -a module_flags=()
     IFS='|' read -r arch name src out <<< "$job"
     case "$name" in
-        gdn_conv_prep_bf16_gfx1201|gdn_kkt_shared_bf16_gfx1201)
+        gdn_chunk_prep|gdn_chunk_kkt_solve)
             module_flags+=("-ffp-contract=off")
             ;;
-        gdn_chunk_scan_bf16_q8_gfx1201)
-            module_flags+=("-ffp-contract=off" "-mcumode")
+        gdn_chunk_scan)
+            module_flags+=("-ffp-contract=off")
+            [ "$arch" = "gfx1201" ] && module_flags+=("-mcumode")
             ;;
     esac
 

@@ -6747,20 +6747,20 @@ pub const GATED_DELTA_NET_Q8_FAST_SRC: &str = concat!(
     include_str!("../../../kernels/src/gated_delta_net_q8_fast.hip")
 );
 
-/// Exact-gfx1201 compact-BF16 R4D GDN parent preamble.
+/// fused chunked gated-delta-net prefill scan, WMMA-resident state (hipfire design; structure informed by public FLA/AITER chunk decomposition).
 #[cfg(feature = "deltanet")]
-pub const GDN_CONV_PREP_BF16_GFX1201_SRC: &str =
-    include_str!("../../../kernels/src/gdn_conv_prep_bf16.gfx1201.hip");
+pub const GDN_CHUNK_PREP_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_scan_prep.gfx1201.hip");
 
-/// Exact-gfx1201 compact-BF16 R4D GDN shared-Gram KKT solve.
+/// Shared-Gram KKT solve for the GDN chunk scan on gfx1100/gfx1151/gfx1201.
 #[cfg(feature = "deltanet")]
-pub const GDN_KKT_SHARED_BF16_GFX1201_SRC: &str =
-    include_str!("../../../kernels/src/gdn_kkt_shared_bf16.gfx1201.hip");
+pub const GDN_CHUNK_KKT_SOLVE_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_scan_kkt_solve.gfx1201.hip");
 
-/// Exact-gfx1201 compact-BF16 R4D GDN fused chunk scan and Q8+EF commit.
+/// Fused GDN chunk scan and Q8+EF state commit on gfx1100/gfx1151/gfx1201.
 #[cfg(feature = "deltanet")]
-pub const GDN_CHUNK_SCAN_BF16_Q8_GFX1201_SRC: &str =
-    include_str!("../../../kernels/src/gdn_chunk_scan_bf16_q8.gfx1201.hip");
+pub const GDN_CHUNK_SCAN_SRC: &str =
+    include_str!("../../../kernels/src/gdn_chunk_scan.gfx1201.hip");
 
 /// Decode-only compact-QK variants for Qwen3.5 DeltaNet GQA (16 Q/K heads,
 /// 32 value/state heads). Each pair of state heads reads one normalized Q/K

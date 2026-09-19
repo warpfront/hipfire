@@ -6227,7 +6227,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
     commit_stride: Option<usize>,
-    r4d_admitted: bool,
+    gdn_chunk_scan_admitted: bool,
 ) -> HipResult<()> {
     // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
     // activation to match its pre-rotated weights; HFQ4 uses
@@ -6242,25 +6242,25 @@ pub(crate) fn batch_chunk_delta_net_attn(
     // together (the all-together corruption-prevention rule from
     // docs/plans/mq-lloyd-batched-prefill-followup.md). MQ4-Lloyd
     // is wired in a separate PR (issue #182).
-    let r4d_views = if r4d_admitted {
+    let gdn_chunk_scan_views = if gdn_chunk_scan_admitted {
         let segment_rows = commit_stride.unwrap_or(n);
         if !(64..=512).contains(&segment_rows)
             || (commit_stride.is_some() && n % segment_rows != 0)
         {
-            return Err(HipError::new(0, "invalid admitted R4D GDN segment geometry"));
+            return Err(HipError::new(0, "invalid admitted GDN chunk scan segment geometry"));
         }
 
         let checked_bytes = |rows: usize, width: usize, elem: usize| -> HipResult<usize> {
             rows.checked_mul(width)
                 .and_then(|v| v.checked_mul(elem))
-                .ok_or_else(|| HipError::new(0, "R4D GDN byte extent overflow"))
+                .ok_or_else(|| HipError::new(0, "GDN chunk scan byte extent overflow"))
         };
         let raw_view = |tensor: &GpuTensor, need: usize, name: &str| -> HipResult<GpuTensor> {
             if tensor.buf.size() < need {
                 return Err(HipError::new(
                     0,
                     &format!(
-                        "R4D GDN {name} scratch undersized: have {}, need {need}",
+                        "GDN chunk scan {name} scratch undersized: have {}, need {need}",
                         tensor.buf.size()
                     ),
                 ));
@@ -6278,7 +6278,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
                 Err(HipError::new(
                     0,
                     &format!(
-                        "R4D GDN {name} undersized: have {}, need {need}",
+                        "GDN chunk scan {name} undersized: have {}, need {need}",
                         tensor.buf.size()
                     ),
                 ))
@@ -6328,7 +6328,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
         )?;
         let ef = dn_state
             .ef_residual(delta_layer_idx)
-            .ok_or_else(|| HipError::new(0, "R4D GDN requires complete EF state"))?;
+            .ok_or_else(|| HipError::new(0, "GDN chunk scan requires complete EF state"))?;
         require_bytes(ef, 48 * 128 * 128 * 2, "EF state")?;
         require_bytes(
             &dn_state.conv_states[delta_layer_idx],
@@ -6338,7 +6338,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
 
         // JIT/load failure must occur before input projection or persistent
         // preamble mutation; no legacy retry is valid after this point.
-        gpu.prepare_gdn_r4d_gfx1201()?;
+        gpu.gdn_chunk_prepare()?;
         Some((q, k, v, a, segment_rows))
     } else {
         None
@@ -6346,8 +6346,8 @@ pub(crate) fn batch_chunk_delta_net_attn(
 
     batch_chunk_delta_net_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
 
-    if let Some((q, k, v, a, segment_rows)) = r4d_views {
-        gpu.gdn_conv_prep_bf16_gfx1201(
+    if let Some((q, k, v, a, segment_rows)) = gdn_chunk_scan_views {
+        gpu.gdn_chunk_prep(
             &pbs.dn_qkv_batch,
             &layer.conv_weight,
             &dn_state.conv_states[delta_layer_idx],
@@ -6364,9 +6364,9 @@ pub(crate) fn batch_chunk_delta_net_attn(
         )?;
         let ef = dn_state
             .ef_residual(delta_layer_idx)
-            .expect("R4D admission prevalidated EF state");
+            .expect("GDN chunk scan admission prevalidated EF state");
         for row0 in (0..n).step_by(segment_rows) {
-            gpu.gated_delta_net_q8_r4d_segment_gfx1201(
+            gpu.gdn_chunk_scan_segment(
                 &q,
                 &k,
                 &v,
@@ -10864,7 +10864,7 @@ fn forward_prefill_chunk_pair(
                         BatchEpilogue::Residual,
                         fusion,
                         None, // commit_stride: pair halves keep legacy cadence
-                        false, // R4D: paired halves retain the incumbent route
+                        false, // Paired halves retain the incumbent route
                     )?;
                     batch_chunk_delta_net_ffn(
                         gpu,
@@ -11473,8 +11473,8 @@ pub(crate) fn forward_batch_chunk_impl(
 
     let mut delta_layer_idx = band.map(|b| b.delta_layer_offset).unwrap_or(0);
     let mut kv_layer_idx = band.map(|b| b.kv_layer_offset).unwrap_or(0);
-    let r4d_common_admitted = gpu.flags.gfx12_gdn_r4d
-        && gpu.arch == "gfx1201"
+    let gdn_chunk_scan_common_admitted = gpu.flags.gfx12_gdn_chunk_scan
+        && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
         && config.num_experts == 0
         && config.linear_num_key_heads == 16
         && config.linear_num_value_heads == 48
@@ -11482,8 +11482,7 @@ pub(crate) fn forward_batch_chunk_impl(
         && config.linear_value_head_dim == 128
         && config.conv_kernel_dim == 4
         && dense_layers_are_all_mq4v2(weights)
-        && (gpu.iu4_producer_sidecar_active(n, dim)
-            || gpu.iu4_producer_quant_fused_active(n, dim))
+        && gpu.flags.iu4_prefill_enabled()
         && kv_cache.quant_fp8
         && dn_state.quant == StateQuant::Q8
         && !dn_state.s_matrices.is_empty()
@@ -11509,7 +11508,7 @@ pub(crate) fn forward_batch_chunk_impl(
     for layer_idx in layer_start..layer_end {
         match (&weights.layers[layer_idx], config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNet(layer), LayerType::LinearAttention) => {
-                let r4d_admitted = r4d_common_admitted
+                let gdn_chunk_scan_admitted = gdn_chunk_scan_common_admitted
                     && layer.wqkv.gpu_dtype == DType::MQ4G256V2
                     && layer.wz.gpu_dtype == DType::MQ4G256V2
                     && layer.w_beta.gpu_dtype == DType::MQ4G256V2
@@ -11537,7 +11536,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     BatchEpilogue::Residual,
                     fusion,
                     commit_stride,
-                    r4d_admitted,
+                    gdn_chunk_scan_admitted,
                 )?;
                 batch_chunk_delta_net_ffn(
                     gpu,

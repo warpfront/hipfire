@@ -13,7 +13,13 @@
 #define GK_PITCH 68
 #define GK_B 16
 
-typedef _Float16 gk_b8 __attribute__((ext_vector_type(8)));
+#if defined(__gfx1200__) || defined(__gfx1201__)
+#define GDN_CHUNK_GFX12 1
+typedef _Float16 gk_bfrag __attribute__((ext_vector_type(8)));
+#else
+#define GDN_CHUNK_GFX12 0
+typedef _Float16 gk_bfrag __attribute__((ext_vector_type(16)));
+#endif
 typedef float gk_f8 __attribute__((ext_vector_type(8)));
 
 __device__ __forceinline__ float gk_from_bf(unsigned short x) {
@@ -25,44 +31,70 @@ __device__ __forceinline__ unsigned short gk_to_bf(float x) {
 __device__ __forceinline__ gk_f8 gk_zero() {
     return (gk_f8){0,0,0,0,0,0,0,0};
 }
-__device__ __forceinline__ gk_f8 gk_mma(gk_b8 a, gk_b8 b, gk_f8 c) {
+__device__ __forceinline__ gk_f8 gk_mma(gk_bfrag a, gk_bfrag b, gk_f8 c) {
+#if GDN_CHUNK_GFX12
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a,b,c);
+#else
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a,b,c);
+#endif
 }
-__device__ __forceinline__ gk_b8 gk_frag_shared(
+__device__ __forceinline__ int gk_acc_row(int lane, int elem) {
+#if GDN_CHUNK_GFX12
+    return 8 * (lane >> 4) + elem;
+#else
+    return 2 * elem + (lane >> 4);
+#endif
+}
+__device__ __forceinline__ gk_bfrag gk_frag_shared(
     const unsigned short* p, int pitch, int row0, int k0, int lane) {
-    union { unsigned short h[8]; gk_b8 v; } u;
+    union { unsigned short h[sizeof(gk_bfrag) / sizeof(unsigned short)]; gk_bfrag v; } u;
     const int row = row0 + (lane & 15);
+#if GDN_CHUNK_GFX12
     const int kh = k0 + 4 * (lane >> 4);
 #pragma unroll
     for (int e=0;e<4;++e) {
         u.h[e] = p[row*pitch + kh+e];
         u.h[e+4] = p[row*pitch + kh+8+e];
     }
+#else
+#pragma unroll
+    for (int e=0;e<16;++e) u.h[e] = p[row*pitch + k0+e];
+#endif
     return u.v;
 }
-__device__ __forceinline__ gk_b8 gk_frag_transpose(
+__device__ __forceinline__ gk_bfrag gk_frag_transpose(
     const unsigned short* p, int pitch, int row0, int k0, int lane) {
-    union { unsigned short h[8]; gk_b8 v; } u;
+    union { unsigned short h[sizeof(gk_bfrag) / sizeof(unsigned short)]; gk_bfrag v; } u;
     const int row = row0 + (lane & 15);
+#if GDN_CHUNK_GFX12
     const int kh = k0 + 4 * (lane >> 4);
 #pragma unroll
     for (int e=0;e<4;++e) {
         u.h[e] = p[(kh+e)*pitch + row];
         u.h[e+4] = p[(kh+8+e)*pitch + row];
     }
+#else
+#pragma unroll
+    for (int e=0;e<16;++e) u.h[e] = p[(k0+e)*pitch + row];
+#endif
     return u.v;
 }
-__device__ __forceinline__ gk_b8 gk_frag_global(
+__device__ __forceinline__ gk_bfrag gk_frag_global(
     const unsigned short* p, unsigned row_stride, int row0, int last, int k0, int lane) {
-    union { unsigned short h[8]; gk_b8 v; } u;
+    union { unsigned short h[sizeof(gk_bfrag) / sizeof(unsigned short)]; gk_bfrag v; } u;
     int row = row0 + (lane & 15);
     if (row > last) row = last;
+#if GDN_CHUNK_GFX12
     const int kh = k0 + 4 * (lane >> 4);
 #pragma unroll
     for (int e=0;e<4;++e) {
         u.h[e] = p[(unsigned)row*row_stride + kh+e];
         u.h[e+4] = p[(unsigned)row*row_stride + kh+8+e];
     }
+#else
+#pragma unroll
+    for (int e=0;e<16;++e) u.h[e] = p[(unsigned)row*row_stride + k0+e];
+#endif
     return u.v;
 }
 __device__ __forceinline__ void gk_tile(int t, int& rb, int& cb) {
@@ -81,7 +113,7 @@ struct __attribute__((aligned(16))) GkLds {
 };
 
 extern "C" __launch_bounds__(128)
-__global__ void gdn_kkt_shared_bf16_gfx1201(
+__global__ void gdn_chunk_kkt_solve(
     const unsigned short* __restrict__ k,
     const float* __restrict__ G,
     const float* __restrict__ beta,
@@ -136,9 +168,8 @@ __global__ void gdn_kkt_shared_bf16_gfx1201(
             const int tile=wave+slot*4;
             if(tile<10){int rb,cb;gk_tile(tile,rb,cb);
                 const int i=cb*GK_B+(lane&15);
-                const int j0=rb*GK_B+8*(lane>>4);
 #pragma unroll
-                for(int e=0;e<8;++e){const int j=j0+e;float value=0.0f;
+                for(int e=0;e<8;++e){const int j=rb*GK_B+gk_acc_row(lane,e);float value=0.0f;
                     if(i<rows && j<i && j<rows){
                         const float exponent=s.gate[i]-s.gate[j];
                         value=s.beta[i]*expf(exponent)*gram[slot][e];
@@ -173,16 +204,16 @@ __global__ void gdn_kkt_shared_bf16_gfx1201(
             gk_f8 x=gk_zero();
             x=gk_mma(gk_frag_shared(&s.a[0][0],GK_PITCH,origin+16,origin,lane),
                      gk_frag_transpose(&s.a[0][0],GK_PITCH,origin,origin,lane),x);
-            const int xn=lane&15, xm=8*(lane>>4);
+            const int xn=lane&15;
 #pragma unroll
-            for(int e=0;e<8;++e)s.tmp[wave*16+xn][xm+e]=gk_to_bf(x[e]);
+            for(int e=0;e<8;++e)s.tmp[wave*16+xn][gk_acc_row(lane,e)]=gk_to_bf(x[e]);
             __builtin_amdgcn_wave_barrier();
             gk_f8 y=gk_zero();
             y=gk_mma(gk_frag_shared(&s.a[0][0],GK_PITCH,origin+16,origin+16,lane),
                      gk_frag_shared(&s.tmp[0][0],36,wave*16,0,lane),y);
-            const int yr=origin+16+8*(lane>>4), yc=origin+(lane&15);
+            const int yc=origin+(lane&15);
 #pragma unroll
-            for(int e=0;e<8;++e)s.a[yr+e][yc]=gk_to_bf(-y[e]);
+            for(int e=0;e<8;++e)s.a[origin+16+gk_acc_row(lane,e)][yc]=gk_to_bf(-y[e]);
         }
         __syncthreads();
 
@@ -196,9 +227,9 @@ __global__ void gdn_kkt_shared_bf16_gfx1201(
             for(int kk=0;kk<2;++kk)
                 y=gk_mma(gk_frag_shared(&s.a[0][0],GK_PITCH,32+rb*16,kk*16,lane),
                          gk_frag_transpose(&s.a[0][0],GK_PITCH,cb*16,kk*16,lane),y);
-            const int yn=cb*16+(lane&15), ym=rb*16+8*(lane>>4);
+            const int yn=cb*16+(lane&15);
 #pragma unroll
-            for(int e=0;e<8;++e)s.tmp[yn][ym+e]=gk_to_bf(y[e]);
+            for(int e=0;e<8;++e)s.tmp[yn][rb*16+gk_acc_row(lane,e)]=gk_to_bf(y[e]);
         }
         __syncthreads();
         {
@@ -209,9 +240,9 @@ __global__ void gdn_kkt_shared_bf16_gfx1201(
             for(int kk=0;kk<2;++kk)
                 z=gk_mma(gk_frag_shared(&s.a[0][0],GK_PITCH,32+rb*16,32+kk*16,lane),
                          gk_frag_shared(&s.tmp[0][0],36,cb*16,kk*16,lane),z);
-            const int zr=32+rb*16+8*(lane>>4), zc=cb*16+(lane&15);
+            const int zc=cb*16+(lane&15);
 #pragma unroll
-            for(int e=0;e<8;++e)s.a[zr+e][zc]=gk_to_bf(-z[e]);
+            for(int e=0;e<8;++e)s.a[32+rb*16+gk_acc_row(lane,e)][zc]=gk_to_bf(-z[e]);
         }
         __syncthreads();
 
