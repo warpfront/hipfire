@@ -49,25 +49,20 @@
 //     K-loop VALU. All fragment addresses are hoisted to kernel top
 //     (frA/frW tables); slab/sb/nb/rg are unroll constants, so the K-step
 //     carries no dynamic address math.
-//   - Double-buffered slab staging (Change A): the W (weight) slab is
-//     double-buffered per 64-K slab (W0/W1); the A (activation) slab stays
-//     single-buffered (A) with v2's publish fence. DS and SZ metadata
-//     ping-pong per half-block (plane[h], kb = 2g+h) while token (d,s) is
-//     re-read from the DS plane at fold time (same values, same DAG).
-//     Steady state per block: prefetch slab 1 into A_pf/W_pf, compute slab
-//     0 from (A,W0), B0 (slab-0 A-reads done), publish slab 1 to (A,W1),
-//     B1, then the next-block fetch epoch: all six next-block raw loads
-//     (next A slab 0, next W slab 0, next DS word, next header word) issue
-//     immediately after B1 into private registers. Compute slab 1 from
-//     (A,W1), fold the current block, B2a (slab-1 A-reads done; also
-//     drains the fetch epoch after the useful compute1+fold window),
-//     publish next (masked/converted) to (A,W0,DS[h^1],SZ[h^1]), B2b.
-//     Four barriers per block (vs five before); slab 1 loads issue above
-//     slab 0's WMMAs (sched_barrier-pinned, as in v2) and the fetch epoch
-//     issues above compute 1 + fold. Bit-identical: same K order, same
-//     pinned IU4_FOLD_RN DAG.
-//     LDS 16384 B keeps 3 WG/CU on gfx1201 (3 x 16384 = 49152 < 65536/CU;
-//     the host still passes 19456 B, a harmless superset, same occupancy).
+//   - A and W are double-buffered per 64-K slab: slot 0 is (A0,W0), slot 1
+//     is (A1,W1). DS and SZ metadata ping-pong per half-block (plane[h],
+//     kb = 2g+h) while token (d,s) is re-read from the DS plane at fold time
+//     (same values, same DAG).
+//     Steady state per block: prefetch slab 1 into A_pf/W_pf while computing
+//     slab 0 from slot 0, publish slab 1 to the free slot 1, then rendezvous
+//     once for both slot-0 retirement and slot-1 readiness. The next-block
+//     fetch epoch issues into the same private payload, overlaps slot-1
+//     compute plus fold, publishes next slab 0 to the now-free slot 0, then
+//     rendezvous once for both slot-1 retirement and slot-0 readiness.
+//     Two barriers per block; each publish targets the alternate slot, so no
+//     readers-done barrier is needed before its stores. Bit-identical: same K
+//     order and pinned IU4_FOLD_RN DAG.
+//     LDS 20480 B keeps 3 WG/CU on gfx1201 (3 x 20480 = 61440 <= 65536/CU).
 //   - Coalesced store (fp8 K2 mechanism): each (rg, nb) phase dumps the
 //     wave's 16x16 f32 sub-tile to an LDS slot ([16][20], stride-20 pad for
 //     bank-clean streaming), then all 256 threads stream 64 rows x 32 cols
@@ -77,16 +72,17 @@
 //     column block (same K order), same pinned IU4_FOLD_RN DAG. Integer MMA:
 //     any oracle difference is a bug.
 //
-// LDS layout (16384 B = 16 KiB on gfx1201; compute planes and store slots
+// LDS layout (20480 B = 20 KiB on gfx1201; compute planes and store slots
 // overlap — A/W/DS/SZ are all dead once folds complete):
-//   A  = 16 WMMA fragments x 256 B (fragment order, below)  @ 0     (4096 B)
+//   A0 = 16 WMMA fragments x 256 B (fragment order, below)  @ 0     (4096 B)
 //   W0 = 16 WMMA fragments x 256 B                         @ 4096  (4096 B)
-//   W1 = 16 WMMA fragments x 256 B (second slab buffer)    @ 8192  (4096 B)
+//   W1 = 16 WMMA fragments x 256 B                         @ 8192  (4096 B)
 //   DS0 = [128][8] token (d f32, s i32), even halves        @ 12288 (1024 B)
 //   DS1 = [128][8] token (d f32, s i32), odd halves         @ 13312 (1024 B)
 //   SZ0 = [128][8] row (sc f32, zp f32), even halves        @ 14336 (1024 B)
 //   SZ1 = [128][8] row (sc f32, zp f32), odd halves         @ 15360 (1024 B)
-//   end                                                             = 16384 B
+//   A1 = 16 WMMA fragments x 256 B                         @ 16384 (4096 B)
+//   end                                                             = 20480 B
 //   store slots = 8 waves x [16][20] f32 @ 0                        (10240 B)
 //
 // Fragment order (probe-verified on gfx1201, 2026-09-18: the old
@@ -113,14 +109,12 @@
 // Store stream reads: bank = 5*i + x/4, 5 coprime 32 (2-way floor across
 // x-pairs); global stores are 2x64 B segments per wave32.
 //
-// Grid: [ceil(M/128), ceil(N/128)]. Block: [256,1,1]. LDS: 16384 bytes
-// (host passes 19456; kernel uses the first 16384).
+// Grid: [ceil(M/128), ceil(N/128)]. Block: [256,1,1]. LDS: 20480 bytes.
 //
 // Sweep note: 64x256 / 256x64 aspects need a different wave map (wt_pair /
 // tok_half split) plus matching host grid/LDS; the fold/prefetch/store
-// mechanisms transfer unchanged. Host (gemm.rs launch arm) and the oracle
-// launcher hardcode the same 128/128/256-thread contract (19456 B passed;
-// kernel uses 16384) — a geometry change must update all three consistently.
+// mechanisms transfer unchanged. Host, oracle, and timing launchers hardcode
+// the same 128/128/256-thread, 20480-byte contract and must change together.
 //
 // Compile gate: gfx1200 / gfx1201 only. Non-gfx12 archs get empty stubs (the
 
@@ -168,10 +162,9 @@
 #define IU4_SZ0_OFF (IU4_DS1_OFF + IU4_DS_BYTES)
 #define IU4_SZ_BYTES (IU4_BN * 8)
 #define IU4_SZ1_OFF (IU4_SZ0_OFF + IU4_SZ_BYTES)
-#define IU4_LDS_BYTES (IU4_SZ1_OFF + IU4_SZ_BYTES)
-// The host launch arm passes 19456 B (must cover the kernel's footprint);
-// fail loudly here if a geometry change outgrows it.
-_Static_assert(IU4_LDS_BYTES <= 19456, "iu4 fragment planes exceed host LDS");
+#define IU4_A1_OFF (IU4_SZ1_OFF + IU4_SZ_BYTES)
+#define IU4_LDS_BYTES (IU4_A1_OFF + IU4_A_BYTES)
+_Static_assert(IU4_LDS_BYTES <= 20480, "iu4 fragment planes exceed host LDS");
 // Store slots reuse LDS base: 8 waves x [16][20] f32.
 #define IU4_SLOT_COLS 20
 #define IU4_SLOT_FLOATS (16 * IU4_SLOT_COLS)
@@ -301,7 +294,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
 
     const int groups_per_row = K / 256;
     extern __shared__ char LDS[];
-    // A slab base is fixed (single buffer); W base re-points W0 <-> W1.
+    // The current A/W slab always shares slot parity.
     char* __restrict__ a_lds = LDS + IU4_A_OFF;
     char* __restrict__ w_lds = LDS + IU4_W0_OFF;
     // DS/SZ ping-pong bases (plane[h], kb = 2g+h) selected inside the loop.
@@ -447,7 +440,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
             // this block's compute+fold reads.
             char* __restrict__ ds_lds = LDS + ((h == 0) ? IU4_DS_OFF : IU4_DS1_OFF);
             char* __restrict__ sz_lds = LDS + ((h == 0) ? IU4_SZ0_OFF : IU4_SZ1_OFF);
-            // --- Slab 0 compute (A, W0) with slab 1 prefetch as producer. ---
+            // --- Slot 0 compute with slot 1 prefetch as producer. ---
             {
                 // Slab 1 prefetch, b64-coalesced: uniform SGPR bases carry
                 // kb/g/h, lane VGPR offsets were hoisted to kernel top.
@@ -455,44 +448,37 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 const char* __restrict__ wB1 = A + (long long)g * 136 + 8 + (long long)h * 64 + 32;
                 #pragma unroll
                 for (int r = 0; r < 2; r++) {
-                    const u32x2_t av = *(const u32x2_t*)(xqB1 + st_avoff[r]);
-                    A_pf[r] = st_aok[r] ? av : z64;
+                    A_pf[r] = *(const u32x2_t*)(xqB1 + st_avoff[r]);
                     W_pf[r] = *(const u32x2_t*)(wB1 + st_wvoff[r]);
                 }
-                // Variant 0: NO pin barrier here. The previous trip's fold
-                // VALU (above its B2a) must be free to sink among this
-                // trip's WMMAs; a sched_barrier(0) would retire the whole
-                // fold before the chain starts. True deps (cacc WAR per
-                // element, A_pf/W_pf publish after B0) still order what
-                // must be ordered; the scheduler hoists the prefetch loads
-                // for latency on its own.
+                // No scheduling pin here: the previous trip's fold VALU must
+                // remain free to sink among this trip's WMMAs. Raw A_pf is
+                // consumed only at the alternate-slot publication below.
                 // Every 128-K block restarts its int32 accumulation from zero
                 // (each block folds independently): FIRST=true on slab 0 of
                 // every (g,h), exactly as in v2. No h-dependence here.
                 iu4_bundle<0, true>(w_lds, a_lds, frW, frA, cacc, zc);
                 iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
-                // B0: slab-0 A-reads done on every wave (A is single-buffered:
-                // the publish below overwrites slab 0 with slab 1). W1 writes
-                // need no fence but share it.
-                __syncthreads();
-                // Publish slab 1 (A_pf -> A plane, W_pf -> W1) and re-point
-                // W at W1 (A is fixed). Nothing next-block is live yet: the
-                // fetch epoch is BELOW B1, never above.
+                // Publish slab 1 to the free alternate slot. The raw A pin
+                // keeps its zero-select at this first use, after slot-0
+                // compute, without imposing a memory or scheduling fence.
+                a_lds = LDS + IU4_A1_OFF;
                 w_lds = LDS + IU4_W1_OFF;
                 #pragma unroll
                 for (int r = 0; r < 2; r++) {
-                    *(u32x2_t*)(a_lds + st_ldsoff[r]) = A_pf[r];
+                    asm volatile("" : "+v"(A_pf[r][0]), "+v"(A_pf[r][1]));
+                    *(u32x2_t*)(a_lds + st_ldsoff[r]) = st_aok[r] ? A_pf[r] : z64;
                     *(u32x2_t*)(w_lds + st_ldsoff[r]) = W_pf[r];
                 }
-                // B1: slab-1 publish visible to all waves before compute 1.
+                // Slot-0 retirement plus slot-1 readiness.
                 __syncthreads();
                 if (!last) {
                     // Next-block fetch epoch: all six next-block raw loads
                     // (4 b64 nibble + 1 DS word + 1 packed header word) issue
                     // here, immediately after B1, into private registers. No
                     // masks, header conversion, DS stores or first use yet:
-                    // first use is the publish below B2a, so the waits drain
-                    // after compute1 + fold and the epoch overlaps them.
+                    // first use is the alternate-slot publish after compute1
+                    // plus fold, so the waits overlap that useful window.
                     // A_pf/W_pf are dead (slab 1 published above) and reused
                     // as the next-payload nibble words; ds_nx/sz_nx hold the
                     // raw next metadata words.
@@ -518,12 +504,12 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                         + g_nx * 136 + h_nx * 4);
                 }
             }
-            // --- Slab 1 compute (A, W1), current fold, next-block publish. ---
+            // --- Slot 1 compute, current fold, next slot-0 publish. ---
             {
                 iu4_bundle<0, false>(w_lds, a_lds, frW, frA, cacc, zc);
                 iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
-                // Fold (rescheduled above B2a so the fetch epoch overlaps
-                // compute1 + this VALU): 4 K32 int32 partials per (nb, rg)
+                // Fold while the next fetch epoch remains in flight: 4 K32
+                // int32 partials per (nb, rg)
                 // through the pinned IU4_FOLD_RN DAG. Reads only cacc plus
                 // the current DS[h]/SZ[h] planes, independent of the private
                 // next payload. Same f32 values, same DAG order: per-half
@@ -572,16 +558,14 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
 #endif
                     }
                 }
-                // B2a: slab-1 A-reads done on every wave, so the single A
-                // plane may be republished with next slab 0. This drain also
-                // completes the fetch epoch's in-flight loads, AFTER the
-                // useful compute1 + fold window above.
-                __syncthreads();
+                // Slot 0 was retired at the preceding rendezvous and is free
+                // while slot 1 computes, so publish needs no readers-done
+                // barrier here.
                 if (!last) {
-                    // Publish next block (first use of the fetch epoch):
-                    // original A zero-select, clamped W value, masked DS
-                    // word and converted header word, with the original
-                    // producer map. Re-point W at W0.
+                    // Publish next block into free slot 0 (first use of the
+                    // fetch epoch): original A zero-select, clamped W value,
+                    // masked DS word and converted header word.
+                    a_lds = LDS + IU4_A_OFF;
                     w_lds = LDS + IU4_W0_OFF;
                     #pragma unroll
                     for (int r = 0; r < 2; r++) {
@@ -604,9 +588,8 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                         ((float*)(sz_n + (tid >> 1) * 8))[w_szp] = (row_szp < M) ? f : 0.0f;
                     }
                 }
-                // B2b: next-block A/W0/DS/SZ publish visible to all waves
-                // (entry condition of the next trip); on the last block it
-                // guards the store-slot reuse of LDS base below.
+                // Slot-1 retirement plus next slot-0 readiness; on the last
+                // block this guards store-slot reuse of LDS base.
                 __syncthreads();
             }
         } // for h
