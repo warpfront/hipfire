@@ -3653,7 +3653,9 @@ impl Gpu {
         // arch/shape/eager gates; everything else falls through to the
         // byte-identical incumbent path below. Arch-disjoint from the
         // gfx1201 arm above (gfx11 allowlist only); the two flags are
-        // independent. Opt out with `HIPFIRE_GFX11_FA2_PREFILL=0`.
+        // independent. The fixed 16-row query tile zero-fills and guards its
+        // final partial tile, so every admitted batch >=64 is valid. Opt out
+        // with `HIPFIRE_GFX11_FA2_PREFILL=0`.
         if self.flags.gfx11_fa2_prefill
             && matches!(
                 self.arch.as_str(),
@@ -3665,7 +3667,6 @@ impl Gpu {
             && n_kv_heads == 4
             && head_dim == 256
             && self.fa2_gfx11_batch_admitted(batch_size)
-            && batch_size % 16 == 0
             && (64..=32768).contains(&max_ctx_len)
         {
             return self.attention_q8_0_fa2_gqa_gfx11(
@@ -4636,7 +4637,7 @@ impl Gpu {
     }
     /// Packet-minimal Q128 twin of
     /// [`Self::attention_fp8_e4m3_fa2_gqa_fp8_gfx1201`] (exact stage-b
-    /// arithmetic; fused Q-preconvert + multi-run launch). Dense ownership: one workgroup owns 128
+    /// arithmetic; attention S1). Dense ownership: one workgroup owns 128
     /// query-head rows (`row = 128*bx + 16*wave + ml`, `query = row/6`,
     /// `head = 6*kv_h + row%6`) over eight compute waves and KT64 tiles.
     /// Q f32->E4M3 conversion is fused into each owned row with the same

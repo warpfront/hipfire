@@ -1849,11 +1849,11 @@ fn dispatch_attend(
                 // pre-converts Q into f16 scratch (rotation fused, Q never
                 // mutated), so like the gfx1201 arm above this one is
                 // replay-idempotent and capture-safe — no recorder/capture
-                // gates. Otherwise same shape predicates (arch-disjoint
-                // gfx11 allowlist, independent flag). F2: exactly-1024 is
-                // admitted on exact gfx1151 only (shared predicate with the
-                // Q8 ingress); every other batch keeps the 64..=512 gate.
-                // Falls through to the incumbent below otherwise.
+                // gates. The fixed 16-row query tile zero-fills and guards its
+                // final partial tile. F2: exactly-1024 is admitted on exact
+                // gfx1151 only (shared predicate with the Q8 ingress); every
+                // other batch keeps the 64..=512 gate. Falls through to the
+                // incumbent below otherwise.
                 if gpu.flags.gfx11_fa2_prefill
                     && matches!(
                         gpu.arch.as_str(),
@@ -1863,7 +1863,6 @@ fn dispatch_attend(
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
                     && gpu.fa2_gfx11_batch_admitted(io.batch_size)
-                    && io.batch_size % 16 == 0
                     && (64..=32768).contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                     && plan.v_mode_bits == 8

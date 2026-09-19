@@ -3021,15 +3021,15 @@ impl Gpu {
         self.scratch.reserve_int4_mmq(&self.hip, k, n)
     }
 
-    /// True when the C2 producer-sidecar route is live for this call:
-    /// IU4 + gfx1151 + eager (no replay/capture) + batch and K constraints
-    /// of the iu4 MMQ consumer.
+    /// True when the portable producer-sidecar route is live for this call:
+    /// IU4 + gfx1100/gfx1151 + eager (no replay/capture) + the K constraint
+    /// of the IU4 MMQ consumer. Every producer grid is row-parallel, and the
+    /// gfx11 IU4 MMQ base entry handles partial 128-row tiles.
     pub fn iu4_producer_sidecar_active(&self, batch: usize, k: usize) -> bool {
         self.flags.iu4_producer_sidecar_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
-            && batch >= 128
-            && batch % 128 == 0
+            && batch >= 64
             && k > 0
             && k % 256 == 0
     }
