@@ -54,8 +54,8 @@
 #define GDN_RS_XCH 0
 // K16/Q16 streaming f16 panel (16x128 = 2048 halves = 1024 floats).
 #define GDN_RS_PANEL 6176
-// Carry Kt panel (64 keys x 64 tokens f16 = 4096 halves = 2048 floats) over
-// HOLE; everything else is dead during carry except VEC.
+// Carry Kt panels (two key halves x 64 keys x 64 tokens f16 = 8192 halves =
+// 4096 floats) exactly fill HOLE; everything else is dead during carry.
 #define GDN_RS_KT 2080
 #define GDN_RS_EXP 2080
 #define GDN_RS_VEC 7200
@@ -72,6 +72,7 @@ __device__ __forceinline__ rs_f8 rs_floatv(rs_h8 x) {
 __device__ __forceinline__ rs_f8 rs_mma(rs_h8 a, rs_h8 b, rs_f8 c) {
     return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(a, b, c);
 }
+
 
 extern "C" __global__ void gated_delta_net_q8_register_scan_gfx1201(
     const float* __restrict__ q,
@@ -533,12 +534,13 @@ extern "C" __global__ void gated_delta_net_q8_register_scan_gfx1201(
             }
         }
 
-        // ---- carry: Kt panel (64 keys x 64 tokens f16, transposed), WMMA ----
+        // ---- carry: two Kt panels (key half x 64 keys x 64 tokens f16) ----
         {
             _Float16* kt = reinterpret_cast<_Float16*>(LDSB + GDN_RS_KT);
+            const int kt_lane = vg * 32 + lane;
 #pragma clang loop unroll(disable)
-            for (int u = 0; u < 16; u++) {
-                const int x = tid + u * 256;
+            for (int u = 0; u < 32; u++) {
+                const int x = kt_lane + u * 128;
                 const int r = x / 64;
                 const int tc = x % 64;
                 const int gt = c0 + tc;
@@ -549,7 +551,7 @@ extern "C" __global__ void gated_delta_net_q8_register_scan_gfx1201(
                                        (unsigned)(kh * 64) + (unsigned)r];
                     kk = (gt < n_tokens) ? lv : 0.0f;
                 }
-                kt[x] = (__half)kk;
+                kt[kh * 4096 + x] = (__half)kk;
             }
             __syncthreads();
             const float elast = LDSB[GDN_RS_VEC + 192];
@@ -570,7 +572,8 @@ extern "C" __global__ void gated_delta_net_q8_register_scan_gfx1201(
                     #pragma unroll
                     for (int j = 0; j < 8; j++) {
                         const int stok = s * 16 + kg * 8 + j;
-                        A[j] = kt[(kb * 16 + ml) * 64 + stok];
+                        A[j] =
+                            kt[kh * 4096 + (kb * 16 + ml) * 64 + stok];
                         const float cf =
                             (stok < cn) ? expf(Ge - LDSB[GDN_RS_VEC + stok]) : 0.0f;
                         B[j] = (__half)(cf * Ds[j]);
