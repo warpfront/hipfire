@@ -1224,7 +1224,7 @@ fn mtp_trunk_verify_lm_head(
                     n_verify,
                 )?;
             } else {
-                gpu.gemm_q8_0_batched(
+                gpu.gemm_q8_0_batched_f32_chunked(
                     &w_out.buf,
                     verify_hidden,
                     logits_view,

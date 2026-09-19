@@ -14,8 +14,9 @@
 //!   2. **bit-exactness** between the two entry points
 //!
 //! Two arms are timed, and the second is the one that matters cross-arch:
-//!   * `scalar`  — `gemm_q8_0_batched` directly. Always the wave32-shaped
-//!     scalar kernel, on every architecture. A fixed reference point.
+//!   * `scalar`  — `gemm_q8_0_batched_f32_chunked`. Always the wave32-shaped
+//!     scalar kernel, on every architecture. It is also the exact reference
+//!     for batches above the kernel's fixed `MAX_BATCH=64`.
 //!   * `prod`    — `gemm_q8_0_batched_chunked`, the entry point production
 //!     actually calls (dspark_core.rs:496). This is ARCH-ROUTED: on any
 //!     `has_wmma()` part with K%32==0 it returns `gemm_q8_0_wmma`
@@ -180,7 +181,7 @@ fn main() {
                     g.gemm_q8_0_batched_chunked(&w_t, &x_t, y, c.m, c.k, c.b)
                         .map_err(|e| format!("{e:?}"))
                 } else {
-                    g.gemm_q8_0_batched(&w_t, &x_t, y, c.m, c.k, c.b)
+                    g.gemm_q8_0_batched_f32_chunked(&w_t, &x_t, y, c.m, c.k, c.b)
                         .map_err(|e| format!("{e:?}"))
                 }
             };
