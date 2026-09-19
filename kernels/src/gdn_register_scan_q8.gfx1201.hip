@@ -161,7 +161,6 @@ extern "C" __global__ void gated_delta_net_q8_register_scan_gfx1201(
             LDSB[GDN_RS_VEC + 192] = expf(LDSB[GDN_RS_VEC + (cn - 1)]);
             LDSB[GDN_RS_VEC + 193] = LDSB[GDN_RS_VEC + (cn - 1)];
         }
-        __syncthreads();
 
         // ---- stage full K f16 panel (64x128) into HOLE ----
         {
@@ -195,13 +194,11 @@ extern "C" __global__ void gated_delta_net_q8_register_scan_gfx1201(
         __syncthreads();
 
         // ---- KK Gram -> compact strict-lower L (packed row i: i(i-1)/2+j) ----
-        // WMMA rule (see FA2 header): lane (ml,kg) supplies A[ml][kg*8+j] and
-        // B[ml][kg*8+j]; acc[j] = C[8*kg+j][ml]. So C rows vary with j and C
-        // cols with ml. A_mat rows R0+ml (R0 = vg*16, pair-redundant across
-        // the key-half wave pair); B_mat rows p*16+ml. acc[j] covers Gram row
-        // R0+8*kg+j, col p*16+ml: all 32 lanes write disjoint packed slots.
-        {
-            const _Float16* f16k = reinterpret_cast<const _Float16*>(LDSB + GDN_RS_HOLE);
+        // One wave from each key-half pair owns the shared Gram tile. The
+        // partner wave has identical operands and would only duplicate work.
+        if (kh == 0) {
+            const _Float16* f16k =
+                reinterpret_cast<const _Float16*>(LDSB + GDN_RS_HOLE);
             const int R0 = vg * 16;
 #pragma clang loop unroll(disable)
             for (int p = 0; p < 4; p++) {
@@ -212,29 +209,24 @@ extern "C" __global__ void gated_delta_net_q8_register_scan_gfx1201(
                     #pragma unroll
                     for (int j = 0; j < 8; j++) {
                         A[j] = f16k[(R0 + ml) * 128 + s * 16 + kg * 8 + j];
-                        B[j] = f16k[(p * 16 + ml) * 128 + s * 16 + kg * 8 + j];
+                        B[j] = f16k[(p * 16 + ml) * 128 +
+                                    s * 16 + kg * 8 + j];
                     }
                     acc = rs_mma(A, B, acc);
                 }
-                // Packed writes need valid slots: L row 0 has none, and
-                // upper-triangle indices overlap later rows' slots. Invalid
-                // lanes store junk 0.0 to dead slot CMP[2079] (free during
-                // the L phase: L uses 0..2015). Masked rows still write real
-                // slots (0.0) so no stale data survives across chunks.
-                {
-                    #pragma unroll
-                    for (int j = 0; j < 8; j++) {
-                        const int row = R0 + kg * 8 + j;
-                        const int col = p * 16 + ml;
-                        const float bv = (row < cn) ? LDSB[GDN_RS_VEC + 128 + row] : 0.0f;
-                        const float Gr = LDSB[GDN_RS_VEC + row];
-                        const int poff = row * (row - 1) / 2;
-                        float lv = 0.0f;
-                        bool valid = (col < row && row < cn && row != 0);
-                        if (valid)
-                            lv = bv * expf(Gr - LDSB[GDN_RS_VEC + col]) * acc[j];
-                        LDSB[GDN_RS_CMP + (valid ? poff + col : 2079)] = lv;
-                    }
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const int row = R0 + kg * 8 + j;
+                    const int col = p * 16 + ml;
+                    const float bv =
+                        (row < cn) ? LDSB[GDN_RS_VEC + 128 + row] : 0.0f;
+                    const float Gr = LDSB[GDN_RS_VEC + row];
+                    const int poff = row * (row - 1) / 2;
+                    const bool valid = (col < row && row < cn && row != 0);
+                    const float lv =
+                        bv * expf(Gr - LDSB[GDN_RS_VEC + col]) * acc[j] *
+                        (float)valid;
+                    LDSB[GDN_RS_CMP + (valid ? poff + col : 2079)] = lv;
                 }
             }
         }
@@ -328,7 +320,6 @@ extern "C" __global__ void gated_delta_net_q8_register_scan_gfx1201(
                 }
             }
         }
-        __syncthreads();
 
         // ---- solve (I+L)*delta=rhs: 64 rank updates, wave-local ----
 #pragma clang loop unroll(disable)
@@ -388,12 +379,10 @@ extern "C" __global__ void gated_delta_net_q8_register_scan_gfx1201(
         __syncthreads();
 
         // ---- QK Gram -> compact lower-incl M (packed i(i+1)/2+j) ----
-        // Same WMMA rule: acc[j] = C[8*kg+j][ml]. A_mat rows R0+ml (Q rows,
-        // R0 = vg*16 pair-redundant, streamed from global); B_mat rows
-        // p*16+ml (K rows from staged f16k). acc[j] covers QK row R0+8*kg+j,
-        // col p*16+ml: all lanes write disjoint packed slots.
-        {
-            const _Float16* f16k = reinterpret_cast<const _Float16*>(LDSB + GDN_RS_HOLE);
+        // As for KK, only kh=0 computes each shared row tile.
+        if (kh == 0) {
+            const _Float16* f16k =
+                reinterpret_cast<const _Float16*>(LDSB + GDN_RS_HOLE);
             const int R0 = vg * 16;
 #pragma clang loop unroll(disable)
             for (int p = 0; p < 4; p++) {
@@ -401,43 +390,46 @@ extern "C" __global__ void gated_delta_net_q8_register_scan_gfx1201(
 #pragma clang loop unroll(disable)
                 for (int s = 0; s < 8; s++) {
                     rs_h8 A, B;
-                    // Branchless masked load: clamp index, zero value.
-                    {
-                        const int ar = R0 + ml;
-                        const int agt = c0 + ar;
-                        const int agtc = (agt < n_tokens) ? agt : (n_tokens - 1);
-                        const float* ap =
-                            q + (unsigned)agtc * ustride + h_off + s * 16 + kg * 8;
-                        #pragma unroll
-                        for (int j = 0; j < 8; j++)
-                            A[j] = (__half)(((agt < n_tokens) ? ap[j] : 0.0f));
-                    }
+                    const int ar = R0 + ml;
+                    const int agt = c0 + ar;
+                    const int agtc = (agt < n_tokens) ? agt : (n_tokens - 1);
+                    const float* ap =
+                        q + (unsigned)agtc * ustride + h_off +
+                        (unsigned)(s * 16 + kg * 8);
+                    const float4 a0 = *reinterpret_cast<const float4*>(ap);
+                    const float4 a1 = *reinterpret_cast<const float4*>(ap + 4);
+                    const bool avalid = (agt < n_tokens);
+                    rs_f8 av;
+                    av[0] = avalid ? a0.x : 0.0f;
+                    av[1] = avalid ? a0.y : 0.0f;
+                    av[2] = avalid ? a0.z : 0.0f;
+                    av[3] = avalid ? a0.w : 0.0f;
+                    av[4] = avalid ? a1.x : 0.0f;
+                    av[5] = avalid ? a1.y : 0.0f;
+                    av[6] = avalid ? a1.z : 0.0f;
+                    av[7] = avalid ? a1.w : 0.0f;
+                    A = rs_halfv(av);
                     #pragma unroll
                     for (int j = 0; j < 8; j++)
-                        B[j] = f16k[(p * 16 + ml) * 128 + s * 16 + kg * 8 + j];
+                        B[j] = f16k[(p * 16 + ml) * 128 +
+                                    s * 16 + kg * 8 + j];
                     acc = rs_mma(A, B, acc);
                 }
-                // Invalid (col>row) packed indices overlap later rows' slots;
-                // route junk to dead EXP[0] (expanded L is dead after solve).
-                // Masked rows still write real slots (0.0) against staleness.
-                {
-                    #pragma unroll
-                    for (int j = 0; j < 8; j++) {
-                        const int row = R0 + kg * 8 + j;
-                        const int col = p * 16 + ml;
-                        const float Gr = LDSB[GDN_RS_VEC + row];
-                        const int poff = row * (row + 1) / 2;
-                        float mv = 0.0f;
-                        bool valid = (col <= row && row < cn);
-                        if (valid)
-                            mv = expf(Gr - LDSB[GDN_RS_VEC + col]) * acc[j];
-                        // Single LDS store with per-lane address (no branch).
-                        LDSB[valid ? GDN_RS_CMP + poff + col : GDN_RS_EXP] = mv;
-                    }
+                #pragma unroll
+                for (int j = 0; j < 8; j++) {
+                    const int row = R0 + kg * 8 + j;
+                    const int col = p * 16 + ml;
+                    const float Gr = LDSB[GDN_RS_VEC + row];
+                    const int poff = row * (row + 1) / 2;
+                    const bool valid = (col <= row && row < cn);
+                    const float mv =
+                        expf(Gr - LDSB[GDN_RS_VEC + col]) * acc[j] *
+                        (float)valid;
+                    LDSB[valid ? GDN_RS_CMP + poff + col : GDN_RS_EXP] = mv;
                 }
-                __syncthreads();
             }
         }
+        __syncthreads();
 
         // ---- expand compact M -> EXP (zero upper) ----
 #pragma clang loop unroll(disable)
@@ -530,9 +522,9 @@ extern "C" __global__ void gated_delta_net_q8_register_scan_gfx1201(
                     if (gt < n_tokens)
                         output[(unsigned)gtc * ustride + h_off + (unsigned)vrow] = ov;
                 }
-                __syncthreads();
             }
         }
+        __syncthreads();
 
         // ---- carry: two Kt panels (key half x 64 keys x 64 tokens f16) ----
         {
@@ -575,7 +567,8 @@ extern "C" __global__ void gated_delta_net_q8_register_scan_gfx1201(
                         A[j] =
                             kt[kh * 4096 + (kb * 16 + ml) * 64 + stok];
                         const float cf =
-                            (stok < cn) ? expf(Ge - LDSB[GDN_RS_VEC + stok]) : 0.0f;
+                            expf(Ge - LDSB[GDN_RS_VEC + stok]) *
+                            (float)(stok < cn);
                         B[j] = (__half)(cf * Ds[j]);
                     }
                     acc = rs_mma(A, B, acc);
