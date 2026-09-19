@@ -431,16 +431,21 @@ static __device__ __forceinline__ float hipfire_fp8_e4m3_to_f32_tile(unsigned ch
     const unsigned int s = (u & 0x80u) << 24;
     const unsigned int e = (u >> 3) & 0x0fu;
     const unsigned int m = u & 0x07u;
-    if (e == 0u) {
-        const float f = (float)m * 1.953125e-3f;  // m * 2^-9, exact
-        return s ? -f : f;
-    }
-    if (e == 15u) {
-        const float f = (m == 7u) ? __builtin_bit_cast(float, 0x7fc00000u)
-                                  : 256.0f * (1.0f + (float)m * 0.125f);
-        return s ? -f : f;
-    }
-    return __builtin_bit_cast(float, s | ((e - 7u + 127u) << 23) | (m << 20));
+    // Branchless OCP E4M3FN -> f32 (bias 7; E=15/m=7 is NaN, E=15/m<=6 is
+    // finite up to 448). Bit-exact for all 256 codes: subnormal via f32
+    // multiply, normals via bit-construction, E15-finite via f32 scale-up,
+    // NaN preserved; sign applied once at the end. No data-dependent
+    // branches (the Vfill grouped layout serves one byte per dim, so the
+    // old dword+hardware-decode path no longer applies).
+    float f_sub = (float)m * 1.953125e-3f;  // m * 2^-9, exact
+    float f_norm = __builtin_bit_cast(float, ((e + 120u) << 23) | (m << 20));
+    float f_e15 = 256.0f * (1.0f + (float)m * 0.125f);
+    float mag = (e == 0u) ? f_sub : f_norm;
+    mag = (e == 15u && m != 7u) ? f_e15 : mag;
+    mag = (e == 15u && m == 7u)
+        ? __builtin_bit_cast(float, 0x7fc00000u)
+        : mag;
+    return __builtin_bit_cast(float, __builtin_bit_cast(unsigned int, mag) | s);
 }
 // Vfill grouped-fragment V code address: (head kv_h, 8-key group g, dim d) is
 // one contiguous b64 at group_base + kv_h*D*8 + d*8; byte j = slot&7. Scales
