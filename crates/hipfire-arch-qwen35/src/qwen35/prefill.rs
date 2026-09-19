@@ -177,8 +177,9 @@ fn try_gfx12_rmsnorm_quant_fused_prepared(
 /// `prepare_mq4v2_fp8_x_f32` (scale_mode=1) planes for Lloyd-weight fp8
 /// GEMMs. `None` → caller keeps the incumbent producer + standalone-pack
 /// path. Admission is uniform `MQ4G256V2Lloyd` next-linear plus the shared
-/// `fp8_stream_active` gate (exact gfx1201, eager, batch % 64 == 0,
-/// K % 256 == 0). The F32 `x_rot` store is always written, so every
+/// `fp8_stream_active` gate (exact gfx1201, eager, batch >= 64,
+/// K % 256 == 0; partial N tiles are masked in-kernel, so odd tails run
+/// unpadded). The F32 `x_rot` store is always written, so every
 /// downstream reader is preserved byte-for-byte.
 fn try_gfx12_fp8_stream_rmsnorm_prepared(
     gpu: &mut Gpu,
