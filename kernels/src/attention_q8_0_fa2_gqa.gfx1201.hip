@@ -1724,8 +1724,8 @@ extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_g
 }
 #endif
 // ---- Packet-minimal Q128 body (FaPacket K1, exact) ----
-// Gated by HIPFIRE_FA2_PACKET (opt-in via kernel.gfx12_fa_packet): all other
-// translation units preprocess this region away, so K0/K3/K8 objects stay
+// Gated by HIPFIRE_FA2_PACKET (default route via kernel.gfx12_fa_packet): all
+// other translation units preprocess this region away, so K0/K3/K8 objects stay
 // byte-identical. Geometry: 256 threads / eight wave32s, ALL computing, 128
 // densely enumerated query-head rows per KV head, KT64, 49408 B dynamic LDS.
 // Fill is the T-verified paired mechanism (b128 K/V pairs, wave-private 2

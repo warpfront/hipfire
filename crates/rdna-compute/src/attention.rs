@@ -4644,7 +4644,7 @@ impl Gpu {
     /// Same kernargs/ABI/scratch contract as the route-N launcher (codes+sq
     /// via the shared stage-b pre-convert; separate module: the packet
     /// entry symbols never collide in the symbol-keyed function cache).
-    /// Opt-in only via `kernel.gfx12_fa_packet` dispatch (default off).
+    /// Default route on exact gfx1201; `kernel.gfx12_fa_packet=false` opts out.
     #[allow(clippy::too_many_arguments)]
     pub fn attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
         &mut self,
