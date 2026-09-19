@@ -120,6 +120,8 @@ Route selection for “must I run X?” stays in
 On thinking models, probe TTFT can include the full think phase when
 visible tokens are stripped — that is not prefill. Prefer daemon fields.
 
+`hipfire bench --ttft` reports the competitor-comparable prefill number: client-side wall clock from generate request send to first streamed token with `max_tokens=1` and thinking off, plus `prompt_tokens / TTFT` (median/stdev over `--runs` after `--warmups`, prompt from `--prompt-file`, identity in the `ttft` JSON block). It differs from `--matrix`, which drives synthetic `bench_prefill` device-timer probes outside the generate path; cite the `--ttft` number when comparing against HTTP-client TTFT figures such as radiance's `prompt_tokens/TTFT p50`.
+
 ## Noise and confounders
 
 There is **no single universal noise band** for every GPU, harness, and

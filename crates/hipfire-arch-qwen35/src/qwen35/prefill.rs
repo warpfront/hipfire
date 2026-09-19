@@ -1152,11 +1152,11 @@ pub fn ordinary_prefill_chunk_limit(
     Ok(admitted.min(prefill_chunk_rows_requested(gpu).max(WIDENED_COMMIT_ROWS)))
 }
 ///
-/// Next direct-ordinary chunk under a widened ceiling: group complete
-/// legacy 512-row chunks into the largest power-of-two multiple the ceiling
-/// covers (at least two), else the legacy `<= 512` tail schedule. Preserves
-/// the direct partitioner's singleton avoidance: 513→511+2, 1025→512+511+2,
-/// 1537→1024+511+2, 2049→1024+512+511+2, 4097→2048+1024+512+511+2. Pure.
+/// Next direct-ordinary chunk under a widened ceiling. Keep all valid rows in
+/// the largest admitted chunk so non-rung tails ride the padded multi-row GEMM
+/// path instead of becoming a separate small-M request. A chunk whose final
+/// 512-row commit would be a singleton is shortened by two rows, preserving
+/// the legacy two-token minimum at the state/KV seam.
 fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usize> {
     if remaining < MIN_BATCH || ceiling < MIN_BATCH {
         return None;
@@ -1164,38 +1164,21 @@ fn next_exact_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usiz
     if ceiling <= WIDENED_COMMIT_ROWS {
         return next_prefill_chunk_len(remaining, ceiling);
     }
-    let reserve_two = if remaining % WIDENED_COMMIT_ROWS == 1 { 2 } else { 0 };
-    let full = remaining.saturating_sub(reserve_two) / WIDENED_COMMIT_ROWS;
-    let count = full.min(ceiling / WIDENED_COMMIT_ROWS);
-    if count >= 2 {
-        // Largest power of two ≤ count (count ≥ 2, so the shift is safe).
-        let pow2 = 1usize << (usize::BITS - count.leading_zeros() - 1);
-        Some(WIDENED_COMMIT_ROWS * pow2)
-    } else {
-        next_prefill_chunk_len(remaining, WIDENED_COMMIT_ROWS)
+    let mut chunk = remaining.min(ceiling);
+    if chunk > WIDENED_COMMIT_ROWS && chunk % WIDENED_COMMIT_ROWS == 1 {
+        chunk -= MIN_BATCH;
     }
+    Some(chunk)
 }
 ///
-/// Serve-caller outer chunk under a widened ceiling: the serve caller
-/// (`ar.rs`) splits with `min(remaining, chunk_max)` and invokes forward
-/// separately per outer chunk, so its tail rule differs from the direct one
-/// — served 1025→1024+1, flattening to old 512+512+1. Pure.
+/// Serve-caller outer chunk under a widened ceiling. Keep a short final region
+/// attached to the preceding rows; the inner planner preserves exact 512-row
+/// state/KV commits and handles the singleton exception.
 pub fn ordinary_serve_prefill_chunk_len(remaining: usize, ceiling: usize) -> Option<usize> {
     if remaining == 0 || ceiling < MIN_BATCH {
         return None;
     }
-    if ceiling <= WIDENED_COMMIT_ROWS || remaining <= WIDENED_COMMIT_ROWS {
-        return Some(remaining.min(ceiling));
-    }
-    let count = (remaining / WIDENED_COMMIT_ROWS).min(ceiling / WIDENED_COMMIT_ROWS);
-    if count >= 2 {
-        let pow2 = 1usize << (usize::BITS - count.leading_zeros() - 1);
-        Some(WIDENED_COMMIT_ROWS * pow2)
-    } else {
-        // Fewer than two full chunks: legacy ≤512 tail (this branch only
-        // runs with a widened ceiling, so the 512 cap is below it).
-        Some(remaining.min(WIDENED_COMMIT_ROWS))
-    }
+    Some(remaining.min(ceiling))
 }
 ///
 /// First-prefill receipt: proves requested-vs-executed rows for the evidence
@@ -2137,9 +2120,8 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         let mut chunk_start = 0usize;
         while chunk_start < n {
             let remaining = n - chunk_start;
-            // Widened grouping merges complete 512s into power-of-two chunks;
-            // the legacy tail schedule (and its singleton avoidance) is the
-            // fallback for both the legacy path and widened tails.
+            // Widened grouping keeps an odd tail attached to the largest
+            // admitted chunk so its GEMMs use the padded multi-row route.
             let chunk_n = if wide {
                 next_exact_prefill_chunk_len(remaining, chunk_batch)
             } else {
@@ -2151,10 +2133,8 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     "forward_prefill_batch: chunk plan cannot satisfy the two-token minimum",
                 )
             })?;
-            // F2 pair peek: merge exactly two complete 512-row chunks (never
-            // a partial tail — the tail selector below is unchanged, so 513
-            // stays 511+2 and 1025 stays 512+511+2). The second length is
-            // only computed when the first is a complete half.
+            // F2 pair peek is only relevant to the legacy 512-row schedule;
+            // widened chunks carry their tail directly.
             let pair_b = if chunk_n == FA_PAIR_ROWS
                 && fa_pair_common_admitted
                 && remaining - chunk_n >= MIN_BATCH
@@ -2257,7 +2237,6 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 .map_err(|e| hip_bridge::HipError::new(0, &e))?;
             // Only the admitted wide path produces `Some(512)`; every other
             // caller (captured, TP/EP, independent, pair, Halo) passes `None`.
-            // Small tails keep the legacy branch inside the chunk body.
             let commit_stride = if wide && chunk_n > WIDENED_COMMIT_ROWS {
                 Some(WIDENED_COMMIT_ROWS)
             } else {
@@ -6416,29 +6395,23 @@ pub(crate) fn batch_chunk_delta_net_attn(
                         )?
                     }
                 } else if let Some(stride) = commit_stride {
-                    // Widened ordinary chunk: the same wrapper with the same
-                    // 512-row q/k/v/output views and the same unsliced
-                    // S/scales/EF owners, once per legacy segment. Repeats the
-                    // exact dequant→recurrence→EF-fold→requant at every seam;
-                    // no new arithmetic exists. Only the admitted ordinary
-                    // path sets `commit_stride`, so tree/independent/TP/EP
-                    // callers keep their branch above.
-                    assert!(
-                        n % stride == 0,
-                        "widened GDN chunk {n} is not a multiple of commit stride {stride}"
-                    );
+                    // Widened ordinary chunk: commit every full 512-row seam,
+                    // then commit the final valid partial segment. Projection
+                    // GEMMs may pad their batch, but recurrence state advances
+                    // for valid rows only.
                     for off in (0..n).step_by(stride) {
-                        let q = pbs.dn_q_batch.sub_offset(off * v_dim, stride * v_dim);
-                        let k = pbs.dn_k_batch.sub_offset(off * v_dim, stride * v_dim);
-                        let v = pbs.dn_v_batch.sub_offset(off * v_dim, stride * v_dim);
+                        let seg_n = (n - off).min(stride);
+                        let q = pbs.dn_q_batch.sub_offset(off * v_dim, seg_n * v_dim);
+                        let k = pbs.dn_k_batch.sub_offset(off * v_dim, seg_n * v_dim);
+                        let v = pbs.dn_v_batch.sub_offset(off * v_dim, seg_n * v_dim);
                         let alpha = pbs
                             .dn_alpha_batch
-                            .sub_offset(off * n_v_heads, stride * n_v_heads);
+                            .sub_offset(off * n_v_heads, seg_n * n_v_heads);
                         let beta = pbs
                             .dn_beta_batch
-                            .sub_offset(off * n_v_heads, stride * n_v_heads);
+                            .sub_offset(off * n_v_heads, seg_n * n_v_heads);
                         let out =
-                            pbs.dn_attn_out_batch.sub_offset(off * v_dim, stride * v_dim);
+                            pbs.dn_attn_out_batch.sub_offset(off * v_dim, seg_n * v_dim);
                         gpu.gated_delta_net_q8_batch_seq(
                             &q,
                             &k,
@@ -6448,7 +6421,7 @@ pub(crate) fn batch_chunk_delta_net_attn(
                             &dn_state.s_matrices[delta_layer_idx],
                             &dn_state.s_scales[delta_layer_idx],
                             &out,
-                            stride,
+                            seg_n,
                             n_v_heads,
                             config.linear_value_head_dim,
                             dn_state.ef_residual(delta_layer_idx),
@@ -7854,26 +7827,20 @@ fn batch_chunk_fa_attend(
         unreachable!("independent variant must carry active_mask");
     }
     if let Some(stride) = commit_stride {
-        // Widened ordinary chunk: one 512-row write-then-attend tile per
-        // legacy segment, each with its own tile-local context
-        // (`start+o .. start+o+512`). The family writes that tile's KV rows
-        // before attending, so earlier logical prefix is present and no
-        // future tile row is needed — the same kernel route, scalar
-        // arguments and byte operands each legacy 512 request sees.
+        // Widened ordinary chunk: commit every full 512-row write/attend tile,
+        // then the final valid partial tile. Padded projection rows never
+        // enter KV; each context ends at the last valid row in its segment.
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
-        assert!(
-            n % stride == 0,
-            "widened FA chunk {n} is not a multiple of commit stride {stride}"
-        );
         for off in (0..n).step_by(stride) {
-            let q = pbs.fa_q_batch.sub_offset(off * q_dim, stride * q_dim);
-            let k = pbs.fa_k_batch.sub_offset(off * kv_dim, stride * kv_dim);
-            let v = pbs.fa_v_batch.sub_offset(off * kv_dim, stride * kv_dim);
-            let positions = pbs.positions.sub_offset(off, stride);
+            let seg_n = (n - off).min(stride);
+            let q = pbs.fa_q_batch.sub_offset(off * q_dim, seg_n * q_dim);
+            let k = pbs.fa_k_batch.sub_offset(off * kv_dim, seg_n * kv_dim);
+            let v = pbs.fa_v_batch.sub_offset(off * kv_dim, seg_n * kv_dim);
+            let positions = pbs.positions.sub_offset(off, seg_n);
             let out = pbs
                 .fa_attn_out_batch
-                .sub_offset(off * q_dim, stride * q_dim);
+                .sub_offset(off * q_dim, seg_n * q_dim);
             execute_fa_attend_step(
                 gpu,
                 config,
@@ -7884,9 +7851,9 @@ fn batch_chunk_fa_attend(
                 &out,
                 s,
                 kv_cache,
-                stride,
+                seg_n,
                 start_pos + off,
-                start_pos + off + stride,
+                start_pos + off + seg_n,
                 ctx,
                 tree_verify,
                 layer_idx,
@@ -13704,33 +13671,24 @@ mod tests {
         assert_eq!(next_prefill_chunk_len(3, 2), None);
     }
     #[test]
-    fn widened_direct_grouping_matches_tail_contract() {
-        // Plan §2.3 first-chunk examples at the 4096 ceiling.
+    fn widened_direct_grouping_keeps_non_rung_tail_attached() {
+        assert_eq!(next_exact_prefill_chunk_len(277, 4096), Some(277));
         assert_eq!(next_exact_prefill_chunk_len(513, 4096), Some(511));
-        assert_eq!(next_exact_prefill_chunk_len(1025, 4096), Some(512));
-        assert_eq!(next_exact_prefill_chunk_len(1537, 4096), Some(1024));
-        assert_eq!(next_exact_prefill_chunk_len(2049, 4096), Some(1024));
-        assert_eq!(next_exact_prefill_chunk_len(4097, 4096), Some(2048));
-        // Power-of-two merging: non-power counts snap down (6→4, 7→4).
-        assert_eq!(next_exact_prefill_chunk_len(3072, 4096), Some(2048));
-        assert_eq!(next_exact_prefill_chunk_len(3584, 4096), Some(2048));
-        assert_eq!(next_exact_prefill_chunk_len(1024, 4096), Some(1024));
+        assert_eq!(next_exact_prefill_chunk_len(1025, 4096), Some(1023));
+        assert_eq!(next_exact_prefill_chunk_len(1813, 4096), Some(1813));
+        assert_eq!(next_exact_prefill_chunk_len(4097, 4096), Some(4095));
+        assert_eq!(next_exact_prefill_chunk_len(5909, 4096), Some(4096));
+        assert_eq!(next_exact_prefill_chunk_len(5909, 8192), Some(5909));
         assert_eq!(next_exact_prefill_chunk_len(8192, 8192), Some(8192));
-        // Sub-512 explicit ceilings keep the legacy schedule exactly
-        // (513→256+255+2, like the legacy 256 planner).
+        // Sub-512 explicit ceilings keep the legacy schedule exactly.
         assert_eq!(next_exact_prefill_chunk_len(513, 256), Some(256));
         assert_eq!(next_exact_prefill_chunk_len(385, 384), Some(383));
-        // Degenerate inputs refuse like the legacy planner.
         assert_eq!(next_exact_prefill_chunk_len(1, 4096), None);
         assert_eq!(next_exact_prefill_chunk_len(3, 2), None);
     }
 
     #[test]
     fn widened_direct_flattened_commits_equal_legacy_schedule() {
-        // Every wide chunk is an exact multiple of 512, so expanding each
-        // wide chunk back into 512-row commits must reproduce the legacy
-        // 512 schedule row-for-row (the plan's partition proof). Deterministic
-        // CPU check over lengths 2..=16385 and every staged ceiling.
         fn schedule(mut remaining: usize, ceiling: usize, exact: bool) -> Vec<usize> {
             let mut chunks = Vec::new();
             while remaining > 0 {
@@ -13748,11 +13706,11 @@ mod tests {
         fn commits(schedule: &[usize]) -> Vec<usize> {
             let mut out = Vec::new();
             for &c in schedule {
-                if c > 512 {
-                    assert_eq!(c % 512, 0, "wide chunk must be a 512 multiple");
-                    out.extend(std::iter::repeat_n(512, c / 512));
-                } else {
-                    out.push(c);
+                let full = c / WIDENED_COMMIT_ROWS;
+                out.extend(std::iter::repeat_n(WIDENED_COMMIT_ROWS, full));
+                let tail = c % WIDENED_COMMIT_ROWS;
+                if tail != 0 {
+                    out.push(tail);
                 }
             }
             out
@@ -13774,9 +13732,7 @@ mod tests {
     }
 
     #[test]
-    fn widened_serve_grouping_matches_caller_contract() {
-        // Serve splits outer chunks and invokes forward separately: 1025 →
-        // 1024+1 (flattening to old 512+512+1 inside), 1537 → 1024+512+1.
+    fn widened_serve_grouping_keeps_tail_in_outer_call() {
         fn plan(mut remaining: usize, ceiling: usize) -> Vec<usize> {
             let mut chunks = Vec::new();
             while remaining > 0 {
@@ -13787,10 +13743,10 @@ mod tests {
             }
             chunks
         }
-        assert_eq!(plan(1025, 4096), vec![1024, 1]);
-        assert_eq!(plan(1537, 4096), vec![1024, 512, 1]);
-        assert_eq!(plan(513, 4096), vec![512, 1]);
-        assert_eq!(plan(2049, 2048), vec![2048, 1]);
+        assert_eq!(plan(1025, 4096), vec![1025]);
+        assert_eq!(plan(1813, 4096), vec![1813]);
+        assert_eq!(plan(5909, 4096), vec![4096, 1813]);
+        assert_eq!(plan(5909, 8192), vec![5909]);
         // At the 512 ceiling the serve split is the legacy min-split.
         for len in 1..=3000usize {
             let mut legacy = Vec::new();

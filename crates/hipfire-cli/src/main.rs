@@ -499,6 +499,12 @@ pub(crate) struct BenchArgs {
     /// Run deterministic synthetic prefill/decode rows.
     #[arg(long)]
     matrix: bool,
+    /// Client-side time-to-first-token: per run, generate one token on the
+    /// standard prompt and time request-send to first streamed token.
+    /// Reports prompt_tokens / TTFT, the competitor-comparable prefill
+    /// number. Standard generate path only (not --matrix).
+    #[arg(long)]
+    ttft: bool,
     #[arg(
         long,
         value_delimiter = ',',
@@ -4488,6 +4494,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && (args.matrix || args.redline) {
         bail!("--exp cannot be combined with matrix or Redline options");
     }
+    if args.ttft && args.matrix {
+        bail!("--ttft cannot be combined with --matrix (it measures the standard generate path)");
+    }
     if args.exp && args.json {
         bail!("--json is not supported with --exp");
     }
@@ -4556,6 +4565,16 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     eprintln!("  prompt_chars: {prompt_chars}");
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
+    } else if args.ttft {
+        bench_ttft(
+            &mut engine,
+            &args,
+            &prompt,
+            &prompt_md5,
+            prompt_chars,
+            &loaded,
+            &post_diag,
+        )
     } else {
         // The warmup exists to populate kernel caches and its output is
         // discarded, so it stays in answer mode even under --reasoning-on: a
@@ -5012,6 +5031,95 @@ fn bench_probe(
     }
 }
 
+/// Client-side TTFT on the standard generate path: per run, generate a
+/// single token with thinking off and time wall clock from request send to
+/// the first streamed `token` event. `pp_tok_s = prompt_tokens / ttft_s` is
+/// the competitor-comparable prefill number (radiance reports
+/// prompt_tokens/TTFT p50 at an HTTP client). Warmups run the same shape
+/// and are discarded. `--reasoning-on` is intentionally ignored here: the
+/// metric is defined with thinking off.
+fn bench_ttft(
+    engine: &mut Engine,
+    args: &BenchArgs,
+    prompt: &str,
+    prompt_md5: &str,
+    prompt_chars: u64,
+    loaded: &serde_json::Value,
+    diag: &serde_json::Value,
+) -> Result<()> {
+    // The shared bench banner prints args.max_tokens; the ttft path always
+    // generates exactly one token with thinking off, so say so explicitly.
+    eprintln!("  ttft shape: max_tokens=1, thinking off");
+    for _ in 0..args.warmups {
+        let _ = bench_generate(engine, prompt, 1)?;
+    }
+    let mut ttft_ms_samples = Vec::new();
+    let mut prompt_tokens: Option<u64> = None;
+    for _ in 0..args.runs {
+        let start = Instant::now();
+        let mut first: Option<Duration> = None;
+        let request = bench_generate_request(prompt, 1);
+        let done = engine.generate(&request, |event| {
+            if first.is_none()
+                && event.get("type").and_then(serde_json::Value::as_str) == Some("token")
+            {
+                first = Some(start.elapsed());
+            }
+            Ok(())
+        })?;
+        let elapsed =
+            first.ok_or_else(|| anyhow!("no streamed token observed; cannot measure client-side TTFT"))?;
+        ttft_ms_samples.push(elapsed.as_secs_f64() * 1000.0);
+        if prompt_tokens.is_none() {
+            prompt_tokens = bench_prompt_tokens_from_done(&done);
+        }
+        eprint!(".");
+        std::io::stderr().flush()?;
+    }
+    eprintln!();
+    if let Some(tokens) = prompt_tokens {
+        eprintln!("  prompt_tokens: {tokens}");
+    }
+    let pp_samples: Vec<f64> = match prompt_tokens {
+        Some(tokens) if tokens > 0 => ttft_ms_samples
+            .iter()
+            .map(|ms| tokens as f64 / (ms / 1000.0))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let ttft_stats = sample_stats(&ttft_ms_samples);
+    let pp_stats = sample_stats(&pp_samples);
+    let report = serde_json::json!({
+        "protocol": "client-ttft-v1",
+        "model": args.model,
+        "loaded": loaded,
+        "gpu": diag,
+        "max_tokens": 1,
+        "runs": args.runs,
+        "warmups": args.warmups,
+        "batch": 1,
+        "prompt_tokens": prompt_tokens,
+        "prompt_md5": prompt_md5,
+        "prompt_chars": prompt_chars,
+        "ttft": {
+            "samples": ttft_ms_samples,
+            "median": ttft_stats.map(|stats| stats.median),
+            "stdev": ttft_stats.map(|stats| stats.stdev),
+            "prompt_tokens": prompt_tokens,
+            "prompt_md5": prompt_md5,
+        },
+        "pp_tok_s": pp_stats,
+        "pp_tok_s_samples": pp_samples,
+    });
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_sample_row("ttft ms", ttft_stats);
+        print_sample_row("pp tok/s", pp_stats);
+    }
+    Ok(())
+}
+
 fn bench_matrix(
     engine: &mut Engine,
     args: &BenchArgs,
@@ -5184,6 +5292,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             json: false,
             exp: false,
             matrix: false,
+            ttft: false,
             pp: vec![128],
             ctx: vec![128],
             tg: 1,
@@ -11323,6 +11432,7 @@ mod tests {
             json: true,
             exp: false,
             matrix: false,
+            ttft: false,
             pp: vec![128],
             ctx: vec![128],
             tg: 128,
