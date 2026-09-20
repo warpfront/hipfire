@@ -1704,13 +1704,16 @@ pub(crate) fn run() {
     };
 
     // Build metadata JSON for .hfq
-    let metadata = serde_json::json!({
+    let mut metadata = serde_json::json!({
         "architecture": arch_str,
         "config": config,
         "tokenizer": tokenizer_str.as_deref().unwrap_or("{}"),
         "tokenizer_config": tokenizer_config,
         "generation_config": generation_config,
     });
+    if args.mq4v2_symmetric {
+        metadata["mq4v2.symmetric"] = serde_json::json!(1);
+    }
     // `mut` so the SP4b bake-prune path can patch the routed-expert count down to
     // the kept count before write_hfq (so the baked model loads with the compact
     // count and NO env var). Untouched in every non-prune path.
