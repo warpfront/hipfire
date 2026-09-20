@@ -59,7 +59,11 @@ pub struct PrefillBatchScratch {
     pub dn_attn_out_batch: GpuTensor, // [N × v_dim]
     pub dn_normed_batch: GpuTensor,   // [N × v_dim]
 
-    // FFN intermediates [N × hidden_dim]
+    // FFN intermediates [N × hidden_dim]. Gate and up are non-owning views
+    // into one contiguous [gate plane || up plane] allocation so the gfx1201
+    // IU4 gate+up launcher can write both planes in one dispatch while every
+    // downstream consumer retains the established planar layout.
+    gate_up_ffn_batch: GpuTensor,
     pub gate_ffn_batch: GpuTensor,
     pub up_batch: GpuTensor,
     // SwiGLU output (FWHT-rotated for MQ4) feeding w_down.
@@ -276,8 +280,7 @@ impl PrefillBatchScratch {
         let i_dn_k_batch = alloc!(&[max_batch * v_dim], DType::F32);
         let i_dn_attn_out_batch = alloc!(&[max_batch * v_dim], DType::F32);
         let i_dn_normed_batch = alloc!(&[max_batch * v_dim], DType::F32);
-        let i_gate_ffn_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
-        let i_up_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
+        let i_gate_up_ffn_batch = alloc!(&[max_batch * 2 * hidden_dim], DType::F32);
         let i_ffn_hidden_batch = alloc!(&[max_batch * hidden_dim], DType::F32);
         let i_dn_normed_rot_batch = alloc!(&[max_batch * v_dim], DType::F32);
         // F32 dtype = 4 bytes/element, same layout as i32. The rope /
@@ -420,6 +423,10 @@ impl PrefillBatchScratch {
             DType::F32
         );
 
+        let gate_up_ffn_batch = take!(i_gate_up_ffn_batch);
+        let gate_ffn_batch = gate_up_ffn_batch.sub_offset(0, max_batch * hidden_dim);
+        let up_batch =
+            gate_up_ffn_batch.sub_offset(max_batch * hidden_dim, max_batch * hidden_dim);
         let moe_router_logits_batch = i_moe_router_logits_batch.map(|i| take!(i));
         let moe_router_score_views_batch = moe_router_logits_batch.as_ref().map(|router_logits| {
             (1..=max_batch)
@@ -447,8 +454,9 @@ impl PrefillBatchScratch {
             dn_k_batch: take!(i_dn_k_batch),
             dn_attn_out_batch: take!(i_dn_attn_out_batch),
             dn_normed_batch: take!(i_dn_normed_batch),
-            gate_ffn_batch: take!(i_gate_ffn_batch),
-            up_batch: take!(i_up_batch),
+            gate_up_ffn_batch,
+            gate_ffn_batch,
+            up_batch,
             ffn_hidden_batch: take!(i_ffn_hidden_batch),
             dn_normed_rot_batch: take!(i_dn_normed_rot_batch),
             positions: take!(i_positions),
@@ -515,8 +523,7 @@ impl PrefillBatchScratch {
             self.dn_k_batch,
             self.dn_attn_out_batch,
             self.dn_normed_batch,
-            self.gate_ffn_batch,
-            self.up_batch,
+            self.gate_up_ffn_batch,
             self.ffn_hidden_batch,
             self.dn_normed_rot_batch,
             self.positions,

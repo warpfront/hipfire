@@ -19749,6 +19749,85 @@ impl Gpu {
         result
     }
 
+    /// gfx1201 dense gate/up pair: one logical row grid over two independent
+    /// MQ4V2 weight allocations and two planar output views. The 128-row split
+    /// alignment guarantees no workgroup straddles the gate/up boundary.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_mq4g256v2_mmq_gate_up_set_prequant_iu4(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        x_i4_ptr: *mut c_void,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        debug_assert_eq!(self.arch, "gfx1201");
+        debug_assert_eq!(gate_m % 128, 0);
+        debug_assert_eq!(up_m % 128, 0);
+        self.bind_thread()?;
+        const KERNEL: &str = "gemm_mq4g256v2_residual_mmq_iu4_gate_up_full_set";
+        const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gfx12";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SRC,
+            KERNEL,
+        )?;
+        let mut ag_ptr = a_gate.buf.as_ptr();
+        let mut au_ptr = a_up.buf.as_ptr();
+        let mut xq_ptr = x_i4_ptr;
+        let mut yg_ptr = y_gate.buf.as_ptr();
+        let mut yu_ptr = y_up.buf.as_ptr();
+        let mut gm_val = gate_m as i32;
+        let mut um_val = up_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ag_ptr as *mut _ as *mut c_void,
+            &mut au_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut yg_ptr as *mut _ as *mut c_void,
+            &mut yu_ptr as *mut _ as *mut c_void,
+            &mut gm_val as *mut _ as *mut c_void,
+            &mut um_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let total_m = gate_m + up_m;
+        let row_tiles = total_m.div_ceil(128);
+        let batch_tiles = batch_size.div_ceil(128);
+        let bytes = total_m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES
+            + batch_size * total_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [256, 1, 1],
+            20480,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ag_ptr);
+                b.push_ptr(au_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(yg_ptr);
+                b.push_ptr(yu_ptr);
+                b.push_i32(gm_val);
+                b.push_i32(um_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     pub fn gemm_mq4g256v2_mmq_set_prequant_iu4(
         &mut self,
         a_raw: &GpuTensor,
@@ -31050,7 +31129,10 @@ impl Gpu {
         result
     }
 
-    /// C2 prepared IU4 consumer for gate_up: never launches `quantize_int4_mmq_ds128`.
+    /// C2 prepared IU4 consumer for gate_up: never launches
+    /// `quantize_int4_mmq_ds128`. On gfx1201, tile-aligned dense pairs share
+    /// one logical row grid and one launch; other arches and tail geometries
+    /// retain the two established launches.
     pub fn gemm_gate_up_mq4g256v2_wmma_iu4_prepared(
         &mut self,
         a_gate: &GpuTensor,
@@ -31064,11 +31146,15 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        if self.arch == "gfx1201" && gate_m % 128 == 0 && up_m % 128 == 0 {
+            return self.gemm_mq4g256v2_mmq_gate_up_set_prequant_iu4(
+                a_gate, a_up, xq, y_gate, y_up, gate_m, up_m, k, batch_size,
+            );
+        }
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(
             a_gate, xq, y_gate, gate_m, k, batch_size,
         )?;
-        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
-        Ok(())
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)
     }
 
     /// MQ4V2 gfx1100 gate_up batch-tile (BT6 / BT12).

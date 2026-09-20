@@ -30,6 +30,7 @@ const IU4_GFX12_SRC: &str = concat!(
 const MODULE: &str = "tmp_iu4_gfx12_oracle";
 const SET_SYM: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_set";
 const ADD_SYM: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_add";
+const GATE_UP_SYM: &str = "gemm_mq4g256v2_residual_mmq_iu4_gate_up_full_set";
 
 const QT_MQ4V2: u8 = 44;
 const GATE_NAME: &str = "model.language_model.layers.0.mlp.gate_proj.weight";
@@ -194,6 +195,91 @@ fn launch_iu4(
     gpu.launch_kernel_blob(sym, grid, [256, 1, 1], lds, &mut blob)
         .unwrap_or_else(|e| panic!("launch {sym}: {e}"));
 }
+#[allow(clippy::too_many_arguments)]
+fn launch_iu4_gate_up(
+    gpu: &mut Gpu,
+    a_gate_ptr: *const std::ffi::c_void,
+    a_up_ptr: *const std::ffi::c_void,
+    xq_ptr: *const std::ffi::c_void,
+    y_gate_ptr: *const std::ffi::c_void,
+    y_up_ptr: *const std::ffi::c_void,
+    gate_m: usize,
+    up_m: usize,
+    k: usize,
+    n: usize,
+) {
+    let mut b = KernargBlob::new();
+    b.push_ptr(a_gate_ptr);
+    b.push_ptr(a_up_ptr);
+    b.push_ptr(xq_ptr);
+    b.push_ptr(y_gate_ptr);
+    b.push_ptr(y_up_ptr);
+    b.push_i32(gate_m as i32);
+    b.push_i32(up_m as i32);
+    b.push_i32(k as i32);
+    b.push_i32(n as i32);
+    let mut blob = b.into_vec();
+    let grid = [(gate_m + up_m).div_ceil(128) as u32, n.div_ceil(128) as u32, 1];
+    gpu.launch_kernel_blob(GATE_UP_SYM, grid, [256, 1, 1], 20480, &mut blob)
+        .unwrap_or_else(|e| panic!("launch {GATE_UP_SYM}: {e}"));
+}
+
+fn run_gate_up_pair_case(gpu: &mut Gpu, a_bytes: &[u8], m: usize, k: usize, n: usize) -> bool {
+    gpu.ensure_kernel_public(MODULE, IU4_GFX12_SRC, GATE_UP_SYM)
+        .unwrap_or_else(|e| panic!("JIT {GATE_UP_SYM}: {e}"));
+    let x: Vec<f32> = (0..n * k).map(|i| prng_f32(i, 0x6A7E_0001)).collect();
+    let d_x = gpu.upload_f32(&x, &[n, k]).expect("upload pair X");
+    let xq_ptr =
+        gpu.ensure_int4_mmq_x(&d_x, n, k).expect("ensure pair int4 X") as *mut std::ffi::c_void;
+    let d_a = gpu.upload_raw(a_bytes, &[a_bytes.len()]).expect("upload pair A");
+    let a_ptr = d_a.buf.as_ptr() as *const std::ffi::c_void;
+    let zeros = vec![0.0f32; n * m];
+    let d_ref = gpu.upload_f32(&zeros, &[n, m]).expect("upload pair ref");
+    let d_gate = gpu.upload_f32(&zeros, &[n, m]).expect("upload pair gate");
+    let d_up = gpu.upload_f32(&zeros, &[n, m]).expect("upload pair up");
+    launch_iu4(
+        gpu,
+        SET_SYM,
+        a_ptr,
+        xq_ptr as *const _,
+        d_ref.buf.as_ptr() as *const _,
+        m,
+        k,
+        n,
+        false,
+    );
+    launch_iu4_gate_up(
+        gpu,
+        a_ptr,
+        a_ptr,
+        xq_ptr as *const _,
+        d_gate.buf.as_ptr() as *const _,
+        d_up.buf.as_ptr() as *const _,
+        m,
+        m,
+        k,
+        n,
+    );
+    gpu.hip.device_synchronize().expect("sync pair");
+    let reference = gpu.download_f32(&d_ref).expect("download pair ref");
+    let gate = gpu.download_f32(&d_gate).expect("download pair gate");
+    let up = gpu.download_f32(&d_up).expect("download pair up");
+    let (gate_ok, gate_mism) = bitwise_eq(&gate, &reference, None, m);
+    let (up_ok, up_mism) = bitwise_eq(&up, &reference, None, m);
+    eprintln!(
+        "gate_up/merged-set: gate_bitwise={} (mism={gate_mism}) up_bitwise={} (mism={up_mism}) {}",
+        if gate_ok { "OK" } else { "FAIL" },
+        if up_ok { "OK" } else { "FAIL" },
+        if gate_ok && up_ok { "PASS" } else { "FAIL" },
+    );
+    let _ = gpu.free_tensor(d_x);
+    let _ = gpu.free_tensor(d_a);
+    let _ = gpu.free_tensor(d_ref);
+    let _ = gpu.free_tensor(d_gate);
+    let _ = gpu.free_tensor(d_up);
+    gate_ok && up_ok
+}
+
 
 /// CPU reference with the pinned IU4_FOLD_RN DAG. `rows: None` = all rows,
 /// `Some(&[...])` = only those rows (edge stripes for big cases).
@@ -460,7 +546,7 @@ fn main() {
     eprintln!("tmp_iu4_gfx12_oracle on {}", gpu.arch);
     assert_eq!(gpu.arch, "gfx1201", "this oracle targets gfx1201");
 
-    for s in [SET_SYM, ADD_SYM] {
+    for s in [SET_SYM, ADD_SYM, GATE_UP_SYM] {
         gpu.ensure_kernel_public(MODULE, IU4_GFX12_SRC, s)
             .unwrap_or_else(|e| panic!("JIT {s}: {e}"));
         eprintln!("JIT OK: {s}");
@@ -517,6 +603,7 @@ fn main() {
     ok &= run_case(&mut gpu, "gate/add", &gate, gate_m, gate_k, 512, true, 0xC0DE_0002, false);
     ok &= run_case(&mut gpu, "down/set", &down, down_m, down_k, 512, false, 0xC0DE_0003, false);
     ok &= run_case(&mut gpu, "down/add", &down, down_m, down_k, 512, true, 0xC0DE_0004, false);
+    ok &= run_gate_up_pair_case(&mut gpu, &gate, gate_m, gate_k, 512);
     // Phase edges, synthetic data (full CPU check: small).
     let a48 = pack_mq4g256v2_synth(48, 1024, 0xED6E_4000);
     ok &= run_case(&mut gpu, "m48tail/set", &a48, 48, 1024, 512, false, 0xE040, true);

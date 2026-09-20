@@ -269,21 +269,48 @@ static __device__ __forceinline__ void iu4_bundle(
 }
 
 // Shared compute body for residual / full_add / full_set. `ADD` selects
-// += (residual) vs = (set) writeback.
-template <bool ADD>
+// += (residual) vs = (set) writeback. `PAIRED` joins two independent weight
+// and planar-output allocations into one logical M extent without copying;
+// both split points must be 128-row tile aligned. `SWIZZLE_G8T0` is reserved
+// for that merged extent so the incumbent single-projection launches retain
+// their direct raster.
+template <bool ADD, bool PAIRED = false, bool SWIZZLE_G8T0 = false>
 static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_body(
     const char*           __restrict__ A,   // [M × groups_per_row × 136]
     const block_i4_128*   __restrict__ Xq,  // [K/128 × N]
     float*                __restrict__ Y,   // [N × M] column-major
-    int M, int K, int N
+    int M, int K, int N,
+    const char*           __restrict__ A2 = nullptr,
+    float*                __restrict__ Y2 = nullptr,
+    int M2 = 0
 ) {
     const int tid = threadIdx.x;
     const int wave = tid >> 5;
     const int lane = tid & 31;
-    const int rs = blockIdx.x * IU4_BN;
-    const int bs = blockIdx.y * IU4_BM;
+    const int total_m = M + (PAIRED ? M2 : 0);
+    int rs = blockIdx.x * IU4_BN;
+    int bs = blockIdx.y * IU4_BM;
+    if constexpr (SWIZZLE_G8T0) {
+        const int num_m = (total_m + IU4_BN - 1) / IU4_BN;
+        const int num_n = (N + IU4_BM - 1) / IU4_BM;
+        if ((num_m % 8) == 0) {
+            const int bid = blockIdx.y * gridDim.x + blockIdx.x;
+            const int n_t = (bid / 8) % num_n;
+            const int m_t = (bid / (8 * num_n)) * 8 + (bid % 8);
+            rs = m_t * IU4_BN;
+            bs = n_t * IU4_BM;
+        }
+    }
 
-    if (rs >= M || bs >= N) return;
+    if (rs >= total_m || bs >= N) return;
+    if constexpr (PAIRED) {
+        if (rs >= M) {
+            rs -= M;
+            M = M2;
+            A = A2;
+            Y = Y2;
+        }
+    }
 
     const int m_lane = lane & 15;  // 0..15: row within a 16-row group
     const int k_grp  = lane >> 4;  // 0/1: which K-half this lane carries
@@ -717,6 +744,22 @@ void gemm_mq4g256v2_residual_mmq_iu4_full_set(
     gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<false>(A, Xq, Y, M, K, N);
 }
 
+// Dense gate/up pair: one logical M=(gate_m+up_m) grid, separate weight and
+// planar-output bases. The first landing keeps direct raster; G8T0 is enabled
+// only after the merged-launch gate is measured independently.
+extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
+void gemm_mq4g256v2_residual_mmq_iu4_gate_up_full_set(
+    const char*           __restrict__ A_gate,
+    const char*           __restrict__ A_up,
+    const block_i4_128*   __restrict__ Xq,
+    float*                __restrict__ Y_gate,
+    float*                __restrict__ Y_up,
+    int gate_M, int up_M, int K, int N
+) {
+    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<false, true, false>(
+        A_gate, Xq, Y_gate, gate_M, K, N, A_up, Y_up, up_M);
+}
+
 #else
 
 // Stubs for non-gfx12 archs (the gfx11 iu4 kernel and gfx906 dp4a MMQ kernel
@@ -731,6 +774,10 @@ extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add(
 
 extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set(
     const char*, const void*, float*, int, int, int, int
+) {}
+
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_gate_up_full_set(
+    const char*, const char*, const void*, float*, float*, int, int, int, int
 ) {}
 
 #endif
