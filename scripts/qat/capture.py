@@ -722,9 +722,46 @@ def precision_validation(
     }
 
 
+def load_resident_model(source: Path, device: Any) -> Any:
+    """Instantiate on meta and stream each safetensor directly to GPU."""
+    import torch
+    from accelerate.utils import set_module_tensor_to_device
+    from safetensors import safe_open
+    from transformers import AutoConfig, AutoModel
+
+    full_config = AutoConfig.from_pretrained(source, trust_remote_code=False)
+    with torch.device("meta"):
+        model = AutoModel.from_config(full_config, attn_implementation="eager")
+    expected = set(model.state_dict())
+    index = json.loads((source / "model.safetensors.index.json").read_text())
+    by_shard: dict[str, list[str]] = {}
+    for source_name, shard in index["weight_map"].items():
+        if source_name.startswith("model."):
+            by_shard.setdefault(shard, []).append(source_name)
+    mapped = {name.removeprefix("model.") for names in by_shard.values() for name in names}
+    if mapped != expected:
+        raise RuntimeError(
+            f"resident model tensor coverage mismatch: missing={sorted(expected - mapped)[:8]} "
+            f"unexpected={sorted(mapped - expected)[:8]}"
+        )
+    for shard in sorted(by_shard):
+        with safe_open(source / shard, framework="pt", device=str(device)) as handle:
+            for source_name in by_shard[shard]:
+                target_name = source_name.removeprefix("model.")
+                value = handle.get_tensor(source_name)
+                set_module_tensor_to_device(
+                    model,
+                    target_name,
+                    device,
+                    value=value,
+                    dtype=torch.bfloat16,
+                )
+    model.eval()
+    return model
+
+
 def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
     import torch
-    from transformers import AutoModel
 
     started = time.monotonic()
     require_card_b(args.device, args.allow_other_device)
@@ -761,24 +798,22 @@ def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
     atomic_json(args.out / "manifest.json", manifest)
 
     model_load_started = time.monotonic()
-    model = AutoModel.from_pretrained(
-        args.source,
-        torch_dtype=torch.bfloat16,
-        attn_implementation="eager",
-        low_cpu_mem_usage=True,
-        device_map={"": "cuda:0"},
-    )
+    model = load_resident_model(args.source, device)
     language = model.language_model
     layers = language.layers
     parameter_devices = sorted({str(parameter.device) for parameter in model.parameters()})
     if parameter_devices != [str(device)]:
         raise RuntimeError(f"teacher is not fully resident on {device}: {parameter_devices}")
     capture["resident_teacher"] = {
-        "loader": "transformers.AutoModel.from_pretrained",
+        "loader": "meta-init + safetensors.safe_open(device='cuda:0')",
         "dtype": "bfloat16",
-        "device_map": getattr(model, "hf_device_map", {"": str(device)}),
+        "device_map": {"": str(device)},
         "parameter_devices": parameter_devices,
         "load_wall_clock_seconds": time.monotonic() - model_load_started,
+        "host_max_rss_bytes_after_load": __import__("resource").getrusage(
+            __import__("resource").RUSAGE_SELF
+        ).ru_maxrss
+        * 1024,
     }
 
     boundary_shape = (seq_count, seq_len, config.hidden_size)
