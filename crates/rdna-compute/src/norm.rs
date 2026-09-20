@@ -4973,8 +4973,8 @@ impl Gpu {
         ];
         self.launch_maybe_blob(
             SCAN_MODULE,
-            [2, 48, 1],
-            [256, 1, 1],
+            [1, 48, 1],
+            [512, 1, 1],
             0,
             &mut scan_params,
             || {
