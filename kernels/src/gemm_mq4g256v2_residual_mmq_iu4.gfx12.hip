@@ -745,8 +745,8 @@ void gemm_mq4g256v2_residual_mmq_iu4_full_set(
 }
 
 // Dense gate/up pair: one logical M=(gate_m+up_m) grid, separate weight and
-// planar-output bases. The first landing keeps direct raster; G8T0 is enabled
-// only after the merged-launch gate is measured independently.
+// planar-output bases. G8T0 rastering is intentionally confined to this merged
+// entry so all existing IU4 launch shapes retain their established ordering.
 extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
 void gemm_mq4g256v2_residual_mmq_iu4_gate_up_full_set(
     const char*           __restrict__ A_gate,
@@ -756,7 +756,7 @@ void gemm_mq4g256v2_residual_mmq_iu4_gate_up_full_set(
     float*                __restrict__ Y_up,
     int gate_M, int up_M, int K, int N
 ) {
-    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<false, true, false>(
+    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<false, true, true>(
         A_gate, Xq, Y_gate, gate_M, K, N, A_up, Y_up, up_M);
 }
 
