@@ -17,11 +17,11 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 #include <math.h>
-// Default 2 on gfx1201 (measured 2026-09-21 on the symmetric XT artifact: the
-// {5,7} subset covers 97.9% of selections; pp8192 +2.9..+3.1%, TTFT -3.1%,
-// iu4 c24 +0.0011, fp8v2 route unchanged). Override with -DIU4_A4_CANDIDATES=4.
+// Default 1 (RTN, d=amax/7) on gfx1201 (measured 2026-09-21 on the symmetric XT
+// artifact vs N=2: TTFT 1694->1666 ms (3,546 tok/s), pp8192 +1.7%, iu4 c24
+// 0.0787->0.0860 (budget 0.10), fp8v2 route unchanged 0.0495). -DIU4_A4_CANDIDATES=2/4 to revert.
 #ifndef IU4_A4_CANDIDATES
-#define IU4_A4_CANDIDATES 2
+#define IU4_A4_CANDIDATES 1
 #endif
 
 #if IU4_A4_CANDIDATES != 1 && IU4_A4_CANDIDATES != 2 && IU4_A4_CANDIDATES != 4
