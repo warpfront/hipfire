@@ -573,6 +573,20 @@ def load_text_model(
                     value=handle.get_tensor(source_name),
                     dtype=torch.bfloat16,
                 )
+    # Non-persistent buffers are absent from state_dict(), so they remain on
+    # meta after the checkpoint tensors above are materialized. Recreate RoPE
+    # on the target device to initialize its buffers and derived attributes.
+    model.model.rotary_emb = type(model.model.rotary_emb)(config=config, device=device)
+    meta_tensors = [
+        f"parameter:{name}"
+        for name, tensor in model.named_parameters()
+        if tensor.device.type == "meta"
+    ]
+    meta_tensors.extend(
+        f"buffer:{name}" for name, tensor in model.named_buffers() if tensor.device.type == "meta"
+    )
+    if meta_tensors:
+        raise RuntimeError(f"text model still has meta tensors: {meta_tensors[:8]}")
     if pure_torch_deltanet:
         from transformers.models.qwen3_5 import modeling_qwen3_5
 
