@@ -27,7 +27,8 @@
 //  - Lanes r and r+16 load byte-identical fragments (address depends on
 //    lane%16 only), so duplicate-lane ownership is moot.
 //
-// LDS: (128*18 + 128*42)*4 = 30720 B (vs 57344 B baseline) -> 2 blocks/CU.
+// LDS: (2*128*18 + 128*42)*4 = 39936 B (two-slot activation staging;
+// single-slot was 30720 B) -> 1 block/CU on gfx11's 64 KB budget.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -241,6 +242,24 @@ static __device__ __forceinline__ void vec_dot_i4_x128(
         }
     }
 }
+// Xq activation half fill into one LDS slot: per-128-K block per column
+// 64 B nibbles + (f32 d, i32 s) header = 72 B = 18 ints. `half_block`
+// indexes the [K/128, N] block stream (2*kb+h).
+template <bool FULL>
+static __device__ __forceinline__ void fill_xq_half(
+    const block_i4_128* __restrict__ Xq,
+    int* __restrict__ slot,
+    int col0,
+    int N,
+    int half_block
+) {
+    const int* by = (const int*)(Xq + (long long)half_block * N + col0);
+    for (int l0 = 0; l0 < IU4_MMQ_X * IU4_TILE_Y_K; l0 += IU4_MMQ_NWARPS * IU4_WARP_SIZE) {
+        const int l = l0 + threadIdx.y * IU4_WARP_SIZE + threadIdx.x;
+        if (FULL || col0 + l / IU4_TILE_Y_K < N) slot[l] = by[l];
+        else slot[l] = 0;
+    }
+}
 
 template <bool FULL>
 static __device__ __forceinline__ void gemm_iu4_body(
@@ -262,33 +281,48 @@ static __device__ __forceinline__ void gemm_iu4_body(
     const int blocks128 = K / 128;
 
     extern __shared__ int smem[];
-    int* tile_y = smem;
-    int* tile_x = tile_y + IU4_MMQ_X * IU4_TILE_Y_K;
+    // Two-slot activation staging (mirrors the gfx1201 A0/A1 protocol):
+    // slot 0 owns even halves (t = 2*kb), slot 1 owns odd halves
+    // (t = 2*kb+1). Each fill targets the slot freed two halves ago, so
+    // no readers-done barrier is needed before its stores. The weight
+    // tile stays single-buffered with a readers-done rendezvous after
+    // each odd-half compute. Three barriers per K group (vs four):
+    // slot-1 readiness + slot-0 retirement, slot-1 retirement + weight
+    // readers-done, next weights + slot-0 readiness. Prefetch loads
+    // issue above the preceding half's WMMAs. Bit-identical: same K
+    // order, same pinned IU4_FOLD_RN DAG.
+    // LDS: (2*128*18 + 128*42)*4 = 39936 B -> 1 block/CU on gfx11's
+    // 64 KB budget (vs 30720 B / 2 blocks before); the lf16 entry below
+    // keeps its single-slot planes (the host passes a superset).
+    int* tile_y0 = smem;
+    int* tile_y1 = tile_y0 + IU4_MMQ_X * IU4_TILE_Y_K;
+    int* tile_x = tile_y1 + IU4_MMQ_X * IU4_TILE_Y_K;
 
     float sum[IU4_MMQ_X * IU4_MMQ_Y / (IU4_MMQ_NWARPS * IU4_WARP_SIZE)] = {0.0f};
 
+    // Prologue: weights kb=0 + even half t=0 into slot 0.
+    load_iu4_tile<FULL>(A, tile_x, row0, 0, M, groups_per_row);
+    fill_xq_half<FULL>(Xq, tile_y0, col0, N, 0);
+    __syncthreads();
     for (int kb = 0; kb < groups_per_row; ++kb) {
-        load_iu4_tile<FULL>(A, tile_x, row0, kb, M, groups_per_row);
-
-        const int* by0 = (const int*)(Xq + (long long)(2 * kb) * N + col0);
-        for (int l0 = 0; l0 < IU4_MMQ_X * IU4_TILE_Y_K; l0 += IU4_MMQ_NWARPS * IU4_WARP_SIZE) {
-            const int l = l0 + threadIdx.y * IU4_WARP_SIZE + threadIdx.x;
-            if (FULL || col0 + l / IU4_TILE_Y_K < N) tile_y[l] = by0[l];
-            else tile_y[l] = 0;
-        }
-        __syncthreads();
-        vec_dot_i4_x128(tile_x, tile_y, sum, 0);
-        __syncthreads();
-
+        // Prefetch the odd half into free slot 1, then compute the even
+        // half from slot 0: the prefetch waits drain behind compute 0's
+        // WMMAs instead of behind a dedicated barrier.
         if (2 * kb + 1 < blocks128) {
-            const int* by1 = (const int*)(Xq + (long long)(2 * kb + 1) * N + col0);
-            for (int l0 = 0; l0 < IU4_MMQ_X * IU4_TILE_Y_K; l0 += IU4_MMQ_NWARPS * IU4_WARP_SIZE) {
-                const int l = l0 + threadIdx.y * IU4_WARP_SIZE + threadIdx.x;
-                if (FULL || col0 + l / IU4_TILE_Y_K < N) tile_y[l] = by1[l];
-                else tile_y[l] = 0;
-            }
+            fill_xq_half<FULL>(Xq, tile_y1, col0, N, 2 * kb + 1);
+        }
+        vec_dot_i4_x128(tile_x, tile_y0, sum, 0);
+        // B0: slot-0 retirement + slot-1 readiness.
+        __syncthreads();
+        if (2 * kb + 1 < blocks128) {
+            vec_dot_i4_x128(tile_x, tile_y1, sum, 1);
+            // B1: slot-1 retirement + weight-tile readers-done.
             __syncthreads();
-            vec_dot_i4_x128(tile_x, tile_y, sum, 1);
+        }
+        if (kb + 1 < groups_per_row) {
+            load_iu4_tile<FULL>(A, tile_x, row0, kb + 1, M, groups_per_row);
+            fill_xq_half<FULL>(Xq, tile_y0, col0, N, 2 * (kb + 1));
+            // B2: next weights + slot-0 readiness for the next trip.
             __syncthreads();
         }
     }
