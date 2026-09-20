@@ -311,6 +311,7 @@ pub struct HfqFile {
     mmap: Option<Mmap>,
     pub arch_id: u32,
     pub metadata_json: String,
+    mq4v2_symmetric: bool,
     tensors: Vec<HfqTensorInfo>,
     tensor_map: HashMap<String, usize>,
     /// Reusable read buffer for pread-based tensor reads.
@@ -347,6 +348,10 @@ impl HfqFile {
             .map(std::path::PathBuf::from);
         Self::open_with_reap_plan(path, reap_plan.as_deref())
     }
+    pub fn mq4v2_symmetric(&self) -> bool {
+        self.mq4v2_symmetric
+    }
+
 
     /// `open` with the REAP plan injected instead of taken from process config.
     ///
@@ -635,6 +640,10 @@ impl HfqFile {
             ));
         }
         let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
+        let mq4v2_symmetric = serde_json::from_str::<serde_json::Value>(&metadata_json)
+            .ok()
+            .and_then(|metadata| metadata.get("mq4v2.symmetric").cloned())
+            .is_some_and(|marker| marker == serde_json::json!(1) || marker == serde_json::json!(true));
 
         // Parse tensor index (follows metadata JSON)
         let mut pos = metadata_offset + json_end;
@@ -709,6 +718,44 @@ impl HfqFile {
             });
             cumulative_offset = end;
         }
+        if mq4v2_symmetric {
+            let mut sampled_groups = 0usize;
+            for tensor in tensors.iter().filter(|tensor| tensor.quant_type == 44).take(4) {
+                let groups = tensor.data_size / 136;
+                if groups == 0 {
+                    continue;
+                }
+                for group in [0, groups / 2, groups - 1] {
+                    let header = tensor.data_offset + group * 136;
+                    for half_idx in 0..2 {
+                        let offset = header + half_idx * 4;
+                        let d_bits = u16::from_le_bytes(mmap[offset..offset + 2].try_into().unwrap());
+                        let z_bits =
+                            u16::from_le_bytes(mmap[offset + 2..offset + 4].try_into().unwrap());
+                        let d = half::f16::from_bits(d_bits).to_f32();
+                        let expected = half::f16::from_f32(-8.0 * d).to_bits();
+                        if z_bits != expected {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!(
+                                    "HfqFile: symmetric MQ4V2 marker/header mismatch in '{}' \
+                                     group {group} half {half_idx}: z=0x{z_bits:04x}, \
+                                     expected -8*d=0x{expected:04x}",
+                                    tensor.name
+                                ),
+                            ));
+                        }
+                    }
+                    sampled_groups += 1;
+                }
+            }
+            if sampled_groups == 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "HfqFile: symmetric MQ4V2 marker set but no qt=44 groups exist",
+                ));
+            }
+        }
         let me = Self {
             _file: file,
             path: path.to_path_buf(),
@@ -716,6 +763,7 @@ impl HfqFile {
             arch_id,
             metadata_json,
             tensors,
+            mq4v2_symmetric,
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
             evict_page_cache: true,

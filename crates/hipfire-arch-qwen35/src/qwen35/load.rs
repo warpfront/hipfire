@@ -2613,6 +2613,9 @@ impl WeightSource for HfqSource<'_> {
     fn n_layers(&self) -> usize {
         self.c.n_layers
     }
+    fn mq4v2_symmetric(&self) -> bool {
+        self.hfq.mq4v2_symmetric()
+    }
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
         // Keep the mmap alive on discrete GPUs (the carrier cleared
         // `evict_page_cache` there): weight uploads DMA straight out of

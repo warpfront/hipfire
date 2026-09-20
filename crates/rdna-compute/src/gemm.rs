@@ -19600,17 +19600,26 @@ impl Gpu {
             // A + W slabs and DS/SZ metadata staged in LDS once per WG per
             // 128-K block; partial M/N handled natively (zero-filled slab /
             // guarded writeback). Block [256,1,1].
-            let kernel_name = if add {
-                "gemm_mq4g256v2_residual_mmq_iu4_full_add"
-            } else {
-                "gemm_mq4g256v2_residual_mmq_iu4_full_set"
+            let symfold = self.mq4v2_symmetric
+                && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0");
+            let kernel_name = match (symfold, add) {
+                (true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
+                (true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
+                (false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+                (false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
             };
-            const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gfx12";
-            self.ensure_kernel(
-                MODULE,
-                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SRC,
-                kernel_name,
-            )?;
+            let (module, source) = if symfold {
+                (
+                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC,
+                )
+            } else {
+                (
+                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SRC,
+                )
+            };
+            self.ensure_kernel(module, source, kernel_name)?;
             let mut a_ptr = a_raw.buf.as_ptr();
             let mut xq_ptr = x_i4_ptr;
             let mut y_ptr = y.buf.as_ptr();
