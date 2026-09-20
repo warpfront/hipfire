@@ -11,9 +11,9 @@
     clippy::all
 )]
 
-use std::collections::HashMap;
-use std::fs::File;
-use std::io::Write;
+use std::collections::{HashMap, HashSet};
+use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
@@ -46,6 +46,7 @@ use hipfire_quantize::vision_sidecar::{
     is_vision_group_tensor, is_vision_tower_tensor, passes_include_prefix, resolve_vision_prefix,
     vision_dtype, VisionDtype,
 };
+use hipfire_runtime::hfq::{HfqFile as RuntimeHfqFile, HfqTensorInfo};
 
 // ── Per-tensor grouping for disposition helpers ──────────────────────────
 struct PerTensorCtx<'a> {
@@ -146,6 +147,340 @@ struct FormatFlags {
     use_q8hfq: bool,
 }
 
+fn awq_sidecar_name(weight_name: &str) -> String {
+    match weight_name.strip_suffix(".weight") {
+        Some(stem) => format!("{stem}.awq_scale.weight"),
+        None => format!("{weight_name}.awq_scale.weight"),
+    }
+}
+
+fn validate_mq4v2_xt_source(
+    source: &RuntimeHfqFile,
+    by_name: &HashMap<&str, &HfqTensorInfo>,
+) -> Result<(), String> {
+    let metadata: serde_json::Value = serde_json::from_str(&source.metadata_json)
+        .map_err(|error| format!("input HFQ metadata is invalid JSON: {error}"))?;
+    if metadata
+        .get("hipfire_product_tier")
+        .and_then(|value| value.as_str())
+        != Some("xt")
+    {
+        return Err("final-code import requires an HFQ with hipfire_product_tier=`xt`".to_string());
+    }
+    if metadata
+        .get("hipfire_base_format")
+        .and_then(|value| value.as_str())
+        != Some("mq4v2")
+    {
+        return Err("final-code import requires an MQ4V2 XT source artifact".to_string());
+    }
+    if let Some(tensor) = source
+        .tensors()
+        .iter()
+        .find(|tensor| !matches!(tensor.quant_type, 1 | 3 | MQ4V2_FINAL_CODE_QTYPE))
+    {
+        return Err(format!(
+            "input is not the MQ4V2-XT type map: `{}` has qt={}",
+            tensor.name, tensor.quant_type
+        ));
+    }
+
+    for sidecar in source
+        .tensors()
+        .iter()
+        .filter(|tensor| tensor.name.ends_with(".awq_scale.weight"))
+    {
+        let stem = sidecar
+            .name
+            .strip_suffix(".awq_scale.weight")
+            .expect("filtered suffix");
+        let parent_name = format!("{stem}.weight");
+        let parent = by_name.get(parent_name.as_str()).ok_or_else(|| {
+            format!(
+                "MQ4V2-XT type map has orphan AWQ sidecar `{}`",
+                sidecar.name
+            )
+        })?;
+        if sidecar.quant_type != QuantType::F16 as u8
+            || sidecar.group_size != 0
+            || sidecar.shape.len() != 1
+            || parent.quant_type != MQ4V2_FINAL_CODE_QTYPE
+            || parent.shape.len() != 2
+            || sidecar.shape[0] != parent.shape[1]
+        {
+            return Err(format!(
+                "MQ4V2-XT type map mismatch for `{parent_name}` and `{}`",
+                sidecar.name
+            ));
+        }
+    }
+    for tensor in source
+        .tensors()
+        .iter()
+        .filter(|tensor| tensor.quant_type == MQ4V2_FINAL_CODE_QTYPE)
+    {
+        if tensor.name == "lm_head.weight" {
+            continue;
+        }
+        let sidecar = awq_sidecar_name(&tensor.name);
+        if !by_name.contains_key(sidecar.as_str()) {
+            return Err(format!(
+                "MQ4V2-XT type map is missing AWQ sidecar `{sidecar}` for `{}`",
+                tensor.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn same_hfq_manifest(left: &RuntimeHfqFile, right: &RuntimeHfqFile) -> bool {
+    left.arch_id == right.arch_id
+        && left.metadata_json == right.metadata_json
+        && left.tensors().len() == right.tensors().len()
+        && left
+            .tensors()
+            .iter()
+            .zip(right.tensors())
+            .all(|(left, right)| {
+                left.name == right.name
+                    && left.quant_type == right.quant_type
+                    && left.shape == right.shape
+                    && left.group_size == right.group_size
+                    && left.data_offset == right.data_offset
+                    && left.data_size == right.data_size
+            })
+}
+
+fn export_mq4v2_final_codes(
+    input: &Path,
+    records_path: &Path,
+    output: &Path,
+) -> Result<(usize, String), String> {
+    if !input.is_file() {
+        return Err(format!(
+            "--mq4v2-final-codes requires --input to be an HFQ file, got {}",
+            input.display()
+        ));
+    }
+    let input_canonical = std::fs::canonicalize(input)
+        .map_err(|error| format!("canonicalize input {}: {error}", input.display()))?;
+    if output.exists()
+        && std::fs::canonicalize(output)
+            .map(|path| path == input_canonical)
+            .unwrap_or(false)
+    {
+        return Err("--output must differ from the source HFQ".to_string());
+    }
+
+    eprintln!("MQ4V2 final-code import: hashing {}", input.display());
+    let source_sha = sha256_file_hex(input)?;
+    let source = RuntimeHfqFile::open_with_reap_plan(input, None)
+        .map_err(|error| format!("open source HFQ {}: {error}", input.display()))?;
+    let by_name: HashMap<&str, &HfqTensorInfo> = source
+        .tensors()
+        .iter()
+        .map(|tensor| (tensor.name.as_str(), tensor))
+        .collect();
+    validate_mq4v2_xt_source(&source, &by_name)?;
+
+    let records = load_mq4v2_final_code_records(records_path, &source_sha)?;
+    let selected_by_name: HashMap<&str, usize> = records
+        .iter()
+        .enumerate()
+        .map(|(index, mapped)| (mapped.as_record().name, index))
+        .collect();
+    let mut selected_groups: HashMap<String, Vec<u8>> = HashMap::new();
+
+    for mapped in &records {
+        let record = mapped.as_record();
+        let tensor = by_name.get(record.name).ok_or_else(|| {
+            format!(
+                "{}: tensor `{}` is absent from source HFQ",
+                mapped.path.display(),
+                record.name
+            )
+        })?;
+        let m = u32::try_from(record.m)
+            .map_err(|_| format!("{}: M does not fit u32", record.name))?;
+        let k = u32::try_from(record.k)
+            .map_err(|_| format!("{}: K does not fit u32", record.name))?;
+        let expected_bytes = record
+            .m
+            .checked_mul(record.k)
+            .and_then(|weights| weights.checked_div(256))
+            .and_then(|groups| groups.checked_mul(MQ4V2_GROUP_BYTES))
+            .ok_or_else(|| format!("{}: packed size overflows", record.name))?;
+        if tensor.quant_type != MQ4V2_FINAL_CODE_QTYPE
+            || tensor.group_size != 256
+            || tensor.shape != [m, k]
+            || tensor.data_size != expected_bytes
+        {
+            return Err(format!(
+                "{}: source type-map entry for `{}` is qt={} shape={:?} group_size={} bytes={}, \
+                 expected qt=44 shape=[{},{}] group_size=256 bytes={expected_bytes}",
+                mapped.path.display(),
+                record.name,
+                tensor.quant_type,
+                tensor.shape,
+                tensor.group_size,
+                tensor.data_size,
+                record.m,
+                record.k
+            ));
+        }
+        let sidecar_name = awq_sidecar_name(record.name);
+        let sidecar = by_name.get(sidecar_name.as_str()).ok_or_else(|| {
+            format!(
+                "{}: source HFQ is missing selected tensor's sidecar `{sidecar_name}`",
+                record.name
+            )
+        })?;
+        if sidecar.quant_type != QuantType::F16 as u8
+            || sidecar.group_size != 0
+            || sidecar.shape != [k]
+            || sidecar.data_size != record.s_f16.len()
+        {
+            return Err(format!(
+                "{}: sidecar `{sidecar_name}` is not F16[{k}] in the XT type map",
+                record.name
+            ));
+        }
+        if let Some(group) = mq4v2_shared_scale_group(record.name) {
+            match selected_groups.get(&group) {
+                Some(scales) if scales.as_slice() != record.s_f16 => {
+                    return Err(format!(
+                        "{}: imported S_f16 differs within shared producer group `{group}`",
+                        record.name
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    selected_groups.insert(group, record.s_f16.to_vec());
+                }
+            }
+        }
+    }
+
+    // Compare each selected group's effective output scales, including
+    // unselected siblings whose existing sidecars will be preserved.
+    for (group, expected_scales) in &selected_groups {
+        for tensor in source.tensors().iter().filter(|tensor| {
+            tensor.quant_type == MQ4V2_FINAL_CODE_QTYPE
+                && mq4v2_shared_scale_group(&tensor.name).as_deref() == Some(group.as_str())
+        }) {
+            let effective_scales = if let Some(index) = selected_by_name.get(tensor.name.as_str()) {
+                records[*index].as_record().s_f16
+            } else {
+                let sidecar_name = awq_sidecar_name(&tensor.name);
+                source
+                    .tensor_data(&sidecar_name)
+                    .ok_or_else(|| {
+                        format!(
+                            "shared producer group `{group}` is missing sidecar `{sidecar_name}`"
+                        )
+                    })?
+                    .1
+            };
+            if effective_scales != expected_scales {
+                return Err(format!(
+                    "shared producer group `{group}` has inconsistent S_f16 at `{}`; \
+                     import every sibling when changing a tied scale",
+                    tensor.name
+                ));
+            }
+        }
+    }
+
+    let parent = output.parent().unwrap_or_else(|| Path::new("."));
+    if !parent.is_dir() {
+        return Err(format!(
+            "output parent directory does not exist: {}",
+            parent.display()
+        ));
+    }
+    let output_name = output
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| format!("invalid output path {}", output.display()))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| format!("system clock before Unix epoch: {error}"))?
+        .as_nanos();
+    let temporary = parent.join(format!(
+        ".{output_name}.mq4v2-final-{}-{nonce}.tmp",
+        std::process::id()
+    ));
+
+    let write_result = (|| -> Result<(), String> {
+        std::fs::copy(input, &temporary).map_err(|error| {
+            format!(
+                "copy source HFQ {} to {}: {error}",
+                input.display(),
+                temporary.display()
+            )
+        })?;
+        let mut file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&temporary)
+            .map_err(|error| format!("open temporary HFQ {}: {error}", temporary.display()))?;
+        for mapped in &records {
+            let record = mapped.as_record();
+            let packed = pack_mq4g256v2_from_f16_grid(
+                record.m,
+                record.k,
+                record.d_z_f16,
+                record.codes_u8,
+            )
+            .map_err(|error| format!("{}: {error}", record.name))?;
+            let tensor = by_name[record.name];
+            if packed.len() != tensor.data_size {
+                return Err(format!(
+                    "{}: packed {} bytes but source slot has {}",
+                    record.name,
+                    packed.len(),
+                    tensor.data_size
+                ));
+            }
+            file.seek(SeekFrom::Start(tensor.data_offset as u64))
+                .and_then(|_| file.write_all(&packed))
+                .map_err(|error| format!("write final codes for {}: {error}", record.name))?;
+
+            let sidecar_name = awq_sidecar_name(record.name);
+            let sidecar = by_name[sidecar_name.as_str()];
+            file.seek(SeekFrom::Start(sidecar.data_offset as u64))
+                .and_then(|_| file.write_all(record.s_f16))
+                .map_err(|error| format!("write AWQ scales for {}: {error}", record.name))?;
+        }
+        file.sync_all()
+            .map_err(|error| format!("sync temporary HFQ {}: {error}", temporary.display()))?;
+        drop(file);
+
+        let rewritten = RuntimeHfqFile::open_with_reap_plan(&temporary, None)
+            .map_err(|error| format!("reopen temporary HFQ {}: {error}", temporary.display()))?;
+        if !same_hfq_manifest(&source, &rewritten) {
+            return Err(
+                "final-code export changed the XT tensor type map, index, metadata, or offsets"
+                    .to_string(),
+            );
+        }
+        Ok(())
+    })();
+    if let Err(error) = write_result {
+        let _ = std::fs::remove_file(&temporary);
+        return Err(error);
+    }
+    std::fs::rename(&temporary, output).map_err(|error| {
+        let _ = std::fs::remove_file(&temporary);
+        format!(
+            "rename completed HFQ {} to {}: {error}",
+            temporary.display(),
+            output.display()
+        )
+    })?;
+    Ok((records.len(), source_sha))
+}
+
 pub(crate) fn run() {
     let args = QuantizeArgs::parse();
 
@@ -162,6 +497,30 @@ pub(crate) fn run() {
             Ok(()) => return,
             Err(e) => {
                 eprintln!("error: flux pack: {e}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    if let Some(records_path) = args.mq4v2_final_codes.as_deref() {
+        let input = args
+            .input
+            .as_deref()
+            .expect("--input is required for --mq4v2-final-codes");
+        match export_mq4v2_final_codes(
+            Path::new(input),
+            records_path,
+            Path::new(&args.output),
+        ) {
+            Ok((count, source_sha)) => {
+                eprintln!(
+                    "MQ4V2 final-code import complete: {count} tensor(s), source_sha={source_sha}, output={}",
+                    args.output
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("error: MQ4V2 final-code import failed: {error}");
                 std::process::exit(2);
             }
         }

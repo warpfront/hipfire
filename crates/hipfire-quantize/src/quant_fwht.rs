@@ -275,6 +275,46 @@ pub(crate) fn pack_mq4g256v2_from_codes(
     Ok(output)
 }
 
+/// Pack the frozen C3 `[M,K/256,2,2]` F16 `(d,z)` grid and unpacked U8
+/// codes directly. This function only serializes: it never applies FWHT or
+/// selects a grid/code, so trained codes cross the export boundary exactly once.
+pub(crate) fn pack_mq4g256v2_from_f16_grid(
+    m: usize,
+    k: usize,
+    d_z_f16: &[u8],
+    codes: &[u8],
+) -> Result<Vec<u8>, String> {
+    if k % 256 != 0 {
+        return Err(format!("MQ4V2 final codes require K % 256 == 0, got K={k}"));
+    }
+    let group_count = m
+        .checked_mul(k)
+        .ok_or_else(|| format!("MQ4V2 shape overflows: {m}x{k}"))?
+        / 256;
+    let expected_grid_bytes = group_count
+        .checked_mul(8)
+        .ok_or_else(|| format!("MQ4V2 grid byte count overflows: {m}x{k}"))?;
+    if d_z_f16.len() != expected_grid_bytes {
+        return Err(format!(
+            "MQ4V2 d_z_f16 byte count {} != M*K/256*2*2*2 {}",
+            d_z_f16.len(),
+            expected_grid_bytes
+        ));
+    }
+    let headers: Vec<[u16; 4]> = d_z_f16
+        .chunks_exact(8)
+        .map(|bytes| {
+            [
+                u16::from_le_bytes([bytes[0], bytes[1]]),
+                u16::from_le_bytes([bytes[2], bytes[3]]),
+                u16::from_le_bytes([bytes[4], bytes[5]]),
+                u16::from_le_bytes([bytes[6], bytes[7]]),
+            ]
+        })
+        .collect();
+    pack_mq4g256v2_from_codes(m, k, &headers, codes)
+}
+
 pub(crate) fn quantize_mq4g256v2(
     w: &[f32],
     m: usize,
@@ -759,6 +799,13 @@ mod tests {
         }
         let repacked = pack_mq4g256v2_from_codes(m, k, &headers, &codes).unwrap();
         assert_eq!(repacked, encoded);
+        let d_z_f16: Vec<u8> = headers
+            .iter()
+            .flat_map(|header| header.iter().flat_map(|bits| bits.to_le_bytes()))
+            .collect();
+        let repacked_from_grid =
+            pack_mq4g256v2_from_f16_grid(m, k, &d_z_f16, &codes).unwrap();
+        assert_eq!(repacked_from_grid, encoded);
     }
 
     #[test]

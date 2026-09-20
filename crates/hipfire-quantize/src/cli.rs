@@ -210,6 +210,18 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, conflicts_with = "awq_alpha")]
     pub awq_a4_aware: bool,
 
+    /// Replace selected MQ4V2-XT tensors in an existing HFQ with trained final
+    /// codes. PATH is one frozen-record `.safetensors` file or a directory of
+    /// them; each record carries metadata `name,M,K,qt,source_sha` and tensors
+    /// `S_f16`, `d_z_f16`, `codes_u8`. `--input` must be the source HFQ named
+    /// by `source_sha`; unselected tensor/index/metadata bytes are copied intact.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["flux_pipe", "reap_overlay", "reap_bake"]
+    )]
+    pub mq4v2_final_codes: Option<PathBuf>,
+
     /// Enable K-map promotion for dense models.
     #[arg(long)]
     pub kmap_dense: bool,
