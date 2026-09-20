@@ -1104,6 +1104,14 @@ pub struct Qwen35Scratch {
     // Optional long-prefill scratch. Default is None to preserve VRAM
     // footprint; set HIPFIRE_PREFILL_REUSE_PBS=1 to allocate and reuse it.
     pub prefill_batch: Option<PrefillBatchScratch>,
+    // Retained widened-prefill PBS: the fully-admitted large owned scratch
+    // (up to the 8192-row ceiling) is reused across requests when it fits
+    // instead of alloc/free per request (~25 ms on 6k-token prefills).
+    // Bit-identical: every PBS tensor is overwritten before it is read,
+    // the same reuse contract the legacy `prefill_batch` cache above relies
+    // on. RefCell because the prefill entries take `&Qwen35Scratch`; all
+    // mutation happens on the single owning daemon thread.
+    pub widened_prefill_batch: std::cell::RefCell<Option<PrefillBatchScratch>>,
 }
 
 fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
@@ -1321,6 +1329,7 @@ impl Qwen35Scratch {
             moe_topk_weights: None,
             moe_down_expanded: None,
             prefill_batch: None,
+            widened_prefill_batch: std::cell::RefCell::new(None),
         })
         .and_then(|mut s| {
             // Allocate MoE scratch only for MoE configs. Done after the
@@ -1474,6 +1483,9 @@ impl Qwen35Scratch {
             }
         }
         if let Some(pbs) = self.prefill_batch {
+            note(pbs.free_gpu(gpu));
+        }
+        if let Some(pbs) = self.widened_prefill_batch.into_inner() {
             note(pbs.free_gpu(gpu));
         }
         match first_err {

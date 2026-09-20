@@ -2554,7 +2554,20 @@ pub fn generate(
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
     // Borrow `tokenizer` per-use (never held across whole-`m` calls): the
     // context-full reset below reborrows `m` through the canonical reset.
-    let prompt_est = m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20;
+    // Skip the full BPE encode when the prompt provably fits: every token
+    // covers >= 1 byte, so byte length over-approximates the token count
+    // and a byte-fit implies a token-fit. Near-boundary requests still
+    // measure exactly, so reset decisions are unchanged.
+    let prompt_est = if m.eviction.is_none()
+        && m.seq_pos.saturating_add(prompt.len())
+            .saturating_add(20)
+            .saturating_add(max_tokens)
+            > m.max_seq
+    {
+        m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20
+    } else {
+        0
+    };
     if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
         .ok()
         .as_deref()
