@@ -893,6 +893,13 @@ def export_artifact(
         capture_output=True,
     )
     output_sha = sha256_file(output)
+    output_reader = ArtifactReader(output)
+    adapted_by_name = {wrapper.artifact_name: wrapper for wrapper in adapted}
+    for name in names:
+        source_zero = adapted_by_name[name].grid[..., 1].contiguous().view(torch.int16).cpu()
+        output_zero = output_reader.spec(name).grid[..., 1].contiguous().view(torch.int16).cpu()
+        if not torch.equal(output_zero, source_zero):
+            raise AssertionError(f"{name}: exported MQ4V2 zero points changed")
     _, output_map = astrea.read_hfq_index(output, max_tensors=0)
     touched_input = tensor_digest(args.artifact, tensor_map, names)
     touched_output = tensor_digest(output, output_map, names)
@@ -924,6 +931,7 @@ def export_artifact(
         "touched_source_sha256": touched_input,
         "touched_output_sha256": touched_output,
         "touched_changed": changed,
+        "zero_points_preserved": True,
         "seconds": time.monotonic() - started,
         "quantizer_stderr": completed.stderr.strip(),
         "merged_bf16": merged_bf16,
