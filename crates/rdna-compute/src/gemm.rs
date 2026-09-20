@@ -19709,15 +19709,14 @@ impl Gpu {
         const MMQ_X: usize = 128;
         const MMQ_Y: usize = 128;
         // Y tile: per-128-K block per column 64 B nibbles + (f32 d, i32 s)
-        // header = 72 B = 18 ints, TWO slots (even/odd halves staged
-        // concurrently). X tile: 32 nibble words + 8 half2 header
-        // slots + 2 pad = 42 ints. LDS = (2*128*18 + 128*42)*4 = 39936 B.
+        // header = 72 B = 18 ints. X tile: 32 nibble words + 8 half2 header
+        // slots + 2 pad = 42 ints. LDS = (128*18 + 128*42)*4 = 30720 B.
         const MMQ_TILE_Y_K: usize = 18;
         const MMQ_TILE_X_K: usize = 42;
         let row_tiles = m.div_ceil(MMQ_Y);
         let batch_tiles = batch_size.div_ceil(MMQ_X);
         let shared_mem =
-            ((2 * MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
+            ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
         let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
         let grid = if use_col {
