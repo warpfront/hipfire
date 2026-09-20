@@ -218,13 +218,16 @@ class ArtifactReader:
         grid = torch.from_numpy(grid_bits.copy()).view(torch.float16)
         packed = torch.from_numpy(blocks[:, 8:].copy()).reshape(m, k // 2)
         sidecar = name[: -len(".weight")] + ".awq_scale.weight"
-        if sidecar not in self.tensor_map:
-            raise KeyError(f"{name}: missing AWQ sidecar {sidecar}")
-        scale_item = self.tensor_map[sidecar]
-        if list(map(int, scale_item["shape"])) != [k] or int(scale_item["quant_type"]) != 1:
-            raise ValueError(f"{sidecar}: expected F16 [{k}]")
-        scale_bits = np.frombuffer(self.bytes(sidecar), dtype="<u2").copy()
-        scale = torch.from_numpy(scale_bits).view(torch.float16)
+        if sidecar in self.tensor_map:
+            scale_item = self.tensor_map[sidecar]
+            if list(map(int, scale_item["shape"])) != [k] or int(scale_item["quant_type"]) != 1:
+                raise ValueError(f"{sidecar}: expected F16 [{k}]")
+            scale_bits = np.frombuffer(self.bytes(sidecar), dtype="<u2").copy()
+            scale = torch.from_numpy(scale_bits).view(torch.float16)
+        else:
+            # MQ4V2 tensors without learned AWQ (notably lm_head) still use the
+            # fixed rotation with the identity diagonal S.
+            scale = torch.ones(k, dtype=torch.float16)
         if not bool(torch.isfinite(scale.float()).all()) or not bool((scale > 0).all()):
             raise ValueError(f"{sidecar}: scales must be finite and positive")
         return PackedSpec(name, m, k, scale, grid, packed)
