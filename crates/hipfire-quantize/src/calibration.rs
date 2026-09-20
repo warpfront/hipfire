@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::fs::File;
 use std::io::Write;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex, OnceLock};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use clap::Parser;
@@ -25,6 +25,10 @@ use crate::dequant::*;
 
 pub(crate) static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 pub(crate) static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
+pub(crate) static AWQ_A4_AWARE: OnceLock<bool> = OnceLock::new();
+pub(crate) const AWQ_A4_CANDIDATE_ALPHAS: [f32; 5] = [0.35, 0.45, 0.55, 0.65, 0.75];
+static AWQ_A4_ALPHA_BY_ACTIVATION: LazyLock<Mutex<HashMap<Vec<u32>, f32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
 
 
 pub(crate) fn resolve_model_path(input: &str) -> String {
@@ -521,6 +525,339 @@ pub(crate) fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
         .into_iter()
         .map(|l| ((l - mean_log).exp() as f32).clamp(AWQ_SCALE_MIN, AWQ_SCALE_MAX))
         .collect()
+}
+
+/// Host representation of the runtime's 72-byte `block_i4_128` activation block.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BlockI4_128 {
+    pub(crate) d: f32,
+    pub(crate) s: i32,
+    pub(crate) qs: [u8; 64],
+}
+
+impl BlockI4_128 {
+    pub(crate) fn to_bytes(&self) -> [u8; 72] {
+        let mut bytes = [0u8; 72];
+        bytes[..4].copy_from_slice(&self.d.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.s.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.qs);
+        bytes
+    }
+
+    fn dequantize(&self) -> [f32; 128] {
+        let mut values = [0.0f32; 128];
+        for (i, value) in values.iter_mut().enumerate() {
+            let nibble = if i & 1 == 0 {
+                self.qs[i / 2] & 0x0f
+            } else {
+                self.qs[i / 2] >> 4
+            };
+            let q = ((nibble as i8) << 4) >> 4;
+            *value = self.d * q as f32;
+        }
+        values
+    }
+}
+
+/// CPU twin of the gfx1201 producer specialization in
+/// `kernels/src/block_i4_128_quant.hip`.
+///
+/// Arithmetic order is intentional: four values are accumulated per simulated
+/// wave lane and then reduced with the same XOR 16,8,4,2,1 tree. The four scale
+/// candidates and their pre-rounded constants are the runtime contract.
+pub(crate) fn fake_quantize_block_i4_128(input: &[f32; 128]) -> BlockI4_128 {
+    let mut lane_amax = [0.0f32; 32];
+    for lane in 0..32 {
+        let base = lane * 4;
+        lane_amax[lane] = input[base]
+            .abs()
+            .max(input[base + 1].abs())
+            .max(input[base + 2].abs())
+            .max(input[base + 3].abs());
+    }
+    for offset in [16usize, 8, 4, 2, 1] {
+        let prior = lane_amax;
+        for lane in 0..32 {
+            lane_amax[lane] = lane_amax[lane].max(prior[lane ^ offset]);
+        }
+    }
+    let amax = lane_amax[0];
+
+    let mut best_d = 1.0f32;
+    if amax != 0.0 {
+        let candidate_base = (amax / 7.0f32) * 0.5f32;
+        let multipliers = [
+            1.0f32,
+            f32::from_bits(0x3fa4_9249),
+            f32::from_bits(0x3fdb_6db7),
+            2.0f32,
+        ];
+        let mut best_mse = 1.0e30f32;
+        for multiplier in multipliers {
+            let d = candidate_base * multiplier;
+            let mut lane_mse = [0.0f32; 32];
+            for lane in 0..32 {
+                let base = lane * 4;
+                let mut mse = 0.0f32;
+                for e in 0..4 {
+                    let q = (input[base + e] / d)
+                        .round_ties_even()
+                        .clamp(-8.0, 7.0);
+                    let err = (-q).mul_add(d, input[base + e]);
+                    mse = err.mul_add(err, mse);
+                }
+                lane_mse[lane] = mse;
+            }
+            for offset in [16usize, 8, 4, 2, 1] {
+                let prior = lane_mse;
+                for lane in 0..32 {
+                    lane_mse[lane] += prior[lane ^ offset];
+                }
+            }
+            if lane_mse[0] < best_mse {
+                best_mse = lane_mse[0];
+                best_d = d;
+            }
+        }
+    }
+
+    let mut q4 = [0i32; 128];
+    for i in 0..128 {
+        q4[i] = if amax == 0.0 {
+            0
+        } else {
+            (input[i] / best_d)
+                .round_ties_even()
+                .clamp(-8.0, 7.0) as i32
+        };
+    }
+    let s = q4.iter().sum();
+    let mut qs = [0u8; 64];
+    for i in 0..64 {
+        qs[i] = ((q4[2 * i] & 15) | ((q4[2 * i + 1] & 15) << 4)) as u8;
+    }
+    BlockI4_128 { d: best_d, s, qs }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct A4AwareAwqResult {
+    pub(crate) scales: Vec<f32>,
+    pub(crate) alpha: f32,
+    pub(crate) relative_output_mse: f64,
+}
+
+fn representative_activation(in_sum2: &[f32]) -> Vec<f32> {
+    let mut x: Vec<f32> = in_sum2
+        .iter()
+        .map(|&v| (v as f64).max(1e-12).min(1e30).sqrt() as f32)
+        .collect();
+    let rms = (x
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        / x.len() as f64)
+        .sqrt() as f32;
+    if rms.is_finite() && rms > 0.0 {
+        for value in &mut x {
+            *value /= rms;
+        }
+    }
+    x
+}
+
+fn fake_quantize_runtime_activation(
+    activation: &[f32],
+    scales: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<f32> {
+    use crate::quant_fwht::cpu_fwht_256;
+
+    debug_assert_eq!(activation.len(), scales.len());
+    debug_assert_eq!(activation.len() % 256, 0);
+    let mut output = vec![0.0f32; activation.len()];
+    for group_start in (0..activation.len()).step_by(256) {
+        let mut group = [0.0f32; 256];
+        for i in 0..256 {
+            group[i] = activation[group_start + i] / scales[group_start + i];
+        }
+        cpu_fwht_256(&mut group, signs1, signs2);
+        for half in 0..2 {
+            let mut input = [0.0f32; 128];
+            input.copy_from_slice(&group[half * 128..(half + 1) * 128]);
+            let dequantized = fake_quantize_block_i4_128(&input).dequantize();
+            output[group_start + half * 128..group_start + (half + 1) * 128]
+                .copy_from_slice(&dequantized);
+        }
+    }
+    output
+}
+
+fn fake_quantize_mq4v2_weight_group(group: &mut [f32; 256]) {
+    for half in 0..2 {
+        let values = &group[half * 128..(half + 1) * 128];
+        let lo = values.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
+        let scale_bits = if hi == lo { 0 } else { f32_to_f16(step_f32) };
+        let zero_bits = f32_to_f16(lo);
+        let scale = f16_to_f32(scale_bits);
+        let zero = f16_to_f32(zero_bits);
+        let degenerate = hi == lo || step_f32 == 0.0 || scale == 0.0;
+        for i in half * 128..(half + 1) * 128 {
+            group[i] = if degenerate {
+                zero
+            } else {
+                let q = ((group[i] - zero) * (1.0 / scale) + 0.5)
+                    .floor()
+                    .clamp(0.0, 15.0);
+                q.mul_add(scale, zero)
+            };
+        }
+    }
+}
+
+fn w4a4_relative_output_mse(
+    weights: &[f32],
+    m: usize,
+    k: usize,
+    activation: &[f32],
+    reference_outputs: &[f64],
+    sampled_rows: &[usize],
+    scales: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> f64 {
+    use crate::quant_fwht::cpu_fwht_256;
+
+    let quantized_activation =
+        fake_quantize_runtime_activation(activation, scales, signs1, signs2);
+    let mut error2 = 0.0f64;
+    let mut signal2 = 0.0f64;
+    for (sample, &row) in sampled_rows.iter().enumerate() {
+        let row_weights = &weights[row * k..(row + 1) * k];
+        let mut output = 0.0f64;
+        for group_start in (0..k).step_by(256) {
+            let mut group = [0.0f32; 256];
+            for i in 0..256 {
+                group[i] = row_weights[group_start + i] * scales[group_start + i];
+            }
+            cpu_fwht_256(&mut group, signs1, signs2);
+            fake_quantize_mq4v2_weight_group(&mut group);
+            for i in 0..256 {
+                output +=
+                    (group[i] as f64) * (quantized_activation[group_start + i] as f64);
+            }
+        }
+        let reference = reference_outputs[sample];
+        let error = output - reference;
+        error2 += error * error;
+        signal2 += reference * reference;
+    }
+    error2 / signal2.max(1e-30)
+}
+
+/// Search the fixed AWQ alpha grid against the actual MQ4V2 × runtime-A4
+/// output objective. The imatrix diagonal supplies a representative per-channel
+/// RMS activation; rows are sampled uniformly to keep the search bounded on
+/// vocab and wide projection matrices.
+pub(crate) fn compute_a4_aware_awq_scales(
+    in_sum2: &[f32],
+    weights: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> A4AwareAwqResult {
+    debug_assert_eq!(in_sum2.len(), k);
+    debug_assert_eq!(weights.len(), m * k);
+    debug_assert_eq!(k % 256, 0);
+
+    let activation = representative_activation(in_sum2);
+    let sample_count = m.min(128);
+    let sampled_rows: Vec<usize> = (0..sample_count)
+        .map(|sample| sample * m / sample_count)
+        .collect();
+    let reference_outputs: Vec<f64> = sampled_rows
+        .iter()
+        .map(|&row| {
+            weights[row * k..(row + 1) * k]
+                .iter()
+                .zip(&activation)
+                .map(|(&w, &x)| (w as f64) * (x as f64))
+                .sum()
+        })
+        .collect();
+
+    let mut best: Option<A4AwareAwqResult> = None;
+    for alpha in AWQ_A4_CANDIDATE_ALPHAS {
+        let scales = compute_awq_scales(in_sum2, alpha);
+        let relative_output_mse = w4a4_relative_output_mse(
+            weights,
+            m,
+            k,
+            &activation,
+            &reference_outputs,
+            &sampled_rows,
+            &scales,
+            signs1,
+            signs2,
+        );
+        if best
+            .as_ref()
+            .map_or(true, |current| relative_output_mse < current.relative_output_mse)
+        {
+            best = Some(A4AwareAwqResult {
+                scales,
+                alpha,
+                relative_output_mse,
+            });
+        }
+    }
+    best.expect("AWQ A4 alpha grid is non-empty")
+}
+
+pub(crate) fn compute_awq_scales_for_weight(
+    in_sum2: &[f32],
+    fallback_alpha: f32,
+    weights: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> A4AwareAwqResult {
+    if AWQ_A4_AWARE.get().copied().unwrap_or(false) {
+        // Fused qkvza/gate-up producers inverse-scale one activation for several
+        // weight matrices. Every matrix consuming the same calibration vector
+        // must therefore use the same alpha, or its folded W*s no longer
+        // cancels x/s at runtime. Tensor ordering puts the large fused anchor
+        // first; subsequent siblings reuse its winning alpha.
+        let activation_key: Vec<u32> = in_sum2.iter().map(|value| value.to_bits()).collect();
+        if let Some(alpha) = AWQ_A4_ALPHA_BY_ACTIVATION
+            .lock()
+            .expect("A4 AWQ alpha cache poisoned")
+            .get(&activation_key)
+            .copied()
+        {
+            return A4AwareAwqResult {
+                scales: compute_awq_scales(in_sum2, alpha),
+                alpha,
+                relative_output_mse: f64::NAN,
+            };
+        }
+        let selected = compute_a4_aware_awq_scales(in_sum2, weights, m, k, signs1, signs2);
+        AWQ_A4_ALPHA_BY_ACTIVATION
+            .lock()
+            .expect("A4 AWQ alpha cache poisoned")
+            .insert(activation_key, selected.alpha);
+        selected
+    } else {
+        A4AwareAwqResult {
+            scales: compute_awq_scales(in_sum2, fallback_alpha),
+            alpha: fallback_alpha,
+            relative_output_mse: f64::NAN,
+        }
+    }
 }
 
 /// Apply AWQ pre-scaling to a row-major [m, k] weight tensor in place:
@@ -1347,5 +1684,32 @@ mod gemma4_name_translation_tests {
             gguf_to_safetensors_name("blk.2.layer_output_scale.weight", 13).unwrap(),
             "model.layers.2.layer_scalar"
         );
+    }
+}
+
+#[cfg(test)]
+mod block_i4_128_tests {
+    use super::fake_quantize_block_i4_128;
+
+    /// Fixture dumped on gfx1201 by launching the shipping
+    /// `quantize_int4_mmq_ds128` kernel from `block_i4_128_quant.hip`.
+    #[test]
+    fn cpu_fake_quant_matches_dumped_gfx1201_block_bit_for_bit() {
+        let mut input = [0.0f32; 128];
+        let mut state = 0x1234_5678u32;
+        for value in &mut input {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let centered = ((state >> 8) & 0xffff) as i32 - 32_768;
+            *value = centered as f32 * (1.0f32 / 4096.0f32);
+        }
+        let expected = [
+            0xe5, 0x54, 0x7a, 0x3f, 0x05, 0x00, 0x00, 0x00, 0xbc, 0xe6, 0x36, 0x59, 0x5b,
+            0xd0, 0x8f, 0x68, 0x01, 0x3e, 0x48, 0x9d, 0x72, 0x1e, 0x70, 0xfc, 0xc5, 0x1c,
+            0xfa, 0x7b, 0x2f, 0x0a, 0xdc, 0x5a, 0x18, 0x1a, 0xb4, 0x7d, 0x15, 0xc2, 0xae,
+            0x60, 0x3f, 0x17, 0x22, 0x43, 0x4a, 0xe5, 0x25, 0x70, 0xa1, 0x06, 0x27, 0x91,
+            0xc8, 0x19, 0xd5, 0x2e, 0x5b, 0x6c, 0xb6, 0xbe, 0x1e, 0x45, 0x63, 0x25, 0x4c,
+            0xa6, 0x4a, 0x07, 0xec, 0xa7, 0xec, 0x62,
+        ];
+        assert_eq!(fake_quantize_block_i4_128(&input).to_bytes(), expected);
     }
 }

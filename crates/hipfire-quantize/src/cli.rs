@@ -205,6 +205,11 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, value_name = "ALPHA")]
     pub awq_alpha: Option<f32>,
 
+    /// Select AWQ alpha per shared activation group using the runtime-exact
+    /// MQ4V2 × A4 block-output error over the fixed alpha grid.
+    #[arg(long, conflicts_with = "awq_alpha")]
+    pub awq_a4_aware: bool,
+
     /// Enable K-map promotion for dense models.
     #[arg(long)]
     pub kmap_dense: bool,

@@ -827,8 +827,12 @@ pub(crate) fn run() {
     // outlier mitigation techniques" — MR-GPTQ is the right lever there,
     // tracked as Stage C). HFP4/MFP4 are explicitly NOT awq-pre-scaled
     // in this patch.
-    let awq_enabled = args.awq || args.awq_alpha.is_some();
+    let awq_enabled = args.awq || args.awq_alpha.is_some() || args.awq_a4_aware;
     let awq_alpha = args.awq_alpha.unwrap_or(0.55);
+    if args.awq_a4_aware && !use_mq4v2 {
+        eprintln!("error: --awq-a4-aware currently requires --format mq4v2");
+        std::process::exit(1);
+    }
     if awq_enabled {
         if IMATRIX.get().is_none() {
             eprintln!(
@@ -844,9 +848,21 @@ pub(crate) fn run() {
         AWQ_ALPHA
             .set(awq_alpha)
             .expect("AWQ_ALPHA set twice — should not happen");
-        eprintln!(
-            "AWQ pre-scaling: ENABLED (alpha={awq_alpha}, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)"
-        );
+        if args.awq_a4_aware {
+            AWQ_A4_AWARE
+                .set(true)
+                .expect("AWQ_A4_AWARE set twice — should not happen");
+        }
+        if args.awq_a4_aware {
+            eprintln!(
+                "AWQ pre-scaling: ENABLED (A4-aware shared-activation alpha search over {:?})",
+                AWQ_A4_CANDIDATE_ALPHAS
+            );
+        } else {
+            eprintln!(
+                "AWQ pre-scaling: ENABLED (alpha={awq_alpha}, formula: s[j]=(RMS_act[j])^alpha, geo-mean normalized to 1)"
+            );
+        }
     }
     // K-map gate: applies to MoE models by default. Dense models opt in
     // via --kmap-dense (the K-map dense PPL effect is mixed: regression at
@@ -1357,7 +1373,31 @@ pub(crate) fn run() {
             all_tensors.push((name, fi));
         }
     }
-    all_tensors.sort_by_key(|(name, _)| name.to_string());
+    if args.awq_a4_aware {
+        // Runtime fusion applies one inverse AWQ scale to each shared input.
+        // Visit the largest fused projection first so it chooses the alpha
+        // cached for its qkvza/gate-up siblings.
+        const A4_ANCHOR_ORDER: [(&str, &str); 7] = [
+            (".linear_attn.in_proj_qkv.weight", ".linear_attn.in_proj_0_qkv.weight"),
+            (".linear_attn.in_proj_z.weight", ".linear_attn.in_proj_1_z.weight"),
+            (".linear_attn.in_proj_a.weight", ".linear_attn.in_proj_2_a.weight"),
+            (".linear_attn.in_proj_b.weight", ".linear_attn.in_proj_3_b.weight"),
+            (".self_attn.q_proj.weight", ".self_attn.0_q_proj.weight"),
+            (".self_attn.k_proj.weight", ".self_attn.1_k_proj.weight"),
+            (".self_attn.v_proj.weight", ".self_attn.2_v_proj.weight"),
+        ];
+        all_tensors.sort_by_key(|(name, _)| {
+            A4_ANCHOR_ORDER
+                .iter()
+                .find_map(|(suffix, ordered_suffix)| {
+                    name.strip_suffix(suffix)
+                        .map(|prefix| format!("{prefix}{ordered_suffix}"))
+                })
+                .unwrap_or_else(|| name.to_string())
+        });
+    } else {
+        all_tensors.sort_by_key(|(name, _)| name.to_string());
+    }
     eprintln!(
         "Found {} tensors ({} FP8 scale siblings indexed)",
         all_tensors.len(),
@@ -5230,9 +5270,24 @@ fn handle_main_quant(
                                 (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                             {
                                 if awq_eligible(name) {
-                                    let scales = compute_awq_scales(im_weights, alpha);
-                                    awq_sidecar_scales = Some(scales.clone());
                                     let m_dim = meta.shape[0];
+                                    let selected = compute_awq_scales_for_weight(
+                                        im_weights,
+                                        alpha,
+                                        &f32_data,
+                                        m_dim,
+                                        k_dim,
+                                        &signs1,
+                                        &signs2,
+                                    );
+                                    if selected.relative_output_mse.is_finite() {
+                                        eprintln!(
+                                            "    AWQ A4: {} alpha={:.2} relative_output_mse={:.8e}",
+                                            name, selected.alpha, selected.relative_output_mse
+                                        );
+                                    }
+                                    let scales = selected.scales;
+                                    awq_sidecar_scales = Some(scales.clone());
                                     let mut scaled = f32_data.clone();
                                     awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
                                     quantize_mq4g256v2(&scaled, m_dim, k_dim, &signs1, &signs2)
@@ -5872,9 +5927,24 @@ fn handle_main_quant(
                             (AWQ_ALPHA.get().copied(), imatrix_weights_for(name))
                         {
                             if awq_eligible(name) {
-                                let scales = compute_awq_scales(im_weights, alpha);
-                                awq_sidecar_scales = Some(scales.clone());
                                 let m_dim = meta.shape[0];
+                                let selected = compute_awq_scales_for_weight(
+                                    im_weights,
+                                    alpha,
+                                    &f32_data,
+                                    m_dim,
+                                    k_dim,
+                                    &signs1,
+                                    &signs2,
+                                );
+                                if selected.relative_output_mse.is_finite() {
+                                    eprintln!(
+                                        "    AWQ A4: {} alpha={:.2} relative_output_mse={:.8e}",
+                                        name, selected.alpha, selected.relative_output_mse
+                                    );
+                                }
+                                let scales = selected.scales;
+                                awq_sidecar_scales = Some(scales.clone());
                                 let mut scaled = f32_data.clone();
                                 awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
                                 quantize_mq4g256v2(&scaled, m_dim, k_dim, &signs1, &signs2)
