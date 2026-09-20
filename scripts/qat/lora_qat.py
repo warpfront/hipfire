@@ -133,6 +133,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--lora-alpha", type=float, default=LORA_ALPHA)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--warmup", type=int, default=20)
+    parser.add_argument("--p4-kl-weight", type=float, default=0.8)
+    parser.add_argument("--p4-ce-weight", type=float, default=0.2)
+    parser.add_argument("--p8-kl-weight", type=float, default=0.25)
     parser.add_argument("--accumulate", type=int, default=4)
     parser.add_argument("--grad-norm", type=float, default=1.0)
     parser.add_argument("--seed", type=int, default=20260920)
@@ -1116,8 +1119,8 @@ def full_route_backward(
         lambda value, begin, end: value.to(torch.bfloat16) @ teacher_head[begin:end].T,
     )
     token_count = labels.numel()
-    kl_weight = 0.8 if route == "p4" else 0.25
-    ce_weight = 0.2 if route == "p4" else 0.0
+    kl_weight = args.p4_kl_weight if route == "p4" else args.p8_kl_weight
+    ce_weight = args.p4_ce_weight if route == "p4" else 0.0
     kl_value = 0.0
     ce_value = 0.0
     for start in range(0, vocab, tile):
@@ -1250,7 +1253,11 @@ def full_eval(
     if was_training:
         model.train()
     result = {key: value / count for key, value in sums.items()}
-    result["objective"] = 0.8 * result["p4_kl"] + 0.2 * result["p4_ce"] + 0.25 * result["p8_kl"]
+    result["objective"] = (
+        args.p4_kl_weight * result["p4_kl"]
+        + args.p4_ce_weight * result["p4_ce"]
+        + args.p8_kl_weight * result["p8_kl"]
+    )
     return result
 
 
@@ -1355,7 +1362,11 @@ def run_full(
     total_seconds = time.monotonic() - started
     return {
         "mode": "full",
-        "objective": "0.8*KL(teacher||p4) + 0.2*CE(p4,tokens) + 0.25*KL(teacher||p8)",
+        "objective": (
+            f"{args.p4_kl_weight}*KL(teacher||p4) + "
+            f"{args.p4_ce_weight}*CE(p4,tokens) + "
+            f"{args.p8_kl_weight}*KL(teacher||p8)"
+        ),
         "teacher": "resident BF16 source model; pure torch DeltaNet; online no-grad logits",
         "student_deltanet": {"backend": "FLA chunked", "validation": fla_delta},
         "steps": args.steps,
