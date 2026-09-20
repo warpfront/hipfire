@@ -4,7 +4,7 @@
 Full mode trains the complete text model against the C2 vocabulary-tiled
 teacher-logit recipe.  Dry mode uses the three immutable block-boundary pairs
 from the L2.5 capture to prove the codec, recurrent-state, optimizer, memory,
-and throughput paths on one R9700 without pretending that block MSE is KL.
+and throughput paths on the rented MI300X without pretending that block MSE is KL.
 """
 from __future__ import annotations
 
@@ -128,6 +128,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--device", default="cuda")
     parser.add_argument("--dtype", choices=("bfloat16",), default="bfloat16")
     parser.add_argument("--steps", type=int)
+    parser.add_argument("--schedule-steps", type=int)
     parser.add_argument("--rank", type=int, default=RANK)
     parser.add_argument("--lora-alpha", type=float, default=LORA_ALPHA)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -147,6 +148,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.steps is None:
         args.steps = 20 if args.dry_run else 500
+    if args.schedule_steps is None:
+        args.schedule_steps = args.steps if args.dry_run else 500
     if args.capture is None:
         args.capture = DRY_CAPTURE_DEFAULT if args.dry_run else FULL_CAPTURE_DEFAULT
     if args.blocks is None:
@@ -155,8 +158,8 @@ def parse_args() -> argparse.Namespace:
         args.eval_every = 5 if args.dry_run else 50
     if args.heldout_sequences is None:
         args.heldout_sequences = 2 if args.dry_run else 32
-    if args.steps <= 0 or args.accumulate <= 0 or args.rank <= 0:
-        parser.error("steps, accumulate, and rank must be positive")
+    if args.steps <= 0 or args.schedule_steps < args.steps or args.accumulate <= 0 or args.rank <= 0:
+        parser.error("steps/accumulate/rank must be positive and schedule-steps >= steps")
     if args.warmup < 0 or args.eval_every <= 0 or args.heldout_sequences <= 0:
         parser.error("warmup must be nonnegative; eval cadence/count must be positive")
     if args.dry_run and args.blocks != [0, 31, 60]:
@@ -167,13 +170,10 @@ def parse_args() -> argparse.Namespace:
 def require_device(args: argparse.Namespace) -> torch.device:
     if not torch.cuda.is_available() or not args.device.startswith("cuda"):
         raise RuntimeError("the QAT trainer requires a visible ROCm GPU")
-    visible = os.environ.get("ROCR_VISIBLE_DEVICES")
     props = torch.cuda.get_device_properties(0)
-    if args.dry_run and visible != CARD_A_UUID:
-        raise RuntimeError(f"dry-run requires card-A ({CARD_A_UUID}), got ROCR_VISIBLE_DEVICES={visible!r}")
-    if args.full and props.total_memory < 180 * (1 << 30):
+    if props.total_memory < 180 * (1 << 30):
         raise RuntimeError(
-            f"full mode requires the single >=180-GiB MI300X; visible device has {props.total_memory / (1 << 30):.1f} GiB"
+            f"QAT requires the single >=180-GiB MI300X; visible device has {props.total_memory / (1 << 30):.1f} GiB"
         )
     return torch.device(args.device)
 
@@ -340,6 +340,15 @@ class PackedQATLinear(nn.Module):
         else:
             merged = base
         return _FixedGridSTE.apply(merged, scale, zero)
+
+    @torch.no_grad()
+    def merged_source_rows(self, start: int, end: int) -> torch.Tensor:
+        base, _, _ = self._base_rows(start, end)
+        merged = base
+        if self.adapted:
+            merged = merged + self.lora_scale * (self.lora_b[start:end] @ self.lora_a)
+        source = fwht256(merged.T.contiguous(), inverse=True).T.contiguous()
+        return source / self.awq_scale.float()
 
     def prepare_input(self, value: torch.Tensor) -> tuple[torch.Tensor, tuple[int, ...], torch.dtype]:
         original_dtype = value.dtype
@@ -518,7 +527,9 @@ def _source_to_text_name(source_name: str) -> str | None:
     return None
 
 
-def load_text_model(source_path: Path, device: torch.device) -> nn.Module:
+def load_text_model(
+    source_path: Path, device: torch.device, pure_torch_deltanet: bool = False
+) -> nn.Module:
     from accelerate.utils import set_module_tensor_to_device
     from safetensors import safe_open
     from transformers import AutoConfig
@@ -556,6 +567,13 @@ def load_text_model(source_path: Path, device: torch.device) -> nn.Module:
                     value=handle.get_tensor(source_name),
                     dtype=torch.bfloat16,
                 )
+    if pure_torch_deltanet:
+        from transformers.models.qwen3_5 import modeling_qwen3_5
+
+        for layer in model.model.layers:
+            if hasattr(layer, "linear_attn"):
+                layer.linear_attn.chunk_gated_delta_rule = modeling_qwen3_5.torch_chunk_gated_delta_rule
+                layer.linear_attn.recurrent_gated_delta_rule = modeling_qwen3_5.torch_recurrent_gated_delta_rule
     return model
 
 
@@ -766,6 +784,80 @@ def save_records(
     return names
 
 
+@torch.no_grad()
+def merged_source_tensor(wrapper: PackedQATLinear, row_chunk: int) -> torch.Tensor:
+    output = torch.empty(
+        (wrapper.out_features, wrapper.in_features), dtype=torch.bfloat16, device="cpu"
+    )
+    for start in range(0, wrapper.out_features, row_chunk):
+        end = min(start + row_chunk, wrapper.out_features)
+        output[start:end].copy_(
+            wrapper.merged_source_rows(start, end).to(torch.bfloat16).cpu()
+        )
+    return output
+
+
+def export_merged_bf16(
+    args: argparse.Namespace,
+    wrappers: list[PackedQATLinear],
+    label: str,
+) -> dict[str, Any]:
+    from safetensors import safe_open
+
+    output_root = args.out / "exports" / label / "merged-bf16"
+    if output_root.exists():
+        shutil.rmtree(output_root)
+    output_root.mkdir(parents=True)
+    wrapper_map = {wrapper.artifact_name: wrapper for wrapper in wrappers}
+    index = json.loads((args.source / "model.safetensors.index.json").read_text())
+    by_shard: dict[str, list[str]] = {}
+    for name, shard in index["weight_map"].items():
+        by_shard.setdefault(shard, []).append(name)
+    source = SafeTensorSource(args.source)
+    files: list[dict[str, Any]] = []
+    aggregate = hashlib.sha256()
+    started = time.monotonic()
+    for shard in sorted(by_shard):
+        tensors: dict[str, torch.Tensor] = {}
+        for name in sorted(by_shard[shard]):
+            wrapper = wrapper_map.get(name)
+            tensors[name] = (
+                merged_source_tensor(wrapper, args.record_row_chunk)
+                if wrapper is not None
+                else source.get(name).contiguous()
+            )
+        with safe_open(args.source / shard, framework="pt", device="cpu") as handle:
+            metadata = handle.metadata()
+        temporary = output_root / f".{shard}.tmp"
+        save_file(tensors, temporary, metadata=metadata)
+        destination = output_root / shard
+        os.replace(temporary, destination)
+        digest = sha256_file(destination)
+        size = destination.stat().st_size
+        files.append({"file": shard, "sha256": digest, "bytes": size})
+        aggregate.update(shard.encode())
+        aggregate.update(bytes.fromhex(digest))
+        del tensors
+    for source_path in args.source.iterdir():
+        if source_path.name.startswith("model-") and source_path.suffix == ".safetensors":
+            continue
+        destination = output_root / source_path.name
+        if source_path.is_dir():
+            shutil.copytree(source_path, destination, dirs_exist_ok=True)
+        else:
+            shutil.copy2(source_path, destination)
+    receipt = {
+        "directory": str(output_root),
+        "basis": "BF16 source; W=FWHT_inverse(U0+2BA)/S",
+        "shards": files,
+        "bytes": sum(item["bytes"] for item in files),
+        "aggregate_sha256": aggregate.hexdigest(),
+        "seconds": time.monotonic() - started,
+    }
+    atomic_json(output_root / "receipt.json", receipt)
+    return receipt
+
+
 def export_artifact(
     args: argparse.Namespace,
     adapted: list[PackedQATLinear],
@@ -773,6 +865,7 @@ def export_artifact(
     tensor_map: dict[str, dict[str, Any]],
     label: str,
     assert_initial: bool = False,
+    all_wrappers: list[PackedQATLinear] | None = None,
 ) -> dict[str, Any]:
     export_root = args.out / "exports" / label
     records_dir = export_root / "records"
@@ -809,6 +902,13 @@ def export_artifact(
             raise AssertionError(f"step-0 artifact SHA differs: {output_sha} != {artifact_sha}")
         if touched_output != touched_input:
             raise AssertionError("step-0 touched tensor bytes differ from the L1 artifact")
+    merged_bf16 = None
+    if args.full:
+        if all_wrappers is None:
+            raise ValueError("full export requires all qt44 wrappers")
+        # Every qt44 tensor, adapted or frozen, is emitted from its decoded U0
+        # so the directory is a complete source-basis model for re-quantization.
+        merged_bf16 = export_merged_bf16(args, all_wrappers, label)
     receipt = {
         "label": label,
         "records": len(names),
@@ -823,6 +923,7 @@ def export_artifact(
         "touched_changed": changed,
         "seconds": time.monotonic() - started,
         "quantizer_stderr": completed.stderr.strip(),
+        "merged_bf16": merged_bf16,
     }
     atomic_json(export_root / "receipt.json", receipt)
     return receipt
@@ -895,7 +996,7 @@ def run_dry(
                 loss_sum += float((coefficient * route_loss).detach().item()) / args.accumulate
             processed_tokens += args.dry_tokens
         grad_norm = float(torch.nn.utils.clip_grad_norm_(parameters, args.grad_norm).item())
-        lr = learning_rate(step, args.steps, args.lr, args.warmup)
+        lr = learning_rate(step, args.schedule_steps, args.lr, args.warmup)
         for group in optimizer.param_groups:
             group["lr"] = lr
         optimizer.step()
@@ -1108,6 +1209,7 @@ def full_eval(
     args: argparse.Namespace,
     manifest: dict[str, Any],
     model: nn.Module,
+    teacher_model: nn.Module,
     wrappers: list[PackedQATLinear],
     teacher_head: torch.Tensor,
     device: torch.device,
@@ -1120,13 +1222,15 @@ def full_eval(
     token_array = np.memmap(
         args.capture / token_meta["file"], dtype="<u4", mode="r", shape=tuple(token_meta["shape"])
     )
-    final_meta = manifest["capture"]["final_norm"]
     sums = {"p4_kl": 0.0, "p4_ce": 0.0, "p8_kl": 0.0}
     was_training = model.training
     model.eval()
     for sequence in range(train_count, train_count + count):
         tokens = torch.from_numpy(np.asarray(token_array[sequence]).astype(np.int64)).view(1, seq_len).to(device)
-        teacher = read_bf16_sequence(args.capture, final_meta, sequence, seq_len, device)
+        with torch.no_grad():
+            teacher = teacher_model.model(
+                input_ids=tokens, use_cache=False, return_dict=True
+            ).last_hidden_state
         p4 = full_eval_sequence(args, model, wrappers, teacher_head, tokens, teacher, "p4")
         p8 = full_eval_sequence(args, model, wrappers, teacher_head, tokens, teacher, "p8")
         sums["p4_kl"] += p4["kl"]
@@ -1153,12 +1257,25 @@ def run_full(
     model, wrappers, adapted = install_full_model(args, reader, device, torch.bfloat16)
     if len(adapted) != 368:
         raise AssertionError(f"expected 368 adapted tensors, got {len(adapted)}")
-    source = SafeTensorSource(args.source)
-    teacher_head = source.get("lm_head.weight").to(device=device, dtype=torch.bfloat16)
+    teacher_model = load_text_model(args.source, device, pure_torch_deltanet=True)
+    teacher_model.eval()
+    for parameter in teacher_model.parameters():
+        parameter.requires_grad_(False)
+    teacher_head = teacher_model.lm_head.weight
+    delta_path = args.capture / "fla_delta.json"
+    if not delta_path.is_file():
+        raise FileNotFoundError("full mode requires capture/fla_delta.json")
+    fla_delta = json.loads(delta_path.read_text())
+    if float(fla_delta["relative_rms"]) > args.split_relative_rms:
+        raise RuntimeError(f"FLA student surrogate exceeds limit: {fla_delta}")
     if any(bool(torch.count_nonzero(wrapper.lora_b).item()) for wrapper in adapted):
         raise AssertionError("LoRA B must be exactly zero at step 0")
-    step0_export = export_artifact(args, adapted, artifact_sha, reader.tensor_map, "step-000", True)
-    initial_eval = full_eval(args, manifest, model, wrappers, teacher_head, device)
+    step0_export = export_artifact(
+        args, adapted, artifact_sha, reader.tensor_map, "step-000", True, wrappers
+    )
+    initial_eval = full_eval(
+        args, manifest, model, teacher_model, wrappers, teacher_head, device
+    )
     best_eval = dict(initial_eval)
     best_step = 0
     best_state = adapter_state(adapted)
@@ -1171,7 +1288,6 @@ def run_full(
     token_array = np.memmap(
         args.capture / token_meta["file"], dtype="<u4", mode="r", shape=tuple(token_meta["shape"])
     )
-    final_meta = manifest["capture"]["final_norm"]
     history: list[dict[str, Any]] = [{"step": 0, "heldout": initial_eval}]
     processed_tokens = 0
     started = time.monotonic()
@@ -1182,7 +1298,10 @@ def run_full(
         for micro in range(args.accumulate):
             sequence = ((step - 1) * args.accumulate + micro) % train_count
             tokens = torch.from_numpy(np.asarray(token_array[sequence]).astype(np.int64)).view(1, seq_len).to(device)
-            teacher = read_bf16_sequence(args.capture, final_meta, sequence, seq_len, device)
+            with torch.no_grad():
+                teacher = teacher_model.model(
+                    input_ids=tokens, use_cache=False, return_dict=True
+                ).last_hidden_state
             p4 = full_route_backward(args, model, wrappers, teacher_head, tokens, teacher, "p4", args.accumulate)
             p8 = full_route_backward(args, model, wrappers, teacher_head, tokens, teacher, "p8", args.accumulate)
             totals["p4_kl"] += p4["kl"] / args.accumulate
@@ -1191,7 +1310,7 @@ def run_full(
             totals["weighted"] += (p4["weighted"] + p8["weighted"]) / args.accumulate
             processed_tokens += seq_len
         grad_norm = float(torch.nn.utils.clip_grad_norm_(parameters, args.grad_norm).item())
-        lr = learning_rate(step, args.steps, args.lr, args.warmup)
+        lr = learning_rate(step, args.schedule_steps, args.lr, args.warmup)
         for group in optimizer.param_groups:
             group["lr"] = lr
         optimizer.step()
@@ -1204,7 +1323,9 @@ def run_full(
             "tokens_per_second": args.accumulate * seq_len / elapsed,
         }
         if step % args.eval_every == 0 or step == args.steps:
-            heldout = full_eval(args, manifest, model, wrappers, teacher_head, device)
+            heldout = full_eval(
+                args, manifest, model, teacher_model, wrappers, teacher_head, device
+            )
             row["heldout"] = heldout
             if heldout["objective"] < best_eval["objective"]:
                 best_eval = dict(heldout)
@@ -1213,13 +1334,19 @@ def run_full(
         history.append(row)
         print(json.dumps(row, sort_keys=True), flush=True)
         if step in args.export_steps:
-            export_artifact(args, adapted, artifact_sha, reader.tensor_map, f"step-{step:03d}")
+            export_artifact(
+                args, adapted, artifact_sha, reader.tensor_map, f"step-{step:03d}", False, wrappers
+            )
     load_adapter_state(adapted, best_state)
-    best_export = export_artifact(args, adapted, artifact_sha, reader.tensor_map, f"best-step-{best_step:03d}")
+    best_export = export_artifact(
+        args, adapted, artifact_sha, reader.tensor_map, f"best-step-{best_step:03d}", False, wrappers
+    )
     total_seconds = time.monotonic() - started
     return {
         "mode": "full",
         "objective": "0.8*KL(teacher||p4) + 0.2*CE(p4,tokens) + 0.25*KL(teacher||p8)",
+        "teacher": "resident BF16 source model; pure torch DeltaNet; online no-grad logits",
+        "student_deltanet": {"backend": "FLA chunked", "validation": fla_delta},
         "steps": args.steps,
         "sequence_length": seq_len,
         "accumulate": args.accumulate,
@@ -1244,13 +1371,13 @@ def command_lines(args: argparse.Namespace) -> dict[str, str]:
         f"ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 "
         f"PYTORCH_HIP_ALLOC_CONF=expandable_segments:True python3 {script} --full "
         f"--device cuda --dtype bfloat16 --source {args.source} --artifact {args.artifact} "
-        f"--capture {FULL_CAPTURE_DEFAULT} --quantizer {args.quantizer}"
+        f"--capture {args.capture} --quantizer {args.quantizer}"
     )
     return {
         "mi300x_kill_experiment": common
-        + " --steps 100 --export-steps 0,50,100 --out /home/kaden/qcal/qat/l3/lora-kill-mi300x",
+        + f" --steps 100 --schedule-steps 500 --export-steps 0,50,100 --out {args.out}",
         "mi300x_full": common
-        + " --steps 500 --export-steps 0,50,100 --out /home/kaden/qcal/qat/l3/lora-full-mi300x",
+        + f" --steps 500 --schedule-steps 500 --export-steps 0,50,100 --out {args.out}",
     }
 
 
@@ -1298,6 +1425,7 @@ def main() -> int:
             "dropout": 0.0,
             "lr": args.lr,
             "warmup": args.warmup,
+            "schedule_steps": args.schedule_steps,
             "schedule": "linear warmup then cosine decay",
             "optimizer": "AdamW",
             "weight_decay": 0.0,

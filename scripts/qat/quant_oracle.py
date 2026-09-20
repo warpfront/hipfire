@@ -91,11 +91,19 @@ def _validate_z(z: torch.Tensor, multiple: int) -> tuple[int, int]:
     return K, T
 
 
-def _build_key() -> str:
+def _oracle_arch() -> str:
+    if torch.cuda.is_available():
+        value = getattr(torch.cuda.get_device_properties(0), "gcnArchName", "")
+        if value:
+            return value.split(":", 1)[0]
+    return os.environ.get("QAT_ORACLE_ARCH", "gfx1201")
+
+
+def _build_key(arch: str) -> str:
     digest = hashlib.sha256()
     for path in (_HIP_SOURCE, *_IMPORTED_SOURCES):
         digest.update(path.read_bytes())
-    digest.update(b"gfx1201-O3-v1")
+    digest.update(f"{arch}-O3-v2".encode())
     return digest.hexdigest()[:16]
 
 
@@ -103,7 +111,8 @@ def build_oracle(cache_dir: str | os.PathLike[str] = _DEFAULT_CACHE, force: bool
     """Build the training-only HIP launch library for gfx1201."""
     cache = Path(cache_dir)
     cache.mkdir(parents=True, exist_ok=True)
-    output = cache / f"quant_oracle_gfx1201_{_build_key()}.so"
+    arch = _oracle_arch()
+    output = cache / f"quant_oracle_{arch}_{_build_key(arch)}.so"
     if output.exists() and not force:
         return output
     hipcc = shutil.which("hipcc") or "/opt/rocm/core/bin/hipcc"
@@ -111,7 +120,7 @@ def build_oracle(cache_dir: str | os.PathLike[str] = _DEFAULT_CACHE, force: bool
         hipcc,
         "-O3",
         "-std=c++17",
-        "--offload-arch=gfx1201",
+        f"--offload-arch={arch}",
         "-shared",
         "-fPIC",
         str(_HIP_SOURCE),
@@ -331,6 +340,37 @@ def _a8_forward_cpu(z: torch.Tensor, source: str) -> tuple[torch.Tensor, dict[st
     }
 
 
+def _a8_forward_torch(z: torch.Tensor, source: str) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    K, T = _validate_z(z, 256)
+    token_major = z.transpose(0, 1).contiguous()
+    if source == "f16":
+        token_major = token_major.to(torch.float16).to(torch.float32)
+    elif source != "f32":
+        raise ValueError("A8 source must be 'f32' or 'f16'")
+    amax = token_major.abs().amax(dim=1)
+    scaled = amax * np.float32(1.0 / 224.0)
+    bits = scaled.view(torch.int32)
+    exponent = ((bits >> 23) & 0xFF) - 127 + ((bits & 0x7FFFFF) != 0).to(torch.int32)
+    exponent = exponent.clamp_(-31, 9)
+    scales = torch.ldexp(torch.ones_like(scaled), exponent)
+    scales = torch.where(amax > 0, scales, torch.ones_like(scales))
+    qs = (token_major / scales[:, None]).to(torch.float8_e4m3fn).view(torch.uint8)
+    raw_decoded = _decode_e4m3(qs)
+    decoded = raw_decoded * scales[:, None]
+    lanes = raw_decoded.reshape(T, K // 256, 2, 32, 4)
+    lanes = ((lanes[..., 0] + lanes[..., 1]) + lanes[..., 2]) + lanes[..., 3]
+    for offset in (16, 8, 4, 2, 1):
+        order = torch.arange(32, device=z.device) ^ offset
+        lanes = lanes + lanes.index_select(-1, order)
+    half_sums = lanes[..., 0]
+    return decoded.transpose(0, 1).contiguous(), {
+        "scale": scales,
+        "half_sums": half_sums,
+        "qs": qs.transpose(0, 1).contiguous(),
+        "qs_token_major": qs,
+    }
+
+
 def a8_forward(z: torch.Tensor, source: str = "f32") -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """Run the shipping E4M3 per-token power-of-two-to-224 pre-pass."""
     K, T = _validate_z(z, 256)
@@ -338,6 +378,8 @@ def a8_forward(z: torch.Tensor, source: str = "f32") -> tuple[torch.Tensor, dict
         raise ValueError("A8 source must be 'f32' or 'f16'")
     if not z.is_cuda:
         return _a8_forward_cpu(z, source)
+    if _oracle_arch() not in {"gfx1200", "gfx1201"}:
+        return _a8_forward_torch(z, source)
     token_major = z.transpose(0, 1).contiguous()
     if source == "f16":
         token_major = token_major.to(torch.float16)

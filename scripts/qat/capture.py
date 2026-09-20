@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """Deterministic corpus and layer-streamed Qwen3.8 teacher capture for QAT.
 
-The collector deliberately never places the complete 27B teacher on one GPU.
-It loads the embedding, one decoder block, final norm, or lm-head at a time and
-keeps block boundaries on disk.  Dense teacher logits are represented by a
-vocabulary-tiled recompute recipe because their BF16 materialization would
-exceed the capture disk budget.
+The MI300X collector keeps the complete BF16 teacher resident for one corpus
+pass, but stores only the six input/output boundaries needed by the three-block
+dry run.  Full-model training recomputes teacher logits online and never stores
+dense logits or a full per-layer boundary archive.
 """
 
 from __future__ import annotations
@@ -789,7 +788,7 @@ def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
         "observed_rocr_visible_devices": os.environ.get("ROCR_VISIBLE_DEVICES"),
         "observed_hip_visible_devices": os.environ.get("HIP_VISIBLE_DEVICES"),
     }
-    capture["producer_sample_count_per_block"] = args.producer_samples
+    capture["producer_sample_count_per_block"] = 0
     capture["batch_size"] = args.batch_size
     capture["blocks"] = {}
     capture["boundaries"] = {}
@@ -801,9 +800,23 @@ def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
     model = load_resident_model(args.source, device)
     language = model.language_model
     layers = language.layers
+    from transformers.models.qwen3_5 import modeling_qwen3_5
+
+    torch_deltanet_blocks = []
+    for block, layer in enumerate(layers):
+        if hasattr(layer, "linear_attn"):
+            layer.linear_attn.chunk_gated_delta_rule = modeling_qwen3_5.torch_chunk_gated_delta_rule
+            layer.linear_attn.recurrent_gated_delta_rule = modeling_qwen3_5.torch_recurrent_gated_delta_rule
+            torch_deltanet_blocks.append(block)
+    capture["teacher_deltanet_backend"] = {
+        "implementation": "transformers torch_chunk_gated_delta_rule",
+        "pure_torch": True,
+        "blocks": torch_deltanet_blocks,
+    }
     parameter_devices = sorted({str(parameter.device) for parameter in model.parameters()})
-    if parameter_devices != [str(device)]:
-        raise RuntimeError(f"teacher is not fully resident on {device}: {parameter_devices}")
+    expected_device = f"{device.type}:{torch.cuda.current_device()}"
+    if parameter_devices != [expected_device]:
+        raise RuntimeError(f"teacher is not fully resident on {expected_device}: {parameter_devices}")
     capture["resident_teacher"] = {
         "loader": "meta-init + safetensors.safe_open(device='cuda:0')",
         "dtype": "bfloat16",
@@ -817,15 +830,16 @@ def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
     }
 
     boundary_shape = (seq_count, seq_len, config.hidden_size)
+    validation_blocks = (0, 31, 60)
+    boundary_ids = sorted({value for block in validation_blocks for value in (block, block + 1)})
     boundary_tensors: dict[int, RawTensor] = {}
     boundary_hashers: dict[int, Any] = {}
-    for boundary in range(config.num_hidden_layers + 1):
+    for boundary in boundary_ids:
         path = tensors_dir / "boundaries" / f"boundary_{boundary:02d}.bf16"
         boundary_tensors[boundary] = RawTensor(path, boundary_shape, "bfloat16", "w+")
         boundary_hashers[boundary] = hashlib.sha256()
-    final_path = tensors_dir / "final_norm.bf16"
-    final = RawTensor(final_path, boundary_shape, "bfloat16", "w+")
-    final_digest = hashlib.sha256()
+    capture["stored_boundary_blocks"] = list(validation_blocks)
+    capture["stored_boundary_ids"] = boundary_ids
     current_batch = {"start": 0, "count": 0}
 
     def write_boundary(boundary: int, value: Any) -> None:
@@ -836,32 +850,20 @@ def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
         payload = boundary_tensors[boundary].write_torch(slice(start, stop), value)
         boundary_hashers[boundary].update(payload)
 
-    boundary_handles = [
-        layers[0].register_forward_pre_hook(
-            lambda _module, inputs: write_boundary(0, inputs[0])
-        )
-    ]
-    for block, layer in enumerate(layers):
+    boundary_handles = []
+    for block in validation_blocks:
         boundary_handles.append(
-            layer.register_forward_hook(
+            layers[block].register_forward_pre_hook(
+                lambda _module, inputs, boundary=block: write_boundary(boundary, inputs[0])
+            )
+        )
+        boundary_handles.append(
+            layers[block].register_forward_hook(
                 lambda _module, _inputs, output, boundary=block + 1: write_boundary(boundary, output)
             )
         )
 
-    samplers = [
-        ProducerSampler(
-            block,
-            args.out,
-            args.producer_samples,
-            config.hidden_size,
-            seq_count,
-            seq_len,
-            args.seed,
-        )
-        for block in range(config.num_hidden_layers)
-    ]
-    for sampler, layer in zip(samplers, layers, strict=True):
-        sampler.install(layer)
+    samplers: list[ProducerSampler] = []
 
     capture["status"] = "capturing_resident_batched"
     atomic_json(args.out / "manifest.json", manifest)
@@ -884,8 +886,6 @@ def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
                 use_cache=False,
                 return_dict=True,
             )
-            payload = final.write_torch(slice(start, stop), outputs.last_hidden_state)
-            final_digest.update(payload)
             print(f"resident batch {start:03d}:{stop:03d}/{seq_count}", flush=True)
             del ids, outputs
     torch.cuda.synchronize(device)
@@ -894,7 +894,6 @@ def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
         handle.remove()
     for tensor in boundary_tensors.values():
         tensor.flush()
-    final.flush()
 
     for boundary, tensor in boundary_tensors.items():
         capture["boundaries"][str(boundary)] = {
@@ -910,19 +909,13 @@ def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
                 else f"block-{boundary - 1} teacher y / block-{boundary} boundary h"
             ),
         }
-    producer_meta = [sampler.close() for sampler in samplers]
-    for sites in producer_meta:
-        for value in sites.values():
-            value["file"] = relative(Path(value["file"]), args.out)
-    capture["final_norm"] = {
-        "file": relative(final_path, args.out),
-        "shape": list(boundary_shape),
-        "axes": ["sequence", "token", "hidden"],
-        "dtype": "bfloat16-le",
-        "sha256": final_digest.hexdigest(),
-        "bytes": final_path.stat().st_size,
-        "wall_clock_seconds": 0.0,
-        "meaning": "canonical model final RMSNorm output",
+    producer_meta = [{} for _ in range(config.num_hidden_layers)]
+    capture["teacher_logits"] = {
+        "mode": "resident_online_no_grad",
+        "complete_dense_storage": False,
+        "stored_bytes": 0,
+        "logical_shape": [seq_count, seq_len, config.vocab_size],
+        "consumer": "scripts/qat/lora_qat.py resident teacher forward",
     }
     capture["resident_forward_wall_clock_seconds"] = forward_seconds
     capture["resident_forward_sequences_per_minute"] = seq_count * 60.0 / forward_seconds
@@ -930,7 +923,8 @@ def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
     atomic_json(args.out / "manifest.json", manifest)
 
     validation_sequence = int(args.validation_sequence)
-    for block, layer in enumerate(layers):
+    for block in validation_blocks:
+        layer = layers[block]
         block_started = time.monotonic()
         layer_device = next(layer.parameters()).device
         boundary = boundary_tensors[block]
@@ -987,11 +981,11 @@ def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
         print(f"validated block {block:02d}/63", flush=True)
     atomic_json(args.out / "manifest.json", manifest)
 
-    del model, language, layers, final
+    del model, language, layers
     boundary_tensors.clear()
     torch.cuda.empty_cache()
-    capture_teacher_logit_receipt(manifest, args, source, config, device)
-    build_tensor_records(manifest, args.out)
+    capture["tensor_shards"] = []
+    capture["tensor_shard_record_count"] = 0
     capture["status"] = "complete"
     completed_unix = time.time()
     capture["completed_unix"] = completed_unix
@@ -1001,7 +995,7 @@ def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
     capture["disk_bytes"] = capture_disk_bytes(manifest, args.out)
     capture["run_root_disk_bytes_including_siblings"] = disk_bytes(args.out)
     capture["dense_logit_materialization_bytes_bf16"] = seq_count * seq_len * config.vocab_size * 2
-    capture["dense_logit_storage_decision"] = "not materialized: vocabulary-tiled deterministic recompute from captured final_norm and immutable BF16 lm_head"
+    capture["dense_logit_storage_decision"] = "not materialized: resident BF16 teacher recompute in the training loop"
     atomic_json(args.out / "manifest.json", manifest)
     print(json.dumps({"manifest": str(args.out / "manifest.json"), "status": capture["status"], "wall_clock_seconds": capture["wall_clock_seconds"], "disk_bytes": capture["disk_bytes"], "resident_forward_sequences_per_minute": capture["resident_forward_sequences_per_minute"]}, indent=2))
     return manifest
@@ -1161,9 +1155,7 @@ def capture_disk_bytes(manifest: dict[str, Any], out: Path) -> int:
     files = {manifest["corpus"][name]["file"] for name in ("token_stream", "attention_mask", "positions")}
     files.update(meta["file"] for meta in capture["boundaries"].values())
     for block in capture["blocks"].values():
-        files.update(meta["file"] for meta in block["producer_sites"].values())
-    files.add(capture["final_norm"]["file"])
-    files.add(capture["teacher_logits"]["receipt"]["file"])
+        files.update(meta["file"] for meta in block.get("producer_sites", {}).values())
     return sum((out / path).stat().st_size for path in files)
 
 
@@ -1309,7 +1301,7 @@ def parser() -> argparse.ArgumentParser:
     corpus.add_argument("--c4-scan-docs", type=int, default=100_000)
     corpus.set_defaults(func=select_corpus)
 
-    capture = sub.add_parser("capture", help="capture all layer boundaries, producer samples, and logit recipe")
+    capture = sub.add_parser("capture", help="capture sparse dry-run boundaries with a resident teacher")
     capture.add_argument("--source", type=Path, default=DEFAULT_SOURCE)
     capture.add_argument("--out", type=Path, default=DEFAULT_OUT)
     capture.add_argument("--device", default="cuda")
