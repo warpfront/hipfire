@@ -2168,6 +2168,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Fuse the int4 activation quantiser into fused_silu_mul_mq_rotate_awq on gfx1201 (default on exact gfx1201; set to false or HIPFIRE_GFX12_SILU_QUANT_FUSED=0 to opt out; emits block_i4_128 from the down-proj SwiGLU/FWHT producer so the standalone quantize_int4_mmq_ds128 launch disappears, bit-identical)."
     ),
     process_bool_field!(
+        "kernel.gfx12_fp8_gateup_out",
+        "gfx12_fp8_gateup_out",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_FP8_GATEUP_OUT",
+        "Emit separate unscaled E4M3FN gate/up rows from the gfx1201 IU4 GEMM epilogue and consume them in the fused SwiGLU/AWQ/FWHT/int4 producer (experimental, default off)."
+    ),
+    process_bool_field!(
         "kernel.gfx12_producer_quant_fused",
         "gfx12_producer_quant_fused",
         Kernel,

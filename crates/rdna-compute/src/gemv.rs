@@ -3708,6 +3708,51 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.fused_silu_mul_rotate_mq_i4_gfx12_batched_impl(
+            gate, up, awq, x_rot, reservation, k, batch_size, false,
+        )
+    }
+
+    /// Variant A of the gfx1201 producer: separate unscaled OCP E4M3FN gate
+    /// and up rows are decoded in pairs, then the incumbent
+    /// SwiGLU/AWQ/FWHT/MSE-int4 path runs unchanged.
+    pub fn fused_silu_mul_rotate_mq_fp8_i4_gfx12_batched(
+        &mut self,
+        gate_fp8: &GpuTensor,
+        up_fp8: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        if gate_fp8.dtype != DType::Raw
+            || up_fp8.dtype != DType::Raw
+            || gate_fp8.byte_size() < k * batch_size
+            || up_fp8.byte_size() < k * batch_size
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused_silu_mul_rotate_mq_fp8_i4_gfx12_batched: fp8 scratch dtype/extent mismatch",
+            ));
+        }
+        self.fused_silu_mul_rotate_mq_i4_gfx12_batched_impl(
+            gate_fp8, up_fp8, awq, x_rot, reservation, k, batch_size, true,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn fused_silu_mul_rotate_mq_i4_gfx12_batched_impl(
+        &mut self,
+        gate: &GpuTensor,
+        up: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+        fp8_input: bool,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
         self.bind_thread()?;
         if reservation.k() != k || reservation.n() != batch_size {
             return Err(hip_bridge::HipError::new(
@@ -3716,13 +3761,23 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let (module, source, kernel) = match (awq.is_some(), fp8_input) {
+            (true, true) => (
+                "fused_silu_mul_mq_rotate_awq_fp8_i4_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_I4_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_awq_fp8_i4_gfx12",
+            ),
+            (false, true) => (
+                "fused_silu_mul_mq_rotate_fp8_i4_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_FP8_I4_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_fp8_i4_gfx12",
+            ),
+            (true, false) => (
                 "fused_silu_mul_mq_rotate_awq_i4_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_i4_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "fused_silu_mul_mq_rotate_i4_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_i4_gfx12",
@@ -3768,17 +3823,15 @@ impl Gpu {
             ]
         };
         let blocks_k = k / 128;
-        let bytes = (k * 4 * 3 + 2 * 256 * 4 + blocks_k * 72) * batch_size;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            if awq.is_some() {
-                "fused_silu_mul_mq_rotate_awq_i4_gfx12_batched"
-            } else {
-                "fused_silu_mul_mq_rotate_i4_gfx12_batched"
-            },
-            bytes,
-        );
+        let input_bytes = if fp8_input { k * 2 } else { k * 4 * 2 };
+        let bytes = (input_bytes + 2 * 256 * 4 + blocks_k * 72) * batch_size;
+        let profile_name = match (awq.is_some(), fp8_input) {
+            (true, true) => "fused_silu_mul_mq_rotate_awq_fp8_i4_gfx12_batched",
+            (false, true) => "fused_silu_mul_mq_rotate_fp8_i4_gfx12_batched",
+            (true, false) => "fused_silu_mul_mq_rotate_awq_i4_gfx12_batched",
+            (false, false) => "fused_silu_mul_mq_rotate_i4_gfx12_batched",
+        };
+        let timer = crate::profile::begin_timer(&self.hip, "fused", profile_name, bytes);
         let result = self.launch_maybe_blob(
             kernel,
             [n_groups, batch_size as u32, 1],

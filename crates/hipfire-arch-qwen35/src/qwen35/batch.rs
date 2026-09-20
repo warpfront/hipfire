@@ -62,6 +62,11 @@ pub struct PrefillBatchScratch {
     // FFN intermediates [N × hidden_dim]
     pub gate_ffn_batch: GpuTensor,
     pub up_batch: GpuTensor,
+    // Byte-dtype aliases over the first N*hidden_dim bytes of the F32 owners
+    // above. Variant A writes/reads E4M3FN through these aliases. They are
+    // non-owning and MUST NOT be freed separately.
+    pub gate_ffn_fp8_batch: GpuTensor,
+    pub up_fp8_batch: GpuTensor,
     // SwiGLU output (FWHT-rotated for MQ4) feeding w_down.
     pub ffn_hidden_batch: GpuTensor,
 
@@ -431,6 +436,18 @@ impl PrefillBatchScratch {
                 .collect::<Vec<_>>()
                 .into_boxed_slice()
         });
+        let gate_ffn_batch = take!(i_gate_ffn_batch);
+        let up_batch = take!(i_up_batch);
+        let gate_ffn_fp8_batch = GpuTensor {
+            buf: unsafe { gate_ffn_batch.buf.alias() },
+            shape: vec![max_batch * hidden_dim],
+            dtype: DType::Raw,
+        };
+        let up_fp8_batch = GpuTensor {
+            buf: unsafe { up_batch.buf.alias() },
+            shape: vec![max_batch * hidden_dim],
+            dtype: DType::Raw,
+        };
         Ok(Self {
             max_batch,
             x_batch: take!(i_x_batch),
@@ -447,8 +464,10 @@ impl PrefillBatchScratch {
             dn_k_batch: take!(i_dn_k_batch),
             dn_attn_out_batch: take!(i_dn_attn_out_batch),
             dn_normed_batch: take!(i_dn_normed_batch),
-            gate_ffn_batch: take!(i_gate_ffn_batch),
-            up_batch: take!(i_up_batch),
+            gate_ffn_batch,
+            up_batch,
+            gate_ffn_fp8_batch,
+            up_fp8_batch,
             ffn_hidden_batch: take!(i_ffn_hidden_batch),
             dn_normed_rot_batch: take!(i_dn_normed_rot_batch),
             positions: take!(i_positions),

@@ -245,6 +245,11 @@ pub struct FeatureFlags {
     /// `quantize_int4_mmq_ds128` launch for the down-proj input.
     /// Bit-identical vs the silu+quantizer chain; any byte difference kills it.
     pub gfx12_silu_quant_fused: bool,
+    /// Experimental gfx1201 IU4 gate/up f32-store replacement: each GEMM
+    /// writes a separate unscaled E4M3FN row and the SwiGLU producer decodes
+    /// those bytes before the incumbent AWQ/FWHT/MSE-int4 recipe. Default OFF
+    /// until both KLD routes and paired daemon gates pass.
+    pub gfx12_fp8_gateup_out: bool,
     /// gfx1201 RMSNorm/rotate/gated-norm + int4 quant fusions (slices 2-4:
     /// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`, `kernel.gfx12_producer_quant_fused`).
     /// Default ON on exact gfx1201; `=0` opts out to the standalone
@@ -651,6 +656,8 @@ impl FeatureFlags {
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")),
             gfx12_silu_quant_fused: parse_bool("HIPFIRE_GFX12_SILU_QUANT_FUSED")
                 .unwrap_or(arch == "gfx1201"),
+            gfx12_fp8_gateup_out: parse_bool("HIPFIRE_GFX12_FP8_GATEUP_OUT")
+                .unwrap_or(false),
             gfx12_producer_quant_fused: parse_bool("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED")
                 .unwrap_or(arch == "gfx1201"),
             gfx11_producer_quant_fused: parse_bool("HIPFIRE_GFX11_PRODUCER_QUANT_FUSED")
@@ -819,6 +826,10 @@ impl FeatureFlags {
     pub fn gfx12_silu_quant_fused_enabled(&self) -> bool {
         self.gfx12_silu_quant_fused && self.arch == "gfx1201"
     }
+    /// True only on exact gfx1201 while the experimental gate is enabled.
+    pub fn gfx12_fp8_gateup_out_enabled(&self) -> bool {
+        self.gfx12_fp8_gateup_out && self.arch == "gfx1201"
+    }
     /// True only on exact gfx1201 with the opt-in set. The `_gfx12`
     /// RMSNorm/rotate/gated-norm producers emit the shared `block_i4_128`
     /// recipe, so output is bit-identical to the standalone
@@ -981,6 +992,7 @@ impl FeatureFlags {
             gfx12_gdn_chunk_scan: false,
             gfx12_silu_quant_fused: false,
             gfx12_producer_quant_fused: false,
+            gfx12_fp8_gateup_out: false,
             gfx11_producer_quant_fused: false,
             gfx12_fp8_stream: false,
             residual_ldsstage: false,

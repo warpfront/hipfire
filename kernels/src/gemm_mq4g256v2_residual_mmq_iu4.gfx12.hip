@@ -269,12 +269,15 @@ static __device__ __forceinline__ void iu4_bundle(
 }
 
 // Shared compute body for residual / full_add / full_set. `ADD` selects
-// += (residual) vs = (set) writeback.
-template <bool ADD>
+// += (residual) vs = (set) writeback. `FP8_OUT` changes only the final
+// writeback: the exact same f32 accumulator is rounded once to OCP E4M3FN.
+// It is intentionally SET-only; the fp8 gate/up scratch has no meaningful
+// residual-add operation.
+template <bool ADD, bool FP8_OUT = false>
 static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_body(
     const char*           __restrict__ A,   // [M × groups_per_row × 136]
     const block_i4_128*   __restrict__ Xq,  // [K/128 × N]
-    float*                __restrict__ Y,   // [N × M] column-major
+    void*                 __restrict__ Y,   // f32 [N × M], or E4M3 bytes when FP8_OUT
     int M, int K, int N
 ) {
     const int tid = threadIdx.x;
@@ -606,13 +609,8 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     float* slots = (float*)LDS;
     const int store_i = tid & 15;
     const int store_x = (tid >> 4) & 15;
-    const unsigned store_lane_off =
-        ((unsigned)store_x * (unsigned)M + (unsigned)store_i) * sizeof(float);
-    float* const y_tile = Y + (long long)bs * M + rs;
-    const auto y_tile_rsrc = __builtin_amdgcn_make_buffer_rsrc(
-        y_tile, 0, 0xffffffffu, 0x31004000u);
-    const bool full_tile = rs + IU4_BN <= M && bs + IU4_BM <= N;
-    if (full_tile) {
+    if constexpr (FP8_OUT) {
+        const bool full_tile = rs + IU4_BN <= M && bs + IU4_BM <= N;
         #pragma unroll
         for (int rg = 0; rg < 2; rg++) {
             #pragma unroll
@@ -628,55 +626,100 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     const int h = k & 1;
                     const int owner = (p << 1) | h;
                     const float v = slots[(unsigned)(owner * 320 + store_i * 20 + store_x)];
-                    const unsigned phase_off =
-                        ((unsigned)(h * 64 + nb * 16) * (unsigned)M
-                            + (unsigned)(p * 32 + rg * 16)) * sizeof(float);
-                    if constexpr (ADD) {
-                        const unsigned old_bits = __builtin_amdgcn_raw_buffer_load_b32(
-                            y_tile_rsrc, store_lane_off, phase_off, 0);
-                        const float out = __builtin_bit_cast(float, old_bits) + v;
-                        __builtin_amdgcn_raw_buffer_store_b32(
-                            __builtin_bit_cast(unsigned, out),
-                            y_tile_rsrc, store_lane_off, phase_off, 0);
-                    } else {
-                        __builtin_amdgcn_raw_buffer_store_b32(
-                            __builtin_bit_cast(unsigned, v),
-                            y_tile_rsrc, store_lane_off, phase_off, 0);
+                    const int row_rel = p * 32 + rg * 16 + store_i;
+                    const int col_rel = h * 64 + nb * 16 + store_x;
+                    // Adjacent lanes own adjacent output rows. Pack each
+                    // even/odd pair with one native RNE conversion and let
+                    // the even lane issue the contiguous 2-byte store.
+                    const float mate = __shfl_xor(v, 1);
+                    if ((store_i & 1) == 0) {
+                        unsigned pack = 0u;
+                        pack = __builtin_amdgcn_cvt_pk_fp8_f32(v, mate, pack, false);
+                        unsigned char* yp = (unsigned char*)Y
+                            + (long long)(bs + col_rel) * M + rs + row_rel;
+                        if (full_tile || (bs + col_rel < N && rs + row_rel + 1 < M)) {
+                            *(unsigned short*)yp = (unsigned short)pack;
+                        } else if (bs + col_rel < N && rs + row_rel < M) {
+                            *yp = (unsigned char)pack;
+                        }
                     }
                 }
                 __syncthreads();
             }
         }
     } else {
-        #pragma unroll
-        for (int rg = 0; rg < 2; rg++) {
+        const unsigned store_lane_off =
+            ((unsigned)store_x * (unsigned)M + (unsigned)store_i) * sizeof(float);
+        float* const y_tile = (float*)Y + (long long)bs * M + rs;
+        const auto y_tile_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+            y_tile, 0, 0xffffffffu, 0x31004000u);
+        const bool full_tile = rs + IU4_BN <= M && bs + IU4_BM <= N;
+        if (full_tile) {
             #pragma unroll
-            for (int nb = 0; nb < 4; nb++) {
+            for (int rg = 0; rg < 2; rg++) {
                 #pragma unroll
-                for (int j = 0; j < 8; j++) {
-                    slots[(unsigned)(wave * 320 + (8 * k_grp + j) * 20 + m_lane)] = acc[nb][rg][j];
-                }
-                __syncthreads();
-                #pragma unroll
-                for (int k = 0; k < 8; k++) {
-                    const int p = k >> 1;    // row-pair 0..3
-                    const int h = k & 1;     // token-half 0..1
-                    const int row_rel = p * 32 + rg * 16 + store_i;
-                    const int col_rel = h * 64 + nb * 16 + store_x;
-                    const int owner = (p << 1) | h;
-                    const float v = slots[(unsigned)(owner * 320 + store_i * 20 + store_x)];
-                    const int row = rs + row_rel;
-                    const int col = bs + col_rel;
-                    if (row < M && col < N) {
-                        float* yp = Y + (long long)col * M + row;
+                for (int nb = 0; nb < 4; nb++) {
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        slots[(unsigned)(wave * 320 + (8 * k_grp + j) * 20 + m_lane)] = acc[nb][rg][j];
+                    }
+                    __syncthreads();
+                    #pragma unroll
+                    for (int k = 0; k < 8; k++) {
+                        const int p = k >> 1;
+                        const int h = k & 1;
+                        const int owner = (p << 1) | h;
+                        const float v = slots[(unsigned)(owner * 320 + store_i * 20 + store_x)];
+                        const unsigned phase_off =
+                            ((unsigned)(h * 64 + nb * 16) * (unsigned)M
+                                + (unsigned)(p * 32 + rg * 16)) * sizeof(float);
                         if constexpr (ADD) {
-                            *yp += v;
+                            const unsigned old_bits = __builtin_amdgcn_raw_buffer_load_b32(
+                                y_tile_rsrc, store_lane_off, phase_off, 0);
+                            const float out = __builtin_bit_cast(float, old_bits) + v;
+                            __builtin_amdgcn_raw_buffer_store_b32(
+                                __builtin_bit_cast(unsigned, out),
+                                y_tile_rsrc, store_lane_off, phase_off, 0);
                         } else {
-                            *yp = v;
+                            __builtin_amdgcn_raw_buffer_store_b32(
+                                __builtin_bit_cast(unsigned, v),
+                                y_tile_rsrc, store_lane_off, phase_off, 0);
                         }
                     }
+                    __syncthreads();
                 }
-                __syncthreads();
+            }
+        } else {
+            #pragma unroll
+            for (int rg = 0; rg < 2; rg++) {
+                #pragma unroll
+                for (int nb = 0; nb < 4; nb++) {
+                    #pragma unroll
+                    for (int j = 0; j < 8; j++) {
+                        slots[(unsigned)(wave * 320 + (8 * k_grp + j) * 20 + m_lane)] = acc[nb][rg][j];
+                    }
+                    __syncthreads();
+                    #pragma unroll
+                    for (int k = 0; k < 8; k++) {
+                        const int p = k >> 1;
+                        const int h = k & 1;
+                        const int row_rel = p * 32 + rg * 16 + store_i;
+                        const int col_rel = h * 64 + nb * 16 + store_x;
+                        const int owner = (p << 1) | h;
+                        const float v = slots[(unsigned)(owner * 320 + store_i * 20 + store_x)];
+                        const int row = rs + row_rel;
+                        const int col = bs + col_rel;
+                        if (row < M && col < N) {
+                            float* yp = (float*)Y + (long long)col * M + row;
+                            if constexpr (ADD) {
+                                *yp += v;
+                            } else {
+                                *yp = v;
+                            }
+                        }
+                    }
+                    __syncthreads();
+                }
             }
         }
     }
@@ -691,10 +734,10 @@ void gemm_mq4g256v2_residual_mmq_iu4(
     int M, int K, int N, int add
 ) {
     if (add) {
-        gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<true>(A, Xq, Y, M, K, N);
+        gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<true, false>(A, Xq, Y, M, K, N);
     } else {
-        gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<false>(A, Xq, Y, M, K, N);
-    }
+        gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<false, false>(A, Xq, Y, M, K, N);
+}
 }
 
 extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
@@ -704,7 +747,7 @@ void gemm_mq4g256v2_residual_mmq_iu4_full_add(
     float*                __restrict__ Y,
     int M, int K, int N, int
 ) {
-    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<true>(A, Xq, Y, M, K, N);
+    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<true, false>(A, Xq, Y, M, K, N);
 }
 
 extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
@@ -714,7 +757,20 @@ void gemm_mq4g256v2_residual_mmq_iu4_full_set(
     float*                __restrict__ Y,
     int M, int K, int N, int
 ) {
-    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<false>(A, Xq, Y, M, K, N);
+    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<false, false>(A, Xq, Y, M, K, N);
+}
+
+// Variant A: gate/up SET epilogue. Same GEMM arithmetic and tile as the f32
+// symbol; only the terminal store rounds each exact f32 result to one OCP
+// E4M3FN byte. No int4 quantization and no FWHT occur here.
+extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2) __attribute__((amdgpu_num_vgpr(202)))
+void gemm_mq4g256v2_residual_mmq_iu4_full_set_fp8(
+    const char*           __restrict__ A,
+    const block_i4_128*   __restrict__ Xq,
+    unsigned char*        __restrict__ Y,
+    int M, int K, int N, int
+) {
+    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<false, true>(A, Xq, Y, M, K, N);
 }
 
 #else
@@ -731,6 +787,10 @@ extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add(
 
 extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set(
     const char*, const void*, float*, int, int, int, int
+) {}
+
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_fp8(
+    const char*, const void*, unsigned char*, int, int, int, int
 ) {}
 
 #endif

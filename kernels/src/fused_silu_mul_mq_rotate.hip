@@ -26,11 +26,35 @@
 #define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate
 #endif
 
+#ifdef HIPFIRE_GATE_UP_FP8
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1201__)
+#error "HIPFIRE_GATE_UP_FP8 requires gfx1201 native OCP E4M3 decode"
+#endif
+typedef unsigned char hipfire_gate_up_elem_t;
+typedef float hipfire_gate_up_f32x2_t __attribute__((ext_vector_type(2)));
+typedef float hipfire_gate_up_f32x8_t __attribute__((ext_vector_type(8)));
+static __device__ __forceinline__ hipfire_gate_up_f32x8_t hipfire_gate_up_load8(
+    const unsigned char* p
+) {
+    const unsigned w0 = *(const unsigned*)(p);
+    const unsigned w1 = *(const unsigned*)(p + 4);
+    const hipfire_gate_up_f32x2_t p01 = __builtin_amdgcn_cvt_pk_f32_fp8(w0, 0);
+    const hipfire_gate_up_f32x2_t p23 = __builtin_amdgcn_cvt_pk_f32_fp8(w0, 1);
+    const hipfire_gate_up_f32x2_t p45 = __builtin_amdgcn_cvt_pk_f32_fp8(w1, 0);
+    const hipfire_gate_up_f32x2_t p67 = __builtin_amdgcn_cvt_pk_f32_fp8(w1, 1);
+    return (hipfire_gate_up_f32x8_t){
+        p01[0], p01[1], p23[0], p23[1], p45[0], p45[1], p67[0], p67[1]
+    };
+}
+#else
+typedef float hipfire_gate_up_elem_t;
+#endif
+
 #if defined(__gfx1030__) && !defined(HIPFIRE_IU4_SIDECAR)
 extern "C" __launch_bounds__(32)
 __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
+    const hipfire_gate_up_elem_t* __restrict__ gate,
+    const hipfire_gate_up_elem_t* __restrict__ up,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
     float* __restrict__ x_rot,
@@ -45,8 +69,8 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     // and blockIdx.y = 0 (byte-identical to pre-batching). For prefill,
     // grid=[groups_total, N, 1]; gate, up, and x_rot are [N × K] row-major.
     const long long batch_off = (long long)blockIdx.y * K;
-    const float* gate_b  = gate  + batch_off;
-    const float* up_b    = up    + batch_off;
+    const hipfire_gate_up_elem_t* gate_b = gate + batch_off;
+    const hipfire_gate_up_elem_t* up_b   = up   + batch_off;
           float* x_rot_b = x_rot + batch_off;
 
     int d0 = tid * 8;
@@ -98,8 +122,8 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
 #else
 extern "C" __launch_bounds__(32, 16)
 __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
-    const float* __restrict__ gate,
-    const float* __restrict__ up,
+    const hipfire_gate_up_elem_t* __restrict__ gate,
+    const hipfire_gate_up_elem_t* __restrict__ up,
     const float* __restrict__ signs1,
     const float* __restrict__ signs2,
 #ifdef HIPFIRE_IU4_SIDECAR
@@ -121,8 +145,8 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     // and blockIdx.y = 0 (byte-identical to pre-batching). For prefill,
     // grid=[groups_total, N, 1]; gate, up, and x_rot are [N × K] row-major.
     const long long batch_off = (long long)blockIdx.y * K;
-    const float* gate_b  = gate  + batch_off;
-    const float* up_b    = up    + batch_off;
+    const hipfire_gate_up_elem_t* gate_b = gate + batch_off;
+    const hipfire_gate_up_elem_t* up_b   = up   + batch_off;
 #ifdef HIPFIRE_IU4_SIDECAR
           float* x_rot_b = (x_rot != nullptr) ? (x_rot + batch_off) : nullptr;
 #else
@@ -135,6 +159,18 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     // Phase 1: read gate + up, compute silu(gate)*up, apply signs1.
     // silu(z) = z / (1 + exp(-z)).
     #define SILU_MUL(g, u) ((g) / (1.0f + expf(-(g))) * (u))
+#ifdef HIPFIRE_GATE_UP_FP8
+    const hipfire_gate_up_f32x8_t gv = hipfire_gate_up_load8(gate_b + base);
+    const hipfire_gate_up_f32x8_t uv = hipfire_gate_up_load8(up_b + base);
+    float g0 = gv[0]; float u0 = uv[0];
+    float g1 = gv[1]; float u1 = uv[1];
+    float g2 = gv[2]; float u2 = uv[2];
+    float g3 = gv[3]; float u3 = uv[3];
+    float g4 = gv[4]; float u4 = uv[4];
+    float g5 = gv[5]; float u5 = uv[5];
+    float g6 = gv[6]; float u6 = uv[6];
+    float g7 = gv[7]; float u7 = uv[7];
+#else
     float g0 = gate_b[base];     float u0 = up_b[base];
     float g1 = gate_b[base + 1]; float u1 = up_b[base + 1];
     float g2 = gate_b[base + 2]; float u2 = up_b[base + 2];
@@ -143,6 +179,7 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     float g5 = gate_b[base + 5]; float u5 = up_b[base + 5];
     float g6 = gate_b[base + 6]; float u6 = up_b[base + 6];
     float g7 = gate_b[base + 7]; float u7 = up_b[base + 7];
+#endif
 
     float v0 = SILU_MUL(g0, u0) * signs1[d0];
     float v1 = SILU_MUL(g1, u1) * signs1[d0 + 1];

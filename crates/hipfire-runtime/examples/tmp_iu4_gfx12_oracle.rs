@@ -30,6 +30,7 @@ const IU4_GFX12_SRC: &str = concat!(
 const MODULE: &str = "tmp_iu4_gfx12_oracle";
 const SET_SYM: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_set";
 const ADD_SYM: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_add";
+const FP8_SET_SYM: &str = "gemm_mq4g256v2_residual_mmq_iu4_full_set_fp8";
 
 const QT_MQ4V2: u8 = 44;
 const GATE_NAME: &str = "model.language_model.layers.0.mlp.gate_proj.weight";
@@ -98,6 +99,57 @@ fn f16_to_f32(b: u16) -> f32 {
         (s << 31) | (((e - 15 + 127) as u32) << 23) | (m << 13)
     };
     f32::from_bits(bits)
+}
+/// OCP E4M3FN round-to-nearest-even. Positive finite codes are monotonic, so
+/// a seven-step binary search is exact and cheap enough for full GEMM output.
+fn e4m3_decode(bits: u8) -> f32 {
+    let sign = if bits & 0x80 != 0 { -1.0f32 } else { 1.0 };
+    let exp = (bits >> 3) & 0x0f;
+    let mant = bits & 0x07;
+    if exp == 0 {
+        return sign * (mant as f32) * (2.0f32).powi(-9);
+    }
+    if exp == 0x0f && mant == 0x07 {
+        return f32::NAN.copysign(sign);
+    }
+    sign * (1.0 + (mant as f32) / 8.0) * (2.0f32).powi(exp as i32 - 7)
+}
+
+fn e4m3_rne(x: f32) -> u8 {
+    if x.is_nan() {
+        return 0x7f;
+    }
+    let sign = if x.is_sign_negative() { 0x80 } else { 0 };
+    let ax = x.abs();
+    if ax >= 448.0 {
+        return sign | 0x7e;
+    }
+    let mut lo = 0u8;
+    let mut hi = 0x7e;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if e4m3_decode(mid) < ax {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    if lo == 0 {
+        return sign;
+    }
+    let lower = lo - 1;
+    let lower_err = ax - e4m3_decode(lower);
+    let upper_err = e4m3_decode(lo) - ax;
+    let code = if lower_err < upper_err {
+        lower
+    } else if upper_err < lower_err {
+        lo
+    } else if lower & 1 == 0 {
+        lower
+    } else {
+        lo
+    };
+    sign | code
 }
 
 fn pack_mq4g256v2_synth(m: usize, k: usize, salt: u32) -> Vec<u8> {
@@ -290,7 +342,7 @@ fn run_case(
 ) -> bool {
     assert_eq!(k % 256, 0, "{label}: K={k} not multiple of 256");
     let sym = if add { ADD_SYM } else { SET_SYM };
-    for s in [SET_SYM, ADD_SYM] {
+    for s in [SET_SYM, ADD_SYM, FP8_SET_SYM] {
         gpu.ensure_kernel_public(MODULE, IU4_GFX12_SRC, s)
             .unwrap_or_else(|e| panic!("JIT {s}: {e}"));
     }
@@ -348,6 +400,35 @@ fn run_case(
     };
     let y_ref = cpu_ref(a_bytes, &xq, &y0, m, k, n, rows.as_deref());
     let (eq_cpu, mism_cpu) = bitwise_eq(&y1, &y_ref, rows.as_deref(), m);
+    // New epilogue oracle: the SET kernel must be exactly the incumbent f32
+    // kernel followed by host OCP E4M3FN RNE, byte for byte.
+    let fp8_out_ok = if !add {
+        let zeros = vec![0u8; y_elems];
+        let d_y8 = gpu.upload_raw(&zeros, &[y_elems]).expect("upload Y8");
+        let y8_ptr = d_y8.buf.as_ptr() as *const std::ffi::c_void;
+        launch_iu4(gpu, FP8_SET_SYM, a_ptr, xq_ptr as *const _, y8_ptr, m, k, n, false);
+        gpu.hip.device_synchronize().expect("sync fp8 output");
+        let y8 = dtoh_raw(gpu, d_y8.buf.as_ptr(), y_elems);
+        let mut mism = 0usize;
+        for (i, (&got, &want_f32)) in y8.iter().zip(y1.iter()).enumerate() {
+            let want = e4m3_rne(want_f32);
+            if got != want {
+                mism += 1;
+                if mism <= 4 {
+                    eprintln!(
+                        "  fp8 mism[{i}] col={} row={}: gpu=0x{got:02x} host=0x{want:02x} f32={want_f32:e}",
+                        i / m,
+                        i % m,
+                    );
+                }
+            }
+        }
+        let _ = gpu.free_tensor(d_y8);
+        eprintln!("{label}: fp8_output_exact={} (mism={mism})", if mism == 0 { "OK" } else { "FAIL" });
+        mism == 0
+    } else {
+        true
+    };
 
     // 3. vs shipped fp8 route (N%64 only).
     let mut fp8_stat = String::from("n/a");
@@ -376,7 +457,7 @@ fn run_case(
         let _ = gpu.free_tensor(d_yf);
     }
 
-    let ok = eq_cpu && eq_rep;
+    let ok = eq_cpu && eq_rep && fp8_out_ok;
     eprintln!(
         "{label}: cpu_bitwise={} (mism={mism_cpu}) repeat_identical={} (mism={mism_rep}) fp8[{fp8_stat}] {}",
         if eq_cpu { "OK" } else { "FAIL" },
@@ -391,6 +472,91 @@ fn run_case(
 }
 
 /// GPU-event us/call: warmup then 100 timed launches, median. Returns
+fn run_fp8_producer_oracle(gpu: &mut Gpu, awq_enabled: bool) -> bool {
+    let k = 1024usize;
+    let n = 128usize;
+    let mut gate_codes = Vec::with_capacity(k * n);
+    let mut up_codes = Vec::with_capacity(k * n);
+    for i in 0..k * n {
+        gate_codes.push(e4m3_rne(prng_f32(i, 0xF8A0_1001) * 3.5));
+        up_codes.push(e4m3_rne(prng_f32(i, 0xF8A0_2002) * 3.5));
+    }
+    let gate_f32: Vec<f32> = gate_codes.iter().copied().map(e4m3_decode).collect();
+    let up_f32: Vec<f32> = up_codes.iter().copied().map(e4m3_decode).collect();
+    let d_gate_f32 = gpu.upload_f32(&gate_f32, &[n, k]).expect("upload gate f32");
+    let d_up_f32 = gpu.upload_f32(&up_f32, &[n, k]).expect("upload up f32");
+    let d_gate_fp8 = gpu.upload_raw(&gate_codes, &[n, k]).expect("upload gate fp8");
+    let d_up_fp8 = gpu.upload_raw(&up_codes, &[n, k]).expect("upload up fp8");
+    let d_awq = if awq_enabled {
+        let scales: Vec<f32> =
+            (0..k).map(|i| 0.75 + 0.5 * (i % 97) as f32 / 96.0).collect();
+        Some(gpu.upload_f32(&scales, &[k]).expect("upload awq"))
+    } else {
+        None
+    };
+
+    let reservation = gpu.reserve_int4_mmq(k, n).expect("reserve incumbent i4");
+    let incumbent = gpu
+        .fused_silu_mul_rotate_mq_i4_gfx12_batched(
+            &d_gate_f32,
+            &d_up_f32,
+            d_awq.as_ref(),
+            None,
+            reservation,
+            k,
+            n,
+        )
+        .expect("incumbent producer");
+    gpu.hip.device_synchronize().expect("sync incumbent producer");
+    let (generation, live_ptr) = gpu.scratch.int4_mmq_live();
+    let incumbent_ptr =
+        incumbent.checked_ptr(generation, live_ptr, k, n).expect("incumbent prepared ptr");
+    let sidecar_bytes = (k / 128) * n * 72;
+    let incumbent_bytes = dtoh_raw(gpu, incumbent_ptr, sidecar_bytes);
+
+    let reservation = gpu.reserve_int4_mmq(k, n).expect("reserve fp8 i4");
+    let candidate = gpu
+        .fused_silu_mul_rotate_mq_fp8_i4_gfx12_batched(
+            &d_gate_fp8,
+            &d_up_fp8,
+            d_awq.as_ref(),
+            None,
+            reservation,
+            k,
+            n,
+        )
+        .expect("fp8 producer");
+    gpu.hip.device_synchronize().expect("sync fp8 producer");
+    let (generation, live_ptr) = gpu.scratch.int4_mmq_live();
+    let candidate_ptr =
+        candidate.checked_ptr(generation, live_ptr, k, n).expect("candidate prepared ptr");
+    let candidate_bytes = dtoh_raw(gpu, candidate_ptr, sidecar_bytes);
+
+    let mut mism = 0usize;
+    for (i, (&got, &want)) in candidate_bytes.iter().zip(incumbent_bytes.iter()).enumerate() {
+        if got != want {
+            mism += 1;
+            if mism <= 4 {
+                eprintln!("  producer mism[{i}]: fp8=0x{got:02x} incumbent=0x{want:02x}");
+            }
+        }
+    }
+    eprintln!(
+        "fp8 producer{}: incumbent_sidecar_exact={} (mism={mism})",
+        if awq_enabled { "/awq" } else { "" },
+        if mism == 0 { "OK" } else { "FAIL" },
+    );
+
+    let _ = gpu.free_tensor(d_gate_f32);
+    let _ = gpu.free_tensor(d_up_f32);
+    let _ = gpu.free_tensor(d_gate_fp8);
+    let _ = gpu.free_tensor(d_up_fp8);
+    if let Some(t) = d_awq {
+        let _ = gpu.free_tensor(t);
+    }
+    mism == 0
+}
+
 /// (median_us, tops_vs_539.7).
 fn time_case(
     gpu: &mut Gpu,
@@ -402,7 +568,7 @@ fn time_case(
     add: bool,
 ) {
     let sym = if add { ADD_SYM } else { SET_SYM };
-    for s in [SET_SYM, ADD_SYM] {
+    for s in [SET_SYM, ADD_SYM, FP8_SET_SYM] {
         gpu.ensure_kernel_public(MODULE, IU4_GFX12_SRC, s)
             .unwrap_or_else(|e| panic!("JIT {s}: {e}"));
     }
@@ -445,8 +611,11 @@ fn time_case(
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let compile_only = args.iter().any(|a| a == "--compile-only");
+    let fp8_only = args.iter().any(|a| a == "--fp8-only");
     let model = args.iter().find(|a| !a.starts_with('-')).cloned().unwrap_or_else(|| {
-        eprintln!("usage: tmp_iu4_gfx12_oracle <model.mq4-xt> [--compile-only]");
+        eprintln!(
+            "usage: tmp_iu4_gfx12_oracle <model.mq4-xt> [--compile-only|--fp8-only]"
+        );
         std::process::exit(2);
     });
 
@@ -460,7 +629,7 @@ fn main() {
     eprintln!("tmp_iu4_gfx12_oracle on {}", gpu.arch);
     assert_eq!(gpu.arch, "gfx1201", "this oracle targets gfx1201");
 
-    for s in [SET_SYM, ADD_SYM] {
+    for s in [SET_SYM, ADD_SYM, FP8_SET_SYM] {
         gpu.ensure_kernel_public(MODULE, IU4_GFX12_SRC, s)
             .unwrap_or_else(|e| panic!("JIT {s}: {e}"));
         eprintln!("JIT OK: {s}");
@@ -511,8 +680,31 @@ fn main() {
         return;
     }
     drop(hfq);
+    if fp8_only {
+        let mut ok = run_fp8_producer_oracle(&mut gpu, false);
+        ok &= run_fp8_producer_oracle(&mut gpu, true);
+        let apart = pack_mq4g256v2_synth(100, 512, 0xED6E_7000);
+        ok &= run_case(
+            &mut gpu,
+            "m100n100/set",
+            &apart,
+            100,
+            512,
+            100,
+            false,
+            0xE070,
+            true,
+        );
+        if ok {
+            eprintln!("GFX12-FP8-GATEUP ORACLE PASS");
+            return;
+        }
+        eprintln!("GFX12-FP8-GATEUP ORACLE FAIL");
+        std::process::exit(1);
+    }
 
-    let mut ok = true;
+    let mut ok = run_fp8_producer_oracle(&mut gpu, false);
+    ok &= run_fp8_producer_oracle(&mut gpu, true);
     ok &= run_case(&mut gpu, "gate/set", &gate, gate_m, gate_k, 512, false, 0xC0DE_0001, false);
     ok &= run_case(&mut gpu, "gate/add", &gate, gate_m, gate_k, 512, true, 0xC0DE_0002, false);
     ok &= run_case(&mut gpu, "down/set", &down, down_m, down_k, 512, false, 0xC0DE_0003, false);

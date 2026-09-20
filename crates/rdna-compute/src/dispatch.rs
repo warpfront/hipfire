@@ -3049,6 +3049,13 @@ impl Gpu {
             && k > 0
             && k % 256 == 0
     }
+    /// Variant-A gate/up fp8 intermediate admission. It stacks only with the
+    /// exact-gfx1201 IU4 producer route: both projection GEMMs write E4M3FN
+    /// bytes and the following producer must consume those bytes immediately.
+    pub fn iu4_fp8_gateup_out_active(&self, batch: usize, k: usize) -> bool {
+        self.flags.gfx12_fp8_gateup_out_enabled()
+            && self.iu4_silu_quant_fused_active(batch, k)
+    }
     /// True when a gfx1201 slices-2-4 producer+quant fusion is live for this
     /// call: IU4 + `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` on exact gfx1201 +
     /// eager (no replay/capture) + K constraint of the iu4 MMQ consumer. Any

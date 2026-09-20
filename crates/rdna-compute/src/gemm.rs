@@ -19577,6 +19577,7 @@ impl Gpu {
         k: usize,
         batch_size: usize,
         add: bool,
+        output_fp8: bool,
     ) -> HipResult<()> {
         if !matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201") {
             return Err(hip_bridge::HipError::new(
@@ -19593,6 +19594,12 @@ impl Gpu {
                 &format!("MQ4V2 iu4 MMQ requires K divisible by 256 (m={m} k={k} n={batch_size})"),
             ));
         }
+        if output_fp8 && (self.arch != "gfx1201" || add || y.dtype != DType::Raw || y.byte_size() < m * batch_size) {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ4V2 iu4 fp8 output requires exact gfx1201 SET and Raw N*M-byte destination",
+            ));
+        }
         self.bind_thread()?;
         if self.arch.as_str() == "gfx1201" {
             // gfx12 K32 v2 staged tile: 128-row x 128-col workgroups
@@ -19600,10 +19607,11 @@ impl Gpu {
             // A + W slabs and DS/SZ metadata staged in LDS once per WG per
             // 128-K block; partial M/N handled natively (zero-filled slab /
             // guarded writeback). Block [256,1,1].
-            let kernel_name = if add {
-                "gemm_mq4g256v2_residual_mmq_iu4_full_add"
-            } else {
-                "gemm_mq4g256v2_residual_mmq_iu4_full_set"
+            let kernel_name = match (add, output_fp8) {
+                (true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+                (false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
+                (false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_fp8",
+                (true, true) => unreachable!("validated above"),
             };
             const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gfx12";
             self.ensure_kernel(
@@ -19630,7 +19638,8 @@ impl Gpu {
             let row_tiles = m.div_ceil(128);
             // 128-column workgroup tile (8 waves cover 2 64-col halves).
             let batch_tiles = batch_size.div_ceil(128);
-            let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
+            let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES
+                + batch_size * m * if output_fp8 { 1 } else { 4 };
             let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
             // LDS: 20480 B (A/W double-buffered + ping-pong DS/SZ; store
             // slots overlap).
@@ -19758,7 +19767,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, false)
+        self.gemm_mq4g256v2_mmq_prequant_iu4(
+            a_raw, x_i4_ptr, y, m, k, batch_size, false, false,
+        )
     }
 
     pub fn gemm_mq4g256v2_mmq_add_prequant_iu4(
@@ -19770,7 +19781,25 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        self.gemm_mq4g256v2_mmq_prequant_iu4(a_raw, x_i4_ptr, y, m, k, batch_size, true)
+        self.gemm_mq4g256v2_mmq_prequant_iu4(
+            a_raw, x_i4_ptr, y, m, k, batch_size, true, false,
+        )
+    }
+
+    /// Variant-A SET epilogue: rounds each exact f32 IU4 GEMM result once to
+    /// an unscaled OCP E4M3FN byte. Exact gfx1201 only.
+    pub fn gemm_mq4g256v2_mmq_set_prequant_iu4_fp8(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_i4_ptr: *mut c_void,
+        y_fp8: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_mmq_prequant_iu4(
+            a_raw, x_i4_ptr, y_fp8, m, k, batch_size, false, true,
+        )
     }
 
 
@@ -31069,6 +31098,30 @@ impl Gpu {
         )?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
         Ok(())
+    }
+
+    /// Variant-A prepared IU4 gate/up consumer. Gate and up are independent
+    /// unscaled OCP E4M3FN byte matrices; no SwiGLU, int4 quantization, or
+    /// rotation is performed in either GEMM epilogue.
+    pub fn gemm_gate_up_mq4g256v2_wmma_iu4_prepared_fp8(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        y_gate_fp8: &GpuTensor,
+        y_up_fp8: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4_fp8(
+            a_gate, xq, y_gate_fp8, gate_m, k, batch_size,
+        )?;
+        self.gemm_mq4g256v2_mmq_set_prequant_iu4_fp8(
+            a_up, xq, y_up_fp8, up_m, k, batch_size,
+        )
     }
 
     /// MQ4V2 gfx1100 gate_up batch-tile (BT6 / BT12).

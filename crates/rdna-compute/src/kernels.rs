@@ -1378,6 +1378,25 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
 );
+/// gfx1201 Variant-A producer twins: gate and up arrive as separate unscaled
+/// OCP E4M3FN byte rows from the IU4 GEMM store epilogue. The producer decodes
+/// pairs natively, then keeps the incumbent SwiGLU/AWQ/FWHT/MSE-int4 recipe.
+pub const FUSED_SILU_MUL_MQ_ROTATE_FP8_I4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_GATE_UP_FP8 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_fp8_i4_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip")
+);
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_I4_GFX12_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_GATE_UP_FP8 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_fp8_i4_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
+);
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq_indexed.hip");
 
