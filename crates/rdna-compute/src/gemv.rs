@@ -3223,7 +3223,14 @@ impl Gpu {
             ]
         };
         let block_size = 256u32;
-        let shared_mem = ((k + 256) * 4) as u32;
+        // The kernel only ever touches `smem[256]` for the block reduction;
+        // without the f32 store the K-sized staging half is dead, so launch
+        // with the 1024-B reduction footprint (same cut as the `_gfx12` twin).
+        let shared_mem = if x_rot.is_some() {
+            ((k + 256) * std::mem::size_of::<f32>()) as u32
+        } else {
+            (256 * std::mem::size_of::<f32>()) as u32
+        };
         let blocks_k = k / 128;
         let bytes = (k * 4 * 3 + 2 * 256 * 4 + blocks_k * 72) * batch_size;
         let timer = crate::profile::begin_timer(
@@ -4358,18 +4365,18 @@ impl Gpu {
         result
     }
     /// T-B IU4 producer: standalone FWHT rotate + in-register `block_i4_128`
-    /// sidecar for wo (residual) inputs. The f32 `x_out` store is kept (all
-    /// downstream readers preserved byte-for-byte); the sidecar lets the IU4
-    /// residual GEMM consume an `Int4MmqPrepared` instead of launching the
-    /// standalone `quantize_int4_mmq_ds128`. `awq = Some` selects the AWQ twin
-    /// symbol (divide before FWHT, same formation as `rotate_x_mq_awq`).
+    /// sidecar for wo (residual) inputs. `x_out = None` skips the f32 store
+    /// (the prepared IU4 consumer is the only downstream reader on the
+    /// admitted path); the sidecar still receives the same register values
+    /// and bytes. `awq = Some` selects the AWQ twin symbol (divide before
+    /// FWHT, same formation as `rotate_x_mq_awq`).
     /// Seals `reservation` into a prepared handle after a successful launch —
     /// never calls `ensure_int4_mmq_x`.
     pub fn rotate_x_mq_i4_batched(
         &mut self,
         x_in: &GpuTensor,
         awq: Option<&GpuTensor>,
-        x_out: &GpuTensor,
+        x_out: Option<&GpuTensor>,
         reservation: crate::scratch::Int4MmqReservation,
         k: usize,
         batch_size: usize,
@@ -4399,7 +4406,9 @@ impl Gpu {
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut xp = x_in.buf.as_ptr();
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
-        let mut xrp = x_out.buf.as_ptr();
+        let mut xrp = x_out
+            .map(|t| t.buf.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
         let mut i4p = reservation.ptr();
@@ -4464,7 +4473,9 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
-        self.invalidate_x_caches_for(xrp);
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
         result?;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }

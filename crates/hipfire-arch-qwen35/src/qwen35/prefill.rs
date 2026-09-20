@@ -329,11 +329,13 @@ fn try_gfx12_gdn_quant_fused_prepared(
 /// GEMM via standalone `quantize_int4_mmq_ds128`, which this removes.
 /// `None` → caller keeps incumbent rotate + standalone-quantizer path.
 /// Residual-only (w_down C2 precedent): Partial TP keeps the plain path.
+/// The f32 `x_rot` store is always skipped: on the admitted path the
+/// prepared IU4 GEMM is the only consumer, and every fallback writes the
+/// buffer itself before reading it.
 fn try_iu4_rotate_prepared(
     gpu: &mut Gpu,
     wo: &hipfire_runtime::llama::WeightTensor,
     x: &GpuTensor,
-    x_rot: &GpuTensor,
     k: usize,
     n: usize,
     epilogue: &BatchEpilogue<'_>,
@@ -348,7 +350,7 @@ fn try_iu4_rotate_prepared(
     let prep = gpu.rotate_x_mq_i4_batched(
         x,
         wo.awq_scale.as_ref(),
-        x_rot,
+        None,
         res,
         k,
         n,
@@ -358,12 +360,12 @@ fn try_iu4_rotate_prepared(
 
 /// T-B: epilogue-free twin of [`try_iu4_rotate_prepared`] for the MoE wo
 /// sites, which have no `epilogue` param and always accumulate residual
-/// into x_batch. Same gate minus the Residual check.
+/// into x_batch. Same gate minus the Residual check. The f32 `x_rot` store
+/// is always skipped for the same reason as the Residual twin.
 fn try_iu4_rotate_prepared_no_epilogue(
     gpu: &mut Gpu,
     wo: &hipfire_runtime::llama::WeightTensor,
     x: &GpuTensor,
-    x_rot: &GpuTensor,
     k: usize,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Int4MmqPrepared>> {
@@ -374,7 +376,7 @@ fn try_iu4_rotate_prepared_no_epilogue(
     let prep = gpu.rotate_x_mq_i4_batched(
         x,
         wo.awq_scale.as_ref(),
-        x_rot,
+        None,
         res,
         k,
         n,
@@ -6091,7 +6093,6 @@ fn batch_chunk_delta_net_output_projection(
             gpu,
             &layer.wo,
             &pbs.dn_normed_batch,
-            &pbs.dn_normed_rot_batch,
             layer.wo.k,
             n,
             &epilogue,
@@ -7789,7 +7790,6 @@ fn batch_chunk_full_attn_output_projection(
             gpu,
             &layer.wo,
             &pbs.fa_attn_out_batch,
-            &pbs.fa_attn_out_rot_batch,
             layer.wo.k,
             n,
             &epilogue,
@@ -9451,7 +9451,6 @@ fn batch_chunk_delta_net_moe(
             gpu,
             &layer.wo,
             &pbs.dn_normed_batch,
-            &pbs.dn_normed_rot_batch,
             layer.wo.k,
             n,
         )?;
@@ -10090,7 +10089,6 @@ fn batch_chunk_full_attn_moe_finish(
         gpu,
         &layer.wo,
         &pbs.fa_attn_out_batch,
-        &pbs.fa_attn_out_rot_batch,
         layer.wo.k,
         n,
     )?;
