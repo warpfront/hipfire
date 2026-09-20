@@ -210,6 +210,11 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, conflicts_with = "awq_alpha")]
     pub awq_a4_aware: bool,
 
+    /// Encode MQ4V2 with a per-128 symmetric grid while retaining the existing
+    /// affine header layout. The stored zero is `-8*d`, so code 8 maps to zero.
+    #[arg(long)]
+    pub mq4v2_symmetric: bool,
+
     /// Replace selected MQ4V2-XT tensors in an existing HFQ with trained final
     /// codes. PATH is one frozen-record `.safetensors` file or a directory of
     /// them; each record carries metadata `name,M,K,qt,source_sha` and tensors

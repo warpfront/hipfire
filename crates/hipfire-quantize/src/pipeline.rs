@@ -147,6 +147,22 @@ struct FormatFlags {
     use_q8hfq: bool,
 }
 
+static MQ4V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
+
+fn quantize_mq4g256v2_selected(
+    weights: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    if MQ4V2_SYMMETRIC.get().copied().unwrap_or(false) {
+        quantize_mq4g256v2_symmetric(weights, m, k, signs1, signs2)
+    } else {
+        quantize_mq4g256v2(weights, m, k, signs1, signs2)
+    }
+}
+
 fn awq_sidecar_name(weight_name: &str) -> String {
     match weight_name.strip_suffix(".weight") {
         Some(stem) => format!("{stem}.awq_scale.weight"),
@@ -1191,6 +1207,18 @@ pub(crate) fn run() {
     if args.awq_a4_aware && !use_mq4v2 {
         eprintln!("error: --awq-a4-aware currently requires --format mq4v2");
         std::process::exit(1);
+    }
+    if args.mq4v2_symmetric && !use_mq4v2 {
+        eprintln!("error: --mq4v2-symmetric currently requires --format mq4v2");
+        std::process::exit(1);
+    }
+    MQ4V2_SYMMETRIC
+        .set(args.mq4v2_symmetric)
+        .expect("MQ4V2_SYMMETRIC set twice — should not happen");
+    if args.mq4v2_symmetric {
+        eprintln!(
+            "MQ4V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-8*d)"
+        );
     }
     if awq_enabled {
         if IMATRIX.get().is_none() {
@@ -4009,7 +4037,7 @@ fn try_handle_lfm2moe(
             } else if use_mq4v2 {
                 let m = meta.shape[0];
                 let k = meta.shape[1];
-                let qq = quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2);
+                let qq = quantize_mq4g256v2_selected(&f32_data, m, k, &signs1, &signs2);
                 (qq, QuantType::MQ4G256V2, "MQ4V2-LFM")
             } else {
                 let qq = quantize_mq4g256(&f32_data, &signs1, &signs2);
@@ -5244,7 +5272,7 @@ fn handle_moe_expert_3d(
                 // This arm is what makes `--format mq4` mean qt44 for routed
                 // experts. Without it the experts fall to the qt13 arm below,
                 // and on an A3B MoE that is ~99% of the model by tensor count.
-                let q = quantize_mq4g256v2(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
+                let q = quantize_mq4g256v2_selected(&f32_slice, inner_m, inner_k_e, &signs1, &signs2);
                 (q, QuantType::MQ4G256V2, 256u32)
             } else if supports_g256 {
                 let q = quantize_mq4g256(&f32_slice, &signs1, &signs2);
@@ -5649,16 +5677,16 @@ fn handle_main_quant(
                                     awq_sidecar_scales = Some(scales.clone());
                                     let mut scaled = f32_data.clone();
                                     awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                    quantize_mq4g256v2(&scaled, m_dim, k_dim, &signs1, &signs2)
+                                    quantize_mq4g256v2_selected(&scaled, m_dim, k_dim, &signs1, &signs2)
                                 } else {
                                     let m = meta.shape[0];
                                     let k = k_dim;
-                                    quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2)
+                                    quantize_mq4g256v2_selected(&f32_data, m, k, &signs1, &signs2)
                                 }
                             } else {
                                 let m = meta.shape[0];
                                 let k = k_dim;
-                                quantize_mq4g256v2(&f32_data, m, k, &signs1, &signs2)
+                                quantize_mq4g256v2_selected(&f32_data, m, k, &signs1, &signs2)
                             };
                             (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                         }
@@ -5961,7 +5989,7 @@ fn handle_main_quant(
                                 (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
                             }
                             "mq4v2" => {
-                                let q = quantize_mq4g256v2(&f32_data, m, k, &s1, &s2);
+                                let q = quantize_mq4g256v2_selected(&f32_data, m, k, &s1, &s2);
                                 (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                             }
                             "mq4v2-lloyd" | "mq4l" | "mq4v2l" => {
@@ -6144,7 +6172,7 @@ fn handle_main_quant(
                                     (q, QuantType::MQ5G256V2, 256u32, "MQ5G256V2")
                                 }
                                 "mq4v2" => {
-                                    let q = quantize_mq4g256v2(&f32_data, m, k, &s1, &s2);
+                                    let q = quantize_mq4g256v2_selected(&f32_data, m, k, &s1, &s2);
                                     (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                                 }
                                 "mq4v2-lloyd" | "mq4l" | "mq4v2l" => {
@@ -6306,16 +6334,16 @@ fn handle_main_quant(
                                 awq_sidecar_scales = Some(scales.clone());
                                 let mut scaled = f32_data.clone();
                                 awq_pre_scale_weights(&mut scaled, m_dim, k_dim, &scales);
-                                quantize_mq4g256v2(&scaled, m_dim, k_dim, &signs1, &signs2)
+                                quantize_mq4g256v2_selected(&scaled, m_dim, k_dim, &signs1, &signs2)
                             } else {
                                 let m_dim = meta.shape[0];
                                 let k = k_dim;
-                                quantize_mq4g256v2(&f32_data, m_dim, k, &signs1, &signs2)
+                                quantize_mq4g256v2_selected(&f32_data, m_dim, k, &signs1, &signs2)
                             }
                         } else {
                             let m_dim = meta.shape[0];
                             let k = k_dim;
-                            quantize_mq4g256v2(&f32_data, m_dim, k, &signs1, &signs2)
+                            quantize_mq4g256v2_selected(&f32_data, m_dim, k, &signs1, &signs2)
                         };
                         (q, QuantType::MQ4G256V2, 256u32, "MQ4G256V2")
                     } else {

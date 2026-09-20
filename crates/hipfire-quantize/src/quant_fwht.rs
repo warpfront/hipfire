@@ -322,6 +322,33 @@ pub(crate) fn quantize_mq4g256v2(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, false)
+}
+
+/// MQ4V2 with a symmetric per-128 grid in the existing affine wire format.
+///
+/// The stored zero point is exactly `-8*d`, so code 8 reconstructs zero and
+/// shipped decoders remain byte-format compatible. The four scale candidates
+/// mirror the runtime A4 producer ladder, shifted to the 15-interval midpoint
+/// grid; selection includes fp16 round-trip error.
+pub(crate) fn quantize_mq4g256v2_symmetric(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, true)
+}
+
+fn quantize_mq4g256v2_impl(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    symmetric: bool,
+) -> Vec<u8> {
     assert!(k % 256 == 0, "MQ4V2 requires K % 256 == 0, got K={k}");
     assert_eq!(w.len(), m * k, "w.len() {} != m*k {}*{}={}", w.len(), m, k, m * k);
     let group_count = w.len() / 256;
@@ -337,19 +364,67 @@ pub(crate) fn quantize_mq4g256v2(
         for half in 0..2 {
             let offset = half * 128;
             let values = &group[offset..offset + 128];
-            let lo = values.iter().copied().fold(f32::INFINITY, f32::min);
-            let hi = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-            let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
-            scales[half] = if hi == lo { 0 } else { f32_to_f16(step_f32) };
-            zeros[half] = f32_to_f16(lo);
-            let scale = f16_to_f32(scales[half]);
-            let zero = f16_to_f32(zeros[half]);
-            if hi != lo && step_f32 != 0.0 && scale != 0.0 {
+            if symmetric {
+                let amax = values.iter().fold(0.0f32, |acc, &value| acc.max(value.abs()));
+                if amax == 0.0 {
+                    scales[half] = 0;
+                    zeros[half] = f32_to_f16(-0.0);
+                    codes[offset..offset + 128].fill(8);
+                    continue;
+                }
+
+                let candidate_base = (amax / 7.5) * 0.5;
+                let multipliers = [
+                    1.0f32,
+                    f32::from_bits(0x3fa4_9249),
+                    f32::from_bits(0x3fdb_6db7),
+                    2.0f32,
+                ];
+                let mut best_mse = f64::INFINITY;
+                for multiplier in multipliers {
+                    let scale_bits = f32_to_f16(candidate_base * multiplier);
+                    let scale = f16_to_f32(scale_bits);
+                    if scale == 0.0 {
+                        continue;
+                    }
+                    let zero_bits = f32_to_f16(-8.0 * scale);
+                    let zero = f16_to_f32(zero_bits);
+                    let inverse = 1.0 / scale;
+                    let mut mse = 0.0f64;
+                    for &value in values {
+                        let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, 15.0);
+                        let error = value - code.mul_add(scale, zero);
+                        mse += (error as f64) * (error as f64);
+                    }
+                    if mse < best_mse {
+                        best_mse = mse;
+                        scales[half] = scale_bits;
+                        zeros[half] = zero_bits;
+                    }
+                }
+                let scale = f16_to_f32(scales[half]);
+                let zero = f16_to_f32(zeros[half]);
                 let inverse = 1.0 / scale;
                 for i in 0..128 {
-                    codes[offset + i] = ((group[offset + i] - zero) * inverse + 0.5)
-                        .floor()
-                        .clamp(0.0, 15.0) as u8;
+                    codes[offset + i] =
+                        ((group[offset + i] - zero) * inverse + 0.5).floor().clamp(0.0, 15.0)
+                            as u8;
+                }
+            } else {
+                let lo = values.iter().copied().fold(f32::INFINITY, f32::min);
+                let hi = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
+                scales[half] = if hi == lo { 0 } else { f32_to_f16(step_f32) };
+                zeros[half] = f32_to_f16(lo);
+                let scale = f16_to_f32(scales[half]);
+                let zero = f16_to_f32(zeros[half]);
+                if hi != lo && step_f32 != 0.0 && scale != 0.0 {
+                    let inverse = 1.0 / scale;
+                    for i in 0..128 {
+                        codes[offset + i] =
+                            ((group[offset + i] - zero) * inverse + 0.5).floor().clamp(0.0, 15.0)
+                                as u8;
+                    }
                 }
             }
         }
