@@ -2,9 +2,11 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-// Batched gated RMSNorm + FWHT rotation + `block_i4_128` IU4 sidecar
-// (exact gfx1201).
+// Batched gated RMSNorm + FWHT rotation + `block_i4_128` IU4 sidecar.
 //
+// Body is arch-portable (wave32, register/LDS-only, no WMMA): the gfx1201
+// `_gfx12` entries and the gfx11 `_gfx11` entries share this file with
+// distinct `HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL` symbols from the host JIT.
 // gfx1201-fusion slice 4: LA post-GDN producer for the iu4 residual `wo`
 // path. Replaces, per LA layer:
 //   gated_norm_f32_batched  (grid [n_heads, N], block 32)

@@ -252,6 +252,13 @@ pub struct FeatureFlags {
     /// Bit-identical vs the producer+quantizer chain; any byte difference
     /// kills it.
     pub gfx12_producer_quant_fused: bool,
+    /// gfx11 sigmoid/gated-norm + int4 quant fusions
+    /// (`HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`,
+    /// `kernel.gfx11_producer_quant_fused`). Default ON on gfx1100/gfx1151;
+    /// `=0` opts out to the standalone `quantize_int4_mmq_ds128` launch at
+    /// each admitted site. Bit-identical vs the producer+quantizer chain;
+    /// any byte difference kills it.
+    pub gfx11_producer_quant_fused: bool,
     /// gfx1201 RMSNorm+rotate producer → MQ4v2 FP8 pre-pass fusion
     /// (`HIPFIRE_GFX12_FP8_STREAM`, `kernel.gfx12_fp8_stream`). Default OFF;
     /// `=1` opts in on exact gfx1201. The `_mq4v2_fp8_gfx12` producer twins
@@ -646,6 +653,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_producer_quant_fused: parse_bool("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED")
                 .unwrap_or(arch == "gfx1201"),
+            gfx11_producer_quant_fused: parse_bool("HIPFIRE_GFX11_PRODUCER_QUANT_FUSED")
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_fa2_prefill: parse_bool("HIPFIRE_GFX12_FA2_PREFILL")
@@ -817,6 +826,13 @@ impl FeatureFlags {
     pub fn gfx12_producer_quant_fused_enabled(&self) -> bool {
         self.gfx12_producer_quant_fused && self.arch == "gfx1201"
     }
+    /// True only on gfx1100/gfx1151 with the opt-in set. The `_gfx11`
+    /// sigmoid/gated-norm producers emit the shared `block_i4_128` recipe,
+    /// so output is bit-identical to the standalone
+    /// `quantize_int4_mmq_ds128` chain on the same f32 row.
+    pub fn gfx11_producer_quant_fused_enabled(&self) -> bool {
+        self.gfx11_producer_quant_fused && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+    }
     /// True only on exact gfx1201 with the opt-in set. The `_mq4v2_fp8_gfx12`
     /// RMSNorm/rotate producers emit byte-identical standalone-pack outputs,
     /// so the fused route is exact on finite rows.
@@ -965,6 +981,7 @@ impl FeatureFlags {
             gfx12_gdn_chunk_scan: false,
             gfx12_silu_quant_fused: false,
             gfx12_producer_quant_fused: false,
+            gfx11_producer_quant_fused: false,
             gfx12_fp8_stream: false,
             residual_ldsstage: false,
             gate_up_ldsstage: false,
@@ -1236,6 +1253,45 @@ mod tests {
         for arch in ["gfx1201", "gfx1100", "gfx1151"] {
             let test_flags = FeatureFlags::for_test(arch);
             assert!(!test_flags.gfx12_producer_quant_fused, "arch={arch}");
+        }
+    }
+    #[test]
+    fn gfx11_producer_quant_fused_default_on_gfx11_with_opt_out() {
+        // Default process policy: the gfx11 sigmoid/gated-norm +quant
+        // fusions admit on gfx1100/gfx1151 (bit-identical to the standalone
+        // quantizer chains); explicit `=0` restores the incumbent
+        // producer+quantizer launches.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1100", "gfx1151"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(flags.gfx11_producer_quant_fused, "arch={arch}");
+            assert!(flags.gfx11_producer_quant_fused_enabled(), "arch={arch}");
+        }
+        for arch in ["gfx1201", "gfx1101", "gfx1102", "gfx1150", "gfx1200", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.gfx11_producer_quant_fused, "arch={arch}");
+            assert!(!flags.gfx11_producer_quant_fused_enabled(), "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.gfx11_producer_quant_fused", "false").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        let opted_out = FeatureFlags::from_process_config("gfx1100", &process);
+        assert!(!opted_out.gfx11_producer_quant_fused);
+        assert!(!opted_out.gfx11_producer_quant_fused_enabled());
+
+        // The unit-test constructor stays fully off (deterministic baseline).
+        for arch in ["gfx1201", "gfx1100", "gfx1151"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.gfx11_producer_quant_fused, "arch={arch}");
         }
     }
     #[test]

@@ -298,21 +298,63 @@ static __device__ __forceinline__ void gemm_iu4_body(
     constexpr int ntx = rows_per_warp / tile_C::I;
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
-    #pragma unroll
-    for (int j0 = 0; j0 < IU4_MMQ_X; j0 += ntx * tile_C::J) {
+    // Y epilogue. Y is column-major [N][M]: element (j,i) of this tile
+    // stores to Y + (col0+j)*M + (row0+i).
+    //
+    // Full tiles use one tile-relative buffer descriptor. Its base stays
+    // uniform in SGPRs; each lane forms one 32-bit byte offset
+    // ((j*M+i)*4 fits u32 for every live model dim: j < 128, M < 2^25)
+    // instead of rebuilding a 64-bit global address for every store.
+    // Edge tiles retain the original checked path. Per-element arithmetic
+    // is unchanged (one residual add), hence bit-identical; only the
+    // address formation changes.
+    if constexpr (FULL) {
+        float* const y_tile = Y + (long long)col0 * M + row0;
+        const auto y_tile_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+            y_tile, 0, 0xffffffffu, 0x31004000u);
         #pragma unroll
-        for (int n = 0; n < ntx; ++n) {
+        for (int j0 = 0; j0 < IU4_MMQ_X; j0 += ntx * tile_C::J) {
             #pragma unroll
-            for (int l = 0; l < tile_C::ne; ++l) {
-                const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
-                const int i = i0 + n * tile_C::I + tile_C::get_i(l);
-                if (FULL || (row0 + i < M && col0 + j < N)) {
-                    float* yp = Y + (long long)(col0 + j) * M + (row0 + i);
+            for (int n = 0; n < ntx; ++n) {
+                #pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+                    const int i = i0 + n * tile_C::I + tile_C::get_i(l);
+                    const unsigned elem_off =
+                        ((unsigned)j * (unsigned)M + (unsigned)i) * sizeof(float);
                     const float v = sum[(j0 / tile_C::J + n) * tile_C::ne + l];
                     if (add) {
-                        *yp += v;
+                        const unsigned old_bits = __builtin_amdgcn_raw_buffer_load_b32(
+                            y_tile_rsrc, elem_off, 0, 0);
+                        const float out = __builtin_bit_cast(float, old_bits) + v;
+                        __builtin_amdgcn_raw_buffer_store_b32(
+                            __builtin_bit_cast(unsigned, out),
+                            y_tile_rsrc, elem_off, 0, 0);
                     } else {
-                        *yp = v;
+                        __builtin_amdgcn_raw_buffer_store_b32(
+                            __builtin_bit_cast(unsigned, v),
+                            y_tile_rsrc, elem_off, 0, 0);
+                    }
+                }
+            }
+        }
+    } else {
+        #pragma unroll
+        for (int j0 = 0; j0 < IU4_MMQ_X; j0 += ntx * tile_C::J) {
+            #pragma unroll
+            for (int n = 0; n < ntx; ++n) {
+                #pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) {
+                    const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
+                    const int i = i0 + n * tile_C::I + tile_C::get_i(l);
+                    if (row0 + i < M && col0 + j < N) {
+                        float* yp = Y + (long long)(col0 + j) * M + (row0 + i);
+                        const float v = sum[(j0 / tile_C::J + n) * tile_C::ne + l];
+                        if (add) {
+                            *yp += v;
+                        } else {
+                            *yp = v;
+                        }
                     }
                 }
             }
