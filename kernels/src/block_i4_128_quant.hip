@@ -17,6 +17,13 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 #include <math.h>
+#ifndef IU4_A4_CANDIDATES
+#define IU4_A4_CANDIDATES 4
+#endif
+
+#if IU4_A4_CANDIDATES != 1 && IU4_A4_CANDIDATES != 2 && IU4_A4_CANDIDATES != 4
+#error "IU4_A4_CANDIDATES must be 1, 2, or 4"
+#endif
 
 // int4 activation block: one 128-K group for one token (column).
 // qs: 64 B, even K low nibble / odd K high nibble, two's complement.
@@ -31,10 +38,11 @@ static_assert(sizeof(block_i4_128) == 72, "bad block size");
 // Wave32-synchronous quant of one 128-element group.
 // Lane l owns elements 4l..4l+3 in xv[4]. Reductions use offsets 16..1
 // (wave64-safe width-32 shuffles). Writes qs for every lane; lane 0 of the
-// group publishes d and s. The default specialization matches the original
-// 8-candidate body. The explicit gfx1201 producer specialization uses the
-// frozen candidate subset {0,2,5,7} with pre-rounded exact header constants.
-template <bool ProducerFourCandidates>
+// group publishes d and s. The portable specialization retains the original
+// 8-candidate body. On gfx1201, IU4_A4_CANDIDATES selects the producer search:
+// 4 keeps the incumbent {0,2,5,7} subset, 2 keeps the measured-most-selected
+// {5,7} subset, and 1 is plain RTN with d=max(abs(x))/7.
+template <bool ProducerCandidateSet>
 __device__ __forceinline__ void quantize_block_i4_128_wave(
     const float xv[4],
     block_i4_128* __restrict__ out,
@@ -48,17 +56,27 @@ __device__ __forceinline__ void quantize_block_i4_128_wave(
     float best_d = 1.0f;
     if (amax != 0.0f) {
         float best_mse = 1.0e30f;
-        if constexpr (ProducerFourCandidates) {
+        if constexpr (ProducerCandidateSet) {
+#if IU4_A4_CANDIDATES == 1
+            best_d = amax / 7.0f;
+#else
             const float candidate_base = (amax / 7.0f) * 0.5f;
             #pragma unroll 1
-            for (int ci = 0; ci < 4; ++ci) {
+            for (int ci = 0; ci < IU4_A4_CANDIDATES; ++ci) {
                 float multiplier;
+#if IU4_A4_CANDIDATES == 2
+                switch (ci) {
+                    case 0: multiplier = 0x1.b6db6ep+0f; break;
+                    default: multiplier = 2.0f; break;
+                }
+#else
                 switch (ci) {
                     case 0: multiplier = 1.0f; break;
                     case 1: multiplier = 0x1.492492p+0f; break;
                     case 2: multiplier = 0x1.b6db6ep+0f; break;
                     default: multiplier = 2.0f; break;
                 }
+#endif
                 const float dj = candidate_base * multiplier;
                 float mse = 0.0f;
                 #pragma unroll
@@ -76,6 +94,7 @@ __device__ __forceinline__ void quantize_block_i4_128_wave(
                     best_d = dj;
                 }
             }
+#endif
         } else {
             for (int j = 0; j < 8; ++j) {
                 const float dj = (amax / 7.0f) * 0.5f * (1.0f + (float)j / 7.0f);
