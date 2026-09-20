@@ -4236,6 +4236,156 @@ impl Gpu {
         result?;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
+    /// gfx11 slices-4 IU4 producer: batched gated RMSNorm + FWHT +
+    /// in-register `block_i4_128` emit for the LA post-GDN `wo` input,
+    /// under the `_gfx11` entry symbols. `awq = Some` selects the AWQ twin
+    /// (divide folded into the LDS staging, same expression order as the
+    /// standalone gated_norm → rotate_x_mq_awq chain). `x_rot = None`
+    /// skips the f32 store. Grid [(K/256), N], block 64, only the
+    /// incumbent 1024-B LDS handoff (static `normalized[256]`). Gated by
+    /// `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gated_norm_rotate_mq_i4_gfx11_batched(
+        &mut self,
+        x: &GpuTensor,
+        z: &GpuTensor,
+        weight: &GpuTensor,
+        awq: Option<&GpuTensor>,
+        x_rot: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        n_heads: usize,
+        head_dim: usize,
+        eps: f32,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.bind_thread()?;
+        if head_dim != 128 || k == 0 || k % 256 != 0 || batch_size == 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gated_norm_rotate_mq_i4_gfx11_batched: head_dim == 128, K % 256 == 0, N >= 1 required",
+            ));
+        }
+        if n_heads * head_dim != k {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "gated_norm_rotate_mq_i4_gfx11_batched: n_heads*head_dim != K",
+            ));
+        }
+        if let Some(scale) = awq {
+            if scale.numel() < k {
+                return Err(hip_bridge::HipError::new(
+                    1,
+                    "gated_norm_rotate_mq_i4_gfx11_batched: undersized awq_scale",
+                ));
+            }
+        }
+        if reservation.k() != k || reservation.n() != batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gated_norm_rotate_mq_i4_gfx11_batched: reservation (k,n) mismatch",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        let (module, source, kernel) = match awq {
+            Some(_) => (
+                "gated_norm_mq_rotate_awq_i4_gfx11",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC,
+                "gated_norm_mq_rotate_awq_i4_gfx11",
+            ),
+            None => (
+                "gated_norm_mq_rotate_i4_gfx11",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX11_SRC,
+                "gated_norm_mq_rotate_i4_gfx11",
+            ),
+        };
+        self.ensure_kernel(module, source, kernel)?;
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut xp = x.buf.as_ptr();
+        let mut zp = z.buf.as_ptr();
+        let mut wp = weight.buf.as_ptr();
+        let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut s1 = s1_ptr;
+        let mut s2 = s2_ptr;
+        let mut xrp = x_rot.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut i4p = reservation.ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut ep = eps;
+        let mut kv = k as i32;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut zp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+        ];
+        if awq.is_some() {
+            params.push(&mut awp as *mut _ as *mut c_void);
+        }
+        params.extend(
+            [
+                &mut s1 as *mut _ as *mut c_void,
+                &mut s2 as *mut _ as *mut c_void,
+                &mut xrp as *mut _ as *mut c_void,
+                &mut i4p as *mut _ as *mut c_void,
+                &mut nh as *mut _ as *mut c_void,
+                &mut hd as *mut _ as *mut c_void,
+                &mut ep as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+                &mut nv as *mut _ as *mut c_void,
+            ]
+            .into_iter(),
+        );
+        let blocks_k = k / 128;
+        let bytes = (crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k)
+            + blocks_k * 72)
+            * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fused",
+            if awq.is_some() {
+                "gated_norm_mq_rotate_awq_i4_gfx11_batched"
+            } else {
+                "gated_norm_mq_rotate_i4_gfx11_batched"
+            },
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            kernel,
+            [(k / 256) as u32, batch_size as u32, 1],
+            [64, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(zp);
+                b.push_ptr(wp);
+                if awq.is_some() {
+                    b.push_ptr(awp);
+                }
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(i4p);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_f32(ep);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
+        result?;
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+    }
 
     /// Standalone FWHT rotation for MagnumQuant (MQ4). Writes K floats into x_rot.
     pub fn rotate_x_mq(&mut self, x: &GpuTensor, x_rot: &GpuTensor, k: usize) -> HipResult<()> {
@@ -4648,6 +4798,95 @@ impl Gpu {
             &self.hip,
             "fwht",
             "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [((k / 256) * batch_size) as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ap);
+                b.push_ptr(gp);
+                b.push_ptr(awp);
+                b.push_ptr(xrp);
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(i4p);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        if !xrp.is_null() {
+            self.invalidate_x_caches_for(xrp);
+        }
+        result?;
+        Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
+    }
+    /// gfx11 FA output producer: exact sigmoid multiply + AWQ/FWHT rotate +
+    /// in-register `block_i4_128`, under the `_gfx11` entry symbol. The old
+    /// path stored the sigmoided attention row to f32 and immediately
+    /// reloaded it in `rotate_x_mq_awq_i4`; this entry keeps that f32 value
+    /// in-register and leaves `attn` unmodified. Gated by
+    /// `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sigmoid_mul_rotate_x_mq_awq_i4_gfx11_batched(
+        &mut self,
+        attn: &GpuTensor,
+        gate: &GpuTensor,
+        awq: &GpuTensor,
+        x_out: Option<&GpuTensor>,
+        reservation: crate::scratch::Int4MmqReservation,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Int4MmqPrepared> {
+        self.bind_thread()?;
+        if reservation.k() != k || reservation.n() != batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gfx11_batched: reservation (k,n) mismatch",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        const MODULE: &str = "sigmoid_mul_rotate_x_mq_awq_i4_gfx11";
+        const KERNEL: &str = "sigmoid_mul_rotate_x_mq_awq_i4_gfx11";
+        self.ensure_kernel(
+            MODULE,
+            kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX11_SRC,
+            KERNEL,
+        )?;
+        let mut ap = attn.buf.as_ptr();
+        let mut gp = gate.buf.as_ptr();
+        let mut awp = awq.buf.as_ptr();
+        let mut xrp = x_out.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut i4p = reservation.ptr();
+        let mut kv = k as i32;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut ap as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut awp as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut i4p as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ];
+        let blocks_k = k / 128;
+        let bytes = (k * 4 * 3 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fwht",
+            "sigmoid_mul_rotate_x_mq_awq_i4_gfx11_batched",
             bytes,
         );
         let result = self.launch_maybe_blob(

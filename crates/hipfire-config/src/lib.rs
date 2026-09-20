@@ -2177,6 +2177,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Fuse the int4 activation quantiser into the gfx1201 RMSNorm/rotate/gated-norm producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx12 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
     ),
     process_bool_field!(
+        "kernel.gfx11_producer_quant_fused",
+        "gfx11_producer_quant_fused",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX11_PRODUCER_QUANT_FUSED",
+        "Fuse the int4 activation quantiser into the gfx11 sigmoid/gated-norm producers (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx11 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
+    ),
+    process_bool_field!(
         "kernel.gfx12_fp8_stream",
         "gfx12_fp8_stream",
         Kernel,

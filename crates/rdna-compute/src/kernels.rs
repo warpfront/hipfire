@@ -1183,6 +1183,22 @@ pub const MQ_ROTATE_X_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_KERNEL rotate_x_mq_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
+/// gfx11 FA out-proj IU4 producer: exact `sigmoid_mul_f32` formation +
+/// AWQ/FWHT rotate + in-register `block_i4_128`, under a distinct `_gfx11`
+/// entry symbol so gfx11 HSACO caches and profiler rows cannot alias the
+/// `_gfx12` twin. Same shared body (`mq_rotate_x_i4.hip`, wave32,
+/// register-only, no WMMA); the attention input is intentionally left
+/// unmodified and the prepared residual GEMM is its only downstream
+/// consumer on the admitted route. Gated by
+/// `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`.
+pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_SIGMOID_GATE 1\n",
+    "#define HIPFIRE_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gfx11\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
 /// gfx1201 FA out-proj IU4 producer: exact `sigmoid_mul_f32` formation +
 /// AWQ/FWHT rotate + in-register `block_i4_128`. The attention input is
 /// intentionally left unmodified; the prepared residual GEMM is its only
@@ -1295,6 +1311,32 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+/// gfx11 slices-4 IU4 producer: batched gated RMSNorm + FWHT + in-register
+/// `block_i4_128` emit for the LA post-GDN `wo` input, under a distinct
+/// `_gfx11` entry symbol so gfx11 HSACO caches and profiler rows cannot
+/// alias the `_gfx12` twin. Same shared body
+/// (`gated_norm_mq_rotate_quant.gfx12.hip`: wave32, register/LDS-only, no
+/// WMMA — arch-portable); replaces `gated_norm_f32_batched` +
+/// `rotate_x_mq[_awq]_batched` + `quantize_int4_mmq_ds128` with one launch.
+/// Grid [(K/256), N], block 64, only the incumbent 1024-B LDS handoff.
+/// Gated by `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`.
+pub const GATED_NORM_MQ_ROTATE_I4_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_gfx11\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+/// gfx11 slices-4 IU4 AWQ producer: AWQ divide folded into the LDS staging
+/// (same expression order as the standalone gated_norm → rotate_x_mq_awq
+/// chain), then FWHT + in-register `block_i4_128` emit, under a distinct
+/// `_gfx11` entry symbol.
+pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx11\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
 /// Phase A Stage A — F2: AWQ-aware variant of `mq_rotate_x` for the

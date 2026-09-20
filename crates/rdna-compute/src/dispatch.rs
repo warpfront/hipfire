@@ -3064,6 +3064,21 @@ impl Gpu {
             && k > 0
             && k % 256 == 0
     }
+    /// True when a gfx11 sigmoid/gated-norm producer+quant fusion is live
+    /// for this call: IU4 + `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED` on
+    /// gfx1100/gfx1151 + eager (no replay/capture) + K constraint of the
+    /// iu4 MMQ consumer. Any batch >= 64, same row-parallel justification
+    /// as `iu4_producer_quant_fused_active`; the GDN fused producer
+    /// additionally requires head_dim == 128 at its callsite helper.
+    pub fn iu4_gfx11_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
+        self.flags.gfx11_producer_quant_fused_enabled()
+            && self.flags.iu4_prefill_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && batch >= 64
+            && k > 0
+            && k % 256 == 0
+    }
     /// True when the gfx1201 FP8-stream producer fusion is live for this
     /// call: `HIPFIRE_GFX12_FP8_STREAM=1` on exact gfx1201 + eager (no
     /// replay/capture) + K constraint of the MQ4v2 FP8 consumer (`k % 256
