@@ -177,6 +177,20 @@ typedef float   __attribute__((ext_vector_type(8)))  float8_t;
 // note at the K-loop top). Ext-vector so global/LDS accesses codegen to
 // single b64 instructions with elementwise branch-free selects.
 typedef unsigned __attribute__((ext_vector_type(2))) u32x2_t;
+
+static __device__ __forceinline__ u32x2_t iu4_weight_staging_word(u32x2_t value) {
+#if defined(IU4_SYMMETRIC_FOLD) && defined(__gfx1201__)
+    // Flip each uint4 code's sign bit so the signed WMMA consumes q-8.
+    return value ^ (u32x2_t){0x88888888u, 0x88888888u};
+#else
+    return value;
+#endif
+}
+#if defined(IU4_SYMMETRIC_FOLD) && defined(__gfx1201__)
+#define IU4_WEIGHT_SIGNED true
+#else
+#define IU4_WEIGHT_SIGNED false
+#endif
 // IU4_FOLD_RN — W4.0/LF.0 bit-exact fold pin, shared with the gfx11 iu4
 // kernel. Every output element folds one int32 WMMA result C through EXACTLY
 // this DAG:
@@ -222,6 +236,21 @@ static __device__ __forceinline__ float2 iu4_fold_rn_pair(
     out.y = __fadd_rn(sum1, term_1);
     return out;
 }
+#if defined(IU4_SYMMETRIC_FOLD) && defined(__gfx1201__)
+static __device__ __forceinline__ float2 iu4_symmetric_fold_rn_pair(
+    float sum0, float sum1,
+    float sc0, float sc1,
+    float d, int c0, int c1) {
+    const float t1_0 = __fmul_rn(sc0, d);
+    const float t1_1 = __fmul_rn(sc1, d);
+    const float p_0 = __fmul_rn(t1_0, (float)c0);
+    const float p_1 = __fmul_rn(t1_1, (float)c1);
+    float2 out;
+    out.x = __fadd_rn(sum0, p_0);
+    out.y = __fadd_rn(sum1, p_1);
+    return out;
+}
+#endif
 #endif
 
 // One K32-sub-block compute bundle: 2 W-frags + 4 A-frags +
@@ -256,11 +285,11 @@ static __device__ __forceinline__ void iu4_bundle(
             const int32x2_t b = (nb == 0) ? bf0 : (nb == 1) ? bf1 : (nb == 2) ? bf2 : bf3;
             if constexpr (FIRST) {
                 cacc[nb][rg] = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(
-                    false, a, true, b, zc, false
+                    IU4_WEIGHT_SIGNED, a, true, b, zc, false
                 );
             } else {
                 cacc[nb][rg] = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(
-                    false, a, true, b, cacc[nb][rg], false
+                    IU4_WEIGHT_SIGNED, a, true, b, cacc[nb][rg], false
                 );
             }
         }
@@ -421,7 +450,8 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         for (int r = 0; r < 2; r++) {
             const u32x2_t av = *(const u32x2_t*)(xqB0 + st_avoff[r]);
             *(u32x2_t*)(a_lds + st_ldsoff[r]) = st_aok[r] ? av : z64;
-            *(u32x2_t*)(w_lds + st_ldsoff[r]) = *(const u32x2_t*)(wB0 + st_wvoff[r]);
+            *(u32x2_t*)(w_lds + st_ldsoff[r]) =
+                iu4_weight_staging_word(*(const u32x2_t*)(wB0 + st_wvoff[r]));
         }
     }
     __syncthreads();
@@ -449,7 +479,8 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 #pragma unroll
                 for (int r = 0; r < 2; r++) {
                     A_pf[r] = *(const u32x2_t*)(xqB1 + st_avoff[r]);
-                    W_pf[r] = *(const u32x2_t*)(wB1 + st_wvoff[r]);
+                    W_pf[r] = iu4_weight_staging_word(
+                        *(const u32x2_t*)(wB1 + st_wvoff[r]));
                 }
                 // No scheduling pin here: the previous trip's fold VALU must
                 // remain free to sink among this trip's WMMAs. Raw A_pf is
@@ -493,7 +524,8 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     const char* __restrict__ w_nx = A + (long long)g_nx * 136 + 8 + (long long)h_nx * 64;
                     #pragma unroll
                     for (int r = 0; r < 2; r++) {
-                        W_pf[r] = *(const u32x2_t*)(w_nx + st_wvoff[r]);
+                        W_pf[r] = iu4_weight_staging_word(
+                            *(const u32x2_t*)(w_nx + st_wvoff[r]));
                     }
                     const int tok_ds = bs + (tid >> 1);
                     const int tok_dsc = (tok_ds < N) ? tok_ds : (N - 1);
@@ -521,18 +553,33 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 #pragma unroll
                 for (int rg = 0; rg < 2; rg++) {
                     float sc_row[8];
+#if !defined(IU4_SYMMETRIC_FOLD) || !defined(__gfx1201__)
                     float zp_row[8];
+#endif
                     #pragma unroll
                     for (int j = 0; j < 8; j++) {
                         const unsigned jbase = (unsigned)(wave_row0 + rg * 16 + 8 * k_grp + j) * 8u;
                         sc_row[j] = *(const float*)(sz_lds + jbase);
+#if !defined(IU4_SYMMETRIC_FOLD) || !defined(__gfx1201__)
                         zp_row[j] = *(const float*)(sz_lds + jbase + 4u);
+#endif
                     }
                     #pragma unroll
                     for (int nb = 0; nb < 4; nb++) {
                         int* acc_i = (int*)&cacc[nb][rg];
                         const unsigned tbase = (unsigned)(wave_tok0 + nb * 16 + m_lane) * 8u;
                         const float d_x = *(const float*)(ds_lds + tbase);
+#if defined(IU4_SYMMETRIC_FOLD) && defined(__gfx1201__)
+                        #pragma unroll
+                        for (int j = 0; j < 8; j += 2) {
+                            const float2 pair = iu4_symmetric_fold_rn_pair(
+                                acc[nb][rg][j], acc[nb][rg][j + 1],
+                                sc_row[j], sc_row[j + 1],
+                                d_x, acc_i[j], acc_i[j + 1]);
+                            acc[nb][rg][j] = pair.x;
+                            acc[nb][rg][j + 1] = pair.y;
+                        }
+#else
                         const int s_x = *(const int*)(ds_lds + tbase + 4u);
 #if defined(__gfx1201__)
                         // Paired fold: same values, same DAG as IU4_FOLD_RN;
@@ -555,6 +602,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                         for (int j = 0; j < 8; j++) {
                             IU4_FOLD_RN(acc[nb][rg][j], sc_row[j], zp_row[j], d_x, acc_i[j], s_x);
                         }
+#endif
 #endif
                     }
                 }

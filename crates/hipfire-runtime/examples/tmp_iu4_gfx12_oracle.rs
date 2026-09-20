@@ -110,11 +110,12 @@ fn pack_mq4g256v2_synth(m: usize, k: usize, salt: u32) -> Vec<u8> {
     for r in 0..m {
         for g in 0..gpr {
             let dst = (r * gpr + g) * GB;
-            let sc0 = f16_bits(0.05 + (prng_u32((r * gpr + g) as u64, salt) % 20) as f32 * 0.001);
-            let zp0 = f16_bits(-0.35);
+            let sc0 =
+                f16_bits(0.05 + (prng_u32((r * gpr + g) as u64, salt) % 20) as f32 * 0.001);
+            let zp0 = f16_bits(-8.0 * f16_to_f32(sc0));
             let sc1 =
                 f16_bits(0.07 + (prng_u32((r * gpr + g) as u64, salt ^ 1) % 20) as f32 * 0.001);
-            let zp1 = f16_bits(-0.45);
+            let zp1 = f16_bits(-8.0 * f16_to_f32(sc1));
             blob[dst..dst + 2].copy_from_slice(&sc0.to_le_bytes());
             blob[dst + 2..dst + 4].copy_from_slice(&zp0.to_le_bytes());
             blob[dst + 4..dst + 6].copy_from_slice(&sc1.to_le_bytes());

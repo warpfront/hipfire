@@ -673,6 +673,9 @@ pub struct Gpu {
     pub scratch: crate::scratch::ScratchState,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
+    /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
+    /// metadata; false for legacy/asymmetric artifacts.
+    pub mq4v2_symmetric: bool,
 
     /// Process-pinned optional CK runtime. Loading is explicit and fail-closed;
     /// individual attention families still decide whether a capability cell is
@@ -1384,6 +1387,7 @@ impl Gpu {
                 fa2_fp8_q_scratch_bytes: 0,
             },
             replay: crate::replay::ReplayController::from_config(),
+            mq4v2_symmetric: false,
             #[cfg(feature = "flash-attn-ck")]
             flash_attn_ck,
             #[cfg(feature = "flash-attn-ck")]
