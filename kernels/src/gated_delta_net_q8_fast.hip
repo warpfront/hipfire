@@ -48,6 +48,13 @@
 #define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast
 #endif
 
+// permlanex16 requires the gfx10-insts target feature, which CDNA3 does not
+// advertise. Keep the identical reduction tree through the shfl fallback.
+#if defined(HIPFIRE_GDN_DPP_REDUCE) \
+    && (defined(__gfx940__) || defined(__gfx941__) || defined(__gfx942__))
+#undef HIPFIRE_GDN_DPP_REDUCE
+#endif
+
 #if defined(HIPFIRE_GDN_DPP_REDUCE)
 // Preserve the shipping shfl_down reduction order while replacing its LDS
 // bpermutes with gfx11 VALU cross-lane operations. Only lane 0 is consumed.

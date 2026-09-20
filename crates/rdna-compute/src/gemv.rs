@@ -8336,7 +8336,10 @@ impl Gpu {
 
         // RDNA2 (gfx1030/1031): always use the arch-optimized narrow kernel.
         // Other non-RDNA3 archs: use wide kernel (2 rows/block) for large M.
-        let use_wide = !gfx1151_lm_head_dot2
+        // The wide two-row symbol is not emitted by the V2 source. CDNA3 uses
+        // the generic 32-lane scalar kernel, which is valid in one half-wave64.
+        let use_wide = !self.arch_caps.is_cdna3()
+            && !gfx1151_lm_head_dot2
             && !gfx1151_lm_head_r1_hybrid_buffer
             && !use_multirow
             && m >= 64
@@ -9188,7 +9191,10 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_K2048", false);
-        let use_wide = !gfx1151_lm_head_dot2
+        // The qt44 source exports no `_wide` symbol on CDNA3. Its generic
+        // 32-thread kernel is still correct there: it occupies half a wave64
+        // and its shuffle reduction intentionally stops at offset 16.
+        let use_wide = !self.arch_caps.is_cdna3() && !gfx1151_lm_head_dot2
             && !gfx1151_lm_head_r1_hybrid_buffer
             && !use_multirow
             && m >= 64
@@ -9573,7 +9579,7 @@ impl Gpu {
             && m == 248_320
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_K2048", false);
-        let use_wide = !gfx1151_lm_head_dot2
+        let use_wide = !self.arch_caps.is_cdna3() && !gfx1151_lm_head_dot2
             && !gfx1151_lm_head_r1_hybrid_buffer
             && !use_multirow
             && m >= 64
@@ -10284,7 +10290,7 @@ impl Gpu {
             && k == 2_048
             && hipfire_config::developer_bool("HIPFIRE_GFX1151_LM_HEAD_K2048", false);
 
-        let use_wide = !gfx1151_lm_head_dot2
+        let use_wide = !self.arch_caps.is_cdna3() && !gfx1151_lm_head_dot2
             && !gfx1151_lm_head_r1_hybrid_buffer
             && !use_multirow
             && m >= 64

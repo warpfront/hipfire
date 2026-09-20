@@ -4835,17 +4835,24 @@ pub(crate) enum PrefillRouteMode<'a> {
     },
 }
 
+static LAYER_HIDDEN_DUMP_DIR: std::sync::OnceLock<std::path::PathBuf> =
+    std::sync::OnceLock::new();
+
+/// Configure complete post-block residual dumps for evaluator tooling.
+/// This is one-shot and process-global because the ordinary forward API
+/// deliberately stays free of diagnostic parameters.
+pub fn set_layer_hidden_dump_dir(dir: std::path::PathBuf) -> Result<(), std::path::PathBuf> {
+    LAYER_HIDDEN_DUMP_DIR.set(dir)
+}
+
 #[allow(clippy::too_many_arguments)]
-/// Debug localization hook (no-op unless `HIPFIRE_DUMP_HIDDEN` is set to a file
-/// prefix). Appends the post-layer hidden row for the target absolute position
-/// to `{HIPFIRE_DUMP_HIDDEN}.{tag}` as `u32 layer_idx` followed by `dim`
-/// little-endian f32. The target absolute position is `HIPFIRE_DUMP_HIDDEN_POS`
-/// (default 0); `abs_pos_of_row0` is the absolute sequence position of row 0 of
-/// `x` (`start_pos` for the batched residual `pbs.x_batch`, `pos` for the
-/// single-row per-token `s.x`). Used to localize the PARO batched-prefill
-/// divergence by diffing `.batched` vs `.pertoken` per layer. Requires
-/// `HIPFIRE_GRAPH=0` (does a synchronous D2H readback, which is illegal under
-/// graph capture).
+/// Debug hidden-state hook. The evaluator's runtime dump setting appends every
+/// post-block residual row to one raw little-endian f32 file per layer.
+/// `HIPFIRE_DUMP_HIDDEN` retains the older single-row localization format,
+/// appending the target row to `{HIPFIRE_DUMP_HIDDEN}.{tag}` as `u32 layer_idx`
+/// followed by `dim` f32s.
+/// Both modes require `HIPFIRE_GRAPH=0` because they synchronize and read back
+/// device memory.
 pub(crate) fn dump_hidden_localize(
     gpu: &Gpu,
     x: &GpuTensor,
@@ -4855,6 +4862,30 @@ pub(crate) fn dump_hidden_localize(
     layer_idx: usize,
     tag: &str,
 ) {
+    if matches!(tag, "batched" | "pertoken") {
+        if let Some(dir) = LAYER_HIDDEN_DUMP_DIR.get() {
+            if gpu.hip.device_synchronize().is_ok() {
+                if let Ok(all) = gpu.download_f32(x) {
+                    let end = n_rows.saturating_mul(dim);
+                    if end <= all.len() {
+                        use std::io::Write;
+                        let path = dir.join(format!("layer-{layer_idx:03}.f32"));
+                        if let Ok(mut file) = std::fs::OpenOptions::new()
+                            .create(true)
+                            .append(true)
+                            .open(path)
+                        {
+                            let mut bytes = Vec::with_capacity(end * 4);
+                            for value in &all[..end] {
+                                bytes.extend_from_slice(&value.to_le_bytes());
+                            }
+                            let _ = file.write_all(&bytes);
+                        }
+                    }
+                }
+            }
+        }
+    }
     let prefix = match hipfire_config::developer_var("HIPFIRE_DUMP_HIDDEN") {
         Ok(p) => p,
         Err(_) => return,

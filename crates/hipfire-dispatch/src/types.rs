@@ -941,7 +941,11 @@ impl KernelKey {
             // MQ2G256LloydU shares MQ2G256Lloyd's kernels byte-for-byte, so it
             // inherits the identical arch gating.
             MQ2G256Lloyd | MQ2G256LloydU | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
-            MQ2G256GL | MQ3G256GL | MQ4G256V2 | MQ4G256V2Lloyd | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2 | MQ4CG256 => ArchPredicate::HasWave32,
+            // qt44's generic 32-thread kernel reduces only the active half of a
+            // wave64, so it is valid on CDNA3 as well as every wave32 target.
+            // The other V2 formats below still require their wave32 routes.
+            MQ4G256V2 | MQ4G256V2Lloyd => ArchPredicate::Always,
+            MQ2G256GL | MQ3G256GL | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2 | MQ4CG256 => ArchPredicate::HasWave32,
             Q8HFQ | Raw => ArchPredicate::Always,
         }
     }
@@ -1066,5 +1070,17 @@ mod tests {
             KernelKey::gemv_steps(DType::MQ4G256V2Lloyd, GemvVariant::WithResidual)
                 .contains(&PipelineOp::RotateFwht)
         );
+    }
+
+    #[test]
+    fn mq4g256v2_generic_gemv_is_arch_portable() {
+        assert!(matches!(
+            KernelKey::dtype_arch_predicate(DType::MQ4G256V2),
+            ArchPredicate::Always
+        ));
+        assert!(matches!(
+            KernelKey::dtype_arch_predicate(DType::MQ4G256V2Lloyd),
+            ArchPredicate::Always
+        ));
     }
 }

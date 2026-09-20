@@ -68,6 +68,7 @@ fn main() {
         kv_v: String,
         scoring_mode: String,
         max_chunks: Option<usize>,
+        dump_layer_hidden: Option<PathBuf>,
     }
     let argv: Vec<String> = std::env::args().collect();
     let mut model: Option<PathBuf> = None;
@@ -77,6 +78,7 @@ fn main() {
     let mut kv_v = "q8".to_string();
     let mut scoring_mode = "prefill".to_string();
     let mut max_chunks: Option<usize> = None;
+    let mut dump_layer_hidden: Option<PathBuf> = None;
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -134,8 +136,12 @@ fn main() {
                 max_chunks = Some(argv[i + 1].parse().expect("--max-chunks must be integer"));
                 i += 2;
             }
+            "--dump-layer-hidden" => {
+                dump_layer_hidden = Some(PathBuf::from(&argv[i + 1]));
+                i += 2;
+            }
             "-h" | "--help" => {
-                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill] [--max-chunks N]");
+                eprintln!("Usage: eval_hipfire --model <path> --ref <path> --output <path> [--kv-mode asym3] [--kv-v q8] [--scoring-mode prefill] [--max-chunks N] [--dump-layer-hidden DIR]");
                 std::process::exit(0);
             }
             other => {
@@ -152,6 +158,7 @@ fn main() {
         kv_v,
         scoring_mode,
         max_chunks,
+        dump_layer_hidden,
     };
 
     // -------- eval-mode env vars (must precede Gpu::init / forward) --------
@@ -778,6 +785,54 @@ fn main() {
             mean_kld_per_seq.push(mean);
             p99_kld_per_seq.push(p99);
             mean_nll_per_seq.push(mean_nll);
+        }
+        if let Some(dir) = args.dump_layer_hidden.as_ref() {
+            std::fs::create_dir_all(dir).expect("create --dump-layer-hidden directory");
+            for layer_idx in 0..config.n_layers {
+                let path = dir.join(format!("layer-{layer_idx:03}.f32"));
+                if path.exists() {
+                    std::fs::remove_file(&path).expect("clear stale layer-hidden dump");
+                }
+            }
+            qwen35::prefill::set_layer_hidden_dump_dir(dir.clone())
+                .expect("layer-hidden dump was already configured");
+            dn_state
+                .reset(&mut gpu)
+                .expect("reset DeltaNet state for --dump-layer-hidden");
+            qwen35::forward_prefill_batch(
+                &mut gpu,
+                &weights,
+                &config,
+                &tokens[..n_ctx],
+                0,
+                &mut kv_cache,
+                &mut dn_state,
+                &scratch,
+                None,
+                None,
+                None,
+                None,
+            )
+            .expect("forward chunk 0 for --dump-layer-hidden");
+            let expected_bytes = (n_ctx * config.dim * std::mem::size_of::<f32>()) as u64;
+            for layer_idx in 0..config.n_layers {
+                let path = dir.join(format!("layer-{layer_idx:03}.f32"));
+                let actual_bytes = std::fs::metadata(&path)
+                    .unwrap_or_else(|error| panic!("missing {}: {error}", path.display()))
+                    .len();
+                assert_eq!(
+                    actual_bytes,
+                    expected_bytes,
+                    "{} has incomplete layer-hidden dump",
+                    path.display()
+                );
+            }
+            eprintln!(
+                "eval_hipfire: dumped {} post-block residual streams ({n_ctx}x{} f32) to {}",
+                config.n_layers,
+                config.dim,
+                dir.display()
+            );
         }
         // qwen35 owns hidden_buf drop; keep eprintln identity
         drop(hidden_buf);
