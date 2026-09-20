@@ -763,10 +763,10 @@ def capture_boundaries(args: argparse.Namespace) -> dict[str, Any]:
     model_load_started = time.monotonic()
     model = AutoModel.from_pretrained(
         args.source,
-        dtype=torch.bfloat16,
+        torch_dtype=torch.bfloat16,
         attn_implementation="eager",
         low_cpu_mem_usage=True,
-        device_map={"": device},
+        device_map={"": "cuda:0"},
     )
     language = model.language_model
     layers = language.layers
