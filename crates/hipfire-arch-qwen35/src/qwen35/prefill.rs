@@ -2148,6 +2148,9 @@ fn forward_prefill_batch_with_pbs_opts_inner(
     // min(configured/capped max, pbs.max_batch, hidden_rb staging) so no
     // write exceeds a staging owner.
     let mut own_pbs: Option<PrefillBatchScratch> = None;
+    // True when `own_pbs` was taken from the retained widened cache below
+    // (not freshly allocated): it is moved back on return instead of freed.
+    let mut widened_from_cache = false;
     // F2 pair scratch (second 512-row PBS + 1024-row FA staging), allocated
     // lazily on the first pair and shared by all pairs of this call.
     let mut pair_scratch: Option<(PrefillBatchScratch, FaPairStage)> = None;
@@ -2162,7 +2165,20 @@ fn forward_prefill_batch_with_pbs_opts_inner(
             Some(p) => p,
             None if wide => {
                 let owned_rows = limit.min(n).max(MIN_BATCH);
-                own_pbs = Some(PrefillBatchScratch::new_opt(gpu, config, owned_rows, false)?);
+                // Retained widened PBS: reuse across requests when it fits,
+                // else replace. Saves the ~25 ms per-request alloc on
+                // 6k-token prefills. Bit-identical: every PBS tensor is
+                // overwritten before it is read (same reuse contract as the
+                // legacy `prefill_batch` cache).
+                let mut cached = scratch.widened_prefill_batch.borrow_mut();
+                if !cached.as_ref().is_some_and(|p| p.max_batch >= owned_rows) {
+                    if let Some(old) = cached.take() {
+                        let _ = old.free_gpu(gpu);
+                    }
+                    *cached = Some(PrefillBatchScratch::new_opt(gpu, config, owned_rows, false)?);
+                }
+                own_pbs = cached.take();
+                widened_from_cache = true;
                 own_pbs.as_ref().unwrap()
             }
             None => {
@@ -2367,7 +2383,13 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         }
         Ok(())
     })();
-    if let Some(owned) = own_pbs {
+    if widened_from_cache {
+        // Return the retained PBS to the cache (also on error: it is pure
+        // scratch, and the next use overwrites before reading).
+        if let Some(owned) = own_pbs {
+            *scratch.widened_prefill_batch.borrow_mut() = Some(owned);
+        }
+    } else if let Some(owned) = own_pbs {
         owned.free_gpu(gpu);
     }
     if let Some((pbs2, stage)) = pair_scratch {
