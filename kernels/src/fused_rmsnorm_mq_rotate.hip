@@ -3,6 +3,12 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#ifndef HIPFIRE_IU4_GROUP_K
+#define HIPFIRE_IU4_GROUP_K 128
+#endif
+#if HIPFIRE_IU4_GROUP_K != 128 && HIPFIRE_IU4_GROUP_K != 256 && HIPFIRE_IU4_GROUP_K != 512
+#error "HIPFIRE_IU4_GROUP_K must be 128, 256, or 512"
+#endif
 
 // Fused RMSNorm + FWHT rotation for MagnumQuant inputs.
 //
@@ -97,21 +103,28 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         local_sum += v * v;
     }
 
-    // Prefetch first FWHT group's x/weight (+ lane-local signs) so the
-    // loads ride under Phase-1b barriers. groups layout is wave-uniform
-    // (depends only on K and warp_id), so this is safe before rms exists.
+    // Prefetch this wave's first group. Coarse IU4 variants schedule complete
+    // 256/512-K windows per wave; all other variants keep the incumbent
+    // contiguous groups-per-wave schedule.
     const int groups_total = K / 256;
+    const int d0 = lane_id * 8;
+#if defined(HIPFIRE_IU4_SIDECAR) && HIPFIRE_IU4_GROUP_K > 128
+    constexpr int groups_per_window = HIPFIRE_IU4_GROUP_K / 256;
+    const int windows_total = K / HIPFIRE_IU4_GROUP_K;
+    const int pref_group = warp_id * groups_per_window;
+    const bool have_pref = warp_id < windows_total;
+#else
     const int groups_per_warp = (groups_total + num_warps - 1) / num_warps;
     const int warp_group_start = warp_id * groups_per_warp;
-    const int d0 = lane_id * 8;
+    const int pref_group = warp_group_start;
+    const bool have_pref = (groups_per_warp > 0 && pref_group < groups_total);
+#endif
 
     float4 pref_x0, pref_x1, pref_w0, pref_w1;
 #ifdef HIPFIRE_RMSNORM_AWQ
     float4 pref_a0, pref_a1;
 #endif
     float4 s10, s11, s20, s21;
-    const int pref_group = warp_group_start;
-    const bool have_pref = (groups_per_warp > 0 && pref_group < groups_total);
     if (have_pref) {
         const int base = pref_group * 256 + d0;
         pref_x0 = *reinterpret_cast<const float4*>(x_b + base);
@@ -152,6 +165,114 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     float row_amax = 0.0f;
 #endif
 
+#if defined(HIPFIRE_IU4_SIDECAR) && HIPFIRE_IU4_GROUP_K > 128
+    // One wave owns each complete coarse K window. Its final FWHT values stay
+    // in registers until one wave reduction supplies the shared scale; no
+    // activation-plane write/re-read or additional launch is involved.
+    for (int window = warp_id; window < windows_total; window += num_warps) {
+        float values[groups_per_window][8];
+        #pragma unroll
+        for (int wg = 0; wg < groups_per_window; ++wg) {
+            const int group = window * groups_per_window + wg;
+            const int base = group * 256 + d0;
+            float4 x0, x1, w0, w1;
+#ifdef HIPFIRE_RMSNORM_AWQ
+            float4 a0, a1;
+#endif
+            if (window == warp_id && wg == 0 && have_pref) {
+                x0 = pref_x0; x1 = pref_x1;
+                w0 = pref_w0; w1 = pref_w1;
+#ifdef HIPFIRE_RMSNORM_AWQ
+                a0 = pref_a0; a1 = pref_a1;
+#endif
+            } else {
+                x0 = *reinterpret_cast<const float4*>(x_b + base);
+                x1 = *reinterpret_cast<const float4*>(x_b + base + 4);
+                w0 = *reinterpret_cast<const float4*>(weight + base);
+                w1 = *reinterpret_cast<const float4*>(weight + base + 4);
+#ifdef HIPFIRE_RMSNORM_AWQ
+                a0 = *reinterpret_cast<const float4*>(awq_scale + base);
+                a1 = *reinterpret_cast<const float4*>(awq_scale + base + 4);
+#endif
+            }
+
+#ifdef HIPFIRE_RMSNORM_AWQ
+            float v0 = (x0.x * w0.x * rms / a0.x) * s10.x;
+            float v1 = (x0.y * w0.y * rms / a0.y) * s10.y;
+            float v2 = (x0.z * w0.z * rms / a0.z) * s10.z;
+            float v3 = (x0.w * w0.w * rms / a0.w) * s10.w;
+            float v4 = (x1.x * w1.x * rms / a1.x) * s11.x;
+            float v5 = (x1.y * w1.y * rms / a1.y) * s11.y;
+            float v6 = (x1.z * w1.z * rms / a1.z) * s11.z;
+            float v7 = (x1.w * w1.w * rms / a1.w) * s11.w;
+#else
+            float v0 = x0.x * w0.x * rms * s10.x;
+            float v1 = x0.y * w0.y * rms * s10.y;
+            float v2 = x0.z * w0.z * rms * s10.z;
+            float v3 = x0.w * w0.w * rms * s10.w;
+            float v4 = x1.x * w1.x * rms * s11.x;
+            float v5 = x1.y * w1.y * rms * s11.y;
+            float v6 = x1.z * w1.z * rms * s11.z;
+            float v7 = x1.w * w1.w * rms * s11.w;
+#endif
+
+            float t;
+            t = v0; v0 = v0 + v1; v1 = t - v1;
+            t = v2; v2 = v2 + v3; v3 = t - v3;
+            t = v4; v4 = v4 + v5; v5 = t - v5;
+            t = v6; v6 = v6 + v7; v7 = t - v7;
+            t = v0; v0 = v0 + v2; v2 = t - v2;
+            t = v1; v1 = v1 + v3; v3 = t - v3;
+            t = v4; v4 = v4 + v6; v6 = t - v6;
+            t = v5; v5 = v5 + v7; v7 = t - v7;
+            t = v0; v0 = v0 + v4; v4 = t - v4;
+            t = v1; v1 = v1 + v5; v5 = t - v5;
+            t = v2; v2 = v2 + v6; v6 = t - v6;
+            t = v3; v3 = v3 + v7; v7 = t - v7;
+
+            #define HBFLY_COARSE(v, pat, str) do { \
+                float _p = __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), (pat))); \
+                if (lane_id & (str)) { (v) = _p - (v); } else { (v) = (v) + _p; } \
+            } while (0)
+            #define HBFLY8_COARSE(pat, str) \
+                HBFLY_COARSE(v0,pat,str); HBFLY_COARSE(v1,pat,str); \
+                HBFLY_COARSE(v2,pat,str); HBFLY_COARSE(v3,pat,str); \
+                HBFLY_COARSE(v4,pat,str); HBFLY_COARSE(v5,pat,str); \
+                HBFLY_COARSE(v6,pat,str); HBFLY_COARSE(v7,pat,str)
+            HBFLY8_COARSE(0x041F, 1);
+            HBFLY8_COARSE(0x081F, 2);
+            HBFLY8_COARSE(0x101F, 4);
+            HBFLY8_COARSE(0x201F, 8);
+            HBFLY8_COARSE(0x401F, 16);
+            #undef HBFLY8_COARSE
+            #undef HBFLY_COARSE
+
+            const float scale = 0.0625f;
+            values[wg][0] = v0 * scale * s20.x;
+            values[wg][1] = v1 * scale * s20.y;
+            values[wg][2] = v2 * scale * s20.z;
+            values[wg][3] = v3 * scale * s20.w;
+            values[wg][4] = v4 * scale * s21.x;
+            values[wg][5] = v5 * scale * s21.y;
+            values[wg][6] = v6 * scale * s21.z;
+            values[wg][7] = v7 * scale * s21.w;
+
+            if (x_rot != nullptr) {
+                float4 out0, out1;
+                out0.x = values[wg][0]; out0.y = values[wg][1];
+                out0.z = values[wg][2]; out0.w = values[wg][3];
+                out1.x = values[wg][4]; out1.y = values[wg][5];
+                out1.z = values[wg][6]; out1.w = values[wg][7];
+                *reinterpret_cast<float4*>(x_rot_b + base) = out0;
+                *reinterpret_cast<float4*>(x_rot_b + base + 4) = out1;
+            }
+        }
+
+        emit_iu4_sidecar_window_from_producer8<groups_per_window>(
+            values, x_i4, window * groups_per_window,
+            (int)blockIdx.x, N, lane_id);
+    }
+#else
     // Phase 2: FWHT. First group uses prefetched x/w; later groups (if any)
     // load as before. signs already in registers.
     for (int gi = 0; gi < groups_per_warp; gi++) {
@@ -283,6 +404,7 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         *reinterpret_cast<float4*>(x_rot_b + base + 4) = out1;
 #endif
     }
+#endif
     #ifdef HIPFIRE_FP8_STREAM
     // FP8 stream: whole-row scale + pack from the just-written F32 row
     // (L1-resident re-read). Byte-identical to pack_f32_to_fp8_mq4v2_gfx12

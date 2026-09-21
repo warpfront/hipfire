@@ -1130,6 +1130,45 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+/// Single-pass coarse-scale RMSNorm/FWHT producers. One wave retains a
+/// complete 256/512-K window in registers, reduces its amax, and repeats that
+/// scale in the ordinary K128 headers. At K512, the other fused IU4 families
+/// keep K128 because each workgroup owns only one K256 slice; their separate
+/// K256 variants coarsen exactly that already-owned slice.
+pub const FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_K256_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_GROUP_K 256\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4_gfx12_k256\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_K256_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_GROUP_K 256\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12_k256\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_K512_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_GROUP_K 512\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4_gfx12_k512\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_K512_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_GROUP_K 512\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12_k512\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
 /// gfx1201 FP8-stream producer: RMSNorm/FWHT + in-register whole-row scale +
 /// E4M3 pack under distinct entry symbols so HSACO caches and profiler rows
 /// cannot alias any other fusion. Emits byte-identical
@@ -1197,6 +1236,21 @@ pub const MQ_ROTATE_X_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_KERNEL rotate_x_mq_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
+pub const MQ_ROTATE_X_I4_GFX12_K256_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_GROUP_K 256\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i4_gfx12_k256\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
+pub const MQ_ROTATE_X_AWQ_I4_GFX12_K256_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_GROUP_K 256\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_KERNEL rotate_x_mq_awq_i4_gfx12_k256\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
 /// gfx1201 row-wide rotate producers that emit the MQ4v2 FP8 prepared
 /// planes.  Sigmoid twins fold the FA gate multiply into the same launch.
 pub const MQ_ROTATE_X_FP8_GFX12_SRC: &str = concat!(
@@ -1249,6 +1303,15 @@ pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_SIGMOID_GATE 1\n",
     "#define HIPFIRE_ROTATE_AWQ 1\n",
     "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
+pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_K256_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_GROUP_K 256\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_SIGMOID_GATE 1\n",
+    "#define HIPFIRE_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gfx12_k256\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
 
@@ -1353,6 +1416,21 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
+pub const GATED_NORM_MQ_ROTATE_I4_GFX12_K256_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_GROUP_K 256\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_gfx12_k256\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_K256_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_GROUP_K 256\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12_k256\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
 /// gfx1201 FP8-stream gated-norm producer for the LA output projection.
 /// Emits the exact gated-norm/AWQ/FWHT F32 row and the standalone packer's
 /// three planes in one row-wide workgroup.
@@ -1430,6 +1508,22 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_IU4_SIDECAR 1\n",
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
+);
+pub const FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_K256_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_GROUP_K 256\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_i4_gfx12_k256\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip")
+);
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_K256_SRC: &str = concat!(
+    "#define HIPFIRE_IU4_GROUP_K 256\n",
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_gfx12_k256\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
 );
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_INDEXED_SRC: &str =

@@ -140,6 +140,84 @@ __device__ __forceinline__ void quantize_block_i4_128_wave(
         out->s = s;
     }
 }
+// Quantize one K128 block with a scale already reduced across a wider,
+// producer-owned K window. The block-local integer sum remains exact so this
+// helper is safe for both symmetric and asymmetric consumers.
+__device__ __forceinline__ void quantize_block_i4_128_wave_fixed_scale(
+    const float xv[4],
+    block_i4_128* __restrict__ out,
+    int lane,
+    float d
+) {
+    int q4[4];
+    #pragma unroll
+    for (int e = 0; e < 4; ++e) {
+        float q = rintf(xv[e] / d);
+        q = fminf(fmaxf(q, -8.0f), 7.0f);
+        q4[e] = (int)q;
+    }
+    int s = q4[0] + q4[1] + q4[2] + q4[3];
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        s += __shfl_xor(s, offset, 32);
+    }
+
+    unsigned char* qb = out->qs;
+    qb[lane * 2 + 0] = (unsigned char)((q4[0] & 15) | ((q4[1] & 15) << 4));
+    qb[lane * 2 + 1] = (unsigned char)((q4[2] & 15) | ((q4[3] & 15) << 4));
+    if (lane == 0) {
+        out->d = d;
+        out->s = s;
+    }
+}
+
+// A producer wave owns one or two adjacent 256-K FWHT groups. Keep their
+// final values in registers, reduce one scale over the complete 256/512-K
+// window, then publish the ordinary four-values-per-lane K128 blocks.
+template <int Groups>
+__device__ __forceinline__ void emit_iu4_sidecar_window_from_producer8(
+    const float values[Groups][8],
+    block_i4_128* __restrict__ Y,
+    int first_group,
+    int token,
+    int N,
+    int lane
+) {
+    static_assert(Groups == 1 || Groups == 2, "supported producer window");
+    float amax = 0.0f;
+    #pragma unroll
+    for (int g = 0; g < Groups; ++g) {
+        #pragma unroll
+        for (int e = 0; e < 8; ++e) {
+            amax = fmaxf(amax, fabsf(values[g][e]));
+        }
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
+    }
+    const float d = (amax == 0.0f) ? 1.0f : amax / 7.0f;
+
+    #pragma unroll
+    for (int g = 0; g < Groups; ++g) {
+        #pragma unroll
+        for (int h = 0; h < 2; ++h) {
+            const int src = 16 * h + (lane >> 1);
+            float shuffled[8];
+            #pragma unroll
+            for (int e = 0; e < 8; ++e) {
+                shuffled[e] = __shfl(values[g][e], src, 32);
+            }
+            float xv[4];
+            const int half = (lane & 1) * 4;
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) {
+                xv[e] = shuffled[half + e];
+            }
+            block_i4_128* out =
+                Y + (long long)(2 * (first_group + g) + h) * N + token;
+            quantize_block_i4_128_wave_fixed_scale(xv, out, lane, d);
+        }
+    }
+}
 
 // Remap producer-final 8 floats/lane into the standalone quant ownership
 // (lane l owns 4l..4l+3 of each 128-half) and emit two block_i4_128 rows.
@@ -155,6 +233,13 @@ __device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
     int N,
     int lane
 ) {
+#if defined(HIPFIRE_IU4_GROUP_K) && HIPFIRE_IU4_GROUP_K == 256
+    const float values[1][8] = {{
+        f0, f1, f2, f3, f4, f5, f6, f7
+    }};
+    emit_iu4_sidecar_window_from_producer8<1>(
+        values, Y, group, token, N, lane);
+#else
     #pragma unroll
     for (int h = 0; h < 2; ++h) {
         const int src = 16 * h + (lane >> 1);
@@ -179,6 +264,7 @@ __device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
         quantize_block_i4_128_wave<false>(xv, out, lane);
 #endif
     }
+#endif
 }
 
 // Standalone quantizer: same (X, Y, K, N) grid contract as
