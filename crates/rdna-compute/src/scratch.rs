@@ -568,23 +568,36 @@ pub(crate) fn fa2_fp8_q_needed(
     (scale_offset + scale_bytes, sq_offset, scale_offset)
 }
 
-/// Byte size of the `int4_mmq_x_scratch` slot for `(k, batch_size)`: one 72 B
-/// `block_i4_128` per [K/128 block, batch]. Shared by `ensure_int4_mmq_x`
-/// and its `Gpu` caller.
+/// Byte size of the activation block selected by the default-off finer-scale
+/// screen.  The outer indexing and 64-byte nibble payload remain K128; K64
+/// adds one `(d,s)` pair and K32 adds three.
+#[inline]
+fn int4_mmq_block_bytes() -> usize {
+    match hipfire_config::developer_var("HIPFIRE_A4_GROUP_K")
+        .ok()
+        .as_deref()
+    {
+        Some("64") => 80,
+        Some("32") => 96,
+        _ => 72,
+    }
+}
+
+/// Byte size of the `int4_mmq_x_scratch` slot for `(k, batch_size)`.
+/// Shared by `ensure_int4_mmq_x` and its `Gpu` caller.
 #[inline]
 pub(crate) fn int4_mmq_x_needed(k: usize, batch_size: usize) -> usize {
     let blocks_k = (k + 127) / 128;
-    let block_i4_128_bytes = 72usize;
-    blocks_k * batch_size * block_i4_128_bytes
+    blocks_k * batch_size * int4_mmq_block_bytes()
 }
 
 /// Byte size of the `int4_mmq_x_scratch` slot for a producer reservation
 /// `(k, n)`. Shared by `reserve_int4_mmq` and its `Gpu` caller. The caller
-/// must have checked `k % 256 == 0 && n > 0` first (same as `reserve_int4_mmq`).
+/// must have checked `k % 256 == 0 && n > 0` first.
 #[inline]
 pub(crate) fn int4_mmq_reserve_needed(k: usize, n: usize) -> usize {
     let blocks_k = k / 128;
-    blocks_k * n * 72
+    blocks_k * n * int4_mmq_block_bytes()
 }
 
 /// Byte sizes of the three MQ4v2 FP8 pre-pass buffers `(x_fp8, half_sums,

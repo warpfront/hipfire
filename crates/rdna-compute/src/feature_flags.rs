@@ -488,6 +488,22 @@ impl FeatureFlags {
             }
         }
         if arch == "gfx1201" {
+            match parse_usize("HIPFIRE_A4_GROUP_K") {
+                None | Some(128) => {}
+                Some(64) => append_hipcc_flag("-DIU4_A4_GROUP_K=64"),
+                Some(32) => append_hipcc_flag("-DIU4_A4_GROUP_K=32"),
+                Some(other) => {
+                    eprintln!("unknown HIPFIRE_A4_GROUP_K={other}; using K128")
+                }
+            }
+            match parse_usize("HIPFIRE_A4_CANDIDATES") {
+                None | Some(1) => {}
+                Some(2) => append_hipcc_flag("-DIU4_A4_CANDIDATES=2"),
+                Some(4) => append_hipcc_flag("-DIU4_A4_CANDIDATES=4"),
+                Some(other) => {
+                    eprintln!("unknown HIPFIRE_A4_CANDIDATES={other}; using 1")
+                }
+            }
             let policy_flag = match value("HIPFIRE_GFX12_WEIGHT_LOAD_POLICY").ok().as_deref() {
                 None | Some("") | Some("rt") => None,
                 Some("global") => Some("-DHIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS=1"),
