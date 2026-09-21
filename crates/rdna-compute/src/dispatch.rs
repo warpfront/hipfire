@@ -3074,6 +3074,13 @@ impl Gpu {
             && k > 0
             && k % 256 == 0
     }
+    /// True when the IU4 route requested a scale span wider than one K128
+    /// block. Callers use this to keep the projection on IU4 and take the
+    /// standalone grouped quantizer rather than falling through to FP8.
+    pub fn iu4_grouped_activation_active(&self, k: usize) -> bool {
+        self.flags.iu4_prefill_enabled() && !iu4_activation_uses_fused_sidecar(k)
+    }
+
     /// True when a gfx11 sigmoid/gated-norm producer+quant fusion is live
     /// for this call: IU4 + `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED` on
     /// gfx1100/gfx1151 + eager (no replay/capture) + K constraint of the
