@@ -72,6 +72,10 @@ typedef float __attribute__((ext_vector_type(8))) v8f_t;
 #define HIPFIRE_FP8_SYMFOLD 0
 #endif
 
+#ifndef HIPFIRE_FP8_WPRESHUFFLE
+#define HIPFIRE_FP8_WPRESHUFFLE 0
+#endif
+
 // Expand one 32-bit nibble pack (8 q values, q_i = (pk >> 4*i) & 0xF)
 // into one per-lane FP8 WMMA operand (8 E4M3 bytes) bit-cast to v2i_t.
 // Byte i of the result is the E4M3 encoding of q_i per the table above.
@@ -433,6 +437,7 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     const int wave_tok = tok_part * 64;
     const int wave_wt = wt_part * 32;
     const int gpr = K / 256;
+    const int ksteps = K >> 4;
 
     extern __shared__ char lds[];
     char* lds_A = lds + HIPFIRE_FP8_V2_A_OFF;
@@ -504,6 +509,15 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
 #else
 #define HIPFIRE_FP8_V2_PICK(GR, ASRC, LR) do { int _v2g = (GR); const char* _v2a = A_gate; int _v2l = _v2g; if (_v2g >= gate_m) { _v2a = A_up; _v2l = _v2g - gate_m; } (ASRC) = _v2a; (LR) = _v2l; } while (0)
 #endif
+#if HIPFIRE_FP8_QKVZA
+#define HIPFIRE_FP8_V2_ROWS(GR, ROWS) do { int _v2g = (GR); int _v2r = qkv_m; if (_v2g >= qkv_m + z_m + beta_m) _v2r = alpha_m; else if (_v2g >= qkv_m + z_m) _v2r = beta_m; else if (_v2g >= qkv_m) _v2r = z_m; (ROWS) = _v2r; } while (0)
+#elif HIPFIRE_FP8_RESIDUAL
+#define HIPFIRE_FP8_V2_ROWS(GR, ROWS) do { (void)(GR); (ROWS) = res_m; } while (0)
+#elif HIPFIRE_FP8_QKV
+#define HIPFIRE_FP8_V2_ROWS(GR, ROWS) do { int _v2g = (GR); int _v2r = q_m; if (_v2g >= q_m + k_m) _v2r = v_m; else if (_v2g >= q_m) _v2r = k_m; (ROWS) = _v2r; } while (0)
+#else
+#define HIPFIRE_FP8_V2_ROWS(GR, ROWS) do { (ROWS) = (GR) >= gate_m ? up_m : gate_m; } while (0)
+#endif
     const unsigned st_quad = (unsigned)(tid & 3);
     const unsigned st_grp = (unsigned)(tid >> 2);
     const v2i_t st_z64 = {0, 0};
@@ -549,12 +563,22 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         const char* w_asrc;
         int w_lr;
         HIPFIRE_FP8_V2_PICK(w_grow_c, w_asrc, w_lr);
+#if HIPFIRE_FP8_WPRESHUFFLE
+        st_wbase[r] = w_asrc
+            + ((((unsigned)(w_lr >> 4) * (unsigned)ksteps + st_quad) * 32u
+                + (unsigned)(w_lr & 15)) * 4u);
+#else
         st_wbase[r] = w_asrc + (unsigned int)w_lr * (unsigned int)gpr * 136u;
+#endif
         st_wok[r] = (w_grow < tm) ? 1u : 0u;
         #pragma unroll
         for (int pp = 0; pp < 2; pp++) {
             const unsigned pk = st_quad * 2u + (unsigned)pp;
+#if HIPFIRE_FP8_WPRESHUFFLE
+            st_wpoff[r][pp] = (unsigned)pp * 64u;
+#else
             st_wpoff[r][pp] = pk * 4u;
+#endif
 #if HIPFIRE_FP8_V2_FRAG_ORDER
             st_wslot[r][pp] = ((unsigned)(w_row >> 4) * (unsigned)HIPFIRE_FP8_V2_K16 + st_quad)
                 * (unsigned)HIPFIRE_FP8_V2_FRAG + (unsigned)((w_row & 15) + pp * 16) * 8u;
@@ -575,6 +599,9 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     // SZ entries: symmetric stores scale only; asymmetric stores scale+zero.
     const char* st_szbase[HIPFIRE_FP8_V2_SZITER];
     unsigned st_szok[HIPFIRE_FP8_V2_SZITER];
+#if HIPFIRE_FP8_WPRESHUFFLE
+    size_t st_szhstride[HIPFIRE_FP8_V2_SZITER];
+#endif
 #if !HIPFIRE_FP8_SYMFOLD
     unsigned st_szword[HIPFIRE_FP8_V2_SZITER];
 #endif
@@ -592,7 +619,16 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         const char* sz_asrc;
         int sz_lr;
         HIPFIRE_FP8_V2_PICK(sz_grow_c, sz_asrc, sz_lr);
+#if HIPFIRE_FP8_WPRESHUFFLE
+        int sz_rows;
+        HIPFIRE_FP8_V2_ROWS(sz_grow_c, sz_rows);
+        const size_t sz_row_tiles = (size_t)sz_rows >> 4;
+        st_szbase[e] = sz_asrc + (size_t)sz_rows * (size_t)K / 2u
+            + ((size_t)(sz_lr >> 4) * 4u) * 16u + (unsigned)(sz_lr & 15);
+        st_szhstride[e] = sz_row_tiles * 64u;
+#else
         st_szbase[e] = sz_asrc + (unsigned int)sz_lr * (unsigned int)gpr * 136u;
+#endif
         st_szok[e] = (sz_grow < tm) ? 1u : 0u;
 #if HIPFIRE_FP8_SYMFOLD
         st_szlds[e] = (unsigned)sz_row * 4u;
@@ -644,10 +680,19 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
 #endif
                 // SZ: scale only for symmetric, scale+zero otherwise.
                 {
+#if HIPFIRE_FP8_WPRESHUFFLE
+                    const unsigned int half_block = (unsigned int)g * 2u + (unsigned int)h;
+#else
                     const unsigned int hwoff = (unsigned int)g * 136u + (unsigned int)h * 4u;
+#endif
                     #pragma unroll
                     for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
-#if HIPFIRE_FP8_SYMFOLD
+#if HIPFIRE_FP8_WPRESHUFFLE
+                        const unsigned char* hp = (const unsigned char*)st_szbase[e]
+                            + (size_t)half_block * st_szhstride[e];
+                        const unsigned short h16 =
+                            (unsigned short)hp[16] | ((unsigned short)hp[0] << 8);
+#elif HIPFIRE_FP8_SYMFOLD
                         const unsigned short h16 = *(const unsigned short*)(st_szbase[e] + hwoff);
 #else
                         const unsigned int hw = *(const unsigned int*)(st_szbase[e] + hwoff);
@@ -682,8 +727,13 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                 }
                 // W: two raw packs per round; expand immediately (bit-exact).
                 {
+#if HIPFIRE_FP8_WPRESHUFFLE
+                    const unsigned int pack_base =
+                        ((unsigned int)g * 16u + (unsigned int)h * 8u) * 128u;
+#else
                     const unsigned int pack_base = (unsigned int)g * 136u + 8u
                         + (unsigned int)h * 64u;
+#endif
                     #pragma unroll
                     for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
                         #pragma unroll
@@ -718,9 +768,15 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                         }
                     }
                     {
+#if HIPFIRE_FP8_WPRESHUFFLE
+                        const unsigned int pack_base =
+                            ((unsigned int)g * 16u + (unsigned int)h * 8u
+                                + (unsigned int)(slab + 1) * 4u) * 128u;
+#else
                         const unsigned int pack_base = (unsigned int)g * 136u + 8u
                             + (unsigned int)h * 64u
                             + (unsigned int)(slab + 1) * (unsigned int)(HIPFIRE_FP8_V2_BK / 2);
+#endif
                         #pragma unroll
                         for (int r = 0; r < HIPFIRE_FP8_V2_W_ROUNDS; r++) {
                             #pragma unroll

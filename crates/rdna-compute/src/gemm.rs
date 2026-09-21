@@ -9512,8 +9512,7 @@ impl Gpu {
             && (batch_size >= 256 || prepared.fragment_order);
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
         let fragment_order = foldfree && prepared.fragment_order;
-        let wpreshuffle = fragment_order
-            && self.mq4v2_weight_is_wpreshuffled(a_qkv)?
+        let wpreshuffle = self.mq4v2_weight_is_wpreshuffled(a_qkv)?
             && self.mq4v2_weight_is_wpreshuffled(a_z)?
             && self.mq4v2_weight_is_wpreshuffled(a_beta)?
             && self.mq4v2_weight_is_wpreshuffled(a_alpha)?;
@@ -9541,7 +9540,7 @@ impl Gpu {
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
         let (func_name, ksrc, bv): (&str, &str, usize) = if foldfree {
-            if wpreshuffle {
+            if fragment_order && wpreshuffle {
                 (
                     "gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_frag_wp_gfx1201",
                     kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_WP_SRC,
@@ -9562,6 +9561,12 @@ impl Gpu {
                     16,
                 )
             }
+        } else if symfold && wpreshuffle && (vbm, vbn) == (128, 128) {
+            (
+                "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold_wp",
+                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_WP_SRC,
+                8,
+            )
         } else if symfold {
             match (vbm, vbn) {
                 (128, 128) => (
@@ -9859,8 +9864,7 @@ impl Gpu {
             && (batch_size >= 256 || prepared.fragment_order);
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
         let fragment_order = foldfree && prepared.fragment_order;
-        let wpreshuffle = fragment_order
-            && self.mq4v2_weight_is_wpreshuffled(a_q)?
+        let wpreshuffle = self.mq4v2_weight_is_wpreshuffled(a_q)?
             && self.mq4v2_weight_is_wpreshuffled(a_k)?
             && self.mq4v2_weight_is_wpreshuffled(a_v)?;
         let (vbm, vbn, vbk, vwaves) = if foldfree {
@@ -9885,7 +9889,7 @@ impl Gpu {
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
         let (func_name, ksrc, bv): (&str, &str, usize) = if foldfree {
-            if wpreshuffle {
+            if fragment_order && wpreshuffle {
                 (
                     "gemm_qkv_mq4g256v2_wmma_fp8_v2_foldfree_frag_wp_gfx1201",
                     kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_WP_SRC,
@@ -9906,6 +9910,12 @@ impl Gpu {
                     16,
                 )
             }
+        } else if symfold && wpreshuffle && (vbm, vbn) == (128, 128) {
+            (
+                "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold_wp",
+                kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_WP_SRC,
+                8,
+            )
         } else if symfold {
             match (vbm, vbn) {
                 (128, 128) => (
@@ -30415,8 +30425,7 @@ impl Gpu {
             && (batch_size >= 256 || prepared.fragment_order);
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
         let fragment_order = foldfree && prepared.fragment_order;
-        let wpreshuffle = fragment_order
-            && self.mq4v2_weight_is_wpreshuffled(a_gate)?
+        let wpreshuffle = self.mq4v2_weight_is_wpreshuffled(a_gate)?
             && self.mq4v2_weight_is_wpreshuffled(a_up)?;
         let (vbm, vbn, vbk, vwaves) = if foldfree {
             (256, 128, 64, 8)
@@ -30445,7 +30454,7 @@ impl Gpu {
         // ranking so BT8/BT4 keep their exact ranges). Grid ceil-divides
         // batch_tiles and the kernels guard `oc < N`, so any tile covers N%64.
         let (func_name, ksrc, bv): (&str, &str, usize) = if foldfree {
-            if wpreshuffle {
+            if fragment_order && wpreshuffle {
                 (
                     "gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_frag_wp_gfx1201",
                     kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_WP_SRC,
@@ -30466,6 +30475,12 @@ impl Gpu {
                     16,
                 )
             }
+        } else if symfold && wpreshuffle && (vbm, vbn) == (128, 128) {
+            (
+                "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold_wp",
+                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_WP_SRC,
+                8,
+            )
         } else if symfold {
             match (vbm, vbn) {
                 (128, 128) => (
@@ -32252,8 +32267,7 @@ impl Gpu {
             && (batch_size >= 256 || prepared.fragment_order);
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
         let fragment_order = foldfree && prepared.fragment_order;
-        let wpreshuffle =
-            fragment_order && self.mq4v2_weight_is_wpreshuffled(a_raw)?;
+        let wpreshuffle = self.mq4v2_weight_is_wpreshuffled(a_raw)?;
         let (vbm, vbn, vbk, vwaves) = if foldfree {
             (256, 128, 64, 8)
         } else {
@@ -32276,7 +32290,7 @@ impl Gpu {
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
         let (func_name, ksrc, bv): (&str, &str, usize) = if foldfree {
-            if wpreshuffle {
+            if fragment_order && wpreshuffle {
                 (
                     "gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_frag_wp_gfx1201",
                     kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_WP_SRC,
@@ -32297,6 +32311,12 @@ impl Gpu {
                     16,
                 )
             }
+        } else if symfold && wpreshuffle && (vbm, vbn) == (128, 128) {
+            (
+                "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x128_gfx1201_symfold_wp",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_WP_SRC,
+                8,
+            )
         } else if symfold {
             match (vbm, vbn) {
                 (128, 128) => (

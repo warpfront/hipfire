@@ -4252,6 +4252,46 @@ fp8_v2_symfold_source!(
     128, 64, 4, "#define HIPFIRE_FP8_QKV 1\n",
     "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201_symfold"
 );
+macro_rules! fp8_v2_symfold_wp_source {
+    ($name:ident, $family:literal, $entry:literal) => {
+        pub const $name: &str = concat!(
+            "#define HIPFIRE_FP8_SYMFOLD 1\n",
+            "#define HIPFIRE_FP8_WPRESHUFFLE 1\n",
+            "#define HIPFIRE_FP8_V2_TILE 1\n",
+            "#define HIPFIRE_FP8_V2_BM 128\n",
+            "#define HIPFIRE_FP8_V2_BN 128\n",
+            "#define HIPFIRE_FP8_V2_BK 64\n",
+            "#define HIPFIRE_FP8_V2_WAVES 8\n",
+            $family,
+            "#define HIPFIRE_FP8_GATEUP_KERNEL ",
+            $entry,
+            "\n",
+            include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip")
+        );
+    };
+}
+
+fp8_v2_symfold_wp_source!(
+    GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_WP_SRC,
+    "",
+    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold_wp"
+);
+fp8_v2_symfold_wp_source!(
+    GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_WP_SRC,
+    "#define HIPFIRE_FP8_RESIDUAL 1\n",
+    "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x128_gfx1201_symfold_wp"
+);
+fp8_v2_symfold_wp_source!(
+    GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_WP_SRC,
+    "#define HIPFIRE_FP8_QKVZA 1\n",
+    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold_wp"
+);
+fp8_v2_symfold_wp_source!(
+    GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_WP_SRC,
+    "#define HIPFIRE_FP8_QKV 1\n",
+    "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold_wp"
+);
+
 /// Fold-free pow2-scale MQ4V2 kernels.  The per-family prefix fixes the ABI
 /// and symbol; the shared body owns the 256x128 / 64x64-wave implementation.
 pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC: &str = concat!(

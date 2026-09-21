@@ -250,13 +250,14 @@ fn mq4v2_wpreshuffle_enabled(gpu: &Gpu, name: &str, m: usize, k: usize) -> bool 
         || name.ends_with(".self_attn.q_proj.weight")
         || name.ends_with(".self_attn.k_proj.weight")
         || name.ends_with(".self_attn.v_proj.weight");
+    let foldfree_direct_a = gpu.mq4v2_pow2scale != 0
+        && hipfire_config::developer_var("HIPFIRE_FP8_FRAGMENT_ORDER").as_deref() == Ok("1");
     target
         && gpu.arch == "gfx1201"
-        && gpu.mq4v2_pow2scale != 0
+        && gpu.mq4v2_symmetric
+        && (gpu.mq4v2_pow2scale == 0 || foldfree_direct_a)
         && m % 16 == 0
         && k % 256 == 0
-        && hipfire_config::developer_var("HIPFIRE_FP8_FOLDFREE").as_deref() != Ok("0")
-        && hipfire_config::developer_var("HIPFIRE_FP8_FRAGMENT_ORDER").as_deref() == Ok("1")
         && hipfire_config::developer_var("HIPFIRE_FP8_WPRESHUFFLE").as_deref() != Ok("0")
 }
 
@@ -677,9 +678,16 @@ fn load_weight_tensor_raw(
             };
             let upload = permuted.as_deref().unwrap_or(data);
             let buf = gpu.upload_raw(upload, &[upload.len()])?;
-            if let Some(row_scales) = row_scales {
-                let sidecar = gpu.upload_raw(&row_scales, &[m * std::mem::size_of::<f32>()])?;
-                gpu.install_mq4v2_foldfree_weight(&buf, sidecar, wpreshuffle)?;
+            let row_scale_sidecar = if let Some(row_scales) = row_scales {
+                Some(gpu.upload_raw(
+                    &row_scales,
+                    &[m * std::mem::size_of::<f32>()],
+                )?)
+            } else {
+                None
+            };
+            if row_scale_sidecar.is_some() || wpreshuffle {
+                gpu.install_mq4v2_foldfree_weight(&buf, row_scale_sidecar, wpreshuffle)?;
             }
             Ok(WeightTensor {
                 buf,

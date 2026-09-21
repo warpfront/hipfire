@@ -646,7 +646,7 @@ pub struct MmqScreenState {
 /// `self.replay` will silently truncate a retained tape — use
 /// `debug_assert_tape_parity` or compare the two counts in a test.
 pub(crate) struct Mq4v2FoldfreeWeight {
-    row_scales: GpuTensor,
+    row_scales: Option<GpuTensor>,
     wpreshuffled: bool,
 }
 
@@ -969,12 +969,13 @@ impl Gpu {
         // bind_thread: skip — pure flag read, touches no device state.
         self.flags.slot_trace
     }
-    /// Attach a loader-built per-output-row 2^e_row sidecar to a resident
-    /// MQ4V2 weight.  The Gpu owns the sidecar; callers keep only the weight.
+    /// Attach loader-built MQ4V2 metadata to a resident weight. Fold-free
+    /// weights carry a per-row reference-scale sidecar; symmetric-fold
+    /// weights may carry only the load-time W-layout marker.
     pub fn install_mq4v2_foldfree_weight(
         &self,
         weight: &GpuTensor,
-        row_scales: GpuTensor,
+        row_scales: Option<GpuTensor>,
         wpreshuffled: bool,
     ) -> HipResult<()> {
         let key = weight.buf.as_ptr() as usize;
@@ -1009,7 +1010,8 @@ impl Gpu {
             .lock()
             .map_err(|_| HipError::new(0, "MQ4V2 fold-free weight map poisoned"))?
             .get(&key)
-            .map(|metadata| metadata.row_scales.buf.as_ptr())
+            .and_then(|metadata| metadata.row_scales.as_ref())
+            .map(|row_scales| row_scales.buf.as_ptr())
             .ok_or_else(|| HipError::new(0, "MQ4V2 fold-free row sidecar missing"))
     }
 
@@ -3897,7 +3899,9 @@ impl Gpu {
             .map_err(|_| HipError::new(0, "MQ4V2 fold-free weight map poisoned"))?
             .remove(&key);
         if let Some(metadata) = foldfree_metadata {
-            self.free_tensor(metadata.row_scales)?;
+            if let Some(row_scales) = metadata.row_scales {
+                self.free_tensor(row_scales)?;
+            }
         }
         if self.vmm_arenas.contains_key(&key) {
             if !tensor.buf.is_vmm_owner() {
