@@ -1,6 +1,7 @@
 # Changelog
 
 ## Unreleased
+- Symmetric MQ4V2 artifacts on gfx1201 now select centered FP8-v2 GEMM twins for gate/up, residual, qkvza, and qkv prefill: packed nibbles expand directly through an E4M3 `(q-8)` table, scale-only metadata replaces scale+zero staging, and each K128 partial uses one scale FMA instead of scale+zero correction. `HIPFIRE_FP8_SYMFOLD=0` restores the asymmetric twins for developer comparison; non-symmetric artifacts are unchanged. On Qwen3.8-27B XT, paired pp8192 improved by 6.1–7.4%, the four profiled v2 GEMM families fell 8.4% in aggregate, fp8/q8 WT2 c24 KLD was 0.049063, and the no-think serve battery passed 5/5.
 - `hipfire-quantize --awq-a4-aware` keeps MQ4V2's wire/header and FWHT seeds unchanged while selecting each shared activation group's AWQ alpha from `{0.35,0.45,0.55,0.65,0.75}` by sampled W4A4 block-output error. Activation fake quantization mirrors the gfx1201 four-candidate `block_i4_128` MSE recipe bit-for-bit, and fused qkvza/gate-up siblings reuse the anchor projection's alpha.
 - Drop obsolete `HIPFIRE_LLOYD_GFX12` opt-in: MQ3/MQ4 Lloyd WMMA batched prefill is always-on for gfx1200/gfx1201 (validated since PR #195).
 - W4A4 iu4-direct MQ4V2 prefill is now default-on through `kernel.iu4_prefill` on its exact gfx1100/gfx1151/gfx1201 kernel routes; unsupported architectures keep their incumbent path. `hipfire config set kernel.iu4_prefill false` opts out globally, and the same key supports per-model opt-out; `HIPFIRE_IU4_PREFILL` remains a developer override.
