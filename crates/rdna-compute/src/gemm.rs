@@ -10291,6 +10291,26 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Integer-A8 (iu8) MMQ route: explicit opt-in via HIPFIRE_IU8_PREFILL
+        // on exact gfx1201 (see `iu8_prefill_enabled`). Checked first so the
+        // explicit selection wins over the default-on iu4 route. Partial M/N
+        // tiles are masked in-kernel (no tail kernels needed, unlike the
+        // gfx11 path); the per-128 X prelude is excluded (the gfx12
+        // consumer corrects per 32-K sub-block).
+        if self.flags.iu8_prefill_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && k % 256 == 0
+            && batch_size >= 64
+            && !self.flags.gfx11_mmq_x128_enabled()
+        {
+            let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_gfx12(a_qkv, xq, y_qkv, qkv_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_gfx12(a_z, xq, y_z, z_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_gfx12(a_beta, xq, y_beta, beta_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_gfx12(a_alpha, xq, y_alpha, alpha_m, k, batch_size)?;
+            return Ok(());
+        }
         // gfx12 iu4-direct MMQ handles partial 128-row tiles natively, so odd
         // prefill batches stay on the W4A4 path without host padding.
         if self.flags.iu4_prefill_enabled()
@@ -19134,6 +19154,118 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.gemm_mq4g256v2_mmq_prequant(a_raw, x_q8_ptr, y, m, k, batch_size, true)
+    }
+
+    /// gfx12 (RDNA4) iu8 MMQ consumer for the MQ4V2 family (integer-A8
+    /// prefill): W int4 expanded to int8 x Q8_1 int8 activations on
+    /// `wmma_i32_16x16x16_iu8_w32_gfx12` (single-wave 16-row tile, LDS 0).
+    /// Same 7-arg ABI as `gemm_mq4g256v2_mmq_prequant`; partial M/N tiles
+    /// are masked in-kernel, so there is no full/add/base symbol split —
+    /// all three entry names map to the same guarded body (the name is
+    /// still selected for profile fidelity). Opt-in via
+    /// `HIPFIRE_IU8_PREFILL` on exact gfx1201; returns Err elsewhere so a
+    /// misrouted call fails loud instead of running the arch-guard stubs.
+    fn gemm_mq4g256v2_mmq_prequant_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        add: bool,
+    ) -> HipResult<()> {
+        if self.arch.as_str() != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ4V2 iu8 gfx12 MMQ requires exact gfx1201",
+            ));
+        }
+        if k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "MQ4V2 iu8 gfx12 MMQ requires K divisible by 256",
+            ));
+        }
+        self.bind_thread()?;
+        let full = m % 128 == 0 && batch_size % 128 == 0;
+        let kernel_name = match (full, add) {
+            (true, true) => "gemm_mq4g256v2_residual_mmq_full_add",
+            (true, false) => "gemm_mq4g256v2_residual_mmq_full_set",
+            (false, _) => "gemm_mq4g256v2_residual_mmq",
+        };
+        const MODULE: &str = "gemm_mq4g256v2_residual_mmq_gfx12";
+        self.ensure_kernel(
+            MODULE,
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_GFX12_SRC,
+            kernel_name,
+        )?;
+        let mut a_ptr = a_raw.buf.as_ptr();
+        let mut xq_ptr = x_q8_ptr;
+        let mut y_ptr = y.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut add_val = i32::from(add);
+        let mut params: Vec<*mut c_void> = vec![
+            &mut a_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut y_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut add_val as *mut _ as *mut c_void,
+        ];
+        let row_tiles = m.div_ceil(16);
+        let batch_tiles = batch_size.div_ceil(16);
+        let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [row_tiles as u32, batch_tiles as u32, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(add_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    pub fn gemm_mq4g256v2_mmq_set_prequant_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_mmq_prequant_gfx12(a_raw, x_q8_ptr, y, m, k, batch_size, false)
+    }
+
+    pub fn gemm_mq4g256v2_mmq_add_prequant_gfx12(
+        &mut self,
+        a_raw: &GpuTensor,
+        x_q8_ptr: *mut c_void,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.gemm_mq4g256v2_mmq_prequant_gfx12(a_raw, x_q8_ptr, y, m, k, batch_size, true)
     }
 
     /// MQ4G256V2-Lloyd (qt=52) MMQ-LUT twin of `gemm_mq4g256v2_mmq_prequant`.
@@ -29710,6 +29842,24 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // Integer-A8 (iu8) MMQ route: explicit opt-in via HIPFIRE_IU8_PREFILL
+        // on exact gfx1201 (see `iu8_prefill_enabled`). Checked first so the
+        // explicit selection wins over the default-on iu4 route. Partial M/N
+        // tiles are masked in-kernel; the per-128 X prelude is excluded (the
+        // gfx12 consumer corrects per 32-K sub-block).
+        if self.flags.iu8_prefill_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && k % 256 == 0
+            && batch_size >= 64
+            && !self.flags.gfx11_mmq_x128_enabled()
+        {
+            let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_gfx12(a_q, xq, y_q, q_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_gfx12(a_k, xq, y_k, k_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_gfx12(a_v, xq, y_v, v_m, k, batch_size)?;
+            return Ok(());
+        }
         // gfx12 iu4-direct MMQ handles partial 128-row tiles natively.
         if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"
@@ -30333,6 +30483,23 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Integer-A8 (iu8) MMQ route: explicit opt-in via HIPFIRE_IU8_PREFILL
+        // on exact gfx1201 (see `iu8_prefill_enabled`). Checked first so the
+        // explicit selection wins over the default-on iu4 route. Partial M/N
+        // tiles are masked in-kernel; the per-128 X prelude is excluded (the
+        // gfx12 consumer corrects per 32-K sub-block).
+        if self.flags.iu8_prefill_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && k % 256 == 0
+            && batch_size >= 64
+            && !self.flags.gfx11_mmq_x128_enabled()
+        {
+            let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_gfx12(a_gate, xq, y_gate, gate_m, k, batch_size)?;
+            self.gemm_mq4g256v2_mmq_set_prequant_gfx12(a_up, xq, y_up, up_m, k, batch_size)?;
+            return Ok(());
+        }
         // gfx12 iu4-direct MMQ handles partial 128-row tiles natively.
         if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"
@@ -32509,6 +32676,22 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Integer-A8 (iu8) MMQ route: explicit opt-in via HIPFIRE_IU8_PREFILL
+        // on exact gfx1201 (see `iu8_prefill_enabled`). Checked first so the
+        // explicit selection wins over the default-on iu4 route. Partial M/N
+        // tiles are masked in-kernel; the per-128 X prelude is excluded (the
+        // gfx12 consumer corrects per 32-K sub-block).
+        if self.flags.iu8_prefill_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && k % 256 == 0
+            && batch_size >= 64
+            && !self.flags.gfx11_mmq_x128_enabled()
+        {
+            let xq = self.ensure_q8_1_mmq_x_v2(x, batch_size, k)?;
+            self.gemm_mq4g256v2_mmq_add_prequant_gfx12(a_raw, xq, y, m, k, batch_size)?;
+            return Ok(());
+        }
         // gfx12 iu4-direct MMQ handles partial 128-row tiles natively.
         if self.flags.iu4_prefill_enabled()
             && self.arch == "gfx1201"

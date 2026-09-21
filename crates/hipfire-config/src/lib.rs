@@ -2231,6 +2231,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the W4A4 iu4-direct MMQ prefill route (default on exact gfx1100/gfx1151/gfx1201, other arches keep their incumbent route; set to false or HIPFIRE_IU4_PREFILL=0 to opt out)."
     ),
     process_bool_field!(
+        "kernel.iu8_prefill",
+        "iu8_prefill",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_IU8_PREFILL",
+        "Enable the integer-A8 iu8 MMQ prefill route (W int4 expanded to int8 x Q8_1 int8 activations on wmma_i32_16x16x16_iu8; opt-in on exact gfx1201, other arches keep their incumbent route; set to false or HIPFIRE_IU8_PREFILL=0 to opt out)."
+    ),
+    process_bool_field!(
         "kernel.npu_spillover",
         "npu_spillover",
         Kernel,

@@ -47,6 +47,14 @@ pub struct FeatureFlags {
     /// Quality cost ~+0.016 WT2-24 KLD on the MQ4-XT speed rung
     /// (gfx1201: 0.048028 -> 0.063890).
     pub iu4_prefill: Option<bool>,
+    /// iu8 MMQ prefill (integer A8: W int4 expanded to int8 x Q8_1 int8
+    /// activations on `wmma_i32_16x16x16_iu8`, `HIPFIRE_IU8_PREFILL`,
+    /// `kernel.iu8_prefill`). Opt-in on exact gfx1201 only (default off
+    /// everywhere); unset/`=0` keeps the incumbent iu4 (default on) / fp8 /
+    /// f16 route. Quality arm candidate replacing the fp8 v2 route; the
+    /// gfx12 compute kernel has no symfold twin (see
+    /// `gemm_mq4g256v2_residual_mmq.gfx12.hip`).
+    pub iu8_prefill: Option<bool>,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -516,6 +524,7 @@ impl FeatureFlags {
             gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
+            iu8_prefill: parse_bool("HIPFIRE_IU8_PREFILL"),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -804,6 +813,12 @@ impl FeatureFlags {
         self.iu4_prefill.unwrap_or(true)
             && matches!(self.arch.as_str(), "gfx1100" | "gfx1151" | "gfx1201")
     }
+    /// Resolved integer-A8 MMQ route: explicit opt-in only, and only on
+    /// exact gfx1201 (the only arch with a gfx12 iu8 MMQ kernel).
+    /// Unset/`=0`/other arches keep the incumbent.
+    pub fn iu8_prefill_enabled(&self) -> bool {
+        self.iu8_prefill.unwrap_or(false) && self.arch.as_str() == "gfx1201"
+    }
 
     /// Producer-emitted IU4 sidecar route on gfx1100/gfx1151 + IU4 opt-in.
     /// When live (and eager + batch/K admission), RMSNorm/FWHT and
@@ -911,6 +926,7 @@ impl FeatureFlags {
             hfq3_dp4a: None,
             hfq3_mmq: None,
             hfq4_mmq_rdna2: None,
+            iu8_prefill: Some(false),
             fp8_wmma: false,
             dot2_gemv: false,
             gcn5_wave64_hybrid: None,
@@ -1377,6 +1393,40 @@ mod tests {
         for arch in ["gfx1100", "gfx1151"] {
             let test_flags = FeatureFlags::for_test(arch);
             assert!(!test_flags.iu4_prefill_enabled(), "arch={arch}");
+        }
+    }
+    #[test]
+    fn iu8_prefill_opt_in_gfx1201_only() {
+        // Default process policy: the integer-A8 MMQ prefill route stays off
+        // everywhere until `kernel.iu8_prefill=true` (or
+        // `HIPFIRE_IU8_PREFILL=1`); the opt-in admits only exact gfx1201.
+        let resolved = resolve([]).unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        for arch in ["gfx1100", "gfx1151", "gfx1201", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.iu8_prefill_enabled(), "arch={arch}");
+        }
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("kernel.iu8_prefill", "true").unwrap();
+        let resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: "config.toml".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let process = ProcessConfig::from_resolved(&resolved).unwrap();
+        assert!(FeatureFlags::from_process_config("gfx1201", &process).iu8_prefill_enabled());
+        for arch in ["gfx1100", "gfx1151", "gfx942"] {
+            let flags = FeatureFlags::from_process_config(arch, &process);
+            assert!(!flags.iu8_prefill_enabled(), "arch={arch}");
+        }
+
+        // The unit-test constructor stays off (deterministic baseline).
+        for arch in ["gfx1100", "gfx1151", "gfx1201"] {
+            let test_flags = FeatureFlags::for_test(arch);
+            assert!(!test_flags.iu8_prefill_enabled(), "arch={arch}");
         }
     }
 

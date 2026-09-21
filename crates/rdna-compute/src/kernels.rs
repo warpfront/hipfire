@@ -3650,6 +3650,14 @@ pub const GEMM_HFQ4G256_RESIDUAL_MMQ_SRC: &str =
 // unchanged; metadata loads select the dual fp16 header per 128-weight half.
 pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.hip");
+// gfx12 (RDNA4) iu8 MMQ sister: same 7-arg ABI and Q8_1 activations as the
+// RDNA3 kernel above, single-wave 16-row tile on
+// `wmma_i32_16x16x16_iu8_w32_gfx12`, V2 dual-fp16 headers per 128-K half.
+// Opt-in through HIPFIRE_IU8_PREFILL on exact gfx1201. Distinct MODULE
+// (`gemm_mq4g256v2_residual_mmq_gfx12`) so the code-object cache cannot
+// alias the RDNA3 module (same entry-symbol names). No symfold twin.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq.gfx12.hip");
 // MQ4G256V2-Lloyd (qt=52) MMQ-LUT twin: `-DHIPFIRE_MMQ_LUT=1` swaps nibble→byte
 // expand for a C16 lookup + sc/16, and emits `*_lloyd` entry symbols with +4
 // u32 kernargs. Distinct MODULE (`gemm_mq4g256v2_residual_mmq_lloyd`) so the
