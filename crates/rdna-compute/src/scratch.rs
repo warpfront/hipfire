@@ -1510,6 +1510,13 @@ impl ScratchState {
         k: usize,
     ) -> HipResult<*mut c_void> {
         crate::graph::bind_thread(hip, device_id)?;
+        let row_global =
+            hipfire_config::developer_var("HIPFIRE_IU4_GLOBAL_A_SCREEN").as_deref() == Ok("1");
+        let quant_symbol = if row_global {
+            "quantize_int4_mmq_row"
+        } else {
+            "quantize_int4_mmq_ds128"
+        };
         compile_and_load_kernel(
             compiler,
             hip,
@@ -1517,7 +1524,7 @@ impl ScratchState {
             functions,
             "gemm_mq4g256v2_residual_mmq_iu4",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
-            "quantize_int4_mmq_ds128",
+            quant_symbol,
         )?;
 
         let needed = int4_mmq_x_needed(k, batch_size);
@@ -1544,11 +1551,10 @@ impl ScratchState {
                 &mut k_val as *mut _ as *mut c_void,
                 &mut n_val as *mut _ as *mut c_void,
             ];
-            let grid_x = ((k + 1023) / 1024) as u32;
+            let grid_x = if row_global { 1 } else { (k + 1023) / 1024 } as u32;
             let grid_y = batch_size as u32;
             let bytes = batch_size * k * 4 + needed;
-            let timer =
-                crate::profile::begin_timer(hip, "quantize", "quantize_int4_mmq_ds128", bytes);
+            let timer = crate::profile::begin_timer(hip, "quantize", quant_symbol, bytes);
             launch_maybe_blob(
                 hip,
                 Some(&*compiler),
@@ -1558,7 +1564,7 @@ impl ScratchState {
                 capture_mode,
                 force_blob_path,
                 Some(replay),
-                "quantize_int4_mmq_ds128",
+                quant_symbol,
                 [grid_x, grid_y, 1],
                 [256, 1, 1],
                 0,

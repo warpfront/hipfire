@@ -206,6 +206,57 @@ extern "C" __global__ void quantize_int4_mmq_ds128(
     block_i4_128* out = Y + (long long)kblock * N + token;
     quantize_block_i4_128_wave<false>(xv, out, lane);
 }
+// Screening-only row-global int4 quantizer. One workgroup owns one token row,
+// chooses a single d=amax/7 over all K values, and repeats that d in every
+// block_i4_128 header. The symmetric iu4 consumer does not read s.
+extern "C" __global__ void quantize_int4_mmq_row(
+    const float* __restrict__ X,
+    block_i4_128* __restrict__ Y,
+    int K,
+    int N
+) {
+    const int token = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+    if (token >= N) return;
+
+    __shared__ float wave_max[8];
+    float amax = 0.0f;
+    for (int i = tid; i < K; i += blockDim.x) {
+        amax = fmaxf(amax, fabsf(X[(long long)token * K + i]));
+    }
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
+    }
+    if (lane == 0) wave_max[wave] = amax;
+    __syncthreads();
+    if (tid == 0) {
+        float row_max = wave_max[0];
+        #pragma unroll
+        for (int w = 1; w < 8; ++w) row_max = fmaxf(row_max, wave_max[w]);
+        wave_max[0] = (row_max == 0.0f) ? 1.0f : row_max / 7.0f;
+    }
+    __syncthreads();
+    const float d = wave_max[0];
+
+    const int blocks = K / 128;
+    for (int b = tid; b < blocks; b += blockDim.x) {
+        block_i4_128* out = Y + (long long)b * N + token;
+        out->d = d;
+        out->s = 0;
+    }
+    for (int byte = tid; byte < K / 2; byte += blockDim.x) {
+        const int i = byte * 2;
+        float q0 = rintf(X[(long long)token * K + i] / d);
+        float q1 = rintf(X[(long long)token * K + i + 1] / d);
+        q0 = fminf(fmaxf(q0, -8.0f), 7.0f);
+        q1 = fminf(fmaxf(q1, -8.0f), 7.0f);
+        block_i4_128* out = Y + (long long)(i / 128) * N + token;
+        out->qs[byte & 63] =
+            (unsigned char)(((int)q0 & 15) | (((int)q1 & 15) << 4));
+    }
+}
 #endif // HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE
 
 #endif // HIPFIRE_BLOCK_I4_128_QUANT_HIP
