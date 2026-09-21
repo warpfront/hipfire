@@ -246,7 +246,7 @@ def select_corpus(args: argparse.Namespace) -> dict[str, Any]:
     tokenizer = AutoTokenizer.from_pretrained(args.source, trust_remote_code=False, use_fast=True)
     tokenizer_sha = sha256_file(args.source / "tokenizer.json")
     reference = read_kldref_tokens(args.ref)
-    if reference["n_ctx"] != args.seq_len:
+    if not args.pack_documents and reference["n_ctx"] != args.seq_len:
         raise ValueError(f"reference n_ctx={reference['n_ctx']} does not match seq_len={args.seq_len}")
     reference_tokens = reference.pop("tokens")
     reference_ngrams: set[bytes] = set()
@@ -256,79 +256,260 @@ def select_corpus(args: argparse.Namespace) -> dict[str, Any]:
     need_per_source = (args.train_sequences + args.heldout_sequences) // 2
     if (args.train_sequences % 2) or (args.heldout_sequences % 2):
         raise ValueError("train and heldout sequence counts must both be even for a 50/50 corpus")
-
-    wt = load_dataset(WT2_REPO, WT2_CONFIG, split="train", revision=WT2_REVISION)
-    wt_heap: list[tuple[int, int, dict[str, Any]]] = []
-    excluded_wt_docs = 0
-    eligible_wt_docs = 0
-    for ordinal, (doc_id, text, provenance) in enumerate(wt2_documents(wt)):
-        item = candidate_record("wikitext2-train", doc_id, text, provenance, tokenizer, args.seed, args.seq_len, reference_ngrams)
-        if item is None:
-            # This count includes short docs and ref-overlap docs; the exact
-            # no-overlap assertion is independently rerun on selected records.
-            excluded_wt_docs += 1
-            continue
-        eligible_wt_docs += 1
-        retain_lowest(wt_heap, item, need_per_source, ordinal)
-    if len(wt_heap) != need_per_source:
-        raise RuntimeError(f"only {len(wt_heap)} eligible WT2 documents; need {need_per_source}")
-
-    c4 = load_dataset(C4_REPO, C4_CONFIG, split="train", streaming=True, revision=C4_REVISION)
-    c4_heap: list[tuple[int, int, dict[str, Any]]] = []
-    eligible_c4_docs = 0
-    scanned_c4_docs = 0
-    for row_index, row in enumerate(c4):
-        if row_index >= args.c4_scan_docs:
-            break
-        scanned_c4_docs += 1
-        text = str(row["text"])
-        url = str(row.get("url", ""))
-        timestamp = str(row.get("timestamp", ""))
-        doc_id = f"c4-train:{row_index}:{sha256_bytes(url.encode())[:16]}"
-        provenance = {"stream_row": row_index, "url": url, "timestamp": timestamp}
-        item = candidate_record("c4-train", doc_id, text, provenance, tokenizer, args.seed, args.seq_len, reference_ngrams)
-        if item is None:
-            continue
-        eligible_c4_docs += 1
-        retain_lowest(c4_heap, item, need_per_source, row_index)
-    if len(c4_heap) != need_per_source:
-        raise RuntimeError(
-            f"only {len(c4_heap)} eligible C4 documents in first {scanned_c4_docs}; need {need_per_source}; increase --c4-scan-docs"
-        )
+    train_half = args.train_sequences // 2
+    held_half = args.heldout_sequences // 2
 
     def ordered(heap: list[tuple[int, int, dict[str, Any]]]) -> list[dict[str, Any]]:
         rows = [(-neg_priority, record) for neg_priority, _, record in heap]
         rows.sort(key=lambda row: row[0])
         return [record for _, record in rows]
 
-    wt_rows = ordered(wt_heap)
-    c4_rows = ordered(c4_heap)
-    train_half = args.train_sequences // 2
-    held_half = args.heldout_sequences // 2
-    records: list[dict[str, Any]] = []
-    for split, source_rows in (
-        ("train", wt_rows[:train_half]),
-        ("train", c4_rows[:train_half]),
-        ("heldout", wt_rows[train_half : train_half + held_half]),
-        ("heldout", c4_rows[train_half : train_half + held_half]),
-    ):
-        for row in source_rows:
-            row = dict(row)
-            row["split"] = split
-            records.append(row)
-    records.sort(key=lambda row: (0 if row["split"] == "train" else 1, row["source"], row["token_sha256"]))
+    wt = load_dataset(WT2_REPO, WT2_CONFIG, split="train", revision=WT2_REVISION)
+    c4 = load_dataset(C4_REPO, C4_CONFIG, split="train", streaming=True, revision=C4_REVISION)
+    scanned_c4_docs = 0
+    packing: dict[str, Any]
+
+    if args.pack_documents:
+        eos_token_id = tokenizer.eos_token_id
+        if eos_token_id is None:
+            raise RuntimeError("document packing requires an EOS token")
+
+        def packed_candidate(
+            source_name: str,
+            doc_id: str,
+            text: str,
+            provenance: dict[str, Any],
+        ) -> tuple[int, dict[str, Any]] | None:
+            doc_bytes = text.encode("utf-8")
+            doc_sha = sha256_bytes(doc_bytes)
+            token_ids = [int(token) for token in tokenizer.encode(text, add_special_tokens=False)]
+            if not token_ids or has_reference_overlap(token_ids, reference_ngrams, OVERLAP_NGRAM):
+                return None
+            return priority_for(source_name, doc_id, doc_sha, args.seed), {
+                "source": source_name,
+                "dataset_document_id": doc_id,
+                "document_sha256": doc_sha,
+                "document_bytes": len(doc_bytes),
+                "document_token_count": len(token_ids),
+                "tokens": token_ids,
+                "provenance": provenance,
+            }
+
+        wt_candidates: list[tuple[int, dict[str, Any]]] = []
+        excluded_wt_docs = 0
+        for doc_id, text, provenance in wt2_documents(wt):
+            item = packed_candidate("wikitext2-train", doc_id, text, provenance)
+            if item is None:
+                excluded_wt_docs += 1
+            else:
+                wt_candidates.append(item)
+        wt_candidates.sort(key=lambda item: item[0])
+        wt_docs = [record for _, record in wt_candidates]
+
+        raw_c4_heap: list[tuple[int, int, dict[str, Any]]] = []
+        raw_pool_size = need_per_source * 64
+        for row_index, row in enumerate(c4):
+            if row_index >= args.c4_scan_docs:
+                break
+            scanned_c4_docs += 1
+            text = str(row["text"])
+            if not text.strip():
+                continue
+            url = str(row.get("url", ""))
+            timestamp = str(row.get("timestamp", ""))
+            doc_id = f"c4-train:{row_index}:{sha256_bytes(url.encode())[:16]}"
+            doc_sha = sha256_bytes(text.encode("utf-8"))
+            item = (
+                priority_for("c4-train", doc_id, doc_sha, args.seed),
+                {
+                    "doc_id": doc_id,
+                    "text": text,
+                    "provenance": {"stream_row": row_index, "url": url, "timestamp": timestamp},
+                },
+            )
+            retain_lowest(raw_c4_heap, item, raw_pool_size, row_index)
+        c4_candidates: list[tuple[int, dict[str, Any]]] = []
+        for raw in ordered(raw_c4_heap):
+            item = packed_candidate("c4-train", raw["doc_id"], raw["text"], raw["provenance"])
+            if item is not None:
+                c4_candidates.append(item)
+        c4_candidates.sort(key=lambda item: item[0])
+        c4_docs = [record for _, record in c4_candidates]
+
+        def pack_source(
+            source_name: str,
+            documents: list[dict[str, Any]],
+        ) -> list[dict[str, Any]]:
+            result: list[dict[str, Any]] = []
+            document_index = 0
+            for split, count in (("train", train_half), ("heldout", held_half)):
+                for _ in range(count):
+                    sequence: list[int] = []
+                    pieces: list[dict[str, Any]] = []
+                    while len(sequence) < args.seq_len:
+                        if document_index >= len(documents):
+                            raise RuntimeError(
+                                f"{source_name} exhausted {len(documents)} documents while packing "
+                                f"{count} {split} sequences"
+                            )
+                        if sequence:
+                            sequence.append(int(eos_token_id))
+                            pieces.append({"kind": "eos", "token_count": 1})
+                            if len(sequence) == args.seq_len:
+                                break
+                        document = documents[document_index]
+                        document_index += 1
+                        remaining = args.seq_len - len(sequence)
+                        token_ids = document["tokens"]
+                        take = min(remaining, len(token_ids))
+                        offset = deterministic_offset(
+                            len(token_ids), document["document_sha256"], args.seed, take
+                        )
+                        sequence.extend(token_ids[offset : offset + take])
+                        pieces.append(
+                            {
+                                "kind": "document",
+                                "dataset_document_id": document["dataset_document_id"],
+                                "document_sha256": document["document_sha256"],
+                                "document_bytes": document["document_bytes"],
+                                "document_token_count": document["document_token_count"],
+                                "token_offset": offset,
+                                "token_count": take,
+                                "provenance": document["provenance"],
+                            }
+                        )
+                    token_sha = sha256_bytes(packed_u32(sequence))
+                    document_pieces = [piece for piece in pieces if piece["kind"] == "document"]
+                    aggregate_sha = sha256_bytes(
+                        canonical_json([piece["document_sha256"] for piece in document_pieces])
+                    )
+                    result.append(
+                        {
+                            "source": source_name,
+                            "split": split,
+                            "dataset_document_id": f"packed:{source_name}:{aggregate_sha[:16]}",
+                            "document_sha256": aggregate_sha,
+                            "document_bytes": sum(piece["document_bytes"] for piece in document_pieces),
+                            "document_token_count": sum(
+                                piece["document_token_count"] for piece in document_pieces
+                            ),
+                            "token_offset": 0,
+                            "token_count": args.seq_len,
+                            "token_sha256": token_sha,
+                            "tokens": sequence,
+                            "provenance": {"packing": pieces},
+                            "packed_documents": document_pieces,
+                        }
+                    )
+            return result
+
+        records = pack_source("wikitext2-train", wt_docs)
+        records.extend(pack_source("c4-train", c4_docs))
+        eligible_wt_docs = len(wt_docs)
+        eligible_c4_docs = len(c4_docs)
+        packing = {
+            "enabled": True,
+            "strategy": "deterministic-priority documents, EOS-separated, no document shared across train/heldout",
+            "eos_token_id": int(eos_token_id),
+            "c4_candidate_pool_documents": len(raw_c4_heap),
+        }
+    else:
+        wt_heap: list[tuple[int, int, dict[str, Any]]] = []
+        excluded_wt_docs = 0
+        eligible_wt_docs = 0
+        for ordinal, (doc_id, text, provenance) in enumerate(wt2_documents(wt)):
+            item = candidate_record(
+                "wikitext2-train",
+                doc_id,
+                text,
+                provenance,
+                tokenizer,
+                args.seed,
+                args.seq_len,
+                reference_ngrams,
+            )
+            if item is None:
+                excluded_wt_docs += 1
+                continue
+            eligible_wt_docs += 1
+            retain_lowest(wt_heap, item, need_per_source, ordinal)
+        if len(wt_heap) != need_per_source:
+            raise RuntimeError(f"only {len(wt_heap)} eligible WT2 documents; need {need_per_source}")
+
+        c4_heap: list[tuple[int, int, dict[str, Any]]] = []
+        eligible_c4_docs = 0
+        for row_index, row in enumerate(c4):
+            if row_index >= args.c4_scan_docs:
+                break
+            scanned_c4_docs += 1
+            text = str(row["text"])
+            url = str(row.get("url", ""))
+            timestamp = str(row.get("timestamp", ""))
+            doc_id = f"c4-train:{row_index}:{sha256_bytes(url.encode())[:16]}"
+            provenance = {"stream_row": row_index, "url": url, "timestamp": timestamp}
+            item = candidate_record(
+                "c4-train",
+                doc_id,
+                text,
+                provenance,
+                tokenizer,
+                args.seed,
+                args.seq_len,
+                reference_ngrams,
+            )
+            if item is None:
+                continue
+            eligible_c4_docs += 1
+            retain_lowest(c4_heap, item, need_per_source, row_index)
+        if len(c4_heap) != need_per_source:
+            raise RuntimeError(
+                f"only {len(c4_heap)} eligible C4 documents in first {scanned_c4_docs}; "
+                f"need {need_per_source}; increase --c4-scan-docs"
+            )
+        wt_rows = ordered(wt_heap)
+        c4_rows = ordered(c4_heap)
+        records = []
+        for split, source_rows in (
+            ("train", wt_rows[:train_half]),
+            ("train", c4_rows[:train_half]),
+            ("heldout", wt_rows[train_half : train_half + held_half]),
+            ("heldout", c4_rows[train_half : train_half + held_half]),
+        ):
+            for row in source_rows:
+                row = dict(row)
+                row["split"] = split
+                records.append(row)
+        packing = {"enabled": False}
+
+    records.sort(
+        key=lambda row: (
+            0 if row["split"] == "train" else 1,
+            row["source"],
+            row["token_sha256"],
+        )
+    )
     if len(records) != args.train_sequences + args.heldout_sequences:
         raise AssertionError("selected corpus count mismatch")
-
-    doc_hashes = [row["document_sha256"] for row in records]
     token_hashes = [row["token_sha256"] for row in records]
-    if len(set(doc_hashes)) != len(doc_hashes):
-        raise AssertionError("train/heldout corpus contains repeated documents")
     if len(set(token_hashes)) != len(token_hashes):
         raise AssertionError("train/heldout corpus contains repeated token sequences")
+    train_documents: set[str] = set()
+    heldout_documents: set[str] = set()
+    all_documents: list[str] = []
     for row in records:
+        document_hashes = [
+            piece["document_sha256"] for piece in row.get("packed_documents", [row])
+        ]
+        all_documents.extend(document_hashes)
+        target = train_documents if row["split"] == "train" else heldout_documents
+        target.update(document_hashes)
         if has_reference_overlap(row["tokens"], reference_ngrams, OVERLAP_NGRAM):
             raise AssertionError(f"selected sequence overlaps c24 reference: {row['token_sha256']}")
+    if len(set(all_documents)) != len(all_documents):
+        raise AssertionError("a source document was selected more than once")
+    intersection = train_documents & heldout_documents
+    if intersection:
+        raise AssertionError(f"train/heldout source documents overlap: {sorted(intersection)[:8]}")
 
     tokens = np.asarray([row.pop("tokens") for row in records], dtype="<u4")
     token_path = corpus_dir / "tokens.u32"
@@ -352,31 +533,98 @@ def select_corpus(args: argparse.Namespace) -> dict[str, Any]:
         "heldout_sequences": args.heldout_sequences,
         "total_sequences": len(records),
         "total_tokens": int(tokens.size),
-        "mixture": {"train": {"wikitext2-train": train_half, "c4-train": train_half}, "heldout": {"wikitext2-train": held_half, "c4-train": held_half}},
-        "datasets": {
-            "wikitext2": {"repo": WT2_REPO, "config": WT2_CONFIG, "split": "train", "revision": WT2_REVISION, "eligible_documents": eligible_wt_docs, "excluded_or_short_documents": excluded_wt_docs},
-            "c4": {"repo": C4_REPO, "config": C4_CONFIG, "split": "train", "revision": C4_REVISION, "scanned_documents": scanned_c4_docs, "eligible_documents": eligible_c4_docs},
+        "mixture": {
+            "train": {"wikitext2-train": train_half, "c4-train": train_half},
+            "heldout": {"wikitext2-train": held_half, "c4-train": held_half},
         },
-        "tokenizer": {"path": str(args.source.resolve()), "tokenizer_json_sha256": tokenizer_sha, "class": tokenizer.__class__.__name__, "add_special_tokens": False},
-        "token_stream": {"file": relative(token_path, args.out), "dtype": "uint32-le", "axes": ["sequence", "token"], "shape": list(tokens.shape), "sha256": sha256_file(token_path), "aggregate_token_sha256": corpus_token_sha},
-        "attention_mask": {"file": relative(mask_path, args.out), "dtype": "uint8", "axes": ["sequence", "token"], "shape": list(tokens.shape), "sha256": sha256_file(mask_path), "semantics": "all tokens valid; no padding"},
-        "positions": {"file": relative(position_path, args.out), "dtype": "uint32-le", "axes": ["sequence", "token"], "shape": list(tokens.shape), "sha256": sha256_file(position_path), "semantics": "0..2047 independently for every document"},
-        "state": {"reset": "zero at each selected source document", "carry": "within one 2048-token document only", "kv": "empty", "convolution": "zero", "recurrent": "zero", "snapshot_aliasing": False},
+        "packing": packing,
+        "datasets": {
+            "wikitext2": {
+                "repo": WT2_REPO,
+                "config": WT2_CONFIG,
+                "split": "train",
+                "revision": WT2_REVISION,
+                "eligible_documents": eligible_wt_docs,
+                "excluded_or_short_documents": excluded_wt_docs,
+            },
+            "c4": {
+                "repo": C4_REPO,
+                "config": C4_CONFIG,
+                "split": "train",
+                "revision": C4_REVISION,
+                "scanned_documents": scanned_c4_docs,
+                "eligible_documents": eligible_c4_docs,
+            },
+        },
+        "tokenizer": {
+            "path": str(args.source.resolve()),
+            "tokenizer_json_sha256": tokenizer_sha,
+            "class": tokenizer.__class__.__name__,
+            "add_special_tokens": False,
+        },
+        "token_stream": {
+            "file": relative(token_path, args.out),
+            "dtype": "uint32-le",
+            "axes": ["sequence", "token"],
+            "shape": list(tokens.shape),
+            "sha256": sha256_file(token_path),
+            "aggregate_token_sha256": corpus_token_sha,
+        },
+        "attention_mask": {
+            "file": relative(mask_path, args.out),
+            "dtype": "uint8",
+            "axes": ["sequence", "token"],
+            "shape": list(tokens.shape),
+            "sha256": sha256_file(mask_path),
+            "semantics": "all tokens valid; no padding",
+        },
+        "positions": {
+            "file": relative(position_path, args.out),
+            "dtype": "uint32-le",
+            "axes": ["sequence", "token"],
+            "shape": list(tokens.shape),
+            "sha256": sha256_file(position_path),
+            "semantics": f"0..{args.seq_len - 1} independently for every sequence",
+        },
+        "state": {
+            "reset": "zero at each selected sequence",
+            "carry": "within one sequence, including across EOS-separated documents",
+            "kv": "empty",
+            "convolution": "zero",
+            "recurrent": "zero",
+            "snapshot_aliasing": False,
+        },
         "sequences": records,
         "disjointness": {
             "document_hashes_unique": True,
             "token_hashes_unique": True,
             "train_heldout_document_intersection": 0,
+            "reference_dataset": {
+                "repo": WT2_REPO,
+                "config": WT2_CONFIG,
+                "split": "train",
+                "construction": "benchmarks/quality-baselines/slice/make_slice.sh",
+            },
             "reference_path": reference["path"],
             "reference_file_sha256": reference["file_sha256"],
-            "reference_header": {key: reference[key] for key in ("version", "n_ctx", "n_vocab", "n_chunk", "top_k", "flags")},
+            "reference_header": {
+                key: reference[key]
+                for key in ("version", "n_ctx", "n_vocab", "n_chunk", "top_k", "flags")
+            },
             "reference_token_stream_sha256": reference["token_stream_sha256"],
             "reference_c2_token_sha256": reference["c2_token_sha256"],
             "reference_c24_token_sha256": reference["c24_token_sha256"],
             "reference_chunk_token_sha256": reference["chunk_token_sha256"],
-            "reference_scoring_context_positions_zero_based": reference["scoring_context_positions_zero_based"],
-            "reference_scored_prediction_positions_half_open": reference["scored_prediction_positions_half_open"],
-            "overlap_assertion": "zero matching contiguous 64-token spans against every token window in the first 24 reference chunks; WT2 source documents with any match were excluded whole",
+            "reference_scoring_context_positions_zero_based": reference[
+                "scoring_context_positions_zero_based"
+            ],
+            "reference_scored_prediction_positions_half_open": reference[
+                "scored_prediction_positions_half_open"
+            ],
+            "overlap_assertion": (
+                "zero matching contiguous 64-token spans against every token window in the "
+                "first 24 reference chunks; source documents with any match were excluded whole"
+            ),
             "overlap_ngram_tokens": OVERLAP_NGRAM,
             "selected_reference_ngram_intersections": 0,
         },
@@ -390,7 +638,18 @@ def select_corpus(args: argparse.Namespace) -> dict[str, Any]:
         "capture": {"status": "corpus_ready", "blocks": {}, "tensor_shards": [], "validation": {}},
     }
     atomic_json(args.out / "manifest.json", manifest)
-    print(json.dumps({"manifest": str(args.out / "manifest.json"), "source_sha256": source["sha256"], "corpus_token_sha256": corpus_token_sha, "sequences": len(records), "wall_clock_seconds": corpus["wall_clock_seconds"]}, indent=2))
+    print(
+        json.dumps(
+            {
+                "manifest": str(args.out / "manifest.json"),
+                "source_sha256": source["sha256"],
+                "corpus_token_sha256": corpus_token_sha,
+                "sequences": len(records),
+                "wall_clock_seconds": corpus["wall_clock_seconds"],
+            },
+            indent=2,
+        )
+    )
     return manifest
 
 
@@ -1219,8 +1478,10 @@ def verify_manifest(args: argparse.Namespace) -> None:
         observed = sha256_file(args.out / meta["file"])
         if observed != meta["sha256"]:
             failures.append(f"{name}: {observed} != {meta['sha256']}")
-    if corpus["total_sequences"] != 160 or corpus["sequence_length"] != 2048:
-        failures.append("corpus shape is not the frozen 160x2048 contract")
+    if corpus["total_sequences"] != 160:
+        failures.append("corpus sequence count is not the frozen 160-sequence contract")
+    if corpus["sequence_length"] != corpus["token_stream"]["shape"][1]:
+        failures.append("corpus sequence length does not match the token stream shape")
     if corpus["train_sequences"] != 128 or corpus["heldout_sequences"] != 32:
         failures.append("corpus split is not the frozen 128/32 contract")
 
@@ -1295,6 +1556,11 @@ def parser() -> argparse.ArgumentParser:
     corpus.add_argument("--ref", type=Path, default=DEFAULT_REF)
     corpus.add_argument("--out", type=Path, default=DEFAULT_OUT)
     corpus.add_argument("--seq-len", type=int, default=SEQ_LEN)
+    corpus.add_argument(
+        "--pack-documents",
+        action="store_true",
+        help="build each sequence by concatenating deterministic EOS-separated source documents",
+    )
     corpus.add_argument("--train-sequences", type=int, default=TRAIN_SEQUENCES)
     corpus.add_argument("--heldout-sequences", type=int, default=HELDOUT_SEQUENCES)
     corpus.add_argument("--seed", type=int, default=CORPUS_SEED)
