@@ -1832,6 +1832,7 @@ fn main() {
     slot_cfg.max_seq = ctx_capacity + cfg_block_size_for_slot + 16;
     slot_cfg.kv_mode = match kv_mode_str.as_str() {
         "q8" => hipfire_arch_qwen35::speculative::KvMode::Q8,
+        "fp8" => hipfire_arch_qwen35::speculative::KvMode::Fp8,
         "asym4" | "turbo4" => hipfire_arch_qwen35::speculative::KvMode::Asym4,
         "asym3" | "turbo3" | "turbo" => hipfire_arch_qwen35::speculative::KvMode::Asym3,
         "asym2" | "turbo2" => hipfire_arch_qwen35::speculative::KvMode::Asym2,
@@ -1840,7 +1841,7 @@ fn main() {
         "fwht2" => hipfire_arch_qwen35::speculative::KvMode::Fwht2,
         other => {
             eprintln!(
-                "unknown --kv-mode: {other}. Valid: q8, asym4, asym3, asym2, fwht4, fwht3, fwht2"
+                "unknown --kv-mode: {other}. Valid: q8, fp8, asym4, asym3, asym2, fwht4, fwht3, fwht2"
             );
             std::process::exit(1);
         }

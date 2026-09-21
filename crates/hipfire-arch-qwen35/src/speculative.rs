@@ -959,11 +959,18 @@ impl ModelSlot {
                 config.head_dim,
                 slot_config.max_seq,
             )?,
-            KvMode::Fp8 | KvMode::Bf16 => {
+            KvMode::Fp8 => KvCache::new_gpu_fp8_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+            KvMode::Bf16 => {
                 return Err(hip_bridge::HipError::new(
                     0,
-                    "ModelSlot::load rejects fp8/bf16 KV: single-slot speculative assembly \
-                     has no native-format slot constructors; load through the carrier path",
+                    "ModelSlot::load rejects bf16 KV: single-slot speculative assembly \
+                     has no native-format slot constructor; load through the carrier path",
                 ));
             }
         };
