@@ -65,6 +65,13 @@ typedef int   __attribute__((ext_vector_type(2))) v2i_t;
 typedef int   __attribute__((ext_vector_type(4))) v4i_t;
 typedef float __attribute__((ext_vector_type(8))) v8f_t;
 
+// Symmetric MQ4V2 twin: the artifact guarantees z = -8*d for every
+// 128-value half-group. Center the nibble in E4M3 before WMMA so the fold is
+// one scale FMA and neither activation half-sums nor zero metadata are read.
+#ifndef HIPFIRE_FP8_SYMFOLD
+#define HIPFIRE_FP8_SYMFOLD 0
+#endif
+
 // Expand one 32-bit nibble pack (8 q values, q_i = (pk >> 4*i) & 0xF)
 // into one per-lane FP8 WMMA operand (8 E4M3 bytes) bit-cast to v2i_t.
 // Byte i of the result is the E4M3 encoding of q_i per the table above.
@@ -101,6 +108,24 @@ __device__ static inline unsigned int mq4_lut8(unsigned int sel,
 // (which also preprocesses this TU) through; a non-gfx12 DEVICE compile
 // still hits the #error below instead of silently building the wrong idiom.
 #if defined(__gfx1200__) || defined(__gfx1201__) || !defined(__HIP_DEVICE_COMPILE__)
+#if HIPFIRE_FP8_SYMFOLD
+// q -> E4M3(q-8), held in four immediate dwords:
+// [-8,-7,-6,-5], [-4,-3,-2,-1], [0,1,2,3], [4,5,6,7].
+// Two table perms plus the top-bit select replace scalar int->f32->fp8
+// conversion. The selector construction lowers to the same v_perm/lshl-or
+// idiom as the unsigned table without any per-element arithmetic.
+__device__ static inline unsigned int mq4_lut8(unsigned int sel) {
+    const unsigned int C0 = 0xCACCCED0u;
+    const unsigned int C1 = 0xB8C0C4C8u;
+    const unsigned int C2 = 0x44403800u;
+    const unsigned int C3 = 0x4E4C4A48u;
+    const unsigned int idx = sel & 0x07070707u;
+    const unsigned int lo = __builtin_amdgcn_perm(C1, C0, idx);
+    const unsigned int hi = __builtin_amdgcn_perm(C3, C2, idx);
+    const unsigned int selp = 0x03020100u | ((sel & 0x08080808u) >> 1);
+    return __builtin_amdgcn_perm(hi, lo, selp);
+}
+#else
 // Uniform-table gfx120x fast path (bit-exact vs the two-perm form above:
 // exhaustive on-device check of all 65536 x16 x 2 halves, see
 // /tmp/wmma_probe/expand_probe2.hip candidate B). The upper half of the
@@ -125,6 +150,7 @@ __device__ static inline unsigned int mq4_lut8(unsigned int sel) {
     const unsigned int selp = 0x03020100u | ((sel & 0x08080808u) >> 1);
     return __builtin_amdgcn_perm(hi, lo, selp);
 }
+#endif
 #else
 #error "uniform mq4_lut8 perm-blend fast path requires gfx1200/gfx1201"
 #endif
@@ -296,10 +322,17 @@ __device__ static inline v2i_t mq4_qpk_to_e4m3(unsigned int pk) {
 #define HIPFIRE_FP8_V2_W_OFF    HIPFIRE_FP8_V2_A_BYTES
 #define HIPFIRE_FP8_V2_W_BYTES  (HIPFIRE_FP8_V2_BN * HIPFIRE_FP8_V2_STRIDE)
 #endif
+#if HIPFIRE_FP8_SYMFOLD
+#define HIPFIRE_FP8_V2_S_OFF    (HIPFIRE_FP8_V2_W_OFF + HIPFIRE_FP8_V2_W_BYTES)
+#define HIPFIRE_FP8_V2_S_BYTES  0
+#define HIPFIRE_FP8_V2_SZ_OFF   HIPFIRE_FP8_V2_S_OFF
+#define HIPFIRE_FP8_V2_SZ_BYTES (HIPFIRE_FP8_V2_BN * 4)
+#else
 #define HIPFIRE_FP8_V2_S_OFF    (HIPFIRE_FP8_V2_W_OFF + HIPFIRE_FP8_V2_W_BYTES)
 #define HIPFIRE_FP8_V2_S_BYTES  (HIPFIRE_FP8_V2_BM * 4)
 #define HIPFIRE_FP8_V2_SZ_OFF   (HIPFIRE_FP8_V2_S_OFF + HIPFIRE_FP8_V2_S_BYTES)
 #define HIPFIRE_FP8_V2_SZ_BYTES (HIPFIRE_FP8_V2_BN * 8)
+#endif
 #define HIPFIRE_FP8_V2_LDS_BYTES (HIPFIRE_FP8_V2_SZ_OFF + HIPFIRE_FP8_V2_SZ_BYTES)
 #define HIPFIRE_FP8_V2_NSLABS   (128 / HIPFIRE_FP8_V2_BK)
 #define HIPFIRE_FP8_V2_K16      (HIPFIRE_FP8_V2_BK / 16)
@@ -455,7 +488,11 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
 #else
 #error "HIPFIRE_FP8_V2 BM must divide NTHREADS by 1, 2 or 4"
 #endif
+#if HIPFIRE_FP8_SYMFOLD
+#define HIPFIRE_FP8_V2_SZITER ((HIPFIRE_FP8_V2_BN + HIPFIRE_FP8_V2_NTHREADS - 1) / HIPFIRE_FP8_V2_NTHREADS)
+#else
 #define HIPFIRE_FP8_V2_SZITER ((HIPFIRE_FP8_V2_BN * 2 + HIPFIRE_FP8_V2_NTHREADS - 1) / HIPFIRE_FP8_V2_NTHREADS)
+#endif
     // Route a valid global row GR (< tm) to (ASRC, LR). All matrices cover
     // [0, tm) exactly as the old single-row router did; callers clamp first.
 #if HIPFIRE_FP8_QKVZA
@@ -526,6 +563,7 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
 #endif
         }
     }
+#if !HIPFIRE_FP8_SYMFOLD
     // S entry: one f32 per lane (2^S_SH lanes share a row, dup benign).
     const int st_srow = tid >> HIPFIRE_FP8_V2_S_SH;
     const int st_stok = bs + st_srow;
@@ -533,15 +571,22 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
     const unsigned st_sok = (st_stok < N) ? 1u : 0u;
     const unsigned st_soff = (unsigned)st_stok_c * (unsigned)gpr * 2u;
     const unsigned st_slds = (unsigned)st_srow * 4u;
-    // SZ entries: SZITER f32 words per lane (dup benign when BN*2 < NTHREADS).
+#endif
+    // SZ entries: symmetric stores scale only; asymmetric stores scale+zero.
     const char* st_szbase[HIPFIRE_FP8_V2_SZITER];
     unsigned st_szok[HIPFIRE_FP8_V2_SZITER];
+#if !HIPFIRE_FP8_SYMFOLD
     unsigned st_szword[HIPFIRE_FP8_V2_SZITER];
+#endif
     unsigned st_szlds[HIPFIRE_FP8_V2_SZITER];
     #pragma unroll
     for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
+#if HIPFIRE_FP8_SYMFOLD
+        const int sz_row = tid * HIPFIRE_FP8_V2_SZITER + e;
+#else
         const int sz_idx = tid * HIPFIRE_FP8_V2_SZITER + e;
         const int sz_row = sz_idx & (HIPFIRE_FP8_V2_BN - 1);
+#endif
         const int sz_grow = rs + sz_row;
         const int sz_grow_c = (sz_grow < tm) ? sz_grow : (tm - 1);
         const char* sz_asrc;
@@ -549,8 +594,12 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         HIPFIRE_FP8_V2_PICK(sz_grow_c, sz_asrc, sz_lr);
         st_szbase[e] = sz_asrc + (unsigned int)sz_lr * (unsigned int)gpr * 136u;
         st_szok[e] = (sz_grow < tm) ? 1u : 0u;
+#if HIPFIRE_FP8_SYMFOLD
+        st_szlds[e] = (unsigned)sz_row * 4u;
+#else
         st_szword[e] = ((unsigned)sz_idx / (unsigned)HIPFIRE_FP8_V2_BN) & 1u;
         st_szlds[e] = (unsigned)sz_row * 8u + st_szword[e] * 4u;
+#endif
     }
 
     const v8f_t zc = v8f_t{0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
@@ -582,6 +631,7 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
             // active on every round; OOB clamps to the last valid index with
             // a branch-free zero-select (exact old ternary semantics).
             {
+#if !HIPFIRE_FP8_SYMFOLD
                 // S: one f32 per lane.
                 {
                     const unsigned int s_idx = st_soff + (unsigned int)g * 2u + (unsigned int)h;
@@ -591,13 +641,18 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                     const float s_v = st_sok ? s_ld : 0.0f;
                     *(float*)(lds_S + st_slds) = s_v;
                 }
-                // SZ: SZITER f32 words per lane.
+#endif
+                // SZ: scale only for symmetric, scale+zero otherwise.
                 {
                     const unsigned int hwoff = (unsigned int)g * 136u + (unsigned int)h * 4u;
                     #pragma unroll
                     for (int e = 0; e < HIPFIRE_FP8_V2_SZITER; e++) {
+#if HIPFIRE_FP8_SYMFOLD
+                        const unsigned short h16 = *(const unsigned short*)(st_szbase[e] + hwoff);
+#else
                         const unsigned int hw = *(const unsigned int*)(st_szbase[e] + hwoff);
                         const unsigned short h16 = (unsigned short)(st_szword[e] ? (hw >> 16) : (hw & 0xFFFFu));
+#endif
                         const float f = __half2float(__ushort_as_half(h16));
                         *(float*)(lds_SZ + st_szlds[e]) = st_szok[e] ? f : 0.0f;
                     }
@@ -812,6 +867,22 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                 }
 
                 if (slab == HIPFIRE_FP8_V2_NSLABS - 1) {
+#if HIPFIRE_FP8_SYMFOLD
+                    // q was centered to q-8 before WMMA, so z=-8*d is already
+                    // represented in P. Fold one scale FMA per half-group and
+                    // output; no activation sum or zero metadata participates.
+                    #pragma unroll
+                    for (int wf = 0; wf < 2; wf++) {
+                        #pragma unroll
+                        for (int j = 0; j < 8; j++) {
+                            const int grow = wave_wt + wf * 16 + 8 * kg + j;
+                            const float s_h = *(const float*)(lds_SZ + (unsigned int)grow * 4u);
+                            #pragma unroll
+                            for (int nb = 0; nb < 4; nb++)
+                                T[nb][wf][j] = fmaf(s_h, P[nb][wf][j], T[nb][wf][j]);
+                        }
+                    }
+#else
                     // Fold at the 128-K half boundary. Stream s/z; S per token frag.
                     float Sh[4];
                     #pragma unroll
@@ -833,6 +904,7 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
                             }
                         }
                     }
+#endif
                 }
 
                 __syncthreads();

@@ -9358,10 +9358,8 @@ impl Gpu {
     /// Staged-tile v2 geometry selector (`HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM`).
     /// Returns `(BM, BN, BK, WAVES)`; absent/unknown values keep 128x128x64/8w
     /// on exact gfx1201 (measured pin) and the frozen 256x64x64/8w elsewhere.
-    /// All four v2 launch arms derive block (`WAVES*32`),
-    /// dynamic LDS (`BM*(BK+8) + BN*(BK+8) + BM*4 + BN*8`) and grid
-    /// (`ceil(rows/BN)`, `ceil(N/BM)`) from this one tuple, so geometry stays
-    /// consistent between the compiled SRC constant and the launch.
+    /// V2 launchers derive block, dynamic LDS and grid from this tuple, so the
+    /// geometry remains consistent with the selected source constant.
     fn fp8_v2_geom(arch: &str) -> (usize, usize, usize, usize) {
         match hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM").as_deref() {
             Ok("128x128") => (128, 128, 64, 8),
@@ -9374,6 +9372,21 @@ impl Gpu {
             _ if arch == "gfx1201" => (128, 128, 64, 8),
             _ => (256, 64, 64, 8),
         }
+    }
+    #[inline]
+    fn fp8_v2_symfold_enabled(&self, v2: bool) -> bool {
+        v2 && self.mq4v2_symmetric
+            && hipfire_config::developer_var("HIPFIRE_FP8_SYMFOLD").as_deref() != Ok("0")
+    }
+
+    #[inline]
+    fn fp8_v2_lds_bytes(vbm: usize, vbn: usize, vbk: usize, symfold: bool) -> u32 {
+        let metadata = if symfold {
+            vbn * 4
+        } else {
+            vbm * 4 + vbn * 8
+        };
+        (vbm * (vbk + 8) + vbn * (vbk + 8) + metadata) as u32
     }
     /// MQ4 v2 (qt 44) — dedicated v2 source `GEMM_QKVZA_MQ4G256V2_*_SRC`.
     /// MQ4 v2 (qt 44) — gfx1201 FP8-WMMA 4-way fused QKVZA candidate,
@@ -9427,7 +9440,8 @@ impl Gpu {
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
         let vblock = [(vwaves * 32) as u32, 1, 1];
-        let vlds = (vbm * (vbk + 8) + vbn * (vbk + 8) + vbm * 4 + vbn * 8) as u32;
+        let symfold = self.fp8_v2_symfold_enabled(v2);
+        let vlds = Self::fp8_v2_lds_bytes(vbm, vbn, vbk, symfold);
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols (see gate_up launcher).
         let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
@@ -9435,7 +9449,30 @@ impl Gpu {
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
-        let (func_name, ksrc, bv): (&str, &str, usize) = if v2 {
+        let (func_name, ksrc, bv): (&str, &str, usize) = if symfold {
+            match (vbm, vbn) {
+                (128, 128) => (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_SRC,
+                    8,
+                ),
+                (64, 256) => (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201_symfold",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B64X256_SYMFOLD_SRC,
+                    4,
+                ),
+                (128, 64) => (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201_symfold",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X64W4_SYMFOLD_SRC,
+                    8,
+                ),
+                _ => (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201_symfold",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_SYMFOLD_SRC,
+                    16,
+                ),
+            }
+        } else if v2 {
             match (vbm, vbn) {
                 (128, 128) => (
                     "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201",
@@ -9632,7 +9669,8 @@ impl Gpu {
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
         let vblock = [(vwaves * 32) as u32, 1, 1];
-        let vlds = (vbm * (vbk + 8) + vbn * (vbk + 8) + vbm * 4 + vbn * 8) as u32;
+        let symfold = self.fp8_v2_symfold_enabled(v2);
+        let vlds = Self::fp8_v2_lds_bytes(vbm, vbn, vbk, symfold);
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols (see gate_up launcher).
         let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
@@ -9640,7 +9678,30 @@ impl Gpu {
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
-        let (func_name, ksrc, bv): (&str, &str, usize) = if v2 {
+        let (func_name, ksrc, bv): (&str, &str, usize) = if symfold {
+            match (vbm, vbn) {
+                (128, 128) => (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_SRC,
+                    8,
+                ),
+                (64, 256) => (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201_symfold",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B64X256_SYMFOLD_SRC,
+                    4,
+                ),
+                (128, 64) => (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201_symfold",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X64W4_SYMFOLD_SRC,
+                    8,
+                ),
+                _ => (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201_symfold",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_SYMFOLD_SRC,
+                    16,
+                ),
+            }
+        } else if v2 {
             match (vbm, vbn) {
                 (128, 128) => (
                     "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201",
@@ -9829,7 +9890,8 @@ impl Gpu {
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
         let vblock = [(vwaves * 32) as u32, 1, 1];
-        let vlds = (vbm * (vbk + 8) + vbn * (vbk + 8) + vbm * 4 + vbn * 8) as u32;
+        let symfold = self.fp8_v2_symfold_enabled(v2);
+        let vlds = Self::fp8_v2_lds_bytes(vbm, vbn, vbk, symfold);
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols (see gate_up launcher).
         let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
@@ -9837,7 +9899,30 @@ impl Gpu {
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
-        let (func_name, ksrc, bv): (&str, &str, usize) = if v2 {
+        let (func_name, ksrc, bv): (&str, &str, usize) = if symfold {
+            match (vbm, vbn) {
+                (128, 128) => (
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold",
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_SRC,
+                    8,
+                ),
+                (64, 256) => (
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201_symfold",
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B64X256_SYMFOLD_SRC,
+                    4,
+                ),
+                (128, 64) => (
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201_symfold",
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X64W4_SYMFOLD_SRC,
+                    8,
+                ),
+                _ => (
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201_symfold",
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_SYMFOLD_SRC,
+                    16,
+                ),
+            }
+        } else if v2 {
             match (vbm, vbn) {
                 (128, 128) => (
                     "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201",
@@ -10023,7 +10108,8 @@ impl Gpu {
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
         let vblock = [(vwaves * 32) as u32, 1, 1];
-        let vlds = (vbm * (vbk + 8) + vbn * (vbk + 8) + vbm * 4 + vbn * 8) as u32;
+        let symfold = self.fp8_v2_symfold_enabled(v2);
+        let vlds = Self::fp8_v2_lds_bytes(vbm, vbn, vbk, symfold);
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols (see gate_up launcher).
         let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
@@ -10031,7 +10117,30 @@ impl Gpu {
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
-        let (func_name, ksrc, bv): (&str, &str, usize) = if v2 {
+        let (func_name, ksrc, bv): (&str, &str, usize) = if symfold {
+            match (vbm, vbn) {
+                (128, 128) => (
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold",
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_SRC,
+                    8,
+                ),
+                (64, 256) => (
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201_symfold",
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B64X256_SYMFOLD_SRC,
+                    4,
+                ),
+                (128, 64) => (
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201_symfold",
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X64W4_SYMFOLD_SRC,
+                    8,
+                ),
+                _ => (
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201_symfold",
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_SYMFOLD_SRC,
+                    16,
+                ),
+            }
+        } else if v2 {
             match (vbm, vbn) {
                 (128, 128) => (
                     "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201",
@@ -30476,8 +30585,9 @@ impl Gpu {
         // Balanced-aspect launch: block/LDS/grid follow the selected geometry
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
+        let symfold = self.fp8_v2_symfold_enabled(v2);
         let vblock = [(vwaves * 32) as u32, 1, 1];
-        let vlds = (vbm * (vbk + 8) + vbn * (vbk + 8) + vbm * 4 + vbn * 8) as u32;
+        let vlds = Self::fp8_v2_lds_bytes(vbm, vbn, vbk, symfold);
         // Two-slab S2BT8 form by default (`HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols): each wave covers 32 rows, halving
         // the row grid. One env read per call.
@@ -30490,7 +30600,30 @@ impl Gpu {
         // at N=640, +38% at N=768 over BT8; at N<=256 the mask waste flips the
         // ranking so BT8/BT4 keep their exact ranges). Grid ceil-divides
         // batch_tiles and the kernels guard `oc < N`, so any tile covers N%64.
-        let (func_name, ksrc, bv): (&str, &str, usize) = if v2 {
+        let (func_name, ksrc, bv): (&str, &str, usize) = if symfold {
+            match (vbm, vbn) {
+                (128, 128) => (
+                    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold",
+                    kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_SRC,
+                    8,
+                ),
+                (64, 256) => (
+                    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b64x256_gfx1201_symfold",
+                    kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B64X256_SYMFOLD_SRC,
+                    4,
+                ),
+                (128, 64) => (
+                    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201_symfold",
+                    kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_B128X64W4_SYMFOLD_SRC,
+                    8,
+                ),
+                _ => (
+                    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_gfx1201_symfold",
+                    kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_SYMFOLD_SRC,
+                    16,
+                ),
+            }
+        } else if v2 {
             match (vbm, vbn) {
                 (128, 128) => (
                     "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201",
@@ -32192,7 +32325,8 @@ impl Gpu {
         // (bv = BM/16 keeps batch_tiles = ceil(N/BM)).
         let (vbm, vbn, vbk, vwaves) = Self::fp8_v2_geom(&self.arch);
         let vblock = [(vwaves * 32) as u32, 1, 1];
-        let vlds = (vbm * (vbk + 8) + vbn * (vbk + 8) + vbm * 4 + vbn * 8) as u32;
+        let symfold = self.fp8_v2_symfold_enabled(v2);
+        let vlds = Self::fp8_v2_lds_bytes(vbm, vbn, vbk, symfold);
         // Two-slab S2BT8 form by default; `HIPFIRE_GFX12_MQ4V2_FP8_SLABS=1`
         // selects the single-slab symbols (see gate_up launcher).
         let slabs2 = hipfire_config::developer_var("HIPFIRE_GFX12_MQ4V2_FP8_SLABS").as_deref()
@@ -32200,7 +32334,30 @@ impl Gpu {
             && batch_size % 128 == 0;
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
-        let (func_name, ksrc, bv): (&str, &str, usize) = if v2 {
+        let (func_name, ksrc, bv): (&str, &str, usize) = if symfold {
+            match (vbm, vbn) {
+                (128, 128) => (
+                    "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x128_gfx1201_symfold",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_B128X128_SYMFOLD_SRC,
+                    8,
+                ),
+                (64, 256) => (
+                    "gemm_mq4g256v2_residual_wmma_fp8_v2_b64x256_gfx1201_symfold",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_B64X256_SYMFOLD_SRC,
+                    4,
+                ),
+                (128, 64) => (
+                    "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x64w4_gfx1201_symfold",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_B128X64W4_SYMFOLD_SRC,
+                    8,
+                ),
+                _ => (
+                    "gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201_symfold",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_SYMFOLD_SRC,
+                    16,
+                ),
+            }
+        } else if v2 {
             match (vbm, vbn) {
                 (128, 128) => (
                     "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x128_gfx1201",
