@@ -65,9 +65,7 @@ main-agent call; the artifact and both numbers are above.
 
 # Follow-up: pow2-half (`m * 2^e`, m in {1, 1.5}) + fold-honest MSE
 
-Impl commit `f640ae2` (unpushed; same branch `mq4v2-pow2-scale`).
-
-## Flag diff
+Impl commit `1b13b0369` (same branch `mq4v2-pow2-scale`, unmerged).
 
 - `cli.rs`: new `--mq4v2-pow2-scale-half` (`requires = "mq4v2_symmetric"`,
   `conflicts_with = "mq4v2_pow2_scale"`; both guards probed via `--help`
