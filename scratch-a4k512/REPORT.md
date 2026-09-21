@@ -12,10 +12,10 @@ Source milestone: `e70ccde8f` (`add single-pass coarse int4 activation scales`).
 
 Read-only references: branch `gfx1201-rowglobal-a`, commits `2977acb21`, `1b0e6a1bc`, report commit `c1f774b8b`, and `scratch-rowa/REPORT.md`.
 
-That experiment established two facts:
+That report supplied two working premises:
 
-1. One scale for the entire activation row gives a large IU4 quality win (c24 0.045510 versus 0.081199 for shipped K128; its per-K512 measurement equaled row-global in the offline quantizer).
-2. Its implementation writes the producer result to an activation plane and launches a second reduction/quantization pass because no grid-wide barrier exists. That extra full-plane traffic moved producers from about 39.5 to 61.3 us/token and killed prefill/TTFT.
+1. It attributed a large quality win to one scale for the entire activation row (c24 0.045510 versus 0.081199 for shipped K128) and reported that offline per-K512 measurement equaled row-global.
+2. Its implementation writes the producer result to an activation plane and launches a second reduction/quantization pass because no grid-wide barrier exists. The reported extra full-plane traffic moved producers from about 39.5 to 61.3 us/token and killed prefill/TTFT.
 
 The present implementation instead retains a complete scale window in one wave's registers, reduces its amax once, and directly writes the usual K128 payloads and sidecars. It adds no activation-plane materialization, no second kernel, and no second pass.
 
@@ -69,7 +69,7 @@ Corrected rocprof traces:
 
 The traces are exact pp8192 replays (`replay-iu4.jsonl`, `replay-k512.jsonl`, and `replay-k256.jsonl`). Decode is expected to retain the baseline symbols because the fused batched producer route is not used there.
 
-This configuration discovery also means RowGlobalA's unique-symbol profiler proves that its grouped kernel was exercised, but wall-time runs driven only by an ambient flag should be audited against process configuration before their exact deltas are treated as settled. This report does not rely on those wall-time deltas.
+A late independent route audit by RowGlobalCheap found that RowGlobalA's 0.037143-quality trace was an FP8 fallback from a stale binary, not grouped IU4. With a route-fixed current binary, that audit measured row-global c2 0.118151 and K512 c2 0.072867. The original quality premise is therefore not treated as proven. This experiment's direct quality results are distinct from the 0.037143 FP8 value, and its corrected daemon traces explicitly contain the IU4 symfold GEMMs and unique candidate producer symbols.
 
 ## Producer cost
 
