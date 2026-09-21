@@ -5,21 +5,23 @@
 // MQ4v2 FP8 producer-pack helpers for gfx1201 producer→fp8-stream fusion
 // (`HIPFIRE_GFX12_FP8_STREAM`, exact-gfx1201, fp8-v2 default route only).
 //
-// Statement-identical copies of the scale/encode recipe in
-// `pack_f16_to_fp8_mq4v2.gfx12.hip` (`mq4v2_fast_log2_ceil`,
-// `mq4v2_fast_pow2`, `mq4v2_e4m3_to_f32`, `mq4v2_wave_max`, `mq4v2_wave_sum`,
-// `mq4v2_row_scale_from_absmax`). The pack TU keeps its own copies; this
-// header lets fused producers emit byte-identical
-// `prepare_mq4v2_fp8_x_f32` outputs (E4M3 codes `[N,K]`, F32 decoded-code
-// half sums `[N,K/256,2]`, F32 row scales `[N]`, scale_mode=1) without
-// editing the standalone pack kernel.
+// The normal variants emit row-major E4M3 bytes.  `_frag` variants define
+// `HIPFIRE_FP8_FRAGMENT_ORDER` and emit the same bytes in the register-direct
+// WMMA layout below; decoded-code half sums and row scales stay row-major.
 //
-// Byte-identity contract (finite inputs only; non-finite row rejects the
-// candidate): the producer's register values equal the stored F32 row
-// exactly (F32 store/load round trip is exact), so the whole-row absmax,
-// the power-of-two-to-224 scale, the per-lane codes, and the decoded-code
-// half-sum tree match the standalone `_f32` pack bit-for-bit. Must NOT be
-// compared against the F16 pack path (double rounding, last-ULP differences).
+// For logical byte `(row,k)`, with `K` divisible by 16:
+//   lane = (row & 15) + 16 * ((k >> 3) & 1)
+//   byte_offset =
+//     (((row >> 4) * (K / 16) + (k >> 4)) * 32 + lane) * 8 + (k & 7)
+// Thus each 16-row x 16-K fragment is 256 contiguous bytes, and lane `l`
+// owns its eight WMMA input bytes at fragment_base + 8*l.  Rows are allocated
+// through `round_up(N,256)`, matching the GEMM workgroup tile; producer
+// workgroups for the padded tail explicitly write FP8 zero. The mapping is a
+// bijection over `[0,Npad) x [0,K)`.
+//
+// The scale/encode recipe is statement-identical to
+// `pack_f16_to_fp8_mq4v2.gfx12.hip`.  For finite inputs, changing the address
+// above is the only byte-plane difference from `prepare_mq4v2_fp8_x_f32`.
 
 #ifndef HIPFIRE_MQ4V2_FP8_PRODUCER_PACK_HIP
 #define HIPFIRE_MQ4V2_FP8_PRODUCER_PACK_HIP
@@ -78,6 +80,22 @@ __device__ inline float fp8stream_row_scale_from_absmax(float amax) {
     return fp8stream_fast_pow2(exp);
 }
 
+__device__ __forceinline__ size_t fp8stream_frag_byte_offset(
+    int row, int k, int K) {
+    const int lane = (row & 15) + 16 * ((k >> 3) & 1);
+    return ((((size_t)(row >> 4) * (size_t)(K >> 4) + (unsigned)(k >> 4))
+             * 32u + (unsigned)lane) * 8u + (unsigned)(k & 7));
+}
+
+// One workgroup owns one padded row.  This is only reached by `_frag`
+// producer launches whose grid is round_up(N,256); scale/sum planes retain
+// their true-N extents and are intentionally not touched for padded rows.
+__device__ inline void fp8stream_zero_frag_row(
+    unsigned char* __restrict__ out, int row, int K, int tid) {
+    for (int k = tid; k < K; k += 256)
+        out[fp8stream_frag_byte_offset(row, k, K)] = 0;
+}
+
 // Pack one token row from its just-written F32 store (scale_mode=1).
 //
 // Uniform call over a 256-thread (8-wave) row workgroup; contains the two
@@ -85,18 +103,19 @@ __device__ inline float fp8stream_row_scale_from_absmax(float amax) {
 // the scale publication from the encode (same barriers as the standalone
 // pack). `smem8` is 8 shared floats (the producer's reduction smem reused
 // after its last use). `x_row` is the row just stored by this workgroup
-// (L1-resident re-read, no extra DRAM traffic); `out_row`, `sums_row`
-// (`[K/256,2]`), and `scale_slot` follow the standalone pack layout for
-// row n. Reduces `row_amax` (the caller's per-thread finite absmax over the
-// exact values it stored) with the standalone fmaxf order.
+// (L1-resident re-read, no extra DRAM traffic); `out` is the byte-plane base,
+// while `sums_row` (`[K/256,2]`) and `scale_slot` follow the standalone pack
+// layout for row n. Reduces `row_amax` (the caller's per-thread finite absmax
+// over the exact values it stored) with the standalone fmaxf order.
 __device__ inline void fp8stream_pack_row_from_f32(
     const float* __restrict__ x_row,
-    unsigned char* __restrict__ out_row,
+    unsigned char* __restrict__ out,
     float* __restrict__ sums_row,
     float* __restrict__ scale_slot,
     float row_amax,
     float* __restrict__ smem8,
     int K,
+    int token,
     int tid,
     int lane,
     int wave) {
@@ -132,7 +151,12 @@ __device__ inline void fp8stream_pack_row_from_f32(
         unsigned int pack = 0u;
         pack = __builtin_amdgcn_cvt_pk_fp8_f32(v0, v1, pack, false);
         pack = __builtin_amdgcn_cvt_pk_fp8_f32(v2, v3, pack, true);
-        *reinterpret_cast<unsigned int*>(out_row + k0) = pack;
+#ifdef HIPFIRE_FP8_FRAGMENT_ORDER
+        *reinterpret_cast<unsigned int*>(
+            out + fp8stream_frag_byte_offset(token, k0, K)) = pack;
+#else
+        *reinterpret_cast<unsigned int*>(out + (size_t)token * K + k0) = pack;
+#endif
 
         const float s0 = fp8stream_e4m3_to_f32((unsigned char)(pack & 0xFFu));
         const float s1 = fp8stream_e4m3_to_f32((unsigned char)((pack >> 8) & 0xFFu));

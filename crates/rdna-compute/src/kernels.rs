@@ -1149,6 +1149,21 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+pub const FUSED_RMSNORM_MQ_ROTATE_FP8_GFX12_FRAG_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_FRAGMENT_ORDER 1\n",
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_FP8_STREAM 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12_frag\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_GFX12_FRAG_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_FRAGMENT_ORDER 1\n",
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_FP8_STREAM 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12_frag\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
 /// gfx1201 FP8-stream SwiGLU/FWHT producer for residual down projections.
 /// The row-wide geometry preserves the incumbent wave-local arithmetic and
 /// emits the standalone F32 packer's three planes in the same launch.
@@ -1161,6 +1176,19 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
     "#define HIPFIRE_SILU_FP8_AWQ 1\n",
     "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
+);
+pub const FUSED_SILU_MUL_MQ_ROTATE_FP8_GFX12_FRAG_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_FRAGMENT_ORDER 1\n",
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12_frag\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
+);
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_GFX12_FRAG_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_FRAGMENT_ORDER 1\n",
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_SILU_FP8_AWQ 1\n",
+    "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12_frag\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
 );
 /// T-B IU4 producer sidecar: standalone FWHT rotate + in-register
@@ -1221,6 +1249,34 @@ pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_FP8_SIGMOID_GATE 1\n",
     "#define HIPFIRE_ROTATE_FP8_AWQ 1\n",
     "#define HIPFIRE_ROTATE_FP8_KERNEL sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
+);
+pub const MQ_ROTATE_X_FP8_GFX12_FRAG_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_FRAGMENT_ORDER 1\n",
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_ROTATE_FP8_KERNEL mq_rotate_x_mq4v2_fp8_gfx12_frag\n",
+    include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
+);
+pub const MQ_ROTATE_X_AWQ_FP8_GFX12_FRAG_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_FRAGMENT_ORDER 1\n",
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_ROTATE_FP8_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_FP8_KERNEL rotate_x_mq_awq_mq4v2_fp8_gfx12_frag\n",
+    include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
+);
+pub const SIGMOID_MUL_MQ_ROTATE_X_FP8_GFX12_FRAG_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_FRAGMENT_ORDER 1\n",
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_ROTATE_FP8_SIGMOID_GATE 1\n",
+    "#define HIPFIRE_ROTATE_FP8_KERNEL sigmoid_mul_rotate_x_mq4v2_fp8_gfx12_frag\n",
+    include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
+);
+pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_GFX12_FRAG_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_FRAGMENT_ORDER 1\n",
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_ROTATE_FP8_SIGMOID_GATE 1\n",
+    "#define HIPFIRE_ROTATE_FP8_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_FP8_KERNEL sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12_frag\n",
     include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
 );
 /// gfx11 FA out-proj IU4 producer: exact `sigmoid_mul_f32` formation +
@@ -1365,6 +1421,19 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
     "#define HIPFIRE_GATED_NORM_FP8_AWQ 1\n",
     "#define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_fp8.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_FP8_GFX12_FRAG_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_FRAGMENT_ORDER 1\n",
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_mq4v2_fp8_gfx12_frag\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_fp8.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_FP8_GFX12_FRAG_SRC: &str = concat!(
+    "#define HIPFIRE_FP8_FRAGMENT_ORDER 1\n",
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_GATED_NORM_FP8_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12_frag\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_fp8.gfx12.hip")
 );
 /// gfx11 slices-4 IU4 producer: batched gated RMSNorm + FWHT + in-register
@@ -4189,6 +4258,41 @@ pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma_fp8_v2_foldfree.gfx12.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip")
 );
+/// Experimental fragment-order direct-A twins. These retain the family ABI
+/// but use distinct symbols and the no-A-LDS body selected only by the
+/// explicit fragment layout gate.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC: &str =
+    concat!(
+        "#define HIPFIRE_FP8_QKVZA 0\n",
+        "#define HIPFIRE_FP8_RESIDUAL 0\n",
+        "#define HIPFIRE_FP8_QKV 0\n",
+        "#define HIPFIRE_FP8_FOLDFREE_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_frag_gfx1201\n",
+        include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip")
+    );
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC: &str =
+    concat!(
+        "#define HIPFIRE_FP8_QKVZA 0\n",
+        "#define HIPFIRE_FP8_RESIDUAL 1\n",
+        "#define HIPFIRE_FP8_QKV 0\n",
+        "#define HIPFIRE_FP8_FOLDFREE_KERNEL gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_frag_gfx1201\n",
+        include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip")
+    );
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC: &str =
+    concat!(
+        "#define HIPFIRE_FP8_QKVZA 1\n",
+        "#define HIPFIRE_FP8_RESIDUAL 0\n",
+        "#define HIPFIRE_FP8_QKV 0\n",
+        "#define HIPFIRE_FP8_FOLDFREE_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_frag_gfx1201\n",
+        include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip")
+    );
+pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC: &str =
+    concat!(
+        "#define HIPFIRE_FP8_QKVZA 0\n",
+        "#define HIPFIRE_FP8_RESIDUAL 0\n",
+        "#define HIPFIRE_FP8_QKV 1\n",
+        "#define HIPFIRE_FP8_FOLDFREE_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_v2_foldfree_frag_gfx1201\n",
+        include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip")
+    );
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma_gfx12_bt.hip");
 pub const GEMM_GATE_UP_MQ6G256V2_WMMA_GFX12_BT_SRC: &str =

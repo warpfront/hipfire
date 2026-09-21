@@ -9378,6 +9378,24 @@ impl Gpu {
         v2 && self.mq4v2_symmetric
             && hipfire_config::developer_var("HIPFIRE_FP8_SYMFOLD").as_deref() != Ok("0")
     }
+    // Negative standalone decision gate: retain direct-A only as an explicit
+    // experiment. Default fold-free dispatch continues to use staged A.
+    #[inline]
+    pub(crate) fn fp8_fragment_order_enabled(&self, n: usize, k: usize) -> bool {
+        self.arch == "gfx1201"
+            && n >= 256
+            && k != 0
+            && k % 256 == 0
+            && self.flags.gfx12_mq4v2_fp8_v2
+            && self.flags.gfx12_mq4v2_fp8_gateup
+            && self.flags.gfx12_mq4v2_fp8_resid
+            && self.flags.gfx12_mq4v2_fp8_qkvza
+            && self.flags.gfx12_mq4v2_fp8_qkv
+            && self.mq4v2_pow2scale != 0
+            && hipfire_config::developer_var("HIPFIRE_FP8_FOLDFREE").as_deref() != Ok("0")
+            && hipfire_config::developer_var("HIPFIRE_FP8_FRAGMENT_ORDER").as_deref() == Ok("1")
+    }
+
     #[inline]
     fn fp8_v2_foldfree_enabled(&self, v2: bool) -> bool {
         v2 && self.mq4v2_pow2scale != 0
@@ -9386,10 +9404,15 @@ impl Gpu {
 
     #[inline]
     const fn fp8_v2_foldfree_lds_bytes() -> u32 {
-        // A phase: 128*(64+8), W fragments: 9,216, LUT: 512.
+        // Reused 128-row A phase: 9,216 B; W fragments: 9,216 B; LUT: 512 B.
         18_944
     }
 
+    #[inline]
+    const fn fp8_v2_foldfree_frag_lds_bytes() -> u32 {
+        // W fragments: 9,216 B; exponent-fold LUT: 512 B. A is register-direct.
+        9_728
+    }
 
     #[inline]
     fn fp8_v2_lds_bytes(vbm: usize, vbn: usize, vbk: usize, symfold: bool) -> u32 {
@@ -9487,6 +9510,7 @@ impl Gpu {
             && self.flags.gfx12_mq4v2_fp8_qkvza
             && batch_size >= 256;
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
+        let fragment_order = foldfree && prepared.fragment_order;
         // Fold-free owns a fixed 256-token x 128-row tile. Other v2 routes
         // continue to honor the experimental geometry selector.
         let (vbm, vbn, vbk, vwaves) = if foldfree {
@@ -9496,7 +9520,9 @@ impl Gpu {
         };
         let vblock = [(vwaves * 32) as u32, 1, 1];
         let symfold = !foldfree && self.fp8_v2_symfold_enabled(v2);
-        let vlds = if foldfree {
+        let vlds = if fragment_order {
+            Self::fp8_v2_foldfree_frag_lds_bytes()
+        } else if foldfree {
             Self::fp8_v2_foldfree_lds_bytes()
         } else {
             Self::fp8_v2_lds_bytes(vbm, vbn, vbk, symfold)
@@ -9510,8 +9536,16 @@ impl Gpu {
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
         let (func_name, ksrc, bv): (&str, &str, usize) = if foldfree {
             (
-                "gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201",
-                kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC,
+                if fragment_order {
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_frag_gfx1201"
+                } else {
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201"
+                },
+                if fragment_order {
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC
+                } else {
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC
+                },
                 16,
             )
         } else if symfold {
@@ -9810,6 +9844,7 @@ impl Gpu {
             && self.flags.gfx12_mq4v2_fp8_qkv
             && batch_size >= 256;
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
+        let fragment_order = foldfree && prepared.fragment_order;
         let (vbm, vbn, vbk, vwaves) = if foldfree {
             (256, 128, 64, 8)
         } else {
@@ -9817,7 +9852,9 @@ impl Gpu {
         };
         let vblock = [(vwaves * 32) as u32, 1, 1];
         let symfold = !foldfree && self.fp8_v2_symfold_enabled(v2);
-        let vlds = if foldfree {
+        let vlds = if fragment_order {
+            Self::fp8_v2_foldfree_frag_lds_bytes()
+        } else if foldfree {
             Self::fp8_v2_foldfree_lds_bytes()
         } else {
             Self::fp8_v2_lds_bytes(vbm, vbn, vbk, symfold)
@@ -9831,8 +9868,16 @@ impl Gpu {
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
         let (func_name, ksrc, bv): (&str, &str, usize) = if foldfree {
             (
-                "gemm_qkv_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201",
-                kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC,
+                if fragment_order {
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_foldfree_frag_gfx1201"
+                } else {
+                    "gemm_qkv_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201"
+                },
+                if fragment_order {
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC
+                } else {
+                    kernels::GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC
+                },
                 16,
             )
         } else if symfold {
@@ -30343,6 +30388,7 @@ impl Gpu {
             && self.flags.gfx12_mq4v2_fp8_gateup
             && batch_size >= 256;
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
+        let fragment_order = foldfree && prepared.fragment_order;
         let (vbm, vbn, vbk, vwaves) = if foldfree {
             (256, 128, 64, 8)
         } else {
@@ -30350,7 +30396,9 @@ impl Gpu {
         };
         let vblock = [(vwaves * 32) as u32, 1, 1];
         let symfold = !foldfree && self.fp8_v2_symfold_enabled(v2);
-        let vlds = if foldfree {
+        let vlds = if fragment_order {
+            Self::fp8_v2_foldfree_frag_lds_bytes()
+        } else if foldfree {
             Self::fp8_v2_foldfree_lds_bytes()
         } else {
             Self::fp8_v2_lds_bytes(vbm, vbn, vbk, symfold)
@@ -30369,8 +30417,16 @@ impl Gpu {
         // batch_tiles and the kernels guard `oc < N`, so any tile covers N%64.
         let (func_name, ksrc, bv): (&str, &str, usize) = if foldfree {
             (
-                "gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201",
-                kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC,
+                if fragment_order {
+                    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_frag_gfx1201"
+                } else {
+                    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201"
+                },
+                if fragment_order {
+                    kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC
+                } else {
+                    kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC
+                },
                 16,
             )
         } else if symfold {
@@ -32158,6 +32214,7 @@ impl Gpu {
             && self.flags.gfx12_mq4v2_fp8_resid
             && batch_size >= 256;
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
+        let fragment_order = foldfree && prepared.fragment_order;
         let (vbm, vbn, vbk, vwaves) = if foldfree {
             (256, 128, 64, 8)
         } else {
@@ -32165,7 +32222,9 @@ impl Gpu {
         };
         let vblock = [(vwaves * 32) as u32, 1, 1];
         let symfold = !foldfree && self.fp8_v2_symfold_enabled(v2);
-        let vlds = if foldfree {
+        let vlds = if fragment_order {
+            Self::fp8_v2_foldfree_frag_lds_bytes()
+        } else if foldfree {
             Self::fp8_v2_foldfree_lds_bytes()
         } else {
             Self::fp8_v2_lds_bytes(vbm, vbn, vbk, symfold)
@@ -32179,8 +32238,16 @@ impl Gpu {
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
         let (func_name, ksrc, bv): (&str, &str, usize) = if foldfree {
             (
-                "gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_gfx1201",
-                kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_FOLDFREE_SRC,
+                if fragment_order {
+                    "gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_frag_gfx1201"
+                } else {
+                    "gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_gfx1201"
+                },
+                if fragment_order {
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC
+                } else {
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_FOLDFREE_SRC
+                },
                 16,
             )
         } else if symfold {

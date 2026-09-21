@@ -3436,13 +3436,24 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let fragment_order = self.fp8_fragment_order_enabled(batch_size, k);
+        let (module, source, kernel) = match (awq.is_some(), fragment_order) {
+            (true, true) => (
+                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12_frag",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_GFX12_FRAG_SRC,
+                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12_frag",
+            ),
+            (false, true) => (
+                "fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12_frag",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_FP8_GFX12_FRAG_SRC,
+                "fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12_frag",
+            ),
+            (true, false) => (
                 "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_FP8_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12",
@@ -3452,7 +3463,7 @@ impl Gpu {
         // All three MQ4v2 FP8 buffers grow below; invalidate first if any of
         // them will (mirrors `prepare_mq4v2_fp8_x`; eager-only above).
         let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) =
-            crate::scratch::mq4v2_fp8_needed(batch_size, k);
+            crate::scratch::mq4v2_fp8_needed_for_layout(batch_size, k, fragment_order);
         {
             let s = &self.scratch;
             if crate::scratch::scratch_will_grow(
@@ -3473,7 +3484,7 @@ impl Gpu {
         }
         let (x_fp8_ptr, half_sums_ptr, row_scales_ptr) = self
             .scratch
-            .grow_mq4v2_fp8_for_producer(&self.hip, batch_size, k)?;
+            .grow_mq4v2_fp8_for_producer(&self.hip, batch_size, k, fragment_order)?;
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut xp = x.buf.as_ptr();
@@ -3522,19 +3533,22 @@ impl Gpu {
         let shared_mem = ((k + 256) * 4) as u32;
         let groups = k / 256;
         let bytes = (k * 4 * 3 + k + groups * 2 * 4 + 4) * batch_size;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            if awq.is_some() {
-                "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12_batched"
-            } else {
-                "fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12_batched"
-            },
-            bytes,
-        );
+        let profile_name = if fragment_order {
+            kernel
+        } else if awq.is_some() {
+            "fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12_batched"
+        } else {
+            "fused_rmsnorm_mq_rotate_mq4v2_fp8_gfx12_batched"
+        };
+        let launch_rows = if fragment_order {
+            (batch_size + 255) & !255
+        } else {
+            batch_size
+        };
+        let timer = crate::profile::begin_timer(&self.hip, "fused", profile_name, bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            [batch_size as u32, 1, 1],
+            [launch_rows as u32, 1, 1],
             [block_size, 1, 1],
             shared_mem,
             &mut params,
@@ -3572,6 +3586,7 @@ impl Gpu {
             n: batch_size,
             k,
             scale_mode: 1,
+            fragment_order,
         })
     }
     /// gfx1201 FP8-stream producer for residual down projections.  Fuses the
@@ -3612,13 +3627,24 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let fragment_order = self.fp8_fragment_order_enabled(batch_size, k);
+        let (module, source, kernel) = match (awq.is_some(), fragment_order) {
+            (true, true) => (
+                "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12_frag",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_GFX12_FRAG_SRC,
+                "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12_frag",
+            ),
+            (false, true) => (
+                "fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12_frag",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_FP8_GFX12_FRAG_SRC,
+                "fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12_frag",
+            ),
+            (true, false) => (
                 "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_FP8_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12",
@@ -3626,7 +3652,7 @@ impl Gpu {
         };
         self.ensure_kernel(module, source, kernel)?;
         let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) =
-            crate::scratch::mq4v2_fp8_needed(batch_size, k);
+            crate::scratch::mq4v2_fp8_needed_for_layout(batch_size, k, fragment_order);
         {
             let s = &self.scratch;
             if crate::scratch::scratch_will_grow(
@@ -3647,7 +3673,7 @@ impl Gpu {
         }
         let (x_fp8_ptr, half_sums_ptr, row_scales_ptr) = self
             .scratch
-            .grow_mq4v2_fp8_for_producer(&self.hip, batch_size, k)?;
+            .grow_mq4v2_fp8_for_producer(&self.hip, batch_size, k, fragment_order)?;
         let mut gp = gate.buf.as_ptr();
         let mut up = up.buf.as_ptr();
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
@@ -3688,19 +3714,22 @@ impl Gpu {
             ]
         };
         let bytes = (k * 4 * 3 + k + (k / 256) * 2 * 4 + 4) * batch_size;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            if awq.is_some() {
-                "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12_batched"
-            } else {
-                "fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12_batched"
-            },
-            bytes,
-        );
+        let profile_name = if fragment_order {
+            kernel
+        } else if awq.is_some() {
+            "fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12_batched"
+        } else {
+            "fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12_batched"
+        };
+        let launch_rows = if fragment_order {
+            (batch_size + 255) & !255
+        } else {
+            batch_size
+        };
+        let timer = crate::profile::begin_timer(&self.hip, "fused", profile_name, bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            [batch_size as u32, 1, 1],
+            [launch_rows as u32, 1, 1],
             [256, 1, 1],
             0,
             &mut params,
@@ -3737,6 +3766,7 @@ impl Gpu {
             n: batch_size,
             k,
             scale_mode: 1,
+            fragment_order,
         })
     }
 
@@ -4449,13 +4479,24 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let fragment_order = self.fp8_fragment_order_enabled(batch_size, k);
+        let (module, source, kernel) = match (awq.is_some(), fragment_order) {
+            (true, true) => (
+                "gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12_frag",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_FP8_GFX12_FRAG_SRC,
+                "gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12_frag",
+            ),
+            (false, true) => (
+                "gated_norm_mq_rotate_mq4v2_fp8_gfx12_frag",
+                kernels::GATED_NORM_MQ_ROTATE_FP8_GFX12_FRAG_SRC,
+                "gated_norm_mq_rotate_mq4v2_fp8_gfx12_frag",
+            ),
+            (true, false) => (
                 "gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC,
                 "gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "gated_norm_mq_rotate_mq4v2_fp8_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_FP8_GFX12_SRC,
                 "gated_norm_mq_rotate_mq4v2_fp8_gfx12",
@@ -4463,7 +4504,7 @@ impl Gpu {
         };
         self.ensure_kernel(module, source, kernel)?;
         let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) =
-            crate::scratch::mq4v2_fp8_needed(batch_size, k);
+            crate::scratch::mq4v2_fp8_needed_for_layout(batch_size, k, fragment_order);
         {
             let s = &self.scratch;
             if crate::scratch::scratch_will_grow(
@@ -4484,7 +4525,7 @@ impl Gpu {
         }
         let (x_fp8_ptr, half_sums_ptr, row_scales_ptr) = self
             .scratch
-            .grow_mq4v2_fp8_for_producer(&self.hip, batch_size, k)?;
+            .grow_mq4v2_fp8_for_producer(&self.hip, batch_size, k, fragment_order)?;
         let mut xp = x.buf.as_ptr();
         let mut zp = z.buf.as_ptr();
         let mut wp = weight.buf.as_ptr();
@@ -4525,19 +4566,22 @@ impl Gpu {
             .into_iter(),
         );
         let bytes = (k * 4 * 4 + k + (k / 256) * 2 * 4 + 4) * batch_size;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            if awq.is_some() {
-                "gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12_batched"
-            } else {
-                "gated_norm_mq_rotate_mq4v2_fp8_gfx12_batched"
-            },
-            bytes,
-        );
+        let profile_name = if fragment_order {
+            kernel
+        } else if awq.is_some() {
+            "gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12_batched"
+        } else {
+            "gated_norm_mq_rotate_mq4v2_fp8_gfx12_batched"
+        };
+        let launch_rows = if fragment_order {
+            (batch_size + 255) & !255
+        } else {
+            batch_size
+        };
+        let timer = crate::profile::begin_timer(&self.hip, "fused", profile_name, bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            [batch_size as u32, 1, 1],
+            [launch_rows as u32, 1, 1],
             [256, 1, 1],
             ((k + 8) * 4) as u32,
             &mut params,
@@ -4578,6 +4622,7 @@ impl Gpu {
             n: batch_size,
             k,
             scale_mode: 1,
+            fragment_order,
         })
     }
 
@@ -5123,31 +5168,53 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match (gate.is_some(), awq.is_some()) {
-            (false, false) => (
-                "mq_rotate_x_mq4v2_fp8_gfx12",
-                kernels::MQ_ROTATE_X_FP8_GFX12_SRC,
-                "mq_rotate_x_mq4v2_fp8_gfx12",
-            ),
-            (false, true) => (
-                "rotate_x_mq_awq_mq4v2_fp8_gfx12",
-                kernels::MQ_ROTATE_X_AWQ_FP8_GFX12_SRC,
-                "rotate_x_mq_awq_mq4v2_fp8_gfx12",
-            ),
-            (true, false) => (
-                "sigmoid_mul_rotate_x_mq4v2_fp8_gfx12",
-                kernels::SIGMOID_MUL_MQ_ROTATE_X_FP8_GFX12_SRC,
-                "sigmoid_mul_rotate_x_mq4v2_fp8_gfx12",
-            ),
-            (true, true) => (
-                "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12",
-                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_GFX12_SRC,
-                "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12",
-            ),
-        };
+        let fragment_order = self.fp8_fragment_order_enabled(batch_size, k);
+        let (module, source, kernel) =
+            match (gate.is_some(), awq.is_some(), fragment_order) {
+                (false, false, true) => (
+                    "mq_rotate_x_mq4v2_fp8_gfx12_frag",
+                    kernels::MQ_ROTATE_X_FP8_GFX12_FRAG_SRC,
+                    "mq_rotate_x_mq4v2_fp8_gfx12_frag",
+                ),
+                (false, true, true) => (
+                    "rotate_x_mq_awq_mq4v2_fp8_gfx12_frag",
+                    kernels::MQ_ROTATE_X_AWQ_FP8_GFX12_FRAG_SRC,
+                    "rotate_x_mq_awq_mq4v2_fp8_gfx12_frag",
+                ),
+                (true, false, true) => (
+                    "sigmoid_mul_rotate_x_mq4v2_fp8_gfx12_frag",
+                    kernels::SIGMOID_MUL_MQ_ROTATE_X_FP8_GFX12_FRAG_SRC,
+                    "sigmoid_mul_rotate_x_mq4v2_fp8_gfx12_frag",
+                ),
+                (true, true, true) => (
+                    "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12_frag",
+                    kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_GFX12_FRAG_SRC,
+                    "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12_frag",
+                ),
+                (false, false, false) => (
+                    "mq_rotate_x_mq4v2_fp8_gfx12",
+                    kernels::MQ_ROTATE_X_FP8_GFX12_SRC,
+                    "mq_rotate_x_mq4v2_fp8_gfx12",
+                ),
+                (false, true, false) => (
+                    "rotate_x_mq_awq_mq4v2_fp8_gfx12",
+                    kernels::MQ_ROTATE_X_AWQ_FP8_GFX12_SRC,
+                    "rotate_x_mq_awq_mq4v2_fp8_gfx12",
+                ),
+                (true, false, false) => (
+                    "sigmoid_mul_rotate_x_mq4v2_fp8_gfx12",
+                    kernels::SIGMOID_MUL_MQ_ROTATE_X_FP8_GFX12_SRC,
+                    "sigmoid_mul_rotate_x_mq4v2_fp8_gfx12",
+                ),
+                (true, true, false) => (
+                    "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12",
+                    kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_GFX12_SRC,
+                    "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12",
+                ),
+            };
         self.ensure_kernel(module, source, kernel)?;
         let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) =
-            crate::scratch::mq4v2_fp8_needed(batch_size, k);
+            crate::scratch::mq4v2_fp8_needed_for_layout(batch_size, k, fragment_order);
         {
             let s = &self.scratch;
             if crate::scratch::scratch_will_grow(
@@ -5168,7 +5235,7 @@ impl Gpu {
         }
         let (x_fp8_ptr, half_sums_ptr, row_scales_ptr) = self
             .scratch
-            .grow_mq4v2_fp8_for_producer(&self.hip, batch_size, k)?;
+            .grow_mq4v2_fp8_for_producer(&self.hip, batch_size, k, fragment_order)?;
         let mut xp = x_in.buf.as_ptr();
         let mut gp = gate.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
@@ -5205,10 +5272,15 @@ impl Gpu {
             + (k / 256) * 2 * 4
             + 4)
             * batch_size;
+        let launch_rows = if fragment_order {
+            (batch_size + 255) & !255
+        } else {
+            batch_size
+        };
         let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
-            [batch_size as u32, 1, 1],
+            [launch_rows as u32, 1, 1],
             [256, 1, 1],
             0,
             &mut params,
@@ -5247,6 +5319,7 @@ impl Gpu {
             n: batch_size,
             k,
             scale_mode: 1,
+            fragment_order,
         })
     }
 

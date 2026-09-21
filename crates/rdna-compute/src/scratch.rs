@@ -30,6 +30,8 @@ pub struct Mq4v2Fp8Prepared {
     pub n: usize,
     pub k: usize,
     pub scale_mode: i32,
+    /// `true` when `x_fp8` uses 16x16 WMMA-fragment order rather than [N,K].
+    pub fragment_order: bool,
 }
 
 /// Opaque reservation of the shared `int4_mmq_x_scratch` buffer for a
@@ -603,6 +605,24 @@ pub(crate) fn mq4v2_fp8_needed(n: usize, k: usize) -> (usize, usize, usize) {
     let row_scales_bytes = n
         .checked_mul(std::mem::size_of::<f32>())
         .expect("mq4v2 fp8 row_scales extent overflow");
+    (x_fp8_bytes, half_sums_bytes, row_scales_bytes)
+}
+
+/// Producer layout extents. Fragment-order A pads only the byte plane to a
+/// complete 256-row GEMM tile; decoded sums and scales keep their true-N ABI.
+#[inline]
+pub(crate) fn mq4v2_fp8_needed_for_layout(
+    n: usize,
+    k: usize,
+    fragment_order: bool,
+) -> (usize, usize, usize) {
+    let storage_n = if fragment_order {
+        n.checked_add(255).expect("mq4v2 fp8 row padding overflow") & !255
+    } else {
+        n
+    };
+    let (x_fp8_bytes, _, _) = mq4v2_fp8_needed(storage_n, k);
+    let (_, half_sums_bytes, row_scales_bytes) = mq4v2_fp8_needed(n, k);
     (x_fp8_bytes, half_sums_bytes, row_scales_bytes)
 }
 
@@ -1312,6 +1332,7 @@ impl ScratchState {
             n,
             k,
             scale_mode,
+            fragment_order: false,
         })
     }
 
@@ -1624,6 +1645,7 @@ impl ScratchState {
         hip: &HipRuntime,
         n: usize,
         k: usize,
+        fragment_order: bool,
     ) -> HipResult<(*mut c_void, *mut c_void, *mut c_void)> {
         if k == 0 || n == 0 || k % 256 != 0 {
             return Err(hip_bridge::HipError::new(
@@ -1631,7 +1653,8 @@ impl ScratchState {
                 "grow_mq4v2_fp8_for_producer: need k%256==0 and n>0",
             ));
         }
-        let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) = mq4v2_fp8_needed(n, k);
+        let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) =
+            mq4v2_fp8_needed_for_layout(n, k, fragment_order);
         grow_scratch_buffer(
             hip,
             &mut self.mq4v2_fp8_x_scratch,

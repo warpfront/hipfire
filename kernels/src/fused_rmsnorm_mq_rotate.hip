@@ -77,12 +77,19 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     float* reduce = smem;              // [256]
 
     const int tid = threadIdx.x;
+    const int token = (int)blockIdx.x;
+#ifdef HIPFIRE_FP8_FRAGMENT_ORDER
+    if (token >= N) {
+        fp8stream_zero_frag_row(x_fp8, token, K, tid);
+        return;
+    }
+#endif
     const int block_size = blockDim.x; // 256
     const int lane_id = tid & 31;
     const int warp_id = tid >> 5;      // 0..7
     const int num_warps = block_size >> 5;
 
-    const long long batch_off = (long long)blockIdx.x * K;
+    const long long batch_off = (long long)token * K;
     const float* x_b     = x     + batch_off;
 #ifdef HIPFIRE_IU4_SIDECAR
           float* x_rot_b = (x_rot != nullptr) ? (x_rot + batch_off) : nullptr;
@@ -288,17 +295,16 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
     // (L1-resident re-read). Byte-identical to pack_f32_to_fp8_mq4v2_gfx12
     // with scale_mode=1 on finite rows; reuses the reduction smem.
     {
-        const int token = (int)blockIdx.x;
-        const long long frow = (long long)token * K;
         const int gpr = K >> 8;
         fp8stream_pack_row_from_f32(
             x_rot_b,
-            x_fp8 + frow,
+            x_fp8,
             fp8_half_sums + (long long)token * gpr * 2,
             fp8_row_scales + token,
             row_amax,
             reduce,
             K,
+            token,
             tid,
             lane_id,
             warp_id);

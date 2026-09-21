@@ -39,7 +39,7 @@
 #error invalid BENCH_FAMILY
 #endif
 
-#include "../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip"
+#include "../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip"
 
 #define HIP_OK(call) do { hipError_t e_ = (call); if (e_ != hipSuccess) { \
   std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, hipGetErrorString(e_)); std::exit(2); \
@@ -47,7 +47,7 @@
 
 static constexpr const char* kArtifact =
     "/home/kaden/qcal/qat/v25/qwen3.8-27b.mq4v2.xt.sym-pow2h-a035.hfq";
-static constexpr size_t kLdsBytes = 18944;
+static constexpr size_t kLdsBytes = 9728;
 
 struct WeightSpec { const char* name; uint64_t offset; int m; int k; };
 #if BENCH_FAMILY == 0
@@ -173,6 +173,21 @@ static std::vector<uint8_t> make_x(int n, int k) {
   return x;
 }
 
+static size_t frag_offset(int row, int col, int k) {
+  const int lane = (row & 15) + 16 * ((col >> 3) & 1);
+  return ((((size_t)(row >> 4) * (k >> 4) + (col >> 4)) * 32 + lane) * 8
+          + (col & 7));
+}
+
+static std::vector<uint8_t> tile_x(const std::vector<uint8_t>& row_major, int n, int k) {
+  const int npad = (n + 255) & ~255;
+  std::vector<uint8_t> tiled(static_cast<size_t>(npad) * k, 0);
+  for (int t = 0; t < n; ++t)
+    for (int c = 0; c < k; ++c)
+      tiled[frag_offset(t, c, k)] = row_major[static_cast<size_t>(t) * k + c];
+  return tiled;
+}
+
 static void launch(dim3 grid, dim3 block, size_t lds, hipStream_t stream,
                    const std::vector<Weight>& w, uint8_t* x, float* hs, float* xs,
                    const std::vector<float*>& y, const std::vector<int>& m, int k, int n) {
@@ -216,13 +231,14 @@ int main(int argc, char** argv) {
   close(fd);
 
   std::vector<uint8_t> hx = make_x(n, k);
+  std::vector<uint8_t> hxt = tile_x(hx, n, k);
   std::vector<float> hxs(n);
   for (int t = 0; t < n; ++t) hxs[t] = std::ldexp(1.0f, (t % 5) - 2);
   uint8_t* dx = nullptr; float* dhs = nullptr; float* dxs = nullptr;
-  HIP_OK(hipMalloc(&dx, hx.size()));
+  HIP_OK(hipMalloc(&dx, hxt.size()));
   HIP_OK(hipMalloc(&dhs, static_cast<size_t>(n) * (k / 256) * 2 * sizeof(float)));
   HIP_OK(hipMalloc(&dxs, hxs.size() * sizeof(float)));
-  HIP_OK(hipMemcpy(dx, hx.data(), hx.size(), hipMemcpyHostToDevice));
+  HIP_OK(hipMemcpy(dx, hxt.data(), hxt.size(), hipMemcpyHostToDevice));
   HIP_OK(hipMemset(dhs, 0, static_cast<size_t>(n) * (k / 256) * 2 * sizeof(float)));
   HIP_OK(hipMemcpy(dxs, hxs.data(), hxs.size() * sizeof(float), hipMemcpyHostToDevice));
 

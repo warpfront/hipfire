@@ -31,8 +31,16 @@ void HIPFIRE_ROTATE_FP8_KERNEL(
     int N)
 {
     const int token = (int)blockIdx.x;
-    if (token >= N || K <= 0) return;
+    if (K <= 0) return;
     const int tid = (int)threadIdx.x;
+#ifdef HIPFIRE_FP8_FRAGMENT_ORDER
+    if (token >= N) {
+        fp8stream_zero_frag_row(x_fp8, token, K, tid);
+        return;
+    }
+#else
+    if (token >= N) return;
+#endif
     const int lane = tid & 31;
     const int wave = tid >> 5;
     const int groups_total = K >> 8;
@@ -153,12 +161,13 @@ void HIPFIRE_ROTATE_FP8_KERNEL(
     const int gpr = K >> 8;
     fp8stream_pack_row_from_f32(
         x_out_b,
-        x_fp8 + row_off,
+        x_fp8,
         fp8_half_sums + (long long)token * gpr * 2,
         fp8_row_scales + token,
         row_amax,
         smem8,
         K,
+        token,
         tid,
         lane,
         wave);

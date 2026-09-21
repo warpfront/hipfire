@@ -113,3 +113,90 @@ Scoped release builds passed for `hipfire-daemon`, `hipfire-cli`, and the `hipfi
 - `4409c7c92` qkvza selector
 - `cea320ca9` qkv selector
 - `9ee38ac79` metadata, loader sidecars, dispatch, and launch integration
+
+## Fragment-order direct-A follow-up
+
+### Producer layout and CPU proof
+
+The fused FP8 producers were given fragment-order variants using
+
+```text
+lane = (row & 15) + 16 * ((k >> 3) & 1)
+offset = (((row >> 4) * (K >> 4) + (k >> 4)) * 32 + lane) * 8 + (k & 7)
+```
+
+Only the FP8 byte plane is padded to a complete 256-row GEMM tile. The decoded
+half-sum and row-scale planes retain their true-N extents. A complete CPU
+permutation/inverse check covered every byte at the pp8192 gate shape and a
+non-aligned tail:
+
+| N | padded N | K | bytes | permutation | padded tail |
+|---:|---:|---:|---:|---|---|
+| 8,192 | 8,192 | 5,120 | 41,943,040 | exact bijection | exact zero |
+| 8,195 | 8,448 | 5,120 | 43,253,760 | exact bijection | exact zero |
+
+All ten producer source variants (RMSNorm, SwiGLU, rotate, sigmoid-gated
+rotate, gated norm, and their AWQ twins) compiled for gfx1201.
+
+A gfx1201 device smoke check packed `N=259, Npad=512, K=512` through the
+row-major and fragment-order helper variants. Untiling the fragment byte plane
+matched every row-major byte, the padded tail was all zero, and half sums plus
+row scales matched (`byte_mismatch=0`, `tail_nonzero=0`,
+`metadata_mismatch=0`).
+
+### ISA gate
+
+The final direct-A form uses four wave-uniform scalar fragment bases and one
+unsigned lane offset. Parenthesizing the complete 32-bit offset before pointer
+addition was necessary for SADDR selection. An empty compiler memory barrier
+after the sixteen source loads was also necessary to prevent the scheduler
+from stranding one four-load group above W expansion.
+
+The resulting gate/up ISA has exactly one contiguous clause per K64:
+
+```text
+s_clause 0xf
+global_load_b64 ..., v180, s[18:19]
+global_load_b64 ..., v180, s[18:19] offset:256
+...
+global_load_b64 ..., v180, s[24:25] offset:768
+```
+
+There are sixteen scalar-address `global_load_b64` instructions in that
+clause. The following 64-WMMA drain contains no `s_wait_loadcnt`; its waits are
+only `s_wait_dscnt` for W LDS reads. The A LDS plane is absent. Dynamic LDS is
+9,728 B (9,216 B W plus 512 B LUT).
+
+| family | SGPR | VGPR | scratch/spill | compiler waves/SIMD | measured blocks/CU |
+|---|---:|---:|---:|---:|---:|
+| gate/up | 34 | 206 | 0 / 0 | 7 | 3 |
+| residual | 34 | 205 | 0 / 0 | 7 | 3 |
+
+The LDS reduction did not reach four blocks/CU because VGPR allocation remains
+the limiting resource.
+
+### Real-slab exactness
+
+Card C, real pow2-half qt44 slabs, N=256:
+
+| family | K | relative RMS | max absolute | nonfinite |
+|---|---:|---:|---:|---:|
+| gate/up | 5,120 | 0 | 0 | 0 |
+| residual | 17,408 | 0 | 0 | 0 |
+
+### Standalone decision gate
+
+Card C, N=8192, five warmups, median of 20 HIP-event timings:
+
+| family | median us | TFLOP/s | shipped median us | time delta |
+|---|---:|---:|---:|---:|
+| gate/up | 16,849.316 | 173.335 | 18,059.408 | -6.70% |
+| residual | 9,470.285 | 154.197 | 8,029.042 | +17.95% |
+| combined | 26,319.601 | 166.449 | 26,088.450 | +0.89% |
+
+The direct-A candidate improves gate/up but loses materially on residual and
+misses the shipped combined baseline by 0.88% throughput. It therefore fails
+the required first-two-family win. QKV/QKVZA, daemon pairs, KLD, TTFT, battery,
+and profiling were intentionally not run. The implementation is retained only
+behind explicit `HIPFIRE_FP8_FRAGMENT_ORDER=1`; the default fold-free route
+remains the shipped staged-A implementation.
