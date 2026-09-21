@@ -2219,7 +2219,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         "HIPFIRE_ATTN_QRESIDENT",
-        "Enable the gfx1201 register-resident-Q wide-workgroup FA2 prefill attention candidate (default off; exact H24/KV4/D256 native-fp8-KV shapes only)."
+        "Enable the gfx1201 register-resident-Q wide-workgroup FA2 prefill route (default on exact gfx1201; set to false or HIPFIRE_ATTN_QRESIDENT=0 to opt out; exact H24/KV4/D256 native-fp8-KV shapes only)."
     ),
     process_bool_field!(
         "kernel.gfx11_fa2_prefill",

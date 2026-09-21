@@ -278,8 +278,8 @@ pub struct FeatureFlags {
     /// kills it.
     pub gfx12_fa_packet: bool,
     /// Register-resident-Q wide gfx1201 FA2 prefill body
-    /// (`HIPFIRE_ATTN_QRESIDENT`, `kernel.attn_qresident`). Default OFF;
-    /// exact H24/KV4/D256 native-fp8-KV shapes only.
+    /// (`HIPFIRE_ATTN_QRESIDENT`, `kernel.attn_qresident`). Default ON on
+    /// exact gfx1201; `=0` opts out. Exact H24/KV4/D256 native-fp8-KV shapes only.
     pub attn_qresident: bool,
     /// `HIPFIRE_GFX11_FA2_PREFILL=0` opts out of the gfx11 GQA-fused FA2
     /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
@@ -665,7 +665,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_fa_packet: parse_bool("HIPFIRE_GFX12_FA_PACKET")
                 .unwrap_or(arch == "gfx1201"),
-            attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT").unwrap_or(false),
+            attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT")
+                .unwrap_or(arch == "gfx1201"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
