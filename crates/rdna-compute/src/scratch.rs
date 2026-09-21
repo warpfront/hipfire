@@ -14,6 +14,21 @@ use hip_bridge::{
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
+/// Activation-scale K span for the guarded gfx1201 IU4 experiment.
+/// The shipping path remains 128. `HIPFIRE_A4_ROWGLOBAL=1` takes precedence;
+/// `HIPFIRE_A4_GROUP_K` exists only to measure the granularity ladder.
+pub(crate) fn iu4_activation_group_k(k: usize) -> usize {
+    if hipfire_config::developer_var("HIPFIRE_A4_ROWGLOBAL").as_deref() == Ok("1") {
+        return k;
+    }
+    match hipfire_config::developer_var("HIPFIRE_A4_GROUP_K")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+    {
+        Some(group_k) if group_k >= 128 && group_k % 128 == 0 => group_k.min(k),
+        _ => 128,
+    }
+}
 
 // ── ScratchState ─────────────────────────────────────────────────────────
 
@@ -1510,6 +1525,12 @@ impl ScratchState {
         k: usize,
     ) -> HipResult<*mut c_void> {
         crate::graph::bind_thread(hip, device_id)?;
+        let group_k = iu4_activation_group_k(k);
+        let quant_symbol = if group_k == 128 {
+            "quantize_int4_mmq_ds128"
+        } else {
+            "quantize_int4_mmq_grouped"
+        };
         compile_and_load_kernel(
             compiler,
             hip,
@@ -1517,7 +1538,7 @@ impl ScratchState {
             functions,
             "gemm_mq4g256v2_residual_mmq_iu4",
             kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
-            "quantize_int4_mmq_ds128",
+            quant_symbol,
         )?;
 
         let needed = int4_mmq_x_needed(k, batch_size);
@@ -1538,17 +1559,24 @@ impl ScratchState {
             let mut yp = out_ptr;
             let mut k_val = k as i32;
             let mut n_val = batch_size as i32;
+            let mut group_k_val = group_k as i32;
             let mut params: Vec<*mut c_void> = vec![
                 &mut xp as *mut _ as *mut c_void,
                 &mut yp as *mut _ as *mut c_void,
                 &mut k_val as *mut _ as *mut c_void,
                 &mut n_val as *mut _ as *mut c_void,
             ];
-            let grid_x = ((k + 1023) / 1024) as u32;
+            if group_k != 128 {
+                params.push(&mut group_k_val as *mut _ as *mut c_void);
+            }
+            let grid_x = if group_k == 128 {
+                ((k + 1023) / 1024) as u32
+            } else {
+                k.div_ceil(group_k) as u32
+            };
             let grid_y = batch_size as u32;
             let bytes = batch_size * k * 4 + needed;
-            let timer =
-                crate::profile::begin_timer(hip, "quantize", "quantize_int4_mmq_ds128", bytes);
+            let timer = crate::profile::begin_timer(hip, "quantize", quant_symbol, bytes);
             launch_maybe_blob(
                 hip,
                 Some(&*compiler),
@@ -1558,7 +1586,7 @@ impl ScratchState {
                 capture_mode,
                 force_blob_path,
                 Some(replay),
-                "quantize_int4_mmq_ds128",
+                quant_symbol,
                 [grid_x, grid_y, 1],
                 [256, 1, 1],
                 0,
@@ -1569,6 +1597,9 @@ impl ScratchState {
                     b.push_ptr(out_ptr);
                     b.push_i32(k_val);
                     b.push_i32(n_val);
+                    if group_k != 128 {
+                        b.push_i32(group_k_val);
+                    }
                     b
                 },
             )?;
