@@ -4907,7 +4907,7 @@ impl Gpu {
             SYMBOL,
             [grid_x, 4, grid_z],
             [768, 1, 1],
-            33024,
+            49408,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
