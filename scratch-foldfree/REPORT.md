@@ -88,7 +88,7 @@ Delta: **-3.578 ms (-0.137%) TTFT**, +0.137% effective prefill throughput.
 
 ## Serve battery
 
-`scripts/serve_harness.py`, recipe:nothink, fp8/vmm, speculation off, five built-in genres: **5/5 PASS**, finish=stop for every turn, runaway=0, empty=0, attractor=0, retrieval_miss=0. Evidence: `scratch-foldfree/battery.json` and `battery-serve.log`.
+`scripts/serve_harness.py`, recipe:nothink, fp8/vmm, speculation off, five built-in genres: **5/5 PASS**, finish=stop for every turn, runaway=0, empty=0, attractor=0, retrieval_miss=0. Evidence: `scratch-foldfree/battery.json`.
 
 ## In-daemon rocprof
 
