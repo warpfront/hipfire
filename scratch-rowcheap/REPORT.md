@@ -4,15 +4,15 @@
 
 **KILL.** The premise was refuted before the performance gates: coarsening the activation scale hurts the genuine IU4 route. The previously reported `0.037143 / 0.045510` row-global result came from an FP8 route selected by a stale predecessor binary, not from grouped-IU4 activation quantization. There is therefore no quality win for the per-tile-amax construction to preserve.
 
-The route-fixed ladder is recorded by `A4K512` at commit `5ade50219`:
+The route-fixed ladder is recorded by `A4K512` at correction commit `f8a16acef` (implementation commit `5ade50219`):
 
-| activation scale | c2 KLD | result versus K128 |
-|---|---:|---|
-| K128 control | 0.064864 | control |
-| K512 | 0.072867 | worse |
-| row-global | 0.118151 | much worse; already beyond the c24 hard budget of 0.10 at c2 |
+| activation scale | c2 KLD | c24 KLD | result versus K128 |
+|---|---:|---:|---|
+| K128 control | 0.064864 | 0.081199 | control |
+| K512 | 0.072867 | 0.096131 | worse |
+| row-global | 0.118151 | 0.158940 | much worse; fails the c24 hard budget of 0.10 |
 
-No c24 or performance matrix was run after this refutation. Main explicitly stopped further gates.
+No performance matrix was run after this refutation. Main explicitly stopped further gates.
 
 ## Route evidence and refutation
 
@@ -23,7 +23,7 @@ A fresh card-B trace of the current route-fixed row-global path is in `scratch-r
 - 256 `gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold` launches;
 - zero FP8 projection GEMMs or FP8 activation packers.
 
-That genuine IU4 run measured c1 KLD `0.091611`; the matching route-fixed c2 run measured `0.118151`. The current K128 control reproduced c2 `0.064864`, and K512 measured c2 `0.072867`.
+That genuine IU4 run measured c1 KLD `0.091611`; the matching route-fixed row-global run measured c2/c24 `0.118151 / 0.158940`. The current K128 control reproduced c2/c24 `0.064864 / 0.081199`, and K512 measured `0.072867 / 0.096131`.
 
 For comparison, rerunning the old `wt-rowa` binary produced the attractive c1 `0.030996`, but `scratch-rowa/trace-row/bench_results.db` contains FP8 producers and FP8 projection GEMMs, with zero grouped quantizer launches and zero IU4 projection GEMMs. Its low score is the route inversion, not a row-global IU4 result. `InversionDiag` independently confirmed there was no post-fix KLD run coupling the old low score to IU4 symbols.
 
