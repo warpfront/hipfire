@@ -201,7 +201,7 @@ and profiling were intentionally not run. The implementation is retained only
 behind explicit `HIPFIRE_FP8_FRAGMENT_ORDER=1`; the default fold-free route
 remains the shipped staged-A implementation.
 
-## Fragment-order W preshuffle follow-up
+## Fragment-order W preshuffle follow-up — final decision
 
 Commits:
 
@@ -209,53 +209,101 @@ Commits:
 - `fca0979ed` `gfx1201: extend fold-free W preshuffle to qkvza`
 - `8bf488a1b` `gfx1201: extend fold-free W preshuffle to qkv`
 - `ba8c5ac6b` `gfx1201: apply W preshuffle to symmetric-fold fp8 GEMM`
+- `f43e0f24d` `gfx1201: coalesced K64 fragment order for symmetric W preshuffle`
 
 The CPU proof remains bit exact: bijection, round trip, dequantization, and
 padded-tail checks all pass for 19 logical rows in 32 storage rows. The
 permutation replaces the uploaded MQ4V2 byte buffer without changing its
 length, so prepared-weight VRAM delta is exactly 0 bytes.
 
-On card C, the fold-free gate/up and residual pair measured 14,795.144 us
-(197.401 TFLOP/s) and 8,826.476 us (165.444 TFLOP/s), respectively:
-23,621.620 us combined and 185.46 aggregate TFLOP/s. This reproduces the
-pre-reboot 186.099 TFLOP/s result within 0.34%. QKVZA and QKV real-slab
-checks at N=256 were exact (`rel_rms=0`, `max_abs=0`, no nonfinite values).
-Their warmed standalone results were 7,007.517 us (197.280 TFLOP/s) and
-5,978.076 us (201.167 TFLOP/s).
-
-The pow2-half artifact remains a quality dead end: its 24-chunk KLD is
-0.056627, above the 0.05 shipping limit. The symmetric artifact
-`qwen3.8-27b.mq4v2.xt.sym-a035.qat-r5s100.hfq` measured KLD 0.045510,
-mean NLL 1.858547, PPL 6.4144 over 24,552 tokens; a two-chunk candidate and
+The fold-free result remains 185.46 aggregate TFLOP/s after reboot, within
+0.34% of the earlier 186.099 TFLOP/s result and 10.8% above the shipped
+symmetric-fold baseline. It is not a shipping candidate: the required pow2
+grid's 24-chunk KLD is 0.056627, above the hard 0.05 limit. The current
+symmetric artifact remains inside the limit at KLD 0.045510, mean NLL
+1.858547, and PPL 6.4144 over 24,552 tokens. A two-chunk candidate and
 row-major control were byte-identical (MD5
 `d4b51612337125932d5e338299f83ca7`).
 
-The symmetric standalone candidate measured 17,866.916 us gate/up
-(163.463 TFLOP/s) and 7,944.252 us residual (183.817 TFLOP/s), for
-25,811.168 us and **169.728 aggregate TFLOP/s**, 1.07% above the shipped
-167.924 TFLOP/s baseline.
+### Final coalesced-K64 standalone and exactness
 
-### Symmetric daemon gate
+Card C, N=8192, five in-process warmups, median of 20 HIP-event timings:
 
-Card B paired ABBA rows, with IU4 disabled:
+| family | median us | TFLOP/s |
+|---|---:|---:|
+| gate/up | 17,833.392 | 163.770 |
+| residual | 8,063.789 | 181.092 |
+| combined | 25,897.181 | 169.164 |
+
+The combined result is **0.74% above** the shipped 167.924 TFLOP/s baseline
+and 0.33% below the earlier pre-remap 169.728 TFLOP/s result. It misses the
+1.5% standalone shipping bar.
+
+Final-mapping exactness was checked against the row-major symmetric kernel
+using real layer-0 slabs from
+`qwen3.8-27b.mq4v2.xt.sym-a035.qat-r5s100.hfq`, N=256, and 128 output rows
+per projection:
+
+- gate/up: 65,536 float outputs were byte-identical, MD5
+  `4971f449cc6f63a0eae70a4c6a780811`;
+- residual: 32,768 float outputs were byte-identical, MD5
+  `90fcff8968871a4cb2051a548c9bc127`;
+- neither path produced a non-finite value;
+- the independent production-shape scalar gate/up check had relative RMS
+  `1.33396503e-6` and max absolute error `4.48226929e-5`;
+- the prior QKVZA and QKV real-slab checks remain exact (`rel_rms=0`,
+  `max_abs=0`, no non-finite values).
+
+### Mandatory final decode gate
+
+The coalesced-K64 candidate was built in release mode and run first on card B
+with IU4 disabled, pp512/ctx128/tg128, three measured runs, and one warmup.
+The saved evidence is `symwp-final-decode.json`.
+
+- pp512 median: 2312.5 tokens/s;
+- tg128 median: **31.1583 tokens/s**;
+- tg128 samples: 31.2260, 31.1583, 31.1046 tokens/s;
+- validated shipped baseline: 36.68 tokens/s;
+- candidate delta: **-15.05%**.
+
+This is far outside the required 1% decode-neutral band. The mandated
+early-stop therefore fired. Final-remap pp8192, TTFT, KLD, long-context,
+battery, profiling, and IU4 reruns were intentionally not performed.
+
+### Archival pre-remap daemon evidence
+
+These numbers predate the final coalesced-K64 remap and are retained only to
+explain the decision history; they are not final-candidate measurements.
 
 | pair | pp512 OFF | pp512 ON | pp8192 OFF | pp8192 ON | tg128 OFF | tg128 ON |
 |---|---:|---:|---:|---:|---:|---:|
 | 1 | 2258.1 | 2304.9 | 2334.0 | 2379.7 | 36.681 | 27.718 |
 | 2 | 2213.5 | 2308.0 | 2297.3 | 2377.5 | 36.572 | 27.680 |
 
-Mean pp8192 increased by 62.95 tokens/s, or 2.72%. TTFT changed from
-2612.190 ms OFF to 2535.006 ms ON, a 77.183 ms (2.95%) improvement.
-With the normal flag-free IU4 route, the single measured TTFT row was
-1624.381 ms (3637.696 effective prefill tokens/s).
+The pre-remap mean pp8192 gain was 62.95 tokens/s, or 2.72%. Its TTFT changed
+from 2612.190 ms OFF to 2535.006 ms ON, a 77.183 ms (2.95%) improvement.
+The flag-free IU4 row measured 1624.381 ms (3637.696 effective prefill
+tokens/s).
 
-The required battery gate failed decisively: the preshuffled symmetric route
-scored **0/5**, producing only repeated exclamation marks for every prompt,
-while the row-major control remained coherent. Synthetic production-shape
-scalar gate/up and residual checks matched the CPU reference to relative RMS
-1.334e-6 and 2.557e-6, so the failure is in integration rather than the
-standalone permutation formula. The candidate is therefore not shippable and
-profiling was not used to override the correctness gate. Symmetric
-preshuffling is retained only as an explicit experiment with
-`HIPFIRE_FP8_WPRESHUFFLE=1`; the default current-artifact route remains the
-row-major shipped implementation.
+After repairing all known layout-sensitive small/tail routes, the pre-remap
+battery produced five coherent responses. The verbatim outputs and metrics
+are preserved in `symwp-battery-fixed.json`: three ended normally and two
+coherent answers reached the harness's 128-token cap, so the harness counted
+3/5 rather than the required 5/5. This archival battery is not evidence for
+the final mapping. A higher-cap final battery was skipped because the decode
+gate had already required termination.
+
+Flag-free IU4 loading remains row-major and therefore unchanged. Explicitly
+combining IU4 prefill with W preshuffle routes the affected MLP prefill work
+through FP8 rather than an IU4-preshuffled implementation. That interaction
+does not alter the current shipped/default behavior, but it would be a
+shipping-contract blocker if W preshuffle became a default.
+
+### Verdict
+
+**KILL.** The only quality-eligible symmetric candidate gains just 0.74% in
+the standalone aggregate, below the 1.5% bar, and loses 15.05% on tg128,
+violating the no-row-more-than-1%-slower rule. The pre-remap pp8192 and TTFT
+wins cannot rescue a different final mapping. Keep the default current
+symmetric artifact on the row-major shipped implementation; do not ship or
+enable the W-preshuffle experiment by default.
