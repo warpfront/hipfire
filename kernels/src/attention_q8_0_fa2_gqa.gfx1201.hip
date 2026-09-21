@@ -2570,17 +2570,16 @@ void attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
                 mx = fmaxf(mx, sacc[j]);
             mx = fmaxf(mx, fa2_qr_xor16(mx));
 
-            // Keep a stable maximum for up to four natural-log units. Only
-            // the uncommon rebase path scales the 128-element accumulator.
+            // Keep a stable maximum for up to four natural-log units. A rare
+            // rebase moves the common alpha into the physical O scale rather
+            // than multiplying all 128 logical accumulator elements.
             if (mx != -INFINITY) {
                 if (m_ref == -INFINITY) {
                     m_ref = mx;
                 } else if (mx > m_ref + 4.0f) {
                     const float alpha = __expf(m_ref - mx);
                     l_val *= alpha;
-#pragma unroll
-                    for (int dc = 0; dc < 16; ++dc)
-                        Ofr[dc] *= alpha;
+                    b_ref *= alpha;
                     m_ref = mx;
                 }
             }
