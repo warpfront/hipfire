@@ -142,16 +142,99 @@ fn load_norm_weight(
     dequant_norm(gpu, info.quant_type, &data, shape, QWEN35_NORM_BIAS)
 }
 
+/// Replace an MQ4V2 row-major image with the gfx1201 iu4 WMMA fragment
+/// order. Payload byte `(row, k/2)` (where `k` is the even nibble column)
+/// maps to
+/// `((((row/16)*(K/64)+k/64)*32 + 16*((k/16)&1) + row%16)*16
+///    + 8*((k/32)&1) + (k%16)/2)`.
+/// Thus a wave assigned one 16-row tile reads both K32 fragments of one K64
+/// slab with one lane-contiguous b128. Headers follow the payload in four
+/// byte planes; the transform is size-preserving and bijective.
+fn mq4v2_iu4_wpreshuffle(data: &[u8], m: usize, k: usize) -> HipResult<Vec<u8>> {
+    if m % 16 != 0 || k % 256 != 0 {
+        return Err(HipError::new(
+            0,
+            &format!("MQ4V2 iu4 W preshuffle needs M%16=0 and K%256=0, got M={m} K={k}"),
+        ));
+    }
+    let groups_per_row = k / 256;
+    let expected = m * groups_per_row * 136;
+    if data.len() != expected {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "MQ4V2 iu4 W preshuffle length mismatch: expected {expected}, got {}",
+                data.len()
+            ),
+        ));
+    }
+    let payload_bytes = m * k / 2;
+    let row_tiles = m / 16;
+    let mut out = vec![0u8; data.len()];
+    for row in 0..m {
+        for packed_col in 0..k / 2 {
+            let nibble = packed_col * 2;
+            let src = (row * groups_per_row + nibble / 256) * 136
+                + 8 + (nibble & 255) / 2;
+            let lane = 16 * ((nibble >> 4) & 1) + (row & 15);
+            let dst = ((((row >> 4) * (k >> 6) + (nibble >> 6)) * 32 + lane) * 16)
+                + ((nibble >> 5) & 1) * 8
+                + ((nibble & 15) >> 1);
+            out[dst] = data[src];
+        }
+        for half_block in 0..k / 128 {
+            let src = (row * groups_per_row + half_block / 2) * 136
+                + (half_block & 1) * 4;
+            for (byte, plane) in [1usize, 0, 2, 3].into_iter().enumerate() {
+                let dst = payload_bytes
+                    + (((half_block * row_tiles + (row >> 4)) * 4 + plane) * 16)
+                    + (row & 15);
+                out[dst] = data[src + byte];
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn mq4v2_iu4_wpreshuffle_enabled(gpu: &Gpu, name: &str, m: usize, k: usize) -> bool {
+    let target = name.ends_with(".mlp.gate_proj.weight")
+        || name.ends_with(".mlp.up_proj.weight")
+        || name.ends_with(".mlp.down_proj.weight")
+        || name.ends_with(".linear_attn.in_proj_qkv.weight")
+        || name.ends_with(".linear_attn.in_proj_z.weight")
+        || name.ends_with(".linear_attn.in_proj_a.weight")
+        || name.ends_with(".linear_attn.in_proj_b.weight")
+        || name.ends_with(".self_attn.q_proj.weight")
+        || name.ends_with(".self_attn.k_proj.weight")
+        || name.ends_with(".self_attn.v_proj.weight");
+    target
+        && gpu.arch == "gfx1201"
+        && gpu.mq4v2_symmetric
+        && m % 16 == 0
+        && k % 256 == 0
+        && hipfire_config::developer_var("HIPFIRE_IU4_WPRESHUFFLE").as_deref() != Ok("0")
+}
+
 fn load_weight_tensor_raw(
     gpu: &Gpu,
     quant_type: u8,
     data: &[u8],
     m: usize,
     k: usize,
+    wpreshuffle: bool,
 ) -> HipResult<WeightTensor> {
     match quant_type {
         6 => {
-            let buf = gpu.upload_raw(data, &[data.len()])?;
+            let permuted = if wpreshuffle {
+                Some(mq4v2_iu4_wpreshuffle(data, m, k)?)
+            } else {
+                None
+            };
+            let upload = permuted.as_deref().unwrap_or(data);
+            let buf = gpu.upload_raw(upload, &[upload.len()])?;
+            if wpreshuffle {
+                gpu.install_mq4v2_iu4_wpreshuffled(&buf)?;
+            }
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::HFQ4G256,
@@ -988,13 +1071,17 @@ pub(crate) fn load_weight_tensor(
         for candidate in candidates(name) {
             if let Some((info, data)) = hfq.tensor_data(&candidate) {
                 let qt = info.quant_type;
-                wt = Some(load_weight_tensor_raw(gpu, qt, data, m, k)?);
+                wt = Some(load_weight_tensor_raw(
+                    gpu, qt, data, m, k, mq4v2_iu4_wpreshuffle_enabled(gpu, name, m, k),
+                )?);
                 matched = Some(candidate);
                 break;
             }
             if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
                 let qt = info.quant_type;
-                wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k)?);
+                wt = Some(load_weight_tensor_raw(
+                    gpu, qt, &buf, m, k, mq4v2_iu4_wpreshuffle_enabled(gpu, name, m, k),
+                )?);
                 matched = Some(candidate);
                 break;
             }
@@ -1048,7 +1135,14 @@ pub(crate) fn load_weight_tensor(
             }
             found.unwrap_or_else(|| panic!("tensor not found: {name}"))
         };
-        let mut wt = load_weight_tensor_raw(gpu, info.quant_type, data, m, k)?;
+        let mut wt = load_weight_tensor_raw(
+            gpu,
+            info.quant_type,
+            data,
+            m,
+            k,
+            mq4v2_iu4_wpreshuffle_enabled(gpu, name, m, k),
+        )?;
         if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
                 .or_else(|| load_awq_scale_for(hfq, gpu, name, k));
@@ -1177,7 +1271,7 @@ fn load_weight_tensor_keep(
             ),
         ));
     }
-    let mut wt = load_weight_tensor_raw(gpu, info.quant_type, &sub, m, k)?;
+    let mut wt = load_weight_tensor_raw(gpu, info.quant_type, &sub, m, k, false)?;
     if wt.gpu_dtype.supports_awq_sidecar() {
         // The AWQ sidecar is indexed by K and remains unchanged by row
         // gathering. Resolve under the original source name.
@@ -2684,7 +2778,9 @@ impl WeightSource for HfqSource<'_> {
             |gpu| {
                 let (lm_info, lm_data) = qwen35_tensor_data_cow(hfq, "lm_head.weight")
                     .ok_or_else(|| HipError::new(0, "lm_head present"))?;
-                load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)
+                load_weight_tensor_raw(
+                    gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim, false,
+                )
             },
             |gpu| {
                 let (embd_meta, embd_data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
@@ -3651,7 +3747,14 @@ fn load_weight_tensor_dense_tp(
             ),
         }
     };
-    let mut weight = match load_weight_tensor_raw(gpu, quant_type, &bytes, new_m, new_k) {
+    let mut weight = match load_weight_tensor_raw(
+        gpu,
+        quant_type,
+        &bytes,
+        new_m,
+        new_k,
+        mq4v2_iu4_wpreshuffle_enabled(gpu, name, new_m, new_k),
+    ) {
         Ok(w) => w,
         Err(e) => return Err(e),
     };
@@ -3919,7 +4022,9 @@ pub fn load_weights_dense_tp_rank(
             |gpu| {
                 let (info, data) = qwen35_tensor_data_cow(hfq, "lm_head.weight")
                     .ok_or_else(|| HipError::new(0, "lm_head.weight not found"))?;
-                load_weight_tensor_raw(gpu, info.quant_type, &data, config.vocab_size, dim)
+                load_weight_tensor_raw(
+                    gpu, info.quant_type, &data, config.vocab_size, dim, false,
+                )
             },
             |gpu| {
                 let (info, data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")

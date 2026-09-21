@@ -143,17 +143,27 @@
 #define IU4_WAVES 8
 #endif
 #define IU4_NTHREADS (IU4_WAVES * 32)
-// Fragment-order slab: each 64-K slab (IU4_BK nibbles/row) holds 8 row/token
-// groups of 16 x 2 K32 steps = 16 fragments of 256 contiguous bytes
-// (32 lanes x 8 B, lane L at frag*256 + L*8). Same 4096 data bytes as the
-// old [128][32] rows, no pad: contiguous-lane b64 reads sit at the b64
-// width floor (see bank enumeration above).
+// Preshuffled W is not staged: one 16-row wave consumes one b128/lane/K64
+// directly from `A + (((row_tile*(K/64)+k64)*32+lane)*16)`. Lane
+// `L=16*khalf+row_in_tile` receives packed K bytes
+// `[k64+16*khalf..+15, k64+32+16*khalf..+15]`, the two K32 operands.
+// This is the exact inverse of the load-time formula documented above.
 #define IU4_FRAG_BYTES 256
 #define IU4_A_FRAGS ((IU4_BM / 16) * (IU4_BK / 32))
-#define IU4_W_FRAGS ((IU4_BN / 16) * (IU4_BK / 32))
 #define IU4_A_BYTES (IU4_A_FRAGS * IU4_FRAG_BYTES)
-#define IU4_W_BYTES (IU4_W_FRAGS * IU4_FRAG_BYTES)
 #define IU4_A_OFF 0
+#if defined(IU4_WPRESHUFFLE)
+#define IU4_DS_OFF (IU4_A_OFF + IU4_A_BYTES)
+#define IU4_DS_BYTES (IU4_BM * 8)
+#define IU4_DS1_OFF (IU4_DS_OFF + IU4_DS_BYTES)
+#define IU4_SZ0_OFF (IU4_DS1_OFF + IU4_DS_BYTES)
+#define IU4_SZ_BYTES (IU4_BN * 8)
+#define IU4_SZ1_OFF (IU4_SZ0_OFF + IU4_SZ_BYTES)
+#define IU4_A1_OFF (IU4_SZ1_OFF + IU4_SZ_BYTES)
+#define IU4_LDS_BYTES (IU4_A1_OFF + IU4_A_BYTES)
+#else
+#define IU4_W_FRAGS ((IU4_BN / 16) * (IU4_BK / 32))
+#define IU4_W_BYTES (IU4_W_FRAGS * IU4_FRAG_BYTES)
 #define IU4_W0_OFF (IU4_A_OFF + IU4_A_BYTES)
 #define IU4_W1_OFF (IU4_W0_OFF + IU4_W_BYTES)
 #define IU4_DS_OFF (IU4_W1_OFF + IU4_W_BYTES)
@@ -164,6 +174,7 @@
 #define IU4_SZ1_OFF (IU4_SZ0_OFF + IU4_SZ_BYTES)
 #define IU4_A1_OFF (IU4_SZ1_OFF + IU4_SZ_BYTES)
 #define IU4_LDS_BYTES (IU4_A1_OFF + IU4_A_BYTES)
+#endif
 _Static_assert(IU4_LDS_BYTES <= 20480, "iu4 fragment planes exceed host LDS");
 // Store slots reuse LDS base: 8 waves x [16][20] f32.
 #define IU4_SLOT_COLS 20
@@ -177,11 +188,21 @@ typedef float   __attribute__((ext_vector_type(8)))  float8_t;
 // note at the K-loop top). Ext-vector so global/LDS accesses codegen to
 // single b64 instructions with elementwise branch-free selects.
 typedef unsigned __attribute__((ext_vector_type(2))) u32x2_t;
+typedef unsigned __attribute__((ext_vector_type(4))) u32x4_t;
 
 static __device__ __forceinline__ u32x2_t iu4_weight_staging_word(u32x2_t value) {
 #if defined(IU4_SYMMETRIC_FOLD) && defined(__gfx1201__)
     // Flip each uint4 code's sign bit so the signed WMMA consumes q-8.
     return value ^ (u32x2_t){0x88888888u, 0x88888888u};
+#else
+    return value;
+#endif
+}
+static __device__ __forceinline__ u32x4_t iu4_weight_direct_word(u32x4_t value) {
+#if defined(IU4_SYMMETRIC_FOLD) && defined(__gfx1201__)
+    return value ^ (u32x4_t){
+        0x88888888u, 0x88888888u, 0x88888888u, 0x88888888u
+    };
 #else
     return value;
 #endif
@@ -253,15 +274,41 @@ static __device__ __forceinline__ float2 iu4_symmetric_fold_rn_pair(
 #endif
 #endif
 
-// One K32-sub-block compute bundle: 2 W-frags + 4 A-frags +
-// 8 WMMAs (2 row-groups x 4 column blocks), then a scheduling fence.
-// SB is a template constant (folded into LDS immediates); FIRST picks
-// the shared zero C vector for each chain's first step (avoids 64 separate
-// Compute reads slab sb of A from the single A plane and
-// of W from Wn (n = sb); the caller re-points w_lds per phase. Both W planes
-// share the fragment-order layout, so the hoisted frA/frW offsets apply to
-// either. Each fragment read is one ds_read_b64 at frag*256 + lane*8.
-// K-step VALU: ds_reads + WMMAs only.
+#if defined(IU4_WPRESHUFFLE)
+// One b128 supplies this wave/lane's two K32 W operands. A remains staged in
+// fragment order; there are eight 16-token fragments because each wave owns
+// one 16-row tile and the complete 128-token workgroup tile.
+template <int SB, bool FIRST>
+static __device__ __forceinline__ void iu4_bundle(
+    const u32x4_t& w,
+    const char* __restrict__ a_lds,
+    const unsigned (&frA)[8][2],
+    int32x8_t cacc[4][2],
+    const int32x8_t& zc
+) {
+    const int32x2_t a = (SB == 0)
+        ? (int32x2_t){(int)w[0], (int)w[1]}
+        : (int32x2_t){(int)w[2], (int)w[3]};
+    #pragma unroll
+    for (int th = 0; th < 2; th++) {
+        #pragma unroll
+        for (int nb = 0; nb < 4; nb++) {
+            const int32x2_t b =
+                *(const int32x2_t*)(a_lds + frA[th * 4 + nb][SB]);
+            if constexpr (FIRST) {
+                cacc[nb][th] = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(
+                    IU4_WEIGHT_SIGNED, a, true, b, zc, false
+                );
+            } else {
+                cacc[nb][th] = __builtin_amdgcn_wmma_i32_16x16x32_iu4_w32_gfx12(
+                    IU4_WEIGHT_SIGNED, a, true, b, cacc[nb][th], false
+                );
+            }
+        }
+    }
+    __builtin_amdgcn_sched_barrier(0);
+}
+#else
 template <int SB, bool FIRST>
 static __device__ __forceinline__ void iu4_bundle(
     const char* __restrict__ w_lds,
@@ -296,6 +343,20 @@ static __device__ __forceinline__ void iu4_bundle(
     }
     __builtin_amdgcn_sched_barrier(0);
 }
+#endif
+#if defined(IU4_WPRESHUFFLE)
+static __device__ __forceinline__ unsigned iu4_wp_header(
+    const char* a, int rows, int k, int row, int half_block) {
+    const unsigned char* p = (const unsigned char*)a
+        + (size_t)rows * (size_t)k / 2u
+        + (((size_t)half_block * (size_t)(rows >> 4)
+            + (unsigned)(row >> 4)) * 4u) * 16u
+        + (unsigned)(row & 15);
+    return (unsigned)p[16] | ((unsigned)p[0] << 8)
+         | ((unsigned)p[32] << 16) | ((unsigned)p[48] << 24);
+}
+#endif
+
 
 // Shared compute body for residual / full_add / full_set. `ADD` selects
 // += (residual) vs = (set) writeback.
@@ -314,35 +375,53 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
 
     if (rs >= M || bs >= N) return;
 
-    const int m_lane = lane & 15;  // 0..15: row within a 16-row group
-    const int k_grp  = lane >> 4;  // 0/1: which K-half this lane carries
-    const int wt_pair = wave >> 1;     // 0..3: which 32-row group
-    const int tok_half = wave & 1;     // 0/1: which 64-token half
+    const int m_lane = lane & 15;
+    const int k_grp  = lane >> 4;
+#if defined(IU4_WPRESHUFFLE)
+    // Eight waves split rows only; each owns one 16-row tile and all eight
+    // 16-token blocks. This makes the complete K64 W operand exactly one
+    // lane-contiguous b128.
+    const int wave_row0 = wave * 16;
+    const int wave_tok0 = 0;
+#else
+    const int wt_pair = wave >> 1;
+    const int tok_half = wave & 1;
     const int wave_row0 = wt_pair * 32;
     const int wave_tok0 = tok_half * 64;
+#endif
 
     const int groups_per_row = K / 256;
     extern __shared__ char LDS[];
-    // The current A/W slab always shares slot parity.
     char* __restrict__ a_lds = LDS + IU4_A_OFF;
+#if !defined(IU4_WPRESHUFFLE)
     char* __restrict__ w_lds = LDS + IU4_W0_OFF;
-    // DS/SZ ping-pong bases (plane[h], kb = 2g+h) selected inside the loop.
-    // Hoisted K-loop addresses: full LDS byte offsets of every fragment this
-    // lane will ever read. Computed once at kernel top (outside ALL loops);
-    // the K-step indexes them with unroll constants only.
+#endif
+    const unsigned lane8 = (unsigned)lane * 8u;
+#if defined(IU4_WPRESHUFFLE)
+    unsigned frA[8][2];
+    #pragma unroll
+    for (int tb = 0; tb < 8; tb++) {
+        #pragma unroll
+        for (int sb = 0; sb < 2; sb++) {
+            frA[tb][sb] =
+                ((unsigned)tb * 2u + (unsigned)sb) * IU4_FRAG_BYTES + lane8;
+        }
+    }
+    const int w_row0 = rs + wave_row0;
+    const bool w_valid = w_row0 < M;
+    const int w_safe_row0 = w_valid ? w_row0 : (M - 16);
+    const char* __restrict__ w_direct = A
+        + (((size_t)(w_safe_row0 >> 4) * (size_t)(K >> 6) * 32u
+            + (unsigned)lane) * 16u);
+#else
     unsigned frA[4][2];
     unsigned frW[2][2];
-    // Fragment-order offsets: token group g8 = tok_half*4+nb (A) or row
-    // group g8 = wt_pair*2+rg (W); fragment (g8,sb) lives at (g8*2+sb)*256
-    // and this lane's 8 bytes at +lane8. All loop-invariant (wave/nb/rg/sb
-    // are kernel-top or unroll constants; lane = tid&31 is fixed).
-    const unsigned lane8 = (unsigned)lane * 8u;
     #pragma unroll
     for (int nb = 0; nb < 4; nb++) {
         const unsigned g8a = (unsigned)(tok_half * 4 + nb);
         #pragma unroll
         for (int sb = 0; sb < 2; sb++) {
-            frA[nb][sb] = (g8a * 2u + (unsigned)sb) * (unsigned)IU4_FRAG_BYTES + lane8;
+            frA[nb][sb] = (g8a * 2u + (unsigned)sb) * IU4_FRAG_BYTES + lane8;
         }
     }
     #pragma unroll
@@ -350,12 +429,13 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         const unsigned g8w = (unsigned)(wt_pair * 2 + rg);
         #pragma unroll
         for (int sb = 0; sb < 2; sb++) {
-            frW[rg][sb] = (g8w * 2u + (unsigned)sb) * (unsigned)IU4_FRAG_BYTES + lane8;
+            frW[rg][sb] = (g8w * 2u + (unsigned)sb) * IU4_FRAG_BYTES + lane8;
         }
     }
+#endif
 
-    // Output accumulators (gfx12 wave32 layout):
-    // acc[nb][rg][j] = Y[wave_tok0 + nb*16 + m_lane][rs + wave_row0 + rg*16 + 8*k_grp + j].
+    // acc[nb][half][j]: half is the token half for preshuffled W and the
+    // second 16-row group otherwise.
     float8_t acc[4][2];
     // b64-coalesced staging map. Each lane stages 2 rounds; round r covers 64
     // slab rows (R = r*64 + (tid>>2)) with quad q = tid&3 (8 contiguous
@@ -377,7 +457,9 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     // select (exact old semantics) via branch-free ternary (cndmask, no EXEC
     // masking), while W keeps the clamped value exactly as before.
     unsigned st_avoff[2];
+#if !defined(IU4_WPRESHUFFLE)
     unsigned st_wvoff[2];
+#endif
     unsigned st_ldsoff[2];
     unsigned st_aok[2];
     #pragma unroll
@@ -387,13 +469,15 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         st_aok[r] = (tok_r < N) ? 1u : 0u;
         st_avoff[r] = (unsigned)tok_c * (unsigned)sizeof(block_i4_128)
             + (unsigned)(tid & 3) * 8u;
+#if !defined(IU4_WPRESHUFFLE)
         const int grow_r = rs + r * 64 + (tid >> 2);
         const int src_c = (grow_r < M) ? grow_r : (M - 1);
         st_wvoff[r] = (unsigned)src_c * (unsigned)groups_per_row * 136u
             + (unsigned)(tid & 3) * 8u;
+#endif
         const unsigned R = (unsigned)(r * 64 + (tid >> 2));
         const unsigned q = (unsigned)(tid & 3);
-        st_ldsoff[r] = ((R >> 4) * 2u + (q >> 1)) * (unsigned)IU4_FRAG_BYTES
+        st_ldsoff[r] = ((R >> 4) * 2u + (q >> 1)) * IU4_FRAG_BYTES
             + ((R & 15u) + (q & 1u) * 16u) * 8u;
     }
     const u32x2_t z64 = { 0u, 0u };
@@ -406,10 +490,10 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     // One reusable zero C vector for each chain's first WMMA.
     const int32x8_t zc = (int32x8_t){0, 0, 0, 0, 0, 0, 0, 0};
     int32x8_t cacc[4][2];
-    // Slab prefetch registers (slab s+1 globals while computing slab s): b64
-    // pairs, same 8 dwords/lane as before (2 rounds x 1 u32x2 per plane).
     u32x2_t A_pf[2];
+#if !defined(IU4_WPRESHUFFLE)
     u32x2_t W_pf[2];
+#endif
     // Next-block raw metadata words for the rescheduled fetch epoch (loaded
     // after B1, consumed at the publish below B2a): one token DS word and
     // one packed weight header word per lane.
@@ -436,22 +520,29 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         const int w = i & 1;
         const int grow = rs + row_idx;
         const int src_row = (grow < M) ? grow : (M - 1);
+#if defined(IU4_WPRESHUFFLE)
+        const unsigned hw = iu4_wp_header(A, M, K, src_row, 0);
+#else
         const unsigned hw = *(const unsigned*)(A + (long long)src_row * groups_per_row * 136);
+#endif
         const float f = (w == 0)
             ? __half2float(__ushort_as_half((unsigned short)(hw & 0xFFFFu)))
             : __half2float(__ushort_as_half((unsigned short)(hw >> 16)));
         ((float*)(LDS + IU4_SZ0_OFF + row_idx * 8))[w] = (grow < M) ? f : 0.0f;
     }
-    // Prologue slab 0 of block 0, b64-coalesced (same map as the K-loop).
     {
         const char* __restrict__ xqB0 = (const char*)Xq + 8;
+#if !defined(IU4_WPRESHUFFLE)
         const char* __restrict__ wB0 = A + 8;
+#endif
         #pragma unroll
         for (int r = 0; r < 2; r++) {
             const u32x2_t av = *(const u32x2_t*)(xqB0 + st_avoff[r]);
             *(u32x2_t*)(a_lds + st_ldsoff[r]) = st_aok[r] ? av : z64;
+#if !defined(IU4_WPRESHUFFLE)
             *(u32x2_t*)(w_lds + st_ldsoff[r]) =
                 iu4_weight_staging_word(*(const u32x2_t*)(wB0 + st_wvoff[r]));
+#endif
         }
     }
     __syncthreads();
@@ -475,12 +566,17 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 // Slab 1 prefetch, b64-coalesced: uniform SGPR bases carry
                 // kb/g/h, lane VGPR offsets were hoisted to kernel top.
                 const char* __restrict__ xqB1 = (const char*)(Xq + (long long)kb * N) + 8 + 32;
-                const char* __restrict__ wB1 = A + (long long)g * 136 + 8 + (long long)h * 64 + 32;
+#if !defined(IU4_WPRESHUFFLE)
+                const char* __restrict__ wB1 =
+                    A + (long long)g * 136 + 8 + (long long)h * 64 + 32;
+#endif
                 #pragma unroll
                 for (int r = 0; r < 2; r++) {
                     A_pf[r] = *(const u32x2_t*)(xqB1 + st_avoff[r]);
+#if !defined(IU4_WPRESHUFFLE)
                     W_pf[r] = iu4_weight_staging_word(
                         *(const u32x2_t*)(wB1 + st_wvoff[r]));
+#endif
                 }
                 // No scheduling pin here: the previous trip's fold VALU must
                 // remain free to sink among this trip's WMMAs. Raw A_pf is
@@ -488,18 +584,30 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 // Every 128-K block restarts its int32 accumulation from zero
                 // (each block folds independently): FIRST=true on slab 0 of
                 // every (g,h), exactly as in v2. No h-dependence here.
+#if defined(IU4_WPRESHUFFLE)
+                u32x4_t w0 = iu4_weight_direct_word(
+                    *(const u32x4_t*)(w_direct + (size_t)(kb * 2) * 512u));
+                if (!w_valid) w0 = (u32x4_t){0, 0, 0, 0};
+                iu4_bundle<0, true>(w0, a_lds, frA, cacc, zc);
+                iu4_bundle<1, false>(w0, a_lds, frA, cacc, zc);
+#else
                 iu4_bundle<0, true>(w_lds, a_lds, frW, frA, cacc, zc);
                 iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
+#endif
                 // Publish slab 1 to the free alternate slot. The raw A pin
                 // keeps its zero-select at this first use, after slot-0
                 // compute, without imposing a memory or scheduling fence.
                 a_lds = LDS + IU4_A1_OFF;
+#if !defined(IU4_WPRESHUFFLE)
                 w_lds = LDS + IU4_W1_OFF;
+#endif
                 #pragma unroll
                 for (int r = 0; r < 2; r++) {
                     asm volatile("" : "+v"(A_pf[r][0]), "+v"(A_pf[r][1]));
                     *(u32x2_t*)(a_lds + st_ldsoff[r]) = st_aok[r] ? A_pf[r] : z64;
+#if !defined(IU4_WPRESHUFFLE)
                     *(u32x2_t*)(w_lds + st_ldsoff[r]) = W_pf[r];
+#endif
                 }
                 // Slot-0 retirement plus slot-1 readiness.
                 __syncthreads();
@@ -521,25 +629,40 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     }
                     const int g_nx = g + h;
                     const int h_nx = h ^ 1;
-                    const char* __restrict__ w_nx = A + (long long)g_nx * 136 + 8 + (long long)h_nx * 64;
+#if !defined(IU4_WPRESHUFFLE)
+                    const char* __restrict__ w_nx =
+                        A + (long long)g_nx * 136 + 8 + (long long)h_nx * 64;
                     #pragma unroll
                     for (int r = 0; r < 2; r++) {
                         W_pf[r] = iu4_weight_staging_word(
                             *(const u32x2_t*)(w_nx + st_wvoff[r]));
                     }
+#endif
                     const int tok_ds = bs + (tid >> 1);
                     const int tok_dsc = (tok_ds < N) ? tok_ds : (N - 1);
                     ds_nx = ((const unsigned*)(Xq + (long long)kb_nx * N + tok_dsc))[tid & 1];
                     const int row_sz = rs + (tid >> 1);
                     const int src_sz = (row_sz < M) ? row_sz : (M - 1);
+#if defined(IU4_WPRESHUFFLE)
+                    sz_nx = iu4_wp_header(A, M, K, src_sz, kb_nx);
+#else
                     sz_nx = *(const unsigned*)(A + (long long)src_sz * groups_per_row * 136
                         + g_nx * 136 + h_nx * 4);
+#endif
                 }
             }
             // --- Slot 1 compute, current fold, next slot-0 publish. ---
             {
+#if defined(IU4_WPRESHUFFLE)
+                u32x4_t w1 = iu4_weight_direct_word(
+                    *(const u32x4_t*)(w_direct + (size_t)(kb * 2 + 1) * 512u));
+                if (!w_valid) w1 = (u32x4_t){0, 0, 0, 0};
+                iu4_bundle<0, false>(w1, a_lds, frA, cacc, zc);
+                iu4_bundle<1, false>(w1, a_lds, frA, cacc, zc);
+#else
                 iu4_bundle<0, false>(w_lds, a_lds, frW, frA, cacc, zc);
                 iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
+#endif
                 // Fold while the next fetch epoch remains in flight: 4 K32
                 // int32 partials per (nb, rg)
                 // through the pinned IU4_FOLD_RN DAG. Reads only cacc plus
@@ -558,7 +681,13 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
 #endif
                     #pragma unroll
                     for (int j = 0; j < 8; j++) {
-                        const unsigned jbase = (unsigned)(wave_row0 + rg * 16 + 8 * k_grp + j) * 8u;
+#if defined(IU4_WPRESHUFFLE)
+                        const unsigned jbase =
+                            (unsigned)(wave_row0 + 8 * k_grp + j) * 8u;
+#else
+                        const unsigned jbase =
+                            (unsigned)(wave_row0 + rg * 16 + 8 * k_grp + j) * 8u;
+#endif
                         sc_row[j] = *(const float*)(sz_lds + jbase);
 #if !defined(IU4_SYMMETRIC_FOLD) || !defined(__gfx1201__)
                         zp_row[j] = *(const float*)(sz_lds + jbase + 4u);
@@ -567,7 +696,13 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     #pragma unroll
                     for (int nb = 0; nb < 4; nb++) {
                         int* acc_i = (int*)&cacc[nb][rg];
-                        const unsigned tbase = (unsigned)(wave_tok0 + nb * 16 + m_lane) * 8u;
+#if defined(IU4_WPRESHUFFLE)
+                        const unsigned tbase =
+                            (unsigned)(rg * 64 + nb * 16 + m_lane) * 8u;
+#else
+                        const unsigned tbase =
+                            (unsigned)(wave_tok0 + nb * 16 + m_lane) * 8u;
+#endif
                         const float d_x = *(const float*)(ds_lds + tbase);
 #if defined(IU4_SYMMETRIC_FOLD) && defined(__gfx1201__)
                         #pragma unroll
@@ -614,11 +749,15 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     // fetch epoch): original A zero-select, clamped W value,
                     // masked DS word and converted header word.
                     a_lds = LDS + IU4_A_OFF;
+#if !defined(IU4_WPRESHUFFLE)
                     w_lds = LDS + IU4_W0_OFF;
+#endif
                     #pragma unroll
                     for (int r = 0; r < 2; r++) {
                         *(u32x2_t*)(a_lds + st_ldsoff[r]) = st_aok[r] ? A_pf[r] : z64;
+#if !defined(IU4_WPRESHUFFLE)
                         *(u32x2_t*)(w_lds + st_ldsoff[r]) = W_pf[r];
+#endif
                     }
                     const int h_np = h ^ 1;
                     char* __restrict__ ds_n = LDS + ((h_np == 0) ? IU4_DS_OFF : IU4_DS1_OFF);
@@ -642,6 +781,65 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
             }
         } // for h
     } // for g
+#if defined(IU4_WPRESHUFFLE)
+    // Each wave publishes its 16 rows; all threads then stream two columns
+    // across 128 contiguous rows per pass. Eight passes cover the 16-token
+    // block, preserving the same per-element accumulator value.
+    float* slots = (float*)LDS;
+    const int store_row = tid & 127;
+    const int store_half = tid >> 7;
+    float* const y_tile = Y + (long long)bs * M + rs;
+    const auto y_tile_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        y_tile, 0, 0xffffffffu, 0x31004000u);
+    const bool full_tile = rs + IU4_BN <= M && bs + IU4_BM <= N;
+    const unsigned store_lane_off =
+        ((unsigned)store_half * (unsigned)M + (unsigned)store_row) * sizeof(float);
+    #pragma unroll
+    for (int th = 0; th < 2; th++) {
+        #pragma unroll
+        for (int nb = 0; nb < 4; nb++) {
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                slots[(unsigned)(wave * 320 + (8 * k_grp + j) * 20 + m_lane)] =
+                    acc[nb][th][j];
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int p = 0; p < 8; p++) {
+                const int local_col = 2 * p + store_half;
+                const int owner = store_row >> 4;
+                const float v = slots[(unsigned)(
+                    owner * 320 + (store_row & 15) * 20 + local_col)];
+                const int token_block = th * 4 + nb;
+                if (full_tile) {
+                    const unsigned phase_off =
+                        (unsigned)(token_block * 16 + 2 * p) * (unsigned)M
+                        * sizeof(float);
+                    if constexpr (ADD) {
+                        const unsigned old_bits = __builtin_amdgcn_raw_buffer_load_b32(
+                            y_tile_rsrc, store_lane_off, phase_off, 0);
+                        const float out = __builtin_bit_cast(float, old_bits) + v;
+                        __builtin_amdgcn_raw_buffer_store_b32(
+                            __builtin_bit_cast(unsigned, out),
+                            y_tile_rsrc, store_lane_off, phase_off, 0);
+                    } else {
+                        __builtin_amdgcn_raw_buffer_store_b32(
+                            __builtin_bit_cast(unsigned, v),
+                            y_tile_rsrc, store_lane_off, phase_off, 0);
+                    }
+                } else {
+                    const int row = rs + store_row;
+                    const int col = bs + token_block * 16 + local_col;
+                    if (row < M && col < N) {
+                        float* yp = Y + (long long)col * M + row;
+                        if constexpr (ADD) *yp += v; else *yp = v;
+                    }
+                }
+            }
+            __syncthreads();
+        }
+    }
+#else
     // Coalesced store: the WMMA C layout leaves lane (m_lane,k_grp) holding
     // acc[nb][rg][j] for token wave_tok0+nb*16+m_lane and rows at 4 B each.
     // Transpose each (rg,nb) 16x16 wave tile through LDS instead: all 8 waves
@@ -728,6 +926,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
             }
         }
     }
+#endif
 }
 
 // residual: += (the `add` kernarg picks += vs = at runtime).

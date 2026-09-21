@@ -15,7 +15,7 @@ use hip_bridge::{
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
 ///
@@ -676,6 +676,10 @@ pub struct Gpu {
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
+    /// Resident MQ4V2 weights whose row-major image was replaced by the
+    /// size-identical gfx1201 iu4 fragment-order image.
+    pub(crate) mq4v2_iu4_wpreshuffled: Mutex<std::collections::HashSet<usize>>,
+
 
     /// Process-pinned optional CK runtime. Loading is explicit and fail-closed;
     /// individual attention families still decide whether a capability cell is
@@ -957,6 +961,34 @@ impl Gpu {
         // bind_thread: skip — pure flag read, touches no device state.
         self.flags.slot_trace
     }
+    pub fn install_mq4v2_iu4_wpreshuffled(&self, weight: &GpuTensor) -> HipResult<()> {
+        let key = weight.buf.as_ptr() as usize;
+        if !self
+            .mq4v2_iu4_wpreshuffled
+            .lock()
+            .map_err(|_| HipError::new(0, "MQ4V2 iu4 W-layout map poisoned"))?
+            .insert(key)
+        {
+            return Err(HipError::new(
+                0,
+                "MQ4V2 iu4 W-layout installed twice for one weight",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mq4v2_weight_is_iu4_wpreshuffled(
+        &self,
+        weight: &GpuTensor,
+    ) -> HipResult<bool> {
+        let key = weight.buf.as_ptr() as usize;
+        Ok(self
+            .mq4v2_iu4_wpreshuffled
+            .lock()
+            .map_err(|_| HipError::new(0, "MQ4V2 iu4 W-layout map poisoned"))?
+            .contains(&key))
+    }
+
 
     /// Whether the multi-slot decode step should be hipGraph-captured.
     pub fn slots_decode_graph(&self) -> bool {
@@ -1388,6 +1420,7 @@ impl Gpu {
             },
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
+            mq4v2_iu4_wpreshuffled: Mutex::new(std::collections::HashSet::new()),
             #[cfg(feature = "flash-attn-ck")]
             flash_attn_ck,
             #[cfg(feature = "flash-attn-ck")]
@@ -3823,6 +3856,10 @@ impl Gpu {
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         let key = tensor.buf.as_ptr() as usize;
+        self.mq4v2_iu4_wpreshuffled
+            .lock()
+            .map_err(|_| HipError::new(0, "MQ4V2 iu4 W-layout map poisoned"))?
+            .remove(&key);
         if self.vmm_arenas.contains_key(&key) {
             if !tensor.buf.is_vmm_owner() {
                 return Err(HipError::new(

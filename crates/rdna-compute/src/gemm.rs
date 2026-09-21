@@ -19711,13 +19711,21 @@ impl Gpu {
             // guarded writeback). Block [256,1,1].
             let symfold = self.mq4v2_symmetric
                 && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0");
-            let kernel_name = match (symfold, add) {
-                (true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
-                (true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
-                (false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
-                (false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
+            let wpreshuffle = symfold && self.mq4v2_weight_is_iu4_wpreshuffled(a_raw)?;
+            let kernel_name = match (wpreshuffle, symfold, add) {
+                (true, _, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold_wp",
+                (true, _, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold_wp",
+                (false, true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
+                (false, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
+                (false, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+                (false, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
             };
-            let (module, source) = if symfold {
+            let (module, source) = if wpreshuffle {
+                (
+                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_wp",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_WP_SRC,
+                )
+            } else if symfold {
                 (
                     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold",
                     kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC,
@@ -19750,9 +19758,8 @@ impl Gpu {
             let batch_tiles = batch_size.div_ceil(128);
             let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
             let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-            // LDS: 20480 B (A/W double-buffered + ping-pong DS/SZ; store
-            // slots overlap).
-            let lds_bytes: u32 = 20480;
+            // Preshuffled W removes both 4 KiB W planes.
+            let lds_bytes: u32 = if wpreshuffle { 12288 } else { 20480 };
             let result = self.launch_maybe_blob(
                 kernel_name,
                 [row_tiles as u32, batch_tiles as u32, 1],
@@ -33816,9 +33823,28 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let module_v2 = "fused_gate_up_hfq4g256_mq4v2";
-        let func_name = "fused_gate_up_mq4g256v2";
-        self.ensure_kernel(module_v2, kernels::FUSED_GATE_UP_MQ4G256V2_SRC, func_name)?;
+        let wp_gate = self.mq4v2_weight_is_iu4_wpreshuffled(a_gate)?;
+        let wp_up = self.mq4v2_weight_is_iu4_wpreshuffled(a_up)?;
+        if wp_gate != wp_up {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gate/up MQ4V2 W layouts do not match",
+            ));
+        }
+        let (module_v2, func_name, source) = if wp_gate {
+            (
+                "fused_gate_up_hfq4g256_mq4v2_wp",
+                "fused_gate_up_mq4g256v2_wp",
+                kernels::FUSED_GATE_UP_MQ4G256V2_WP_SRC,
+            )
+        } else {
+            (
+                "fused_gate_up_hfq4g256_mq4v2",
+                "fused_gate_up_mq4g256v2",
+                kernels::FUSED_GATE_UP_MQ4G256V2_SRC,
+            )
+        };
+        self.ensure_kernel(module_v2, source, func_name)?;
         let ag = a_gate.buf.as_ptr();
         let au = a_up.buf.as_ptr();
         let xp = x.buf.as_ptr();

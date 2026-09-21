@@ -9407,15 +9407,22 @@ impl Gpu {
         };
         // For gfx1201 minimal dense set, rows=1 and no multirow/wave64 path is taken.
         // Still thread define through the helper rather than bypassing it.
-        let (v2_src, v2_entry) = kernels::gemv_mq4g256v2_residual_for_arch(&self.arch_caps);
+        let wpreshuffled = self.mq4v2_weight_is_iu4_wpreshuffled(a_raw)?;
+        let (v2_src, v2_entry) = if wpreshuffled {
+            (
+                kernels::GEMV_MQ4G256V2_RESIDUAL_WP_SRC,
+                "gemv_mq4g256v2_residual_wp",
+            )
+        } else {
+            kernels::gemv_mq4g256v2_residual_for_arch(&self.arch_caps)
+        };
         let (_, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps);
-        // Exact gfx1151 runs the row-serialized no-spill twin under its own
-        // unique module+entry so a stale HSACO cannot alias it; every other
-        // architecture keeps the existing module and the default entry.
-        // Grid stays M (Slice 1 keeps scheduling and grid contraction separate).
         let module_v2: String;
         let func_name: &str;
-        if self.arch_caps.is_gfx1151() {
+        if wpreshuffled {
+            module_v2 = "gemv_mq4g256v2_residual_wp".to_string();
+            func_name = v2_entry;
+        } else if self.arch_caps.is_gfx1151() {
             module_v2 = v2_entry.to_string();
             func_name = v2_entry;
         } else {
@@ -9602,6 +9609,7 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        let wpreshuffled = self.mq4v2_weight_is_iu4_wpreshuffled(a_raw)?;
         let gfx1151_lm_head_dot2 = self.arch_caps.is_gfx1151()
             && m == 248_320
             && k == 2_048
@@ -9616,7 +9624,14 @@ impl Gpu {
         // the generic dual-scale source; the arch gating is preserved so
         // occupancy/VGPR comparisons remain apples-to-apples. The module is
         // v1 module + `_mq4v2` and the C symbol is `gemv_mq4g256v2`.
-        let func_name = if gfx1151_lm_head_dot2 {
+        let func_name = if wpreshuffled {
+            self.ensure_kernel(
+                "gemv_mq4g256v2_wp",
+                kernels::GEMV_MQ4G256V2_WP_SRC,
+                "gemv_mq4g256v2_wp",
+            )?;
+            "gemv_mq4g256v2_wp"
+        } else if gfx1151_lm_head_dot2 {
             self.ensure_kernel(
                 "gemv_hfq4g256_lm_head_dot2_gfx1151_mq4v2",
                 kernels::GEMV_MQ4G256V2_SRC,

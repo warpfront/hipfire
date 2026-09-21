@@ -16,6 +16,34 @@
 #define HIPFIRE_RESIDUAL_KERNEL gemv_mq4g256v2_residual
 #endif
 
+#ifndef HIPFIRE_MQ4V2_WPRESHUFFLE
+#define HIPFIRE_MQ4V2_WPRESHUFFLE 0
+#endif
+
+#if HIPFIRE_MQ4V2_WPRESHUFFLE
+__device__ __forceinline__ unsigned int mq4v2_res_wp_header(
+    const char* a, int rows, int k, int row, int half_block) {
+    const unsigned char* p = (const unsigned char*)a
+        + (size_t)rows * (size_t)k / 2u
+        + (((size_t)half_block * (size_t)(rows >> 4)
+            + (unsigned)(row >> 4)) * 4u) * 16u
+        + (unsigned)(row & 15);
+    return (unsigned int)p[16] | ((unsigned int)p[0] << 8)
+         | ((unsigned int)p[32] << 16) | ((unsigned int)p[48] << 24);
+}
+
+__device__ __forceinline__ unsigned int mq4v2_res_wp_packed(
+    const char* a, int k, int row, int group, int tid) {
+    const int slab = group * 4 + (tid >> 3);
+    const int lane = ((tid >> 1) & 1) * 16 + (row & 15);
+    const int byte = ((tid >> 2) & 1) * 8 + (tid & 1) * 4;
+    return *(const unsigned int*)(a
+        + (((size_t)(row >> 4) * (size_t)(k >> 6)
+            + (unsigned)slab) * 32u + (unsigned)lane) * 16u
+        + (unsigned)byte);
+}
+#endif
+
 // HFQ4-G256 GEMV with fused residual add: y[row] += A[row] · x.
 //
 // VARIANT R36c1 res_w_preload:
@@ -96,6 +124,18 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
     #define HIPFIRE_RESIDUAL_LOAD_ZP(weight_rsrc, gp, weight_offset) HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 4, (weight_offset) + 4)
     #endif
 
+#if HIPFIRE_MQ4V2_WPRESHUFFLE
+    #define LOAD_W(gp, weight_offset, sc, zp, pk) do { \
+        const unsigned int _off = (unsigned int)(weight_offset); \
+        const int _row = (int)(_off / (unsigned int)row_stride); \
+        const int _group = (int)((_off % (unsigned int)row_stride) / 136u); \
+        const unsigned int _hs = mq4v2_res_wp_header( \
+            A, M, K, _row, 2 * _group + (tid >> 4)); \
+        (sc) = __half2float(__ushort_as_half((unsigned short)(_hs & 0xFFFFu))); \
+        (zp) = __half2float(__ushort_as_half((unsigned short)(_hs >> 16))); \
+        (pk) = mq4v2_res_wp_packed(A, K, _row, _group, tid); \
+    } while (0)
+#else
     #define LOAD_W(gp, weight_offset, sc, zp, pk) do { \
         const unsigned int hA = HIPFIRE_RESIDUAL_LOAD_SC(weight_rsrc, gp, weight_offset); \
         const unsigned int hB = HIPFIRE_RESIDUAL_LOAD_ZP(weight_rsrc, gp, weight_offset); \
@@ -104,6 +144,7 @@ extern "C" __global__ void HIPFIRE_RESIDUAL_KERNEL(
         (zp) = __half2float(__ushort_as_half((unsigned short)(hs >> 16))); \
         (pk) = HIPFIRE_WEIGHT_LOAD_PTR_U32(weight_rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
     } while (0)
+#endif
 
 #if defined(HIPFIRE_GFX1151_RESIDUAL_K4096)
     // Keep the fixed four-quad bound without expanding the body. Full unroll
