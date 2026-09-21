@@ -448,3 +448,118 @@ win at the daemon's actual shapes, but it is not a shippable route: its
 tg128 throughput regresses by 15.23%, and the required pow2h artifact also
 misses the hard quality budget. Keep the integration behind its three
 existing default-off developer settings; do not enable it by default.
+
+## 2026-09-21 fragment-W decode consumer conversion
+
+### Symbol-diff diagnosis
+
+A 40-token short generation and the existing pp8192 replay were traced with
+the candidate settings embedded in the daemon `configure` message. The
+pp8192 MLP set contained only
+`gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_frag_wp_gfx1201` and
+`gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_frag_wp_gfx1201`. Before this
+change, the short trace added two decode-only MLP consumers:
+
+| consumer | calls | mean time |
+|---|---:|---:|
+| `fused_gate_up_mq4g256v2_wp` | 2,560 | 203.019 us |
+| `gemv_mq4g256v2_residual_wp` | 2,560 | 94.235 us |
+
+Those symbols consumed the newer coalesced-K64 mapping even though the
+resident MLP image held the older K16 fragment mapping. This accounts for
+the repeated decode failure signature without implicating the converted
+prefill kernels. Evidence:
+`scratch-foldfree/prof-decode-candidate-pre/decode-candidate-pre_kernel_{stats,trace}.csv`
+and
+`scratch-foldfree/prof-pair-candidate-route/pair-candidate_kernel_{stats,trace}.csv`.
+
+### Conversion and exactness
+
+Commit `a743ed2ae` replaces the weight-layout boolean in dispatch metadata
+with an explicit `RowMajor`, `CoalescedSymfold`, or `Fragment` layout. The
+loader derives that value directly from the active artifact and flag set,
+so the old K16 fragment mapping is an explicit consequence of the fold-free,
+W-preshuffle, and fragment-order settings. The pre-existing non-pow2
+coalesced-K64 route remains distinct.
+
+The MLP scalar fused gate/up and residual GEMV consumers now have fragment
+readers and distinct symbols:
+
+- `fused_gate_up_mq4g256v2_frag_wp`;
+- `gemv_mq4g256v2_residual_frag_wp`;
+- `gemv_mq4g256v2_frag_wp` for the plain GEMV route.
+
+Attention QKV/QKVZA, attention output projection, lm_head/output,
+embeddings, routers/MoE, and TP column slices remain row-major. In
+particular, the concurrent `gemv_mq4g256v2_residual` symbol in the short
+trace is attention output projection, not an unconverted MLP down
+consumer.
+
+The focused proof in `scratch-foldfree/frag_wp_decode_proof.hip` checked
+every byte of the K16 permutation for both daemon MLP shapes:
+
+| shape | bytes | bijection | byte round-trip | dequant values |
+|---|---:|---:|---:|---:|
+| K=5,120 | 87,040 | exact | exact | bit-exact |
+| K=17,408 | 295,936 | exact | exact | bit-exact |
+
+GPU-reader comparison against an independently decoded reference gave
+relative RMS `1.23214881e-06` and max absolute `2.67028809e-05` for plain,
+fused-gate, and fused-up at K=5,120, and relative RMS `3.46142711e-06`
+with max absolute `0.00013923645` for residual at K=17,408. The rig passed.
+The resident allocation remains size-preserving: **0 bytes VRAM delta** and
+no second weight copy. The scoped release build and
+`cargo check -p rdna-compute -p hipfire-arch-qwen35` passed.
+
+### Post-conversion route proof and final tg128 gate
+
+The post-conversion short trace contains 2,560 calls each to
+`fused_gate_up_mq4g256v2_frag_wp` and
+`gemv_mq4g256v2_residual_frag_wp`. Representative resource signatures are
+0 B LDS / 96 VGPR / Grid Y 1 for fused gate/up and 0 B LDS / 88 VGPR /
+Grid Y 1 for residual. The short generation produced coherent reasoning
+through its 40-token cap. No coalesced `_wp` MLP decode symbol remains.
+Evidence:
+`scratch-foldfree/prof-decode-candidate-post/decode-candidate-post_kernel_{stats,trace}.csv`.
+
+The same mandatory command and same-card control as above were used after
+a fresh release build and warm run. The exact candidate settings were
+installed under card C's HOME, including the four string-valued developer
+settings:
+
+| arm | pp512 median | pp512 samples | tg128 median | tg128 samples |
+|---|---:|---|---:|---|
+| shipped symfold control | 2,224.4 tok/s | 2,222.9, 2,226.1, 2,224.4 | 36.6198 tok/s | 36.6327, 36.6198, 36.6146 |
+| fragment-W decode conversion | **2,732.4 tok/s** | 2,724.7, 2,732.4, 2,739.3 | **27.1542 tok/s** | 27.2267, 27.1542, 27.0728 |
+
+The final candidate gains **22.838%** at pp512 but loses **25.848%** at
+tg128. It is also 12.525% slower at tg128 than the already-failing
+pre-conversion route. The trace identifies no remaining unconverted MLP
+consumer by symbol. Instead, the correctly converted decode kernels
+themselves dominate the profile: fused gate/up averages 242.505 us
+(+19.45% versus the former wrong-layout reader) and residual averages
+126.814 us (+34.57%). Thus the required fragment resident layout is
+fundamentally hostile to these scalar decode readers in their current
+access geometry.
+
+Evidence is `scratch-foldfree/frag-wp-decode-gate.json`. The mandatory
+early-stop fired. Two pp512/pp8192 ABBA pairs, final pp8192, the 5,909-token
+TTFT pair, new KLD, long-context, and the five-prompt battery were not run;
+none can rescue a 25.848% decode loss. The pp8192 delta and actual candidate
+TTFT are therefore intentionally unreported rather than inferred.
+
+### Product position and final verdict
+
+Even if the proven 67 us/token prefill saving survived a future redesign,
+it projects to roughly **2,214 ms** for the 5,909-token fixture, still well
+behind the IU4 arm at roughly **1,640 ms**. Its only product role would be
+the quality arm. The shipped FP8-v2 artifact has c24 `0.045510` versus IU4
+at `0.078594`, but the pow2h artifact required here remains at **0.055408**,
+above the hard FP8-v2 budget of `0.050`. QAT run 8 must close the remaining
+`0.005408`; the best possible future state is ready pending run 8, never
+ship now.
+
+**KILL.** The consumer conversion is exact, complete for the MLP resident
+image, default-off, and uses no extra VRAM, but the pair fails the blocking
+decode gate by 25.848%. Keep commit `a743ed2ae` as diagnostic implementation
+and evidence only; do not enable the fragment-W pair.

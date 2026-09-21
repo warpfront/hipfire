@@ -1,0 +1,35 @@
+{
+  "date": "2026-09-21",
+  "device": "GPU-085289909a86cc63",
+  "command": "hipfire bench qwen3.8:27b-mq4-xt --matrix --pp 512 --ctx 128 --tg 128 --spec off --runs 3 --warmups 1 --kv-mode fp8 --json",
+  "config": {
+    "kernel.iu4_prefill": false,
+    "kernel.gfx12_fp8_stream": true,
+    "kernel.gfx12_silu_quant_fused": true,
+    "kernel.gfx12_producer_quant_fused": true,
+    "developer.fp8_symfold": "1",
+    "developer.fp8_foldfree": "1",
+    "developer.fp8_wpreshuffle": "1",
+    "developer.fp8_fragment_order": "1"
+  },
+  "candidate": {
+    "pp512_tokens_per_second": {
+      "median": 2732.4,
+      "samples": [2724.7, 2732.4, 2739.3]
+    },
+    "tg128_tokens_per_second": {
+      "median": 27.1542269841,
+      "samples": [27.2267460923, 27.1542269841, 27.0728337301]
+    }
+  },
+  "same_card_control": {
+    "artifact": "scratch-foldfree/pair-decode-control.json",
+    "pp512_median_tokens_per_second": 2224.4,
+    "tg128_median_tokens_per_second": 36.61983255100358
+  },
+  "deltas_percent": {
+    "pp512": 22.83761913324942,
+    "tg128": -25.84830379472659
+  },
+  "early_stop": true
+}
