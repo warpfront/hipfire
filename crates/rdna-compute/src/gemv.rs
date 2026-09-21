@@ -5087,6 +5087,169 @@ impl Gpu {
         result?;
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
+    /// gfx1201 row-wide FWHT producer with optional sigmoid gate and AWQ
+    /// divide.  Emits the exact rotated F32 row and MQ4v2 FP8 prepared planes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rotate_x_mq_fp8_gfx12_batched(
+        &mut self,
+        x_in: &GpuTensor,
+        gate: Option<&GpuTensor>,
+        awq: Option<&GpuTensor>,
+        x_out: &GpuTensor,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<crate::scratch::Mq4v2Fp8Prepared> {
+        self.bind_thread()?;
+        if self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rotate_x_mq_fp8_gfx12_batched: eager-only",
+            ));
+        }
+        if self.arch != "gfx1201" || k == 0 || k % 256 != 0 || batch_size == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rotate_x_mq_fp8_gfx12_batched: invalid gfx1201 shape",
+            ));
+        }
+        if x_in.numel() < batch_size * k
+            || x_out.numel() < batch_size * k
+            || gate.is_some_and(|t| t.numel() < batch_size * k)
+            || awq.is_some_and(|t| t.numel() < k)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rotate_x_mq_fp8_gfx12_batched: undersized tensor",
+            ));
+        }
+        self.ensure_mq_signs()?;
+        let (module, source, kernel) = match (gate.is_some(), awq.is_some()) {
+            (false, false) => (
+                "mq_rotate_x_mq4v2_fp8_gfx12",
+                kernels::MQ_ROTATE_X_FP8_GFX12_SRC,
+                "mq_rotate_x_mq4v2_fp8_gfx12",
+            ),
+            (false, true) => (
+                "rotate_x_mq_awq_mq4v2_fp8_gfx12",
+                kernels::MQ_ROTATE_X_AWQ_FP8_GFX12_SRC,
+                "rotate_x_mq_awq_mq4v2_fp8_gfx12",
+            ),
+            (true, false) => (
+                "sigmoid_mul_rotate_x_mq4v2_fp8_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_FP8_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq4v2_fp8_gfx12",
+            ),
+            (true, true) => (
+                "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12",
+            ),
+        };
+        self.ensure_kernel(module, source, kernel)?;
+        let (x_fp8_bytes, half_sums_bytes, row_scales_bytes) =
+            crate::scratch::mq4v2_fp8_needed(batch_size, k);
+        {
+            let s = &self.scratch;
+            if crate::scratch::scratch_will_grow(
+                s.mq4v2_fp8_x_scratch_bytes,
+                s.mq4v2_fp8_x_scratch.is_some(),
+                x_fp8_bytes,
+            ) || crate::scratch::scratch_will_grow(
+                s.mq4v2_fp8_half_sums_scratch_bytes,
+                s.mq4v2_fp8_half_sums_scratch.is_some(),
+                half_sums_bytes,
+            ) || crate::scratch::scratch_will_grow(
+                s.mq4v2_fp8_row_scales_scratch_bytes,
+                s.mq4v2_fp8_row_scales_scratch.is_some(),
+                row_scales_bytes,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
+        let (x_fp8_ptr, half_sums_ptr, row_scales_ptr) = self
+            .scratch
+            .grow_mq4v2_fp8_for_producer(&self.hip, batch_size, k)?;
+        let mut xp = x_in.buf.as_ptr();
+        let mut gp = gate.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut awp = awq.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
+        let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut xrp = x_out.buf.as_ptr();
+        let mut x8p = x_fp8_ptr;
+        let mut sump = half_sums_ptr;
+        let mut sclp = row_scales_ptr;
+        let mut kv = k as i32;
+        let mut nv = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![&mut xp as *mut _ as *mut c_void];
+        if gate.is_some() {
+            params.push(&mut gp as *mut _ as *mut c_void);
+        }
+        if awq.is_some() {
+            params.push(&mut awp as *mut _ as *mut c_void);
+        }
+        params.extend(
+            [
+                &mut s1 as *mut _ as *mut c_void,
+                &mut s2 as *mut _ as *mut c_void,
+                &mut xrp as *mut _ as *mut c_void,
+                &mut x8p as *mut _ as *mut c_void,
+                &mut sump as *mut _ as *mut c_void,
+                &mut sclp as *mut _ as *mut c_void,
+                &mut kv as *mut _ as *mut c_void,
+                &mut nv as *mut _ as *mut c_void,
+            ]
+            .into_iter(),
+        );
+        let bytes = (k * 4 * (if gate.is_some() { 3 } else { 2 })
+            + k
+            + (k / 256) * 2 * 4
+            + 4)
+            * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
+        let result = self.launch_maybe_blob(
+            kernel,
+            [batch_size as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                if gate.is_some() {
+                    b.push_ptr(gp);
+                }
+                if awq.is_some() {
+                    b.push_ptr(awp);
+                }
+                b.push_ptr(s1);
+                b.push_ptr(s2);
+                b.push_ptr(xrp);
+                b.push_ptr(x8p);
+                b.push_ptr(sump);
+                b.push_ptr(sclp);
+                b.push_i32(kv);
+                b.push_i32(nv);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(xrp);
+        result?;
+        Ok(crate::scratch::Mq4v2Fp8Prepared {
+            x_fp8: x_fp8_ptr,
+            half_sums: half_sums_ptr,
+            row_scales: row_scales_ptr,
+            x_fp8_bytes,
+            half_sums_bytes,
+            row_scales_bytes,
+            n: batch_size,
+            k,
+            scale_mode: 1,
+        })
+    }
+
     /// gfx1201 FA output producer: exact sigmoid multiply + AWQ/FWHT rotate +
     /// in-register `block_i4_128`. The old path stored the sigmoided attention
     /// row to f32 and immediately reloaded it in `rotate_x_mq_awq_i4_gfx12`;

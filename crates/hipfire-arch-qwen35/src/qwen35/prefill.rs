@@ -298,6 +298,31 @@ fn try_gfx12_sigmoid_rotate_quant_fused_prepared(
     )?;
     Ok(Some(prep))
 }
+/// gfx1201 FP8-stream FA output producer.  Folds sigmoid, optional AWQ,
+/// FWHT rotation and the scale_mode=1 pack into one row-wide launch.
+fn try_gfx12_fp8_stream_sigmoid_prepared(
+    gpu: &mut Gpu,
+    wo: &hipfire_runtime::llama::WeightTensor,
+    attn: &GpuTensor,
+    gate: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+    n: usize,
+) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
+    if wo.gpu_dtype != DType::MQ4G256V2Lloyd || !gpu.fp8_stream_active(n, k) {
+        return Ok(None);
+    }
+    let prep = gpu.rotate_x_mq_fp8_gfx12_batched(
+        attn,
+        Some(gate),
+        wo.awq_scale.as_ref(),
+        x_rot,
+        k,
+        n,
+    )?;
+    Ok(Some(prep))
+}
+
 /// gfx11 FA out-proj producer: fuse the still-standalone
 /// `sigmoid_mul_f32` into the AWQ rotate+IU4 sidecar, under the `_gfx11`
 /// entry symbol. Deliberately AWQ-only like the `_gfx12` twin: the arm of
@@ -8097,7 +8122,19 @@ fn batch_chunk_full_attn_output_projection(
             &epilogue,
         )?;
     }
+    let mut fp8_wo_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if iu4_wo_prep.is_none() {
+        fp8_wo_prep = try_gfx12_fp8_stream_sigmoid_prepared(
+            gpu,
+            &layer.wo,
+            &pbs.fa_attn_out_batch,
+            &pbs.fa_gate_batch,
+            &pbs.fa_attn_out_rot_batch,
+            layer.wo.k,
+            n,
+        )?;
+    }
+    if iu4_wo_prep.is_none() && fp8_wo_prep.is_none() {
         gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
         // T-B / slices-3: rotate+quantize once the standalone sigmoid has
         // produced the f32 input. All non-admitted routes remain unchanged.
@@ -8121,7 +8158,7 @@ fn batch_chunk_full_attn_output_projection(
             )?;
         }
     }
-    let fa_wo_input = if iu4_wo_prep.is_some() {
+    let fa_wo_input = if iu4_wo_prep.is_some() || fp8_wo_prep.is_some() {
         &pbs.fa_attn_out_rot_batch
     } else if fa_wo_is_mq {
         rotate_x_mq_batched_for(
@@ -8143,6 +8180,15 @@ fn batch_chunk_full_attn_output_projection(
             &pbs.x_batch,
             layer.wo.m,
             layer.wo.k,
+            n,
+        )?;
+    } else if let Some(prep) = &fp8_wo_prep {
+        dispatch_batched_fp8_lloyd_epilogue(
+            gpu,
+            pbs,
+            &layer.wo,
+            prep,
+            &epilogue,
             n,
         )?;
     } else {
