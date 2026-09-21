@@ -19711,13 +19711,23 @@ impl Gpu {
             // guarded writeback). Block [256,1,1].
             let symfold = self.mq4v2_symmetric
                 && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0");
-            let kernel_name = match (symfold, add) {
-                (true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
-                (true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
-                (false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
-                (false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
+            let shiftfold = symfold
+                && hipfire_config::developer_var("HIPFIRE_IU4_SHIFT_FOLDFREE").as_deref()
+                    == Ok("1");
+            let kernel_name = match (shiftfold, symfold, add) {
+                (true, _, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_shiftfold",
+                (true, _, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_shiftfold",
+                (false, true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
+                (false, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
+                (false, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+                (false, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
             };
-            let (module, source) = if symfold {
+            let (module, source) = if shiftfold {
+                (
+                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12_shiftfold",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SHIFTFOLD_SRC,
+                )
+            } else if symfold {
                 (
                     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold",
                     kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC,
@@ -19746,13 +19756,10 @@ impl Gpu {
                 &mut add_val as *mut _ as *mut c_void,
             ];
             let row_tiles = m.div_ceil(128);
-            // 128-column workgroup tile (8 waves cover 2 64-col halves).
-            let batch_tiles = batch_size.div_ceil(128);
+            let batch_tiles = batch_size.div_ceil(if shiftfold { 256 } else { 128 });
             let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
             let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-            // LDS: 20480 B (A/W double-buffered + ping-pong DS/SZ; store
-            // slots overlap).
-            let lds_bytes: u32 = 20480;
+            let lds_bytes: u32 = if shiftfold { 30720 } else { 20480 };
             let result = self.launch_maybe_blob(
                 kernel_name,
                 [row_tiles as u32, batch_tiles as u32, 1],
