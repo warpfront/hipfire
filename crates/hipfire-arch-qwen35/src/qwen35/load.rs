@@ -188,12 +188,11 @@ fn mq4v2_foldfree_row_scales(
     Ok(scales)
 }
 
-/// Permute one MQ4V2 buffer into the fragment-order layout consumed by the
-/// gfx1201 direct-A fold-free gate/up and residual kernels.  The first `M*K/2`
-/// bytes are one 32-lane dword slot per `(row-tile, K16)`; the remaining
-/// `M*K/32` bytes are the original four-byte K128 headers in byte planes.
-/// Plane zero holds the informative high f16 byte, so four adjacent rows need
-/// one b32 scale load.  Every source byte is moved exactly once.
+/// Replace an MQ4V2 row-major image with a size-preserving gfx1201 fragment
+/// order. Each 16-row by K64 payload tile stores 32 lane-contiguous b128
+/// records, so scalar GEMV, IU4, and FP8 consumers all issue coalesced loads.
+/// The remaining `M*K/32` bytes retain the original four-byte K128 headers in
+/// byte planes. Every source byte is moved exactly once.
 fn mq4v2_wpreshuffle(data: &[u8], m: usize, k: usize) -> HipResult<Vec<u8>> {
     if m % 16 != 0 || k % 256 != 0 {
         return Err(HipError::new(
@@ -219,9 +218,10 @@ fn mq4v2_wpreshuffle(data: &[u8], m: usize, k: usize) -> HipResult<Vec<u8>> {
         for packed_col in 0..k / 2 {
             let nibble = packed_col * 2;
             let src = (row * groups_per_row + nibble / 256) * 136 + 8 + (nibble & 255) / 2;
-            let lane = 16 * ((nibble >> 3) & 1) + (row & 15);
-            let dst = ((((row >> 4) * (k >> 4) + (nibble >> 4)) * 32 + lane) * 4)
-                + ((nibble & 7) >> 1);
+            let lane = 16 * ((nibble >> 4) & 1) + (row & 15);
+            let dst = ((((row >> 4) * (k >> 6) + (nibble >> 6)) * 32 + lane) * 16)
+                + ((nibble >> 5) & 1) * 8
+                + ((nibble & 15) >> 1);
             out[dst] = data[src];
         }
         for half_block in 0..k / 128 {
@@ -240,25 +240,18 @@ fn mq4v2_wpreshuffle(data: &[u8], m: usize, k: usize) -> HipResult<Vec<u8>> {
 }
 
 fn mq4v2_wpreshuffle_enabled(gpu: &Gpu, name: &str, m: usize, k: usize) -> bool {
-    let target = name.ends_with(".mlp.gate_proj.weight")
+    let mlp_target = name.ends_with(".mlp.gate_proj.weight")
         || name.ends_with(".mlp.up_proj.weight")
-        || name.ends_with(".mlp.down_proj.weight")
-        || name.ends_with(".linear_attn.in_proj_qkv.weight")
-        || name.ends_with(".linear_attn.in_proj_z.weight")
-        || name.ends_with(".linear_attn.in_proj_a.weight")
-        || name.ends_with(".linear_attn.in_proj_b.weight")
-        || name.ends_with(".self_attn.q_proj.weight")
-        || name.ends_with(".self_attn.k_proj.weight")
-        || name.ends_with(".self_attn.v_proj.weight");
-    let foldfree_direct_a = gpu.mq4v2_pow2scale != 0
-        && hipfire_config::developer_var("HIPFIRE_FP8_FRAGMENT_ORDER").as_deref() == Ok("1");
-    target
+        || name.ends_with(".mlp.down_proj.weight");
+    let setting = hipfire_config::developer_var("HIPFIRE_FP8_WPRESHUFFLE");
+    mlp_target
         && gpu.arch == "gfx1201"
         && gpu.mq4v2_symmetric
-        && (gpu.mq4v2_pow2scale == 0 || foldfree_direct_a)
+        && gpu.mq4v2_pow2scale == 0
         && m % 16 == 0
         && k % 256 == 0
-        && hipfire_config::developer_var("HIPFIRE_FP8_WPRESHUFFLE").as_deref() != Ok("0")
+        && setting.as_deref() != Ok("0")
+        && (!gpu.flags.iu4_prefill_enabled() || setting.as_deref() == Ok("1"))
 }
 
 fn load_weight_tensor_raw(

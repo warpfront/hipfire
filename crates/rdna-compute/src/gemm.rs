@@ -30416,17 +30416,17 @@ impl Gpu {
         }
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
-        // block 256, dynamic LDS ~20 KiB). Admitted only on the
-        // already-guarded uniform route above (exact gfx1201, eager, K%256)
-        // plus N>=256; the family flag stays a prerequisite and smaller
-        // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
-        let v2 = self.flags.gfx12_mq4v2_fp8_v2
-            && self.flags.gfx12_mq4v2_fp8_gateup
-            && (batch_size >= 256 || prepared.fragment_order);
-        let foldfree = self.fp8_v2_foldfree_enabled(v2);
-        let fragment_order = foldfree && prepared.fragment_order;
+        // block 256, dynamic LDS ~20 KiB). Admitted on the already-guarded
+        // uniform route above for large batches, fragment-order weights, or
+        // fragment-preshuffled weights. The latter must never fall through to
+        // the row-major small-batch kernels.
         let wpreshuffle = self.mq4v2_weight_is_wpreshuffled(a_gate)?
             && self.mq4v2_weight_is_wpreshuffled(a_up)?;
+        let v2 = self.flags.gfx12_mq4v2_fp8_v2
+            && self.flags.gfx12_mq4v2_fp8_gateup
+            && (batch_size >= 256 || prepared.fragment_order || wpreshuffle);
+        let foldfree = self.fp8_v2_foldfree_enabled(v2);
+        let fragment_order = foldfree && prepared.fragment_order;
         let (vbm, vbn, vbk, vwaves) = if foldfree {
             (256, 128, 64, 8)
         } else {
@@ -32257,17 +32257,14 @@ impl Gpu {
         }
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
-        // block 256, dynamic LDS ~20 KiB). Admitted only on the
-        // already-guarded uniform route above (exact gfx1201, eager, M>0,
-        // K%256) plus N>=256; the family flag stays a prerequisite and
-        // smaller batches keep s2bt8/BT. Params/blob layout below is the
-        // frozen v2 ABI.
+        // block 256, dynamic LDS ~20 KiB). Fragment-preshuffled weights must
+        // stay on this layout-aware family even for a short or tail batch.
+        let wpreshuffle = self.mq4v2_weight_is_wpreshuffled(a_raw)?;
         let v2 = self.flags.gfx12_mq4v2_fp8_v2
             && self.flags.gfx12_mq4v2_fp8_resid
-            && (batch_size >= 256 || prepared.fragment_order);
+            && (batch_size >= 256 || prepared.fragment_order || wpreshuffle);
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
         let fragment_order = foldfree && prepared.fragment_order;
-        let wpreshuffle = self.mq4v2_weight_is_wpreshuffled(a_raw)?;
         let (vbm, vbn, vbk, vwaves) = if foldfree {
             (256, 128, 64, 8)
         } else {

@@ -1015,7 +1015,7 @@ impl Gpu {
             .ok_or_else(|| HipError::new(0, "MQ4V2 fold-free row sidecar missing"))
     }
 
-    pub(crate) fn mq4v2_weight_is_wpreshuffled(&self, weight: &GpuTensor) -> HipResult<bool> {
+    pub fn mq4v2_weight_is_wpreshuffled(&self, weight: &GpuTensor) -> HipResult<bool> {
         let key = weight.buf.as_ptr() as usize;
         Ok(self
             .mq4v2_foldfree_weights

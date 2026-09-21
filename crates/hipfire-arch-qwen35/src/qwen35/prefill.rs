@@ -6919,9 +6919,12 @@ fn batch_chunk_delta_net_ffn_gate_up(
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     let _ = fusion;
+    let gate_up_wp = gpu.mq4v2_weight_is_wpreshuffled(&layer.w_gate.buf)?
+        && gpu.mq4v2_weight_is_wpreshuffled(&layer.w_up.buf)?;
     // S3-f16-projection-inputs fast path: exact-FP16 FFN gate/up inputs.
     // gate/up share the pre-rotation input, so both must be MQ4G256V2.
     if mq_f16_projection_fast_route(gpu, fusion, n, dim)
+        && !gate_up_wp
         && layer.w_gate.gpu_dtype == DType::MQ4G256V2
         && layer.w_up.gpu_dtype == DType::MQ4G256V2
     {
@@ -6981,6 +6984,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if ffn_is_mq {
         // C2: MQ4V2 IU4 producer (emit_f32=false — gate_up has no f32 small tails).
+        if !gate_up_wp {
         iu4_prep = try_iu4_rmsnorm_prepared(
             gpu,
             &pbs.x_batch,
@@ -7005,6 +7009,7 @@ fn batch_chunk_delta_net_ffn_gate_up(
                 n,
                 false,
             )?;
+        }
         }
         if iu4_prep.is_none() {
             // gfx1201 FP8-stream: RMSNorm/FWHT producer emits the fp8
@@ -7217,21 +7222,17 @@ fn batch_chunk_delta_net_ffn_gate_up(
             0,
             "batch_chunk_delta_net_ffn_gate_up: mixed MQ4G256V2Lloyd/uniform gate/up — refusing (quantize both or neither)",
         ));
-        } else if layer.w_gate.gpu_dtype == DType::MQ4G256V2
-            && layer.w_up.gpu_dtype == DType::MQ4G256V2
-            && gpu.flags.gfx12_mq4v2_fp8_gateup
-            && !gpu.flags.hfq4g256_ldsstage_wmma
-            && fp8_prep.is_some()
-        {
-            // gfx1201 FP8-stream (uniform): the producer already emitted the
-            // fp8 pre-pass planes; consume them directly with the launch twin
-            // of the family's fp8 route — no pack launch. Same fp8 intercept
-            // conditions as the uniform router (iu4 divergence excluded by
-            // producer-side ordering: fp8_prep implies iu4_prep is None).
+    } else if layer.w_gate.gpu_dtype == DType::MQ4G256V2
+        && layer.w_up.gpu_dtype == DType::MQ4G256V2
+        && gpu.flags.gfx12_mq4v2_fp8_gateup
+        && !gpu.flags.hfq4g256_ldsstage_wmma
+        && (fp8_prep.is_some() || gate_up_wp)
+    {
+        if let Some(prep) = &fp8_prep {
             gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared(
                 &layer.w_gate.buf,
                 &layer.w_up.buf,
-                fp8_prep.as_ref().unwrap(),
+                prep,
                 &pbs.gate_ffn_batch,
                 &pbs.up_batch,
                 layer.w_gate.m,
@@ -7240,6 +7241,20 @@ fn batch_chunk_delta_net_ffn_gate_up(
                 n,
             )?;
         } else {
+            gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+                1,
+            )?;
+        }
+    } else {
         run_fused_gate_up_key(
             gpu,
             crate::forward_slots::fused_gate_up_key_for(layer.w_gate.gpu_dtype),
@@ -7274,9 +7289,10 @@ fn batch_chunk_delta_net_ffn_down(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
+    let w_down_wp = gpu.mq4v2_weight_is_wpreshuffled(&layer.w_down.buf)?;
     // S4: one silu*up+FWHT+F16 producer + direct-F16 residual GEMM instead
     // of fused_silu_mul_rotate_mq_batched + convert.
-    if s4_residual_fast(gpu, fusion, layer.w_down.gpu_dtype, &epilogue, n) {
+    if s4_residual_fast(gpu, fusion, layer.w_down.gpu_dtype, &epilogue, n) && !w_down_wp {
         let k = layer.w_down.k;
         let m = layer.w_down.m;
         if k > 0 && k % 256 == 0 && k == hidden_dim {
@@ -7328,7 +7344,7 @@ fn batch_chunk_delta_net_ffn_down(
     if w_down_is_mq {
         // C2: SwiGLU/FWHT IU4 producer for w_down (emit_f32=false). Residual only —
         // Partial TP epilogue still needs the f32 rotated buffer.
-        if matches!(&epilogue, BatchEpilogue::Residual) {
+        if matches!(&epilogue, BatchEpilogue::Residual) && !w_down_wp {
             iu4_prep = try_iu4_silu_prepared(
                 gpu,
                 &layer.w_down,
@@ -7395,6 +7411,17 @@ fn batch_chunk_delta_net_ffn_down(
             pbs,
             &layer.w_down,
             prep,
+            &epilogue,
+            n,
+        )?;
+    } else if layer.w_down.gpu_dtype == DType::MQ4G256V2 && w_down_wp {
+        let prepared =
+            gpu.prepare_mq4v2_fp8_x(&pbs.ffn_hidden_batch, n, layer.w_down.k, 1)?;
+        dispatch_batched_fp8_lloyd_epilogue(
+            gpu,
+            pbs,
+            &layer.w_down,
+            &prepared,
             &epilogue,
             n,
         )?;
@@ -8615,8 +8642,11 @@ fn batch_chunk_full_attn_ffn_gate_up(
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
     let _ = fusion;
+    let gate_up_wp = gpu.mq4v2_weight_is_wpreshuffled(&layer.w_gate.buf)?
+        && gpu.mq4v2_weight_is_wpreshuffled(&layer.w_up.buf)?;
     // S3-f16-projection-inputs fast path: exact-FP16 FA-FFN gate/up inputs.
     if mq_f16_projection_fast_route(gpu, fusion, n, dim)
+        && !gate_up_wp
         && layer.w_gate.gpu_dtype == DType::MQ4G256V2
         && layer.w_up.gpu_dtype == DType::MQ4G256V2
     {
@@ -8676,6 +8706,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if fa_ffn_is_mq {
+        if !gate_up_wp {
         iu4_prep = try_iu4_rmsnorm_prepared(
             gpu,
             &pbs.x_batch,
@@ -8700,6 +8731,7 @@ fn batch_chunk_full_attn_ffn_gate_up(
                 n,
                 false,
             )?;
+        }
         }
         if iu4_prep.is_none() {
             // gfx1201 FP8-stream: RMSNorm/FWHT producer emits the fp8
@@ -8908,21 +8940,17 @@ fn batch_chunk_full_attn_ffn_gate_up(
             0,
             "batch_chunk_full_attn_ffn_gate_up: mixed MQ4G256V2Lloyd/uniform gate/up — refusing (quantize both or neither)",
         ));
-        } else if layer.w_gate.gpu_dtype == DType::MQ4G256V2
-            && layer.w_up.gpu_dtype == DType::MQ4G256V2
-            && gpu.flags.gfx12_mq4v2_fp8_gateup
-            && !gpu.flags.hfq4g256_ldsstage_wmma
-            && fp8_prep.is_some()
-        {
-            // gfx1201 FP8-stream (uniform): the producer already emitted the
-            // fp8 pre-pass planes; consume them directly with the launch twin
-            // of the family's fp8 route — no pack launch. Same fp8 intercept
-            // conditions as the uniform router (iu4 divergence excluded by
-            // producer-side ordering: fp8_prep implies iu4_prep is None).
+    } else if layer.w_gate.gpu_dtype == DType::MQ4G256V2
+        && layer.w_up.gpu_dtype == DType::MQ4G256V2
+        && gpu.flags.gfx12_mq4v2_fp8_gateup
+        && !gpu.flags.hfq4g256_ldsstage_wmma
+        && (fp8_prep.is_some() || gate_up_wp)
+    {
+        if let Some(prep) = &fp8_prep {
             gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12_prepared(
                 &layer.w_gate.buf,
                 &layer.w_up.buf,
-                fp8_prep.as_ref().unwrap(),
+                prep,
                 &pbs.gate_ffn_batch,
                 &pbs.up_batch,
                 layer.w_gate.m,
@@ -8931,6 +8959,20 @@ fn batch_chunk_full_attn_ffn_gate_up(
                 n,
             )?;
         } else {
+            gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_bt12(
+                &layer.w_gate.buf,
+                &layer.w_up.buf,
+                &pbs.x_rot_batch,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                layer.w_gate.m,
+                layer.w_up.m,
+                layer.w_gate.k,
+                n,
+                1,
+            )?;
+        }
+    } else {
         run_fused_gate_up_key(
             gpu,
             crate::forward_slots::fused_gate_up_key_for(layer.w_gate.gpu_dtype),
@@ -8965,9 +9007,10 @@ fn batch_chunk_full_attn_ffn_down(
     epilogue: BatchEpilogue<'_>,
     fusion: DflashFusionCtx,
 ) -> HipResult<()> {
+    let w_down_wp = gpu.mq4v2_weight_is_wpreshuffled(&layer.w_down.buf)?;
     // S4: one silu*up+FWHT+F16 producer + direct-F16 residual GEMM instead
     // of fused_silu_mul_rotate_mq_batched + convert.
-    if s4_residual_fast(gpu, fusion, layer.w_down.gpu_dtype, &epilogue, n) {
+    if s4_residual_fast(gpu, fusion, layer.w_down.gpu_dtype, &epilogue, n) && !w_down_wp {
         let k = layer.w_down.k;
         let m = layer.w_down.m;
         if k > 0 && k % 256 == 0 && k == hidden_dim {
@@ -9011,7 +9054,7 @@ fn batch_chunk_full_attn_ffn_down(
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if fa_w_down_is_mq {
-        if matches!(&epilogue, BatchEpilogue::Residual) {
+        if matches!(&epilogue, BatchEpilogue::Residual) && !w_down_wp {
             iu4_prep = try_iu4_silu_prepared(
                 gpu,
                 &layer.w_down,
@@ -9076,6 +9119,17 @@ fn batch_chunk_full_attn_ffn_down(
             pbs,
             &layer.w_down,
             prep,
+            &epilogue,
+            n,
+        )?;
+    } else if layer.w_down.gpu_dtype == DType::MQ4G256V2 && w_down_wp {
+        let prepared =
+            gpu.prepare_mq4v2_fp8_x(&pbs.ffn_hidden_batch, n, layer.w_down.k, 1)?;
+        dispatch_batched_fp8_lloyd_epilogue(
+            gpu,
+            pbs,
+            &layer.w_down,
+            &prepared,
             &epilogue,
             n,
         )?;

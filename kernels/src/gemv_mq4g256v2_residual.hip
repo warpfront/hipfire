@@ -34,11 +34,13 @@ __device__ __forceinline__ unsigned int mq4v2_res_wp_header(
 
 __device__ __forceinline__ unsigned int mq4v2_res_wp_packed(
     const char* a, int k, int row, int group, int tid) {
-    const int kstep = group * 16 + (tid >> 1);
-    const int lane = (tid & 1) * 16 + (row & 15);
+    const int slab = group * 4 + (tid >> 3);
+    const int lane = ((tid >> 1) & 1) * 16 + (row & 15);
+    const int byte = ((tid >> 2) & 1) * 8 + (tid & 1) * 4;
     return *(const unsigned int*)(a
-        + (((size_t)(row >> 4) * (size_t)(k >> 4)
-            + (unsigned)kstep) * 32u + (unsigned)lane) * 4u);
+        + (((size_t)(row >> 4) * (size_t)(k >> 6)
+            + (unsigned)slab) * 32u + (unsigned)lane) * 16u
+        + (unsigned)byte);
 }
 #endif
 

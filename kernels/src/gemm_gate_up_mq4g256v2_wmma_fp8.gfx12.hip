@@ -565,8 +565,9 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         HIPFIRE_FP8_V2_PICK(w_grow_c, w_asrc, w_lr);
 #if HIPFIRE_FP8_WPRESHUFFLE
         st_wbase[r] = w_asrc
-            + ((((unsigned)(w_lr >> 4) * (unsigned)ksteps + st_quad) * 32u
-                + (unsigned)(w_lr & 15)) * 4u);
+            + (((((unsigned)(w_lr >> 4) * (unsigned)(K >> 6)) * 32u
+                + (st_quad & 1u) * 16u + (unsigned)(w_lr & 15)) * 16u)
+                + (st_quad >> 1) * 8u);
 #else
         st_wbase[r] = w_asrc + (unsigned int)w_lr * (unsigned int)gpr * 136u;
 #endif
@@ -575,7 +576,7 @@ void HIPFIRE_FP8_GATEUP_KERNEL(
         for (int pp = 0; pp < 2; pp++) {
             const unsigned pk = st_quad * 2u + (unsigned)pp;
 #if HIPFIRE_FP8_WPRESHUFFLE
-            st_wpoff[r][pp] = (unsigned)pp * 64u;
+            st_wpoff[r][pp] = (unsigned)pp * 4u;
 #else
             st_wpoff[r][pp] = pk * 4u;
 #endif
