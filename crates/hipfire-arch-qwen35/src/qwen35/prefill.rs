@@ -11612,7 +11612,12 @@ pub(crate) fn forward_batch_chunk_impl(
         && config.linear_value_head_dim == 128
         && config.conv_kernel_dim == 4
         && dense_layers_are_all_mq4v2(weights)
-        && gpu.flags.iu4_prefill_enabled()
+        // gfx1201 admits both MQ4V2 projection routes: iu4-direct (default) or
+        // FP8-WMMA qkvza (HIPFIRE_IU4_PREFILL=0 arm). Every qkvza dispatch arm
+        // writes the same f32 dn_qkv/dn_z/dn_beta/dn_alpha scratch the scan
+        // consumes, so the scan is route-agnostic. gfx11 keeps the iu4 gate.
+        && (gpu.flags.iu4_prefill_enabled()
+            || (gpu.arch == "gfx1201" && gpu.flags.gfx12_mq4v2_fp8_qkvza))
         // Native FP8 KV is gfx1201-only; gfx11 runs this scan with its supported Q8 KV tier.
         && (kv_cache.quant_fp8 || (gpu.arch != "gfx1201" && kv_cache.quant_q8))
         && dn_state.quant == StateQuant::Q8
