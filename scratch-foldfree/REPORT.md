@@ -307,3 +307,144 @@ violating the no-row-more-than-1%-slower rule. The pre-remap pp8192 and TTFT
 wins cannot rescue a different final mapping. Keep the default current
 symmetric artifact on the row-major shipped implementation; do not ship or
 enable the W-preshuffle experiment by default.
+
+## 2026-09-21 shape-correct fold-free + W-preshuffle re-screen
+
+The earlier 185.46--186.10 TFLOP/s headline used aggregate rig shapes that
+the daemon does not execute, so it is not used as a predictor here. This
+re-screen used the audited daemon shapes directly on card C
+(`GPU-085289909a86cc63`), with `N=8192`, five in-process warmups, and the
+median of 20 HIP-event timings:
+
+- MLP gate and up independently: `M=17408, K=5120`, `full_set`,
+  128 calls/pass in total;
+- MLP down: `M=5120, K=17408`, `full_add`, 64 calls/pass;
+- linear-attention QKV: `M=10240, K=5120`, 48 calls/pass;
+- linear-attention Z: `M=6144, K=5120`, 48 calls/pass.
+
+The pair uses the direct-A fragment-order kernel and its original K16 W
+layout. There is no separate current "pair without fragment-order A" binary:
+the fold-free W-preshuffle kernels consume fragment-order W directly.
+Accordingly, the requested pair and pair-plus-fragment-A entries are the same
+physical configuration rather than two measurements. The folded
+W-preshuffle-only arm uses the newer coalesced K64 mapping.
+
+### Standalone matrix at daemon shapes
+
+| configuration | shape | median us | us/token | TFLOP/s | blocks/CU | dynamic LDS | batch tile |
+|---|---|---:|---:|---:|---:|---:|---:|
+| shipped symfold | gate/up | 9,618.273 | 1.174106 | 151.824 | 3 | 18,944 B | 128 |
+| shipped symfold | down-add | 9,184.495 | 1.121154 | 158.995 | 3 | 18,944 B | 128 |
+| shipped symfold | LA QKV | 5,759.710 | 0.703090 | 149.138 | 3 | 18,944 B | 128 |
+| shipped symfold | LA Z | 3,479.301 | 0.424719 | 148.132 | 3 | 18,944 B | 128 |
+| fold-free only | gate/up | 9,498.373 | 1.159469 | 153.741 | 3 | 18,944 B | 256 |
+| fold-free only | down-add | 9,339.951 | 1.140131 | 156.349 | 3 | 18,944 B | 256 |
+| fold-free only | LA QKV | 5,857.575 | 0.715036 | 146.647 | 3 | 18,944 B | 256 |
+| fold-free only | LA Z | 3,622.589 | 0.442211 | 142.273 | 3 | 18,944 B | 256 |
+| folded W preshuffle only | gate/up | 9,423.194 | 1.150292 | 154.968 | 3 | 18,944 B | 128 |
+| folded W preshuffle only | down-add | 8,970.631 | 1.095048 | 162.786 | 3 | 18,944 B | 128 |
+| folded W preshuffle only | LA QKV | 5,507.388 | 0.672289 | 155.971 | 3 | 18,944 B | 128 |
+| folded W preshuffle only | LA Z | 3,352.525 | 0.409244 | 153.734 | 3 | 18,944 B | 128 |
+| fold-free + W preshuffle + fragment A | gate/up | 7,318.166 | 0.893331 | 199.543 | 3 | 9,728 B | 256 |
+| fold-free + W preshuffle + fragment A | down-add | 6,691.704 | 0.816858 | 218.224 | 4 | 9,728 B | 256 |
+| fold-free + W preshuffle + fragment A | LA QKV | 4,500.976 | 0.549436 | 190.846 | 4 | 9,728 B | 256 |
+| fold-free + W preshuffle + fragment A | LA Z | 2,765.811 | 0.337623 | 186.345 | 4 | 9,728 B | 256 |
+
+The pair reduces time by 23.91%, 27.14%, 21.85%, and 20.51% respectively
+against the shipped control. Weighting `us/token` by the audited calls/pass
+gives:
+
+| configuration | weighted GEMM us/token | weighted TFLOP/s |
+|---|---:|---:|
+| shipped symfold | 276.174 | 153.087 |
+| fold-free only | 276.928 | 152.670 |
+| folded W preshuffle only | 269.234 | 157.033 |
+| fold-free + W preshuffle + fragment A | **209.204** | **202.093** |
+
+Thus the shape-correct standalone pair clears the 2% admission gate:
+**-24.249% weighted GEMM time**, equivalently **+32.012% weighted
+throughput**. Fragment-order preshuffle round-tripped exactly, and each
+pair kernel matched its independently decoded reference with relative RMS
+zero and no non-finite output. Raw evidence is
+`scratch-foldfree/shape-screen-card-c.txt`; compiler evidence is
+`scratch-foldfree/shape-screen-compile.log`.
+
+The batch tile changes from 128 rows in the control to 256 rows in the pair.
+For the 5,909-token TTFT fixture this implies 6,016 control rows versus 6,144
+candidate rows, 128 extra padded rows. This geometric penalty is kept
+separate from the kernel result.
+
+### Minimal route integration and dispatch proof
+
+The loader now chooses the W layout explicitly. The existing non-pow2
+symfold path retains its coalesced K64 condition and mapping unchanged.
+Pow2-marked weights may use the old K16 fragment layout only for MLP
+gate/up/down, and only when all three developer settings are route-proven:
+`developer.fp8_foldfree=1`, `developer.fp8_wpreshuffle=1`, and
+`developer.fp8_fragment_order=1`, with `kernel.iu4_prefill=false`.
+All settings remain default-off. A scoped release build of
+`hipfire-daemon` passed.
+
+Both arms were replayed under `rocprofv3` with the settings embedded in the
+daemon `configure` object. The route-proving MLP signatures were:
+
+| arm/family | kernel symbol | VGPR | SGPR | spills | dynamic LDS | blocks/CU | Grid Y |
+|---|---|---:|---:|---:|---:|---:|---:|
+| control gate/up | `gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201_symfold` | 186 | 32 | 0 | 18,944 B | 3 | 64 |
+| control down/output residual | `gemm_mq4g256v2_residual_wmma_fp8_v2_b128x128_gfx1201_symfold` | 191 | 30 | 0 | 18,944 B | 3 | 64 |
+| candidate gate/up | `gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_frag_wp_gfx1201` | 193 | 29 | 0 | 9,728 B | 3 | 32 |
+| candidate MLP down | `gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_frag_wp_gfx1201` | 191 | 30 | 0 | 9,728 B | 4 | 32 |
+
+The candidate profile contains 128 gate/up calls and 128 MLP-down
+`frag_wp` calls. QKVZA, QKV, and the output residual deliberately remain
+the row-major fold-free `frag` symbols, proving the admission is limited to
+the three intended MLP tensors. Neither trace contains an IU4 kernel.
+Evidence:
+`scratch-foldfree/prof-pair-control-route/pair-control_kernel_{stats,trace}.csv`
+and
+`scratch-foldfree/prof-pair-candidate-route/pair-candidate_kernel_{stats,trace}.csv`.
+The profiler reports zero dynamic LDS on this device, so the LDS values above
+come from the actual launch request; VGPR/SGPR/spill counts come from the
+generated code-object metadata, and Grid Y from the trace.
+
+### Mandatory tg128 gate
+
+The daemon ignores ambient feature variables, so each arm was installed via
+`hipfire config set` under card C's HOME before starting a fresh benchmark
+process. Both arms pinned the FP8 route:
+`kernel.iu4_prefill=false`, `kernel.gfx12_fp8_stream=true`,
+`kernel.gfx12_silu_quant_fused=true`, and
+`kernel.gfx12_producer_quant_fused=true`. The branch does not register
+`kernel.attn_qresident`, so no unrecognized setting was injected. Control
+pp512 was 2,224.4 tokens/s, inside the FP8 orientation band.
+
+Command:
+`hipfire bench qwen3.8:27b-mq4-xt --matrix --pp 512 --ctx 128 --tg 128
+--spec off --runs 3 --warmups 1 --kv-mode fp8 --json`.
+
+| arm | pp512 median | tg128 median | tg128 samples |
+|---|---:|---:|---|
+| shipped symfold control | 2,224.4 tok/s | **36.6198 tok/s** | 36.6327, 36.6198, 36.6146 |
+| fold-free + W preshuffle | 2,721.7 tok/s | **31.0424 tok/s** | 31.1003, 31.0424, 31.0065 |
+
+The pair gains 22.36% at pp512 but loses **15.23%** at tg128. This is far
+outside the required 1% decode-neutral band and reproduces the decisive
+decode regression seen in the folded preshuffle experiment. Evidence:
+`scratch-foldfree/pair-decode-{control,candidate}.json`.
+
+The mandatory early-stop fired. Two ABBA pp512/pp8192 pairs, the 5,909-token
+TTFT pair, a new KLD run, long-context, and the five-prompt battery were not
+performed because none can rescue a 15.23% decode loss. The current pow2h
+artifact independently remains over the hard FP8-v2 quality budget
+(`c24=0.055408` versus `0.05`); training run 8 must close that gap before any
+future performance re-gate could become shippable. Even its measured
+2,721.7-token/s pp512 row remains below the roughly 3,600-token/s IU4
+performance arm.
+
+### Shape-correct verdict
+
+**KILL.** The fold-free + W-preshuffle pair is a real, large prefill GEMM
+win at the daemon's actual shapes, but it is not a shippable route: its
+tg128 throughput regresses by 15.23%, and the required pow2h artifact also
+misses the hard quality budget. Keep the integration behind its three
+existing default-off developer settings; do not enable it by default.

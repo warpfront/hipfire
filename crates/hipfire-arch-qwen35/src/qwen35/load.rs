@@ -188,12 +188,23 @@ fn mq4v2_foldfree_row_scales(
     Ok(scales)
 }
 
-/// Replace an MQ4V2 row-major image with a size-preserving gfx1201 fragment
-/// order. Each 16-row by K64 payload tile stores 32 lane-contiguous b128
-/// records, so scalar GEMV, IU4, and FP8 consumers all issue coalesced loads.
-/// The remaining `M*K/32` bytes retain the original four-byte K128 headers in
-/// byte planes. Every source byte is moved exactly once.
-fn mq4v2_wpreshuffle(data: &[u8], m: usize, k: usize) -> HipResult<Vec<u8>> {
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Mq4v2Wpreshuffle {
+    None,
+    CoalescedSymfold,
+    Fragment,
+}
+
+/// Replace an MQ4V2 row-major image with one of the size-preserving gfx1201
+/// layouts. Symfold uses coalesced K64 records; the fold-free direct-A kernels
+/// use their original K16 fragment records. The flag-derived mode makes that
+/// incompatibility explicit at the load boundary.
+fn mq4v2_wpreshuffle(
+    data: &[u8],
+    m: usize,
+    k: usize,
+    mode: Mq4v2Wpreshuffle,
+) -> HipResult<Vec<u8>> {
     if m % 16 != 0 || k % 256 != 0 {
         return Err(HipError::new(
             0,
@@ -218,10 +229,20 @@ fn mq4v2_wpreshuffle(data: &[u8], m: usize, k: usize) -> HipResult<Vec<u8>> {
         for packed_col in 0..k / 2 {
             let nibble = packed_col * 2;
             let src = (row * groups_per_row + nibble / 256) * 136 + 8 + (nibble & 255) / 2;
-            let lane = 16 * ((nibble >> 4) & 1) + (row & 15);
-            let dst = ((((row >> 4) * (k >> 6) + (nibble >> 6)) * 32 + lane) * 16)
-                + ((nibble >> 5) & 1) * 8
-                + ((nibble & 15) >> 1);
+            let dst = match mode {
+                Mq4v2Wpreshuffle::CoalescedSymfold => {
+                    let lane = 16 * ((nibble >> 4) & 1) + (row & 15);
+                    ((((row >> 4) * (k >> 6) + (nibble >> 6)) * 32 + lane) * 16)
+                        + ((nibble >> 5) & 1) * 8
+                        + ((nibble & 15) >> 1)
+                }
+                Mq4v2Wpreshuffle::Fragment => {
+                    let lane = 16 * ((nibble >> 3) & 1) + (row & 15);
+                    ((((row >> 4) * (k >> 4) + (nibble >> 4)) * 32 + lane) * 4)
+                        + ((nibble & 7) >> 1)
+                }
+                Mq4v2Wpreshuffle::None => unreachable!("preshuffle called without a layout"),
+            };
             out[dst] = data[src];
         }
         for half_block in 0..k / 128 {
@@ -239,19 +260,41 @@ fn mq4v2_wpreshuffle(data: &[u8], m: usize, k: usize) -> HipResult<Vec<u8>> {
     Ok(out)
 }
 
-fn mq4v2_wpreshuffle_enabled(gpu: &Gpu, name: &str, m: usize, k: usize) -> bool {
+fn mq4v2_wpreshuffle_mode(
+    gpu: &Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+) -> Mq4v2Wpreshuffle {
     let mlp_target = name.ends_with(".mlp.gate_proj.weight")
         || name.ends_with(".mlp.up_proj.weight")
         || name.ends_with(".mlp.down_proj.weight");
     let setting = hipfire_config::developer_var("HIPFIRE_FP8_WPRESHUFFLE");
-    mlp_target
-        && gpu.arch == "gfx1201"
-        && gpu.mq4v2_symmetric
-        && gpu.mq4v2_pow2scale == 0
-        && m % 16 == 0
-        && k % 256 == 0
-        && setting.as_deref() != Ok("0")
-        && (!gpu.flags.iu4_prefill_enabled() || setting.as_deref() == Ok("1"))
+    if !mlp_target
+        || gpu.arch != "gfx1201"
+        || !gpu.mq4v2_symmetric
+        || m % 16 != 0
+        || k % 256 != 0
+    {
+        return Mq4v2Wpreshuffle::None;
+    }
+    if gpu.mq4v2_pow2scale == 0 {
+        if setting.as_deref() != Ok("0")
+            && (!gpu.flags.iu4_prefill_enabled() || setting.as_deref() == Ok("1"))
+        {
+            return Mq4v2Wpreshuffle::CoalescedSymfold;
+        }
+        return Mq4v2Wpreshuffle::None;
+    }
+    if setting.as_deref() == Ok("1")
+        && hipfire_config::developer_var("HIPFIRE_FP8_FOLDFREE").as_deref() != Ok("0")
+        && hipfire_config::developer_var("HIPFIRE_FP8_FRAGMENT_ORDER").as_deref() == Ok("1")
+        && !gpu.flags.iu4_prefill_enabled()
+    {
+        Mq4v2Wpreshuffle::Fragment
+    } else {
+        Mq4v2Wpreshuffle::None
+    }
 }
 
 fn load_weight_tensor_raw(
@@ -260,7 +303,7 @@ fn load_weight_tensor_raw(
     data: &[u8],
     m: usize,
     k: usize,
-    wpreshuffle: bool,
+    wpreshuffle: Mq4v2Wpreshuffle,
 ) -> HipResult<WeightTensor> {
     match quant_type {
         6 => {
@@ -664,10 +707,9 @@ fn load_weight_tensor_raw(
             } else {
                 None
             };
-            let permuted = if wpreshuffle {
-                Some(mq4v2_wpreshuffle(data, m, k)?)
-            } else {
-                None
+            let permuted = match wpreshuffle {
+                Mq4v2Wpreshuffle::None => None,
+                mode => Some(mq4v2_wpreshuffle(data, m, k, mode)?),
             };
             let upload = permuted.as_deref().unwrap_or(data);
             let buf = gpu.upload_raw(upload, &[upload.len()])?;
@@ -679,8 +721,12 @@ fn load_weight_tensor_raw(
             } else {
                 None
             };
-            if row_scale_sidecar.is_some() || wpreshuffle {
-                gpu.install_mq4v2_foldfree_weight(&buf, row_scale_sidecar, wpreshuffle)?;
+            if row_scale_sidecar.is_some() || wpreshuffle != Mq4v2Wpreshuffle::None {
+                gpu.install_mq4v2_foldfree_weight(
+                    &buf,
+                    row_scale_sidecar,
+                    wpreshuffle != Mq4v2Wpreshuffle::None,
+                )?;
             }
             Ok(WeightTensor {
                 buf,
@@ -1134,7 +1180,7 @@ pub(crate) fn load_weight_tensor(
                     data,
                     m,
                     k,
-                    mq4v2_wpreshuffle_enabled(gpu, name, m, k),
+                    mq4v2_wpreshuffle_mode(gpu, name, m, k),
                 )?);
                 matched = Some(candidate);
                 break;
@@ -1147,7 +1193,7 @@ pub(crate) fn load_weight_tensor(
                     &buf,
                     m,
                     k,
-                    mq4v2_wpreshuffle_enabled(gpu, name, m, k),
+                    mq4v2_wpreshuffle_mode(gpu, name, m, k),
                 )?);
                 matched = Some(candidate);
                 break;
@@ -1208,7 +1254,7 @@ pub(crate) fn load_weight_tensor(
             data,
             m,
             k,
-            mq4v2_wpreshuffle_enabled(gpu, name, m, k),
+            mq4v2_wpreshuffle_mode(gpu, name, m, k),
         )?;
         if wt.gpu_dtype.supports_awq_sidecar() {
             wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, k)
@@ -1338,7 +1384,14 @@ fn load_weight_tensor_keep(
             ),
         ));
     }
-    let mut wt = load_weight_tensor_raw(gpu, info.quant_type, &sub, m, k, false)?;
+    let mut wt = load_weight_tensor_raw(
+        gpu,
+        info.quant_type,
+        &sub,
+        m,
+        k,
+        Mq4v2Wpreshuffle::None,
+    )?;
     if wt.gpu_dtype.supports_awq_sidecar() {
         // The AWQ sidecar is indexed by K and remains unchanged by row
         // gathering. Resolve under the original source name.
@@ -2854,7 +2907,7 @@ impl WeightSource for HfqSource<'_> {
                     &lm_data,
                     c.vocab_size,
                     c.dim,
-                    false,
+                    Mq4v2Wpreshuffle::None,
                 )
             },
             |gpu| {
@@ -3828,7 +3881,7 @@ fn load_weight_tensor_dense_tp(
         &bytes,
         new_m,
         new_k,
-        mq4v2_wpreshuffle_enabled(gpu, name, new_m, new_k),
+        mq4v2_wpreshuffle_mode(gpu, name, new_m, new_k),
     ) {
         Ok(w) => w,
         Err(e) => return Err(e),
@@ -4103,7 +4156,7 @@ pub fn load_weights_dense_tp_rank(
                     &data,
                     config.vocab_size,
                     dim,
-                    false,
+                    Mq4v2Wpreshuffle::None,
                 )
             },
             |gpu| {

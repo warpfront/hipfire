@@ -15,40 +15,85 @@
 #define BENCH_FAMILY 0
 #endif
 
+#ifndef BENCH_CONFIG
+#define BENCH_CONFIG 0
+#endif
+
+#if BENCH_CONFIG < 0 || BENCH_CONFIG > 3
+#error invalid BENCH_CONFIG
+#endif
+
+#if BENCH_CONFIG == 0 || BENCH_CONFIG == 2
+#define HIPFIRE_FP8_SYMFOLD 1
+#if BENCH_CONFIG == 2
+#define HIPFIRE_FP8_WPRESHUFFLE 1
+#endif
+#define HIPFIRE_FP8_V2_TILE 1
+#define HIPFIRE_FP8_V2_BM 128
+#define HIPFIRE_FP8_V2_BN 128
+#define HIPFIRE_FP8_V2_BK 64
+#define HIPFIRE_FP8_V2_WAVES 8
+#if BENCH_FAMILY == 0
+#define HIPFIRE_FP8_GATEUP_KERNEL bench_symfold_gate
+#elif BENCH_FAMILY == 1
+#define HIPFIRE_FP8_RESIDUAL 1
+#define HIPFIRE_FP8_GATEUP_KERNEL bench_symfold_residual
+#elif BENCH_FAMILY == 2
+#define HIPFIRE_FP8_QKVZA 1
+#define HIPFIRE_FP8_GATEUP_KERNEL bench_symfold_qkvza
+#else
+#error invalid BENCH_FAMILY
+#endif
+#include "../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip"
+#define BENCH_KERNEL HIPFIRE_FP8_GATEUP_KERNEL
+#elif BENCH_CONFIG == 1
+#if BENCH_FAMILY == 0
+#include "../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree.gfx12.hip"
+#elif BENCH_FAMILY == 1
+#include "../kernels/src/gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree.gfx12.hip"
+#elif BENCH_FAMILY == 2
+#include "../kernels/src/gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree.gfx12.hip"
+#else
+#error invalid BENCH_FAMILY
+#endif
+#include "../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip"
+#define BENCH_KERNEL HIPFIRE_FP8_FOLDFREE_KERNEL
+#else
 #if BENCH_FAMILY == 0
 #define HIPFIRE_FP8_QKVZA 0
 #define HIPFIRE_FP8_RESIDUAL 0
 #define HIPFIRE_FP8_QKV 0
-#define HIPFIRE_FP8_FOLDFREE_KERNEL gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201
+#define HIPFIRE_FP8_FOLDFREE_KERNEL bench_pair_gate
 #elif BENCH_FAMILY == 1
 #define HIPFIRE_FP8_QKVZA 0
 #define HIPFIRE_FP8_RESIDUAL 1
 #define HIPFIRE_FP8_QKV 0
-#define HIPFIRE_FP8_FOLDFREE_KERNEL gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_gfx1201
+#define HIPFIRE_FP8_FOLDFREE_KERNEL bench_pair_residual
 #elif BENCH_FAMILY == 2
 #define HIPFIRE_FP8_QKVZA 1
 #define HIPFIRE_FP8_RESIDUAL 0
 #define HIPFIRE_FP8_QKV 0
-#define HIPFIRE_FP8_FOLDFREE_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201
-#elif BENCH_FAMILY == 3
-#define HIPFIRE_FP8_QKVZA 0
-#define HIPFIRE_FP8_RESIDUAL 0
-#define HIPFIRE_FP8_QKV 1
-#define HIPFIRE_FP8_FOLDFREE_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201
+#define HIPFIRE_FP8_FOLDFREE_KERNEL bench_pair_qkvza
 #else
 #error invalid BENCH_FAMILY
 #endif
-
 #define HIPFIRE_FP8_WPRESHUFFLE 1
 #include "../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip"
-
+#define BENCH_KERNEL HIPFIRE_FP8_FOLDFREE_KERNEL
+#endif
 #define HIP_OK(call) do { hipError_t e_ = (call); if (e_ != hipSuccess) { \
   std::fprintf(stderr, "%s:%d: %s\n", __FILE__, __LINE__, hipGetErrorString(e_)); std::exit(2); \
 } } while (0)
 
 static constexpr const char* kArtifact =
     "/home/kaden/qcal/qat/v25/qwen3.8-27b.mq4v2.xt.sym-pow2h-a035.hfq";
-static constexpr size_t kLdsBytes = 9728;
+static constexpr bool kWShuffle = BENCH_CONFIG == 2 || BENCH_CONFIG == 3;
+static constexpr bool kFragmentA = BENCH_CONFIG == 3;
+static constexpr size_t kLdsBytes = BENCH_CONFIG == 3 ? 9728 : 18944;
+static constexpr int kBatchTile = BENCH_CONFIG == 0 || BENCH_CONFIG == 2 ? 128 : 256;
+static constexpr const char* kConfigNames[] = {
+  "shipped-symfold", "foldfree", "preshuffle", "foldfree+preshuffle",
+};
 
 struct WeightSpec { const char* name; uint64_t offset; int m; int k; };
 #if BENCH_FAMILY == 0
@@ -85,6 +130,23 @@ static void pread_all(int fd, void* dst, size_t bytes, uint64_t offset) {
     p += got; bytes -= static_cast<size_t>(got); offset += static_cast<size_t>(got);
   }
 }
+static size_t preshuffle_payload_offset(int row, int nibble, int k) {
+#if BENCH_CONFIG == 3
+  return (((static_cast<size_t>(row >> 4) * (k >> 4)
+            + static_cast<unsigned>(nibble >> 4)) * 32
+           + (static_cast<unsigned>((nibble >> 3) & 1) * 16
+              + static_cast<unsigned>(row & 15))) * 4
+          + static_cast<unsigned>(nibble & 7) / 2);
+#else
+  return (((static_cast<size_t>(row >> 4) * (k >> 6)
+            + static_cast<unsigned>(nibble >> 6)) * 32
+           + (static_cast<unsigned>((nibble >> 4) & 1) * 16
+              + static_cast<unsigned>(row & 15))) * 16
+          + static_cast<unsigned>((nibble >> 5) & 1) * 8
+          + static_cast<unsigned>(nibble & 15) / 2);
+#endif
+}
+
 
 static std::vector<uint8_t> preshuffle_weight(const std::vector<uint8_t>& src,
                                               int rows, int k) {
@@ -111,12 +173,7 @@ static std::vector<uint8_t> preshuffle_weight(const std::vector<uint8_t>& src,
       const size_t si = (static_cast<size_t>(r) * gpr
                          + static_cast<size_t>(nibble >> 8)) * 136
                         + 8 + static_cast<unsigned>(nibble & 255) / 2;
-      const size_t di =
-          (((static_cast<size_t>(r >> 4) * (k >> 4)
-              + static_cast<unsigned>(nibble >> 4)) * 32
-             + (static_cast<unsigned>((nibble >> 3) & 1) * 16
-                + static_cast<unsigned>(r & 15))) * 4
-            + static_cast<unsigned>(nibble & 7) / 2);
+      const size_t di = preshuffle_payload_offset(r, nibble, k);
       put(di, src[si]);
     }
     for (int hb = 0; hb < k / 128; ++hb) {
@@ -162,12 +219,7 @@ static std::vector<uint8_t> unshuffle_weight(const std::vector<uint8_t>& src,
       const size_t di = (static_cast<size_t>(r) * gpr
                          + static_cast<size_t>(nibble >> 8)) * 136
                         + 8 + static_cast<unsigned>(nibble & 255) / 2;
-      const size_t si =
-          (((static_cast<size_t>(r >> 4) * (k >> 4)
-              + static_cast<unsigned>(nibble >> 4)) * 32
-             + (static_cast<unsigned>((nibble >> 3) & 1) * 16
-                + static_cast<unsigned>(r & 15))) * 4
-            + static_cast<unsigned>(nibble & 7) / 2);
+      const size_t si = preshuffle_payload_offset(r, nibble, k);
       put(di, src[si]);
     }
     for (int hb = 0; hb < k / 128; ++hb) {
@@ -231,12 +283,7 @@ static int cpu_permutation_proof() {
       uint32_t reference_header;
       std::memcpy(&reference_header, hp, sizeof(reference_header));
       const int nibble = c;
-      const size_t pi =
-          (((static_cast<size_t>(r >> 4) * (k >> 4)
-              + static_cast<unsigned>(nibble >> 4)) * 32
-             + (static_cast<unsigned>((nibble >> 3) & 1) * 16
-                + static_cast<unsigned>(r & 15))) * 4
-            + static_cast<unsigned>(nibble & 7) / 2);
+      const size_t pi = preshuffle_payload_offset(r, nibble, k);
       const unsigned code = (shuffled[pi] >> ((nibble & 1) * 4)) & 15u;
       const uint8_t packed_ref = original[(static_cast<size_t>(r) * gpr
           + static_cast<unsigned>(c >> 8)) * 136 + 8
@@ -284,7 +331,8 @@ static Weight load_weight(int fd, const WeightSpec& spec, int rows) {
     }
     w.erow[r] = std::ldexp(1.0f, static_cast<int>(max_exp) - 15);
   }
-  const std::vector<uint8_t> shuffled = preshuffle_weight(w.host, rows, spec.k);
+  const std::vector<uint8_t> shuffled =
+      kWShuffle ? preshuffle_weight(w.host, rows, spec.k) : w.host;
   HIP_OK(hipMalloc(&w.dev, shuffled.size()));
   HIP_OK(hipMalloc(&w.dev_erow, w.erow.size() * sizeof(float)));
   HIP_OK(hipMemcpy(w.dev, shuffled.data(), shuffled.size(), hipMemcpyHostToDevice));
@@ -366,48 +414,66 @@ static std::vector<uint8_t> tile_x(const std::vector<uint8_t>& row_major, int n,
 static void launch(dim3 grid, dim3 block, size_t lds, hipStream_t stream,
                    const std::vector<Weight>& w, uint8_t* x, float* hs, float* xs,
                    const std::vector<float*>& y, const std::vector<int>& m, int k, int n) {
+#if BENCH_CONFIG == 0 || BENCH_CONFIG == 2
 #if BENCH_FAMILY == 0
-  hipLaunchKernelGGL(HIPFIRE_FP8_FOLDFREE_KERNEL, grid, block, lds, stream,
+  hipLaunchKernelGGL(BENCH_KERNEL, grid, block, lds, stream,
+    w[0].dev, w[1].dev, x, hs, xs, y[0], y[1], m[0], m[1], k, n);
+#elif BENCH_FAMILY == 1
+  hipLaunchKernelGGL(BENCH_KERNEL, grid, block, lds, stream,
+    w[0].dev, x, hs, xs, y[0], m[0], k, n);
+#else
+  hipLaunchKernelGGL(BENCH_KERNEL, grid, block, lds, stream,
+    w[0].dev, w[1].dev, w[2].dev, w[3].dev, x, hs, xs,
+    y[0], y[1], y[2], y[3], m[0], m[1], m[2], m[3], k, n);
+#endif
+#else
+#if BENCH_FAMILY == 0
+  hipLaunchKernelGGL(BENCH_KERNEL, grid, block, lds, stream,
     w[0].dev, w[1].dev, w[0].dev_erow, w[1].dev_erow, x, hs, xs,
     y[0], y[1], m[0], m[1], k, n);
 #elif BENCH_FAMILY == 1
-  hipLaunchKernelGGL(HIPFIRE_FP8_FOLDFREE_KERNEL, grid, block, lds, stream,
+  hipLaunchKernelGGL(BENCH_KERNEL, grid, block, lds, stream,
     w[0].dev, w[0].dev_erow, x, hs, xs, y[0], m[0], k, n);
-#elif BENCH_FAMILY == 2
-  hipLaunchKernelGGL(HIPFIRE_FP8_FOLDFREE_KERNEL, grid, block, lds, stream,
+#else
+  hipLaunchKernelGGL(BENCH_KERNEL, grid, block, lds, stream,
     w[0].dev, w[1].dev, w[2].dev, w[3].dev,
     w[0].dev_erow, w[1].dev_erow, w[2].dev_erow, w[3].dev_erow,
     x, hs, xs, y[0], y[1], y[2], y[3], m[0], m[1], m[2], m[3], k, n);
-#else
-  hipLaunchKernelGGL(HIPFIRE_FP8_FOLDFREE_KERNEL, grid, block, lds, stream,
-    w[0].dev, w[1].dev, w[2].dev, w[0].dev_erow, w[1].dev_erow, w[2].dev_erow,
-    x, hs, xs, y[0], y[1], y[2], m[0], m[1], m[2], k, n);
+#endif
 #endif
 }
 
 int main(int argc, char** argv) {
   if (argc > 1 && std::string(argv[1]) == "proof") return cpu_permutation_proof();
   const bool exact = argc > 1 && std::string(argv[1]) == "exact";
+  const std::string shape = argc > 1 ? argv[1] : "";
   const int fd = open(kArtifact, O_RDONLY);
   if (fd < 0) { std::perror("open artifact"); return 2; }
 #if BENCH_FAMILY == 0
-  std::vector<int> m = exact ? std::vector<int>{128,128} : std::vector<int>{17408,17408};
+  std::vector<int> m = exact ? std::vector<int>{128,0}
+                             : (shape == "pair" ? std::vector<int>{17408,17408}
+                                                : std::vector<int>{17408,0});
 #elif BENCH_FAMILY == 1
   std::vector<int> m = exact ? std::vector<int>{128} : std::vector<int>{5120};
-#elif BENCH_FAMILY == 2
-  std::vector<int> m = exact ? std::vector<int>{32,32,32,32} : std::vector<int>{10240,6144,48,48};
 #else
-  std::vector<int> m = exact ? std::vector<int>{64,32,32} : std::vector<int>{12288,1024,1024};
+  std::vector<int> m;
+  if (exact || shape == "qkv") m = exact ? std::vector<int>{32,0,0,0}
+                                        : std::vector<int>{10240,0,0,0};
+  else if (shape == "z") m = std::vector<int>{0,6144,0,0};
+  else {
+    std::fprintf(stderr, "family 2 requires qkv or z\n");
+    return 2;
+  }
 #endif
   const int k = kSpecs[0].k;
   const int n = exact ? 256 : 8192;
   std::vector<Weight> weights;
   for (size_t i = 0; i < sizeof(kSpecs)/sizeof(kSpecs[0]); ++i)
-    weights.push_back(load_weight(fd, kSpecs[i], m[i]));
+    weights.push_back(load_weight(fd, kSpecs[i], std::max(m[i], 16)));
   close(fd);
 
   std::vector<uint8_t> hx = make_x(n, k);
-  std::vector<uint8_t> hxt = tile_x(hx, n, k);
+  std::vector<uint8_t> hxt = kFragmentA ? tile_x(hx, n, k) : hx;
   std::vector<float> hxs(n);
   for (int t = 0; t < n; ++t) hxs[t] = std::ldexp(1.0f, (t % 5) - 2);
   uint8_t* dx = nullptr; float* dhs = nullptr; float* dxs = nullptr;
@@ -421,16 +487,17 @@ int main(int argc, char** argv) {
   std::vector<float*> dy(m.size(), nullptr);
   std::vector<std::vector<float>> initial(m.size());
   for (size_t i = 0; i < m.size(); ++i) {
-    const size_t elems = static_cast<size_t>(n) * m[i];
+    const size_t elems = std::max<size_t>(static_cast<size_t>(n) * m[i], 1);
     HIP_OK(hipMalloc(&dy[i], elems * sizeof(float)));
     initial[i].assign(elems, BENCH_FAMILY == 1 ? 0.125f : 0.0f);
     HIP_OK(hipMemcpy(dy[i], initial[i].data(), elems * sizeof(float), hipMemcpyHostToDevice));
   }
   int total_m = 0; for (int v : m) total_m += v;
-  const dim3 grid((total_m + 127) / 128, (n + 255) / 256, 1), block(256,1,1);
+  const dim3 grid((total_m + 127) / 128, (n + kBatchTile - 1) / kBatchTile, 1),
+             block(256,1,1);
   int blocks = 0;
   HIP_OK(hipOccupancyMaxActiveBlocksPerMultiprocessor(
-      &blocks, HIPFIRE_FP8_FOLDFREE_KERNEL, 256, kLdsBytes));
+      &blocks, BENCH_KERNEL, 256, kLdsBytes));
 
   if (exact) {
     std::vector<std::vector<float>> folded(m.size());
@@ -447,6 +514,12 @@ int main(int argc, char** argv) {
     for (size_t part = 0; part < m.size(); ++part) {
       std::vector<float> got(static_cast<size_t>(n) * m[part]);
       HIP_OK(hipMemcpy(got.data(), dy[part], got.size() * sizeof(float), hipMemcpyDeviceToHost));
+      if (part == 0) {
+        std::printf("sample");
+        for (int r = 0; r < std::min(m[part], 8); ++r)
+          std::printf(" %.9g", got[r]);
+        std::printf("\n");
+      }
       for (int t = 0; t < n; ++t) {
         for (int r = 0; r < m[part]; ++r) {
           float sum = 0.0f;
@@ -484,7 +557,9 @@ int main(int argc, char** argv) {
   std::sort(us.begin(), us.end());
   const double median_us = (us[9] + us[10]) * 0.5;
   const double flop = 2.0 * n * static_cast<double>(k) * total_m;
-  std::printf("family=%d m=%d n=%d k=%d median_us=%.3f tflops=%.3f blocks_per_cu=%d lds=%zu\n",
-              BENCH_FAMILY, total_m, n, k, median_us, flop / median_us / 1e6, blocks, kLdsBytes);
+  std::printf("config=%s family=%d shape=%s m=%d n=%d k=%d median_us=%.3f us_per_token=%.6f tflops=%.3f blocks_per_cu=%d lds=%zu batch_tile=%d\n",
+              kConfigNames[BENCH_CONFIG], BENCH_FAMILY, shape.c_str(), total_m, n, k,
+              median_us, median_us / n, flop / median_us / 1e6, blocks, kLdsBytes,
+              kBatchTile);
   return 0;
 }

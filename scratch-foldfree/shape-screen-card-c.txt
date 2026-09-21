@@ -1,0 +1,47 @@
+config=0 family=0 requested_shape=gate rc=0 wall_s=0.534
+config=shipped-symfold family=0 shape= m=17408 n=8192 k=5120 median_us=9618.273 us_per_token=1.174106 tflops=151.824 blocks_per_cu=3 lds=18944 batch_tile=128
+
+config=0 family=1 requested_shape=down rc=0 wall_s=0.513
+config=shipped-symfold family=1 shape= m=5120 n=8192 k=17408 median_us=9184.495 us_per_token=1.121154 tflops=158.995 blocks_per_cu=3 lds=18944 batch_tile=128
+
+config=0 family=2 requested_shape=qkv rc=0 wall_s=0.364
+config=shipped-symfold family=2 shape=qkv m=10240 n=8192 k=5120 median_us=5759.710 us_per_token=0.703090 tflops=149.138 blocks_per_cu=3 lds=18944 batch_tile=128
+
+config=0 family=2 requested_shape=z rc=0 wall_s=0.263
+config=shipped-symfold family=2 shape=z m=6144 n=8192 k=5120 median_us=3479.301 us_per_token=0.424719 tflops=148.132 blocks_per_cu=3 lds=18944 batch_tile=128
+
+config=1 family=0 requested_shape=gate rc=0 wall_s=0.529
+config=foldfree family=0 shape= m=17408 n=8192 k=5120 median_us=9498.373 us_per_token=1.159469 tflops=153.741 blocks_per_cu=3 lds=18944 batch_tile=256
+
+config=1 family=1 requested_shape=down rc=0 wall_s=0.517
+config=foldfree family=1 shape= m=5120 n=8192 k=17408 median_us=9339.951 us_per_token=1.140131 tflops=156.349 blocks_per_cu=3 lds=18944 batch_tile=256
+
+config=1 family=2 requested_shape=qkv rc=0 wall_s=0.365
+config=foldfree family=2 shape=qkv m=10240 n=8192 k=5120 median_us=5857.575 us_per_token=0.715036 tflops=146.647 blocks_per_cu=3 lds=18944 batch_tile=256
+
+config=1 family=2 requested_shape=z rc=0 wall_s=0.273
+config=foldfree family=2 shape=z m=6144 n=8192 k=5120 median_us=3622.589 us_per_token=0.442211 tflops=142.273 blocks_per_cu=3 lds=18944 batch_tile=256
+
+config=2 family=0 requested_shape=gate rc=0 wall_s=0.652
+config=preshuffle family=0 shape= m=17408 n=8192 k=5120 median_us=9423.194 us_per_token=1.150292 tflops=154.968 blocks_per_cu=3 lds=18944 batch_tile=128
+
+config=2 family=1 requested_shape=down rc=0 wall_s=0.627
+config=preshuffle family=1 shape= m=5120 n=8192 k=17408 median_us=8970.631 us_per_token=1.095048 tflops=162.786 blocks_per_cu=3 lds=18944 batch_tile=128
+
+config=2 family=2 requested_shape=qkv rc=0 wall_s=0.426
+config=preshuffle family=2 shape=qkv m=10240 n=8192 k=5120 median_us=5507.388 us_per_token=0.672289 tflops=155.971 blocks_per_cu=3 lds=18944 batch_tile=128
+
+config=2 family=2 requested_shape=z rc=0 wall_s=0.305
+config=preshuffle family=2 shape=z m=6144 n=8192 k=5120 median_us=3352.525 us_per_token=0.409244 tflops=153.734 blocks_per_cu=3 lds=18944 batch_tile=128
+
+config=3 family=0 requested_shape=gate rc=0 wall_s=0.578
+config=foldfree+preshuffle family=0 shape= m=17408 n=8192 k=5120 median_us=7318.166 us_per_token=0.893331 tflops=199.543 blocks_per_cu=3 lds=9728 batch_tile=256
+
+config=3 family=1 requested_shape=down rc=0 wall_s=0.579
+config=foldfree+preshuffle family=1 shape= m=5120 n=8192 k=17408 median_us=6691.704 us_per_token=0.816858 tflops=218.224 blocks_per_cu=4 lds=9728 batch_tile=256
+
+config=3 family=2 requested_shape=qkv rc=0 wall_s=0.387
+config=foldfree+preshuffle family=2 shape=qkv m=10240 n=8192 k=5120 median_us=4500.976 us_per_token=0.549436 tflops=190.846 blocks_per_cu=4 lds=9728 batch_tile=256
+
+config=3 family=2 requested_shape=z rc=0 wall_s=0.288
+config=foldfree+preshuffle family=2 shape=z m=6144 n=8192 k=5120 median_us=2765.811 us_per_token=0.337623 tflops=186.345 blocks_per_cu=4 lds=9728 batch_tile=256

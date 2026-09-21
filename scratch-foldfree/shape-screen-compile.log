@@ -1,0 +1,167 @@
+=== config=0 family=0 rc=0 ===
+In file included from scratch-foldfree/bench_foldfree.hip:47:
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark: Function Name: bench_symfold_gate [-Rpass-analysis=kernel-resource-usage]
+  424 | ) {
+      | ^
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     TotalSGPRs: 32 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     VGPRs: 186 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+
+=== config=0 family=1 rc=0 ===
+In file included from scratch-foldfree/bench_foldfree.hip:47:
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark: Function Name: bench_symfold_residual [-Rpass-analysis=kernel-resource-usage]
+  391 | ) {
+      | ^
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     TotalSGPRs: 30 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     VGPRs: 191 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+
+=== config=0 family=2 rc=0 ===
+In file included from scratch-foldfree/bench_foldfree.hip:47:
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark: Function Name: bench_symfold_qkvza [-Rpass-analysis=kernel-resource-usage]
+  379 | ) {
+      | ^
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     TotalSGPRs: 38 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     VGPRs: 206 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     Occupancy [waves/SIMD]: 7 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+
+=== config=1 family=0 rc=0 ===
+In file included from scratch-foldfree/bench_foldfree.hip:59:
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:130:1: remark: Function Name: gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+  130 |     float* Y_gate, float* Y_up, int gate_m, int up_m, int K, int N) {
+      | ^
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:130:1: remark:     TotalSGPRs: 36 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:130:1: remark:     VGPRs: 185 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:130:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:130:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:130:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:130:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:130:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:130:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+
+=== config=1 family=1 rc=0 ===
+In file included from scratch-foldfree/bench_foldfree.hip:59:
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:116:1: remark: Function Name: gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+  116 |     float* Y_res, int res_m, int K, int N) {
+      | ^
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:116:1: remark:     TotalSGPRs: 36 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:116:1: remark:     VGPRs: 185 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:116:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:116:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:116:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:116:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:116:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:116:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+
+=== config=1 family=2 rc=0 ===
+In file included from scratch-foldfree/bench_foldfree.hip:59:
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:110:1: remark: Function Name: gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+  110 |     int qkv_m, int z_m, int beta_m, int alpha_m, int K, int N) {
+      | ^
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:110:1: remark:     TotalSGPRs: 61 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:110:1: remark:     VGPRs: 185 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:110:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:110:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:110:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:110:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:110:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip:110:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+
+=== config=2 family=0 rc=0 ===
+In file included from scratch-foldfree/bench_foldfree.hip:47:
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark: Function Name: bench_symfold_gate [-Rpass-analysis=kernel-resource-usage]
+  424 | ) {
+      | ^
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     TotalSGPRs: 34 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     VGPRs: 188 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:424:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+
+=== config=2 family=1 rc=0 ===
+In file included from scratch-foldfree/bench_foldfree.hip:47:
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark: Function Name: bench_symfold_residual [-Rpass-analysis=kernel-resource-usage]
+  391 | ) {
+      | ^
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     TotalSGPRs: 34 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     VGPRs: 191 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:391:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+
+=== config=2 family=2 rc=0 ===
+In file included from scratch-foldfree/bench_foldfree.hip:47:
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark: Function Name: bench_symfold_qkvza [-Rpass-analysis=kernel-resource-usage]
+  379 | ) {
+      | ^
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     TotalSGPRs: 38 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     VGPRs: 208 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     Occupancy [waves/SIMD]: 7 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:379:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+
+=== config=3 family=0 rc=0 ===
+In file included from scratch-foldfree/bench_foldfree.hip:81:
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:134:1: remark: Function Name: bench_pair_gate [-Rpass-analysis=kernel-resource-usage]
+  134 |     float* Y_gate, float* Y_up, int gate_m, int up_m, int K, int N) {
+      | ^
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:134:1: remark:     TotalSGPRs: 29 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:134:1: remark:     VGPRs: 193 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:134:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:134:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:134:1: remark:     Occupancy [waves/SIMD]: 7 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:134:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:134:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:134:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+
+=== config=3 family=1 rc=0 ===
+In file included from scratch-foldfree/bench_foldfree.hip:81:
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:120:1: remark: Function Name: bench_pair_residual [-Rpass-analysis=kernel-resource-usage]
+  120 |     float* Y_res, int res_m, int K, int N) {
+      | ^
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:120:1: remark:     TotalSGPRs: 30 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:120:1: remark:     VGPRs: 191 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:120:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:120:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:120:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:120:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:120:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:120:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+
+=== config=3 family=2 rc=0 ===
+In file included from scratch-foldfree/bench_foldfree.hip:81:
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:114:1: remark: Function Name: bench_pair_qkvza [-Rpass-analysis=kernel-resource-usage]
+  114 |     int qkv_m, int z_m, int beta_m, int alpha_m, int K, int N) {
+      | ^
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:114:1: remark:     TotalSGPRs: 52 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:114:1: remark:     VGPRs: 190 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:114:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:114:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:114:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:114:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:114:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-foldfree/../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip:114:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
