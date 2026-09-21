@@ -206,6 +206,63 @@ extern "C" __global__ void quantize_int4_mmq_ds128(
     block_i4_128* out = Y + (long long)kblock * N + token;
     quantize_block_i4_128_wave<false>(xv, out, lane);
 }
+// Coarser-granularity RTN quantizer used by the guarded gfx1201 quality gate.
+// One workgroup owns one (token, K-window), reduces a single amax over
+// `group_k` values, and repeats d=amax/7 in every 128-K header in the window.
+// The nibble conversion is intentionally the same rintf + [-8,7] clamp as the
+// one-candidate producer specialization above. The symmetric gfx1201 consumer
+// does not read `s`, so it is explicitly zeroed.
+extern "C" __global__ void quantize_int4_mmq_grouped(
+    const float* __restrict__ X,
+    block_i4_128* __restrict__ Y,
+    int K,
+    int N,
+    int group_k
+) {
+    const int token = blockIdx.y;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int wave = tid >> 5;
+    const int begin = blockIdx.x * group_k;
+    const int end = min(begin + group_k, K);
+    if (token >= N || begin >= K) return;
+
+    __shared__ float wave_max[8];
+    float amax = 0.0f;
+    for (int i = begin + tid; i < end; i += blockDim.x)
+        amax = fmaxf(amax, fabsf(X[(long long)token * K + i]));
+    for (int offset = 16; offset > 0; offset >>= 1)
+        amax = fmaxf(amax, __shfl_xor(amax, offset, 32));
+    if (lane == 0) wave_max[wave] = amax;
+    __syncthreads();
+    if (tid == 0) {
+        float window_max = wave_max[0];
+        #pragma unroll
+        for (int w = 1; w < 8; ++w)
+            window_max = fmaxf(window_max, wave_max[w]);
+        wave_max[0] = (window_max == 0.0f) ? 1.0f : window_max / 7.0f;
+    }
+    __syncthreads();
+    const float d = wave_max[0];
+
+    const int first_block = begin / 128;
+    const int block_count = (end - begin) / 128;
+    for (int b = tid; b < block_count; b += blockDim.x) {
+        block_i4_128* out = Y + (long long)(first_block + b) * N + token;
+        out->d = d;
+        out->s = 0;
+    }
+    for (int byte = tid; byte < (end - begin) / 2; byte += blockDim.x) {
+        const int i = begin + byte * 2;
+        float q0 = rintf(X[(long long)token * K + i] / d);
+        float q1 = rintf(X[(long long)token * K + i + 1] / d);
+        q0 = fminf(fmaxf(q0, -8.0f), 7.0f);
+        q1 = fminf(fmaxf(q1, -8.0f), 7.0f);
+        block_i4_128* out = Y + (long long)(i / 128) * N + token;
+        out->qs[(i & 127) >> 1] =
+            (unsigned char)(((int)q0 & 15) | (((int)q1 & 15) << 4));
+    }
+}
 #endif // HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE
 
 #endif // HIPFIRE_BLOCK_I4_128_QUANT_HIP

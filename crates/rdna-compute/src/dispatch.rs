@@ -40,6 +40,10 @@ pub const LLOYD_MQ3_GROUP_BYTES: usize = 112;
 /// stride-mismatch bugs (followup discipline from
 /// docs/plans/mq-lloyd-batched-prefill-followup.md).
 pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
+#[inline]
+fn iu4_activation_uses_fused_sidecar(k: usize) -> bool {
+    crate::scratch::iu4_activation_group_k(k) == 128
+}
 
 /// HIP `hipDeviceAttribute_t` ordinal for `hipDeviceAttributeIntegrated`
 /// ("Device is integrated GPU"). Pinned by enumerating the CUDA-compatible
@@ -3045,7 +3049,8 @@ impl Gpu {
     /// writeback), so the old %128 multiple was grid convenience only.
     /// Default on for the IU4 route (`HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts out).
     pub fn iu4_silu_quant_fused_active(&self, batch: usize, k: usize) -> bool {
-        self.flags.gfx12_silu_quant_fused_enabled()
+        iu4_activation_uses_fused_sidecar(k)
+            && self.flags.gfx12_silu_quant_fused_enabled()
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
@@ -3060,7 +3065,8 @@ impl Gpu {
     /// `iu4_silu_quant_fused_active`; the GDN fused producer additionally
     /// requires head_dim == 128 at its callsite helper.
     pub fn iu4_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
-        self.flags.gfx12_producer_quant_fused_enabled()
+        iu4_activation_uses_fused_sidecar(k)
+            && self.flags.gfx12_producer_quant_fused_enabled()
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode
