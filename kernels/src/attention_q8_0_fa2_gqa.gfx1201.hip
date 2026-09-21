@@ -2362,16 +2362,15 @@ void attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
 
     extern __shared__ uint32_t LDS[];
     unsigned char* K8 = (unsigned char*)LDS;
-    unsigned char* V8 = (unsigned char*)LDS + 16384;
-    uint32_t* SCR = LDS + 8192 + (unsigned)wave * 512u;
+    uint32_t* VRAW = LDS + 4096;
     const uint16_t* SK =
-        (const uint16_t*)((const unsigned char*)LDS + 49152);
+        (const uint16_t*)((const unsigned char*)LDS + 32768);
     const uint16_t* SV =
-        (const uint16_t*)((const unsigned char*)LDS + 49280);
+        (const uint16_t*)((const unsigned char*)LDS + 32896);
 
     // One-time query-position bound reduction. The two barrier costs are
     // outside the KV loop and the scale-header bytes are overwritten later.
-    int* bounds = (int*)((unsigned char*)LDS + 49152);
+    int* bounds = (int*)((unsigned char*)LDS + 32768);
     if (tid == 0) {
         bounds[0] = -1;
         bounds[1] = 0x7fffffff;
@@ -2437,8 +2436,11 @@ void attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
             }
         }
 
-        // Only eight waves are needed to stage the common V64 tile.
+        // Eight waves stage V in its stored row-major byte layout. Every
+        // compute wave forms the WMMA fragments it needs directly from this
+        // raw plane, avoiding the separate 16 KiB transpose destination.
         if (wave < 8) {
+            uint32_t* vraw = VRAW + (unsigned)wave * 512u;
 #pragma unroll 4
             for (int r = 0; r < 8; ++r) {
                 const int gkey = ktile + wave * 8 + r;
@@ -2450,58 +2452,10 @@ void attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
                     v = *(const unsigned long long*)(
                         rrow + (unsigned)lane * 8u);
                 }
-                SCR[((r * 64 + lane * 2) ^ ((r & 3) * 8))] =
+                vraw[((r * 64 + lane * 2) ^ ((r & 3) * 8))] =
                     (uint32_t)(v & 0xffffffffULL);
-                SCR[((r * 64 + lane * 2 + 1) ^ ((r & 3) * 8))] =
+                vraw[((r * 64 + lane * 2 + 1) ^ ((r & 3) * 8))] =
                     (uint32_t)(v >> 32);
-            }
-        }
-        // Each transpose wave consumes only its own private SCR region.
-        // A wave barrier is sufficient; the later workgroup barrier publishes
-        // completed K/V planes to all 24 compute waves.
-        __builtin_amdgcn_wave_barrier();
-
-        if (wave < 8) {
-            const int sub = wave >> 1;
-            const int r = ml & 3;
-            const int dq = ml >> 2;
-            const uint32_t rbase0 = (uint32_t)r * 64u;
-            const uint32_t rbase1 = (uint32_t)(r + 4) * 64u;
-            const uint32_t rmask = (uint32_t)(r & 3) * 8u;
-            const uint32_t sel1 =
-                ((r & 1) == 0) ? 0x06020400u : 0x03070105u;
-            const uint32_t sel2 =
-                (r < 2) ? 0x05040100u : 0x03020706u;
-            if (((lane >> 4) & 1) == (wave & 1)) {
-#pragma unroll 4
-                for (int p = 0; p < 8; ++p) {
-                    uint4 store = {0u, 0u, 0u, 0u};
-                    uint32_t* s32 = (uint32_t*)&store;
-#pragma unroll
-                    for (int h = 0; h < 2; ++h) {
-                        const int dc = 2 * p + h;
-                        const uint32_t w = (uint32_t)(dc * 4 + dq);
-                        const uint32_t d0 = SCR[((rbase0 + w) ^ rmask)];
-                        const uint32_t d1 = SCR[((rbase1 + w) ^ rmask)];
-                        uint32_t e0 =
-                            (uint32_t)__shfl_xor((int)d0, 1, 32);
-                        e0 = __builtin_amdgcn_perm(e0, d0, sel1);
-                        uint32_t e1 =
-                            (uint32_t)__shfl_xor((int)d1, 1, 32);
-                        e1 = __builtin_amdgcn_perm(e1, d1, sel1);
-                        const uint32_t f0 =
-                            (uint32_t)__shfl_xor((int)e0, 2, 32);
-                        s32[h * 2] =
-                            __builtin_amdgcn_perm(f0, e0, sel2);
-                        const uint32_t f1 =
-                            (uint32_t)__shfl_xor((int)e1, 2, 32);
-                        s32[h * 2 + 1] =
-                            __builtin_amdgcn_perm(f1, e1, sel2);
-                    }
-                    *(uint4*)(V8
-                        + (unsigned)(((sub * 8 + p) * 32 + lane) * 16))
-                        = store;
-                }
             }
         }
 
@@ -2518,8 +2472,8 @@ void attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
                 svv = (uint16_t)vr[1024 + kv_h * 2]
                     | ((uint16_t)vr[1024 + kv_h * 2 + 1] << 8);
             }
-            ((uint16_t*)((unsigned char*)LDS + 49152))[tid] = skv;
-            ((uint16_t*)((unsigned char*)LDS + 49280))[tid] = svv;
+            ((uint16_t*)((unsigned char*)LDS + 32768))[tid] = skv;
+            ((uint16_t*)((unsigned char*)LDS + 32896))[tid] = svv;
         }
         __syncthreads();
 
@@ -2621,10 +2575,44 @@ void attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
             p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
                 sacc[6] / b_ref, sacc[7] / b_ref, p1, true);
             const v2i_t pb = {(int)p0, (int)p1};
+            const int vr = ml & 3;
+            const int vdq = ml >> 2;
+            const uint32_t vrbase0 = (uint32_t)vr * 64u;
+            const uint32_t vrbase1 = (uint32_t)(vr + 4) * 64u;
+            const uint32_t vrmask = (uint32_t)(vr & 3) * 8u;
+            const uint32_t vsel1 =
+                ((vr & 1) == 0) ? 0x06020400u : 0x03070105u;
+            const uint32_t vsel2 =
+                (vr < 2) ? 0x05040100u : 0x03020706u;
+            const uint32_t* vraw =
+                VRAW + (unsigned)(sub * 2 + (lane >> 4)) * 512u;
 #pragma unroll
             for (int p = 0; p < 8; ++p) {
-                const uint4 vv = *(const uint4*)(V8
-                    + (unsigned)(((sub * 8 + p) * 32 + lane) * 16));
+                uint4 vv = {0u, 0u, 0u, 0u};
+                uint32_t* v32 = (uint32_t*)&vv;
+#pragma unroll
+                for (int h = 0; h < 2; ++h) {
+                    const int dc = 2 * p + h;
+                    const uint32_t w = (uint32_t)(dc * 4 + vdq);
+                    const uint32_t d0 =
+                        vraw[((vrbase0 + w) ^ vrmask)];
+                    const uint32_t d1 =
+                        vraw[((vrbase1 + w) ^ vrmask)];
+                    uint32_t e0 =
+                        (uint32_t)__shfl_xor((int)d0, 1, 32);
+                    e0 = __builtin_amdgcn_perm(e0, d0, vsel1);
+                    uint32_t e1 =
+                        (uint32_t)__shfl_xor((int)d1, 1, 32);
+                    e1 = __builtin_amdgcn_perm(e1, d1, vsel1);
+                    const uint32_t f0 =
+                        (uint32_t)__shfl_xor((int)e0, 2, 32);
+                    v32[h * 2] =
+                        __builtin_amdgcn_perm(f0, e0, vsel2);
+                    const uint32_t f1 =
+                        (uint32_t)__shfl_xor((int)e1, 2, 32);
+                    v32[h * 2 + 1] =
+                        __builtin_amdgcn_perm(f1, e1, vsel2);
+                }
                 const v2i_t va0 = {(int)vv.x, (int)vv.y};
                 const v2i_t va1 = {(int)vv.z, (int)vv.w};
                 Ofr[2 * p] =
