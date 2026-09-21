@@ -1,0 +1,15 @@
+[hardware]
+devices = "GPU-085289909a86cc63"
+
+[experimental.graph]
+forward = true
+
+[kernel]
+iu4_prefill = true
+gfx12_silu_quant_fused = false
+gfx12_producer_quant_fused = false
+gfx12_fp8_stream = false
+
+[developer]
+iu4_global_a_screen = "1"
+iu4_shift_foldfree = "1"
