@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import mmap
+import struct
 import os
 import re
 import shutil
@@ -192,6 +193,7 @@ class PackedSpec:
     scale: torch.Tensor
     grid: torch.Tensor
     packed: torch.Tensor
+    pow2_half: bool
 
 
 class ArtifactReader:
@@ -200,6 +202,12 @@ class ArtifactReader:
         self.summary, self.tensor_map = astrea.read_hfq_index(path, max_tensors=0)
         self.handle = path.open("rb")
         self.mapped = mmap.mmap(self.handle.fileno(), 0, access=mmap.ACCESS_READ)
+        metadata_offset = struct.unpack_from("<Q", self.mapped, 16)[0]
+        data_offset = struct.unpack_from("<Q", self.mapped, 24)[0]
+        metadata_region = self.mapped[metadata_offset:data_offset]
+        metadata_end = astrea.json_object_end(metadata_region)
+        self.metadata = json.loads(metadata_region[:metadata_end].decode("utf-8"))
+        self.pow2_scale = int(self.metadata.get("mq4v2.pow2scale", 0))
 
     def close(self) -> None:
         self.mapped.close()
@@ -220,7 +228,9 @@ class ArtifactReader:
         raw = self.bytes(name)
         groups = m * k // GROUP
         blocks = np.frombuffer(raw, dtype=np.uint8).reshape(groups, GROUP_BYTES)
-        grid_bits = np.frombuffer(blocks[:, :8].copy().tobytes(), dtype="<u2").reshape(m, k // GROUP, 2, 2)
+        grid_bits = np.frombuffer(blocks[:, :8].copy().tobytes(), dtype="<u2").reshape(
+            m, k // GROUP, 2, 2
+        )
         grid = torch.from_numpy(grid_bits.copy()).view(torch.float16)
         packed = torch.from_numpy(blocks[:, 8:].copy()).reshape(m, k // 2)
         sidecar = name[: -len(".weight")] + ".awq_scale.weight"
@@ -229,14 +239,12 @@ class ArtifactReader:
             if list(map(int, scale_item["shape"])) != [k] or int(scale_item["quant_type"]) != 1:
                 raise ValueError(f"{sidecar}: expected F16 [{k}]")
             scale_bits = np.frombuffer(self.bytes(sidecar), dtype="<u2").copy()
-            scale = torch.from_numpy(scale_bits).view(torch.float16)
+            scale = torch.from_numpy(scale_bits.copy()).view(torch.float16)
         else:
-            # MQ4V2 tensors without learned AWQ (notably lm_head) still use the
-            # fixed rotation with the identity diagonal S.
             scale = torch.ones(k, dtype=torch.float16)
         if not bool(torch.isfinite(scale.float()).all()) or not bool((scale > 0).all()):
             raise ValueError(f"{sidecar}: scales must be finite and positive")
-        return PackedSpec(name, m, k, scale, grid, packed)
+        return PackedSpec(name, m, k, scale, grid, packed, self.pow2_scale == 2)
 
     def q8_tensor(
         self,
@@ -280,6 +288,57 @@ class _FixedGridSTE(torch.autograd.Function):
         (inside,) = ctx.saved_tensors
         return gradient * inside, None, None
 
+@torch.no_grad()
+def pow2_half_quantize(values: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Exhaustive fold-honest MQ4V2 pow2-half oracle over each 128-value cell."""
+    rows, width = values.shape
+    groups = values.detach().float().reshape(rows, width // 128, 128)
+    amax = groups.abs().amax(dim=-1)
+    base = amax / 7.5
+    safe_base = torch.where(base > 0, base, torch.ones_like(base))
+    floor_e = torch.floor(torch.log2(safe_base)).clamp_(-14, 15).to(torch.int32)
+    ceil_e = torch.ceil(torch.log2(safe_base)).clamp_(-14, 15).to(torch.int32)
+    best_mse = torch.full_like(base, float("inf"))
+    best_codes = torch.full(groups.shape, 8, dtype=torch.uint8, device=values.device)
+    best_decoded = torch.zeros_like(groups)
+    best_scale = torch.zeros_like(base)
+    offsets = torch.arange(-8, 8, dtype=torch.float32, device=values.device)
+    half_offsets = torch.tensor(
+        [-12.0, -10.0, -9.0, -7.5, -6.0, -4.5, -3.0, -1.5,
+          0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.0],
+        dtype=torch.float32,
+        device=values.device,
+    )
+    for mantissa, normalized in ((1.0, offsets), (1.5, half_offsets)):
+        for exponent_index, exponent in enumerate((floor_e, ceil_e)):
+            two_e = torch.pow(2.0, exponent.float())
+            reconstruction = two_e.unsqueeze(-1) * normalized
+            trial_error = torch.full_like(groups, float("inf"))
+            trial_codes = torch.zeros_like(best_codes)
+            trial_decoded = torch.zeros_like(groups)
+            for code in range(16):
+                decoded = reconstruction[..., code].unsqueeze(-1)
+                error = (groups - decoded).square()
+                better = error < trial_error
+                trial_error = torch.where(better, error, trial_error)
+                trial_codes = torch.where(
+                    better, torch.full_like(trial_codes, code), trial_codes
+                )
+                trial_decoded = torch.where(better, decoded, trial_decoded)
+            mse = trial_error.sum(dim=-1)
+            if exponent_index == 1:
+                mse = torch.where(
+                    ceil_e != floor_e, mse, torch.full_like(mse, float("inf"))
+                )
+            better_cell = (mse < best_mse) & (amax > 0)
+            best_mse = torch.where(better_cell, mse, best_mse)
+            best_codes = torch.where(better_cell.unsqueeze(-1), trial_codes, best_codes)
+            best_decoded = torch.where(
+                better_cell.unsqueeze(-1), trial_decoded, best_decoded
+            )
+            best_scale = torch.where(better_cell, mantissa * two_e, best_scale)
+    grid = torch.stack((best_scale, -8.0 * best_scale), dim=-1).to(torch.float16)
+    return best_decoded.reshape(rows, width), grid, best_codes.reshape(rows, width)
 
 class PackedQATLinear(nn.Module):
     """Packed incumbent grid plus a merge-before-quantize rotated-basis adapter."""
@@ -302,6 +361,7 @@ class PackedQATLinear(nn.Module):
         self.compute_dtype = compute_dtype
         self.lora_scale = float(lora_alpha / rank)
         self.route = "p4"
+        self.pow2_half = spec.pow2_half
         self.register_buffer("awq_scale", spec.scale.to(device), persistent=False)
         self.register_buffer("grid", spec.grid.to(device), persistent=False)
         self.register_buffer("packed_codes", spec.packed.to(device), persistent=False)
@@ -338,7 +398,21 @@ class PackedQATLinear(nn.Module):
     def _base_rows(self, start: int, end: int) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         scale, zero = self._grid_rows(start, end)
         codes = self._codes(start, end).float()
-        base = torch.where(scale != 0, codes * scale + zero, zero)
+        if self.pow2_half:
+            exponent = torch.floor(torch.log2(torch.where(scale > 0, scale, torch.ones_like(scale))))
+            mantissa = scale / torch.pow(2.0, exponent)
+            half_offsets = torch.tensor(
+                [-12.0, -10.0, -9.0, -7.5, -6.0, -4.5, -3.0, -1.5,
+                  0.0, 1.5, 3.0, 4.5, 6.0, 7.5, 9.0, 10.0],
+                dtype=torch.float32,
+                device=codes.device,
+            )
+            normalized = torch.where(
+                mantissa == 1.5, half_offsets[codes.long()], codes - 8.0
+            )
+            base = torch.where(scale > 0, normalized * torch.pow(2.0, exponent), 0.0)
+        else:
+            base = torch.where(scale != 0, codes * scale + zero, zero)
         return base, scale, zero
 
     def fake_weight_rows(self, start: int = 0, end: int | None = None) -> torch.Tensor:
@@ -348,6 +422,9 @@ class PackedQATLinear(nn.Module):
             merged = base + self.lora_scale * (self.lora_b[start:end] @ self.lora_a)
         else:
             merged = base
+        if self.pow2_half and self.adapted:
+            decoded, _, _ = pow2_half_quantize(merged)
+            return merged + (decoded - merged).detach()
         return _FixedGridSTE.apply(merged, scale, zero)
 
     @torch.no_grad()
@@ -381,31 +458,52 @@ class PackedQATLinear(nn.Module):
         return output.reshape(*shape, self.out_features).to(original_dtype)
 
     @torch.no_grad()
-    def exported_codes(self, row_chunk: int, assert_initial: bool = False) -> torch.Tensor:
-        chunks: list[torch.Tensor] = []
+    def exported_quantization(
+        self, row_chunk: int, assert_initial: bool = False
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        code_chunks: list[torch.Tensor] = []
+        grid_chunks: list[torch.Tensor] = []
         for start in range(0, self.out_features, row_chunk):
             end = min(start + row_chunk, self.out_features)
             base, scale, zero = self._base_rows(start, end)
             merged = base
             if self.adapted:
                 merged = merged + self.lora_scale * (self.lora_b[start:end] @ self.lora_a)
-            safe = torch.where(scale != 0, scale, torch.ones_like(scale))
-            selected = torch.where(
-                scale != 0,
-                torch.floor((merged - zero) / safe + 0.5).clamp_(0, 15),
-                torch.zeros_like(merged),
-            ).to(torch.uint8)
-            if assert_initial and not torch.equal(selected, self._codes(start, end)):
-                mismatches = int((selected != self._codes(start, end)).sum().item())
-                raise AssertionError(f"{self.artifact_name}: B=0 changed {mismatches} incumbent codes")
-            chunks.append(selected.cpu())
-        return torch.cat(chunks, dim=0)
+            if self.pow2_half:
+                _, selected_grid, selected = pow2_half_quantize(merged)
+                selected_grid = selected_grid.reshape(
+                    end - start, self.in_features // GROUP, 2, 2
+                )
+            else:
+                safe = torch.where(scale != 0, scale, torch.ones_like(scale))
+                selected = torch.where(
+                    scale != 0,
+                    torch.floor((merged - zero) / safe + 0.5).clamp_(0, 15),
+                    torch.zeros_like(merged),
+                ).to(torch.uint8)
+                selected_grid = self.grid[start:end]
+            if assert_initial:
+                incumbent = self._codes(start, end)
+                if not torch.equal(selected, incumbent):
+                    mismatches = int((selected != incumbent).sum().item())
+                    raise AssertionError(
+                        f"{self.artifact_name}: B=0 changed {mismatches} incumbent codes"
+                    )
+                if not torch.equal(
+                    selected_grid.contiguous().view(torch.int16),
+                    self.grid[start:end].contiguous().view(torch.int16),
+                ):
+                    raise AssertionError(f"{self.artifact_name}: B=0 changed incumbent pow2h grid")
+            code_chunks.append(selected.cpu())
+            grid_chunks.append(selected_grid.cpu())
+        return torch.cat(grid_chunks, dim=0), torch.cat(code_chunks, dim=0)
 
     def record_tensors(self, row_chunk: int, assert_initial: bool) -> dict[str, torch.Tensor]:
+        grid, codes = self.exported_quantization(row_chunk, assert_initial)
         return {
             "S_f16": self.awq_scale.detach().cpu(),
-            "d_z_f16": self.grid.detach().cpu(),
-            "codes_u8": self.exported_codes(row_chunk, assert_initial),
+            "d_z_f16": grid,
+            "codes_u8": codes,
         }
 
 
@@ -915,11 +1013,19 @@ def export_artifact(
     output_sha = sha256_file(output)
     output_reader = ArtifactReader(output)
     adapted_by_name = {wrapper.artifact_name: wrapper for wrapper in adapted}
-    for name in names:
-        source_zero = adapted_by_name[name].grid[..., 1].contiguous().view(torch.int16).cpu()
-        output_zero = output_reader.spec(name).grid[..., 1].contiguous().view(torch.int16).cpu()
-        if not torch.equal(output_zero, source_zero):
-            raise AssertionError(f"{name}: exported MQ4V2 zero points changed")
+    pow2_half = any(wrapper.pow2_half for wrapper in adapted)
+    if pow2_half:
+        if output_reader.pow2_scale != 2:
+            raise AssertionError(
+                f"export lost mq4v2.pow2scale=2 metadata: {output_reader.pow2_scale}"
+            )
+    else:
+        for name in names:
+            source_zero = adapted_by_name[name].grid[..., 1].contiguous().view(torch.int16).cpu()
+            output_zero = output_reader.spec(name).grid[..., 1].contiguous().view(torch.int16).cpu()
+            if not torch.equal(output_zero, source_zero):
+                raise AssertionError(f"{name}: exported MQ4V2 zero points changed")
+    output_reader.close()
     _, output_map = astrea.read_hfq_index(output, max_tensors=0)
     touched_input = tensor_digest(args.artifact, tensor_map, names)
     touched_output = tensor_digest(output, output_map, names)
@@ -951,7 +1057,8 @@ def export_artifact(
         "touched_source_sha256": touched_input,
         "touched_output_sha256": touched_output,
         "touched_changed": changed,
-        "zero_points_preserved": True,
+        "zero_points_preserved": not pow2_half,
+        "mq4v2_pow2scale": 2 if pow2_half else 0,
         "seconds": time.monotonic() - started,
         "quantizer_stderr": completed.stderr.strip(),
         "merged_bf16": merged_bf16,
@@ -1098,6 +1205,34 @@ def logsumexp_tiles(
     return result
 
 
+@torch.no_grad()
+def teacher_statistics(
+    args: argparse.Namespace,
+    teacher_hidden: torch.Tensor,
+    teacher_head: torch.Tensor,
+    completion_mask: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    vocab = teacher_head.shape[0]
+    teacher_lse = logsumexp_tiles(
+        teacher_hidden,
+        vocab,
+        args.logit_tile_vocab,
+        lambda value, begin, end: value.to(torch.bfloat16) @ teacher_head[begin:end].T,
+    )
+    entropy = torch.zeros_like(teacher_lse)
+    for start in range(0, vocab, args.logit_tile_vocab):
+        end = min(start + args.logit_tile_vocab, vocab)
+        logits = (teacher_hidden.to(torch.bfloat16) @ teacher_head[start:end].T).float()
+        log_probability = logits - teacher_lse.unsqueeze(-1)
+        probability = torch.exp(log_probability)
+        entropy -= (probability * log_probability).sum(dim=-1)
+    entropy_weight = 1.0 + 2.0 * (1.0 - entropy / math.log(vocab))
+    token_weight = entropy_weight.clamp_(1.0, 3.0) * completion_mask.float()
+    if not bool((token_weight.sum() > 0).item()):
+        raise RuntimeError("sequence has no completion tokens for the QAT objective")
+    return teacher_lse, token_weight
+
+
 def full_route_backward(
     args: argparse.Namespace,
     model: nn.Module,
@@ -1105,6 +1240,8 @@ def full_route_backward(
     teacher_head: torch.Tensor,
     tokens: torch.Tensor,
     teacher_final: torch.Tensor,
+    teacher_lse: torch.Tensor,
+    token_weight: torch.Tensor,
     route: str,
     divisor: float,
 ) -> dict[str, float]:
@@ -1129,13 +1266,7 @@ def full_route_backward(
             *student_shape, end - begin
         ),
     )
-    teacher_lse = logsumexp_tiles(
-        teacher_hidden,
-        vocab,
-        tile,
-        lambda value, begin, end: value.to(torch.bfloat16) @ teacher_head[begin:end].T,
-    )
-    token_count = labels.numel()
+    weight_sum = token_weight.sum()
     kl_weight = args.p4_kl_weight if route == "p4" else args.p8_kl_weight
     ce_weight = args.p4_ce_weight if route == "p4" else 0.0
     kl_value = 0.0
@@ -1149,7 +1280,7 @@ def full_route_backward(
             teacher_logits = teacher_hidden.to(torch.bfloat16) @ teacher_head[start:end].T
             teacher_logits = teacher_logits.float()
             teacher_probability = torch.exp(teacher_logits - teacher_lse.unsqueeze(-1))
-        kl = (
+        kl_per_token = (
             teacher_probability
             * (
                 teacher_logits
@@ -1157,22 +1288,26 @@ def full_route_backward(
                 - student_logits
                 + student_lse.unsqueeze(-1)
             )
-        ).sum() / token_count
+        ).sum(dim=-1)
+        kl = (kl_per_token * token_weight).sum() / weight_sum
         in_tile = (labels >= start) & (labels < end)
         if bool(in_tile.any()):
             positions = in_tile.nonzero(as_tuple=False)
             local = labels[in_tile] - start
             selected = student_logits[positions[:, 0], positions[:, 1], local]
-            ce_logits = -selected.sum() / token_count
+            ce_logits = -(selected * token_weight[in_tile]).sum() / weight_sum
         else:
             ce_logits = student_logits.sum() * 0.0
-        softmax_mass = torch.exp(student_logits - student_lse.unsqueeze(-1)).sum() / token_count
+        softmax_mass = (
+            torch.exp(student_logits - student_lse.unsqueeze(-1)).sum(dim=-1)
+            * token_weight
+        ).sum() / weight_sum
         correction = (kl_weight + ce_weight) * (softmax_mass - softmax_mass.detach())
         loss = (kl_weight * kl + ce_weight * ce_logits + correction) / divisor
         loss.backward()
         kl_value += float(kl.detach().item())
         ce_value += float(ce_logits.detach().item())
-    ce_value += float(student_lse.mean().item())
+    ce_value += float((student_lse * token_weight).sum().item() / weight_sum.item())
     if prepared.grad is None:
         raise AssertionError("tiled vocabulary objective produced no activation gradient")
     prepared_original.backward(prepared.grad)
@@ -1190,11 +1325,15 @@ def full_eval_sequence(
     teacher_head: torch.Tensor,
     tokens: torch.Tensor,
     teacher_final: torch.Tensor,
+    teacher_lse: torch.Tensor,
+    token_weight: torch.Tensor,
     route: str,
 ) -> dict[str, float]:
     set_route(wrappers, route)
     with torch.no_grad():
-        student_hidden = model.model(input_ids=tokens, use_cache=False, return_dict=True).last_hidden_state[:, :-1]
+        student_hidden = model.model(
+            input_ids=tokens, use_cache=False, return_dict=True
+        ).last_hidden_state[:, :-1]
         teacher_hidden = teacher_final[:, :-1]
         labels = tokens[:, 1:]
         head = model.lm_head
@@ -1208,10 +1347,7 @@ def full_eval_sequence(
                 *student_shape, end - begin
             ),
         )
-        teacher_lse = logsumexp_tiles(
-            teacher_hidden, head.out_features, args.logit_tile_vocab,
-            lambda value, begin, end: value.to(torch.bfloat16) @ teacher_head[begin:end].T,
-        )
+        weight_sum = token_weight.sum()
         kl = 0.0
         target_logits = torch.empty_like(student_lse)
         for start in range(0, head.out_features, args.logit_tile_vocab):
@@ -1219,20 +1355,30 @@ def full_eval_sequence(
             student_logits = head.forward_prepared_rows(prepared, start, end).reshape(
                 *student_shape, end - start
             ).float()
-            teacher_logits = (teacher_hidden.to(torch.bfloat16) @ teacher_head[start:end].T).float()
+            teacher_logits = (
+                teacher_hidden.to(torch.bfloat16) @ teacher_head[start:end].T
+            ).float()
             probability = torch.exp(teacher_logits - teacher_lse.unsqueeze(-1))
-            kl += float(
-                (
-                    probability
-                    * (teacher_logits - teacher_lse.unsqueeze(-1) - student_logits + student_lse.unsqueeze(-1))
-                ).sum(dim=-1).mean().item()
-            )
+            kl_per_token = (
+                probability
+                * (
+                    teacher_logits
+                    - teacher_lse.unsqueeze(-1)
+                    - student_logits
+                    + student_lse.unsqueeze(-1)
+                )
+            ).sum(dim=-1)
+            kl += float(((kl_per_token * token_weight).sum() / weight_sum).item())
             in_tile = (labels >= start) & (labels < end)
             if bool(in_tile.any()):
                 positions = in_tile.nonzero(as_tuple=False)
                 local = labels[in_tile] - start
-                target_logits[in_tile] = student_logits[positions[:, 0], positions[:, 1], local]
-        ce = float((-target_logits + student_lse).mean().item())
+                target_logits[in_tile] = student_logits[
+                    positions[:, 0], positions[:, 1], local
+                ]
+        ce = float(
+            (((-target_logits + student_lse) * token_weight).sum() / weight_sum).item()
+        )
     return {"kl": kl, "ce": ce}
 
 
@@ -1253,17 +1399,44 @@ def full_eval(
     token_array = np.memmap(
         args.capture / token_meta["file"], dtype="<u4", mode="r", shape=tuple(token_meta["shape"])
     )
+    loss_meta = manifest["corpus"].get("loss_mask")
+    loss_array = (
+        np.memmap(
+            args.capture / loss_meta["file"],
+            dtype=np.uint8,
+            mode="r",
+            shape=tuple(loss_meta["shape"]),
+        )
+        if loss_meta is not None
+        else None
+    )
     sums = {"p4_kl": 0.0, "p4_ce": 0.0, "p8_kl": 0.0}
     was_training = model.training
     model.eval()
     for sequence in range(train_count, train_count + count):
-        tokens = torch.from_numpy(np.asarray(token_array[sequence]).astype(np.int64)).view(1, seq_len).to(device)
+        tokens = torch.from_numpy(np.asarray(token_array[sequence]).astype(np.int64)).view(
+            1, seq_len
+        ).to(device)
+        completion_mask = (
+            torch.ones((1, seq_len - 1), dtype=torch.float32, device=device)
+            if loss_array is None
+            else torch.from_numpy(np.asarray(loss_array[sequence, 1:]).copy())
+            .view(1, seq_len - 1)
+            .to(device)
+        )
         with torch.no_grad():
             teacher = teacher_model.model(
                 input_ids=tokens, use_cache=False, return_dict=True
             ).last_hidden_state
-        p4 = full_eval_sequence(args, model, wrappers, teacher_head, tokens, teacher, "p4")
-        p8 = full_eval_sequence(args, model, wrappers, teacher_head, tokens, teacher, "p8")
+            teacher_lse, token_weight = teacher_statistics(
+                args, teacher[:, :-1], teacher_head, completion_mask
+            )
+        p4 = full_eval_sequence(
+            args, model, wrappers, teacher_head, tokens, teacher, teacher_lse, token_weight, "p4"
+        )
+        p8 = full_eval_sequence(
+            args, model, wrappers, teacher_head, tokens, teacher, teacher_lse, token_weight, "p8"
+        )
         sums["p4_kl"] += p4["kl"]
         sums["p4_ce"] += p4["ce"]
         sums["p8_kl"] += p8["kl"]
@@ -1338,6 +1511,17 @@ def run_full(
     token_array = np.memmap(
         args.capture / token_meta["file"], dtype="<u4", mode="r", shape=tuple(token_meta["shape"])
     )
+    loss_meta = manifest["corpus"].get("loss_mask")
+    loss_array = (
+        np.memmap(
+            args.capture / loss_meta["file"],
+            dtype=np.uint8,
+            mode="r",
+            shape=tuple(loss_meta["shape"]),
+        )
+        if loss_meta is not None
+        else None
+    )
     history: list[dict[str, Any]] = [{"step": 0, "heldout": initial_eval}]
     processed_tokens = 0
     started = time.monotonic()
@@ -1352,8 +1536,41 @@ def run_full(
                 teacher = teacher_model.model(
                     input_ids=tokens, use_cache=False, return_dict=True
                 ).last_hidden_state
-            p4 = full_route_backward(args, model, wrappers, teacher_head, tokens, teacher, "p4", args.accumulate)
-            p8 = full_route_backward(args, model, wrappers, teacher_head, tokens, teacher, "p8", args.accumulate)
+            completion_mask = (
+                torch.ones((1, seq_len - 1), dtype=torch.float32, device=device)
+                if loss_array is None
+                else torch.from_numpy(np.asarray(loss_array[sequence, 1:]).copy())
+                .view(1, seq_len - 1)
+                .to(device)
+            )
+            with torch.no_grad():
+                teacher_lse, token_weight = teacher_statistics(
+                    args, teacher[:, :-1], teacher_head, completion_mask
+                )
+            p4 = full_route_backward(
+                args,
+                model,
+                wrappers,
+                teacher_head,
+                tokens,
+                teacher,
+                teacher_lse,
+                token_weight,
+                "p4",
+                args.accumulate,
+            )
+            p8 = full_route_backward(
+                args,
+                model,
+                wrappers,
+                teacher_head,
+                tokens,
+                teacher,
+                teacher_lse,
+                token_weight,
+                "p8",
+                args.accumulate,
+            )
             totals["p4_kl"] += p4["kl"] / args.accumulate
             totals["p4_ce"] += p4["ce"] / args.accumulate
             totals["p8_kl"] += p8["kl"] / args.accumulate
