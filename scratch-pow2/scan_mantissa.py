@@ -71,6 +71,9 @@ def f16_to_f32(bits):
     return -v if s else v
 
 off = data_off
+mode = sys.argv[2] if len(sys.argv) > 2 else "pow2"
+allowed = {0x000} if mode == "pow2" else {0x000, 0x200}
+print(f"mode={mode} allowed_mantissas={[hex(a) for a in sorted(allowed)]}")
 total_groups = 0
 checked = 0
 bad_mantissa = 0
@@ -96,7 +99,7 @@ for (name, qt, shape, gs, dl) in tensors:
                 zero_scale += 1
                 continue
             checked += 1
-            if s & 0x3FF:
+            if (s & 0x3FF) not in allowed:
                 bad_mantissa += 1
                 if len(bad_examples) < 5:
                     bad_examples.append((name, g, hex(s)))

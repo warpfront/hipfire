@@ -149,6 +149,7 @@ struct FormatFlags {
 
 static MQ4V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
 static MQ4V2_POW2_SCALE: OnceLock<bool> = OnceLock::new();
+static MQ4V2_POW2_HALF: OnceLock<bool> = OnceLock::new();
 
 fn quantize_mq4g256v2_selected(
     weights: &[f32],
@@ -158,7 +159,9 @@ fn quantize_mq4g256v2_selected(
     signs2: &[f32],
 ) -> Vec<u8> {
     if MQ4V2_SYMMETRIC.get().copied().unwrap_or(false) {
-        if MQ4V2_POW2_SCALE.get().copied().unwrap_or(false) {
+        if MQ4V2_POW2_HALF.get().copied().unwrap_or(false) {
+            quantize_mq4g256v2_symmetric_pow2_half(weights, m, k, signs1, signs2)
+        } else if MQ4V2_POW2_SCALE.get().copied().unwrap_or(false) {
             quantize_mq4g256v2_symmetric_pow2(weights, m, k, signs1, signs2)
         } else {
             quantize_mq4g256v2_symmetric(weights, m, k, signs1, signs2)
@@ -1225,12 +1228,23 @@ pub(crate) fn run() {
         eprintln!("error: --mq4v2-pow2-scale requires --mq4v2-symmetric");
         std::process::exit(1);
     }
+    if args.mq4v2_pow2_scale_half && !use_mq4v2 {
+        eprintln!("error: --mq4v2-pow2-scale-half currently requires --format mq4v2");
+        std::process::exit(1);
+    }
+    if args.mq4v2_pow2_scale_half && !args.mq4v2_symmetric {
+        eprintln!("error: --mq4v2-pow2-scale-half requires --mq4v2-symmetric");
+        std::process::exit(1);
+    }
     MQ4V2_SYMMETRIC
         .set(args.mq4v2_symmetric)
         .expect("MQ4V2_SYMMETRIC set twice — should not happen");
     MQ4V2_POW2_SCALE
         .set(args.mq4v2_pow2_scale)
         .expect("MQ4V2_POW2_SCALE set twice — should not happen");
+    MQ4V2_POW2_HALF
+        .set(args.mq4v2_pow2_scale_half)
+        .expect("MQ4V2_POW2_HALF set twice — should not happen");
     if args.mq4v2_symmetric {
         eprintln!(
             "MQ4V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-8*d)"
@@ -1238,6 +1252,9 @@ pub(crate) fn run() {
     }
     if args.mq4v2_pow2_scale {
         eprintln!("MQ4V2 pow2 scale: ENABLED (per-128 d restricted to power of two)");
+    }
+    if args.mq4v2_pow2_scale_half {
+        eprintln!("MQ4V2 pow2-half scale: ENABLED (per-128 d = m*2^e with m 1 or 1.5)");
     }
     if awq_enabled {
         if IMATRIX.get().is_none() {
@@ -1735,6 +1752,9 @@ pub(crate) fn run() {
     }
     if args.mq4v2_pow2_scale {
         metadata["mq4v2.pow2scale"] = serde_json::json!(1);
+    }
+    if args.mq4v2_pow2_scale_half {
+        metadata["mq4v2.pow2scale"] = serde_json::json!(2);
     }
     // `mut` so the SP4b bake-prune path can patch the routed-expert count down to
     // the kept count before write_hfq (so the baked model loads with the compact

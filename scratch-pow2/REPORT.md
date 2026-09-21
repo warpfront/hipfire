@@ -60,3 +60,58 @@ Restricting `d` to pow2 costs ~+0.02 KLD on both routes at c24 with zero
 kernel changes (fold-free hypothesis still untested — needs the GEMM-side
 fold measurement from the receipt). Whether +0.02 is acceptable is a
 main-agent call; the artifact and both numbers are above.
+
+---
+
+# Follow-up: pow2-half (`m * 2^e`, m in {1, 1.5}) + fold-honest MSE
+
+Impl commit `f640ae2` (unpushed; same branch `mq4v2-pow2-scale`).
+
+## Flag diff
+
+- `cli.rs`: new `--mq4v2-pow2-scale-half` (`requires = "mq4v2_symmetric"`,
+  `conflicts_with = "mq4v2_pow2_scale"`; both guards probed via `--help`
+  invocations).
+- `quant_fwht.rs`: new `e4m3_rne()` (RNE into the fp8 E4M3 grid, 3 mantissa
+  bits) + `quantize_mq4g256v2_symmetric_pow2_half` wrapper; impl gains
+  `pow2_half: bool`. BOTH pow2 modes now use fold-honest MSE selection AND
+  final code choice: per candidate `d = m * 2^e`, all 16 codes are scored
+  under `recon = e4m3((code-8) * m) * 2^e` (exhaustive per-element argmin;
+  for m = 1 the fold is the identity since integers -8..7 sit exactly on the
+  e4m3 grid). Half mode: 4 candidates (floor/ceil octave x {1, 1.5}) as exact
+  f16 (`(biased << 10) | (m == 1.5 ? 0x200 : 0)`); zero = `f16(-8d)` (exact
+  for both m). Ladder (asym + plain symmetric) paths untouched.
+- `pipeline.rs`: `MQ4V2_POW2_HALF` static, dispatch, validation, banner, and
+  metadata `mq4v2.pow2scale = 2`.
+
+## Artifact
+
+- Path: `/home/kaden/qcal/qat/v25/qwen3.8-27b.mq4v2.xt.sym-pow2h-a035.hfq`
+- Size: 14987185152 bytes (14987.2 MB, same as pow2/sym)
+- sha256: `febf70570354ccf8867ae2c7330da0dd80b4263e3ce2603f724abd62eccaf7c8`
+- Metadata: `mq4v2.symmetric = 1`, `mq4v2.pow2scale = 2`.
+- Quantize wall time 864 s (vs 299 s for full pow2 — exhaustive 16-code
+  search over up to 4 candidates).
+
+## Mantissa check
+
+- Same scanner, `half` mode (allowed mantissas 0x000/0x200): 497 qt44
+  tensors, 100085760 groups, 3469316 scales sampled, 0 bad mantissa,
+  0 bad zero. → PASS.
+
+## KLD (same harness/flags as c24 screen)
+
+| artifact | route | chunks | KLD | NLL | PPL |
+|---|---|---|---|---|---|
+| sym-pow2h | fp8v2 | 24 | **0.057072** | 1.883551 | 6.5768 |
+| sym-pow2h | iu4 (pin) | 2 | **0.071897** | 2.269302 | 9.6726 |
+
+Context: shipped sym fp8v2 c24 0.0491; full-pow2 fp8v2 c24 0.070638; full-pow2
+fp8v2 c2 0.058107; shipped fp8v2 c2 0.040442.
+
+## Reading
+
+Half recovers most of the full-pow2 cost on the fold-capable route: +0.0080
+over baseline vs +0.0215 for strict pow2. The remaining gap is the honest
+folded error (1.5x products that round in e4m3, e.g. 10.5 -> 10), i.e. close
+to the best a fold-free fp8 kernel can do with a 2-bit mantissa choice.

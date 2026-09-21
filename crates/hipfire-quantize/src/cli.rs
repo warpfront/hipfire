@@ -222,6 +222,18 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, requires = "mq4v2_symmetric")]
     pub mq4v2_pow2_scale: bool,
 
+    /// Restrict the symmetric per-128 scale `d` to `m * 2^e` with m in
+    /// {1, 1.5} (f16 mantissa 0x000 or 0x200), zero = `-8*d`. Four candidates
+    /// bracket base = amax/7.5 (floor/ceil octave x {1, 1.5}). Both pow2 modes
+    /// use fold-honest MSE/code choice (e4m3((code-8) * m) * 2^e). Alternative
+    /// to `--mq4v2-pow2-scale`. Wire format unchanged (f16 `d`).
+    #[arg(
+        long,
+        requires = "mq4v2_symmetric",
+        conflicts_with = "mq4v2_pow2_scale"
+    )]
+    pub mq4v2_pow2_scale_half: bool,
+
     /// Replace selected MQ4V2-XT tensors in an existing HFQ with trained final
     /// codes. PATH is one frozen-record `.safetensors` file or a directory of
     /// them; each record carries metadata `name,M,K,qt,source_sha` and tensors

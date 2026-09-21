@@ -315,6 +315,38 @@ pub(crate) fn pack_mq4g256v2_from_f16_grid(
     pack_mq4g256v2_from_codes(m, k, &headers, codes)
 }
 
+/// Round-to-nearest-even into the fp8 E4M3 grid (1 sign, 4 exponent bits
+/// bias 8, 3 mantissa bits), returned as f32. Models what a fold-free fp8
+/// kernel computes for the mantissa product: `e4m3((code - 8) * m) * 2^e`.
+/// Steps: |x| in [8,16) step 1, [4,8) step 0.5, [2,4) step 0.25, etc.
+/// Normal-range grid; our folded operands (|x| <= 12 or exact 0) never hit
+/// the subnormal or saturation paths, which clamp defensively.
+fn e4m3_rne(x: f32) -> f32 {
+    if x == 0.0 {
+        return 0.0;
+    }
+    let neg = x < 0.0;
+    let ax = x.abs();
+    let mut exp = ax.log2().floor() as i32;
+    exp = exp.clamp(-6, 8);
+    let step = 2f32.powi(exp - 3);
+    let q = ax / step;
+    let lo = q.floor();
+    let frac = q - lo;
+    let round_up = frac > 0.5 || (frac == 0.5 && (lo as i64 & 1) == 1);
+    let mut n = if round_up { lo + 1.0 } else { lo };
+    let mut e = exp;
+    if n >= 16.0 {
+        n = 8.0;
+        e += 1;
+    }
+    let mut v = n * 2f32.powi(e - 3);
+    if v > 448.0 {
+        v = 448.0;
+    }
+    if neg { -v } else { v }
+}
+
 pub(crate) fn quantize_mq4g256v2(
     w: &[f32],
     m: usize,
@@ -322,7 +354,7 @@ pub(crate) fn quantize_mq4g256v2(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, false, false)
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, false, false, false)
 }
 
 /// MQ4V2 with a symmetric per-128 grid in the existing affine wire format.
@@ -338,13 +370,16 @@ pub(crate) fn quantize_mq4g256v2_symmetric(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, true, false)
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, true, false, false)
 }
 
 /// MQ4V2 symmetric variant with the per-128 scale `d` restricted to an exact
 /// power of two (zero f16 mantissa), zero = f16(-8d). Wire format unchanged.
 /// Candidates bracket base = amax/7.5: {2^floor(log2 base), 2^ceil(log2 base)}
-/// as exact f16 powers of two (0/subnormal skipped); same MSE selection.
+/// as exact f16 powers of two (0/subnormal skipped). Candidate MSE and final
+/// code choice are fold-honest: reconstruction is e4m3((code-8) * m) * 2^e,
+/// what a fold-free fp8 kernel computes (identity here since m = 1 keeps
+/// (code-8) exactly on the e4m3 grid).
 pub(crate) fn quantize_mq4g256v2_symmetric_pow2(
     w: &[f32],
     m: usize,
@@ -352,7 +387,21 @@ pub(crate) fn quantize_mq4g256v2_symmetric_pow2(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, true, true)
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, true, true, false)
+}
+
+/// MQ4V2 symmetric half-pow2 variant: `d = m * 2^e` with m in {1, 1.5}
+/// (f16 mantissa 0x000 or 0x200), zero = f16(-8d). Four candidates bracket
+/// base = amax/7.5 (floor/ceil octave x {1, 1.5}); fold-honest MSE and code
+/// choice as above (1.5x products round into e4m3, e.g. 10.5 -> 10).
+pub(crate) fn quantize_mq4g256v2_symmetric_pow2_half(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, true, true, true)
 }
 
 fn quantize_mq4g256v2_impl(
@@ -363,6 +412,7 @@ fn quantize_mq4g256v2_impl(
     signs2: &[f32],
     symmetric: bool,
     pow2_scale: bool,
+    pow2_half: bool,
 ) -> Vec<u8> {
     assert!(k % 256 == 0, "MQ4V2 requires K % 256 == 0, got K={k}");
     assert_eq!(w.len(), m * k, "w.len() {} != m*k {}*{}={}", w.len(), m, k, m * k);
@@ -389,57 +439,80 @@ fn quantize_mq4g256v2_impl(
                 }
 
                 if pow2_scale {
-                    // Power-of-two scale: candidates bracket base = amax/7.5 as
-                    // exact f16 powers of two (zero mantissa); 0/subnormal
-                    // skipped. Same MSE selection, zero = f16(-8d).
+                    // Fold-honest scale search: d = m * 2^e with m = 1, or
+                    // m in {1, 1.5} for the half variant (f16 mantissa 0x000
+                    // or 0x200). Octaves bracket base = amax/7.5 (up to 4
+                    // candidates: floor/ceil x {1, 1.5}); 0/subnormal skipped.
+                    // A fold-free fp8 kernel reconstructs e4m3((code-8) * m)
+                    // * 2^e, so both candidate MSE and the final per-code
+                    // choice search all 16 codes under that reconstruction.
                     let base = amax / 7.5;
                     let log2b = base.log2();
                     let floor_e = log2b.floor() as i32;
                     let ceil_e = log2b.ceil() as i32;
-                    let mut candidates = [0u16; 2];
-                    let mut candidate_count = 0;
                     let mut exponents = [floor_e, ceil_e];
                     if floor_e == ceil_e {
                         exponents[1] = i32::MIN;
                     }
-                    for exponent in exponents {
-                        if exponent == i32::MIN {
-                            continue;
+                    let mantissas: &[f32] = if pow2_half { &[1.0, 1.5] } else { &[1.0] };
+                    // (f16 scale bits, mantissa m, octave e)
+                    let mut candidates = [(0u16, 1.0f32, 0i32); 4];
+                    let mut candidate_count = 0;
+                    for &mantissa in mantissas {
+                        for &exponent in &exponents {
+                            if exponent == i32::MIN {
+                                continue;
+                            }
+                            let biased = exponent + 15;
+                            if !(1..=30).contains(&biased) {
+                                continue;
+                            }
+                            let mut bits = (biased as u16) << 10;
+                            if mantissa == 1.5 {
+                                bits |= 0x0200;
+                            }
+                            candidates[candidate_count] = (bits, mantissa, exponent);
+                            candidate_count += 1;
                         }
-                        let biased = exponent + 15;
-                        if !(1..=30).contains(&biased) {
-                            continue;
-                        }
-                        candidates[candidate_count] = (biased as u16) << 10;
-                        candidate_count += 1;
                     }
                     if candidate_count == 0 {
-                        let clamped = (floor_e + 15).clamp(1, 30) as u16;
-                        candidates[0] = clamped << 10;
+                        let clamped = (floor_e + 15).clamp(1, 30);
+                        candidates[0] = ((clamped as u16) << 10, 1.0, clamped - 15);
                         candidate_count = 1;
                     }
                     let mut best_mse = f64::INFINITY;
+                    let mut best_codes = [0u8; 128];
                     for i in 0..candidate_count {
-                        let scale_bits = candidates[i];
-                        let scale = f16_to_f32(scale_bits);
-                        if scale == 0.0 {
-                            continue;
+                        let (scale_bits, mantissa, exponent) = candidates[i];
+                        let two_e = 2f32.powi(exponent);
+                        let mut recon = [0.0f32; 16];
+                        for code in 0..16 {
+                            recon[code] = e4m3_rne((code as f32 - 8.0) * mantissa) * two_e;
                         }
-                        let zero_bits = f32_to_f16(-8.0 * scale);
-                        let zero = f16_to_f32(zero_bits);
-                        let inverse = 1.0 / scale;
                         let mut mse = 0.0f64;
-                        for &value in values {
-                            let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, 15.0);
-                            let error = value - code.mul_add(scale, zero);
-                            mse += (error as f64) * (error as f64);
+                        let mut trial = [0u8; 128];
+                        for (j, &value) in values.iter().enumerate() {
+                            let mut best_code = 0usize;
+                            let mut best_err = f64::INFINITY;
+                            for code in 0..16 {
+                                let err = (value - recon[code]) as f64;
+                                let sq = err * err;
+                                if sq < best_err {
+                                    best_err = sq;
+                                    best_code = code;
+                                }
+                            }
+                            trial[j] = best_code as u8;
+                            mse += best_err;
                         }
                         if mse < best_mse {
                             best_mse = mse;
                             scales[half] = scale_bits;
-                            zeros[half] = zero_bits;
+                            zeros[half] = f32_to_f16(-8.0 * f16_to_f32(scale_bits));
+                            best_codes = trial;
                         }
                     }
+                    codes[offset..offset + 128].copy_from_slice(&best_codes);
                 } else {
                     let candidate_base = (amax / 7.5) * 0.5;
                     let multipliers = [
@@ -470,14 +543,14 @@ fn quantize_mq4g256v2_impl(
                             zeros[half] = zero_bits;
                         }
                     }
-                }
-                let scale = f16_to_f32(scales[half]);
-                let zero = f16_to_f32(zeros[half]);
-                let inverse = 1.0 / scale;
-                for i in 0..128 {
-                    codes[offset + i] =
-                        ((group[offset + i] - zero) * inverse + 0.5).floor().clamp(0.0, 15.0)
-                            as u8;
+                    let scale = f16_to_f32(scales[half]);
+                    let zero = f16_to_f32(zeros[half]);
+                    let inverse = 1.0 / scale;
+                    for i in 0..128 {
+                        codes[offset + i] =
+                            ((group[offset + i] - zero) * inverse + 0.5).floor().clamp(0.0, 15.0)
+                                as u8;
+                    }
                 }
             } else {
                 let lo = values.iter().copied().fold(f32::INFINITY, f32::min);
