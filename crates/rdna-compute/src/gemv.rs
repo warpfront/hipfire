@@ -3299,14 +3299,31 @@ impl Gpu {
                 "fused_rmsnorm_rotate_mq_i4_gfx12_batched: reservation (k,n) mismatch",
             ));
         }
+        let cheap = self.a4_rowglobal_cheap_active();
+        if cheap && (x_rot.is_none() || reservation.tile_amax_ptr().is_null()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rowglobal cheap RMSNorm producer requires x_rot and tile-amax scratch",
+            ));
+        }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let (module, source, kernel) = match (cheap, awq.is_some()) {
+            (true, true) => (
+                "fused_rmsnorm_mq_rotate_awq_i4_rowglobal_cheap_gfx12",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_ROWGLOBAL_CHEAP_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i4_rowglobal_cheap_gfx12",
+            ),
+            (true, false) => (
+                "fused_rmsnorm_mq_rotate_i4_rowglobal_cheap_gfx12",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_I4_ROWGLOBAL_CHEAP_GFX12_SRC,
+                "fused_rmsnorm_mq_rotate_i4_rowglobal_cheap_gfx12",
+            ),
+            (false, true) => (
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "fused_rmsnorm_mq_rotate_i4_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_i4_gfx12",
@@ -3324,35 +3341,31 @@ impl Gpu {
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
         let mut i4p = reservation.ptr();
+        let mut amp = reservation.tile_amax_ptr();
         let mut kv = k as i32;
         let mut eps_v = eps;
         let mut nv = batch_size as i32;
-        let mut params: Vec<*mut c_void> = if awq.is_some() {
-            vec![
-                &mut xp as *mut _ as *mut c_void,
-                &mut wp as *mut _ as *mut c_void,
-                &mut awp as *mut _ as *mut c_void,
-                &mut s1 as *mut _ as *mut c_void,
-                &mut s2 as *mut _ as *mut c_void,
-                &mut xrp as *mut _ as *mut c_void,
-                &mut i4p as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-                &mut eps_v as *mut _ as *mut c_void,
-                &mut nv as *mut _ as *mut c_void,
-            ]
-        } else {
-            vec![
-                &mut xp as *mut _ as *mut c_void,
-                &mut wp as *mut _ as *mut c_void,
-                &mut s1 as *mut _ as *mut c_void,
-                &mut s2 as *mut _ as *mut c_void,
-                &mut xrp as *mut _ as *mut c_void,
-                &mut i4p as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-                &mut eps_v as *mut _ as *mut c_void,
-                &mut nv as *mut _ as *mut c_void,
-            ]
-        };
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+        ];
+        if awq.is_some() {
+            params.push(&mut awp as *mut _ as *mut c_void);
+        }
+        params.extend([
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut i4p as *mut _ as *mut c_void,
+        ]);
+        if cheap {
+            params.push(&mut amp as *mut _ as *mut c_void);
+        }
+        params.extend([
+            &mut kv as *mut _ as *mut c_void,
+            &mut eps_v as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ]);
         let block_size = 256u32;
         let shared_mem = if x_rot.is_some() {
             ((k + 256) * std::mem::size_of::<f32>()) as u32
@@ -3361,16 +3374,7 @@ impl Gpu {
         };
         let blocks_k = k / 128;
         let bytes = (k * 4 * 3 + 2 * 256 * 4 + blocks_k * 72) * batch_size;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            if awq.is_some() {
-                "fused_rmsnorm_mq_rotate_awq_i4_gfx12_batched"
-            } else {
-                "fused_rmsnorm_mq_rotate_i4_gfx12_batched"
-            },
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
             [batch_size as u32, 1, 1],
@@ -3388,6 +3392,9 @@ impl Gpu {
                 b.push_ptr(s2);
                 b.push_ptr(xrp);
                 b.push_ptr(i4p);
+                if cheap {
+                    b.push_ptr(amp);
+                }
                 b.push_i32(kv);
                 b.push_f32(eps_v);
                 b.push_i32(nv);
@@ -3401,6 +3408,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
+        if cheap {
+            self.finalize_int4_mmq_rowglobal_cheap(x_rot.unwrap(), &reservation)?;
+        }
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
     /// gfx1201 FP8-stream producer: RMSNorm/FWHT + whole-row scale + E4M3
@@ -3881,14 +3891,31 @@ impl Gpu {
                 "fused_silu_mul_rotate_mq_i4_gfx12_batched: reservation (k,n) mismatch",
             ));
         }
+        let cheap = self.a4_rowglobal_cheap_active();
+        if cheap && (x_rot.is_none() || reservation.tile_amax_ptr().is_null()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rowglobal cheap SiLU producer requires x_rot and tile-amax scratch",
+            ));
+        }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let (module, source, kernel) = match (cheap, awq.is_some()) {
+            (true, true) => (
+                "fused_silu_mul_mq_rotate_awq_i4_rowglobal_cheap_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_ROWGLOBAL_CHEAP_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_awq_i4_rowglobal_cheap_gfx12",
+            ),
+            (true, false) => (
+                "fused_silu_mul_mq_rotate_i4_rowglobal_cheap_gfx12",
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_I4_ROWGLOBAL_CHEAP_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_i4_rowglobal_cheap_gfx12",
+            ),
+            (false, true) => (
                 "fused_silu_mul_mq_rotate_awq_i4_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_awq_i4_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "fused_silu_mul_mq_rotate_i4_gfx12",
                 kernels::FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_SRC,
                 "fused_silu_mul_mq_rotate_i4_gfx12",
@@ -3907,44 +3934,32 @@ impl Gpu {
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
         let mut i4p = reservation.ptr();
+        let mut amp = reservation.tile_amax_ptr();
         let mut kv = k as i32;
         let mut nv = batch_size as i32;
-        let mut params: Vec<*mut c_void> = if awq.is_some() {
-            vec![
-                &mut gp as *mut _ as *mut c_void,
-                &mut up_p as *mut _ as *mut c_void,
-                &mut awp as *mut _ as *mut c_void,
-                &mut s1 as *mut _ as *mut c_void,
-                &mut s2 as *mut _ as *mut c_void,
-                &mut xrp as *mut _ as *mut c_void,
-                &mut i4p as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-                &mut nv as *mut _ as *mut c_void,
-            ]
-        } else {
-            vec![
-                &mut gp as *mut _ as *mut c_void,
-                &mut up_p as *mut _ as *mut c_void,
-                &mut s1 as *mut _ as *mut c_void,
-                &mut s2 as *mut _ as *mut c_void,
-                &mut xrp as *mut _ as *mut c_void,
-                &mut i4p as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-                &mut nv as *mut _ as *mut c_void,
-            ]
-        };
+        let mut params: Vec<*mut c_void> = vec![
+            &mut gp as *mut _ as *mut c_void,
+            &mut up_p as *mut _ as *mut c_void,
+        ];
+        if awq.is_some() {
+            params.push(&mut awp as *mut _ as *mut c_void);
+        }
+        params.extend([
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut i4p as *mut _ as *mut c_void,
+        ]);
+        if cheap {
+            params.push(&mut amp as *mut _ as *mut c_void);
+        }
+        params.extend([
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ]);
         let blocks_k = k / 128;
         let bytes = (k * 4 * 3 + 2 * 256 * 4 + blocks_k * 72) * batch_size;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            if awq.is_some() {
-                "fused_silu_mul_mq_rotate_awq_i4_gfx12_batched"
-            } else {
-                "fused_silu_mul_mq_rotate_i4_gfx12_batched"
-            },
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
             [n_groups, batch_size as u32, 1],
@@ -3962,6 +3977,9 @@ impl Gpu {
                 b.push_ptr(s2);
                 b.push_ptr(xrp);
                 b.push_ptr(i4p);
+                if cheap {
+                    b.push_ptr(amp);
+                }
                 b.push_i32(kv);
                 b.push_i32(nv);
                 b
@@ -3974,6 +3992,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
+        if cheap {
+            self.finalize_int4_mmq_rowglobal_cheap(x_rot.unwrap(), &reservation)?;
+        }
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
 
@@ -4302,14 +4323,31 @@ impl Gpu {
                 "gated_norm_rotate_mq_i4_gfx12_batched: reservation (k,n) mismatch",
             ));
         }
+        let cheap = self.a4_rowglobal_cheap_active();
+        if cheap && (x_rot.is_none() || reservation.tile_amax_ptr().is_null()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rowglobal cheap gated-norm producer requires x_rot and tile-amax scratch",
+            ));
+        }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let (module, source, kernel) = match (cheap, awq.is_some()) {
+            (true, true) => (
+                "gated_norm_mq_rotate_awq_i4_rowglobal_cheap_gfx12",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_ROWGLOBAL_CHEAP_GFX12_SRC,
+                "gated_norm_mq_rotate_awq_i4_rowglobal_cheap_gfx12",
+            ),
+            (true, false) => (
+                "gated_norm_mq_rotate_i4_rowglobal_cheap_gfx12",
+                kernels::GATED_NORM_MQ_ROTATE_I4_ROWGLOBAL_CHEAP_GFX12_SRC,
+                "gated_norm_mq_rotate_i4_rowglobal_cheap_gfx12",
+            ),
+            (false, true) => (
                 "gated_norm_mq_rotate_awq_i4_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC,
                 "gated_norm_mq_rotate_awq_i4_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "gated_norm_mq_rotate_i4_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_SRC,
                 "gated_norm_mq_rotate_i4_gfx12",
@@ -4326,6 +4364,7 @@ impl Gpu {
         let mut s2 = s2_ptr;
         let mut xrp = x_rot.map(|t| t.buf.as_ptr()).unwrap_or(std::ptr::null_mut());
         let mut i4p = reservation.ptr();
+        let mut amp = reservation.tile_amax_ptr();
         let mut nh = n_heads as i32;
         let mut hd = head_dim as i32;
         let mut ep = eps;
@@ -4339,34 +4378,27 @@ impl Gpu {
         if awq.is_some() {
             params.push(&mut awp as *mut _ as *mut c_void);
         }
-        params.extend(
-            [
-                &mut s1 as *mut _ as *mut c_void,
-                &mut s2 as *mut _ as *mut c_void,
-                &mut xrp as *mut _ as *mut c_void,
-                &mut i4p as *mut _ as *mut c_void,
-                &mut nh as *mut _ as *mut c_void,
-                &mut hd as *mut _ as *mut c_void,
-                &mut ep as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-                &mut nv as *mut _ as *mut c_void,
-            ]
-            .into_iter(),
-        );
+        params.extend([
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut xrp as *mut _ as *mut c_void,
+            &mut i4p as *mut _ as *mut c_void,
+        ]);
+        if cheap {
+            params.push(&mut amp as *mut _ as *mut c_void);
+        }
+        params.extend([
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ]);
         let blocks_k = k / 128;
         let bytes = (crate::profile::gated_norm_bytes(k) + crate::profile::mq_rotate_bytes(k)
             + blocks_k * 72)
             * batch_size;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            if awq.is_some() {
-                "gated_norm_mq_rotate_awq_i4_gfx12_batched"
-            } else {
-                "gated_norm_mq_rotate_i4_gfx12_batched"
-            },
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
             [(k / 256) as u32, batch_size as u32, 1],
@@ -4385,6 +4417,9 @@ impl Gpu {
                 b.push_ptr(s2);
                 b.push_ptr(xrp);
                 b.push_ptr(i4p);
+                if cheap {
+                    b.push_ptr(amp);
+                }
                 b.push_i32(nh);
                 b.push_i32(hd);
                 b.push_f32(ep);
@@ -4400,6 +4435,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
+        if cheap {
+            self.finalize_int4_mmq_rowglobal_cheap(x_rot.unwrap(), &reservation)?;
+        }
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
     /// gfx1201 FP8-stream LA output producer: gated RMSNorm + AWQ/FWHT +
@@ -4998,14 +5036,31 @@ impl Gpu {
                 "rotate_x_mq_i4_gfx12_batched: reservation (k,n) mismatch",
             ));
         }
+        let cheap = self.a4_rowglobal_cheap_active();
+        if cheap && (x_out.is_none() || reservation.tile_amax_ptr().is_null()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rowglobal cheap rotate producer requires x_out and tile-amax scratch",
+            ));
+        }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let (module, source, kernel) = match (cheap, awq.is_some()) {
+            (true, true) => (
+                "mq_rotate_x_awq_i4_rowglobal_cheap_gfx12",
+                kernels::MQ_ROTATE_X_AWQ_I4_ROWGLOBAL_CHEAP_GFX12_SRC,
+                "rotate_x_mq_awq_i4_rowglobal_cheap_gfx12",
+            ),
+            (true, false) => (
+                "mq_rotate_x_i4_rowglobal_cheap_gfx12",
+                kernels::MQ_ROTATE_X_I4_ROWGLOBAL_CHEAP_GFX12_SRC,
+                "mq_rotate_x_i4_rowglobal_cheap_gfx12",
+            ),
+            (false, true) => (
                 "mq_rotate_x_awq_i4_gfx12",
                 kernels::MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
                 "rotate_x_mq_awq_i4_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "mq_rotate_x_i4_gfx12",
                 kernels::MQ_ROTATE_X_I4_GFX12_SRC,
                 "mq_rotate_x_i4_gfx12",
@@ -5020,43 +5075,30 @@ impl Gpu {
         let mut s1 = s1_ptr;
         let mut s2 = s2_ptr;
         let mut i4p = reservation.ptr();
+        let mut amp = reservation.tile_amax_ptr();
         let mut kv = k as i32;
         let mut nv = batch_size as i32;
-        let mut params: Vec<*mut c_void> = if awq.is_some() {
-            vec![
-                &mut xp as *mut _ as *mut c_void,
-                &mut awp as *mut _ as *mut c_void,
-                &mut xrp as *mut _ as *mut c_void,
-                &mut s1 as *mut _ as *mut c_void,
-                &mut s2 as *mut _ as *mut c_void,
-                &mut i4p as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-                &mut nv as *mut _ as *mut c_void,
-            ]
-        } else {
-            vec![
-                &mut xp as *mut _ as *mut c_void,
-                &mut xrp as *mut _ as *mut c_void,
-                &mut s1 as *mut _ as *mut c_void,
-                &mut s2 as *mut _ as *mut c_void,
-                &mut i4p as *mut _ as *mut c_void,
-                &mut kv as *mut _ as *mut c_void,
-                &mut nv as *mut _ as *mut c_void,
-            ]
-        };
+        let mut params: Vec<*mut c_void> = vec![&mut xp as *mut _ as *mut c_void];
+        if awq.is_some() {
+            params.push(&mut awp as *mut _ as *mut c_void);
+        }
+        params.extend([
+            &mut xrp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut i4p as *mut _ as *mut c_void,
+        ]);
+        if cheap {
+            params.push(&mut amp as *mut _ as *mut c_void);
+        }
+        params.extend([
+            &mut kv as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
+        ]);
         let blocks_k = k / 128;
         let bytes =
             (k * 4 * 2 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fwht",
-            if awq.is_some() {
-                "rotate_x_mq_awq_i4_gfx12_batched"
-            } else {
-                "mq_rotate_x_i4_gfx12_batched"
-            },
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", kernel, bytes);
         let result = self.launch_maybe_blob(
             kernel,
             [((k / 256) * batch_size) as u32, 1, 1],
@@ -5073,6 +5115,9 @@ impl Gpu {
                 b.push_ptr(s1);
                 b.push_ptr(s2);
                 b.push_ptr(i4p);
+                if cheap {
+                    b.push_ptr(amp);
+                }
                 b.push_i32(kv);
                 b.push_i32(nv);
                 b
@@ -5085,6 +5130,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
+        if cheap {
+            self.finalize_int4_mmq_rowglobal_cheap(x_out.unwrap(), &reservation)?;
+        }
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
     /// gfx1201 row-wide FWHT producer with optional sigmoid gate and AWQ
@@ -5272,14 +5320,28 @@ impl Gpu {
                 "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched: reservation (k,n) mismatch",
             ));
         }
+        let cheap = self.a4_rowglobal_cheap_active();
+        if cheap && (x_out.is_none() || reservation.tile_amax_ptr().is_null()) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rowglobal cheap sigmoid producer requires x_out and tile-amax scratch",
+            ));
+        }
         self.ensure_mq_signs()?;
-        const MODULE: &str = "sigmoid_mul_rotate_x_mq_awq_i4_gfx12";
-        const KERNEL: &str = "sigmoid_mul_rotate_x_mq_awq_i4_gfx12";
-        self.ensure_kernel(
-            MODULE,
-            kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
-            KERNEL,
-        )?;
+        let (module, source, kernel) = if cheap {
+            (
+                "sigmoid_mul_rotate_x_mq_awq_i4_rowglobal_cheap_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_ROWGLOBAL_CHEAP_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_i4_rowglobal_cheap_gfx12",
+            )
+        } else {
+            (
+                "sigmoid_mul_rotate_x_mq_awq_i4_gfx12",
+                kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC,
+                "sigmoid_mul_rotate_x_mq_awq_i4_gfx12",
+            )
+        };
+        self.ensure_kernel(module, source, kernel)?;
         let mut ap = attn.buf.as_ptr();
         let mut gp = gate.buf.as_ptr();
         let mut awp = awq.buf.as_ptr();
@@ -5287,6 +5349,7 @@ impl Gpu {
         let mut s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let mut s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let mut i4p = reservation.ptr();
+        let mut amp = reservation.tile_amax_ptr();
         let mut kv = k as i32;
         let mut nv = batch_size as i32;
         let mut params: Vec<*mut c_void> = vec![
@@ -5297,19 +5360,19 @@ impl Gpu {
             &mut s1 as *mut _ as *mut c_void,
             &mut s2 as *mut _ as *mut c_void,
             &mut i4p as *mut _ as *mut c_void,
+        ];
+        if cheap {
+            params.push(&mut amp as *mut _ as *mut c_void);
+        }
+        params.extend([
             &mut kv as *mut _ as *mut c_void,
             &mut nv as *mut _ as *mut c_void,
-        ];
+        ]);
         let blocks_k = k / 128;
         let bytes = (k * 4 * 3 + blocks_k * 72 + 2 * 256 * 4) * batch_size;
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fwht",
-            "sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched",
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "fwht", kernel, bytes);
         let result = self.launch_maybe_blob(
-            KERNEL,
+            kernel,
             [((k / 256) * batch_size) as u32, 1, 1],
             [32, 1, 1],
             0,
@@ -5323,6 +5386,9 @@ impl Gpu {
                 b.push_ptr(s1);
                 b.push_ptr(s2);
                 b.push_ptr(i4p);
+                if cheap {
+                    b.push_ptr(amp);
+                }
                 b.push_i32(kv);
                 b.push_i32(nv);
                 b
@@ -5335,6 +5401,9 @@ impl Gpu {
             self.invalidate_x_caches_for(xrp);
         }
         result?;
+        if cheap {
+            self.finalize_int4_mmq_rowglobal_cheap(x_out.unwrap(), &reservation)?;
+        }
         Ok(crate::scratch::Int4MmqPrepared::from_reservation(reservation))
     }
     /// gfx11 FA output producer: exact sigmoid multiply + AWQ/FWHT rotate +

@@ -2177,6 +2177,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Fuse the int4 activation quantiser into the gfx1201 RMSNorm/rotate/gated-norm producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx12 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
     ),
     process_bool_field!(
+        "kernel.a4_rowglobal_cheap",
+        "a4_rowglobal_cheap",
+        Kernel,
+        false,
+        false,
+        "HIPFIRE_A4_ROWGLOBAL_CHEAP",
+        "Assemble one row-global int4 activation scale from producer-emitted K256 tile maxima, then quantize the existing F32 row in one pass (default off; exact gfx1201 IU4 prefill only)."
+    ),
+    process_bool_field!(
         "kernel.gfx11_producer_quant_fused",
         "gfx11_producer_quant_fused",
         Kernel,

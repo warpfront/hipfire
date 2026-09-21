@@ -56,6 +56,9 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
 #ifdef HIPFIRE_IU4_SIDECAR
     float* __restrict__ x_rot,          // nullable when emit_f32=false
     block_i4_128* __restrict__ x_i4,    // [K/128, N] block_i4_128
+#ifdef HIPFIRE_IU4_ROWGLOBAL_CHEAP
+    float* __restrict__ tile_amax,      // [N, K/256]
+#endif
     int K,
     float eps,
     int N
@@ -267,7 +270,11 @@ extern "C" __global__ void HIPFIRE_RMSNORM_KERNEL(
         // token = blockIdx.x; N is the batch extent for [K/128, N] layout.
         emit_iu4_sidecar_from_producer8(
             f0, f1, f2, f3, f4, f5, f6, f7,
-            x_i4, group, (int)blockIdx.x, N, lane_id);
+            x_i4,
+#ifdef HIPFIRE_IU4_ROWGLOBAL_CHEAP
+            tile_amax, K / 256,
+#endif
+            group, (int)blockIdx.x, N, lane_id);
 #else
         float4 out0;
         float4 out1;

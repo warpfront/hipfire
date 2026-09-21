@@ -252,6 +252,11 @@ pub struct FeatureFlags {
     /// Bit-identical vs the producer+quantizer chain; any byte difference
     /// kills it.
     pub gfx12_producer_quant_fused: bool,
+    /// Experimental exact-gfx1201 IU4 path: fused producers publish one
+    /// K256 amax per row/tile, then a single-pass quantizer assembles the
+    /// row-global scale without scanning the F32 activation for its maximum.
+    /// Typed key `kernel.a4_rowglobal_cheap`; default off.
+    pub a4_rowglobal_cheap: bool,
     /// gfx11 sigmoid/gated-norm + int4 quant fusions
     /// (`HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`,
     /// `kernel.gfx11_producer_quant_fused`). Default ON on gfx1100/gfx1151;
@@ -653,6 +658,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_producer_quant_fused: parse_bool("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED")
                 .unwrap_or(arch == "gfx1201"),
+            a4_rowglobal_cheap: parse_bool("HIPFIRE_A4_ROWGLOBAL_CHEAP").unwrap_or(false),
             gfx11_producer_quant_fused: parse_bool("HIPFIRE_GFX11_PRODUCER_QUANT_FUSED")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM")
@@ -826,6 +832,10 @@ impl FeatureFlags {
     pub fn gfx12_producer_quant_fused_enabled(&self) -> bool {
         self.gfx12_producer_quant_fused && self.arch == "gfx1201"
     }
+    /// True only on exact gfx1201 with the typed experiment enabled.
+    pub fn a4_rowglobal_cheap_enabled(&self) -> bool {
+        self.a4_rowglobal_cheap && self.arch == "gfx1201"
+    }
     /// True only on gfx1100/gfx1151 with the opt-in set. The `_gfx11`
     /// sigmoid/gated-norm producers emit the shared `block_i4_128` recipe,
     /// so output is bit-identical to the standalone
@@ -982,6 +992,7 @@ impl FeatureFlags {
             gfx12_silu_quant_fused: false,
             gfx12_producer_quant_fused: false,
             gfx11_producer_quant_fused: false,
+            a4_rowglobal_cheap: false,
             gfx12_fp8_stream: false,
             residual_ldsstage: false,
             gate_up_ldsstage: false,

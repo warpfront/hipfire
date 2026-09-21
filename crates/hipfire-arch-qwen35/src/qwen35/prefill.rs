@@ -130,7 +130,11 @@ fn try_gfx12_silu_quant_fused_prepared(
         gate,
         up,
         w_down.awq_scale.as_ref(),
-        if emit_f32 { Some(x_rot) } else { None },
+        if emit_f32 || gpu.a4_rowglobal_cheap_active() {
+            Some(x_rot)
+        } else {
+            None
+        },
         res,
         k,
         n,
@@ -165,7 +169,11 @@ fn try_gfx12_rmsnorm_quant_fused_prepared(
         x,
         norm_weight,
         next_linear.awq_scale.as_ref(),
-        if emit_f32 { Some(x_rot) } else { None },
+        if emit_f32 || gpu.a4_rowglobal_cheap_active() {
+            Some(x_rot)
+        } else {
+            None
+        },
         res,
         k,
         eps,
@@ -269,7 +277,11 @@ fn try_gfx12_rotate_quant_fused_prepared(
     let prep = gpu.rotate_x_mq_i4_gfx12_batched(
         x,
         wo.awq_scale.as_ref(),
-        None,
+        if gpu.a4_rowglobal_cheap_active() {
+            Some(x_rot)
+        } else {
+            None
+        },
         res,
         k,
         n,
@@ -285,6 +297,7 @@ fn try_gfx12_sigmoid_rotate_quant_fused_prepared(
     wo: &hipfire_runtime::llama::WeightTensor,
     attn: &GpuTensor,
     gate: &GpuTensor,
+    x_rot: &GpuTensor,
     k: usize,
     n: usize,
     epilogue: &BatchEpilogue<'_>,
@@ -301,7 +314,17 @@ fn try_gfx12_sigmoid_rotate_quant_fused_prepared(
     }
     let res = gpu.reserve_int4_mmq(k, n)?;
     let prep = gpu.sigmoid_mul_rotate_x_mq_awq_i4_gfx12_batched(
-        attn, gate, awq, None, res, k, n,
+        attn,
+        gate,
+        awq,
+        if gpu.a4_rowglobal_cheap_active() {
+            Some(x_rot)
+        } else {
+            None
+        },
+        res,
+        k,
+        n,
     )?;
     Ok(Some(prep))
 }
@@ -407,7 +430,11 @@ fn try_gfx12_gdn_quant_fused_prepared(
         z,
         norm_weight,
         wo.awq_scale.as_ref(),
-        None,
+        if gpu.a4_rowglobal_cheap_active() {
+            Some(x_rot)
+        } else {
+            None
+        },
         res,
         n_heads,
         head_dim,
@@ -8130,6 +8157,7 @@ fn batch_chunk_full_attn_output_projection(
         &layer.wo,
         &pbs.fa_attn_out_batch,
         &pbs.fa_gate_batch,
+        &pbs.fa_attn_out_rot_batch,
         layer.wo.k,
         n,
         &epilogue,

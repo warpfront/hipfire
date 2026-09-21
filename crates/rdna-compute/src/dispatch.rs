@@ -1374,6 +1374,8 @@ impl Gpu {
                 q8_1_mmq_x_scratch_bytes: 0,
                 int4_mmq_x_scratch: None,
                 int4_mmq_x_scratch_bytes: 0,
+                int4_mmq_tile_amax_scratch: None,
+                int4_mmq_tile_amax_scratch_bytes: 0,
                 int4_mmq_generation: 0,
                 mq4v2_fp8_x_scratch: None,
                 mq4v2_fp8_x_scratch_bytes: 0,
@@ -3018,15 +3020,47 @@ impl Gpu {
         // Mirror `reserve_int4_mmq`'s validity gate: no growth on the error path.
         if k != 0 && n != 0 && k % 256 == 0 {
             let needed = crate::scratch::int4_mmq_reserve_needed(k, n);
-            if crate::scratch::scratch_will_grow(
+            let x_will_grow = crate::scratch::scratch_will_grow(
                 self.scratch.int4_mmq_x_scratch_bytes,
                 self.scratch.int4_mmq_x_scratch.is_some(),
                 needed,
-            ) {
+            );
+            let amax_will_grow = self.flags.a4_rowglobal_cheap_enabled()
+                && crate::scratch::scratch_will_grow(
+                    self.scratch.int4_mmq_tile_amax_scratch_bytes,
+                    self.scratch.int4_mmq_tile_amax_scratch.is_some(),
+                    crate::scratch::int4_mmq_tile_amax_needed(k, n),
+                );
+            if x_will_grow || amax_will_grow {
                 self.invalidate_for_scratch_growth();
             }
         }
         self.scratch.reserve_int4_mmq(&self.hip, k, n)
+    }
+
+    /// Launch the scale-plane-only reduction plus one-pass row quantizer after
+    /// a cheap row-global fused producer has written `x_rot` and tile maxima.
+    pub(crate) fn finalize_int4_mmq_rowglobal_cheap(
+        &mut self,
+        x_rot: &GpuTensor,
+        reservation: &crate::scratch::Int4MmqReservation,
+    ) -> HipResult<()> {
+        let capture_mode = self.graphs.capture_mode;
+        let force_blob = self.flags.force_blob_path;
+        self.scratch.finalize_int4_mmq_rowglobal_cheap(
+            &self.hip,
+            &mut self.compiler,
+            &mut self.modules,
+            &mut self.functions,
+            self.active_stream.as_ref(),
+            &mut self.graphs.capture_blobs,
+            capture_mode,
+            force_blob,
+            &mut self.replay,
+            self.device_id,
+            x_rot,
+            reservation,
+        )
     }
 
     /// True when the portable producer-sidecar route is live for this call:
@@ -3049,7 +3083,7 @@ impl Gpu {
     /// writeback), so the old %128 multiple was grid convenience only.
     /// Default on for the IU4 route (`HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts out).
     pub fn iu4_silu_quant_fused_active(&self, batch: usize, k: usize) -> bool {
-        iu4_activation_uses_fused_sidecar(k)
+        (iu4_activation_uses_fused_sidecar(k) || self.flags.a4_rowglobal_cheap_enabled())
             && self.flags.gfx12_silu_quant_fused_enabled()
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
@@ -3065,7 +3099,7 @@ impl Gpu {
     /// `iu4_silu_quant_fused_active`; the GDN fused producer additionally
     /// requires head_dim == 128 at its callsite helper.
     pub fn iu4_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
-        iu4_activation_uses_fused_sidecar(k)
+        (iu4_activation_uses_fused_sidecar(k) || self.flags.a4_rowglobal_cheap_enabled())
             && self.flags.gfx12_producer_quant_fused_enabled()
             && self.flags.iu4_prefill_enabled()
             && !self.replay.is_recording()
@@ -3078,7 +3112,15 @@ impl Gpu {
     /// block. Callers use this to keep the projection on IU4 and take the
     /// standalone grouped quantizer rather than falling through to FP8.
     pub fn iu4_grouped_activation_active(&self, k: usize) -> bool {
-        self.flags.iu4_prefill_enabled() && !iu4_activation_uses_fused_sidecar(k)
+        self.flags.iu4_prefill_enabled()
+            && (!iu4_activation_uses_fused_sidecar(k)
+                || self.flags.a4_rowglobal_cheap_enabled())
+    }
+
+    /// Exact-gfx1201 typed gate for the producer-tile row-global path.
+    #[inline]
+    pub fn a4_rowglobal_cheap_active(&self) -> bool {
+        self.flags.iu4_prefill_enabled() && self.flags.a4_rowglobal_cheap_enabled()
     }
 
     /// True when a gfx11 sigmoid/gated-norm producer+quant fusion is live

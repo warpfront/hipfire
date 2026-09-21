@@ -36,6 +36,9 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
 #ifdef HIPFIRE_IU4_SIDECAR
     float* __restrict__ x_rot,          // nullable when emit_f32=false
     block_i4_128* __restrict__ x_i4,    // [K/128, N]
+#ifdef HIPFIRE_IU4_ROWGLOBAL_CHEAP
+    float* __restrict__ tile_amax,      // [N, K/256]
+#endif
     int K,
     int N
 #else
@@ -144,7 +147,11 @@ __global__ void HIPFIRE_SILU_MQ_ROTATE_KERNEL(
     }
     emit_iu4_sidecar_from_producer8(
         f0, f1, f2, f3, f4, f5, f6, f7,
-        x_i4, group, (int)blockIdx.y, N, tid);
+        x_i4,
+#ifdef HIPFIRE_IU4_ROWGLOBAL_CHEAP
+        tile_amax, K / 256,
+#endif
+        group, (int)blockIdx.y, N, tid);
 #else
     x_rot_b[base    ] = f0;
     x_rot_b[base + 1] = f1;

@@ -14,11 +14,14 @@ use hip_bridge::{
 };
 use std::collections::HashMap;
 use std::ffi::c_void;
-/// Activation-scale K span for the guarded gfx1201 IU4 experiment.
-/// The shipping path remains 128. `HIPFIRE_A4_ROWGLOBAL=1` takes precedence;
-/// `HIPFIRE_A4_GROUP_K` exists only to measure the granularity ladder.
+/// Activation-scale K span for the guarded gfx1201 IU4 experiments.
+/// The shipping path remains 128. The typed cheap-rowglobal path and the
+/// older full-row screen both take precedence over the granularity ladder.
 pub(crate) fn iu4_activation_group_k(k: usize) -> usize {
-    if hipfire_config::developer_var("HIPFIRE_A4_ROWGLOBAL").as_deref() == Ok("1") {
+    if hipfire_config::process_value("HIPFIRE_A4_ROWGLOBAL_CHEAP")
+        .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        || hipfire_config::developer_var("HIPFIRE_A4_ROWGLOBAL").as_deref() == Ok("1")
+    {
         return k;
     }
     match hipfire_config::developer_var("HIPFIRE_A4_GROUP_K")
@@ -58,6 +61,7 @@ pub struct Int4MmqReservation {
     k: usize,
     n: usize,
     generation: u64,
+    tile_amax_ptr: *mut c_void,
 }
 
 impl Int4MmqReservation {
@@ -79,6 +83,11 @@ impl Int4MmqReservation {
     #[inline]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    #[inline]
+    pub fn tile_amax_ptr(&self) -> *mut c_void {
+        self.tile_amax_ptr
     }
 }
 
@@ -187,6 +196,9 @@ pub struct ScratchState {
     /// never writes, so aliasing would corrupt both routes.
     pub int4_mmq_x_scratch: Option<DeviceBuffer>,
     pub int4_mmq_x_scratch_bytes: usize,
+    /// Per-(row,K256 tile) maxima for the cheap row-global IU4 path.
+    pub int4_mmq_tile_amax_scratch: Option<DeviceBuffer>,
+    pub int4_mmq_tile_amax_scratch_bytes: usize,
     /// Generation bumped on every `reserve_int4_mmq` so a prepared handle
     /// cannot outlive a later re-reservation of the same scratch slot.
     pub int4_mmq_generation: u64,
@@ -600,6 +612,12 @@ pub(crate) fn int4_mmq_x_needed(k: usize, batch_size: usize) -> usize {
 pub(crate) fn int4_mmq_reserve_needed(k: usize, n: usize) -> usize {
     let blocks_k = k / 128;
     blocks_k * n * 72
+}
+
+/// Byte size of the per-(row,K256 tile) f32 amax plane.
+#[inline]
+pub(crate) fn int4_mmq_tile_amax_needed(k: usize, n: usize) -> usize {
+    (k / 256) * n * std::mem::size_of::<f32>()
 }
 
 /// Byte sizes of the three MQ4v2 FP8 pre-pass buffers `(x_fp8, half_sums,
@@ -1611,6 +1629,95 @@ impl ScratchState {
         Ok(self.int4_mmq_x_scratch.as_ref().unwrap().as_ptr())
     }
 
+    /// Complete a producer-emitted tile-amax reservation by assembling the
+    /// row maximum from the scale plane and quantizing the F32 row once.
+    #[allow(clippy::too_many_arguments)]
+    pub fn finalize_int4_mmq_rowglobal_cheap(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
+        device_id: i32,
+        x: &GpuTensor,
+        reservation: &Int4MmqReservation,
+    ) -> HipResult<()> {
+        crate::graph::bind_thread(hip, device_id)?;
+        if reservation.tile_amax_ptr().is_null() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "rowglobal cheap finalizer: missing producer tile-amax plane",
+            ));
+        }
+        compile_and_load_kernel(
+            compiler,
+            hip,
+            modules,
+            functions,
+            "quantize_int4_mmq_rowglobal_cheap",
+            kernels::QUANTIZE_INT4_MMQ_ROWGLOBAL_CHEAP_SRC,
+            "quantize_int4_mmq_rowglobal_cheap",
+        )?;
+
+        let src_ptr = x.buf.as_ptr();
+        let out_ptr = reservation.ptr();
+        let amax_ptr = reservation.tile_amax_ptr();
+        let mut xp = src_ptr;
+        let mut yp = out_ptr;
+        let mut ap = amax_ptr;
+        let mut k_val = reservation.k() as i32;
+        let mut n_val = reservation.n() as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut xp as *mut _ as *mut c_void,
+            &mut yp as *mut _ as *mut c_void,
+            &mut ap as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let bytes = reservation.n() * reservation.k() * 4
+            + int4_mmq_reserve_needed(reservation.k(), reservation.n())
+            + int4_mmq_tile_amax_needed(reservation.k(), reservation.n());
+        let timer = crate::profile::begin_timer(
+            hip,
+            "quantize",
+            "quantize_int4_mmq_rowglobal_cheap",
+            bytes,
+        );
+        launch_maybe_blob(
+            hip,
+            Some(&*compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
+            "quantize_int4_mmq_rowglobal_cheap",
+            [reservation.n() as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(src_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(amax_ptr);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        )?;
+        if let Some(t) = timer {
+            t.finish(hip);
+        }
+        Ok(())
+    }
+
     /// Grow `int4_mmq_x_scratch` for a producer-emitted IU4 sidecar and bump
     /// the generation. Does **not** launch `quantize_int4_mmq_ds128` — the
     /// RMSNorm/FWHT or SwiGLU/FWHT producer writes the 72-byte blocks.
@@ -1633,6 +1740,23 @@ impl ScratchState {
             &mut self.int4_mmq_x_scratch_bytes,
             needed,
         )?;
+        let tile_amax_ptr = if hipfire_config::process_value("HIPFIRE_A4_ROWGLOBAL_CHEAP")
+            .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "yes" | "on"))
+        {
+            let amax_needed = int4_mmq_tile_amax_needed(k, n);
+            grow_scratch_buffer(
+                hip,
+                &mut self.int4_mmq_tile_amax_scratch,
+                &mut self.int4_mmq_tile_amax_scratch_bytes,
+                amax_needed,
+            )?;
+            self.int4_mmq_tile_amax_scratch
+                .as_ref()
+                .unwrap()
+                .as_ptr()
+        } else {
+            std::ptr::null_mut()
+        };
         self.int4_mmq_generation = self.int4_mmq_generation.wrapping_add(1);
         let ptr = self.int4_mmq_x_scratch.as_ref().unwrap().as_ptr();
         Ok(Int4MmqReservation {
@@ -1640,6 +1764,7 @@ impl ScratchState {
             k,
             n,
             generation: self.int4_mmq_generation,
+            tile_amax_ptr,
         })
     }
     /// Grow the three MQ4v2 FP8 pre-pass buffers for a producer-emitted FP8
