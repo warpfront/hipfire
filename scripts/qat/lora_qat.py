@@ -362,6 +362,7 @@ class PackedQATLinear(nn.Module):
         self.lora_scale = float(lora_alpha / rank)
         self.route = "p4"
         self.pow2_half = spec.pow2_half
+        self.preserve_incumbent = bool(spec.pow2_half and adapter)
         self.register_buffer("awq_scale", spec.scale.to(device), persistent=False)
         self.register_buffer("grid", spec.grid.to(device), persistent=False)
         self.register_buffer("packed_codes", spec.packed.to(device), persistent=False)
@@ -423,6 +424,11 @@ class PackedQATLinear(nn.Module):
         else:
             merged = base
         if self.pow2_half and self.adapted:
+            if self.preserve_incumbent:
+                # A zero residual is the identity transform: use the artifact's
+                # decoded codebook rather than re-solving a non-idempotent
+                # scale search over those already-decoded values.
+                return merged
             decoded, _, _ = pow2_half_quantize(merged)
             return merged + (decoded - merged).detach()
         return _FixedGridSTE.apply(merged, scale, zero)
@@ -470,10 +476,14 @@ class PackedQATLinear(nn.Module):
             if self.adapted:
                 merged = merged + self.lora_scale * (self.lora_b[start:end] @ self.lora_a)
             if self.pow2_half:
-                _, selected_grid, selected = pow2_half_quantize(merged)
-                selected_grid = selected_grid.reshape(
-                    end - start, self.in_features // GROUP, 2, 2
-                )
+                if assert_initial:
+                    selected = self._codes(start, end).to(torch.uint8)
+                    selected_grid = self.grid[start:end]
+                else:
+                    _, selected_grid, selected = pow2_half_quantize(merged)
+                    selected_grid = selected_grid.reshape(
+                        end - start, self.in_features // GROUP, 2, 2
+                    )
             else:
                 safe = torch.where(scale != 0, scale, torch.ones_like(scale))
                 selected = torch.where(
@@ -1491,6 +1501,8 @@ def run_full(
                 f"unexpected={sorted(set(initial_state) - expected)[:8]}"
             )
         load_adapter_state(adapted, initial_state)
+        for wrapper in adapted:
+            wrapper.preserve_incumbent = False
     elif any(bool(torch.count_nonzero(wrapper.lora_b).item()) for wrapper in adapted):
         raise AssertionError("LoRA B must be exactly zero at step 0")
     step0_export = export_artifact(
@@ -1581,6 +1593,8 @@ def run_full(
         for group in optimizer.param_groups:
             group["lr"] = lr
         optimizer.step()
+        for wrapper in adapted:
+            wrapper.preserve_incumbent = False
         elapsed = time.monotonic() - step_started
         row: dict[str, Any] = {
             "step": step,
