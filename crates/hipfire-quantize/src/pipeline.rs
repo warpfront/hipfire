@@ -148,6 +148,7 @@ struct FormatFlags {
 }
 
 static MQ4V2_SYMMETRIC: OnceLock<bool> = OnceLock::new();
+static MQ4V2_POW2_SCALE: OnceLock<bool> = OnceLock::new();
 
 fn quantize_mq4g256v2_selected(
     weights: &[f32],
@@ -157,7 +158,11 @@ fn quantize_mq4g256v2_selected(
     signs2: &[f32],
 ) -> Vec<u8> {
     if MQ4V2_SYMMETRIC.get().copied().unwrap_or(false) {
-        quantize_mq4g256v2_symmetric(weights, m, k, signs1, signs2)
+        if MQ4V2_POW2_SCALE.get().copied().unwrap_or(false) {
+            quantize_mq4g256v2_symmetric_pow2(weights, m, k, signs1, signs2)
+        } else {
+            quantize_mq4g256v2_symmetric(weights, m, k, signs1, signs2)
+        }
     } else {
         quantize_mq4g256v2(weights, m, k, signs1, signs2)
     }
@@ -1212,13 +1217,27 @@ pub(crate) fn run() {
         eprintln!("error: --mq4v2-symmetric currently requires --format mq4v2");
         std::process::exit(1);
     }
+    if args.mq4v2_pow2_scale && !use_mq4v2 {
+        eprintln!("error: --mq4v2-pow2-scale currently requires --format mq4v2");
+        std::process::exit(1);
+    }
+    if args.mq4v2_pow2_scale && !args.mq4v2_symmetric {
+        eprintln!("error: --mq4v2-pow2-scale requires --mq4v2-symmetric");
+        std::process::exit(1);
+    }
     MQ4V2_SYMMETRIC
         .set(args.mq4v2_symmetric)
         .expect("MQ4V2_SYMMETRIC set twice — should not happen");
+    MQ4V2_POW2_SCALE
+        .set(args.mq4v2_pow2_scale)
+        .expect("MQ4V2_POW2_SCALE set twice — should not happen");
     if args.mq4v2_symmetric {
         eprintln!(
             "MQ4V2 symmetric headers: ENABLED (per-128 MSE scale search, zero=-8*d)"
         );
+    }
+    if args.mq4v2_pow2_scale {
+        eprintln!("MQ4V2 pow2 scale: ENABLED (per-128 d restricted to power of two)");
     }
     if awq_enabled {
         if IMATRIX.get().is_none() {
@@ -1713,6 +1732,9 @@ pub(crate) fn run() {
     });
     if args.mq4v2_symmetric {
         metadata["mq4v2.symmetric"] = serde_json::json!(1);
+    }
+    if args.mq4v2_pow2_scale {
+        metadata["mq4v2.pow2scale"] = serde_json::json!(1);
     }
     // `mut` so the SP4b bake-prune path can patch the routed-expert count down to
     // the kept count before write_hfq (so the baked model loads with the compact

@@ -215,6 +215,13 @@ pub(crate) struct QuantizeArgs {
     #[arg(long)]
     pub mq4v2_symmetric: bool,
 
+    /// Restrict the symmetric per-128 scale `d` to an exact power of two
+    /// (zero f16 mantissa) with zero = `-8*d`. Uses pow2 candidates
+    /// {2^floor(log2(amax/7.5)), 2^ceil(log2(amax/7.5))} with the same MSE
+    /// selection as `--mq4v2-symmetric`. Wire format unchanged (f16 `d`).
+    #[arg(long, requires = "mq4v2_symmetric")]
+    pub mq4v2_pow2_scale: bool,
+
     /// Replace selected MQ4V2-XT tensors in an existing HFQ with trained final
     /// codes. PATH is one frozen-record `.safetensors` file or a directory of
     /// them; each record carries metadata `name,M,K,qt,source_sha` and tensors

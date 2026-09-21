@@ -322,7 +322,7 @@ pub(crate) fn quantize_mq4g256v2(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, false)
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, false, false)
 }
 
 /// MQ4V2 with a symmetric per-128 grid in the existing affine wire format.
@@ -338,7 +338,21 @@ pub(crate) fn quantize_mq4g256v2_symmetric(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, true)
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, true, false)
+}
+
+/// MQ4V2 symmetric variant with the per-128 scale `d` restricted to an exact
+/// power of two (zero f16 mantissa), zero = f16(-8d). Wire format unchanged.
+/// Candidates bracket base = amax/7.5: {2^floor(log2 base), 2^ceil(log2 base)}
+/// as exact f16 powers of two (0/subnormal skipped); same MSE selection.
+pub(crate) fn quantize_mq4g256v2_symmetric_pow2(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, true, true)
 }
 
 fn quantize_mq4g256v2_impl(
@@ -348,6 +362,7 @@ fn quantize_mq4g256v2_impl(
     signs1: &[f32],
     signs2: &[f32],
     symmetric: bool,
+    pow2_scale: bool,
 ) -> Vec<u8> {
     assert!(k % 256 == 0, "MQ4V2 requires K % 256 == 0, got K={k}");
     assert_eq!(w.len(), m * k, "w.len() {} != m*k {}*{}={}", w.len(), m, k, m * k);
@@ -373,33 +388,87 @@ fn quantize_mq4g256v2_impl(
                     continue;
                 }
 
-                let candidate_base = (amax / 7.5) * 0.5;
-                let multipliers = [
-                    1.0f32,
-                    f32::from_bits(0x3fa4_9249),
-                    f32::from_bits(0x3fdb_6db7),
-                    2.0f32,
-                ];
-                let mut best_mse = f64::INFINITY;
-                for multiplier in multipliers {
-                    let scale_bits = f32_to_f16(candidate_base * multiplier);
-                    let scale = f16_to_f32(scale_bits);
-                    if scale == 0.0 {
-                        continue;
+                if pow2_scale {
+                    // Power-of-two scale: candidates bracket base = amax/7.5 as
+                    // exact f16 powers of two (zero mantissa); 0/subnormal
+                    // skipped. Same MSE selection, zero = f16(-8d).
+                    let base = amax / 7.5;
+                    let log2b = base.log2();
+                    let floor_e = log2b.floor() as i32;
+                    let ceil_e = log2b.ceil() as i32;
+                    let mut candidates = [0u16; 2];
+                    let mut candidate_count = 0;
+                    let mut exponents = [floor_e, ceil_e];
+                    if floor_e == ceil_e {
+                        exponents[1] = i32::MIN;
                     }
-                    let zero_bits = f32_to_f16(-8.0 * scale);
-                    let zero = f16_to_f32(zero_bits);
-                    let inverse = 1.0 / scale;
-                    let mut mse = 0.0f64;
-                    for &value in values {
-                        let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, 15.0);
-                        let error = value - code.mul_add(scale, zero);
-                        mse += (error as f64) * (error as f64);
+                    for exponent in exponents {
+                        if exponent == i32::MIN {
+                            continue;
+                        }
+                        let biased = exponent + 15;
+                        if !(1..=30).contains(&biased) {
+                            continue;
+                        }
+                        candidates[candidate_count] = (biased as u16) << 10;
+                        candidate_count += 1;
                     }
-                    if mse < best_mse {
-                        best_mse = mse;
-                        scales[half] = scale_bits;
-                        zeros[half] = zero_bits;
+                    if candidate_count == 0 {
+                        let clamped = (floor_e + 15).clamp(1, 30) as u16;
+                        candidates[0] = clamped << 10;
+                        candidate_count = 1;
+                    }
+                    let mut best_mse = f64::INFINITY;
+                    for i in 0..candidate_count {
+                        let scale_bits = candidates[i];
+                        let scale = f16_to_f32(scale_bits);
+                        if scale == 0.0 {
+                            continue;
+                        }
+                        let zero_bits = f32_to_f16(-8.0 * scale);
+                        let zero = f16_to_f32(zero_bits);
+                        let inverse = 1.0 / scale;
+                        let mut mse = 0.0f64;
+                        for &value in values {
+                            let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, 15.0);
+                            let error = value - code.mul_add(scale, zero);
+                            mse += (error as f64) * (error as f64);
+                        }
+                        if mse < best_mse {
+                            best_mse = mse;
+                            scales[half] = scale_bits;
+                            zeros[half] = zero_bits;
+                        }
+                    }
+                } else {
+                    let candidate_base = (amax / 7.5) * 0.5;
+                    let multipliers = [
+                        1.0f32,
+                        f32::from_bits(0x3fa4_9249),
+                        f32::from_bits(0x3fdb_6db7),
+                        2.0f32,
+                    ];
+                    let mut best_mse = f64::INFINITY;
+                    for multiplier in multipliers {
+                        let scale_bits = f32_to_f16(candidate_base * multiplier);
+                        let scale = f16_to_f32(scale_bits);
+                        if scale == 0.0 {
+                            continue;
+                        }
+                        let zero_bits = f32_to_f16(-8.0 * scale);
+                        let zero = f16_to_f32(zero_bits);
+                        let inverse = 1.0 / scale;
+                        let mut mse = 0.0f64;
+                        for &value in values {
+                            let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, 15.0);
+                            let error = value - code.mul_add(scale, zero);
+                            mse += (error as f64) * (error as f64);
+                        }
+                        if mse < best_mse {
+                            best_mse = mse;
+                            scales[half] = scale_bits;
+                            zeros[half] = zero_bits;
+                        }
                     }
                 }
                 let scale = f16_to_f32(scales[half]);
