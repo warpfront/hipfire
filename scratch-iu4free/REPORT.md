@@ -2,9 +2,7 @@
 
 ## Result
 
-The artifact quality gate passes, and a one-accumulator exponent-shift kernel is viable but not ready to ship. On the paired card-C standalone screen it improves the gate/up shape by 10.58%, is effectively flat on down (-0.59%), and improves the two-shape aggregate by 7.14%. The environment-gated implementation is retained for follow-up; the default path is unchanged.
-
-The first production gate passes: card-C tg128 changes by -0.21%, within the 1% decode-neutral band. The remaining pp8192, TTFT, battery, and daemon profiler gates are delegated to `Iu4ShiftFoldGate`.
+**Do not ship this candidate.** The numeric contract is valid on the iu4 arm and the corrected standalone two-shape aggregate improves by 7.14%, but the daemon inverts it: paired pp8192 is **-0.185%**, pp512 is **-0.457%**, and 5,909-token TTFT regresses by **15.532 ms (+0.594%)**. Decode stays within its neutral band at -0.211%, and the five-prompt decoded-text battery is clean. The implementation remains explicit-env-only; the default path is unchanged.
 
 ## Quality gates
 
@@ -71,11 +69,46 @@ Same full-pow2 artifact and one-scale-per-token iu4 route, fresh daemon per arm,
 | control (`HIPFIRE_IU4_SHIFT_FOLDFREE=0`) | 2222.7 tok/s | 36.59365 tok/s | 36.60088, 36.59365, 36.56283 |
 | candidate (`HIPFIRE_IU4_SHIFT_FOLDFREE=1`) | 2221.3 tok/s | 36.51656 tok/s | 36.52859, 36.51656, 36.50954 |
 
-Decode delta is **-0.211%**, inside the required 1% neutral band. The pp512 row from this decode-first screen is -0.063%; the delegated paired prefill gate uses two full pairs.
+Decode delta is **-0.211%**, inside the required 1% neutral band. The pp512 row from this decode-first screen is -0.063%.
 
-## Missing production gates
+## Paired daemon prefill and TTFT
 
-The qkvza and qkv shape screens and daemon profiler attribution were not completed in this branch. Card-C pp512/pp8192 pairs, TTFT, and the five-prompt decoded-text battery are delegated to `Iu4ShiftFoldGate`. The candidate remains experimental and off by default pending those receipts.
+Card-C ABBA order, fresh daemon per arm, same full-pow2 artifact, fp8 KV, graph enabled, one warmup and three measured matrix runs:
+
+| pair | pp512 control | pp512 candidate | delta | pp8192 control | pp8192 candidate | delta |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 | 2207.3 | 2195.9 | -0.516% | 2259.4 | 2256.5 | -0.128% |
+| 2 | 2212.5 | 2203.7 | -0.398% | 2268.0 | 2262.5 | -0.243% |
+
+Mean paired delta: **-0.457% at pp512** and **-0.185% at pp8192**. The predicted standalone uplift does not convert in the daemon.
+
+The 5,909-token TTFT pair used eight measured runs after two warmups:
+
+| arm | median TTFT | effective prefill |
+|---|---:|---:|
+| control | 2614.154 ms | 2260.389 tok/s |
+| candidate | 2629.686 ms | 2247.038 tok/s |
+
+Candidate delta is **+15.532 ms (+0.594%) latency** and -0.591% effective prefill throughput.
+
+## In-daemon iu4 GEMM attribution
+
+A kernel trace over two complete 8,192-token prefills (16,384 tokens total, replay chunk 512) summed the `full_set` and `full_add` iu4 families:
+
+| arm | full-set total | full-add total | family us/token |
+|---|---:|---:|---:|
+| control | 3.096541 s | 1.630147 s | 288.494 |
+| candidate | 3.138665 s | 1.574574 s | 287.673 |
+
+The candidate saves only **0.821 us/token (0.285%)** in the complete profiled family. Its full-set work regresses while full-add improves, explaining why the standalone gate/up result is not representative of the production mix. These profiler numbers use a 512-row replay and are family device time, not wall-clock prefill time.
+
+## Serve battery
+
+The candidate completed the five built-in genres at a 512-token cap: **5/5 finish=stop**, runaway=0, empty=0, attractor=0, retrieval_miss=0. I read all decoded responses: executable sorted-list merge code, a correct 210-mile train calculation, a correct explanation of axial-tilt seasons, a coherent lighthouse/time-anomaly vignette, and five relevant refactoring practices.
+
+## Final scope
+
+QKVZA and QKV standalone extensions were intentionally not attempted after the paired pp8192 and TTFT verdict failed. The one-accumulator experiment is retained behind its explicit environment flag for research only.
 
 ## Reproduction pointers
 
@@ -86,3 +119,7 @@ The qkvza and qkv shape screens and daemon profiler attribution were not complet
 - `bench-baseline-corrected-down-pair.txt` and `bench-shiftfold-corrected-down.txt`: down pair.
 - `pow2-global-a-fp8v2-c24.log`: forced fp8v2 full-pow2 cell, 0.071194.
 - `tg128-control-cardc.jsonl` and `tg128-candidate-cardc.jsonl`: paired decode-first daemon gate.
+- `prefill-pair{1,2}-{control,candidate}.jsonl`: two ABBA daemon prefill pairs.
+- `ttft-{control,candidate}-cardc.jsonl`: 5,909-token TTFT pair.
+- `battery-candidate-cardc.json`: clean decoded-text battery.
+- `prof-{control,candidate}/iu4free_results.db`: in-daemon kernel traces.
