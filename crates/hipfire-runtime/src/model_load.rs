@@ -122,6 +122,9 @@ pub trait WeightSource {
     fn mq4v2_symmetric(&self) -> bool {
         false
     }
+    fn mq4v2_pow2scale(&self) -> u8 {
+        0
+    }
     /// Pre-load hook. HFQ drops the mmap when n==1; PaRo rejects n>1; llama no-op.
     fn prepare(&mut self, n_devices: usize) -> HipResult<()>;
     fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)>;
@@ -423,8 +426,10 @@ fn load_weights_inner<S: WeightSource>(
         ));
     }
     let mq4v2_symmetric = source.mq4v2_symmetric();
+    let mq4v2_pow2scale = source.mq4v2_pow2scale();
     for device in devices.iter_mut() {
         device.mq4v2_symmetric = mq4v2_symmetric;
+        device.mq4v2_pow2scale = mq4v2_pow2scale;
     }
     layout
         .validate(n_devices, source.n_layers())

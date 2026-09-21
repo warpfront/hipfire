@@ -142,6 +142,52 @@ fn load_norm_weight(
     dequant_norm(gpu, info.quant_type, &data, shape, QWEN35_NORM_BIAS)
 }
 
+/// Build the per-output-row power-of-two reference used by the fold-free
+/// MQ4V2 kernels.  Each qt44 row contains two positive f16 `d` values per
+/// 256-K group.  The largest exponent is the common unit: staging shifts every
+/// E4M3 mantissa down by `e_row - e`, and the epilogue restores `2^e_row`.
+fn mq4v2_foldfree_row_scales(
+    data: &[u8],
+    m: usize,
+    k: usize,
+    pow2scale: u8,
+) -> HipResult<Vec<u8>> {
+    debug_assert!(pow2scale == 1 || pow2scale == 2);
+    let groups_per_row = k / 256;
+    let mut scales = Vec::with_capacity(m * std::mem::size_of::<f32>());
+    for row in 0..m {
+        let mut max_exp = 0u16;
+        for group in 0..groups_per_row {
+            let header = (row * groups_per_row + group) * 136;
+            for offset in [0usize, 4] {
+                let bits = u16::from_le_bytes([data[header + offset], data[header + offset + 1]]);
+                let exp = (bits >> 10) & 0x1f;
+                let mantissa = bits & 0x03ff;
+                let valid_mantissa =
+                    mantissa == 0 || (pow2scale == 2 && mantissa == 0x0200);
+                if bits & 0x8000 != 0 || exp == 0 || exp == 0x1f || !valid_mantissa {
+                    return Err(HipError::new(
+                        0,
+                        &format!(
+                            "MQ4V2 pow2scale={pow2scale} row {row} group {group} has invalid d=0x{bits:04x}"
+                        ),
+                    ));
+                }
+                max_exp = max_exp.max(exp);
+            }
+        }
+        if max_exp == 0 {
+            return Err(HipError::new(
+                0,
+                &format!("MQ4V2 pow2scale row {row} has no normal scale"),
+            ));
+        }
+        let f32_exp = (max_exp as u32) + (127 - 15);
+        scales.extend_from_slice(&f32::from_bits(f32_exp << 23).to_le_bytes());
+    }
+    Ok(scales)
+}
+
 fn load_weight_tensor_raw(
     gpu: &Gpu,
     quant_type: u8,
@@ -541,7 +587,21 @@ fn load_weight_tensor_raw(
                     ),
                 ));
             }
+            let row_scales = if gpu.mq4v2_pow2scale != 0 {
+                Some(mq4v2_foldfree_row_scales(
+                    data,
+                    m,
+                    k,
+                    gpu.mq4v2_pow2scale,
+                )?)
+            } else {
+                None
+            };
             let buf = gpu.upload_raw(data, &[data.len()])?;
+            if let Some(row_scales) = row_scales {
+                let sidecar = gpu.upload_raw(&row_scales, &[m * std::mem::size_of::<f32>()])?;
+                gpu.install_mq4v2_foldfree_row_scales(&buf, sidecar)?;
+            }
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ4G256V2,
@@ -2615,6 +2675,9 @@ impl WeightSource for HfqSource<'_> {
     }
     fn mq4v2_symmetric(&self) -> bool {
         self.hfq.mq4v2_symmetric()
+    }
+    fn mq4v2_pow2scale(&self) -> u8 {
+        self.hfq.mq4v2_pow2scale()
     }
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
         // Keep the mmap alive on discrete GPUs (the carrier cleared

@@ -4171,6 +4171,24 @@ fp8_v2_symfold_source!(
     128, 64, 4, "#define HIPFIRE_FP8_QKV 1\n",
     "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x64w4_gfx1201_symfold"
 );
+/// Fold-free pow2-scale MQ4V2 kernels.  The per-family prefix fixes the ABI
+/// and symbol; the shared body owns the 256x128 / 64x64-wave implementation.
+pub const GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree.gfx12.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip")
+);
+pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_FOLDFREE_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree.gfx12.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip")
+);
+pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree.gfx12.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip")
+);
+pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemm_qkv_mq4g256v2_wmma_fp8_v2_foldfree.gfx12.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_common.gfx12.hip")
+);
 pub const GEMM_GATE_UP_MQ5G256V2_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq5g256v2_wmma_gfx12_bt.hip");
 pub const GEMM_GATE_UP_MQ6G256V2_WMMA_GFX12_BT_SRC: &str =

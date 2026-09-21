@@ -15,7 +15,7 @@ use hip_bridge::{
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::AtomicUsize;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
 ///
@@ -676,6 +676,11 @@ pub struct Gpu {
     /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
     /// metadata; false for legacy/asymmetric artifacts.
     pub mq4v2_symmetric: bool,
+    /// Artifact fold contract: 0=ordinary, 1=pow2, 2={1,1.5}*pow2.
+    pub mq4v2_pow2scale: u8,
+    /// Loader-built 2^e_row F32 sidecars, keyed by the resident weight pointer.
+    /// The map owns the sidecars for the lifetime of the model/Gpu.
+    pub(crate) mq4v2_foldfree_row_scales: Mutex<HashMap<usize, GpuTensor>>,
 
     /// Process-pinned optional CK runtime. Loading is explicit and fail-closed;
     /// individual attention families still decide whether a capability cell is
@@ -956,6 +961,39 @@ impl Gpu {
     pub fn slot_trace(&self) -> bool {
         // bind_thread: skip — pure flag read, touches no device state.
         self.flags.slot_trace
+    }
+    /// Attach a loader-built per-output-row 2^e_row sidecar to a resident
+    /// MQ4V2 weight.  The Gpu owns the sidecar; callers keep only the weight.
+    pub fn install_mq4v2_foldfree_row_scales(
+        &self,
+        weight: &GpuTensor,
+        sidecar: GpuTensor,
+    ) -> HipResult<()> {
+        let key = weight.buf.as_ptr() as usize;
+        let mut sidecars = self
+            .mq4v2_foldfree_row_scales
+            .lock()
+            .map_err(|_| HipError::new(0, "MQ4V2 fold-free sidecar map poisoned"))?;
+        if sidecars.insert(key, sidecar).is_some() {
+            return Err(HipError::new(
+                0,
+                "MQ4V2 fold-free sidecar installed twice for one weight",
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn mq4v2_foldfree_row_scales_ptr(
+        &self,
+        weight: &GpuTensor,
+    ) -> HipResult<*mut c_void> {
+        let key = weight.buf.as_ptr() as usize;
+        self.mq4v2_foldfree_row_scales
+            .lock()
+            .map_err(|_| HipError::new(0, "MQ4V2 fold-free sidecar map poisoned"))?
+            .get(&key)
+            .map(|sidecar| sidecar.buf.as_ptr())
+            .ok_or_else(|| HipError::new(0, "MQ4V2 fold-free row sidecar missing"))
     }
 
     /// Whether the multi-slot decode step should be hipGraph-captured.
@@ -1388,6 +1426,8 @@ impl Gpu {
             },
             replay: crate::replay::ReplayController::from_config(),
             mq4v2_symmetric: false,
+            mq4v2_pow2scale: 0,
+            mq4v2_foldfree_row_scales: Mutex::new(HashMap::new()),
             #[cfg(feature = "flash-attn-ck")]
             flash_attn_ck,
             #[cfg(feature = "flash-attn-ck")]
@@ -3823,6 +3863,14 @@ impl Gpu {
     pub fn free_tensor(&mut self, tensor: GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         let key = tensor.buf.as_ptr() as usize;
+        let foldfree_sidecar = self
+            .mq4v2_foldfree_row_scales
+            .lock()
+            .map_err(|_| HipError::new(0, "MQ4V2 fold-free sidecar map poisoned"))?
+            .remove(&key);
+        if let Some(sidecar) = foldfree_sidecar {
+            self.free_tensor(sidecar)?;
+        }
         if self.vmm_arenas.contains_key(&key) {
             if !tensor.buf.is_vmm_owner() {
                 return Err(HipError::new(

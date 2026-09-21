@@ -312,6 +312,9 @@ pub struct HfqFile {
     pub arch_id: u32,
     pub metadata_json: String,
     mq4v2_symmetric: bool,
+    /// 0 for ordinary artifacts, 1 for d=2^e, 2 for d=m*2^e with
+    /// m in {1,1.5}.  Parsed from the artifact-level mq4v2.pow2scale marker.
+    mq4v2_pow2scale: u8,
     tensors: Vec<HfqTensorInfo>,
     tensor_map: HashMap<String, usize>,
     /// Reusable read buffer for pread-based tensor reads.
@@ -350,6 +353,9 @@ impl HfqFile {
     }
     pub fn mq4v2_symmetric(&self) -> bool {
         self.mq4v2_symmetric
+    }
+    pub fn mq4v2_pow2scale(&self) -> u8 {
+        self.mq4v2_pow2scale
     }
 
 
@@ -640,10 +646,24 @@ impl HfqFile {
             ));
         }
         let metadata_json = String::from_utf8_lossy(&meta_bytes[..json_end]).to_string();
-        let mq4v2_symmetric = serde_json::from_str::<serde_json::Value>(&metadata_json)
-            .ok()
-            .and_then(|metadata| metadata.get("mq4v2.symmetric").cloned())
-            .is_some_and(|marker| marker == serde_json::json!(1) || marker == serde_json::json!(true));
+        let metadata = serde_json::from_str::<serde_json::Value>(&metadata_json).ok();
+        let mq4v2_symmetric = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("mq4v2.symmetric"))
+            .is_some_and(|marker| marker == &serde_json::json!(1) || marker == &serde_json::json!(true));
+        let mq4v2_pow2scale = metadata
+            .as_ref()
+            .and_then(|metadata| metadata.get("mq4v2.pow2scale"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        if mq4v2_pow2scale > 2 || (mq4v2_pow2scale != 0 && !mq4v2_symmetric) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HfqFile: mq4v2.pow2scale must be 1 or 2 on a symmetric artifact, got {mq4v2_pow2scale}"
+                ),
+            ));
+        }
 
         // Parse tensor index (follows metadata JSON)
         let mut pos = metadata_offset + json_end;
@@ -764,6 +784,7 @@ impl HfqFile {
             metadata_json,
             tensors,
             mq4v2_symmetric,
+            mq4v2_pow2scale: mq4v2_pow2scale as u8,
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
             evict_page_cache: true,
