@@ -277,6 +277,12 @@ pub struct FeatureFlags {
     /// to the route-N body. Exact stage-b arithmetic; any raw-O bit difference
     /// kills it.
     pub gfx12_fa_packet: bool,
+    /// Quantize Q once and run the QK product with E4M3 WMMA against raw
+    /// fp8 K bytes in LDS. Default ON on exact gfx1201; `=0` opts out.
+    pub attn_qk8: bool,
+    /// Pack the softmax numerator to E4M3 and run PV with E4M3 WMMA against
+    /// raw fp8 V bytes in LDS. Default ON on exact gfx1201; `=0` opts out.
+    pub attn_pv8: bool,
     /// `HIPFIRE_GFX11_FA2_PREFILL=0` opts out of the gfx11 GQA-fused FA2
     /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
     /// Default ON on gfx1100/gfx1151; `=1` forces it on other arches
@@ -661,6 +667,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_fa_packet: parse_bool("HIPFIRE_GFX12_FA_PACKET")
                 .unwrap_or(arch == "gfx1201"),
+            attn_qk8: parse_bool("HIPFIRE_ATTN_QK8").unwrap_or(arch == "gfx1201"),
+            attn_pv8: parse_bool("HIPFIRE_ATTN_PV8").unwrap_or(arch == "gfx1201"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
@@ -992,6 +1000,8 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_v2: false,
             gfx12_fa2_prefill: false,
             gfx12_fa_packet: false,
+            attn_qk8: false,
+            attn_pv8: false,
             gfx11_fa2_prefill: false,
             gemm_dump: false,
             deterministic: false,

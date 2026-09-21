@@ -4276,6 +4276,244 @@ impl Gpu {
         result
     }
 
+    /// Selectable native-fp8 attention leg. QK8 uses an E4M3 Q scratch;
+    /// PV8 retains the f16 Q scratch. Both keep the production tensor ABI.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_fp8_e4m3_fa2_gqa_leg_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        symbol: &'static str,
+        preconvert: &'static str,
+        src: &'static str,
+        fp8_q: bool,
+        dynamic_lds: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{symbol} requires gfx1201, got {}", self.arch),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{symbol} requires H24/KV4/D256, got H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        if batch_size == 0 || batch_size > 512 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("{symbol} requires 1 <= batch <= 512, got {batch_size}"),
+            ));
+        }
+        if max_ctx_len == 0 || max_ctx_len > 32768 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{symbol} requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                ),
+            ));
+        }
+        let need_qo = batch_size * n_heads * head_dim;
+        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "{symbol} capacity mismatch: q={} out={} positions={} \
+                     (need qo>={need_qo}, pos>={batch_size})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        if !self.functions.contains_key(symbol) || !self.functions.contains_key(preconvert) {
+            self.ensure_kernel(symbol, src, symbol)?;
+            self.ensure_kernel(symbol, src, preconvert)?;
+        }
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+        );
+        let timer =
+            crate::profile::begin_timer(&self.hip, "attention", symbol, bytes);
+        let q_arg = if fp8_q {
+            let (need_bytes, sq_off, _) =
+                crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.fa2_fp8_q_scratch_bytes,
+                self.scratch.fa2_fp8_q_scratch.is_some(),
+                need_bytes,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+            let ptr = self
+                .scratch
+                .ensure_fa2_fp8_q_scratch(&self.hip, need_bytes)?;
+            let sq_ptr = unsafe { (ptr as *mut u8).add(sq_off) as *mut c_void };
+            self.launch_fa2_q_preconvert_fp8(
+                preconvert,
+                q.buf.as_ptr(),
+                ptr,
+                sq_ptr,
+                batch_size,
+            )?;
+            ptr
+        } else {
+            let need_bytes = batch_size * n_heads * head_dim * 2;
+            if crate::scratch::scratch_will_grow(
+                self.scratch.fa2_q16_scratch_bytes,
+                self.scratch.fa2_q16_scratch.is_some(),
+                need_bytes,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+            let ptr = self
+                .scratch
+                .ensure_fa2_q16_scratch(&self.hip, need_bytes)?;
+            self.launch_fa2_q_preconvert_gfx11(
+                preconvert,
+                q.buf.as_ptr(),
+                ptr,
+                std::ptr::null(),
+                std::ptr::null(),
+                batch_size,
+                0,
+            )?;
+            ptr
+        };
+        let grid_x = batch_size.div_ceil(8) as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_arg = q_arg;
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_arg as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // The timer starts before the selected Q pre-converter, matching the
+        // established f16 and combined route-N profiling contract.
+        let result = self.launch_maybe_blob(
+            symbol,
+            [grid_x, 4, 1],
+            [128, 1, 1],
+            dynamic_lds,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_arg);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Native-fp8 cache with an E4M3 QK leg and f16 P/V leg.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_qk8_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.attention_fp8_e4m3_fa2_gqa_leg_gfx1201(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            "attention_fp8_e4m3_fa2_gqa_qk8_gfx1201",
+            "attention_fp8_e4m3_fa2_q_preconvert_qk8_gfx1201",
+            kernels::ATTENTION_FP8_E4M3_FA2_GQA_QK8_GFX1201_SRC,
+            true,
+            32768,
+        )
+    }
+
+    /// Native-fp8 cache with a f16 QK leg and E4M3 P/V leg.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_pv8_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.attention_fp8_e4m3_fa2_gqa_leg_gfx1201(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            "attention_fp8_e4m3_fa2_gqa_pv8_gfx1201",
+            "attention_fp8_e4m3_fa2_q_preconvert_pv8_gfx1201",
+            kernels::ATTENTION_FP8_E4M3_FA2_GQA_PV8_GFX1201_SRC,
+            false,
+            49152,
+        )
+    }
+
     /// gfx1201-only GQA-fused FA2 prefill with stage-b fp8 arithmetic on the
     /// q8 cache (route Q, research path — no dispatch arm selects it).
     ///

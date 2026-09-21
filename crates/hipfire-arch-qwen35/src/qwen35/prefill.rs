@@ -8316,6 +8316,8 @@ fn batch_chunk_fa_attend(
         // chunks qualify; an odd tail takes the per-segment loop below.
         let packet_runs = gpu.arch == "gfx1201"
             && gpu.flags.gfx12_fa_packet
+            && gpu.flags.attn_qk8
+            && gpu.flags.attn_pv8
             && kv_cache.quant_fp8
             && config.n_heads == 24
             && config.n_kv_heads == 4

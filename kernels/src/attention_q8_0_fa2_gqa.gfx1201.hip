@@ -124,6 +124,22 @@ static __device__ __forceinline__ float fa2_fp8_e4m3_to_f32(unsigned char b) {
 }
 #endif
 
+// Route-N scale accessor (header-direct). B4 gives route Q the same
+// signature backed by its scratch scale plane, so the B2/B3 epilogue calls
+// only this and the body stays source-agnostic. OOR keys read scale 0,
+// matching the code-0 rule (§2: zero fragments contribute exactly zero).
+static __device__ __forceinline__ float fa2_scale_n(
+    const unsigned char* __restrict__ cache, int gkey, int kv_h, int seq_len)
+{
+    uint16_t u = 0;
+    if (gkey < seq_len) {
+        const unsigned char* row =
+            cache + (unsigned long long)gkey * 1032ULL;
+        u = (uint16_t)row[1024 + kv_h * 2] |
+            ((uint16_t)row[1024 + kv_h * 2 + 1] << 8);
+    }
+    return (float)((fa2_dw_t){.u = (uint32_t)u}).h[0];
+}
 // Shared workgroup body. PARTIAL=false writes normalized O to `out`;
 // PARTIAL=true writes [m, l, O_unnormalized[256]] records (stride 258) to
 // `out`. `tile0/tile1` bound the KT64 tile range (direct: whole sequence;
@@ -159,10 +175,14 @@ __device__ __forceinline__ void fa2_gqa_body(
     const int kv_blk = kv_h * (256 / 32);
 
     extern __shared__ uint32_t LDS[];
-    // Fragment-major f16 planes: K at byte 0, V at byte 32768.
     _Float16* K16 = (_Float16*)LDS;
+#if defined(HIPFIRE_FA2_PV8_ONLY)
+    // PV8-only: K stays f16, while V occupies a raw-E4M3 16 KiB plane.
+    unsigned char* V8 = (unsigned char*)LDS + 32768;
+#else
+    // Baseline: two fragment-major f16 planes, K then V.
     _Float16* V16 = (_Float16*)(LDS + 8192);
-
+#endif
     // ---- Transition 1: online state init (compute waves) ----
     // Q arrives f16 pre-converted (see attention_fa2_q_preconvert_gfx1201);
     // within a KT64 tile, each dim-chunk Q fragment is loaded once (one
@@ -172,6 +192,10 @@ __device__ __forceinline__ void fa2_gqa_body(
     float8_t Ofr[16];
     float m_old = -INFINITY;
     float l_val = 0.0f;
+#if defined(HIPFIRE_FA2_PV8_ONLY)
+    // O_physical = b_prev * Ofr while P/V use their E4M3 units.
+    float b_prev = 1.0f;
+#endif
     int h_ml = 0;
     int qr_ml = 0;
     bool qok_ml = false;
@@ -373,7 +397,50 @@ __device__ __forceinline__ void fa2_gqa_body(
         }
 #endif
 #endif
-#if HIPFIRE_FA2_KMODE == 8
+#if defined(HIPFIRE_FA2_PV8_ONLY)
+        // Keep V as native E4M3 bytes. Each lane gathers one fragment:
+        // eight keys at one output dimension, in the exact PV WMMA layout.
+#pragma unroll 1
+        for (int t = 0; t < 16; ++t) {
+            const int idx = tid + t * 128;
+            const int sub = idx >> 9;
+            const int r = idx & 511;
+            const int dc = r >> 5;
+            const int vlane = r & 31;
+            const int dim = dc * 16 + (vlane & 15);
+            const int kbase = ktile + sub * 16 + (vlane >> 4) * 8;
+            unsigned long long w = 0;
+            if (kbase + 7 < seq_len) {
+                const unsigned char* r0 = v_cache
+                    + (unsigned long long)kbase * 1032ULL
+                    + (unsigned long long)kv_h * 256ULL
+                    + (unsigned long long)dim;
+                w = (unsigned long long)r0[0]
+                    | ((unsigned long long)r0[1032] << 8)
+                    | ((unsigned long long)r0[2064] << 16)
+                    | ((unsigned long long)r0[3096] << 24)
+                    | ((unsigned long long)r0[4128] << 32)
+                    | ((unsigned long long)r0[5160] << 40)
+                    | ((unsigned long long)r0[6192] << 48)
+                    | ((unsigned long long)r0[7224] << 56);
+            } else if (kbase < seq_len) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int gkey = kbase + j;
+                    if (gkey < seq_len) {
+                        const unsigned char c = *(v_cache
+                            + (unsigned long long)gkey * 1032ULL
+                            + (unsigned long long)kv_h * 256ULL
+                            + (unsigned long long)dim);
+                        w |= (unsigned long long)c
+                            << (unsigned long long)(j * 8);
+                    }
+                }
+            }
+            *(unsigned long long*)(V8
+                + (unsigned)(((sub * 16 + dc) * 32 + vlane) * 8)) = w;
+        }
+#elif HIPFIRE_FA2_KMODE == 8
         // Native fp8 V (Q0 fill-time decode): 256 key-pairs (m*8+b) like the
         // Q8 path; each slot reads dims b*32..b*32+31 of keys ktile+2m /
         // ktile+2m+1 from their token-local fp8 rows and packs
@@ -635,8 +702,67 @@ __device__ __forceinline__ void fa2_gqa_body(
                     (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
                 m_old = m_new;
 
-                // Probabilities pack straight into the PV B operand.
-                // The sum chain likewise serializes rows.
+#if defined(HIPFIRE_FA2_PV8_ONLY)
+                // Denominator uses pre-quantization probabilities. The V
+                // scale enters only the numerator before E4M3 packing.
+                float sv[8];
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    sv[j] = fa2_scale_n(
+                        v_cache, kt_sub + 8 * kg + j, kv_h, seq_len);
+                float sum = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float e = (m_new == -INFINITY)
+                        ? 0.0f
+                        : __expf(sacc[j] - m_new);
+                    sum += e;
+                    sacc[j] = e * sv[j];
+                }
+                sum += __shfl_xor(sum, 16, 32);
+                l_val = l_val * alpha + sum;
+
+                // E4M3's 448 maximum admits at most eight full binary
+                // octaves of growth. Rebase the numerator every subtile so
+                // the packed P operand always stays within that bound.
+                float wmax = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    wmax = fmaxf(wmax, sacc[j]);
+                wmax = fmaxf(wmax, __shfl_xor(wmax, 16, 32));
+                float b_new = b_prev;
+                if (wmax > 0.0f)
+                    b_new = fmaxf(wmax / 448.0f, 0x1p-64f);
+                const float rho = (alpha * b_prev) / b_new;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc)
+                    Ofr[dc] *= rho;
+
+                unsigned int p0 = 0u;
+                p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[0] / b_new, sacc[1] / b_new, p0, false);
+                p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[2] / b_new, sacc[3] / b_new, p0, true);
+                unsigned int p1 = 0u;
+                p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[4] / b_new, sacc[5] / b_new, p1, false);
+                p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                    sacc[6] / b_new, sacc[7] / b_new, p1, true);
+                const v2i_t pb = {(int)p0, (int)p1};
+                const v2i_t* Vf = (const v2i_t*)V8;
+                const unsigned vbn =
+                    (unsigned)(sub * 512) + (unsigned)lane;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc) {
+                    const v2i_t vf = Vf[vbn + dc * 32];
+                    Ofr[dc] =
+                        __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                            vf, pb, Ofr[dc]);
+                    asm volatile("" ::: "memory");
+                }
+                b_prev = b_new;
+#else
+                // Baseline f16 P/V path.
                 half8_t prow;
                 float sum = 0.0f;
 #pragma unroll
@@ -649,26 +775,19 @@ __device__ __forceinline__ void fa2_gqa_body(
                 }
                 sum += __shfl_xor(sum, 16, 32);
                 l_val = l_val * alpha + sum;
-
-                // O rescale with the lane's OWN alpha: Ofr rows are the
-                // lane's own softmax query (O[query=ml][dim]).
 #pragma unroll
                 for (int dc = 0; dc < 16; ++dc)
                     Ofr[dc] *= alpha;
-
-                // PV as O^T = V^T*P^T: A = V^T fragment (row ml = dim of
-                // the dc tile), B = prow. Ofr[dc][j] = O[query][dim].
-                // One aligned half8 load = Vfrag(sub, dc, lane):
-                // V[key=sub*16+kg*8..+8][dim=dc*16+ml].
                 const half8_t* Vf = (const half8_t*)V16;
 #pragma unroll
                 for (int dc = 0; dc < 16; ++dc) {
                     const half8_t vf = Vf[fa2_vfrag8(sub, dc, lane)];
-                    Ofr[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
-                        vf, prow, Ofr[dc]);
-                    // Bound V-load hoisting to this chunk.
+                    Ofr[dc] =
+                        __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                            vf, prow, Ofr[dc]);
                     asm volatile("" ::: "memory");
                 }
+#endif
             }
         }
         // Tile turnover: no wave may overwrite LDS before every PV read
@@ -683,6 +802,11 @@ __device__ __forceinline__ void fa2_gqa_body(
         if (!PARTIAL) {
             if (qok_ml) {
                 const float inv = l_val > 0.0f ? 1.0f / l_val : 0.0f;
+#if defined(HIPFIRE_FA2_PV8_ONLY)
+                const float out_unit = b_prev * inv;
+#else
+                const float out_unit = inv;
+#endif
                 // 32-bit row base (whole O tensor < 10 MiB).
                 const unsigned bo =
                     (unsigned)qr_ml * 6144u + (unsigned)h_ml * 256u;
@@ -691,7 +815,7 @@ __device__ __forceinline__ void fa2_gqa_body(
                     const unsigned bd = bo + (unsigned)(dc * 16 + kg * 8);
 #pragma unroll
                     for (int j = 0; j < 8; ++j)
-                        out[bd + (unsigned)j] = Ofr[dc][j] * inv;
+                        out[bd + (unsigned)j] = Ofr[dc][j] * out_unit;
                 }
             }
         } else {
@@ -716,6 +840,11 @@ __device__ __forceinline__ void fa2_gqa_body(
                          * (unsigned)n_splits + (unsigned)split)
                         * 258u;
                 float* rec = out + rb;
+#if defined(HIPFIRE_FA2_PV8_ONLY)
+                const float record_unit = b_prev;
+#else
+                const float record_unit = 1.0f;
+#endif
                 // j-outer/dc-inner, matching the direct epilogue's proven
                 // structure: j selects this lane's 8 dims per chunk.
 #pragma unroll
@@ -723,7 +852,8 @@ __device__ __forceinline__ void fa2_gqa_body(
                     const unsigned rj = rb + 2u + (unsigned)(kg * 8 + j);
 #pragma unroll
                     for (int dc = 0; dc < 16; ++dc)
-                        rec[rj + (unsigned)(dc * 16)] = Ofr[dc][j];
+                        rec[rj + (unsigned)(dc * 16)] =
+                            record_unit * Ofr[dc][j];
                 }
             }
         }
@@ -746,22 +876,6 @@ __device__ __forceinline__ void fa2_gqa_body(
 // body cannot run here (its V plane at byte 32768 is out of bounds), so B2
 // replaces dump+return with the fp8 body while keeping this fill.
 //
-// Route-N scale accessor (header-direct). B4 gives route Q the same
-// signature backed by its scratch scale plane, so the B2/B3 epilogue calls
-// only this and the body stays source-agnostic. OOR keys read scale 0,
-// matching the code-0 rule (§2: zero fragments contribute exactly zero).
-static __device__ __forceinline__ float fa2_scale_n(
-    const unsigned char* __restrict__ cache, int gkey, int kv_h, int seq_len)
-{
-    uint16_t u = 0;
-    if (gkey < seq_len) {
-        const unsigned char* row =
-            cache + (unsigned long long)gkey * 1032ULL;
-        u = (uint16_t)row[1024 + kv_h * 2] |
-            ((uint16_t)row[1024 + kv_h * 2 + 1] << 8);
-    }
-    return (float)((fa2_dw_t){.u = (uint32_t)u}).h[0];
-}
 
 // B1b fill+dump. Dump layout per (blockIdx.x, kv_h, split, tile), in u32
 // words at out + ((((bx*4+kv_h)*S+s)*512+t)*8320): K plane (4096) | V plane
@@ -1189,6 +1303,57 @@ __device__ void fa2_stageb_nbody(
                     (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
                 m_old = m_new;
 
+#if defined(HIPFIRE_FA2_QK8_ONLY)
+                // Keep P and PV in f16: decode the raw V bytes only at
+                // consumption so QK8 can be selected independently.
+                half8_t prow;
+                float sum = 0.0f;
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const float e = (m_new == -INFINITY)
+                        ? 0.0f
+                        : __expf(sacc[j] - m_new);
+                    prow[j] = (_Float16)e;
+                    sum += e;
+                }
+                sum += __shfl_xor(sum, 16, 32);
+                l_val = l_val * alpha + sum;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc)
+                    Ofr[dc] *= alpha;
+#pragma unroll
+                for (int j = 0; j < 8; ++j)
+                    sc[j] = fa2_scale_n(
+                        v_cache, kt_sub + 8 * kg + j, kv_h, seq_len);
+                const unsigned long long* Vf =
+                    (const unsigned long long*)V8;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc) {
+                    const unsigned long long vc = Vf[vbn + dc * 32];
+                    float2_t dd;
+                    half8_t vf;
+                    dd = __builtin_amdgcn_cvt_pk_f32_fp8(
+                        (unsigned)vc, 0);
+                    vf[0] = (_Float16)(dd[0] * sc[0]);
+                    vf[1] = (_Float16)(dd[1] * sc[1]);
+                    dd = __builtin_amdgcn_cvt_pk_f32_fp8(
+                        (unsigned)vc, 1);
+                    vf[2] = (_Float16)(dd[0] * sc[2]);
+                    vf[3] = (_Float16)(dd[1] * sc[3]);
+                    dd = __builtin_amdgcn_cvt_pk_f32_fp8(
+                        (unsigned)(vc >> 32), 0);
+                    vf[4] = (_Float16)(dd[0] * sc[4]);
+                    vf[5] = (_Float16)(dd[1] * sc[5]);
+                    dd = __builtin_amdgcn_cvt_pk_f32_fp8(
+                        (unsigned)(vc >> 32), 1);
+                    vf[6] = (_Float16)(dd[0] * sc[6]);
+                    vf[7] = (_Float16)(dd[1] * sc[7]);
+                    Ofr[dc] =
+                        __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(
+                            vf, prow, Ofr[dc]);
+                    asm volatile("" ::: "memory");
+                }
+#else
                 // Weighted-P quantization (plan §5): l accumulates
                 // UNWEIGHTED e; w = e*sv enters only the numerator. sacc is
                 // dead after e, so w reuses its registers (no w array).
@@ -1256,6 +1421,7 @@ __device__ void fa2_stageb_nbody(
                     asm volatile("" ::: "memory");
                 }
                 b_prev = b_new;
+#endif
             }
         }
         // Tile turnover: no wave may overwrite LDS before every PV read
@@ -1309,6 +1475,28 @@ __device__ void fa2_stageb_nbody(
 }
 
 
+#if defined(HIPFIRE_FA2_QK8_ONLY)
+#define HIPFIRE_FA2_ROUTE_BODY_SYM attention_fp8_e4m3_fa2_gqa_qk8_gfx1201
+#define HIPFIRE_FA2_ROUTE_QPRE_SYM attention_fp8_e4m3_fa2_q_preconvert_qk8_gfx1201
+#define HIPFIRE_FA2_ROUTE_PARTIAL_SYM attention_fp8_e4m3_fa2_gqa_partial_qk8_gfx1201
+#define HIPFIRE_FA2_ROUTE_MERGE_SYM attention_fp8_e4m3_fa2_gqa_merge_qk8_gfx1201
+#elif defined(HIPFIRE_FA2_PV8_ONLY)
+#define HIPFIRE_FA2_ROUTE_BODY_SYM attention_fp8_e4m3_fa2_gqa_pv8_gfx1201
+#define HIPFIRE_FA2_ROUTE_QPRE_SYM attention_fp8_e4m3_fa2_q_preconvert_pv8_gfx1201
+#define HIPFIRE_FA2_ROUTE_PARTIAL_SYM attention_fp8_e4m3_fa2_gqa_partial_pv8_gfx1201
+#define HIPFIRE_FA2_ROUTE_MERGE_SYM attention_fp8_e4m3_fa2_gqa_merge_pv8_gfx1201
+#elif defined(HIPFIRE_FA2_FP8)
+#define HIPFIRE_FA2_ROUTE_BODY_SYM attention_fp8_e4m3_fa2_gqa_gfx1201
+#define HIPFIRE_FA2_ROUTE_QPRE_SYM attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201
+#define HIPFIRE_FA2_ROUTE_PARTIAL_SYM attention_fp8_e4m3_fa2_gqa_partial_gfx1201
+#define HIPFIRE_FA2_ROUTE_MERGE_SYM attention_fp8_e4m3_fa2_gqa_merge_gfx1201
+#else
+#define HIPFIRE_FA2_ROUTE_BODY_SYM attention_fp8_e4m3_fa2_gqa_f16_gfx1201
+#define HIPFIRE_FA2_ROUTE_QPRE_SYM attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201
+#define HIPFIRE_FA2_ROUTE_PARTIAL_SYM attention_fp8_e4m3_fa2_gqa_partial_f16_gfx1201
+#define HIPFIRE_FA2_ROUTE_MERGE_SYM attention_fp8_e4m3_fa2_gqa_merge_f16_gfx1201
+#endif
+
 // Body entries take pre-converted f16 Q at kernarg offset 0 (same slot, same
 // size as the old f32 Q pointer, so the pointer-array blob ABI is unchanged).
 // Q0 (slice-B) entry: KMODE=8 selects `attention_fp8_e4m3_fa2_gqa_f16_gfx1201`
@@ -1318,7 +1506,7 @@ __device__ void fa2_stageb_nbody(
 // B1b diagnostic (§14.2/§14.3): route-N byte-copy fill + plane dump; the fp8
 // body lands in B2. Kernargs frozen: fp8-code Q in the old Q slot (unused by
 // the fill), sq at +batch*24*256, out is the plane dump buffer, 32768 LDS.
-extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_gfx1201(
+extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_ROUTE_BODY_SYM(
     const unsigned char* __restrict__ q8_codes,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -1345,7 +1533,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_
 }
 #else
 #if HIPFIRE_FA2_KMODE == 8
-extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_f16_gfx1201(
+extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_ROUTE_BODY_SYM(
 #elif defined(HIPFIRE_FA2_FP8)
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fp8_gfx1201(
 #else
@@ -1400,9 +1588,13 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_gfx1
 #if HIPFIRE_FA2_KMODE == 3
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_fwht3_gfx1201
 #elif HIPFIRE_FA2_KMODE == 8
-// Q0 body is f16 with no rotation, same as KMODE=0, but the symbol must be
-// distinct: the host function cache is keyed by symbol alone.
+// The f16 pre-converter remains a distinct symbol in fp8-Q modules. PV8
+// consumes it, while QK8 additionally exports its fp8 pre-converter below.
+#if defined(HIPFIRE_FA2_PV8_ONLY)
+#define HIPFIRE_FA2_Q_PRECONVERT_SYM HIPFIRE_FA2_ROUTE_QPRE_SYM
+#else
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201
+#endif
 #else
 #define HIPFIRE_FA2_Q_PRECONVERT_SYM attention_fa2_q_preconvert_gfx1201
 #endif
@@ -1462,7 +1654,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SY
 // the native fp8 writer uses. 8 codes/lane in one aligned u64 store; sq by
 // lane 0. Zero rows yield zero codes with sq=1. Q never mutated. B2 gates
 // the numerics; B1b gates compile + resources.
-extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201(
+extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_ROUTE_QPRE_SYM(
     const float* __restrict__ q,
     unsigned char* __restrict__ codes,
     float* __restrict__ sq,
@@ -1552,7 +1744,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_fwht
 #if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8)
 // B1b diagnostic partial twin: same tile partition as the f16 partial; the
 // dump index carries the split so split dumps never alias.
-extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_partial_gfx1201(
+extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_ROUTE_PARTIAL_SYM(
     const unsigned char* __restrict__ q8_codes,
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
@@ -1588,7 +1780,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_
 }
 #else
 #if HIPFIRE_FA2_KMODE == 8
-extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_partial_f16_gfx1201(
+extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_ROUTE_PARTIAL_SYM(
 #elif defined(HIPFIRE_FA2_FP8)
 extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_partial_fp8_gfx1201(
 #else
@@ -1637,7 +1829,7 @@ extern "C" __global__ __launch_bounds__(128, 1) void attention_q8_0_fa2_gqa_part
 // Stage-b merge (§14.3): record format is scale-free (physical numerator in
 // the 258-float record), so this is the f16 merge body under the stage-b
 // symbol. Duplicated rather than shared so the Q0 object stays identical.
-extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_merge_gfx1201(
+extern "C" __global__ __launch_bounds__(256) void HIPFIRE_FA2_ROUTE_MERGE_SYM(
     const float* __restrict__ partials,
     float* __restrict__ out,
     int batch_size,
@@ -1678,7 +1870,7 @@ extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_mer
 }
 #else
 #if HIPFIRE_FA2_KMODE == 8
-extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_merge_f16_gfx1201(
+extern "C" __global__ __launch_bounds__(256) void HIPFIRE_FA2_ROUTE_MERGE_SYM(
 #elif defined(HIPFIRE_FA2_FP8)
 extern "C" __global__ __launch_bounds__(256) void attention_q8_0_fa2_gqa_merge_fp8_gfx1201(
 #else

@@ -6230,6 +6230,21 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_F16_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_KMODE 8\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
+/// Native-fp8-KV variant with only the QK leg quantized to E4M3.
+/// K/V remain raw bytes in LDS; V is decoded to f16 at PV consumption.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_QK8_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_QK8_ONLY 1\n",
+    "#define HIPFIRE_FA2_FP8 1\n",
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
+/// Native-fp8-KV variant with only the PV leg quantized to E4M3.
+/// QK remains f16 while V is staged as raw bytes and P is packed once.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_PV8_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_PV8_ONLY 1\n",
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
 /// Route-N stage-b source ([`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`] +
 /// `HIPFIRE_FA2_FP8=1` + `HIPFIRE_FA2_KMODE=8`): fp8 (E4M3) QK + PV
 /// arithmetic on native-fp8 KV rows (codes copied verbatim, scales from

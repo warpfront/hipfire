@@ -2292,22 +2292,15 @@ fn dispatch_attend(
                 ))
             }
             KernelKey::AttnFp8E4m3KvBatchedMasked => {
-                // gfx1201 FA2 prefill on native fp8 KV, Q0 (slice-B; default
-                // on; `HIPFIRE_GFX12_FA2_PREFILL=0` opts out). F4b: the
-                // launcher pre-converts Q into f16 scratch (Q never mutated)
-                // and the fill decodes native E4M3 rows into its f16 planes,
-                // so like the q8/fwht3 FA2 ingresses this arm is
-                // replay-idempotent and capture-safe — no recorder/capture
-                // gates. Same shape predicates as those ingresses (exact
-                // gfx1201/H24/KV4/D256, 64..=512 rows, 64..=32768 ctx),
-                // plus no tree-verify (FA2 has no tree path). Falls through
-                // to the scalar/tile crossover below otherwise.
-                // Stage-b route N retains its separate Q pre-convert for the
-                // oracle-only fallback. The packet route instead converts Q
-                // in-kernel. Batches above 512 are equal-length 512-row runs:
-                // one 3-D launch uses z for the run while x restarts the exact
-                // former per-step ownership and causal-bound grouping.
+                // Exact gfx1201/H24/KV4/D256 FA2 on native fp8 KV. The
+                // E4M3 QK and PV legs are independent opt-ins; with both
+                // disabled the f16-QK/f16-PV implementation remains the
+                // default. The 256-thread packet geometry is valid only
+                // when both fp8 legs are active. Every route leaves Q
+                // immutable and uses Gpu-owned pre-convert scratch.
                 if gpu.flags.gfx12_fa_packet
+                    && gpu.flags.attn_qk8
+                    && gpu.flags.attn_pv8
                     && gpu.arch == "gfx1201"
                     && io.n_heads == 24
                     && io.n_kv_heads == 4
@@ -2340,18 +2333,64 @@ fn dispatch_attend(
                     && (64..=32768).contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                 {
-                    hip!(gpu.attention_fp8_e4m3_fa2_gqa_fp8_gfx1201(
-                        io.q,
-                        io.k_cache,
-                        io.v_cache,
-                        io.output,
-                        io.positions(),
-                        io.n_heads,
-                        io.n_kv_heads,
-                        io.head_dim,
-                        io.max_ctx_len,
-                        io.batch_size,
-                    ))?;
+                    match (gpu.flags.attn_qk8, gpu.flags.attn_pv8) {
+                        (false, false) => {
+                            hip!(gpu.attention_fp8_e4m3_fa2_gqa_f16_gfx1201(
+                                io.q,
+                                io.k_cache,
+                                io.v_cache,
+                                io.output,
+                                io.positions(),
+                                io.n_heads,
+                                io.n_kv_heads,
+                                io.head_dim,
+                                io.max_ctx_len,
+                                io.batch_size,
+                            ))?;
+                        }
+                        (true, false) => {
+                            hip!(gpu.attention_fp8_e4m3_fa2_gqa_qk8_gfx1201(
+                                io.q,
+                                io.k_cache,
+                                io.v_cache,
+                                io.output,
+                                io.positions(),
+                                io.n_heads,
+                                io.n_kv_heads,
+                                io.head_dim,
+                                io.max_ctx_len,
+                                io.batch_size,
+                            ))?;
+                        }
+                        (false, true) => {
+                            hip!(gpu.attention_fp8_e4m3_fa2_gqa_pv8_gfx1201(
+                                io.q,
+                                io.k_cache,
+                                io.v_cache,
+                                io.output,
+                                io.positions(),
+                                io.n_heads,
+                                io.n_kv_heads,
+                                io.head_dim,
+                                io.max_ctx_len,
+                                io.batch_size,
+                            ))?;
+                        }
+                        (true, true) => {
+                            hip!(gpu.attention_fp8_e4m3_fa2_gqa_fp8_gfx1201(
+                                io.q,
+                                io.k_cache,
+                                io.v_cache,
+                                io.output,
+                                io.positions(),
+                                io.n_heads,
+                                io.n_kv_heads,
+                                io.head_dim,
+                                io.max_ctx_len,
+                                io.batch_size,
+                            ))?;
+                        }
+                    }
                     return Ok(());
                 }
                 // Scalar-batched at short ctx (same gfx12 4096 crossover as

@@ -2213,6 +2213,24 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx1201 packet-minimal Q128 FA2 attention body (default on exact gfx1201; set to false or HIPFIRE_GFX12_FA_PACKET=0 to opt out to route-N; exact stage-b arithmetic)."
     ),
     process_bool_field!(
+        "kernel.attn_qk8",
+        "attn_qk8",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_ATTN_QK8",
+        "Run the gfx1201 fp8-KV prefill QK product with E4M3 WMMA (default on exact gfx1201; set to false or HIPFIRE_ATTN_QK8=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.attn_pv8",
+        "attn_pv8",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_ATTN_PV8",
+        "Run the gfx1201 fp8-KV prefill PV product with E4M3 WMMA (default on exact gfx1201; set to false or HIPFIRE_ATTN_PV8=0 to opt out)."
+    ),
+    process_bool_field!(
         "kernel.gfx11_fa2_prefill",
         "gfx11_fa2_prefill",
         Kernel,
