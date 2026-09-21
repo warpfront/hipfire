@@ -246,7 +246,10 @@ fn mq4v2_wpreshuffle_enabled(gpu: &Gpu, name: &str, m: usize, k: usize) -> bool 
         || name.ends_with(".linear_attn.in_proj_qkv.weight")
         || name.ends_with(".linear_attn.in_proj_z.weight")
         || name.ends_with(".linear_attn.in_proj_a.weight")
-        || name.ends_with(".linear_attn.in_proj_b.weight");
+        || name.ends_with(".linear_attn.in_proj_b.weight")
+        || name.ends_with(".self_attn.q_proj.weight")
+        || name.ends_with(".self_attn.k_proj.weight")
+        || name.ends_with(".self_attn.v_proj.weight");
     target
         && gpu.arch == "gfx1201"
         && gpu.mq4v2_pow2scale != 0

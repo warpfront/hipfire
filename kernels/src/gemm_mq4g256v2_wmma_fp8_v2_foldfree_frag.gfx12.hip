@@ -218,9 +218,6 @@ void HIPFIRE_FP8_FOLDFREE_KERNEL(
         // expansion and reintroduce loadcnt waits in the WMMA drain.
         asm volatile("" ::: "memory");
 #if HIPFIRE_FP8_WPRESHUFFLE
-#if HIPFIRE_FP8_QKV
-#error "weight preshuffle is not implemented for qkv"
-#endif
         // One lane owns four adjacent output rows at one K8 half-fragment.
         // The load-time layout makes those four packed dwords contiguous, so
         // the entire compact-W contribution is one b128.  The high bytes of
@@ -250,6 +247,15 @@ void HIPFIRE_FP8_FOLDFREE_KERNEL(
         } else if (wgrc >= qkv_m) {
             wtile = A_z; etile = E_z;
             wlr = wgrc - qkv_m; wtile_rows = z_m;
+        }
+#elif HIPFIRE_FP8_QKV
+        wtile = A_q; etile = E_q; wlr = wgrc; wtile_rows = q_m;
+        if (wgrc >= q_m + k_m) {
+            wtile = A_v; etile = E_v;
+            wlr = wgrc - (q_m + k_m); wtile_rows = v_m;
+        } else if (wgrc >= q_m) {
+            wtile = A_k; etile = E_k;
+            wlr = wgrc - q_m; wtile_rows = k_m;
         }
 #elif HIPFIRE_FP8_RESIDUAL
         wtile = A_w; etile = E_w; wlr = wgrc; wtile_rows = res_m;

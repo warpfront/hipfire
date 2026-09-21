@@ -4318,6 +4318,15 @@ pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_WP_SRC: &str =
         "#define HIPFIRE_FP8_FOLDFREE_KERNEL gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_frag_wp_gfx1201\n",
         include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip")
     );
+pub const GEMM_QKV_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_WP_SRC: &str =
+    concat!(
+        "#define HIPFIRE_FP8_QKVZA 0\n",
+        "#define HIPFIRE_FP8_RESIDUAL 0\n",
+        "#define HIPFIRE_FP8_QKV 1\n",
+        "#define HIPFIRE_FP8_WPRESHUFFLE 1\n",
+        "#define HIPFIRE_FP8_FOLDFREE_KERNEL gemm_qkv_mq4g256v2_wmma_fp8_v2_foldfree_frag_wp_gfx1201\n",
+        include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip")
+    );
 pub const GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC: &str =
     concat!(
         "#define HIPFIRE_FP8_QKVZA 1\n",
