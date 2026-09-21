@@ -26,7 +26,7 @@ from typing import Any, Iterator
 
 import numpy as np
 import torch
-from safetensors.torch import save_file
+from safetensors.torch import load_file, save_file
 from torch import nn
 from torch.utils.checkpoint import checkpoint
 
@@ -122,6 +122,7 @@ def parse_args() -> argparse.Namespace:
     mode.add_argument("--full", action="store_true")
     parser.add_argument("--source", type=Path, default=SOURCE_DEFAULT)
     parser.add_argument("--artifact", type=Path, default=ARTIFACT_DEFAULT)
+    parser.add_argument("--initial-adapters", type=Path)
     parser.add_argument("--capture", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--quantizer", type=Path, default=QUANTIZER_DEFAULT)
@@ -165,6 +166,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("steps/accumulate/rank must be positive and schedule-steps >= steps")
     if args.warmup < 0 or args.eval_every <= 0 or args.heldout_sequences <= 0:
         parser.error("warmup must be nonnegative; eval cadence/count must be positive")
+    if args.dry_run and args.initial_adapters is not None:
+        parser.error("--initial-adapters requires --full")
     if args.dry_run and args.blocks != [0, 31, 60]:
         parser.error("dry-run uses exactly blocks 0,31,60 from the small capture")
     return args
@@ -1300,10 +1303,25 @@ def run_full(
     fla_delta = json.loads(delta_path.read_text())
     if float(fla_delta["relative_rms"]) > args.split_relative_rms:
         raise RuntimeError(f"FLA student surrogate exceeds limit: {fla_delta}")
-    if any(bool(torch.count_nonzero(wrapper.lora_b).item()) for wrapper in adapted):
+    resumed = args.initial_adapters is not None
+    if resumed:
+        initial_state = load_file(args.initial_adapters, device=str(device))
+        expected = {
+            wrapper.artifact_name + suffix
+            for wrapper in adapted
+            for suffix in (".lora_A", ".lora_B")
+        }
+        if set(initial_state) != expected:
+            raise RuntimeError(
+                f"initial adapter coverage mismatch: "
+                f"missing={sorted(expected - set(initial_state))[:8]} "
+                f"unexpected={sorted(set(initial_state) - expected)[:8]}"
+            )
+        load_adapter_state(adapted, initial_state)
+    elif any(bool(torch.count_nonzero(wrapper.lora_b).item()) for wrapper in adapted):
         raise AssertionError("LoRA B must be exactly zero at step 0")
     step0_export = export_artifact(
-        args, adapted, artifact_sha, reader.tensor_map, "step-000", True, wrappers
+        args, adapted, artifact_sha, reader.tensor_map, "step-000", not resumed, wrappers
     )
     initial_eval = full_eval(
         args, manifest, model, teacher_model, wrappers, teacher_head, device
@@ -1409,6 +1427,8 @@ def command_lines(args: argparse.Namespace) -> dict[str, str]:
         f"--device cuda --dtype bfloat16 --source {args.source} --artifact {args.artifact} "
         f"--capture {args.capture} --quantizer {args.quantizer}"
     )
+    if args.initial_adapters is not None:
+        common += f" --initial-adapters {args.initial_adapters}"
     return {
         "mi300x_kill_experiment": common
         + f" --steps 100 --schedule-steps 500 --export-steps 0,50,100 --out {args.out}",
@@ -1424,6 +1444,8 @@ def main() -> int:
         raise FileNotFoundError("source, artifact, or capture manifest is missing")
     if not args.quantizer.is_file():
         raise FileNotFoundError(args.quantizer)
+    if args.initial_adapters is not None and not args.initial_adapters.is_file():
+        raise FileNotFoundError(args.initial_adapters)
     args.out.mkdir(parents=True, exist_ok=True)
     artifact_sha = sha256_file(args.artifact)
     reader = ArtifactReader(args.artifact)
@@ -1462,6 +1484,9 @@ def main() -> int:
             "lr": args.lr,
             "warmup": args.warmup,
             "schedule_steps": args.schedule_steps,
+            "initial_adapters": (
+                str(args.initial_adapters.resolve()) if args.initial_adapters is not None else None
+            ),
             "schedule": "linear warmup then cosine decay",
             "optimizer": "AdamW",
             "weight_decay": 0.0,
