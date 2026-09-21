@@ -200,6 +200,22 @@ Old Maren found a glass bottle still sealed after the storm, its label smeared b
 5. Keep dependencies minimal and well documented.
 ````
 
+## Correction to the inherited quality premise
+
+The row-global/coarse-A activation quality win does **not** exist on the genuine IU4 path. The earlier `0.037143 / 0.045510` c2/c24 figures belong to the FP8v2 route, whose activation packer is row-wide by construction. They were mislabeled as grouped IU4 because the evaluation fell back to FP8 while using a stale binary.
+
+Route-fixed IU4 measurements on the same shipped artifact and WT2 reference are monotonically worse as the activation group gets coarser:
+
+| Genuine IU4 activation group | c2 KLD | c24 KLD |
+|---|---:|---:|
+| K128 | 0.064864 | 0.081199 |
+| K512 | 0.072867 | 0.096131 |
+| row-global | 0.118151 | 0.158940 |
+
+The c24 correction was rerun explicitly after the route audit: `HIPFIRE_A4_GROUP_K=512` produced 0.096131 and the route-fixed row-global path produced 0.158940. The row-global c1 trace contains 512 grouped-quantizer launches, 736 + 256 IU4 symfold GEMMs, and zero FP8 projection GEMMs. Thus the coarse-A premise is refuted in the same c24 units as the campaign gate, independent of this lane's mixed K512/K128 result.
+
+The reference distribution also changes the absolute budget picture. Against `/home/kaden/kldrefs/qwen3.8-27b.ref_ag.bin`, the shipped artifact measures IU4 c24 **0.251918** and FP8v2 c24 **0.159494**, versus 0.081199 and 0.045510 on WT2. Both serving-distribution values are roughly three times worse than the screening-reference values.
+
 ## Gate accounting
 
 | Gate | Required | Result |
