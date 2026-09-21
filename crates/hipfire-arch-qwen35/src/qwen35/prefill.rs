@@ -8315,7 +8315,7 @@ fn batch_chunk_fa_attend(
         // and max/min bounds as the former per-step launch. Only whole-run
         // chunks qualify; an odd tail takes the per-segment loop below.
         let packet_runs = gpu.arch == "gfx1201"
-            && gpu.flags.gfx12_fa_packet
+            && (gpu.flags.gfx12_fa_packet || gpu.flags.attn_qresident)
             && kv_cache.quant_fp8
             && config.n_heads == 24
             && config.n_kv_heads == 4

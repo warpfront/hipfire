@@ -1,0 +1,10 @@
+{
+  "wmma_fp8": 32,
+  "wmma_f16": 0,
+  "fp8_cvt": 68,
+  "scratch": 0,
+  "global_load": 48,
+  "global_store": 32,
+  "barrier_signal": 4,
+  "barrier_wait": 4
+}
