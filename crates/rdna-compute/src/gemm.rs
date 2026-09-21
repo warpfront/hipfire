@@ -9512,6 +9512,11 @@ impl Gpu {
             && (batch_size >= 256 || prepared.fragment_order);
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
         let fragment_order = foldfree && prepared.fragment_order;
+        let wpreshuffle = fragment_order
+            && self.mq4v2_weight_is_wpreshuffled(a_qkv)?
+            && self.mq4v2_weight_is_wpreshuffled(a_z)?
+            && self.mq4v2_weight_is_wpreshuffled(a_beta)?
+            && self.mq4v2_weight_is_wpreshuffled(a_alpha)?;
         // Fold-free owns a fixed 256-token x 128-row tile. Other v2 routes
         // continue to honor the experimental geometry selector.
         let (vbm, vbn, vbk, vwaves) = if foldfree {
@@ -9536,19 +9541,27 @@ impl Gpu {
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
         let (func_name, ksrc, bv): (&str, &str, usize) = if foldfree {
-            (
-                if fragment_order {
-                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_frag_gfx1201"
-                } else {
-                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201"
-                },
-                if fragment_order {
-                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC
-                } else {
-                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC
-                },
-                16,
-            )
+            if wpreshuffle {
+                (
+                    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_frag_wp_gfx1201",
+                    kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_WP_SRC,
+                    16,
+                )
+            } else {
+                (
+                    if fragment_order {
+                        "gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_frag_gfx1201"
+                    } else {
+                        "gemm_qkvza_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201"
+                    },
+                    if fragment_order {
+                        kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC
+                    } else {
+                        kernels::GEMM_QKVZA_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC
+                    },
+                    16,
+                )
+            }
         } else if symfold {
             match (vbm, vbn) {
                 (128, 128) => (

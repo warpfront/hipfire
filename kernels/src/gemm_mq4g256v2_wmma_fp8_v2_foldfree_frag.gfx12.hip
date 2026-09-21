@@ -218,8 +218,8 @@ void HIPFIRE_FP8_FOLDFREE_KERNEL(
         // expansion and reintroduce loadcnt waits in the WMMA drain.
         asm volatile("" ::: "memory");
 #if HIPFIRE_FP8_WPRESHUFFLE
-#if HIPFIRE_FP8_QKVZA || HIPFIRE_FP8_QKV
-#error "weight preshuffle is implemented only for gate/up and residual"
+#if HIPFIRE_FP8_QKV
+#error "weight preshuffle is not implemented for qkv"
 #endif
         // One lane owns four adjacent output rows at one K8 half-fragment.
         // The load-time layout makes those four packed dwords contiguous, so
@@ -233,19 +233,33 @@ void HIPFIRE_FP8_FOLDFREE_KERNEL(
         const int wkst = wrest & 3;
         const int wntl = wrest >> 2;
         const int wrow = wntl * 16 + (wlane & 15);
-#if HIPFIRE_FP8_RESIDUAL
-        const char* wtile = A_w;
-        const float* etile = E_w;
-        const int wtile_row0 = rs;
-        const int wtile_rows = res_m;
+        const int wgr = rs + wrow;
+        const int wgrc = wgr < tm ? wgr : tm - 4;
+        const char* wtile;
+        const float* etile;
+        int wlr;
+        int wtile_rows;
+#if HIPFIRE_FP8_QKVZA
+        wtile = A_qkv; etile = E_qkv; wlr = wgrc; wtile_rows = qkv_m;
+        if (wgrc >= qkv_m + z_m + beta_m) {
+            wtile = A_alpha; etile = E_alpha;
+            wlr = wgrc - (qkv_m + z_m + beta_m); wtile_rows = alpha_m;
+        } else if (wgrc >= qkv_m + z_m) {
+            wtile = A_beta; etile = E_beta;
+            wlr = wgrc - (qkv_m + z_m); wtile_rows = beta_m;
+        } else if (wgrc >= qkv_m) {
+            wtile = A_z; etile = E_z;
+            wlr = wgrc - qkv_m; wtile_rows = z_m;
+        }
+#elif HIPFIRE_FP8_RESIDUAL
+        wtile = A_w; etile = E_w; wlr = wgrc; wtile_rows = res_m;
 #else
-        const bool wtile_up = rs >= gate_m;
-        const char* wtile = wtile_up ? A_up : A_gate;
-        const float* etile = wtile_up ? E_up : E_gate;
-        const int wtile_row0 = wtile_up ? rs - gate_m : rs;
-        const int wtile_rows = wtile_up ? up_m : gate_m;
+        const bool wtile_up = wgrc >= gate_m;
+        wtile = wtile_up ? A_up : A_gate;
+        etile = wtile_up ? E_up : E_gate;
+        wlr = wtile_up ? wgrc - gate_m : wgrc;
+        wtile_rows = wtile_up ? up_m : gate_m;
 #endif
-        const int wlr = wtile_row0 + wrow;
         const int wlane_idx = (wlane & 16) | (wlr & 15);
         const size_t wpayload_bytes =
             (size_t)wtile_rows * (size_t)K / 2u;
@@ -258,8 +272,9 @@ void HIPFIRE_FP8_FOLDFREE_KERNEL(
             (const unsigned char*)wtile + wpayload_bytes
             + ((size_t)(wlr >> 4) * 4u) * 16u + (unsigned)(wlr & 15);
         const float4 wref = *(const float4*)(etile + wlr);
-        const ff_v4i_t pk4 =
+        ff_v4i_t pk4 =
             *(const ff_v4i_t*)(wpacked_base + (size_t)k0 * 8u);
+        if (wgr >= tm) pk4 = ff_v4i_t{0, 0, 0, 0};
         const unsigned int sc4 = *(const unsigned int*)(
             wscale_base + (size_t)(k0 >> 7) * wmeta_half_stride);
 #pragma unroll
