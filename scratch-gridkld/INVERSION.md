@@ -24,7 +24,7 @@ On that route the actual daemon IU4 GEMMs do not get faster: set is **130.822 ->
 
 Corrected card-E pp8192 ABBA is neutral/noise (**+0.126% candidate throughput**), while corrected client TTFT C-X-X-C is a clear failure: **1,849.956 -> 1,883.053 ms, +33.097 ms / +1.789% latency**. The candidate fails the daemon gate even before the separate artifact-quality decision.
 
-The independent configuration audit is `/home/kaden/ClaudeCode/warpfront/wt-inv/scratch-inv/INVERSION.md`. This report owns the route and performance diagnosis; the audit owns the command/configuration-chain review.
+The independent configuration audit is `/home/kaden/ClaudeCode/warpfront/wt-inv/scratch-inv/INVERSION.md` at commit `9547a6872`. This report owns the route and performance diagnosis; the audit owns the command/configuration-chain review.
 
 ## Provenance
 
