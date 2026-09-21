@@ -6261,6 +6261,16 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_PACKET_GFX1201_SRC: &str = concat!(
     "#define HIPFIRE_FA2_KMODE 8\n",
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
 );
+/// Register-resident-Q wide-workgroup gfx1201 native-fp8 attention candidate.
+/// Twenty-four wave32s own 384 query-head rows and retain converted Q
+/// fragments across every K64/V64 tile.
+pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_GFX1201_SRC: &str = concat!(
+    "#define HIPFIRE_FA2_QRESIDENT 1\n",
+    "#define HIPFIRE_FA2_FP8 1\n",
+    "#define HIPFIRE_FA2_KMODE 8\n",
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip")
+);
+
 
 /// gfx11 (RDNA3) sister of [`ATTENTION_Q8_0_FA2_GQA_GFX1201_SRC`]
 /// (research opt-in). One workgroup per KV head x 8 positions; K/V

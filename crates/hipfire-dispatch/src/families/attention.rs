@@ -2307,6 +2307,30 @@ fn dispatch_attend(
                 // in-kernel. Batches above 512 are equal-length 512-row runs:
                 // one 3-D launch uses z for the run while x restarts the exact
                 // former per-step ownership and causal-bound grouping.
+                if gpu.flags.attn_qresident
+                    && gpu.arch == "gfx1201"
+                    && io.n_heads == 24
+                    && io.n_kv_heads == 4
+                    && io.head_dim == 256
+                    && (64..=32768).contains(&io.batch_size)
+                    && (io.batch_size <= 512 || io.batch_size % 512 == 0)
+                    && (64..=32768).contains(&io.max_ctx_len)
+                    && io.tree_bias.is_none()
+                {
+                    hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ))?;
+                    return Ok(());
+                }
                 if gpu.flags.gfx12_fa_packet
                     && gpu.arch == "gfx1201"
                     && io.n_heads == 24

@@ -2260,3 +2260,398 @@ extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_pac
     }
 }
 #endif
+
+// ---- Register-resident-Q wide packet candidate ----
+// One 768-thread workgroup owns 384 query-head rows for one KV head.
+// Converted Q fragments remain live across the complete KV loop.
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8) && defined(HIPFIRE_FA2_QRESIDENT)
+static __device__ __forceinline__ float fa2_qr_xor16(float v)
+{
+    int bits = __builtin_bit_cast(int, v);
+    bits = __builtin_amdgcn_permlanex16(bits, bits, 0x76543210, 0xfedcba98,
+                                        false, false);
+    return __builtin_bit_cast(float, bits);
+}
+
+static __device__ __forceinline__ float fa2_qr_f16(uint16_t u)
+{
+    return (float)((fa2_dw_t){.u = (uint32_t)u}).h[0];
+}
+
+extern "C" __global__ __launch_bounds__(768, 1)
+void attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
+    const float* __restrict__ q,
+    const unsigned char* __restrict__ k_cache,
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,
+    const int* __restrict__ positions,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn)
+{
+    if (n_heads != 24 || n_kv_heads != 4 || head_dim != 256)
+        return;
+    const int kv_h = (int)blockIdx.y;
+    if (kv_h >= 4)
+        return;
+    const int query_offset = batch_size > 512 ? 512 * (int)blockIdx.z : 0;
+    if (query_offset >= batch_size)
+        return;
+    const int run_rows = min(512, batch_size - query_offset);
+    const int row_base = 384 * (int)blockIdx.x;
+    if (row_base >= 6 * run_rows)
+        return;
+
+    const int tid = (int)threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int ml = lane & 15;
+    const int kg = lane >> 4;
+    const int row = row_base + 16 * wave + ml;
+    const int query_local = row / 6;
+    const int query = query_offset + query_local;
+    const int head = 6 * kv_h + row % 6;
+    const bool qok = row < 6 * run_rows;
+    const unsigned qrow =
+        qok ? (unsigned)query * 24u + (unsigned)head : 0u;
+
+    // Sixteen resident 16-dimension Q fragments, one lane-half per row.
+    v2i_t Qfr[16];
+    float q_row_scale = 1.0f;
+    if (qok) {
+        const float* qp = q + (unsigned long long)qrow * 256ULL;
+        float a = 0.0f;
+#pragma unroll
+        for (int frag = 0; frag < 16; ++frag) {
+            const float8_t v = *(const float8_t*)(
+                qp + (unsigned)(frag * 16 + kg * 8));
+            a = fmaxf(a, fabsf(v[0]));
+            a = fmaxf(a, fabsf(v[1]));
+            a = fmaxf(a, fabsf(v[2]));
+            a = fmaxf(a, fabsf(v[3]));
+            a = fmaxf(a, fabsf(v[4]));
+            a = fmaxf(a, fabsf(v[5]));
+            a = fmaxf(a, fabsf(v[6]));
+            a = fmaxf(a, fabsf(v[7]));
+        }
+        a = fmaxf(a, fa2_qr_xor16(a));
+        q_row_scale = (a == 0.0f) ? 1.0f : a / 448.0f;
+#pragma unroll
+        for (int frag = 0; frag < 16; ++frag) {
+            const float8_t v = *(const float8_t*)(
+                qp + (unsigned)(frag * 16 + kg * 8));
+            unsigned int w0 = 0u;
+            w0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                v[0] / q_row_scale, v[1] / q_row_scale, w0, false);
+            w0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                v[2] / q_row_scale, v[3] / q_row_scale, w0, true);
+            unsigned int w1 = 0u;
+            w1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                v[4] / q_row_scale, v[5] / q_row_scale, w1, false);
+            w1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                v[6] / q_row_scale, v[7] / q_row_scale, w1, true);
+            Qfr[frag] = (v2i_t){(int)w0, (int)w1};
+        }
+    } else {
+#pragma unroll
+        for (int frag = 0; frag < 16; ++frag)
+            Qfr[frag] = (v2i_t){0, 0};
+    }
+
+    extern __shared__ uint32_t LDS[];
+    unsigned char* K8 = (unsigned char*)LDS;
+    unsigned char* V8 = (unsigned char*)LDS + 16384;
+    uint32_t* SCR = LDS + 8192 + (unsigned)wave * 512u;
+    const uint16_t* SK =
+        (const uint16_t*)((const unsigned char*)LDS + 49152);
+    const uint16_t* SV =
+        (const uint16_t*)((const unsigned char*)LDS + 49280);
+
+    // One-time query-position bound reduction. The two barrier costs are
+    // outside the KV loop and the scale-header bytes are overwritten later.
+    int* bounds = (int*)((unsigned char*)LDS + 49152);
+    if (tid == 0) {
+        bounds[0] = -1;
+        bounds[1] = 0x7fffffff;
+    }
+    __syncthreads();
+    const int bound_queries = ((min(row_base + 384, 6 * run_rows) - 1) / 6)
+        - row_base / 6 + 1;
+    if (tid < bound_queries) {
+        const int ql = row_base / 6 + tid;
+        if (ql < run_rows) {
+            const int p = positions[query_offset + ql];
+            atomicMax(bounds + 0, p);
+            atomicMin(bounds + 1, p);
+        }
+    }
+    __syncthreads();
+    const int gmax = bounds[0];
+    const int gmin = bounds[1];
+    const int seq_len = gmax + 1;
+    const bool qok_all = row_base + 383 < 6 * run_rows;
+
+    float8_t Ofr[16];
+#pragma unroll
+    for (int dc = 0; dc < 16; ++dc)
+        Ofr[dc] =
+            (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+    float m_ref = -INFINITY;
+    float l_val = 0.0f;
+    float b_ref = 0x1p-64f;
+
+    for (int ktile = 0; ktile < seq_len; ktile += 64) {
+        const bool full = qok_all && (ktile + 63 <= gmin);
+
+        // The first 256 threads fill the shared K plane.
+        if (tid < 256) {
+#pragma unroll
+            for (int t = 0; t < 4; ++t) {
+                const int idx = tid + t * 256;
+                const int ln = idx & 31;
+                const int sub = (idx >> 5) & 3;
+                const int p = idx >> 7;
+                const int gk = ktile + sub * 16 + (ln & 15);
+                uint4 pair = {0u, 0u, 0u, 0u};
+                if (gk < seq_len) {
+                    const unsigned char* rrow =
+                        k_cache + (unsigned long long)gk * 1032ULL
+                        + (unsigned long long)kv_h * 256ULL;
+                    const unsigned long long* r64 =
+                        (const unsigned long long*)rrow;
+                    const unsigned long long a =
+                        r64[(unsigned)(2 * p) * 2u
+                            + (unsigned)(ln >> 4)];
+                    const unsigned long long b =
+                        r64[(unsigned)(2 * p + 1) * 2u
+                            + (unsigned)(ln >> 4)];
+                    pair.x = (uint32_t)(a & 0xffffffffULL);
+                    pair.y = (uint32_t)(a >> 32);
+                    pair.z = (uint32_t)(b & 0xffffffffULL);
+                    pair.w = (uint32_t)(b >> 32);
+                }
+                *(uint4*)(K8
+                    + (unsigned)(((p * 4 + sub) * 32 + ln) * 16)) = pair;
+            }
+        }
+
+        // Only eight waves are needed to stage the common V64 tile.
+        if (wave < 8) {
+#pragma unroll 4
+            for (int r = 0; r < 8; ++r) {
+                const int gkey = ktile + wave * 8 + r;
+                unsigned long long v = 0ULL;
+                if (gkey < seq_len) {
+                    const unsigned char* rrow =
+                        v_cache + (unsigned long long)gkey * 1032ULL
+                        + (unsigned long long)kv_h * 256ULL;
+                    v = *(const unsigned long long*)(
+                        rrow + (unsigned)lane * 8u);
+                }
+                SCR[((r * 64 + lane * 2) ^ ((r & 3) * 8))] =
+                    (uint32_t)(v & 0xffffffffULL);
+                SCR[((r * 64 + lane * 2 + 1) ^ ((r & 3) * 8))] =
+                    (uint32_t)(v >> 32);
+            }
+        }
+        // Each transpose wave consumes only its own private SCR region.
+        // A wave barrier is sufficient; the later workgroup barrier publishes
+        // completed K/V planes to all 24 compute waves.
+        __builtin_amdgcn_wave_barrier();
+
+        if (wave < 8) {
+            const int sub = wave >> 1;
+            const int r = ml & 3;
+            const int dq = ml >> 2;
+            const uint32_t rbase0 = (uint32_t)r * 64u;
+            const uint32_t rbase1 = (uint32_t)(r + 4) * 64u;
+            const uint32_t rmask = (uint32_t)(r & 3) * 8u;
+            const uint32_t sel1 =
+                ((r & 1) == 0) ? 0x06020400u : 0x03070105u;
+            const uint32_t sel2 =
+                (r < 2) ? 0x05040100u : 0x03020706u;
+            if (((lane >> 4) & 1) == (wave & 1)) {
+#pragma unroll 4
+                for (int p = 0; p < 8; ++p) {
+                    uint4 store = {0u, 0u, 0u, 0u};
+                    uint32_t* s32 = (uint32_t*)&store;
+#pragma unroll
+                    for (int h = 0; h < 2; ++h) {
+                        const int dc = 2 * p + h;
+                        const uint32_t w = (uint32_t)(dc * 4 + dq);
+                        const uint32_t d0 = SCR[((rbase0 + w) ^ rmask)];
+                        const uint32_t d1 = SCR[((rbase1 + w) ^ rmask)];
+                        uint32_t e0 =
+                            (uint32_t)__shfl_xor((int)d0, 1, 32);
+                        e0 = __builtin_amdgcn_perm(e0, d0, sel1);
+                        uint32_t e1 =
+                            (uint32_t)__shfl_xor((int)d1, 1, 32);
+                        e1 = __builtin_amdgcn_perm(e1, d1, sel1);
+                        const uint32_t f0 =
+                            (uint32_t)__shfl_xor((int)e0, 2, 32);
+                        s32[h * 2] =
+                            __builtin_amdgcn_perm(f0, e0, sel2);
+                        const uint32_t f1 =
+                            (uint32_t)__shfl_xor((int)e1, 2, 32);
+                        s32[h * 2 + 1] =
+                            __builtin_amdgcn_perm(f1, e1, sel2);
+                    }
+                    *(uint4*)(V8
+                        + (unsigned)(((sub * 8 + p) * 32 + lane) * 16))
+                        = store;
+                }
+            }
+        }
+
+        if (tid < 64) {
+            const int gk = ktile + tid;
+            uint16_t skv = 0, svv = 0;
+            if (gk < seq_len) {
+                const unsigned char* kr =
+                    k_cache + (unsigned long long)gk * 1032ULL;
+                const unsigned char* vr =
+                    v_cache + (unsigned long long)gk * 1032ULL;
+                skv = (uint16_t)kr[1024 + kv_h * 2]
+                    | ((uint16_t)kr[1024 + kv_h * 2 + 1] << 8);
+                svv = (uint16_t)vr[1024 + kv_h * 2]
+                    | ((uint16_t)vr[1024 + kv_h * 2 + 1] << 8);
+            }
+            ((uint16_t*)((unsigned char*)LDS + 49152))[tid] = skv;
+            ((uint16_t*)((unsigned char*)LDS + 49280))[tid] = svv;
+        }
+        __syncthreads();
+
+        const bool do0 = ktile <= gmax;
+        const bool do1 = ktile + 16 <= gmax;
+        const bool do2 = ktile + 32 <= gmax;
+        const bool do3 = ktile + 48 <= gmax;
+        const float qs_tile = q_row_scale * scale_attn;
+        const int pos = (!full && qok) ? positions[query] : 0;
+#pragma unroll 1
+        for (int sub = 0; sub < 4; ++sub) {
+            const bool dos = (sub == 0) ? do0
+                : (sub == 1) ? do1 : (sub == 2) ? do2 : do3;
+            if (!dos)
+                continue;
+            float8_t sacc =
+                (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+#pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const uint4 kv = *(const uint4*)(K8
+                    + (unsigned)(((p * 4 + sub) * 32 + lane) * 16));
+                const v2i_t kf0 = {(int)kv.x, (int)kv.y};
+                const v2i_t kf1 = {(int)kv.z, (int)kv.w};
+                sacc =
+                    __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        kf0, Qfr[2 * p], sacc);
+                sacc =
+                    __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        kf1, Qfr[2 * p + 1], sacc);
+                asm volatile("" ::: "memory");
+            }
+
+            const int kt_sub = ktile + sub * 16;
+            const bool sub_full = full || ((kt_sub + 15) <= gmin);
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const int key_g = kt_sub + 8 * kg + j;
+                const bool ok =
+                    qok && (sub_full || key_g <= pos);
+                sacc[j] = ok
+                    ? (sacc[j] * qs_tile)
+                        * fa2_qr_f16(SK[sub * 16 + 8 * kg + j])
+                    : -INFINITY;
+            }
+            float mx = -INFINITY;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                mx = fmaxf(mx, sacc[j]);
+            mx = fmaxf(mx, fa2_qr_xor16(mx));
+
+            // Keep a stable maximum for up to four natural-log units. Only
+            // the uncommon rebase path scales the 128-element accumulator.
+            if (mx != -INFINITY) {
+                if (m_ref == -INFINITY) {
+                    m_ref = mx;
+                } else if (mx > m_ref + 4.0f) {
+                    const float alpha = __expf(m_ref - mx);
+                    l_val *= alpha;
+#pragma unroll
+                    for (int dc = 0; dc < 16; ++dc)
+                        Ofr[dc] *= alpha;
+                    m_ref = mx;
+                }
+            }
+            float sum = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j) {
+                const float e = (m_ref == -INFINITY)
+                    ? 0.0f : __expf(sacc[j] - m_ref);
+                sum += e;
+                sacc[j] =
+                    e * fa2_qr_f16(SV[sub * 16 + 8 * kg + j]);
+            }
+            sum += fa2_qr_xor16(sum);
+            l_val += sum;
+
+            float wmax = 0.0f;
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                wmax = fmaxf(wmax, sacc[j]);
+            wmax = fmaxf(wmax, fa2_qr_xor16(wmax));
+            const float needed =
+                wmax > 0.0f ? fmaxf(wmax / 448.0f, 0x1p-64f) : b_ref;
+            if (needed > b_ref) {
+                const float rho = b_ref / needed;
+#pragma unroll
+                for (int dc = 0; dc < 16; ++dc)
+                    Ofr[dc] *= rho;
+                b_ref = needed;
+            }
+
+            unsigned int p0 = 0u;
+            p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                sacc[0] / b_ref, sacc[1] / b_ref, p0, false);
+            p0 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                sacc[2] / b_ref, sacc[3] / b_ref, p0, true);
+            unsigned int p1 = 0u;
+            p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                sacc[4] / b_ref, sacc[5] / b_ref, p1, false);
+            p1 = __builtin_amdgcn_cvt_pk_fp8_f32(
+                sacc[6] / b_ref, sacc[7] / b_ref, p1, true);
+            const v2i_t pb = {(int)p0, (int)p1};
+#pragma unroll
+            for (int p = 0; p < 8; ++p) {
+                const uint4 vv = *(const uint4*)(V8
+                    + (unsigned)(((sub * 8 + p) * 32 + lane) * 16));
+                const v2i_t va0 = {(int)vv.x, (int)vv.y};
+                const v2i_t va1 = {(int)vv.z, (int)vv.w};
+                Ofr[2 * p] =
+                    __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        va0, pb, Ofr[2 * p]);
+                Ofr[2 * p + 1] =
+                    __builtin_amdgcn_wmma_f32_16x16x16_fp8_fp8_w32_gfx12(
+                        va1, pb, Ofr[2 * p + 1]);
+                asm volatile("" ::: "memory");
+            }
+        }
+        __syncthreads();
+    }
+
+    if (qok) {
+        const float inv = l_val > 0.0f ? b_ref / l_val : 0.0f;
+        const unsigned bo =
+            (unsigned)query * 6144u + (unsigned)head * 256u;
+#pragma unroll
+        for (int dc = 0; dc < 16; ++dc) {
+            const unsigned bd =
+                bo + (unsigned)(dc * 16 + kg * 8);
+#pragma unroll
+            for (int j = 0; j < 8; ++j)
+                out[bd + (unsigned)j] = Ofr[dc][j] * inv;
+        }
+    }
+}
+#endif

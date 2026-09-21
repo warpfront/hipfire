@@ -4795,6 +4795,140 @@ impl Gpu {
         }
         result
     }
+
+    /// Opt-in gfx1201 native-fp8 prefill attention with 384 query-head rows
+    /// per 768-thread workgroup. Converted Q fragments stay register-resident
+    /// for the complete context traversal.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_qresident_gfx1201 requires gfx1201, got {}",
+                    self.arch
+                ),
+            ));
+        }
+        if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_qresident_gfx1201 requires H24/KV4/D256, got \
+                     H{n_heads}/KV{n_kv_heads}/D{head_dim}"
+                ),
+            ));
+        }
+        if batch_size == 0 || batch_size > 32768 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_qresident_gfx1201 requires 1 <= batch <= 32768, got {batch_size}"
+                ),
+            ));
+        }
+        if max_ctx_len == 0 || max_ctx_len > 32768 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_qresident_gfx1201 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                ),
+            ));
+        }
+        let need_qo = batch_size * n_heads * head_dim;
+        if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_qresident_gfx1201 capacity mismatch: \
+                     q={} out={} positions={} (need qo>={need_qo}, pos>={batch_size})",
+                    q.numel(),
+                    out.numel(),
+                    positions.numel()
+                ),
+            ));
+        }
+        const SYMBOL: &str =
+            "attention_fp8_e4m3_fa2_gqa_qresident_gfx1201";
+        let src =
+            kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_GFX1201_SRC;
+        if !self.functions.contains_key(SYMBOL) {
+            self.ensure_kernel(SYMBOL, src, SYMBOL)?;
+        }
+        let run_rows = batch_size.min(512);
+        let grid_x = (run_rows * 6).div_ceil(384) as u32;
+        let grid_z = batch_size.div_ceil(512) as u32;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut q_arg = q.buf.as_ptr();
+        let mut k_ptr = k_cache.buf.as_ptr();
+        let mut v_ptr = v_cache.buf.as_ptr();
+        let mut out_ptr = out.buf.as_ptr();
+        let mut pos_ptr = positions.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut bs = batch_size as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut q_arg as *mut _ as *mut c_void,
+            &mut k_ptr as *mut _ as *mut c_void,
+            &mut v_ptr as *mut _ as *mut c_void,
+            &mut out_ptr as *mut _ as *mut c_void,
+            &mut pos_ptr as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut bs as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
+            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+        );
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            SYMBOL,
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            SYMBOL,
+            [grid_x, 4, grid_z],
+            [768, 1, 1],
+            49408,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(q_arg);
+                b.push_ptr(k_ptr);
+                b.push_ptr(v_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(pos_ptr);
+                b.push_i32(nh);
+                b.push_i32(nkv);
+                b.push_i32(hd);
+                b.push_i32(bs);
+                b.push_f32(sc);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     /// Benchmark/oracle-only split-KV stage-b route-N path (S partitions +
     /// stable merge). `partials` is caller-owned F32 scratch of at least
     /// `n_splits * batch_size * n_heads * (head_dim + 2)` elements; this
