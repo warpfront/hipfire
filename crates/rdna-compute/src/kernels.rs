@@ -1149,6 +1149,20 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+/// gfx1201 FP8-stream SwiGLU/FWHT producer for residual down projections.
+/// The row-wide geometry preserves the incumbent wave-local arithmetic and
+/// emits the standalone F32 packer's three planes in the same launch.
+pub const FUSED_SILU_MUL_MQ_ROTATE_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
+);
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_SILU_FP8_AWQ 1\n",
+    "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
+);
 /// T-B IU4 producer sidecar: standalone FWHT rotate + in-register
 /// `block_i4_128` emit for wo (residual) inputs. Prepends the shared quant
 /// recipe; the old `mq_rotate_x` / `rotate_x_mq_awq` symbols stay untouched.

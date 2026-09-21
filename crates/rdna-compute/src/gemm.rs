@@ -31594,12 +31594,6 @@ impl Gpu {
                 "mq4v2-lloyd residual FP8 prefill: K divisible by 256 required",
             ));
         }
-        if batch_size % 64 != 0 {
-            return Err(hip_bridge::HipError::new(
-                0,
-                "mq4v2-lloyd residual FP8 prefill: batch divisible by 64 required (pad upstream)",
-            ));
-        }
         if prepared.n != batch_size || prepared.k != k {
             return Err(hip_bridge::HipError::new(
                 0,

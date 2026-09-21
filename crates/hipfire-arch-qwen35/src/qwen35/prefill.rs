@@ -208,6 +208,33 @@ fn try_gfx12_fp8_stream_rmsnorm_prepared(
     )?;
     Ok(Some(prep))
 }
+/// gfx1201 FP8-stream down-projection producer.  The admitted Lloyd route
+/// writes the exact F32 SwiGLU/AWQ/FWHT row plus the standalone packer's
+/// scale_mode=1 planes, allowing the residual GEMM to consume a prepared
+/// handle without a second launch.
+fn try_gfx12_fp8_stream_silu_prepared(
+    gpu: &mut Gpu,
+    w_down: &hipfire_runtime::llama::WeightTensor,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+    n: usize,
+) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
+    if w_down.gpu_dtype != DType::MQ4G256V2Lloyd || !gpu.fp8_stream_active(n, k) {
+        return Ok(None);
+    }
+    let prep = gpu.fused_silu_mul_rotate_mq_fp8_gfx12_batched(
+        gate,
+        up,
+        w_down.awq_scale.as_ref(),
+        x_rot,
+        k,
+        n,
+    )?;
+    Ok(Some(prep))
+}
+
 
 /// gfx1201 slices-3: FWHT-rotate + `block_i4_128` IU4 producer for the
 /// attention out-proj input. `None` → caller keeps the incumbent rotate +
@@ -787,6 +814,35 @@ fn dispatch_batched_gemm_epilogue(
         }
     }
 }
+/// Consume producer-emitted MQ4v2 FP8 planes for a Lloyd residual/partial
+/// projection.  This is the prepared twin of `dispatch_batched_gemm_epilogue`
+/// for the exact gfx1201 route; no activation pack is launched here.
+fn dispatch_batched_fp8_lloyd_epilogue(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    w: &hipfire_runtime::llama::WeightTensor,
+    prepared: &rdna_compute::Mq4v2Fp8Prepared,
+    epilogue: &BatchEpilogue<'_>,
+    n: usize,
+) -> HipResult<()> {
+    let out = match epilogue {
+        BatchEpilogue::Residual => &pbs.x_batch,
+        BatchEpilogue::Partial(out) => {
+            zero_partial_for_residual(gpu, out, n, w.m)?;
+            out
+        }
+    };
+    gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared_lloyd(
+        &w.buf,
+        prepared,
+        out,
+        w.m,
+        w.k,
+        n,
+        lloyd_e4m3_or_fail(w, "dispatch_batched_fp8_lloyd_epilogue")?,
+    )
+}
+
 
 /// Batched prefill entry point: processes N prompt tokens in one call,
 /// writing the last token's logits into `scratch.logits` and leaving
@@ -7156,6 +7212,7 @@ fn batch_chunk_delta_net_ffn_down(
             | DType::MFP4G32
     );
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
+    let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if w_down_is_mq {
         // C2: SwiGLU/FWHT IU4 producer for w_down (emit_f32=false). Residual only —
         // Partial TP epilogue still needs the f32 rotated buffer.
@@ -7185,6 +7242,17 @@ fn batch_chunk_delta_net_ffn_down(
             }
         }
         if iu4_prep.is_none() {
+            fp8_prep = try_gfx12_fp8_stream_silu_prepared(
+                gpu,
+                &layer.w_down,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                &pbs.ffn_hidden_batch,
+                hidden_dim,
+                n,
+            )?;
+        }
+        if iu4_prep.is_none() && fp8_prep.is_none() {
             // F2: AWQ-aware silu_mul+rotate for w_down input.
             fused_silu_mul_rotate_mq_batched_for(
                 gpu,
@@ -7207,6 +7275,15 @@ fn batch_chunk_delta_net_ffn_down(
             &pbs.x_batch,
             layer.w_down.m,
             layer.w_down.k,
+            n,
+        )?;
+    } else if let Some(prep) = &fp8_prep {
+        dispatch_batched_fp8_lloyd_epilogue(
+            gpu,
+            pbs,
+            &layer.w_down,
+            prep,
+            &epilogue,
             n,
         )?;
     } else {
@@ -8799,6 +8876,7 @@ fn batch_chunk_full_attn_ffn_down(
             | DType::MFP4G32
     );
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
+    let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if fa_w_down_is_mq {
         if matches!(&epilogue, BatchEpilogue::Residual) {
             iu4_prep = try_iu4_silu_prepared(
@@ -8826,6 +8904,17 @@ fn batch_chunk_full_attn_ffn_down(
             }
         }
         if iu4_prep.is_none() {
+            fp8_prep = try_gfx12_fp8_stream_silu_prepared(
+                gpu,
+                &layer.w_down,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                &pbs.ffn_hidden_batch,
+                hidden_dim,
+                n,
+            )?;
+        }
+        if iu4_prep.is_none() && fp8_prep.is_none() {
             fused_silu_mul_rotate_mq_batched_for(
                 gpu,
                 &layer.w_down,
@@ -8846,6 +8935,15 @@ fn batch_chunk_full_attn_ffn_down(
             &pbs.x_batch,
             layer.w_down.m,
             layer.w_down.k,
+            n,
+        )?;
+    } else if let Some(prep) = &fp8_prep {
+        dispatch_batched_fp8_lloyd_epilogue(
+            gpu,
+            pbs,
+            &layer.w_down,
+            prep,
+            &epilogue,
             n,
         )?;
     } else {
