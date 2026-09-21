@@ -380,6 +380,44 @@ fn try_gfx12_gdn_quant_fused_prepared(
     )?;
     Ok(Some(prep))
 }
+/// gfx1201 FP8-stream LA output producer.  Replaces gated_norm + AWQ/FWHT
+/// rotate + standalone pack for Lloyd residual consumers.
+#[allow(clippy::too_many_arguments)]
+fn try_gfx12_fp8_stream_gdn_prepared(
+    gpu: &mut Gpu,
+    wo: &hipfire_runtime::llama::WeightTensor,
+    x: &GpuTensor,
+    z: &GpuTensor,
+    norm_weight: &GpuTensor,
+    x_rot: &GpuTensor,
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    k: usize,
+    n: usize,
+) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
+    if wo.gpu_dtype != DType::MQ4G256V2Lloyd
+        || head_dim != 128
+        || n_heads * head_dim != k
+        || !gpu.fp8_stream_active(n, k)
+    {
+        return Ok(None);
+    }
+    let prep = gpu.gated_norm_rotate_mq_fp8_gfx12_batched(
+        x,
+        z,
+        norm_weight,
+        wo.awq_scale.as_ref(),
+        x_rot,
+        n_heads,
+        head_dim,
+        eps,
+        k,
+        n,
+    )?;
+    Ok(Some(prep))
+}
+
 /// gfx11 slices-4: gated RMSNorm + FWHT + `block_i4_128` IU4 producer for
 /// the LA post-GDN `wo` input, under the `_gfx11` entry symbols. `None` →
 /// caller keeps the incumbent gated_norm_f32 + rotate +
@@ -6260,7 +6298,23 @@ fn batch_chunk_delta_net_output_projection(
             &epilogue,
         )?;
     }
+    let mut fp8_gdn_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if gdn_fused_prep.is_none() {
+        fp8_gdn_prep = try_gfx12_fp8_stream_gdn_prepared(
+            gpu,
+            &layer.wo,
+            &pbs.dn_attn_out_batch,
+            &pbs.dn_z_batch,
+            &layer.norm_weight,
+            &pbs.dn_normed_rot_batch,
+            n_v_heads,
+            config.linear_value_head_dim,
+            config.norm_eps,
+            layer.wo.k,
+            n,
+        )?;
+    }
+    if gdn_fused_prep.is_none() && fp8_gdn_prep.is_none() {
         // Batched gated output norm.
         gpu.gated_norm_f32_batched(
             &pbs.dn_attn_out_batch,
@@ -6302,7 +6356,7 @@ fn batch_chunk_delta_net_output_projection(
     // Skipped when the slices-4 GDN producer already emitted both outputs
     // (`dn_normed_batch` is stale there by construction).
     let mut iu4_wo_prep: Option<rdna_compute::Int4MmqPrepared> = None;
-    if gdn_fused_prep.is_none() {
+    if gdn_fused_prep.is_none() && fp8_gdn_prep.is_none() {
         iu4_wo_prep = try_iu4_rotate_prepared(
             gpu,
             &layer.wo,
@@ -6324,7 +6378,10 @@ fn batch_chunk_delta_net_output_projection(
             )?;
         }
     }
-    let wo_input = if gdn_fused_prep.is_some() || iu4_wo_prep.is_some() {
+    let wo_input = if gdn_fused_prep.is_some()
+        || fp8_gdn_prep.is_some()
+        || iu4_wo_prep.is_some()
+    {
         &pbs.dn_normed_rot_batch
     } else if wo_is_mq {
         rotate_x_mq_batched_for(
@@ -6346,6 +6403,15 @@ fn batch_chunk_delta_net_output_projection(
             &pbs.x_batch,
             layer.wo.m,
             layer.wo.k,
+            n,
+        )?;
+    } else if let Some(prep) = &fp8_gdn_prep {
+        dispatch_batched_fp8_lloyd_epilogue(
+            gpu,
+            pbs,
+            &layer.wo,
+            prep,
+            &epilogue,
             n,
         )?;
     } else {

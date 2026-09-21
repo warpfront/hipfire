@@ -1327,6 +1327,20 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
+/// gfx1201 FP8-stream gated-norm producer for the LA output projection.
+/// Emits the exact gated-norm/AWQ/FWHT F32 row and the standalone packer's
+/// three planes in one row-wide workgroup.
+pub const GATED_NORM_MQ_ROTATE_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_fp8.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_GATED_NORM_FP8_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_fp8.gfx12.hip")
+);
 /// gfx11 slices-4 IU4 producer: batched gated RMSNorm + FWHT + in-register
 /// `block_i4_128` emit for the LA post-GDN `wo` input, under a distinct
 /// `_gfx11` entry symbol so gfx11 HSACO caches and profiler rows cannot
