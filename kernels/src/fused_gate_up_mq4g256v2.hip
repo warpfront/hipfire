@@ -16,6 +16,32 @@
 #define HIPFIRE_FUSED_GATE_UP_KERNEL fused_gate_up_mq4g256v2
 #endif
 
+#ifndef HIPFIRE_MQ4V2_WPRESHUFFLE
+#define HIPFIRE_MQ4V2_WPRESHUFFLE 0
+#endif
+
+#if HIPFIRE_MQ4V2_WPRESHUFFLE
+__device__ __forceinline__ unsigned int mq4v2_wp_header(
+    const char* a, int rows, int k, int row, int half_block) {
+    const unsigned char* p = (const unsigned char*)a
+        + (size_t)rows * (size_t)k / 2u
+        + (((size_t)half_block * (size_t)(rows >> 4)
+            + (unsigned)(row >> 4)) * 4u) * 16u
+        + (unsigned)(row & 15);
+    return (unsigned int)p[16] | ((unsigned int)p[0] << 8)
+         | ((unsigned int)p[32] << 16) | ((unsigned int)p[48] << 24);
+}
+
+__device__ __forceinline__ unsigned int mq4v2_wp_packed(
+    const char* a, int k, int row, int group, int tid) {
+    const int kstep = group * 16 + (tid >> 1);
+    const int lane = (tid & 1) * 16 + (row & 15);
+    return *(const unsigned int*)(a
+        + (((size_t)(row >> 4) * (size_t)(k >> 4)
+            + (unsigned)kstep) * 32u + (unsigned)lane) * 4u);
+}
+#endif
+
 // Fused Gate+Up HFQ4-G256: two GEMVs in one launch (saves 1 launch per
 // FFN layer vs separate gate/up calls). Grid = [gate_m + up_m] — each
 // block processes one row from either A_gate or A_up based on its index.
@@ -93,41 +119,46 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
     const auto row_rsrc = HIPFIRE_WEIGHT_RSRC(row_ptr);
 #endif
 
+#if HIPFIRE_MQ4V2_WPRESHUFFLE
+    const int matrix_rows = gid < gate_m ? gate_m : up_m;
+    #define LOAD_W(G, HS, PK) do { \
+        (HS) = mq4v2_wp_header(A, matrix_rows, K, local_row, \
+                               2 * (G) + (tid >> 4)); \
+        (PK) = mq4v2_wp_packed(A, K, local_row, (G), tid); \
+    } while (0)
+#else
+    #define LOAD_W(G, HS, PK) do { \
+        const char* _gp = row_ptr + (G) * 136; \
+        const unsigned int _ha = HIPFIRE_WEIGHT_LOAD_PTR_U32( \
+            row_rsrc, _gp, (G) * 136); \
+        const unsigned int _hb = HIPFIRE_WEIGHT_LOAD_PTR_U32( \
+            row_rsrc, _gp + 4, (G) * 136 + 4); \
+        (HS) = (tid < 16) ? _ha : _hb; \
+        (PK) = HIPFIRE_WEIGHT_LOAD_PTR_U32( \
+            row_rsrc, _gp + 8 + boff, (G) * 136 + 8 + boff); \
+    } while (0)
+#endif
+
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
-        const char* gp0 = row_ptr + g * 136;
-        const char* gp1 = gp0 + 136;
-        const char* gp2 = gp1 + 136;
-        const char* gp3 = gp2 + 136;
-
-        const unsigned int hA_sc0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0, (g + 0) * 136);
-        const unsigned int hB_sc0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 4, (g + 0) * 136 + 4);
-        const unsigned int hs_sc0 = (tid < 16) ? hA_sc0 : hB_sc0;
+        unsigned int hs_sc0, hs_sc1, hs_sc2, hs_sc3;
+        unsigned int pk0, pk1, pk2, pk3;
+        LOAD_W(g + 0, hs_sc0, pk0);
+        LOAD_W(g + 1, hs_sc1, pk1);
+        LOAD_W(g + 2, hs_sc2, pk2);
+        LOAD_W(g + 3, hs_sc3, pk3);
         float sc0 = __half2float(__ushort_as_half((unsigned short)(hs_sc0 & 0xFFFFu)));
         float zp0 = __half2float(__ushort_as_half((unsigned short)(hs_sc0 >> 16)));
-        const unsigned int hA_sc1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1, (g + 1) * 136);
-        const unsigned int hB_sc1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 4, (g + 1) * 136 + 4);
-        const unsigned int hs_sc1 = (tid < 16) ? hA_sc1 : hB_sc1;
         float sc1 = __half2float(__ushort_as_half((unsigned short)(hs_sc1 & 0xFFFFu)));
         float zp1 = __half2float(__ushort_as_half((unsigned short)(hs_sc1 >> 16)));
-        const unsigned int hA_sc2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2, (g + 2) * 136);
-        const unsigned int hB_sc2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 4, (g + 2) * 136 + 4);
-        const unsigned int hs_sc2 = (tid < 16) ? hA_sc2 : hB_sc2;
         float sc2 = __half2float(__ushort_as_half((unsigned short)(hs_sc2 & 0xFFFFu)));
         float zp2 = __half2float(__ushort_as_half((unsigned short)(hs_sc2 >> 16)));
-        const unsigned int hA_sc3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3, (g + 3) * 136);
-        const unsigned int hB_sc3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 4, (g + 3) * 136 + 4);
-        const unsigned int hs_sc3 = (tid < 16) ? hA_sc3 : hB_sc3;
         float sc3 = __half2float(__ushort_as_half((unsigned short)(hs_sc3 & 0xFFFFu)));
         float zp3 = __half2float(__ushort_as_half((unsigned short)(hs_sc3 >> 16)));
-        unsigned int pk0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 8 + boff, (g + 0) * 136 + 8 + boff);
-        unsigned int pk1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 8 + boff, (g + 1) * 136 + 8 + boff);
-        unsigned int pk2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 8 + boff, (g + 2) * 136 + 8 + boff);
-        unsigned int pk3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 8 + boff, (g + 3) * 136 + 8 + boff);
 
         int base = g * 256 + tid * 8;
 
@@ -162,41 +193,33 @@ extern "C" __global__ void HIPFIRE_FUSED_GATE_UP_KERNEL(
 
     if (tail >= 1) {
         const int g = quads << 2;
-        const char* gp = row_ptr + g * 136;
-        const unsigned int hA_sc = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136);
-        const unsigned int hB_sc = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4);
-        const unsigned int hs_sc = (tid < 16) ? hA_sc : hB_sc;
+        unsigned int hs_sc, pk;
+        LOAD_W(g, hs_sc, pk);
         float sc = __half2float(__ushort_as_half((unsigned short)(hs_sc & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hs_sc >> 16)));
-        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
-        const char* gp = row_ptr + g * 136;
-        const unsigned int hA_sc = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136);
-        const unsigned int hB_sc = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4);
-        const unsigned int hs_sc = (tid < 16) ? hA_sc : hB_sc;
+        unsigned int hs_sc, pk;
+        LOAD_W(g, hs_sc, pk);
         float sc = __half2float(__ushort_as_half((unsigned short)(hs_sc & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hs_sc >> 16)));
-        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
-        const char* gp = row_ptr + g * 136;
-        const unsigned int hA_sc = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp, g * 136);
-        const unsigned int hB_sc = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 4, g * 136 + 4);
-        const unsigned int hs_sc = (tid < 16) ? hA_sc : hB_sc;
+        unsigned int hs_sc, pk;
+        LOAD_W(g, hs_sc, pk);
         float sc = __half2float(__ushort_as_half((unsigned short)(hs_sc & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hs_sc >> 16)));
-        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp + 8 + boff, g * 136 + 8 + boff);
         int base = g * 256 + tid * 8;
         TAIL_DOG(pk, sc, zp, base, acc2);
     }
     #undef TAIL_DOG
+    #undef LOAD_W
     #undef MQ4V2_DEQ
 
     float acc = (acc0 + acc1) + (acc2 + acc3);

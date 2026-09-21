@@ -39,6 +39,7 @@
 #error invalid BENCH_FAMILY
 #endif
 
+#define HIPFIRE_FP8_WPRESHUFFLE 1
 #include "../kernels/src/gemm_mq4g256v2_wmma_fp8_v2_foldfree_frag.gfx12.hip"
 
 #define HIP_OK(call) do { hipError_t e_ = (call); if (e_ != hipSuccess) { \
@@ -85,6 +86,179 @@ static void pread_all(int fd, void* dst, size_t bytes, uint64_t offset) {
   }
 }
 
+static std::vector<uint8_t> preshuffle_weight(const std::vector<uint8_t>& src,
+                                              int rows, int k) {
+  if ((rows & 15) || (k & 255)) {
+    std::fprintf(stderr, "preshuffle needs rows%%16=0 and k%%256=0\n");
+    std::exit(2);
+  }
+  const size_t gpr = static_cast<size_t>(k) / 256;
+  const size_t payload_bytes = static_cast<size_t>(rows) * k / 2;
+  const size_t row_tiles = static_cast<size_t>(rows) / 16;
+  std::vector<uint8_t> dst(src.size());
+  std::vector<uint8_t> seen(src.size(), 0);
+  auto put = [&](size_t di, uint8_t v) {
+    if (di >= dst.size() || seen[di]) {
+      std::fprintf(stderr, "non-bijective destination %zu\n", di);
+      std::exit(2);
+    }
+    dst[di] = v;
+    seen[di] = 1;
+  };
+  for (int r = 0; r < rows; ++r) {
+    for (int cb = 0; cb < k / 2; ++cb) {
+      const int nibble = cb * 2;
+      const size_t si = (static_cast<size_t>(r) * gpr
+                         + static_cast<size_t>(nibble >> 8)) * 136
+                        + 8 + static_cast<unsigned>(nibble & 255) / 2;
+      const size_t di =
+          (((static_cast<size_t>(r >> 4) * (k >> 4)
+              + static_cast<unsigned>(nibble >> 4)) * 32
+             + (static_cast<unsigned>((nibble >> 3) & 1) * 16
+                + static_cast<unsigned>(r & 15))) * 4
+            + static_cast<unsigned>(nibble & 7) / 2);
+      put(di, src[si]);
+    }
+    for (int hb = 0; hb < k / 128; ++hb) {
+      const size_t hsrc = (static_cast<size_t>(r) * gpr
+                           + static_cast<unsigned>(hb >> 1)) * 136
+                          + static_cast<unsigned>(hb & 1) * 4;
+      static constexpr int plane[4] = {1, 0, 2, 3};
+      for (int b = 0; b < 4; ++b) {
+        const size_t di = payload_bytes
+            + ((((static_cast<size_t>(hb) * row_tiles
+                  + static_cast<unsigned>(r >> 4)) * 4
+                 + static_cast<unsigned>(plane[b]))) * 16
+               + static_cast<unsigned>(r & 15));
+        put(di, src[hsrc + b]);
+      }
+    }
+  }
+  if (std::find(seen.begin(), seen.end(), uint8_t{0}) != seen.end()) {
+    std::fprintf(stderr, "preshuffle left destination bytes unwritten\n");
+    std::exit(2);
+  }
+  return dst;
+}
+
+static std::vector<uint8_t> unshuffle_weight(const std::vector<uint8_t>& src,
+                                            int rows, int k) {
+  const size_t gpr = static_cast<size_t>(k) / 256;
+  const size_t payload_bytes = static_cast<size_t>(rows) * k / 2;
+  const size_t row_tiles = static_cast<size_t>(rows) / 16;
+  std::vector<uint8_t> dst(src.size());
+  std::vector<uint8_t> seen(src.size(), 0);
+  auto put = [&](size_t di, uint8_t v) {
+    if (di >= dst.size() || seen[di]) {
+      std::fprintf(stderr, "non-bijective inverse destination %zu\n", di);
+      std::exit(2);
+    }
+    dst[di] = v;
+    seen[di] = 1;
+  };
+  for (int r = 0; r < rows; ++r) {
+    for (int cb = 0; cb < k / 2; ++cb) {
+      const int nibble = cb * 2;
+      const size_t di = (static_cast<size_t>(r) * gpr
+                         + static_cast<size_t>(nibble >> 8)) * 136
+                        + 8 + static_cast<unsigned>(nibble & 255) / 2;
+      const size_t si =
+          (((static_cast<size_t>(r >> 4) * (k >> 4)
+              + static_cast<unsigned>(nibble >> 4)) * 32
+             + (static_cast<unsigned>((nibble >> 3) & 1) * 16
+                + static_cast<unsigned>(r & 15))) * 4
+            + static_cast<unsigned>(nibble & 7) / 2);
+      put(di, src[si]);
+    }
+    for (int hb = 0; hb < k / 128; ++hb) {
+      const size_t hdst = (static_cast<size_t>(r) * gpr
+                           + static_cast<unsigned>(hb >> 1)) * 136
+                          + static_cast<unsigned>(hb & 1) * 4;
+      static constexpr int plane[4] = {1, 0, 2, 3};
+      for (int b = 0; b < 4; ++b) {
+        const size_t si = payload_bytes
+            + ((((static_cast<size_t>(hb) * row_tiles
+                  + static_cast<unsigned>(r >> 4)) * 4
+                 + static_cast<unsigned>(plane[b]))) * 16
+               + static_cast<unsigned>(r & 15));
+        put(hdst + b, src[si]);
+      }
+    }
+  }
+  if (std::find(seen.begin(), seen.end(), uint8_t{0}) != seen.end()) {
+    std::fprintf(stderr, "inverse left source bytes unwritten\n");
+    std::exit(2);
+  }
+  return dst;
+}
+
+static int cpu_permutation_proof() {
+  constexpr int logical_rows = 19;
+  constexpr int storage_rows = 32;
+  constexpr int k = 512;
+  const size_t gpr = static_cast<size_t>(k) / 256;
+  std::vector<uint8_t> original(static_cast<size_t>(storage_rows) * gpr * 136);
+  for (int r = 0; r < storage_rows; ++r) {
+    for (size_t g = 0; g < gpr; ++g) {
+      uint8_t* p = original.data() + (static_cast<size_t>(r) * gpr + g) * 136;
+      const uint16_t header[4] = {0x3c00u, 0xbc00u, 0x4000u, 0x3800u};
+      std::memcpy(p, header, sizeof(header));
+      for (int i = 0; i < 128; ++i)
+        p[8 + i] = static_cast<uint8_t>((r * 29 + static_cast<int>(g) * 17 + i * 7) & 255);
+    }
+  }
+  const auto shuffled = preshuffle_weight(original, storage_rows, k);
+  const auto restored = unshuffle_weight(shuffled, storage_rows, k);
+  if (restored != original) {
+    std::fprintf(stderr, "round-trip byte mismatch\n");
+    return 1;
+  }
+  const size_t payload_bytes = static_cast<size_t>(storage_rows) * k / 2;
+  const size_t row_tiles = storage_rows / 16;
+  for (int r = 0; r < storage_rows; ++r) {
+    for (int c = 0; c < k; ++c) {
+      const int hb = c >> 7;
+      const uint8_t* hp = original.data()
+          + (static_cast<size_t>(r) * gpr + static_cast<unsigned>(c >> 8)) * 136
+          + static_cast<unsigned>(hb & 1) * 4;
+      const uint8_t* sp = shuffled.data() + payload_bytes
+          + ((static_cast<size_t>(hb) * row_tiles + static_cast<unsigned>(r >> 4)) * 4) * 16
+          + static_cast<unsigned>(r & 15);
+      const uint32_t reconstructed = static_cast<uint32_t>(sp[16])
+          | (static_cast<uint32_t>(sp[0]) << 8)
+          | (static_cast<uint32_t>(sp[32]) << 16)
+          | (static_cast<uint32_t>(sp[48]) << 24);
+      uint32_t reference_header;
+      std::memcpy(&reference_header, hp, sizeof(reference_header));
+      const int nibble = c;
+      const size_t pi =
+          (((static_cast<size_t>(r >> 4) * (k >> 4)
+              + static_cast<unsigned>(nibble >> 4)) * 32
+             + (static_cast<unsigned>((nibble >> 3) & 1) * 16
+                + static_cast<unsigned>(r & 15))) * 4
+            + static_cast<unsigned>(nibble & 7) / 2);
+      const unsigned code = (shuffled[pi] >> ((nibble & 1) * 4)) & 15u;
+      const uint8_t packed_ref = original[(static_cast<size_t>(r) * gpr
+          + static_cast<unsigned>(c >> 8)) * 136 + 8
+          + static_cast<unsigned>(c & 255) / 2];
+      const unsigned code_ref = (packed_ref >> ((c & 1) * 4)) & 15u;
+      const uint16_t sc_bits = static_cast<uint16_t>(reference_header);
+      const uint16_t zp_bits = static_cast<uint16_t>(reference_header >> 16);
+      const float dequant = __half2float(__ushort_as_half(sc_bits)) * code
+                          + __half2float(__ushort_as_half(zp_bits));
+      const float dequant_ref = __half2float(__ushort_as_half(sc_bits)) * code_ref
+                              + __half2float(__ushort_as_half(zp_bits));
+      if (reconstructed != reference_header || code != code_ref || dequant != dequant_ref) {
+        std::fprintf(stderr, "dequant mismatch row=%d col=%d\n", r, c);
+        return 1;
+      }
+    }
+  }
+  std::printf("cpu_proof bijection=ok roundtrip=ok dequant=bit_exact logical_rows=%d storage_rows=%d padded_tail_rows=%d bytes=%zu\n",
+              logical_rows, storage_rows, storage_rows - logical_rows, original.size());
+  return 0;
+}
+
 static Weight load_weight(int fd, const WeightSpec& spec, int rows) {
   Weight w; w.m = rows; w.k = spec.k;
   const size_t gpr = static_cast<size_t>(spec.k) / 256;
@@ -110,9 +284,10 @@ static Weight load_weight(int fd, const WeightSpec& spec, int rows) {
     }
     w.erow[r] = std::ldexp(1.0f, static_cast<int>(max_exp) - 15);
   }
-  HIP_OK(hipMalloc(&w.dev, w.host.size()));
+  const std::vector<uint8_t> shuffled = preshuffle_weight(w.host, rows, spec.k);
+  HIP_OK(hipMalloc(&w.dev, shuffled.size()));
   HIP_OK(hipMalloc(&w.dev_erow, w.erow.size() * sizeof(float)));
-  HIP_OK(hipMemcpy(w.dev, w.host.data(), w.host.size(), hipMemcpyHostToDevice));
+  HIP_OK(hipMemcpy(w.dev, shuffled.data(), shuffled.size(), hipMemcpyHostToDevice));
   HIP_OK(hipMemcpy(w.dev_erow, w.erow.data(), w.erow.size() * sizeof(float), hipMemcpyHostToDevice));
   return w;
 }
@@ -211,11 +386,12 @@ static void launch(dim3 grid, dim3 block, size_t lds, hipStream_t stream,
 }
 
 int main(int argc, char** argv) {
+  if (argc > 1 && std::string(argv[1]) == "proof") return cpu_permutation_proof();
   const bool exact = argc > 1 && std::string(argv[1]) == "exact";
   const int fd = open(kArtifact, O_RDONLY);
   if (fd < 0) { std::perror("open artifact"); return 2; }
 #if BENCH_FAMILY == 0
-  std::vector<int> m = exact ? std::vector<int>{64,64} : std::vector<int>{17408,17408};
+  std::vector<int> m = exact ? std::vector<int>{128,128} : std::vector<int>{17408,17408};
 #elif BENCH_FAMILY == 1
   std::vector<int> m = exact ? std::vector<int>{128} : std::vector<int>{5120};
 #elif BENCH_FAMILY == 2

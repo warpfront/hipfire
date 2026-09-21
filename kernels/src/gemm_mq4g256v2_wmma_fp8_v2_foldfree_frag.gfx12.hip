@@ -18,6 +18,7 @@
 #include <hip/hip_fp16.h>
 
 typedef int   __attribute__((ext_vector_type(2))) ff_v2i_t;
+typedef int   __attribute__((ext_vector_type(4))) ff_v4i_t;
 typedef float __attribute__((ext_vector_type(8))) ff_v8f_t;
 
 #define FF_BM 256
@@ -29,6 +30,10 @@ typedef float __attribute__((ext_vector_type(8))) ff_v8f_t;
 #define FF_W_BYTES ((FF_BN / 16) * FF_K16 * FF_FRAG)
 #define FF_LUT_BYTES 512
 #define FF_LDS_BYTES (FF_W_BYTES + FF_LUT_BYTES)
+
+#ifndef HIPFIRE_FP8_WPRESHUFFLE
+#define HIPFIRE_FP8_WPRESHUFFLE 0
+#endif
 
 #if !defined(__gfx1201__) && defined(__HIP_DEVICE_COMPILE__)
 #error "fold-free MQ4V2 FP8 kernel requires gfx1201"
@@ -212,6 +217,69 @@ void HIPFIRE_FP8_FOLDFREE_KERNEL(
         // Otherwise the scheduler can strand one token fragment above the
         // expansion and reintroduce loadcnt waits in the WMMA drain.
         asm volatile("" ::: "memory");
+#if HIPFIRE_FP8_WPRESHUFFLE
+#if HIPFIRE_FP8_QKVZA || HIPFIRE_FP8_QKV
+#error "weight preshuffle is implemented only for gate/up and residual"
+#endif
+        // One lane owns four adjacent output rows at one K8 half-fragment.
+        // The load-time layout makes those four packed dwords contiguous, so
+        // the entire compact-W contribution is one b128.  The high bytes of
+        // the four positive f16 scales form a parallel b32 plane; the other
+        // three header bytes are retained in unused planes to keep the
+        // transform byte-for-byte bijective.
+        const unsigned int wslot = (unsigned int)tid * 4u;
+        const int wlane = (int)(wslot & 31u);
+        const int wrest = (int)(wslot >> 5);
+        const int wkst = wrest & 3;
+        const int wntl = wrest >> 2;
+        const int wrow = wntl * 16 + (wlane & 15);
+#if HIPFIRE_FP8_RESIDUAL
+        const char* wtile = A_w;
+        const float* etile = E_w;
+        const int wtile_row0 = rs;
+        const int wtile_rows = res_m;
+#else
+        const bool wtile_up = rs >= gate_m;
+        const char* wtile = wtile_up ? A_up : A_gate;
+        const float* etile = wtile_up ? E_up : E_gate;
+        const int wtile_row0 = wtile_up ? rs - gate_m : rs;
+        const int wtile_rows = wtile_up ? up_m : gate_m;
+#endif
+        const int wlr = wtile_row0 + wrow;
+        const int wlane_idx = (wlane & 16) | (wlr & 15);
+        const size_t wpayload_bytes =
+            (size_t)wtile_rows * (size_t)K / 2u;
+        const size_t wmeta_half_stride =
+            (size_t)(wtile_rows >> 4) * 64u;
+        const char* wpacked_base = wtile
+            + (((size_t)(wlr >> 4) * (size_t)ksteps
+                + (size_t)wkst) * 32u + (unsigned)wlane_idx) * 4u;
+        const unsigned char* wscale_base =
+            (const unsigned char*)wtile + wpayload_bytes
+            + ((size_t)(wlr >> 4) * 4u) * 16u + (unsigned)(wlr & 15);
+        const float4 wref = *(const float4*)(etile + wlr);
+        const ff_v4i_t pk4 =
+            *(const ff_v4i_t*)(wpacked_base + (size_t)k0 * 8u);
+        const unsigned int sc4 = *(const unsigned int*)(
+            wscale_base + (size_t)(k0 >> 7) * wmeta_half_stride);
+#pragma unroll
+        for (int q=0; q<4; ++q) {
+            const unsigned int dbits = ((sc4 >> (q * 8)) & 0xffu) << 8;
+            const unsigned int erow_bits = __float_as_uint(wref[q]);
+            const int erow = (int)((erow_bits >> 23) & 0xffu) - 127;
+            const int e = (int)((dbits >> 10) & 0x1fu) - 15;
+            int delta = erow - e;
+            delta = delta < 0 ? 0 : (delta > 15 ? 15 : delta);
+            const int mant = (dbits & 0x03ffu) != 0;
+            const ff_v2i_t w8 =
+                ff_expand((unsigned int)pk4[q],
+                          lds_lut + (mant * 16 + delta) * 4);
+            const int row = wrow + q;
+            const int frag = ((row >> 4) * FF_K16 + wkst) * FF_FRAG;
+            *(ff_v2i_t*)(lds_W + frag
+                         + ((row & 15) + (wlane >> 4) * 16) * 8) = w8;
+        }
+#else
         // Expand one 4 KiB compact W tile into fragment order for all waves.
 #pragma unroll
         for (int it=0; it<4; ++it) {
@@ -244,6 +312,7 @@ void HIPFIRE_FP8_FOLDFREE_KERNEL(
             const int frag = ((wr >> 4) * FF_K16 + ks) * FF_FRAG;
             *(ff_v2i_t*)(lds_W + frag + ((wr & 15) + hk * 16) * 8) = w8;
         }
+#endif
         ff_lds_barrier();
 
 #pragma unroll

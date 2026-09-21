@@ -9383,7 +9383,8 @@ impl Gpu {
     #[inline]
     pub(crate) fn fp8_fragment_order_enabled(&self, n: usize, k: usize) -> bool {
         self.arch == "gfx1201"
-            && n >= 256
+            && (n >= 256
+                || hipfire_config::developer_var("HIPFIRE_FP8_WPRESHUFFLE").as_deref() != Ok("0"))
             && k != 0
             && k % 256 == 0
             && self.flags.gfx12_mq4v2_fp8_v2
@@ -9508,7 +9509,7 @@ impl Gpu {
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 = self.flags.gfx12_mq4v2_fp8_v2
             && self.flags.gfx12_mq4v2_fp8_qkvza
-            && batch_size >= 256;
+            && (batch_size >= 256 || prepared.fragment_order);
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
         let fragment_order = foldfree && prepared.fragment_order;
         // Fold-free owns a fixed 256-token x 128-row tile. Other v2 routes
@@ -9842,7 +9843,7 @@ impl Gpu {
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 = self.flags.gfx12_mq4v2_fp8_v2
             && self.flags.gfx12_mq4v2_fp8_qkv
-            && batch_size >= 256;
+            && (batch_size >= 256 || prepared.fragment_order);
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
         let fragment_order = foldfree && prepared.fragment_order;
         let (vbm, vbn, vbk, vwaves) = if foldfree {
@@ -30386,9 +30387,12 @@ impl Gpu {
         // batches keep s2bt8/BT. Params/blob layout below is the frozen v2 ABI.
         let v2 = self.flags.gfx12_mq4v2_fp8_v2
             && self.flags.gfx12_mq4v2_fp8_gateup
-            && batch_size >= 256;
+            && (batch_size >= 256 || prepared.fragment_order);
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
         let fragment_order = foldfree && prepared.fragment_order;
+        let wpreshuffle = fragment_order
+            && self.mq4v2_weight_is_wpreshuffled(a_gate)?
+            && self.mq4v2_weight_is_wpreshuffled(a_up)?;
         let (vbm, vbn, vbk, vwaves) = if foldfree {
             (256, 128, 64, 8)
         } else {
@@ -30416,19 +30420,27 @@ impl Gpu {
         // ranking so BT8/BT4 keep their exact ranges). Grid ceil-divides
         // batch_tiles and the kernels guard `oc < N`, so any tile covers N%64.
         let (func_name, ksrc, bv): (&str, &str, usize) = if foldfree {
-            (
-                if fragment_order {
-                    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_frag_gfx1201"
-                } else {
-                    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201"
-                },
-                if fragment_order {
-                    kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC
-                } else {
-                    kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC
-                },
-                16,
-            )
+            if wpreshuffle {
+                (
+                    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_frag_wp_gfx1201",
+                    kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_WP_SRC,
+                    16,
+                )
+            } else {
+                (
+                    if fragment_order {
+                        "gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_frag_gfx1201"
+                    } else {
+                        "gemm_gate_up_mq4g256v2_wmma_fp8_v2_foldfree_gfx1201"
+                    },
+                    if fragment_order {
+                        kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC
+                    } else {
+                        kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_FP8_GFX12_V2_FOLDFREE_SRC
+                    },
+                    16,
+                )
+            }
         } else if symfold {
             match (vbm, vbn) {
                 (128, 128) => (
@@ -32212,9 +32224,11 @@ impl Gpu {
         // frozen v2 ABI.
         let v2 = self.flags.gfx12_mq4v2_fp8_v2
             && self.flags.gfx12_mq4v2_fp8_resid
-            && batch_size >= 256;
+            && (batch_size >= 256 || prepared.fragment_order);
         let foldfree = self.fp8_v2_foldfree_enabled(v2);
         let fragment_order = foldfree && prepared.fragment_order;
+        let wpreshuffle =
+            fragment_order && self.mq4v2_weight_is_wpreshuffled(a_raw)?;
         let (vbm, vbn, vbk, vwaves) = if foldfree {
             (256, 128, 64, 8)
         } else {
@@ -32237,19 +32251,27 @@ impl Gpu {
         // Batch tile by N: S2BT8 under SLABS=2, else BT12 when exact or masked
         // past N=256 (masked BT12 beats exact BT8/BT4 there; see gate_up).
         let (func_name, ksrc, bv): (&str, &str, usize) = if foldfree {
-            (
-                if fragment_order {
-                    "gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_frag_gfx1201"
-                } else {
-                    "gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_gfx1201"
-                },
-                if fragment_order {
-                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC
-                } else {
-                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_FOLDFREE_SRC
-                },
-                16,
-            )
+            if wpreshuffle {
+                (
+                    "gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_frag_wp_gfx1201",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_WP_SRC,
+                    16,
+                )
+            } else {
+                (
+                    if fragment_order {
+                        "gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_frag_gfx1201"
+                    } else {
+                        "gemm_mq4g256v2_residual_wmma_fp8_v2_foldfree_gfx1201"
+                    },
+                    if fragment_order {
+                        kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_FOLDFREE_FRAG_SRC
+                    } else {
+                        kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_FP8_GFX12_V2_FOLDFREE_SRC
+                    },
+                    16,
+                )
+            }
         } else if symfold {
             match (vbm, vbn) {
                 (128, 128) => (
@@ -33723,9 +33745,28 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let module_v2 = "fused_gate_up_hfq4g256_mq4v2";
-        let func_name = "fused_gate_up_mq4g256v2";
-        self.ensure_kernel(module_v2, kernels::FUSED_GATE_UP_MQ4G256V2_SRC, func_name)?;
+        let wp_gate = self.mq4v2_weight_is_wpreshuffled(a_gate)?;
+        let wp_up = self.mq4v2_weight_is_wpreshuffled(a_up)?;
+        if wp_gate != wp_up {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "fused gate/up MQ4V2 weight layouts disagree",
+            ));
+        }
+        let (module_v2, func_name, source) = if wp_gate {
+            (
+                "fused_gate_up_hfq4g256_mq4v2_wp",
+                "fused_gate_up_mq4g256v2_wp",
+                kernels::FUSED_GATE_UP_MQ4G256V2_WP_SRC,
+            )
+        } else {
+            (
+                "fused_gate_up_hfq4g256_mq4v2",
+                "fused_gate_up_mq4g256v2",
+                kernels::FUSED_GATE_UP_MQ4G256V2_SRC,
+            )
+        };
+        self.ensure_kernel(module_v2, source, func_name)?;
         let ag = a_gate.buf.as_ptr();
         let au = a_up.buf.as_ptr();
         let xp = x.buf.as_ptr();

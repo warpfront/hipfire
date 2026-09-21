@@ -13,6 +13,32 @@
 #define HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS 0
 #endif
 
+#ifndef HIPFIRE_MQ4V2_WPRESHUFFLE
+#define HIPFIRE_MQ4V2_WPRESHUFFLE 0
+#endif
+
+#if HIPFIRE_MQ4V2_WPRESHUFFLE
+__device__ __forceinline__ unsigned int mq4v2_wp_plain_header(
+    const char* a, int rows, int k, int row, int half_block) {
+    const unsigned char* p = (const unsigned char*)a
+        + (size_t)rows * (size_t)k / 2u
+        + (((size_t)half_block * (size_t)(rows >> 4)
+            + (unsigned)(row >> 4)) * 4u) * 16u
+        + (unsigned)(row & 15);
+    return (unsigned int)p[16] | ((unsigned int)p[0] << 8)
+         | ((unsigned int)p[32] << 16) | ((unsigned int)p[48] << 24);
+}
+
+__device__ __forceinline__ unsigned int mq4v2_wp_plain_packed(
+    const char* a, int k, int row, int group, int tid) {
+    const int kstep = group * 16 + (tid >> 1);
+    const int lane = (tid & 1) * 16 + (row & 15);
+    return *(const unsigned int*)(a
+        + (((size_t)(row >> 4) * (size_t)(k >> 4)
+            + (unsigned)kstep) * 32u + (unsigned)lane) * 4u);
+}
+#endif
+
 // HFQ4-G256 GEMV: default (arch-agnostic) kernel.
 //
 // Ported from gemv_mq4g256v2.gfx1100.hip in order to produce BYTE-EXACT
@@ -108,6 +134,21 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
     #define LOAD_WEIGHT_PACKED(ptr, offset) (*(const unsigned int*)(ptr))
 #endif
 
+#if HIPFIRE_MQ4V2_WPRESHUFFLE
+    #define LOAD_GROUP(G, GP, GOFF, HS, PK) do { \
+        (HS) = mq4v2_wp_plain_header(A, M, K, row, \
+                                     2 * (G) + (tid >> 4)); \
+        (PK) = mq4v2_wp_plain_packed(A, K, row, (G), tid); \
+    } while (0)
+#else
+    #define LOAD_GROUP(G, GP, GOFF, HS, PK) do { \
+        const unsigned int _ha = LOAD_WEIGHT_HEADER((GP), (GOFF)); \
+        const unsigned int _hb = LOAD_WEIGHT_HEADER((GP) + 4, (GOFF) + 4u); \
+        (HS) = (tid < 16) ? _ha : _hb; \
+        (PK) = LOAD_WEIGHT_PACKED((GP) + 8 + boff, (GOFF) + 8u + boff); \
+    } while (0)
+#endif
+
     float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
@@ -134,31 +175,20 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
         const char* gp3 = gp2 + 136;
 
         const unsigned int goff = row_weight_offset + (unsigned int)g * 136u;
-        const unsigned int hA0 = LOAD_WEIGHT_HEADER(gp0, goff);
-        const unsigned int hB0 = LOAD_WEIGHT_HEADER(gp0 + 4, goff + 4u);
-        const unsigned int hs0 = (tid < 16) ? hA0 : hB0;
+        unsigned int hs0, hs1, hs2, hs3;
+        unsigned int pk0, pk1, pk2, pk3;
+        LOAD_GROUP(g + 0, gp0, goff, hs0, pk0);
+        LOAD_GROUP(g + 1, gp1, goff + 136u, hs1, pk1);
+        LOAD_GROUP(g + 2, gp2, goff + 272u, hs2, pk2);
+        LOAD_GROUP(g + 3, gp3, goff + 408u, hs3, pk3);
         float sc0 = __half2float(__ushort_as_half((unsigned short)(hs0 & 0xFFFFu)));
         float zp0 = __half2float(__ushort_as_half((unsigned short)(hs0 >> 16)));
-        const unsigned int hA1 = LOAD_WEIGHT_HEADER(gp1, goff + 136u);
-        const unsigned int hB1 = LOAD_WEIGHT_HEADER(gp1 + 4, goff + 140u);
-        const unsigned int hs1 = (tid < 16) ? hA1 : hB1;
         float sc1 = __half2float(__ushort_as_half((unsigned short)(hs1 & 0xFFFFu)));
         float zp1 = __half2float(__ushort_as_half((unsigned short)(hs1 >> 16)));
-        const unsigned int hA2 = LOAD_WEIGHT_HEADER(gp2, goff + 272u);
-        const unsigned int hB2 = LOAD_WEIGHT_HEADER(gp2 + 4, goff + 276u);
-        const unsigned int hs2 = (tid < 16) ? hA2 : hB2;
         float sc2 = __half2float(__ushort_as_half((unsigned short)(hs2 & 0xFFFFu)));
         float zp2 = __half2float(__ushort_as_half((unsigned short)(hs2 >> 16)));
-        const unsigned int hA3 = LOAD_WEIGHT_HEADER(gp3, goff + 408u);
-        const unsigned int hB3 = LOAD_WEIGHT_HEADER(gp3 + 4, goff + 412u);
-        const unsigned int hs3 = (tid < 16) ? hA3 : hB3;
         float sc3 = __half2float(__ushort_as_half((unsigned short)(hs3 & 0xFFFFu)));
         float zp3 = __half2float(__ushort_as_half((unsigned short)(hs3 >> 16)));
-
-        unsigned int pk0 = LOAD_WEIGHT_PACKED(gp0 + 8 + boff, goff + 8u + boff);
-        unsigned int pk1 = LOAD_WEIGHT_PACKED(gp1 + 8 + boff, goff + 144u + boff);
-        unsigned int pk2 = LOAD_WEIGHT_PACKED(gp2 + 8 + boff, goff + 280u + boff);
-        unsigned int pk3 = LOAD_WEIGHT_PACKED(gp3 + 8 + boff, goff + 416u + boff);
 
         int base = g * 256 + tid * 8;
 
@@ -215,12 +245,10 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
         const int g = quads << 2;
         const char* gp = row_ptr + g * 136;
         const unsigned int goff = row_weight_offset + (unsigned int)g * 136u;
-        const unsigned int hA = LOAD_WEIGHT_HEADER(gp, goff);
-        const unsigned int hB = LOAD_WEIGHT_HEADER(gp + 4, goff + 4u);
-        const unsigned int hs = (tid < 16) ? hA : hB;
+        unsigned int hs, pk;
+        LOAD_GROUP(g, gp, goff, hs, pk);
         float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
-        unsigned int pk = LOAD_WEIGHT_PACKED(gp + 8 + boff, goff + 8u + boff);
         int base = g * 256 + tid * 8;
 #ifdef HIPFIRE_MQ4G256V2_LUT
         TAIL_DOG_LUT(pk, sc, zp, base, acc0);
@@ -232,12 +260,10 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
         const int g = (quads << 2) + 1;
         const char* gp = row_ptr + g * 136;
         const unsigned int goff = row_weight_offset + (unsigned int)g * 136u;
-        const unsigned int hA = LOAD_WEIGHT_HEADER(gp, goff);
-        const unsigned int hB = LOAD_WEIGHT_HEADER(gp + 4, goff + 4u);
-        const unsigned int hs = (tid < 16) ? hA : hB;
+        unsigned int hs, pk;
+        LOAD_GROUP(g, gp, goff, hs, pk);
         float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
-        unsigned int pk = LOAD_WEIGHT_PACKED(gp + 8 + boff, goff + 8u + boff);
         int base = g * 256 + tid * 8;
 #ifdef HIPFIRE_MQ4G256V2_LUT
         TAIL_DOG_LUT(pk, sc, zp, base, acc1);
@@ -249,12 +275,10 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
         const int g = (quads << 2) + 2;
         const char* gp = row_ptr + g * 136;
         const unsigned int goff = row_weight_offset + (unsigned int)g * 136u;
-        const unsigned int hA = LOAD_WEIGHT_HEADER(gp, goff);
-        const unsigned int hB = LOAD_WEIGHT_HEADER(gp + 4, goff + 4u);
-        const unsigned int hs = (tid < 16) ? hA : hB;
+        unsigned int hs, pk;
+        LOAD_GROUP(g, gp, goff, hs, pk);
         float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
         float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
-        unsigned int pk = LOAD_WEIGHT_PACKED(gp + 8 + boff, goff + 8u + boff);
         int base = g * 256 + tid * 8;
 #ifdef HIPFIRE_MQ4G256V2_LUT
         TAIL_DOG_LUT(pk, sc, zp, base, acc2);
@@ -265,6 +289,7 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
     #undef TAIL_DOG
     #undef LOAD_WEIGHT_PACKED
     #undef LOAD_WEIGHT_HEADER
+    #undef LOAD_GROUP
 
     float acc = (acc0 + acc1) + (acc2 + acc3);
     for (int offset = 16; offset > 0; offset >>= 1)
