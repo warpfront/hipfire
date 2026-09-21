@@ -13,6 +13,30 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::thread;
+fn gfx12_a4_producer_module(name: &str) -> bool {
+    matches!(
+        name,
+        "fused_rmsnorm_mq_rotate_awq_i4_gfx12"
+            | "fused_rmsnorm_mq_rotate_i4_gfx12"
+            | "fused_silu_mul_mq_rotate_awq_i4_gfx12"
+            | "fused_silu_mul_mq_rotate_i4_gfx12"
+            | "gated_norm_mq_rotate_awq_i4_gfx12"
+            | "gated_norm_mq_rotate_i4_gfx12"
+            | "mq_rotate_x_awq_i4_gfx12"
+            | "mq_rotate_x_i4_gfx12"
+            | "sigmoid_mul_rotate_x_mq_awq_i4_gfx12"
+    )
+}
+
+fn gfx12_a4_module(name: &str) -> bool {
+    gfx12_a4_producer_module(name)
+        || matches!(
+            name,
+            "gemm_mq4g256v2_residual_mmq_iu4"
+                | "gemm_mq4g256v2_residual_mmq_iu4_gfx12"
+                | "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold"
+        )
+}
 
 #[cfg(target_os = "windows")]
 use std::os::windows::process::CommandExt;
@@ -540,25 +564,46 @@ impl KernelCompiler {
         name: &str,
         gfx1151_cumode_modules: &HashSet<String>,
     ) -> Vec<String> {
-        // Radiowave-selected spill-free RM2/BV6 schedule.
-        if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
-            vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned()]
-        } else if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
-            && matches!(
-                name,
-                "gdn_chunk_prep" | "gdn_chunk_kkt_solve" | "gdn_chunk_scan"
-            )
-        {
-            let mut flags = vec!["-ffp-contract=off".to_owned()];
-            if arch == "gfx1201" && name == "gdn_chunk_scan" {
-                flags.push("-mcumode".to_owned());
+        let mut flags =
+            if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
+                vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned()]
+            } else if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
+                && matches!(
+                    name,
+                    "gdn_chunk_prep" | "gdn_chunk_kkt_solve" | "gdn_chunk_scan"
+                )
+            {
+                let mut flags = vec!["-ffp-contract=off".to_owned()];
+                if arch == "gfx1201" && name == "gdn_chunk_scan" {
+                    flags.push("-mcumode".to_owned());
+                }
+                flags
+            } else if arch == "gfx1151" && gfx1151_cumode_modules.contains(name) {
+                vec!["-mcumode".to_owned()]
+            } else {
+                Vec::new()
+            };
+        if arch == "gfx1201" && gfx12_a4_module(name) {
+            match hipfire_config::developer_var("HIPFIRE_A4_GROUP_K")
+                .ok()
+                .as_deref()
+            {
+                Some("64") => flags.push("-DIU4_A4_GROUP_K=64".to_owned()),
+                Some("32") => flags.push("-DIU4_A4_GROUP_K=32".to_owned()),
+                _ => {}
             }
-            flags
-        } else if arch == "gfx1151" && gfx1151_cumode_modules.contains(name) {
-            vec!["-mcumode".to_owned()]
-        } else {
-            Vec::new()
+            if gfx12_a4_producer_module(name) {
+                match hipfire_config::developer_var("HIPFIRE_A4_CANDIDATES")
+                    .ok()
+                    .as_deref()
+                {
+                    Some("2") => flags.push("-DIU4_A4_CANDIDATES=2".to_owned()),
+                    Some("4") => flags.push("-DIU4_A4_CANDIDATES=4".to_owned()),
+                    _ => {}
+                }
+            }
         }
+        flags
     }
 
     fn module_flags(&self, name: &str) -> Vec<String> {
@@ -716,6 +761,7 @@ impl KernelCompiler {
     fn ensure_radiowave_certification(&self, name: &str, artifact: &Path) {
         if !self.has_hipcc {
             return;
+
         }
         let manifest = artifact.with_extension("radiowave.json");
         let already_valid = std::fs::read(artifact)
@@ -747,6 +793,53 @@ impl KernelCompiler {
             );
         }
     }
+    fn gfx12_a4_source<'a>(&self, name: &str, source: &'a str) -> &'a str {
+        if self.arch != "gfx1201"
+            || !matches!(
+                hipfire_config::developer_var("HIPFIRE_A4_GROUP_K")
+                    .ok()
+                    .as_deref(),
+                Some("64" | "32")
+            )
+        {
+            return source;
+        }
+        match name {
+            "fused_rmsnorm_mq_rotate_awq_i4_gfx12" => {
+                crate::kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_FINE_SRC
+            }
+            "fused_rmsnorm_mq_rotate_i4_gfx12" => {
+                crate::kernels::FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_FINE_SRC
+            }
+            "fused_silu_mul_mq_rotate_awq_i4_gfx12" => {
+                crate::kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_FINE_SRC
+            }
+            "fused_silu_mul_mq_rotate_i4_gfx12" => {
+                crate::kernels::FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_FINE_SRC
+            }
+            "gated_norm_mq_rotate_awq_i4_gfx12" => {
+                crate::kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_FINE_SRC
+            }
+            "gated_norm_mq_rotate_i4_gfx12" => {
+                crate::kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_FINE_SRC
+            }
+            "mq_rotate_x_awq_i4_gfx12" => crate::kernels::MQ_ROTATE_X_AWQ_I4_GFX12_FINE_SRC,
+            "mq_rotate_x_i4_gfx12" => crate::kernels::MQ_ROTATE_X_I4_GFX12_FINE_SRC,
+            "sigmoid_mul_rotate_x_mq_awq_i4_gfx12" => {
+                crate::kernels::SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_FINE_SRC
+            }
+            "gemm_mq4g256v2_residual_mmq_iu4" => {
+                crate::kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_FINE_SRC
+            }
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx12" => {
+                crate::kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_FINE_SRC
+            }
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold" => {
+                crate::kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_FINE_SRC
+            }
+            _ => source,
+        }
+    }
 
     /// Compile a HIP kernel source string. Returns path to .hsaco file.
     /// Tries pre-compiled blob first (with hash validation), falls back to hipcc.
@@ -754,6 +847,7 @@ impl KernelCompiler {
         if self.compiled.contains_key(name) {
             return Ok(&self.compiled[name]);
         }
+        let source = self.gfx12_a4_source(name, source);
 
         // Hash source + arch + flags + toolchain + ABI for cache validation (used by
         // both pre-compiled and runtime paths). Flags and toolchain matter: identical

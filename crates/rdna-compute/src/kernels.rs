@@ -1119,12 +1119,27 @@ pub const FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4_gfx12\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+pub const FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_FINE_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant_fine.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4_gfx12\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
 /// gfx1201 slices-2 IU4 AWQ producer: AWQ divide + RMSNorm/FWHT +
 /// in-register `block_i4_128` emit for the qkvza/gate_up inputs (K=5120 in
 /// flight).
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_FINE_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant_fine.hip"),
     "#define HIPFIRE_IU4_SIDECAR 1\n",
     "#define HIPFIRE_RMSNORM_AWQ 1\n",
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12\n",
@@ -1188,11 +1203,24 @@ pub const MQ_ROTATE_X_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i4_gfx12\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
+pub const MQ_ROTATE_X_I4_GFX12_FINE_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant_fine.hip"),
+    "#define HIPFIRE_ROTATE_KERNEL mq_rotate_x_i4_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
 /// gfx1201 slices-3 IU4 AWQ producer: AWQ divide + FWHT rotate +
 /// in-register `block_i4_128` emit for the attention out-proj input.
 pub const MQ_ROTATE_X_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_KERNEL rotate_x_mq_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
+pub const MQ_ROTATE_X_AWQ_I4_GFX12_FINE_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant_fine.hip"),
     "#define HIPFIRE_ROTATE_AWQ 1\n",
     "#define HIPFIRE_ROTATE_KERNEL rotate_x_mq_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
@@ -1246,6 +1274,14 @@ pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX11_SRC: &str = concat!(
 pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_ROTATE_SIGMOID_GATE 1\n",
+    "#define HIPFIRE_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
+pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_FINE_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant_fine.hip"),
     "#define HIPFIRE_ROTATE_SIGMOID_GATE 1\n",
     "#define HIPFIRE_ROTATE_AWQ 1\n",
     "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gfx12\n",
@@ -1343,12 +1379,25 @@ pub const GATED_NORM_MQ_ROTATE_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_gfx12\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
+pub const GATED_NORM_MQ_ROTATE_I4_GFX12_FINE_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant_fine.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
 /// gfx1201 slices-4 IU4 AWQ producer: AWQ divide folded into the LDS staging
 /// (same expression order as the standalone gated_norm → rotate_x_mq_awq
 /// chain), then FWHT + in-register `block_i4_128` emit.
 pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_FINE_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant_fine.hip"),
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
@@ -1423,11 +1472,25 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_i4_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip")
 );
+pub const FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_FINE_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant_fine.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_i4_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate.hip")
+);
 /// gfx1201 slice-1 IU4 AWQ producer: AWQ divide + SwiGLU/FWHT + in-register
 /// `block_i4_128` emit for the down-proj input (K=17408 in flight).
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
+);
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_FINE_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant_fine.hip"),
     "#define HIPFIRE_IU4_SIDECAR 1\n",
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
@@ -3691,6 +3754,22 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC: &str = concat!(
     "#define gemm_mq4g256v2_residual_mmq_iu4_full_set gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip")
+);
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_FINE_SRC: &str = concat!(
+    include_str!("../../../kernels/src/block_i4_128_quant_fine.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
+);
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_FINE_SRC: &str = concat!(
+    include_str!("../../../kernels/src/block_i4_128_quant_fine.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_fine.gfx12.hip")
+);
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_FINE_SRC: &str = concat!(
+    "#define IU4_SYMMETRIC_FOLD 1\n",
+    "#define gemm_mq4g256v2_residual_mmq_iu4 gemm_mq4g256v2_residual_mmq_iu4_symfold\n",
+    "#define gemm_mq4g256v2_residual_mmq_iu4_full_add gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold\n",
+    "#define gemm_mq4g256v2_residual_mmq_iu4_full_set gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold\n",
+    include_str!("../../../kernels/src/block_i4_128_quant_fine.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_fine.gfx12.hip")
 );
 // gfx12 (RDNA4) i8-WMMA MMQ port (single-wave 16-row tile, [32,1,1], LDS 0).
 // RDNA3's #if guard excludes gfx12, so RDNA4 needs this separate source.

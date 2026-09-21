@@ -297,6 +297,85 @@ static __device__ __forceinline__ void iu4_bundle(
     __builtin_amdgcn_sched_barrier(0);
 }
 
+#if IU4_A4_GROUP_K < 128
+// Fold one independently-scaled K32/K64 activation subgroup.  The nibble
+// staging geometry remains K128; only the int32 chain reset/fold cadence and
+// the per-subgroup metadata differ.
+static __device__ __forceinline__ void iu4_fold_activation_subgroup(
+    const block_i4_128* __restrict__ Xq,
+    int kb,
+    int subgroup,
+    int N,
+    int bs,
+    int wave_row0,
+    int wave_tok0,
+    int m_lane,
+    int k_grp,
+    const char* __restrict__ sz_lds,
+    int32x8_t cacc[4][2],
+    float8_t acc[4][2]
+) {
+    #pragma unroll
+    for (int rg = 0; rg < 2; rg++) {
+        float sc_row[8];
+#if !defined(IU4_SYMMETRIC_FOLD) || !defined(__gfx1201__)
+        float zp_row[8];
+#endif
+        #pragma unroll
+        for (int j = 0; j < 8; j++) {
+            const unsigned jbase =
+                (unsigned)(wave_row0 + rg * 16 + 8 * k_grp + j) * 8u;
+            sc_row[j] = *(const float*)(sz_lds + jbase);
+#if !defined(IU4_SYMMETRIC_FOLD) || !defined(__gfx1201__)
+            zp_row[j] = *(const float*)(sz_lds + jbase + 4u);
+#endif
+        }
+        #pragma unroll
+        for (int nb = 0; nb < 4; nb++) {
+            int* acc_i = (int*)&cacc[nb][rg];
+            const int tok = bs + wave_tok0 + nb * 16 + m_lane;
+            float d_x = 0.0f;
+            int s_x = 0;
+            if (tok < N) {
+                const block_i4_128* block = Xq + (long long)kb * N + tok;
+                d_x = block->d[subgroup];
+                s_x = block->s[subgroup];
+            }
+#if defined(IU4_SYMMETRIC_FOLD) && defined(__gfx1201__)
+            #pragma unroll
+            for (int j = 0; j < 8; j += 2) {
+                const float2 pair = iu4_symmetric_fold_rn_pair(
+                    acc[nb][rg][j], acc[nb][rg][j + 1],
+                    sc_row[j], sc_row[j + 1],
+                    d_x, acc_i[j], acc_i[j + 1]);
+                acc[nb][rg][j] = pair.x;
+                acc[nb][rg][j + 1] = pair.y;
+            }
+#elif defined(__gfx1201__)
+            const float sf_x = (float)s_x;
+            #pragma unroll
+            for (int j = 0; j < 8; j += 2) {
+                const float2 pair = iu4_fold_rn_pair(
+                    acc[nb][rg][j], acc[nb][rg][j + 1],
+                    sc_row[j], sc_row[j + 1],
+                    zp_row[j], zp_row[j + 1],
+                    d_x, acc_i[j], acc_i[j + 1], sf_x);
+                acc[nb][rg][j] = pair.x;
+                acc[nb][rg][j + 1] = pair.y;
+            }
+#else
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                IU4_FOLD_RN(
+                    acc[nb][rg][j], sc_row[j], zp_row[j],
+                    d_x, acc_i[j], s_x);
+            }
+#endif
+        }
+    }
+}
+#endif
+
 // Shared compute body for residual / full_add / full_set. `ADD` selects
 // += (residual) vs = (set) writeback.
 template <bool ADD>
@@ -444,7 +523,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     }
     // Prologue slab 0 of block 0, b64-coalesced (same map as the K-loop).
     {
-        const char* __restrict__ xqB0 = (const char*)Xq + 8;
+        const char* __restrict__ xqB0 = (const char*)Xq + IU4_A4_PAYLOAD_OFFSET;
         const char* __restrict__ wB0 = A + 8;
         #pragma unroll
         for (int r = 0; r < 2; r++) {
@@ -474,7 +553,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
             {
                 // Slab 1 prefetch, b64-coalesced: uniform SGPR bases carry
                 // kb/g/h, lane VGPR offsets were hoisted to kernel top.
-                const char* __restrict__ xqB1 = (const char*)(Xq + (long long)kb * N) + 8 + 32;
+                const char* __restrict__ xqB1 = (const char*)(Xq + (long long)kb * N) + IU4_A4_PAYLOAD_OFFSET + 32;
                 const char* __restrict__ wB1 = A + (long long)g * 136 + 8 + (long long)h * 64 + 32;
                 #pragma unroll
                 for (int r = 0; r < 2; r++) {
@@ -488,8 +567,25 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 // Every 128-K block restarts its int32 accumulation from zero
                 // (each block folds independently): FIRST=true on slab 0 of
                 // every (g,h), exactly as in v2. No h-dependence here.
+#if IU4_A4_GROUP_K == 32
+                iu4_bundle<0, true>(w_lds, a_lds, frW, frA, cacc, zc);
+                iu4_fold_activation_subgroup(
+                    Xq, kb, 0, N, bs, wave_row0, wave_tok0, m_lane, k_grp,
+                    sz_lds, cacc, acc);
+                iu4_bundle<1, true>(w_lds, a_lds, frW, frA, cacc, zc);
+                iu4_fold_activation_subgroup(
+                    Xq, kb, 1, N, bs, wave_row0, wave_tok0, m_lane, k_grp,
+                    sz_lds, cacc, acc);
+#elif IU4_A4_GROUP_K == 64
                 iu4_bundle<0, true>(w_lds, a_lds, frW, frA, cacc, zc);
                 iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
+                iu4_fold_activation_subgroup(
+                    Xq, kb, 0, N, bs, wave_row0, wave_tok0, m_lane, k_grp,
+                    sz_lds, cacc, acc);
+#else
+                iu4_bundle<0, true>(w_lds, a_lds, frW, frA, cacc, zc);
+                iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
+#endif
                 // Publish slab 1 to the free alternate slot. The raw A pin
                 // keeps its zero-select at this first use, after slot-0
                 // compute, without imposing a memory or scheduling fence.
@@ -514,7 +610,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     // as the next-payload nibble words; ds_nx/sz_nx hold the
                     // raw next metadata words.
                     const int kb_nx = kb + 1;
-                    const char* __restrict__ xq_nx = (const char*)(Xq + (long long)kb_nx * N) + 8;
+                    const char* __restrict__ xq_nx = (const char*)(Xq + (long long)kb_nx * N) + IU4_A4_PAYLOAD_OFFSET;
                     #pragma unroll
                     for (int r = 0; r < 2; r++) {
                         A_pf[r] = *(const u32x2_t*)(xq_nx + st_avoff[r]);
@@ -538,6 +634,22 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
             }
             // --- Slot 1 compute, current fold, next slot-0 publish. ---
             {
+#if IU4_A4_GROUP_K == 32
+                iu4_bundle<0, true>(w_lds, a_lds, frW, frA, cacc, zc);
+                iu4_fold_activation_subgroup(
+                    Xq, kb, 2, N, bs, wave_row0, wave_tok0, m_lane, k_grp,
+                    sz_lds, cacc, acc);
+                iu4_bundle<1, true>(w_lds, a_lds, frW, frA, cacc, zc);
+                iu4_fold_activation_subgroup(
+                    Xq, kb, 3, N, bs, wave_row0, wave_tok0, m_lane, k_grp,
+                    sz_lds, cacc, acc);
+#elif IU4_A4_GROUP_K == 64
+                iu4_bundle<0, true>(w_lds, a_lds, frW, frA, cacc, zc);
+                iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
+                iu4_fold_activation_subgroup(
+                    Xq, kb, 1, N, bs, wave_row0, wave_tok0, m_lane, k_grp,
+                    sz_lds, cacc, acc);
+#else
                 iu4_bundle<0, false>(w_lds, a_lds, frW, frA, cacc, zc);
                 iu4_bundle<1, false>(w_lds, a_lds, frW, frA, cacc, zc);
                 // Fold while the next fetch epoch remains in flight: 4 K32
@@ -582,10 +694,6 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
 #else
                         const int s_x = *(const int*)(ds_lds + tbase + 4u);
 #if defined(__gfx1201__)
-                        // Paired fold: same values, same DAG as IU4_FOLD_RN;
-                        // sf hoisted (the int sum is loop-invariant, the
-                        // compiler CSEs the baseline's per-j conversion to
-                        // one anyway: 4 sf converts per half, unchanged).
                         const float sf_x = (float)s_x;
                         #pragma unroll
                         for (int j = 0; j < 8; j += 2) {
@@ -606,6 +714,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
 #endif
                     }
                 }
+#endif
                 // Slot 0 was retired at the preceding rendezvous and is free
                 // while slot 1 computes, so publish needs no readers-done
                 // barrier here.
