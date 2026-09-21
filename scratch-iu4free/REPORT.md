@@ -4,23 +4,26 @@
 
 The artifact quality gate passes, and a one-accumulator exponent-shift kernel is viable but not ready to ship. On the paired card-C standalone screen it improves the gate/up shape by 10.58%, is effectively flat on down (-0.59%), and improves the two-shape aggregate by 7.14%. The environment-gated implementation is retained for follow-up; the default path is unchanged.
 
-Daemon gates were not run because card-B was occupied by the row-global-A gate and the fold-free candidate had not completed the required qkv family screens. Therefore there are no defensible tg128, pp8192, TTFT, or daemon GEMM-us/token numbers for this candidate.
+The first production gate passes: card-C tg128 changes by -0.21%, within the 1% decode-neutral band. The remaining pp8192, TTFT, battery, and daemon profiler gates are delegated to `Iu4ShiftFoldGate`.
 
 ## Quality gates
 
 All scores use the exact 24-chunk prefill KLD evaluator on card-C unless noted.
 
-| artifact / activation route | c2 | c24 | result |
+| artifact / compute route / activation route | c2 | c24 | result |
 |---|---:|---:|---|
-| pow2h, existing K128 activation scales | 0.071897 | **0.091338** | pass (`<= 0.10`) |
-| shipped control, existing K128 activation scales | 0.064864 | 0.081199 | control |
-| pow2h, one activation scale per token | 0.046252 | 0.055408 | pass |
-| full-pow2, one activation scale per token | 0.058773 | **0.071194** | pass |
-| pow2h row-max normalized weights, one activation scale per token | 0.098325 | 0.117126 | fail |
-| pow2h MSE-selected row-common weights, one activation scale per token | not run | 0.114720 | fail |
-| pow2h mantissa collapsed to integer weights | 0.121697 | not run | fail early |
+| `sym-pow2h-a035.hfq`, iu4, existing K128 A scales | 0.071897 | **0.091338** | pass (`<= 0.10`) |
+| `sym-a035.qat-r5s100.hfq`, iu4, existing K128 A scales | 0.064864 | 0.081199 | shipped control |
+| `sym-pow2h-a035.hfq`, iu4, one A scale per token | 0.046252 | 0.055408 | pass |
+| `sym-pow2-a035.hfq`, iu4, one A scale per token | 0.058773 | **0.071194** | pass |
+| `sym-pow2-a035.hfq`, fp8v2 forced with row-global screening env | not run | **0.071194** | fail hard fp8 budget (`> 0.05`) |
+| pow2h row-max-normalized derivative, iu4, one A scale per token | 0.098325 | 0.117126 | fail |
+| pow2h MSE-selected row-common derivative, iu4, one A scale per token | not run | 0.114720 | fail |
+| pow2h integer-mantissa derivative, iu4 | 0.121697 | not run | fail early |
 
 The full-pow2 plus row-global-activation route is the clean numeric contract for shift folding. The pre-enlargement candidate produced byte-identical c2 and c24 score binaries to that route. After the tile enlargement and metadata fix, the rebuilt candidate again scored c2 = 0.058773 and its score binary was byte-identical to the baseline route.
+
+The requested full-pow2 fp8v2 cell was run with `HIPFIRE_IU4_PREFILL=0`, row-global screening enabled, and fused producer quantization disabled. It scored 0.071194, so it does not clear the hard fp8v2 c24 budget of 0.05. Row-global A changes the int4 activation sidecar used by iu4; fp8 activation packing is already row-wide and does not consume that sidecar. The full-pow2 grid is therefore quality-valid only for the iu4 arm unless the fp8 arm keeps its current grid/artifact or receives QAT.
 
 ## Weight screens
 
@@ -59,9 +62,20 @@ Card-C, B=8192, five warmups plus 20 HIP-event samples, median of positions 9 an
 
 For these two GEMMs across 64 layers, the standalone timing corresponds to 141.087 us/token baseline and 131.680 us/token candidate. This is not a daemon profile and must not be presented as total production GEMM time.
 
+## Card-C decode gate
+
+Same full-pow2 artifact and one-scale-per-token iu4 route, fresh daemon per arm, fp8 KV, graph enabled, pp512/ctx128/tg128 matrix, one warmup and three measured runs:
+
+| arm | pp512 median | tg128@128 median | decode samples |
+|---|---:|---:|---|
+| control (`HIPFIRE_IU4_SHIFT_FOLDFREE=0`) | 2222.7 tok/s | 36.59365 tok/s | 36.60088, 36.59365, 36.56283 |
+| candidate (`HIPFIRE_IU4_SHIFT_FOLDFREE=1`) | 2221.3 tok/s | 36.51656 tok/s | 36.52859, 36.51656, 36.50954 |
+
+Decode delta is **-0.211%**, inside the required 1% neutral band. The pp512 row from this decode-first screen is -0.063%; the delegated paired prefill gate uses two full pairs.
+
 ## Missing production gates
 
-The qkvza and qkv shape screens, card-B daemon warmup/pair, tg128, pp8192, TTFT, and daemon profiler attribution were not completed. No shipping claim is made. The candidate is experimental, off by default, and requires those gates before integration.
+The qkvza and qkv shape screens and daemon profiler attribution were not completed in this branch. Card-C pp512/pp8192 pairs, TTFT, and the five-prompt decoded-text battery are delegated to `Iu4ShiftFoldGate`. The candidate remains experimental and off by default pending those receipts.
 
 ## Reproduction pointers
 
@@ -70,3 +84,5 @@ The qkvza and qkv shape screens, card-B daemon warmup/pair, tg128, pp8192, TTFT,
 - `rownorm-opt-global-a-c24.log`: row-common MSE screen, 0.114720.
 - `bench-baseline-corrected-pair.txt` and `bench-shiftfold-corrected-gate.txt`: gate/up pair.
 - `bench-baseline-corrected-down-pair.txt` and `bench-shiftfold-corrected-down.txt`: down pair.
+- `pow2-global-a-fp8v2-c24.log`: forced fp8v2 full-pow2 cell, 0.071194.
+- `tg128-control-cardc.jsonl` and `tg128-candidate-cardc.jsonl`: paired decode-first daemon gate.
