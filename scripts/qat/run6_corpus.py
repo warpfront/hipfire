@@ -95,15 +95,19 @@ def prefix_before_assistant(messages: Iterable[dict[str, Any]], legacy: bool = F
 
 
 def prompt_ids(tokenizer: Any, row: dict[str, Any]) -> list[int]:
-    return [
-        int(token)
-        for token in tokenizer.apply_chat_template(
-            row["messages"],
-            tokenize=True,
-            add_generation_prompt=True,
-            enable_thinking=bool(row["enable_thinking"]),
-        )
-    ]
+    encoded = tokenizer.apply_chat_template(
+        row["messages"],
+        tokenize=True,
+        add_generation_prompt=True,
+        enable_thinking=bool(row["enable_thinking"]),
+    )
+    if hasattr(encoded, "keys") and "input_ids" in encoded:
+        encoded = encoded["input_ids"]
+    if hasattr(encoded, "tolist"):
+        encoded = encoded.tolist()
+    if encoded and isinstance(encoded[0], list):
+        encoded = encoded[0]
+    return [int(token) for token in encoded]
 
 
 def dataset_sha(repo: str) -> str | None:
