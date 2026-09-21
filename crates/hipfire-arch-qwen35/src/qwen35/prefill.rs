@@ -194,7 +194,9 @@ fn try_gfx12_fp8_stream_rmsnorm_prepared(
     if !matches!(
         next_linear.gpu_dtype,
         DType::MQ4G256V2 | DType::MQ4G256V2Lloyd
-    ) || !gpu.fp8_stream_active(n, k) {
+    ) || !gpu.fp8_stream_active(n, k)
+        || gpu.iu4_grouped_activation_active(k)
+    {
         return Ok(None);
     }
     let prep = gpu.fused_rmsnorm_rotate_mq_fp8_gfx12_batched(
@@ -225,6 +227,7 @@ fn try_gfx12_fp8_stream_silu_prepared(
         w_down.gpu_dtype,
         DType::MQ4G256V2 | DType::MQ4G256V2Lloyd
     ) || !gpu.fp8_stream_active(n, k)
+        || gpu.iu4_grouped_activation_active(k)
     {
         return Ok(None);
     }
@@ -317,6 +320,7 @@ fn try_gfx12_fp8_stream_sigmoid_prepared(
         wo.gpu_dtype,
         DType::MQ4G256V2 | DType::MQ4G256V2Lloyd
     ) || !gpu.fp8_stream_active(n, k)
+        || gpu.iu4_grouped_activation_active(k)
     {
         return Ok(None);
     }
@@ -433,6 +437,7 @@ fn try_gfx12_fp8_stream_gdn_prepared(
         || head_dim != 128
         || n_heads * head_dim != k
         || !gpu.fp8_stream_active(n, k)
+        || gpu.iu4_grouped_activation_active(k)
     {
         return Ok(None);
     }
