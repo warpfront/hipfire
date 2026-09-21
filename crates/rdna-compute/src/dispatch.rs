@@ -645,9 +645,16 @@ pub struct MmqScreenState {
 /// helper that appends to `capture_blobs` without also recording into
 /// `self.replay` will silently truncate a retained tape — use
 /// `debug_assert_tape_parity` or compare the two counts in a test.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Mq4v2WeightLayout {
+    RowMajor,
+    CoalescedSymfold,
+    Fragment,
+}
+
 pub(crate) struct Mq4v2FoldfreeWeight {
     row_scales: Option<GpuTensor>,
-    wpreshuffled: bool,
+    layout: Mq4v2WeightLayout,
 }
 
 pub struct Gpu {
@@ -970,13 +977,13 @@ impl Gpu {
         self.flags.slot_trace
     }
     /// Attach loader-built MQ4V2 metadata to a resident weight. Fold-free
-    /// weights carry a per-row reference-scale sidecar; symmetric-fold
-    /// weights may carry only the load-time W-layout marker.
+    /// weights carry a per-row reference-scale sidecar; the explicit layout
+    /// records which size-preserving permutation the resident bytes use.
     pub fn install_mq4v2_foldfree_weight(
         &self,
         weight: &GpuTensor,
         row_scales: Option<GpuTensor>,
-        wpreshuffled: bool,
+        layout: Mq4v2WeightLayout,
     ) -> HipResult<()> {
         let key = weight.buf.as_ptr() as usize;
         let mut weights = self
@@ -988,7 +995,7 @@ impl Gpu {
                 key,
                 Mq4v2FoldfreeWeight {
                     row_scales,
-                    wpreshuffled,
+                    layout,
                 },
             )
             .is_some()
@@ -1015,15 +1022,19 @@ impl Gpu {
             .ok_or_else(|| HipError::new(0, "MQ4V2 fold-free row sidecar missing"))
     }
 
-    pub fn mq4v2_weight_is_wpreshuffled(&self, weight: &GpuTensor) -> HipResult<bool> {
+    pub fn mq4v2_weight_layout(&self, weight: &GpuTensor) -> HipResult<Mq4v2WeightLayout> {
         let key = weight.buf.as_ptr() as usize;
         Ok(self
             .mq4v2_foldfree_weights
             .lock()
             .map_err(|_| HipError::new(0, "MQ4V2 fold-free weight map poisoned"))?
             .get(&key)
-            .map(|metadata| metadata.wpreshuffled)
-            .unwrap_or(false))
+            .map(|metadata| metadata.layout)
+            .unwrap_or(Mq4v2WeightLayout::RowMajor))
+    }
+
+    pub fn mq4v2_weight_is_wpreshuffled(&self, weight: &GpuTensor) -> HipResult<bool> {
+        Ok(self.mq4v2_weight_layout(weight)? != Mq4v2WeightLayout::RowMajor)
     }
 
     /// Whether the multi-slot decode step should be hipGraph-captured.

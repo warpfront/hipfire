@@ -20,6 +20,10 @@
 #define HIPFIRE_MQ4V2_WPRESHUFFLE 0
 #endif
 
+#ifndef HIPFIRE_MQ4V2_FRAGMENT_WPRESHUFFLE
+#define HIPFIRE_MQ4V2_FRAGMENT_WPRESHUFFLE 0
+#endif
+
 #if HIPFIRE_MQ4V2_WPRESHUFFLE
 __device__ __forceinline__ unsigned int mq4v2_res_wp_header(
     const char* a, int rows, int k, int row, int half_block) {
@@ -34,6 +38,13 @@ __device__ __forceinline__ unsigned int mq4v2_res_wp_header(
 
 __device__ __forceinline__ unsigned int mq4v2_res_wp_packed(
     const char* a, int k, int row, int group, int tid) {
+#if HIPFIRE_MQ4V2_FRAGMENT_WPRESHUFFLE
+    const int k8 = group * 32 + tid;
+    return *(const unsigned int*)(a
+        + (((size_t)(row >> 4) * (size_t)(k >> 4)
+            + (unsigned)(k8 >> 1)) * 32u
+            + (unsigned)(k8 & 1) * 16u + (unsigned)(row & 15)) * 4u);
+#else
     const int slab = group * 4 + (tid >> 3);
     const int lane = ((tid >> 1) & 1) * 16 + (row & 15);
     const int byte = ((tid >> 2) & 1) * 8 + (tid & 1) * 4;
@@ -41,6 +52,7 @@ __device__ __forceinline__ unsigned int mq4v2_res_wp_packed(
         + (((size_t)(row >> 4) * (size_t)(k >> 6)
             + (unsigned)slab) * 32u + (unsigned)lane) * 16u
         + (unsigned)byte);
+#endif
 }
 #endif
 

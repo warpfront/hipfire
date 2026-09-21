@@ -703,6 +703,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
             | "fused_gate_up_mq4g256v2"
             | "fused_gate_up_mq4g256v2_wp"
+            | "fused_gate_up_mq4g256v2_frag_wp"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24), write(32)]);
     }
@@ -882,8 +883,10 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemv_mq4g256v2"
             | "gemv_mq4g256v2_wp"
+            | "gemv_mq4g256v2_frag_wp"
             | "gemv_mq4g256v2_residual"
             | "gemv_mq4g256v2_residual_wp"
+            | "gemv_mq4g256v2_residual_frag_wp"
             | "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch"
             | "gemv_mq6g256v2"
             | "gemv_mq6g256v2_residual"
@@ -1411,6 +1414,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "fused_gate_up_hfq4g256_stage_x32_gfx1100"
             | "fused_gate_up_mq4g256v2"
             | "fused_gate_up_mq4g256v2_wp"
+            | "fused_gate_up_mq4g256v2_frag_wp"
     ) {
         return Some(64);
     }
@@ -1548,8 +1552,10 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         kernel,
         "gemv_mq4g256v2"
             | "gemv_mq4g256v2_wp"
+            | "gemv_mq4g256v2_frag_wp"
             | "gemv_mq4g256v2_residual"
             | "gemv_mq4g256v2_residual_wp"
+            | "gemv_mq4g256v2_residual_frag_wp"
             | "gemv_mq4g256v2_residual_r1_k4096_gfx1100_noscratch"
             | "gemv_mq6g256v2"
             | "gemv_mq6g256v2_residual"
@@ -6773,6 +6779,7 @@ mod tests {
         "fused_qkv_mq4g256v2_k2048_x_buffer_gfx1100",
         "fused_gate_up_mq4g256v2",
         "fused_gate_up_mq4g256v2_wp",
+        "fused_gate_up_mq4g256v2_frag_wp",
         "fused_sigmoid_alpha_gate_f32",
         "conv1d_silu_split_f32",
         "conv1d_silu_split_qknorm_b256_scalar_prep",

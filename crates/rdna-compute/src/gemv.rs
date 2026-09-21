@@ -9480,20 +9480,25 @@ impl Gpu {
         };
         // For gfx1201 minimal dense set, rows=1 and no multirow/wave64 path is taken.
         // Still thread define through the helper rather than bypassing it.
-        let wpreshuffled = self.mq4v2_weight_is_wpreshuffled(a_raw)?;
-        let (v2_src, v2_entry) = if wpreshuffled {
-            (
+        let weight_layout = self.mq4v2_weight_layout(a_raw)?;
+        let (v2_src, v2_entry) = match weight_layout {
+            crate::Mq4v2WeightLayout::Fragment => (
+                kernels::GEMV_MQ4G256V2_RESIDUAL_FRAGMENT_WP_SRC,
+                "gemv_mq4g256v2_residual_frag_wp",
+            ),
+            crate::Mq4v2WeightLayout::CoalescedSymfold => (
                 kernels::GEMV_MQ4G256V2_RESIDUAL_WP_SRC,
                 "gemv_mq4g256v2_residual_wp",
-            )
-        } else {
-            kernels::gemv_mq4g256v2_residual_for_arch(&self.arch_caps)
+            ),
+            crate::Mq4v2WeightLayout::RowMajor => {
+                kernels::gemv_mq4g256v2_residual_for_arch(&self.arch_caps)
+            }
         };
         let (_, module) = kernels::gemv_hfq4g256_residual_for_arch(&self.arch_caps);
         // Distinct symbols keep every load layout in a distinct module cache.
         let module_v2: String;
         let func_name: &str;
-        if wpreshuffled || self.arch_caps.is_gfx1151() {
+        if weight_layout != crate::Mq4v2WeightLayout::RowMajor || self.arch_caps.is_gfx1151() {
             module_v2 = v2_entry.to_string();
             func_name = v2_entry;
         } else {
@@ -9694,14 +9699,23 @@ impl Gpu {
         // the generic dual-scale source; the arch gating is preserved so
         // occupancy/VGPR comparisons remain apples-to-apples. The module is
         // v1 module + `_mq4v2` and the C symbol is `gemv_mq4g256v2`.
-        let wpreshuffled = self.mq4v2_weight_is_wpreshuffled(a_raw)?;
-        let func_name = if wpreshuffled {
-            self.ensure_kernel(
-                "gemv_mq4g256v2_wp",
-                kernels::GEMV_MQ4G256V2_WP_SRC,
-                "gemv_mq4g256v2_wp",
-            )?;
-            "gemv_mq4g256v2_wp"
+        let weight_layout = self.mq4v2_weight_layout(a_raw)?;
+        let func_name = if weight_layout != crate::Mq4v2WeightLayout::RowMajor {
+            let (module, source, entry) = match weight_layout {
+                crate::Mq4v2WeightLayout::Fragment => (
+                    "gemv_mq4g256v2_frag_wp",
+                    kernels::GEMV_MQ4G256V2_FRAGMENT_WP_SRC,
+                    "gemv_mq4g256v2_frag_wp",
+                ),
+                crate::Mq4v2WeightLayout::CoalescedSymfold => (
+                    "gemv_mq4g256v2_wp",
+                    kernels::GEMV_MQ4G256V2_WP_SRC,
+                    "gemv_mq4g256v2_wp",
+                ),
+                crate::Mq4v2WeightLayout::RowMajor => unreachable!(),
+            };
+            self.ensure_kernel(module, source, entry)?;
+            entry
         } else if gfx1151_lm_head_dot2 {
             self.ensure_kernel(
                 "gemv_hfq4g256_lm_head_dot2_gfx1151_mq4v2",

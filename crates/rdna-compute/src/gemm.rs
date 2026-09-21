@@ -33787,26 +33787,30 @@ impl Gpu {
         k: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let wp_gate = self.mq4v2_weight_is_wpreshuffled(a_gate)?;
-        let wp_up = self.mq4v2_weight_is_wpreshuffled(a_up)?;
-        if wp_gate != wp_up {
+        let gate_layout = self.mq4v2_weight_layout(a_gate)?;
+        let up_layout = self.mq4v2_weight_layout(a_up)?;
+        if gate_layout != up_layout {
             return Err(hip_bridge::HipError::new(
                 0,
                 "fused gate/up MQ4V2 weight layouts disagree",
             ));
         }
-        let (module_v2, func_name, source) = if wp_gate {
-            (
+        let (module_v2, func_name, source) = match gate_layout {
+            crate::Mq4v2WeightLayout::Fragment => (
+                "fused_gate_up_hfq4g256_mq4v2_frag_wp",
+                "fused_gate_up_mq4g256v2_frag_wp",
+                kernels::FUSED_GATE_UP_MQ4G256V2_FRAGMENT_WP_SRC,
+            ),
+            crate::Mq4v2WeightLayout::CoalescedSymfold => (
                 "fused_gate_up_hfq4g256_mq4v2_wp",
                 "fused_gate_up_mq4g256v2_wp",
                 kernels::FUSED_GATE_UP_MQ4G256V2_WP_SRC,
-            )
-        } else {
-            (
+            ),
+            crate::Mq4v2WeightLayout::RowMajor => (
                 "fused_gate_up_hfq4g256_mq4v2",
                 "fused_gate_up_mq4g256v2",
                 kernels::FUSED_GATE_UP_MQ4G256V2_SRC,
-            )
+            ),
         };
         self.ensure_kernel(module_v2, source, func_name)?;
         let ag = a_gate.buf.as_ptr();
