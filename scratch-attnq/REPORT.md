@@ -120,6 +120,8 @@ The final trace records 216 VGPR and a `[768,1,1]` workgroup for every resident 
 
 After commit `1492b6cb2`, a fresh HOME with no config file and no `HIPFIRE_ATTN_QRESIDENT` variable produced a flag-free canonical TTFT median of **1,635.666 ms / 3,612.60 prompt tok/s** over 8 runs after 2 warmups. The fresh-home trace selected only the Q-resident symbol. This is the shipped headline.
 
+A final exact typed opt-out replay set `kernel.attn_qresident=false` in the daemon `ProcessConfig` and selected only `attention_fp8_e4m3_fa2_gqa_packet_gfx1201` (32 calls, 397,164,550 ns). This proves the shipped config opt-out after the default flip rather than relying on pre-flip behavior.
+
 ## Phase 2 residual audit and experiment
 
 ### Launch count source answer
