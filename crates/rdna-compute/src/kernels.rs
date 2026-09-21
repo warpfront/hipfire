@@ -1149,6 +1149,20 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_mq4v2_fp8_gfx12\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+/// gfx1201 FP8-stream SwiGLU/FWHT producer for residual down projections.
+/// The row-wide geometry preserves the incumbent wave-local arithmetic and
+/// emits the standalone F32 packer's three planes in the same launch.
+pub const FUSED_SILU_MUL_MQ_ROTATE_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
+);
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_SILU_FP8_AWQ 1\n",
+    "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_awq_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
+);
 /// T-B IU4 producer sidecar: standalone FWHT rotate + in-register
 /// `block_i4_128` emit for wo (residual) inputs. Prepends the shared quant
 /// recipe; the old `mq_rotate_x` / `rotate_x_mq_awq` symbols stay untouched.
@@ -1182,6 +1196,32 @@ pub const MQ_ROTATE_X_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_AWQ 1\n",
     "#define HIPFIRE_ROTATE_KERNEL rotate_x_mq_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
+);
+/// gfx1201 row-wide rotate producers that emit the MQ4v2 FP8 prepared
+/// planes.  Sigmoid twins fold the FA gate multiply into the same launch.
+pub const MQ_ROTATE_X_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_ROTATE_FP8_KERNEL mq_rotate_x_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
+);
+pub const MQ_ROTATE_X_AWQ_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_ROTATE_FP8_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_FP8_KERNEL rotate_x_mq_awq_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
+);
+pub const SIGMOID_MUL_MQ_ROTATE_X_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_ROTATE_FP8_SIGMOID_GATE 1\n",
+    "#define HIPFIRE_ROTATE_FP8_KERNEL sigmoid_mul_rotate_x_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
+);
+pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_ROTATE_FP8_SIGMOID_GATE 1\n",
+    "#define HIPFIRE_ROTATE_FP8_AWQ 1\n",
+    "#define HIPFIRE_ROTATE_FP8_KERNEL sigmoid_mul_rotate_x_mq_awq_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/mq_rotate_x_fp8.gfx12.hip")
 );
 /// gfx11 FA out-proj IU4 producer: exact `sigmoid_mul_f32` formation +
 /// AWQ/FWHT rotate + in-register `block_i4_128`, under a distinct `_gfx11`
@@ -1312,6 +1352,20 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+/// gfx1201 FP8-stream gated-norm producer for the LA output projection.
+/// Emits the exact gated-norm/AWQ/FWHT F32 row and the standalone packer's
+/// three planes in one row-wide workgroup.
+pub const GATED_NORM_MQ_ROTATE_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_fp8.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_FP8_GFX12_SRC: &str = concat!(
+    include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
+    "#define HIPFIRE_GATED_NORM_FP8_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_FP8_KERNEL gated_norm_mq_rotate_awq_mq4v2_fp8_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_fp8.gfx12.hip")
 );
 /// gfx11 slices-4 IU4 producer: batched gated RMSNorm + FWHT + in-register
 /// `block_i4_128` emit for the LA post-GDN `wo` input, under a distinct

@@ -208,6 +208,37 @@ fn try_gfx12_fp8_stream_rmsnorm_prepared(
     )?;
     Ok(Some(prep))
 }
+/// gfx1201 FP8-stream down-projection producer.  The admitted Lloyd route
+/// writes the exact F32 SwiGLU/AWQ/FWHT row plus the standalone packer's
+/// scale_mode=1 planes, allowing the residual GEMM to consume a prepared
+/// handle without a second launch.
+fn try_gfx12_fp8_stream_silu_prepared(
+    gpu: &mut Gpu,
+    w_down: &hipfire_runtime::llama::WeightTensor,
+    gate: &GpuTensor,
+    up: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+    n: usize,
+) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
+    if !matches!(
+        w_down.gpu_dtype,
+        DType::MQ4G256V2 | DType::MQ4G256V2Lloyd
+    ) || !gpu.fp8_stream_active(n, k)
+    {
+        return Ok(None);
+    }
+    let prep = gpu.fused_silu_mul_rotate_mq_fp8_gfx12_batched(
+        gate,
+        up,
+        w_down.awq_scale.as_ref(),
+        x_rot,
+        k,
+        n,
+    )?;
+    Ok(Some(prep))
+}
+
 
 /// gfx1201 slices-3: FWHT-rotate + `block_i4_128` IU4 producer for the
 /// attention out-proj input. `None` → caller keeps the incumbent rotate +
@@ -271,6 +302,35 @@ fn try_gfx12_sigmoid_rotate_quant_fused_prepared(
     )?;
     Ok(Some(prep))
 }
+/// gfx1201 FP8-stream FA output producer.  Folds sigmoid, optional AWQ,
+/// FWHT rotation and the scale_mode=1 pack into one row-wide launch.
+fn try_gfx12_fp8_stream_sigmoid_prepared(
+    gpu: &mut Gpu,
+    wo: &hipfire_runtime::llama::WeightTensor,
+    attn: &GpuTensor,
+    gate: &GpuTensor,
+    x_rot: &GpuTensor,
+    k: usize,
+    n: usize,
+) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
+    if !matches!(
+        wo.gpu_dtype,
+        DType::MQ4G256V2 | DType::MQ4G256V2Lloyd
+    ) || !gpu.fp8_stream_active(n, k)
+    {
+        return Ok(None);
+    }
+    let prep = gpu.rotate_x_mq_fp8_gfx12_batched(
+        attn,
+        Some(gate),
+        wo.awq_scale.as_ref(),
+        x_rot,
+        k,
+        n,
+    )?;
+    Ok(Some(prep))
+}
+
 /// gfx11 FA out-proj producer: fuse the still-standalone
 /// `sigmoid_mul_f32` into the AWQ rotate+IU4 sidecar, under the `_gfx11`
 /// entry symbol. Deliberately AWQ-only like the `_gfx12` twin: the arm of
@@ -353,6 +413,44 @@ fn try_gfx12_gdn_quant_fused_prepared(
     )?;
     Ok(Some(prep))
 }
+/// gfx1201 FP8-stream LA output producer.  Replaces gated_norm + AWQ/FWHT
+/// rotate + standalone pack for Lloyd residual consumers.
+#[allow(clippy::too_many_arguments)]
+fn try_gfx12_fp8_stream_gdn_prepared(
+    gpu: &mut Gpu,
+    wo: &hipfire_runtime::llama::WeightTensor,
+    x: &GpuTensor,
+    z: &GpuTensor,
+    norm_weight: &GpuTensor,
+    x_rot: &GpuTensor,
+    n_heads: usize,
+    head_dim: usize,
+    eps: f32,
+    k: usize,
+    n: usize,
+) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
+    if !matches!(wo.gpu_dtype, DType::MQ4G256V2 | DType::MQ4G256V2Lloyd)
+        || head_dim != 128
+        || n_heads * head_dim != k
+        || !gpu.fp8_stream_active(n, k)
+    {
+        return Ok(None);
+    }
+    let prep = gpu.gated_norm_rotate_mq_fp8_gfx12_batched(
+        x,
+        z,
+        norm_weight,
+        wo.awq_scale.as_ref(),
+        x_rot,
+        n_heads,
+        head_dim,
+        eps,
+        k,
+        n,
+    )?;
+    Ok(Some(prep))
+}
+
 /// gfx11 slices-4: gated RMSNorm + FWHT + `block_i4_128` IU4 producer for
 /// the LA post-GDN `wo` input, under the `_gfx11` entry symbols. `None` →
 /// caller keeps the incumbent gated_norm_f32 + rotate +
@@ -787,6 +885,48 @@ fn dispatch_batched_gemm_epilogue(
         }
     }
 }
+/// Consume producer-emitted MQ4v2 FP8 planes for a Lloyd residual/partial
+/// projection.  This is the prepared twin of `dispatch_batched_gemm_epilogue`
+/// for the exact gfx1201 route; no activation pack is launched here.
+fn dispatch_batched_fp8_lloyd_epilogue(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    w: &hipfire_runtime::llama::WeightTensor,
+    prepared: &rdna_compute::Mq4v2Fp8Prepared,
+    epilogue: &BatchEpilogue<'_>,
+    n: usize,
+) -> HipResult<()> {
+    let out = match epilogue {
+        BatchEpilogue::Residual => &pbs.x_batch,
+        BatchEpilogue::Partial(out) => {
+            zero_partial_for_residual(gpu, out, n, w.m)?;
+            out
+        }
+    };
+    match w.gpu_dtype {
+        DType::MQ4G256V2 => gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared(
+            &w.buf,
+            prepared,
+            out,
+            w.m,
+            w.k,
+            n,
+        ),
+        DType::MQ4G256V2Lloyd => {
+            gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared_lloyd(
+                &w.buf,
+                prepared,
+                out,
+                w.m,
+                w.k,
+                n,
+                lloyd_e4m3_or_fail(w, "dispatch_batched_fp8_lloyd_epilogue")?,
+            )
+        }
+        _ => unreachable!("fp8 producer admission accepts only MQ4G256V2 weights"),
+    }
+}
+
 
 /// Batched prefill entry point: processes N prompt tokens in one call,
 /// writing the last token's logits into `scratch.logits` and leaving
@@ -6204,7 +6344,23 @@ fn batch_chunk_delta_net_output_projection(
             &epilogue,
         )?;
     }
+    let mut fp8_gdn_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if gdn_fused_prep.is_none() {
+        fp8_gdn_prep = try_gfx12_fp8_stream_gdn_prepared(
+            gpu,
+            &layer.wo,
+            &pbs.dn_attn_out_batch,
+            &pbs.dn_z_batch,
+            &layer.norm_weight,
+            &pbs.dn_normed_rot_batch,
+            n_v_heads,
+            config.linear_value_head_dim,
+            config.norm_eps,
+            layer.wo.k,
+            n,
+        )?;
+    }
+    if gdn_fused_prep.is_none() && fp8_gdn_prep.is_none() {
         // Batched gated output norm.
         gpu.gated_norm_f32_batched(
             &pbs.dn_attn_out_batch,
@@ -6246,7 +6402,7 @@ fn batch_chunk_delta_net_output_projection(
     // Skipped when the slices-4 GDN producer already emitted both outputs
     // (`dn_normed_batch` is stale there by construction).
     let mut iu4_wo_prep: Option<rdna_compute::Int4MmqPrepared> = None;
-    if gdn_fused_prep.is_none() {
+    if gdn_fused_prep.is_none() && fp8_gdn_prep.is_none() {
         iu4_wo_prep = try_iu4_rotate_prepared(
             gpu,
             &layer.wo,
@@ -6268,7 +6424,10 @@ fn batch_chunk_delta_net_output_projection(
             )?;
         }
     }
-    let wo_input = if gdn_fused_prep.is_some() || iu4_wo_prep.is_some() {
+    let wo_input = if gdn_fused_prep.is_some()
+        || fp8_gdn_prep.is_some()
+        || iu4_wo_prep.is_some()
+    {
         &pbs.dn_normed_rot_batch
     } else if wo_is_mq {
         rotate_x_mq_batched_for(
@@ -6290,6 +6449,15 @@ fn batch_chunk_delta_net_output_projection(
             &pbs.x_batch,
             layer.wo.m,
             layer.wo.k,
+            n,
+        )?;
+    } else if let Some(prep) = &fp8_gdn_prep {
+        dispatch_batched_fp8_lloyd_epilogue(
+            gpu,
+            pbs,
+            &layer.wo,
+            prep,
+            &epilogue,
             n,
         )?;
     } else {
@@ -7156,6 +7324,7 @@ fn batch_chunk_delta_net_ffn_down(
             | DType::MFP4G32
     );
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
+    let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if w_down_is_mq {
         // C2: SwiGLU/FWHT IU4 producer for w_down (emit_f32=false). Residual only —
         // Partial TP epilogue still needs the f32 rotated buffer.
@@ -7185,6 +7354,17 @@ fn batch_chunk_delta_net_ffn_down(
             }
         }
         if iu4_prep.is_none() {
+            fp8_prep = try_gfx12_fp8_stream_silu_prepared(
+                gpu,
+                &layer.w_down,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                &pbs.ffn_hidden_batch,
+                hidden_dim,
+                n,
+            )?;
+        }
+        if iu4_prep.is_none() && fp8_prep.is_none() {
             // F2: AWQ-aware silu_mul+rotate for w_down input.
             fused_silu_mul_rotate_mq_batched_for(
                 gpu,
@@ -7207,6 +7387,15 @@ fn batch_chunk_delta_net_ffn_down(
             &pbs.x_batch,
             layer.w_down.m,
             layer.w_down.k,
+            n,
+        )?;
+    } else if let Some(prep) = &fp8_prep {
+        dispatch_batched_fp8_lloyd_epilogue(
+            gpu,
+            pbs,
+            &layer.w_down,
+            prep,
+            &epilogue,
             n,
         )?;
     } else {
@@ -7954,7 +8143,19 @@ fn batch_chunk_full_attn_output_projection(
             &epilogue,
         )?;
     }
+    let mut fp8_wo_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if iu4_wo_prep.is_none() {
+        fp8_wo_prep = try_gfx12_fp8_stream_sigmoid_prepared(
+            gpu,
+            &layer.wo,
+            &pbs.fa_attn_out_batch,
+            &pbs.fa_gate_batch,
+            &pbs.fa_attn_out_rot_batch,
+            layer.wo.k,
+            n,
+        )?;
+    }
+    if iu4_wo_prep.is_none() && fp8_wo_prep.is_none() {
         gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
         // T-B / slices-3: rotate+quantize once the standalone sigmoid has
         // produced the f32 input. All non-admitted routes remain unchanged.
@@ -7978,7 +8179,7 @@ fn batch_chunk_full_attn_output_projection(
             )?;
         }
     }
-    let fa_wo_input = if iu4_wo_prep.is_some() {
+    let fa_wo_input = if iu4_wo_prep.is_some() || fp8_wo_prep.is_some() {
         &pbs.fa_attn_out_rot_batch
     } else if fa_wo_is_mq {
         rotate_x_mq_batched_for(
@@ -8000,6 +8201,15 @@ fn batch_chunk_full_attn_output_projection(
             &pbs.x_batch,
             layer.wo.m,
             layer.wo.k,
+            n,
+        )?;
+    } else if let Some(prep) = &fp8_wo_prep {
+        dispatch_batched_fp8_lloyd_epilogue(
+            gpu,
+            pbs,
+            &layer.wo,
+            prep,
+            &epilogue,
             n,
         )?;
     } else {
@@ -8799,6 +9009,7 @@ fn batch_chunk_full_attn_ffn_down(
             | DType::MFP4G32
     );
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
+    let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
     if fa_w_down_is_mq {
         if matches!(&epilogue, BatchEpilogue::Residual) {
             iu4_prep = try_iu4_silu_prepared(
@@ -8826,6 +9037,17 @@ fn batch_chunk_full_attn_ffn_down(
             }
         }
         if iu4_prep.is_none() {
+            fp8_prep = try_gfx12_fp8_stream_silu_prepared(
+                gpu,
+                &layer.w_down,
+                &pbs.gate_ffn_batch,
+                &pbs.up_batch,
+                &pbs.ffn_hidden_batch,
+                hidden_dim,
+                n,
+            )?;
+        }
+        if iu4_prep.is_none() && fp8_prep.is_none() {
             fused_silu_mul_rotate_mq_batched_for(
                 gpu,
                 &layer.w_down,
@@ -8846,6 +9068,15 @@ fn batch_chunk_full_attn_ffn_down(
             &pbs.x_batch,
             layer.w_down.m,
             layer.w_down.k,
+            n,
+        )?;
+    } else if let Some(prep) = &fp8_prep {
+        dispatch_batched_fp8_lloyd_epilogue(
+            gpu,
+            pbs,
+            &layer.w_down,
+            prep,
+            &epilogue,
             n,
         )?;
     } else {
