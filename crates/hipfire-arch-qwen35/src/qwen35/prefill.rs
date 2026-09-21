@@ -221,7 +221,11 @@ fn try_gfx12_fp8_stream_silu_prepared(
     k: usize,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
-    if w_down.gpu_dtype != DType::MQ4G256V2Lloyd || !gpu.fp8_stream_active(n, k) {
+    if !matches!(
+        w_down.gpu_dtype,
+        DType::MQ4G256V2 | DType::MQ4G256V2Lloyd
+    ) || !gpu.fp8_stream_active(n, k)
+    {
         return Ok(None);
     }
     let prep = gpu.fused_silu_mul_rotate_mq_fp8_gfx12_batched(
@@ -309,7 +313,11 @@ fn try_gfx12_fp8_stream_sigmoid_prepared(
     k: usize,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
-    if wo.gpu_dtype != DType::MQ4G256V2Lloyd || !gpu.fp8_stream_active(n, k) {
+    if !matches!(
+        wo.gpu_dtype,
+        DType::MQ4G256V2 | DType::MQ4G256V2Lloyd
+    ) || !gpu.fp8_stream_active(n, k)
+    {
         return Ok(None);
     }
     let prep = gpu.rotate_x_mq_fp8_gfx12_batched(
@@ -421,7 +429,7 @@ fn try_gfx12_fp8_stream_gdn_prepared(
     k: usize,
     n: usize,
 ) -> HipResult<Option<rdna_compute::Mq4v2Fp8Prepared>> {
-    if wo.gpu_dtype != DType::MQ4G256V2Lloyd
+    if !matches!(wo.gpu_dtype, DType::MQ4G256V2 | DType::MQ4G256V2Lloyd)
         || head_dim != 128
         || n_heads * head_dim != k
         || !gpu.fp8_stream_active(n, k)
@@ -895,15 +903,28 @@ fn dispatch_batched_fp8_lloyd_epilogue(
             out
         }
     };
-    gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared_lloyd(
-        &w.buf,
-        prepared,
-        out,
-        w.m,
-        w.k,
-        n,
-        lloyd_e4m3_or_fail(w, "dispatch_batched_fp8_lloyd_epilogue")?,
-    )
+    match w.gpu_dtype {
+        DType::MQ4G256V2 => gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared(
+            &w.buf,
+            prepared,
+            out,
+            w.m,
+            w.k,
+            n,
+        ),
+        DType::MQ4G256V2Lloyd => {
+            gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared_lloyd(
+                &w.buf,
+                prepared,
+                out,
+                w.m,
+                w.k,
+                n,
+                lloyd_e4m3_or_fail(w, "dispatch_batched_fp8_lloyd_epilogue")?,
+            )
+        }
+        _ => unreachable!("fp8 producer admission accepts only MQ4G256V2 weights"),
+    }
 }
 
 

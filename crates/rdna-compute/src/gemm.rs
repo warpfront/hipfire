@@ -32305,6 +32305,43 @@ impl Gpu {
             ));
         }
         let prepared = self.prepare_mq4v2_fp8_x(x, batch_size, k, scale_mode)?;
+        self.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared(
+            a_raw,
+            &prepared,
+            y,
+            m,
+            k,
+            batch_size,
+        )
+    }
+    pub fn gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_prepared(
+        &mut self,
+        a_raw: &GpuTensor,
+        prepared: &crate::scratch::Mq4v2Fp8Prepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" || self.replay.is_recording() || self.graphs.capture_mode {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_mq4g256v2_residual_wmma_fp8_gfx12: exact gfx1201 eager-only",
+            ));
+        }
+        if m == 0 || batch_size == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_mq4g256v2_residual_wmma_fp8_gfx12: need M>0, N>0, K%256==0",
+            ));
+        }
+        if prepared.n != batch_size || prepared.k != k || prepared.scale_mode != 1 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemm_mq4g256v2_residual_wmma_fp8_gfx12: prepared (n,k,scale_mode) mismatch",
+            ));
+        }
         // Staged-tile v2 candidate (default ON on gfx1201): geometry from
         // `HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM` (default BM128 x BN128 x BK64,
         // block 256, dynamic LDS ~20 KiB). Admitted only on the
