@@ -47,7 +47,7 @@ Flags may appear before or after the model. CLI help and the native typed schema
 | `--kv-backend <legacy\|vmm>` | KV allocation backend. Omitted = automatic (prefer VMM). `contiguous` is **rejected** (renamed to `legacy`). |
 | `--kv-k <name>` | Qwen-family K-axis override (`q8`, `fwhtN`, `asymN`/`turboN` → `fwhtN`, `legacy-asymN`). |
 | `--kv-v <name>` | Qwen-family V-axis override (`q8`, `lloyd2`/`3`/`4`). |
-| `--max-seq <n>` | Context length for this load. Default = min(model trained context, measured card capacity); explicit value wins. |
+| `--max-seq <n>` | Context length for this load. Eligible growing Qwen VMM KV defaults to min(model trained context, measured card capacity); legacy and other owners retain their bounds. Explicit value wins. |
 | `--spec <m>` / `--speculation <m>` | Spec mechanism: `off` \| `auto` \| `ngram` \| `dflash` \| `mtp` \| `dspark` (config default `auto`). |
 | `-md, --model-draft <path>` | DFlash draft path; implies `--spec dflash` unless `--spec`/env already set. |
 | `--draft-max`, `--draft <N>` | Draft window for the active mechanism. |
@@ -79,7 +79,7 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 | `--kv-backend` | `legacy` \| `vmm`; **default automatic prefer VMM** | Accepts only those two spellings. Old `contiguous` is rejected with a migration error that names `legacy` (e.g. use `--kv-backend legacy` or `memory.kv_backend = "legacy"`). Selecting legacy (explicit or automatic fallback) prints one stderr warning containing the stable token `HIPFIRE_KV_BACKEND=legacy`. Explicit `vmm` on an unsupported combination fails closed before teardown. |
 | `--kv-mode` | `auto` (default when unset), `q8`, `fwht2`/`3`/`4`, `asym2`/`3`/`4`, `turbo`/`turbo2`/`3`/`4`, `fp8`, `bf16`, … | Whole-cache preset that seeds *(K, V)*. |
 | `--kv-k` / `--kv-v` | Qwen-only axis overrides; omitted when unset | Orthogonal to mode. On supported Qwen sites `asymN` and `turboN` (bare `turbo` = `turbo3`) mean **`fwhtN`**; `legacy-asymN` selects the old Givens asym K. V names: `q8`, `lloyd2`/`3`/`4`. Non-Qwen carriers refuse these axes before teardown. |
-| `--max-seq` | int when set; else automatic | Default = **min(model trained context, measured card capacity)** after weights load. Explicit CLI/config override wins over both bounds. |
+| `--max-seq` | int when set; else automatic | On eligible growing Qwen VMM KV, default = **min(model trained context, measured card capacity)** after weights load; legacy and other owners retain their existing bounds. Explicit CLI/config override wins. |
 
 **Qwen `auto` / unset mode:** `q8`/`q8` on every arch **except** exact `gfx1201`, where eligible single-GPU Qwen routes default to native `fp8`/`fp8`. Non-Qwen family defaults are unchanged (e.g. Maple BF16, DeepSeek compressor F32, Gemma layered policy).
 
@@ -96,7 +96,7 @@ Shared by `hipfire run`, `hipfire serve`, and `hipfire bench` (including `--matr
 | `--kv-mode <m>` | KV mode preset for this process (same contract as `run`). |
 | `--kv-backend <legacy\|vmm>` | KV allocation backend (same as `run`; `contiguous` rejected → use `legacy`). |
 | `--kv-k <name>` / `--kv-v <name>` | Qwen-family K/V axis overrides (same as `run`). |
-| `--max-seq <n>` | Context length (default min(trained context, card capacity); explicit wins). |
+| `--max-seq <n>` | Context length (eligible growing Qwen VMM KV defaults to min(trained context, card capacity); explicit wins). |
 | `--idle-timeout <s>` | Unload after idle seconds (`0` = never; max `86400`). |
 | `--no-prewarm` | Lazy-load on first request. |
 | `--tp N` | Expert-parallel across N GPUs (supported MoE paths only; `1..64`). |
