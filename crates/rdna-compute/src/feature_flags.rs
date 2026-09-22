@@ -47,6 +47,9 @@ pub struct FeatureFlags {
     /// Quality cost ~+0.016 WT2-24 KLD on the MQ4-XT speed rung
     /// (gfx1201: 0.048028 -> 0.063890).
     pub iu4_prefill: Option<bool>,
+    /// Split partial-N gfx11 IU4 grids into unchecked full-tile interior and
+    /// one guarded tail launch (`kernel.gfx11_iu4_gridspec`, default off).
+    pub gfx11_iu4_gridspec: bool,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -520,6 +523,7 @@ impl FeatureFlags {
             gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
+            gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(false),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -909,6 +913,7 @@ impl FeatureFlags {
             // Deterministic unit-test baseline: the iu4 route stays off here
             // even though the process default is on.
             iu4_prefill: Some(false),
+            gfx11_iu4_gridspec: false,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,
