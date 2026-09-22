@@ -278,29 +278,98 @@ model's contract still accepts the named-cap route):
 
 | Key | Default | Validated values |
 |---|---|---|
-| `kv_cache` | `"auto"` | `auto`, `q8`, `asym4`, `asym3`, `asym2`, `fwht4`, `fwht3`, `fwht2`, `turbo`, `turbo4`, `turbo3`, `turbo2` |
+| `kv_cache` | `"auto"` | `auto`, `q8`, `asym4`, `asym3`, `asym2`, `fwht4`, `fwht3`, `fwht2`, `turbo`, `turbo4`, `turbo3`, `turbo2`, `fp8`, `bf16` (family-dependent) |
+| `kv_k` | empty (unset) | Qwen-only: `q8`, `fwht2`–`fwht4`, `asym2`–`asym4`, `turbo`/`turbo2`–`turbo4`, `legacy-asym2`–`legacy-asym4` |
+| `kv_v` | empty (unset) | Qwen-only: `q8`, `lloyd2`–`lloyd4` |
 | `kv_adaptive` | `"off"` | `off`, `conservative`, `balanced`, `aggressive`, or `advanced:k=<fwht4\|fwht3\|fwht2>,v=<lloyd4\|lloyd3\|lloyd2>` |
-| `kv_backend` | automatic (prefer VMM) | `contiguous` \| `vmm` |
+| `kv_backend` | automatic (prefer VMM) | `legacy` \| `vmm` |
 
-**Resolution of `auto`:** registry entry `default_kv_mode` if present and valid;
-otherwise Qwen uses `q8` K/V except exact gfx1201, where single-GPU Qwen
-uses native `fp8`. Explicit KV modes remain untouched.
+### Mode, K, and V
 
-`turbo*` values remain accepted aliases for validation/compat; resolution maps them in `resolveKvMode`.
+`memory.kv_cache` / `--kv-mode` is the whole-cache preset. It supplies the
+initial *(K, V)* pair. Typed `memory.kv_k` / `memory.kv_v` (CLI `--kv-k` /
+`--kv-v`) are **Qwen-only** orthogonal axis overrides: empty by default and
+omitted from IPC when unset. After the mode pair is chosen, a K override
+replaces only K and a V override replaces only V.
 
-`kv_adaptive` is opt-in. With adaptive on, `max_seq` is the context guaranteed at the floor tier. Daemon param overrides `HIPFIRE_KV_ADAPTIVE` when set through CLI load path.
+**Qwen K names** (shared table for `--kv-mode` preset K and `--kv-k`):
+
+- `q8` → Q8 K
+- `fwht2` \| `fwht3` \| `fwht4` → signed FWHT K at that bit width
+- `asym2` \| `asym3` \| `asym4` and `turbo` \| `turbo2` \| `turbo3` \| `turbo4`
+  → **FWHT** K (`turbo` ≡ `fwht3`, `turboN`/`asymN` ≡ `fwhtN`). These are
+  not the old Givens-Asym constructors.
+- `legacy-asym2` \| `legacy-asym3` \| `legacy-asym4` → old Givens-Asym K
+  (explicit rollback spelling)
+
+**Qwen V names:** `q8`, `lloyd2`, `lloyd3`, `lloyd4`. Lloyd V **requires**
+FWHT K (including `asymN`/`turboN` aliases that resolve to FWHT). Lloyd V
+with `q8` or `legacy-asymN` K is rejected before teardown.
+
+**Native pairs are indivisible.** An authored `--kv-mode fp8` or `bf16`
+(or the same via config) cannot be combined with any authored K or V axis
+override — even when the override would equal the native axis. Adaptive
+plus a fixed K/V override is likewise refused. An `auto` selection that
+landed on eligible gfx1201 native FP8 is **not** an authored `fp8` mode:
+both axes together may replace that pair when the constructor supports
+them; a single axis against native FP8 refuses and advises `--kv-mode q8`
+or both axes (never FP8-K/Q8-V).
+
+Unsupported K/V by topology, head dimension, or arch; static CASK with
+FWHT/Lloyd-V; and explicit native FP8/BF16 on unsupported arch/PP all fail
+**before** destructive teardown with requested/effective values and
+supported alternatives. No silent fallback on unsupported Qwen sites.
+
+**Resolution of `auto` / unset (Qwen family):** Q8/Q8 on every route
+(HFQ, PaRo, PP, Dir) except exact **gfx1201** eligible single-GPU sites
+whose accepted set includes native FP8, which select FP8/FP8. Qwen PP/Dir
+without an FP8 constructor stay Q8/Q8. gfx1200 / gfx11 / gfx94x never
+inherit FP8. Registry Qwen cards leave mode as `auto` (no q8 pin).
+
+**Non-Qwen families are unchanged:** Maple keeps BF16/BF16 (registry and
+direct-path auto; explicit `--kv-mode q8` still works). Gemma4 eager stays
+Q8/Q8; lowered stays sliding Q8 / full Asym3+Q8. DeepSeek4 keeps its F32
+compressor default (or explicit F16); V is not independently selectable
+there. Other carriers keep their existing site policy.
+
+**Kill switch:** `HIPFIRE_QWEN_KV_DEFAULT_Q8=0` restores the prior
+*implicit Qwen* per-site default (HFQ/PaRo auto distinctions). Default is
+ON (Q8/Q8). It must not override any authored CLI/config mode or K/V, must
+not touch the exact eligible gfx1201 FP8 path, and must not affect
+non-Qwen families.
+
+**Precedence** (each key independently — mode, K, V, backend):
+
+CLI flag **>** one-shot env **>** per-model TOML **>** global TOML **>**
+registry preset / arch default.
+
+Mode supplies the initial pair; axis overrides then apply regardless of
+which layer authored the mode. Effective resolution logs
+`requested mode=…, effective K=…, effective V=…` with sources.
+
+`kv_adaptive` is opt-in and is a *changing tier* path (starts FWHT4/Q8,
+downshifts toward FWHT/Lloyd floors), not a fixed static pair. With
+adaptive on, `max_seq` is the context guaranteed at the floor tier. Daemon
+param overrides `HIPFIRE_KV_ADAPTIVE` when set through the CLI load path.
+Adaptive plus authored `--kv-k`/`--kv-v` is rejected.
 
 ### `kv_backend` (allocation backend)
 
-Omitted `memory.kv_backend` / `--kv-backend` is **automatic**. Automatic selects
-on-demand HIP VMM mapping on certified Qwen layout/device/topology combinations
-(single-GPU and dense TP with per-rank VMM), covering static modes, adaptive,
-and native `fp8`/`bf16`. Otherwise it falls back to contiguous once per load,
-logging the reason and the effective backend. Absolute HFQ/safetensors paths and
-registry tags resolve identically for the same source/mode/topology; registry
-cards set neither backend nor `memory.max_seq`, but may still set
-`generation.max_tokens`. On gfx1100/gfx1151 the certified Qwen VMM route is q8
-only; unvalidated modes retain the existing contiguous fallback.
+Accepted values are **`legacy`** and **`vmm` only**. The former spelling
+`contiguous` is **rejected** with an actionable migration message naming
+`legacy` (e.g. use `--kv-backend legacy` or
+`memory.kv_backend = "legacy"`). It is not a deprecated alias.
+
+Omitted `memory.kv_backend` / `--kv-backend` is **automatic**. Automatic
+selects on-demand HIP VMM mapping on certified Qwen layout/device/topology
+combinations (single-GPU and dense TP with per-rank VMM), covering static
+modes, adaptive, and native `fp8`/`bf16`. Otherwise it falls back to
+**legacy** once per load, logging the reason and the effective backend.
+Absolute HFQ/safetensors paths and registry tags resolve identically for
+the same source/mode/topology; registry cards set neither backend nor
+`memory.max_seq`, but may still set `generation.max_tokens`. On
+gfx1100/gfx1151 the certified Qwen VMM route is q8 only; unvalidated modes
+retain the existing legacy fallback.
 
 For single-card **dense** Qwen HFQ VMM loads, omission of `max_seq` first
 preflights projected model fit before tearing down a resident model. After
@@ -322,18 +391,18 @@ default (with a loaded diagnostic reason) until its distinct prefill scratch can
 be budgeted; other carriers keep their existing context behavior until their
 different cache ownership can use the same allocation accounting.
 
-**Explicit override precedence** (forced choices, not automatic policy): CLI
-`--kv-backend` **>** per-model TOML `memory.kv_backend` **>** global TOML
-`memory.kv_backend`. Explicit `contiguous` always wins and never emits a
-misleading VMM marker. Explicit `vmm` on an unsupported combination fails with
-an actionable capability error **before** resident-model teardown and never
-silently falls back.
+**Explicit backend override precedence** (forced choices, not automatic
+policy): CLI `--kv-backend` **>** per-model TOML `memory.kv_backend` **>**
+global TOML `memory.kv_backend`. Explicit `legacy` always wins and never
+emits a misleading VMM marker. Explicit `vmm` on an unsupported combination
+fails with an actionable capability error **before** resident-model teardown
+and never silently falls back (refusal may suggest `--kv-backend legacy`).
 
 Unsupported automatic cases (for example MoE EP/PP, non-Qwen carriers without a
 matching owner, uncertified device/OS, or missing HIP VMM symbols) keep
-contiguous service with a logged reason. Adaptive→CASK handoff **requires**
+legacy service with a logged reason. Adaptive→CASK handoff **requires**
 VMM: if VMM is unavailable that combination is refused rather than handed off as
-invalid contiguous. Private speculative draft caches (DFlash/MTP) are owned
+invalid legacy. Private speculative draft caches (DFlash/MTP) are owned
 separately from the trunk KV backend and do not relabel it; their actual backend
 is logged on its own.
 
@@ -341,7 +410,8 @@ On Windows (ROCm 7.2), VMM maps the full reservation upfront for correctness —
 do not expect on-demand VRAM savings there. There is no env-based second default
 for the backend (`memory.kv_backend` has no `HIPFIRE_*` compat binding).
 
-Legacy one-shot alias for **mode** only: `HIPFIRE_KV_MODE` (see [`env-vars.md`](env-vars.md)).
+One-shot aliases: `HIPFIRE_KV_MODE` for **mode** only; see also
+`HIPFIRE_QWEN_KV_DEFAULT_Q8` above and [`env-vars.md`](env-vars.md).
 
 ---
 

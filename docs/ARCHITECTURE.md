@@ -105,10 +105,10 @@ Native CLI (`crates/hipfire-cli`)
   resolve registry tag → model path under ~/.hipfire/models/ (or local path)
   if serve up AND not forced local → HTTP POST /v1/chat/completions
     forced local when `HIPFIRE_LOCAL` is truthy or any of `--image`,
-    `--kv-mode`, `--kv-backend`, `--spec`/`--speculation`, `--model-draft`,
-    `--draft-max`, `--dspark-conf-threshold` is passed (`force_local` in
-    `crates/hipfire-cli/src/main.rs`; `--json`/`--no-stream` ride the HTTP
-    route and do not force local)
+    `--kv-mode`, `--kv-backend`, `--kv-k`, `--kv-v`, `--spec`/`--speculation`,
+    `--model-draft`, `--draft-max`, `--dspark-conf-threshold` is passed
+    (`force_local` in `crates/hipfire-cli/src/main.rs`; `--json`/`--no-stream`
+    ride the HTTP route and do not force local)
     if HTTP fails while serve still live → abort (no local spawn; would collide)
   else → spawn one-shot daemon binary
         │
@@ -372,8 +372,29 @@ accepted sets differ by carrier). Concrete modes include:
 | `asym2` / `asym3` / `asym4` | Lower-bit rotated/Lloyd K; V typically wider |
 | `fwht2` / `fwht3` / `fwht4` | FWHT-rotated K tiers |
 
-Exact layouts and math: [`QUANTIZATION.md`](QUANTIZATION.md). Hybrid linear
-layers (DeltaNet) use fixed recurrent state instead of FA KV for those layers.
+**Qwen-family `auto` / unset** (arch-aware, Qwen only): targets **q8/q8** on
+every arch except exact `gfx1201`, where eligible single-GPU Qwen routes keep
+native **fp8/fp8**. Non-Qwen family defaults are unchanged (Maple BF16, DeepSeek
+compressor F32, Gemma layered policy, …). Full K/V axis overrides (`--kv-k` /
+`--kv-v`) and precedence live in [`CONFIG.md`](CONFIG.md) / [`CLI.md`](CLI.md).
+
+**Backend selection** (`--kv-backend` / `memory.kv_backend`): accept only
+`legacy` \| `vmm`. Omitted request is **automatic** and prefers **VMM** on
+certified combinations; otherwise falls back to legacy once per load with a
+logged reason. Selecting legacy (explicit or automatic) emits exactly one
+stderr warning whose stable token is the contiguous substring
+`HIPFIRE_KV_BACKEND=legacy`. Old spelling `contiguous` is rejected with a
+migration error that names `legacy`. Explicit `vmm` on an unsupported
+combination fails closed before teardown.
+
+**Physical layout:** the legacy backend still backs the trunk KV arena as one
+physically contiguous allocation (stable base pointer for the full
+reservation). VMM instead reserves a virtual address range and maps physical
+pages on demand; both keep graph/retained base pointers stable within their
+model. Private draft caches (DFlash/MTP) are owned separately and do not
+relabel the trunk backend. Exact quant layouts and math:
+[`QUANTIZATION.md`](QUANTIZATION.md). Hybrid linear layers (DeltaNet) use fixed
+recurrent state instead of FA KV for those layers.
 
 ## Observability hooks
 

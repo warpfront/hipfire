@@ -21,6 +21,7 @@ Tick the surfaces this PR changes so a reviewer can match evidence to the claim 
 - [ ] `cargo build --release` clean
 - [ ] `cargo test --lib --workspace` passes
 - [ ] **load / serve / kernel changes:** I ran `python3 scripts/serve_harness.py --model <flagship artifact> --mode battery --out battery.json` on hardware myself and attached `battery.json` below. A `hipfire run` transcript is not evidence.
+- [ ] I inspected loaded/bench/harness KV backend fields (`kv_backend`, `kv_backend_legacy`, `kv_backend_reason`); if any run used legacy, I disclose the `HIPFIRE_KV_BACKEND=legacy` token in this PR with whether it was explicit or automatic and the reason
 - [ ] If perf-relevant: `./scripts/speed-gate.sh` within ±2% of locked baselines
 - [ ] If this raises a ceiling in `scripts/leanup-thresholds.txt`: the commit message carries `RATCHET-RAISE: <metric> <old> -> <new>, traded for <reason>` **and** the PR carries the `ratchet-raise` label (CI fails without both)
 
