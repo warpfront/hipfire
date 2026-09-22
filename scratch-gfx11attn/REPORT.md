@@ -13,6 +13,10 @@ This is not an end-to-end tuning gap. The candidate missed the 1.25x standalone 
 
 These candidates failed for measured and inspectable reasons; this is not a claim that the ISA makes every possible structural attention kernel impossible. Together with the earlier in-place iu8 result (0.532x), however, the two separable halves of the gfx1201 attention design have now both lost on gfx11: the arithmetic half because RDNA3 iu8 WMMA runs at f16 rate while Q8_0 adds eight scale folds, and this structural half because compressed-LDS fragment construction plus the register-mandated D split adds substantially more arithmetic than the saved traffic can repay.
 
+Two initial explanations are explicitly ruled out. First, this is **not** a register-occupancy-knee failure: the candidate compiled to 193 VGPR / 32 SGPR with zero spills and the HIP API measured one 16-wave block/CU, exactly at the latency-hiding knee. The similarity between the gfx1151 0.344x result and the earlier eight-wave RB64 failure band is coincidental. Second, the capacity premise was real but **non-binding**: compressed LDS does fit more keys, but production had already selected KT32 over a measured KT64, deliberately declining the larger f16-plane capacity.
+
+The generalizable mechanism is plane-sharing amortization. The incumbent pays code-times-scale conversion once while constructing a shared f16 LDS plane, then every query consuming that plane reuses the result. Fragment-time dequantization repeats the conversion for every consuming wave and duplicate lane half: roughly 6x more K and V conversions per query/subtile here. The zero-spill D128 shape additionally raises WMMA work 1.5x by repeating QK and softmax. Native fp8 on gfx1201 does not pay this conversion penalty at fragment build, which is why the same structural layout can win there without contradicting this gfx11 result.
+
 ## Corrected production baseline
 
 The experiment was rebased on production commit `7a34a572a`. The initial brief described two 32 KiB f16 planes. That does **not** describe the shipped kernel at this commit:
