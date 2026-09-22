@@ -19777,6 +19777,10 @@ impl Gpu {
             return result;
         }
         let full = m % 128 == 0 && batch_size % 128 == 0;
+        let symfold_requested = matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && self.mq4v2_symmetric
+            && self.flags.gfx11_iu4_symfold
+            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0");
         // A partial N grid can still use FULL=true for every complete column
         // tile when M itself is full. The guarded wrapper below targets only
         // the one remaining column tile while retaining the original N stride.
@@ -19785,6 +19789,7 @@ impl Gpu {
             && m % 128 == 0
             && batch_size >= 128
             && batch_size % 128 != 0;
+        let symfold = symfold_requested && (full || gridspec);
         // gfx1151/gfx1100 + eager + unchecked tiles → column-adjacent entries.
         // A grid-specialized partial N uses the same order for its unchecked
         // interior split launch.
@@ -19801,7 +19806,7 @@ impl Gpu {
             && self.flags.gfx11_iu4_shape;
         let use_lf16 =
             shape_lf16 || (use_col && !add && self.arch.as_str() == "gfx1151");
-        let kernel_name = match (full || gridspec, add, use_col) {
+        let base_kernel_name = match (full || gridspec, add, use_col) {
             (true, true, true) if use_lf16 => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151"
             }
@@ -19824,6 +19829,37 @@ impl Gpu {
             (true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
             (false, _, _) => "gemm_mq4g256v2_residual_mmq_iu4",
         };
+        let kernel_name = if symfold && (full || gridspec) {
+            match base_kernel_name {
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151" => {
+                    "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151_symfold"
+                }
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100" => {
+                    "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100_symfold"
+                }
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151" => {
+                    "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151_symfold"
+                }
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100" => {
+                    "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100_symfold"
+                }
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151" => {
+                    "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151_symfold"
+                }
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151" => {
+                    "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151_symfold"
+                }
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3" => {
+                    "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_symfold"
+                }
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3" => {
+                    "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_symfold"
+                }
+                _ => base_kernel_name,
+            }
+        } else {
+            base_kernel_name
+        };
         let block = if use_lf16 { [32, 16, 1] } else { [32, 8, 1] };
         const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
         const GRIDSPEC_MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gridspec";
@@ -19835,10 +19871,26 @@ impl Gpu {
                 "../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_gridspec.gfx11.hip"
             )
         );
-        let (module, source) = if gridspec {
-            (GRIDSPEC_MODULE, GRIDSPEC_SRC)
-        } else {
-            (MODULE, kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC)
+        const SYMFOLD_MODULE: &str =
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx11_symfold";
+        const GRIDSPEC_SYMFOLD_MODULE: &str =
+            "gemm_mq4g256v2_residual_mmq_iu4_gridspec_symfold";
+        const GRIDSPEC_SYMFOLD_SRC: &str = concat!(
+            "#define IU4_SYMMETRIC_FOLD 1\n",
+            include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+            include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip"),
+            include_str!(
+                "../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_gridspec.gfx11.hip"
+            )
+        );
+        let (module, source) = match (gridspec, symfold) {
+            (true, true) => (GRIDSPEC_SYMFOLD_MODULE, GRIDSPEC_SYMFOLD_SRC),
+            (true, false) => (GRIDSPEC_MODULE, GRIDSPEC_SRC),
+            (false, true) => (
+                SYMFOLD_MODULE,
+                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_SYMFOLD_SRC,
+            ),
+            (false, false) => (MODULE, kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC),
         };
         self.ensure_kernel(module, source, kernel_name)?;
         if gridspec {

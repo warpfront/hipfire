@@ -54,6 +54,10 @@ pub struct FeatureFlags {
     /// (`kernel.gfx11_iu4_shape`, default off). gfx1151 keeps its shipped
     /// SET-only selection regardless of this experiment.
     pub gfx11_iu4_shape: bool,
+    /// Exploit MQ4V2's symmetric `zp = -8 * scale` contract by rebiasing
+    /// packed weight codes once and using signed-weight IU4 WMMA
+    /// (`kernel.gfx11_iu4_symfold`). Default off on exact gfx1100/gfx1151.
+    pub gfx11_iu4_symfold: bool,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -542,6 +546,7 @@ impl FeatureFlags {
             iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(false),
+            gfx11_iu4_symfold: parse_bool("HIPFIRE_IU4_SYMFOLD").unwrap_or(false),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -933,6 +938,7 @@ impl FeatureFlags {
             iu4_prefill: Some(false),
             gfx11_iu4_gridspec: false,
             gfx11_iu4_shape: false,
+            gfx11_iu4_symfold: false,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,

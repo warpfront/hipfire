@@ -2268,6 +2268,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Use the gfx1100-specific IU4 workgroup-shape experiment; default off and ignored on other architectures."
     ),
     process_bool_field!(
+        "kernel.gfx11_iu4_symfold",
+        "gfx11_iu4_symfold",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_IU4_SYMFOLD",
+        "Exploit symmetric MQ4V2 weights on exact gfx1100/gfx1151 by rebiasing q to q-8 and using signed-weight IU4 WMMA; default off, with HIPFIRE_IU4_SYMFOLD=0 as an explicit escape."
+    ),
+    process_bool_field!(
         "kernel.npu_spillover",
         "npu_spillover",
         Kernel,
