@@ -4513,11 +4513,11 @@ impl Gpu {
                 ),
             ));
         }
-        if max_ctx_len == 0 || max_ctx_len > 32768 {
+        if max_ctx_len == 0 || max_ctx_len > 262_144 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_fp8_e4m3_fa2_gqa_fp8_gfx1201 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                    "attention_fp8_e4m3_fa2_gqa_fp8_gfx1201 requires 1 <= max_ctx_len <= 262144, got {max_ctx_len}"
                 ),
             ));
         }
@@ -4687,11 +4687,11 @@ impl Gpu {
                 ),
             ));
         }
-        if max_ctx_len == 0 || max_ctx_len > 32768 {
+        if max_ctx_len == 0 || max_ctx_len > 262_144 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_fp8_e4m3_fa2_gqa_packet_gfx1201 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                    "attention_fp8_e4m3_fa2_gqa_packet_gfx1201 requires 1 <= max_ctx_len <= 262144, got {max_ctx_len}"
                 ),
             ));
         }
@@ -4840,11 +4840,11 @@ impl Gpu {
                 ),
             ));
         }
-        if max_ctx_len == 0 || max_ctx_len > 32768 {
+        if max_ctx_len == 0 || max_ctx_len > 262_144 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
-                    "attention_fp8_e4m3_fa2_gqa_qresident_gfx1201 requires 1 <= max_ctx_len <= 32768, got {max_ctx_len}"
+                    "attention_fp8_e4m3_fa2_gqa_qresident_gfx1201 requires 1 <= max_ctx_len <= 262144, got {max_ctx_len}"
                 ),
             ));
         }

@@ -8411,7 +8411,7 @@ fn batch_chunk_fa_attend(
             && stride == WIDENED_COMMIT_ROWS
             && n % WIDENED_COMMIT_ROWS == 0
             && n <= 32768
-            && max_ctx_len <= 32768
+            && max_ctx_len <= 262_144
             && tree_verify.is_none();
         if packet_runs {
             execute_fa_attend_step(

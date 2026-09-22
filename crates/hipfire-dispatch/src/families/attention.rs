@@ -2299,7 +2299,7 @@ fn dispatch_attend(
                 // so like the q8/fwht3 FA2 ingresses this arm is
                 // replay-idempotent and capture-safe — no recorder/capture
                 // gates. Same shape predicates as those ingresses (exact
-                // gfx1201/H24/KV4/D256, 64..=512 rows, 64..=32768 ctx),
+                // gfx1201/H24/KV4/D256, 64..=512 rows, 64..=262144 ctx),
                 // plus no tree-verify (FA2 has no tree path). Falls through
                 // to the scalar/tile crossover below otherwise.
                 // Stage-b route N retains its separate Q pre-convert for the
@@ -2307,6 +2307,9 @@ fn dispatch_attend(
                 // in-kernel. Batches above 512 are equal-length 512-row runs:
                 // one 3-D launch uses z for the run while x restarts the exact
                 // former per-step ownership and causal-bound grouping.
+                // Context is bounded by the model's 262144 positions, not by
+                // the fixed per-run query tile; KV offsets use 64-bit arithmetic.
+                const FP8_FA2_MAX_CTX: usize = 262_144;
                 if gpu.flags.attn_qresident
                     && gpu.arch == "gfx1201"
                     && io.n_heads == 24
@@ -2314,7 +2317,7 @@ fn dispatch_attend(
                     && io.head_dim == 256
                     && (64..=32768).contains(&io.batch_size)
                     && (io.batch_size <= 512 || io.batch_size % 512 == 0)
-                    && (64..=32768).contains(&io.max_ctx_len)
+                    && (64..=FP8_FA2_MAX_CTX).contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                 {
                     hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
@@ -2338,7 +2341,7 @@ fn dispatch_attend(
                     && io.head_dim == 256
                     && (64..=32768).contains(&io.batch_size)
                     && (io.batch_size <= 512 || io.batch_size % 512 == 0)
-                    && (64..=32768).contains(&io.max_ctx_len)
+                    && (64..=FP8_FA2_MAX_CTX).contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                 {
                     hip!(gpu.attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
@@ -2361,7 +2364,7 @@ fn dispatch_attend(
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
                     && (64..=512).contains(&io.batch_size)
-                    && (64..=32768).contains(&io.max_ctx_len)
+                    && (64..=FP8_FA2_MAX_CTX).contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                 {
                     hip!(gpu.attention_fp8_e4m3_fa2_gqa_fp8_gfx1201(
