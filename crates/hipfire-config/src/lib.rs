@@ -2240,6 +2240,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the W4A4 iu4-direct MMQ prefill route (default on exact gfx1100/gfx1151/gfx1201, other arches keep their incumbent route; set to false or HIPFIRE_IU4_PREFILL=0 to opt out)."
     ),
     process_bool_field!(
+        "kernel.gfx11_iu4_gridspec",
+        "gfx11_iu4_gridspec",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX11_IU4_GRIDSPEC",
+        "Split partial-N gfx11 IU4 GEMMs so full interior tiles use the unchecked specialization and only the final tile uses guarded loads/stores (default on; set to false or HIPFIRE_GFX11_IU4_GRIDSPEC=0 to opt out)."
+    ),
+    process_bool_field!(
         "kernel.npu_spillover",
         "npu_spillover",
         Kernel,
