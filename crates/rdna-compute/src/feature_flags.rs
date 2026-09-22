@@ -55,6 +55,10 @@ pub struct FeatureFlags {
     /// (`kernel.gfx11_iu4_shape`, default off). gfx1151 keeps its shipped
     /// SET-only selection regardless of this experiment.
     pub gfx11_iu4_shape: bool,
+    /// Issue the guarded partial-N IU4 tail on a separate stream
+    /// (`kernel.gfx11_iu4_resid`, default off) to test whether same-stream
+    /// serialization explains the residual gfx1100 N=5909 gap.
+    pub gfx11_iu4_resid: bool,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -530,6 +534,7 @@ impl FeatureFlags {
             iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
             gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(false),
+            gfx11_iu4_resid: parse_bool("HIPFIRE_GFX11_IU4_RESID").unwrap_or(false),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -921,6 +926,7 @@ impl FeatureFlags {
             iu4_prefill: Some(false),
             gfx11_iu4_gridspec: false,
             gfx11_iu4_shape: false,
+            gfx11_iu4_resid: false,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,

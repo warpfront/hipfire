@@ -2258,6 +2258,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Use the gfx1100-specific IU4 workgroup-shape experiment; default off and ignored on other architectures."
     ),
     process_bool_field!(
+        "kernel.gfx11_iu4_resid",
+        "gfx11_iu4_resid",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX11_IU4_RESID",
+        "Issue the guarded partial-N IU4 tail on a separate stream to test whether same-stream launch serialization explains the residual gfx1100 N=5909 gap; default off."
+    ),
+    process_bool_field!(
         "kernel.npu_spillover",
         "npu_spillover",
         Kernel,
