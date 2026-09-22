@@ -1,0 +1,8 @@
+Pre-registered on 2026-09-22 after gfx1100 stacked c24 completed and before any gfx1151 c24 run.
+
+Natural cross-architecture prediction under the shared LF16 arithmetic entry:
+- P: WT2 0.088665; agentic 0.256882.
+- A: WT2 0.087513; agentic 0.242258.
+- C: WT2 0.088467; agentic 0.252013.
+
+Prediction: gfx1151 will reproduce the corresponding gfx1100 values digit-for-digit. Equality would confirm that the surprising A-versus-C quality interaction is arithmetic rather than card-specific. Any divergence will be treated as a real finding and reported without averaging.
