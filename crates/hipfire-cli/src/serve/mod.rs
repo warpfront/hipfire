@@ -1182,9 +1182,9 @@ impl ServeRuntime {
                 // request budgeting and then stop early at the slot boundary.
                 params["max_seq"] = serde_json::json!(self.multi_slot_ctx);
             }
-            let loaded_max_seq = params["max_seq"].as_u64().unwrap_or(0);
-            if minimum_max_seq.is_some() {
-                eprintln!("[hipfire] bumping load max_seq to {loaded_max_seq} for request budget");
+            let requested_max_seq = params["max_seq"].as_u64().unwrap_or(0);
+            if let Some(minimum) = minimum_max_seq {
+                eprintln!("[hipfire] loading model for request context of at least {minimum}");
             }
             let loaded = self.engine.load(&path, params)?;
             if !self.multi_slot_enabled && should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp)
@@ -1223,7 +1223,10 @@ impl ServeRuntime {
                 .get("continuous_batch_capable")
                 .and_then(serde_json::Value::as_bool)
                 .unwrap_or(false);
-            self.current_max_seq = loaded_max_seq;
+            self.current_max_seq = loaded
+                .get("max_seq")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(requested_max_seq);
             // Report the model the way it was requested. A path-form
             // request now resolves its registry entry (for sidecars and
             // tag policy), but clients — serve_harness's warm probe among
