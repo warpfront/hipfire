@@ -1,0 +1,727 @@
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=parity
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+PARITY start=0 B=512 ctx_end=512 values=3145728 mismatches=0 first=3145728 max_abs=0 nonfinite=0
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+PARITY start=0 B=2048 ctx_end=2048 values=12582912 mismatches=0 first=12582912 max_abs=0 nonfinite=0
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+PARITY start=0 B=8192 ctx_end=8192 values=50331648 mismatches=0 first=50331648 max_abs=0 nonfinite=0
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=parity
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+PARITY start=32768 B=512 ctx_end=33280 values=3145728 mismatches=0 first=3145728 max_abs=0 nonfinite=0
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+PARITY start=32768 B=2048 ctx_end=34816 values=12582912 mismatches=0 first=12582912 max_abs=0 nonfinite=0
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+PARITY start=32768 B=8192 ctx_end=40960 values=50331648 mismatches=0 first=50331648 max_abs=0 nonfinite=0
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=parity
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+PARITY start=65536 B=512 ctx_end=66048 values=3145728 mismatches=0 first=3145728 max_abs=0 nonfinite=0
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+PARITY start=65536 B=2048 ctx_end=67584 values=12582912 mismatches=0 first=12582912 max_abs=0 nonfinite=0
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+PARITY start=65536 B=8192 ctx_end=73728 values=50331648 mismatches=0 first=50331648 max_abs=0 nonfinite=0
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=parity
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+PARITY start=131072 B=512 ctx_end=131584 values=3145728 mismatches=0 first=3145728 max_abs=0 nonfinite=0
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+PARITY start=131072 B=2048 ctx_end=133120 values=12582912 mismatches=0 first=12582912 max_abs=0 nonfinite=0
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+PARITY start=131072 B=8192 ctx_end=139264 values=50331648 mismatches=0 first=50331648 max_abs=0 nonfinite=0
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=parity
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+PARITY start=245760 B=512 ctx_end=246272 values=3145728 mismatches=0 first=3145728 max_abs=0 nonfinite=0
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+PARITY start=245760 B=2048 ctx_end=247808 values=12582912 mismatches=0 first=12582912 max_abs=0 nonfinite=0
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+PARITY start=245760 B=8192 ctx_end=253952 values=50331648 mismatches=0 first=50331648 max_abs=0 nonfinite=0
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=parity
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+PARITY start=253952 B=512 ctx_end=254464 values=3145728 mismatches=0 first=3145728 max_abs=0 nonfinite=0
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+PARITY start=253952 B=2048 ctx_end=256000 values=12582912 mismatches=0 first=12582912 max_abs=0 nonfinite=0
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+PARITY start=253952 B=8192 ctx_end=262144 values=50331648 mismatches=0 first=50331648 max_abs=0 nonfinite=0
+PROCESS block=1 start=0 arm=F
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=F
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=0 B=512 ctx_end=512 median_us=385.767 samples_us=386.727,385.767,381.967,387.687,381.967,
+TIME mode=Q start=0 B=512 ctx_end=512 median_us=383.767 samples_us=387.327,384.327,383.527,383.767,379.559,
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=0 B=2048 ctx_end=2048 median_us=1679.273 samples_us=1695.794,1665.593,1678.473,1679.273,1711.353,
+TIME mode=Q start=0 B=2048 ctx_end=2048 median_us=1916.752 samples_us=1952.473,1927.593,1875.152,1870.433,1916.752,
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=0 B=8192 ctx_end=8192 median_us=26545.225 samples_us=27119.141,26844.383,26545.225,25541.073,25458.712,
+TIME mode=Q start=0 B=8192 ctx_end=8192 median_us=25035.635 samples_us=25035.635,25940.392,24736.475,24843.956,26014.393,
+PROCESS block=1 start=0 arm=S
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=S
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=0 B=512 ctx_end=512 median_us=385.281 samples_us=385.920,382.201,382.721,387.000,385.281,
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=0 B=2048 ctx_end=2048 median_us=2017.632 samples_us=2017.632,1939.153,1964.313,2058.992,2165.793,
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=0 B=8192 ctx_end=8192 median_us=29947.257 samples_us=31367.565,30500.050,29947.257,29289.460,29011.581,
+PROCESS block=1 start=0 arm=S
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=S
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=0 B=512 ctx_end=512 median_us=383.843 samples_us=468.003,387.123,383.843,382.362,380.003,
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=0 B=2048 ctx_end=2048 median_us=2047.476 samples_us=2047.476,1952.597,1969.955,2086.471,2209.911,
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=0 B=8192 ctx_end=8192 median_us=29615.635 samples_us=31201.873,30768.928,29615.635,29370.799,29112.675,
+PROCESS block=1 start=0 arm=F
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=F
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=0 B=512 ctx_end=512 median_us=383.559 samples_us=383.399,383.559,383.879,391.119,383.479,
+TIME mode=Q start=0 B=512 ctx_end=512 median_us=381.359 samples_us=381.239,386.399,381.359,385.519,379.439,
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=0 B=2048 ctx_end=2048 median_us=1766.718 samples_us=1821.554,1741.758,1729.638,1766.718,1868.398,
+TIME mode=Q start=0 B=2048 ctx_end=2048 median_us=1983.112 samples_us=1976.393,1955.233,1983.112,1986.672,2057.112,
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=0 B=8192 ctx_end=8192 median_us=26354.368 samples_us=27153.030,26707.848,26354.368,25416.920,24774.719,
+TIME mode=Q start=0 B=8192 ctx_end=8192 median_us=25579.119 samples_us=25579.119,25193.359,25511.925,26226.402,25799.484,
+PROCESS block=1 start=32768 arm=F
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=F
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=32768 B=512 ctx_end=33280 median_us=15926.466 samples_us=16194.342,16184.586,15926.466,15577.586,15415.947,
+TIME mode=Q start=32768 B=512 ctx_end=33280 median_us=14817.952 samples_us=14873.112,14817.952,14951.711,14675.832,14567.271,
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=32768 B=2048 ctx_end=34816 median_us=52820.122 samples_us=53126.595,52749.836,52932.198,52820.122,52612.667,
+TIME mode=Q start=32768 B=2048 ctx_end=34816 median_us=53663.280 samples_us=53462.440,53663.280,53472.038,53989.269,53766.426,
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=32768 B=8192 ctx_end=40960 median_us=232630.173 samples_us=232630.173,232627.487,233070.145,232005.096,233975.189,
+TIME mode=Q start=32768 B=8192 ctx_end=40960 median_us=234808.609 samples_us=235604.156,234587.173,234808.609,234973.221,233880.310,
+PROCESS block=1 start=32768 arm=S
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=S
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=32768 B=512 ctx_end=33280 median_us=16232.279 samples_us=16807.480,16690.199,16224.440,16232.279,16049.318,
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=32768 B=2048 ctx_end=34816 median_us=59903.380 samples_us=59870.013,59903.380,59747.781,60103.142,60259.260,
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=32768 B=8192 ctx_end=40960 median_us=261770.561 samples_us=261770.561,260645.804,261487.331,263688.564,263545.056,
+PROCESS block=1 start=32768 arm=S
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=S
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=32768 B=512 ctx_end=33280 median_us=16834.211 samples_us=16957.012,16834.211,17668.350,16121.677,16068.689,
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=32768 B=2048 ctx_end=34816 median_us=60265.362 samples_us=60004.644,60300.105,60376.025,60029.880,60265.362,
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=32768 B=8192 ctx_end=40960 median_us=261018.784 samples_us=260522.467,260658.331,261018.784,261637.445,262778.769,
+PROCESS block=1 start=32768 arm=F
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=F
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=32768 B=512 ctx_end=33280 median_us=16664.215 samples_us=17095.043,16707.966,16664.215,16209.295,16057.375,
+TIME mode=Q start=32768 B=512 ctx_end=33280 median_us=15349.771 samples_us=15349.771,15489.970,15501.170,15043.651,14998.653,
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=32768 B=2048 ctx_end=34816 median_us=53244.553 samples_us=52167.393,52767.311,53349.350,53324.512,53244.553,
+TIME mode=Q start=32768 B=2048 ctx_end=34816 median_us=53677.956 samples_us=53796.997,53318.794,54042.793,53675.873,53677.956,
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=32768 B=8192 ctx_end=40960 median_us=232346.741 samples_us=231713.913,232791.687,231956.284,232346.741,234500.610,
+TIME mode=Q start=32768 B=8192 ctx_end=40960 median_us=236438.980 samples_us=235675.217,236063.263,236690.338,236438.980,236579.025,
+PROCESS block=1 start=65536 arm=F
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=F
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=65536 B=512 ctx_end=66048 median_us=31206.163 samples_us=32965.797,32021.080,31206.163,30606.325,30256.044,
+TIME mode=Q start=65536 B=512 ctx_end=66048 median_us=29821.049 samples_us=29853.607,29882.729,29821.049,29766.928,29626.570,
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=65536 B=2048 ctx_end=67584 median_us=107022.041 samples_us=107119.728,106789.253,106677.299,107022.041,107557.533,
+TIME mode=Q start=65536 B=2048 ctx_end=67584 median_us=107898.781 samples_us=108421.944,107593.346,108122.147,107898.781,107785.141,
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=65536 B=8192 ctx_end=73728 median_us=445220.917 samples_us=444859.161,443776.489,445555.176,445788.330,445220.917,
+TIME mode=Q start=65536 B=8192 ctx_end=73728 median_us=450353.973 samples_us=449464.691,450353.973,449219.147,452068.481,451080.994,
+PROCESS block=1 start=65536 arm=S
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=S
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=65536 B=512 ctx_end=66048 median_us=31659.081 samples_us=33275.879,32541.359,31659.081,31527.201,30534.595,
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=65536 B=2048 ctx_end=67584 median_us=117731.604 samples_us=117731.604,117280.531,117553.253,117754.534,118230.776,
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=65536 B=8192 ctx_end=73728 median_us=503067.127 samples_us=499833.241,502380.442,503067.127,562513.887,563440.208,
+PROCESS block=1 start=65536 arm=S
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=S
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=65536 B=512 ctx_end=66048 median_us=31700.308 samples_us=33174.362,32857.044,31700.308,31036.589,30563.932,
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=65536 B=2048 ctx_end=67584 median_us=118312.168 samples_us=118312.168,118253.370,117658.451,118463.135,118715.055,
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=65536 B=8192 ctx_end=73728 median_us=503935.301 samples_us=499601.748,503801.907,503935.301,562887.697,564720.303,
+PROCESS block=1 start=65536 arm=F
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=F
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=65536 B=512 ctx_end=66048 median_us=32212.147 samples_us=33388.866,32583.187,32212.147,31403.706,30595.631,
+TIME mode=Q start=65536 B=512 ctx_end=66048 median_us=30042.950 samples_us=30343.309,30050.749,30042.950,29970.388,29942.268,
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=65536 B=2048 ctx_end=67584 median_us=106861.557 samples_us=106797.272,106861.557,106584.763,107308.998,107138.161,
+TIME mode=Q start=65536 B=2048 ctx_end=67584 median_us=108568.611 samples_us=108568.611,107858.284,108311.768,108728.607,109291.328,
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=65536 B=8192 ctx_end=73728 median_us=447105.377 samples_us=447314.270,444488.617,447105.377,446318.604,447796.509,
+TIME mode=Q start=65536 B=8192 ctx_end=73728 median_us=452119.019 samples_us=452119.019,452106.171,452721.466,451987.854,452520.447,
+PROCESS block=1 start=131072 arm=F
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=F
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=131072 B=512 ctx_end=131584 median_us=59599.968 samples_us=63415.848,60513.969,59567.249,59461.849,59599.968,
+TIME mode=Q start=131072 B=512 ctx_end=131584 median_us=60210.415 samples_us=60210.415,60864.216,60067.211,60304.413,60049.175,
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=131072 B=2048 ctx_end=133120 median_us=213855.209 samples_us=213484.772,214426.575,213665.054,213855.209,216671.021,
+TIME mode=Q start=131072 B=2048 ctx_end=133120 median_us=218058.319 samples_us=218058.319,217751.328,217788.452,218779.678,219559.219,
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=131072 B=8192 ctx_end=139264 median_us=877898.865 samples_us=873278.625,877898.865,874743.103,993745.972,1097774.414,
+TIME mode=Q start=131072 B=8192 ctx_end=139264 median_us=898990.234 samples_us=895030.579,901968.750,893698.181,898990.234,900228.271,
+PROCESS block=1 start=131072 arm=S
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=S
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=131072 B=512 ctx_end=131584 median_us=61203.712 samples_us=64701.958,61960.751,61203.712,60525.909,60651.867,
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=131072 B=2048 ctx_end=133120 median_us=241491.974 samples_us=238456.650,241491.974,239279.900,249528.816,249069.096,
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=131072 B=8192 ctx_end=139264 median_us=1127355.934 samples_us=1065287.739,1125031.334,1129983.475,1127355.934,1129754.234,
+PROCESS block=1 start=131072 arm=S
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=S
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=131072 B=512 ctx_end=131584 median_us=60247.700 samples_us=62797.749,61212.219,59792.217,59600.819,60247.700,
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=131072 B=2048 ctx_end=133120 median_us=242023.026 samples_us=242023.026,238638.496,240377.220,248426.186,246103.775,
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=131072 B=8192 ctx_end=139264 median_us=1113132.401 samples_us=1055431.633,1113132.401,1112465.721,1117268.883,1115683.113,
+PROCESS block=1 start=131072 arm=F
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=F
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=131072 B=512 ctx_end=131584 median_us=61434.616 samples_us=63329.868,62548.222,61434.616,60220.295,60800.537,
+TIME mode=Q start=131072 B=512 ctx_end=131584 median_us=60205.814 samples_us=59887.856,59510.014,60640.736,60205.814,61244.621,
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=131072 B=2048 ctx_end=133120 median_us=215759.476 samples_us=215602.142,214382.507,215972.031,215759.476,216251.358,
+TIME mode=Q start=131072 B=2048 ctx_end=133120 median_us=218338.181 samples_us=218338.181,218047.348,218720.490,218087.860,219855.957,
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=131072 B=8192 ctx_end=139264 median_us=896592.834 samples_us=881426.086,885855.896,897886.963,896592.834,899264.526,
+TIME mode=Q start=131072 B=8192 ctx_end=139264 median_us=885456.848 samples_us=883343.628,883257.385,890838.074,892789.856,885456.848,
+PROCESS block=1 start=245760 arm=F
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=F
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=245760 B=512 ctx_end=246272 median_us=115307.571 samples_us=116262.199,114380.348,115800.644,114716.080,115307.571,
+TIME mode=Q start=245760 B=512 ctx_end=246272 median_us=116306.816 samples_us=116306.816,115054.047,118781.715,117387.184,114739.250,
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=245760 B=2048 ctx_end=247808 median_us=414114.197 samples_us=404972.137,408462.463,415079.895,414114.197,420925.568,
+TIME mode=Q start=245760 B=2048 ctx_end=247808 median_us=425624.054 samples_us=425624.054,423826.660,425631.134,427311.584,423471.283,
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=245760 B=8192 ctx_end=253952 median_us=1708425.903 samples_us=1710739.990,1701738.281,1699079.956,1708425.903,1709785.034,
+TIME mode=Q start=245760 B=8192 ctx_end=253952 median_us=1704848.877 samples_us=1704440.186,1708355.591,1704848.877,1711111.816,1692187.500,
+PROCESS block=1 start=245760 arm=S
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=S
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=245760 B=512 ctx_end=246272 median_us=114364.136 samples_us=117425.232,114364.136,114089.729,114348.175,115700.867,
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=245760 B=2048 ctx_end=247808 median_us=478606.934 samples_us=470227.798,478203.842,478606.934,504811.752,517192.963,
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=245760 B=8192 ctx_end=253952 median_us=2110432.678 samples_us=2106104.675,2128068.588,2110432.678,2105060.013,2113755.203,
+PROCESS block=1 start=245760 arm=S
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=S
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=245760 B=512 ctx_end=246272 median_us=115544.731 samples_us=115544.731,116183.578,115436.485,115152.206,115944.412,
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=245760 B=2048 ctx_end=247808 median_us=473763.657 samples_us=464160.049,471680.916,473763.657,498755.257,518472.107,
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=245760 B=8192 ctx_end=253952 median_us=2129354.340 samples_us=2118378.815,2136149.094,2129354.340,2120391.541,2137767.319,
+PROCESS block=1 start=245760 arm=F
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=F
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=245760 B=512 ctx_end=246272 median_us=114938.431 samples_us=115966.728,114938.431,114526.146,115285.789,112961.227,
+TIME mode=Q start=245760 B=512 ctx_end=246272 median_us=115627.563 samples_us=114960.632,117702.972,116253.967,115627.563,114725.792,
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=245760 B=2048 ctx_end=247808 median_us=416837.219 samples_us=407238.342,411295.502,418710.022,416837.219,419439.209,
+TIME mode=Q start=245760 B=2048 ctx_end=247808 median_us=428745.880 samples_us=433564.697,429338.074,428745.880,427057.953,426165.009,
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=245760 B=8192 ctx_end=253952 median_us=1702624.756 samples_us=1705265.259,1695590.576,1710979.614,1702624.756,1698610.596,
+TIME mode=Q start=245760 B=8192 ctx_end=253952 median_us=1713905.762 samples_us=1719009.888,1705689.331,1716362.793,1713905.762,1706410.767,
+PROCESS block=1 start=253952 arm=F
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=F
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=253952 B=512 ctx_end=254464 median_us=119548.286 samples_us=121464.569,119548.286,119203.476,117864.563,120067.726,
+TIME mode=Q start=253952 B=512 ctx_end=254464 median_us=120273.819 samples_us=120273.819,120547.905,120169.693,120492.027,119388.176,
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=253952 B=2048 ctx_end=256000 median_us=431201.141 samples_us=422545.319,425748.840,432506.683,431201.141,439559.509,
+TIME mode=Q start=253952 B=2048 ctx_end=256000 median_us=440471.130 samples_us=440471.130,441267.303,438588.654,439678.650,443224.792,
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=253952 B=8192 ctx_end=262144 median_us=1771801.880 samples_us=1784700.928,1773245.239,1771171.265,1771801.880,1769931.641,
+TIME mode=Q start=253952 B=8192 ctx_end=262144 median_us=1770406.494 samples_us=1770406.494,1770504.517,1761921.753,1760709.106,1774214.600,
+PROCESS block=1 start=253952 arm=S
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=S
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=253952 B=512 ctx_end=254464 median_us=119929.077 samples_us=120623.840,117938.736,117585.426,120046.600,119929.077,
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=253952 B=2048 ctx_end=256000 median_us=499254.623 samples_us=484896.584,494272.812,499254.623,525164.680,532887.161,
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=253952 B=8192 ctx_end=262144 median_us=2180100.189 samples_us=2180671.082,2180100.189,2171235.107,2180093.994,2183390.274,
+PROCESS block=1 start=253952 arm=S
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=S
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=253952 B=512 ctx_end=254464 median_us=119689.720 samples_us=120076.599,119689.720,117494.347,120013.802,118930.122,
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=253952 B=2048 ctx_end=256000 median_us=499496.452 samples_us=484160.599,499496.452,494519.127,527446.289,542884.628,
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=253952 B=8192 ctx_end=262144 median_us=2172222.137 samples_us=2172676.819,2171270.340,2165914.734,2172222.137,2190059.708,
+PROCESS block=1 start=253952 arm=F
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=F
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=253952 B=512 ctx_end=254464 median_us=118550.636 samples_us=119126.038,118226.120,119206.642,117313.263,118550.636,
+TIME mode=Q start=253952 B=512 ctx_end=254464 median_us=120862.427 samples_us=119967.331,122818.001,122176.514,120862.427,120223.976,
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=253952 B=2048 ctx_end=256000 median_us=430757.019 samples_us=423601.196,427387.299,430993.561,430757.019,436904.816,
+TIME mode=Q start=253952 B=2048 ctx_end=256000 median_us=440682.861 samples_us=434574.341,440682.861,439179.138,444591.187,444604.736,
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=253952 B=8192 ctx_end=262144 median_us=1767562.012 samples_us=1762273.560,1767562.012,1769684.570,1766916.016,1768062.378,
+TIME mode=Q start=253952 B=8192 ctx_end=262144 median_us=1757884.033 samples_us=1750228.516,1768754.028,1754406.738,1757884.033,1772623.413,
+PROCESS block=2 start=0 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=F
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=0 B=512 ctx_end=512 median_us=388.610 samples_us=389.810,383.689,388.610,388.850,382.449,
+TIME mode=Q start=0 B=512 ctx_end=512 median_us=380.969 samples_us=380.969,387.809,385.129,379.209,376.809,
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=0 B=2048 ctx_end=2048 median_us=1670.691 samples_us=1738.829,1637.587,1634.490,1670.691,1762.132,
+TIME mode=Q start=0 B=2048 ctx_end=2048 median_us=1955.453 samples_us=1955.453,1969.612,1954.852,1930.812,1981.972,
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=0 B=8192 ctx_end=8192 median_us=26809.576 samples_us=29082.661,27376.579,26809.576,26513.775,26615.936,
+TIME mode=Q start=0 B=8192 ctx_end=8192 median_us=24893.684 samples_us=25902.771,24893.684,24633.244,24698.843,25278.048,
+PROCESS block=2 start=0 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=S
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=0 B=512 ctx_end=512 median_us=387.570 samples_us=595.975,387.570,387.850,385.929,386.089,
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=0 B=2048 ctx_end=2048 median_us=2039.974 samples_us=2039.974,1948.654,1950.694,2055.474,2218.735,
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=0 B=8192 ctx_end=8192 median_us=31183.685 samples_us=32230.809,31664.403,31183.685,30098.439,29807.236,
+PROCESS block=2 start=0 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=S
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=0 B=512 ctx_end=512 median_us=385.968 samples_us=385.968,390.248,389.729,385.488,385.568,
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=0 B=2048 ctx_end=2048 median_us=2024.215 samples_us=2024.215,1945.494,1955.895,2068.932,2222.533,
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=0 B=8192 ctx_end=8192 median_us=31068.163 samples_us=32165.888,31761.204,31068.163,30298.199,29950.755,
+PROCESS block=2 start=0 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=F
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=0 B=512 ctx_end=512 median_us=381.567 samples_us=383.127,379.607,382.367,380.207,381.567,
+TIME mode=Q start=0 B=512 ctx_end=512 median_us=378.447 samples_us=378.487,378.447,384.887,372.767,374.522,
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=0 B=2048 ctx_end=2048 median_us=1749.529 samples_us=1749.529,1709.569,1726.289,1869.211,1969.810,
+TIME mode=Q start=0 B=2048 ctx_end=2048 median_us=1997.091 samples_us=2021.252,1997.091,1949.651,1941.611,2027.411,
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=0 B=8192 ctx_end=8192 median_us=26712.175 samples_us=27923.260,27841.276,26417.948,26712.175,26299.772,
+TIME mode=Q start=0 B=8192 ctx_end=8192 median_us=25854.492 samples_us=25668.648,25883.692,26003.372,25328.928,25854.492,
+PROCESS block=2 start=32768 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=F
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=32768 B=512 ctx_end=33280 median_us=16679.714 samples_us=16944.553,16679.714,16687.902,16501.661,16335.443,
+TIME mode=Q start=32768 B=512 ctx_end=33280 median_us=15523.178 samples_us=15748.338,15707.058,15523.178,15399.457,15416.946,
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=32768 B=2048 ctx_end=34816 median_us=53040.142 samples_us=51867.188,52889.530,53365.177,53172.665,53040.142,
+TIME mode=Q start=32768 B=2048 ctx_end=34816 median_us=53862.614 samples_us=53537.159,54107.639,54072.166,53625.042,53862.614,
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=32768 B=8192 ctx_end=40960 median_us=233796.219 samples_us=233796.219,234289.078,233052.505,233322.693,235787.750,
+TIME mode=Q start=32768 B=8192 ctx_end=40960 median_us=236473.053 samples_us=237197.281,237824.692,236213.242,236473.053,236319.412,
+PROCESS block=2 start=32768 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=S
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=32768 B=512 ctx_end=33280 median_us=16942.425 samples_us=16942.425,17132.147,17085.632,16779.188,16276.190,
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=32768 B=2048 ctx_end=34816 median_us=60667.130 samples_us=61085.653,60667.130,60648.608,60832.170,60555.842,
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=32768 B=8192 ctx_end=40960 median_us=264066.131 samples_us=263091.519,262108.554,264066.131,265764.704,265976.023,
+PROCESS block=2 start=32768 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=S
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=32768 B=512 ctx_end=33280 median_us=16820.951 samples_us=16980.951,16953.152,16820.951,16425.430,16184.107,
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=32768 B=2048 ctx_end=34816 median_us=60709.297 samples_us=60740.536,60779.573,60495.732,60325.374,60709.297,
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=32768 B=8192 ctx_end=40960 median_us=264417.308 samples_us=262697.418,263216.177,264417.308,266654.488,268892.059,
+PROCESS block=2 start=32768 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=F
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=32768 B=512 ctx_end=33280 median_us=16825.470 samples_us=17390.707,17019.669,16825.470,16628.908,16341.307,
+TIME mode=Q start=32768 B=512 ctx_end=33280 median_us=15680.145 samples_us=15889.066,15680.145,15726.025,15636.545,15375.383,
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=32768 B=2048 ctx_end=34816 median_us=53497.684 samples_us=52079.041,52734.921,53497.684,53871.731,53928.051,
+TIME mode=Q start=32768 B=2048 ctx_end=34816 median_us=54244.576 samples_us=54353.825,54293.144,54244.576,54189.857,54101.814,
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=32768 B=8192 ctx_end=40960 median_us=233947.845 samples_us=234341.919,233947.845,233946.106,233942.932,236361.008,
+TIME mode=Q start=32768 B=8192 ctx_end=40960 median_us=237683.578 samples_us=237476.059,237794.586,237902.039,237683.578,236967.712,
+PROCESS block=2 start=65536 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=F
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=65536 B=512 ctx_end=66048 median_us=32577.148 samples_us=33601.669,33073.303,32577.148,31710.302,31129.299,
+TIME mode=Q start=65536 B=512 ctx_end=66048 median_us=30222.536 samples_us=30505.655,30222.536,30028.452,30409.573,29973.249,
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=65536 B=2048 ctx_end=67584 median_us=107453.041 samples_us=107315.163,107923.607,106736.282,107453.041,107608.131,
+TIME mode=Q start=65536 B=2048 ctx_end=67584 median_us=108615.570 samples_us=107264.130,108615.570,107768.364,108702.179,108865.013,
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=65536 B=8192 ctx_end=73728 median_us=447541.260 samples_us=445567.841,447298.004,447541.260,447965.698,449213.348,
+TIME mode=Q start=65536 B=8192 ctx_end=73728 median_us=452015.167 samples_us=450624.695,451262.360,452015.167,485307.526,458045.380,
+PROCESS block=2 start=65536 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=S
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=65536 B=512 ctx_end=66048 median_us=32732.834 samples_us=34217.804,33467.876,32732.834,32619.873,31941.750,
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=65536 B=2048 ctx_end=67584 median_us=118738.224 samples_us=118918.663,118738.224,118424.301,118493.025,119025.513,
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=65536 B=8192 ctx_end=73728 median_us=505618.965 samples_us=501039.799,505618.965,505062.843,559756.401,560197.422,
+PROCESS block=2 start=65536 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=S
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=65536 B=512 ctx_end=66048 median_us=32725.990 samples_us=33731.884,33209.320,32725.990,32055.069,32077.633,
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=65536 B=2048 ctx_end=67584 median_us=119208.960 samples_us=118892.992,119594.358,119506.443,119208.960,119083.595,
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=65536 B=8192 ctx_end=73728 median_us=505297.512 samples_us=501604.979,504200.031,505297.512,560519.127,558284.710,
+PROCESS block=2 start=65536 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=F
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=65536 B=512 ctx_end=66048 median_us=33131.001 samples_us=34341.404,33396.957,33021.282,33131.001,31547.070,
+TIME mode=Q start=65536 B=512 ctx_end=66048 median_us=30442.024 samples_us=30862.827,30759.989,30442.024,30339.102,30096.661,
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=65536 B=2048 ctx_end=67584 median_us=107741.760 samples_us=107618.401,107788.399,108016.159,107373.283,107741.760,
+TIME mode=Q start=65536 B=2048 ctx_end=67584 median_us=109232.414 samples_us=109232.414,108998.573,107924.126,109994.225,110013.664,
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=65536 B=8192 ctx_end=73728 median_us=448471.893 samples_us=446526.672,448857.758,448112.457,448471.893,448498.322,
+TIME mode=Q start=65536 B=8192 ctx_end=73728 median_us=452313.416 samples_us=452523.224,451034.973,452583.221,452313.416,452100.037,
+PROCESS block=2 start=131072 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=F
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=131072 B=512 ctx_end=131584 median_us=60822.937 samples_us=63520.348,63130.550,60822.937,60607.491,60190.128,
+TIME mode=Q start=131072 B=512 ctx_end=131584 median_us=60042.294 samples_us=59887.653,59899.452,60799.095,60162.292,60042.294,
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=131072 B=2048 ctx_end=133120 median_us=215540.375 samples_us=215635.193,214667.465,214151.276,215540.375,219303.879,
+TIME mode=Q start=131072 B=2048 ctx_end=133120 median_us=219218.246 samples_us=219218.246,219214.584,218975.922,219606.430,219460.800,
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=131072 B=8192 ctx_end=139264 median_us=884636.536 samples_us=877426.453,879502.014,885241.150,884636.536,888772.217,
+TIME mode=Q start=131072 B=8192 ctx_end=139264 median_us=894128.967 samples_us=894128.967,896083.862,887421.082,895386.536,890043.213,
+PROCESS block=2 start=131072 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=S
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=131072 B=512 ctx_end=131584 median_us=62510.353 samples_us=63992.641,63516.602,62510.353,60304.417,59855.663,
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=131072 B=2048 ctx_end=133120 median_us=240579.811 samples_us=240291.122,240331.856,240579.811,247579.510,249116.840,
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=131072 B=8192 ctx_end=139264 median_us=1118156.471 samples_us=1066730.801,1121597.534,1118870.071,1118156.471,1118136.879,
+PROCESS block=2 start=131072 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=S
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=131072 B=512 ctx_end=131584 median_us=63002.651 samples_us=64820.137,63225.689,63002.651,61319.115,60614.986,
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=131072 B=2048 ctx_end=133120 median_us=242829.010 samples_us=242205.517,240563.148,242829.010,245151.630,251017.708,
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=131072 B=8192 ctx_end=139264 median_us=1117062.019 samples_us=1063205.902,1117062.019,1116785.515,1118126.106,1118121.445,
+PROCESS block=2 start=131072 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=F
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=131072 B=512 ctx_end=131584 median_us=61649.586 samples_us=64103.592,62769.733,60840.279,61649.586,61297.344,
+TIME mode=Q start=131072 B=512 ctx_end=131584 median_us=60598.099 samples_us=58657.562,60889.061,60088.867,61471.680,60598.099,
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=131072 B=2048 ctx_end=133120 median_us=215896.194 samples_us=214729.294,215896.194,216845.200,215466.080,217814.484,
+TIME mode=Q start=131072 B=2048 ctx_end=133120 median_us=219929.764 samples_us=219513.321,219587.143,219929.764,220481.323,221366.501,
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=131072 B=8192 ctx_end=139264 median_us=886657.593 samples_us=884830.139,885483.459,886657.593,887140.503,891132.385,
+TIME mode=Q start=131072 B=8192 ctx_end=139264 median_us=893993.164 samples_us=892085.388,893993.164,895296.875,894025.635,887392.090,
+PROCESS block=2 start=245760 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=F
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=245760 B=512 ctx_end=246272 median_us=115419.044 samples_us=117790.871,115419.044,115593.132,113833.397,114170.197,
+TIME mode=Q start=245760 B=512 ctx_end=246272 median_us=116109.016 samples_us=114853.409,117490.265,117166.061,116029.617,116109.016,
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=245760 B=2048 ctx_end=247808 median_us=415409.637 samples_us=406451.355,412349.792,417261.078,415409.637,418503.357,
+TIME mode=Q start=245760 B=2048 ctx_end=247808 median_us=427433.655 samples_us=427506.866,428273.407,425461.792,427433.655,422440.369,
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=245760 B=8192 ctx_end=253952 median_us=1716307.251 samples_us=1705568.237,1716307.251,1720382.324,1720396.729,1707374.023,
+TIME mode=Q start=245760 B=8192 ctx_end=253952 median_us=1715762.451 samples_us=1702598.389,1720280.640,1716683.350,1713664.551,1715762.451,
+PROCESS block=2 start=245760 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=S
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=245760 B=512 ctx_end=246272 median_us=114347.763 samples_us=114227.798,114347.763,113849.846,116776.024,117120.552,
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=245760 B=2048 ctx_end=247808 median_us=477795.227 samples_us=465500.916,475383.881,477795.227,503838.326,513899.521,
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=245760 B=8192 ctx_end=253952 median_us=2099388.153 samples_us=2086034.630,2074934.303,2099388.153,2106190.308,2102490.776,
+PROCESS block=2 start=245760 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=S
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=245760 B=512 ctx_end=246272 median_us=115173.683 samples_us=115654.961,114263.153,115173.683,115976.639,114484.512,
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=245760 B=2048 ctx_end=247808 median_us=480328.186 samples_us=465263.931,480328.186,475610.992,504425.217,520293.869,
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=245760 B=8192 ctx_end=253952 median_us=2081955.956 samples_us=2072896.935,2083976.204,2081955.956,2079968.964,2100852.638,
+PROCESS block=2 start=245760 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=F
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=245760 B=512 ctx_end=246272 median_us=115555.534 samples_us=116718.452,114341.156,115555.534,117184.662,114899.254,
+TIME mode=Q start=245760 B=512 ctx_end=246272 median_us=116117.462 samples_us=116117.462,116286.423,117255.302,115725.853,114730.377,
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=245760 B=2048 ctx_end=247808 median_us=412750.885 samples_us=404885.284,409576.569,413180.542,412750.885,416713.409,
+TIME mode=Q start=245760 B=2048 ctx_end=247808 median_us=430308.594 samples_us=431686.615,425320.343,423779.419,430932.281,430308.594,
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=245760 B=8192 ctx_end=253952 median_us=1714593.384 samples_us=1714593.384,1709447.144,1715487.183,1717190.063,1711867.310,
+TIME mode=Q start=245760 B=8192 ctx_end=253952 median_us=1714041.382 samples_us=1710084.351,1723547.852,1717740.356,1714041.382,1708005.737,
+PROCESS block=2 start=253952 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=F
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=253952 B=512 ctx_end=254464 median_us=119292.786 samples_us=119490.829,119292.786,119179.840,118032.677,120350.327,
+TIME mode=Q start=253952 B=512 ctx_end=254464 median_us=120098.564 samples_us=119983.368,120108.612,122396.179,120023.766,120098.564,
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=253952 B=2048 ctx_end=256000 median_us=429087.677 samples_us=423505.798,426035.950,429087.677,433474.030,438218.262,
+TIME mode=Q start=253952 B=2048 ctx_end=256000 median_us=441971.802 samples_us=439153.168,440549.469,446766.907,445644.775,441971.802,
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=253952 B=8192 ctx_end=262144 median_us=1773103.271 samples_us=1774165.039,1768477.539,1776818.604,1761806.030,1773103.271,
+TIME mode=Q start=253952 B=8192 ctx_end=262144 median_us=1769486.450 samples_us=1770364.136,1774038.452,1769486.450,1747964.355,1759159.180,
+PROCESS block=2 start=253952 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=S
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=253952 B=512 ctx_end=254464 median_us=119669.937 samples_us=121751.427,120676.903,117846.283,119669.937,117568.024,
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=253952 B=2048 ctx_end=256000 median_us=498402.115 samples_us=482345.772,493695.091,498402.115,530828.239,535035.583,
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=253952 B=8192 ctx_end=262144 median_us=2164334.885 samples_us=2158185.654,2164255.585,2174950.226,2181618.973,2164334.885,
+PROCESS block=2 start=253952 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=S
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=253952 B=512 ctx_end=254464 median_us=119013.435 samples_us=120650.688,119003.830,119013.435,117320.503,119761.719,
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=253952 B=2048 ctx_end=256000 median_us=495821.602 samples_us=488480.888,495821.602,493713.898,531587.486,529503.647,
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=253952 B=8192 ctx_end=262144 median_us=2156393.143 samples_us=2174641.235,2138768.448,2158821.350,2156393.143,2152959.488,
+PROCESS block=2 start=253952 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=F
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=253952 B=512 ctx_end=254464 median_us=119010.635 samples_us=118718.262,119010.635,120013.237,119158.829,118799.355,
+TIME mode=Q start=253952 B=512 ctx_end=254464 median_us=120709.686 samples_us=119804.077,120785.286,120709.686,119149.277,121117.126,
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=253952 B=2048 ctx_end=256000 median_us=429299.072 samples_us=425531.433,426703.003,429726.837,429299.072,433766.907,
+TIME mode=Q start=253952 B=2048 ctx_end=256000 median_us=441583.435 samples_us=441583.435,439307.404,439376.251,443928.314,444321.289,
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=253952 B=8192 ctx_end=262144 median_us=1768398.193 samples_us=1771149.780,1772340.942,1768398.193,1765295.898,1766604.736,
+TIME mode=Q start=253952 B=8192 ctx_end=262144 median_us=1756968.018 samples_us=1754361.450,1752845.215,1756968.018,1771557.495,1758924.805,
+PROCESS block=3 start=0 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=F
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=0 B=512 ctx_end=512 median_us=387.643 samples_us=450.164,387.643,385.043,388.364,383.283,
+TIME mode=Q start=0 B=512 ctx_end=512 median_us=384.483 samples_us=386.923,384.483,391.724,379.603,364.604,
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=0 B=2048 ctx_end=2048 median_us=1770.140 samples_us=1770.140,1691.090,1675.690,1879.011,1980.372,
+TIME mode=Q start=0 B=2048 ctx_end=2048 median_us=2015.256 samples_us=2015.256,2077.776,2025.937,1961.256,2004.576,
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=0 B=8192 ctx_end=8192 median_us=28129.328 samples_us=28383.940,28129.328,28232.489,27135.456,26901.457,
+TIME mode=Q start=0 B=8192 ctx_end=8192 median_us=26419.144 samples_us=26419.144,26535.904,26778.864,25959.101,25739.140,
+PROCESS block=3 start=0 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=S
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=0 B=512 ctx_end=512 median_us=388.564 samples_us=535.806,388.845,388.564,386.725,388.324,
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=0 B=2048 ctx_end=2048 median_us=2043.247 samples_us=2043.247,1958.879,1943.598,2061.238,2253.998,
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=0 B=8192 ctx_end=8192 median_us=31910.680 samples_us=32999.316,32445.467,31910.680,31209.960,30848.726,
+PROCESS block=3 start=0 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=S
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=0 B=512 ctx_end=512 median_us=385.689 samples_us=392.649,385.689,384.089,388.089,384.409,
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=0 B=2048 ctx_end=2048 median_us=2068.612 samples_us=2068.612,1944.651,1967.612,2079.494,2226.215,
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=0 B=8192 ctx_end=8192 median_us=31614.844 samples_us=33080.365,32195.743,31614.844,31406.761,31023.683,
+PROCESS block=3 start=0 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=0 mode=F
+FIXTURE ctx=512 B=512 fwht3 K production-writer all positions 0..511; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=0 B=512 ctx_end=512 median_us=386.484 samples_us=387.884,389.604,385.524,385.604,386.484,
+TIME mode=Q start=0 B=512 ctx_end=512 median_us=381.164 samples_us=384.924,380.723,381.164,382.524,365.164,
+FIXTURE ctx=2048 B=2048 fwht3 K production-writer all positions 0..2047; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=0 B=2048 ctx_end=2048 median_us=1697.458 samples_us=1713.811,1673.257,1630.017,1697.458,1909.260,
+TIME mode=Q start=0 B=2048 ctx_end=2048 median_us=1988.377 samples_us=2014.257,1952.456,1995.497,1943.497,1988.377,
+FIXTURE ctx=8192 B=8192 fwht3 K production-writer all positions 0..8191; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=0 B=8192 ctx_end=8192 median_us=27395.380 samples_us=28371.349,27977.781,27395.380,27050.013,26678.612,
+TIME mode=Q start=0 B=8192 ctx_end=8192 median_us=25753.172 samples_us=25956.852,26427.896,25585.852,25753.172,25641.932,
+PROCESS block=3 start=32768 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=F
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=32768 B=512 ctx_end=33280 median_us=17121.683 samples_us=17133.484,17121.683,17135.485,16662.682,16611.803,
+TIME mode=Q start=32768 B=512 ctx_end=33280 median_us=15957.920 samples_us=15989.960,16058.601,15957.920,15661.639,15562.558,
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=32768 B=2048 ctx_end=34816 median_us=53468.887 samples_us=53018.120,52302.681,53468.887,54075.207,53796.928,
+TIME mode=Q start=32768 B=2048 ctx_end=34816 median_us=54654.766 samples_us=54732.296,54430.733,54654.766,55000.568,54349.953,
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=32768 B=8192 ctx_end=40960 median_us=235829.727 samples_us=235693.832,235960.129,235829.727,234598.022,237976.425,
+TIME mode=Q start=32768 B=8192 ctx_end=40960 median_us=238693.176 samples_us=239070.709,238693.176,238197.418,240245.438,237012.238,
+PROCESS block=3 start=32768 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=S
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=32768 B=512 ctx_end=33280 median_us=16909.288 samples_us=17179.087,17068.207,16909.288,16785.088,16689.840,
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=32768 B=2048 ctx_end=34816 median_us=61429.438 samples_us=61843.244,61456.799,61429.438,61090.796,61209.355,
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=32768 B=8192 ctx_end=40960 median_us=266823.106 samples_us=265579.271,264151.085,266823.106,266916.811,269771.701,
+PROCESS block=3 start=32768 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=S
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=32768 B=512 ctx_end=33280 median_us=17033.762 samples_us=17307.404,17252.644,17033.762,16858.601,16616.880,
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=32768 B=2048 ctx_end=34816 median_us=61208.199 samples_us=62374.979,61479.400,61208.199,60829.679,60487.316,
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=32768 B=8192 ctx_end=40960 median_us=265545.813 samples_us=264119.370,265290.414,265545.813,267885.968,267996.620,
+PROCESS block=3 start=32768 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=32768 mode=F
+FIXTURE ctx=33280 B=512 fwht3 K production-writer all positions 0..33279; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=32768 B=512 ctx_end=33280 median_us=17085.064 samples_us=17508.003,17451.843,17085.064,16826.582,16979.076,
+TIME mode=Q start=32768 B=512 ctx_end=33280 median_us=16151.037 samples_us=16164.557,16151.037,16672.722,15815.036,15684.310,
+FIXTURE ctx=34816 B=2048 fwht3 K production-writer all positions 0..34815; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=32768 B=2048 ctx_end=34816 median_us=53775.558 samples_us=52909.737,52435.513,53775.558,54024.990,54129.551,
+TIME mode=Q start=32768 B=2048 ctx_end=34816 median_us=54483.521 samples_us=54406.441,54483.521,54235.157,54821.838,54610.802,
+FIXTURE ctx=40960 B=8192 fwht3 K production-writer all positions 0..40959; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=32768 B=8192 ctx_end=40960 median_us=235418.991 samples_us=235286.652,235418.991,235288.956,235739.197,236950.882,
+TIME mode=Q start=32768 B=8192 ctx_end=40960 median_us=238693.710 samples_us=238959.976,238488.342,238693.710,240038.437,236968.781,
+PROCESS block=3 start=65536 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=F
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=65536 B=512 ctx_end=66048 median_us=33046.589 samples_us=33541.885,33295.429,33046.589,32280.926,32058.044,
+TIME mode=Q start=65536 B=512 ctx_end=66048 median_us=30569.040 samples_us=30911.932,30621.960,30374.678,30569.040,30361.038,
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=65536 B=2048 ctx_end=67584 median_us=108060.608 samples_us=108060.608,107574.928,108539.619,107115.929,108814.102,
+TIME mode=Q start=65536 B=2048 ctx_end=67584 median_us=109084.816 samples_us=109084.816,109241.295,108905.174,109552.223,109044.418,
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=65536 B=8192 ctx_end=73728 median_us=451589.813 samples_us=453375.122,450539.124,451589.813,451375.610,452343.231,
+TIME mode=Q start=65536 B=8192 ctx_end=73728 median_us=455658.508 samples_us=456357.086,455658.508,455368.500,456814.606,455655.487,
+PROCESS block=3 start=65536 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=S
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=65536 B=512 ctx_end=66048 median_us=33045.269 samples_us=34100.327,33502.510,33045.269,32388.729,32414.490,
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=65536 B=2048 ctx_end=67584 median_us=119211.275 samples_us=119211.275,119214.516,118737.549,119013.712,119647.629,
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=65536 B=8192 ctx_end=73728 median_us=510804.554 samples_us=505801.085,509506.065,510804.554,566684.769,566448.524,
+PROCESS block=3 start=65536 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=S
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=65536 B=512 ctx_end=66048 median_us=32980.335 samples_us=33979.855,34098.022,32980.335,32537.609,32486.130,
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=65536 B=2048 ctx_end=67584 median_us=118947.073 samples_us=119122.469,119217.718,118878.559,118542.629,118947.073,
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=65536 B=8192 ctx_end=73728 median_us=509143.316 samples_us=505305.267,509143.316,509058.313,564161.175,563798.382,
+PROCESS block=3 start=65536 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=65536 mode=F
+FIXTURE ctx=66048 B=512 fwht3 K production-writer all positions 0..66047; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=65536 B=512 ctx_end=66048 median_us=33205.723 samples_us=34331.173,33777.248,33205.723,32601.284,32074.760,
+TIME mode=Q start=65536 B=512 ctx_end=66048 median_us=30629.240 samples_us=31160.442,30776.079,30629.240,30433.998,30161.676,
+FIXTURE ctx=67584 B=2048 fwht3 K production-writer all positions 0..67583; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=65536 B=2048 ctx_end=67584 median_us=108046.967 samples_us=107263.168,108495.827,108046.967,108477.936,107420.296,
+TIME mode=Q start=65536 B=2048 ctx_end=67584 median_us=109695.343 samples_us=109969.543,109018.784,109753.983,109357.986,109695.343,
+FIXTURE ctx=73728 B=8192 fwht3 K production-writer all positions 0..73727; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=65536 B=8192 ctx_end=73728 median_us=451298.492 samples_us=454449.585,449581.909,451241.791,451298.492,451775.391,
+TIME mode=Q start=65536 B=8192 ctx_end=73728 median_us=456250.305 samples_us=456250.305,455556.213,455501.831,456367.340,456361.511,
+PROCESS block=3 start=131072 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=F
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=131072 B=512 ctx_end=131584 median_us=60053.196 samples_us=63335.171,63420.094,60053.196,59663.555,58958.271,
+TIME mode=Q start=131072 B=512 ctx_end=131584 median_us=60761.089 samples_us=60573.238,59888.599,61341.290,60901.844,60761.089,
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=131072 B=2048 ctx_end=133120 median_us=217005.280 samples_us=215188.461,217412.643,217005.280,216754.532,217777.603,
+TIME mode=Q start=131072 B=2048 ctx_end=133120 median_us=219220.123 samples_us=218015.167,219980.789,219220.123,218994.980,219972.382,
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=131072 B=8192 ctx_end=139264 median_us=899979.248 samples_us=887125.244,886023.010,902368.164,899979.248,903706.726,
+TIME mode=Q start=131072 B=8192 ctx_end=139264 median_us=905118.103 samples_us=899294.922,899878.723,909683.411,908026.123,905118.103,
+PROCESS block=3 start=131072 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=S
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=131072 B=512 ctx_end=131584 median_us=61552.441 samples_us=64454.842,63341.610,61552.441,61488.758,61191.078,
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=131072 B=2048 ctx_end=133120 median_us=241352.219 samples_us=240091.877,240114.525,241352.219,247263.557,248991.222,
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=131072 B=8192 ctx_end=139264 median_us=1135319.504 samples_us=1070183.399,1137184.036,1133090.775,1135319.504,1139568.367,
+PROCESS block=3 start=131072 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=S
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=131072 B=512 ctx_end=131584 median_us=61113.823 samples_us=63626.328,63286.198,61113.823,59421.337,59197.697,
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=131072 B=2048 ctx_end=133120 median_us=241497.421 samples_us=241034.424,241497.421,238925.976,245757.545,244588.375,
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=131072 B=8192 ctx_end=139264 median_us=1134686.981 samples_us=1077245.216,1137254.456,1136096.275,1134686.981,1132403.130,
+PROCESS block=3 start=131072 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=131072 mode=F
+FIXTURE ctx=131584 B=512 fwht3 K production-writer all positions 0..131583; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=131072 B=512 ctx_end=131584 median_us=60505.573 samples_us=64954.994,61612.289,60484.440,60505.573,59109.005,
+TIME mode=Q start=131072 B=512 ctx_end=131584 median_us=60529.984 samples_us=60231.903,60529.984,59764.233,61472.603,60753.761,
+FIXTURE ctx=133120 B=2048 fwht3 K production-writer all positions 0..133119; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=131072 B=2048 ctx_end=133120 median_us=217333.313 samples_us=217596.100,216019.882,217333.313,217082.291,217631.699,
+TIME mode=Q start=131072 B=2048 ctx_end=133120 median_us=219986.862 samples_us=218687.424,220207.794,219771.988,219996.353,219986.862,
+FIXTURE ctx=139264 B=8192 fwht3 K production-writer all positions 0..139263; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=131072 B=8192 ctx_end=139264 median_us=898682.251 samples_us=887524.536,887749.207,901457.458,902015.320,898682.251,
+TIME mode=Q start=131072 B=8192 ctx_end=139264 median_us=893138.611 samples_us=894659.973,885512.329,893138.611,893694.397,883416.748,
+PROCESS block=3 start=245760 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=F
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=245760 B=512 ctx_end=246272 median_us=115282.173 samples_us=115282.173,113882.339,113671.219,115914.345,115438.553,
+TIME mode=Q start=245760 B=512 ctx_end=246272 median_us=115792.152 samples_us=115262.383,116791.870,115792.152,116453.995,114999.786,
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=245760 B=2048 ctx_end=247808 median_us=415676.819 samples_us=406762.695,410728.333,415676.819,416801.880,421095.764,
+TIME mode=Q start=245760 B=2048 ctx_end=247808 median_us=426396.729 samples_us=426396.729,430762.695,426726.257,425150.391,424837.402,
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=245760 B=8192 ctx_end=253952 median_us=1711767.700 samples_us=1711767.700,1714415.771,1709700.684,1698737.915,1718438.965,
+TIME mode=Q start=245760 B=8192 ctx_end=253952 median_us=1702480.347 samples_us=1704120.728,1701620.483,1706210.083,1690510.986,1702480.347,
+PROCESS block=3 start=245760 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=S
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=245760 B=512 ctx_end=246272 median_us=115174.774 samples_us=115570.534,115174.774,114804.413,115012.573,115693.344,
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=245760 B=2048 ctx_end=247808 median_us=482508.087 samples_us=468243.721,473586.067,482508.087,495227.417,514413.399,
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=245760 B=8192 ctx_end=253952 median_us=2124718.170 samples_us=2121017.227,2129464.371,2128708.588,2124718.170,2122322.327,
+PROCESS block=3 start=245760 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=S
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=245760 B=512 ctx_end=246272 median_us=114570.587 samples_us=116847.870,114570.587,114242.424,113972.786,116118.713,
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=245760 B=2048 ctx_end=247808 median_us=477811.752 samples_us=464163.673,477811.752,476058.182,506833.397,523966.606,
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=245760 B=8192 ctx_end=253952 median_us=2109511.002 samples_us=2111778.778,2104516.632,2114461.426,2109511.002,2108415.009,
+PROCESS block=3 start=245760 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=245760 mode=F
+FIXTURE ctx=246272 B=512 fwht3 K production-writer all positions 0..246271; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=245760 B=512 ctx_end=246272 median_us=115298.752 samples_us=117176.750,116405.075,114363.701,115038.673,115298.752,
+TIME mode=Q start=245760 B=512 ctx_end=246272 median_us=115252.991 samples_us=113896.507,116448.158,116257.317,115252.991,113845.062,
+FIXTURE ctx=247808 B=2048 fwht3 K production-writer all positions 0..247807; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=245760 B=2048 ctx_end=247808 median_us=414362.518 samples_us=408961.060,413282.013,414362.518,417066.132,421760.101,
+TIME mode=Q start=245760 B=2048 ctx_end=247808 median_us=427191.864 samples_us=427191.864,426461.212,425261.658,427827.332,429949.158,
+FIXTURE ctx=253952 B=8192 fwht3 K production-writer all positions 0..253951; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=245760 B=8192 ctx_end=253952 median_us=1707329.834 samples_us=1707329.834,1707100.464,1709773.071,1700910.767,1708139.648,
+TIME mode=Q start=245760 B=8192 ctx_end=253952 median_us=1691201.172 samples_us=1700374.512,1704248.779,1691201.172,1691009.399,1690227.173,
+PROCESS block=3 start=253952 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=F
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=253952 B=512 ctx_end=254464 median_us=119537.384 samples_us=119537.384,117356.094,118221.504,121184.273,120193.588,
+TIME mode=Q start=253952 B=512 ctx_end=254464 median_us=119899.475 samples_us=119899.475,120873.390,121340.599,119438.431,119884.590,
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=253952 B=2048 ctx_end=256000 median_us=429853.973 samples_us=424193.451,426503.143,433000.488,429853.973,440730.194,
+TIME mode=Q start=253952 B=2048 ctx_end=256000 median_us=443210.449 samples_us=441337.952,444557.800,442337.097,447284.698,443210.449,
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=253952 B=8192 ctx_end=262144 median_us=1772817.017 samples_us=1763743.652,1774067.749,1771606.812,1777610.352,1772817.017,
+TIME mode=Q start=253952 B=8192 ctx_end=262144 median_us=1753837.158 samples_us=1766091.919,1748293.823,1753837.158,1751528.320,1771526.367,
+PROCESS block=3 start=253952 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=S
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=253952 B=512 ctx_end=254464 median_us=118541.893 samples_us=122132.698,119142.799,117960.083,118450.996,118541.893,
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=253952 B=2048 ctx_end=256000 median_us=493919.121 samples_us=482075.340,493560.768,493919.121,528972.397,536260.162,
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=253952 B=8192 ctx_end=262144 median_us=2155942.490 samples_us=2176373.245,2160690.933,2155942.490,2154582.565,2139159.317,
+PROCESS block=3 start=253952 arm=S HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=S
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=S start=253952 B=512 ctx_end=254464 median_us=119456.512 samples_us=120898.033,117747.025,119456.512,119880.081,119090.675,
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=S start=253952 B=2048 ctx_end=256000 median_us=496929.810 samples_us=483602.509,491800.903,496929.810,533159.088,536574.875,
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=S start=253952 B=8192 ctx_end=262144 median_us=2177399.368 samples_us=2174135.284,2177399.368,2179125.641,2190778.534,2177035.324,
+PROCESS block=3 start=253952 arm=F HIP_VISIBLE_DEVICES=0
+DEVICE ordinal=0 arch=gfx1100 start=253952 mode=F
+FIXTURE ctx=254464 B=512 fwht3 K production-writer all positions 0..254463; V and q8 K production q8 writer; Q16=6291456 bytes
+TIME mode=F start=253952 B=512 ctx_end=254464 median_us=119004.921 samples_us=119626.083,118909.309,120415.451,118300.995,119004.921,
+TIME mode=Q start=253952 B=512 ctx_end=254464 median_us=119942.047 samples_us=119942.047,122041.626,121694.466,118903.130,119283.890,
+FIXTURE ctx=256000 B=2048 fwht3 K production-writer all positions 0..255999; V and q8 K production q8 writer; Q16=25165824 bytes
+TIME mode=F start=253952 B=2048 ctx_end=256000 median_us=428629.669 samples_us=424389.832,425042.480,428629.669,429594.879,432042.725,
+TIME mode=Q start=253952 B=2048 ctx_end=256000 median_us=444698.212 samples_us=443458.923,444698.212,450480.774,450079.590,440184.937,
+FIXTURE ctx=262144 B=8192 fwht3 K production-writer all positions 0..262143; V and q8 K production q8 writer; Q16=100663296 bytes
+TIME mode=F start=253952 B=8192 ctx_end=262144 median_us=1768379.517 samples_us=1768379.517,1764432.251,1757268.066,1776160.522,1772918.213,
+TIME mode=Q start=253952 B=8192 ctx_end=262144 median_us=1752658.325 samples_us=1742344.482,1752658.325,1763002.563,1760887.695,1745793.457,
+G0 COMPLETE
