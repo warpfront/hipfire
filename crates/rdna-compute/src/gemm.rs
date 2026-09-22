@@ -19792,20 +19792,35 @@ impl Gpu {
             && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
             && !self.replay.is_recording()
             && !self.graphs.capture_mode;
-        // LF: exact gfx1151 full SET tiles → 16-wave sum[32] entry (2 WG/CU);
-        // add tiles measured slower on it and stay on the 8-wave entry.
-        let use_lf16 = use_col && !add && self.arch.as_str() == "gfx1151";
+        // LF: gfx1151 full SET tiles keep the shipped 16-wave column route.
+        // The default-off gfx1100 experiment admits SET and ADD. Eager launches
+        // use the column-adjacent wrapper; graph/replay capture uses an
+        // arithmetic-identical row-major wrapper matching its recorded grid.
+        let shape_lf16 = (full || gridspec)
+            && self.arch.as_str() == "gfx1100"
+            && self.flags.gfx11_iu4_shape;
+        let use_lf16 =
+            shape_lf16 || (use_col && !add && self.arch.as_str() == "gfx1151");
         let kernel_name = match (full || gridspec, add, use_col) {
+            (true, true, true) if use_lf16 => {
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151"
+            }
+            (true, true, false) if use_lf16 => {
+                "gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100"
+            }
             (true, true, true) => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151"
             }
+            (true, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
             (true, false, true) if use_lf16 => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151"
+            }
+            (true, false, false) if use_lf16 => {
+                "gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100"
             }
             (true, false, true) => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151"
             }
-            (true, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3",
             (true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3",
             (false, _, _) => "gemm_mq4g256v2_residual_mmq_iu4",
         };
