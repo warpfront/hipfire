@@ -19777,17 +19777,24 @@ impl Gpu {
             return result;
         }
         let full = m % 128 == 0 && batch_size % 128 == 0;
-        // A5: gfx1151/gfx1100 + eager + full tiles only → column-adjacent
-        // entries with grid [N/128, M/128, 1]. Non-full, capture/replay, and
-        // non-gfx1151 keep baseline symbols and [M/128, N/128, 1].
-        let use_col = full
+        // A partial N grid can still use FULL=true for every complete column
+        // tile when M itself is full. The guarded wrapper below targets only
+        // the one remaining column tile while retaining the original N stride.
+        let gridspec = self.flags.gfx11_iu4_gridspec
+            && m % 128 == 0
+            && batch_size >= 128
+            && batch_size % 128 != 0;
+        // A5: gfx1151/gfx1100 + eager + unchecked tiles → column-adjacent
+        // entries with grid [N/128, M/128, 1]. A grid-specialized partial N
+        // uses this route for its interior launch only.
+        let use_col = (full || gridspec)
             && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
             && !self.replay.is_recording()
             && !self.graphs.capture_mode;
         // LF: exact gfx1151 full SET tiles → 16-wave sum[32] entry (2 WG/CU);
         // add tiles measured slower on it and stay on the 8-wave entry.
         let use_lf16 = use_col && !add && self.arch.as_str() == "gfx1151";
-        let kernel_name = match (full, add, use_col) {
+        let kernel_name = match (full || gridspec, add, use_col) {
             (true, true, true) => {
                 "gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151"
             }
@@ -19803,11 +19810,24 @@ impl Gpu {
         };
         let block = if use_lf16 { [32, 16, 1] } else { [32, 8, 1] };
         const MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4";
-        self.ensure_kernel(
-            MODULE,
-            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC,
-            kernel_name,
-        )?;
+        const GRIDSPEC_MODULE: &str = "gemm_mq4g256v2_residual_mmq_iu4_gridspec";
+        const GRIDSPEC_TAIL: &str = "gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec";
+        const GRIDSPEC_SRC: &str = concat!(
+            include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+            include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip"),
+            include_str!(
+                "../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4_gridspec.gfx11.hip"
+            )
+        );
+        let (module, source) = if gridspec {
+            (GRIDSPEC_MODULE, GRIDSPEC_SRC)
+        } else {
+            (MODULE, kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC)
+        };
+        self.ensure_kernel(module, source, kernel_name)?;
+        if gridspec {
+            self.ensure_kernel(module, source, GRIDSPEC_TAIL)?;
+        }
         let mut a_ptr = a_raw.buf.as_ptr();
         let mut xq_ptr = x_i4_ptr;
         let mut y_ptr = y.buf.as_ptr();
@@ -19837,30 +19857,79 @@ impl Gpu {
             ((MMQ_X * MMQ_TILE_Y_K + MMQ_Y * MMQ_TILE_X_K) * std::mem::size_of::<i32>()) as u32;
         let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
         let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
-        let grid = if use_col {
-            // col_tile=blockIdx.x, row_tile=blockIdx.y
-            [batch_tiles as u32, row_tiles as u32, 1]
+        let result = if gridspec {
+            let interior_tiles = batch_size / MMQ_X;
+            let interior_grid = if use_col {
+                // col_tile=blockIdx.x, row_tile=blockIdx.y
+                [interior_tiles as u32, row_tiles as u32, 1]
+            } else {
+                [row_tiles as u32, interior_tiles as u32, 1]
+            };
+            let interior_result = self.launch_maybe_blob(
+                kernel_name,
+                interior_grid,
+                block,
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(xq_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(n_val);
+                    b.push_i32(add_val);
+                    b
+                },
+            );
+            match interior_result {
+                Err(error) => Err(error),
+                Ok(()) => self.launch_maybe_blob(
+                    GRIDSPEC_TAIL,
+                    [row_tiles as u32, 1, 1],
+                    [32, 8, 1],
+                    shared_mem,
+                    &mut params,
+                    || {
+                        let mut b = hip_bridge::KernargBlob::new();
+                        b.push_ptr(a_ptr);
+                        b.push_ptr(xq_ptr);
+                        b.push_ptr(y_ptr);
+                        b.push_i32(m_val);
+                        b.push_i32(k_val);
+                        b.push_i32(n_val);
+                        b.push_i32(add_val);
+                        b
+                    },
+                ),
+            }
         } else {
-            [row_tiles as u32, batch_tiles as u32, 1]
+            let grid = if use_col {
+                // col_tile=blockIdx.x, row_tile=blockIdx.y
+                [batch_tiles as u32, row_tiles as u32, 1]
+            } else {
+                [row_tiles as u32, batch_tiles as u32, 1]
+            };
+            self.launch_maybe_blob(
+                kernel_name,
+                grid,
+                block,
+                shared_mem,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(a_ptr);
+                    b.push_ptr(xq_ptr);
+                    b.push_ptr(y_ptr);
+                    b.push_i32(m_val);
+                    b.push_i32(k_val);
+                    b.push_i32(n_val);
+                    b.push_i32(add_val);
+                    b
+                },
+            )
         };
-        let result = self.launch_maybe_blob(
-            kernel_name,
-            grid,
-            block,
-            shared_mem,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(a_ptr);
-                b.push_ptr(xq_ptr);
-                b.push_ptr(y_ptr);
-                b.push_i32(m_val);
-                b.push_i32(k_val);
-                b.push_i32(n_val);
-                b.push_i32(add_val);
-                b
-            },
-        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
