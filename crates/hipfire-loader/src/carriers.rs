@@ -676,8 +676,17 @@ impl Carrier for Qwen35Carrier {
                     .iter()
                     .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                     .collect();
+                let native_eligible = hipfire_runtime::kv_mode::qwen35_native_eligible(
+                    ctx.gpu.arch.as_str(), config.n_heads, config.n_kv_heads, config.head_dim,
+                    ctx.pp, false, ctx.cask.sidecar.is_some(),
+                );
+                let policy = hipfire_runtime::kv_mode::qwen35_policy_for_native(
+                    &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY,
+                    &kv_mode_from_ctx(ctx),
+                    native_eligible,
+                );
                 let (mode, v_mode) =
-                    resolve_qwen_kv_pair(ctx, &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY)?;
+                    resolve_qwen_kv_pair(ctx, &policy)?;
                 // Same native-tier admission as the HFQ carrier site: exact
                 // gfx1201/dense/legacy-or-VMM. The Dir path still honors
                 // resolved VMode below; adaptive/CASK stay HFQ-only.

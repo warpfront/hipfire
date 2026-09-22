@@ -8,6 +8,7 @@
 pub use saddle_core::kv::{KvMode, VMode};
 
 /// Per-site alias table + accepted set + default. One const per load site.
+#[derive(Clone, Copy)]
 pub struct KvModePolicy {
     /// Human label for diagnostics ("qwen35-hfq", "qwen35-pp", ...).
     pub site: &'static str,
@@ -22,6 +23,44 @@ pub struct KvModePolicy {
     /// What an unrecognized / recognized-but-unaccepted string resolves to
     /// under [`resolve`].
     pub default: KvMode,
+}
+
+/// Native Qwen35 cache eligibility, shared by auto selection and preflight.
+/// Explicit native presets still report a refusal when this is false.
+pub fn qwen35_native_eligible(
+    arch: &str,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    pp: usize,
+    adaptive: bool,
+    cask: bool,
+) -> bool {
+    arch == "gfx1201"
+        && n_heads == 24
+        && n_kv_heads == 4
+        && head_dim == 256
+        && pp == 1
+        && !adaptive
+        && !cask
+}
+
+/// Retain explicit native-mode diagnostics, but don't choose native for an
+/// ineligible model's implicit auto preset. All names still use the one parser.
+pub fn qwen35_policy_for_native(
+    policy: &KvModePolicy,
+    mode_raw: &str,
+    native_eligible: bool,
+) -> KvModePolicy {
+    let mut selected = *policy;
+    if !native_eligible && matches!(mode_raw.trim(), "" | "auto") {
+        selected.accepted = match policy.site {
+            "qwen35-hfq" => &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4],
+            "qwen35-paro" => &[Q8, Asym2, Asym4, Fwht2, Fwht3, Fwht4],
+            _ => policy.accepted,
+        };
+    }
+    selected
 }
 
 /// The result of [`resolve`]: the concrete mode plus an optional operator-facing
@@ -518,6 +557,24 @@ mod tests {
         for p in [&QWEN35_PP_POLICY, &DIR_SAFETENSORS_POLICY] {
             let (k, v) = pair("auto", None, None, p, "gfx1201", true).unwrap();
             assert_eq!((k, v), (Q8, VMode::Q8), "site={}", p.site);
+        }
+    }
+
+    #[test]
+    fn mismatched_qwen_geometry_auto_is_q8_but_explicit_native_is_preserved() {
+        for base in [&QWEN35_HFQ_POLICY, &QWEN35_PARO_POLICY] {
+            let eligible = qwen35_native_eligible("gfx1201", 24, 4, 256, 1, false, false);
+            let small = qwen35_native_eligible("gfx1201", 8, 2, 256, 1, false, false);
+            assert!(eligible);
+            assert!(!small);
+            assert!(!qwen35_native_eligible("gfx1201", 24, 4, 256, 1, false, true));
+            let native = qwen35_policy_for_native(base, "auto", eligible);
+            let portable = qwen35_policy_for_native(base, "auto", small);
+            assert_eq!(pair("auto", None, None, &native, "gfx1201", true).unwrap().0, Fp8);
+            assert_eq!(pair("auto", None, None, &portable, "gfx1201", true).unwrap().0, Q8);
+            assert_eq!(pair("auto", Some("q8"), None, &portable, "gfx1201", true).unwrap().0, Q8);
+            let explicit = qwen35_policy_for_native(base, "fp8", small);
+            assert_eq!(pair("fp8", None, None, &explicit, "gfx1201", true).unwrap().0, Fp8);
         }
     }
 

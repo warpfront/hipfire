@@ -851,12 +851,27 @@ pub fn admit_source(
             .kv_mode
             .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str())
             .to_ascii_lowercase();
+        let qwen_cfg = if matches!(arch_id, 5 | 6) {
+            Some(match &source {
+                ModelSource::Hfq(h) => hipfire_arch_qwen35::qwen35::config_from_hfq(h),
+                ModelSource::Dir(d) => hipfire_arch_qwen35::qwen35::config_from_safetensors(d),
+            }.map_err(|e| format!("Qwen KV admission config: {e}"))?)
+        } else {
+            None
+        };
         let adaptive = hints.kv_adaptive.is_some_and(|v| !matches!(v, "" | "off"));
+        let native_eligible = qwen_cfg.as_ref().is_some_and(|cfg|
+            kv_mode::qwen35_native_eligible(
+                gpu_arch, cfg.n_heads, cfg.n_kv_heads, cfg.head_dim,
+                pp, adaptive, hints.cask.is_some_and(|c| c.sidecar.is_some()),
+            )
+        );
+        let policy = kv_mode::qwen35_policy_for_native(policy, &mode, native_eligible);
         if adaptive && (k_axis.is_some() || v_axis.is_some()) {
             return Err("adaptive Qwen KV cannot combine with fixed --kv-k/--kv-v; disable kv_adaptive or omit both axes".into());
         }
         let (k, v) = kv_mode::resolve_kv_pair(
-            &mode, k_axis, v_axis, policy, gpu_arch, hints.qwen_default_q8,
+            &mode, k_axis, v_axis, &policy, gpu_arch, hints.qwen_default_q8,
         )
         .map_err(|e| format!("Qwen KV admission: {e}"))?;
         if (pp > 1 || tp > 1) && v != kv_mode::VMode::Q8 {
@@ -884,28 +899,19 @@ pub fn admit_source(
                 return Err(format!("Qwen legacy-asym K requires head_dim=256 (got {head_dim}); use --kv-mode q8"));
             }
         }
-        if matches!(arch_id, 5 | 6)
-            && matches!(k, KvMode::Fp8 | KvMode::Bf16 | KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4)
-        {
-            let cfg = match &source {
-                ModelSource::Hfq(h) => hipfire_arch_qwen35::qwen35::config_from_hfq(h),
-                ModelSource::Dir(d) => hipfire_arch_qwen35::qwen35::config_from_safetensors(d),
-            }
-            .map_err(|e| format!("Qwen KV admission config: {e}"))?;
-            if matches!(k, KvMode::Fp8 | KvMode::Bf16)
-                && (gpu_arch != "gfx1201" || cfg.n_heads != 24 || cfg.n_kv_heads != 4
-                    || cfg.head_dim != 256 || pp > 1 || tp > 1 || adaptive
-                    || hints.cask.is_some_and(|c| c.sidecar.is_some()))
-            {
-                return Err(format!(
-                    "Qwen native KV requires exact gfx1201, H24/Hkv4/D256, single GPU and no CASK/adaptive (got {gpu_arch}, H{}/Hkv{}/D{}); use --kv-mode q8",
-                    cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
-                ));
-            }
-            if matches!(k, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4)
-                && cfg.head_dim != 256
-            {
-                return Err(format!("Qwen legacy-asym K requires head_dim=256 (got {}); use --kv-mode q8", cfg.head_dim));
+        if let Some(cfg) = qwen_cfg.as_ref() {
+            if matches!(k, KvMode::Fp8 | KvMode::Bf16 | KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4) {
+                if matches!(k, KvMode::Fp8 | KvMode::Bf16) && !native_eligible {
+                    return Err(format!(
+                        "Qwen native KV requires exact gfx1201, H24/Hkv4/D256, single GPU and no CASK/adaptive (got {gpu_arch}, H{}/Hkv{}/D{}); use --kv-mode q8",
+                        cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
+                    ));
+                }
+                if matches!(k, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4)
+                    && cfg.head_dim != 256
+                {
+                    return Err(format!("Qwen legacy-asym K requires head_dim=256 (got {}); use --kv-mode q8", cfg.head_dim));
+                }
             }
         }
         if !adaptive && hints.cask.is_some_and(|c| c.sidecar.is_some())
