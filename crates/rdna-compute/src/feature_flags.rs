@@ -294,8 +294,9 @@ pub struct FeatureFlags {
     pub attn_qresident: bool,
     /// Experimental whole-chunk Q8/Q8 FA2 on exact gfx1100/gfx1151
     /// (`HIPFIRE_GFX11_Q8_FA2_WIDE`, `kernel.gfx11_q8_fa2_wide`).
-    /// Default OFF; requires the master gfx11 FA2 flag. B64..8192 with
-    /// above-512 batches aligned to 512 and ctx64..32768.
+    /// Default ON only on exact gfx1100; gfx1151 defaults OFF but an
+    /// explicit true still opts it in. Requires the master gfx11 FA2 flag.
+    /// B64..8192, above-512 batches aligned to 512, ctx64..32768.
     pub gfx11_q8_fa2_wide: bool,
     /// `HIPFIRE_GFX11_FA2_PREFILL=0` opts out of the gfx11 GQA-fused FA2
     /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
@@ -699,7 +700,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT")
                 .unwrap_or(arch == "gfx1201"),
-            gfx11_q8_fa2_wide: parse_bool("HIPFIRE_GFX11_Q8_FA2_WIDE").unwrap_or(false),
+            gfx11_q8_fa2_wide: parse_bool("HIPFIRE_GFX11_Q8_FA2_WIDE")
+                .unwrap_or(arch == "gfx1100"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
@@ -1530,5 +1532,31 @@ mod tests {
         assert_eq!(flags.gemv_rows, Some(4));
         assert!(flags.rdna3_hfq4_qkvza_k2048);
         assert!(flags.rdna3_hfq4_residual_stage_x32);
+    }
+
+    #[test]
+    fn gfx11_q8_fa2_wide_auto_is_exact_gfx1100_with_explicit_overrides() {
+        let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        assert!(process.legacy_value("HIPFIRE_GFX11_Q8_FA2_WIDE").is_none());
+        for (arch, expected) in [
+            ("gfx1100", true),
+            ("gfx1101", false),
+            ("gfx1151", false),
+            ("gfx1201", false),
+        ] {
+            assert_eq!(FeatureFlags::from_process_config(arch, &process).gfx11_q8_fa2_wide, expected, "arch={arch}");
+        }
+        for (value, expected) in [("false", false), ("true", true)] {
+            let mut layer = ConfigLayer::default();
+            layer.set_cli("kernel.gfx11_q8_fa2_wide", value).unwrap();
+            let resolved = resolve([NamedLayer {
+                source: ConfigSource::GlobalUser { path: "config.toml".into() },
+                layer,
+            }]).unwrap();
+            let process = ProcessConfig::from_resolved(&resolved).unwrap();
+            for arch in ["gfx1100", "gfx1151"] {
+                assert_eq!(FeatureFlags::from_process_config(arch, &process).gfx11_q8_fa2_wide, expected, "arch={arch} value={value}");
+            }
+        }
     }
 }
