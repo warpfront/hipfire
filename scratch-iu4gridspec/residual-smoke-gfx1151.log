@@ -1,0 +1,4 @@
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=forward,mode=split
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=shipped,shape=down,N=5909,M=5120,K=17408,add=1,median_us=32259.074,tops=32.652,spread_pct=6.831
+RESULT,variant=gridspec_split,shape=down,N=5909,M=5120,K=17408,add=1,median_us=22451.438,tops=46.916,spread_pct=1.158

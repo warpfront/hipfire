@@ -23,10 +23,17 @@ __global__ void compare_bits(const float* a, const float* b, size_t n,
     atomicAdd(mismatches, 1ull);
 }
 
+__global__ void init_residual(float* y, size_t n) {
+  const size_t i = (size_t)blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < n) y[i] = 0.25f;
+}
+
 static void configure_kernels() {
   HIP_OK(hipFuncSetAttribute((const void*)gemm_mq4g256v2_residual_mmq_iu4,
       hipFuncAttributeMaxDynamicSharedMemorySize, LDS_BYTES));
   HIP_OK(hipFuncSetAttribute((const void*)gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec,
+      hipFuncAttributeMaxDynamicSharedMemorySize, LDS_BYTES));
+  HIP_OK(hipFuncSetAttribute((const void*)gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec,
       hipFuncAttributeMaxDynamicSharedMemorySize, LDS_BYTES));
   HIP_OK(hipFuncSetAttribute((const void*)gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151,
       hipFuncAttributeMaxDynamicSharedMemorySize, LDS_BYTES));
@@ -55,6 +62,18 @@ static void launch_full(const char* w, const block_i4_128* x, float* y,
   }
 }
 
+static void launch_full_ordinary(const char* w, const block_i4_128* x, float* y,
+                                 int M, int K, int N, int add, int col_tiles) {
+  const dim3 grid(col_tiles, M / 128);
+  if (add) {
+    gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151
+        <<<grid, dim3(32, 8), LDS_BYTES>>>(w, x, y, M, K, N, add);
+  } else {
+    gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151
+        <<<grid, dim3(32, 8), LDS_BYTES>>>(w, x, y, M, K, N, add);
+  }
+}
+
 static void launch_shipped(const char* w, const block_i4_128* x, float* y,
                            int M, int K, int N, int add) {
   if (N % 128 == 0) {
@@ -66,8 +85,8 @@ static void launch_shipped(const char* w, const block_i4_128* x, float* y,
   }
 }
 
-static void launch_candidate(const char* w, const block_i4_128* x, float* y,
-                             int M, int K, int N, int add) {
+static void launch_split(const char* w, const block_i4_128* x, float* y,
+                         int M, int K, int N, int add) {
   if (N % 128 == 0) {
     launch_full(w, x, y, M, K, N, add, N / 128);
     return;
@@ -75,6 +94,29 @@ static void launch_candidate(const char* w, const block_i4_128* x, float* y,
   launch_full(w, x, y, M, K, N, add, N / 128);
   gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec
       <<<dim3(M / 128, 1), dim3(32, 8), LDS_BYTES>>>
+      (w, x, y, M, K, N, add);
+}
+
+static void launch_split_ordinary(const char* w, const block_i4_128* x, float* y,
+                                  int M, int K, int N, int add) {
+  if (N % 128 == 0) {
+    launch_full(w, x, y, M, K, N, add, N / 128);
+    return;
+  }
+  launch_full_ordinary(w, x, y, M, K, N, add, N / 128);
+  gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec
+      <<<dim3(M / 128, 1), dim3(32, 8), LDS_BYTES>>>
+      (w, x, y, M, K, N, add);
+}
+
+static void launch_branch(const char* w, const block_i4_128* x, float* y,
+                          int M, int K, int N, int add) {
+  if (N % 128 == 0) {
+    launch_full(w, x, y, M, K, N, add, N / 128);
+    return;
+  }
+  gemm_mq4g256v2_residual_mmq_iu4_branch_gridspec
+      <<<dim3((N + 127) / 128, M / 128), dim3(32, 8), LDS_BYTES>>>
       (w, x, y, M, K, N, add);
 }
 
@@ -105,13 +147,26 @@ static void run_arm(const char* variant, Launch launch,
 }
 
 int main(int argc, char** argv) {
-  if (argc < 3 || argc > 4) {
-    std::fprintf(stderr, "usage: %s gate|down N [--reverse]\n", argv[0]);
+  if (argc < 3 || argc > 5) {
+    std::fprintf(stderr,
+        "usage: %s gate|down N [--reverse] [--branch|--ordinary-split]\n", argv[0]);
     return 2;
   }
   const bool down = std::strcmp(argv[1], "down") == 0;
   const int N = std::atoi(argv[2]);
-  const bool reverse = argc == 4 && std::strcmp(argv[3], "--reverse") == 0;
+  bool reverse = false;
+  bool branch = false;
+  bool ordinary_split = false;
+  for (int i = 3; i < argc; ++i) {
+    reverse |= std::strcmp(argv[i], "--reverse") == 0;
+    branch |= std::strcmp(argv[i], "--branch") == 0;
+    ordinary_split |= std::strcmp(argv[i], "--ordinary-split") == 0;
+  }
+  const Launch candidate =
+      ordinary_split ? launch_split_ordinary : (branch ? launch_branch : launch_split);
+  const char* candidate_name = ordinary_split
+      ? "gridspec_split_ordinary"
+      : (branch ? "gridspec_branch" : "gridspec_split");
   const int M = down ? 5120 : 17408;
   const int K = down ? 17408 : 5120;
   const int add = down ? 1 : 0;
@@ -123,8 +178,9 @@ int main(int argc, char** argv) {
         expected ? expected : "<unset>", prop.gcnArchName);
     return 3;
   }
-  std::printf("DEVICE,arch=%s,name=%s,order=%s\n", prop.gcnArchName, prop.name,
-      reverse ? "reverse" : "forward");
+  const char* mode = ordinary_split ? "ordinary-split" : (branch ? "branch" : "split");
+  std::printf("DEVICE,arch=%s,name=%s,order=%s,mode=%s\n", prop.gcnArchName, prop.name,
+      reverse ? "reverse" : "forward", mode);
 
   const size_t groups = (size_t)M * (K / 256);
   const size_t blocks = (size_t)(K / 128) * N;
@@ -158,10 +214,15 @@ int main(int argc, char** argv) {
   HIP_OK(hipMemcpy(x, hx.data(), hx.size() * sizeof(block_i4_128), hipMemcpyHostToDevice));
   configure_kernels();
 
-  HIP_OK(hipMemset(ya, 0, elems * sizeof(float)));
-  HIP_OK(hipMemset(yb, 0, elems * sizeof(float)));
+  if (add) {
+    init_residual<<<(elems + 255) / 256, 256>>>(ya, elems);
+    init_residual<<<(elems + 255) / 256, 256>>>(yb, elems);
+  } else {
+    HIP_OK(hipMemset(ya, 0, elems * sizeof(float)));
+    HIP_OK(hipMemset(yb, 0, elems * sizeof(float)));
+  }
   launch_shipped(w, x, ya, M, K, N, add);
-  launch_candidate(w, x, yb, M, K, N, add);
+  candidate(w, x, yb, M, K, N, add);
   HIP_OK(hipMemset(mismatches, 0, sizeof(*mismatches)));
   compare_bits<<<(elems + 255) / 256, 256>>>(ya, yb, elems, mismatches);
   unsigned long long host_mismatches = 0;
@@ -172,9 +233,9 @@ int main(int argc, char** argv) {
 
   if (!reverse) {
     run_arm("shipped", launch_shipped, w, x, ya, M, K, N, add);
-    run_arm("gridspec", launch_candidate, w, x, yb, M, K, N, add);
+    run_arm(candidate_name, candidate, w, x, yb, M, K, N, add);
   } else {
-    run_arm("gridspec", launch_candidate, w, x, yb, M, K, N, add);
+    run_arm(candidate_name, candidate, w, x, yb, M, K, N, add);
     run_arm("shipped", launch_shipped, w, x, ya, M, K, N, add);
   }
 

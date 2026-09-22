@@ -1,0 +1,4 @@
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward,mode=split
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=shipped,shape=down,N=5909,M=5120,K=17408,add=1,median_us=10730.789,tops=98.159,spread_pct=4.382
+RESULT,variant=gridspec_split,shape=down,N=5909,M=5120,K=17408,add=1,median_us=8747.813,tops=120.410,spread_pct=3.965

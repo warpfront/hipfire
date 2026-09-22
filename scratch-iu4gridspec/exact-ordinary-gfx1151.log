@@ -1,0 +1,64 @@
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=forward,mode=ordinary-split
+PARITY,shape=gate,N=5909,mismatches=0,total=102863872
+RESULT,variant=shipped,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=32338.695,tops=32.572,spread_pct=1.493
+RESULT,variant=gridspec_split_ordinary,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=21853.031,tops=48.200,spread_pct=2.915
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=reverse,mode=ordinary-split
+PARITY,shape=gate,N=5909,mismatches=0,total=102863872
+RESULT,variant=gridspec_split_ordinary,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=21800.055,tops=48.318,spread_pct=1.852
+RESULT,variant=shipped,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=32279.037,tops=32.632,spread_pct=3.819
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=reverse,mode=ordinary-split
+PARITY,shape=gate,N=5909,mismatches=0,total=102863872
+RESULT,variant=gridspec_split_ordinary,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=21967.688,tops=47.949,spread_pct=2.742
+RESULT,variant=shipped,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=32418.816,tops=32.491,spread_pct=2.745
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=forward,mode=ordinary-split
+PARITY,shape=gate,N=5909,mismatches=0,total=102863872
+RESULT,variant=shipped,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=32115.707,tops=32.798,spread_pct=3.719
+RESULT,variant=gridspec_split_ordinary,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=21864.727,tops=48.175,spread_pct=0.979
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=forward,mode=ordinary-split
+PARITY,shape=gate,N=8192,mismatches=0,total=142606336
+RESULT,variant=shipped,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=30303.268,tops=48.189,spread_pct=1.175
+RESULT,variant=gridspec_split_ordinary,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=30327.900,tops=48.150,spread_pct=1.340
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=reverse,mode=ordinary-split
+PARITY,shape=gate,N=8192,mismatches=0,total=142606336
+RESULT,variant=gridspec_split_ordinary,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=30402.057,tops=48.033,spread_pct=1.598
+RESULT,variant=shipped,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=30295.125,tops=48.202,spread_pct=1.091
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=reverse,mode=ordinary-split
+PARITY,shape=gate,N=8192,mismatches=0,total=142606336
+RESULT,variant=gridspec_split_ordinary,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=30410.453,tops=48.019,spread_pct=0.838
+RESULT,variant=shipped,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=30326.697,tops=48.152,spread_pct=0.753
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=forward,mode=ordinary-split
+PARITY,shape=gate,N=8192,mismatches=0,total=142606336
+RESULT,variant=shipped,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=30368.174,tops=48.086,spread_pct=1.561
+RESULT,variant=gridspec_split_ordinary,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=30280.934,tops=48.225,spread_pct=0.998
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=forward,mode=ordinary-split
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=shipped,shape=down,N=5909,M=5120,K=17408,add=1,median_us=31883.379,tops=33.037,spread_pct=4.216
+RESULT,variant=gridspec_split_ordinary,shape=down,N=5909,M=5120,K=17408,add=1,median_us=22438.371,tops=46.943,spread_pct=1.306
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=reverse,mode=ordinary-split
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=gridspec_split_ordinary,shape=down,N=5909,M=5120,K=17408,add=1,median_us=22695.855,tops=46.411,spread_pct=1.747
+RESULT,variant=shipped,shape=down,N=5909,M=5120,K=17408,add=1,median_us=32240.963,tops=32.670,spread_pct=7.883
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=reverse,mode=ordinary-split
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=gridspec_split_ordinary,shape=down,N=5909,M=5120,K=17408,add=1,median_us=22501.812,tops=46.811,spread_pct=0.865
+RESULT,variant=shipped,shape=down,N=5909,M=5120,K=17408,add=1,median_us=32185.703,tops=32.727,spread_pct=5.831
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=forward,mode=ordinary-split
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=shipped,shape=down,N=5909,M=5120,K=17408,add=1,median_us=31881.352,tops=33.039,spread_pct=8.243
+RESULT,variant=gridspec_split_ordinary,shape=down,N=5909,M=5120,K=17408,add=1,median_us=22498.121,tops=46.818,spread_pct=1.407
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=forward,mode=ordinary-split
+PARITY,shape=down,N=8192,mismatches=0,total=41943040
+RESULT,variant=shipped,shape=down,N=8192,M=5120,K=17408,add=1,median_us=30344.168,tops=48.124,spread_pct=1.663
+RESULT,variant=gridspec_split_ordinary,shape=down,N=8192,M=5120,K=17408,add=1,median_us=30444.918,tops=47.965,spread_pct=1.297
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=reverse,mode=ordinary-split
+PARITY,shape=down,N=8192,mismatches=0,total=41943040
+RESULT,variant=gridspec_split_ordinary,shape=down,N=8192,M=5120,K=17408,add=1,median_us=30446.406,tops=47.963,spread_pct=0.625
+RESULT,variant=shipped,shape=down,N=8192,M=5120,K=17408,add=1,median_us=30372.105,tops=48.080,spread_pct=0.829
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=reverse,mode=ordinary-split
+PARITY,shape=down,N=8192,mismatches=0,total=41943040
+RESULT,variant=gridspec_split_ordinary,shape=down,N=8192,M=5120,K=17408,add=1,median_us=30431.539,tops=47.986,spread_pct=1.205
+RESULT,variant=shipped,shape=down,N=8192,M=5120,K=17408,add=1,median_us=30515.451,tops=47.854,spread_pct=0.664
+DEVICE,arch=gfx1151,name=AMD Radeon 8060S Graphics,order=forward,mode=ordinary-split
+PARITY,shape=down,N=8192,mismatches=0,total=41943040
+RESULT,variant=shipped,shape=down,N=8192,M=5120,K=17408,add=1,median_us=30423.127,tops=47.999,spread_pct=0.883
+RESULT,variant=gridspec_split_ordinary,shape=down,N=8192,M=5120,K=17408,add=1,median_us=30551.600,tops=47.797,spread_pct=1.122

@@ -19781,12 +19781,13 @@ impl Gpu {
         // tile when M itself is full. The guarded wrapper below targets only
         // the one remaining column tile while retaining the original N stride.
         let gridspec = self.flags.gfx11_iu4_gridspec
+            && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
             && m % 128 == 0
             && batch_size >= 128
             && batch_size % 128 != 0;
-        // A5: gfx1151/gfx1100 + eager + unchecked tiles → column-adjacent
-        // entries with grid [N/128, M/128, 1]. A grid-specialized partial N
-        // uses this route for its interior launch only.
+        // gfx1151/gfx1100 + eager + unchecked tiles → column-adjacent entries.
+        // A grid-specialized partial N uses the same order for its unchecked
+        // interior split launch.
         let use_col = (full || gridspec)
             && matches!(self.arch.as_str(), "gfx1151" | "gfx1100")
             && !self.replay.is_recording()

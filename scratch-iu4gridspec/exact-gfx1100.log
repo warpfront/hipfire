@@ -1,0 +1,64 @@
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward
+PARITY,shape=gate,N=5909,mismatches=0,total=102863872
+RESULT,variant=shipped,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=10492.948,tops=100.384,spread_pct=4.215
+RESULT,variant=gridspec,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=8996.006,tops=117.088,spread_pct=4.597
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse
+PARITY,shape=gate,N=5909,mismatches=0,total=102863872
+RESULT,variant=gridspec,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=9859.350,tops=106.835,spread_pct=7.201
+RESULT,variant=shipped,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=9847.923,tops=106.959,spread_pct=3.943
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse
+PARITY,shape=gate,N=5909,mismatches=0,total=102863872
+RESULT,variant=gridspec,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=9895.031,tops=106.450,spread_pct=7.114
+RESULT,variant=shipped,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=9879.325,tops=106.619,spread_pct=6.252
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward
+PARITY,shape=gate,N=5909,mismatches=0,total=102863872
+RESULT,variant=shipped,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=10571.547,tops=99.638,spread_pct=4.814
+RESULT,variant=gridspec,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=9047.395,tops=116.423,spread_pct=6.047
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward
+PARITY,shape=gate,N=8192,mismatches=0,total=142606336
+RESULT,variant=shipped,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=12916.416,tops=113.057,spread_pct=7.443
+RESULT,variant=gridspec,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=11883.828,tops=122.880,spread_pct=7.896
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse
+PARITY,shape=gate,N=8192,mismatches=0,total=142606336
+RESULT,variant=gridspec,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=12814.257,tops=113.958,spread_pct=7.995
+RESULT,variant=shipped,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=11904.981,tops=122.662,spread_pct=5.949
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse
+PARITY,shape=gate,N=8192,mismatches=0,total=142606336
+RESULT,variant=gridspec,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=12864.577,tops=113.512,spread_pct=6.876
+RESULT,variant=shipped,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=11909.742,tops=122.613,spread_pct=6.123
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward
+PARITY,shape=gate,N=8192,mismatches=0,total=142606336
+RESULT,variant=shipped,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=12812.899,tops=113.970,spread_pct=7.082
+RESULT,variant=gridspec,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=11905.944,tops=122.652,spread_pct=6.358
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=shipped,shape=down,N=5909,M=5120,K=17408,add=1,median_us=10663.147,tops=98.782,spread_pct=6.744
+RESULT,variant=gridspec,shape=down,N=5909,M=5120,K=17408,add=1,median_us=8708.691,tops=120.951,spread_pct=5.935
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=gridspec,shape=down,N=5909,M=5120,K=17408,add=1,median_us=9370.205,tops=112.412,spread_pct=6.445
+RESULT,variant=shipped,shape=down,N=5909,M=5120,K=17408,add=1,median_us=9932.249,tops=106.051,spread_pct=4.891
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=gridspec,shape=down,N=5909,M=5120,K=17408,add=1,median_us=9597.646,tops=109.748,spread_pct=5.488
+RESULT,variant=shipped,shape=down,N=5909,M=5120,K=17408,add=1,median_us=10466.849,tops=100.634,spread_pct=4.881
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=shipped,shape=down,N=5909,M=5120,K=17408,add=1,median_us=10676.351,tops=98.660,spread_pct=5.542
+RESULT,variant=gridspec,shape=down,N=5909,M=5120,K=17408,add=1,median_us=8691.094,tops=121.196,spread_pct=4.455
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward
+PARITY,shape=down,N=8192,mismatches=0,total=41943040
+RESULT,variant=shipped,shape=down,N=8192,M=5120,K=17408,add=1,median_us=12398.424,tops=117.780,spread_pct=5.280
+RESULT,variant=gridspec,shape=down,N=8192,M=5120,K=17408,add=1,median_us=11486.600,tops=127.130,spread_pct=4.569
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse
+PARITY,shape=down,N=8192,mismatches=0,total=41943040
+RESULT,variant=gridspec,shape=down,N=8192,M=5120,K=17408,add=1,median_us=12460.983,tops=117.189,spread_pct=5.599
+RESULT,variant=shipped,shape=down,N=8192,M=5120,K=17408,add=1,median_us=11461.883,tops=127.404,spread_pct=4.807
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse
+PARITY,shape=down,N=8192,mismatches=0,total=41943040
+RESULT,variant=gridspec,shape=down,N=8192,M=5120,K=17408,add=1,median_us=12453.704,tops=117.257,spread_pct=5.457
+RESULT,variant=shipped,shape=down,N=8192,M=5120,K=17408,add=1,median_us=11527.755,tops=126.676,spread_pct=5.485
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward
+PARITY,shape=down,N=8192,mismatches=0,total=41943040
+RESULT,variant=shipped,shape=down,N=8192,M=5120,K=17408,add=1,median_us=12403.852,tops=117.729,spread_pct=5.845
+RESULT,variant=gridspec,shape=down,N=8192,M=5120,K=17408,add=1,median_us=11482.662,tops=127.173,spread_pct=4.730
