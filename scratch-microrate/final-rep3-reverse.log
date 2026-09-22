@@ -1,0 +1,13 @@
+DEVICE,name=AMD Radeon AI PRO R9700,arch=gfx1201,cu=32,order=reverse
+RESULT,dtype=iu4,blocks_per_cu=1,lds=65536,median_ms=0.480404,rate=698.462809,launch_spread_pct=0.6828,samples=7
+RESULT,dtype=fp8,blocks_per_cu=1,lds=65536,median_ms=0.503524,rate=333.195951,launch_spread_pct=2.4468,samples=7
+RESULT,dtype=iu8,blocks_per_cu=1,lds=65536,median_ms=0.507684,rate=330.465728,launch_spread_pct=2.1194,samples=7
+RESULT,dtype=f16,blocks_per_cu=1,lds=65536,median_ms=0.985447,rate=170.249807,launch_spread_pct=3.3487,samples=7
+RESULT,dtype=iu4,blocks_per_cu=3,lds=21845,median_ms=1.444410,rate=696.916376,launch_spread_pct=3.0130,samples=7
+RESULT,dtype=fp8,blocks_per_cu=3,lds=21845,median_ms=1.475571,rate=341.099458,launch_spread_pct=1.9138,samples=7
+RESULT,dtype=iu8,blocks_per_cu=3,lds=21845,median_ms=1.468292,rate=342.790454,launch_spread_pct=3.0946,samples=7
+RESULT,dtype=f16,blocks_per_cu=3,lds=21845,median_ms=2.756944,rate=182.563190,launch_spread_pct=7.5172,samples=7
+RESULT,dtype=iu4,blocks_per_cu=8,lds=0,median_ms=3.731948,rate=719.290470,launch_spread_pct=2.9829,samples=7
+RESULT,dtype=fp8,blocks_per_cu=8,lds=0,median_ms=3.749029,rate=358.006649,launch_spread_pct=2.4038,samples=7
+RESULT,dtype=iu8,blocks_per_cu=8,lds=0,median_ms=3.694668,rate=363.274118,launch_spread_pct=1.5190,samples=7
+RESULT,dtype=f16,blocks_per_cu=8,lds=0,median_ms=6.823572,rate=196.697162,launch_spread_pct=3.4369,samples=7
