@@ -1146,7 +1146,12 @@ mod tests {
                     data: vec![0u8; 32],
                 });
             }
-            write_hfqm_package_mem(&path, arch_id, "{}", &tensors).unwrap();
+            let metadata = if arch_id == 5 {
+                r#"{"config":{"text_config":{"hidden_size":2048,"num_hidden_layers":4,"num_attention_heads":16,"num_key_value_heads":4,"vocab_size":1000,"max_position_embeddings":131072}}}"#
+            } else {
+                "{}"
+            };
+            write_hfqm_package_mem(&path, arch_id, metadata, &tensors).unwrap();
             path
         }
 
