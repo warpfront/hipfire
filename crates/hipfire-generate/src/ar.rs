@@ -3818,7 +3818,7 @@ pub fn generate(
             let chunk_max = if m.kv_adaptive.is_some() {
                 qwen35::PREFILL_MAX_BATCH
             } else {
-                match qwen35::ordinary_prefill_chunk_limit(gpu, weights, config, dn, None) {
+                match qwen35::ordinary_prefill_chunk_limit(gpu, weights, config, dn, kv, None) {
                     Ok(limit) => limit,
                     Err(e) => {
                         eprintln!(

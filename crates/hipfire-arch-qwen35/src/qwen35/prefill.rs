@@ -1495,6 +1495,7 @@ pub fn ordinary_prefill_chunk_limit(
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     dn_state: &DeltaNetState,
+    kv_cache: &llama::KvCache,
     pbs: Option<&PrefillBatchScratch>,
 ) -> HipResult<usize> {
     let legacy = prefill_max_batch_for_model(gpu, weights);
@@ -2346,7 +2347,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         && !gpu.graphs.capture_mode
         && !gpu.replay.is_recording();
     let limit = if wide_candidate {
-        ordinary_prefill_chunk_limit(gpu, weights, config, dn_state, None)?
+        ordinary_prefill_chunk_limit(gpu, weights, config, dn_state, kv_cache, None)?
     } else {
         max_batch
     };
