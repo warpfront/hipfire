@@ -1,0 +1,1 @@
+de8ee8256033c3690b0f1a2aff14e77cc88fff490e118648b04a833a3f2969b5  /home/kaden/.hipfire/models/qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq

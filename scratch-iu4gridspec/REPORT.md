@@ -7,12 +7,14 @@ The default-off `kernel.gfx11_iu4_gridspec` experiment splits a partial-N grid i
 1. complete 128-column tiles using the existing `FULL=true` production entry, and
 2. one guarded tail-column launch using the existing `FULL=false` body through a tiny wrapper that preserves the original N stride.
 
-The split is bit-identical to the shipped route in every tested process. It materially improves N=5909, especially on gfx1151, and leaves exact N=8192 on the source-identical shipped route. It does **not** pass the advancement bar because gfx1100 gate/up improves only **1.0803x**, below the required 1.15x. gfx1151 gate/up improves **1.4672x**. Therefore daemon matrix, TTFT, c24, and serve-battery gates were not run.
+This is a bit-exact win. At the exact 5,909-token production prompt shape, graph-on daemon TTFT prefill improves **1,616.6 -> 1,651.4 tok/s (+2.2%) on gfx1100** and **519.8 -> 651.1 tok/s (+25.2%) on gfx1151** in fresh-process ABBA runs. The split is bit-identical to the shipped route in every tested comparison. The knob remains default-off; integration recommendation is left to Main.
 
-Chosen split-launch gate/up headline:
+N=8192 is an exact multiple of 128, so it already takes the unchecked route and cannot gain. The lever's entire value is at partial N, which is every real prompt. Consequently pp8192 is the wrong headline for this lever: it measures the one route production prompts do not take. TTFT-5909 is the honest end-to-end measure. On gfx1151 the shipped TTFT prefill is only 520 tok/s while the synthetic exact-N pp8192 result is 645-678 tok/s, so the tracked exact-N benchmark had hidden a roughly 25% real-prompt penalty.
 
-- gfx1100: **103.400 -> 111.699 TOPS, 1.0803x, 40.82% -> 44.10% of 253.296 TOPS**. This remains 50.281 TOPS below the 161.98-TOPS target.
-- gfx1151: **32.690 -> 47.963 TOPS, 1.4672x, 29.80% -> 43.73% of 109.690 TOPS**. This remains 4.217 TOPS below the 52.18-TOPS target.
+Microbenchmark headline, with `down` beside gate/up:
+
+- gfx1100 gate/up: **103.400 -> 111.699 TOPS, 1.0803x**; down: **101.032 -> 116.077 TOPS, 1.1489x**.
+- gfx1151 gate/up: **32.690 -> 47.963 TOPS, 1.4672x**; down: **32.772 -> 46.865 TOPS, 1.4301x**.
 
 ## Source mechanism
 
@@ -67,11 +69,12 @@ The alternative single-launch entry uses a uniform workgroup branch on `col_tile
 
 Each cell used four fresh processes in forward/reverse/reverse/forward order. Each arm used two warmups and nine event-timed samples; the process median is reported and the table value is the arithmetic mean of four process medians. Every process asserted `gfx1100` or `gfx1151` from `gcnArchName` rather than trusting the device index.
 
-The artifact hash was checked before each measurement window:
+The pinned artifact was identified by full SHA-256 once for the final session and by unchanged `stat` identity thereafter:
 
-`de8ee8256033c3690b0f1a2aff14e77cc88fff490e118648b04a833a3f2969b5`
+- SHA-256: `de8ee8256033c3690b0f1a2aff14e77cc88fff490e118648b04a833a3f2969b5`
+- `stat -c '%s %Y %i'`: `14987185152 1789995527 5398606`
 
-Every pre/post `rocm-smi --showpids` check was empty except the persistent zero-VRAM `gpusentry`. One 5.68-second sibling hipcc compile started immediately after the gfx1100 branch-window announce. The intervening precheck/hash took 29.24 seconds, so the compile ended more than 23 seconds before the 7.23-second GPU runner began; no sample overlapped it.
+Earlier microbenchmark windows also rehashed the artifact; the later stat-only protocol avoids evicting 15 GB of page cache and prevents shared-memory contention on gfx1151. Every pre/post `rocm-smi --showpids` check was empty except the persistent zero-VRAM `gpusentry`. One 5.68-second sibling hipcc compile started immediately after the gfx1100 branch-window announce. The intervening precheck/hash took 29.24 seconds, so the compile ended more than 23 seconds before the 7.23-second GPU runner began; no sample overlapped it.
 
 Across the split and branch windows there were 64 fresh-process bitwise comparisons. Every comparison reported zero mismatches. The additional gfx1151 ordinary-split route-control window also reported zero mismatches in all 16 processes.
 
@@ -93,6 +96,83 @@ TOPS values are four-process means. Percent is relative to the architecture's me
 | gfx1151 | down | 8192 | 47.840 | 47.696 | 0.9970x | 43.61% | 43.48% |
 
 N=8192 is a source-identical control: both arms launch the same symbol through the same host path. Its 0.9970x..1.0015x range is the observed repeatability band, not a candidate-path regression.
+
+## Graph-on daemon gates
+
+The daemon gates used typed `experimental.graph.forward=true` and `experimental.graph.ar=true`. Timing used fresh-process ABBA order `A1=off, B1=on, B2=on, A2=off`; every JSON result asserted the reported architecture. `--spec off` disabled MTP so the missing MTP head could not pollute admission or timing.
+
+### Exact 5,909-token TTFT
+
+Command:
+
+`hipfire bench <model> --ttft --prompt-file benchmarks/prompts/ttft_5900.txt --runs 8 --warmups 2 --spec off --json`
+
+Every arm asserted 5,909 prompt tokens and prompt MD5 `ed720348b81a19fab64d4783c75c1ae3`. Values below are each fresh process's eight-sample median.
+
+| Arch | A1 off ms / tok/s | B1 on ms / tok/s | B2 on ms / tok/s | A2 off ms / tok/s | ABBA off -> on | gain |
+|---|---:|---:|---:|---:|---:|---:|
+| gfx1100 | 3,638.8 / 1,623.9 | 3,577.9 / 1,651.5 | 3,578.3 / 1,651.3 | 3,671.7 / 1,609.3 | 1,616.6 -> **1,651.4 tok/s** | **+2.2%** |
+| gfx1151 | 11,358.8 / 520.2 | 9,070.3 / 651.5 | 9,081.7 / 650.7 | 11,377.1 / 519.4 | 519.8 -> **651.1 tok/s** | **+25.2%** |
+
+The gfx1151 mean TTFT falls from 11,368.0 ms to 9,076.0 ms, a 20.2% time reduction and 25.2% throughput gain. The corresponding gfx1100 time reduction is 2.1%.
+
+### Exact-N matrix controls
+
+Command:
+
+`hipfire bench <model> --matrix --pp 512,8192 --ctx 128 --tg 128 --spec off --runs 3 --warmups 1 --json`
+
+Both prefill lengths are multiples of 128 and therefore source-identical controls. Values are each process's three-sample median in tok/s.
+
+| Arch | arm | pp512 | pp8192 | decode ctx128/tg128 |
+|---|---|---:|---:|---:|
+| gfx1100 | A1 off | 1,640.6 | 1,652.2 | 49.110 |
+| gfx1100 | B1 on | 1,621.7 | 1,638.3 | 49.040 |
+| gfx1100 | B2 on | 1,613.5 | 1,631.8 | 49.119 |
+| gfx1100 | A2 off | 1,609.8 | 1,629.6 | 48.964 |
+| gfx1151 | A1 off | 721.5 | 677.5 | 14.902 |
+| gfx1151 | B1 on | 701.3 | 650.4 | 14.904 |
+| gfx1151 | B2 on | 692.3 | 646.2 | 14.900 |
+| gfx1151 | A2 off | 687.6 | 645.4 | 14.899 |
+
+ABBA on/off ratios are 0.9953/0.9964/1.0009 on gfx1100 and 0.9890/0.9801/1.0001 on gfx1151 for pp512/pp8192/decode respectively. The monotone prefill drift is bracketed by ABBA; there is no exact-N or decode gain, as required by the source-identical route.
+
+## Deterministic quality and graph-capture correctness
+
+The gfx1100 c24 evaluator scored 24 chunks / 24,552 tokens for both references with graph forced off by `eval_hipfire`, as designed. Although an OFF/ON pair was run before the deterministic-gate protocol was narrowed, each pair is byte-identical:
+
+| reference | slice-mean KLD | mean NLL | PPL | OFF/ON `kldseq` SHA-256 |
+|---|---:|---:|---:|---|
+| WT2 | 0.088665 | 1.904655 | 6.7171 | `922975d2499ed84f93870b37878c9af5b74cbea2f6415046cd8337cc8ec1c033` |
+| agentic | 0.256882 | 2.041904 | 7.7053 | `ed80e3b804db94d488c4ef47a8a772a1f8057f42ad652551e3a4018f9cf285db` |
+
+`cmp` succeeded for each OFF/ON pair. The gfx1151 c24 repeat was deliberately omitted: the standalone kernel was already bit-exact on that card, making logits and deterministic KLD arch-independent.
+
+The graph-on gfx1100 campaign command was exactly:
+
+`python3 scripts/serve_harness.py --mode battery --model <model> --thinking off`
+
+There was no `--max-tokens` override. It completed 5/5 turns with `runaway=0`, `empty=0`, `attractor=0`, and `retrieval_miss=0`. The decoded text printed by the harness is reproduced verbatim below; the harness intentionally prints a 96-character `repr` preview:
+
+```text
+[code] '```python\ndef merge_sorted(a, b):\n    """Merge two already-sorted lists into one sorted li'
+[reason] 'Step 1: Distance for the first part  \n\\(60 \\text{ mph} \\times 2.5 \\text{ hours} = 150 \\tex'
+[factual] "The seasons on Earth are caused by the tilt of Earth's axis relative to its orbital plane "
+[prose] 'Elias climbed the gale-battered rocks at dawn, expecting only kelp and broken shells.  \nIn'
+[instruct] '1. Use clear, descriptive names for variables, functions, and modules.\n2. Keep functions s'
+```
+
+The five responses finished normally (`finish=stop`) with 227, 171, 213, 298, and 195 generated tokens. This one battery is the capture-sensitive check that deterministic standalone parity cannot replace. A second gfx1151 battery was deliberately omitted because graph-capture semantics and the split's disjoint-buffer ordering are arch-independent, while the card-specific performance path was covered by TTFT ABBA.
+
+## Production-route profiler proof
+
+A manual `hipfire serve` under rocprofiler, with graceful daemon shutdown so the CSV flushed, traced one exact 5,909-token gfx1151 request. The trace maps `Agent 2` to `gfx1151` and records:
+
+- 272 `gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151` interior dispatches;
+- 128 `gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151` interior dispatches;
+- exactly 400 `gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec` tail dispatches.
+
+Thus every one of the 400 eligible interior launches is paired with exactly one tail launch. Sample adjacent trace rows show a full interior dispatch immediately followed by `tail_gridspec`; the tail resource census is 200 VGPR, 0 scratch, 32x8 workgroup. This proves that the typed knob reaches the intended production split under graph-on serving rather than merely selecting it in the standalone harness.
 
 ## Single-launch per-workgroup branch results
 
@@ -126,15 +206,18 @@ A third control used the same two-launch split but forced the ordinary 8-wave fu
 
 Thus the LF16 route change is separable and contributes no measured gain here: ordinary split is 1.0041x LF16 split, inside the sub-percent control band. The large gfx1151 recovery comes from limiting the generic body to the tail, not from switching the interior to LF16. The selected implementation nevertheless preserves the existing production full-tile routing rule; the two full entries are statistically tied in this partial-N experiment, and preserving the incumbent symbol is the cleaner cutover.
 
-## Gate decision
+## Verdict and gate scoping
 
-The advancement condition was >=1.15x on gate/up N=5909 on both cards with no exact-N route regression.
+The original microbenchmark advancement condition was at least 1.15x on gate/up N=5909 on both cards. The chosen split measured 1.0803x on gfx1100 and 1.4672x on gfx1151, so it did not satisfy that initial two-card threshold. Main explicitly overrode the stop condition to obtain the production evidence above.
 
-- gfx1100 split: **1.0803x — fail**.
-- gfx1151 split: **1.4672x — pass**.
-- exact N=8192 remains source-identical and measures within the 0.3% control band.
+The resulting verdict is: **bit-exact win, default-off, worth +25.2% exact-5909 TTFT throughput on gfx1151 and +2.2% on gfx1100**. Exact N=8192 remains source-identical and within the control/noise band. The strongest standalone effects are gate/up 1.4672x and down 1.4301x on gfx1151; both major matmul directions benefit rather than merely gate/up.
 
-Because the gfx1100 gate failed, no end-to-end daemon matrix, exact-5909 TTFT, c24 WT2/agentic, or campaign serve battery was run. There is therefore no decoded campaign text to report.
+Gate scoping was deliberate:
+
+- timing claims use fresh-process ABBA; deterministic checks do not need thermal pairing;
+- c24 was run on gfx1100 for WT2 and agentic, with byte-identical OFF/ON outputs; gfx1151 c24 was omitted because bit-exact output makes deterministic KLD arch-independent;
+- one graph-on five-turn campaign battery checked readable capture output; gfx1151 battery was omitted because graph ordering correctness is arch-independent;
+- both cards still received graph-on matrix and exact-5909 TTFT ABBA, and both standalone gate/up and down N=5909 ratios are reported.
 
 ## Build and artifacts
 
@@ -147,3 +230,9 @@ Because the gfx1100 gate failed, no end-to-end daemon matrix, exact-5909 TTFT, c
 - `exact-branch-gfx1100.log`, `exact-branch-gfx1151.log`: single-launch branch windows.
 - `exact-ordinary-gfx1151.log`: ordinary-entry split route-control window.
 - `residual-smoke-gfx1100.log`, `residual-smoke-gfx1151.log`: corrected nonzero-residual ADD parity smokes.
+- `e2e-gfx{1100,1151}-matrix-{A1,B1,B2,A2}.json`: graph-on exact-N matrix ABBA.
+- `e2e-gfx{1100,1151}-ttft-{A1,B1,B2,A2}.json`: graph-on exact-5909 TTFT ABBA.
+- `quality-gfx1100-{wt2,ag}-{off,on}.stderr` and `.kldseq`: c24 metrics and byte-parity outputs.
+- `battery-gfx1100.console`: exact-command graph-on five-turn decoded campaign evidence.
+- `rocprof-grid-gfx1151/daemon_{agent_info,kernel_stats,kernel_trace}.csv`: manual-serve production split proof.
+- `model-sha-quality-gfx1100.txt` and `model-stat-session.txt`: artifact identity evidence.
