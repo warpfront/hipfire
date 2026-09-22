@@ -1977,7 +1977,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Integer { min: 2, max: 1048576 },
         false,
         "HIPFIRE_PREFILL_CHUNK_ROWS",
-        "Widened ordinary-prefill chunk ceiling in rows (default 4096 on exact gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH stays the explicit override; per-device VRAM admission may still select a smaller rung)."
+        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung)."
     ),
     process_bool_field!(
         "speculation.draft_f16",
@@ -2244,6 +2244,25 @@ pub static FIELDS: &[ConfigField] = &[
         "Fuse the int4 activation quantiser into the gfx11 sigmoid/gated-norm producers (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx11 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
     ),
     process_bool_field!(
+        "kernel.gfx11_lean_pbs",
+        "gfx11_lean_pbs",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_GFX11_LEAN_PBS",
+        "Size fallback-only ordinary gfx11 MQ4V2 prefill scratch for at most 64 rows (default on for the admitted fused gfx1100/gfx1151 route); verify, non-fused, and other architectures retain full scratch. Set false or HIPFIRE_GFX11_LEAN_PBS=0 to opt out."
+    ),
+    process_field!(
+        "kernel.gfx11_a4_candidates",
+        "gfx11_a4_candidates",
+        Kernel,
+        DefaultValue::String("2"),
+        ValueRule::Enum(&["1", "2", "4", "8"]),
+        true,
+        "HIPFIRE_GFX11_A4_CANDIDATES",
+        "Number of activation-quantization candidates searched inside fused gfx1100/gfx1151 IU4 producers (default 2, selecting {5,7}); 8 restores the full-grid search. Other architectures and the standalone quantizer are unchanged."
+    ),
+    process_bool_field!(
         "kernel.gfx12_fp8_stream",
         "gfx12_fp8_stream",
         Kernel,
@@ -2279,6 +2298,14 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_ATTN_QRESIDENT",
         "Enable the gfx1201 register-resident-Q wide-workgroup FA2 prefill route (default on exact gfx1201; set to false or HIPFIRE_ATTN_QRESIDENT=0 to opt out; exact H24/KV4/D256 native-fp8-KV shapes only)."
     ),
+    process_auto_bool_field!(
+        "kernel.gfx11_q8_fa2_wide",
+        "gfx11_q8_fa2_wide",
+        Kernel,
+        true,
+        "HIPFIRE_GFX11_Q8_FA2_WIDE",
+        "Whole-chunk Q8/Q8 FA2 prefill: auto enables on exact gfx1100 only; gfx1151 and other arches default off. Explicit false opts out; explicit true can opt gfx1151 in. Requires kernel.gfx11_fa2_prefill, H24/KV4/D256, 64..8192 rows (above 512 aligned to 512), context 64..32768; explicit flash-off, CK and alternate variants retain precedence."
+    ),
     process_bool_field!(
         "kernel.gfx11_fa2_prefill",
         "gfx11_fa2_prefill",
@@ -2296,6 +2323,33 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_IU4_PREFILL",
         "Enable the W4A4 iu4-direct MMQ prefill route (default on exact gfx1100/gfx1151/gfx1201, other arches keep their incumbent route; set to false or HIPFIRE_IU4_PREFILL=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_iu4_gridspec",
+        "gfx11_iu4_gridspec",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX11_IU4_GRIDSPEC",
+        "Split partial-N gfx11 IU4 GEMMs so full interior tiles use the unchecked specialization and only the final tile uses guarded loads/stores (default on; set to false or HIPFIRE_GFX11_IU4_GRIDSPEC=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_iu4_shape",
+        "gfx11_iu4_shape",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_GFX11_IU4_SHAPE",
+        "Use the 16-wave low-footprint IU4 full-tile entry on gfx1100 (default on); ignored on other architectures. Set false or HIPFIRE_GFX11_IU4_SHAPE=0 to restore the prior gfx1100 shape."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_iu4_symfold",
+        "gfx11_iu4_symfold",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_IU4_SYMFOLD",
+        "Exploit symmetric MQ4V2 weights on exact gfx1100/gfx1151 by rebiasing q to q-8 and using signed-weight IU4 WMMA (default on for symmetric artifacts only); set false or HIPFIRE_IU4_SYMFOLD=0 to opt out. Asymmetric artifacts and other architectures are unchanged."
     ),
     process_bool_field!(
         "kernel.npu_spillover",

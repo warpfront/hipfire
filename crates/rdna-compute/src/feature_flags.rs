@@ -47,6 +47,17 @@ pub struct FeatureFlags {
     /// Quality cost ~+0.016 WT2-24 KLD on the MQ4-XT speed rung
     /// (gfx1201: 0.048028 -> 0.063890).
     pub iu4_prefill: Option<bool>,
+    /// Split partial-N gfx11 IU4 grids into unchecked full-tile interior and
+    /// one guarded tail launch (`kernel.gfx11_iu4_gridspec`, default on).
+    pub gfx11_iu4_gridspec: bool,
+    /// Use the 16-wave low-footprint IU4 full-tile entry on gfx1100
+    /// (`kernel.gfx11_iu4_shape`, default on). gfx1151 keeps its shipped
+    /// SET-only selection regardless of this setting.
+    pub gfx11_iu4_shape: bool,
+    /// Exploit MQ4V2's symmetric `zp = -8 * scale` contract by rebiasing
+    /// packed weight codes once and using signed-weight IU4 WMMA
+    /// (`kernel.gfx11_iu4_symfold`). Default on for symmetric gfx1100/gfx1151 only.
+    pub gfx11_iu4_symfold: bool,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -281,6 +292,12 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_ATTN_QRESIDENT`, `kernel.attn_qresident`). Default ON on
     /// exact gfx1201; `=0` opts out. Exact H24/KV4/D256 native-fp8-KV shapes only.
     pub attn_qresident: bool,
+    /// Experimental whole-chunk Q8/Q8 FA2 on exact gfx1100/gfx1151
+    /// (`HIPFIRE_GFX11_Q8_FA2_WIDE`, `kernel.gfx11_q8_fa2_wide`).
+    /// Default ON only on exact gfx1100; gfx1151 defaults OFF but an
+    /// explicit true still opts it in. Requires the master gfx11 FA2 flag.
+    /// B64..8192, above-512 batches aligned to 512, ctx64..32768.
+    pub gfx11_q8_fa2_wide: bool,
     /// `HIPFIRE_GFX11_FA2_PREFILL=0` opts out of the gfx11 GQA-fused FA2
     /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
     /// Default ON on gfx1100/gfx1151; `=1` forces it on other arches
@@ -487,6 +504,19 @@ impl FeatureFlags {
                 }
             }
         }
+        if matches!(arch, "gfx1100" | "gfx1151") {
+            let candidates = match value("HIPFIRE_GFX11_A4_CANDIDATES").ok().as_deref() {
+                Some(candidate @ ("1" | "2" | "4" | "8")) => candidate.to_string(),
+                None | Some("") => "2".to_string(),
+                Some(other) => {
+                    eprintln!(
+                        "unknown HIPFIRE_GFX11_A4_CANDIDATES={other:?}; using default value 2"
+                    );
+                    "2".to_string()
+                }
+            };
+            append_hipcc_flag(&format!("-DIU4_A4_CANDIDATES={candidates}"));
+        }
         if arch == "gfx1201" {
             let policy_flag = match value("HIPFIRE_GFX12_WEIGHT_LOAD_POLICY").ok().as_deref() {
                 None | Some("") | Some("rt") => None,
@@ -520,6 +550,9 @@ impl FeatureFlags {
             gfx1151_e8_buffer: parse_bool("HIPFIRE_GFX1151_E8_BUFFER"),
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
+            gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
+            gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(true),
+            gfx11_iu4_symfold: parse_bool("HIPFIRE_IU4_SYMFOLD").unwrap_or(true),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -667,6 +700,8 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT")
                 .unwrap_or(arch == "gfx1201"),
+            gfx11_q8_fa2_wide: parse_bool("HIPFIRE_GFX11_Q8_FA2_WIDE")
+                .unwrap_or(arch == "gfx1100"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
@@ -909,6 +944,9 @@ impl FeatureFlags {
             // Deterministic unit-test baseline: the iu4 route stays off here
             // even though the process default is on.
             iu4_prefill: Some(false),
+            gfx11_iu4_gridspec: false,
+            gfx11_iu4_shape: false,
+            gfx11_iu4_symfold: false,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,
@@ -999,6 +1037,7 @@ impl FeatureFlags {
             gfx12_fa2_prefill: false,
             gfx12_fa_packet: false,
             attn_qresident: false,
+            gfx11_q8_fa2_wide: false,
             gfx11_fa2_prefill: false,
             gemm_dump: false,
             deterministic: false,
@@ -1493,5 +1532,31 @@ mod tests {
         assert_eq!(flags.gemv_rows, Some(4));
         assert!(flags.rdna3_hfq4_qkvza_k2048);
         assert!(flags.rdna3_hfq4_residual_stage_x32);
+    }
+
+    #[test]
+    fn gfx11_q8_fa2_wide_auto_is_exact_gfx1100_with_explicit_overrides() {
+        let process = ProcessConfig::from_resolved(&resolve([]).unwrap()).unwrap();
+        assert!(process.legacy_value("HIPFIRE_GFX11_Q8_FA2_WIDE").is_none());
+        for (arch, expected) in [
+            ("gfx1100", true),
+            ("gfx1101", false),
+            ("gfx1151", false),
+            ("gfx1201", false),
+        ] {
+            assert_eq!(FeatureFlags::from_process_config(arch, &process).gfx11_q8_fa2_wide, expected, "arch={arch}");
+        }
+        for (value, expected) in [("false", false), ("true", true)] {
+            let mut layer = ConfigLayer::default();
+            layer.set_cli("kernel.gfx11_q8_fa2_wide", value).unwrap();
+            let resolved = resolve([NamedLayer {
+                source: ConfigSource::GlobalUser { path: "config.toml".into() },
+                layer,
+            }]).unwrap();
+            let process = ProcessConfig::from_resolved(&resolved).unwrap();
+            for arch in ["gfx1100", "gfx1151"] {
+                assert_eq!(FeatureFlags::from_process_config(arch, &process).gfx11_q8_fa2_wide, expected, "arch={arch} value={value}");
+            }
+        }
     }
 }

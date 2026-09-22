@@ -2077,6 +2077,54 @@ fn dispatch_attend(
                         return Ok(());
                     }
                 }
+                // Wide Q8/Q8 FA2 is independent of the default flash envelope,
+                // but cannot override explicit flash-off, CK, scalar/batched,
+                // tree/window, or speculative verify. The lower ingress
+                // rechecks exact arch, shape and batch before direct launch.
+                if gpu.flags.gfx11_q8_fa2_wide
+                    && gpu.flags.gfx11_fa2_prefill
+                    && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
+                    && flash_optin
+                    && !gpu.flash_attn_ck_loaded()
+                    && !matches!(
+                        hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
+                            .ok().as_deref(),
+                        Some("scalar") | Some("batched")
+                    )
+                    && ctx.workload == crate::context::DispatchWorkload::Standard
+                    && io.tree_bias.is_none()
+                    && plan.window <= 0
+                    && plan.v_mode_bits == 8
+                    && io.block_cols == 0
+                    && io.k_cache.buf.is_vmm_owner()
+                    && io.v_cache.buf.is_vmm_owner()
+                    && io.n_heads == 24
+                    && io.n_kv_heads == 4
+                    && io.head_dim == 256
+                    && (64..=8192).contains(&io.batch_size)
+                    && (io.batch_size <= 512 || io.batch_size % 512 == 0)
+                    && (64..=32768).contains(&io.max_ctx_len)
+                    && io.max_ctx_len
+                        .checked_mul(4 * (256 / 32) * 34)
+                        .is_some_and(|bytes| {
+                            io.k_cache.buf.size() >= bytes && io.v_cache.buf.size() >= bytes
+                        })
+                    && io.pos.checked_add(io.batch_size) == Some(io.max_ctx_len)
+                    && io.max_ctx_len <= io.physical_cap
+                {
+                    return hip!(gpu.attention_q8_0_flash_prefill_wmma(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ));
+                }
                 // Query-tiled flash prefill. Its LDS depends only on BR/BC and
                 // never on context, so it has no capacity ceiling and no
                 // occupancy decay. Measured on gfx1151 (nh=8 nkv=2 hd=256,

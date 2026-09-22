@@ -3625,6 +3625,26 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // Opt-in wide Q8/Q8 ingress. Dispatch has already resolved flash-off,
+        // loaded CK, explicit alternate variants, window/tree, and workload;
+        // the single-slot launcher independently checks its arch/shape/size.
+        // Q16 scratch growth invalidates retained graphs before allocation;
+        // the same-stream preconvert and body both use owned kernarg blobs.
+        if self.flags.gfx11_q8_fa2_wide
+            && self.flags.gfx11_fa2_prefill
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && n_heads == 24
+            && n_kv_heads == 4
+            && head_dim == 256
+            && (64..=8192).contains(&batch_size)
+            && (batch_size <= 512 || batch_size % 512 == 0)
+            && (64..=32768).contains(&max_ctx_len)
+        {
+            return self.attention_q8_0_fa2_gqa_gfx11(
+                q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
+                max_ctx_len, batch_size,
+            );
+        }
         // Default-on: gfx1201 GQA-fused FA2 prefill. Exact arch/shape/
         // eager gates; everything else falls through to the byte-identical
         // incumbent path below. Never inside `_wmma_slots` (its all-or-none
@@ -5529,7 +5549,11 @@ impl Gpu {
         // launcher (F1-oracle-proven bit-exact vs two N512 halves); the F2
         // pair path launches the merged 1024-row FA2 through production
         // ingress, which admits exactly-1024 on gfx1151 only.
-        let max_fa2_batch: usize = if self.arch.as_str() == "gfx1151" {
+        let max_fa2_batch: usize = if self.flags.gfx11_q8_fa2_wide
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+        {
+            8192
+        } else if self.arch.as_str() == "gfx1151" {
             1024
         } else {
             512
@@ -5550,7 +5574,15 @@ impl Gpu {
                 ),
             ));
         }
-        let need_qo = batch_size * n_heads * head_dim;
+        let Some(need_qo) = batch_size
+            .checked_mul(n_heads)
+            .and_then(|v| v.checked_mul(head_dim))
+        else {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_fa2_gqa_gfx11 query size overflow",
+            ));
+        };
         if q.numel() < need_qo || out.numel() < need_qo || positions.numel() < batch_size {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -5561,6 +5593,25 @@ impl Gpu {
                     out.numel(),
                     positions.numel()
                 ),
+            ));
+        }
+        // Q8_0 has 34 bytes per 32 dimensions per KV head. Tensor lengths
+        // bound the reserved prefix; VMM mapping for this step is grown by
+        // the KV owner before writing, without reading positions on the host.
+        let need_kv = max_ctx_len
+            .checked_mul(n_kv_heads)
+            .and_then(|v| v.checked_mul(head_dim / 32))
+            .and_then(|v| v.checked_mul(34))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "attention_q8_0_fa2_gqa_gfx11 KV size overflow")
+            })?;
+        if self.flags.gfx11_q8_fa2_wide
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && (k_cache.buf.size() < need_kv || v_cache.buf.size() < need_kv)
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "attention_q8_0_fa2_gqa_gfx11 KV prefix exceeds cache capacity",
             ));
         }
         let module = "attention_q8_0_fa2_gqa_gfx11";
@@ -5581,7 +5632,23 @@ impl Gpu {
         }
         // F4b scratch: [batch, 24, 256] f16 (n_heads/head_dim validated
         // H24/D256 above), Gpu-owned, grows-never-shrinks.
-        let need_q16_bytes = batch_size * n_heads * head_dim * 2;
+        let need_q16_bytes = need_qo.checked_mul(2).ok_or_else(|| {
+            hip_bridge::HipError::new(0, "attention_q8_0_fa2_gqa_gfx11 Q16 size overflow")
+        })?;
+        if self.flags.gfx11_q8_fa2_wide
+            && matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && (self.graphs.capture_mode || self.replay.is_recording())
+            && crate::scratch::scratch_will_grow(
+                self.scratch.fa2_q16_scratch_bytes,
+                self.scratch.fa2_q16_scratch.is_some(),
+                need_q16_bytes,
+            )
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "wide gfx11 FA2 Q16 scratch must be grown before graph capture/recording",
+            ));
+        }
         // Same pre-growth invalidation contract as above.
         if crate::scratch::scratch_will_grow(
             self.scratch.fa2_q16_scratch_bytes,
