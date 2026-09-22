@@ -2189,10 +2189,10 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.gfx11_lean_pbs",
         "gfx11_lean_pbs",
         Kernel,
-        false,
+        true,
         true,
         "HIPFIRE_GFX11_LEAN_PBS",
-        "Size fallback-only ordinary gfx11 MQ4V2 prefill scratch for at most 64 rows; other routes retain full scratch."
+        "Size fallback-only ordinary gfx11 MQ4V2 prefill scratch for at most 64 rows (default on for the admitted fused gfx1100/gfx1151 route); verify, non-fused, and other architectures retain full scratch. Set false or HIPFIRE_GFX11_LEAN_PBS=0 to opt out."
     ),
     process_field!(
         "kernel.gfx11_a4_candidates",
