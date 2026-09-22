@@ -1,0 +1,10 @@
+[package]
+name = "gfx11-attn-wide-probe"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+
+[dependencies]
+rdna-compute = { path = "../crates/rdna-compute" }
+half = "2.7"

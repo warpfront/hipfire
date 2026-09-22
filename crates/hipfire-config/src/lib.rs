@@ -2231,6 +2231,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx11 GQA-fused FA2 prefill attention route (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_FA2_PREFILL=0 to opt out)."
     ),
     process_bool_field!(
+        "kernel.gfx11_attn_wide",
+        "gfx11_attn_wide",
+        Kernel,
+        false,
+        false,
+        "HIPFIRE_GFX11_ATTN_WIDE",
+        "Enable the experimental gfx11 register-resident-Q wide-workgroup FA2 prefill route (default off; exact H24/KV4/D256 Q8 K/V shapes only)."
+    ),
+    process_bool_field!(
         "kernel.iu4_prefill",
         "iu4_prefill",
         Kernel,

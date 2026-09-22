@@ -290,6 +290,9 @@ pub struct FeatureFlags {
     /// Default ON on gfx1100/gfx1151; `=1` forces it on other arches
     /// (launchers stay on the gfx11 allowlist).
     pub gfx11_fa2_prefill: bool,
+    /// Experimental gfx11 Q-resident wide-row FA2 route
+    /// (`kernel.gfx11_attn_wide`). Default off.
+    pub gfx11_attn_wide: bool,
     pub gemm_dump: bool,
     pub deterministic: bool,
     pub mw16: bool,
@@ -674,6 +677,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
+            gfx11_attn_wide: parse_bool("HIPFIRE_GFX11_ATTN_WIDE").unwrap_or(false),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
             deterministic: value("HIPFIRE_DETERMINISTIC").ok().as_deref() == Some("1"),
             mw16: value("HIPFIRE_MW16").map_or(false, |v| v == "1"),
@@ -1006,6 +1010,7 @@ impl FeatureFlags {
             gfx12_fa_packet: false,
             attn_qresident: false,
             gfx11_fa2_prefill: false,
+            gfx11_attn_wide: false,
             gemm_dump: false,
             deterministic: false,
             mw16: false,

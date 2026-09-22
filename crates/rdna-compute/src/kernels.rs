@@ -6287,6 +6287,12 @@ pub const ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_GFX1201_SRC: &str = concat!(
 pub const ATTENTION_Q8_0_FA2_GQA_GFX11_SRC: &str =
     include_str!("../../../kernels/src/attention_q8_0_fa2_gqa.gfx11.hip");
 
+/// Experimental gfx11 register-resident-Q wide-row FA2 candidate.
+/// Q8_0 K/V codes stay compressed in LDS and become f16 only while fragments
+/// are assembled; all matrix arithmetic remains ordinary f16 WMMA.
+pub const ATTENTION_Q8_0_FA2_GQA_WIDE_GFX11_SRC: &str =
+    include_str!("../../../kernels/src/attention_q8_0_fa2_gqa_wide.gfx11.hip");
+
 /// fwht3-K variant of [`ATTENTION_Q8_0_FA2_GQA_GFX11_SRC`] (`HIPFIRE_FA2_KMODE=3`):
 /// K dequantizes fwht3 records (f32 cnorm + 96 B of 3-bit codes, K stored
 /// FWHT-rotated) into the unchanged K plane. F4b: the Q-side signed-FWHT-256
