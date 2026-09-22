@@ -494,6 +494,19 @@ impl FeatureFlags {
                 }
             }
         }
+        if matches!(arch, "gfx1100" | "gfx1151") {
+            let candidates = match value("HIPFIRE_GFX11_A4_CANDIDATES").ok().as_deref() {
+                Some(candidate @ ("1" | "2" | "4" | "8")) => candidate.to_string(),
+                None | Some("") => "8".to_string(),
+                Some(other) => {
+                    eprintln!(
+                        "unknown HIPFIRE_GFX11_A4_CANDIDATES={other:?}; using shipped value 8"
+                    );
+                    "8".to_string()
+                }
+            };
+            append_hipcc_flag(&format!("-DIU4_A4_CANDIDATES={candidates}"));
+        }
         if arch == "gfx1201" {
             let policy_flag = match value("HIPFIRE_GFX12_WEIGHT_LOAD_POLICY").ok().as_deref() {
                 None | Some("") | Some("rt") => None,

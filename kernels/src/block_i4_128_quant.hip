@@ -17,15 +17,20 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 #include <math.h>
-// Default 1 (RTN, d=amax/7) on gfx1201 (measured 2026-09-21 on the symmetric XT
-// artifact vs N=2: TTFT 1694->1666 ms (3,546 tok/s), pp8192 +1.7%, iu4 c24
-// 0.0787->0.0860 (budget 0.10), fp8v2 route unchanged 0.0495). -DIU4_A4_CANDIDATES=2/4 to revert.
+// gfx11 shipped with the original 8-candidate MSE search. gfx1201 defaults to
+// RTN (d=amax/7), measured 2026-09-21 on the symmetric XT artifact vs N=2:
+// TTFT 1694->1666 ms (3,546 tok/s), pp8192 +1.7%, iu4 c24 0.0787->0.0860
+// (budget 0.10), fp8v2 route unchanged 0.0495.
 #ifndef IU4_A4_CANDIDATES
+#if defined(__gfx1100__) || defined(__gfx1151__)
+#define IU4_A4_CANDIDATES 8
+#else
 #define IU4_A4_CANDIDATES 1
 #endif
+#endif
 
-#if IU4_A4_CANDIDATES != 1 && IU4_A4_CANDIDATES != 2 && IU4_A4_CANDIDATES != 4
-#error "IU4_A4_CANDIDATES must be 1, 2, or 4"
+#if IU4_A4_CANDIDATES != 1 && IU4_A4_CANDIDATES != 2 && IU4_A4_CANDIDATES != 4 && IU4_A4_CANDIDATES != 8
+#error "IU4_A4_CANDIDATES must be 1, 2, 4, or 8"
 #endif
 
 // int4 activation block: one 128-K group for one token (column).
@@ -42,9 +47,9 @@ static_assert(sizeof(block_i4_128) == 72, "bad block size");
 // Lane l owns elements 4l..4l+3 in xv[4]. Reductions use offsets 16..1
 // (wave64-safe width-32 shuffles). Writes qs for every lane; lane 0 of the
 // group publishes d and s. The portable specialization retains the original
-// 8-candidate body. On gfx1201, IU4_A4_CANDIDATES selects the producer search:
-// 4 keeps the incumbent {0,2,5,7} subset, 2 keeps the measured-most-selected
-// {5,7} subset, and 1 is plain RTN with d=max(abs(x))/7.
+// 8-candidate body. IU4_A4_CANDIDATES selects the fused producer search: 8 is
+// the full grid, 4 keeps {0,2,5,7}, 2 keeps the measured-most-selected {5,7},
+// and 1 is plain RTN with d=max(abs(x))/7.
 template <bool ProducerCandidateSet>
 __device__ __forceinline__ void quantize_block_i4_128_wave(
     const float xv[4],
@@ -62,6 +67,11 @@ __device__ __forceinline__ void quantize_block_i4_128_wave(
         if constexpr (ProducerCandidateSet) {
 #if IU4_A4_CANDIDATES == 1
             best_d = amax / 7.0f;
+#else
+#if IU4_A4_CANDIDATES == 8
+            #pragma unroll 1
+            for (int ci = 0; ci < 8; ++ci) {
+                const float dj = (amax / 7.0f) * 0.5f * (1.0f + (float)ci / 7.0f);
 #else
             const float candidate_base = (amax / 7.0f) * 0.5f;
             #pragma unroll 1
@@ -81,6 +91,7 @@ __device__ __forceinline__ void quantize_block_i4_128_wave(
                 }
 #endif
                 const float dj = candidate_base * multiplier;
+#endif
                 float mse = 0.0f;
                 #pragma unroll
                 for (int e = 0; e < 4; ++e) {
@@ -173,7 +184,7 @@ __device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
             xv[0] = s4; xv[1] = s5; xv[2] = s6; xv[3] = s7;
         }
         block_i4_128* out = Y + (long long)(2 * group + h) * N + token;
-#if defined(__gfx1201__)
+#if defined(__gfx1201__) || defined(__gfx1100__) || defined(__gfx1151__)
         quantize_block_i4_128_wave<true>(xv, out, lane);
 #else
         quantize_block_i4_128_wave<false>(xv, out, lane);
