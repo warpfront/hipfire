@@ -585,12 +585,19 @@ fn admit_and_load(
         path,
         1,
         1,
-        None,
+        hipfire_loader::admission::KvBackendRequest::Automatic,
         None,
         gpu.arch.as_str(),
         vision,
         None,
         max_seq,
+        hipfire_loader::admission::KvBackendHints {
+            kv_mode: None,
+            kv_adaptive: None,
+            cask: None,
+            deepseek4_heterogeneous: false,
+            vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+        },
     )
     .expect("admit fixture source");
     hipfire_loader::load_admitted_with_gemma4_drafter(

@@ -1058,6 +1058,11 @@ fn main() {
                             }
                         }
                     }
+                    if msg.get("params").and_then(|p| p.get("kv_backend")).is_none() {
+                        eprintln!("KV backend: automatic vmm unavailable (fixed Q8 slot arena has no VMM owner) -> contiguous");
+                    } else {
+                        eprintln!("KV backend: explicit contiguous override (fixed Q8 slot arena)");
+                    }
                     // Tear down PFlash / ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
@@ -1167,7 +1172,14 @@ fn main() {
                                 "cache_capable": true,
                                 "retry_reset_eligible": false,
                                 "continuous_batch_capable": false,
-                                "experimental_multi_slot": true
+                                "experimental_multi_slot": true,
+                                "kv_backend_request": if msg.get("params").and_then(|p| p.get("kv_backend")).is_none() { "automatic" } else { "explicit" },
+                                "kv_backend": "contiguous",
+                                "kv_backend_reason": if msg.get("params").and_then(|p| p.get("kv_backend")).is_none() {
+                                    Some("fixed Q8 slot arena has no VMM owner")
+                                } else {
+                                    None
+                                }
                             });
                             let _ = writeln!(stdout, "{ack}");
                             let _ = stdout.flush();
@@ -1773,16 +1785,26 @@ fn main() {
                 // BEFORE any destructive side effect so a refusal leaves the
                 // prior model usable. The retained SourceAdmission is consumed
                 // by the load route below — no re-open, no re-classify.
+                let backend_request = match hipfire_loader::admission::KvBackendRequest::from_override(
+                    kv_backend_override.as_deref()
+                ) {
+                    Ok(request) => request,
+                    Err(e) => {
+                        emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
                 let admission = match hipfire_loader::admission::admit_source(
-                    path,
-                    tp,
-                    pp,
-                    kv_backend_override.as_deref(),
-                    draft_path.as_deref(),
-                    gpu.arch.as_str(),
-                    vision_path.as_deref(),
-                    head_path.as_deref(),
-                    max_seq,
+                    path, tp, pp, backend_request, draft_path.as_deref(),
+                    gpu.arch.as_str(), vision_path.as_deref(), head_path.as_deref(), max_seq,
+                    hipfire_loader::admission::KvBackendHints {
+                        kv_mode: kv_mode_override.as_deref(),
+                        kv_adaptive: kv_adaptive_override.as_deref(),
+                        cask: Some(&cask),
+                        deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
+                        vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+                    },
                 ) {
                     Ok(a) => a,
                     Err(e) => {
@@ -1794,6 +1816,19 @@ fn main() {
                         continue;
                     }
                 };
+                if let Some(reason) = &admission.kv_backend_reason {
+                    eprintln!("KV backend: automatic vmm unavailable ({reason}) -> contiguous");
+                } else if matches!(backend_request, hipfire_loader::admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Contiguous)) {
+                    eprintln!("KV backend: explicit contiguous override");
+                }
+                let backend_diagnostics = (
+                    match backend_request {
+                        hipfire_loader::admission::KvBackendRequest::Automatic => "automatic",
+                        hipfire_loader::admission::KvBackendRequest::Explicit(_) => "explicit",
+                    },
+                    admission.kv_backend.as_str(),
+                    admission.kv_backend_reason.clone(),
+                );
 
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
@@ -1859,13 +1894,8 @@ fn main() {
                 }
                 let loaded = if tp > 1 {
                     hipfire_loader::load_model_ep_admitted(
-                        admission,
-                        path,
-                        max_seq,
-                        tp,
-                        kv_mode_override.as_deref(),
-                        kv_backend_override.as_deref(),
-                        state_quant_override.as_deref(),
+                        admission, path, max_seq, tp,
+                        kv_mode_override.as_deref(), state_quant_override.as_deref(),
                     )
                 } else {
                     hipfire_loader::load_admitted_with_gemma4_drafter(
@@ -2138,11 +2168,13 @@ fn main() {
                         };
                         let reasoning_efforts_json = serde_json::to_string(&reasoning_efforts)
                             .unwrap_or_else(|_| "[]".to_string());
-                        // Load ack exposes batch dimensions/capability; EP adds parallelism metadata but never infers operation from logs.
+                        let backend_reason_json = serde_json::to_string(&backend_diagnostics.2)
+                            .expect("backend reason is serializable");
+                        // Load ack reports effective storage, not only the request.
                         if staged_ep_batch {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{}}}"#,
                                 arch,
                                 dim,
                                 layers,
@@ -2156,11 +2188,14 @@ fn main() {
                                 continuous_batch_capable,
                                 staged_ep_slots,
                                 staged_ep_lane_cap,
+                                backend_diagnostics.0,
+                                backend_diagnostics.1,
+                                backend_reason_json,
                             );
                         } else {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{}}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{}}}"#,
                                 arch,
                                 dim,
                                 layers,
@@ -2171,7 +2206,10 @@ fn main() {
                                 reasoning_efforts_json,
                                 cache_capable,
                                 retry_reset_eligible,
-                                continuous_batch_capable
+                                continuous_batch_capable,
+                                backend_diagnostics.0,
+                                backend_diagnostics.1,
+                                backend_reason_json,
                             );
                         }
                         // ── PFlash drafter load (Phase 4.0) ──────────────

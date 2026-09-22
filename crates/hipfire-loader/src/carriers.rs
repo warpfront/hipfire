@@ -1285,6 +1285,9 @@ impl Carrier for Deepseek4Carrier {
             ctx.deepseek4_compute_placement,
             hipfire_config::Deepseek4ComputePlacement::Single
         ) {
+            if ctx.kv_backend != KvBackend::Contiguous {
+                return Err("deepseek4 heterogeneous compressor owner requires admitted contiguous backend".into());
+            }
             let model = hipfire_arch_deepseek4::load_deepseek4_heterogeneous_model(
                 &src,
                 ctx,
@@ -1378,7 +1381,8 @@ impl Carrier for Deepseek4Carrier {
         };
         let advertised_context = config.max_position_embeddings;
         eprintln!(
-            "  deepseek4 KV cache: automatic VMM growth to advertised context {advertised_context}"
+            "  deepseek4 KV cache: {} growth to advertised context {advertised_context}",
+            if ctx.kv_backend == KvBackend::Vmm { "VMM" } else { "contiguous" }
         );
         Ok(LoadedModel {
             state: Some(Box::new(deepseek4::Deepseek4Bundle {

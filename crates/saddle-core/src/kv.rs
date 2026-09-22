@@ -37,8 +37,8 @@ pub enum KvMode {
 /// KV storage backend selection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KvBackend {
-    #[default]
     Contiguous,
+    #[default]
     Vmm,
 }
 

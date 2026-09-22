@@ -280,6 +280,7 @@ model's contract still accepts the named-cap route):
 |---|---|---|
 | `kv_cache` | `"auto"` | `auto`, `q8`, `asym4`, `asym3`, `asym2`, `fwht4`, `fwht3`, `fwht2`, `turbo`, `turbo4`, `turbo3`, `turbo2` |
 | `kv_adaptive` | `"off"` | `off`, `conservative`, `balanced`, `aggressive`, or `advanced:k=<fwht4\|fwht3\|fwht2>,v=<lloyd4\|lloyd3\|lloyd2>` |
+| `kv_backend` | automatic (prefer VMM) | `contiguous` \| `vmm` |
 
 **Resolution of `auto`:** registry entry `default_kv_mode` if present and valid;
 else universal fallback **`q8`**. There is no per-arch implicit FWHT table.
@@ -288,12 +289,37 @@ else universal fallback **`q8`**. There is no per-arch implicit FWHT table.
 
 `kv_adaptive` is opt-in. With adaptive on, `max_seq` is the context guaranteed at the floor tier. Daemon param overrides `HIPFIRE_KV_ADAPTIVE` when set through CLI load path.
 
-`--kv-backend vmm` enables on-demand HIP VMM mapping for single-GPU Qwen3.5
-`q8`, `asym3`, and `fwht3` KV caches. The default remains `contiguous`. VMM
-currently does not compose with pipeline/expert parallelism or CASK/TriAttention
-eviction.
+### `kv_backend` (allocation backend)
 
-Legacy one-shot alias: `HIPFIRE_KV_MODE` (see [`env-vars.md`](env-vars.md)).
+Omitted `memory.kv_backend` / `--kv-backend` is **automatic**. Automatic selects
+on-demand HIP VMM mapping on certified Qwen layout/device/topology combinations
+(single-GPU and dense TP with per-rank VMM), covering static modes, adaptive,
+and native `fp8`/`bf16`. Otherwise it falls back to contiguous once per load,
+logging the reason and the effective backend. Absolute HFQ/safetensors paths and
+registry tags resolve identically for the same source/mode/topology; registry
+cards no longer write a backend (they may still set `memory.max_seq` /
+`generation.max_tokens`).
+
+**Explicit override precedence** (forced choices, not automatic policy): CLI
+`--kv-backend` **>** per-model TOML `memory.kv_backend` **>** global TOML
+`memory.kv_backend`. Explicit `contiguous` always wins and never emits a
+misleading VMM marker. Explicit `vmm` on an unsupported combination fails with
+an actionable capability error **before** resident-model teardown and never
+silently falls back.
+
+Unsupported automatic cases (for example MoE EP/PP, non-Qwen carriers without a
+matching owner, uncertified device/OS, or missing HIP VMM symbols) keep
+contiguous service with a logged reason. Adaptive→CASK handoff **requires**
+VMM: if VMM is unavailable that combination is refused rather than handed off as
+invalid contiguous. Private speculative draft caches (DFlash/MTP) are owned
+separately from the trunk KV backend and do not relabel it; their actual backend
+is logged on its own.
+
+On Windows (ROCm 7.2), VMM maps the full reservation upfront for correctness —
+do not expect on-demand VRAM savings there. There is no env-based second default
+for the backend (`memory.kv_backend` has no `HIPFIRE_*` compat binding).
+
+Legacy one-shot alias for **mode** only: `HIPFIRE_KV_MODE` (see [`env-vars.md`](env-vars.md)).
 
 ---
 

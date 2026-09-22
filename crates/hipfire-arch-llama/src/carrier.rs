@@ -610,6 +610,9 @@ fn classify_hfq_route(hfq: &HfqFile) -> HfqLoadRoute {
 }
 
 pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, String> {
+    if ctx.kv_backend != hipfire_runtime::kv_backend::KvBackend::Contiguous {
+        return Err("llama: no VMM KV owner; admit contiguous before carrier load".into());
+    }
     let (config, weights, kv, scratch, manifest_plan, weight_store, mesh, weight_origin) = match src
     {
         ModelSource::Hfq(hfq) => {

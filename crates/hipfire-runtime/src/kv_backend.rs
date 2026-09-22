@@ -24,8 +24,8 @@ mod tests {
     }
 
     #[test]
-    fn default_is_the_existing_contiguous_path() {
-        assert_eq!(KvBackend::default(), KvBackend::Contiguous);
+    fn default_is_vmm() {
+        assert_eq!(KvBackend::default(), KvBackend::Vmm);
     }
 
     #[test]

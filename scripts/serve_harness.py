@@ -96,13 +96,15 @@ def resolve_kv_mode(explicit, tag, registry_path):
 def _tag_load_policy(canonical_tag):
     """Automatic load policy keyed by canonical registry tag.
 
-    Mirrors hipfire-registry's tag-aware config layer (not wire fields):
+    Mirrors hipfire-registry's tag-aware config layer (not wire fields).
+    Backend selection is runtime-automatic (omitted request); tags only set
+    context/generation caps:
       - family qwen3.5 / qwen3.6 / qwen3.8, non-draft/non-dflash target
-        → kv_backend=vmm, max_seq=262144, max_tokens=81920
+        → max_seq=262144, max_tokens=81920
       - family deepseek-v4-flash / deepseek-v4-flash-preview, non-draft/non-dflash
-        → kv_backend=vmm, max_seq=1048576, max_tokens=393216
+        → max_seq=1048576, max_tokens=393216
       - muse-glimmer / muse-glimmer:fast
-        → kv_backend=vmm, max_seq=131072 (max_tokens stays harness fallback)
+        → max_seq=131072 (max_tokens stays harness fallback)
       - original qwen3:*, muse-glimmer:draft, draft/dflash sidecars, others
         → no policy (harness fallbacks apply)
     """
@@ -114,38 +116,31 @@ def _tag_load_policy(canonical_tag):
     family = tag.split(":", 1)[0]
     if family in ("qwen3.5", "qwen3.6", "qwen3.8"):
         return {
-            "kv_backend": "vmm",
             "max_seq": 262144,
             "max_tokens": 81920,
         }
     if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
         return {
-            "kv_backend": "vmm",
             "max_seq": 1048576,
             "max_tokens": 393216,
         }
     if tag in ("muse-glimmer", "muse-glimmer:fast"):
         return {
-            "kv_backend": "vmm",
             "max_seq": 131072,
         }
     return {}
 
 
-def resolve_kv_backend(explicit, tag, registry_path):
-    """Resolve KV allocator backend: explicit → tag policy → contiguous."""
+def resolve_kv_backend_request(explicit):
+    """Requested backend: explicit CLI/config value, else automatic (None).
+
+    Tags no longer choose a backend. The daemon/runtime picks VMM or contiguous
+    from the omitted request; the harness only observes the effective marker.
+    """
     if explicit is not None:
         return explicit, "explicit(--kv-backend)"
-    try:
-        canonical, entry = _registry_entry(tag, registry_path)
-    except Exception as e:
-        print(f"  [warn] could not resolve kv_backend policy from {registry_path}: {e}",
-              file=sys.stderr)
-        canonical, entry = tag, {}
-    policy = _tag_load_policy(canonical) if entry else {}
-    if "kv_backend" in policy:
-        return policy["kv_backend"], f"tag-policy({canonical})"
-    return "contiguous", "default(contiguous)"
+    return None, "automatic"
+
 
 
 def resolve_max_seq(explicit, tag, registry_path):
@@ -279,8 +274,8 @@ def infer_tag(model_path):
 def build_config(args):
     tag = args.tag or infer_tag(args.model)
     kv, kv_source = resolve_kv_mode(args.kv, tag, args.registry)
-    kv_backend, kv_backend_source = resolve_kv_backend(
-        getattr(args, "kv_backend", None), tag, args.registry)
+    kv_backend, kv_backend_source = resolve_kv_backend_request(
+        getattr(args, "kv_backend", None))
     max_seq, max_seq_source = resolve_max_seq(
         getattr(args, "max_seq", None), tag, args.registry)
     max_tokens, max_tokens_source = resolve_max_tokens(
@@ -474,9 +469,21 @@ def show_config(cfg):
     print("==================== serve_harness pre-flight (CONFIRM before run) ====================")
     print(f"  model         : {cfg['model']}")
     print(f"  registry tag  : {cfg['tag'] or '(none — sampling cannot be registry-resolved)'}")
+    _kv_req = cfg.get("kv_backend")
+    _kv_req_disp = "automatic" if _kv_req is None else _kv_req
+    _kv_eff = cfg.get("kv_backend_effective")
+    if _kv_eff:
+        _kv_eff_reason = cfg.get("kv_backend_effective_reason")
+        _kv_disp = _kv_eff
+        _kv_src = (
+            f"observed({_kv_eff_reason})" if _kv_eff_reason else "observed"
+        )
+    else:
+        _kv_disp = _kv_req_disp
+        _kv_src = cfg.get("kv_backend_source", "unknown")
     print(f"  kv_mode       : {cfg['kv']} [{cfg.get('kv_source', 'unknown')}]"
-          f"   kv_backend: {cfg.get('kv_backend', 'contiguous')}"
-          f" [{cfg.get('kv_backend_source', 'unknown')}]"
+          f"   kv_backend: {_kv_disp}"
+          f" [{_kv_src}]"
           f"   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
     print(f"  max_seq       : {cfg.get('max_seq', 32768)}"
           f" [{cfg.get('max_seq_source', 'unknown')}]")
@@ -829,20 +836,61 @@ def _serve_log_text(log, offset=0):
         return handle.read()
 
 
+def _log_has_vmm_kv_marker(txt):
+    """True when the current-attempt log engaged a VMM KV owner."""
+    if not txt:
+        return False
+    return bool(
+        re.search(r"KV cache:.*\bvmm\s*\(", txt, re.IGNORECASE)
+        or re.search(r"KV cache:.*\bvmm\b", txt, re.IGNORECASE)
+        or re.search(r"deepseek4 KV cache:\s+automatic VMM growth\b", txt)
+    )
+
+
+def observe_effective_kv_backend(txt):
+    """Parse serve log for the effective KV backend (not the requested value).
+
+    Returns (backend, detail) where backend is "vmm", "contiguous", or None if
+    no marker is present. Contiguous fp8/q8 markers do not spell the word
+    contiguous; prefer the daemon reason line, else a non-VMM KV cache line
+    (placeholder style) proves contiguous.
+    """
+    if not txt:
+        return None, None
+    m = re.search(
+        r"KV backend:\s*automatic vmm unavailable \((.+?)\)\s*->\s*contiguous",
+        txt,
+        re.IGNORECASE,
+    )
+    if m:
+        return "contiguous", f"automatic-fallback({m.group(1).strip()})"
+    if re.search(r"KV backend:\s*explicit contiguous override", txt, re.IGNORECASE):
+        return "contiguous", "explicit-contiguous"
+    if _log_has_vmm_kv_marker(txt):
+        return "vmm", "log-marker"
+    # Contiguous owners: `KV cache: fp8-e4m3 (... placeholder)` / q8 / etc.
+    m = re.search(r"KV cache:\s*(\S+).*\bplaceholder\b", txt, re.IGNORECASE)
+    if m:
+        return "contiguous", f"log-marker({m.group(1)})"
+    m = re.search(r"KV cache:\s*(\S+)", txt, re.IGNORECASE)
+    if m and "vmm" not in m.group(0).lower():
+        return "contiguous", f"log-marker({m.group(1).rstrip(':,')})"
+    return None, None
+
+
 def _startup_path_proof_failures(cfg, txt):
     """VMM + DFlash draft-load failures for one attempt's log slice (no sys.exit)."""
     failures = []
 
+    # Only an *explicit* VMM request is fail-closed on missing markers.
+    # Automatic omission lets the runtime choose; harness reports the observed
+    # effective backend after warm instead of asserting a tag policy.
     if cfg.get("kv_backend") == "vmm":
-        # Generic KV caches and DS4's model-owned KV cache use different
-        # load markers for the same typed backend.
-        vmm_loaded = re.search(r"KV cache:.*\bvmm\b", txt, re.IGNORECASE) or re.search(
-            r"deepseek4 KV cache:\s+automatic VMM growth\b", txt
-        )
-        if not vmm_loaded:
+        if not _log_has_vmm_kv_marker(txt):
             failures.append(
                 "kv_backend=vmm requested but serve log has no VMM allocation marker"
             )
+
 
     dflash = cfg.get("dflash", "off") or "off"
     if dflash == "on":
@@ -1022,10 +1070,18 @@ def _self_test_serve_path_proofs():
         req_fails = _dflash_request_proof_failures(cfg_df, rows=ar_rows, log_txt=cur)
         check(not req_fails, f"log dflash/tau evidence must pass, got {req_fails!r}")
 
-        # Non-DFlash / non-VMM configs stay silent.
+        # Non-DFlash / non-explicit-VMM configs stay silent (automatic included).
         plain = {"kv_backend": "contiguous", "dflash": "off"}
         check(not _startup_path_proof_failures(plain, ""), "plain startup must be no-op")
         check(not _dflash_request_proof_failures(plain, [], ""), "plain request proof must be no-op")
+        auto = {"kv_backend": None, "dflash": "off"}
+        check(not _startup_path_proof_failures(auto, ""), "automatic request must not require VMM marker")
+        check(
+            not _startup_path_proof_failures(
+                auto, "KV cache: fp8-e4m3 (4/16 layers carry KV, others placeholder)\n"
+            ),
+            "automatic + contiguous marker must stay silent",
+        )
 
     os.unlink(path)
     print("serve_harness: path-proof self-test OK", flush=True)
@@ -1089,8 +1145,10 @@ def _self_test_kv_resolution():
 
 
 def _self_test_load_defaults():
-    """Canonical-tag load policy for kv_backend/max_seq/max_tokens; explicit CLI wins."""
+    """Tag max_seq/max_tokens policy; backend request is automatic unless explicit."""
     import argparse
+    from contextlib import redirect_stdout
+    from io import StringIO
 
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
         # Wire fields intentionally absent: policy is tag-keyed, not registry JSON.
@@ -1124,129 +1182,128 @@ def _self_test_load_defaults():
                 "muse-glimmer:quality": "muse-glimmer",
             },
         }, tmp)
-        path = tmp.name
+        reg_path = tmp.name
     try:
-        # Qwen3.8 family (alias → canonical) gets full native settings.
-        assert resolve_kv_backend(None, "qwen38:27b", path) == (
-            "vmm", "tag-policy(qwen3.8:27b)")
-        assert resolve_max_seq(None, "qwen38:27b", path) == (
+        # Backend request ignores tags: omission is always automatic.
+        assert resolve_kv_backend_request(None) == (None, "automatic")
+        assert resolve_kv_backend_request("contiguous") == (
+            "contiguous", "explicit(--kv-backend)")
+        assert resolve_kv_backend_request("vmm") == (
+            "vmm", "explicit(--kv-backend)")
+
+        # Qwen3.8 family (alias -> canonical) keeps native context/generation caps.
+        assert resolve_max_seq(None, "qwen38:27b", reg_path) == (
             262144, "tag-policy(qwen3.8:27b)")
-        assert resolve_max_tokens(None, "qwen38:27b", path) == (
+        assert resolve_max_tokens(None, "qwen38:27b", reg_path) == (
             81920, "tag-policy(qwen3.8:27b)")
-        vals, sources = resolve_sampling("registry", "qwen38:27b", path)
+        vals, sources = resolve_sampling("registry", "qwen38:27b", reg_path)
         assert vals["temperature"] == 1.0
         assert vals["reasoning_effort"] == "xhigh"
         assert vals["thinking_budget"] == "uncapped"
         assert sources["temperature"] == "registry(qwen3.8:27b)"
         # Exact Qwen family tags keep the same native context contract.
         for tag in ("qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b"):
-            assert resolve_kv_backend(None, tag, path) == (
-                "vmm", f"tag-policy({tag})")
-            assert resolve_max_seq(None, tag, path) == (
-                262144, f"tag-policy({tag})")
-            assert resolve_max_tokens(None, tag, path) == (
-                81920, f"tag-policy({tag})")
-        # Explicit CLI overrides beat tag policy.
-        assert resolve_kv_backend("contiguous", "qwen38:27b", path) == (
-            "contiguous", "explicit(--kv-backend)")
-        assert resolve_max_seq(4096, "qwen38:27b", path) == (
+            assert resolve_max_seq(None, tag, reg_path) == (
+                262144, "tag-policy(%s)" % tag)
+            assert resolve_max_tokens(None, tag, reg_path) == (
+                81920, "tag-policy(%s)" % tag)
+        # Explicit CLI overrides beat tag policy for caps.
+        assert resolve_max_seq(4096, "qwen38:27b", reg_path) == (
             4096, "explicit(--max-seq)")
-        assert resolve_max_tokens(512, "qwen38:27b", path) == (
+        assert resolve_max_tokens(512, "qwen38:27b", reg_path) == (
             512, "explicit(--max-tokens)")
-        # Original Qwen3 stays on contiguous/32768/2048 fallbacks.
-        assert resolve_kv_backend(None, "qwen3:latest", path) == (
-            "contiguous", "default(contiguous)")
-        assert resolve_max_seq(None, "qwen3:latest", path) == (
+        # Original Qwen3 stays on 32768/2048 fallbacks (no backend tag policy).
+        assert resolve_max_seq(None, "qwen3:latest", reg_path) == (
             32768, "default(32768)")
-        assert resolve_max_tokens(None, "qwen3:latest", path) == (
+        assert resolve_max_tokens(None, "qwen3:latest", reg_path) == (
             2048, "default(2048)")
-        # DeepSeek V4 Flash canonical targets: VMM + 1M ctx + 384Ki output.
+        # DeepSeek V4 Flash canonical targets: 1M ctx + 384Ki output.
         for tag in (
             "deepseek-v4-flash",
             "deepseek-v4-flash:mq2lloyd",
             "deepseek-v4-flash-preview",
         ):
-            assert resolve_kv_backend(None, tag, path) == (
-                "vmm", f"tag-policy({tag})")
-            assert resolve_max_seq(None, tag, path) == (
-                1048576, f"tag-policy({tag})")
-            assert resolve_max_tokens(None, tag, path) == (
-                393216, f"tag-policy({tag})")
+            assert resolve_max_seq(None, tag, reg_path) == (
+                1048576, "tag-policy(%s)" % tag)
+            assert resolve_max_tokens(None, tag, reg_path) == (
+                393216, "tag-policy(%s)" % tag)
         # Aliases resolve to the same DeepSeek canonical policy.
-        assert resolve_kv_backend(None, "ds4", path) == (
-            "vmm", "tag-policy(deepseek-v4-flash)")
-        assert resolve_max_seq(None, "ds4", path) == (
+        assert resolve_max_seq(None, "ds4", reg_path) == (
             1048576, "tag-policy(deepseek-v4-flash)")
-        assert resolve_max_tokens(None, "ds4", path) == (
+        assert resolve_max_tokens(None, "ds4", reg_path) == (
             393216, "tag-policy(deepseek-v4-flash)")
-        assert resolve_kv_backend(None, "deepseek4:mq2lloyd", path) == (
-            "vmm", "tag-policy(deepseek-v4-flash:mq2lloyd)")
-        assert resolve_max_seq(None, "deepseek4:mq2lloyd", path) == (
+        assert resolve_max_seq(None, "deepseek4:mq2lloyd", reg_path) == (
             1048576, "tag-policy(deepseek-v4-flash:mq2lloyd)")
-        assert resolve_max_tokens(None, "ds4:preview", path) == (
+        assert resolve_max_tokens(None, "ds4:preview", reg_path) == (
             393216, "tag-policy(deepseek-v4-flash-preview)")
         # Explicit overrides still beat DeepSeek policy.
-        assert resolve_kv_backend("contiguous", "deepseek-v4-flash", path) == (
-            "contiguous", "explicit(--kv-backend)")
-        assert resolve_max_seq(8192, "deepseek-v4-flash", path) == (
+        assert resolve_max_seq(8192, "deepseek-v4-flash", reg_path) == (
             8192, "explicit(--max-seq)")
-        assert resolve_max_tokens(256, "deepseek-v4-flash", path) == (
+        assert resolve_max_tokens(256, "deepseek-v4-flash", reg_path) == (
             256, "explicit(--max-tokens)")
-        # Muse Glimmer quality + fast: VMM + native 131072; tokens stay fallback.
-        assert resolve_kv_backend(None, "muse-glimmer", path) == (
-            "vmm", "tag-policy(muse-glimmer)")
-        assert resolve_max_seq(None, "muse-glimmer", path) == (
+        # Muse Glimmer quality + fast: native 131072; tokens stay fallback.
+        assert resolve_max_seq(None, "muse-glimmer", reg_path) == (
             131072, "tag-policy(muse-glimmer)")
-        assert resolve_max_tokens(None, "muse-glimmer", path) == (
+        assert resolve_max_tokens(None, "muse-glimmer", reg_path) == (
             2048, "default(2048)")
-        assert resolve_kv_backend(None, "muse-glimmer:fast", path) == (
-            "vmm", "tag-policy(muse-glimmer:fast)")
-        assert resolve_max_seq(None, "muse-glimmer:fast", path) == (
+        assert resolve_max_seq(None, "muse-glimmer:fast", reg_path) == (
             131072, "tag-policy(muse-glimmer:fast)")
-        assert resolve_max_tokens(None, "muse-glimmer:fast", path) == (
+        assert resolve_max_tokens(None, "muse-glimmer:fast", reg_path) == (
             2048, "default(2048)")
         # Quality alias lands on the same canonical Glimmer policy.
-        assert resolve_max_seq(None, "muse-glimmer:quality", path) == (
+        assert resolve_max_seq(None, "muse-glimmer:quality", reg_path) == (
             131072, "tag-policy(muse-glimmer)")
-        # Draft / dflash sidecars and unknown tags: no policy.
-        assert resolve_kv_backend(None, "muse-glimmer:draft", path) == (
-            "contiguous", "default(contiguous)")
-        assert resolve_max_seq(None, "muse-glimmer:draft", path) == (
+        # Draft / dflash sidecars and unknown tags: no context/token policy.
+        assert resolve_max_seq(None, "muse-glimmer:draft", reg_path) == (
             32768, "default(32768)")
-        assert resolve_max_tokens(None, "muse-glimmer:draft", path) == (
+        assert resolve_max_tokens(None, "muse-glimmer:draft", reg_path) == (
             2048, "default(2048)")
-        assert resolve_kv_backend(None, "qwen3.5:4b-draft", path) == (
-            "contiguous", "default(contiguous)")
-        assert resolve_max_seq(None, "qwen3.5:4b-draft", path) == (
+        assert resolve_max_seq(None, "qwen3.5:4b-draft", reg_path) == (
             32768, "default(32768)")
-        assert resolve_max_tokens(None, "qwen3.5:4b-draft", path) == (
+        assert resolve_max_tokens(None, "qwen3.5:4b-draft", reg_path) == (
             2048, "default(2048)")
-        assert resolve_kv_backend(None, "qwen3.6:35b-a3b-dflash", path) == (
-            "contiguous", "default(contiguous)")
-        assert resolve_max_seq(None, "qwen3.6:35b-a3b-dflash", path) == (
+        assert resolve_max_seq(None, "qwen3.6:35b-a3b-dflash", reg_path) == (
             32768, "default(32768)")
-        assert resolve_kv_backend(None, "missing", path) == (
-            "contiguous", "default(contiguous)")
-        assert resolve_max_seq(None, "missing", path) == (32768, "default(32768)")
-        assert resolve_max_tokens(None, "missing", path) == (2048, "default(2048)")
+        assert resolve_max_seq(None, "missing", reg_path) == (32768, "default(32768)")
+        assert resolve_max_tokens(None, "missing", reg_path) == (2048, "default(2048)")
         # Family-looking tags absent from the registry are not registry-selected.
         for tag in (
             "qwen3.8:missing",
             "deepseek-v4-flash:missing",
             "deepseek-v4-flash-preview:missing",
         ):
-            assert resolve_kv_backend(None, tag, path) == (
-                "contiguous", "default(contiguous)")
-            assert resolve_max_seq(None, tag, path) == (
+            assert resolve_max_seq(None, tag, reg_path) == (
                 32768, "default(32768)")
-            assert resolve_max_tokens(None, tag, path) == (
+            assert resolve_max_tokens(None, tag, reg_path) == (
                 2048, "default(2048)")
+
+        # Effective log observer: VMM marker, contiguous placeholder, fallback reason.
+        assert observe_effective_kv_backend(
+            "KV cache: Fp8 vmm (layers; mapped_prefix=1)\n"
+        ) == ("vmm", "log-marker")
+        assert observe_effective_kv_backend(
+            "KV cache: fp8-e4m3 (4/16 layers carry KV, others placeholder)\n"
+        ) == ("contiguous", "log-marker(fp8-e4m3)")
+        assert observe_effective_kv_backend(
+            "KV backend: automatic vmm unavailable "
+            "(carrier llama has no VMM KV owner) -> contiguous\n"
+            "KV cache: q8 (4/16 layers carry KV, others placeholder)\n"
+        ) == (
+            "contiguous",
+            "automatic-fallback(carrier llama has no VMM KV owner)",
+        )
+        assert observe_effective_kv_backend(
+            "KV backend: explicit contiguous override\n"
+        ) == ("contiguous", "explicit-contiguous")
+        assert observe_effective_kv_backend(
+            "  deepseek4 KV cache: automatic VMM growth to advertised context 1048576\n"
+        ) == ("vmm", "log-marker")
 
         def _ns(**kw):
             base = dict(
                 model="/models/qwen3.8-27b.mq4",
                 tag="qwen38:27b",
-                registry=path,
+                registry=reg_path,
                 kv=None,
                 kv_backend=None,
                 mtp="off",
@@ -1279,14 +1336,19 @@ def _self_test_load_defaults():
             base.update(kw)
             return argparse.Namespace(**base)
 
+        # Path and tag both request automatic; caps still come from the tag.
         cfg = build_config(_ns())
-        assert cfg["kv_backend"] == "vmm", cfg
-        assert cfg["kv_backend_source"] == "tag-policy(qwen3.8:27b)"
+        assert cfg["kv_backend"] is None, cfg
+        assert cfg["kv_backend_source"] == "automatic"
         assert cfg["max_seq"] == 262144
         assert cfg["max_seq_source"] == "tag-policy(qwen3.8:27b)"
         assert cfg["max_tokens"] == 81920
         assert cfg["max_tokens_source"] == "tag-policy(qwen3.8:27b)"
         assert cfg["kv"] == "q8"
+
+        cfg = build_config(_ns(tag=None, model="/models/qwen3.8-27b.mq4"))
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
 
         cfg = build_config(_ns(kv_backend="contiguous", max_seq=8192, max_tokens=256))
         assert cfg["kv_backend"] == "contiguous"
@@ -1297,7 +1359,8 @@ def _self_test_load_defaults():
         assert cfg["max_tokens_source"] == "explicit(--max-tokens)"
 
         cfg = build_config(_ns(tag="qwen3:latest", model="/models/qwen3-8b.mq4"))
-        assert cfg["kv_backend"] == "contiguous"
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
         assert cfg["max_seq"] == 32768
         assert cfg["max_tokens"] == 2048
 
@@ -1305,8 +1368,8 @@ def _self_test_load_defaults():
             tag="deepseek-v4-flash",
             model="/models/deepseek-v4-flash-0731.mq2r",
         ))
-        assert cfg["kv_backend"] == "vmm"
-        assert cfg["kv_backend_source"] == "tag-policy(deepseek-v4-flash)"
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
         assert cfg["max_seq"] == 1048576
         assert cfg["max_seq_source"] == "tag-policy(deepseek-v4-flash)"
         assert cfg["max_tokens"] == 393216
@@ -1316,7 +1379,7 @@ def _self_test_load_defaults():
             tag="deepseek-v4-flash:mq2lloyd",
             model="/models/deepseek-v4-flash-0731.mq2lloyd",
         ))
-        assert cfg["kv_backend"] == "vmm"
+        assert cfg["kv_backend"] is None
         assert cfg["max_seq"] == 1048576
         assert cfg["max_tokens"] == 393216
 
@@ -1324,25 +1387,30 @@ def _self_test_load_defaults():
             tag="deepseek-v4-flash-preview",
             model="/models/deepseek-v4-flash.mq2lloyd",
         ))
-        assert cfg["kv_backend"] == "vmm"
+        assert cfg["kv_backend"] is None
         assert cfg["max_seq"] == 1048576
         assert cfg["max_tokens"] == 393216
 
         cfg = build_config(_ns(tag="muse-glimmer", model="/models/muse-glimmer-30b.mq4"))
-        assert cfg["kv_backend"] == "vmm"
-        assert cfg["kv_backend_source"] == "tag-policy(muse-glimmer)"
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
         assert cfg["max_seq"] == 131072
         assert cfg["max_seq_source"] == "tag-policy(muse-glimmer)"
         assert cfg["max_tokens"] == 2048
         assert cfg["max_tokens_source"] == "default(2048)"
 
         cfg = build_config(_ns(tag="muse-glimmer:fast", model="/models/muse-glimmer-30b.mq4r"))
-        assert cfg["kv_backend"] == "vmm"
+        assert cfg["kv_backend"] is None
         assert cfg["max_seq"] == 131072
         assert cfg["max_tokens"] == 2048
 
-        cfg = build_config(_ns(tag="muse-glimmer:draft", model="/models/muse-glimmer-30b-assistant.q8.hfq"))
-        assert cfg["kv_backend"] == "contiguous"
+        # Draft/dflash sidecars: still automatic request; caps stay harness defaults.
+        cfg = build_config(_ns(
+            tag="muse-glimmer:draft",
+            model="/models/muse-glimmer-30b-assistant.q8.hfq",
+        ))
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
         assert cfg["max_seq"] == 32768
         assert cfg["max_tokens"] == 2048
         assert infer_tag("/models/muse-glimmer-30b-dflash.mq4") == "muse-glimmer:draft"
@@ -1351,18 +1419,35 @@ def _self_test_load_defaults():
             tag=None,
             model="/models/muse-glimmer-30b-dflash.mq4",
         ))
-        assert cfg["kv_backend"] == "contiguous"
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
         assert cfg["max_seq"] == 32768
         assert cfg["max_tokens"] == 2048
 
         cfg = build_config(_ns(tag="missing", model="/models/unknown.mq4"))
-        assert cfg["kv_backend"] == "contiguous"
+        assert cfg["kv_backend"] is None
+        assert cfg["kv_backend_source"] == "automatic"
         assert cfg["max_seq"] == 32768
         assert cfg["max_tokens"] == 2048
-    finally:
-        os.unlink(path)
-    print("serve_harness: load-defaults self-test OK", flush=True)
 
+        # Pre-flight shows requested automatic until observation lands.
+        buf = StringIO()
+        with redirect_stdout(buf):
+            show_config(build_config(_ns()))
+        pre = buf.getvalue()
+        assert "kv_backend: automatic [automatic]" in pre, pre
+
+        cfg_obs = build_config(_ns())
+        cfg_obs["kv_backend_effective"] = "vmm"
+        cfg_obs["kv_backend_effective_reason"] = "log-marker"
+        buf = StringIO()
+        with redirect_stdout(buf):
+            show_config(cfg_obs)
+        obs = buf.getvalue()
+        assert "kv_backend: vmm [observed(log-marker)]" in obs, obs
+    finally:
+        os.unlink(reg_path)
+    print("serve_harness: load-defaults self-test OK", flush=True)
 
 
 def _self_test_mtp_ngram_config():
@@ -1996,8 +2081,11 @@ def spawn_serve(cfg, home, log):
     # (would otherwise lower as developer.serve_harness_pid_file).
     env.pop("HIPFIRE_SERVE_HARNESS_PID_FILE", None)
     cli = _native_cli()
-    serve_cmd = [cli, "serve", "127.0.0.1", str(cfg["port"]),
-                 "--kv-backend", cfg.get("kv_backend", "contiguous")]
+    serve_cmd = [cli, "serve", "127.0.0.1", str(cfg["port"])]
+    # Omitted request = automatic runtime selection. Only forward an explicit
+    # user override (CLI --kv-backend contiguous|vmm).
+    if cfg.get("kv_backend") is not None:
+        serve_cmd.extend(["--kv-backend", cfg["kv_backend"]])
     if cfg.get("mode") == "images":
         # Pre-warm the diffusion pipe at serve start and pin it (no idle
         # eviction) so the images battery is deterministic start to finish.
@@ -3460,8 +3548,8 @@ def main():
     ap.add_argument("--kv", default=None,
                     help="cache mode override; omitted resolves the registry default")
     ap.add_argument("--kv-backend", default=None, choices=["contiguous", "vmm"],
-                    help="hipfire serve --kv-backend; omitted resolves canonical-tag "
-                         "policy then contiguous")
+                    help="explicit hipfire serve --kv-backend override; omitted leaves "
+                         "the request automatic (runtime picks VMM or contiguous)")
     ap.add_argument("--mtp", default="off", choices=["off", "on", "auto"])
     ap.add_argument("--dflash", default="off", choices=["off", "auto", "on"],
                     help="DFlash mode written to temporary [speculation] TOML (default off). "
@@ -3682,6 +3770,20 @@ def main():
         head = subprocess.run(f"grep -c 'MTP head loaded' {args.serve_log}", shell=True,
                               capture_output=True, text=True).stdout.strip()
         print(f"  [serve warm; MTP head loaded lines={head}]", flush=True)
+        warm_txt = _serve_log_text(args.serve_log, log_offset)
+        eff, eff_reason = observe_effective_kv_backend(warm_txt)
+        if eff is not None:
+            cfg["kv_backend_effective"] = eff
+            cfg["kv_backend_effective_reason"] = eff_reason
+            detail = f" ({eff_reason})" if eff_reason else ""
+            print(f"  [kv_backend effective: {eff}{detail}]", flush=True)
+        else:
+            req = cfg.get("kv_backend")
+            req_disp = "automatic" if req is None else req
+            print(
+                f"  [kv_backend effective: (no marker yet); requested {req_disp}]",
+                flush=True,
+            )
         _assert_serve_path_proofs(cfg, args.serve_log, offset=log_offset)
     cfg["_serve_log_offset"] = log_offset
     rows = run(cfg, args)

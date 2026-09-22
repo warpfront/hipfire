@@ -15,6 +15,36 @@ use crate::Carrier;
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::loader_api::ModelSource;
 
+/// Omission requests automatic VMM where the actual owner can allocate it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KvBackendRequest {
+    Automatic,
+    Explicit(KvBackend),
+}
+
+impl KvBackendRequest {
+    pub fn from_override(raw: Option<&str>) -> Result<Self, String> {
+        raw.filter(|s| !s.is_empty())
+            .map(|s| s.parse().map(Self::Explicit).map_err(|e| format!("{e}")))
+            .unwrap_or(Ok(Self::Automatic))
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct KvBackendHints<'a> {
+    pub kv_mode: Option<&'a str>,
+    pub kv_adaptive: Option<&'a str>,
+    pub cask: Option<&'a hipfire_runtime::loader_api::CaskConfig>,
+    pub deepseek4_heterogeneous: bool,
+    pub vmm_runtime_available: bool,
+}
+
+impl KvBackendHints<'_> {
+    pub const fn without_device() -> Self {
+        Self { kv_mode: None, kv_adaptive: None, cask: None, deepseek4_heterogeneous: false, vmm_runtime_available: false }
+    }
+}
+
 /// The one effective topology admitted for a load. `tp>1` (expert-parallel) and
 /// `pp>1` (pipeline-parallel) are mutually exclusive; both default to 1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -36,6 +66,9 @@ pub struct SourceAdmission {
     pub has_vision: bool,
     pub topology: EffectiveTopology,
     pub kv_backend: KvBackend,
+    /// Reason for automatic contiguous fallback; absent for explicit selection.
+    pub kv_backend_reason: Option<String>,
+    pub kv_backend_request: KvBackendRequest,
     /// The resolved carrier (single/pp path). `None` for expert-parallel, which
     /// dispatches on `arch_id` directly rather than through the registry.
     pub carrier: Option<&'static dyn Carrier>,
@@ -259,18 +292,6 @@ fn df_lash_lm_head_admission(
     Ok(())
 }
 
-/// Expert-parallel VMM refusal, mirroring `load_model_ep_with_kv_mode`'s
-/// per-arch dispatch: VMM is one arena per device, so the EP arches whose
-/// loaders have no VMM path (Qwen3.5-MoE 5|6, MiniMax 10) refuse it. DeepSeek
-/// V4 (9) is the one EP arch that serves vmm by design and stays vmm-capable
-/// here. Dense Qwen3.5 (5|6, `num_experts == 0`) is exempt at the call site —
-/// it runs the dense-TP path with one arena per rank device — so this
-/// per-arch predicate intentionally still fires for 5|6 (the density probe
-/// in `admit_source` decides whether to apply it).
-fn ep_vmm_refusal(arch_id: u32, kv_backend: KvBackend) -> Option<String> {
-    (kv_backend == KvBackend::Vmm && matches!(arch_id, 5 | 6 | 10))
-        .then(|| format!("KV backend '{}' requires tp=1", kv_backend.as_str()))
-}
 
 /// FLUX/Klein image-gen arch refusal: the trunk GEMM (`gemm_wmma_lds256`)
 /// and `attention_flux_vtk/v2_wmma` use the gfx11
@@ -454,12 +475,13 @@ pub fn admit_source(
     path: &str,
     tp: usize,
     pp: usize,
-    kv_backend_override: Option<&str>,
+    request: KvBackendRequest,
     draft_path: Option<&str>,
     gpu_arch: &str,
     vision: Option<&str>,
     head: Option<&str>,
     max_seq: usize,
+    hints: KvBackendHints<'_>,
 ) -> Result<SourceAdmission, String> {
     // #666 G2: zero parallel degrees are never servable (see the geometry
     // gates above) and previously collapsed silently into `Single`, hiding
@@ -475,10 +497,6 @@ pub fn admit_source(
         .arch_id()
         .ok_or_else(|| format!("unrecognized source: {}", source.describe()))?;
     let is_dir = source.is_dir();
-    let kv_backend: KvBackend = kv_backend_override
-        .unwrap_or("contiguous")
-        .parse()
-        .map_err(|err| format!("{err}"))?;
 
     // FLUX/Klein need gfx11 wave32 WMMA (the trunk GEMM and vtk/v2 use the
     // gfx11 WMMA intrinsic hipcc rejects on gfx12). Refuse here — before the
@@ -487,6 +505,7 @@ pub fn admit_source(
         return Err(refusal);
     }
 
+    let mut qwen35_ep_experts = None;
     let (topology, carrier) = if tp > 1 {
         // Expert-parallel admission (HFQ-only). Mirrors
         // `load_model_ep_with_kv_mode`'s arch_id dispatch + per-arch VMM
@@ -520,14 +539,7 @@ pub fn admit_source(
         } else {
             None
         };
-        // VMM is one arena per device: the replicated-KV MoE/EP path has no
-        // VMM support (5|6 MoE, MiniMax 10) and refuses it; dense Qwen3.5 is
-        // exempt (per-rank arenas under `load_model_tp_qwen35_dense`).
-        if qwen35_num_experts != Some(0) {
-            if let Some(refusal) = ep_vmm_refusal(arch_id, kv_backend) {
-                return Err(refusal);
-            }
-        }
+        qwen35_ep_experts = qwen35_num_experts;
         // #666 G2: refuse an unsatisfiable rank count before any teardown or
         // GPU init (`init_ep` needs one device per rank). Runs after the
         // arch/VMM refusals above so their messages are unchanged.
@@ -551,22 +563,8 @@ pub fn admit_source(
     } else {
         // Single / pipeline-parallel via the carrier registry.
         let carrier = resolve_carrier(&source)?;
-        if kv_backend == KvBackend::Vmm
-            && !matches!(carrier.name(), "qwen35" | "deepseek4" | "muse_glimmer")
-        {
-            return Err(format!(
-                "KV backend 'vmm' currently supports qwen3.5, deepseek4, and Muse Glimmer only (selected carrier: {})",
-                carrier.name()
-            ));
-        }
-        if kv_backend == KvBackend::Vmm && pp > 1 {
-            return Err(
-                "KV backend 'vmm' is single-device and does not support pipeline parallelism (pp>1); \
-                 use a different kv_cache backend or load with pp=1"
-                    .to_string(),
-            );
-        }
-        carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
+        // Selection follows topology validation; unsupported automatic requests
+        // fall back rather than making a non-Qwen source unloadable.
         // #666 G2: refuse an impossible pipeline degree before any teardown
         // (`init_uniform` would fail `n_layers < n_devices` deep in GPU init
         // with the resident model already gone). Runs after the carrier's
@@ -584,6 +582,46 @@ pub fn admit_source(
         };
         (topology, Some(carrier))
     };
+    let heterogeneous_reason = hints.deepseek4_heterogeneous && arch_id == 9;
+    let unsupported = if heterogeneous_reason {
+        Some("heterogeneous DeepSeek compressor owner uses a dense gfx1100 cache with no VMM layout".to_string())
+    } else if !hints.vmm_runtime_available {
+        Some("HIP VMM symbols/granularity unavailable".to_string())
+    } else if cfg!(windows) {
+        Some("Windows VMM mapping/graph semantics are not certified".to_string())
+    } else if gpu_arch != "gfx1201" {
+        Some(format!("device {gpu_arch} has no certified VMM KV path"))
+    } else if pp > 1 {
+        Some("pipeline-parallel KV owner has no VMM layout".to_string())
+    } else if tp > 1 && (arch_id == 10 || qwen35_ep_experts.is_some_and(|n| n > 0)) {
+        Some("replicated-KV MoE/EP owner has no VMM layout".to_string())
+    } else if tp > 1 && arch_id == 9 {
+        Some("DeepSeek EP VMM requires every rank to have a validated VMM device".to_string())
+    } else if carrier.is_some_and(|c| !matches!(c.name(), "qwen35" | "deepseek4" | "muse_glimmer")) {
+        Some(format!("carrier {} has no VMM KV owner", carrier.unwrap().name()))
+    } else if arch_id == 14 && hints.cask.is_some_and(|c| c.sidecar.is_some()) {
+        Some("Muse Glimmer VMM does not support a CASK sidecar".to_string())
+    } else {
+        None
+    };
+    let (kv_backend, kv_backend_reason) = match (request, unsupported) {
+        (KvBackendRequest::Explicit(KvBackend::Contiguous), _) => (KvBackend::Contiguous, None),
+        (KvBackendRequest::Explicit(KvBackend::Vmm), Some(reason)) => {
+            return Err(format!("KV backend 'vmm' unsupported: {reason}; use --kv-backend contiguous or a validated VMM source/device"));
+        }
+        (KvBackendRequest::Explicit(KvBackend::Vmm), None)
+        | (KvBackendRequest::Automatic, None) => (KvBackend::Vmm, None),
+        (KvBackendRequest::Automatic, Some(reason)) => (KvBackend::Contiguous, Some(reason)),
+    };
+    if kv_backend == KvBackend::Contiguous && matches!(arch_id, 5 | 6)
+        && hints.cask.is_some_and(|c| c.sidecar.is_some() && c.handoff_tokens > 0)
+        && hints.kv_adaptive.is_some_and(|s| !matches!(s, "" | "off"))
+    {
+        return Err("kv_adaptive -> CASK handoff requires VMM; disable the sidecar/handoff or use a validated VMM device".into());
+    }
+    if let Some(carrier) = carrier {
+        carrier.admit_topology(arch_id, is_dir, pp, kv_backend)?;
+    }
     let mut has_vision = probe_vision(&source, arch_id)?;
     // Shared tower sidecar (registry `vision` slot / `params.vision` /
     // `HIPFIRE_VISION_SIDECAR`), validated fail-closed; a tower-bearing
@@ -594,6 +632,25 @@ pub fn admit_source(
     }
     if let ModelSource::Hfq(hfq) = &source {
         df_lash_lm_head_admission(hfq, draft_path, gpu_arch)?;
+        if draft_path.is_some() {
+            let mq3_supported = crate::is_dflash_lm_head_wmma_arch(gpu_arch) && arch_id == 5;
+            let unsupported = hfq
+                .first_tensor_with_quant_type(18)
+                .map(|name| ("MQ2 (qt=18)", name))
+                .or_else(|| {
+                    (!mq3_supported)
+                        .then(|| hfq.first_tensor_with_quant_type(17))
+                        .flatten()
+                        .map(|name| ("MQ3 (qt=17)", name))
+                });
+            if let Some((quant, tensor)) = unsupported {
+                return Err(format!(
+                    "DFlash draft requested but model contains {quant} weight `{tensor}` \
+                     without a supported batched verifier on {gpu_arch} (arch_id={arch_id}); \
+                     reload without a draft or use an MQ4/HFQ4/Q8 target"
+                ));
+            }
+        }
         // Gemma 4 lowered min-context: refuse before teardown/alloc so a
         // small max_seq leaves the prior model serving. Eager stays exempt.
         if matches!(arch_id, 13 | 22) {
@@ -614,6 +671,8 @@ pub fn admit_source(
         has_vision,
         topology,
         kv_backend,
+        kv_backend_reason,
+        kv_backend_request: request,
         carrier,
         vision_path,
     })
@@ -622,6 +681,15 @@ pub fn admit_source(
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn admit_source(
+        path: &str, tp: usize, pp: usize, raw: Option<&str>, draft: Option<&str>,
+        arch: &str, vision: Option<&str>, head: Option<&str>, max_seq: usize,
+    ) -> Result<SourceAdmission, String> {
+        super::admit_source(
+            path, tp, pp, KvBackendRequest::from_override(raw)?, draft, arch,
+            vision, head, max_seq, KvBackendHints::without_device(),
+        )
+    }
 
     /// Every Qwen3.5-family HF config embeds `vision_config` even for text-only
     /// quantized artifacts (the 27B/A3B production files all do). The tower
@@ -656,19 +724,14 @@ mod tests {
         }
     }
 
-    /// The EP VMM refusal is per-arch, mirroring `load_model_ep_with_kv_mode`:
-    /// Qwen3.5 (5|6) and MiniMax (10) refuse `vmm`; DeepSeek V4 (9) serves it.
-    /// A blanket gate here would refuse the DS4 EP + vmm load master serves.
     #[test]
-    fn ep_vmm_refusal_is_per_arch() {
-        assert!(ep_vmm_refusal(5, KvBackend::Vmm).is_some());
-        assert!(ep_vmm_refusal(6, KvBackend::Vmm).is_some());
-        assert!(ep_vmm_refusal(10, KvBackend::Vmm).is_some());
-        // DeepSeek V4 is vmm-capable.
-        assert!(ep_vmm_refusal(9, KvBackend::Vmm).is_none());
-        // Non-vmm backends are never refused.
-        assert!(ep_vmm_refusal(5, KvBackend::Contiguous).is_none());
-        assert!(ep_vmm_refusal(9, KvBackend::Contiguous).is_none());
+    fn backend_request_preserves_explicit_opt_out() {
+        assert_eq!(KvBackendRequest::from_override(None).unwrap(), KvBackendRequest::Automatic);
+        assert_eq!(KvBackendRequest::from_override(Some("contiguous")).unwrap(),
+            KvBackendRequest::Explicit(KvBackend::Contiguous));
+        assert_eq!(KvBackendRequest::from_override(Some("vmm")).unwrap(),
+            KvBackendRequest::Explicit(KvBackend::Vmm));
+        assert!(KvBackendRequest::from_override(Some("invalid")).is_err());
     }
 
     /// FLUX/Klein admit exactly the gfx11 wave32 WMMA set: gfx1201 (and any
@@ -780,7 +843,7 @@ mod tests {
     /// The trunk is a tower-less arch-5 text pack; the sidecar carries just
     /// the probe tensor. Admission is read-only — no GPU needed.
     mod vision_sidecar {
-        use super::super::*;
+        use super::*;
         use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqMemTensor};
 
         fn write_hfq(name: &str, arch_id: u32, with_tower: bool) -> std::path::PathBuf {
@@ -888,9 +951,37 @@ mod tests {
             cleanup(&trunk);
             cleanup(&sidecar);
         }
+        #[test]
+        fn automatic_backend_resolves_by_capability_not_source_spelling() {
+            let trunk = write_hfq("kv-request", 5, false);
+            let path = trunk.to_str().unwrap();
+            let hints = KvBackendHints {
+                kv_mode: Some("fp8"),
+                kv_adaptive: None,
+                cask: None,
+                deepseek4_heterogeneous: false,
+                vmm_runtime_available: true,
+            };
+            let admit = |request, arch| super::super::admit_source(
+                path, 1, 1, request, None, arch, None, None, 4096, hints,
+            );
+            let auto = admit(KvBackendRequest::Automatic, "gfx1201").unwrap();
+            assert_eq!(auto.kv_backend, KvBackend::Vmm);
+            assert!(auto.kv_backend_reason.is_none());
+            let explicit = admit(KvBackendRequest::Explicit(KvBackend::Contiguous), "gfx1201").unwrap();
+            assert_eq!(explicit.kv_backend, KvBackend::Contiguous);
+            assert!(explicit.kv_backend_reason.is_none());
+            let unsupported = admit(KvBackendRequest::Automatic, "gfx1100").unwrap();
+            assert_eq!(unsupported.kv_backend, KvBackend::Contiguous);
+            assert!(unsupported.kv_backend_reason.unwrap().contains("gfx1100"));
+            let error = admit(KvBackendRequest::Explicit(KvBackend::Vmm), "gfx1100")
+                .map(|_| ()).unwrap_err();
+            assert!(error.contains("gfx1100") && error.contains("contiguous"));
+            cleanup(&trunk);
+        }
     }
     mod head_overlay {
-        use super::super::*;
+        use super::*;
         use hipfire_runtime::hfq::{write_hfqm_package_mem, HfqFile, HfqMemTensor};
 
         fn write_tensors(

@@ -3062,9 +3062,8 @@ pub(crate) fn load_params(
         .parse_cli(&kv_mode)?;
     let configured_backend = config_string(resolved, "memory.kv_backend")?;
     let kv_backend = kv_backend_override
-        .map(str::to_owned)
         .filter(|value| !value.is_empty())
-        .unwrap_or(configured_backend)
+        .unwrap_or(&configured_backend)
         .to_ascii_lowercase();
     if !matches!(kv_backend.as_str(), "contiguous" | "vmm") {
         bail!("--kv-backend must be contiguous or vmm");
@@ -3127,7 +3126,6 @@ pub(crate) fn load_params(
             "hardware.deepseek4_compute_placement",
         )?,
         "kv_mode": kv_mode,
-        "kv_backend": kv_backend,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
         "vision_mode": config_string(resolved, "vision.mode")?,
@@ -3161,6 +3159,20 @@ pub(crate) fn load_params(
         "speculation": config_string(resolved, "speculation.mode")?,
         "continuous_batch_size": config_u64(resolved, "serve.continuous_batch_size")?,
     });
+    let backend_source = &resolved
+        .get("memory.kv_backend")
+        .expect("schema field")
+        .source;
+    if kv_backend_override.is_some()
+        || matches!(
+            backend_source,
+            ConfigSource::GlobalUser { .. }
+                | ConfigSource::ModelUser { .. }
+                | ConfigSource::OneShot { .. }
+        )
+    {
+        params["kv_backend"] = serde_json::json!(kv_backend);
+    }
     if let Some(experts_per_token) =
         config_optional_u64(resolved, "model.deepseek4_experts_per_token")?
     {
@@ -7346,7 +7358,9 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn load_params_defaults_to_schema_contiguous_backend() {
+    pub(crate) fn load_params_omits_automatic_kv_backend_for_path() {
+        // Absolute path with only schema/built-in backend is automatic: omit
+        // the field so admission can pick VMM or fall back with a reason.
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
         let params = load_params(
@@ -7362,7 +7376,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(params["kv_backend"], "contiguous");
+        assert!(
+            params.get("kv_backend").is_none(),
+            "absolute path automatic backend must omit kv_backend"
+        );
         assert_eq!(params["max_seq"], 32768);
     }
 
@@ -7386,7 +7403,8 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
-        // Exact Qwen families get VMM + 262144 + 81920
+        // Exact Qwen families keep max_seq + max_tokens; registry no longer
+        // pins kv_backend. load_params must omit automatic backend for tags.
         for tag in [
             "qwen3.5:4b",
             "qwen3.6:35b-a3b",
@@ -7395,10 +7413,10 @@ mod tests {
         ] {
             let (_, entry) = registry.model(tag).unwrap();
             let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
-            assert_eq!(
-                config_string(&resolved, "memory.kv_backend").unwrap(),
-                "vmm",
-                "{tag}"
+            let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
+            assert!(
+                direct.get("memory.kv_backend").is_none(),
+                "{tag} registry layer must not write kv_backend"
             );
             assert_eq!(
                 config_u64(&resolved, "memory.max_seq").unwrap(),
@@ -7410,17 +7428,31 @@ mod tests {
                 81920,
                 "{tag}"
             );
+            let model_path = PathBuf::from("/tmp/test-model.mq4");
+            let params = load_params(
+                &resolved,
+                Some(entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(
+                params.get("kv_backend").is_none(),
+                "{tag} load_params must omit automatic kv_backend"
+            );
+            assert_eq!(params["max_seq"], 262144, "{tag}");
         }
 
-        // Original qwen3:* stays contiguous (no automatic policy) — original Qwen3 uses default schema.
+        // Original qwen3:* has no tag policy — backend stays automatic.
         let (_, entry) = registry.model("qwen3:8b").unwrap();
         let resolved =
             resolved_for_model(&paths, "qwen3:8b", Some("qwen3:8b"), Some(entry)).unwrap();
-        assert_eq!(
-            config_string(&resolved, "memory.kv_backend").unwrap(),
-            "contiguous",
-            "original qwen3 must keep the built-in contiguous backend"
-        );
         assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 32768);
         assert_eq!(
             config_u64(&resolved, "generation.max_tokens").unwrap(),
@@ -7431,6 +7463,25 @@ mod tests {
         assert!(direct.get("memory.kv_backend").is_none());
         assert!(direct.get("memory.max_seq").is_none());
         assert!(direct.get("generation.max_tokens").is_none());
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(
+            &resolved,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            params.get("kv_backend").is_none(),
+            "original qwen3 automatic backend must omit kv_backend"
+        );
+        assert_eq!(params["max_seq"], 32768);
 
         // Draft/dflash sidecars do not get the Qwen policy even though family matches.
         for tag in ["qwen3.5:9b-draft", "qwen3.6:27b-dflash"] {
@@ -7472,7 +7523,7 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
-        // Muse Glimmer quality and fast targets get VMM + native 131072, no invented max_tokens.
+        // Muse Glimmer tags set context only; backend remains an automatic request.
         for tag in ["muse-glimmer", "muse-glimmer:fast"] {
             let (_, entry) = registry.model(tag).unwrap();
             let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
@@ -7487,10 +7538,7 @@ mod tests {
                 "{tag}"
             );
             let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
-            assert_eq!(
-                direct.get("memory.kv_backend"),
-                Some(&hipfire_config::ConfigValue::String("vmm".into()))
-            );
+            assert!(direct.get("memory.kv_backend").is_none());
             assert_eq!(
                 direct.get("memory.max_seq"),
                 Some(&hipfire_config::ConfigValue::Integer(131072)),
@@ -7523,12 +7571,9 @@ mod tests {
             Some(entry),
         )
         .unwrap();
-        assert!(
-            resolved.get("memory.kv_backend").is_none()
-                || config_string(&resolved, "memory.kv_backend").unwrap() != "vmm"
-        );
+        assert_eq!(config_string(&resolved, "memory.kv_backend").unwrap(), "vmm");
 
-        // DeepSeek official / MQ2Lloyd / preview targets get VMM + 1M + 384Ki.
+        // DeepSeek tags set context/generation lengths, not a backend.
         for tag in [
             "deepseek-v4-flash",
             "deepseek-v4-flash:mq2lloyd",
@@ -7553,10 +7598,7 @@ mod tests {
                 "{tag}"
             );
             let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
-            assert_eq!(
-                direct.get("memory.kv_backend"),
-                Some(&hipfire_config::ConfigValue::String("vmm".into()))
-            );
+            assert!(direct.get("memory.kv_backend").is_none());
             assert_eq!(
                 direct.get("memory.max_seq"),
                 Some(&hipfire_config::ConfigValue::Integer(1048576))
@@ -7654,7 +7696,7 @@ mod tests {
             1024
         );
 
-        // Also verify load_params respects explicit kv_backend override over configured vmm.
+        // Explicit CLI flag is emitted (flag wins over automatic resolved backend).
         let model_path = PathBuf::from("/tmp/test-model.mq4");
         let params = load_params(
             &resolved,
@@ -7670,7 +7712,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["kv_backend"], "contiguous");
-        // Without explicit override, load_params uses the resolved vmm.
+        // Automatic registry/built-in: omit kv_backend; max_seq still forwarded.
         let params2 = load_params(
             &resolved,
             Some(entry),
@@ -7684,8 +7726,88 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(params2["kv_backend"], "vmm");
+        assert!(
+            params2.get("kv_backend").is_none(),
+            "registry-tag automatic backend must omit kv_backend"
+        );
         assert_eq!(params2["max_seq"], 262144);
+
+        // Global user config is an explicit choice and is emitted.
+        let params_global = load_params(
+            &overridden,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params_global["kv_backend"], "contiguous");
+        assert_eq!(params_global["max_seq"], 32768);
+
+        // Precedence: flag > model config > global config.
+        let mut global_layer = ConfigLayer::default();
+        global_layer
+            .set_cli("memory.kv_backend", "contiguous")
+            .unwrap();
+        let mut model_layer = ConfigLayer::default();
+        model_layer.set_cli("memory.kv_backend", "vmm").unwrap();
+        let model_over_global = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/global.toml"),
+                },
+                layer: global_layer,
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::ModelUser {
+                    model: tag.to_owned(),
+                    path: std::path::PathBuf::from("/tmp/model.toml"),
+                },
+                layer: model_layer,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            config_string(&model_over_global, "memory.kv_backend").unwrap(),
+            "vmm",
+            "model user config must beat global user"
+        );
+        let params_model = load_params(
+            &model_over_global,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params_model["kv_backend"], "vmm");
+        let params_flag = load_params(
+            &model_over_global,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            Some("contiguous"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            params_flag["kv_backend"], "contiguous",
+            "CLI flag must beat model user config"
+        );
 
         // Glimmer target likewise overridable (backend + max_seq).
         let raw2 = r#"{

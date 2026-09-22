@@ -54,10 +54,8 @@ pub fn forward_ep(
 ) -> Result<(), String> {
     let n = gpus.devices.len();
     if state_per_rank.len() == n
-        && gpus
-            .devices
-            .iter()
-            .all(|device| compressor_cache_uses_vmm(device))
+        && gpus.devices.iter().zip(state_per_rank.iter())
+            .all(|(device, state)| compressor_cache_uses_vmm(device, state.compressor_cache_backend))
     {
         for rank in 0..n {
             gpus.devices[rank]
