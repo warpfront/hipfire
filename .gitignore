@@ -161,6 +161,7 @@ redline/db/redline.db
 
 # graphify knowledge-graph output (regenerable; never track)
 /graphify-out/
+scratch-q8wide/
 # Gate-run artifacts (parent-calibration manifests, gate logs). Regenerate
 # with examples/ds4_parent_{inventory,codec}_gate; the durable numbers live
 # in commit messages and docs/investigations/.
