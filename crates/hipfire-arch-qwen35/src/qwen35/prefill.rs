@@ -1393,6 +1393,7 @@ fn iu4_row_bytes_wide(config: &Qwen35Config) -> Option<usize> {
 fn memory_admitted_rung(
     gpu: &Gpu,
     config: &Qwen35Config,
+    kv_cache: &llama::KvCache,
     perf_rows: usize,
     lean: bool,
 ) -> HipResult<usize> {
@@ -1413,11 +1414,18 @@ fn memory_admitted_rung(
     }
     let (free_bytes, _) = gpu.hip.get_vram_info()?;
     let q_dim = config.n_heads.checked_mul(config.head_dim).unwrap_or(0);
-    let q16_need = WIDENED_COMMIT_ROWS
-        .checked_mul(q_dim)
-        .and_then(|v| v.checked_mul(2))
-        .unwrap_or(usize::MAX);
-    let q16_missing = q16_need.saturating_sub(gpu.scratch.fa2_q16_scratch_bytes);
+    // Only a selectable gfx11 whole-chunk FA2 route needs more than the
+    // incumbent 512-row Q16 scratch. Charge each candidate rung separately.
+    let wide_q16_selectable = gpu.flags.gfx11_q8_fa2_wide
+        && gpu.flags.gfx11_fa2_prefill
+        && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
+        && kv_cache.uses_vmm_backend()
+        && kv_cache.quant_q8
+        && !kv_cache.quant_fp8
+        && kv_cache.tier_inputs().v_mode_bits == 8
+        && config.n_heads == 24
+        && config.n_kv_heads == 4
+        && config.head_dim == 256;
     let live_fp8_x = gpu.scratch.mq4v2_fp8_x_scratch_bytes;
     let live_fp8_sums = gpu.scratch.mq4v2_fp8_half_sums_scratch_bytes;
     let live_fp8_scales = gpu.scratch.mq4v2_fp8_row_scales_scratch_bytes;
@@ -1453,6 +1461,16 @@ fn memory_admitted_rung(
                 .unwrap_or(usize::MAX)
                 .saturating_sub(live_iu4)
         };
+        let q16_rows = if wide_q16_selectable {
+            rung
+        } else {
+            WIDENED_COMMIT_ROWS
+        };
+        let q16_need = q16_rows
+            .checked_mul(q_dim)
+            .and_then(|v| v.checked_mul(2))
+            .unwrap_or(usize::MAX);
+        let q16_missing = q16_need.saturating_sub(gpu.scratch.fa2_q16_scratch_bytes);
         let total = need_pbs
             .saturating_add(projection_deficit)
             .saturating_add(q16_missing)
@@ -1487,7 +1505,7 @@ pub fn ordinary_prefill_chunk_limit(
         return Ok(perf.min(legacy));
     }
     let lean = lean_pbs_requested() && lean_pbs_route(gpu, weights, config, perf);
-    let mut admitted = memory_admitted_rung(gpu, config, perf, lean)?;
+    let mut admitted = memory_admitted_rung(gpu, config, kv_cache, perf, lean)?;
     if let Some(p) = pbs {
         admitted = admitted.min(p.max_batch);
     }
@@ -8425,6 +8443,56 @@ fn batch_chunk_fa_attend(
             && max_ctx_len <= 32768
             && tree_verify.is_none();
         if packet_runs {
+            execute_fa_attend_step(
+                gpu,
+                config,
+                &pbs.fa_q_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                &pbs.positions,
+                &pbs.fa_attn_out_batch,
+                s,
+                kv_cache,
+                n,
+                start_pos,
+                max_ctx_len,
+                ctx,
+                None,
+                layer_idx,
+            )?;
+            return Ok(());
+        }
+        // Whole-chunk Q8/Q8 writes all positions before one causal FA2
+        // launch. Keep all exceptions on the unchanged segmented path: an
+        // alternate backend or variant cannot safely receive B>512 here.
+        let q8_wide_runs = gpu.flags.gfx11_q8_fa2_wide
+            && gpu.flags.gfx11_fa2_prefill
+            && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
+            && kv_cache.quant_q8
+            && !kv_cache.quant_fp8
+            && kv_cache.tier_inputs().v_mode_bits == 8
+            && kv_cache.uses_vmm_backend()
+            && !gpu.flash_attn_ck_loaded()
+            && !matches!(
+                hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL").ok().as_deref(),
+                Some("0") | Some("off") | Some("false")
+            )
+            && !matches!(
+                hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL").ok().as_deref(),
+                Some("scalar") | Some("batched")
+            )
+            && ctx.workload == DispatchWorkload::Standard
+            && config.n_heads == 24
+            && config.n_kv_heads == 4
+            && config.head_dim == 256
+            && stride == WIDENED_COMMIT_ROWS
+            && (64..=8192).contains(&n)
+            && (n <= WIDENED_COMMIT_ROWS || n % WIDENED_COMMIT_ROWS == 0)
+            && (64..=32768).contains(&max_ctx_len)
+            && start_pos.checked_add(n) == Some(max_ctx_len)
+            && max_ctx_len <= kv_cache.physical_cap
+            && tree_verify.is_none();
+        if q8_wide_runs {
             execute_fa_attend_step(
                 gpu,
                 config,

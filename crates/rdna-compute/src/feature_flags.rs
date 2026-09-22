@@ -292,6 +292,11 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_ATTN_QRESIDENT`, `kernel.attn_qresident`). Default ON on
     /// exact gfx1201; `=0` opts out. Exact H24/KV4/D256 native-fp8-KV shapes only.
     pub attn_qresident: bool,
+    /// Experimental whole-chunk Q8/Q8 FA2 on exact gfx1100/gfx1151
+    /// (`HIPFIRE_GFX11_Q8_FA2_WIDE`, `kernel.gfx11_q8_fa2_wide`).
+    /// Default OFF; requires the master gfx11 FA2 flag. B64..8192 with
+    /// above-512 batches aligned to 512 and ctx64..32768.
+    pub gfx11_q8_fa2_wide: bool,
     /// `HIPFIRE_GFX11_FA2_PREFILL=0` opts out of the gfx11 GQA-fused FA2
     /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
     /// Default ON on gfx1100/gfx1151; `=1` forces it on other arches
@@ -694,6 +699,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT")
                 .unwrap_or(arch == "gfx1201"),
+            gfx11_q8_fa2_wide: parse_bool("HIPFIRE_GFX11_Q8_FA2_WIDE").unwrap_or(false),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
@@ -1029,6 +1035,7 @@ impl FeatureFlags {
             gfx12_fa2_prefill: false,
             gfx12_fa_packet: false,
             attn_qresident: false,
+            gfx11_q8_fa2_wide: false,
             gfx11_fa2_prefill: false,
             gemm_dump: false,
             deterministic: false,
