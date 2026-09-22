@@ -1919,7 +1919,7 @@ pub static FIELDS: &[ConfigField] = &[
         ValueRule::Integer { min: 2, max: 1048576 },
         false,
         "HIPFIRE_PREFILL_CHUNK_ROWS",
-        "Widened ordinary-prefill chunk ceiling in rows (default 4096 on exact gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH stays the explicit override; per-device VRAM admission may still select a smaller rung)."
+        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung)."
     ),
     process_bool_field!(
         "speculation.draft_f16",
@@ -2184,6 +2184,15 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_GFX11_PRODUCER_QUANT_FUSED",
         "Fuse the int4 activation quantiser into the gfx11 sigmoid/gated-norm producers (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx11 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_lean_pbs",
+        "gfx11_lean_pbs",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX11_LEAN_PBS",
+        "Size fallback-only ordinary gfx11 MQ4V2 prefill scratch for at most 64 rows; other routes retain full scratch."
     ),
     process_field!(
         "kernel.gfx11_a4_candidates",

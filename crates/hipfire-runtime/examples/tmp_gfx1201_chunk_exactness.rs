@@ -1027,13 +1027,13 @@ mod ora {
             .unwrap_or_else(|e| panic!("kv q8 kv_seq={kv_seq}: {e:?}"));
         let mut dn = DeltaNetState::new(&mut *gpu, &m.config).expect("dn fresh");
         assert!(!dn.s_ef_residual.is_empty(), "fresh DN has no EF — not Q8+EF");
-        let admitted = qwen35::ordinary_prefill_chunk_limit(&*gpu, &m.weights, &m.config, &dn, &kv, None);
+        let scratch = Qwen35Scratch::new_with_kv_max(&mut *gpu, &m.config, 128, kv_seq)
+            .unwrap_or_else(|e| panic!("scratch kv_seq={kv_seq}: {e:?}"));
+        let admitted = qwen35::ordinary_prefill_chunk_limit(&*gpu, &m.weights, &m.config, &dn, None);
         match &admitted {
             Ok(a) => eprintln!("  run L={l} resume_p={resume_p}: requested={ceiling} admitted={a}"),
             Err(e) => eprintln!("  run L={l} resume_p={resume_p}: requested={ceiling} admission-query failed: {e:?}"),
         }
-        let scratch = Qwen35Scratch::new_with_kv_max(&mut *gpu, &m.config, 128, kv_seq)
-            .unwrap_or_else(|e| panic!("scratch kv_seq={kv_seq}: {e:?}"));
         let hbuf = gpu.alloc_tensor(&[l, m.config.dim], DType::F32).expect("hbuf");
         let toks = det_tokens(l, m.config.vocab_size);
         if resume_p == 0 {
