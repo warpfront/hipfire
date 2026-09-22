@@ -2185,6 +2185,16 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_GFX11_PRODUCER_QUANT_FUSED",
         "Fuse the int4 activation quantiser into the gfx11 sigmoid/gated-norm producers (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx11 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
     ),
+    process_field!(
+        "kernel.gfx11_a4_candidates",
+        "gfx11_a4_candidates",
+        Kernel,
+        DefaultValue::String("8"),
+        ValueRule::Enum(&["1", "2", "4", "8"]),
+        true,
+        "HIPFIRE_GFX11_A4_CANDIDATES",
+        "Number of activation-quantization candidates searched inside fused gfx1100/gfx1151 IU4 producers; 8 preserves the shipped full-grid search."
+    ),
     process_bool_field!(
         "kernel.gfx12_fp8_stream",
         "gfx12_fp8_stream",
