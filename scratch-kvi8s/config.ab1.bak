@@ -1,0 +1,37 @@
+schema_version = 1
+
+[experimental.graph]
+forward = true
+
+[generation]
+max_tokens = 128
+
+[hardware]
+deepseek4_compute_placement = "single"
+devices = "GPU-e475645fe0200397"
+
+[kernel]
+attn_qresident = true
+gfx12_fp8_stream = false
+gfx12_producer_quant_fused = true
+gfx12_silu_quant_fused = true
+iu4_prefill = true
+
+[memory]
+kv_cache = "fp8"
+max_seq = 262144
+
+[reasoning]
+budget = "off"
+effort = "none"
+
+[serve]
+default_model = "/home/kaden/qcal/qat/v25/qwen3.8-27b.mq4v2.xt.sym-a035.qat-r5s100.hfq"
+host = "127.0.0.1"
+port = 11520
+
+[speculation]
+dflash = "off"
+mode = "off"
+mtp = "off"
+ngram = "off"
