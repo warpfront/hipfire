@@ -2243,10 +2243,10 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.gfx11_iu4_gridspec",
         "gfx11_iu4_gridspec",
         Kernel,
-        false,
         true,
+        false,
         "HIPFIRE_GFX11_IU4_GRIDSPEC",
-        "Split partial-N gfx11 IU4 GEMMs so full interior tiles use the unchecked specialization and only the final tile uses guarded loads/stores."
+        "Split partial-N gfx11 IU4 GEMMs so full interior tiles use the unchecked specialization and only the final tile uses guarded loads/stores (default on; set to false or HIPFIRE_GFX11_IU4_GRIDSPEC=0 to opt out)."
     ),
     process_bool_field!(
         "kernel.npu_spillover",

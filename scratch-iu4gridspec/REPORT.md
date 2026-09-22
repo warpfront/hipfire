@@ -2,12 +2,12 @@
 
 ## Result
 
-The default-off `kernel.gfx11_iu4_gridspec` experiment splits a partial-N grid into:
+The default-on `kernel.gfx11_iu4_gridspec` route splits a partial-N grid into:
 
 1. complete 128-column tiles using the existing `FULL=true` production entry, and
 2. one guarded tail-column launch using the existing `FULL=false` body through a tiny wrapper that preserves the original N stride.
 
-This is a bit-exact win. At the exact 5,909-token production prompt shape, graph-on daemon TTFT prefill improves **1,616.6 -> 1,651.4 tok/s (+2.2%) on gfx1100** and **519.8 -> 651.1 tok/s (+25.2%) on gfx1151** in fresh-process ABBA runs. The split is bit-identical to the shipped route in every tested comparison. The knob remains default-off; integration recommendation is left to Main.
+This is a bit-exact win. At the exact 5,909-token production prompt shape, graph-on daemon TTFT prefill improves **1,616.6 -> 1,651.4 tok/s (+2.2%) on gfx1100** and **519.8 -> 651.1 tok/s (+25.2%) on gfx1151** in fresh-process ABBA runs. The split is bit-identical to the shipped route in every tested comparison. It now defaults on for exact gfx1100/gfx1151; the typed knob remains available for runtime opt-out, and the existing architecture gate leaves gfx1201 unchanged.
 
 N=8192 is an exact multiple of 128, so it already takes the unchecked route and cannot gain. The lever's entire value is at partial N, which is every real prompt. Consequently pp8192 is the wrong headline for this lever: it measures the one route production prompts do not take. TTFT-5909 is the honest end-to-end measure. On gfx1151 the shipped TTFT prefill is only 520 tok/s while the synthetic exact-N pp8192 result is 645-678 tok/s, so the tracked exact-N benchmark had hidden a roughly 25% real-prompt penalty.
 
@@ -210,7 +210,7 @@ Thus the LF16 route change is separable and contributes no measured gain here: o
 
 The original microbenchmark advancement condition was at least 1.15x on gate/up N=5909 on both cards. The chosen split measured 1.0803x on gfx1100 and 1.4672x on gfx1151, so it did not satisfy that initial two-card threshold. Main explicitly overrode the stop condition to obtain the production evidence above.
 
-The resulting verdict is: **bit-exact win, default-off, worth +25.2% exact-5909 TTFT throughput on gfx1151 and +2.2% on gfx1100**. Exact N=8192 remains source-identical and within the control/noise band. The strongest standalone effects are gate/up 1.4672x and down 1.4301x on gfx1151; both major matmul directions benefit rather than merely gate/up.
+The resulting verdict is: **bit-exact win, default-on for exact gfx1100/gfx1151, worth +25.2% exact-5909 TTFT throughput on gfx1151 and +2.2% on gfx1100**. Exact N=8192 remains source-identical and within the control/noise band. The strongest standalone effects are gate/up 1.4672x and down 1.4301x on gfx1151; both major matmul directions benefit rather than merely gate/up.
 
 Gate scoping was deliberate:
 
