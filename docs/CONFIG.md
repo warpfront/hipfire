@@ -205,7 +205,7 @@ startup.
 | `presence_penalty` | `0.0` | number 0.0–2.0 | OpenAI-style flat penalty over the repeat window; zero disables it. |
 | `repeat_penalty` | `1.05` | number 1.0–3.0 | Kept low; higher values harm some MQ4 greedy paths (source comment). Stored default only; see send path below. |
 | `max_tokens` | `4096` | int 1–393216 | Per-turn generation cap for run / OpenAI fallback; 384 Ki tokens matches DeepSeek V4 Flash 0731's documented maximum output length. |
-| `max_seq` | `32768` | int 512–1048576 | KV logical capacity at load; the 1 Mi-token ceiling is serviced by VMM growth where supported. |
+| `max_seq` | automatic on growing Qwen VMM KV | int 512–1048576 when set | Default: min(checkpoint `config.text_config.max_position_embeddings`, card capacity after weights, admitted prefill scratch, and VRAM headroom). Explicit user values override either bound, including the trained window. |
 | `thinking` | `"on"` | `on` \| `off` | Thinking **mode** (on/off). Independent of effort and of any hard think-token cap. When off wins, effort and cap controls are dropped with a warning. |
 | `reasoning_effort` | `"auto"` | `auto` \| `none` \| `low` \| `medium` \| `high` \| `xhigh` \| `max` | **Semantic** effort only — prompt / framing strength. Field meaning never changes by family and is **never** reinterpreted as a token budget. Unsupported or cross-family values are dropped with a warning (see below). |
 | `thinking_budget` | `"med"` | `low` \| `med` \| `high` \| `xhigh` \| `max` \| `uncapped` | Legacy **named cap preset** only on models that still honor that config route. Not an effort dial. On effort-native models the string is dropped with a warning (no implicit cap). |
@@ -283,7 +283,8 @@ model's contract still accepts the named-cap route):
 | `kv_backend` | automatic (prefer VMM) | `contiguous` \| `vmm` |
 
 **Resolution of `auto`:** registry entry `default_kv_mode` if present and valid;
-else universal fallback **`q8`**. There is no per-arch implicit FWHT table.
+otherwise Qwen uses `q8` K/V except exact gfx1201, where single-GPU Qwen
+uses native `fp8`. Explicit KV modes remain untouched.
 
 `turbo*` values remain accepted aliases for validation/compat; resolution maps them in `resolveKvMode`.
 
@@ -297,8 +298,29 @@ on-demand HIP VMM mapping on certified Qwen layout/device/topology combinations
 and native `fp8`/`bf16`. Otherwise it falls back to contiguous once per load,
 logging the reason and the effective backend. Absolute HFQ/safetensors paths and
 registry tags resolve identically for the same source/mode/topology; registry
-cards no longer write a backend (they may still set `memory.max_seq` /
-`generation.max_tokens`).
+cards set neither backend nor `memory.max_seq`, but may still set
+`generation.max_tokens`. On gfx1100/gfx1151 the certified Qwen VMM route is q8
+only; unvalidated modes retain the existing contiguous fallback.
+
+For single-card **dense** Qwen HFQ VMM loads, omission of `max_seq` first
+preflights projected model fit before tearing down a resident model. After
+weights actually load, the Qwen carrier measures free VRAM immediately before
+KV construction. It subtracts only the minimum viable 512-row prefill scratch,
+the existing 1 GiB transient headroom and VMM page rounding to derive card
+capacity; the preflight weight projection never caps the effective context.
+Only full-attention layers carry KV (16 of 64 for Qwen3.8-27B), so card capacity
+divides that remaining memory by the selected K+V token stride. VMM reserves
+virtual space to `max_seq` and maps physical pages on demand; without eviction,
+`physical_cap == max_seq`, while CASK can make `physical_cap < max_seq`.
+Larger prefill PBS allocations are lazy: each request chooses the widest rung
+that fits currently free VRAM after mapped (not virtually reserved) KV. When
+future KV growth needs the memory, widened PBS reuse is released between
+requests, allowing later chunks to narrow rather than making growth OOM.
+The loaded diagnostic reports `max_seq`, its `model`/`card`/`user` bound,
+`model_ctx`, `card_cap` and KV mode. Qwen MoE keeps its prior 32768 built-in
+default (with a loaded diagnostic reason) until its distinct prefill scratch can
+be budgeted; other carriers keep their existing context behavior until their
+different cache ownership can use the same allocation accounting.
 
 **Explicit override precedence** (forced choices, not automatic policy): CLI
 `--kv-backend` **>** per-model TOML `memory.kv_backend` **>** global TOML

@@ -1332,6 +1332,90 @@ fn fp8_row_bytes_wide(config: &Qwen35Config) -> Option<usize> {
 fn iu4_row_bytes_wide(config: &Qwen35Config) -> Option<usize> {
     config.hidden_dim.checked_add(127)?.checked_div(128)?.checked_mul(72)
 }
+/// Per-token physical K+V stride for the selected cache encoding. Only
+/// full-attention layers own KV; DeltaNet layers carry no token rows.
+pub fn vmm_kv_token_bytes(
+    config: &Qwen35Config,
+    mode: hipfire_runtime::kv_mode::KvMode,
+    adaptive: bool,
+) -> Option<usize> {
+    use hipfire_runtime::kv_mode::KvMode;
+    let head = config.head_dim;
+    let k_head = if adaptive {
+        head / 2 + 4 // FWHT4 start, not a future adaptive floor
+    } else {
+        match mode {
+            KvMode::Fp8 => head + 2,
+            KvMode::Bf16 => head * 2,
+            KvMode::Q8 => head / 32 * 34,
+            KvMode::Asym2 | KvMode::Fwht2 => head / 4 + 4,
+            KvMode::Asym3 | KvMode::Fwht3 => head * 3 / 8 + 4,
+            KvMode::Asym4 | KvMode::Fwht4 => head / 2 + 4,
+        }
+    };
+    let v_head = if matches!(mode, KvMode::Fp8 | KvMode::Bf16) && !adaptive {
+        k_head
+    } else {
+        head / 32 * 34
+    };
+    config.layer_types.iter()
+        .filter(|layer| **layer == LayerType::FullAttention)
+        .count()
+        .checked_mul(config.n_kv_heads)?
+        .checked_mul(k_head.checked_add(v_head)?)
+        .filter(|bytes| *bytes > 0)
+}
+
+/// Charge only the minimum viable 512-row prefill scratch when sizing KV.
+/// Larger PBS buffers are allocated lazily and admitted per request from free
+/// VRAM *after mapped KV*, not subtracted from the lifetime context bound.
+pub fn minimum_prefill_reservation_bytes(config: &Qwen35Config, arch: &str) -> Option<usize> {
+    dense_prefill_reservation_bytes(config, WIDENED_COMMIT_ROWS, arch)
+}
+
+fn dense_prefill_reservation_bytes(
+    config: &Qwen35Config,
+    rows: usize,
+    arch: &str,
+) -> Option<usize> {
+    let projection = if arch == "gfx1201" {
+        fp8_row_bytes_wide(config)?
+    } else {
+        iu4_row_bytes_wide(config)?
+    };
+    let q16 = WIDENED_COMMIT_ROWS
+        .checked_mul(config.n_heads)?
+        .checked_mul(config.head_dim)?
+        .checked_mul(2)?;
+    dense_prefill_allocation_bytes(config, rows)?
+        .checked_add(rows.checked_mul(projection)?)?
+        .checked_add(q16)?
+        .checked_add(WIDENED_VRAM_HEADROOM_BYTES)
+}
+/// A widened PBS cache is optional. Retain it only if the *unmapped* VMM
+/// reserve can still become physical while leaving the minimum PBS and the
+/// ordinary headroom intact. Otherwise free it between requests, before the
+/// next prefill/decode can grow KV; the next request re-admits its chunk width.
+fn can_retain_widened_pbs(gpu: &Gpu, kv: &llama::KvCache, config: &Qwen35Config) -> bool {
+    if !kv.uses_vmm_backend() {
+        return true;
+    }
+    let Some(minimum) = minimum_prefill_reservation_bytes(config, &gpu.arch) else {
+        return false;
+    };
+    let mut unmapped = 0usize;
+    for tensor in kv.k_gpu.iter().chain(kv.v_gpu.iter()) {
+        if tensor.buf.is_vmm_owner() {
+            let Some(mapped) = gpu.vmm_mapped_bytes(tensor) else {
+                return false;
+            };
+            unmapped = unmapped.saturating_add(tensor.byte_size().saturating_sub(mapped));
+        }
+    }
+    gpu.hip.get_vram_info().is_ok_and(|(free, _)| {
+        free >= unmapped.saturating_add(minimum).saturating_add(128 << 20)
+    })
+}
 ///
 /// Per-device capacity admission: largest performance-admitted rung
 /// `<= perf_rows` whose full new PBS, projection-prelude deficit, missing FA
@@ -2527,7 +2611,11 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         // Return the retained PBS to the cache (also on error: it is pure
         // scratch, and the next use overwrites before reading).
         if let Some(owned) = own_pbs {
-            *scratch.widened_prefill_batch.borrow_mut() = Some(owned);
+            if can_retain_widened_pbs(gpu, kv_cache, config) {
+                *scratch.widened_prefill_batch.borrow_mut() = Some(owned);
+            } else {
+                let _ = owned.free_gpu(gpu);
+            }
         }
     } else if let Some(owned) = own_pbs {
         owned.free_gpu(gpu);

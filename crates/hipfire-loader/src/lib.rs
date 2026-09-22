@@ -973,6 +973,7 @@ pub struct LoadedModel {
     pub seq_pos: usize,
     pub max_seq: usize,
     pub physical_cap: usize,
+    pub sequence: Option<crate::admission::SequenceResolution>,
     pub eviction: Option<Eviction>,
     pub kv_adaptive: Option<hipfire_runtime::kv_adaptive::KvAdaptive>,
     pub conversation_tokens: Vec<u32>,
@@ -1031,6 +1032,7 @@ impl LoadedModel {
             seq_pos: 0,
             max_seq,
             physical_cap,
+            sequence: None,
             eviction: None,
             kv_adaptive: None,
             conversation_tokens: Vec::new(),
@@ -2372,6 +2374,7 @@ pub fn load_model_with_gemma4_drafter(
             cask: Some(cask),
             deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
             vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+            free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
         },
     )?;
     load_admitted_with_gemma4_drafter(
@@ -2401,7 +2404,7 @@ pub fn load_model_with_gemma4_drafter(
 pub fn load_admitted_with_gemma4_drafter(
     admission: crate::admission::SourceAdmission,
     path: &str,
-    max_seq: usize,
+    _max_seq: usize,
     deepseek4_experts_per_token: Option<usize>,
     deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
     draft_path: Option<&str>,
@@ -2418,6 +2421,8 @@ pub fn load_admitted_with_gemma4_drafter(
     let crate::admission::SourceAdmission {
         source,
         kv_backend,
+        max_seq,
+        sequence,
         carrier,
         vision_path,
         ..
@@ -2432,6 +2437,11 @@ pub fn load_admitted_with_gemma4_drafter(
     let mut ctx = LoadCtx {
         path,
         max_seq,
+        sequence: sequence.as_ref().map(|s| hipfire_runtime::loader_api::SequenceHint {
+            model_ctx: s.model_ctx,
+            automatic: s.bound != "user",
+            card_cap: 0,
+        }),
         deepseek4_compute_placement,
         deepseek4_experts_per_token,
         draft_path,
@@ -2451,6 +2461,14 @@ pub fn load_admitted_with_gemma4_drafter(
         xdna: None,
     };
     let mut result = carrier.load(source, &mut ctx)?;
+    result.sequence = sequence.map(|mut s| {
+        if let Some(measured) = ctx.sequence {
+            s.card_cap = measured.card_cap;
+            s.max_seq = result.max_seq;
+            s.bound = if !measured.automatic { "user" } else if measured.model_ctx <= measured.card_cap { "model" } else { "card" };
+        }
+        s
+    });
     if result.pp > 1 && result.pp_gpus.is_none() {
         return Err("pp>1 LoadedModel missing pp_gpus — carrier bug".into());
     }
@@ -3052,6 +3070,7 @@ pub fn load_model_ep_with_kv_mode(
         crate::admission::KvBackendHints {
             kv_mode, kv_adaptive: None, cask: None,
             deepseek4_heterogeneous: false, vmm_runtime_available,
+            free_vram_bytes: None, // EP has no single-card KV capacity envelope.
         },
     )?;
     load_model_ep_admitted(admission, path, max_seq, tp, kv_mode, state_quant)
@@ -3065,12 +3084,13 @@ pub fn load_model_ep_with_kv_mode(
 pub fn load_model_ep_admitted(
     admission: crate::admission::SourceAdmission,
     path: &str,
-    max_seq: usize,
+    _max_seq: usize,
     tp: usize,
     kv_mode: Option<&str>,
     state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
     let kv_backend = admission.kv_backend;
+    let max_seq = admission.max_seq;
     match admission.arch_id {
         9 => load_model_ep_ds4(
             path,

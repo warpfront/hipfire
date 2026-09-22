@@ -57,10 +57,20 @@ impl ModelSource {
     }
 }
 
+/// Qwen's load-time sequence decision: capacity is filled from actual free
+/// VRAM after weights upload and before its VMM cache is constructed.
+#[derive(Clone, Copy)]
+pub struct SequenceHint {
+    pub model_ctx: usize,
+    pub automatic: bool,
+    pub card_cap: usize,
+}
+
 /// Everything a carrier's `load` needs beyond the source itself.
 pub struct LoadCtx<'a> {
     pub path: &'a str,
     pub max_seq: usize,
+    pub sequence: Option<SequenceHint>,
     /// DeepSeek V4-only physical compute placement. The default is `Single`;
     /// other carriers must ignore it.
     pub deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,

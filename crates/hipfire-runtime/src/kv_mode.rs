@@ -60,16 +60,13 @@ fn normalize_full(raw: &str) -> Option<KvMode> {
         _ => None, // "" → default (silent); unrecognized → default (+warn)
     }
 }
-/// gfx1201 single-GPU Qwen default: an unset or `auto` KV request means native
-/// fp8 on exact gfx1201 (fp8 KV + stage-b FA2 arithmetic); every other arch
-/// keeps the site default, and any explicit mode (including explicit `q8`)
-/// passes through untouched. Pure over the raw string + arch so unit tests
-/// pin it without a GPU. Multi-GPU (pp) sites must NOT use this: they never
-/// construct native tiers.
+/// Single-GPU Qwen automatic KV: exact gfx1201 uses native fp8;
+/// every other arch uses q8 K and q8 V. Explicit modes are untouched.
+/// Multi-GPU sites have their own mode policy and must not call this helper.
 pub fn qwen35_auto_for_arch<'a>(raw: &'a str, arch: &str) -> &'a str {
     let trimmed = raw.trim();
-    if (trimmed.is_empty() || trimmed == "auto") && arch == "gfx1201" {
-        "fp8"
+    if trimmed.is_empty() || trimmed == "auto" {
+        if arch == "gfx1201" { "fp8" } else { "q8" }
     } else {
         raw
     }
@@ -267,11 +264,11 @@ mod tests {
     }
 
     #[test]
-    fn qwen35_auto_means_fp8_on_exact_gfx1201_only() {
+    fn qwen35_auto_means_fp8_on_gfx1201_and_q8_elsewhere() {
         for raw in ["", "auto"] {
             assert_eq!(qwen35_auto_for_arch(raw, "gfx1201"), "fp8");
             for arch in ["gfx1100", "gfx1151", "gfx1200", "gfx942", "gfx906"] {
-                assert_eq!(qwen35_auto_for_arch(raw, arch), raw, "arch={arch}");
+                assert_eq!(qwen35_auto_for_arch(raw, arch), "q8", "arch={arch}");
             }
         }
         // Explicit modes pass through untouched on every arch, including
@@ -281,13 +278,15 @@ mod tests {
                 assert_eq!(qwen35_auto_for_arch(raw, arch), raw, "raw={raw} arch={arch}");
             }
         }
-        // End-to-end through the single-GPU Qwen policies: unset/auto on
-        // gfx1201 resolves fp8 silently; elsewhere the site default holds.
+        // Unset/auto resolves fp8 on gfx1201 and q8 elsewhere, on both
+        // single-GPU Qwen load sites.
         for p in [&QWEN35_HFQ_POLICY, &QWEN35_PARO_POLICY] {
             for raw in ["", "auto"] {
                 let r = resolve(qwen35_auto_for_arch(raw, "gfx1201"), p);
                 assert_eq!(r.mode, KvMode::Fp8, "site {}", p.site);
                 assert!(r.warning.is_none(), "site {}", p.site);
+                let other = resolve(qwen35_auto_for_arch(raw, "gfx1100"), p);
+                assert_eq!(other.mode, KvMode::Q8, "site {}", p.site);
             }
             let r = resolve(qwen35_auto_for_arch("q8", "gfx1201"), p);
             assert_eq!(r.mode, KvMode::Q8, "site {}", p.site);

@@ -1157,6 +1157,7 @@ mod tests {
         LoadCtx {
             path: path.to_str().expect("fixture path is UTF-8"),
             max_seq: 8,
+            sequence: None,
             deepseek4_compute_placement: Default::default(),
             deepseek4_experts_per_token: None,
             draft_path: None,

@@ -552,7 +552,6 @@ impl Carrier for Qwen35Carrier {
                 let _hfq_cache_warmer = hfq_file.start_cache_warmup();
 
                 // ── pp=1 path (single-GPU) ────────────────────
-                let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
 
                 // VL detection — tower loads from the trunk in-place, or from
                 // the shared sidecar when the trunk is tower-less. The sidecar
@@ -629,6 +628,7 @@ impl Carrier for Qwen35Carrier {
                         return Err(e);
                     }
                 };
+                let physical_cap = bundle.kv_cache.physical_cap;
                 finish_qwen35_load(
                     bundle,
                     meta.tokenizer,

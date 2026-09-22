@@ -96,17 +96,12 @@ def resolve_kv_mode(explicit, tag, registry_path):
 def _tag_load_policy(canonical_tag):
     """Automatic load policy keyed by canonical registry tag.
 
-    Mirrors hipfire-registry's tag-aware config layer (not wire fields).
-    Backend selection is runtime-automatic (omitted request); tags only set
-    context/generation caps:
-      - family qwen3.5 / qwen3.6 / qwen3.8, non-draft/non-dflash target
-        → max_seq=262144, max_tokens=81920
-      - family deepseek-v4-flash / deepseek-v4-flash-preview, non-draft/non-dflash
-        → max_seq=1048576, max_tokens=393216
-      - muse-glimmer / muse-glimmer:fast
-        → max_seq=131072 (max_tokens stays harness fallback)
-      - original qwen3:*, muse-glimmer:draft, draft/dflash sidecars, others
-        → no policy (harness fallbacks apply)
+    Mirrors hipfire-registry's generation-only tag policy (not wire fields).
+    Context is resolved by loader admission from model metadata and card
+    capacity; only an explicit user max_seq reaches the sparse TOML.
+      - Qwen3.5 / 3.6 / 3.8 targets → max_tokens=81920
+      - DeepSeek V4 Flash targets → max_tokens=393216
+      - other tags and draft/dflash sidecars → no policy.
     """
     if not canonical_tag:
         return {}
@@ -115,19 +110,9 @@ def _tag_load_policy(canonical_tag):
         return {}
     family = tag.split(":", 1)[0]
     if family in ("qwen3.5", "qwen3.6", "qwen3.8"):
-        return {
-            "max_seq": 262144,
-            "max_tokens": 81920,
-        }
+        return {"max_tokens": 81920}
     if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
-        return {
-            "max_seq": 1048576,
-            "max_tokens": 393216,
-        }
-    if tag in ("muse-glimmer", "muse-glimmer:fast"):
-        return {
-            "max_seq": 131072,
-        }
+        return {"max_tokens": 393216}
     return {}
 
 
@@ -143,20 +128,11 @@ def resolve_kv_backend_request(explicit):
 
 
 
-def resolve_max_seq(explicit, tag, registry_path):
-    """Resolve context length: explicit → tag policy → 32768."""
+def resolve_max_seq(explicit):
+    """Leave automatic context to the loader; forward only user override."""
     if explicit is not None:
         return explicit, "explicit(--max-seq)"
-    try:
-        canonical, entry = _registry_entry(tag, registry_path)
-    except Exception as e:
-        print(f"  [warn] could not resolve max_seq policy from {registry_path}: {e}",
-              file=sys.stderr)
-        canonical, entry = tag, {}
-    policy = _tag_load_policy(canonical) if entry else {}
-    if "max_seq" in policy:
-        return policy["max_seq"], f"tag-policy({canonical})"
-    return 32768, "default(32768)"
+    return None, "automatic(model/card)"
 
 
 def resolve_max_tokens(explicit, tag, registry_path):
@@ -276,8 +252,7 @@ def build_config(args):
     kv, kv_source = resolve_kv_mode(args.kv, tag, args.registry)
     kv_backend, kv_backend_source = resolve_kv_backend_request(
         getattr(args, "kv_backend", None))
-    max_seq, max_seq_source = resolve_max_seq(
-        getattr(args, "max_seq", None), tag, args.registry)
+    max_seq, max_seq_source = resolve_max_seq(getattr(args, "max_seq", None))
     max_tokens, max_tokens_source = resolve_max_tokens(
         getattr(args, "max_tokens", None), tag, args.registry)
     samp, samp_src = resolve_sampling(args.sampling, tag, args.registry)
@@ -485,7 +460,7 @@ def show_config(cfg):
           f"   kv_backend: {_kv_disp}"
           f" [{_kv_src}]"
           f"   mtp_mode: {cfg['mtp']}   mode: {cfg['mode']}")
-    print(f"  max_seq       : {cfg.get('max_seq', 32768)}"
+    print(f"  max_seq       : {cfg['max_seq'] if cfg.get('max_seq') is not None else '(model/card automatic)'}"
           f" [{cfg.get('max_seq_source', 'unknown')}]")
     print(f"  dflash        : {cfg.get('dflash', 'off')}   draft: {cfg.get('draft') or '(none / filename auto-match)'}")
     print(f"  ngram         : {cfg.get('ngram', 'off')}   ngram_k: {cfg.get('ngram_k') if cfg.get('ngram_k') is not None else '(loader default 12)'}")
@@ -792,14 +767,14 @@ def _write_native_config(cfg, home):
 {devices_line}deepseek4_compute_placement = {json.dumps(placement)}
 
 """
+    max_seq_line = f"max_seq = {cfg['max_seq']}\n" if cfg.get("max_seq") is not None else ""
     text = f"""[serve]
 host = "127.0.0.1"
 port = {cfg["port"]}
 default_model = {json.dumps(cfg["model"])}
 
 {model}{hardware}[memory]
-max_seq = {cfg.get("max_seq", 32768)}
-kv_cache = {json.dumps(cfg["kv"])}
+{max_seq_line}kv_cache = {json.dumps(cfg["kv"])}
 
 {speculation}
 [generation]
@@ -1145,7 +1120,7 @@ def _self_test_kv_resolution():
 
 
 def _self_test_load_defaults():
-    """Tag max_seq/max_tokens policy; backend request is automatic unless explicit."""
+    """Tag max_tokens policy; context/backend remain automatic unless explicit."""
     import argparse
     from contextlib import redirect_stdout
     from io import StringIO
@@ -1190,10 +1165,9 @@ def _self_test_load_defaults():
             "contiguous", "explicit(--kv-backend)")
         assert resolve_kv_backend_request("vmm") == (
             "vmm", "explicit(--kv-backend)")
+        assert resolve_max_seq(None) == (None, "automatic(model/card)")
 
-        # Qwen3.8 family (alias -> canonical) keeps native context/generation caps.
-        assert resolve_max_seq(None, "qwen38:27b", reg_path) == (
-            262144, "tag-policy(qwen3.8:27b)")
+        # Qwen3.8 aliases retain their generation cap, never a context cap.
         assert resolve_max_tokens(None, "qwen38:27b", reg_path) == (
             81920, "tag-policy(qwen3.8:27b)")
         vals, sources = resolve_sampling("registry", "qwen38:27b", reg_path)
@@ -1201,70 +1175,46 @@ def _self_test_load_defaults():
         assert vals["reasoning_effort"] == "xhigh"
         assert vals["thinking_budget"] == "uncapped"
         assert sources["temperature"] == "registry(qwen3.8:27b)"
-        # Exact Qwen family tags keep the same native context contract.
+        # All Qwen target tags keep their generation cap.
         for tag in ("qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b"):
-            assert resolve_max_seq(None, tag, reg_path) == (
-                262144, "tag-policy(%s)" % tag)
             assert resolve_max_tokens(None, tag, reg_path) == (
                 81920, "tag-policy(%s)" % tag)
-        # Explicit CLI overrides beat tag policy for caps.
-        assert resolve_max_seq(4096, "qwen38:27b", reg_path) == (
+        # Explicit context and generation overrides remain independent.
+        assert resolve_max_seq(4096) == (
             4096, "explicit(--max-seq)")
         assert resolve_max_tokens(512, "qwen38:27b", reg_path) == (
             512, "explicit(--max-tokens)")
-        # Original Qwen3 stays on 32768/2048 fallbacks (no backend tag policy).
-        assert resolve_max_seq(None, "qwen3:latest", reg_path) == (
-            32768, "default(32768)")
+        # Original Qwen3 has no generation tag policy.
         assert resolve_max_tokens(None, "qwen3:latest", reg_path) == (
             2048, "default(2048)")
-        # DeepSeek V4 Flash canonical targets: 1M ctx + 384Ki output.
+        # DeepSeek V4 Flash canonical targets: 384Ki output.
         for tag in (
             "deepseek-v4-flash",
             "deepseek-v4-flash:mq2lloyd",
             "deepseek-v4-flash-preview",
         ):
-            assert resolve_max_seq(None, tag, reg_path) == (
-                1048576, "tag-policy(%s)" % tag)
             assert resolve_max_tokens(None, tag, reg_path) == (
                 393216, "tag-policy(%s)" % tag)
         # Aliases resolve to the same DeepSeek canonical policy.
-        assert resolve_max_seq(None, "ds4", reg_path) == (
-            1048576, "tag-policy(deepseek-v4-flash)")
         assert resolve_max_tokens(None, "ds4", reg_path) == (
             393216, "tag-policy(deepseek-v4-flash)")
-        assert resolve_max_seq(None, "deepseek4:mq2lloyd", reg_path) == (
-            1048576, "tag-policy(deepseek-v4-flash:mq2lloyd)")
         assert resolve_max_tokens(None, "ds4:preview", reg_path) == (
             393216, "tag-policy(deepseek-v4-flash-preview)")
         # Explicit overrides still beat DeepSeek policy.
-        assert resolve_max_seq(8192, "deepseek-v4-flash", reg_path) == (
+        assert resolve_max_seq(8192) == (
             8192, "explicit(--max-seq)")
         assert resolve_max_tokens(256, "deepseek-v4-flash", reg_path) == (
             256, "explicit(--max-tokens)")
-        # Muse Glimmer quality + fast: native 131072; tokens stay fallback.
-        assert resolve_max_seq(None, "muse-glimmer", reg_path) == (
-            131072, "tag-policy(muse-glimmer)")
+        # Muse Glimmer has no tag context/generation override.
         assert resolve_max_tokens(None, "muse-glimmer", reg_path) == (
             2048, "default(2048)")
-        assert resolve_max_seq(None, "muse-glimmer:fast", reg_path) == (
-            131072, "tag-policy(muse-glimmer:fast)")
         assert resolve_max_tokens(None, "muse-glimmer:fast", reg_path) == (
             2048, "default(2048)")
-        # Quality alias lands on the same canonical Glimmer policy.
-        assert resolve_max_seq(None, "muse-glimmer:quality", reg_path) == (
-            131072, "tag-policy(muse-glimmer)")
         # Draft / dflash sidecars and unknown tags: no context/token policy.
-        assert resolve_max_seq(None, "muse-glimmer:draft", reg_path) == (
-            32768, "default(32768)")
         assert resolve_max_tokens(None, "muse-glimmer:draft", reg_path) == (
             2048, "default(2048)")
-        assert resolve_max_seq(None, "qwen3.5:4b-draft", reg_path) == (
-            32768, "default(32768)")
         assert resolve_max_tokens(None, "qwen3.5:4b-draft", reg_path) == (
             2048, "default(2048)")
-        assert resolve_max_seq(None, "qwen3.6:35b-a3b-dflash", reg_path) == (
-            32768, "default(32768)")
-        assert resolve_max_seq(None, "missing", reg_path) == (32768, "default(32768)")
         assert resolve_max_tokens(None, "missing", reg_path) == (2048, "default(2048)")
         # Family-looking tags absent from the registry are not registry-selected.
         for tag in (
@@ -1272,8 +1222,6 @@ def _self_test_load_defaults():
             "deepseek-v4-flash:missing",
             "deepseek-v4-flash-preview:missing",
         ):
-            assert resolve_max_seq(None, tag, reg_path) == (
-                32768, "default(32768)")
             assert resolve_max_tokens(None, tag, reg_path) == (
                 2048, "default(2048)")
 
@@ -1336,15 +1284,19 @@ def _self_test_load_defaults():
             base.update(kw)
             return argparse.Namespace(**base)
 
-        # Path and tag both request automatic; caps still come from the tag.
+        # Path and tag both request automatic context/backend; only output cap is tagged.
         cfg = build_config(_ns())
         assert cfg["kv_backend"] is None, cfg
         assert cfg["kv_backend_source"] == "automatic"
-        assert cfg["max_seq"] == 262144
-        assert cfg["max_seq_source"] == "tag-policy(qwen3.8:27b)"
+        assert cfg["max_seq"] is None
+        assert cfg["max_seq_source"] == "automatic(model/card)"
         assert cfg["max_tokens"] == 81920
         assert cfg["max_tokens_source"] == "tag-policy(qwen3.8:27b)"
         assert cfg["kv"] == "q8"
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, ".hipfire").mkdir()
+            _write_native_config(cfg, home)
+            assert "max_seq =" not in Path(home, ".hipfire", "config.toml").read_text()
 
         cfg = build_config(_ns(tag=None, model="/models/qwen3.8-27b.mq4"))
         assert cfg["kv_backend"] is None
@@ -1357,11 +1309,15 @@ def _self_test_load_defaults():
         assert cfg["max_seq_source"] == "explicit(--max-seq)"
         assert cfg["max_tokens"] == 256
         assert cfg["max_tokens_source"] == "explicit(--max-tokens)"
+        with tempfile.TemporaryDirectory() as home:
+            Path(home, ".hipfire").mkdir()
+            _write_native_config(cfg, home)
+            assert "max_seq = 8192" in Path(home, ".hipfire", "config.toml").read_text()
 
         cfg = build_config(_ns(tag="qwen3:latest", model="/models/qwen3-8b.mq4"))
         assert cfg["kv_backend"] is None
         assert cfg["kv_backend_source"] == "automatic"
-        assert cfg["max_seq"] == 32768
+        assert cfg["max_seq"] is None
         assert cfg["max_tokens"] == 2048
 
         cfg = build_config(_ns(
@@ -1370,8 +1326,8 @@ def _self_test_load_defaults():
         ))
         assert cfg["kv_backend"] is None
         assert cfg["kv_backend_source"] == "automatic"
-        assert cfg["max_seq"] == 1048576
-        assert cfg["max_seq_source"] == "tag-policy(deepseek-v4-flash)"
+        assert cfg["max_seq"] is None
+        assert cfg["max_seq_source"] == "automatic(model/card)"
         assert cfg["max_tokens"] == 393216
         assert cfg["max_tokens_source"] == "tag-policy(deepseek-v4-flash)"
 
@@ -1380,7 +1336,7 @@ def _self_test_load_defaults():
             model="/models/deepseek-v4-flash-0731.mq2lloyd",
         ))
         assert cfg["kv_backend"] is None
-        assert cfg["max_seq"] == 1048576
+        assert cfg["max_seq"] is None
         assert cfg["max_tokens"] == 393216
 
         cfg = build_config(_ns(
@@ -1388,30 +1344,30 @@ def _self_test_load_defaults():
             model="/models/deepseek-v4-flash.mq2lloyd",
         ))
         assert cfg["kv_backend"] is None
-        assert cfg["max_seq"] == 1048576
+        assert cfg["max_seq"] is None
         assert cfg["max_tokens"] == 393216
 
         cfg = build_config(_ns(tag="muse-glimmer", model="/models/muse-glimmer-30b.mq4"))
         assert cfg["kv_backend"] is None
         assert cfg["kv_backend_source"] == "automatic"
-        assert cfg["max_seq"] == 131072
-        assert cfg["max_seq_source"] == "tag-policy(muse-glimmer)"
+        assert cfg["max_seq"] is None
+        assert cfg["max_seq_source"] == "automatic(model/card)"
         assert cfg["max_tokens"] == 2048
         assert cfg["max_tokens_source"] == "default(2048)"
 
         cfg = build_config(_ns(tag="muse-glimmer:fast", model="/models/muse-glimmer-30b.mq4r"))
         assert cfg["kv_backend"] is None
-        assert cfg["max_seq"] == 131072
+        assert cfg["max_seq"] is None
         assert cfg["max_tokens"] == 2048
 
-        # Draft/dflash sidecars: still automatic request; caps stay harness defaults.
+        # Draft/dflash sidecars: automatic context/backend; generation fallback.
         cfg = build_config(_ns(
             tag="muse-glimmer:draft",
             model="/models/muse-glimmer-30b-assistant.q8.hfq",
         ))
         assert cfg["kv_backend"] is None
         assert cfg["kv_backend_source"] == "automatic"
-        assert cfg["max_seq"] == 32768
+        assert cfg["max_seq"] is None
         assert cfg["max_tokens"] == 2048
         assert infer_tag("/models/muse-glimmer-30b-dflash.mq4") == "muse-glimmer:draft"
         assert infer_tag("/models/muse-glimmer-30b-assistant.q8.hfq") == "muse-glimmer:draft"
@@ -1421,13 +1377,13 @@ def _self_test_load_defaults():
         ))
         assert cfg["kv_backend"] is None
         assert cfg["kv_backend_source"] == "automatic"
-        assert cfg["max_seq"] == 32768
+        assert cfg["max_seq"] is None
         assert cfg["max_tokens"] == 2048
 
         cfg = build_config(_ns(tag="missing", model="/models/unknown.mq4"))
         assert cfg["kv_backend"] is None
         assert cfg["kv_backend_source"] == "automatic"
-        assert cfg["max_seq"] == 32768
+        assert cfg["max_seq"] is None
         assert cfg["max_tokens"] == 2048
 
         # Pre-flight shows requested automatic until observation lands.
@@ -3632,7 +3588,7 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="generation cap; omitted resolves canonical-tag policy then 2048")
     ap.add_argument("--max-seq", type=int, default=None,
-                    help="context length; omitted resolves canonical-tag policy then 32768")
+                    help="context length override; omitted resolves at model/card admission")
     ap.add_argument("--sampling", default="registry",
                     help="registry | registry:general|coding|instruct | greedy | recipe:general|coding|nothink | json:{...}")
     ap.add_argument("--mode", default="battery", choices=["battery", "chain", "session", "images"])

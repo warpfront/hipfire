@@ -979,18 +979,17 @@ fn main() {
                     .and_then(|p| p.get("experimental_multi_slot"))
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
-                // #666 G1: fail-closed floor admission BEFORE any teardown or
-                // allocation on either branch below; both downstream read
-                // sites reuse `requested_seq`, so the refusal cannot be
-                // outflanked by branch order.
+                // Omitted max_seq is resolved from model metadata and card
+                // capacity by source admission. Explicit zero still refuses
+                // before teardown (the fixed slot owner retains its 4096 default).
                 let requested_seq = msg
                     .get("params")
                     .and_then(|p| p.get("max_seq"))
                     .and_then(|v| v.as_u64())
-                    .unwrap_or(4096) as usize;
-                if requested_seq < MIN_REQUESTED_SEQ {
+                    .map(|n| n as usize);
+                if requested_seq.is_some_and(|n| n < MIN_REQUESTED_SEQ) {
                     let e = format!(
-                        "load refused: max_seq {requested_seq} below floor {MIN_REQUESTED_SEQ}"
+                        "load refused: max_seq {} below floor {MIN_REQUESTED_SEQ}", requested_seq.unwrap()
                     );
                     emit_uncorrelated_error(&mut stdout, None, &e, "validation", false, false);
                     let _ = stdout.flush();
@@ -1111,7 +1110,7 @@ fn main() {
                         continue;
                     }
                     // Floor already admitted pre-teardown above.
-                    let requested_max_seq = requested_seq;
+                    let requested_max_seq = requested_seq.unwrap_or(4096);
                     let max_seq = requested_max_seq.min(MAX_REQUESTED_SEQ);
                     let n_slots = msg
                         .get("params")
@@ -1245,13 +1244,10 @@ fn main() {
                 }
 
                 let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
-                // hunt3 H-D: clamp request-driven max_seq to the config ceiling
-                // (MAX_REQUESTED_SEQ = 1M). Without this an unvalidated 10M
-                // max_seq drives a multi-GB KV allocation and OOMs the daemon at
-                // load. Emit an info event when the clamp actually fires so the
-                // operator sees the truncation rather than silently getting 1M.
-                // Floor already admitted pre-teardown above.
-                let requested_max_seq = requested_seq;
+                // Only an explicit request is clamped; omission lets
+                // admission choose the trained/model-card minimum instead
+                // of the old fixed daemon default.
+                let requested_max_seq = requested_seq.unwrap_or(0);
                 let max_seq = requested_max_seq.min(MAX_REQUESTED_SEQ);
                 if requested_max_seq > MAX_REQUESTED_SEQ {
                     let _ = writeln!(
@@ -1804,6 +1800,7 @@ fn main() {
                         cask: Some(&cask),
                         deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
                         vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+                        free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
                     },
                 ) {
                     Ok(a) => a,
@@ -1816,6 +1813,8 @@ fn main() {
                         continue;
                     }
                 };
+                let max_seq = admission.max_seq;
+                let sequence_reason = admission.sequence_reason;
                 if let Some(reason) = &admission.kv_backend_reason {
                     eprintln!("KV backend: automatic vmm unavailable ({reason}) -> contiguous");
                 } else if matches!(backend_request, hipfire_loader::admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Contiguous)) {
@@ -1918,6 +1917,27 @@ fn main() {
                 };
                 match loaded {
                     Ok(mut m) => {
+                        let max_seq = m.max_seq;
+                        let resolved = m.sequence.as_ref();
+                        let seq_bound = resolved.map_or(
+                            if requested_seq.is_some() { "user" } else { "legacy" },
+                            |s| s.bound,
+                        );
+                        let model_ctx = resolved.map(|s| s.model_ctx);
+                        let card_cap = resolved.map(|s| s.card_cap);
+                        let seq_kv = resolved.map_or_else(
+                            || kv_mode_override.as_deref().unwrap_or("auto"),
+                            |s| s.kv_mode,
+                        );
+                        let seq_reason_json = serde_json::to_string(&sequence_reason).unwrap();
+                        if let Some(s) = resolved {
+                            eprintln!("max_seq: {max_seq} (bound={seq_bound}; model_ctx={}, card_cap={}, kv={seq_kv})", s.model_ctx, s.card_cap);
+                        } else {
+                            eprintln!("max_seq: {max_seq} (bound={seq_bound}; model_ctx=unknown, card_cap=unknown, kv={seq_kv})");
+                        }
+                        if let Some(reason) = sequence_reason {
+                            eprintln!("{reason}");
+                        }
                         // Deferred EP retirement lives AFTER continuous-batch
                         // staging below: the prior resident in `model` (and
                         // its PFlash drafter) must survive every fallible
@@ -2174,7 +2194,7 @@ fn main() {
                         if staged_ep_batch {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{}}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
@@ -2191,11 +2211,13 @@ fn main() {
                                 backend_diagnostics.0,
                                 backend_diagnostics.1,
                                 backend_reason_json,
+                                max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
+                                serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
                         } else {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{}}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
@@ -2210,6 +2232,8 @@ fn main() {
                                 backend_diagnostics.0,
                                 backend_diagnostics.1,
                                 backend_reason_json,
+                                max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
+                                serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
                         }
                         // ── PFlash drafter load (Phase 4.0) ──────────────

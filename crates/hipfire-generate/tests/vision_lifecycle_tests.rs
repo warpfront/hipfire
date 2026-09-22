@@ -597,6 +597,7 @@ fn admit_and_load(
             cask: None,
             deepseek4_heterogeneous: false,
             vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
+            free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
         },
     )
     .expect("admit fixture source");

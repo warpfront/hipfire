@@ -295,9 +295,11 @@ impl ModelEntry {
 /// then applies automatic load policy by canonical tag. This is the single
 /// canonical place for tag policy so validation and CLI stay in sync.
 ///
-/// Policy (static; no registry/v1 wire fields): Qwen3.5/3.6/3.8,
-/// DeepSeek V4 Flash, and Muse Glimmer tags supply context/generation lengths,
-/// never a KV backend. Backend selection is source-independent at admission.
+/// Policy (static; no registry/v1 wire fields): Qwen3.5/3.6/3.8 and
+/// DeepSeek V4 Flash tags supply generation max_tokens only — never
+/// `memory.max_seq` (resolved at load time) and never a KV backend.
+/// Backend selection is source-independent at admission. Muse Glimmer
+/// tags write neither length.
 ///
 /// Explicit global/model/one-shot user config remains higher precedence than
 /// this registry layer.
@@ -311,9 +313,6 @@ pub fn config_layer_for_tag(
     let is_qwen_tag_policy = matches!(family, "qwen3.5" | "qwen3.6" | "qwen3.8") && !is_sidecar;
     if is_qwen_tag_policy {
         layer
-            .set("memory.max_seq", ConfigValue::Integer(262144))
-            .map_err(|error| error.to_string())?;
-        layer
             .set("generation.max_tokens", ConfigValue::Integer(81920))
             .map_err(|error| error.to_string())?;
     }
@@ -321,15 +320,7 @@ pub fn config_layer_for_tag(
         matches!(family, "deepseek-v4-flash" | "deepseek-v4-flash-preview") && !is_sidecar;
     if is_deepseek_tag_policy {
         layer
-            .set("memory.max_seq", ConfigValue::Integer(1048576))
-            .map_err(|error| error.to_string())?;
-        layer
             .set("generation.max_tokens", ConfigValue::Integer(393216))
-            .map_err(|error| error.to_string())?;
-    }
-    if matches!(tag, "muse-glimmer" | "muse-glimmer:fast") {
-        layer
-            .set("memory.max_seq", ConfigValue::Integer(131072))
             .map_err(|error| error.to_string())?;
     }
     Ok(layer)
@@ -1235,27 +1226,27 @@ mod tests {
             "effort-native: absence means uncapped"
         );
 
-        // Tag policy provides 262K + 81920 for Qwen3.8 canonical tags; never a KV backend.
+        // Tag policy pins generation.max_tokens only for Qwen3.8; never max_seq or a KV backend.
         let layer =
             config_layer_for_tag(tag, model).expect("qwen3.8:27b tag policy lowers cleanly");
         assert!(layer.get("memory.kv_cache").is_none());
         assert!(layer.get("memory.kv_backend").is_none());
-        assert_eq!(
-            layer.get("memory.max_seq"),
-            Some(&ConfigValue::Integer(262144))
+        assert!(
+            layer.get("memory.max_seq").is_none(),
+            "tag layer must not write memory.max_seq"
         );
         assert_eq!(
             layer.get("generation.max_tokens"),
             Some(&ConfigValue::Integer(81920))
         );
         // Tag policy keys off the family before ':' and excludes only draft/dflash
-        // tags, so the fast SKU receives the same 262K + 81920 lowers (no backend).
+        // tags, so the fast SKU receives the same max_tokens pin (no max_seq/backend).
         let fast_layer = config_layer_for_tag(fast_tag, fast)
             .expect("qwen3.8:27b-fast tag policy lowers cleanly");
         assert!(fast_layer.get("memory.kv_backend").is_none());
-        assert_eq!(
-            fast_layer.get("memory.max_seq"),
-            Some(&ConfigValue::Integer(262144))
+        assert!(
+            fast_layer.get("memory.max_seq").is_none(),
+            "tag layer must not write memory.max_seq"
         );
         assert_eq!(
             fast_layer.get("generation.max_tokens"),
@@ -1627,7 +1618,7 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
-        // Exact Qwen families get 262144 + 81920; never a KV backend.
+        // Exact Qwen families get max_tokens 81920 only; never max_seq or a KV backend.
         for tag in ["qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b"] {
             let (_, entry) = registry.model(tag).unwrap();
             let layer = config_layer_for_tag(tag, entry).unwrap();
@@ -1635,10 +1626,9 @@ mod tests {
                 layer.get("memory.kv_backend").is_none(),
                 "{tag} must not write a KV backend"
             );
-            assert_eq!(
-                layer.get("memory.max_seq"),
-                Some(&ConfigValue::Integer(262144)),
-                "{tag} should get 262144"
+            assert!(
+                layer.get("memory.max_seq").is_none(),
+                "{tag} must not write memory.max_seq"
             );
             assert_eq!(
                 layer.get("generation.max_tokens"),
@@ -1666,7 +1656,7 @@ mod tests {
             assert!(layer.get("generation.max_tokens").is_none());
         }
 
-        // DeepSeek official / MQ2Lloyd / preview targets get 1M + 384Ki; never a KV backend.
+        // DeepSeek official / MQ2Lloyd / preview targets get max_tokens 393216 only.
         for tag in [
             "deepseek-v4-flash",
             "deepseek-v4-flash:mq2lloyd",
@@ -1678,10 +1668,9 @@ mod tests {
                 layer.get("memory.kv_backend").is_none(),
                 "{tag} must not write a KV backend"
             );
-            assert_eq!(
-                layer.get("memory.max_seq"),
-                Some(&ConfigValue::Integer(1048576)),
-                "{tag} should get 1048576"
+            assert!(
+                layer.get("memory.max_seq").is_none(),
+                "{tag} must not write memory.max_seq"
             );
             assert_eq!(
                 layer.get("generation.max_tokens"),
@@ -1697,10 +1686,9 @@ mod tests {
                 layer.get("memory.kv_backend").is_none(),
                 "{alias}->{resolved} must not write a KV backend"
             );
-            assert_eq!(
-                layer.get("memory.max_seq"),
-                Some(&ConfigValue::Integer(1048576)),
-                "{alias}->{resolved} should get 1048576"
+            assert!(
+                layer.get("memory.max_seq").is_none(),
+                "{alias}->{resolved} must not write memory.max_seq"
             );
             assert_eq!(
                 layer.get("generation.max_tokens"),
@@ -1715,7 +1703,7 @@ mod tests {
         assert!(layer.get("memory.max_seq").is_none());
         assert!(layer.get("generation.max_tokens").is_none());
 
-        // Muse Glimmer quality and fast targets get native 131072, no invented max_tokens or backend.
+        // Muse Glimmer quality and fast targets write nothing (no max_seq/max_tokens/backend).
         for tag in ["muse-glimmer", "muse-glimmer:fast"] {
             let (_, entry) = registry.model(tag).unwrap();
             let layer = config_layer_for_tag(tag, entry).unwrap();
@@ -1723,25 +1711,21 @@ mod tests {
                 layer.get("memory.kv_backend").is_none(),
                 "{tag} must not write a KV backend"
             );
-            assert_eq!(
-                layer.get("memory.max_seq"),
-                Some(&ConfigValue::Integer(131072)),
-                "{tag} should get 131072"
+            assert!(
+                layer.get("memory.max_seq").is_none(),
+                "{tag} must not write memory.max_seq"
             );
             assert!(
                 layer.get("generation.max_tokens").is_none(),
                 "{tag} must not get max_tokens"
             );
         }
-        // quality alias lands on trunk and inherits the same policy.
+        // quality alias lands on trunk and inherits the same (empty) policy.
         let (resolved, entry) = registry.model("muse-glimmer:quality").unwrap();
         assert_eq!(resolved, "muse-glimmer");
         let layer = config_layer_for_tag(resolved, entry).unwrap();
         assert!(layer.get("memory.kv_backend").is_none());
-        assert_eq!(
-            layer.get("memory.max_seq"),
-            Some(&ConfigValue::Integer(131072))
-        );
+        assert!(layer.get("memory.max_seq").is_none());
         assert!(layer.get("generation.max_tokens").is_none());
 
         // Muse Glimmer draft receives none
@@ -1818,9 +1802,9 @@ mod tests {
         let (tag, entry) = registry.model("qwen3.8:27b").unwrap();
         let registry_layer = config_layer_for_tag(tag, entry).unwrap();
         assert!(registry_layer.get("memory.kv_backend").is_none());
-        assert_eq!(
-            registry_layer.get("memory.max_seq"),
-            Some(&ConfigValue::Integer(262144))
+        assert!(
+            registry_layer.get("memory.max_seq").is_none(),
+            "tag layer must not write memory.max_seq"
         );
         assert_eq!(
             registry_layer.get("generation.max_tokens"),
@@ -1874,7 +1858,7 @@ mod tests {
             Some(&ConfigValue::Integer(1024))
         );
 
-        // Glimmer target override likewise wins (backend + max_seq).
+        // Glimmer target override likewise wins (backend + max_seq); tag writes neither.
         let raw2 = r#"{
             "schema_version":1,
             "generated_at":"2026-09-01T00:00:00Z",
@@ -1885,10 +1869,7 @@ mod tests {
         let (g_tag, g_entry) = registry2.model("muse-glimmer").unwrap();
         let g_registry_layer = config_layer_for_tag(g_tag, g_entry).unwrap();
         assert!(g_registry_layer.get("memory.kv_backend").is_none());
-        assert_eq!(
-            g_registry_layer.get("memory.max_seq"),
-            Some(&ConfigValue::Integer(131072))
-        );
+        assert!(g_registry_layer.get("memory.max_seq").is_none());
         assert!(g_registry_layer.get("generation.max_tokens").is_none());
         let mut g_user = ConfigLayer::default();
         g_user
@@ -1927,7 +1908,7 @@ mod tests {
             Some(&ConfigValue::Integer(8192))
         );
 
-        // DeepSeek target override wins over 1M/384Ki policy.
+        // DeepSeek target override wins over max_tokens policy; tag writes no max_seq.
         let raw3 = r#"{
             "schema_version":1,
             "generated_at":"2026-09-01T00:00:00Z",
@@ -1937,10 +1918,7 @@ mod tests {
         let registry3 = RegistryV1::parse(raw3, "test").unwrap();
         let (d_tag, d_entry) = registry3.model("deepseek-v4-flash").unwrap();
         let d_registry_layer = config_layer_for_tag(d_tag, d_entry).unwrap();
-        assert_eq!(
-            d_registry_layer.get("memory.max_seq"),
-            Some(&ConfigValue::Integer(1048576))
-        );
+        assert!(d_registry_layer.get("memory.max_seq").is_none());
         assert_eq!(
             d_registry_layer.get("generation.max_tokens"),
             Some(&ConfigValue::Integer(393216))

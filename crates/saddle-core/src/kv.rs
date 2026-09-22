@@ -1956,6 +1956,11 @@ impl KvCache {
             required_tokens,
         )?;
         self.require_mapped_capacity(required_tokens)?;
+        let mapped = self.mapped_token_capacity()?.unwrap_or(0);
+        eprintln!(
+            "KV cache: mapped_prefix={fast_capacity}->{mapped} / physical_cap={} / max_seq={}",
+            self.physical_cap, self.max_seq,
+        );
         Ok(())
     }
 

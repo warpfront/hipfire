@@ -3048,8 +3048,9 @@ pub(crate) fn load_params(
     explicit_draft: bool,
     head_override: Option<&str>,
 ) -> Result<serde_json::Value> {
-    let configured_max_seq = config_u64(resolved, "memory.max_seq")?;
-    let max_seq = configured_max_seq.max(max_tokens.saturating_add(1024));
+    // max_seq is omitted for built-in/registry provenance so the daemon can
+    // derive min(model context, card capacity). Explicit user sources are
+    // forwarded unchanged (no max_tokens+1024 inflation).
     let configured_kv = config_string(resolved, "memory.kv_cache")?;
     let kv_mode = kv_override
         .map(str::to_owned)
@@ -3120,7 +3121,6 @@ pub(crate) fn load_params(
         }
     };
     let mut params = serde_json::json!({
-        "max_seq": max_seq,
         "deepseek4_compute_placement": config_string(
             resolved,
             "hardware.deepseek4_compute_placement",
@@ -3172,6 +3172,20 @@ pub(crate) fn load_params(
         )
     {
         params["kv_backend"] = serde_json::json!(kv_backend);
+    }
+    let max_seq_source = &resolved
+        .get("memory.max_seq")
+        .expect("schema field")
+        .source;
+    if matches!(
+        max_seq_source,
+        ConfigSource::GlobalUser { .. }
+            | ConfigSource::ModelUser { .. }
+            | ConfigSource::OneShot { .. }
+            | ConfigSource::LegacyEnv { .. }
+    ) {
+        let max_seq = config_u64(resolved, "memory.max_seq")?;
+        params["max_seq"] = serde_json::json!(max_seq);
     }
     if let Some(experts_per_token) =
         config_optional_u64(resolved, "model.deepseek4_experts_per_token")?
@@ -4947,8 +4961,16 @@ fn open_bench_engine(
     )?;
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
-        let configured = params["max_seq"].as_u64().unwrap_or(0);
-        params["max_seq"] = serde_json::json!(configured.max(requested));
+        // Automatic max_seq stays omitted so admission can derive the bound.
+        // An explicit user value is never silently inflated — refuse if too small.
+        if let Some(configured) = params.get("max_seq").and_then(|v| v.as_u64()) {
+            if configured < requested {
+                bail!(
+                    "memory.max_seq={configured} is below bench requirement {requested} \
+                     (longest prefill/decode + 32); raise max_seq or shrink the matrix"
+                );
+            }
+        }
     }
     if let Ok(n) = hipfire_config::developer_var("HIPFIRE_BENCH_CONTINUOUS_BATCH") {
         if let Ok(n) = n.parse::<u64>() {
@@ -7359,8 +7381,8 @@ mod tests {
 
     #[test]
     pub(crate) fn load_params_omits_automatic_kv_backend_for_path() {
-        // Absolute path with only schema/built-in backend is automatic: omit
-        // the field so admission can pick VMM or fall back with a reason.
+        // Absolute path with only schema/built-in backend/max_seq is automatic:
+        // omit both so admission can pick VMM and the daemon can derive max_seq.
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
         let params = load_params(
@@ -7380,8 +7402,12 @@ mod tests {
             params.get("kv_backend").is_none(),
             "absolute path automatic backend must omit kv_backend"
         );
-        assert_eq!(params["max_seq"], 32768);
+        assert!(
+            params.get("max_seq").is_none(),
+            "absolute path automatic max_seq must be omitted for runtime default"
+        );
     }
+
 
     #[test]
     pub(crate) fn resolved_for_model_applies_qwen_tag_policy_and_excludes_original_and_sidecars() {
@@ -7403,8 +7429,8 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
-        // Exact Qwen families keep max_seq + max_tokens; registry no longer
-        // pins kv_backend. load_params must omit automatic backend for tags.
+        // Exact Qwen families keep max_tokens only; registry no longer pins
+        // max_seq or kv_backend. load_params omits automatic max_seq/backend.
         for tag in [
             "qwen3.5:4b",
             "qwen3.6:35b-a3b",
@@ -7418,10 +7444,14 @@ mod tests {
                 direct.get("memory.kv_backend").is_none(),
                 "{tag} registry layer must not write kv_backend"
             );
+            assert!(
+                direct.get("memory.max_seq").is_none(),
+                "{tag} registry layer must not write max_seq"
+            );
             assert_eq!(
                 config_u64(&resolved, "memory.max_seq").unwrap(),
-                262144,
-                "{tag}"
+                32768,
+                "{tag} resolved max_seq is schema built-in only"
             );
             assert_eq!(
                 config_u64(&resolved, "generation.max_tokens").unwrap(),
@@ -7446,10 +7476,13 @@ mod tests {
                 params.get("kv_backend").is_none(),
                 "{tag} load_params must omit automatic kv_backend"
             );
-            assert_eq!(params["max_seq"], 262144, "{tag}");
+            assert!(
+                params.get("max_seq").is_none(),
+                "{tag} load_params must omit automatic max_seq"
+            );
         }
 
-        // Original qwen3:* has no tag policy — backend stays automatic.
+        // Original qwen3:* has no tag policy — backend/max_seq stay automatic.
         let (_, entry) = registry.model("qwen3:8b").unwrap();
         let resolved =
             resolved_for_model(&paths, "qwen3:8b", Some("qwen3:8b"), Some(entry)).unwrap();
@@ -7481,7 +7514,10 @@ mod tests {
             params.get("kv_backend").is_none(),
             "original qwen3 automatic backend must omit kv_backend"
         );
-        assert_eq!(params["max_seq"], 32768);
+        assert!(
+            params.get("max_seq").is_none(),
+            "original qwen3 automatic max_seq must be omitted"
+        );
 
         // Draft/dflash sidecars do not get the Qwen policy even though family matches.
         for tag in ["qwen3.5:9b-draft", "qwen3.6:27b-dflash"] {
@@ -7523,7 +7559,7 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
-        // Muse Glimmer tags set context only; backend remains an automatic request.
+        // Muse Glimmer tags no longer pin max_seq; backend remains automatic.
         for tag in ["muse-glimmer", "muse-glimmer:fast"] {
             let (_, entry) = registry.model(tag).unwrap();
             let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
@@ -7534,29 +7570,43 @@ mod tests {
             );
             assert_eq!(
                 config_u64(&resolved, "memory.max_seq").unwrap(),
-                131072,
-                "{tag}"
+                32768,
+                "{tag} resolved max_seq is schema built-in only"
             );
             let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
             assert!(direct.get("memory.kv_backend").is_none());
-            assert_eq!(
-                direct.get("memory.max_seq"),
-                Some(&hipfire_config::ConfigValue::Integer(131072)),
-                "{tag} should get 131072"
+            assert!(
+                direct.get("memory.max_seq").is_none(),
+                "{tag} registry must not write max_seq"
             );
             assert!(
                 direct.get("generation.max_tokens").is_none(),
                 "{tag} must not get max_tokens"
             );
+            let model_path = PathBuf::from("/tmp/test-model.mq4");
+            let params = load_params(
+                &resolved,
+                Some(entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(
+                params.get("max_seq").is_none(),
+                "{tag} load_params must omit automatic max_seq"
+            );
         }
-        // quality alias lands on trunk policy.
+        // quality alias lands on trunk (still no max_seq policy).
         let (resolved_tag, entry) = registry.model("muse-glimmer:quality").unwrap();
         assert_eq!(resolved_tag, "muse-glimmer");
         let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
-        assert_eq!(
-            direct.get("memory.max_seq"),
-            Some(&hipfire_config::ConfigValue::Integer(131072))
-        );
+        assert!(direct.get("memory.max_seq").is_none());
 
         // Muse Glimmer draft receives none.
         let (_, entry) = registry.model("muse-glimmer:draft").unwrap();
@@ -7573,7 +7623,7 @@ mod tests {
         .unwrap();
         assert_eq!(config_string(&resolved, "memory.kv_backend").unwrap(), "vmm");
 
-        // DeepSeek tags set context/generation lengths, not a backend.
+        // DeepSeek tags keep generation.max_tokens only; no max_seq/backend pin.
         for tag in [
             "deepseek-v4-flash",
             "deepseek-v4-flash:mq2lloyd",
@@ -7589,8 +7639,8 @@ mod tests {
             );
             assert_eq!(
                 config_u64(&resolved, "memory.max_seq").unwrap(),
-                1048576,
-                "{tag}"
+                32768,
+                "{tag} resolved max_seq is schema built-in only"
             );
             assert_eq!(
                 config_u64(&resolved, "generation.max_tokens").unwrap(),
@@ -7599,21 +7649,38 @@ mod tests {
             );
             let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
             assert!(direct.get("memory.kv_backend").is_none());
-            assert_eq!(
-                direct.get("memory.max_seq"),
-                Some(&hipfire_config::ConfigValue::Integer(1048576))
+            assert!(
+                direct.get("memory.max_seq").is_none(),
+                "{tag} registry must not write max_seq"
             );
             assert_eq!(
                 direct.get("generation.max_tokens"),
                 Some(&hipfire_config::ConfigValue::Integer(393216))
             );
+            let model_path = PathBuf::from("/tmp/test-model.mq4");
+            let params = load_params(
+                &resolved,
+                Some(entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(
+                params.get("max_seq").is_none(),
+                "{tag} load_params must omit automatic max_seq"
+            );
         }
         for alias in ["deepseek4", "ds4", "deepseek4:preview"] {
             let (resolved_tag, entry) = registry.model(alias).unwrap();
             let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
-            assert_eq!(
-                direct.get("memory.max_seq"),
-                Some(&hipfire_config::ConfigValue::Integer(1048576)),
+            assert!(
+                direct.get("memory.max_seq").is_none(),
                 "{alias}->{resolved_tag}"
             );
             assert_eq!(
@@ -7657,7 +7724,7 @@ mod tests {
             config_string(&resolved, "memory.kv_backend").unwrap(),
             "vmm"
         );
-        assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 262144);
+        assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 32768);
         assert_eq!(
             config_u64(&resolved, "generation.max_tokens").unwrap(),
             81920
@@ -7712,7 +7779,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["kv_backend"], "contiguous");
-        // Automatic registry/built-in: omit kv_backend; max_seq still forwarded.
+        // Automatic registry/built-in: omit kv_backend and max_seq.
         let params2 = load_params(
             &resolved,
             Some(entry),
@@ -7730,7 +7797,10 @@ mod tests {
             params2.get("kv_backend").is_none(),
             "registry-tag automatic backend must omit kv_backend"
         );
-        assert_eq!(params2["max_seq"], 262144);
+        assert!(
+            params2.get("max_seq").is_none(),
+            "registry-tag automatic max_seq must be omitted"
+        );
 
         // Global user config is an explicit choice and is emitted.
         let params_global = load_params(
@@ -7819,14 +7889,8 @@ mod tests {
         let registry2 = RegistryV1::parse(raw2, "test").unwrap();
         let (g_tag, g_entry) = registry2.model("muse-glimmer").unwrap();
         let g_layer = hipfire_registry::config_layer_for_tag(g_tag, g_entry).unwrap();
-        assert_eq!(
-            g_layer.get("memory.kv_backend"),
-            Some(&hipfire_config::ConfigValue::String("vmm".into()))
-        );
-        assert_eq!(
-            g_layer.get("memory.max_seq"),
-            Some(&hipfire_config::ConfigValue::Integer(131072))
-        );
+        assert!(g_layer.get("memory.kv_backend").is_none());
+        assert!(g_layer.get("memory.max_seq").is_none());
         assert!(g_layer.get("generation.max_tokens").is_none());
         let mut g_user = ConfigLayer::default();
         g_user.set_cli("memory.kv_backend", "contiguous").unwrap();
@@ -7852,8 +7916,24 @@ mod tests {
             "contiguous"
         );
         assert_eq!(config_u64(&g_resolved, "memory.max_seq").unwrap(), 8192);
+        let model_path_g = PathBuf::from("/tmp/test-model.mq4");
+        let g_params = load_params(
+            &g_resolved,
+            Some(g_entry),
+            &model_path_g.parent().unwrap(),
+            &model_path_g,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(g_params["kv_backend"], "contiguous");
+        assert_eq!(g_params["max_seq"], 8192);
 
-        // DeepSeek target override wins over 1M/384Ki policy.
+        // DeepSeek target: generation policy remains; user max_seq still wins.
         let raw3 = r#"{
             "schema_version":1,
             "generated_at":"2026-09-01T00:00:00Z",
@@ -7867,7 +7947,7 @@ mod tests {
             config_string(&d_resolved, "memory.kv_backend").unwrap(),
             "vmm"
         );
-        assert_eq!(config_u64(&d_resolved, "memory.max_seq").unwrap(), 1048576);
+        assert_eq!(config_u64(&d_resolved, "memory.max_seq").unwrap(), 32768);
         assert_eq!(
             config_u64(&d_resolved, "generation.max_tokens").unwrap(),
             393216
@@ -7896,6 +7976,20 @@ mod tests {
             config_u64(&d_overridden, "generation.max_tokens").unwrap(),
             2048
         );
+        let d_params = load_params(
+            &d_overridden,
+            Some(d_entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(d_params["max_seq"], 65536);
 
         fs::remove_dir_all(&paths.root).unwrap();
     }

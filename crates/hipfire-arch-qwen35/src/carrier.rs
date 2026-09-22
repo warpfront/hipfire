@@ -54,7 +54,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     let config = <Qwen35 as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
 
     // ── CPU-only parse + compatibility (zero GPU allocation) ─────────
-    let plan = plan_qwen35_gpu_stages(&config, ctx)?;
+    let mut plan = plan_qwen35_gpu_stages(&config, ctx)?;
     let dn_quant = parse_state_quant(ctx.state_quant_override)?;
     eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
     warn_tiny_model_state(&hfq, dn_quant);
@@ -62,6 +62,48 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     // ── Weight upload (first GPU ownership) ──────────────────────────
     let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
     hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+    // The real card bound is determined only now: weights (including any
+    // expanded tensors) already own VRAM, while KV and lazy PBS do not.
+    if let Some(mut sequence) = ctx.sequence {
+        let capacity = (|| -> Result<(usize, usize, usize, usize), String> {
+            let (free, _) = ctx.gpu.hip.get_vram_info().map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
+            let minimum = crate::qwen35::prefill::minimum_prefill_reservation_bytes(
+                &config, &ctx.gpu.arch,
+            ).ok_or("Qwen minimum PBS sizing overflow")?;
+            let stride = crate::qwen35::prefill::vmm_kv_token_bytes(
+                &config, plan.mode, plan.adaptive.is_some(),
+            ).ok_or("Qwen KV stride overflow")?;
+            let card_cap = free.saturating_sub(minimum).saturating_sub(128 << 20) / stride;
+            Ok((free, minimum, stride, card_cap))
+        })();
+        let (free, minimum, stride, card_cap) = match capacity {
+            Ok(v) => v,
+            Err(e) => {
+                weights.free_gpu(ctx.gpu);
+                return Err(e);
+            }
+        };
+        eprintln!(
+            "max_seq budget: free_after_weights={free} min_prefill={minimum} page_rounding={} kv_bytes_per_token={stride}",
+            128 << 20,
+        );
+        if sequence.automatic {
+            if card_cap < 512 {
+                weights.free_gpu(ctx.gpu);
+                return Err("Qwen VMM load refused: measured post-weight VRAM cannot hold minimum PBS and KV".into());
+            }
+            ctx.max_seq = sequence.model_ctx.min(card_cap);
+        }
+        sequence.card_cap = card_cap;
+        ctx.sequence = Some(sequence);
+        plan = match plan_qwen35_gpu_stages(&config, ctx) {
+            Ok(v) => v,
+            Err(e) => {
+                weights.free_gpu(ctx.gpu);
+                return Err(e);
+            }
+        };
+    }
 
     // ── KV (transactional: free weights on fail) ─────────────────────
     let (kv, kv_adaptive) = match construct_kv_cache(&config, ctx, plan) {
