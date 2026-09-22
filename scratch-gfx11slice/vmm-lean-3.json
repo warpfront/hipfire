@@ -1,0 +1,39 @@
+{
+  "request": 3,
+  "start_ns": 252798193262389,
+  "end_ns": 252802046409178,
+  "wall_ms": 3853.146789,
+  "vram_samples": 28,
+  "vram_first_bytes": 20581494784,
+  "vram_peak_observed_bytes": 20581494784,
+  "vram_last_bytes": 20581494784,
+  "usage": {
+    "prompt_tokens": 8192,
+    "completion_tokens": 1,
+    "total_tokens": 8193,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  },
+  "timings": {
+    "ttft_ms": 3814.6,
+    "prefill_ms": 3814.6,
+    "prefill_tok_s": 2147.5,
+    "decode_tok_s": 42.9,
+    "latency_ms": null,
+    "tau": null,
+    "cycles": null,
+    "dflash": null,
+    "mtp": null,
+    "mtp_ngram": null,
+    "ngram_mod_windows": null,
+    "ngram_mod_drafts": null,
+    "ngram_mod_accepted": null,
+    "ngram_mod_accept_rate": null,
+    "mtp_windows": null,
+    "ar_windows": null,
+    "mtp_retired": null,
+    "mtp_window_timings": null
+  },
+  "error": null
+}

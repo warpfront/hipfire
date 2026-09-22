@@ -1,0 +1,73 @@
+gfx1100/gfx1151 C ordinary prefill PBS audit (read-only; no allocator edits)
+Source: f62eee968; C profile hipfire-gfx11stack-profile/scratch-gfx11profile/REPORT.md:131-220,317-360. Shape: D=5120, I=17408, K=2048, V=6144, A=48, Q=6144, W=1024, N=8192; 48 LA +16 FA, FFN 64. All allocation sites below are crates/hipfire-arch-qwen35/src/qwen35/batch.rs; all unconditional, dtype F32 unless F16/Raw shown. Each line lists elements/row, bytes at N=8192, and disposition for C ordinary/iu4/gfx11/q8. The raw prefill allocator is Gpu::alloc_tensor (rdna-compute/src/dispatch.rs:3414-3423): unused buffers cost VRAM, NOT per-layer bandwidth.
+
+name                            dtype elems/row  bytes@8192    site disposition
+x_batch                         F32      5120   167772160     261 USED: embedding, residual + norm, persists across layers
+x_rot_batch                     F32      5120   167772160     262 USED: LA beta/alpha small-tail WMMA; LA IU4 norm producer emits F32, gemm.rs:29542-29589
+x_norm_batch                    F32      5120   167772160     263 UNUSED: MoE shared-expert norm only, prefill.rs:4378-4382
+ dn_qkv_batch                   F32     10240   335544320     264 USED: LA qkvza projection -> conv1d, prefill.rs:5645-5664,6185-6195
+ dn_z_batch                     F32      6144   201326592     265 USED: LA z projection -> gated norm/IU4, prefill.rs:6349-6361
+ dn_alpha_batch                 F32        48     1572864     266 USED: LA alpha -> fused sigmoid/alpha gate -> GDN scan, prefill.rs:6091-6098,6843-6869
+ dn_beta_batch                  F32        48     1572864     267 USED: same as alpha
+ dn_q_raw_batch                 F32      2048    67108864     272 USED: conv split -> fused QK norm/interleave, prefill.rs:6185-6219; N divisible by 64 so no padded-row excess
+ dn_k_raw_batch                 F32      2048    67108864     273 USED: same
+ dn_v_batch                     F32      6144   201326592     274 USED: conv split -> GDN scan, prefill.rs:6185-6195,6843-6869
+ dn_q_batch                     F32      6144   201326592     275 USED: normalized/interleaved Q -> GDN scan, prefill.rs:6208-6219,6843-6869
+ dn_k_batch                     F32      6144   201326592     276 USED: same K
+ dn_attn_out_batch              F32      6144   201326592     277 USED: GDN scan output -> gfx11 gated norm/IU4 producer, prefill.rs:6843-6869,6349-6361
+ dn_normed_batch                F32      6144   201326592     278 UNUSED: gfx11 fused gated_norm_rotate_i4 skips standalone norm, prefill.rs:6328-6362,6379-6390; conditional on HIPFIRE_GFX11_PRODUCER_QUANT_FUSED, MQ4V2, residual, HD128 (466-500)
+gate_ffn_batch                  F32     17408   570425344     279 USED: SET GEMM -> fused SwiGLU/FWHT+i4 producer, prefill.rs:6996-7010,7344-7357
+up_batch                        F32     17408   570425344     280 USED: same
+ffn_hidden_batch                F32     17408   570425344     281 UNUSED: C producer emits only i4 sidecar (emit_f32=false), prefill.rs:7344-7407; fallback/non-residual routes use F32
+ dn_normed_rot_batch            F32      6144   201326592     282 UNUSED: gfx11 fused norm/i4 skips F32 FWHT; prefill.rs:6334-6362,6443-6469; fallback uses it
+positions                       F32         1       32768     286 USED as i32 bits: uploaded then RoPE, KV write and FA2 attend, prefill.rs:5440-5449,7935-7959,8371-8395
+rope_positions                  F32         1       32768     295 UNUSED: only TreeVerifyCtx positions, prefill.rs:5450-5455,7935-7939; ordinary uses positions
+tokens                          F32         1       32768     296 USED as i32 bits: uploaded then embedding, prefill.rs:5303-5332
+fa_q_full_batch                 F32     12288   402653184     297 USED: FA QKV projection -> deinterleave Q/gate, prefill.rs:7628-7668,7970-7973
+fa_q_batch                      F32      6144   201326592     298 USED: deinterleave -> RoPE -> FA2 Q preconvert, prefill.rs:7970-7973,8039-8050,8371-8395
+fa_gate_batch                   F32      6144   201326592     299 USED: deinterleave -> gfx11 sigmoid/IU4 producer, prefill.rs:7970-7973,8152-8160
+fa_k_batch                      F32      1024    33554432     300 USED: FA QKV -> K rmsnorm/rope -> q8 KV write, prefill.rs:7647-7650,7980-7986,8039-8050,8371-8395
+fa_v_batch                      F32      1024    33554432     301 USED: FA QKV -> q8 KV write, prefill.rs:7647-7650,8371-8395
+fa_attn_out_batch               F32      6144   201326592     302 USED: FA2 attention -> gfx11 sigmoid/IU4 producer, prefill.rs:8371-8395,8152-8160
+fa_attn_out_rot_batch           F32      6144   201326592     303 UNUSED: gfx11 sigmoid/i4 emits sidecar directly, prefill.rs:8148-8161,8198-8219; fallback uses F32 rotation
+x_rot_f16_batch                 F16      5120    83886080     304 UNUSED: only DflashFusionCtx::ChainVerify S3 route, ordinary passes Off (prefill.rs:1887-1888,5468-5477)
+dn_normed_rot_f16_batch         F16      6144   100663296     305 UNUSED: ChainVerify S4 route, prefill.rs:6252-6259,6280-6325
+ffn_hidden_f16_batch            F16     17408   285212672     306 UNUSED: ChainVerify S4 route, prefill.rs:7295-7319
+fa_attn_out_rot_f16_batch       F16      6144   100663296     307 UNUSED: ChainVerify S4 route, prefill.rs:8078-8115
+mq_prologue_ctrl                Raw         0         256     310 UNUSED: S9 prescaffold, no prefill reader/writer (only batch.rs allocation/free)
+
+Totals checked against prefill.rs:14419-14444 and batch.rs:1224-1314: current 725388 B/row +256 = 5,942,378,752 bytes; UNUSED 233476 B/row +256 = 1,912,635,648 bytes; USED-only 491912 B/row = 4,029,743,104 bytes. Conditional flags and alt dtypes/TreeVerify/TP/EP change this classification; it is NOT safe to delete allocations unconditionally.
+
+Safe (conceptual, unimplemented) layer-phase overlap upper envelope: x_batch+positions+tokens persist =20,488 B/row. LA nonpersistent set {x_rot,dn_qkv,dn_z,dn_alpha,dn_beta,dn_q_raw,dn_k_raw,dn_v,dn_q,dn_k,dn_attn_out} =201,088 B/row; FA {fa_q_full,fa_q,fa_gate,fa_k,fa_v,fa_attn_out}=131,072 B/row; FFN {gate,up}=139,264 B/row. LA-attn, FA-attn and FFN run serially within a layer; an arena of max(201088,131072,139264) +20488 =221576 B/row, 1,815,150,592 B at 8192; this is a theoretical lifetime envelope, NOT a proved pointer alias implementation. Conservatively alias LA vs FA only, retaining FFN separately: 360840 B/row or 2,956,001,280 B. IU4 reservation and Q8 KV are OUTSIDE this PBS accounting. Optimizing ONLY allocated-unused tensors saves 1.913 GB VRAM but no per-layer bandwidth. Phase aliasing does not itself eliminate traffic of USED F32 buffers.
+
+Logical payload traffic estimate per one N=8192 pass, independent of 7-way vs one-way dispatch slicing. Formula: bytes@8192 × full-tensor write/read counts inferred from prefill.rs callsites. This counts logical PBS payload transactions (one full row per kernel input/output), NOT HBM measurements: intra-kernel repeated reads and caches vary. Time = logical GB / 898 GB/s gfx1100 or 238 GB/s gfx1151, labelled an upper-bound DRAM-time equivalent ONLY for the listed logical transactions because L2/IC/MALL can serve many; it is not a bound on full kernel duration or true physical DRAM bytes. C profile symbols correlate at REPORT.md:150-200,336-360. Counts denote full-8192 tensor traversals, not kernel calls (e.g. 7×1024 contributes one whole pass, and 16×512 FA2 segments likewise).
+
+name                         W passes R passes    W GB    R GB total GB   1100 ms 1151 ms     producer -> consumer / narrower exactness idea
+ gate_ffn_batch                    64       64    36.507  36.507  73.014     81.31   306.78      IU4 full SET -> fused_silu_mul_mq_rotate_awq_i4; fuse gate+up co-tiled producer with SwiGLU/i4 only if both gate/up are ready; F16 storage rounds SiLU inputs, not bit-exact
+ up_batch                         64       64    36.507  36.507  73.014     81.31   306.78      same
+ x_batch                         129      257    21.643  43.117  64.760     72.12   272.10      embedding then norm/input producer and residual full ADD (twice/layer); F32 needed for exact residual accumulation; only cross-kernel norm/add epilogue fusions may avoid reread
+ dn_qkv_batch                     48       48    16.106  16.106  32.212     35.87   135.35      IU4 SET -> conv1d_silu_split; temporal conv needs adjacent rows, narrow F16 changes results; consumer-producer fusion nontrivial
+ dn_z_batch                       48       48     9.664   9.664  19.327     21.52    81.21      IU4 SET -> gated_norm_mq_rotate_awq_i4_gfx11; could emit F16 only with quality proof
+ dn_v_batch                       48       48     9.664   9.664  19.327     21.52    81.21      conv1d split -> GDN q8 scan; consider reduced precision only with numerical proof
+ dn_q_batch                       48       48     9.664   9.664  19.327     21.52    81.21      fused_qk_l2_norm_scale_interleave -> GDN q8 scan; F16 would round normalized Q
+ dn_k_batch                       48       48     9.664   9.664  19.327     21.52    81.21      same K
+ dn_attn_out_batch                48       48     9.664   9.664  19.327     21.52    81.21      GDN scan -> gated_norm/i4; possible fused scan final-store + gate/i4 epilogue only if state/row ordering preserved
+ x_rot_batch                      48       48     8.053   8.053  16.106     17.94    67.67      LA fused_rmsnorm_mq_rotate_awq_i4 emits F32 for alpha/beta small-tail WMMA; convert_f32_to_f16 consumes it (gemm.rs:29329-29354); direct F16 sidecar could halve storage and skip conversion if bit-exact
+ fa_q_full_batch                  16       16     6.442   6.442  12.885     14.35    54.14      QKV IU4 SET -> deinterleave_q_rmsnorm_f32_batched; can avoid via Q projection epilogue only with per-head RMS reduction
+ fa_q_batch                       32       32     6.442   6.442  12.885     14.35    54.14      deinterleave -> in-place RoPE -> attention_fa2_q_preconvert_gfx11; F16 before RoPE/softmax not exact
+ dn_q_raw_batch                   48       48     3.221   3.221   6.442      7.17    27.07      conv1d split -> fused_qk_l2_norm_scale_interleave; fuse producer+norm after neighboring rows available
+ dn_k_raw_batch                   48       48     3.221   3.221   6.442      7.17    27.07      same K
+ fa_gate_batch                    16       16     3.221   3.221   6.442      7.17    27.07      deinterleave -> sigmoid_mul_rotate_x_mq_awq_i4_gfx11; gate must persist until attention completes; F16 would round sigmoid
+ fa_attn_out_batch                16       16     3.221   3.221   6.442      7.17    27.07      FA2 attention -> sigmoid_mul_rotate_x_mq_awq_i4_gfx11; potential attention reducer epilogue fusion, numerical ordering must match
+ fa_k_batch                       48       48     1.611   1.611   3.221      3.59    13.53      QKV SET -> in-place K RMSNorm -> in-place RoPE -> q8 KV write (3W+3R per token)
+ fa_v_batch                       16       16     0.537   0.537   1.074      1.20     4.51      QKV SET -> q8 KV write; direct write/quantize KV epilogue possible with causal/position proof
+ dn_alpha_batch                   96      144     0.151   0.226   0.377      0.42     1.59      LA small WMMA -> in-place sigmoid/alpha gate -> GDN scan; narrow enough already
+ dn_beta_batch                    96      144     0.151   0.226   0.377      0.42     1.59      same
+ positions                         1       48     0.000   0.002   0.002      0.00     0.01      host upload -> RoPE, KV write, FA2 attend; int32 semantic storage already 4B
+ tokens                            1        1     0.000   0.000   0.000      0.00     0.00      host upload -> embedding, int32 semantic storage already 4B
+
+Gate+up exact: 2×8192×17408×4×64×(one SET write + one producer read)=146,028,888,064 bytes, 162.616 ms @898 GB/s or 613.567 ms @238 GB/s. Observed fused_silu_mul_mq_rotate_awq_i4: gfx1100 448 calls/103.965 ms, gfx1151 64 calls/364.329 ms (NOT 282ms); below payload-only HBM-equivalent due cache/on-chip reuse. Fused producer itself also computes SiLU, FWHT and i4, so traffic time is not its wall time. These counts are estimates; kernel symbol does not identify exact tensor pointers, and kernels can read inputs repeatedly or touch only tiles. Unused PBS saves 0 GB traffic; largest avoidable used-path materialization is gate+up, but getting a bit-identical producer/consumer fusion is a separate kernel-design question.
+
+VRAM gap remains UNCLASSIFIED pending live-allocation-vs-pool measurement. Actual earlier patched 3×8192 peak 23,236,759,552 → 23,283,126,272 B (plateau req2→req3). Model file size 14,987,185,152 B is NOT exact GPU-resident weights, and q8 KV allocation for server ctx not measured: subtracting these rough figures from 23.28GB cannot by itself prove leak/pool. rocprofv3 --memory-allocation-trace can provide pointer/size lifetime without code edits, and daemon unload drains GPU pool (daemon/src/main.rs:3784+), but after unload weights also free; a live pool-vs-retained split requires per-buffer ownership or explicit pool snapshot. Do not classify remaining gap as leak or valid until that proof exists.
+
+The `dflash_state_bulk_copy_gfx1100` symbol in the ordinary C trace is not evidence that DFlash verification ran: `hipfire-generate/src/ar.rs:3907-3914` invokes `speculative::take_dn_checkpoint` for ordinary prefix resume; `speculative.rs:8412-8414` saves a DeltaNet snapshot, whose `DeltaNetSnapshot::save_from` uses descriptor-driven bulk copy on gfx1100 (`speculative.rs:1384-1392`). It copies recurrent S matrices/scales and convolution state into reusable prefix-cache checkpoints, not verify activations or PBS sidecars.

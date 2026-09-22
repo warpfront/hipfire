@@ -1277,6 +1277,56 @@ fn ordinary_prefill_static_ceiling(
     }
     Some(rung)
 }
+/// Only the retained widened PBS owner can use this representation: ordinary
+/// sequential prefill runs eager, with no tree/chain verify or MoE/TP/EP.
+/// Check the exact same producer predicates used by the fallback decisions.
+fn lean_pbs_route(
+    gpu: &Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    n: usize,
+) -> bool {
+    matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
+        && config.num_experts == 0
+        && config.linear_value_head_dim == 128
+        && dense_layers_are_all_mq4v2(weights)
+        && gpu.iu4_producer_sidecar_active(n, config.dim)
+        && gpu.iu4_producer_sidecar_active(n, config.hidden_dim)
+        && gpu.iu4_gfx11_producer_quant_fused_active(
+            n,
+            config.linear_num_value_heads * config.linear_value_head_dim,
+        )
+        && gpu.iu4_gfx11_producer_quant_fused_active(n, config.n_heads * config.head_dim)
+        && weights.layers.iter().all(|layer| match layer {
+            LayerWeights::DeltaNet(layer) => {
+                layer.wo.k == config.linear_num_value_heads * config.linear_value_head_dim
+            }
+            LayerWeights::FullAttn(layer) => {
+                let k = config.n_heads * config.head_dim;
+                layer.wo.k == k
+                    && layer.wo.awq_scale.as_ref().is_some_and(|awq| awq.numel() >= k)
+            }
+            _ => false,
+        })
+}
+
+fn lean_pbs_requested() -> bool {
+    hipfire_config::developer_var("HIPFIRE_GFX11_LEAN_PBS")
+        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+}
+
+fn lean_dense_prefill_allocation_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
+    let full = dense_prefill_allocation_bytes(config, rows)?;
+    let v = config.linear_num_value_heads.checked_mul(config.linear_value_head_dim)?;
+    let q = config.n_heads.checked_mul(config.head_dim)?;
+    let fallback_f32 = config.dim.checked_add(v.checked_mul(2)?)?
+        .checked_add(config.hidden_dim)?.checked_add(q)?.checked_mul(4)?;
+    let verify_f16 = config.dim.checked_add(v)?.checked_add(config.hidden_dim)?
+        .checked_add(q)?.checked_mul(2)?.checked_add(4)?;
+    full.checked_sub(rows.saturating_sub(64).checked_mul(fallback_f32)?)
+        .and_then(|bytes| bytes.checked_sub(rows.checked_mul(verify_f16)?))
+}
+
 ///
 /// Steady-state bytes of one dense tape-free [`PrefillBatchScratch`] at
 /// `rows` rows: every unconditional allocation including positions, rope,
@@ -1334,18 +1384,27 @@ fn iu4_row_bytes_wide(config: &Qwen35Config) -> Option<usize> {
 }
 ///
 /// Per-device capacity admission: largest performance-admitted rung
-/// `<= perf_rows` whose full new PBS, projection-prelude deficit, missing FA
-/// Q16 bytes and 1 GiB headroom fit in current free device bytes. The
-/// projection charge is FP8 on gfx1201 and IU4 K16 on gfx1100/gfx1151.
-/// The query runs after model+KV mapping and request-state allocation, so
-/// free bytes already charge mapped KV and any inactive reuse cache. Falls
-/// back to 512 when no enlarged rung fits.
-fn memory_admitted_rung(gpu: &Gpu, config: &Qwen35Config, perf_rows: usize) -> HipResult<usize> {
+/// `<= perf_rows` whose projected PBS bytes, projection-prelude deficit,
+/// missing FA Q16 bytes and 1 GiB headroom fit in current free device bytes.
+/// The retained PBS is conservatively included in projected bytes even when
+/// it will be reused. The query follows model+KV mapping and request-state
+/// allocation. Falls back to 512 when no enlarged rung fits.
+fn memory_admitted_rung(
+    gpu: &Gpu,
+    config: &Qwen35Config,
+    perf_rows: usize,
+    lean: bool,
+) -> HipResult<usize> {
     if perf_rows <= WIDENED_COMMIT_ROWS {
         return Ok(WIDENED_COMMIT_ROWS.min(perf_rows));
     }
     let fp8_projection = gpu.arch == "gfx1201";
-    if dense_prefill_allocation_bytes(config, perf_rows).is_none()
+    if (if lean {
+        lean_dense_prefill_allocation_bytes(config, perf_rows)
+    } else {
+        dense_prefill_allocation_bytes(config, perf_rows)
+    })
+    .is_none()
         || (fp8_projection && fp8_row_bytes_wide(config).is_none())
         || (!fp8_projection && iu4_row_bytes_wide(config).is_none())
     {
@@ -1371,7 +1430,12 @@ fn memory_admitted_rung(gpu: &Gpu, config: &Qwen35Config, perf_rows: usize) -> H
         if rung <= WIDENED_COMMIT_ROWS {
             return Ok(WIDENED_COMMIT_ROWS);
         }
-        let need_pbs = dense_prefill_allocation_bytes(config, rung).unwrap_or(usize::MAX);
+        let need_pbs = if lean {
+            lean_dense_prefill_allocation_bytes(config, rung)
+        } else {
+            dense_prefill_allocation_bytes(config, rung)
+        }
+        .unwrap_or(usize::MAX);
         let projection_deficit = if fp8_projection {
             let x_need = rung.checked_mul(config.hidden_dim).unwrap_or(usize::MAX);
             let sums_need = rung
@@ -1405,13 +1469,13 @@ fn memory_admitted_rung(gpu: &Gpu, config: &Qwen35Config, perf_rows: usize) -> H
 /// per-device byte-based capacity.
 ///
 /// Public only because hipfire-generate's ordinary AR caller needs the same
-/// decision. Existing generic/TP/EP getters are unchanged. `pbs` denotes an
+/// decision. Existing generic/TP/EP getters are unchanged; `pbs` limits the
+/// ceiling when a caller owns a smaller staging buffer.
 pub fn ordinary_prefill_chunk_limit(
     gpu: &Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
     dn_state: &DeltaNetState,
-    kv_cache: &llama::KvCache,
     pbs: Option<&PrefillBatchScratch>,
 ) -> HipResult<usize> {
     let legacy = prefill_max_batch_for_model(gpu, weights);
@@ -1421,8 +1485,8 @@ pub fn ordinary_prefill_chunk_limit(
     if perf <= WIDENED_COMMIT_ROWS {
         return Ok(perf.min(legacy));
     }
-    let _ = kv_cache;
-    let mut admitted = memory_admitted_rung(gpu, config, perf)?;
+    let lean = lean_pbs_requested() && lean_pbs_route(gpu, weights, config, perf);
+    let mut admitted = memory_admitted_rung(gpu, config, perf, lean)?;
     if let Some(p) = pbs {
         admitted = admitted.min(p.max_batch);
     }
@@ -2263,7 +2327,7 @@ fn forward_prefill_batch_with_pbs_opts_inner(
         && !gpu.graphs.capture_mode
         && !gpu.replay.is_recording();
     let limit = if wide_candidate {
-        ordinary_prefill_chunk_limit(gpu, weights, config, dn_state, kv_cache, None)?
+        ordinary_prefill_chunk_limit(gpu, weights, config, dn_state, None)?
     } else {
         max_batch
     };
@@ -2311,11 +2375,17 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                 // overwritten before it is read (same reuse contract as the
                 // legacy `prefill_batch` cache).
                 let mut cached = scratch.widened_prefill_batch.borrow_mut();
-                if !cached.as_ref().is_some_and(|p| p.max_batch >= owned_rows) {
+                let lean = lean_pbs_requested()
+                    && lean_pbs_route(gpu, weights, config, owned_rows);
+                if !cached.as_ref().is_some_and(|p| p.max_batch >= owned_rows && p.lean == lean) {
                     if let Some(old) = cached.take() {
                         let _ = old.free_gpu(gpu);
                     }
-                    *cached = Some(PrefillBatchScratch::new_opt(gpu, config, owned_rows, false)?);
+                    *cached = Some(if lean {
+                        PrefillBatchScratch::new_opt_lean(gpu, config, owned_rows)?
+                    } else {
+                        PrefillBatchScratch::new_opt(gpu, config, owned_rows, false)?
+                    });
                 }
                 own_pbs = cached.take();
                 widened_from_cache = true;
@@ -2377,6 +2447,34 @@ fn forward_prefill_batch_with_pbs_opts_inner(
                     "forward_prefill_batch: chunk plan cannot satisfy the two-token minimum",
                 )
             })?;
+            if pbs.lean {
+                if !matches!(fusion, DflashFusionCtx::Off) || tree_verify.is_some() {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "lean PBS belongs to ordinary prefill; verify route requires full scratch",
+                    ));
+                }
+                if chunk_n > 64 && !lean_pbs_route(gpu, weights, config, chunk_n) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "lean PBS fused producer unavailable beyond 64 fallback rows",
+                    ));
+                }
+                for (name, capacity) in [
+                    ("x_norm", pbs.x_norm_batch.numel() / config.dim),
+                    ("dn_normed", pbs.dn_normed_batch.numel() / (config.linear_num_value_heads * config.linear_value_head_dim)),
+                    ("ffn_hidden", pbs.ffn_hidden_batch.numel() / config.hidden_dim),
+                    ("dn_normed_rot", pbs.dn_normed_rot_batch.numel() / (config.linear_num_value_heads * config.linear_value_head_dim)),
+                    ("fa_attn_out_rot", pbs.fa_attn_out_rot_batch.numel() / (config.n_heads * config.head_dim)),
+                ] {
+                    if chunk_n <= 64 && chunk_n > capacity {
+                        return Err(hip_bridge::HipError::new(
+                            0,
+                            &format!("lean PBS {name} fallback capacity {capacity} < {chunk_n} rows"),
+                        ));
+                    }
+                }
+            }
             // F2 pair peek is only relevant to the legacy 512-row schedule;
             // widened chunks carry their tail directly.
             let pair_b = if chunk_n == FA_PAIR_ROWS
