@@ -1,0 +1,5 @@
+Recorded on 2026-09-22 before any q8/q8 c24 run.
+
+The earlier asym3/q8 numeric predictions and the completed gfx1100 arm-C asym3/q8 scores are superseded. They were derived from solo reports using a KV configuration that gfx11 does not serve in production. They are retained only as historical protocol artifacts and must not be used in the verdict.
+
+Governing quality protocol from this point forward: `--kv-mode q8 --kv-v q8`, deterministic one run per (arm, reference, card), with P/A/C prioritized and S also measured. There is no established q8/q8 absolute baseline to predict from, so quality is evaluated only by within-protocol arm comparisons. The live question is whether C retains or gives back A's quality change under the shipped q8 KV configuration.
