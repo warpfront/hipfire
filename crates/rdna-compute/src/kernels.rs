@@ -3675,6 +3675,14 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
 );
+/// gfx11 symmetric-scale IU4 twin. The appended entries rebias every packed
+/// weight nibble once (`q -> q-8`), use signed-weight WMMA, and fold only
+/// `scale * activation_scale * dot`. Existing asymmetric entries are unchanged.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_SYMFOLD_SRC: &str = concat!(
+    "#define IU4_SYMMETRIC_FOLD 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
+);
 // gfx12 (RDNA4) iu4-direct MMQ sister: weight nibbles feed
 // wmma_i32_16x16x32_iu4_w32_gfx12 directly (K=32/call, int32x2/lane,
 // k_grp=tid>>4 lane split, contiguous-row C — same conventions as the gfx12
