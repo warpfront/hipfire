@@ -281,6 +281,15 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_ATTN_QRESIDENT`, `kernel.attn_qresident`). Default ON on
     /// exact gfx1201; `=0` opts out. Exact H24/KV4/D256 native-fp8-KV shapes only.
     pub attn_qresident: bool,
+    /// Opt-in wide Q8/f16-plane FA2 prefill on exact gfx1201
+    /// (`HIPFIRE_GFX12_Q8_FA2_WIDE`, `kernel.gfx12_q8_fa2_wide`).
+    /// Default OFF on every arch; `=1` opts in. Same H24/KV4/D256
+    /// fp8-width batch/context envelope as the native-fp8 routes
+    /// (64..=32768 rows, above-512 rows a multiple of 512, no `%16`
+    /// below 512, 64..=32768 context), capture-safe via owned blobs.
+    /// The legacy `<=512`/`%16`/eager-only Q8 predicate is unchanged
+    /// when this is off.
+    pub gfx12_q8_fa2_wide: bool,
     /// `HIPFIRE_GFX11_FA2_PREFILL=0` opts out of the gfx11 GQA-fused FA2
     /// prefill attention candidate (Qwen NH24/NKV4/HD256, eager HIP only).
     /// Default ON on gfx1100/gfx1151; `=1` forces it on other arches
@@ -667,6 +676,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT")
                 .unwrap_or(arch == "gfx1201"),
+            gfx12_q8_fa2_wide: parse_bool("HIPFIRE_GFX12_Q8_FA2_WIDE").unwrap_or(false),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gemm_dump: value("HIPFIRE_GEMM_DUMP").ok().as_deref() == Some("1"),
@@ -999,6 +1009,7 @@ impl FeatureFlags {
             gfx12_fa2_prefill: false,
             gfx12_fa_packet: false,
             attn_qresident: false,
+            gfx12_q8_fa2_wide: false,
             gfx11_fa2_prefill: false,
             gemm_dump: false,
             deterministic: false,

@@ -1353,11 +1353,18 @@ fn memory_admitted_rung(gpu: &Gpu, config: &Qwen35Config, perf_rows: usize) -> H
     }
     let (free_bytes, _) = gpu.hip.get_vram_info()?;
     let q_dim = config.n_heads.checked_mul(config.head_dim).unwrap_or(0);
-    let q16_need = WIDENED_COMMIT_ROWS
-        .checked_mul(q_dim)
-        .and_then(|v| v.checked_mul(2))
-        .unwrap_or(usize::MAX);
-    let q16_missing = q16_need.saturating_sub(gpu.scratch.fa2_q16_scratch_bytes);
+    // The legacy 512-row Q16 charge below is exact while the wide-f16 route
+    // cannot be selected. When the opt-in wide route is selectable
+    // (knob + master FA2 switch + exact gfx1201/H24/KV4/D256), each
+    // candidate rung must charge its own Q16 bytes instead:
+    // rung*24*256*2 B (96 MiB at rung 8192). Headroom, fallback, and the
+    // scratch allocation owner are unchanged.
+    let wide_q16_selectable = gpu.flags.gfx12_q8_fa2_wide
+        && gpu.flags.gfx12_fa2_prefill
+        && gpu.arch == "gfx1201"
+        && config.n_heads == 24
+        && config.n_kv_heads == 4
+        && config.head_dim == 256;
     let live_fp8_x = gpu.scratch.mq4v2_fp8_x_scratch_bytes;
     let live_fp8_sums = gpu.scratch.mq4v2_fp8_half_sums_scratch_bytes;
     let live_fp8_scales = gpu.scratch.mq4v2_fp8_row_scales_scratch_bytes;
@@ -1388,6 +1395,16 @@ fn memory_admitted_rung(gpu: &Gpu, config: &Qwen35Config, perf_rows: usize) -> H
                 .unwrap_or(usize::MAX)
                 .saturating_sub(live_iu4)
         };
+        let q16_rows = if wide_q16_selectable {
+            rung
+        } else {
+            WIDENED_COMMIT_ROWS
+        };
+        let q16_need = q16_rows
+            .checked_mul(q_dim)
+            .and_then(|v| v.checked_mul(2))
+            .unwrap_or(usize::MAX);
+        let q16_missing = q16_need.saturating_sub(gpu.scratch.fa2_q16_scratch_bytes);
         let total = need_pbs
             .saturating_add(projection_deficit)
             .saturating_add(q16_missing)
@@ -8326,6 +8343,45 @@ fn batch_chunk_fa_attend(
             && max_ctx_len <= 32768
             && tree_verify.is_none();
         if packet_runs {
+            execute_fa_attend_step(
+                gpu,
+                config,
+                &pbs.fa_q_batch,
+                &pbs.fa_k_batch,
+                &pbs.fa_v_batch,
+                &pbs.positions,
+                &pbs.fa_attn_out_batch,
+                s,
+                kv_cache,
+                n,
+                start_pos,
+                max_ctx_len,
+                ctx,
+                None,
+                layer_idx,
+            )?;
+            return Ok(());
+        }
+        // Opt-in wide Q8/f16 whole-chunk path (default off;
+        // `kernel.gfx12_q8_fa2_wide`): the analogous Q8/Q8 + knob choice
+        // with the same stride, whole-run, context, and tree guards as the
+        // fp8 packet path above, preserving its logic untouched. The inner
+        // dispatch wide arm re-verifies shape/V-mode/backend precedence;
+        // odd tails keep the per-segment loop below intact.
+        let q8_wide_runs = gpu.flags.gfx12_q8_fa2_wide
+            && gpu.flags.gfx12_fa2_prefill
+            && gpu.arch == "gfx1201"
+            && kv_cache.quant_q8
+            && !kv_cache.quant_fp8
+            && config.n_heads == 24
+            && config.n_kv_heads == 4
+            && config.head_dim == 256
+            && stride == WIDENED_COMMIT_ROWS
+            && n % WIDENED_COMMIT_ROWS == 0
+            && n <= 32768
+            && max_ctx_len <= 32768
+            && tree_verify.is_none();
+        if q8_wide_runs {
             execute_fa_attend_step(
                 gpu,
                 config,

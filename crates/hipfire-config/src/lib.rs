@@ -2222,6 +2222,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx1201 register-resident-Q wide-workgroup FA2 prefill route (default on exact gfx1201; set to false or HIPFIRE_ATTN_QRESIDENT=0 to opt out; exact H24/KV4/D256 native-fp8-KV shapes only)."
     ),
     process_bool_field!(
+        "kernel.gfx12_q8_fa2_wide",
+        "gfx12_q8_fa2_wide",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_GFX12_Q8_FA2_WIDE",
+        "Enable the opt-in wide Q8/f16-plane FA2 prefill route on exact gfx1201 (default off; set to true or HIPFIRE_GFX12_Q8_FA2_WIDE=1 to opt in; fp8-width batch/context envelope, capture-safe via owned blobs; the legacy <=512/%16/eager-only Q8 predicate is unchanged when off)."
+    ),
+    process_bool_field!(
         "kernel.gfx11_fa2_prefill",
         "gfx11_fa2_prefill",
         Kernel,

@@ -3625,6 +3625,35 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // Opt-in wide Q8/f16 FA2 (default off; `kernel.gfx12_q8_fa2_wide`).
+        // fp8-width envelope — exact gfx1201/H24/KV4/D256, 64..=32768 rows
+        // (above-512 rows a multiple of 512, no `%16` below 512),
+        // 64..=32768 context — ordinary non-tree/non-window/non-slot Q8/Q8.
+        // Capture-safe via owned blobs (pre-convert + body both use
+        // `launch_maybe_blob`), so unlike the legacy predicate below there
+        // are no recorder/capture gates here. Explicit
+        // `gfx12_fa2_prefill=false` still declines the experiment; explicit
+        // `HIPFIRE_FLASH_PREFILL=0` / alternate-backend precedence is resolved
+        // by the dispatch caller, which reaches this ingress for the wide arm.
+        // Opt out with `HIPFIRE_GFX12_Q8_FA2_WIDE=0`.
+        if self.flags.gfx12_q8_fa2_wide
+            && self.flags.gfx12_fa2_prefill
+            && self.arch == "gfx1201"
+            && n_heads == 24
+            && n_kv_heads == 4
+            && head_dim == 256
+            && (64..=32768).contains(&batch_size)
+            && (batch_size <= 512 || batch_size % 512 == 0)
+            && (64..=32768).contains(&max_ctx_len)
+        {
+            // q8 cache always runs the f16 FA2 body: stage-b route-Q
+            // arithmetic does not exist (B4 pending), so there is nothing to
+            // select here.
+            return self.attention_q8_0_fa2_gqa_gfx1201(
+                q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
+                max_ctx_len, batch_size,
+            );
+        }
         // Default-on: gfx1201 GQA-fused FA2 prefill. Exact arch/shape/
         // eager gates; everything else falls through to the byte-identical
         // incumbent path below. Never inside `_wmma_slots` (its all-or-none
@@ -3961,7 +3990,19 @@ impl Gpu {
                 ),
             ));
         }
-        if batch_size == 0 || batch_size > 512 {
+        // Opt-in wide range for direct oracle/tail coverage (default off;
+        // `kernel.gfx12_q8_fa2_wide`): 1..=32768, mirroring the fp8 launcher
+        // range checks. The `else` arm keeps today's exact predicate.
+        if self.flags.gfx12_q8_fa2_wide {
+            if batch_size == 0 || batch_size > 32768 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "attention_q8_0_fa2_gqa_gfx1201 requires 1 <= batch <= 32768, got {batch_size}"
+                    ),
+                ));
+            }
+        } else if batch_size == 0 || batch_size > 512 {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(

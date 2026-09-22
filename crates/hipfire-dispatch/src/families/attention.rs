@@ -2077,6 +2077,60 @@ fn dispatch_attend(
                         return Ok(());
                     }
                 }
+                // Opt-in wide Q8/f16 FA2 (default off;
+                // `kernel.gfx12_q8_fa2_wide`). Decided independently of the
+                // query16 default envelope above so context 64..255 is
+                // reachable: the old `flash_optin` gate needs ctx>=256 and
+                // >=128 query/head workgroups. Explicit flash-off, an
+                // explicit alternate scalar/batched kernel selection, and a
+                // loaded CK artifact decline the experiment (a successful CK
+                // above already returned); speculative-verify keeps its
+                // existing route. Falls through to the incumbent below
+                // otherwise. The inner ingress re-verifies the envelope.
+                {
+                    let explicit_flash_off = matches!(
+                        hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+                            .ok()
+                            .as_deref(),
+                        Some("0") | Some("off") | Some("false")
+                    );
+                    let explicit_alt_variant = matches!(
+                        hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
+                            .ok()
+                            .as_deref(),
+                        Some("scalar") | Some("batched")
+                    );
+                    if !explicit_flash_off
+                        && !explicit_alt_variant
+                        && !gpu.flash_attn_ck_loaded()
+                        && gfx12_query16_workload_eligible(ctx)
+                        && gpu.flags.gfx12_q8_fa2_wide
+                        && gpu.flags.gfx12_fa2_prefill
+                        && gpu.arch == "gfx1201"
+                        && io.n_heads == 24
+                        && io.n_kv_heads == 4
+                        && io.head_dim == 256
+                        && (64..=32768).contains(&io.batch_size)
+                        && (io.batch_size <= 512 || io.batch_size % 512 == 0)
+                        && (64..=32768).contains(&io.max_ctx_len)
+                        && io.tree_bias.is_none()
+                        && plan.v_mode_bits == 8
+                        && plan.window <= 0
+                    {
+                        return hip!(gpu.attention_q8_0_flash_prefill_wmma(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ));
+                    }
+                }
                 // Query-tiled flash prefill. Its LDS depends only on BR/BC and
                 // never on context, so it has no capacity ceiling and no
                 // occupancy decay. Measured on gfx1151 (nh=8 nkv=2 hd=256,
