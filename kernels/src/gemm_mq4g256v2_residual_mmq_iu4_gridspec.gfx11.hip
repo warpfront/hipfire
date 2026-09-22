@@ -21,4 +21,7 @@ void gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec(
     const int tail_col_tile = N / IU4_MMQ_X + blockIdx.y;
     gemm_iu4_body<false>(A, Xq, Y, M, K, N, add, blockIdx.x, tail_col_tile);
 }
+#else
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec(
+    const char*, const block_i4_128*, float*, int, int, int, int) {}
 #endif
