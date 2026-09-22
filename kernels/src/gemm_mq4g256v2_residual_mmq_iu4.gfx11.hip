@@ -72,6 +72,14 @@ extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx
     const char*, const block_i4_128*, float*, int, int, int, int) {}
 extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151(
     const char*, const block_i4_128*, float*, int, int, int, int) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_col_gfx1151(
+    const char*, const block_i4_128*, float*, int, int, int, int) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151(
+    const char*, const block_i4_128*, float*, int, int, int, int) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100(
+    const char*, const block_i4_128*, float*, int, int, int, int) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100(
+    const char*, const block_i4_128*, float*, int, int, int, int) {}
 
 #else
 
@@ -370,8 +378,8 @@ IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set, true, 2)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3, true, 3)
 IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3, true, 3)
-#if defined(__gfx1151__)
-// Halo IU4 low-footprint (LF.1): M128 x N128 tiled over SIXTEEN wave32s.
+#if defined(__gfx1151__) || defined(__gfx1100__)
+// Sixteen-wave low-footprint IU4 full-tile entry.
 // Same 128x128 output tile, same LDS planes (Xq [0,9216), A [9216,30720)),
 // same grid walk (column-adjacent) and same arithmetic DAG (IU4_FOLD_RN) as
 // shipping. Differences vs shipping vec_dot_i4_x128 / gemm_iu4_body:
@@ -647,6 +655,30 @@ extern "C" __global__ __launch_bounds__(512, 2) __attribute__((amdgpu_num_vgpr(9
 ) {
     gemm_iu4_body_lf16_gfx1151<true>(A, Xq, Y, M, K, N, add, blockIdx.y, blockIdx.x);
 }
+#if defined(__gfx1100__)
+extern "C" __global__ __launch_bounds__(512, 2) __attribute__((amdgpu_num_vgpr(96))) void gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    gemm_iu4_body_lf16_gfx1151<false>(A, Xq, Y, M, K, N, add, blockIdx.x, blockIdx.y);
+}
+extern "C" __global__ __launch_bounds__(512, 2) __attribute__((amdgpu_num_vgpr(96))) void gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100(
+    const char* __restrict__ A,
+    const block_i4_128* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add
+) {
+    gemm_iu4_body_lf16_gfx1151<true>(A, Xq, Y, M, K, N, add, blockIdx.x, blockIdx.y);
+}
+#endif
 #endif
 #if defined(__gfx1151__) || defined(__gfx1100__)
 IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151, true, 3)

@@ -48,9 +48,12 @@ pub struct FeatureFlags {
     /// (gfx1201: 0.048028 -> 0.063890).
     pub iu4_prefill: Option<bool>,
     /// Split partial-N gfx11 IU4 grids into unchecked full-tile interior and
-    /// one guarded tail launch (`kernel.gfx11_iu4_gridspec`). Default on;
-    /// `false` or `HIPFIRE_GFX11_IU4_GRIDSPEC=0` restores the checked grid.
+    /// one guarded tail launch (`kernel.gfx11_iu4_gridspec`, default off).
     pub gfx11_iu4_gridspec: bool,
+    /// Use the 16-wave low-footprint IU4 full-tile entry on gfx1100
+    /// (`kernel.gfx11_iu4_shape`, default off). gfx1151 keeps its shipped
+    /// SET-only selection regardless of this experiment.
+    pub gfx11_iu4_shape: bool,
 
     // ── Quant / format toggles ────────────────────────────────────
     pub hfq3_dp4a: Option<bool>,
@@ -525,6 +528,7 @@ impl FeatureFlags {
             gfx11_mmq_x128: parse_bool("HIPFIRE_GFX11_MMQ_X128"),
             iu4_prefill: parse_bool("HIPFIRE_IU4_PREFILL"),
             gfx11_iu4_gridspec: parse_bool("HIPFIRE_GFX11_IU4_GRIDSPEC").unwrap_or(true),
+            gfx11_iu4_shape: parse_bool("HIPFIRE_GFX11_IU4_SHAPE").unwrap_or(false),
             gemv_prefetch: parse_bool("HIPFIRE_GEMV_PREFETCH"),
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: parse_bool("HIPFIRE_GFX942_LDS_GEMV"),
@@ -911,10 +915,11 @@ impl FeatureFlags {
             gemv_dp4a: None,
             gfx1151_e8_buffer: None,
             gfx11_mmq_x128: None,
-            // Deterministic unit-test baseline: the iu4 routes stay off here
-            // even though both process defaults are on.
+            // Deterministic unit-test baseline: the iu4 route stays off here
+            // even though the process default is on.
             iu4_prefill: Some(false),
             gfx11_iu4_gridspec: false,
+            gfx11_iu4_shape: false,
             gemv_prefetch: None,
             gemv_prefetch_default_on: is_gfx906,
             gfx942_lds_gemv: None,
