@@ -31,7 +31,9 @@ The production gfx1100 row-LF16 SET proof was:
 - candidate symbol `gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_gfx1100_symfold`;
 - grid `(136,46)` for M=17408, N=5909;
 - block `(32,16)`, dynamic LDS 30,720 bytes;
-- VGPR 96 -> 90, with 32 waves/CU reported by the HIP occupancy query.
+- VGPR 96 -> 90. `hipOccupancyMaxActiveBlocksPerMultiprocessor(fn, 512, 30720)` reported two blocks/CU for **both** base and symfold, i.e. a 32-wave resource ceiling for wave32.
+
+That 32-wave figure is not an occupancy improvement caused by the candidate: the base entry reports the same value. It is the HIP API's resource-admissible ceiling, not a runtime residency counter. The LDS arithmetic is internally consistent (`2 * 30,720 = 61,440` bytes, leaving 4,096 bytes of a 64 KiB budget), and `hipFuncGetAttributes` reports zero static LDS, but this campaign did not instrument achieved resident blocks. No performance claim depends on 16 versus 32 achieved waves.
 
 The initial standalone gfx1100 harness launch exposed and then fixed a harness-only geometry error: the row wrapper requires `(M/128,N/128)`, while the Halo column wrapper uses `(N/128,M/128)`. The production dispatcher already had the correct row/column distinction.
 
