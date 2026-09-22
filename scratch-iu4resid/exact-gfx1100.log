@@ -1,0 +1,64 @@
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward,mode=concurrent
+PARITY,shape=gate,N=5909,mismatches=0,total=102863872
+RESULT,variant=gridspec_lf16_serial,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=8747.721,tops=120.411,spread_pct=4.677
+RESULT,variant=gridspec_lf16_concurrent,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=8186.452,tops=128.667,spread_pct=2.759
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse,mode=concurrent
+PARITY,shape=gate,N=5909,mismatches=0,total=102863872
+RESULT,variant=gridspec_lf16_concurrent,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=8766.703,tops=120.151,spread_pct=5.565
+RESULT,variant=gridspec_lf16_serial,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=8217.812,tops=128.176,spread_pct=3.699
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse,mode=concurrent
+PARITY,shape=gate,N=5909,mismatches=0,total=102863872
+RESULT,variant=gridspec_lf16_concurrent,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=8782.008,tops=119.941,spread_pct=5.867
+RESULT,variant=gridspec_lf16_serial,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=8218.563,tops=128.164,spread_pct=3.596
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward,mode=concurrent
+PARITY,shape=gate,N=5909,mismatches=0,total=102863872
+RESULT,variant=gridspec_lf16_serial,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=8784.446,tops=119.908,spread_pct=6.188
+RESULT,variant=gridspec_lf16_concurrent,shape=gate,N=5909,M=17408,K=5120,add=0,median_us=8215.455,tops=128.213,spread_pct=3.358
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward,mode=concurrent
+PARITY,shape=gate,N=8192,mismatches=0,total=142606336
+RESULT,variant=gridspec_lf16_serial,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=11595.605,tops=125.935,spread_pct=75.982
+RESULT,variant=gridspec_lf16_concurrent,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=10714.605,tops=136.290,spread_pct=4.741
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse,mode=concurrent
+PARITY,shape=gate,N=8192,mismatches=0,total=142606336
+RESULT,variant=gridspec_lf16_concurrent,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=11588.522,tops=126.012,spread_pct=8.047
+RESULT,variant=gridspec_lf16_serial,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=10810.204,tops=135.084,spread_pct=4.692
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse,mode=concurrent
+PARITY,shape=gate,N=8192,mismatches=0,total=142606336
+RESULT,variant=gridspec_lf16_concurrent,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=11544.604,tops=126.491,spread_pct=7.234
+RESULT,variant=gridspec_lf16_serial,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=10770.807,tops=135.578,spread_pct=4.685
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward,mode=concurrent
+PARITY,shape=gate,N=8192,mismatches=0,total=142606336
+RESULT,variant=gridspec_lf16_serial,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=11611.123,tops=125.766,spread_pct=6.879
+RESULT,variant=gridspec_lf16_concurrent,shape=gate,N=8192,M=17408,K=5120,add=0,median_us=10771.286,tops=135.572,spread_pct=4.616
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward,mode=concurrent
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=gridspec_lf16_serial,shape=down,N=5909,M=5120,K=17408,add=1,median_us=9466.583,tops=111.268,spread_pct=5.379
+RESULT,variant=gridspec_lf16_concurrent,shape=down,N=5909,M=5120,K=17408,add=1,median_us=8691.170,tops=121.195,spread_pct=5.380
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse,mode=concurrent
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=gridspec_lf16_concurrent,shape=down,N=5909,M=5120,K=17408,add=1,median_us=9206.618,tops=114.410,spread_pct=5.006
+RESULT,variant=gridspec_lf16_serial,shape=down,N=5909,M=5120,K=17408,add=1,median_us=8847.254,tops=119.057,spread_pct=5.093
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse,mode=concurrent
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=gridspec_lf16_concurrent,shape=down,N=5909,M=5120,K=17408,add=1,median_us=9230.856,tops=114.109,spread_pct=7.688
+RESULT,variant=gridspec_lf16_serial,shape=down,N=5909,M=5120,K=17408,add=1,median_us=8855.292,tops=118.949,spread_pct=5.653
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward,mode=concurrent
+PARITY,shape=down,N=5909,mismatches=0,total=30254080
+RESULT,variant=gridspec_lf16_serial,shape=down,N=5909,M=5120,K=17408,add=1,median_us=9446.556,tops=111.504,spread_pct=4.497
+RESULT,variant=gridspec_lf16_concurrent,shape=down,N=5909,M=5120,K=17408,add=1,median_us=8666.512,tops=121.540,spread_pct=5.356
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward,mode=concurrent
+PARITY,shape=down,N=8192,mismatches=0,total=41943040
+RESULT,variant=gridspec_lf16_serial,shape=down,N=8192,M=5120,K=17408,add=1,median_us=12482.803,tops=116.984,spread_pct=6.695
+RESULT,variant=gridspec_lf16_concurrent,shape=down,N=8192,M=5120,K=17408,add=1,median_us=11545.971,tops=126.476,spread_pct=4.247
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse,mode=concurrent
+PARITY,shape=down,N=8192,mismatches=0,total=41943040
+RESULT,variant=gridspec_lf16_concurrent,shape=down,N=8192,M=5120,K=17408,add=1,median_us=12400.841,tops=117.757,spread_pct=6.371
+RESULT,variant=gridspec_lf16_serial,shape=down,N=8192,M=5120,K=17408,add=1,median_us=11489.460,tops=127.098,spread_pct=4.429
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=reverse,mode=concurrent
+PARITY,shape=down,N=8192,mismatches=0,total=41943040
+RESULT,variant=gridspec_lf16_concurrent,shape=down,N=8192,M=5120,K=17408,add=1,median_us=12486.610,tops=116.948,spread_pct=6.683
+RESULT,variant=gridspec_lf16_serial,shape=down,N=8192,M=5120,K=17408,add=1,median_us=11595.102,tops=125.940,spread_pct=4.076
+DEVICE,arch=gfx1100,name=AMD Radeon RX 7900 XTX,order=forward,mode=concurrent
+PARITY,shape=down,N=8192,mismatches=0,total=41943040
+RESULT,variant=gridspec_lf16_serial,shape=down,N=8192,M=5120,K=17408,add=1,median_us=12415.685,tops=117.616,spread_pct=6.146
+RESULT,variant=gridspec_lf16_concurrent,shape=down,N=8192,M=5120,K=17408,add=1,median_us=11561.327,tops=126.308,spread_pct=4.483

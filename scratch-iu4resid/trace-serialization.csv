@@ -1,0 +1,3 @@
+"Kind","Agent_Id","Queue_Id","Stream_Id","Thread_Id","Dispatch_Id","Kernel_Id","Kernel_Name","Correlation_Id","Start_Timestamp","End_Timestamp","LDS_Block_Size","Scratch_Size","VGPR_Count","Accum_VGPR_Count","SGPR_Count","Workgroup_Size_X","Workgroup_Size_Y","Workgroup_Size_Z","Grid_Size_X","Grid_Size_Y","Grid_Size_Z"
+"KERNEL_DISPATCH","Agent 2",2,0,1030973,507,29,"gemm_mq4g256v2_residual_mmq_iu4_full_set_lf16_col_gfx1151",507,209388231906239,209388252659159,0,0,96,0,128,32,16,1,1472,2176,1
+"KERNEL_DISPATCH","Agent 2",2,0,1030973,508,26,"gemm_mq4g256v2_residual_mmq_iu4_tail_gridspec",508,209388252670440,209388253923227,0,0,200,0,128,32,8,1,4352,8,1
