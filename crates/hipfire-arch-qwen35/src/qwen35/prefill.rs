@@ -1312,7 +1312,8 @@ fn lean_pbs_route(
 
 fn lean_pbs_requested() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX11_LEAN_PBS")
-        .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(true)
 }
 
 fn lean_dense_prefill_allocation_bytes(config: &Qwen35Config, rows: usize) -> Option<usize> {
