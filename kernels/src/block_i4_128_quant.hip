@@ -17,10 +17,11 @@
 #include <hip/hip_runtime.h>
 #include <stdint.h>
 #include <math.h>
-// gfx11 shipped with the original 8-candidate MSE search. gfx1201 defaults to
-// RTN (d=amax/7), measured 2026-09-21 on the symmetric XT artifact vs N=2:
-// TTFT 1694->1666 ms (3,546 tok/s), pp8192 +1.7%, iu4 c24 0.0787->0.0860
-// (budget 0.10), fp8v2 route unchanged 0.0495.
+// The gfx11 fused producers default to the measured 2-point {5,7} search
+// through the host compile flag. The standalone quantizer retains its original
+// 8-point body. gfx1201 defaults to RTN (d=amax/7), measured 2026-09-21 on
+// the symmetric XT artifact vs N=2: TTFT 1694->1666 ms (3,546 tok/s),
+// pp8192 +1.7%, iu4 c24 0.0787->0.0860 (budget 0.10), fp8v2 unchanged 0.0495.
 #ifndef IU4_A4_CANDIDATES
 #if defined(__gfx1100__) || defined(__gfx1151__)
 #define IU4_A4_CANDIDATES 8

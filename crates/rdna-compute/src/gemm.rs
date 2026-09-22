@@ -19798,7 +19798,7 @@ impl Gpu {
             && !self.replay.is_recording()
             && !self.graphs.capture_mode;
         // LF: gfx1151 full SET tiles keep the shipped 16-wave column route.
-        // The default-off gfx1100 experiment admits SET and ADD. Eager launches
+        // The default-on gfx1100 shape admits SET and ADD. Eager launches
         // use the column-adjacent wrapper; graph/replay capture uses an
         // arithmetic-identical row-major wrapper matching its recorded grid.
         let shape_lf16 = (full || gridspec)

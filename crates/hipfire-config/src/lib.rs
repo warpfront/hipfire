@@ -2189,11 +2189,11 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.gfx11_a4_candidates",
         "gfx11_a4_candidates",
         Kernel,
-        DefaultValue::String("8"),
+        DefaultValue::String("2"),
         ValueRule::Enum(&["1", "2", "4", "8"]),
         true,
         "HIPFIRE_GFX11_A4_CANDIDATES",
-        "Number of activation-quantization candidates searched inside fused gfx1100/gfx1151 IU4 producers; 8 preserves the shipped full-grid search."
+        "Number of activation-quantization candidates searched inside fused gfx1100/gfx1151 IU4 producers (default 2, selecting {5,7}); 8 restores the full-grid search. Other architectures and the standalone quantizer are unchanged."
     ),
     process_bool_field!(
         "kernel.gfx12_fp8_stream",
@@ -2262,19 +2262,19 @@ pub static FIELDS: &[ConfigField] = &[
         "kernel.gfx11_iu4_shape",
         "gfx11_iu4_shape",
         Kernel,
-        false,
+        true,
         true,
         "HIPFIRE_GFX11_IU4_SHAPE",
-        "Use the gfx1100-specific IU4 workgroup-shape experiment; default off and ignored on other architectures."
+        "Use the 16-wave low-footprint IU4 full-tile entry on gfx1100 (default on); ignored on other architectures. Set false or HIPFIRE_GFX11_IU4_SHAPE=0 to restore the prior gfx1100 shape."
     ),
     process_bool_field!(
         "kernel.gfx11_iu4_symfold",
         "gfx11_iu4_symfold",
         Kernel,
-        false,
+        true,
         true,
         "HIPFIRE_IU4_SYMFOLD",
-        "Exploit symmetric MQ4V2 weights on exact gfx1100/gfx1151 by rebiasing q to q-8 and using signed-weight IU4 WMMA; default off, with HIPFIRE_IU4_SYMFOLD=0 as an explicit escape."
+        "Exploit symmetric MQ4V2 weights on exact gfx1100/gfx1151 by rebiasing q to q-8 and using signed-weight IU4 WMMA (default on for symmetric artifacts only); set false or HIPFIRE_IU4_SYMFOLD=0 to opt out. Asymmetric artifacts and other architectures are unchanged."
     ),
     process_bool_field!(
         "kernel.npu_spillover",
