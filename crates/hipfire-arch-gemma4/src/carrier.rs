@@ -158,8 +158,8 @@ fn free_lowered_sliding_scratch_weights(
 /// `want_batched` env gate, E-series validation, weight/state/KV allocation,
 /// and the preserved `eprintln!` diagnostics for the chosen path.
 pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4Bundle, String> {
-    if ctx.kv_backend != hipfire_runtime::kv_backend::KvBackend::Contiguous {
-        return Err("gemma4: sliding/full KV owners require contiguous backend".into());
+    if ctx.kv_backend != hipfire_runtime::kv_backend::KvBackend::Legacy {
+        return Err("gemma4: sliding/full KV owners require legacy backend".into());
     }
     let hfq = match src {
         ModelSource::Hfq(h) => h,

@@ -69,7 +69,7 @@ pub struct EngineConfig {
     /// Carried explicitly so a bypass of the daemon capability gate still
     /// fails closed inside the engine thread.
     pub kv_mode: String,
-    /// Effective `--kv-backend` for this load (`contiguous` default). Slot
+    /// Effective `--kv-backend` for this load (`legacy` default). Slot
     /// arenas are fixed contiguous `SlotPool` allocations; `vmm` is rejected
     /// in `Rig::build` alongside non-q8 modes.
     pub kv_backend: String,
@@ -269,9 +269,9 @@ impl Rig {
                 cfg.kv_mode
             ));
         }
-        if cfg.kv_backend != "contiguous" {
+        if cfg.kv_backend != "legacy" {
             return Err(format!(
-                "experimental multi-slot requires kv_backend=contiguous (got {:?})",
+                "experimental multi-slot requires kv_backend=legacy (got {:?})",
                 cfg.kv_backend
             ));
         }

@@ -334,6 +334,9 @@ pub enum ValueRule {
         max: f64,
     },
     KvAdaptive,
+    /// `legacy` | `vmm`. Rejects the pre-rename `contiguous` spelling with a
+    /// migration message rather than a generic enum failure.
+    KvBackend,
     Deepseek4Placement,
 }
 
@@ -405,12 +408,22 @@ impl ConfigField {
                 matches!(v.as_str(), "off" | "conservative" | "balanced" | "aggressive")
                     || valid_advanced_kv(v)
             }),
+            ValueRule::KvBackend => {
+                matches!(value, ConfigValue::String(v) if matches!(v.as_str(), "legacy" | "vmm"))
+            }
             ValueRule::Deepseek4Placement => matches!(value, ConfigValue::String(v)
                 if v.parse::<Deepseek4ComputePlacement>().is_ok()),
         };
 
         if valid {
             Ok(())
+        } else if matches!(self.rule, ValueRule::KvBackend)
+            && matches!(value, ConfigValue::String(v) if v == "contiguous")
+        {
+            Err(ConfigError::InvalidValue {
+                key: self.key.to_owned(),
+                message: "KV backend 'contiguous' was renamed to 'legacy'; use --kv-backend legacy or memory.kv_backend = \"legacy\"".into(),
+            })
         } else {
             Err(ConfigError::InvalidValue {
                 key: self.key.to_owned(),
@@ -477,6 +490,27 @@ fn expand_tilde(value: &str) -> PathBuf {
     }
     PathBuf::from(value)
 }
+
+// Qwen-only K/V axis overrides. Empty is the unset default (not an authored
+// format); consumers omit BuiltIn empty values from IPC.
+const KV_K_NAMES: &[&str] = &[
+    "",
+    "q8",
+    "fwht2",
+    "fwht3",
+    "fwht4",
+    "asym2",
+    "asym3",
+    "asym4",
+    "turbo",
+    "turbo2",
+    "turbo3",
+    "turbo4",
+    "legacy-asym2",
+    "legacy-asym3",
+    "legacy-asym4",
+];
+const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 
 // The union of every KV-mode name any SITE accepts. This is the config
 // schema's allow-list only — it is NOT a promise that a given model supports a
@@ -892,11 +926,35 @@ pub static FIELDS: &[ConfigField] = &[
         Memory,
         ModelLoad,
         DefaultValue::String("vmm"),
-        ValueRule::Enum(&["contiguous", "vmm"]),
+        ValueRule::KvBackend,
         true,
         false,
         None,
-        "KV storage backend. VMM reserves the logical context window and commits physical pages on demand."
+        "KV storage backend: legacy (physically contiguous) or vmm (reserves the logical context window and commits physical pages on demand)."
+    ),
+    field!(
+        "memory.kv_k",
+        "kv_k",
+        Memory,
+        ModelLoad,
+        DefaultValue::String(""),
+        ValueRule::Enum(KV_K_NAMES),
+        true,
+        false,
+        None,
+        "Qwen-only K-axis override; empty leaves the mode-preset K unchanged."
+    ),
+    field!(
+        "memory.kv_v",
+        "kv_v",
+        Memory,
+        ModelLoad,
+        DefaultValue::String(""),
+        ValueRule::Enum(KV_V_NAMES),
+        true,
+        false,
+        None,
+        "Qwen-only V-axis override; empty leaves the mode-preset V unchanged."
     ),
     field!(
         "reasoning.mode",
@@ -5556,6 +5614,131 @@ mod tests {
         assert!(layer.set_cli("dflash_ngram_block", "auto").is_ok());
         assert!(layer.set_cli("dflash_ngram_block", "false").is_ok());
     }
+
+    #[test]
+    fn kv_backend_accepts_legacy_and_vmm_rejects_contiguous_with_migration() {
+        let field = field("memory.kv_backend").expect("memory.kv_backend schema field");
+        assert_eq!(field.legacy_key, "kv_backend");
+        assert_eq!(field.default.to_value(), ConfigValue::String("vmm".into()));
+        assert!(matches!(field.rule, ValueRule::KvBackend));
+        assert_eq!(
+            field.parse_cli("legacy").unwrap(),
+            ConfigValue::String("legacy".into())
+        );
+        assert_eq!(
+            field.parse_cli("vmm").unwrap(),
+            ConfigValue::String("vmm".into())
+        );
+
+        let message = field.parse_cli("contiguous").unwrap_err().to_string();
+        assert!(
+            message.contains("contiguous") && message.contains("legacy"),
+            "contiguous rejection must name the legacy rename: {message}"
+        );
+        assert!(
+            message.contains("memory.kv_backend") || message.contains("--kv-backend"),
+            "contiguous rejection must be actionable: {message}"
+        );
+
+        // Both TOML-layer set and config-set CLI paths share field.validate.
+        let mut layer = ConfigLayer::default();
+        layer
+            .set(
+                "memory.kv_backend",
+                ConfigValue::String("legacy".into()),
+            )
+            .expect("legacy must validate on TOML load path");
+        assert!(layer
+            .set(
+                "memory.kv_backend",
+                ConfigValue::String("contiguous".into()),
+            )
+            .is_err());
+        let set_cli_err = layer.set_cli("memory.kv_backend", "contiguous").unwrap_err();
+        let set_cli_msg = set_cli_err.to_string();
+        assert!(
+            set_cli_msg.contains("legacy"),
+            "config set contiguous must name legacy: {set_cli_msg}"
+        );
+    }
+
+    #[test]
+    fn kv_k_and_kv_v_default_empty_and_accept_named_overrides() {
+        let k = field("memory.kv_k").expect("memory.kv_k schema field");
+        let v = field("memory.kv_v").expect("memory.kv_v schema field");
+        assert_eq!(k.legacy_key, "kv_k");
+        assert_eq!(v.legacy_key, "kv_v");
+        assert_eq!(k.default.to_value(), ConfigValue::String(String::new()));
+        assert_eq!(v.default.to_value(), ConfigValue::String(String::new()));
+
+        let resolved = resolve([]).expect("empty resolve");
+        let k_resolved = resolved.get("memory.kv_k").expect("built-in kv_k");
+        let v_resolved = resolved.get("memory.kv_v").expect("built-in kv_v");
+        assert_eq!(k_resolved.value, ConfigValue::String(String::new()));
+        assert_eq!(v_resolved.value, ConfigValue::String(String::new()));
+        assert_eq!(k_resolved.source, ConfigSource::BuiltIn);
+        assert_eq!(v_resolved.source, ConfigSource::BuiltIn);
+
+        for name in [
+            "",
+            "q8",
+            "fwht2",
+            "fwht3",
+            "fwht4",
+            "asym2",
+            "asym3",
+            "asym4",
+            "turbo",
+            "turbo2",
+            "turbo3",
+            "turbo4",
+            "legacy-asym2",
+            "legacy-asym3",
+            "legacy-asym4",
+        ] {
+            assert_eq!(
+                k.parse_cli(name).unwrap(),
+                ConfigValue::String(name.into()),
+                "kv_k must accept {name:?}"
+            );
+        }
+        for name in ["", "q8", "lloyd2", "lloyd3", "lloyd4"] {
+            assert_eq!(
+                v.parse_cli(name).unwrap(),
+                ConfigValue::String(name.into()),
+                "kv_v must accept {name:?}"
+            );
+        }
+        assert!(k.parse_cli("lloyd3").is_err());
+        assert!(v.parse_cli("fwht3").is_err());
+        assert!(k.parse_cli("auto").is_err());
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("memory.kv_k", "legacy-asym3").unwrap();
+        layer.set_cli("memory.kv_v", "lloyd3").unwrap();
+        assert_eq!(
+            layer.get("memory.kv_k"),
+            Some(&ConfigValue::String("legacy-asym3".into()))
+        );
+        assert_eq!(
+            layer.get("memory.kv_v"),
+            Some(&ConfigValue::String("lloyd3".into()))
+        );
+
+        // Default profile still authors only memory.kv_cache = q8, not K/V axes.
+        let default = load_config_profile(
+            &ConfigPaths::under(temp_root("profile-kv-axes")),
+            "default",
+        )
+        .unwrap();
+        assert_eq!(
+            default.get("memory.kv_cache"),
+            Some(&ConfigValue::String("q8".into()))
+        );
+        assert!(default.get("memory.kv_k").is_none());
+        assert!(default.get("memory.kv_v").is_none());
+    }
+
 
     #[test]
     fn documented_config_profiles_match_the_schema() {

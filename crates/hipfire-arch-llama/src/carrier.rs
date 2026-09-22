@@ -609,15 +609,92 @@ fn classify_hfq_route(hfq: &HfqFile) -> HfqLoadRoute {
     }
 }
 
+/// Resolve KV mode for llama-family loads.
+///
+/// Qwen3 (arch_id=1) — both HFQ and Dir — uses the shared pair table with
+/// [`DIR_SAFETENSORS_POLICY`] (flat constructors only: Q8 + legacy Asym3/4).
+/// Non-Qwen keeps the historical single-string [`resolve`] path: Dir stays on
+/// `DIR_SAFETENSORS_POLICY`, HFQ on `LLAMA_HFQ_POLICY`. Authored `--kv-k`/`--kv-v`
+/// on non-Qwen is refused here (admission also gates).
+fn resolve_llama_family_kv_mode(
+    config: &LlamaConfig,
+    ctx: &LoadCtx,
+    dir_source: bool,
+) -> Result<hipfire_runtime::kv_mode::KvMode, String> {
+    use hipfire_runtime::kv_mode::{self, KvMode, VMode};
+    use hipfire_runtime::llama::ModelArch;
+
+    let mode_raw = ctx
+        .kv_mode_override
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
+    let k_raw = ctx.kv_k_override.filter(|s| !s.is_empty());
+    let v_raw = ctx.kv_v_override.filter(|s| !s.is_empty());
+
+    if config.arch == ModelArch::Qwen3 {
+        let (mode, v) = kv_mode::resolve_kv_pair(
+            &mode_raw,
+            k_raw,
+            v_raw,
+            &kv_mode::DIR_SAFETENSORS_POLICY,
+            ctx.gpu.arch.as_str(),
+            ctx.qwen_default_q8,
+        )
+        .map_err(|e| e.to_string())?;
+        // Flat constructors have no Lloyd-V arm; pair path already refuses
+        // Lloyd with legacy-Asym K, but keep an explicit Q8-V gate.
+        if !matches!(v, VMode::Q8) {
+            return Err(format!(
+                "llama/qwen3: V={} unsupported on flat dir-safetensors constructor (need V=q8)",
+                kv_mode::qwen_v_display_name(v)
+            ));
+        }
+        if matches!(mode, KvMode::Asym3 | KvMode::Asym4) && config.head_dim != 256 {
+            return Err(format!(
+                "Qwen legacy-asym K requires head_dim=256 (got {}); use --kv-mode q8",
+                config.head_dim
+            ));
+        }
+        eprintln!(
+            "  KV cache: requested mode={mode_raw}, effective K={}, effective V={} (site {})",
+            kv_mode::qwen_k_display_name(mode),
+            kv_mode::qwen_v_display_name(v),
+            kv_mode::DIR_SAFETENSORS_POLICY.site
+        );
+        Ok(mode)
+    } else {
+        if k_raw.is_some() || v_raw.is_some() {
+            return Err(format!(
+                "--kv-k/--kv-v are Qwen-only (arch={:?}); use --kv-mode for this model",
+                config.arch
+            ));
+        }
+        let policy = if dir_source {
+            &kv_mode::DIR_SAFETENSORS_POLICY
+        } else {
+            &kv_mode::LLAMA_HFQ_POLICY
+        };
+        let rr = kv_mode::resolve(&mode_raw, policy);
+        if let Some(w) = rr.warning {
+            eprintln!("  KV cache: {w} (site {})", policy.site);
+        }
+        Ok(rr.mode)
+    }
+}
+
+
 pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, String> {
-    if ctx.kv_backend != hipfire_runtime::kv_backend::KvBackend::Contiguous {
-        return Err("llama: no VMM KV owner; admit contiguous before carrier load".into());
+    if ctx.kv_backend != hipfire_runtime::kv_backend::KvBackend::Legacy {
+        return Err("llama: no VMM KV owner; admit legacy before carrier load".into());
     }
     let (config, weights, kv, scratch, manifest_plan, weight_store, mesh, weight_origin) = match src
     {
         ModelSource::Hfq(hfq) => {
             let config =
                 <Llama as Architecture>::config_from_hfq(&hfq).map_err(|e| e.to_string())?;
+            // Pair/string resolution is pure CPU; fail before any GPU upload.
+            let kv_mode = resolve_llama_family_kv_mode(&config, ctx, false)?;
             // Admission and route classification are pure source checks.
             // They must run before any manifest fulfillment or GPU upload.
             hipfire_runtime::hfq::validate_llama_hfq_admission(&hfq).map_err(|e| e.to_string())?;
@@ -679,11 +756,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
             };
             let dims = llama_kv_dims(&config, ctx.max_seq, None);
             let kv = match <KvCache as KvCacheExt>::from_mode(
-                hipfire_runtime::kv_mode::resolve(
-                    ctx.kv_mode_override.unwrap_or(""),
-                    &hipfire_runtime::kv_mode::LLAMA_HFQ_POLICY,
-                )
-                .mode,
+                kv_mode,
                 KvTarget::Single(ctx.gpu),
                 &dims,
             ) {
@@ -716,6 +789,8 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
         ModelSource::Dir(source) => {
             let config = hipfire_runtime::hfq::config_from_safetensors_llama(&source)
                 .map_err(|e| format!("failed to parse LLaMA/Qwen3 config from config.json: {e}"))?;
+            // Pair/string resolution is pure CPU; fail before any GPU upload.
+            let mode = resolve_llama_family_kv_mode(&config, ctx, true)?;
             let (mesh, manifest_plan) =
                 plan_single(&config, source.tensor_info("lm_head.weight").is_some())?;
             let weight_origin = WeightOrigin::for_single(&mesh, ctx.gpu);
@@ -723,24 +798,9 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<LlamaBundle, S
                 hipfire_runtime::hfq::load_weights_paroquant_llama(&source, &config, ctx.gpu)
                     .map_err(|e| format!("load_weights_paroquant_llama: {e:?}"))?;
             hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
-            let kv_mode_str = ctx
-                .kv_mode_override
-                .filter(|s| !s.is_empty())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone());
-            let rr = hipfire_runtime::kv_mode::resolve(
-                &kv_mode_str,
-                &hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY,
-            );
-            if let Some(w) = rr.warning {
-                eprintln!(
-                    "  KV cache: {w} (site {})",
-                    hipfire_runtime::kv_mode::DIR_SAFETENSORS_POLICY.site
-                );
-            }
             let dims = llama_kv_dims(&config, ctx.max_seq, Some(ctx.max_seq));
             let kv =
-                match <KvCache as KvCacheExt>::from_mode(rr.mode, KvTarget::Single(ctx.gpu), &dims)
+                match <KvCache as KvCacheExt>::from_mode(mode, KvTarget::Single(ctx.gpu), &dims)
                 {
                     Ok(kv) => kv,
                     Err(error) => {
@@ -1162,9 +1222,12 @@ mod tests {
             deepseek4_experts_per_token: None,
             draft_path: None,
             kv_mode_override: Some("q8"),
-            kv_backend: KvBackend::Contiguous,
+            kv_k_override: None,
+            kv_v_override: None,
+            kv_backend: KvBackend::Legacy,
             kv_adaptive_override: None,
             state_quant_override: None,
+            qwen_default_q8: true,
             vision_path: None,
             cask,
             pp: 1,

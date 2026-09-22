@@ -29,7 +29,7 @@ pub enum KvMode {
     /// with one f16 scale per 256-element head stored inline in the token
     /// row (`[Hkv x D codes][Hkv f16 scales]`, 1032 bytes/row/side at
     /// Hkv=4/D=256). K/V pair is indivisible: fp8 on both sides.
-    /// Contiguous-backend, single-GPU, Qwen dense H24/Hkv4/D256 only;
+    /// Legacy-backend, single-GPU, Qwen dense H24/Hkv4/D256 only;
     /// no VMM / adaptive / compaction / slots support.
     Fp8,
 }
@@ -37,7 +37,7 @@ pub enum KvMode {
 /// KV storage backend selection.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum KvBackend {
-    Contiguous,
+    Legacy,
     #[default]
     Vmm,
 }
@@ -45,7 +45,7 @@ pub enum KvBackend {
 impl KvBackend {
     pub const fn as_str(self) -> &'static str {
         match self {
-            Self::Contiguous => "contiguous",
+            Self::Legacy => "legacy",
             Self::Vmm => "vmm",
         }
     }
@@ -62,7 +62,7 @@ pub struct ParseKvBackendError {
     value: String,
 }
 
-pub const KV_BACKEND_NAMES: &[&str] = &["contiguous", "vmm"];
+pub const KV_BACKEND_NAMES: &[&str] = &["legacy", "vmm"];
 
 pub const DEFAULT_KV_CHUNK_TOKENS: usize = 64;
 pub const DEFAULT_VMM_PHYSICAL_CHUNK_BYTES: usize = 2 * 1024 * 1024;
@@ -230,6 +230,11 @@ fn checked_round_up(value: usize, alignment: usize) -> Result<usize, KvChunkPlan
 
 impl std::fmt::Display for ParseKvBackendError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if self.value == "contiguous" {
+            return f.write_str(
+                "KV backend 'contiguous' was renamed to 'legacy'; use --kv-backend legacy or memory.kv_backend = \"legacy\"",
+            );
+        }
         write!(
             f,
             "unknown KV backend {:?}; expected one of: {}",
@@ -246,7 +251,7 @@ impl std::str::FromStr for KvBackend {
 
     fn from_str(raw: &str) -> Result<Self, Self::Err> {
         match raw {
-            "contiguous" => Ok(Self::Contiguous),
+            "legacy" => Ok(Self::Legacy),
             "vmm" => Ok(Self::Vmm),
             other => Err(ParseKvBackendError {
                 value: other.to_string(),
@@ -862,7 +867,7 @@ impl KvCache {
             ));
         }
         // FP8 is exact-geometry (D256); the VMM arm below re-validates it
-        // through the layout table, but contiguous requests fail here too.
+        // through the layout table, but legacy requests fail here too.
         if mode == KvMode::Fp8 && dims.head_dim != 256 {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -1091,7 +1096,7 @@ impl KvCache {
     /// target)` cells return `Err` rather than panic, so a future policy mis-wire
     /// surfaces as a clean load failure.
     pub fn from_mode(mode: KvMode, gpu: &mut Gpu, dims: &KvDims) -> HipResult<Self> {
-        Self::from_mode_with_backend(mode, KvBackend::Contiguous, gpu, dims)
+        Self::from_mode_with_backend(mode, KvBackend::Legacy, gpu, dims)
     }
 
     pub fn from_mode_with_backend(
@@ -1102,7 +1107,7 @@ impl KvCache {
     ) -> HipResult<Self> {
         Self::validate_mode_with_backend(mode, backend, true, dims)?;
         match backend {
-            KvBackend::Contiguous => Self::from_mode_single(mode, gpu, dims),
+            KvBackend::Legacy => Self::from_mode_single(mode, gpu, dims),
             KvBackend::Vmm => Self::from_mode_single_vmm(mode, gpu, dims),
         }
     }
@@ -1568,7 +1573,7 @@ impl KvCache {
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: bf16 ({n_kv}/{} layers carry KV, others placeholder)",
+            "KV cache: bf16 backend=legacy ({n_kv}/{} layers carry KV, others placeholder)",
             is_kv_layer.len()
         );
         Ok(Self {
@@ -1616,7 +1621,7 @@ impl KvCache {
         let n = is_kv_layer.len();
         let mut k_gpu = Vec::with_capacity(n);
         let mut v_gpu = Vec::with_capacity(n);
-        // Contiguous path mirrors alloc_k_v_vmm_filtered: on any mid-loop
+        // Legacy path mirrors alloc_k_v_vmm_filtered: on any mid-loop
         // failure free every tensor already pushed so a partial build never
         // leaks device memory (GpuTensor has no freeing Drop).
         let result = (|| -> HipResult<()> {
@@ -2338,7 +2343,7 @@ impl KvCache {
         let (cur_k_bpt, cur_v_bpt) = if self.uses_vmm_backend() {
             self.vmm_bytes_per_token()?
         } else {
-            // Contiguous: full buffer is mapped; keep prior full-layer scratch size.
+            // Legacy: full buffer is mapped; keep prior full-layer scratch size.
             (0, 0)
         };
         let prefix_v_bytes = if self.uses_vmm_backend() {
@@ -2818,7 +2823,7 @@ impl KvCache {
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: q8 ({n_kv}/{} layers carry KV, others placeholder)",
+            "KV cache: q8 backend=legacy ({n_kv}/{} layers carry KV, others placeholder)",
             is_kv_layer.len()
         );
         Ok(Self {
@@ -2981,7 +2986,7 @@ impl KvCache {
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: fp8-e4m3 ({n_kv}/{} layers carry KV, others placeholder)",
+            "KV cache: fp8-e4m3 backend=legacy ({n_kv}/{} layers carry KV, others placeholder)",
             is_kv_layer.len()
         );
         Ok(Self {
@@ -3582,7 +3587,7 @@ impl KvCache {
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: asym4 filtered ({n_kv}/{} layers carry KV; K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: asym4 filtered backend=legacy ({n_kv}/{} layers carry KV; K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -3655,7 +3660,7 @@ impl KvCache {
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: fwht4 filtered ({n_kv}/{} layers carry KV; K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: fwht4 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -3729,7 +3734,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
-            "KV cache: asym4 (K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            "KV cache: asym4 backend=legacy (K rotated-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
             k_bph + v_bph,
             (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
         );
@@ -3830,7 +3835,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&s2.buf, &s2_bytes)?;
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
-            "KV cache: fwht4 (K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            "KV cache: fwht4 backend=legacy (K FWHT-4b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
             k_bph + v_bph,
             (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
         );
@@ -3958,7 +3963,7 @@ impl KvCache {
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: asym3 filtered ({n_kv}/{} layers carry KV; K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, physical_cap={physical_cap} / max_seq={max_seq_len})",
+            "KV cache: asym3 filtered backend=legacy ({n_kv}/{} layers carry KV; K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, physical_cap={physical_cap} / max_seq={max_seq_len})",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -4142,7 +4147,7 @@ impl KvCache {
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: fwht3 filtered ({n_kv}/{} layers carry KV; K FWHT-3b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: fwht3 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-3b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -4338,7 +4343,7 @@ impl KvCache {
         };
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
-            "KV cache: asym3 (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
+            "KV cache: asym3 backend=legacy (K rotated-3b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32, physical_cap={physical_cap} / max_seq={max_seq_len})",
             k_bph + v_bph,
             (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
         );
@@ -4423,7 +4428,7 @@ impl KvCache {
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: asym2 filtered ({n_kv}/{} layers carry KV; K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: asym2 filtered backend=legacy ({n_kv}/{} layers carry KV; K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -4514,7 +4519,7 @@ impl KvCache {
         let v_bph = v_bpp / n_kv_heads;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
         eprintln!(
-            "KV cache: fwht2 filtered ({n_kv}/{} layers carry KV; K FWHT-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
+            "KV cache: fwht2 filtered backend=legacy ({n_kv}/{} layers carry KV; K FWHT-2b {k_bph}B + V Q8 {v_bph}B = {} B/head)",
             is_kv_layer.len(),
             k_bph + v_bph,
         );
@@ -4588,7 +4593,7 @@ impl KvCache {
         gpu.hip.memcpy_htod(&st.buf, &sb)?;
         let v_bph = v_bpp / n_kv_heads;
         eprintln!(
-            "KV cache: asym2 (K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
+            "KV cache: asym2 backend=legacy (K rotated-2b {k_bph}B + V Q8 {v_bph}B = {} B/head, {:.1}x vs fp32)",
             k_bph + v_bph,
             (head_dim * 4 * 2) as f64 / (k_bph + v_bph) as f64
         );
@@ -4639,7 +4644,7 @@ impl KvCache {
     /// Free all GPU tensors in this cache. Call before drop to return VRAM.
     /// After calling, follow with gpu.drain_pool() to actually release memory.
     ///
-    /// Contiguous frees keep prior log-and-continue behavior. VMM teardown
+    /// Legacy frees keep prior log-and-continue behavior. VMM teardown
     /// failures are aggregated and returned so unload cannot claim success
     /// while arenas remain registered (retry via `Gpu::ensure_vmm_cleaned`).
     pub fn free_gpu(self, gpu: &mut Gpu) -> HipResult<()> {
@@ -4875,9 +4880,9 @@ mod vmm_layout_tests {
         ] {
             KvCache::validate_mode_with_backend(mode, KvBackend::Vmm, true, &dims)
                 .unwrap_or_else(|e| panic!("mode={mode:?}: {e}"));
-            // Contiguous admission remains open (no VMM-only gate).
-            KvCache::validate_mode_with_backend(mode, KvBackend::Contiguous, true, &dims)
-                .unwrap_or_else(|e| panic!("contiguous mode={mode:?}: {e}"));
+            // Legacy admission remains open (no VMM-only gate).
+            KvCache::validate_mode_with_backend(mode, KvBackend::Legacy, true, &dims)
+                .unwrap_or_else(|e| panic!("legacy mode={mode:?}: {e}"));
         }
     }
 
@@ -5528,15 +5533,15 @@ mod fp8_bf16_format_tests {
     }
 
     #[test]
-    fn validate_admits_fp8_bf16_contiguous_and_vmm() {
-        // Contiguous: fp8 exact geometry, bf16 any non-zero geometry.
-        KvCache::validate_mode_with_backend(KvMode::Fp8, KvBackend::Contiguous, true, &mask_dims(256, None))
+    fn validate_admits_fp8_bf16_legacy_and_vmm() {
+        // Legacy: fp8 exact geometry, bf16 any non-zero geometry.
+        KvCache::validate_mode_with_backend(KvMode::Fp8, KvBackend::Legacy, true, &mask_dims(256, None))
             .unwrap();
-        KvCache::validate_mode_with_backend(KvMode::Bf16, KvBackend::Contiguous, true, &mask_dims(128, None))
+        KvCache::validate_mode_with_backend(KvMode::Bf16, KvBackend::Legacy, true, &mask_dims(128, None))
             .unwrap();
         let err = KvCache::validate_mode_with_backend(
             KvMode::Fp8,
-            KvBackend::Contiguous,
+            KvBackend::Legacy,
             true,
             &mask_dims(128, None),
         )

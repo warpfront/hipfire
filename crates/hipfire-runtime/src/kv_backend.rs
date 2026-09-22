@@ -19,8 +19,10 @@ mod tests {
 
     #[test]
     fn parses_all_stable_backend_names() {
-        assert_eq!("contiguous".parse(), Ok(KvBackend::Contiguous));
+        assert_eq!("legacy".parse(), Ok(KvBackend::Legacy));
         assert_eq!("vmm".parse(), Ok(KvBackend::Vmm));
+        assert_eq!(KvBackend::Legacy.to_string(), "legacy");
+        assert_eq!(KvBackend::Vmm.to_string(), "vmm");
     }
 
     #[test]
@@ -29,11 +31,20 @@ mod tests {
     }
 
     #[test]
+    fn rejects_contiguous_with_legacy_migration_message() {
+        let err = "contiguous".parse::<KvBackend>().unwrap_err().to_string();
+        assert_eq!(
+            err,
+            "KV backend 'contiguous' was renamed to 'legacy'; use --kv-backend legacy or memory.kv_backend = \"legacy\""
+        );
+    }
+
+    #[test]
     fn rejects_unknown_or_empty_names() {
         for raw in ["", "auto", "paged", "VMM"] {
             let err = raw.parse::<KvBackend>().unwrap_err().to_string();
             assert!(err.contains(raw));
-            assert!(err.contains("contiguous, vmm"));
+            assert!(err.contains("legacy, vmm"));
         }
     }
 

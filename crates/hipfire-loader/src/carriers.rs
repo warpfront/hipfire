@@ -210,39 +210,30 @@ fn kv_mode_from_ctx(ctx: &LoadCtx) -> String {
         .unwrap_or_else(|| hipfire_runtime::config::get().kv_mode.clone())
 }
 
-/// Resolve `--kv-mode` under `policy`, printing the site's warning. Returns
-/// `Err` (instead of warn-and-defaulting) when the pp>1 multi-GPU site gets
-/// an explicit native-tier request: multi-GPU never constructs fp8/bf16, so
-/// failing closed beats a silent q8 downgrade.
-fn resolve_kv_mode(
+/// Resolve Qwen K/V via the shared name table. Consumes `LoadCtx` mode + axis
+/// overrides + `qwen_default_q8`; no local Qwen alias maps.
+fn resolve_qwen_kv_pair(
     ctx: &LoadCtx,
     policy: &hipfire_runtime::kv_mode::KvModePolicy,
-) -> Result<hipfire_runtime::kv_mode::KvMode, String> {
-    let kv_mode = kv_mode_from_ctx(ctx);
-    // Single-GPU Qwen default: unset/auto means native fp8 on exact gfx1201.
-    // The pp>1 site is excluded (it never constructs native tiers and refuses
-    // explicit fp8/bf16 below, so a substituted default must never reach it).
-    let raw = if policy.site == hipfire_runtime::kv_mode::QWEN35_PP_POLICY.site {
-        kv_mode.clone()
-    } else {
-        hipfire_runtime::kv_mode::qwen35_auto_for_arch(&kv_mode, ctx.gpu.arch.as_str())
-            .to_string()
-    };
-    let hipfire_runtime::kv_mode::ResolveResult { mode, warning } =
-        hipfire_runtime::kv_mode::resolve(&raw, policy);
-    if let Some(w) = warning {
-        eprintln!("  KV cache: {w} (site {})", policy.site);
-    }
-    if policy.site == hipfire_runtime::kv_mode::QWEN35_PP_POLICY.site {
-        let raw = kv_mode.trim().to_ascii_lowercase();
-        if raw == "fp8" || raw == "bf16" {
-            return Err(format!(
-                "--kv-mode {raw} is single-GPU only (site {}); pp>1 never allocates native tiers",
-                policy.site
-            ));
-        }
-    }
-    Ok(mode)
+) -> Result<(hipfire_runtime::kv_mode::KvMode, hipfire_runtime::llama::VMode), String> {
+    let mode_raw = kv_mode_from_ctx(ctx);
+    let (mode, v_mode) = hipfire_runtime::kv_mode::resolve_kv_pair(
+        &mode_raw,
+        ctx.kv_k_override,
+        ctx.kv_v_override,
+        policy,
+        ctx.gpu.arch.as_str(),
+        ctx.qwen_default_q8,
+    )
+    .map_err(|e| e.to_string())?;
+    let k_name = hipfire_runtime::kv_mode::qwen_k_display_name(mode);
+    let v_name = hipfire_runtime::kv_mode::qwen_v_display_name(v_mode);
+    eprintln!(
+        "  KV cache: requested mode={mode_raw}, effective K={k_name} V={v_name} (site {})",
+        policy.site
+    );
+    eprintln!("  K={k_name} V={v_name}");
+    Ok((mode, v_mode))
 }
 
 fn arch_default_template(arch_id: u32) -> Option<String> {
@@ -313,7 +304,14 @@ fn load_qwen35_pp(
         .iter()
         .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
         .collect();
-    let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PP_POLICY)?;
+    let (mode, v_mode) = resolve_qwen_kv_pair(ctx, &hipfire_runtime::kv_mode::QWEN35_PP_POLICY)?;
+    if !matches!(v_mode, hipfire_runtime::llama::VMode::Q8) {
+        return Err(format!(
+            "qwen35: V={} requires pp=1 (site {}); multi-GPU has no lloyd-V constructor",
+            hipfire_runtime::kv_mode::qwen_v_display_name(v_mode),
+            hipfire_runtime::kv_mode::QWEN35_PP_POLICY.site
+        ));
+    }
     let dims = hipfire_runtime::llama::KvDims {
         layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
         n_kv_heads: config.n_kv_heads,
@@ -518,7 +516,7 @@ impl Carrier for Qwen35Carrier {
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.kv_backend == KvBackend::Vmm && ctx.pp > 1 {
             return Err(
-                "qwen35: KV backend 'vmm' currently requires pp=1; use 'contiguous' for pipeline parallelism"
+                "qwen35: KV backend 'vmm' currently requires pp=1; use 'legacy' for pipeline parallelism"
                     .into(),
             );
         }
@@ -678,17 +676,20 @@ impl Carrier for Qwen35Carrier {
                     .iter()
                     .map(|t| *t == hipfire_arch_qwen35::qwen35::LayerType::FullAttention)
                     .collect();
-                let mode = resolve_kv_mode(ctx, &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY)?;
+                let (mode, v_mode) =
+                    resolve_qwen_kv_pair(ctx, &hipfire_runtime::kv_mode::QWEN35_PARO_POLICY)?;
                 // Same native-tier admission as the HFQ carrier site: exact
-                // gfx1201/dense/contiguous-or-VMM. The Dir path ignores
-                // adaptive/CASK/V overrides by construction, so those arms
-                // pass their permissive values (VMM stays allowed; slots are
-                // rejected by the backend arm, not here).
+                // gfx1201/dense/legacy-or-VMM. The Dir path still honors
+                // resolved VMode below; adaptive/CASK stay HFQ-only.
                 hipfire_arch_qwen35::carrier::validate_native_kv_admission(
-                    mode, &config, ctx, false, None,
+                    mode,
+                    &config,
+                    ctx,
+                    false,
+                    ctx.kv_v_override.filter(|s| !s.is_empty()).is_some(),
                 )?;
                 let dims = hipfire_runtime::llama::KvDims {
-                    layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer),
+                    layers: hipfire_runtime::llama::KvLayers::Mask(is_kv_layer.clone()),
                     n_kv_heads: config.n_kv_heads,
                     head_dim: config.head_dim,
                     max_seq: ctx.max_seq,
@@ -708,16 +709,86 @@ impl Carrier for Qwen35Carrier {
                 hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
 
                 // Staged GPU free on every post-weight error (VMM arenas via free_gpu).
-                let kv_cache = match <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode_with_backend(
-                    mode,
-                    ctx.kv_backend,
-                    hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
-                    &dims,
-                ) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        weights.free_gpu(ctx.gpu);
-                        return Err(format!("KvCache: {e}"));
+                // Propagate resolved VMode: VMM takes it in-constructor; legacy
+                // Q8 uses from_mode; legacy Lloyd-V post-alloc reallocs.
+                let kv_cache = match (ctx.kv_backend, v_mode) {
+                    (KvBackend::Vmm, vm)
+                        if matches!(
+                            mode,
+                            hipfire_runtime::kv_mode::KvMode::Fp8
+                                | hipfire_runtime::kv_mode::KvMode::Bf16
+                        ) =>
+                    {
+                        match <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode_with_backend(
+                            mode,
+                            KvBackend::Vmm,
+                            hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
+                            &dims,
+                        ) {
+                            Ok(k) => {
+                                let _ = vm; // native pair is indivisible
+                                k
+                            }
+                            Err(e) => {
+                                weights.free_gpu(ctx.gpu);
+                                return Err(format!("KvCache: {e}"));
+                            }
+                        }
+                    }
+                    (KvBackend::Vmm, vm) => {
+                        match hipfire_runtime::llama::KvCache::new_gpu_vmm_capped_filtered(
+                            ctx.gpu,
+                            &is_kv_layer,
+                            config.n_kv_heads,
+                            config.head_dim,
+                            ctx.max_seq,
+                            ctx.max_seq,
+                            mode,
+                            vm,
+                        ) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                weights.free_gpu(ctx.gpu);
+                                return Err(format!("KvCache: {e}"));
+                            }
+                        }
+                    }
+                    (KvBackend::Legacy, hipfire_runtime::llama::VMode::Q8) => {
+                        match <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode_with_backend(
+                            mode,
+                            KvBackend::Legacy,
+                            hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
+                            &dims,
+                        ) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                weights.free_gpu(ctx.gpu);
+                                return Err(format!("KvCache: {e}"));
+                            }
+                        }
+                    }
+                    (KvBackend::Legacy, vm) => {
+                        let mut kv = match <hipfire_runtime::llama::KvCache as hipfire_runtime::llama::KvCacheExt>::from_mode_with_backend(
+                            mode,
+                            KvBackend::Legacy,
+                            hipfire_runtime::llama::KvTarget::Single(ctx.gpu),
+                            &dims,
+                        ) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                weights.free_gpu(ctx.gpu);
+                                return Err(format!("KvCache: {e}"));
+                            }
+                        };
+                        if let Err(e) = kv.set_v_mode_realloc(ctx.gpu, vm) {
+                            let mut note = format!("set_v_mode_realloc: {e}");
+                            if let Err(fe) = kv.free_gpu(ctx.gpu) {
+                                note = format!("{note}; cleanup also failed: {fe}");
+                            }
+                            weights.free_gpu(ctx.gpu);
+                            return Err(note);
+                        }
+                        kv
                     }
                 };
 
@@ -1285,8 +1356,8 @@ impl Carrier for Deepseek4Carrier {
             ctx.deepseek4_compute_placement,
             hipfire_config::Deepseek4ComputePlacement::Single
         ) {
-            if ctx.kv_backend != KvBackend::Contiguous {
-                return Err("deepseek4 heterogeneous compressor owner requires admitted contiguous backend".into());
+            if ctx.kv_backend != KvBackend::Legacy {
+                return Err("deepseek4 heterogeneous compressor owner requires admitted legacy backend".into());
             }
             let model = hipfire_arch_deepseek4::load_deepseek4_heterogeneous_model(
                 &src,
@@ -1382,7 +1453,7 @@ impl Carrier for Deepseek4Carrier {
         let advertised_context = config.max_position_embeddings;
         eprintln!(
             "  deepseek4 KV cache: {} growth to advertised context {advertised_context}",
-            if ctx.kv_backend == KvBackend::Vmm { "VMM" } else { "contiguous" }
+            if ctx.kv_backend == KvBackend::Vmm { "VMM" } else { "legacy" }
         );
         Ok(LoadedModel {
             state: Some(Box::new(deepseek4::Deepseek4Bundle {
@@ -2458,7 +2529,7 @@ impl Carrier for MuseGlimmerCarrier {
     fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
         if ctx.kv_backend == KvBackend::Vmm && ctx.cask.sidecar.is_some() {
             return Err(
-                "muse_glimmer: KV backend 'vmm' does not support CASK/TriAttention eviction; disable the sidecar or use 'contiguous'"
+                "muse_glimmer: KV backend 'vmm' does not support CASK/TriAttention eviction; disable the sidecar or use 'legacy'"
                     .into(),
             );
         }

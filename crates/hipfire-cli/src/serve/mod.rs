@@ -9,9 +9,10 @@
 //! shared across HTTP workers so transport changes stay isolated.
 
 use crate::{
-    config_bool, config_f64, config_i64, config_string, config_u64, find_daemon, find_model_path,
-    http_get_json, list_local_models, load_params, probe_host, pull_command, resolved_for_model,
-    resolved_global, ListArgs, Paths, PullArgs, ServeArgs, StopArgs,
+    apply_kv_axis_overrides, config_bool, config_f64, config_i64, config_string, config_u64,
+    find_daemon, find_model_path, http_get_json, list_local_models, load_params, probe_host,
+    pull_command, resolved_for_model, resolved_global, ListArgs, Paths, PullArgs, ServeArgs,
+    StopArgs,
 };
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::Engine;
@@ -89,6 +90,8 @@ pub(crate) struct ServeRuntime {
     pub(crate) current_max_seq: u64,
     pub(crate) cache_capable: bool,
     pub(crate) kv_override: Option<String>,
+    pub(crate) kv_k_override: Option<String>,
+    pub(crate) kv_v_override: Option<String>,
     pub(crate) kv_backend_override: Option<String>,
     /// Explicit vision-tower sidecar (`serve --vision`) projected as
     /// `params["vision"]` on every model load, winning over the registry
@@ -779,6 +782,12 @@ pub(crate) fn detach_serve(paths: &Paths, args: &ServeArgs, host: &str, port: u1
     if let Some(mode) = &args.kv_mode {
         command.arg("--kv-mode").arg(mode);
     }
+    if let Some(k) = &args.kv_k {
+        command.arg("--kv-k").arg(k);
+    }
+    if let Some(v) = &args.kv_v {
+        command.arg("--kv-v").arg(v);
+    }
     if let Some(backend) = &args.kv_backend {
         command.arg("--kv-backend").arg(backend);
     }
@@ -913,6 +922,8 @@ pub(crate) fn serve_foreground(
             current_max_seq: 0,
             cache_capable: false,
             kv_override: args.kv_mode.clone(),
+            kv_k_override: args.kv_k.clone(),
+            kv_v_override: args.kv_v.clone(),
             kv_backend_override: args.kv_backend.clone(),
             vision_override: args.vision.clone(),
             tp: args.tp,
@@ -1160,6 +1171,11 @@ impl ServeRuntime {
                 false,
                 // serve has no --head yet; models load their own head.
                 None,
+            )?;
+            apply_kv_axis_overrides(
+                &mut params,
+                self.kv_k_override.as_deref(),
+                self.kv_v_override.as_deref(),
             )?;
             if let Some(vision) = self.vision_override.as_ref() {
                 // Forwarded in every mode; the daemon's `vision_mode=off` gate decides.

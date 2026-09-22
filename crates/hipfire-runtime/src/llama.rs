@@ -6120,7 +6120,7 @@ impl KvCacheExt for KvCache {
     where
         Self: Sized,
     {
-        <Self as KvCacheExt>::from_mode_with_backend(mode, KvBackend::Contiguous, target, dims)
+        <Self as KvCacheExt>::from_mode_with_backend(mode, KvBackend::Legacy, target, dims)
     }
 
     fn from_mode_with_backend(
@@ -6135,10 +6135,10 @@ impl KvCacheExt for KvCache {
         let single_gpu = matches!(&target, KvTarget::Single(_));
         Self::validate_mode_with_backend(mode, backend, single_gpu, dims)?;
         match (backend, target) {
-            (KvBackend::Contiguous, KvTarget::Single(gpu)) => {
+            (KvBackend::Legacy, KvTarget::Single(gpu)) => {
                 saddle_core::kv::KvCache::from_mode_with_backend(mode, backend, gpu, dims)
             }
-            (KvBackend::Contiguous, KvTarget::Multi(gpus)) => {
+            (KvBackend::Legacy, KvTarget::Multi(gpus)) => {
                 <Self as KvCacheExt>::from_mode_multi(mode, gpus, dims)
             }
             (KvBackend::Vmm, KvTarget::Single(gpu)) => {

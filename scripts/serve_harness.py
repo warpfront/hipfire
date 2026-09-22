@@ -116,10 +116,24 @@ def _tag_load_policy(canonical_tag):
     return {}
 
 
+def parse_kv_backend_arg(value):
+    """CLI --kv-backend: accept legacy|vmm; reject contiguous with migration text."""
+    if value == "contiguous":
+        raise argparse.ArgumentTypeError(
+            "KV backend 'contiguous' was renamed to 'legacy'; "
+            "use --kv-backend legacy or memory.kv_backend = \"legacy\""
+        )
+    if value not in ("legacy", "vmm"):
+        raise argparse.ArgumentTypeError(
+            f"unknown KV backend {value!r}; expected one of: legacy, vmm"
+        )
+    return value
+
+
 def resolve_kv_backend_request(explicit):
     """Requested backend: explicit CLI/config value, else automatic (None).
 
-    Tags no longer choose a backend. The daemon/runtime picks VMM or contiguous
+    Tags no longer choose a backend. The daemon/runtime picks VMM or legacy
     from the omitted request; the harness only observes the effective marker.
     """
     if explicit is not None:
@@ -822,35 +836,250 @@ def _log_has_vmm_kv_marker(txt):
     )
 
 
-def observe_effective_kv_backend(txt):
-    """Parse serve log for the effective KV backend (not the requested value).
+def _normalize_backend_name(name):
+    """Map transitional 'contiguous' spelling to 'legacy'."""
+    if name is None:
+        return None
+    raw = str(name).strip().lower()
+    if raw in ("contiguous", "legacy"):
+        return "legacy"
+    if raw == "vmm":
+        return "vmm"
+    return raw or None
 
-    Returns (backend, detail) where backend is "vmm", "contiguous", or None if
-    no marker is present. Contiguous fp8/q8 markers do not spell the word
-    contiguous; prefer the daemon reason line, else a non-VMM KV cache line
-    (placeholder style) proves contiguous.
+
+def parse_loaded_kv_backend_ack(txt):
+    """Extract the latest type=loaded ACK kv backend fields from serve log text.
+
+    Preferred source over log-line heuristics. Returns a dict with keys
+    kv_backend, kv_backend_request, kv_backend_reason, kv_backend_legacy,
+    kv_backend_warning — or None when no usable loaded ACK is present.
+    """
+    if not txt:
+        return None
+    ack = None
+    for line in txt.splitlines():
+        s = line.strip()
+        if not s.startswith("{") or '"loaded"' not in s:
+            continue
+        try:
+            obj = json.loads(s)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if obj.get("type") != "loaded":
+            continue
+        if "kv_backend" not in obj and "kv_backend_legacy" not in obj:
+            continue
+        ack = obj
+    if ack is None:
+        return None
+    backend = _normalize_backend_name(ack.get("kv_backend"))
+    legacy = ack.get("kv_backend_legacy")
+    if legacy is None:
+        legacy = backend == "legacy"
+    else:
+        legacy = bool(legacy)
+    reason = ack.get("kv_backend_reason")
+    warning = ack.get("kv_backend_warning")
+    if warning is not None and not isinstance(warning, str):
+        warning = str(warning) if warning else None
+    if not warning and legacy:
+        warning = format_legacy_kv_backend_warning(
+            reason,
+            explicit=(
+                ack.get("kv_backend_request") == "explicit"
+                or (isinstance(reason, str) and "explicit" in reason.lower())
+            ),
+        )
+    return {
+        "kv_backend": backend,
+        "kv_backend_request": ack.get("kv_backend_request"),
+        "kv_backend_reason": reason,
+        "kv_backend_legacy": legacy,
+        "kv_backend_warning": warning,
+    }
+
+
+def format_legacy_kv_backend_warning(reason=None, explicit=False):
+    """Build the stable HIPFIRE_KV_BACKEND=legacy warning string."""
+    if explicit:
+        return (
+            "WARNING HIPFIRE_KV_BACKEND=legacy: explicitly selected legacy KV storage "
+            "(--kv-backend legacy or memory.kv_backend); inspect before benchmarking "
+            "or filing a PR."
+        )
+    detail = "unspecified"
+    if reason:
+        detail = str(reason).strip()
+        for prefix in (
+            "automatic-fallback(",
+            "automatic VMM selection unavailable (",
+            "automatic vmm unavailable (",
+        ):
+            if detail.lower().startswith(prefix.lower()) and detail.endswith(")"):
+                detail = detail[len(prefix):-1].strip()
+                break
+        if detail.lower().startswith("explicit"):
+            return format_legacy_kv_backend_warning(explicit=True)
+    return (
+        f"WARNING HIPFIRE_KV_BACKEND=legacy: automatic VMM selection unavailable "
+        f"({detail}); using legacy KV storage. Inspect before benchmarking or "
+        f"filing a PR."
+    )
+
+
+def observe_effective_kv_backend(txt):
+    """Resolve effective KV backend from loaded ACK (preferred) or daemon lines.
+
+    Returns (backend, detail) where backend is \"vmm\", \"legacy\", or None.
+    Does **not** infer trunk backend from bare non-VMM ``KV cache`` markers —
+    those may be auxiliary/draft caches. Prefer type=loaded ACK fields, then
+    the stable WARNING token / KV backend reason lines, then trunk VMM markers.
     """
     if not txt:
         return None, None
+    ack = parse_loaded_kv_backend_ack(txt)
+    if ack and ack.get("kv_backend"):
+        reason = ack.get("kv_backend_reason")
+        if reason:
+            detail = f"ack({reason})"
+        elif ack.get("kv_backend_request") == "explicit":
+            detail = "ack(explicit)"
+        else:
+            detail = "ack"
+        return ack["kv_backend"], detail
+
     m = re.search(
-        r"KV backend:\s*automatic vmm unavailable \((.+?)\)\s*->\s*contiguous",
+        r"WARNING HIPFIRE_KV_BACKEND=legacy:\s*(.+)",
         txt,
         re.IGNORECASE,
     )
     if m:
-        return "contiguous", f"automatic-fallback({m.group(1).strip()})"
-    if re.search(r"KV backend:\s*explicit contiguous override", txt, re.IGNORECASE):
-        return "contiguous", "explicit-contiguous"
+        body = m.group(1).strip()
+        if re.search(r"explicitly selected", body, re.IGNORECASE):
+            return "legacy", "explicit-legacy"
+        m_auto = re.search(
+            r"automatic VMM selection unavailable \((.+?)\)",
+            body,
+            re.IGNORECASE,
+        )
+        if m_auto:
+            return "legacy", f"automatic-fallback({m_auto.group(1).strip()})"
+        return "legacy", "warning-token"
+
+    m = re.search(
+        r"KV backend:\s*automatic vmm unavailable \((.+?)\)\s*->\s*(?:legacy|contiguous)",
+        txt,
+        re.IGNORECASE,
+    )
+    if m:
+        return "legacy", f"automatic-fallback({m.group(1).strip()})"
+    if re.search(
+        r"KV backend:\s*explicit (?:legacy|contiguous) override",
+        txt,
+        re.IGNORECASE,
+    ):
+        return "legacy", "explicit-legacy"
     if _log_has_vmm_kv_marker(txt):
         return "vmm", "log-marker"
-    # Contiguous owners: `KV cache: fp8-e4m3 (... placeholder)` / q8 / etc.
-    m = re.search(r"KV cache:\s*(\S+).*\bplaceholder\b", txt, re.IGNORECASE)
-    if m:
-        return "contiguous", f"log-marker({m.group(1)})"
-    m = re.search(r"KV cache:\s*(\S+)", txt, re.IGNORECASE)
-    if m and "vmm" not in m.group(0).lower():
-        return "contiguous", f"log-marker({m.group(1).rstrip(':,')})"
+    # Deliberately no bare ``KV cache:`` fallback — auxiliary/draft owners also
+    # emit those lines and must not decide the trunk backend.
     return None, None
+
+
+def apply_observed_kv_backend(cfg, txt):
+    """Populate cfg with effective backend metadata from warm log / loaded ACK.
+
+    Emits the once-per-load legacy WARNING (stderr) and
+    ``kv_backend_effective=legacy`` (stdout) when the trunk is legacy.
+    """
+    ack = parse_loaded_kv_backend_ack(txt)
+    if ack:
+        eff = ack.get("kv_backend")
+        reason = ack.get("kv_backend_reason")
+        cfg["kv_backend_effective"] = eff
+        cfg["kv_backend_effective_reason"] = (
+            f"ack({reason})" if reason else "ack"
+        )
+        cfg["kv_backend_reason"] = reason
+        cfg["kv_backend_legacy"] = bool(ack.get("kv_backend_legacy"))
+        cfg["kv_backend_warning"] = ack.get("kv_backend_warning")
+        cfg["kv_backend_request_observed"] = ack.get("kv_backend_request")
+    else:
+        eff, eff_reason = observe_effective_kv_backend(txt)
+        if eff is not None:
+            cfg["kv_backend_effective"] = eff
+            cfg["kv_backend_effective_reason"] = eff_reason
+            cfg["kv_backend_legacy"] = eff == "legacy"
+            explicit = eff == "legacy" and (
+                cfg.get("kv_backend") == "legacy"
+                or (eff_reason or "").startswith("explicit")
+            )
+            reason = None
+            if eff_reason and eff_reason.startswith("automatic-fallback("):
+                reason = eff_reason[len("automatic-fallback("):-1]
+            elif explicit:
+                reason = "explicit operator choice"
+            cfg["kv_backend_reason"] = reason
+            if eff == "legacy":
+                cfg["kv_backend_warning"] = format_legacy_kv_backend_warning(
+                    reason, explicit=explicit
+                )
+            else:
+                cfg["kv_backend_warning"] = None
+
+    _emit_legacy_kv_backend_notice(cfg, log_txt=txt)
+    return cfg.get("kv_backend_effective"), cfg.get("kv_backend_effective_reason")
+
+
+def _emit_legacy_kv_backend_notice(cfg, log_txt=""):
+    """Once-per-load stderr WARNING + stdout effective line for legacy trunk."""
+    if cfg.get("_kv_legacy_notice_emitted"):
+        return
+    is_legacy = (
+        cfg.get("kv_backend_legacy")
+        or cfg.get("kv_backend_effective") == "legacy"
+    )
+    if not is_legacy:
+        return
+    cfg["_kv_legacy_notice_emitted"] = True
+    warning = cfg.get("kv_backend_warning")
+    if not warning:
+        explicit = (
+            cfg.get("kv_backend") == "legacy"
+            or cfg.get("kv_backend_request_observed") == "explicit"
+            or (
+                isinstance(cfg.get("kv_backend_effective_reason"), str)
+                and cfg["kv_backend_effective_reason"].startswith("explicit")
+            )
+        )
+        warning = format_legacy_kv_backend_warning(
+            cfg.get("kv_backend_reason"), explicit=explicit
+        )
+        cfg["kv_backend_warning"] = warning
+    # Daemon stderr is merged into the serve log file, not harness stderr, so
+    # always emit once on harness stderr for the operator console.
+    _ = log_txt  # retained for shared-stream detection if spawn wiring changes
+    print(warning, file=sys.stderr, flush=True)
+    print("kv_backend_effective=legacy", flush=True)
+
+
+def stamp_kv_backend_out_fields(rows, cfg):
+    """Attach load-scoped backend metadata to each --out per-turn row (list shape)."""
+    backend = cfg.get("kv_backend_effective")
+    if backend is None and cfg.get("kv_backend_legacy"):
+        backend = "legacy"
+    meta = {
+        "kv_backend": backend,
+        "kv_backend_legacy": bool(cfg.get("kv_backend_legacy", False)),
+        "kv_backend_warning": cfg.get("kv_backend_warning"),
+        "kv_backend_reason": cfg.get("kv_backend_reason"),
+    }
+    for row in rows or []:
+        if isinstance(row, dict):
+            row.update(meta)
+    return rows
+
 
 
 def _startup_path_proof_failures(cfg, txt):
@@ -1010,7 +1239,7 @@ def _self_test_serve_path_proofs():
         check(not ds4_fails, f"DeepSeek V4 VMM marker must pass, got {ds4_fails!r}")
 
         # --- draft-loaded without request execution must fail ---
-        cfg_df = {"kv_backend": "contiguous", "dflash": "on"}
+        cfg_df = {"kv_backend": "legacy", "dflash": "on"}
         with open(path, "ab") as ap:
             ap.write(b"DFlash draft loaded: /current/draft.hfq\n")
         cur = _serve_log_text(path, offset)
@@ -1046,7 +1275,7 @@ def _self_test_serve_path_proofs():
         check(not req_fails, f"log dflash/tau evidence must pass, got {req_fails!r}")
 
         # Non-DFlash / non-explicit-VMM configs stay silent (automatic included).
-        plain = {"kv_backend": "contiguous", "dflash": "off"}
+        plain = {"kv_backend": "legacy", "dflash": "off"}
         check(not _startup_path_proof_failures(plain, ""), "plain startup must be no-op")
         check(not _dflash_request_proof_failures(plain, [], ""), "plain request proof must be no-op")
         auto = {"kv_backend": None, "dflash": "off"}
@@ -1055,7 +1284,7 @@ def _self_test_serve_path_proofs():
             not _startup_path_proof_failures(
                 auto, "KV cache: fp8-e4m3 (4/16 layers carry KV, others placeholder)\n"
             ),
-            "automatic + contiguous marker must stay silent",
+            "automatic + non-VMM cache marker must stay silent",
         )
 
     os.unlink(path)
@@ -1122,7 +1351,7 @@ def _self_test_kv_resolution():
 def _self_test_load_defaults():
     """Tag max_tokens policy; context/backend remain automatic unless explicit."""
     import argparse
-    from contextlib import redirect_stdout
+    from contextlib import redirect_stderr, redirect_stdout
     from io import StringIO
 
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False) as tmp:
@@ -1161,10 +1390,20 @@ def _self_test_load_defaults():
     try:
         # Backend request ignores tags: omission is always automatic.
         assert resolve_kv_backend_request(None) == (None, "automatic")
-        assert resolve_kv_backend_request("contiguous") == (
-            "contiguous", "explicit(--kv-backend)")
+        assert resolve_kv_backend_request("legacy") == (
+            "legacy", "explicit(--kv-backend)")
         assert resolve_kv_backend_request("vmm") == (
             "vmm", "explicit(--kv-backend)")
+        # contiguous is rejected at argparse with an actionable migration error.
+        try:
+            parse_kv_backend_arg("contiguous")
+            raise AssertionError("contiguous must raise ArgumentTypeError")
+        except argparse.ArgumentTypeError as exc:
+            msg = str(exc)
+            assert "renamed to 'legacy'" in msg, msg
+            assert "--kv-backend legacy" in msg, msg
+        assert parse_kv_backend_arg("legacy") == "legacy"
+        assert parse_kv_backend_arg("vmm") == "vmm"
         assert resolve_max_seq(None) == (None, "automatic(model/card)")
 
         # Qwen3.8 aliases retain their generation cap, never a context cap.
@@ -1225,27 +1464,70 @@ def _self_test_load_defaults():
             assert resolve_max_tokens(None, tag, reg_path) == (
                 2048, "default(2048)")
 
-        # Effective log observer: VMM marker, contiguous placeholder, fallback reason.
+        # Effective observer: VMM marker, ACK preferred, legacy reason/WARNING.
+        # Bare non-VMM KV cache markers alone must NOT decide trunk backend
+        # (auxiliary/draft caches also emit them).
         assert observe_effective_kv_backend(
             "KV cache: Fp8 vmm (layers; mapped_prefix=1)\n"
         ) == ("vmm", "log-marker")
         assert observe_effective_kv_backend(
             "KV cache: fp8-e4m3 (4/16 layers carry KV, others placeholder)\n"
-        ) == ("contiguous", "log-marker(fp8-e4m3)")
+        ) == (None, None)
+        assert observe_effective_kv_backend(
+            "KV backend: automatic vmm unavailable "
+            "(carrier llama has no VMM KV owner) -> legacy\n"
+            "KV cache: q8 (4/16 layers carry KV, others placeholder)\n"
+        ) == (
+            "legacy",
+            "automatic-fallback(carrier llama has no VMM KV owner)",
+        )
+        # Transitional contiguous daemon spelling still maps to legacy.
         assert observe_effective_kv_backend(
             "KV backend: automatic vmm unavailable "
             "(carrier llama has no VMM KV owner) -> contiguous\n"
-            "KV cache: q8 (4/16 layers carry KV, others placeholder)\n"
         ) == (
-            "contiguous",
+            "legacy",
             "automatic-fallback(carrier llama has no VMM KV owner)",
         )
         assert observe_effective_kv_backend(
+            "KV backend: explicit legacy override\n"
+        ) == ("legacy", "explicit-legacy")
+        assert observe_effective_kv_backend(
             "KV backend: explicit contiguous override\n"
-        ) == ("contiguous", "explicit-contiguous")
+        ) == ("legacy", "explicit-legacy")
         assert observe_effective_kv_backend(
             "  deepseek4 KV cache: automatic VMM growth to advertised context 1048576\n"
         ) == ("vmm", "log-marker")
+        # Loaded ACK preferred over auxiliary draft KV cache markers.
+        ack_line = (
+            '{"type":"loaded","kv_backend_request":"automatic","kv_backend":"legacy",'
+            '"kv_backend_reason":"carrier draft has no VMM owner",'
+            '"kv_backend_legacy":true,'
+            '"kv_backend_warning":"WARNING HIPFIRE_KV_BACKEND=legacy: automatic VMM '
+            'selection unavailable (carrier draft has no VMM owner); using legacy KV '
+            'storage. Inspect before benchmarking or filing a PR."}'
+        )
+        mixed = (
+            "draft KV cache: q8 (placeholder)\n"
+            + ack_line
+            + "\n"
+            + "KV cache: fp8-e4m3 (4/16 layers carry KV, others placeholder)\n"
+        )
+        assert observe_effective_kv_backend(mixed) == (
+            "legacy",
+            "ack(carrier draft has no VMM owner)",
+        )
+        ack = parse_loaded_kv_backend_ack(mixed)
+        assert ack["kv_backend"] == "legacy"
+        assert ack["kv_backend_legacy"] is True
+        assert "HIPFIRE_KV_BACKEND=legacy" in ack["kv_backend_warning"]
+        warn_auto = format_legacy_kv_backend_warning(
+            "carrier llama has no VMM KV owner", explicit=False
+        )
+        assert warn_auto.startswith("WARNING HIPFIRE_KV_BACKEND=legacy:")
+        assert "automatic VMM selection unavailable" in warn_auto
+        warn_exp = format_legacy_kv_backend_warning(explicit=True)
+        assert "explicitly selected legacy KV storage" in warn_exp
 
         def _ns(**kw):
             base = dict(
@@ -1302,8 +1584,8 @@ def _self_test_load_defaults():
         assert cfg["kv_backend"] is None
         assert cfg["kv_backend_source"] == "automatic"
 
-        cfg = build_config(_ns(kv_backend="contiguous", max_seq=8192, max_tokens=256))
-        assert cfg["kv_backend"] == "contiguous"
+        cfg = build_config(_ns(kv_backend="legacy", max_seq=8192, max_tokens=256))
+        assert cfg["kv_backend"] == "legacy"
         assert cfg["kv_backend_source"] == "explicit(--kv-backend)"
         assert cfg["max_seq"] == 8192
         assert cfg["max_seq_source"] == "explicit(--max-seq)"
@@ -1401,6 +1683,57 @@ def _self_test_load_defaults():
             show_config(cfg_obs)
         obs = buf.getvalue()
         assert "kv_backend: vmm [observed(log-marker)]" in obs, obs
+
+        # Once-per-load legacy warning + --out row metadata (list shape preserved).
+        cfg_leg = build_config(_ns(kv_backend="legacy"))
+        ack_txt = (
+            '{"type":"loaded","kv_backend_request":"explicit","kv_backend":"legacy",'
+            '"kv_backend_reason":null,"kv_backend_legacy":true,'
+            '"kv_backend_warning":"'
+            + format_legacy_kv_backend_warning(explicit=True)
+            + '"}\n'
+        )
+        out_b, err_b = StringIO(), StringIO()
+        with redirect_stdout(out_b), redirect_stderr(err_b):
+            apply_observed_kv_backend(cfg_leg, ack_txt)
+        err_s = err_b.getvalue()
+        out_s = out_b.getvalue()
+        assert "WARNING HIPFIRE_KV_BACKEND=legacy" in err_s, err_s
+        assert "explicitly selected legacy KV storage" in err_s, err_s
+        assert "kv_backend_effective=legacy" in out_s, out_s
+        assert cfg_leg["kv_backend_legacy"] is True
+        assert cfg_leg["kv_backend_effective"] == "legacy"
+        # Second call must not re-emit.
+        out_b2, err_b2 = StringIO(), StringIO()
+        with redirect_stdout(out_b2), redirect_stderr(err_b2):
+            apply_observed_kv_backend(cfg_leg, ack_txt)
+        assert err_b2.getvalue() == ""
+        assert out_b2.getvalue() == ""
+        # Automatic reason path via WARNING token (no ACK).
+        cfg_auto = build_config(_ns())
+        auto_txt = (
+            "WARNING HIPFIRE_KV_BACKEND=legacy: automatic VMM selection unavailable "
+            "(carrier llama has no VMM KV owner); using legacy KV storage. "
+            "Inspect before benchmarking or filing a PR.\n"
+        )
+        out_b3, err_b3 = StringIO(), StringIO()
+        with redirect_stdout(out_b3), redirect_stderr(err_b3):
+            apply_observed_kv_backend(cfg_auto, auto_txt)
+        assert "HIPFIRE_KV_BACKEND=legacy" in err_b3.getvalue()
+        assert "kv_backend_effective=legacy" in out_b3.getvalue()
+        assert cfg_auto["kv_backend_legacy"] is True
+        rows = [{"gen": 1, "tau": 1.0}, {"gen": 2, "tau": 2.0}]
+        stamp_kv_backend_out_fields(rows, cfg_auto)
+        assert isinstance(rows, list)
+        for row in rows:
+            assert row["kv_backend"] == "legacy"
+            assert row["kv_backend_legacy"] is True
+            assert "HIPFIRE_KV_BACKEND=legacy" in (row["kv_backend_warning"] or "")
+            assert row["kv_backend_reason"] == "carrier llama has no VMM KV owner"
+        # Round-trip list shape for --out consumers.
+        dumped = json.loads(json.dumps(rows))
+        assert isinstance(dumped, list) and len(dumped) == 2
+        assert dumped[0]["kv_backend"] == "legacy"
     finally:
         os.unlink(reg_path)
     print("serve_harness: load-defaults self-test OK", flush=True)
@@ -2039,7 +2372,7 @@ def spawn_serve(cfg, home, log):
     cli = _native_cli()
     serve_cmd = [cli, "serve", "127.0.0.1", str(cfg["port"])]
     # Omitted request = automatic runtime selection. Only forward an explicit
-    # user override (CLI --kv-backend contiguous|vmm).
+    # user override (CLI --kv-backend legacy|vmm).
     if cfg.get("kv_backend") is not None:
         serve_cmd.extend(["--kv-backend", cfg["kv_backend"]])
     if cfg.get("mode") == "images":
@@ -3475,6 +3808,7 @@ def run(cfg, args):
             if os.environ.get("HIPFIRE_GLIMMER_CACHE_TRACE") == "1":
                 raise SystemExit("serve_harness: glimmer-cache trace assertion failed: HIPFIRE_GLIMMER_CACHE_TRACE=1 but no [glimmer-cache] lines found in log (expected {} rows)".format(len(g)))
     if args.out:
+        stamp_kv_backend_out_fields(rows, cfg)
         json.dump(rows, open(args.out, "w"), indent=0)
     return rows
 
@@ -3503,9 +3837,14 @@ def main():
     ap.add_argument("--registry", default=os.path.join(REPO, "registry/v1.json"))
     ap.add_argument("--kv", default=None,
                     help="cache mode override; omitted resolves the registry default")
-    ap.add_argument("--kv-backend", default=None, choices=["contiguous", "vmm"],
-                    help="explicit hipfire serve --kv-backend override; omitted leaves "
-                         "the request automatic (runtime picks VMM or contiguous)")
+    ap.add_argument(
+        "--kv-backend",
+        default=None,
+        type=parse_kv_backend_arg,
+        help="explicit hipfire serve --kv-backend override (legacy|vmm); omitted leaves "
+             "the request automatic (runtime picks VMM or legacy). "
+             "'contiguous' was renamed to 'legacy' and is rejected with a migration error.",
+    )
     ap.add_argument("--mtp", default="off", choices=["off", "on", "auto"])
     ap.add_argument("--dflash", default="off", choices=["off", "auto", "on"],
                     help="DFlash mode written to temporary [speculation] TOML (default off). "
@@ -3727,10 +4066,8 @@ def main():
                               capture_output=True, text=True).stdout.strip()
         print(f"  [serve warm; MTP head loaded lines={head}]", flush=True)
         warm_txt = _serve_log_text(args.serve_log, log_offset)
-        eff, eff_reason = observe_effective_kv_backend(warm_txt)
+        eff, eff_reason = apply_observed_kv_backend(cfg, warm_txt)
         if eff is not None:
-            cfg["kv_backend_effective"] = eff
-            cfg["kv_backend_effective_reason"] = eff_reason
             detail = f" ({eff_reason})" if eff_reason else ""
             print(f"  [kv_backend effective: {eff}{detail}]", flush=True)
         else:

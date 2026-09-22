@@ -593,6 +593,9 @@ fn admit_and_load(
         max_seq,
         hipfire_loader::admission::KvBackendHints {
             kv_mode: None,
+            kv_k: None,
+            kv_v: None,
+            qwen_default_q8: true,
             kv_adaptive: None,
             cask: None,
             deepseek4_heterogeneous: false,
@@ -610,6 +613,8 @@ fn admit_and_load(
         None,
         None,
         hipfire_loader::GEMMA4_EAGLE_DRAFT_LEN,
+        None,
+        None,
         None,
         None,
         None,

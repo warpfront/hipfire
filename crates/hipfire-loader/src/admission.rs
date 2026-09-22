@@ -30,9 +30,33 @@ impl KvBackendRequest {
     }
 }
 
+/// The sampled per-load switch only changes implicit Qwen defaults.
+pub fn qwen_default_q8_enabled() -> bool {
+    !matches!(
+        hipfire_config::developer_var("HIPFIRE_QWEN_KV_DEFAULT_Q8").ok().as_deref(),
+        Some("0")
+    )
+}
+
+/// Single authoritative operator warning for an admitted legacy trunk.
+pub fn legacy_warning(backend: KvBackend, reason: Option<&str>) -> Option<String> {
+    if backend != KvBackend::Legacy {
+        return None;
+    }
+    Some(match reason {
+        Some(reason) => format!(
+            "WARNING HIPFIRE_KV_BACKEND=legacy: automatic VMM selection unavailable ({reason}); using legacy KV storage. Inspect before benchmarking or filing a PR."
+        ),
+        None => "WARNING HIPFIRE_KV_BACKEND=legacy: explicitly selected legacy KV storage (--kv-backend legacy or memory.kv_backend); inspect before benchmarking or filing a PR.".to_string(),
+    })
+}
+
 #[derive(Clone, Copy)]
 pub struct KvBackendHints<'a> {
     pub kv_mode: Option<&'a str>,
+    pub kv_k: Option<&'a str>,
+    pub kv_v: Option<&'a str>,
+    pub qwen_default_q8: bool,
     pub kv_adaptive: Option<&'a str>,
     pub cask: Option<&'a hipfire_runtime::loader_api::CaskConfig>,
     pub deepseek4_heterogeneous: bool,
@@ -43,7 +67,7 @@ pub struct KvBackendHints<'a> {
 
 impl KvBackendHints<'_> {
     pub const fn without_device() -> Self {
-        Self { kv_mode: None, kv_adaptive: None, cask: None, deepseek4_heterogeneous: false, vmm_runtime_available: false, free_vram_bytes: None }
+        Self { kv_mode: None, kv_k: None, kv_v: None, qwen_default_q8: true, kv_adaptive: None, cask: None, deepseek4_heterogeneous: false, vmm_runtime_available: false, free_vram_bytes: None }
     }
 }
 
@@ -70,13 +94,14 @@ pub struct SourceAdmission {
     pub kv_backend: KvBackend,
     /// Single admitted sequence limit consumed by both daemon and loader.
     pub max_seq: usize,
-    /// Reason for automatic contiguous fallback; absent for explicit selection.
+    /// Reason for automatic legacy fallback; absent for explicit selection.
     pub kv_backend_reason: Option<String>,
     /// Effective context and the two default limits (when Qwen owns growing VMM KV).
     pub sequence: Option<SequenceResolution>,
     /// Why an automatic sequence bound retained legacy behavior.
     pub sequence_reason: Option<&'static str>,
     pub kv_backend_request: KvBackendRequest,
+    pub qwen_default_q8: bool,
     /// The resolved carrier (single/pp path). `None` for expert-parallel, which
     /// dispatches on `arch_id` directly rather than through the registry.
     pub carrier: Option<&'static dyn Carrier>,
@@ -708,15 +733,15 @@ pub fn admit_source(
         None
     };
     let (kv_backend, kv_backend_reason) = match (request, unsupported) {
-        (KvBackendRequest::Explicit(KvBackend::Contiguous), _) => (KvBackend::Contiguous, None),
+        (KvBackendRequest::Explicit(KvBackend::Legacy), _) => (KvBackend::Legacy, None),
         (KvBackendRequest::Explicit(KvBackend::Vmm), Some(reason)) => {
-            return Err(format!("KV backend 'vmm' unsupported: {reason}; use --kv-backend contiguous or a validated VMM source/device"));
+            return Err(format!("KV backend 'vmm' unsupported: {reason}; use --kv-backend legacy or a validated VMM source/device"));
         }
         (KvBackendRequest::Explicit(KvBackend::Vmm), None)
         | (KvBackendRequest::Automatic, None) => (KvBackend::Vmm, None),
-        (KvBackendRequest::Automatic, Some(reason)) => (KvBackend::Contiguous, Some(reason)),
+        (KvBackendRequest::Automatic, Some(reason)) => (KvBackend::Legacy, Some(reason)),
     };
-    if kv_backend == KvBackend::Contiguous && matches!(arch_id, 5 | 6)
+    if kv_backend == KvBackend::Legacy && matches!(arch_id, 5 | 6)
         && hints.cask.is_some_and(|c| c.sidecar.is_some() && c.handoff_tokens > 0)
         && hints.kv_adaptive.is_some_and(|s| !matches!(s, "" | "off"))
     {
@@ -800,6 +825,96 @@ pub fn admit_source(
     // consumes it with no second open. Any refusal leaves the prior model
     // loaded — the overlay is in-memory only; no GPU state is touched.
     admit_head_overlay(head, &mut source, arch_id, topology)?;
+    // Split K/V is a Qwen-family contract, resolved before the daemon can
+    // unload the resident model. Non-Qwen owners retain their existing modes.
+    let k_axis = hints.kv_k.filter(|s| !s.is_empty());
+    let v_axis = hints.kv_v.filter(|s| !s.is_empty());
+    if !matches!(arch_id, 1 | 5 | 6) && (k_axis.is_some() || v_axis.is_some()) {
+        return Err(format!(
+            "--kv-k/--kv-v are Qwen-only (arch_id={arch_id}); use --kv-mode for this model"
+        ));
+    }
+    if matches!(arch_id, 1 | 5 | 6) {
+        use hipfire_runtime::kv_mode::{self, KvMode};
+        let policy = if arch_id == 1 {
+            &kv_mode::DIR_SAFETENSORS_POLICY
+        } else if tp > 1 {
+            &kv_mode::QWEN35_TP_POLICY
+        } else if pp > 1 {
+            &kv_mode::QWEN35_PP_POLICY
+        } else if is_dir {
+            &kv_mode::QWEN35_PARO_POLICY
+        } else {
+            &kv_mode::QWEN35_HFQ_POLICY
+        };
+        let mode = hints
+            .kv_mode
+            .unwrap_or(hipfire_runtime::config::get().kv_mode.as_str())
+            .to_ascii_lowercase();
+        let adaptive = hints.kv_adaptive.is_some_and(|v| !matches!(v, "" | "off"));
+        if adaptive && (k_axis.is_some() || v_axis.is_some()) {
+            return Err("adaptive Qwen KV cannot combine with fixed --kv-k/--kv-v; disable kv_adaptive or omit both axes".into());
+        }
+        let (k, v) = kv_mode::resolve_kv_pair(
+            &mode, k_axis, v_axis, policy, gpu_arch, hints.qwen_default_q8,
+        )
+        .map_err(|e| format!("Qwen KV admission: {e}"))?;
+        if (pp > 1 || tp > 1) && v != kv_mode::VMode::Q8 {
+            return Err(format!(
+                "Qwen {} has no multi-GPU Lloyd-V constructor; use --kv-v q8",
+                policy.site
+            ));
+        }
+        if tp > 1 && matches!(k, KvMode::Fp8 | KvMode::Bf16) {
+            return Err("Qwen native fp8/bf16 is single-GPU only; use --kv-mode q8 for TP/EP".into());
+        }
+        if arch_id == 1 && matches!(k, KvMode::Asym3 | KvMode::Asym4) {
+            use hipfire_runtime::arch::Architecture;
+            let head_dim = match &source {
+                ModelSource::Hfq(h) => {
+                    <hipfire_arch_llama::Llama as Architecture>::config_from_hfq(h)
+                        .map_err(|e| format!("Qwen KV admission config: {e}"))?
+                        .head_dim
+                }
+                ModelSource::Dir(d) => hipfire_runtime::hfq::config_from_safetensors_llama(d)
+                    .map_err(|e| format!("Qwen KV admission config: {e}"))?
+                    .head_dim,
+            };
+            if head_dim != 256 {
+                return Err(format!("Qwen legacy-asym K requires head_dim=256 (got {head_dim}); use --kv-mode q8"));
+            }
+        }
+        if matches!(arch_id, 5 | 6)
+            && matches!(k, KvMode::Fp8 | KvMode::Bf16 | KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4)
+        {
+            let cfg = match &source {
+                ModelSource::Hfq(h) => hipfire_arch_qwen35::qwen35::config_from_hfq(h),
+                ModelSource::Dir(d) => hipfire_arch_qwen35::qwen35::config_from_safetensors(d),
+            }
+            .map_err(|e| format!("Qwen KV admission config: {e}"))?;
+            if matches!(k, KvMode::Fp8 | KvMode::Bf16)
+                && (gpu_arch != "gfx1201" || cfg.n_heads != 24 || cfg.n_kv_heads != 4
+                    || cfg.head_dim != 256 || pp > 1 || tp > 1 || adaptive
+                    || hints.cask.is_some_and(|c| c.sidecar.is_some()))
+            {
+                return Err(format!(
+                    "Qwen native KV requires exact gfx1201, H24/Hkv4/D256, single GPU and no CASK/adaptive (got {gpu_arch}, H{}/Hkv{}/D{}); use --kv-mode q8",
+                    cfg.n_heads, cfg.n_kv_heads, cfg.head_dim
+                ));
+            }
+            if matches!(k, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4)
+                && cfg.head_dim != 256
+            {
+                return Err(format!("Qwen legacy-asym K requires head_dim=256 (got {}); use --kv-mode q8", cfg.head_dim));
+            }
+        }
+        if !adaptive && hints.cask.is_some_and(|c| c.sidecar.is_some())
+            && (matches!(k, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
+                || v != kv_mode::VMode::Q8)
+        {
+            return Err("static CASK requires q8 or legacy-asym K with q8 V; use --kv-k legacy-asym3 --kv-v q8 or disable CASK".into());
+        }
+    }
 
     Ok(SourceAdmission {
         source,
@@ -813,6 +928,7 @@ pub fn admit_source(
         sequence,
         sequence_reason,
         kv_backend_request: request,
+        qwen_default_q8: hints.qwen_default_q8,
         carrier,
         vision_path,
     })
@@ -867,11 +983,25 @@ mod tests {
     #[test]
     fn backend_request_preserves_explicit_opt_out() {
         assert_eq!(KvBackendRequest::from_override(None).unwrap(), KvBackendRequest::Automatic);
-        assert_eq!(KvBackendRequest::from_override(Some("contiguous")).unwrap(),
-            KvBackendRequest::Explicit(KvBackend::Contiguous));
+        assert_eq!(KvBackendRequest::from_override(Some("legacy")).unwrap(),
+            KvBackendRequest::Explicit(KvBackend::Legacy));
         assert_eq!(KvBackendRequest::from_override(Some("vmm")).unwrap(),
             KvBackendRequest::Explicit(KvBackend::Vmm));
+        let migration = KvBackendRequest::from_override(Some("contiguous")).unwrap_err();
+        assert!(migration.contains("legacy"), "{migration}");
         assert!(KvBackendRequest::from_override(Some("invalid")).is_err());
+    }
+
+    #[test]
+    fn legacy_warning_discloses_provenance() {
+        assert!(legacy_warning(KvBackend::Vmm, None).is_none());
+        let automatic = legacy_warning(KvBackend::Legacy, Some("device gfx942 unsupported")).unwrap();
+        assert!(automatic.contains("HIPFIRE_KV_BACKEND=legacy"));
+        assert!(automatic.contains("automatic VMM selection unavailable (device gfx942 unsupported)"));
+        let explicit = legacy_warning(KvBackend::Legacy, None).unwrap();
+        assert!(explicit.contains("HIPFIRE_KV_BACKEND=legacy"));
+        assert!(explicit.contains("explicitly selected"));
+        assert!(!explicit.contains("unavailable"));
     }
 
     /// FLUX/Klein admit exactly the gfx11 wave32 WMMA set: gfx1201 (and any
@@ -1096,7 +1226,10 @@ mod tests {
             let trunk = write_hfq("kv-request", 5, false);
             let path = trunk.to_str().unwrap();
             let hints = KvBackendHints {
-                kv_mode: Some("fp8"),
+                kv_mode: Some("q8"),
+                kv_k: None,
+                kv_v: None,
+                qwen_default_q8: true,
                 kv_adaptive: None,
                 cask: None,
                 deepseek4_heterogeneous: false,
@@ -1109,15 +1242,15 @@ mod tests {
             let auto = admit(KvBackendRequest::Automatic, "gfx1201").unwrap();
             assert_eq!(auto.kv_backend, KvBackend::Vmm);
             assert!(auto.kv_backend_reason.is_none());
-            let explicit = admit(KvBackendRequest::Explicit(KvBackend::Contiguous), "gfx1201").unwrap();
-            assert_eq!(explicit.kv_backend, KvBackend::Contiguous);
+            let explicit = admit(KvBackendRequest::Explicit(KvBackend::Legacy), "gfx1201").unwrap();
+            assert_eq!(explicit.kv_backend, KvBackend::Legacy);
             assert!(explicit.kv_backend_reason.is_none());
-            let unsupported = admit(KvBackendRequest::Automatic, "gfx1100").unwrap();
-            assert_eq!(unsupported.kv_backend, KvBackend::Contiguous);
-            assert!(unsupported.kv_backend_reason.unwrap().contains("gfx1100"));
-            let error = admit(KvBackendRequest::Explicit(KvBackend::Vmm), "gfx1100")
+            let unsupported = admit(KvBackendRequest::Automatic, "gfx940").unwrap();
+            assert_eq!(unsupported.kv_backend, KvBackend::Legacy);
+            assert!(unsupported.kv_backend_reason.unwrap().contains("gfx940"));
+            let error = admit(KvBackendRequest::Explicit(KvBackend::Vmm), "gfx940")
                 .map(|_| ()).unwrap_err();
-            assert!(error.contains("gfx1100") && error.contains("contiguous"));
+            assert!(error.contains("gfx940") && error.contains("legacy"));
             cleanup(&trunk);
         }
         #[test]
@@ -1134,6 +1267,9 @@ mod tests {
             write_hfqm_package_mem(&path, 6, metadata, &[embedding]).unwrap();
             let hints = KvBackendHints {
                 kv_mode: Some("q8"),
+                kv_k: None,
+                kv_v: None,
+                qwen_default_q8: true,
                 kv_adaptive: None,
                 cask: None,
                 deepseek4_heterogeneous: false,

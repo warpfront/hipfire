@@ -24,6 +24,8 @@ use hipfire_registry::{
 };
 use hipfire_runtime::prompt_frame::ToolCall;
 use saddle_core::caps::ReasoningContract;
+use saddle_core::kv::KvBackend;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -380,13 +382,19 @@ struct RunArgs {
     #[arg(long)]
     /// One-shot KV format override for this model load.
     kv_mode: Option<String>,
+    #[arg(long = "kv-k")]
+    /// Qwen-only K-format override (e.g. `fwht3`, `legacy-asym3`, `q8`).
+    kv_k: Option<String>,
+    #[arg(long = "kv-v")]
+    /// Qwen-only V-format override (`q8`, `lloyd2`, `lloyd3`, `lloyd4`).
+    kv_v: Option<String>,
     #[arg(long)]
     /// Select a published lm_head variant (see the registry's `heads`), e.g.
     /// `--head q4k`. The overlay shadows the model's own head at load time;
     /// omitting this uses the head baked into the model file.
     head: Option<String>,
-    #[arg(long, value_parser = ["contiguous", "vmm"])]
-    /// One-shot KV storage backend override for this model load.
+    #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
+    /// One-shot KV storage backend override for this model load (`legacy` or `vmm`).
     kv_backend: Option<String>,
     /// Tensor/expert-parallel degree for this model load (same admission as `serve --tp` / `bench --tp`).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
@@ -530,7 +538,14 @@ pub(crate) struct BenchArgs {
     warmups: usize,
     #[arg(long)]
     kv_mode: Option<String>,
-    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    #[arg(long = "kv-k")]
+    /// Qwen-only K-format override (e.g. `fwht3`, `legacy-asym3`, `q8`).
+    kv_k: Option<String>,
+    #[arg(long = "kv-v")]
+    /// Qwen-only V-format override (`q8`, `lloyd2`, `lloyd3`, `lloyd4`).
+    kv_v: Option<String>,
+    #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
+    /// KV storage backend override (`legacy` or `vmm`).
     kv_backend: Option<String>,
     #[arg(long)]
     redline: bool,
@@ -641,8 +656,14 @@ pub(crate) struct ServeArgs {
     /// KV cache mode for models loaded by this service.
     #[arg(long)]
     kv_mode: Option<String>,
-    /// KV storage backend for models loaded by this service.
-    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    /// Qwen-only K-format override for models loaded by this service.
+    #[arg(long = "kv-k")]
+    kv_k: Option<String>,
+    /// Qwen-only V-format override for models loaded by this service.
+    #[arg(long = "kv-v")]
+    kv_v: Option<String>,
+    /// KV storage backend for models loaded by this service (`legacy` or `vmm`).
+    #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
     kv_backend: Option<String>,
     /// Vision-tower sidecar wired into every model load (`params["vision"]`);
     /// overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`;
@@ -2238,6 +2259,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         args.model_draft.is_some(),
         args.head.as_deref(),
     )?;
+    apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
     let selector = args
         .speculation
         .clone()
@@ -2607,6 +2629,8 @@ pub(crate) fn run_should_force_local(args: &RunArgs) -> bool {
     process_truthy("HIPFIRE_LOCAL")
         || args.image.is_some()
         || args.kv_mode.is_some()
+        || args.kv_k.is_some()
+        || args.kv_v.is_some()
         || args.kv_backend.is_some()
         || args.tp.is_some_and(|tp| tp > 1)
         || args.head.is_some()
@@ -2729,6 +2753,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             detach: true,
             no_prewarm: true,
             kv_mode: None,
+            kv_k: None,
+            kv_v: None,
             kv_backend: None,
             vision: None,
             idle_timeout: None,
@@ -3036,6 +3062,86 @@ pub(crate) fn find_model_path(
     candidates.into_iter().next()
 }
 
+
+/// Clap value parser for `--kv-backend`: shared `KvBackend::from_str` so the old
+/// `contiguous` spelling returns the migration error naming `legacy`.
+fn parse_kv_backend_arg(raw: &str) -> std::result::Result<String, String> {
+    raw.parse::<KvBackend>()
+        .map(|backend| backend.as_str().to_owned())
+        .map_err(|err| err.to_string())
+}
+
+/// Layer an authored typed K/V axis from resolved config. Built-in empty defaults
+/// and registry pins are omitted; user/one-shot/env sources emit non-empty values.
+fn authored_kv_axis(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<Option<String>> {
+    let Some(item) = resolved.get(key) else {
+        return Ok(None);
+    };
+    match &item.source {
+        ConfigSource::GlobalUser { .. }
+        | ConfigSource::ModelUser { .. }
+        | ConfigSource::OneShot { .. }
+        | ConfigSource::LegacyEnv { .. } => {}
+        _ => return Ok(None),
+    }
+    match &item.value {
+        hipfire_config::ConfigValue::String(value) if !value.is_empty() => Ok(Some(value.clone())),
+        _ => Ok(None),
+    }
+}
+
+/// Apply CLI `--kv-k` / `--kv-v` onto load params (CLI wins over config axes).
+/// Empty strings are ignored. Validates through the typed schema when present.
+pub(crate) fn apply_kv_axis_overrides(
+    params: &mut serde_json::Value,
+    kv_k: Option<&str>,
+    kv_v: Option<&str>,
+) -> Result<()> {
+    if let Some(raw) = kv_k.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(schema) = field("memory.kv_k") {
+            schema
+                .parse_cli(raw)
+                .map_err(|err| anyhow!("--kv-k {raw}: {err}"))?;
+        }
+        params["kv_k"] = serde_json::json!(raw);
+    }
+    if let Some(raw) = kv_v.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(schema) = field("memory.kv_v") {
+            schema
+                .parse_cli(raw)
+                .map_err(|err| anyhow!("--kv-v {raw}: {err}"))?;
+        }
+        params["kv_v"] = serde_json::json!(raw);
+    }
+    Ok(())
+}
+
+/// Copy validated `loaded` ACK backend fields onto a bench JSON report root.
+fn with_loaded_kv_backend_fields(
+    mut report: serde_json::Value,
+    loaded: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(object) = report.as_object_mut() else {
+        return report;
+    };
+    for key in [
+        "kv_backend",
+        "kv_backend_request",
+        "kv_backend_reason",
+        "kv_backend_legacy",
+        "kv_backend_warning",
+    ] {
+        object.insert(
+            key.to_owned(),
+            loaded.get(key).cloned().unwrap_or(serde_json::Value::Null),
+        );
+    }
+    report
+}
+
 pub(crate) fn load_params(
     resolved: &hipfire_config::ResolvedConfig,
     entry: Option<&ModelEntry>,
@@ -3062,13 +3168,14 @@ pub(crate) fn load_params(
         .expect("schema field")
         .parse_cli(&kv_mode)?;
     let configured_backend = config_string(resolved, "memory.kv_backend")?;
-    let kv_backend = kv_backend_override
+    let backend_raw = kv_backend_override
         .filter(|value| !value.is_empty())
-        .unwrap_or(&configured_backend)
-        .to_ascii_lowercase();
-    if !matches!(kv_backend.as_str(), "contiguous" | "vmm") {
-        bail!("--kv-backend must be contiguous or vmm");
-    }
+        .unwrap_or(configured_backend.as_str());
+    let kv_backend = backend_raw
+        .parse::<KvBackend>()
+        .map_err(|err| anyhow!("{err}"))?
+        .as_str()
+        .to_owned();
     let mut cask_sidecar = config_string(resolved, "memory.cask.sidecar")?;
     if cask_sidecar.is_empty() && config_bool(resolved, "memory.cask.auto_attach")? {
         if let Some(sidecar) = entry.and_then(|entry| entry.triattn.as_ref()) {
@@ -3172,6 +3279,15 @@ pub(crate) fn load_params(
         )
     {
         params["kv_backend"] = serde_json::json!(kv_backend);
+    }
+    // Authored K/V axes only: CLI is applied by callers via apply_kv_axis_overrides
+    // after this returns so serve can share the same helper. Empty/BuiltIn/registry
+    // defaults are omitted from IPC.
+    if let Some(kv_k) = authored_kv_axis(resolved, "memory.kv_k")? {
+        params["kv_k"] = serde_json::json!(kv_k);
+    }
+    if let Some(kv_v) = authored_kv_axis(resolved, "memory.kv_v")? {
+        params["kv_v"] = serde_json::json!(kv_v);
     }
     let max_seq_source = &resolved
         .get("memory.max_seq")
@@ -4534,6 +4650,12 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         bail!("--reasoning-on is not supported with --exp (its token budget is fixed at 128)");
     }
     if let Some(spec) = args.concurrency.clone() {
+        if args.json {
+            bail!(
+                "--json is not supported with --concurrency; omit --json for the concurrency table, \
+                 or run without --concurrency for standard bench JSON (including kv_backend fields)"
+            );
+        }
         return bench_concurrency_command(paths, &args, &spec);
     }
     for (name, values) in [
@@ -4659,25 +4781,28 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         for warning in &warnings {
             eprintln!("  warning: {warning}");
         }
-        let report = serde_json::json!({
-            "protocol": "native-generate-v1",
-            "model": args.model,
-            "loaded": loaded,
-            "gpu": post_diag,
-            "vram_free_before_mb": pre_diag.get("vram_free_mb"),
-            "max_tokens": args.max_tokens,
-            "runs": args.runs,
-            "batch": 1,
-            "prompt_tokens": prompt_tokens,
-            "prompt_md5": prompt_md5,
-            "prompt_chars": prompt_chars,
-            "warnings": warnings,
-            "decode_tok_s": sample_stats(&decode),
-            "prefill_tok_s": sample_stats(&prefill),
-            "wall_tok_s": sample_stats(&wall),
-            "ttft_ms": sample_stats(&ttft),
-            "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
-        });
+        let report = with_loaded_kv_backend_fields(
+            serde_json::json!({
+                "protocol": "native-generate-v1",
+                "model": args.model,
+                "loaded": loaded,
+                "gpu": post_diag,
+                "vram_free_before_mb": pre_diag.get("vram_free_mb"),
+                "max_tokens": args.max_tokens,
+                "runs": args.runs,
+                "batch": 1,
+                "prompt_tokens": prompt_tokens,
+                "prompt_md5": prompt_md5,
+                "prompt_chars": prompt_chars,
+                "warnings": warnings,
+                "decode_tok_s": sample_stats(&decode),
+                "prefill_tok_s": sample_stats(&prefill),
+                "wall_tok_s": sample_stats(&wall),
+                "ttft_ms": sample_stats(&ttft),
+                "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
+            }),
+            &loaded,
+        );
         if args.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
@@ -4947,6 +5072,7 @@ fn open_bench_engine(
         // No --head on this path yet; the model's own head is used.
         None,
     )?;
+    apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
     }
@@ -5123,28 +5249,31 @@ fn bench_ttft(
     };
     let ttft_stats = sample_stats(&ttft_ms_samples);
     let pp_stats = sample_stats(&pp_samples);
-    let report = serde_json::json!({
-        "protocol": "client-ttft-v1",
-        "model": args.model,
-        "loaded": loaded,
-        "gpu": diag,
-        "max_tokens": 1,
-        "runs": args.runs,
-        "warmups": args.warmups,
-        "batch": 1,
-        "prompt_tokens": prompt_tokens,
-        "prompt_md5": prompt_md5,
-        "prompt_chars": prompt_chars,
-        "ttft": {
-            "samples": ttft_ms_samples,
-            "median": ttft_stats.map(|stats| stats.median),
-            "stdev": ttft_stats.map(|stats| stats.stdev),
+    let report = with_loaded_kv_backend_fields(
+        serde_json::json!({
+            "protocol": "client-ttft-v1",
+            "model": args.model,
+            "loaded": loaded,
+            "gpu": diag,
+            "max_tokens": 1,
+            "runs": args.runs,
+            "warmups": args.warmups,
+            "batch": 1,
             "prompt_tokens": prompt_tokens,
             "prompt_md5": prompt_md5,
-        },
-        "pp_tok_s": pp_stats,
-        "pp_tok_s_samples": pp_samples,
-    });
+            "prompt_chars": prompt_chars,
+            "ttft": {
+                "samples": ttft_ms_samples,
+                "median": ttft_stats.map(|stats| stats.median),
+                "stdev": ttft_stats.map(|stats| stats.stdev),
+                "prompt_tokens": prompt_tokens,
+                "prompt_md5": prompt_md5,
+            },
+            "pp_tok_s": pp_stats,
+            "pp_tok_s_samples": pp_samples,
+        }),
+        loaded,
+    );
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
@@ -5255,18 +5384,21 @@ fn bench_matrix(
             sustained_rows.push(serde_json::json!({ "context": context, "tokens": tg, "stats": sample_stats(&samples), "samples": samples }));
         }
     }
-    let report = serde_json::json!({
-        "protocol": "synthetic-pp-tg-matrix-v1",
-        "model": args.model,
-        "loaded": loaded,
-        "gpu": diag,
-        "redline_pm4": args.redline,
-        "kv_mode": args.kv_mode,
-        "runs": args.runs,
-        "prefill": pp_rows,
-        "decode": decode_rows,
-        "sustained": sustained_rows,
-    });
+    let report = with_loaded_kv_backend_fields(
+        serde_json::json!({
+            "protocol": "synthetic-pp-tg-matrix-v1",
+            "model": args.model,
+            "loaded": loaded,
+            "gpu": diag,
+            "redline_pm4": args.redline,
+            "kv_mode": args.kv_mode,
+            "runs": args.runs,
+            "prefill": pp_rows,
+            "decode": decode_rows,
+            "sustained": sustained_rows,
+        }),
+        loaded,
+    );
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     }
@@ -5335,6 +5467,8 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             sustained_ctx: vec![128],
             warmups: 1,
             kv_mode: None,
+            kv_k: None,
+            kv_v: None,
             kv_backend: None,
             redline: false,
             speculation: None,
@@ -7002,6 +7136,9 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
         ValueRule::Enum(values) => {
             serde_json::json!({ "type": "string", "enum": values })
         }
+        ValueRule::KvBackend => {
+            serde_json::json!({ "type": "string", "enum": ["legacy", "vmm"] })
+        }
         ValueRule::AutoBool => serde_json::json!({
             "type": ["boolean", "string"],
             "enum": [true, false, "auto"],
@@ -7045,6 +7182,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::Host => "host",
         ValueRule::PathOrEmpty => "path-or-empty",
         ValueRule::Enum(_) => "enum",
+        ValueRule::KvBackend => "kv-backend",
         ValueRule::AutoBool => "auto-bool",
         ValueRule::NullableString => "string|null",
         ValueRule::NullableEnum(_) => "enum|null",
@@ -7733,7 +7871,7 @@ mod tests {
         // Global user override wins over registry tag policy (registry below global).
         let mut user_layer = ConfigLayer::default();
         user_layer
-            .set_cli("memory.kv_backend", "contiguous")
+            .set_cli("memory.kv_backend", "legacy")
             .unwrap();
         user_layer.set_cli("memory.max_seq", "32768").unwrap();
         user_layer.set_cli("generation.max_tokens", "1024").unwrap();
@@ -7755,7 +7893,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             config_string(&overridden, "memory.kv_backend").unwrap(),
-            "contiguous"
+            "legacy"
         );
         assert_eq!(config_u64(&overridden, "memory.max_seq").unwrap(), 32768);
         assert_eq!(
@@ -7772,13 +7910,13 @@ mod tests {
             &model_path,
             64,
             Some("q8"),
-            Some("contiguous"),
+            Some("legacy"),
             None,
             false,
             None,
         )
         .unwrap();
-        assert_eq!(params["kv_backend"], "contiguous");
+        assert_eq!(params["kv_backend"], "legacy");
         // Automatic registry/built-in: omit kv_backend and max_seq.
         let params2 = load_params(
             &resolved,
@@ -7816,13 +7954,13 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(params_global["kv_backend"], "contiguous");
+        assert_eq!(params_global["kv_backend"], "legacy");
         assert_eq!(params_global["max_seq"], 32768);
 
         // Precedence: flag > model config > global config.
         let mut global_layer = ConfigLayer::default();
         global_layer
-            .set_cli("memory.kv_backend", "contiguous")
+            .set_cli("memory.kv_backend", "legacy")
             .unwrap();
         let mut model_layer = ConfigLayer::default();
         model_layer.set_cli("memory.kv_backend", "vmm").unwrap();
@@ -7868,14 +8006,14 @@ mod tests {
             &model_path,
             64,
             Some("q8"),
-            Some("contiguous"),
+            Some("legacy"),
             None,
             false,
             None,
         )
         .unwrap();
         assert_eq!(
-            params_flag["kv_backend"], "contiguous",
+            params_flag["kv_backend"], "legacy",
             "CLI flag must beat model user config"
         );
 
@@ -7893,7 +8031,7 @@ mod tests {
         assert!(g_layer.get("memory.max_seq").is_none());
         assert!(g_layer.get("generation.max_tokens").is_none());
         let mut g_user = ConfigLayer::default();
-        g_user.set_cli("memory.kv_backend", "contiguous").unwrap();
+        g_user.set_cli("memory.kv_backend", "legacy").unwrap();
         g_user.set_cli("memory.max_seq", "8192").unwrap();
         let g_resolved = hipfire_config::resolve(vec![
             hipfire_config::NamedLayer {
@@ -7913,7 +8051,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             config_string(&g_resolved, "memory.kv_backend").unwrap(),
-            "contiguous"
+            "legacy"
         );
         assert_eq!(config_u64(&g_resolved, "memory.max_seq").unwrap(), 8192);
         let model_path_g = PathBuf::from("/tmp/test-model.mq4");
@@ -7930,7 +8068,7 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(g_params["kv_backend"], "contiguous");
+        assert_eq!(g_params["kv_backend"], "legacy");
         assert_eq!(g_params["max_seq"], 8192);
 
         // DeepSeek target: generation policy remains; user max_seq still wins.
@@ -10772,6 +10910,8 @@ mod tests {
                     current_max_seq: 0,
                     cache_capable: false,
                     kv_override: None,
+                    kv_k_override: None,
+                    kv_v_override: None,
                     kv_backend_override: None,
                     vision_override: None,
                     tp: None,
@@ -11657,6 +11797,8 @@ mod tests {
             sustained_ctx: vec![128],
             warmups: 1,
             kv_mode: None,
+            kv_k: None,
+            kv_v: None,
             kv_backend: None,
             redline: false,
             speculation: None,
@@ -12413,6 +12555,8 @@ mod tests {
             repeat_penalty: None,
             max_tokens: None,
             kv_mode: None,
+            kv_k: None,
+            kv_v: None,
             head: Some("q4k".into()),
             kv_backend: None,
             tp: None,

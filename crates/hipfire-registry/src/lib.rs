@@ -1811,12 +1811,12 @@ mod tests {
             Some(&ConfigValue::Integer(81920))
         );
 
-        // Simulate user global override to contiguous + different max_seq/max_tokens.
+        // Simulate user global override to legacy + different max_seq/max_tokens.
         let mut user_layer = ConfigLayer::default();
         user_layer
             .set(
                 "memory.kv_backend",
-                ConfigValue::String("contiguous".into()),
+                ConfigValue::String("legacy".into()),
             )
             .unwrap();
         user_layer
@@ -1845,7 +1845,7 @@ mod tests {
         // User wins.
         assert_eq!(
             resolved.get("memory.kv_backend").map(|value| &value.value),
-            Some(&ConfigValue::String("contiguous".into()))
+            Some(&ConfigValue::String("legacy".into()))
         );
         assert_eq!(
             resolved.get("memory.max_seq").map(|value| &value.value),
@@ -1875,7 +1875,7 @@ mod tests {
         g_user
             .set(
                 "memory.kv_backend",
-                ConfigValue::String("contiguous".into()),
+                ConfigValue::String("legacy".into()),
             )
             .unwrap();
         g_user
@@ -1901,7 +1901,7 @@ mod tests {
             g_resolved
                 .get("memory.kv_backend")
                 .map(|value| &value.value),
-            Some(&ConfigValue::String("contiguous".into()))
+            Some(&ConfigValue::String("legacy".into()))
         );
         assert_eq!(
             g_resolved.get("memory.max_seq").map(|value| &value.value),

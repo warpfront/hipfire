@@ -477,6 +477,75 @@ fn write_typed_error(
     );
 }
 
+/// Resident KV backend metadata for `loaded` ACK and `diag`.
+/// Set only on successful publish; cleared on unload / empty handoff.
+#[derive(Clone, Debug)]
+struct ResidentKvDiag {
+    request: String,
+    backend: String,
+    reason: Option<String>,
+    legacy: bool,
+    warning: Option<String>,
+}
+
+impl ResidentKvDiag {
+    fn from_admission(
+        request: hipfire_loader::admission::KvBackendRequest,
+        backend: hipfire_runtime::kv_backend::KvBackend,
+        automatic_reason: Option<&str>,
+    ) -> Self {
+        use hipfire_loader::admission::KvBackendRequest;
+        use hipfire_runtime::kv_backend::KvBackend;
+        let request_str = match request {
+            KvBackendRequest::Automatic => "automatic",
+            KvBackendRequest::Explicit(_) => "explicit",
+        };
+        let legacy = matches!(backend, KvBackend::Legacy);
+        let warn_reason = if legacy && matches!(request, KvBackendRequest::Automatic) {
+            automatic_reason
+        } else {
+            None
+        };
+        let warning = hipfire_loader::admission::legacy_warning(backend, warn_reason);
+        if let Some(w) = &warning {
+            eprintln!("{w}");
+        }
+        let reason = if legacy {
+            match request {
+                KvBackendRequest::Automatic => automatic_reason.map(str::to_string),
+                KvBackendRequest::Explicit(_) => Some("explicit operator choice".to_string()),
+            }
+        } else {
+            None
+        };
+        Self {
+            request: request_str.to_string(),
+            backend: backend.as_str().to_string(),
+            reason,
+            legacy,
+            warning,
+        }
+    }
+
+    /// Fixed Q8 slot arena always admits legacy storage.
+    fn for_slot(explicit: bool) -> Self {
+        use hipfire_loader::admission::KvBackendRequest;
+        use hipfire_runtime::kv_backend::KvBackend;
+        let request = if explicit {
+            KvBackendRequest::Explicit(KvBackend::Legacy)
+        } else {
+            KvBackendRequest::Automatic
+        };
+        let automatic_reason = if explicit {
+            None
+        } else {
+            Some("fixed Q8 slot arena has no VMM owner")
+        };
+        Self::from_admission(request, KvBackend::Legacy, automatic_reason)
+    }
+}
+
+
 /// Pure gate for the deferred EP (tp>1) load handoff.
 ///
 /// After a new EP model is constructed, the prior model is unloaded. The new
@@ -823,6 +892,11 @@ fn main() {
     // None => ordinary LoadedModel path. Continuous-batching integration is deferred.
     // Arc allows request workers to hold the model alive only while active; reset/unload/swap refuse while active.
     let mut slot_backend: Option<std::sync::Arc<slots::SlotBackend>> = None;
+    // KV backend ACK fields for the currently published model/slot. Cleared on
+    // unload and empty handoff; preserved when a replacement fails and the prior
+    // resident remains loaded.
+    let mut resident_kv: Option<ResidentKvDiag> = None;
+
 
     // Background stdin reader. Drains stdin into an mpsc channel so
     // the main loop can pull non-blockingly between messages. Abort /
@@ -1010,6 +1084,34 @@ fn main() {
                         let _ = stdout.flush();
                         continue;
                     }
+                    let slot_kv_k = msg
+                        .get("params")
+                        .and_then(|p| p.get("kv_k"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty());
+                    let slot_kv_v = msg
+                        .get("params")
+                        .and_then(|p| p.get("kv_v"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty());
+                    if slot_kv_k.is_some() || slot_kv_v.is_some() {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            "slots do not support --kv-k/--kv-v",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    let slot_kv_explicit = msg
+                        .get("params")
+                        .and_then(|p| p.get("kv_backend"))
+                        .and_then(|v| v.as_str())
+                        .filter(|s| !s.is_empty())
+                        .is_some();
                     // Refuse model swap while slot requests active; do not keep old Arc alive via workers.
                     if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
                         emit_uncorrelated_error(
@@ -1054,14 +1156,13 @@ fn main() {
                                     continue;
                                 }
                                 batch_clear_all_terminals();
+                                resident_kv = None;
                             }
                         }
                     }
-                    if msg.get("params").and_then(|p| p.get("kv_backend")).is_none() {
-                        eprintln!("KV backend: automatic vmm unavailable (fixed Q8 slot arena has no VMM owner) -> contiguous");
-                    } else {
-                        eprintln!("KV backend: explicit contiguous override (fixed Q8 slot arena)");
-                    }
+                    // Fixed Q8 slot arena has no VMM owner — always legacy.
+                    // Emit once here; prior model/slot is about to be torn down.
+                    let slot_kv_diag = ResidentKvDiag::for_slot(slot_kv_explicit);
                     // Tear down PFlash / ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
                     if let Some(mut pf) = pflash_state.take() {
                         if let Some(mut dg) = pflash_drafter_gpu.take() {
@@ -1086,6 +1187,8 @@ fn main() {
                             let _ = stdout.flush();
                             continue;
                         }
+                        // Prior ordinary model is gone; clear resident until slot publishes.
+                        resident_kv = None;
                     } else if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
                         emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
                         let _ = stdout.flush();
@@ -1129,7 +1232,7 @@ fn main() {
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
                     // Effective KV selection for the slot engine. The capability
-                    // gate above already refused anything but q8/contiguous;
+                    // gate above already refused anything but q8/legacy;
                     // these ride into EngineConfig so Rig::build fails closed.
                     let slot_kv_mode = msg
                         .get("params")
@@ -1140,7 +1243,7 @@ fn main() {
                         .get("params")
                         .and_then(|p| p.get("kv_backend"))
                         .and_then(|v| v.as_str())
-                        .unwrap_or("contiguous");
+                        .unwrap_or("legacy");
                     match slots::SlotBackend::load(
                         path,
                         n_slots,
@@ -1157,6 +1260,7 @@ fn main() {
                             // Ensure ordinary model stays None — exactly one weight copy.
                             model = None;
                             slot_backend = Some(std::sync::Arc::new(backend));
+                            resident_kv = Some(slot_kv_diag.clone());
                             // Per contract: continuous_batch_capable false, cache_capable true, reasoning_contract qwen_jinja, plus experimental flag.
                             let ack = serde_json::json!({
                                 "type": "loaded",
@@ -1172,13 +1276,11 @@ fn main() {
                                 "retry_reset_eligible": false,
                                 "continuous_batch_capable": false,
                                 "experimental_multi_slot": true,
-                                "kv_backend_request": if msg.get("params").and_then(|p| p.get("kv_backend")).is_none() { "automatic" } else { "explicit" },
-                                "kv_backend": "contiguous",
-                                "kv_backend_reason": if msg.get("params").and_then(|p| p.get("kv_backend")).is_none() {
-                                    Some("fixed Q8 slot arena has no VMM owner")
-                                } else {
-                                    None
-                                }
+                                "kv_backend_request": slot_kv_diag.request,
+                                "kv_backend": slot_kv_diag.backend,
+                                "kv_backend_reason": slot_kv_diag.reason,
+                                "kv_backend_legacy": slot_kv_diag.legacy,
+                                "kv_backend_warning": slot_kv_diag.warning,
                             });
                             let _ = writeln!(stdout, "{ack}");
                             let _ = stdout.flush();
@@ -1239,6 +1341,8 @@ fn main() {
                                 continue;
                             }
                             batch_clear_all_terminals();
+                            resident_kv = None;
+
                         }
                     }
                 }
@@ -1391,6 +1495,19 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
+                let kv_k_override = msg
+                    .get("params")
+                    .and_then(|p| p.get("kv_k"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+                let kv_v_override = msg
+                    .get("params")
+                    .and_then(|p| p.get("kv_v"))
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(|s| s.to_string());
+
                 // Per-load adaptive-KV selector (mirrors kv_mode). Overrides the
                 // HIPFIRE_KV_ADAPTIVE env. off|conservative|balanced|aggressive|
                 // advanced:k=..,v=.. — resolved in load_model (param > env > off).
@@ -1796,11 +1913,14 @@ fn main() {
                     gpu.arch.as_str(), vision_path.as_deref(), head_path.as_deref(), max_seq,
                     hipfire_loader::admission::KvBackendHints {
                         kv_mode: kv_mode_override.as_deref(),
+                        kv_k: kv_k_override.as_deref(),
+                        kv_v: kv_v_override.as_deref(),
                         kv_adaptive: kv_adaptive_override.as_deref(),
                         cask: Some(&cask),
                         deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
                         vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
                         free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
+                        qwen_default_q8: hipfire_loader::admission::qwen_default_q8_enabled(),
                     },
                 ) {
                     Ok(a) => a,
@@ -1815,19 +1935,14 @@ fn main() {
                 };
                 let max_seq = admission.max_seq;
                 let sequence_reason = admission.sequence_reason;
-                if let Some(reason) = &admission.kv_backend_reason {
-                    eprintln!("KV backend: automatic vmm unavailable ({reason}) -> contiguous");
-                } else if matches!(backend_request, hipfire_loader::admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Contiguous)) {
-                    eprintln!("KV backend: explicit contiguous override");
-                }
-                let backend_diagnostics = (
-                    match backend_request {
-                        hipfire_loader::admission::KvBackendRequest::Automatic => "automatic",
-                        hipfire_loader::admission::KvBackendRequest::Explicit(_) => "explicit",
-                    },
-                    admission.kv_backend.as_str(),
-                    admission.kv_backend_reason.clone(),
+                // Exactly one legacy warning per admitted trunk; loader admitted
+                // path does not emit (daemon owns the boundary).
+                let pending_kv_diag = ResidentKvDiag::from_admission(
+                    backend_request,
+                    admission.kv_backend,
+                    admission.kv_backend_reason.as_deref(),
                 );
+
 
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
@@ -1870,8 +1985,11 @@ fn main() {
                                 false,
                             );
                             let _ = stdout.flush();
+                            resident_kv = None;
                             continue;
                         }
+                        // Prior ordinary model is gone until the new load publishes.
+                        resident_kv = None;
                     } else if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
                         emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
                         let _ = stdout.flush();
@@ -1893,8 +2011,14 @@ fn main() {
                 }
                 let loaded = if tp > 1 {
                     hipfire_loader::load_model_ep_admitted(
-                        admission, path, max_seq, tp,
-                        kv_mode_override.as_deref(), state_quant_override.as_deref(),
+                        admission,
+                        path,
+                        max_seq,
+                        tp,
+                        kv_mode_override.as_deref(),
+                        kv_k_override.as_deref(),
+                        kv_v_override.as_deref(),
+                        state_quant_override.as_deref(),
                     )
                 } else {
                     hipfire_loader::load_admitted_with_gemma4_drafter(
@@ -1907,6 +2031,8 @@ fn main() {
                         gemma4_drafter.as_deref(),
                         gemma4_draft_len,
                         kv_mode_override.as_deref(),
+                        kv_k_override.as_deref(),
+                        kv_v_override.as_deref(),
                         kv_adaptive_override.as_deref(),
                         state_quant_override.as_deref(),
                         &cask,
@@ -2126,6 +2252,7 @@ fn main() {
                                     Err(e) => Some(e),
                                 };
                                 // model stays None; pflash already cleared above.
+                                resident_kv = None;
                                 let msg = ep_deferred_handoff_error_message(
                                     &prior_err,
                                     rollback_err.as_deref(),
@@ -2188,13 +2315,19 @@ fn main() {
                         };
                         let reasoning_efforts_json = serde_json::to_string(&reasoning_efforts)
                             .unwrap_or_else(|_| "[]".to_string());
-                        let backend_reason_json = serde_json::to_string(&backend_diagnostics.2)
-                            .expect("backend reason is serializable");
+                        let backend_reason_json =
+                            serde_json::to_string(&pending_kv_diag.reason)
+                                .expect("backend reason is serializable");
+                        let backend_warning_json =
+                            serde_json::to_string(&pending_kv_diag.warning)
+                                .expect("backend warning is serializable");
+                        // Publish resident KV metadata with the loaded ACK.
+                        resident_kv = Some(pending_kv_diag.clone());
                         // Load ack reports effective storage, not only the request.
                         if staged_ep_batch {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32","kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
@@ -2208,16 +2341,18 @@ fn main() {
                                 continuous_batch_capable,
                                 staged_ep_slots,
                                 staged_ep_lane_cap,
-                                backend_diagnostics.0,
-                                backend_diagnostics.1,
+                                pending_kv_diag.request,
+                                pending_kv_diag.backend,
                                 backend_reason_json,
+                                pending_kv_diag.legacy,
+                                backend_warning_json,
                                 max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
                                 serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
                         } else {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"kv_backend_request":"{}","kv_backend":"{}","kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{},"max_seq":{},"max_seq_bound":"{}","max_seq_reason":{},"model_ctx":{},"card_cap":{},"kv_mode":"{}"}}"#,
                                 arch,
                                 dim,
                                 layers,
@@ -2229,9 +2364,11 @@ fn main() {
                                 cache_capable,
                                 retry_reset_eligible,
                                 continuous_batch_capable,
-                                backend_diagnostics.0,
-                                backend_diagnostics.1,
+                                pending_kv_diag.request,
+                                pending_kv_diag.backend,
                                 backend_reason_json,
+                                pending_kv_diag.legacy,
+                                backend_warning_json,
                                 max_seq, seq_bound, seq_reason_json, serde_json::to_string(&model_ctx).unwrap(),
                                 serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
@@ -3883,6 +4020,7 @@ fn main() {
                                     continuous_batch_size = 1;
                                     batch_poisoned = None;
                                     batch_clear_all_terminals();
+                                    resident_kv = None;
                                     let _ = writeln!(stdout, "{}", r#"{"type":"unloaded"}"#);
                                     let _ = stdout.flush();
                                 }
@@ -3903,6 +4041,7 @@ fn main() {
                             },
                         }
                     } else {
+                        resident_kv = None;
                         let _ = writeln!(stdout, "{}", r#"{"type":"unloaded"}"#);
                         let _ = stdout.flush();
                     }
@@ -3953,9 +4092,12 @@ fn main() {
                 };
                 match unload_result {
                     Ok(()) => {
+                        resident_kv = None;
                         let _ = writeln!(stdout, r#"{{"type":"unloaded"}}"#);
                     }
                     Err(err) => {
+                        // Model handle is already taken; clear resident claim.
+                        resident_kv = None;
                         emit_uncorrelated_error(
                             &mut stdout,
                             None,
@@ -4039,7 +4181,7 @@ fn main() {
             "diag" => {
                 let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                 let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));
-                let has_model = model.is_some();
+                let has_model = model.is_some() || slot_backend.is_some();
                 let model_arch = model
                     .as_ref()
                     .map(|m| match m.arch_id {
@@ -4102,9 +4244,19 @@ fn main() {
                         (hsaco, hash)
                     })
                     .unwrap_or((0, 0));
+                let kv = resident_kv.as_ref();
+                let kv_backend_json = serde_json::to_string(&kv.map(|k| k.backend.as_str()))
+                    .expect("kv_backend serializable");
+                let kv_request_json = serde_json::to_string(&kv.map(|k| k.request.as_str()))
+                    .expect("kv_backend_request serializable");
+                let kv_reason_json = serde_json::to_string(&kv.and_then(|k| k.reason.as_deref()))
+                    .expect("kv_backend_reason serializable");
+                let kv_legacy = kv.map(|k| k.legacy).unwrap_or(false);
+                let kv_warning_json = serde_json::to_string(&kv.and_then(|k| k.warning.as_deref()))
+                    .expect("kv_backend_warning serializable");
                 let _ = writeln!(
                     stdout,
-                    r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{}}}"#,
+                    r#"{{"type":"diag","arch":"{}","hip_version":"{}.{}","vram_free_mb":{},"vram_total_mb":{},"model_loaded":{},"model_arch":"{}","kernels":{},"kernel_hashes":{},"kv_backend":{},"kv_backend_request":{},"kv_backend_reason":{},"kv_backend_legacy":{},"kv_backend_warning":{}}}"#,
                     gpu.arch,
                     hip_ver.0,
                     hip_ver.1,
@@ -4113,7 +4265,12 @@ fn main() {
                     has_model,
                     model_arch,
                     hsaco_count,
-                    hash_count
+                    hash_count,
+                    kv_backend_json,
+                    kv_request_json,
+                    kv_reason_json,
+                    kv_legacy,
+                    kv_warning_json,
                 );
                 let _ = stdout.flush();
             }

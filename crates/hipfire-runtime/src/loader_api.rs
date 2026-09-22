@@ -86,6 +86,11 @@ pub struct LoadCtx<'a> {
     /// (or text-only when the trunk has no tower either).
     pub vision_path: Option<PathBuf>,
     pub kv_mode_override: Option<&'a str>,
+    /// Authored Qwen-only K and V overrides. None preserves the selected whole-cache mode.
+    pub kv_k_override: Option<&'a str>,
+    pub kv_v_override: Option<&'a str>,
+    /// Sampled once per load from HIPFIRE_QWEN_KV_DEFAULT_Q8; never per token.
+    pub qwen_default_q8: bool,
     // NOTE: head overlays (`--head`) deliberately have NO LoadCtx field. They
     // validate and attach in `admit_source` before teardown, so the admitted
     // source the carrier consumes is already effective — threading a second

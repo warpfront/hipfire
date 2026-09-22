@@ -35,7 +35,7 @@ def md5(path):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--kv-backend", choices=("contiguous",), help="explicit contiguous comparator")
+    parser.add_argument("--kv-backend", choices=("legacy",), help="explicit legacy comparator")
     parser.add_argument("--output-dir", type=Path, default=ROOT / "scratch-vmmdefault" / "guard")
     parser.add_argument("--home", type=Path, default=Path("/home/kaden/.hipfire-homes/vmmdefault"))
     args = parser.parse_args()
@@ -83,8 +83,8 @@ def main():
         if proc.returncode:
             raise RuntimeError(f"{suffix}: bench exited {proc.returncode}; see {suffix}.daemon.log")
         if args.kv_backend:
-            if "KV backend: explicit contiguous override" not in text or "KV cache: fp8-e4m3 (" not in text or "KV cache: Fp8 vmm (" in text:
-                raise RuntimeError(f"{suffix}: explicit contiguous was not actually allocated")
+            if "WARNING HIPFIRE_KV_BACKEND=legacy" not in text or "KV cache: fp8-e4m3 backend=legacy (" not in text or "KV cache: Fp8 vmm (" in text:
+                raise RuntimeError(f"{suffix}: explicit legacy was not actually allocated")
         elif "KV cache: Fp8 vmm (" not in text:
             raise RuntimeError(f"{suffix}: automatic fp8 VMM allocation missing")
         if warmup:
