@@ -1,0 +1,7 @@
+Pre-registered before any stacked quality run on 2026-09-22.
+
+Arm C prediction, both gfx1100 and gfx1151:
+- WT2 c24: 0.085790 = 0.088665 - 0.001152 (A4 c2) - 0.001723 (symfold)
+- agentic c24: 0.238812 = 0.256882 - 0.014624 (A4 c2) - 0.003446 (symfold)
+
+Prediction: the two independently quality-positive deltas compose additively. Because gfx1100 uses shape=true and gfx1151 uses the same LF16 arithmetic entry with shape=false, both cards should be digit-for-digit identical on each reference. Any mismatch will be reported, not averaged.
