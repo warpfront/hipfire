@@ -2244,6 +2244,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Launch the gfx1201 _v2 RMSNorm and gated-norm int4 producers (default on exact gfx1201; set to false or HIPFIRE_G12_NORM=0 to restore the incumbent _gfx12 symbols; batched sum-of-squares loads, one-reciprocal RTN codes and one wave per gated-norm group, bit-identical)."
     ),
     process_bool_field!(
+        "kernel.g12_a4c2",
+        "g12_a4c2",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_G12_A4C2",
+        "Search two activation-quantization scales ({5,7}, as on gfx11) inside the gfx1201 int4 producers (default on exact gfx1201; set to false or HIPFIRE_G12_A4C2=0 to restore round-to-nearest d = amax/7; compiles the gfx1201 JIT with -DIU4_A4_CANDIDATES=2, whose one-pass producer-layout search is bit-identical to the generic candidate loop)."
+    ),
+    process_bool_field!(
         "kernel.gfx11_producer_quant_fused",
         "gfx11_producer_quant_fused",
         Kernel,

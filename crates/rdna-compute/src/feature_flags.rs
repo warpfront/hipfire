@@ -550,6 +550,13 @@ impl FeatureFlags {
             if let Some(flag) = policy_flag {
                 append_hipcc_flag(flag);
             }
+            // gfx1201 IU4 producers search {5,7} like gfx11 (`HIPFIRE_G12_A4C2`,
+            // default on): the gfx1201 emit takes the one-pass producer-layout
+            // path in block_i4_128_quant.hip, bit-identical to this flag's
+            // reference search. `=0` restores RTN (d = amax/7).
+            if parse_bool("HIPFIRE_G12_A4C2").unwrap_or(true) {
+                append_hipcc_flag("-DIU4_A4_CANDIDATES=2");
+            }
         }
 
         Self {

@@ -19,9 +19,11 @@
 #include <math.h>
 // The gfx11 fused producers default to the measured 2-point {5,7} search
 // through the host compile flag. The standalone quantizer retains its original
-// 8-point body. gfx1201 defaults to RTN (d=amax/7), measured 2026-09-21 on
-// the symmetric XT artifact vs N=2: TTFT 1694->1666 ms (3,546 tok/s),
+// 8-point body. Without a flag gfx1201 is RTN (d=amax/7), measured 2026-09-21
+// on the symmetric XT artifact vs N=2: TTFT 1694->1666 ms (3,546 tok/s),
 // pp8192 +1.7%, iu4 c24 0.0787->0.0860 (budget 0.10), fp8v2 unchanged 0.0495.
+// The host now passes -DIU4_A4_CANDIDATES=2 on gfx1201 too (HIPFIRE_G12_A4C2,
+// default on), served by the one-pass emit_iu4_sidecar_c2_gfx12 below.
 #ifndef IU4_A4_CANDIDATES
 #if defined(__gfx1100__) || defined(__gfx1151__)
 #define IU4_A4_CANDIDATES 8
@@ -198,6 +200,160 @@ __device__ __forceinline__ void quantize_block_i4_128_wave(
     }
 }
 
+#if defined(__gfx1201__) && IU4_A4_CANDIDATES == 2
+// gfx1201 one-pass 2-candidate emit (`HIPFIRE_G12_A4C2`, which compiles the
+// gfx1201 JIT with -DIU4_A4_CANDIDATES=2). Bit-identical to the remap below
+// plus `quantize_block_i4_128_wave<true>`'s {5,7} search, without the
+// remap, the LDS permutes, or (on the common path) any per-element divide.
+//
+// It quantizes in producer ownership: lane p holds elements 8j..8j+7 of half
+// h = p >> 4 (j = p & 15), so each DPP row of 16 lanes is one 128-block.
+// - amax: max of |x| is order-free (no -0 after fabsf; NaN is ignored by
+//   max_num exactly as in the butterfly), reduced by row_xmask 8, 4, 2, 1.
+// - mse: remap lane l = 2j + b takes xv = x[4b..4b+3] of producer lane j, so
+//   its fma chain is this lane's chain over 4b..4b+3 (acc[b]), and the
+//   remap's xor-16, 8, 4, 2 butterfly steps are xor-8, 4, 2, 1 on j. Its last
+//   step (xor-1 on l) adds acc[1] of the same lane; + is commutative, so all
+//   16 lanes hold the remap's sum.
+// - s: an exact integer sum, order-free. qs bytes 4j..4j+3 are this lane's
+//   eight codes in element order: one u32 store.
+// - codes: r = rcp(d) refined by one Newton step, so |r*d - 1| <= 2^-23 even
+//   for a 2^-12-accurate rcp. For amax in [2^-100, FLT_MAX] both d are
+//   normal and |x/d| < 8.17 (d0 = (6/7) amax/7), hence
+//   |y - x/d| <= 8.17 * 2^-23 + 2^-21 < 2^-19.3 for y = RN(x*r), and the
+//   computed y - rint(y) (exact, or contracted with the product: error
+//   <= 2^-25) is within 2^-19.3 of x/d - rint(y). If every |y - rint(y)| is
+//   <= 0.5 - 2^-18, then |RN(x/d) - rint(y)| <= 0.5 - 2^-18 + 2^-19.3 + 2^-21
+//   < 0.5 (RN(x/d) is within 2^-21 of x/d below 16), so rint(RN(x/d)) ==
+//   rint(y), and d1 = amax/7 codes lie in [-7, 7] without the clamp. When
+//   any lane of the wave fails that test (a value within 2^-18 of a
+//   half-integer, or amax tiny, Inf or NaN), the whole wave redoes both
+//   candidates with the reference divides; the test runs after the mse
+//   pass so the common path stays one basic block.
+// - best_d = 1 (amax == 0, or neither mse below the 1e30 sentinel: NaN
+//   elements, huge rows) reproduces the reference's final rint(x / 1),
+//   forced to 0 when amax == 0.
+template <int Mask>
+__device__ __forceinline__ float iu4_row_xmask_f32(float v) {
+    return __int_as_float(
+        __builtin_amdgcn_update_dpp(0, __float_as_int(v), 0x160 | Mask, 0xF, 0xF, true));
+}
+template <int Mask>
+__device__ __forceinline__ int iu4_row_xmask_i32(int v) {
+    return __builtin_amdgcn_update_dpp(0, v, 0x160 | Mask, 0xF, 0xF, true);
+}
+
+// Clamps q0 in place and forms both candidates' block mse exactly as the
+// reference (fma chain per remap lane, then its butterfly order).
+__device__ __forceinline__ void iu4_c2_mse(const float x[8], float q0[8], const float q1[8],
+                                           float d0, float d1, float& mse0, float& mse1) {
+    float acc0[2] = {0.0f, 0.0f};
+    float acc1[2] = {0.0f, 0.0f};
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        q0[k] = fminf(fmaxf(q0[k], -8.0f), 7.0f);
+        const float e0 = __fmaf_rn(-q0[k], d0, x[k]);
+        const float e1 = __fmaf_rn(-q1[k], d1, x[k]);
+        acc0[k >> 2] = __fmaf_rn(e0, e0, acc0[k >> 2]);
+        acc1[k >> 2] = __fmaf_rn(e1, e1, acc1[k >> 2]);
+    }
+    #pragma unroll
+    for (int b = 0; b < 2; ++b) {
+        acc0[b] += iu4_row_xmask_f32<8>(acc0[b]);
+        acc1[b] += iu4_row_xmask_f32<8>(acc1[b]);
+        acc0[b] += iu4_row_xmask_f32<4>(acc0[b]);
+        acc1[b] += iu4_row_xmask_f32<4>(acc1[b]);
+        acc0[b] += iu4_row_xmask_f32<2>(acc0[b]);
+        acc1[b] += iu4_row_xmask_f32<2>(acc1[b]);
+        acc0[b] += iu4_row_xmask_f32<1>(acc0[b]);
+        acc1[b] += iu4_row_xmask_f32<1>(acc1[b]);
+    }
+    mse0 = acc0[0] + acc0[1];
+    mse1 = acc1[0] + acc1[1];
+}
+
+__device__ __forceinline__ void emit_iu4_sidecar_c2_gfx12(
+    const float x[8],
+    block_i4_128* __restrict__ Y,
+    int group,
+    int token,
+    int N,
+    int lane
+) {
+    float amax = fmaxf(fmaxf(fmaxf(fabsf(x[0]), fabsf(x[1])), fmaxf(fabsf(x[2]), fabsf(x[3]))),
+                       fmaxf(fmaxf(fabsf(x[4]), fabsf(x[5])), fmaxf(fabsf(x[6]), fabsf(x[7]))));
+    amax = fmaxf(amax, iu4_row_xmask_f32<8>(amax));
+    amax = fmaxf(amax, iu4_row_xmask_f32<4>(amax));
+    amax = fmaxf(amax, iu4_row_xmask_f32<2>(amax));
+    amax = fmaxf(amax, iu4_row_xmask_f32<1>(amax));
+    const bool zero = amax == 0.0f;
+
+    // Same expressions as the reference candidate loop.
+    const float candidate_base = (amax / 7.0f) * 0.5f;
+    const float d0 = candidate_base * 0x1.b6db6ep+0f;
+    const float d1 = candidate_base * 2.0f;
+    float r0 = __builtin_amdgcn_rcpf(d0);
+    float r1 = __builtin_amdgcn_rcpf(d1);
+    r0 = __fmaf_rn(r0, __fmaf_rn(-d0, r0, 1.0f), r0);
+    r1 = __fmaf_rn(r1, __fmaf_rn(-d1, r1, 1.0f), r1);
+
+    float q0[8], q1[8];
+    float frac = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const float y0 = x[k] * r0;
+        const float y1 = x[k] * r1;
+        q0[k] = rintf(y0);
+        q1[k] = rintf(y1);
+        frac = fmaxf(frac, fmaxf(fabsf(y0 - q0[k]), fabsf(y1 - q1[k])));
+    }
+    float mse0, mse1;
+    iu4_c2_mse(x, q0, q1, d0, d1, mse0, mse1);
+    const bool exact = zero || (amax >= 0x1p-100f && amax <= 0x1.fffffep+127f && frac <= 0.5f - 0x1p-18f);
+    if (__builtin_amdgcn_ballot_w32(!exact) != 0u) {
+        // Rare (wave-uniform): redo every lane with the reference divides.
+        #pragma unroll
+        for (int k = 0; k < 8; ++k) {
+            q0[k] = rintf(x[k] / d0);
+            q1[k] = fminf(fmaxf(rintf(x[k] / d1), -8.0f), 7.0f);
+        }
+        iu4_c2_mse(x, q0, q1, d0, d1, mse0, mse1);
+    }
+    // Reference: best_mse = 1e30, then strict < for d0, then for d1.
+    const bool take0 = mse0 < 1.0e30f;
+    const bool use1 = mse1 < (take0 ? mse0 : 1.0e30f);
+    const bool unit = zero || !(take0 || use1);
+
+    float q[8];
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) q[k] = use1 ? q1[k] : q0[k];
+    if (unit) {
+        #pragma unroll
+        for (int k = 0; k < 8; ++k)
+            q[k] = zero ? 0.0f : fminf(fmaxf(rintf(x[k] / 1.0f), -8.0f), 7.0f);
+    }
+    int s = 0;
+    unsigned int word = 0u;
+    #pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        const int qi = (int)q[k];
+        s += qi;
+        word |= (unsigned int)(qi & 15) << (4 * k);
+    }
+    s += iu4_row_xmask_i32<8>(s);
+    s += iu4_row_xmask_i32<4>(s);
+    s += iu4_row_xmask_i32<2>(s);
+    s += iu4_row_xmask_i32<1>(s);
+
+    block_i4_128* out = Y + (long long)(2 * group + (lane >> 4)) * N + token;
+    reinterpret_cast<unsigned int*>(out->qs)[lane & 15] = word;
+    if ((lane & 15) == 0) {
+        out->d = unit ? 1.0f : (use1 ? d1 : d0);
+        out->s = s;
+    }
+}
+#endif
+
 // Remap producer-final 8 floats/lane into the standalone quant ownership
 // (lane l owns 4l..4l+3 of each 128-half) and emit two block_i4_128 rows.
 // Producer lane p holds values 8p..8p+7. For half h∈{0,1}:
@@ -212,6 +368,10 @@ __device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
     int N,
     int lane
 ) {
+#if defined(__gfx1201__) && IU4_A4_CANDIDATES == 2
+    const float x[8] = {f0, f1, f2, f3, f4, f5, f6, f7};
+    emit_iu4_sidecar_c2_gfx12(x, Y, group, token, N, lane);
+#else
     #pragma unroll
     for (int h = 0; h < 2; ++h) {
         const int src = 16 * h + (lane >> 1);
@@ -236,6 +396,7 @@ __device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
         quantize_block_i4_128_wave<false>(xv, out, lane);
 #endif
     }
+#endif
 }
 
 // Standalone quantizer: same (X, Y, K, N) grid contract as
