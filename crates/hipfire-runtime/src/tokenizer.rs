@@ -516,6 +516,24 @@ impl Tokenizer {
                     t.add_bos = ab;
                 }
             }
+            // LFM2.5 family (arch "lfm2" / "lfm2_moe") is BOS-trained: the
+            // chat_template starts with `{{- bos_token -}}` and HF's
+            // AutoTokenizer adds BOS for raw prompts (verified: 350M
+            // "The capital of France is" -> [1, 1098, ...] via HF, but
+            // hipfire's add_bos is false when tokenizer_config lacks
+            // `add_bos_token`, so raw prompts miss BOS and the model
+            // sees position-shifted inputs -> single-token attractor
+            // (230M: 856 " is" x8, 350M: 540 x8). Fix: default add_bos
+            // to true for LFM when not explicitly set, and make encode()
+            // avoid double-BOS when the text already starts with the BOS
+            // literal (the Jinja-rendered chat path already contains it).
+            if !t.add_bos {
+                if let Some(arch) = meta.get("architecture").and_then(|v| v.as_str()) {
+                    if arch == "lfm2" || arch == "lfm2_moe" {
+                        t.add_bos = true;
+                    }
+                }
+            }
             return Ok(t);
         }
         if let Some(gguf_meta) = meta.get("gguf_meta") {
@@ -703,7 +721,17 @@ impl Tokenizer {
         // already emits <BOS_TOKEN> must encode with add_bos disabled to avoid
         // a double BOS — a serving concern, separate from raw encode.)
         if self.add_bos {
-            result.push(self.bos_id);
+            // For LFM2 (add_bos auto-enabled above), the Jinja-rendered chat
+            // string already starts with the BOS literal ("<|startoftext|>");
+            // avoid double by not prepending when text already has that prefix.
+            let bos_str = self
+                .vocab
+                .get(self.bos_id as usize)
+                .map(|s| s.as_str())
+                .unwrap_or("");
+            if bos_str.is_empty() || !text.starts_with(bos_str) {
+                result.push(self.bos_id);
+            }
         }
         if self.special_tokens.is_empty() {
             result.extend(self.encode_raw(text));

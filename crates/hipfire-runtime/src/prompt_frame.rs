@@ -743,6 +743,39 @@ pub fn hf_tojson(value: minijinja::Value) -> Result<String, minijinja::Error> {
     })
 }
 
+/// Strip unsupported `{% generation %}` / `{% endgeneration %}` Jinja tags
+/// (with any whitespace/dash variants) from LFM2.5-230M's chat_template.
+/// These are no-op generation-scope markers that minijinja doesn't know;
+/// without stripping, `env.add_template` fails with "unknown statement generation".
+/// Transparent: the markers just delimit the assistant generation block, which
+/// the template already handles via `add_generation_prompt` and the assistant
+/// loop, so removing them is semantics-preserving. (LFM2.5-230M bring-up,
+/// 2026-08-09: `{%- generation -%}` at chat_template.jinja:77,105).
+fn strip_generation_tags(template: &str) -> String {
+    let mut out = String::with_capacity(template.len());
+    let mut i = 0;
+    let bytes = template.as_bytes();
+    while i < bytes.len() {
+        if i + 1 < bytes.len() && bytes[i] == b'{' && bytes[i + 1] == b'%' {
+            if let Some(end) = template[i..].find("%}") {
+                let inner = &template[i + 2..i + end];
+                // Normalize: trim whitespace, then '-' markers, then whitespace again
+                let clean = inner.trim().trim_matches('-').trim();
+                // Handle inner like "- generation -" -> after first trim it's "- generation -",
+                // after trim_matches('-') it's " generation ", after final trim it's "generation"
+                // For " generation " it's already "generation"
+                if clean == "generation" || clean == "endgeneration" {
+                    i += end + 2;
+                    continue;
+                }
+            }
+        }
+        out.push(bytes[i] as char);
+        i += 1;
+    }
+    out
+}
+
 /// Render-time `YYYY-MM-DD` date string for chat templates that surface a
 /// "Current date:" line (MiniMax-M2's `system_message.current_date`, and any
 /// future template using the same convention).
@@ -893,7 +926,8 @@ impl<'a> JinjaChatFrame<'a> {
         // mapping-arg rendering byte-matches transformers' apply_chat_template.
         env.add_filter("tojson", hf_tojson);
 
-        env.add_template("chat", self.template)
+        let cleaned_template = strip_generation_tags(self.template);
+        env.add_template("chat", &cleaned_template)
             .map_err(|e| format!("template parse: {e}"))?;
         let tmpl = env
             .get_template("chat")

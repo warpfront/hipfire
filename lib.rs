@@ -28,8 +28,8 @@ use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::llama;
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
-use hipfire_runtime::ngram_mod::NgramModPool;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
+use hipfire_runtime::ngram_mod::NgramModPool;
 use hipfire_runtime::triattn::{EvictionCtx, TriAttnCenters};
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -2256,7 +2256,8 @@ mod registry_tests {
         // implemented storage below F32 — a widening relative to what these
         // ask for. Only unrecognised strings still fail closed.
         for mode in [
-            "q8", "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo", "turbo3", "turbo4",
+            "q8", "asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "turbo", "turbo3",
+            "turbo4",
         ] {
             assert_eq!(
                 resolve_deepseek4_compressor_cache_kv_mode(Some(mode)).unwrap(),
