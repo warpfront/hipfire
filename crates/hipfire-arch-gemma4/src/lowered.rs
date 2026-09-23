@@ -53,6 +53,29 @@ pub fn batched_prefill_enabled() -> bool {
     })
 }
 
+/// Env gate for batched SLIDING-layer attention in v2 prefill.
+/// **Default OFF (experimental) — does NOT yet pass parity.**
+///
+/// The intent: batch sliding attention for chunks fully within the window
+/// (`start_pos + n_batch <= sliding_window`), where windowed == full-causal and
+/// no ring wrap occurs. The Rust wiring below mirrors the *validated* full-layer
+/// batched path (one masked-flash launch, positions-derived causal bound).
+///
+/// BLOCKED: the batched attention kernel diverges for the SLIDING shape
+/// (`n_kv = 8` GQA + asym3-rotated K + windowed), while the full-layer shape
+/// (`n_kv = 1`) is bit-stable. `prefill_parity_gemma4` shows an IDENTICAL→
+/// DIVERGED continuation regression with this enabled, and the divergence is
+/// independent of `cache_capacity` (both 0 and `sliding_window` diverge). This
+/// is the real reason v2 left sliding attention per-token — a kernel bug, not a
+/// ring-param bug. Fixing it is kernel-level work (batched GQA asym3 windowed
+/// flash). Set `HIPFIRE_GEMMA4_BATCHED_SLIDING_ATTN=1` only to reproduce/debug.
+pub fn batched_sliding_attn_enabled() -> bool {
+    static GATE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *GATE.get_or_init(|| {
+        std::env::var("HIPFIRE_GEMMA4_BATCHED_SLIDING_ATTN").map_or(false, |v| v == "1")
+    })
+}
+
 /// Batched GEMM for prefill projections.
 ///
 /// Scalar path: routes through `GemmFamily::run_key` with the appropriate
@@ -2858,14 +2881,131 @@ fn forward_prefill_batch_v2(
                     dbg_dump(gpu, "[v2] L0 after rope_k", &scratch.pb_k, kv_dim);
                 }
 
-                // Per-token KV write + attention (batched projections, per-token
-                // attention). The batched q8 attention path has a bug that
-                // corrupts KV when cache_capacity > 0 (ring-buffer mode), so
-                // we run attention per-token through the proven decode-path
-                // Step::Attend with batch_size=1. This is only 1.7% of GPU
-                // time per the rocprof profile, so the overhead is minimal.
+                // Sliding-layer attention. For a chunk fully within the sliding
+                // window (start_pos + n_batch <= sliding_window) every query's
+                // window reaches back to position 0, so windowed attention is
+                // numerically identical to full-causal, AND no ring-buffer wrap
+                // occurs (all positions < window) — the validated non-ring regime
+                // the full layers already use (cache_capacity = 0). We batch it
+                // into one masked-flash launch, avoiding the historical "batched
+                // q8 attention corrupts KV in ring-buffer mode" bug (which only
+                // manifests at cache_capacity > 0). Chunks that cross the window
+                // boundary fall back to the proven per-token decode path below.
                 let sliding_cap = config.sliding_window as u32;
-                for i in 0..n_batch {
+                let batch_sliding = batched_sliding_attn_enabled()
+                    && start_pos + n_batch <= config.sliding_window;
+                if batch_sliding {
+                    let tier_inputs = KvTierInputs {
+                        quant_asym4: kv_sliding.quant_asym4,
+                        quant_asym3: kv_sliding.quant_asym3,
+                        quant_asym2: kv_sliding.quant_asym2,
+                        quant_q8: kv_sliding.quant_q8,
+                        quant_fwht: kv_sliding.quant_fwht,
+                        quant_hfq4: false,
+                        quant_q4: false,
+                        v_mode_bits: kv_sliding.v_mode_bits(),
+                        pos: start_pos + n_batch - 1,
+                        flash_mode: 2,
+                        capture_mode: gpu.graphs.capture_mode,
+                        batch_size: n_batch,
+                        is_tree: false,
+                        is_boundary: false,
+                        // Ring params identical to the per-token sliding write so
+                        // the KV layout matches what decode (ring, cap=window)
+                        // later reads. The `start_pos + n_batch <= sliding_window`
+                        // guard means no wrap occurs in this chunk, which is the
+                        // regime the historical batched-ring-corruption bug does
+                        // NOT hit (no wrap to mishandle).
+                        cache_capacity: sliding_cap,
+                        head_dim,
+                        window_size: sliding_cap,
+                    };
+                    let plan = KvTierPlan::derive(tier_inputs)
+                        .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
+                    let io = AttnParams {
+                        q: &scratch.pb_q,
+                        k: &scratch.pb_k,
+                        v: &scratch.pb_v,
+                        k_cache: &kv_sliding.k_gpu[sliding_kv_idx],
+                        v_cache: &kv_sliding.v_gpu[sliding_kv_idx],
+                        k_scales: None,
+                        v_scales: None,
+                        pos_buf: &scratch.pos_buf,
+                        pos: start_pos + n_batch - 1,
+                        positions: Some(&scratch.pb_positions),
+                        n_heads,
+                        n_kv_heads: n_kv,
+                        head_dim,
+                        physical_cap: kv_sliding.max_seq,
+                        cache_capacity: plan.cache_capacity,
+                        window_size: plan.window_size,
+                        batch_size: n_batch,
+                        max_ctx_len: start_pos + n_batch,
+                        flash_partials: Some(&scratch.pb_flash_partials),
+                        givens_cos: kv_sliding.givens_cos.as_ref(),
+                        givens_sin: kv_sliding.givens_sin.as_ref(),
+                        tree_bias: None,
+                        block_start: 0,
+                        block_cols: 0,
+                        output: &scratch.pb_attn_q,
+                    };
+                    let ctx = DispatchCtx::new(gpu);
+                    execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
+                        .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+
+                    // Per-row verify: re-run each query's attention per-token over
+                    // the batched-written cache and report the per-layer worst diff
+                    // vs the batched output. Localizes the divergence to a
+                    // row(position)/head/dim. HIPFIRE_GEMMA4_ATTN_VERIFY=1.
+                    if std::env::var("HIPFIRE_GEMMA4_ATTN_VERIFY").ok().as_deref() == Some("1") {
+                        let batched_out = gpu.download_f32(&scratch.pb_attn_q)?;
+                        let (mut lworst, mut lrow, mut lhead, mut ldim) = (0f32, 0usize, 0usize, 0usize);
+                        for i in 0..n_batch {
+                            let pos = start_pos + i;
+                            gpu.hip.memcpy_htod(&scratch.pos_buf, &(pos as i32).to_ne_bytes())?;
+                            gpu.hip.memcpy_dtod_at(&scratch.q.buf, 0, &scratch.pb_q.buf, i * q_dim_bytes, q_dim_bytes)?;
+                            gpu.hip.memcpy_dtod_at(&scratch.k.buf, 0, &scratch.pb_k.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                            gpu.hip.memcpy_dtod_at(&scratch.v.buf, 0, &scratch.pb_v.buf, i * kv_dim_bytes, kv_dim_bytes)?;
+                            let ti = KvTierInputs {
+                                quant_asym4: kv_sliding.quant_asym4, quant_asym3: kv_sliding.quant_asym3,
+                                quant_asym2: kv_sliding.quant_asym2, quant_q8: kv_sliding.quant_q8,
+                                quant_fwht: kv_sliding.quant_fwht, quant_hfq4: false, quant_q4: false,
+                                v_mode_bits: kv_sliding.v_mode_bits(), pos, flash_mode: 2,
+                                capture_mode: gpu.graphs.capture_mode, batch_size: 1,
+                                is_tree: false, is_boundary: false, cache_capacity: sliding_cap,
+                                head_dim, window_size: sliding_cap,
+                            };
+                            let p1 = KvTierPlan::derive(ti)
+                                .map_err(|e| hip_bridge::HipError::new(0, &format!("{:?}", e)))?;
+                            let io1 = AttnParams {
+                                q: &scratch.q, k: &scratch.k, v: &scratch.v,
+                                k_cache: &kv_sliding.k_gpu[sliding_kv_idx], v_cache: &kv_sliding.v_gpu[sliding_kv_idx],
+                                k_scales: None, v_scales: None,
+                                pos_buf: &scratch.pos_buf, pos, positions: None,
+                                n_heads, n_kv_heads: n_kv, head_dim,
+                                physical_cap: kv_sliding.max_seq, cache_capacity: p1.cache_capacity,
+                                window_size: p1.window_size, batch_size: 1, max_ctx_len: 0,
+                                flash_partials: Some(&scratch.flash_partials),
+                                givens_cos: kv_sliding.givens_cos.as_ref(), givens_sin: kv_sliding.givens_sin.as_ref(),
+                                tree_bias: None, block_start: 0, block_cols: 0,
+                                output: &scratch.attn_out,
+                            };
+                            let c1 = DispatchCtx::new(gpu);
+                            execute_steps(gpu, &c1, &[Step::Attend { plan: p1, io: io1 }])
+                                .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
+                            let single = gpu.download_f32(&scratch.attn_out)?;
+                            let row = &batched_out[i * q_dim..(i + 1) * q_dim];
+                            for j in 0..q_dim {
+                                let d = (single[j] - row[j]).abs();
+                                if d > lworst { lworst = d; lrow = i; lhead = j / head_dim; ldim = j % head_dim; }
+                            }
+                        }
+                        eprintln!("[sliding-attn-verify] L{layer_idx} n={n_batch} maxdiff={lworst:.5} @ row={lrow} head={lhead} dim={ldim}");
+                    }
+                }
+                // Per-token fallback (chunk crosses the window, or flag forced off).
+                // Runs the proven decode-path Step::Attend with batch_size=1.
+                for i in 0..(if batch_sliding { 0 } else { n_batch }) {
                     let pos = start_pos + i;
                     if let Some(stream) = gpu.active_stream.as_ref() {
                         gpu.hip.stream_write_value32(stream, &scratch.pos_buf, pos as u32, 0)?;
@@ -2940,9 +3080,12 @@ fn forward_prefill_batch_v2(
                     }
                 }
                 sliding_kv_idx += 1;
-                if _dump_on { dbg_dump(gpu, "[v2] L0 after attention (pb_q)", &scratch.pb_q, q_dim); }
+                // Batched attention writes into pb_attn_q; the per-token fallback
+                // leaves its result in pb_q. o_proj reads whichever ran.
+                let sliding_attn_buf = if batch_sliding { &scratch.pb_attn_q } else { &scratch.pb_q };
+                if _dump_on { dbg_dump(gpu, "[v2] L0 after attention", sliding_attn_buf, q_dim); }
 
-                run_prefill_gemm(gpu, &lw.o_proj, &scratch.pb_q, &scratch.pb_attn_out, n_batch)?;
+                run_prefill_gemm(gpu, &lw.o_proj, sliding_attn_buf, &scratch.pb_attn_out, n_batch)?;
                 if _dump_on { dbg_dump(gpu, "[v2] L0 after o_proj", &scratch.pb_attn_out, dim); }
                 gpu.rmsnorm_batched(&scratch.pb_attn_out, &lw.post_attention_layernorm,
                     &scratch.pb_attn_out, n_batch, dim, config.norm_eps)?;
