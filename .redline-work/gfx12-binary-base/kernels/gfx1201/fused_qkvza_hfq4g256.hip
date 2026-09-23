@@ -1,0 +1,257 @@
+#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1
+// Opt-in GFX12 weight-load cache-policy experiment.
+//
+// HIPFIRE_GFX12_WEIGHT_CPOL_AUX is the raw-buffer cache-policy immediate:
+//   16 = TH_RT    + SCOPE_DEV (buffer-addressing control)
+//   18 = TH_HT    + SCOPE_DEV
+//   20 = TH_NT_RT + SCOPE_DEV
+//   22 = TH_NT_HT + SCOPE_DEV
+//
+// This preamble is concatenated ahead of selected HFQ4 kernel sources by
+// kernels.rs. gfx1201 defaults to buffer RT after matched model-level gates;
+// HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS preserves the old global-load control.
+#if defined(__gfx1201__) && \
+    defined(HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE) && \
+    !defined(HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS)
+#ifndef HIPFIRE_GFX12_WEIGHT_CPOL_AUX
+#define HIPFIRE_GFX12_WEIGHT_CPOL_AUX 16
+#endif
+#define HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS 1
+#define HIPFIRE_WEIGHT_RSRC(base) \
+    __builtin_amdgcn_make_buffer_rsrc( \
+        const_cast<char*>(base), 0, 0xffffffffu, 0x31004000u)
+#define HIPFIRE_WEIGHT_LOAD_U32(rsrc, byte_offset) \
+    __builtin_amdgcn_raw_buffer_load_b32( \
+        (rsrc), (unsigned int)(byte_offset), 0, HIPFIRE_GFX12_WEIGHT_CPOL_AUX)
+#define HIPFIRE_WEIGHT_LOAD_SPLIT_U32(rsrc, vector_offset, scalar_offset) \
+    __builtin_amdgcn_raw_buffer_load_b32( \
+        (rsrc), (unsigned int)(vector_offset), (unsigned int)(scalar_offset), \
+        HIPFIRE_GFX12_WEIGHT_CPOL_AUX)
+#define HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, ptr, byte_offset) \
+    HIPFIRE_WEIGHT_LOAD_U32((rsrc), (byte_offset))
+#define HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(rsrc, ptr, vector_offset, scalar_offset) \
+    HIPFIRE_WEIGHT_LOAD_SPLIT_U32((rsrc), (vector_offset), (scalar_offset))
+#else
+#define HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS 0
+#define HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, ptr, byte_offset) \
+    (*(const unsigned int*)(ptr))
+#define HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(rsrc, ptr, vector_offset, scalar_offset) \
+    (*(const unsigned int*)(ptr))
+#endif
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+#include <hip/hip_runtime.h>
+
+// 4-way fused HFQ4-G256 GEMV for the Qwen3.5 DeltaNet linear-attention
+// layer preamble. One kernel launch performs all four projections from a
+// single shared x_rot input:
+//
+//   y_qkv   = W_qkv   · x_rot      (M=qkv_m,   e.g. 6144 on 0.8B)
+//   y_z     = W_z     · x_rot      (M=z_m,     e.g. 2048)
+//   y_beta  = W_beta  · x_rot      (M=beta_m,  e.g. 16)
+//   y_alpha = W_alpha · x_rot      (M=alpha_m, e.g. 16)
+//
+// Grid = qkv_m + z_m + beta_m + alpha_m workgroups × 32 threads. Each
+// workgroup picks its target matrix/row via blockIdx.x range check, then
+// runs the SAME 4x-unroll inner loop as gemv_hfq4g256.hip — including
+// the 5302926 tail-group accumulator fix (acc[g%4], not all-into-acc0).
+//
+// Arch coverage: works on every RDNA generation (gfx1010 / gfx1013 /
+// gfx1030 / gfx1100+) because gemv_hfq4g256.hip and its arch variants
+// were unified onto the same 4-accumulator inner loop after the 5302926
+// fix. The launch_bounds(32, 16) target matches the gfx1100 register
+// budget; on gfx1010 this is the same single-wave-per-SIMD-half
+// occupancy used by the standalone gemv_hfq4g256.hip — both kernels
+// share the same VGPR pressure profile.
+//
+// Why fuse:
+//   1. Four launches → one → saves ~3 × (host submit + dispatch floor)
+//      per LA layer. On gfx1100 that's ~36 µs/layer ≈ ~640 µs per
+//      forward. On gfx1010 the per-launch dispatch floor is even higher,
+//      so the relative win is at least as large.
+//   2. The 16-wave w_beta and w_alpha launches are catastrophically
+//      under-subscribed on their own (16 / N_max_waves slots ≪ 1%).
+//      Co-scheduling them with the 6144-wave wqkv body lets the wave
+//      scheduler keep real work in flight during the tails.
+//
+// Bit-exact with four sequential gemv_hfq4g256 calls — the inner loop
+// is a verbatim copy.
+
+__launch_bounds__(32, 16)
+extern "C" __global__ void fused_qkvza_hfq4g256(
+    const char*  __restrict__ A_qkv,
+    const char*  __restrict__ A_z,
+    const char*  __restrict__ A_beta,
+    const char*  __restrict__ A_alpha,
+    const float* __restrict__ x,
+    float*       __restrict__ y_qkv,
+    float*       __restrict__ y_z,
+    float*       __restrict__ y_beta,
+    float*       __restrict__ y_alpha,
+    int qkv_m, int z_m, int beta_m, int alpha_m,
+    int K
+) {
+    const int gid = blockIdx.x;
+    const int total_m = qkv_m + z_m + beta_m + alpha_m;
+    if (gid >= total_m) return;
+
+    // Route this workgroup to its matrix + output row.
+    const char* A;
+    float* y;
+    int row;
+    if (gid < qkv_m) {
+        A = A_qkv;   y = y_qkv;   row = gid;
+    } else if (gid < qkv_m + z_m) {
+        A = A_z;     y = y_z;     row = gid - qkv_m;
+    } else if (gid < qkv_m + z_m + beta_m) {
+        A = A_beta;  y = y_beta;  row = gid - (qkv_m + z_m);
+    } else {
+        A = A_alpha; y = y_alpha; row = gid - (qkv_m + z_m + beta_m);
+    }
+
+    const int tid = threadIdx.x;
+    const int groups_per_row = K / 256;
+    const char* row_ptr = A + (long long)row * groups_per_row * 136;
+    const int boff = tid * 4;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const auto row_rsrc = HIPFIRE_WEIGHT_RSRC(row_ptr);
+#endif
+
+    // Four accumulators for the 4x group unroll. Tail groups go back into
+    // acc[gi] to preserve the 4-way interleaving the combine step assumes
+    // (this is the 5302926 bug fix — DO NOT collapse into acc0).
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    const int quads = groups_per_row >> 2;
+    const int tail  = groups_per_row & 3;
+
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        const char* gp0 = row_ptr + g * 136;
+        const char* gp1 = gp0 + 136;
+        const char* gp2 = gp1 + 136;
+        const char* gp3 = gp2 + 136;
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        // R4c0_qkvza_spref272: L2-resident BOD (occ~35% mem_busy~41%);
+        // soft-prefetch next quad weights (+272B = 2 groups) while this quad's DOG runs.
+        // gfx12-ONLY: s_prefetch_data needs target feature gfx12-insts. The ENTIRE block is
+        // gated so gfx11/gfx10 (RDNA1-3) compile BYTE-IDENTICALLY to the pre-lever kernel —
+        // zero effect on any other arch's codegen. Hint only; identical load/FMA stream.
+        if (q + 1 < quads) {
+            __builtin_amdgcn_s_prefetch_data((const void*)(gp0 + 272), 0);
+        }
+#endif
+
+        float sc0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0, (g + 0) * 136));
+        float zp0 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 4, (g + 0) * 136 + 4));
+        float sc1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1, (g + 1) * 136));
+        float zp1 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 4, (g + 1) * 136 + 4));
+        float sc2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2, (g + 2) * 136));
+        float zp2 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 4, (g + 2) * 136 + 4));
+        float sc3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3, (g + 3) * 136));
+        float zp3 = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 4, (g + 3) * 136 + 4));
+
+        unsigned int pk0 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp0 + 8 + boff, (g + 0) * 136 + 8 + boff);
+        unsigned int pk1 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp1 + 8 + boff, (g + 1) * 136 + 8 + boff);
+        unsigned int pk2 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp2 + 8 + boff, (g + 2) * 136 + 8 + boff);
+        unsigned int pk3 = HIPFIRE_WEIGHT_LOAD_PTR_U32(row_rsrc, gp3 + 8 + boff, (g + 3) * 136 + 8 + boff);
+
+        int base = g * 256 + tid * 8;
+
+        // R-hoist_x32 (gfx12): vectorize x as float4 pairs BEFORE the DOG FMAs,
+        // matching the winning gate_up R20c2_hoist_x32. Bit-exact — a float4 load of
+        // contiguous x is the same 8 values as scalar x[base..base+7], just one
+        // 128-bit load instead of 8 scalar loads (more in-flight bytes → higher
+        // mem_busy on the L2-resident-but-mem-busy-41% qkvza). gfx12-gated so
+        // gfx11/gfx10 compile BYTE-IDENTICALLY: the float4 hoist raises VGPR ~72→96,
+        // which only helps where there's occupancy room (gfx1201, occ~35%); on the
+        // gfx1100 launch_bounds target it would cut occupancy.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+        const float4 xv0a = *reinterpret_cast<const float4*>(x + base);
+        const float4 xv0b = *reinterpret_cast<const float4*>(x + base + 4);
+        const float4 xv1a = *reinterpret_cast<const float4*>(x + base + 256);
+        const float4 xv1b = *reinterpret_cast<const float4*>(x + base + 260);
+        const float4 xv2a = *reinterpret_cast<const float4*>(x + base + 512);
+        const float4 xv2b = *reinterpret_cast<const float4*>(x + base + 516);
+        const float4 xv3a = *reinterpret_cast<const float4*>(x + base + 768);
+        const float4 xv3b = *reinterpret_cast<const float4*>(x + base + 772);
+        #define DOG_V(pk, sc, zp, a, x0, x1, x2, x3, x4, x5, x6, x7) \
+            (a) += (sc * (float)((pk) & 0xFu)        + zp) * (x0) \
+                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
+                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * (x2) \
+                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * (x3) \
+                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * (x4) \
+                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * (x5) \
+                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * (x6) \
+                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * (x7)
+        DOG_V(pk0, sc0, zp0, acc0, xv0a.x,xv0a.y,xv0a.z,xv0a.w,xv0b.x,xv0b.y,xv0b.z,xv0b.w);
+        DOG_V(pk1, sc1, zp1, acc1, xv1a.x,xv1a.y,xv1a.z,xv1a.w,xv1b.x,xv1b.y,xv1b.z,xv1b.w);
+        DOG_V(pk2, sc2, zp2, acc2, xv2a.x,xv2a.y,xv2a.z,xv2a.w,xv2b.x,xv2b.y,xv2b.z,xv2b.w);
+        DOG_V(pk3, sc3, zp3, acc3, xv3a.x,xv3a.y,xv3a.z,xv3a.w,xv3b.x,xv3b.y,xv3b.z,xv3b.w);
+        #undef DOG_V
+#else
+        // ORIGINAL scalar path — verbatim, so gfx11/gfx10 compile byte-identically.
+        #define DOG(pk, sc, zp, b, a) \
+            (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
+                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+        DOG(pk0, sc0, zp0, base,       acc0);
+        DOG(pk1, sc1, zp1, base + 256, acc1);
+        DOG(pk2, sc2, zp2, base + 512, acc2);
+        DOG(pk3, sc3, zp3, base + 768, acc3);
+        #undef DOG
+#endif
+    }
+
+    // Tail handling: preserve acc[gi] interleaving. See 5302926 bug report.
+    #define TAIL_DOG(pk, sc, zp, b, a) \
+        (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
+             + (sc * (float)(((pk) >>  4) & 0xFu) + zp) * x[(b) + 1] \
+             + (sc * (float)(((pk) >>  8) & 0xFu) + zp) * x[(b) + 2] \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+
+    if (tail >= 1) {
+        const int g = quads << 2;
+        const char* gp = row_ptr + g * 136;
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        int base = g * 256 + tid * 8;
+        TAIL_DOG(pk, sc, zp, base, acc0);
+    }
+    if (tail >= 2) {
+        const int g = (quads << 2) + 1;
+        const char* gp = row_ptr + g * 136;
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        int base = g * 256 + tid * 8;
+        TAIL_DOG(pk, sc, zp, base, acc1);
+    }
+    if (tail >= 3) {
+        const int g = (quads << 2) + 2;
+        const char* gp = row_ptr + g * 136;
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        int base = g * 256 + tid * 8;
+        TAIL_DOG(pk, sc, zp, base, acc2);
+    }
+    #undef TAIL_DOG
+
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (tid == 0) y[row] = acc;
+}

@@ -1,0 +1,202 @@
+#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1
+// Opt-in GFX12 weight-load cache-policy experiment.
+//
+// HIPFIRE_GFX12_WEIGHT_CPOL_AUX is the raw-buffer cache-policy immediate:
+//   16 = TH_RT    + SCOPE_DEV (buffer-addressing control)
+//   18 = TH_HT    + SCOPE_DEV
+//   20 = TH_NT_RT + SCOPE_DEV
+//   22 = TH_NT_HT + SCOPE_DEV
+//
+// This preamble is concatenated ahead of selected HFQ4 kernel sources by
+// kernels.rs. gfx1201 defaults to buffer RT after matched model-level gates;
+// HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS preserves the old global-load control.
+#if defined(__gfx1201__) && \
+    defined(HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE) && \
+    !defined(HIPFIRE_GFX12_WEIGHT_GLOBAL_LOADS)
+#ifndef HIPFIRE_GFX12_WEIGHT_CPOL_AUX
+#define HIPFIRE_GFX12_WEIGHT_CPOL_AUX 16
+#endif
+#define HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS 1
+#define HIPFIRE_WEIGHT_RSRC(base) \
+    __builtin_amdgcn_make_buffer_rsrc( \
+        const_cast<char*>(base), 0, 0xffffffffu, 0x31004000u)
+#define HIPFIRE_WEIGHT_LOAD_U32(rsrc, byte_offset) \
+    __builtin_amdgcn_raw_buffer_load_b32( \
+        (rsrc), (unsigned int)(byte_offset), 0, HIPFIRE_GFX12_WEIGHT_CPOL_AUX)
+#define HIPFIRE_WEIGHT_LOAD_SPLIT_U32(rsrc, vector_offset, scalar_offset) \
+    __builtin_amdgcn_raw_buffer_load_b32( \
+        (rsrc), (unsigned int)(vector_offset), (unsigned int)(scalar_offset), \
+        HIPFIRE_GFX12_WEIGHT_CPOL_AUX)
+#define HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, ptr, byte_offset) \
+    HIPFIRE_WEIGHT_LOAD_U32((rsrc), (byte_offset))
+#define HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(rsrc, ptr, vector_offset, scalar_offset) \
+    HIPFIRE_WEIGHT_LOAD_SPLIT_U32((rsrc), (vector_offset), (scalar_offset))
+#else
+#define HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS 0
+#define HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, ptr, byte_offset) \
+    (*(const unsigned int*)(ptr))
+#define HIPFIRE_WEIGHT_LOAD_SPLIT_PTR_U32(rsrc, ptr, vector_offset, scalar_offset) \
+    (*(const unsigned int*)(ptr))
+#endif
+#include <hip/hip_runtime.h>
+
+// Atomic-free variant of `gemv_hfq4g256_moe_down_residual_scaled_k8_indexed_batched`.
+//
+// Same per-(token, krank) GEMV compute. Instead of `atomicAdd(scale * acc)`
+// into a shared `x_residual[N × M]` row (K_TOP-way contention per output
+// cell, observed ~387 GiB/s on R9700/gfx1201 vs the sister gate_up at
+// 954 GiB/s with the same MQ4 layout but no atomic), this kernel writes
+// each (token, krank) result to its own row in an expanded buffer
+// `expert_outputs[N × K_TOP × M]`. A separate `moe_down_combine_k8_batched`
+// kernel folds K_TOP outputs back into the residual stream with topk_weights
+// applied — see kernels/src/moe_down_combine_k8_batched.hip.
+//
+// Shapes (vs the residual_scaled variant):
+//   expert_ptrs    : [n_exp]                — unchanged
+//   topk_indices   : [N × K_TOP]            — unchanged
+//   rot_batch      : [N × K_TOP × K]        — unchanged
+//   expert_outputs : [N × K_TOP × M]        — replaces x_residual; non-atomic
+// Note: `topk_weights` is NOT consumed here; the combine kernel applies the
+// scale during reduction over K_TOP. Dropping the weights load also saves
+// a small amount of bandwidth.
+//
+// Grid: (M, K_TOP, N). Block = 32 threads. No atomic ops — each output
+// address is written by exactly one workgroup, so the writes are pure
+// stores.
+//
+// VARIANT R17c1 down_g2_hoist_x16:
+// BOD: L2-resident/mixed occ~43% mem_busy~44% (post g2_branchless_fulltile WIN).
+// Current body: per-group LOAD_X8 then 4 DOGs → x-load serializes with weight
+// DOG for each of the 2 groups. residual/multirow R13/R15 WIN was hoisting
+// full x for the group-quad BEFORE dual-row DOG so weight MAC dual-issues
+// against resident x under L2-resident weights. Apply that here: float4×4
+// hoist of both groups' 16 x lanes first, then all 8 DOGs (4 rows × 2
+// groups) with x resident. Value-preserving: same sc/zp/pk, same FMA order
+// per DOG, same pairwise slot fold + shfl reduce + masked store.
+
+__launch_bounds__(32, 16)
+extern "C" __global__ void gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+    const unsigned long long* __restrict__ expert_ptrs, // [n_exp]
+    const int*   __restrict__ topk_indices,              // [N × K_TOP]
+    const float* __restrict__ rot_batch,                 // [N × K_TOP × K]
+    float*       __restrict__ expert_outputs,            // [N × K_TOP × M]
+    int M, int K, int K_TOP
+) {
+    const int row0 = blockIdx.x * 4;
+    if (row0 >= M) return;
+    const int row1 = row0 + 1;
+    const int row2 = row0 + 2;
+    const int row3 = row0 + 3;
+    const bool have_row1 = row1 < M;
+    const bool have_row2 = row2 < M;
+    const bool have_row3 = row3 < M;
+    const int krank = blockIdx.y;
+    const int bid = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    const int routing_base = bid * K_TOP;
+    const int expert_id = topk_indices[routing_base + krank];
+    const char* __restrict__ A =
+        reinterpret_cast<const char*>(expert_ptrs[expert_id]);
+    const float* __restrict__ x =
+        rot_batch + ((long long)bid * K_TOP + krank) * K;
+
+    // K=512 → 2 groups; row stride matches baseline (groups*136).
+    const int groups_per_row = K / 256;
+    const long long row_stride = (long long)groups_per_row * 136;
+    // Clamp OOB rows to row0 for weight reads (safe in-bounds); store still masked.
+    const char* row_ptr0 = A + (long long)row0 * row_stride;
+    const char* row_ptr1 = A + (long long)(have_row1 ? row1 : row0) * row_stride;
+    const char* row_ptr2 = A + (long long)(have_row2 ? row2 : row0) * row_stride;
+    const char* row_ptr3 = A + (long long)(have_row3 ? row3 : row0) * row_stride;
+    const int boff = tid * 4;
+#if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
+    const auto row_rsrc0 = HIPFIRE_WEIGHT_RSRC(row_ptr0);
+    const auto row_rsrc1 = HIPFIRE_WEIGHT_RSRC(row_ptr1);
+    const auto row_rsrc2 = HIPFIRE_WEIGHT_RSRC(row_ptr2);
+    const auto row_rsrc3 = HIPFIRE_WEIGHT_RSRC(row_ptr3);
+#endif
+
+    // gfx12: initiate the four first-demand group-0 cacheline fetches while
+    // the existing x float4 hoist provides independent VMEM work.  Group 1
+    // is adjacent and already covered by the group-0 compute window.
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    __builtin_amdgcn_s_prefetch_data((const void*)row_ptr0, 0);
+    __builtin_amdgcn_s_prefetch_data((const void*)row_ptr1, 0);
+    __builtin_amdgcn_s_prefetch_data((const void*)row_ptr2, 0);
+    __builtin_amdgcn_s_prefetch_data((const void*)row_ptr3, 0);
+#endif
+
+    // 2 live pairwise slots/row (acc2/acc3 would stay 0 on groups==2).
+    float acc0 = 0.0f, acc1 = 0.0f;
+    float bcc0 = 0.0f, bcc1 = 0.0f;
+    float ccc0 = 0.0f, ccc1 = 0.0f;
+    float dcc0 = 0.0f, dcc1 = 0.0f;
+
+    #define DOG_X8(gp, rsrc, weight_offset, a, x0, x1, x2, x3, x4, x5, x6, x7) do { \
+        float sc = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, gp, weight_offset)); \
+        float zp = __builtin_bit_cast(float, HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 4, (weight_offset) + 4)); \
+        unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
+        (a) += (sc * (float)((pk) & 0xFu)         + zp) * (x0) \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * (x2) \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * (x3) \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * (x4) \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * (x5) \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * (x6) \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * (x7); \
+    } while (0)
+
+    // Hoist both groups' 16 x elements (float4×4) before any weight DOG.
+    const int base0 = tid * 8;
+    const float4 xv0a = *reinterpret_cast<const float4*>(x + base0);
+    const float4 xv0b = *reinterpret_cast<const float4*>(x + base0 + 4);
+    const float4 xv1a = *reinterpret_cast<const float4*>(x + base0 + 256);
+    const float4 xv1b = *reinterpret_cast<const float4*>(x + base0 + 260);
+
+    // Group 0 → pairwise slot 0 (matches baseline tail g=0 → acc0).
+    DOG_X8(row_ptr0 + 0 * 136, row_rsrc0, 0 * 136, acc0,
+           xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+    DOG_X8(row_ptr1 + 0 * 136, row_rsrc1, 0 * 136, bcc0,
+           xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+    DOG_X8(row_ptr2 + 0 * 136, row_rsrc2, 0 * 136, ccc0,
+           xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+    DOG_X8(row_ptr3 + 0 * 136, row_rsrc3, 0 * 136, dcc0,
+           xv0a.x, xv0a.y, xv0a.z, xv0a.w, xv0b.x, xv0b.y, xv0b.z, xv0b.w);
+
+    // Group 1 → pairwise slot 1 (matches baseline tail g=1 → acc1).
+    DOG_X8(row_ptr0 + 1 * 136, row_rsrc0, 1 * 136, acc1,
+           xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+    DOG_X8(row_ptr1 + 1 * 136, row_rsrc1, 1 * 136, bcc1,
+           xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+    DOG_X8(row_ptr2 + 1 * 136, row_rsrc2, 1 * 136, ccc1,
+           xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+    DOG_X8(row_ptr3 + 1 * 136, row_rsrc3, 1 * 136, dcc1,
+           xv1a.x, xv1a.y, xv1a.z, xv1a.w, xv1b.x, xv1b.y, xv1b.z, xv1b.w);
+    #undef DOG_X8
+
+    // groups==2: only slots 0/1 live; (a0+a1) ≡ baseline (a0+a1)+(a2+a3) with a2=a3=0.
+    float acc = acc0 + acc1;
+    float bcc = bcc0 + bcc1;
+    float ccc = ccc0 + ccc1;
+    float dcc = dcc0 + dcc1;
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        bcc += __shfl_down(bcc, offset);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        ccc += __shfl_down(ccc, offset);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        dcc += __shfl_down(dcc, offset);
+
+    if (tid == 0) {
+        // Direct store to per-(token, krank) row — no atomic contention.
+        // Layout: expert_outputs[bid][krank][row].
+        const long long out_base =
+            ((long long)bid * K_TOP + krank) * (long long)M;
+        expert_outputs[out_base + row0] = acc;
+        if (have_row1) expert_outputs[out_base + row1] = bcc;
+        if (have_row2) expert_outputs[out_base + row2] = ccc;
+        if (have_row3) expert_outputs[out_base + row3] = dcc;
+    }
+}
