@@ -1,0 +1,9 @@
+probe_shape,arm,run,full_set_median_us,notes
+M34816_K5120_N4096,base,1,6656.790,canonical rig on Card-A after warm
+M34816_K5120_N4096,g8t0,1,5965.744,canonical rig on Card-A after warm
+M34816_K5120_N5909,base,A1,9754.070,token-count isolate; 20-sample internal median
+M34816_K5120_N5909,g8t0,B,8748.879,token-count isolate; 20-sample internal median
+M34816_K5120_N5909,base,A2,9771.832,token-count isolate; 20-sample internal median
+M17408_K5120_N5909,base,A1,4446.528,daemon-shape rig; 20-sample internal median
+M17408_K5120_N5909,g8t0,B,4385.304,daemon-shape rig; 20-sample internal median
+M17408_K5120_N5909,base,A2,4441.149,daemon-shape rig; 20-sample internal median

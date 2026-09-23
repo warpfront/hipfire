@@ -4971,10 +4971,17 @@ impl Gpu {
             &r0 as *const _ as *mut c_void,
             &nt as *const _ as *mut c_void,
         ];
+        let gdn_dedup = std::env::var("HIPFIRE_GDN_DEDUP")
+            .is_ok_and(|value| value == "1");
+        let (scan_grid, scan_block) = if gdn_dedup {
+            ([1, 48, 1], [512, 1, 1])
+        } else {
+            ([2, 48, 1], [256, 1, 1])
+        };
         self.launch_maybe_blob(
             SCAN_MODULE,
-            [2, 48, 1],
-            [256, 1, 1],
+            scan_grid,
+            scan_block,
             0,
             &mut scan_params,
             || {

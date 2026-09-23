@@ -1195,12 +1195,24 @@ impl Engine {
 
 impl Drop for EngineInner {
     fn drop(&mut self) {
-        // EngineInner is dropped exactly once after every Engine clone is gone.
-        if let Ok(mut child) = self.child.lock() {
+        // Profilers need the daemon to exit normally so they can drain and
+        // materialize trace/ATT output. This is an instrumented-run escape
+        // hatch; ordinary clients retain the hard-kill lifecycle.
+        let graceful = std::env::var("HIPFIRE_PROFILE_GRACEFUL")
+            .is_ok_and(|value| value == "1");
+        if graceful {
+            if let Ok(mut stdin) = self.stdin.lock() {
+                let _ = stdin.write_all(b"{\"type\":\"shutdown\"}\n");
+                let _ = stdin.flush();
+            }
+            if let Ok(mut child) = self.child.lock() {
+                let _ = child.wait();
+            }
+        } else if let Ok(mut child) = self.child.lock() {
             let _ = child.kill();
             let _ = child.wait();
         }
-        // Dispatch thread will exit on EOF; we don't join to avoid blocking drop.
+        // Dispatch thread exits on EOF; do not join from drop.
     }
 }
 

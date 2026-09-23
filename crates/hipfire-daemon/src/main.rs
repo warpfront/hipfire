@@ -948,6 +948,7 @@ fn main() {
         tracing::debug!("daemon command received");
 
         match msg_type {
+            "shutdown" => break,
             "configure" => {
                 emit_uncorrelated_error(
                     &mut stdout,

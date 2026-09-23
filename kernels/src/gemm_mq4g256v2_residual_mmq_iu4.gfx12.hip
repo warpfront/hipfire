@@ -142,6 +142,38 @@
 #ifndef IU4_WAVES
 #define IU4_WAVES 8
 #endif
+// Rasterization swizzle (sweep lever 1): grouped blockIdx remap. 0 = legacy
+// direct map (rs = blockIdx.x * IU4_BN, bs = blockIdx.y * IU4_BM). N > 0 =
+// G consecutive M-tiles share one N-tile window: bid = y*gx + x maps to
+// n = (bid / G) % num_n, m = (bid / (G*num_n)) * G + (bid % G), so each
+// window of G consecutive blocks reuses one activation (A) slab across the
+// M-tiles. IU4_SWIZZLE_T = 1 transposes the grouping (G consecutive N-tiles
+// share one M-tile window, reusing one weight (W) slab). Bit-identical: only
+// which workgroup computes which tile changes.
+#ifndef IU4_SWIZZLE_G
+#define IU4_SWIZZLE_G 0
+#endif
+#ifndef IU4_SWIZZLE_T
+#define IU4_SWIZZLE_T 0
+#endif
+// Per-operand cache policy (sweep lever 2): raw-buffer TH/SCOPE immediates
+// for activation (A: Xq nibble b64) vs weight (W: nibble b64 + header b32)
+// loads. 0 (default) = plain global loads (shipped behavior). Nonzero =
+// gfx12 TH/SCOPE aux: 16 TH_RT+SCOPE_DEV, 18 TH_HT+SCOPE_DEV,
+// 20 TH_NT_RT+SCOPE_DEV, 22 TH_NT_HT+SCOPE_DEV. DS/metadata and Y traffic
+// are always plain and untouched.
+#ifndef IU4_A_CPOL
+#define IU4_A_CPOL 0
+#endif
+#ifndef IU4_W_CPOL
+#define IU4_W_CPOL 0
+#endif
+#if IU4_A_CPOL != 0
+// (Activation load helper is defined below after the u32x2_t typedef.)
+#endif
+#if IU4_W_CPOL != 0
+// (Weight load helpers are defined below after the u32x2_t typedef.)
+#endif
 #define IU4_NTHREADS (IU4_WAVES * 32)
 // Fragment-order slab: each 64-K slab (IU4_BK nibbles/row) holds 8 row/token
 // groups of 16 x 2 K32 steps = 16 fragments of 256 contiguous bytes
@@ -177,6 +209,39 @@ typedef float   __attribute__((ext_vector_type(8)))  float8_t;
 // note at the K-loop top). Ext-vector so global/LDS accesses codegen to
 // single b64 instructions with elementwise branch-free selects.
 typedef unsigned __attribute__((ext_vector_type(2))) u32x2_t;
+#if IU4_A_CPOL != 0
+static __device__ __forceinline__ u32x2_t iu4_a_load_b64(
+    const char* __restrict__ base, unsigned byte_offset) {
+    const auto rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<char*>(base), 0, 0xffffffffu, 0x31004000u);
+    return __builtin_amdgcn_raw_buffer_load_b64(
+        rsrc, byte_offset, 0, IU4_A_CPOL);
+}
+#define IU4_A_LOAD_B64(base, byte_offset) iu4_a_load_b64((base), (byte_offset))
+#else
+#define IU4_A_LOAD_B64(base, byte_offset) (*(const u32x2_t*)((base) + (byte_offset)))
+#endif
+#if IU4_W_CPOL != 0
+static __device__ __forceinline__ u32x2_t iu4_w_load_b64(
+    const char* __restrict__ base, unsigned byte_offset) {
+    const auto rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<char*>(base), 0, 0xffffffffu, 0x31004000u);
+    return __builtin_amdgcn_raw_buffer_load_b64(
+        rsrc, byte_offset, 0, IU4_W_CPOL);
+}
+static __device__ __forceinline__ unsigned iu4_w_load_b32(
+    const char* __restrict__ base, unsigned byte_offset) {
+    const auto rsrc = __builtin_amdgcn_make_buffer_rsrc(
+        const_cast<char*>(base), 0, 0xffffffffu, 0x31004000u);
+    return __builtin_amdgcn_raw_buffer_load_b32(
+        rsrc, byte_offset, 0, IU4_W_CPOL);
+}
+#define IU4_W_LOAD_B64(base, byte_offset) iu4_w_load_b64((base), (byte_offset))
+#define IU4_W_LOAD_B32(base, byte_offset) iu4_w_load_b32((base), (byte_offset))
+#else
+#define IU4_W_LOAD_B64(base, byte_offset) (*(const u32x2_t*)((base) + (byte_offset)))
+#define IU4_W_LOAD_B32(base, byte_offset) (*(const unsigned*)((base) + (byte_offset)))
+#endif
 // IU4_FOLD_RN — W4.0/LF.0 bit-exact fold pin, shared with the gfx11 iu4
 // kernel. Every output element folds one int32 WMMA result C through EXACTLY
 // this DAG:
@@ -280,8 +345,35 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     const int tid = threadIdx.x;
     const int wave = tid >> 5;
     const int lane = tid & 31;
-    const int rs = blockIdx.x * IU4_BN;
-    const int bs = blockIdx.y * IU4_BM;
+    int rs = blockIdx.x * IU4_BN;
+    int bs = blockIdx.y * IU4_BM;
+#if IU4_SWIZZLE_G != 0
+    {
+        const int num_m = (M + IU4_BN - 1) / IU4_BN;
+        const int num_n = (N + IU4_BM - 1) / IU4_BM;
+        // The grouped map is bijective only when the grouped dimension
+        // divides evenly (T=0: row tiles % G; T=1: token tiles % G).
+        // Otherwise keep the direct map (uniform branch: num_m/num_n are
+        // kernel-uniform, so no divergence). Bit-identical either way.
+        #if IU4_SWIZZLE_T == 0
+        const bool use_swz = (num_m % IU4_SWIZZLE_G) == 0;
+        #else
+        const bool use_swz = (num_n % IU4_SWIZZLE_G) == 0;
+        #endif
+        if (use_swz) {
+            const int bid = blockIdx.y * gridDim.x + blockIdx.x;
+            #if IU4_SWIZZLE_T == 0
+            const int n_t = (bid / IU4_SWIZZLE_G) % num_n;
+            const int m_t = (bid / (IU4_SWIZZLE_G * num_n)) * IU4_SWIZZLE_G + (bid % IU4_SWIZZLE_G);
+            #else
+            const int m_t = (bid / IU4_SWIZZLE_G) % num_m;
+            const int n_t = (bid / (IU4_SWIZZLE_G * num_m)) * IU4_SWIZZLE_G + (bid % IU4_SWIZZLE_G);
+            #endif
+            rs = m_t * IU4_BN;
+            bs = n_t * IU4_BM;
+        }
+    }
+#endif
 
     if (rs >= M || bs >= N) return;
 
@@ -391,7 +483,6 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     // DS plane at fold time (same f32/i32 values, same DAG order) instead of
     // being held in td_x/ts_x across compute: frees 8 VGPRs in the hot
     // compute+staging window. DS-next staging still waits for the fold.
-
     // --- Prologue: DS[0] + SZ[0] + slab 0 of block 0 (A plane + W0). ---
     for (int i = tid; i < IU4_BM * 2; i += IU4_NTHREADS) {
         const int tok_idx = i >> 1;
@@ -407,7 +498,8 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         const int w = i & 1;
         const int grow = rs + row_idx;
         const int src_row = (grow < M) ? grow : (M - 1);
-        const unsigned hw = *(const unsigned*)(A + (long long)src_row * groups_per_row * 136);
+        const unsigned hw = IU4_W_LOAD_B32(
+            A + (long long)src_row * groups_per_row * 136, 0);
         const float f = (w == 0)
             ? __half2float(__ushort_as_half((unsigned short)(hw & 0xFFFFu)))
             : __half2float(__ushort_as_half((unsigned short)(hw >> 16)));
@@ -419,9 +511,9 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         const char* __restrict__ wB0 = A + 8;
         #pragma unroll
         for (int r = 0; r < 2; r++) {
-            const u32x2_t av = *(const u32x2_t*)(xqB0 + st_avoff[r]);
+            const u32x2_t av = IU4_A_LOAD_B64(xqB0, st_avoff[r]);
             *(u32x2_t*)(a_lds + st_ldsoff[r]) = st_aok[r] ? av : z64;
-            *(u32x2_t*)(w_lds + st_ldsoff[r]) = *(const u32x2_t*)(wB0 + st_wvoff[r]);
+            *(u32x2_t*)(w_lds + st_ldsoff[r]) = IU4_W_LOAD_B64(wB0, st_wvoff[r]);
         }
     }
     __syncthreads();
@@ -448,8 +540,8 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 const char* __restrict__ wB1 = A + (long long)g * 136 + 8 + (long long)h * 64 + 32;
                 #pragma unroll
                 for (int r = 0; r < 2; r++) {
-                    A_pf[r] = *(const u32x2_t*)(xqB1 + st_avoff[r]);
-                    W_pf[r] = *(const u32x2_t*)(wB1 + st_wvoff[r]);
+                    A_pf[r] = IU4_A_LOAD_B64(xqB1, st_avoff[r]);
+                    W_pf[r] = IU4_W_LOAD_B64(wB1, st_wvoff[r]);
                 }
                 // No scheduling pin here: the previous trip's fold VALU must
                 // remain free to sink among this trip's WMMAs. Raw A_pf is
@@ -486,22 +578,24 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     const char* __restrict__ xq_nx = (const char*)(Xq + (long long)kb_nx * N) + 8;
                     #pragma unroll
                     for (int r = 0; r < 2; r++) {
-                        A_pf[r] = *(const u32x2_t*)(xq_nx + st_avoff[r]);
+                        A_pf[r] = IU4_A_LOAD_B64(xq_nx, st_avoff[r]);
                     }
                     const int g_nx = g + h;
                     const int h_nx = h ^ 1;
                     const char* __restrict__ w_nx = A + (long long)g_nx * 136 + 8 + (long long)h_nx * 64;
                     #pragma unroll
                     for (int r = 0; r < 2; r++) {
-                        W_pf[r] = *(const u32x2_t*)(w_nx + st_wvoff[r]);
+                        W_pf[r] = IU4_W_LOAD_B64(w_nx, st_wvoff[r]);
                     }
                     const int tok_ds = bs + (tid >> 1);
                     const int tok_dsc = (tok_ds < N) ? tok_ds : (N - 1);
                     ds_nx = ((const unsigned*)(Xq + (long long)kb_nx * N + tok_dsc))[tid & 1];
                     const int row_sz = rs + (tid >> 1);
                     const int src_sz = (row_sz < M) ? row_sz : (M - 1);
-                    sz_nx = *(const unsigned*)(A + (long long)src_sz * groups_per_row * 136
-                        + g_nx * 136 + h_nx * 4);
+                    sz_nx = IU4_W_LOAD_B32(
+                        A + (long long)src_sz * groups_per_row * 136
+                            + g_nx * 136 + h_nx * 4,
+                        0);
                 }
             }
             // --- Slot 1 compute, current fold, next slot-0 publish. ---

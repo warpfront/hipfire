@@ -552,8 +552,23 @@ impl KernelCompiler {
             let mut flags = vec!["-ffp-contract=off".to_owned()];
             if arch == "gfx1201" && name == "gdn_chunk_scan" {
                 flags.push("-mcumode".to_owned());
+                if std::env::var("HIPFIRE_GDN_DEDUP").is_ok_and(|value| value == "1") {
+                    flags.push("-DHIPFIRE_GDN_DEDUP=1".to_owned());
+                }
             }
             flags
+        } else if arch == "gfx1201" && name == "gemm_mq4g256v2_residual_mmq_iu4_gfx12" {
+            let swizzle_g = if std::env::var("HIPFIRE_RASTER_G8T0")
+                .is_ok_and(|value| value == "1")
+            {
+                8
+            } else {
+                0
+            };
+            vec![
+                format!("-DIU4_SWIZZLE_G={swizzle_g}"),
+                "-DIU4_SWIZZLE_T=0".to_owned(),
+            ]
         } else if arch == "gfx1151" && gfx1151_cumode_modules.contains(name) {
             vec!["-mcumode".to_owned()]
         } else {
