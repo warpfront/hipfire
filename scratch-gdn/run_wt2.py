@@ -11,7 +11,7 @@ arch, tag = sys.argv[1:3]
 assert arch in ('gfx1100', 'gfx1151')
 assert tag in ('baseline', 'default', 'c32', 'c64')
 assert arch == 'gfx1151' or tag not in ('c32', 'c64')
-root = Path('/home/kaden/hipfire-gdnprefill')
+root = Path('/home/kaden/hipfire-gdnstack')
 out = root / 'scratch-gdn' / 'quality' / arch / tag
 out.mkdir(parents=True, exist_ok=True)
 model = '/home/kaden/.hipfire/models/qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq'
