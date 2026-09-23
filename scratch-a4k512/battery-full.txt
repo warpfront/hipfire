@@ -1,0 +1,39 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : qwen3.8:27b-mq4-xt
+  registry tag  : (none — sampling cannot be registry-resolved)
+  kv_mode       : auto [default(auto)]   kv_backend: contiguous [default(contiguous)]   mtp_mode: off   mode: battery
+  max_seq       : 32768 [default(32768)]
+  dflash        : off   draft: (none / filename auto-match)
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : (derived from --dflash/--mtp above)
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : (runtime default)
+  expert parallel: tp=1
+  seed          : None   prompt_source: (built-in battery)
+  thinking_cap  : thinking DISABLED (sentinel cap 1) [named-budget(off)]
+  reasoning_effort: auto  (parent prompt semantics; independent of cap)
+  max_tokens     : 2048 [default(2048)]  (no think block emitted)
+  sampling (what IS set):
+      temperature       = 1.0      [registry-fallback:recipe(general)]
+      top_p             = 0.95     [registry-fallback:recipe(general)]
+      top_k             = 20       [registry-fallback:recipe(general)]
+      min_p             = 0.0      [registry-fallback:recipe(general)]
+      presence_penalty  = 0.0      [registry-fallback:recipe(general)]
+  sampling (NOT set, serve/daemon default applies): repeat_penalty, reasoning_effort
+=======================================================================================
+  [serve warm; MTP head loaded lines=0]
+### RUN qwen3.8:27b-mq4-xt|off|battery  kv=auto sampling={'temperature': 1.0, 'top_p': 0.95, 'top_k': 20, 'min_p': 0.0, 'presence_penalty': 0.0} seed=None ###
+  [code]t1  finish=stop   ctx=84     cached=0      gen=305  (think 103/ans 46w) prefill=67.8ms/1239.6tok/s decode=36.4tok/s tau=None | '```python\ndef merge_sorted(a, b):\n    """Merge two sorted lists into one sorted list."""\n '
+  [reason]t2  finish=stop   ctx=95     cached=0      gen=144  (think 12/ans 79w) prefill=62.5ms/1519.0tok/s decode=36.4tok/s tau=None | 'Step 1: Find the distance for the first part of the trip.\n\nDistance = Speed × Time  \nFirst'
+  [factual]t3  finish=stop   ctx=65     cached=0      gen=199  (think 103/ans 47w) prefill=58.0ms/1120.9tok/s decode=36.5tok/s tau=None | "The seasons on Earth are caused primarily by the tilt of Earth's axis relative to its orbi"
+  [prose]t4  finish=stop   ctx=73     cached=0      gen=308  (think 169/ans 58w) prefill=57.9ms/1261.3tok/s decode=36.4tok/s tau=None | 'Old Maren found a glass bottle still sealed after the storm, its label smeared by salt. Wh'
+  [instruct]t5  finish=stop   ctx=71     cached=0      gen=123  (think 43/ans 46w) prefill=58.0ms/1223.4tok/s decode=36.5tok/s tau=None | '1. Use clear and consistent naming for variables, functions, and modules.\n2. Write small f'
+[qwen3.8:27b-mq4-xt|off|battery DONE] turns=5 runaway=0 empty=0 attractor=0 retrieval_miss=0 avg_prefill=1272.8tok/s avg_decode=36.4tok/s
+  prompt_md5=43ca0d15712d3dfb777b51ae76d8fd5f request_md5=b45624e909a1eb3f40f63272c1f41355 step=
+  prompt_md5=640e0fd4f55996cb175a422f0a12cef5 request_md5=98908f629ef79dce205ca9aea163085b step=
+  prompt_md5=8f66b4c97988825bd8e7840aaf44357e request_md5=9502b5d5a6579d96c0a00e350be5375f step=
+  prompt_md5=8fe0ad36f61bcf4992cc9df81cdf3817 request_md5=cfbd00094fb95f078fad91980cc566bf step=
+  prompt_md5=8bed8e2d056dc1d47dccae9d32dbecf4 request_md5=ae84c5a3746b4b9a8247c6601ff2687c step=
+  daemon_binary_md5=af78862f7895bc27442072e921dcf88f path=/home/kaden/ClaudeCode/warpfront/wt-a4k512/target/release/daemon
