@@ -1290,15 +1290,19 @@ impl Gpu {
             &mut po as *mut _ as *mut c_void,
         ];
         let n_pairs = (n_rot / 2) as u32;
-        let block = 32u32.min(n_pairs);
-        let grid_x = (n_pairs + block - 1) / block;
+        let (grid_x, block, shared_bytes) = if legacy {
+            let block = 32u32.min(n_pairs);
+            ((n_pairs + block - 1) / block, block, 0)
+        } else {
+            (1, 256, 2 * n_pairs * std::mem::size_of::<f32>() as u32)
+        };
         let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim) * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "rope", entry, bytes);
         let result = self.launch_maybe_blob(
             entry,
             [grid_x, batch_size as u32, 1],
             [block, 1, 1],
-            0,
+            shared_bytes,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
