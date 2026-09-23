@@ -1,0 +1,1 @@
+HIP_VISIBLE_DEVICES=0 HIP device=0 gcnArchName=gfx1100 name=AMD Radeon RX 7900 XTX
