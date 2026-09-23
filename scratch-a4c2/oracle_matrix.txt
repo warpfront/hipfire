@@ -1,0 +1,145 @@
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=5120  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=5120  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=5120  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=5120  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC       rms      K=5120  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC       rms      K=5120  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_SRC           rmsn     K=5120  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_SRC           rmsn     K=5120  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_SRC             rms      K=5120  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_SRC             rms      K=5120  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_SRC                 rmsn     K=5120  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_SRC                 rmsn     K=5120  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_SRC        rmsfold  K=5120  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_SRC        rmsfold  K=5120  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_FOLD_SRC            rmsfoldn K=5120  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_FOLD_SRC            rmsfoldn K=5120  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 23592960  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=6144  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=6144  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=6144  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=6144  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC          gated    K=6144  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC          gated    K=6144  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_SRC              gatedn   K=6144  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_SRC              gatedn   K=6144  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC       sig      K=6144  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC       sig      K=6144  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+MQ_ROTATE_X_AWQ_I4_GFX12_SRC                   rotawq   K=6144  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+MQ_ROTATE_X_AWQ_I4_GFX12_SRC                   rotawq   K=6144  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+MQ_ROTATE_X_I4_GFX12_SRC                       rot      K=6144  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+MQ_ROTATE_X_I4_GFX12_SRC                       rot      K=6144  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+MQ_ROTATE_X_AWQ_I4_SRC                         rotawq   K=6144  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+MQ_ROTATE_X_AWQ_I4_SRC                         rotawq   K=6144  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+MQ_ROTATE_X_I4_SRC                             rot      K=6144  N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+MQ_ROTATE_X_I4_SRC                             rot      K=6144  N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 28311552  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=17408 N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=17408 N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_SRC          silu     K=17408 N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_I4_GFX12_SRC          silu     K=17408 N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=17408 N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=17408 N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_SRC            siluawq  K=17408 N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_SRC            siluawq  K=17408 N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_I4_SRC                silu     K=17408 N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_I4_SRC                silu     K=17408 N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_SRC        hin      K=17408 N=8192 seed=11 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_SRC        hin      K=17408 N=8192 seed=11 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=5120  N=8192 seed=12 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 23592960; x_rot differing bytes 0 / 167772160  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=5120  N=1000 seed=13 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 2880000  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=5120  N=17   seed=14 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 48960; x_rot differing bytes 0 / 348160  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=5120  N=1    seed=15 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 2880  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=4096  N=777  seed=16 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 1790208  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=2560  N=513  seed=17 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 738720; x_rot differing bytes 0 / 5253120  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=1024  N=64   seed=18 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 36864  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=6144  N=333  seed=19 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 1150848  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=7168  N=65   seed=20 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 262080; x_rot differing bytes 0 / 1863680  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=5120  N=8192 seed=12 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 23592960; x_rot differing bytes 0 / 167772160  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=5120  N=1000 seed=13 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 2880000  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=5120  N=17   seed=14 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 48960; x_rot differing bytes 0 / 348160  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=5120  N=1    seed=15 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 2880  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=4096  N=777  seed=16 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 1790208  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=2560  N=513  seed=17 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 738720; x_rot differing bytes 0 / 5253120  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=1024  N=64   seed=18 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 36864  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=6144  N=333  seed=19 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 1150848  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC    rms      K=7168  N=65   seed=20 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 262080; x_rot differing bytes 0 / 1863680  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=5120  N=8192 seed=12 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 23592960; x_rot differing bytes 0 / 167772160  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=5120  N=1000 seed=13 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 2880000  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=5120  N=17   seed=14 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 48960; x_rot differing bytes 0 / 348160  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=5120  N=1    seed=15 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 2880  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=4096  N=777  seed=16 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 1790208  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=2560  N=513  seed=17 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 738720; x_rot differing bytes 0 / 5253120  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=1024  N=64   seed=18 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 36864  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=6144  N=333  seed=19 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 1150848  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=7168  N=65   seed=20 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 262080; x_rot differing bytes 0 / 1863680  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=5120  N=8192 seed=12 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 23592960; x_rot differing bytes 0 / 167772160  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=5120  N=1000 seed=13 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 2880000  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=5120  N=17   seed=14 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 48960; x_rot differing bytes 0 / 348160  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=5120  N=1    seed=15 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 2880  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=4096  N=777  seed=16 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 1790208  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=2560  N=513  seed=17 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 738720; x_rot differing bytes 0 / 5253120  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=1024  N=64   seed=18 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 36864  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=6144  N=333  seed=19 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 1150848  ORACLE_PASS
+FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC        rmsn     K=7168  N=65   seed=20 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 262080; x_rot differing bytes 0 / 1863680  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=6144  N=8192 seed=12 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 28311552; x_rot differing bytes 0 / 201326592  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=6144  N=1000 seed=13 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 3456000  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=6144  N=1    seed=14 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 3456  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=4096  N=513  seed=15 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 1181952; x_rot differing bytes 0 / 8404992  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=3328  N=77   seed=16 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 144144  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=512   N=64   seed=17 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 18432  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=8192  N=33   seed=18 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 152064; x_rot differing bytes 0 / 1081344  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=6144  N=8192 seed=12 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 28311552; x_rot differing bytes 0 / 201326592  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=6144  N=1000 seed=13 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 3456000  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=6144  N=1    seed=14 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 3456  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=4096  N=513  seed=15 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 1181952; x_rot differing bytes 0 / 8404992  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=3328  N=77   seed=16 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 144144  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=512   N=64   seed=17 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 18432  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC       gated    K=8192  N=33   seed=18 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 152064; x_rot differing bytes 0 / 1081344  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=6144  N=8192 seed=12 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 28311552; x_rot differing bytes 0 / 201326592  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=6144  N=1000 seed=13 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 3456000  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=6144  N=1    seed=14 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 3456  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=4096  N=513  seed=15 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 1181952; x_rot differing bytes 0 / 8404992  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=3328  N=77   seed=16 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 144144  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=512   N=64   seed=17 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 18432  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=8192  N=33   seed=18 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 152064; x_rot differing bytes 0 / 1081344  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=6144  N=8192 seed=12 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 28311552; x_rot differing bytes 0 / 201326592  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=6144  N=1000 seed=13 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 3456000  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=6144  N=1    seed=14 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 3456  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=4096  N=513  seed=15 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 1181952; x_rot differing bytes 0 / 8404992  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=3328  N=77   seed=16 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 144144  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=512   N=64   seed=17 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 18432  ORACLE_PASS
+GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC           gatedn   K=8192  N=33   seed=18 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 152064; x_rot differing bytes 0 / 1081344  ORACLE_PASS
+SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC       sig      K=6144  N=8192 seed=12 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 28311552; x_rot differing bytes 0 / 201326592  ORACLE_PASS
+SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC       sig      K=6144  N=1000 seed=13 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 3456000  ORACLE_PASS
+SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC       sig      K=6144  N=1    seed=14 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 3456  ORACLE_PASS
+SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC       sig      K=5120  N=333  seed=15 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 959040  ORACLE_PASS
+SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC       sig      K=3328  N=77   seed=16 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 144144; x_rot differing bytes 0 / 1025024  ORACLE_PASS
+SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC       sig      K=6144  N=8192 seed=12 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 28311552; x_rot differing bytes 0 / 201326592  ORACLE_PASS
+SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC       sig      K=6144  N=1000 seed=13 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 3456000  ORACLE_PASS
+SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC       sig      K=6144  N=1    seed=14 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 3456  ORACLE_PASS
+SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC       sig      K=5120  N=333  seed=15 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 959040  ORACLE_PASS
+SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GFX12_SRC       sig      K=3328  N=77   seed=16 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 144144; x_rot differing bytes 0 / 1025024  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=17408 N=8192 seed=12 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=17408 N=1000 seed=13 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 9792000; x_rot differing bytes 0 / 69632000  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=17408 N=1    seed=14 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 9792  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=17408 N=333  seed=15 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 3260736  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=4096  N=777  seed=16 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 1790208; x_rot differing bytes 0 / 12730368  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=13824 N=65   seed=17 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 505440  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=17408 N=8192 seed=12 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=17408 N=1000 seed=13 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 9792000; x_rot differing bytes 0 / 69632000  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=17408 N=1    seed=14 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 9792  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=17408 N=333  seed=15 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 3260736  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=4096  N=777  seed=16 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 1790208; x_rot differing bytes 0 / 12730368  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC  hin      K=13824 N=65   seed=17 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 505440  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=17408 N=8192 seed=12 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=17408 N=1000 seed=13 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 9792000; x_rot differing bytes 0 / 69632000  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=17408 N=1    seed=14 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 9792  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=17408 N=333  seed=15 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 3260736  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=4096  N=777  seed=16 xrot=1 normal  | untouched blocks: 0 | i4 differing bytes 0 / 1790208; x_rot differing bytes 0 / 12730368  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=13824 N=65   seed=17 xrot=0 normal  | untouched blocks: 0 | i4 differing bytes 0 / 505440  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=17408 N=8192 seed=12 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 80216064  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=17408 N=1000 seed=13 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 9792000; x_rot differing bytes 0 / 69632000  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=17408 N=1    seed=14 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 9792  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=17408 N=333  seed=15 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 3260736  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=4096  N=777  seed=16 xrot=1 special | untouched blocks: 0 | i4 differing bytes 0 / 1790208; x_rot differing bytes 0 / 12730368  ORACLE_PASS
+FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_GFX12_SRC      siluawq  K=13824 N=65   seed=17 xrot=0 special | untouched blocks: 0 | i4 differing bytes 0 / 505440  ORACLE_PASS
+ORACLE_MATRIX_PASS

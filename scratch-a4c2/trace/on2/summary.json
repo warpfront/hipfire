@@ -1,0 +1,31 @@
+{
+  "label": "on2",
+  "card": "E",
+  "bindir": "/home/kaden/ClaudeCode/warpfront/wt-a4c2/scratch-a4c2/bin/new",
+  "extra_env": {},
+  "daemon_sha256": "9b12cc55d0fd28d1aee4ee0a006e71ae9d895578d7d52b53844d9a50de00ae3c",
+  "dispatches": 3633,
+  "gpu_ms": 2045.254,
+  "wall_ms": 2088.605586,
+  "timings": {
+    "ttft_ms": 2033.3,
+    "prefill_ms": 2033.3,
+    "prefill_tok_s": 4028.9,
+    "decode_tok_s": 22.3,
+    "latency_ms": null,
+    "tau": null,
+    "cycles": null,
+    "dflash": null,
+    "mtp": null,
+    "mtp_ngram": null,
+    "ngram_mod_windows": null,
+    "ngram_mod_drafts": null,
+    "ngram_mod_accepted": null,
+    "ngram_mod_accept_rate": null,
+    "mtp_windows": null,
+    "ar_windows": null,
+    "mtp_retired": null,
+    "mtp_window_timings": null
+  },
+  "text": "A"
+}

@@ -1,0 +1,14 @@
+card-E standalone, N=8192, fresh process per (variant, producer), median of 30x20 launches; 3 interleaved rounds
+fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2 K5120: b_rtn 0.3348 / 0.3355 / 0.3352 (med 0.3352) | b_c2 0.5343 / 0.5389 / 0.5415 (med 0.5389) | n_c2 0.3346 / 0.3338 / 0.3350 (med 0.3346)
+   b_c2 - rtn = +0.2037 ms/call x 128 calls = +26.07 ms at pp8192
+   n_c2 - rtn = -0.0006 ms/call x 128 calls = -0.08 ms at pp8192
+fused_silu_mul_mq_rotate_awq_i4_hin_gfx12 K17408: b_rtn 1.1464 / 1.1473 / 1.1510 (med 1.1473) | b_c2 1.4490 / 1.4584 / 1.4635 (med 1.4584) | n_c2 1.1436 / 1.1534 / 1.1459 (med 1.1459)
+   b_c2 - rtn = +0.3111 ms/call x 64 calls = +19.91 ms at pp8192
+   n_c2 - rtn = -0.0014 ms/call x 64 calls = -0.09 ms at pp8192
+gated_norm_mq_rotate_awq_i4_gfx12_v2 K6144: b_rtn 0.7404 / 0.7422 / 0.7403 (med 0.7404) | b_c2 0.7513 / 0.7491 / 0.7505 (med 0.7505) | n_c2 0.7410 / 0.7418 / 0.7416 (med 0.7416)
+   b_c2 - rtn = +0.0101 ms/call x 48 calls = +0.48 ms at pp8192
+   n_c2 - rtn = +0.0012 ms/call x 48 calls = +0.06 ms at pp8192
+sigmoid_mul_rotate_x_mq_awq_i4_gfx12 K6144: b_rtn 0.7423 / 0.7431 / 0.7439 (med 0.7431) | b_c2 0.7455 / 0.7461 / 0.7464 (med 0.7461) | n_c2 0.7419 / 0.7420 / 0.7418 (med 0.7419)
+   b_c2 - rtn = +0.0030 ms/call x 16 calls = +0.05 ms at pp8192
+   n_c2 - rtn = -0.0012 ms/call x 16 calls = -0.02 ms at pp8192
+TOTAL pp8192 projection: c2 flag +46.52 ms, c2 new -0.13 ms

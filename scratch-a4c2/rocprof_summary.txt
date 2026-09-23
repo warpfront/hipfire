@@ -1,0 +1,17 @@
+card-E rocprof, one warmed uncached pp8192 request per fresh server (fixture pp8192.txt), kernels inside the request window
+producer           calls      off1       on1       on2      off2  base-rtn   base-c2
+RMS A4 v2            128    50.437    52.079    52.237    50.617    50.584    84.089
+SwiGLU hin_gfx12      64    73.097    73.246    73.256    73.177    73.167   105.616
+gated v2              48    35.869    35.927    35.902    35.858    35.838    37.673
+sigmoid               16    11.293    11.294    11.317    11.295    11.321    11.798
+4 producers                170.696   172.546   172.712   170.947   170.910   239.176
+GPU total                 2040.318  2039.998  2045.254  2050.570  2048.540  2112.851
+dispatches                    3633      3633      3633      3633      3633      3633
+text                           'A'       'A'       'A'       'A'       'A'       'A'
+
+new binary, same process pairs ABBA: producers off mean 170.822 ms, on mean 172.629 ms, delta +1.807 ms
+  RMS A4 v2          off   50.527  on   52.158  delta  +1.631  | base rtn   50.584  base c2 flag   84.089  flag delta +33.505
+  SwiGLU hin_gfx12   off   73.137  on   73.251  delta  +0.114  | base rtn   73.167  base c2 flag  105.616  flag delta +32.449
+  gated v2           off   35.864  on   35.915  delta  +0.051  | base rtn   35.838  base c2 flag   37.673  flag delta  +1.835
+  sigmoid            off   11.294  on   11.306  delta  +0.011  | base rtn   11.321  base c2 flag   11.798  flag delta  +0.477
+base binary flag delta (4 producers): +68.266 ms
