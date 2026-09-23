@@ -5455,9 +5455,15 @@ fn handle_main_quant(
                         }
                     }
                 } else if flags.use_hfq6 {
-                    // HFQ6-G256: all weights 6-bit, embeddings Q8
-                    if is_embed {
-                        let q = quantize_q8f16(&f32_data);
+                        } else if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            let q = quantize_hfq4g128_2d(&f32_data, m, k);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        } else {
+                            let q = quantize_hfq4g128(&f32_data);
+                            (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                        }
                         (q, QuantType::Q8F16, 32u32, "Q8_F16")
                     } else {
                         let q = quantize_hfq6g256(&f32_data);
