@@ -31675,10 +31675,12 @@ impl Gpu {
     /// 16-row granularity, weights untouched) and its epilogue stores
     /// h = silu(gate)*up to `h` (FP32 [N][M]) instead of the two streams.
     /// Fires only where both projections would run that GEMM v2 tile on their
-    /// own ([`Self::iu4_v2_tile`]); returns `Ok(false)` without launching
-    /// otherwise. Each g and u is folded exactly as by the SET entry, and
-    /// [`Self::fused_silu_hin_rotate_mq_i4_batched`] then reproduces
-    /// `fused_silu_mul_mq_rotate_awq_i4` bit-for-bit.
+    /// own ([`Self::iu4_v2_tile`]), or on exact gfx1201 the symmetric gfx12
+    /// SET tile ([`Self::gemm_gate_up_silu_mq4g256v2_iu4_gfx12`]); returns
+    /// `Ok(false)` without launching otherwise. Each g and u is folded exactly
+    /// as by the SET entry, and [`Self::fused_silu_hin_rotate_mq_i4_batched`]
+    /// then reproduces `fused_silu_mul_mq_rotate_awq_i4` (`_gfx12`)
+    /// bit-for-bit.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_gate_up_silu_mq4g256v2_iu4_prepared(
         &mut self,
@@ -31695,6 +31697,11 @@ impl Gpu {
             || hipfire_config::developer_var("HIPFIRE_F1LITE").as_deref() == Ok("0")
         {
             return Ok(false);
+        }
+        if self.arch == "gfx1201" {
+            return self.gemm_gate_up_silu_mq4g256v2_iu4_gfx12(
+                a_gate, a_up, prepared, h, gate_m, k, batch_size,
+            );
         }
         let Some(tile) = self.iu4_v2_tile(gate_m, k, batch_size) else {
             return Ok(false);
@@ -31740,6 +31747,86 @@ impl Gpu {
             [(batch_size / t) as u32, (2 * gate_m / t) as u32, 1],
             [32, tile.waves(), 1],
             tile.lds_bytes(),
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(g_ptr);
+                b.push_ptr(u_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(h_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
+    }
+
+    /// F1-lite on exact gfx1201: `gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold`
+    /// in the production symmetric gfx12 iu4 module, i.e. the SET tile (128
+    /// virtual rows x 128 tokens, 8 waves, 20480 B LDS) with gate/up 16-row
+    /// groups interleaved by address and an h epilogue. Requires the SET's
+    /// symmetric route and gate_m % 128 == 0 (whole h tiles, and an even
+    /// row-tile count for the kernel's two-group raster, which keeps each
+    /// group's weights cache-resident like one SET's); partial N tiles are
+    /// guarded in-kernel exactly like the SET's. `Ok(false)` otherwise.
+    #[allow(clippy::too_many_arguments)]
+    fn gemm_gate_up_silu_mq4g256v2_iu4_gfx12(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        h: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<bool> {
+        if !self.mq4v2_symmetric
+            || hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() == Ok("0")
+            || m == 0
+            || m % 128 != 0
+            || k == 0
+            || k % 256 != 0
+            || n == 0
+        {
+            return Ok(false);
+        }
+        self.bind_thread()?;
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
+        const KERNEL: &str = "gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold";
+        self.ensure_kernel(
+            "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold",
+            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC,
+            KERNEL,
+        )?;
+        let mut g_ptr = a_gate.buf.as_ptr();
+        let mut u_ptr = a_up.buf.as_ptr();
+        let mut xq_ptr = xq;
+        let mut h_ptr = h.buf.as_ptr();
+        let mut m_val = m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut g_ptr as *mut _ as *mut c_void,
+            &mut u_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut h_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let bytes = 2 * m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
+        // Virtual (gate/up interleaved) row tile on x, token tile on y, as the SET.
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [(2 * m / 128) as u32, n.div_ceil(128) as u32, 1],
+            [256, 1, 1],
+            20480,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();

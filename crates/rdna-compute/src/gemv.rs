@@ -3860,7 +3860,9 @@ impl Gpu {
     /// AWQ twin with phase 1 reading h = silu(gate)*up (FP32 [N][K], formed
     /// by `gemm_gate_up_silu_mq4g256v2_iu4_prepared`) from one stream. Same
     /// AWQ divide, FWHT and `block_i4_128` recipe, so the sealed sidecar is
-    /// byte-identical; no f32 rotated store (emit_f32 = false).
+    /// byte-identical; no f32 rotated store (emit_f32 = false). Exact gfx1201
+    /// runs the same source under its own `_gfx12` symbol, the twin of
+    /// `fused_silu_mul_mq_rotate_awq_i4_gfx12`.
     pub fn fused_silu_hin_rotate_mq_i4_batched(
         &mut self,
         h: &GpuTensor,
@@ -3877,8 +3879,18 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        const KERNEL: &str = "fused_silu_mul_mq_rotate_awq_i4_hin";
-        self.ensure_kernel(KERNEL, kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_SRC, KERNEL)?;
+        let (source, kernel) = if self.arch == "gfx1201" {
+            (
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_GFX12_SRC,
+                "fused_silu_mul_mq_rotate_awq_i4_hin_gfx12",
+            )
+        } else {
+            (
+                kernels::FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_SRC,
+                "fused_silu_mul_mq_rotate_awq_i4_hin",
+            )
+        };
+        self.ensure_kernel(kernel, source, kernel)?;
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
         let n_groups = (k / 256) as u32;
@@ -3901,9 +3913,9 @@ impl Gpu {
             &mut nv as *mut _ as *mut c_void,
         ];
         let bytes = (k * 4 * 2 + 2 * 256 * 4 + (k / 128) * 72) * batch_size;
-        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", kernel, bytes);
         let result = self.launch_maybe_blob(
-            KERNEL,
+            kernel,
             [n_groups, batch_size as u32, 1],
             [32, 1, 1],
             0,

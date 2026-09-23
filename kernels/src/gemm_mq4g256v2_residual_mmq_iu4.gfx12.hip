@@ -297,22 +297,65 @@ static __device__ __forceinline__ void iu4_bundle(
     __builtin_amdgcn_sched_barrier(0);
 }
 
-// Shared compute body for residual / full_add / full_set. `ADD` selects
-// += (residual) vs = (set) writeback.
-template <bool ADD>
+// Shared compute body. `EPI` selects the writeback:
+//   IU4_EPI_SET / IU4_EPI_ADD: Y = / += result (full_set / full_add / residual).
+//   IU4_EPI_SILU (F1-lite gate/up): A = W_gate, U = W_up, M rows each. The grid
+//     covers 2M virtual rows; virtual 16-row group g8 of a tile holds gate
+//     (g8 even) or up (g8 odd) rows blockIdx.x*64 + 16*(g8>>1) + 0..15, so a
+//     wave's rg=0 / rg=1 accumulators are gate / up of the same 16 h rows (an
+//     address interleave; weights untouched). Every g and u folds exactly as in
+//     full_set, and Y = h [N][M] = IU4_SILU_MUL(g, u), spelled as SILU_MUL in
+//     fused_silu_mul_mq_rotate_awq.hip so the h-producer reproduces it.
+enum { IU4_EPI_SET = 0, IU4_EPI_ADD = 1, IU4_EPI_SILU = 2 };
+#define IU4_SILU_MUL(g, u) ((g) / (1.0f + expf(-(g))) * (u))
+#ifndef IU4_SILU_RGROUPS
+#define IU4_SILU_RGROUPS 2
+#endif
+template <int EPI>
 static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_body(
     const char*           __restrict__ A,   // [M × groups_per_row × 136]
+    const char*           __restrict__ U,   // SILU: W_up, same layout as A
     const block_i4_128*   __restrict__ Xq,  // [K/128 × N]
     float*                __restrict__ Y,   // [N × M] column-major
     int M, int K, int N
 ) {
+    constexpr bool ADD = EPI == IU4_EPI_ADD;
+    constexpr bool SILU = EPI == IU4_EPI_SILU;
     const int tid = threadIdx.x;
     const int wave = tid >> 5;
     const int lane = tid & 31;
-    const int rs = blockIdx.x * IU4_BN;
-    const int bs = blockIdx.y * IU4_BM;
+    int rs = blockIdx.x * IU4_BN;
+    int bs = blockIdx.y * IU4_BM;
+    if constexpr (SILU) {
+        // Raster: the fused grid streams both matrices, twice the weight
+        // bytes of one SET. Visit IU4_SILU_RGROUPS contiguous row-tile groups
+        // one after the other, each over every token tile, so a group's
+        // weights (one SET's worth for 2 groups) stay cache-resident across
+        // token tiles like the separate SETs'. Host: gridDim.x % RGROUPS == 0.
+        const int per = (int)gridDim.x / IU4_SILU_RGROUPS;
+        const int lin = (int)blockIdx.x + (int)gridDim.x * (int)blockIdx.y;
+        const int span = per * (int)gridDim.y;
+        const int grp = lin / span;
+        const int in = lin - grp * span;
+        rs = (grp * per + in % per) * IU4_BN;
+        bs = (in / per) * IU4_BM;
+    }
 
-    if (rs >= M || bs >= N) return;
+    if (rs >= (SILU ? 2 * M : M) || bs >= N) return;
+
+    // SILU: first h row of the tile. Staging W row R (= r*64 + (tid>>2)) is
+    // gate/up by bit 6 of tid and SZ row tid>>1 by bit 5: both wave-uniform,
+    // so each wave reads one of the two matrices from an SGPR base.
+    const int hs = rs >> 1;
+    const char* __restrict__ Aw = A;
+    const char* __restrict__ As = A;
+    int sz_row = 0;
+    if constexpr (SILU) {
+        static_assert(IU4_BN * 2 == IU4_NTHREADS, "one SZ word per thread");
+        Aw = __builtin_amdgcn_readfirstlane((tid >> 6) & 1) ? U : A;
+        As = __builtin_amdgcn_readfirstlane((tid >> 5) & 1) ? U : A;
+        sz_row = hs + (tid >> 6) * 16 + ((tid >> 1) & 15);
+    }
 
     const int m_lane = lane & 15;  // 0..15: row within a 16-row group
     const int k_grp  = lane >> 4;  // 0/1: which K-half this lane carries
@@ -387,10 +430,19 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         st_aok[r] = (tok_r < N) ? 1u : 0u;
         st_avoff[r] = (unsigned)tok_c * (unsigned)sizeof(block_i4_128)
             + (unsigned)(tid & 3) * 8u;
-        const int grow_r = rs + r * 64 + (tid >> 2);
-        const int src_c = (grow_r < M) ? grow_r : (M - 1);
-        st_wvoff[r] = (unsigned)src_c * (unsigned)groups_per_row * 136u
-            + (unsigned)(tid & 3) * 8u;
+        if constexpr (SILU) {
+            // Virtual row R: group R>>4 = 2r + (tid>>6) -> gate/up by bit 0,
+            // h row hs + 16*(R>>5) + (R&15).
+            const int hrow = hs + (r * 2 + (tid >> 7)) * 16 + ((tid >> 2) & 15);
+            const int src_c = (hrow < M) ? hrow : (M - 1);
+            st_wvoff[r] = (unsigned)src_c * (unsigned)groups_per_row * 136u
+                + (unsigned)(tid & 3) * 8u;
+        } else {
+            const int grow_r = rs + r * 64 + (tid >> 2);
+            const int src_c = (grow_r < M) ? grow_r : (M - 1);
+            st_wvoff[r] = (unsigned)src_c * (unsigned)groups_per_row * 136u
+                + (unsigned)(tid & 3) * 8u;
+        }
         const unsigned R = (unsigned)(r * 64 + (tid >> 2));
         const unsigned q = (unsigned)(tid & 3);
         st_ldsoff[r] = ((R >> 4) * 2u + (q >> 1)) * (unsigned)IU4_FRAG_BYTES
@@ -431,21 +483,32 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
             : 0u;
         ((unsigned*)(LDS + IU4_DS_OFF + tok_idx * 8))[w] = dw;
     }
-    for (int i = tid; i < IU4_BN * 2; i += IU4_NTHREADS) {
-        const int row_idx = i >> 1;
-        const int w = i & 1;
-        const int grow = rs + row_idx;
-        const int src_row = (grow < M) ? grow : (M - 1);
-        const unsigned hw = *(const unsigned*)(A + (long long)src_row * groups_per_row * 136);
+    if constexpr (SILU) {
+        // SZ row tid>>1 (virtual) = gate/up (bit 4) of h row sz_row.
+        const int w = tid & 1;
+        const int src_row = (sz_row < M) ? sz_row : (M - 1);
+        const unsigned hw = *(const unsigned*)(As + (long long)src_row * groups_per_row * 136);
         const float f = (w == 0)
             ? __half2float(__ushort_as_half((unsigned short)(hw & 0xFFFFu)))
             : __half2float(__ushort_as_half((unsigned short)(hw >> 16)));
-        ((float*)(LDS + IU4_SZ0_OFF + row_idx * 8))[w] = (grow < M) ? f : 0.0f;
+        ((float*)(LDS + IU4_SZ0_OFF + (tid >> 1) * 8))[w] = (sz_row < M) ? f : 0.0f;
+    } else {
+        for (int i = tid; i < IU4_BN * 2; i += IU4_NTHREADS) {
+            const int row_idx = i >> 1;
+            const int w = i & 1;
+            const int grow = rs + row_idx;
+            const int src_row = (grow < M) ? grow : (M - 1);
+            const unsigned hw = *(const unsigned*)(A + (long long)src_row * groups_per_row * 136);
+            const float f = (w == 0)
+                ? __half2float(__ushort_as_half((unsigned short)(hw & 0xFFFFu)))
+                : __half2float(__ushort_as_half((unsigned short)(hw >> 16)));
+            ((float*)(LDS + IU4_SZ0_OFF + row_idx * 8))[w] = (grow < M) ? f : 0.0f;
+        }
     }
     // Prologue slab 0 of block 0, b64-coalesced (same map as the K-loop).
     {
         const char* __restrict__ xqB0 = (const char*)Xq + 8;
-        const char* __restrict__ wB0 = A + 8;
+        const char* __restrict__ wB0 = Aw + 8;
         #pragma unroll
         for (int r = 0; r < 2; r++) {
             const u32x2_t av = *(const u32x2_t*)(xqB0 + st_avoff[r]);
@@ -475,7 +538,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                 // Slab 1 prefetch, b64-coalesced: uniform SGPR bases carry
                 // kb/g/h, lane VGPR offsets were hoisted to kernel top.
                 const char* __restrict__ xqB1 = (const char*)(Xq + (long long)kb * N) + 8 + 32;
-                const char* __restrict__ wB1 = A + (long long)g * 136 + 8 + (long long)h * 64 + 32;
+                const char* __restrict__ wB1 = Aw + (long long)g * 136 + 8 + (long long)h * 64 + 32;
                 #pragma unroll
                 for (int r = 0; r < 2; r++) {
                     A_pf[r] = *(const u32x2_t*)(xqB1 + st_avoff[r]);
@@ -521,7 +584,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     }
                     const int g_nx = g + h;
                     const int h_nx = h ^ 1;
-                    const char* __restrict__ w_nx = A + (long long)g_nx * 136 + 8 + (long long)h_nx * 64;
+                    const char* __restrict__ w_nx = Aw + (long long)g_nx * 136 + 8 + (long long)h_nx * 64;
                     #pragma unroll
                     for (int r = 0; r < 2; r++) {
                         W_pf[r] = iu4_weight_staging_word(
@@ -530,10 +593,16 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     const int tok_ds = bs + (tid >> 1);
                     const int tok_dsc = (tok_ds < N) ? tok_ds : (N - 1);
                     ds_nx = ((const unsigned*)(Xq + (long long)kb_nx * N + tok_dsc))[tid & 1];
-                    const int row_sz = rs + (tid >> 1);
-                    const int src_sz = (row_sz < M) ? row_sz : (M - 1);
-                    sz_nx = *(const unsigned*)(A + (long long)src_sz * groups_per_row * 136
-                        + g_nx * 136 + h_nx * 4);
+                    if constexpr (SILU) {
+                        const int src_sz = (sz_row < M) ? sz_row : (M - 1);
+                        sz_nx = *(const unsigned*)(As + (long long)src_sz * groups_per_row * 136
+                            + g_nx * 136 + h_nx * 4);
+                    } else {
+                        const int row_sz = rs + (tid >> 1);
+                        const int src_sz = (row_sz < M) ? row_sz : (M - 1);
+                        sz_nx = *(const unsigned*)(A + (long long)src_sz * groups_per_row * 136
+                            + g_nx * 136 + h_nx * 4);
+                    }
                 }
             }
             // --- Slot 1 compute, current fold, next slot-0 publish. ---
@@ -628,7 +697,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
                     }
                     char* __restrict__ sz_n = LDS + ((h_np == 0) ? IU4_SZ0_OFF : IU4_SZ1_OFF);
                     {
-                        const int row_szp = rs + (tid >> 1);
+                        const int row_szp = SILU ? sz_row : rs + (tid >> 1);
                         const int w_szp = tid & 1;
                         const float f = (w_szp == 0)
                             ? __half2float(__ushort_as_half((unsigned short)(sz_nx & 0xFFFFu)))
@@ -654,6 +723,45 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     float* slots = (float*)LDS;
     const int store_i = tid & 15;
     const int store_x = (tid >> 4) & 15;
+    if constexpr (SILU) {
+        // Wave (wt_pair p, tok_half t) holds gate (rg 0) and up (rg 1) of h
+        // rows hs + 16p + 8*k_grp + j. Four phases (nb) of 64 h rows x 32
+        // tokens, streamed like the SET phases with h's own row stride M.
+        const unsigned h_lane_off =
+            ((unsigned)store_x * (unsigned)M + (unsigned)store_i) * sizeof(float);
+        float* const h_tile = Y + (long long)bs * M + hs;
+        const auto h_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+            h_tile, 0, 0xffffffffu, 0x31004000u);
+        const bool full_cols = bs + IU4_BM <= N;
+        #pragma unroll
+        for (int nb = 0; nb < 4; nb++) {
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                slots[(unsigned)(wave * 320 + (8 * k_grp + j) * 20 + m_lane)] =
+                    IU4_SILU_MUL(acc[nb][0][j], acc[nb][1][j]);
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int k = 0; k < 8; k++) {
+                const int p = k >> 1;
+                const int h = k & 1;
+                const int owner = (p << 1) | h;
+                const float v = slots[(unsigned)(owner * 320 + store_i * 20 + store_x)];
+                if (full_cols) {
+                    const unsigned phase_off =
+                        ((unsigned)(h * 64 + nb * 16) * (unsigned)M + (unsigned)(p * 16))
+                        * sizeof(float);
+                    __builtin_amdgcn_raw_buffer_store_b32(
+                        __builtin_bit_cast(unsigned, v), h_rsrc, h_lane_off, phase_off, 0);
+                } else {
+                    const int col = bs + h * 64 + nb * 16 + store_x;
+                    if (col < N) Y[(long long)col * M + hs + p * 16 + store_i] = v;
+                }
+            }
+            __syncthreads();
+        }
+        return;
+    }
     const unsigned store_lane_off =
         ((unsigned)store_x * (unsigned)M + (unsigned)store_i) * sizeof(float);
     float* const y_tile = Y + (long long)bs * M + rs;
@@ -739,9 +847,11 @@ void gemm_mq4g256v2_residual_mmq_iu4(
     int M, int K, int N, int add
 ) {
     if (add) {
-        gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<true>(A, Xq, Y, M, K, N);
+        gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<IU4_EPI_ADD>(
+            A, nullptr, Xq, Y, M, K, N);
     } else {
-        gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<false>(A, Xq, Y, M, K, N);
+        gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<IU4_EPI_SET>(
+            A, nullptr, Xq, Y, M, K, N);
     }
 }
 
@@ -752,7 +862,8 @@ void gemm_mq4g256v2_residual_mmq_iu4_full_add(
     float*                __restrict__ Y,
     int M, int K, int N, int
 ) {
-    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<true>(A, Xq, Y, M, K, N);
+    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<IU4_EPI_ADD>(
+        A, nullptr, Xq, Y, M, K, N);
 }
 
 extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
@@ -762,8 +873,25 @@ void gemm_mq4g256v2_residual_mmq_iu4_full_set(
     float*                __restrict__ Y,
     int M, int K, int N, int
 ) {
-    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<false>(A, Xq, Y, M, K, N);
+    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<IU4_EPI_SET>(
+        A, nullptr, Xq, Y, M, K, N);
 }
+
+// F1-lite gate/up SwiGLU: G/U = gate/up MQ4V2 rows (M each, M % 64 == 0),
+// H = h [N][M]. Grid [2M/128, ceil(N/128)], block [256], LDS 20480.
+extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
+void gemm_mq4g256v2_gate_up_silu_mmq_iu4(
+    const char*           __restrict__ G,
+    const char*           __restrict__ U,
+    const block_i4_128*   __restrict__ Xq,
+    float*                __restrict__ H,
+    int M, int K, int N
+) {
+    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<IU4_EPI_SILU>(
+        G, U, Xq, H, M, K, N);
+}
+
+#undef IU4_SILU_MUL
 
 #else
 
@@ -779,6 +907,10 @@ extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_add(
 
 extern "C" __global__ void gemm_mq4g256v2_residual_mmq_iu4_full_set(
     const char*, const void*, float*, int, int, int, int
+) {}
+
+extern "C" __global__ void gemm_mq4g256v2_gate_up_silu_mmq_iu4(
+    const char*, const char*, const void*, float*, int, int, int
 ) {}
 
 #endif

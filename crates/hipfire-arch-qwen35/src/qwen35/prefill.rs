@@ -109,10 +109,11 @@ fn try_iu4_silu_prepared(
 /// F1-lite: true when this FFN may fold SwiGLU into the gate/up GEMM, i.e.
 /// the down projection would take the AWQ IU4 SwiGLU producer
 /// ([`try_iu4_silu_prepared`] with an AWQ scale: uniform MQ4G256V2, `Residual`
-/// epilogue, no S4 f16 route, portable gfx11 sidecar live) and gate/up are
+/// epilogue, no S4 f16 route, portable gfx11 sidecar live; or on exact
+/// gfx1201 [`try_gfx12_silu_quant_fused_prepared`]'s AWQ twin) and gate/up are
 /// MQ4G256V2 of equal shape. Decided once per FFN, before gate/up; the gate/up
 /// hook then reports whether it actually emitted h
-/// (`Gpu::gemm_gate_up_silu_mq4g256v2_iu4_prepared` adds the GEMM v2 tile
+/// (`Gpu::gemm_gate_up_silu_mq4g256v2_iu4_prepared` adds the per-arch tile
 /// rule and `HIPFIRE_F1LITE`).
 #[allow(clippy::too_many_arguments)]
 fn f1lite_ffn_eligible(
@@ -135,7 +136,8 @@ fn f1lite_ffn_eligible(
         && w_down.k == hidden_dim
         && matches!(epilogue, BatchEpilogue::Residual)
         && !s4_residual_fast(gpu, fusion, w_down.gpu_dtype, epilogue, n)
-        && gpu.iu4_producer_sidecar_active(n, hidden_dim)
+        && (gpu.iu4_producer_sidecar_active(n, hidden_dim)
+            || gpu.iu4_silu_quant_fused_active(n, hidden_dim))
 }
 
 /// F1-lite: AWQ IU4 producer for w_down reading h = silu(gate)*up, already
