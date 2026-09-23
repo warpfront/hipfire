@@ -35,23 +35,6 @@
 // result VGPR j of lane (hi, lr) is output (row 8*hi + j, token lr): each lane
 // owns 8 contiguous rows (two b128 Y accesses per fragment). Y is token-major
 // [N][M].
-//
-// ADD_TOUCH (the `_add_touch` entry, gfx1100 `HIPFIRE_V2C_ADDEPI`): the ADD
-// epilogue's residual read stalls every CTA after its K loop. Starting
-// TOUCH_LEAD epochs before the end, each thread loads one dword of one 64-byte
-// line of its tile's residual per epoch (128 tokens x 512 B = 1024 lines, four
-// per thread, so epochs E-16..E-13) ahead of the staging packet, so the
-// epilogue's loads hit cache. Touch values are discarded; outputs are
-// byte-identical to `_add`.
-//
-// F1-lite gate/up SwiGLU entry (`gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11`):
-// A = W_gate and U = W_up, both M rows; the CTA grid covers 2M virtual rows
-// in which tile fragment 2p is gate rows 16p..16p+15 of the tile's M/2-row
-// window and fragment 2p+1 the same up rows (a load-time address interleave;
-// the weights are not moved). Every g and u is folded exactly as by the SET
-// entry, and the epilogue stores h = SILU_MUL(g, u) to Y [N][M], spelled as in
-// fused_silu_mul_mq_rotate_awq.hip, so the h-producer
-// (`fused_silu_mul_mq_rotate_awq_i4_hin`) reproduces that producer bit-for-bit.
 
 #include <hip/hip_runtime.h>
 #include <hip/hip_fp16.h>
@@ -139,24 +122,10 @@ static __device__ __forceinline__ void stage_store(const Stage& st, char* slot,
     for (int i = 0; i < SX; ++i) *(v2i*)(slot + A_BYTES + lds_off + i * 256) = st.x[i];
 }
 
-#define IU4_V2C_SILU_MUL(g, u) ((g) / (1.0f + expf(-(g))) * (u))
-
-enum { EPI_SET = 0, EPI_ADD = 1, EPI_SILU = 2 };
-
-// Residual touch: one dword per TOUCH_LINE bytes, one line per thread per
-// epoch, starting TOUCH_LEAD epochs before the end of the K loop.
-constexpr int TOUCH_LEAD = 16;
-constexpr int TOUCH_LINE = 64;
-constexpr int TOUCH_LINES = TN * TM * 4 / TOUCH_LINE / NT;  // per thread
-static_assert(TOUCH_LINES == 4 && TOUCH_LINES <= TOUCH_LEAD, "touch schedule");
-
-template <int EPI, bool TOUCH>
+template <bool IS_ADD>
 static __device__ __forceinline__ void body(
-    const char* __restrict__ A, const char* __restrict__ U, const char* __restrict__ Xq,
+    const char* __restrict__ A, const char* __restrict__ Xq,
     float* __restrict__ Y, int M, int K, int N) {
-    constexpr bool IS_ADD = EPI == EPI_ADD;
-    constexpr bool SILU = EPI == EPI_SILU;
-    static_assert(!TOUCH || IS_ADD, "the residual touch serves the ADD epilogue");
     extern __shared__ __attribute__((aligned(16))) char lds[];
     const int lane = threadIdx.x;
     const int wave = __builtin_amdgcn_readfirstlane(threadIdx.y);
@@ -172,16 +141,9 @@ static __device__ __forceinline__ void body(
     const size_t x_epoch = (size_t)N * XBLK_BYTES;
     const char* gA = A + (size_t)row0 * row_bytes;
     const char* gX = Xq + (size_t)col0 * XBLK_BYTES;
-    // Staging ownership (tile-relative 32-bit offsets). F1: staging wave w
-    // owns tile fragment w = gate (w even) / up (w odd) rows
-    // row0/2 + 16*(w/2) + 0..15.
+    // Staging ownership (tile-relative 32-bit offsets).
     const int sr = 16 * wave + lr;
-    const char* gS = gA;
-    uint32_t a_off = (uint32_t)sr * row_bytes + 8u + 8u * (uint32_t)hi;
-    if constexpr (SILU) {
-        gS = ((wave & 1) ? U : A) + (size_t)((row0 >> 1) + 16 * (wave >> 1)) * row_bytes;
-        a_off = (uint32_t)lr * row_bytes + 8u + 8u * (uint32_t)hi;
-    }
+    const uint32_t a_off = (uint32_t)sr * row_bytes + 8u + 8u * (uint32_t)hi;
     const uint32_t x_off = (uint32_t)sr * XBLK_BYTES + 8u + 8u * (uint32_t)hi;
     const uint32_t lds_off = (uint32_t)(wave * 1024 + hi * 128 + lr * 8);
     // Consumer offsets.
@@ -190,15 +152,8 @@ static __device__ __forceinline__ void body(
     const uint32_t xoff = (uint32_t)(A_BYTES + wc * 4 * 1024 + lr * 8);
     // Lane (hi, lr) holds the scale of row 8*hi + (lr&7) of fragment lr>>3,
     // so DPP row_share:(8a+j) hands every lane of half hi row 16a+8hi+j.
-    // F1: fragment lr>>3 is gate (0) / up (1) rows row0/2 + 16*wr + 8hi + j.
-    const char* gW = gA;
-    uint32_t lws =
+    const uint32_t lws =
         (uint32_t)(wr * WAVE_ROWS + 16 * (lr >> 3) + 8 * hi + (lr & 7)) * row_bytes;
-    if constexpr (SILU) {
-        gW = ((lr & 8) ? U : A) +
-             (size_t)((row0 >> 1) + wr * (WAVE_ROWS / 2) + 8 * hi + (lr & 7)) * row_bytes;
-        lws = 0;
-    }
     // Byte offsets of K128 half e inside a row: payload (a_off adds the +8
     // header skip) and its FP16 scale sc_(e&1) in the group header.
     auto a_epoch = [](int e) -> size_t {
@@ -216,18 +171,42 @@ static __device__ __forceinline__ void body(
 #pragma unroll
             for (int j = 0; j < 8; ++j) sum[a][c][j] = 0;
 
-    // Residual touch (TOUCH only): line l = tid + NT*i of the tile's residual.
-    const float* ytile_t = TOUCH ? Y + (size_t)col0 * M + row0 : nullptr;
-    auto touch_addr = [&](int i) -> const uint32_t* {
+#ifndef PF_LEAD
+#define PF_LEAD 0        // first touch epoch = E - PF_LEAD (0 = no epoch touch)
+#endif
+#ifndef PF_PER
+#define PF_PER 1         // lines touched per thread per epoch
+#endif
+#ifndef PF_LINE
+#define PF_LINE 64       // touch granularity (bytes)
+#endif
+#ifndef PF_START
+#define PF_START 0       // 1: touch the whole residual tile at kernel start
+#endif
+    // Residual touch: tile is 128 tokens x 512 B; thread t touches lines
+    // t + NT*i, one dword each; consumed after the next staging wait.
+    constexpr int PF_LINES = TN * TM * 4 / PF_LINE / NT;  // lines per thread
+    const float* ytile_pf = Y + (size_t)col0 * M + row0;
+    auto pf_addr = [&](int i) -> const uint32_t* {
         const uint32_t l = (uint32_t)(threadIdx.y * 32 + lane) + (uint32_t)NT * i;
-        const uint32_t tok = l / (TM * 4 / TOUCH_LINE), part = l % (TM * 4 / TOUCH_LINE);
-        return (const uint32_t*)((const char*)ytile_t + ((size_t)tok * M * 4 + part * TOUCH_LINE));
+        const uint32_t tok = l / (TM * 4 / PF_LINE), part = l % (TM * 4 / PF_LINE);
+        return (const uint32_t*)((const char*)ytile_pf +
+                                 ((size_t)tok * M * 4 + part * PF_LINE));
     };
-    uint32_t touch_acc = 0;
-    (void)touch_addr;
+    uint32_t pf_acc = 0;
+    (void)pf_addr;
+#if PF_START
+    if constexpr (IS_ADD) {
+        uint32_t pv[PF_LINES];
+#pragma unroll
+        for (int i = 0; i < PF_LINES; ++i) pv[i] = *pf_addr(i);
+#pragma unroll
+        for (int i = 0; i < PF_LINES; ++i) pf_acc ^= pv[i];
+    }
+#endif
 
     Stage st;
-    stage_load(st, gS + a_epoch(0), gX, a_off, x_off);
+    stage_load(st, gA + a_epoch(0), gX, a_off, x_off);
     stage_store(st, lds, lds_off);
     __syncthreads();
 
@@ -236,22 +215,29 @@ static __device__ __forceinline__ void body(
         char* slot = lds + (e & 1) * SLOT_BYTES;
         // Current-epoch metadata first (in-order vmcnt returns it before the
         // next-epoch staging packet).
-        const unsigned short wsb = *at<unsigned short>(gW + ws_epoch(e), lws);
+        const unsigned short wsb = *at<unsigned short>(gA + ws_epoch(e), lws);
         float dc[NC];
         const char* xs_e = gX + (size_t)e * x_epoch;
 #pragma unroll
         for (int c = 0; c < NC; ++c)
             dc[c] = *at<float>(xs_e, lxs + (uint32_t)(16 * c * XBLK_BYTES));
         IU4_V2C_FENCE();  // metadata requests precede the staging packet
-        // Touch loads ride ahead of the staging packet, whose wait retires
-        // them (in-order vmcnt); consumed only after that wait.
-        uint32_t touch_v = 0;
-        const int touch_i = e - (E - TOUCH_LEAD);
-        const bool touch_on = TOUCH && touch_i >= 0 && touch_i < TOUCH_LINES;
-        if (touch_on) touch_v = *touch_addr(touch_i);
+#if PF_LEAD
+        // Touch loads ride ahead of the staging packet: its wait retires them.
+        uint32_t pv[PF_PER];
+        const int pe = e - (E - PF_LEAD);
+        const bool pf_on = IS_ADD && pe >= 0 && pe * PF_PER < PF_LINES;
+        if (pf_on) {
+#pragma unroll
+            for (int i = 0; i < PF_PER; ++i) {
+                const int li = pe * PF_PER + i;
+                pv[i] = li < PF_LINES ? *pf_addr(li) : 0u;
+            }
+        }
+#endif
         if constexpr (nxt) {
             const int en = e + 1;
-            stage_load(st, gS + a_epoch(en), gX + (size_t)en * x_epoch, a_off, x_off);
+            stage_load(st, gA + a_epoch(en), gX + (size_t)en * x_epoch, a_off, x_off);
         }
         IU4_V2C_FENCE();
 
@@ -318,36 +304,18 @@ static __device__ __forceinline__ void body(
             IU4_V2C_FENCE();
         }
         if constexpr (nxt) stage_store(st, lds + ((e + 1) & 1) * SLOT_BYTES, lds_off);
-        if (touch_on) touch_acc ^= touch_v;
+#if PF_LEAD
+        if (pf_on) {
+#pragma unroll
+            for (int i = 0; i < PF_PER; ++i) pf_acc ^= pv[i];
+        }
+#endif
         __syncthreads();
     };
     for (int e = 0; e + 1 < E; ++e) epoch(std::true_type{}, e);
     epoch(std::false_type{}, E - 1);
 
-    if constexpr (SILU) {
-        // Lane owns rows 8*hi..8*hi+7 of gate fragment 2p and of up fragment
-        // 2p+1, i.e. h rows row0/2 + 16*(wr*NA/2 + p) + 8hi + 0..7, one token.
-        static_assert(NA % 2 == 0, "gate/up fragment pairs");
-        float* htile = Y + (size_t)col0 * M + (row0 >> 1);
-#pragma unroll
-        for (int c = 0; c < NC; ++c) {
-            const uint32_t hoff = ((uint32_t)(wc * 64 + 16 * c + lr) * (uint32_t)M +
-                                   (uint32_t)(wr * (WAVE_ROWS / 2) + 8 * hi)) * 4u;
-#pragma unroll
-            for (int p = 0; p < NA / 2; ++p)
-#pragma unroll
-                for (int q = 0; q < 2; ++q) {
-                    v4f h;
-#pragma unroll
-                    for (int k = 0; k < 4; ++k)
-                        h[k] = IU4_V2C_SILU_MUL(sum[2 * p][c][4 * q + k],
-                                                sum[2 * p + 1][c][4 * q + k]);
-                    *(v4f*)((char*)htile + hoff + (uint32_t)(16 * p + 4 * q) * 4u) = h;
-                }
-        }
-        return;
-    }
-    if constexpr (TOUCH) asm volatile("" ::"v"(touch_acc));
+    asm volatile("" ::"v"(pf_acc));
     // Epilogue: lane owns rows 8*hi..8*hi+7 of each fragment for one token.
     float* ytile = Y + (size_t)col0 * M + row0;
     uint32_t yoff[NC];
@@ -393,24 +361,15 @@ static __device__ __forceinline__ void body(
 
 }  // namespace iu4_v2c
 
-#define IU4_V2C_ENTRY(name, epi, touch)                                       \
+#define IU4_V2C_ENTRY(name, is_add)                                           \
     extern "C" __global__ __launch_bounds__(iu4_v2c::NT, 2) void name(        \
         const char* __restrict__ A, const char* __restrict__ Xq,              \
         float* __restrict__ Y, int M, int K, int N) {                         \
-        iu4_v2c::body<epi, touch>(A, nullptr, Xq, Y, M, K, N);                \
+        iu4_v2c::body<is_add>(A, Xq, Y, M, K, N);                             \
     }
-IU4_V2C_ENTRY(gemm_mq4g256v2_residual_iu4_v2c_set_gfx11, iu4_v2c::EPI_SET, false)
-IU4_V2C_ENTRY(gemm_mq4g256v2_residual_iu4_v2c_add_gfx11, iu4_v2c::EPI_ADD, false)
-IU4_V2C_ENTRY(gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11, iu4_v2c::EPI_ADD, true)
+IU4_V2C_ENTRY(gemm_mq4g256v2_residual_iu4_v2c_set_gfx11, false)
+IU4_V2C_ENTRY(gemm_mq4g256v2_residual_iu4_v2c_add_gfx11, true)
 #undef IU4_V2C_ENTRY
-// F1-lite: G/U = gate/up MQ4V2 rows (M each), Y = h [N][M]; grid (N/128, 2M/128).
-extern "C" __global__ __launch_bounds__(iu4_v2c::NT, 2) void
-gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11(
-    const char* __restrict__ G, const char* __restrict__ U, const char* __restrict__ Xq,
-    float* __restrict__ Y, int M, int K, int N) {
-    iu4_v2c::body<iu4_v2c::EPI_SILU, false>(G, U, Xq, Y, M, K, N);
-}
-#undef IU4_V2C_SILU_MUL
 #undef IU4_V2C_FENCE
 
 #endif

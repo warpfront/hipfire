@@ -19904,10 +19904,16 @@ impl Gpu {
         // eligibility rule and kill switches.
         let v2_tile = self.iu4_v2_tile(m, k, batch_size);
         if v2_tile == Some(Iu4V2Tile::V2c) {
-            let kernel_name = if add {
-                "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11"
-            } else {
-                "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11"
+            // ADD epilogue (`HIPFIRE_V2C_ADDEPI=0` restores the plain ADD):
+            // `_add_touch` touches the residual tile ahead of the epilogue,
+            // byte-identical to `_add`.
+            let kernel_name = match (
+                add,
+                hipfire_config::developer_var("HIPFIRE_V2C_ADDEPI").as_deref() != Ok("0"),
+            ) {
+                (false, _) => "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
+                (true, true) => "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11",
+                (true, false) => "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11",
             };
             self.ensure_kernel(
                 "gemm_mq4g256v2_residual_iu4_v2c_gfx11",
