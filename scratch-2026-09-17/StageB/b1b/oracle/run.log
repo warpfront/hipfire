@@ -1,0 +1,5 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+full64: compared=131584 mismatches=0
+oor40: compared=131584 mismatches=0
+B1b ORACLE PASS

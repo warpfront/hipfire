@@ -1,0 +1,1 @@
+{"layer":35,"n_tokens":4224,"chunk":384,"nh":24,"nkv":4,"hd":256,"qstride":4,"prompt":"range:0..4224","engine_post_gate":true,"tap_gap":2.384185791015625e-7}

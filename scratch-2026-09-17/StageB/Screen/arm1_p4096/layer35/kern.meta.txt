@@ -1,0 +1,1 @@
+layer=35 n_tokens=4224 chunk=384 nh=24 nkv=4 hd=256 prompt=range:4096..8320 engine_post_gate=true tap_gap=4.768372e-7

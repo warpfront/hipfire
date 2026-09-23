@@ -1,0 +1,44 @@
+new_k8.cu:1363:1: remark: Function Name: attention_fp8_e4m3_fa2_gqa_f16_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+ 1363 | {
+      | ^
+new_k8.cu:1363:1: remark:     TotalSGPRs: 34 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1363:1: remark:     VGPRs: 235 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1363:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1363:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1363:1: remark:     Occupancy [waves/SIMD]: 6 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1363:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1363:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1363:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1421:1: remark: Function Name: attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+ 1421 | {
+      | ^
+new_k8.cu:1421:1: remark:     TotalSGPRs: 6 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1421:1: remark:     VGPRs: 13 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1421:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1421:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1421:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1421:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1421:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1421:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1607:1: remark: Function Name: attention_fp8_e4m3_fa2_gqa_partial_f16_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+ 1607 | {
+      | ^
+new_k8.cu:1607:1: remark:     TotalSGPRs: 36 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1607:1: remark:     VGPRs: 236 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1607:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1607:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1607:1: remark:     Occupancy [waves/SIMD]: 6 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1607:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1607:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1607:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1692:1: remark: Function Name: attention_fp8_e4m3_fa2_gqa_merge_f16_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+ 1692 | {
+      | ^
+new_k8.cu:1692:1: remark:     TotalSGPRs: 10 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1692:1: remark:     VGPRs: 17 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1692:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1692:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1692:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1692:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1692:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+new_k8.cu:1692:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]

@@ -1,0 +1,55 @@
+bis_nofill.cu:1304:1: remark: Function Name: attention_fp8_e4m3_fa2_gqa_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+ 1304 | {
+      | ^
+bis_nofill.cu:1304:1: remark:     TotalSGPRs: 29 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1304:1: remark:     VGPRs: 254 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1304:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1304:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1304:1: remark:     Occupancy [waves/SIMD]: 5 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1304:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1304:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1304:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1394:1: remark: Function Name: attention_fp8_e4m3_fa2_q_preconvert_f16_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+ 1394 | {
+      | ^
+bis_nofill.cu:1394:1: remark:     TotalSGPRs: 6 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1394:1: remark:     VGPRs: 13 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1394:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1394:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1394:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1394:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1394:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1394:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1442:1: remark: Function Name: attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+ 1442 | {
+      | ^
+bis_nofill.cu:1442:1: remark:     TotalSGPRs: 14 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1442:1: remark:     VGPRs: 56 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1442:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1442:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1442:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1442:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1442:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1442:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1539:1: remark: Function Name: attention_fp8_e4m3_fa2_gqa_partial_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+ 1539 | {
+      | ^
+bis_nofill.cu:1539:1: remark:     TotalSGPRs: 32 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1539:1: remark:     VGPRs: 256 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1539:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1539:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1539:1: remark:     Occupancy [waves/SIMD]: 5 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1539:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1539:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1539:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1619:1: remark: Function Name: attention_fp8_e4m3_fa2_gqa_merge_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+ 1619 | {
+      | ^
+bis_nofill.cu:1619:1: remark:     TotalSGPRs: 10 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1619:1: remark:     VGPRs: 17 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1619:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1619:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1619:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1619:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1619:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+bis_nofill.cu:1619:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]

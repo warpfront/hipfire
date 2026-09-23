@@ -1,0 +1,1 @@
+layer=35 tokens=4224 chunk=384 nh=24 nkv=4 hd=256 fp8=false

@@ -1,0 +1,136 @@
+{
+  "scope": "Host-only layout/algebra/budget proof; no GPU, compiler, candidate implementation or performance result.",
+  "kernel_sha256": "fe542415b311d24e962bde47087ae56c6d3e10b248ebf3251086584f290a91ee",
+  "finite_codec_roundtrips": 254,
+  "layouts": [
+    {
+      "side": "K",
+      "element_bytes": 1,
+      "elements": 16384,
+      "unique": 16384
+    },
+    {
+      "side": "V",
+      "element_bytes": 1,
+      "elements": 16384,
+      "unique": 16384
+    },
+    {
+      "side": "K",
+      "element_bytes": 2,
+      "elements": 16384,
+      "unique": 16384
+    },
+    {
+      "side": "V",
+      "element_bytes": 2,
+      "elements": 16384,
+      "unique": 16384
+    }
+  ],
+  "scratch_cases": [
+    {
+      "batch": 1,
+      "splits": 1,
+      "q_and_sq_bytes": 6240,
+      "total_bytes": 7264
+    },
+    {
+      "batch": 1,
+      "splits": 8,
+      "q_and_sq_bytes": 6240,
+      "total_bytes": 14432
+    },
+    {
+      "batch": 7,
+      "splits": 1,
+      "q_and_sq_bytes": 43680,
+      "total_bytes": 44704
+    },
+    {
+      "batch": 7,
+      "splits": 8,
+      "q_and_sq_bytes": 43680,
+      "total_bytes": 51872
+    },
+    {
+      "batch": 8,
+      "splits": 1,
+      "q_and_sq_bytes": 49920,
+      "total_bytes": 50944
+    },
+    {
+      "batch": 8,
+      "splits": 8,
+      "q_and_sq_bytes": 49920,
+      "total_bytes": 58112
+    },
+    {
+      "batch": 9,
+      "splits": 1,
+      "q_and_sq_bytes": 56160,
+      "total_bytes": 58208
+    },
+    {
+      "batch": 9,
+      "splits": 8,
+      "q_and_sq_bytes": 56160,
+      "total_bytes": 72544
+    },
+    {
+      "batch": 512,
+      "splits": 1,
+      "q_and_sq_bytes": 3194880,
+      "total_bytes": 3260416
+    },
+    {
+      "batch": 512,
+      "splits": 8,
+      "q_and_sq_bytes": 3194880,
+      "total_bytes": 3719168
+    }
+  ],
+  "changing_unit_trials": 64,
+  "changing_unit_subtiles_per_trial": 17,
+  "max_f64_relative_identity_error": 2.2982278368308375e-14,
+  "qk_reference": {
+    "wmma": 64,
+    "lds": 160,
+    "address": 72,
+    "move": 69,
+    "wait": 91,
+    "delay": 39,
+    "control": 113,
+    "q_global": 16
+  },
+  "qk_unmeasured_cap": {
+    "wmma": 64,
+    "lds": 64,
+    "address": 16,
+    "move": 69,
+    "wait": 91,
+    "delay": 39,
+    "control": 113,
+    "q_global": 16
+  },
+  "new_support_unmeasured_cap_per_subtile": {
+    "scale_loads": 16,
+    "scale_widen": 16,
+    "scale_address": 8,
+    "scale_wait": 8,
+    "score_extra_mul": 8,
+    "weighted_p_mul": 8,
+    "weighted_p_max_shuffle_wait": 10,
+    "b_floor_inverse": 8,
+    "p_normalize_pack_net": 4,
+    "rho": 3,
+    "misc": 11
+  },
+  "compute_unmeasured_cap_per_wave_kt64": 2216,
+  "decode_required_speedup": 0.11314984709480114,
+  "decode_required_time_reduction": 0.10164835164835151,
+  "decode_required_ms_saved": 3.108512282824204,
+  "ag_reported_delta": 0.006996000000000002,
+  "max_fp32_ou_bound": 1.7738442822920214e+31,
+  "p_floor_rounding_bound": 1.2732925824820995e-11
+}

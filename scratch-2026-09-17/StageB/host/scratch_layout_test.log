@@ -1,0 +1,7 @@
+test scratch::scratch_growth_tests::fa2_fp8_q_layout_aligned_and_disjoint ... ok
+test scratch::scratch_growth_tests::invalidation_contract ... ok
+test scratch::scratch_growth_tests::needed_helpers_match_slot_geometry ... ok
+test scratch::scratch_growth_tests::will_grow_matches_replacement_condition ... ok
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 255 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 0.00s

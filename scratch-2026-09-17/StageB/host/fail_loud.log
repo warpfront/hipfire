@@ -1,0 +1,4 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+route-Q error: HipError { code: 500, message: "hipModuleGetFunction failed for symbol \"attention_q8_0_fa2_q_preconvert_fp8_gfx1201\" in module \"attention_q8_0_fa2_gqa_fp8_gfx1201\": HipError(500): hipModuleGetFunction: named symbol not found (hipError=500)", context: None }
+route-N error: HipError { code: 500, message: "hipModuleGetFunction failed for symbol \"attention_fp8_e4m3_fa2_gqa_gfx1201\" in module \"attention_fp8_e4m3_fa2_gqa_gfx1201\": HipError(500): hipModuleGetFunction: named symbol not found (hipError=500)", context: None }

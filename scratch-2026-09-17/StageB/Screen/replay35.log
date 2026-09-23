@@ -1,0 +1,35 @@
+codec self-test OK (e4m3 grid, native §2 + route-Q §2.3 scale rules, subnormal floors, nonfinite rejection)
+edge-case self-test OK (masked/single-key/rho-sweep/floor-bound/subnormal round-trip)
+--- replay scratch-2026-09-17/StageB/Screen/dump35/layer35 (layer 35) ---
+tap census K: n=4325376 amax=1.958445e1 p99.9=7.370323e0 p99=4.797071e0 | clipped-to-zero 63/4325376=0.0015% subnormal 596/4325376=0.0138%
+tap census V: n=4325376 amax=3.733895e1 p99.9=6.556056e0 p99=3.420186e0 | clipped-to-zero 35/4325376=0.0008% subnormal 577/4325376=0.0133%
+CPU screen L=35 N=4224 queries=96 (stride 4) x 24 heads x up to 4224 keys x 256 dims
+route-Q s_row range over 4224 rows x 4 heads: [3.881e-3, 8.337e-2] (f16 grid, 448*s covers amax_row per-row asserted)
+CPU math done in 484.2s
+self-check B (CPU-q8ref O vs kernel differential, pre-gate): max-abs=9.538e-4
+|O_ref|: p99 threshold T=2.338883e0, max=1.087724e1
+
+=== stage-b screen: L=35 N=4224 queries=96 heads=24 hd=256 p99(|O|)=2.3389e0 ===
+--- per-arm vs ARM 1 (kernel q8/f16 differential, pre-gate) ---
+arm             max-abs      tail-1%  note
+arm2           9.538e-4     1.207e-5  cpu-q8ref vs arm1 (self-check-B mate)
+arm3           7.964e-1     1.939e-2  Q0 format-only (the Q0 predictor)
+arm4            1.916e0     3.179e-2  fp8-QK + exact weighted PV
+arm5            1.915e0     3.209e-2  full stage-b route N (changing-unit O)
+arm6            2.042e0     3.301e-2  full stage-b route Q (changing-unit O)
+--- per-arm vs EXACT (f64 reference) ---
+arm             max-abs      tail-1%  note
+arm1           2.205e-1     3.369e-3  arm1 production gap (kernel vs exact)
+arm2           2.207e-1     3.368e-3  cpu-q8ref
+arm3           6.149e-1     1.889e-2  Q0
+arm4            1.999e0     3.122e-2  qkdiag
+arm5            1.999e0     3.151e-2  stageb-N
+arm6            2.040e0     3.305e-2  stageb-Q
+
+score max|Δ| vs exact: q0=3.341e-1 qk=4.373e-1 sb=4.373e-1 rq=4.544e-1
+P underflow route N (arm5, valid keys): 1838/9287424 = 0.0198% entries, lost mass 0.0000%
+P underflow route Q (arm6, valid keys): 1853/9287424 = 0.0200% entries, lost mass 0.0000%
+true-f32-exp zeros: 0; (q,h) with all-zero V codes: 0
+STOP GATE (plan §8.1/§11: underflow <= 0.1% of positive valid weighted entries, per route): N=PASS Q=PASS
+engine buffer: POST-gate (CPU O gated-iff compared)
+worst sampled queries (final-chunk row:max-abs): 116:1.999e0 368:1.889e0 64:1.758e0

@@ -1,0 +1,2 @@
+#define HIPFIRE_FA2_FP8 1
+#define HIPFIRE_FA2_KMODE 8

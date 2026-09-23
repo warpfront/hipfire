@@ -1,0 +1,40 @@
+  [warn] registry has no recommended_settings for tag None — falling back to recipe(general). Pass --tag <registry-tag> or --sampling explicitly to pin it.
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : qwen3.8:27b-mq4-xt
+  registry tag  : (none — sampling cannot be registry-resolved)
+  kv_mode       : fp8 [explicit(--kv)]   kv_backend: contiguous [default(contiguous)]   mtp_mode: off   mode: battery
+  max_seq       : 32768 [default(32768)]
+  dflash        : off   draft: (none / filename auto-match)
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : (derived from --dflash/--mtp above)
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : 1
+  expert parallel: tp=1
+  seed          : None   prompt_source: (built-in battery)
+  thinking_cap  : thinking DISABLED (sentinel cap 1) [named-budget(off)]
+  reasoning_effort: auto  (parent prompt semantics; independent of cap)
+  max_tokens     : 2048 [default(2048)]  (no think block emitted)
+  sampling (what IS set):
+      temperature       = 1.0      [registry-fallback:recipe(general)]
+      top_p             = 0.95     [registry-fallback:recipe(general)]
+      top_k             = 20       [registry-fallback:recipe(general)]
+      min_p             = 0.0      [registry-fallback:recipe(general)]
+      presence_penalty  = 0.0      [registry-fallback:recipe(general)]
+  sampling (NOT set, serve/daemon default applies): repeat_penalty, reasoning_effort
+=======================================================================================
+  [serve warm; MTP head loaded lines=0]
+### RUN qwen3.8:27b-mq4-xt|off|battery  kv=fp8 sampling={'temperature': 1.0, 'top_p': 0.95, 'top_k': 20, 'min_p': 0.0, 'presence_penalty': 0.0} seed=None ###
+  [code]t1  finish=stop   ctx=84     cached=0      gen=183  (think 49/ans 46w) prefill=155.1ms/541.5tok/s decode=36.4tok/s tau=None | '```python\ndef merge_sorted(a, b):\n    """Merge two sorted lists into one sorted list."""\n '
+  [reason]t2  finish=stop   ctx=95     cached=0      gen=164  (think 25/ans 42w) prefill=154.7ms/614.1tok/s decode=36.4tok/s tau=None | '1. First part: \\(60 \\text{ mph} \\times 2.5 \\text{ hours} = 150 \\text{ miles}\\)\n2. Second p'
+  [factual]t3  finish=stop   ctx=65     cached=0      gen=176  (think 87/ans 44w) prefill=129.0ms/504.0tok/s decode=36.4tok/s tau=None | "Seasons are caused mainly by the tilt of Earth's axis relative to its orbital plane. As Ea"
+  [prose]t4  finish=stop   ctx=73     cached=0      gen=268  (think 128/ans 60w) prefill=133.6ms/546.6tok/s decode=36.4tok/s tau=None | 'When the storm receded, old Elias found a brass key half-buried in the wet rocks. It bore '
+  [instruct]t5  finish=stop   ctx=71     cached=0      gen=119  (think 35/ans 50w) prefill=132.9ms/534.3tok/s decode=36.4tok/s tau=None | '1. Use clear, descriptive names for variables, functions, and modules.\n2. Keep functions s'
+[qwen3.8:27b-mq4-xt|off|battery DONE] turns=5 runaway=0 empty=0 attractor=0 retrieval_miss=0 avg_prefill=548.1tok/s avg_decode=36.4tok/s
+  prompt_md5=43ca0d15712d3dfb777b51ae76d8fd5f request_md5=b45624e909a1eb3f40f63272c1f41355 step=
+  prompt_md5=640e0fd4f55996cb175a422f0a12cef5 request_md5=98908f629ef79dce205ca9aea163085b step=
+  prompt_md5=8f66b4c97988825bd8e7840aaf44357e request_md5=9502b5d5a6579d96c0a00e350be5375f step=
+  prompt_md5=8fe0ad36f61bcf4992cc9df81cdf3817 request_md5=cfbd00094fb95f078fad91980cc566bf step=
+  prompt_md5=8bed8e2d056dc1d47dccae9d32dbecf4 request_md5=ae84c5a3746b4b9a8247c6601ff2687c step=
+  daemon_binary_md5=403d619db3d5589a7d4075faf77f7b2f path=/home/kaden/ClaudeCode/warpfront/wt-fa2a/target/release/daemon

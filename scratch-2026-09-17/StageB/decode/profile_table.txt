@@ -1,0 +1,3 @@
+kernel                                    old_us med(min-max),n        new_us med(min-max),n    delta_med
+attention_flash_fp8_e4m3_tile              245.8(244.1-452.6)x5            37.1(37.0-68.0)x5      -208.7
+attention_fp8_e4m3_kv                      225.8(171.4-262.6)x5         101.9(101.9-147.5)x5      -123.9

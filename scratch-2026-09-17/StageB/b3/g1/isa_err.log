@@ -1,0 +1,1 @@
+/opt/rocm/llvm/bin/llvm-objdump: error: 'new_k8fp8.o': The file was not recognized as a valid object file

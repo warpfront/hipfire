@@ -1,0 +1,8 @@
+"Kind","Agent_Id","Queue_Id","Stream_Id","Thread_Id","Dispatch_Id","Kernel_Id","Kernel_Name","Correlation_Id","Start_Timestamp","End_Timestamp","LDS_Block_Size","Scratch_Size","VGPR_Count","Accum_VGPR_Count","SGPR_Count","Workgroup_Size_X","Workgroup_Size_Y","Workgroup_Size_Z","Grid_Size_X","Grid_Size_Y","Grid_Size_Z"
+"KERNEL_DISPATCH","Agent 3",1,0,2343842,1,14,"__amd_rocclr_copyBuffer",1,1174508978547842,1174508978552042,0,0,16,0,128,512,1,1,512,1,1
+"KERNEL_DISPATCH","Agent 3",1,0,2343842,2,14,"__amd_rocclr_copyBuffer",2,1174508981843975,1174508981847255,0,0,16,0,128,512,1,1,512,1,1
+"KERNEL_DISPATCH","Agent 3",1,0,2343842,3,4,"__amd_rocclr_fillBufferUnAligned",3,1174508982087950,1174508982089950,0,0,8,0,128,256,1,1,512,1,1
+"KERNEL_DISPATCH","Agent 3",1,0,2343842,4,19,"attention_fp8_e4m3_kv",4,1174508982582659,1174508982684581,0,0,40,0,128,256,1,1,2048,1,1
+"KERNEL_DISPATCH","Agent 3",1,0,2343842,5,14,"__amd_rocclr_copyBuffer",5,1174508982727992,1174508982730392,0,0,16,0,128,512,1,1,512,1,1
+"KERNEL_DISPATCH","Agent 3",1,0,2343842,6,4,"__amd_rocclr_fillBufferUnAligned",6,1174508982797913,1174508982799753,0,0,8,0,128,256,1,1,2304,1,1
+"KERNEL_DISPATCH","Agent 3",1,0,2343842,7,21,"attention_flash_fp8_e4m3_tile",7,1174508983101799,1174508983138880,0,0,56,0,128,32,1,1,256,3,1

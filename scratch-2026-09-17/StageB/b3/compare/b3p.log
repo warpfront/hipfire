@@ -1,0 +1,7 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+Q0-vs-arm1: n=2359296 max_abs=1.094868e0 mean_abs=4.336882e-3 tail1pct=2.294689e-2 max_rel=5.144904e1 nonfinite=0
+wrote /home/kaden/ClaudeCode/warpfront/wt-fa2a/scratch-2026-09-17/StageB/b3/compare/b3p.f32
+B2-vs-arm1: n=2359296 max_abs=2.558965e0 mean_abs=6.741474e-3 tail1pct=4.194180e-2 max_rel=1.071502e2 nonfinite=0
+B2-vs-Q0: n=2359296 max_abs=2.414028e0 mean_abs=4.786002e-3 tail1pct=3.082736e-2 max_rel=2.427955e2 nonfinite=0
+wrote /home/kaden/ClaudeCode/warpfront/wt-fa2a/scratch-2026-09-17/StageB/b3/compare/b3p.f32.b2

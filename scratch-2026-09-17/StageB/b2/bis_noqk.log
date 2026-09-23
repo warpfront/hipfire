@@ -1,0 +1,35 @@
+bis_noqk.cu:1161:53: error: use of undeclared identifier 'V16'
+ 1161 |                 const half8_t* Vf = (const half8_t*)V16;
+      |                                                     ^~~
+bis_noqk.cu:1251:41: error: redefinition of 'fa2_scale_n'
+ 1251 | static __device__ __forceinline__ float fa2_scale_n(
+      |                                         ^
+bis_noqk.cu:755:41: note: previous definition is here
+  755 | static __device__ __forceinline__ float fa2_scale_n(
+      |                                         ^
+bis_noqk.cu:1269:17: error: redefinition of 'fa2_stageb_nfill_dump'
+ 1269 | __device__ void fa2_stageb_nfill_dump(
+      |                 ^
+bis_noqk.cu:773:17: note: previous definition is here
+  773 | __device__ void fa2_stageb_nfill_dump(
+      |                 ^
+bis_noqk.cu:1433:17: error: redefinition of 'fa2_stageb_nbody'
+ 1433 | __device__ void fa2_stageb_nbody(
+      |                 ^
+bis_noqk.cu:937:17: note: previous definition is here
+  937 | __device__ void fa2_stageb_nbody(
+      |                 ^
+bis_noqk.cu:1810:5: error: no matching function for call to 'fa2_stageb_nbody'
+ 1810 |     fa2_stageb_nbody<false>(q8_codes, k_cache, v_cache, out, positions,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~
+bis_noqk.cu:1433:17: note: candidate template ignored: substitution failure [with PARTIAL = false]
+ 1433 | __device__ void fa2_stageb_nbody(
+      |                 ^
+bis_noqk.cu:2053:5: error: no matching function for call to 'fa2_stageb_nbody'
+ 2053 |     fa2_stageb_nbody<true>(q8_codes, k_cache, v_cache, out, positions,
+      |     ^~~~~~~~~~~~~~~~~~~~~~
+bis_noqk.cu:1433:17: note: candidate template ignored: substitution failure [with PARTIAL = true]
+ 1433 | __device__ void fa2_stageb_nbody(
+      |                 ^
+6 errors generated when compiling for gfx1201.
+failed to execute:/opt/rocm/core/lib/llvm/bin/clang++  --offload-arch=gfx1201  --cuda-device-only -O3 --no-offload-compress -Rpass-analysis=kernel-resource-usage -o "/dev/null" -x hip bis_noqk.cu

@@ -1,0 +1,37 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+direct shape batch=4 ctx=256 median_us=70.96 cksum=00002f455f37884f
+direct shape batch=8 ctx=512 median_us=128.36 cksum=00005f4a87c49183
+direct shape batch=32 ctx=2048 median_us=468.01 cksum=000172d12ec3c79d
+direct shape batch=64 ctx=4096 median_us=919.85 cksum=0002e09d8655c189
+direct shape batch=128 ctx=8192 median_us=1901.82 cksum=0005c8467e45a9ac
+direct shape batch=256 ctx=16384 median_us=7509.16 cksum=000b96860a1d737e
+direct shape batch=512 ctx=32768 median_us=19406.10 cksum=0017368e705fd0c6
+direct trunc batch=16 ctx=15 median_us=15.52 cksum=0000bbda8dbeb301
+direct trunc batch=16 ctx=16 median_us=15.32 cksum=0000bbd97d3c1370
+direct trunc batch=16 ctx=17 median_us=15.80 cksum=0000bbd97d3c1370
+direct trunc batch=32 ctx=31 median_us=17.36 cksum=0001786df009244d
+direct trunc batch=32 ctx=32 median_us=17.92 cksum=00017868a368dd65
+direct trunc batch=32 ctx=33 median_us=18.12 cksum=00017868a368dd65
+direct trunc batch=64 ctx=63 median_us=22.08 cksum=0002edfc29f06884
+direct trunc batch=64 ctx=64 median_us=24.08 cksum=0002edf05b8e5970
+direct trunc batch=64 ctx=65 median_us=23.76 cksum=0002edf05b8e5970
+direct tail batch=3 ctx=100 median_us=29.32 cksum=0000236448afefcb
+direct tail batch=6 ctx=2000 median_us=298.92 cksum=0000459d99427b10
+direct tail batch=8 ctx=5000 median_us=725.73 cksum=00005e3dcf5bddfb
+direct batch batch=1 ctx=256 median_us=47.20 cksum=00000bd1fcc59e53
+direct batch batch=7 ctx=512 median_us=83.84 cksum=000052cc8d33ee65
+direct batch batch=9 ctx=512 median_us=84.72 cksum=00006a6df9832075
+direct posdup batch=8 ctx=512 median_us=85.64 cksum=00005ea63d0ed873
+direct posnonmono batch=8 ctx=512 median_us=85.20 cksum=00005ea05df7fa71
+direct posallneg batch=8 ctx=512 median_us=11.92 cksum=0000000000000000
+fwht3 k3 batch=64 ctx=4096 cksum=0002ebc2dd3e7d7b
+fwht3 k3 batch=16 ctx=17 cksum=0000bbb3f457a9d1
+Warning: Queue error - HSA_STATUS_ERROR_MEMORY_FAULT
+VGPU(0x5b1e61649e30) hang analysis:
+SWq=0x7c20f2079000, HWq=0x7c20dd600000, id=1, priority=1, Dispatch Header = 0xd02 (type=2, barrier=1, acquire=2, release=1), setup=3, grid=[1024, 4, 1], workgroup=[128, 1, 1], private_seg_size=0, group_seg_size=65536, kernel_obj=0x7c20ecfd1540, kernarg_address=0x7c20dd000800, completion_signal=0x0, rptr=759, wptr=762
+:0:rocdevice.cpp            :3905: 1173691193285 us:  Memory Fault Error [host: hiptrx, GPU index: 0, faulting addr: 0x7c1ebdc12000, kernel: attention_q8_0_fa2_gqa_partial_gfx1201]
+
+thread 'main' (2330011) panicked at crates/hipfire-runtime/examples/tmp_fa2a_g2.rs:273:48:
+called `Result::unwrap()` on an `Err` value: HipError { code: 700, message: "hipMemcpy D2H: an illegal memory access was encountered", context: None }
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace

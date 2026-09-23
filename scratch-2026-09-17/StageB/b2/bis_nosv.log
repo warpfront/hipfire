@@ -1,0 +1,8 @@
+bis_nosv.cu:1194:23: error: redefinition of 'sc'
+ 1194 |                 float sc[8];
+      |                       ^
+bis_nosv.cu:1152:23: note: previous definition is here
+ 1152 |                 float sc[8];
+      |                       ^
+1 error generated when compiling for gfx1201.
+failed to execute:/opt/rocm/core/lib/llvm/bin/clang++  --offload-arch=gfx1201  --cuda-device-only -O3 --no-offload-compress -Rpass-analysis=kernel-resource-usage -o "/dev/null" -x hip bis_nosv.cu

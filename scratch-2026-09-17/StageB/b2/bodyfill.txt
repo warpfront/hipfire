@@ -1,0 +1,65 @@
+        for (int t = 0; t < 8; ++t) {
+            const int idx = tid + t * 128;
+            const int k = idx >> 4;
+            const int dc = idx & 15;
+            const int gk = ktile + k;
+            const int sub = k >> 4;
+            const int ml = k & 15;
+            unsigned char* dst =
+                K8 + (unsigned)(((dc * 4 + sub) * 32 + ml) * 8);
+            if (gk < seq_len) {
+                const unsigned char* src = k_cache
+                    + (unsigned long long)gk * 1032ULL
+                    + (unsigned long long)kv_h * 256ULL
+                    + (unsigned long long)dc * 16ULL;
+                uint4 v = *(const uint4*)src;
+                *(unsigned long long*)dst =
+                    ((unsigned long long)v.y << 32) | v.x;
+                *(unsigned long long*)(dst + 128) =
+                    ((unsigned long long)v.w << 32) | v.z;
+            } else {
+                *(unsigned long long*)dst = 0ULL;
+                *(unsigned long long*)(dst + 128) = 0ULL;
+            }
+        }
+        for (int t = 0; t < 16; ++t) {
+            const int idx = tid + t * 128;
+            const int sub = idx >> 9;
+            const int r = idx & 511;
+            const int dc = r >> 5;
+            const int vlane = r & 31;
+            const int ml = vlane & 15;
+            const int kg = vlane >> 4;
+            const int dim = dc * 16 + ml;
+            const int kbase = ktile + sub * 16 + kg * 8;
+            unsigned char* dst = V8
+                + (unsigned)(((sub * 16 + dc) * 32 + vlane) * 8);
+            unsigned long long w = 0;
+            if (kbase + 7 < seq_len) {
+                const unsigned char* r0 = v_cache
+                    + (unsigned long long)kbase * 1032ULL
+                    + (unsigned long long)kv_h * 256ULL
+                    + (unsigned long long)dim;
+                w = (unsigned long long)r0[0]
+                    | ((unsigned long long)r0[1032] << 8)
+                    | ((unsigned long long)r0[2064] << 16)
+                    | ((unsigned long long)r0[3096] << 24)
+                    | ((unsigned long long)r0[4128] << 32)
+                    | ((unsigned long long)r0[5160] << 40)
+                    | ((unsigned long long)r0[6192] << 48)
+                    | ((unsigned long long)r0[7224] << 56);
+            } else if (kbase < seq_len) {
+#pragma unroll
+                for (int j = 0; j < 8; ++j) {
+                    const int gkey = kbase + j;
+                    unsigned char c = 0;
+                    if (gkey < seq_len)
+                        c = *(v_cache + (unsigned long long)gkey * 1032ULL
+                            + (unsigned long long)kv_h * 256ULL
+                            + (unsigned long long)dim);
+                    w |= (unsigned long long)c
+                        << (unsigned long long)(j * 8);
+                }
+            }
+            *(unsigned long long*)dst = w;
+        }

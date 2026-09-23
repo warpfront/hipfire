@@ -1,0 +1,10 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+fa2_fp8 flag on: false
+shape0 batch=4 ctx=256 wrote /home/kaden/ClaudeCode/warpfront/wt-fa2a/scratch-2026-09-17/StageB/host/oracle/shape0_b4_c256.f32 cksum=00002f8fbf83e1fd
+shape1 batch=8 ctx=512 wrote /home/kaden/ClaudeCode/warpfront/wt-fa2a/scratch-2026-09-17/StageB/host/oracle/shape1_b8_c512.f32 cksum=00005f1b6d7166e1
+shape2 batch=32 ctx=2048 wrote /home/kaden/ClaudeCode/warpfront/wt-fa2a/scratch-2026-09-17/StageB/host/oracle/shape2_b32_c2048.f32 cksum=00017cb6701d7d37
+shape3 batch=64 ctx=4096 wrote /home/kaden/ClaudeCode/warpfront/wt-fa2a/scratch-2026-09-17/StageB/host/oracle/shape3_b64_c4096.f32 cksum=0002faa14e5a12e5
+shape4 batch=128 ctx=8192 wrote /home/kaden/ClaudeCode/warpfront/wt-fa2a/scratch-2026-09-17/StageB/host/oracle/shape4_b128_c8192.f32 cksum=0005f53d7121c8da
+shape5 batch=256 ctx=16384 wrote /home/kaden/ClaudeCode/warpfront/wt-fa2a/scratch-2026-09-17/StageB/host/oracle/shape5_b256_c16384.f32 cksum=000bec6d809ddedf
+shape6 batch=512 ctx=32768 wrote /home/kaden/ClaudeCode/warpfront/wt-fa2a/scratch-2026-09-17/StageB/host/oracle/shape6_b512_c32768.f32 cksum=0017da4c7061f932

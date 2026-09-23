@@ -1,0 +1,32 @@
+bis_nopv.cu:1276:41: error: redefinition of 'fa2_scale_n'
+ 1276 | static __device__ __forceinline__ float fa2_scale_n(
+      |                                         ^
+bis_nopv.cu:755:41: note: previous definition is here
+  755 | static __device__ __forceinline__ float fa2_scale_n(
+      |                                         ^
+bis_nopv.cu:1294:17: error: redefinition of 'fa2_stageb_nfill_dump'
+ 1294 | __device__ void fa2_stageb_nfill_dump(
+      |                 ^
+bis_nopv.cu:773:17: note: previous definition is here
+  773 | __device__ void fa2_stageb_nfill_dump(
+      |                 ^
+bis_nopv.cu:1458:17: error: redefinition of 'fa2_stageb_nbody'
+ 1458 | __device__ void fa2_stageb_nbody(
+      |                 ^
+bis_nopv.cu:937:17: note: previous definition is here
+  937 | __device__ void fa2_stageb_nbody(
+      |                 ^
+bis_nopv.cu:1835:5: error: no matching function for call to 'fa2_stageb_nbody'
+ 1835 |     fa2_stageb_nbody<false>(q8_codes, k_cache, v_cache, out, positions,
+      |     ^~~~~~~~~~~~~~~~~~~~~~~
+bis_nopv.cu:1458:17: note: candidate template ignored: substitution failure [with PARTIAL = false]
+ 1458 | __device__ void fa2_stageb_nbody(
+      |                 ^
+bis_nopv.cu:2078:5: error: no matching function for call to 'fa2_stageb_nbody'
+ 2078 |     fa2_stageb_nbody<true>(q8_codes, k_cache, v_cache, out, positions,
+      |     ^~~~~~~~~~~~~~~~~~~~~~
+bis_nopv.cu:1458:17: note: candidate template ignored: substitution failure [with PARTIAL = true]
+ 1458 | __device__ void fa2_stageb_nbody(
+      |                 ^
+5 errors generated when compiling for gfx1201.
+failed to execute:/opt/rocm/core/lib/llvm/bin/clang++  --offload-arch=gfx1201  --cuda-device-only -O3 --no-offload-compress -Rpass-analysis=kernel-resource-usage -o "/dev/null" -x hip bis_nopv.cu

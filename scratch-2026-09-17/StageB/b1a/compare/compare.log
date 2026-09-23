@@ -1,0 +1,6 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+fa2q0-vs-tiledref n=393216 batch=64
+max_abs=1.546264e-3 mean_abs=8.215926e-5
+tail1pct_mean_abs=2.192105e-4 max_rel(|ref|>1e-3)=4.055091e-1
+nonfinite=0

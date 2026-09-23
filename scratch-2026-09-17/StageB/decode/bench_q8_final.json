@@ -1,0 +1,101 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "qwen3.8:27b-mq4-xt",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.15",
+    "vram_free_mb": 16840,
+    "vram_total_mb": 32624,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 32550,
+  "max_tokens": 128,
+  "runs": 5,
+  "batch": 1,
+  "prompt_tokens": 24,
+  "prompt_md5": "d94d3115a3001f08a654d91461d6bdc4",
+  "prompt_chars": 57,
+  "warnings": [
+    "prompt is 24 tokens; prefill_tok_s at this length measures launch overhead, not prefill throughput — use --prompt-file with ≥256 tokens for a prefill number"
+  ],
+  "decode_tok_s": {
+    "median": 35.3,
+    "mean": 35.7,
+    "min": 35.0,
+    "max": 36.6,
+    "stdev": 0.7429670248402694
+  },
+  "prefill_tok_s": {
+    "median": 433.3,
+    "mean": 416.64,
+    "min": 350.4,
+    "max": 434.0,
+    "stdev": 33.12754744921514
+  },
+  "wall_tok_s": {
+    "median": 34.7,
+    "mean": 35.1,
+    "min": 34.3,
+    "max": 36.0,
+    "stdev": 0.7456540752922902
+  },
+  "ttft_ms": {
+    "median": 55.4,
+    "mean": 58.04,
+    "min": 55.3,
+    "max": 68.5,
+    "stdev": 5.2309081429518525
+  },
+  "samples": {
+    "decode": [
+      35.0,
+      35.0,
+      35.3,
+      36.6,
+      36.6
+    ],
+    "prefill": [
+      350.4,
+      434.0,
+      433.6,
+      433.3,
+      431.9
+    ],
+    "wall": [
+      34.3,
+      34.5,
+      34.7,
+      36.0,
+      36.0
+    ],
+    "ttft_ms": [
+      68.5,
+      55.3,
+      55.4,
+      55.4,
+      55.6
+    ]
+  }
+}

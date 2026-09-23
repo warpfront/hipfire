@@ -1,0 +1,23 @@
+bis_zeroVF.cu:1318:8: error: expected unqualified-id
+ 1318 | extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_gfx1201(
+      |        ^
+bis_zeroVF.cu:1412:8: error: expected unqualified-id
+ 1412 | extern "C" __global__ __launch_bounds__(128, 1) void HIPFIRE_FA2_Q_PRECONVERT_SYM(
+      |        ^
+bis_zeroVF.cu:1462:8: error: expected unqualified-id
+ 1462 | extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201(
+      |        ^
+bis_zeroVF.cu:1552:8: error: expected unqualified-id
+ 1552 | extern "C" __global__ __launch_bounds__(128, 1) void attention_fp8_e4m3_fa2_gqa_partial_gfx1201(
+      |        ^
+bis_zeroVF.cu:1637:8: error: expected unqualified-id
+ 1637 | extern "C" __global__ __launch_bounds__(256) void attention_fp8_e4m3_fa2_gqa_merge_gfx1201(
+      |        ^
+bis_zeroVF.cu:1722:7: error: expected '}'
+ 1722 | #endif
+      |       ^
+bis_zeroVF.cu:951:1: note: to match this '{'
+  951 | {
+      | ^
+6 errors generated when compiling for gfx1201.
+failed to execute:/opt/rocm/core/lib/llvm/bin/clang++  --offload-arch=gfx1201  --cuda-device-only -O3 --no-offload-compress -Rpass-analysis=kernel-resource-usage -o "/dev/null" -x hip bis_zeroVF.cu

@@ -1,0 +1,1 @@
+#define HIPFIRE_FA2_KMODE 3

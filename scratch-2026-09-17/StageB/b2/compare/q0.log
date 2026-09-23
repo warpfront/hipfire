@@ -1,0 +1,4 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/ab1/.hipfire_kernels/gfx1201
+Q0-vs-arm1: n=2359296 max_abs=1.012305e0 mean_abs=4.776716e-3 tail1pct=2.012671e-2 max_rel=7.998139e1 nonfinite=0
+wrote /home/kaden/ClaudeCode/warpfront/wt-fa2a/scratch-2026-09-17/StageB/b2/compare/q0.f32
