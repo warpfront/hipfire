@@ -2307,6 +2307,24 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_ATTN_QRESIDENT_V2",
         "Use the bit-exact v2 schedule of the gfx1201 Q-resident FA2 prefill kernel (default on exact gfx1201; set to false or HIPFIRE_ATTN_QRESIDENT_V2=0 to restore the v1 Q-resident kernel; only applies where kernel.attn_qresident selects the Q-resident route)."
     ),
+    process_bool_field!(
+        "kernel.gfx12_fa_prep_fused",
+        "gfx12_fa_prep_fused",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_FA_PREP_FUSED",
+        "Fuse gfx1201 prefill Q/K norm and RoPE (default on exact gfx1201; false restores the separate launches)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_fa_prep_fp8q",
+        "gfx12_fa_prep_fp8q",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_FA_PREP_FP8Q",
+        "Emit preconverted fp8 Q for gfx1201 Q-resident v2 attention (default on exact gfx1201; false retains F32 Q)."
+    ),
     process_auto_bool_field!(
         "kernel.gfx11_q8_fa2_wide",
         "gfx11_q8_fa2_wide",

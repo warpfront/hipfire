@@ -8108,6 +8108,8 @@ fn batch_chunk_full_attn_prepare(
     _kv_layer_idx: usize,
     layer_idx: usize,
     fusion: DflashFusionCtx,
+    gfx12_fa_prep: bool,
+    gfx12_fa_prep_fp8q: bool,
 ) -> HipResult<()> {
     // S6-fa-prep-q8-pair: exact gfx1100 fold of steps 3-5 (deinterleave +
     // Q/K rmsnorm + half-split RoPE, 4 launches) into one
@@ -8137,7 +8139,31 @@ fn batch_chunk_full_attn_prepare(
         && !hipfire_runtime::triattn::tap_enabled()
         && fa_prep_shape_ok
         && n >= 1;
-    if fa_prep_fused_ok {
+    if gfx12_fa_prep {
+        if gfx12_fa_prep_fp8q {
+            let bytes = n * config.n_heads * (config.head_dim + 4);
+            let q_codes = GpuTensor {
+                buf: unsafe { hip_bridge::DeviceBuffer::from_raw(pbs.fa_q_batch.buf.as_ptr(), bytes) },
+                shape: vec![bytes],
+                dtype: DType::Raw,
+            };
+            gpu.qwen35_fa_prep_batched_gfx1201(
+                &pbs.fa_q_full_batch,
+                rdna_compute::qwen35_fa_batch::FaPrepQOut::Fp8Codes(&q_codes),
+                &pbs.fa_gate_batch, &pbs.fa_k_batch, &layer.q_norm, &layer.k_norm,
+                fa_prep_rope_pos_buf, config.norm_eps, config.rope_theta,
+                kv_cache.compact_offset as i32, config.n_heads, config.n_kv_heads, n,
+            )?;
+        } else {
+            gpu.qwen35_fa_prep_batched_gfx1201(
+                &pbs.fa_q_full_batch,
+                rdna_compute::qwen35_fa_batch::FaPrepQOut::F32(&pbs.fa_q_batch),
+                &pbs.fa_gate_batch, &pbs.fa_k_batch, &layer.q_norm, &layer.k_norm,
+                fa_prep_rope_pos_buf, config.norm_eps, config.rope_theta,
+                kv_cache.compact_offset as i32, config.n_heads, config.n_kv_heads, n,
+            )?;
+        }
+    } else if fa_prep_fused_ok {
         gpu.qwen35_fa_prep_batched_gfx1100(
             &pbs.fa_q_full_batch,
             &pbs.fa_q_batch,
@@ -8490,6 +8516,7 @@ fn batch_chunk_fa_attend(
     layer_idx: usize,
     multirow: bool,
     commit_stride: Option<usize>,
+    gfx12_fa_prep_fp8q: bool,
 ) -> HipResult<()> {
     if let BatchSemantics::Independent {
         lane_capacity,
@@ -8531,11 +8558,19 @@ fn batch_chunk_fa_attend(
             && n <= 32768
             && max_ctx_len <= 262_144
             && tree_verify.is_none();
+        let q_codes = gfx12_fa_prep_fp8q.then(|| {
+            let bytes = n * config.n_heads * (config.head_dim + 4);
+            GpuTensor {
+                buf: unsafe { hip_bridge::DeviceBuffer::from_raw(pbs.fa_q_batch.buf.as_ptr(), bytes) },
+                shape: vec![bytes],
+                dtype: DType::Raw,
+            }
+        });
         if packet_runs {
             execute_fa_attend_step(
                 gpu,
                 config,
-                &pbs.fa_q_batch,
+                q_codes.as_ref().unwrap_or(&pbs.fa_q_batch),
                 &pbs.fa_k_batch,
                 &pbs.fa_v_batch,
                 &pbs.positions,
@@ -8635,6 +8670,19 @@ fn batch_chunk_fa_attend(
             )?;
         }
         return Ok(());
+    }
+    if gfx12_fa_prep_fp8q {
+        let bytes = n * config.n_heads * (config.head_dim + 4);
+        let q_codes = GpuTensor {
+            buf: unsafe { hip_bridge::DeviceBuffer::from_raw(pbs.fa_q_batch.buf.as_ptr(), bytes) },
+            shape: vec![bytes],
+            dtype: DType::Raw,
+        };
+        return execute_fa_attend_step(
+            gpu, config, &q_codes, &pbs.fa_k_batch, &pbs.fa_v_batch, &pbs.positions,
+            &pbs.fa_attn_out_batch, s, kv_cache, n, start_pos, max_ctx_len,
+            ctx, tree_verify, layer_idx,
+        );
     }
     if multirow {
         debug_assert!(gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201());
@@ -8798,6 +8846,31 @@ pub(crate) fn batch_chunk_full_attn_attn(
     // launch covers all N tokens at once.
     let kv_dim = config.n_kv_heads * config.head_dim;
     let q_dim = config.n_heads * config.head_dim;
+    let gfx12_fa_prep = gpu.arch == "gfx1201"
+        && gpu.flags.gfx12_fa_prep_fused
+        && fusion != DflashFusionCtx::ChainVerify
+        && !gpu.flags.rope_interleaved_legacy
+        && !hipfire_runtime::triattn::tap_enabled()
+        && config.head_dim == 256
+        && (config.n_heads, config.n_kv_heads) == (24, 4)
+        && (config.head_dim as f32 * config.partial_rotary_factor) as usize == 64
+        && n > 0;
+    let gfx12_fa_prep_fp8q = gfx12_fa_prep
+        && gpu.flags.gfx12_fa_prep_fp8q
+        && gpu.flags.attn_qresident
+        && gpu.flags.attn_qresident_v2
+        && !fa_attn_multirow
+        && !batch_semantics.is_independent()
+        && kv_cache.quant_fp8
+        && config.n_heads == 24
+        && config.n_kv_heads == 4
+        && (64..=32768).contains(&n)
+        && (n <= 512 || n % 512 == 0)
+        && (64..=262_144).contains(&max_ctx_len)
+        && tree_verify.is_none()
+        && (commit_stride.is_none()
+            || (commit_stride == Some(WIDENED_COMMIT_ROWS)
+                && n % WIDENED_COMMIT_ROWS == 0));
     batch_chunk_full_attn_input_projection(gpu, layer, config, pbs, n, dim, q8_wmma_arch, fusion)?;
 
     batch_chunk_full_attn_prepare(
@@ -8817,6 +8890,8 @@ pub(crate) fn batch_chunk_full_attn_attn(
         kv_layer_idx,
         layer_idx,
         fusion,
+        gfx12_fa_prep,
+        gfx12_fa_prep_fp8q,
     )?;
 
     // 6–7. Batched KV write + flash attention (via dispatch). Split out of
@@ -8838,6 +8913,7 @@ pub(crate) fn batch_chunk_full_attn_attn(
         layer_idx,
         fa_attn_multirow,
         commit_stride,
+        gfx12_fa_prep_fp8q,
     )?;
     batch_chunk_full_attn_output_projection(
         gpu,
@@ -10736,6 +10812,7 @@ fn batch_chunk_full_attn_moe_finish(
         layer_idx,
         fa_attn_multirow,
         None, // commit_stride: MoE finish keeps legacy cadence
+        false,
     )?;
     gpu.sigmoid_mul_f32(&pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
     // wo + residual. Mirrors the dense FA wo dispatch at
@@ -11530,6 +11607,8 @@ fn forward_prefill_chunk_pair(
                         kv_layer_idx,
                         layer_idx,
                         fusion,
+                        false,
+                        false,
                     )?;
                     batch_chunk_full_attn_input_projection(
                         gpu, layer, config, pbs_n, n, dim, q8_wmma_arch, fusion,
@@ -11551,6 +11630,8 @@ fn forward_prefill_chunk_pair(
                         kv_layer_idx,
                         layer_idx,
                         fusion,
+                        false,
+                        false,
                     )?;
                     batch_chunk_fa_attend_merged(
                         gpu,

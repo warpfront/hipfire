@@ -13,7 +13,7 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 use hip_bridge::DeviceBuffer;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 pub struct AttnParams<'a> {
     pub q: &'a GpuTensor,
@@ -162,6 +162,21 @@ impl AttentionFamily {
             is_tree: io.tree_bias.is_some(),
         };
         self.resolve(plan.write_key, ctx, Some(&shape))?; // arch-gate check
+        if io.q.dtype == DType::Raw
+            && !(plan.attend_key == KernelKey::AttnFp8E4m3KvBatchedMasked
+                && gpu.arch == "gfx1201"
+                && gpu.flags.attn_qresident
+                && gpu.flags.attn_qresident_v2
+                && io.n_heads == 24
+                && io.n_kv_heads == 4
+                && io.head_dim == 256
+                && (64..=32768).contains(&io.batch_size)
+                && (io.batch_size <= 512 || io.batch_size % 512 == 0)
+                && (64..=262_144).contains(&io.max_ctx_len)
+                && io.tree_bias.is_none())
+        {
+            return Err(DispatchError::Hip("Raw Q requires gfx1201 native-fp8 Q-resident v2 attention".into()));
+        }
         dispatch_kv_write(gpu, plan.write_key, plan, io).map_err(|error| {
             DispatchError::Hip(format!(
                 "KV write {:?} for {:?} at pos={} cap={}: {error}",
@@ -2368,6 +2383,13 @@ fn dispatch_attend(
                     && (64..=FP8_FA2_MAX_CTX).contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                 {
+                    if io.q.dtype == DType::Raw {
+                        hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201(
+                            io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                            io.n_heads, io.n_kv_heads, io.head_dim, io.max_ctx_len, io.batch_size,
+                        ))?;
+                        return Ok(());
+                    }
                     // v2 is the bit-exact reschedule of the same body;
                     // `kernel.attn_qresident_v2=false` restores v1.
                     if gpu.flags.attn_qresident_v2 {

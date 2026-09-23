@@ -4852,6 +4852,7 @@ impl Gpu {
             "attention_fp8_e4m3_fa2_gqa_qresident_gfx1201",
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_GFX1201_SRC,
             49408,
+            false,
             q,
             k_cache,
             v_cache,
@@ -4886,6 +4887,7 @@ impl Gpu {
             "attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201",
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_GFX1201_SRC,
             33536,
+            false,
             q,
             k_cache,
             v_cache,
@@ -4899,6 +4901,34 @@ impl Gpu {
         )
     }
 
+    /// gfx1201 v2 attention consuming preconverted fp8 Q and F32 row scales.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201(
+        &mut self,
+        q: &GpuTensor,
+        k_cache: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        if q.dtype != crate::DType::Raw
+            || q.buf.size() < batch_size * n_heads * (head_dim + 4)
+        {
+            return Err(hip_bridge::HipError::new(0, "Q8 resident attention requires Raw codes and scales"));
+        }
+        self.qresident_launch(
+            "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
+            kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC,
+            33536, true, q, k_cache, v_cache, out, positions,
+            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
+        )
+    }
+
     /// Shared launcher of the Q-resident bodies: grid
     /// `[ceil(min(batch,512)*6/384), 4, ceil(batch/512)]`, block 768.
     #[allow(clippy::too_many_arguments)]
@@ -4907,6 +4937,7 @@ impl Gpu {
         symbol: &'static str,
         src: &'static str,
         lds_bytes: u32,
+        q8_input: bool,
         q: &GpuTensor,
         k_cache: &GpuTensor,
         v_cache: &GpuTensor,
@@ -4969,6 +5000,11 @@ impl Gpu {
         let grid_z = batch_size.div_ceil(512) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q_arg = q.buf.as_ptr();
+        let mut q_scales = if q8_input {
+            unsafe { (q_arg as *mut u8).add(need_qo) as *mut c_void }
+        } else {
+            std::ptr::null_mut()
+        };
         let mut k_ptr = k_cache.buf.as_ptr();
         let mut v_ptr = v_cache.buf.as_ptr();
         let mut out_ptr = out.buf.as_ptr();
@@ -4990,6 +5026,9 @@ impl Gpu {
             &mut bs as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
         ];
+        if q8_input {
+            params.insert(1, &mut q_scales as *mut _ as *mut c_void);
+        }
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
             batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
         );
@@ -5003,6 +5042,9 @@ impl Gpu {
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(q_arg);
+                if q8_input {
+                    b.push_ptr(q_scales);
+                }
                 b.push_ptr(k_ptr);
                 b.push_ptr(v_ptr);
                 b.push_ptr(out_ptr);
