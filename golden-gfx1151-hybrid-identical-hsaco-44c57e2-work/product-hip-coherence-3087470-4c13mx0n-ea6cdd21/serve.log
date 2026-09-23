@@ -1,0 +1,153 @@
+GPU dev 0: gfx1151 (103.1 GB VRAM, HIP 7.14)
+  pre-compiled kernels: /home/kaden/hipfire-silver-44c57e2/hybrid-identical-gfx1151-cache/.hipfire_kernels/gfx1151
+  HIPFIRE_NO_DEVICE_COMPILER set — treating the device compiler as absent; pre-compiled blobs will be used verbatim
+[hipfire] native serve listening on http://127.0.0.1:49943
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+  loading output_norm...
+  loading output (separate lm_head)...
+  lm_head AWQ sidecar: absent (no-op)
+  loading layer 0/40 (LinearAttention + MoE)...
+  routed MQ4 expert packing: 512 per-expert weight buffers -> 2 layer blobs
+  loading layer 1/40 (LinearAttention + MoE)...
+  loading layer 2/40 (LinearAttention + MoE)...
+  loading layer 3/40 (FullAttention + MoE)...
+  loading layer 4/40 (LinearAttention + MoE)...
+  loading layer 5/40 (LinearAttention + MoE)...
+  loading layer 6/40 (LinearAttention + MoE)...
+  loading layer 7/40 (FullAttention + MoE)...
+  loading layer 8/40 (LinearAttention + MoE)...
+  loading layer 9/40 (LinearAttention + MoE)...
+  loading layer 10/40 (LinearAttention + MoE)...
+  loading layer 11/40 (FullAttention + MoE)...
+  loading layer 12/40 (LinearAttention + MoE)...
+  loading layer 13/40 (LinearAttention + MoE)...
+  loading layer 14/40 (LinearAttention + MoE)...
+  loading layer 15/40 (FullAttention + MoE)...
+  loading layer 16/40 (LinearAttention + MoE)...
+  loading layer 17/40 (LinearAttention + MoE)...
+  loading layer 18/40 (LinearAttention + MoE)...
+  loading layer 19/40 (FullAttention + MoE)...
+  loading layer 20/40 (LinearAttention + MoE)...
+  loading layer 21/40 (LinearAttention + MoE)...
+  loading layer 22/40 (LinearAttention + MoE)...
+  loading layer 23/40 (FullAttention + MoE)...
+  loading layer 24/40 (LinearAttention + MoE)...
+  loading layer 25/40 (LinearAttention + MoE)...
+  loading layer 26/40 (LinearAttention + MoE)...
+  loading layer 27/40 (FullAttention + MoE)...
+  loading layer 28/40 (LinearAttention + MoE)...
+  loading layer 29/40 (LinearAttention + MoE)...
+  loading layer 30/40 (LinearAttention + MoE)...
+  loading layer 31/40 (FullAttention + MoE)...
+  loading layer 32/40 (LinearAttention + MoE)...
+  loading layer 33/40 (LinearAttention + MoE)...
+  loading layer 34/40 (LinearAttention + MoE)...
+  loading layer 35/40 (FullAttention + MoE)...
+  loading layer 36/40 (LinearAttention + MoE)...
+  loading layer 37/40 (LinearAttention + MoE)...
+  loading layer 38/40 (LinearAttention + MoE)...
+  loading layer 39/40 (FullAttention + MoE)...
+KV cache: q8 (10/40 layers carry KV, others placeholder)
+  DeltaNet state: Q8
+[hipfire] pre-warmed /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4r
+  WARNING: embedding_q8_batched: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: fused_rmsnorm_mq_rotate: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gemm_qkvza_hfq4g256_wmma: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: convert_f32_to_f16: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: fused_sigmoid_alpha_gate: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: conv1d_silu_split: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: fused_qk_l2_norm_scale: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: repeat_interleave_qk_batched: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gated_delta_net_q8_fast: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gated_norm: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gemv_mq4g256: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gemm_hfq4g256_residual_wmma_k2x32: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: rmsnorm: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gemm_hfq4g256: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gemm_gate_up_hfq4g256_wmma_ldscoop_nosync: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: softmax: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: moe_topk_renorm_k8_batched: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: fused_silu_mul_mq_rotate: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gemv_hfq4g256_residual_scaled: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: moe_scatter_fused_k8: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gemm_hfq4g256_moe_grouped_mmq_gfx1151: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gemm_hfq4g256_residual_mmq: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: moe_gate_up_unscatter_k8: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: moe_down_combine_grouped_k8: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gemm_qkv_hfq4g256_wmma: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: deinterleave_batched: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: rope_partial_halfsplit_batched: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: kv_cache_write_q8_0_batched: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: attention_q8_0_kv_batched: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: sigmoid_mul: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: sample_top_p_parallel: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: sample_top_p_parallel_fast21: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: embedding_q8: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: fused_rmsnorm_mq_rotate_vecsum: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: fused_qkvza_hfq4g256_k2048_all_buffer_gfx1151: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: conv1d_silu_split_qknorm_b256: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gated_delta_net_q8_compact2_b2: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gated_norm_mq_rotate_gfx1151: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gemv_hfq4g256_residual_rt_low_gfx1151: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: fused_qkvza_hfq4g256_k2048_hybrid_buffer_gfx1151: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: moe_router_softmax_topk_k8_wave64_exact: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gemv_hfq4g256_moe_gate_up_indexed: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: gemv_hfq4g256_moe_down_k8_indexed_batched_expanded: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: fused_qkv_hfq4g256: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: qwen35_fa_prep_gfx1151: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: kv_cache_write_q8_0_pair: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: attention_flash_q8_0_tile: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.
+  WARNING: moe_down_combine_k8_batched: using UNVALIDATED pre-compiled blob (hipcc unavailable)
+           Output may be incorrect. Install ROCm SDK or rebuild blobs with matching hashes.

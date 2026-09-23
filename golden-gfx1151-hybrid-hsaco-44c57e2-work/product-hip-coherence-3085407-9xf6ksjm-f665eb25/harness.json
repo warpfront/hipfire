@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 14,
+"finish": "stop",
+"think_words": 8,
+"ans_words": 0,
+"prefill_ms": 70.2,
+"prefill_tok_s": 313.3,
+"decode_tok_s": 94.1,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.228,
+"wall_s": 0.228,
+"attractor": false,
+"empty": true,
+"runaway": false,
+"ans_preview": "<<no visible content>>",
+"assistant_content": "Here disb *\u591a\u5143 mildly ...\u53d8\u5316 T -N\n\n choice"
+}
+]

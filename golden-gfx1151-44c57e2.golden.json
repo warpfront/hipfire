@@ -1,0 +1,129 @@
+{
+  "schema": "hipfire.redline.golden-reproduction.v1",
+  "created_at_utc": "2026-07-28T05:10:00.094750+00:00",
+  "fixture_registry": "/home/kaden/hipfire-silver-44c57e2/registry/redline-golden-v1.json",
+  "fixture_registry_sha256": "17c3ab92aead1aaacb910c77f28baa835008bb689d8dcaa97c141982ab49b7c1",
+  "fixture": {
+    "id": "qwen36-a3b-mq4r-gfx1151-tg128-q8-pm4",
+    "architecture": "gfx1151",
+    "reference": {
+      "created_at_utc": "2026-07-22",
+      "source_commit": "76f2a5748959a75c3a9cb484564fe467b6d184d8",
+      "daemon_sha256": "ff93c14e0b7bc2aad8f7bffd6d6c4144d07d1ea8bff69ce92b98a613205bcb27",
+      "report_sha256": "2cc50777843f3919535540449d119b1b97263ea923c91ff257753d8bbd088dfd",
+      "hip_median_tok_s": 102.34810044125717,
+      "pm4_min_tok_s": 115.21925370186791,
+      "pm4_median_tok_s": 115.28981279309554,
+      "pm4_max_tok_s": 115.41962647862607,
+      "speedup": 1.1264479975304111,
+      "historical_headline": {
+        "route_proof_status": "sealed certification bundle",
+        "min_tok_s": 115.021,
+        "median_tok_s": 115.104,
+        "max_tok_s": 115.185
+      }
+    },
+    "acceptance": {
+      "minimum_pm4_tok_s": 115.021,
+      "minimum_speedup": 1.1
+    },
+    "benchmark": {
+      "context": 128,
+      "iterations": 128,
+      "warmups": 10,
+      "warmup_iterations": 32,
+      "runs": 8,
+      "transport": "pm4",
+      "kv_mode": "q8",
+      "max_seq": 2048,
+      "settle_window": 8,
+      "settle_min_runs": 8,
+      "settle_confirmation_runs": 8,
+      "settle_max_runs": 120,
+      "settle_max_slope_pct": 0.05,
+      "settle_max_spread_pct": 1.0,
+      "settle_max_median_drift_pct": 0.5
+    },
+    "route": {
+      "dispatches": 604,
+      "packets": 1,
+      "queues": 1,
+      "phases": 1,
+      "queue_id": 2,
+      "command_dwords": 16708,
+      "unique_kernels": 23,
+      "sequence_hash": "42f566b752920679",
+      "observed_positions": [
+        128,
+        255
+      ]
+    },
+    "silver_baseline": {
+      "status": "coherent-stopgap",
+      "created_at_utc": "2026-07-27",
+      "source_commit": "8445fca2acd462d8e9d7547de2fe3823874c24bb",
+      "daemon_sha256": "73a89a1ea57f8938ea02e264ebdd55b8d0b11f950a95f08def4553f580dc795f",
+      "cli_sha256": "0b29e68d425c308bcd14507b7791f76864735f9ef9943b6e8d52567ce648c120",
+      "route": {
+        "dispatches": 604,
+        "packets": 1,
+        "queues": 1,
+        "phases": 1,
+        "queue_id": 2,
+        "command_dwords": 16831,
+        "unique_kernels": 23,
+        "sequence_hash": "42f566b752920679"
+      },
+      "high_water": {
+        "report_sha256": "27f04979fc98fe8315936916c67e9b4560fafde0c2408a909c3d069bb81f8234",
+        "hip_median_tok_s": 101.15920674320344,
+        "pm4_min_tok_s": 114.11144400163151,
+        "pm4_median_tok_s": 114.20878617548057,
+        "pm4_max_tok_s": 114.23598909360095,
+        "speedup": 1.1290004128383884,
+        "embedded_coherence": false
+      },
+      "coherence_certification": {
+        "report_sha256": "c728740e9f0446124d75ea850cb363c79cf0dfa4c37d52b1386d7fcc8902f681",
+        "hip_median_tok_s": 101.50382195750399,
+        "pm4_median_tok_s": 113.65174802335181,
+        "speedup": 1.119679494146868,
+        "hip_coherence_valid": true,
+        "pm4_coherence_valid": true,
+        "route_proof_valid": true
+      },
+      "disposition": "Coherent stopgap; the Golden acceptance floor remains unchanged."
+    },
+    "sealed_bundle": {
+      "source_commit": "661cb5d63a08ac4fde6dc9e2cebc45c5db347317",
+      "daemon_sha256": "43b4bcaba90db63c14bcde107c32da77361fd79ef2c4ddbc762ce641dfb4279c",
+      "certification_payload_sha256": "61d80dab7c5f0c266191d46bc926e0c3de8b76ce5bf442f478fd6e17e461c59e",
+      "hip_source_aggregate_sha256": "eeaca7ae5296f922c4ec4e847570a3f244161cf2a13f57b9e8cffc5e4d2d83ea",
+      "dispatch_source_aggregate_sha256": "342286e2306ab0310c927887a92c8463a070b9b96940f27f1f070362341777e0",
+      "hsaco_manifest_sha256": "a26cef6c353ae02c5dfb17fe8d1dfb38be42e158254478365e28e398f799053b",
+      "launches": 604,
+      "unique_kernels": 23,
+      "sequence_hash": "53414b0dc0f988ac"
+    }
+  },
+  "product_report": "/home/kaden/hipfire-silver-44c57e2/golden-gfx1151-44c57e2.json",
+  "product_report_sha256": "e5aa9cf83ac0451b201ee33e22255af95fbc952e7958094a0a347ddd3ad62da4",
+  "validation": {
+    "valid": false,
+    "classification": "failed",
+    "fixture_id": "qwen36-a3b-mq4r-gfx1151-tg128-q8-pm4",
+    "architecture": "gfx1151",
+    "hip_median_tok_s": 100.96058729968493,
+    "pm4_median_tok_s": 114.25189581329956,
+    "speedup": 1.1316484864946512,
+    "errors": [
+      "pm4_preflight route_proof prepared identity [[604, 1, 2, 16831, 1, 1]] does not contain dispatches=604, packets=1, queues=1, phases=1, command_dwords=16708, queue_id=2",
+      "auto route_proof prepared identity [[604, 1, 2, 16831, 1, 1]] does not contain dispatches=604, packets=1, queues=1, phases=1, command_dwords=16708, queue_id=2",
+      "PM4 median 114.252 < 115.021 tok/s"
+    ],
+    "warnings": [
+      "source commit 44c57e2e04d9e050e521dac4b4782a2c0f2ceb7b differs from reference 76f2a5748959a75c3a9cb484564fe467b6d184d8",
+      "daemon sha256 0c93b2cbc35d8da899140ad3e9d45ca60c0d7c218c4e623b5d97724de6d07629 differs from reference ff93c14e0b7bc2aad8f7bffd6d6c4144d07d1ea8bff69ce92b98a613205bcb27"
+    ]
+  }
+}
