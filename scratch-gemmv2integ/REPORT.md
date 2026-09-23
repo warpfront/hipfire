@@ -169,3 +169,34 @@ Absolute pp8192 on XTX is **2,564.9 tok/s** (lowest V2C process 2,562.5). Raw da
 
 - gfx1151: the kernel TU also builds for `__gfx1151__`, but dispatch is gated to gfx1100. Extending it waits for GemmV2Gfx11's Halo verdict and Main's go-ahead.
 - `V2_RPF` residual prefetch: GemmV2Gfx11's best native ADD arm (235 VGPR) was not ported. It is a follow-up candidate for ADD K6144.
+
+## Addendum: host LDS request (found by MergeV2C)
+
+At `8a2f42ef8`, the host launch in `gemm.rs` requested **33,280 B** of dynamic LDS. That value was left over from the first version, which staged W scales in LDS. The kernel uses 32,768 B (enforced by its `static_assert`). The resource probe above hard-coded 32,768 B, so it did not use the production launch value.
+
+`hipModuleOccupancyMaxActiveBlocksPerMultiprocessor` on the production runtime HSACO, gfx1100, HIP 0 (`gfx1100-occupancy-lds.txt`):
+
+| Dynamic LDS request | Blocks/MP (waves), SET and ADD |
+|---:|---:|
+| 33,280 B | 1 (8) |
+| 32,768 B | 2 (16) |
+
+The follow-up commit sets the host request to 32,768 B.
+
+**Timing: no measurable change.**
+- Standalone, the same object (`v2cp2`) timed at 33,280 B (S2) and 32,768 B (S3) matched within noise; for example, SET M17408 ran at 152.9 vs 152.6 TOPS.
+- Whole model, one fresh-process matrix run per arm (`run_quick_ab.py`, `gfx1100/lds-fix/summary.json`), `8a2f42ef8` binaries vs LDS-fix binaries:
+
+| Row | 33,280 B | 32,768 B | Ratio |
+|---|---:|---:|---:|
+| pp512 | 2,588.8 | 2,573.9 | 0.994 |
+| pp8192 | 2,582.9 | **2,587.4** | 1.002 |
+| tg128 | 49.29 | 48.98 | 0.994 |
+
+All three ratios are within run-to-run noise.
+
+`[INFERENCE]` The hardware already ran both requests at the same residency: a gfx1100 WGP has 128 KB of LDS in WGP mode, while the occupancy API budgets 64 KB per MP. I have not verified this with a direct residency counter.
+
+**Numerics:** unchanged. WT2 c24 q8/q8 with the LDS-fix `eval_hipfire` gives 0.076879, and the KLD sequence is byte-identical (SHA256 `8f2b94bb904603bc53d17f7877c306ee4aacd0afc7c71acbf80a60bea0b1e2b2`, `cmp` passes; V2C object present in the cache).
+
+The fix makes the request match the kernel and the documented resources. It is not a speedup.

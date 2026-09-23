@@ -1,5 +1,6 @@
 // Resource probe for the runtime-compiled V2C HSACO (8 waves, 32,768 B LDS).
-// usage: resource <arch> <hsaco> <kernel...>; fails on spills/private, <2 CTAs/MP.
+// usage: resource <arch> <hsaco> <kernel...>; dynamic LDS from $V2C_LDS (default
+// 32768, the production launch value); fails on private bytes or <2 CTAs/MP.
 #include <hip/hip_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -13,7 +14,8 @@ int main(int argc, char** argv) {
     printf("GPU dev 0: %s\n", prop.gcnArchName);
     hipModule_t mod{};
     check(hipModuleLoad(&mod, argv[2]));
-    const int threads = 256, lds = 32768;
+    const int threads = 256;
+    const int lds = getenv("V2C_LDS") ? atoi(getenv("V2C_LDS")) : 32768;
     int rc = 0;
     for (int a = 3; a < argc; ++a) {
         hipFunction_t fn{};

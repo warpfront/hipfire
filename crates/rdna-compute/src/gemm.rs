@@ -19854,8 +19854,10 @@ impl Gpu {
                 &mut k_val as *mut _ as *mut c_void,
                 &mut n_val as *mut _ as *mut c_void,
             ];
-            // Two 16,640 B K128 slots: 8 KiB W + 8 KiB X payload + 256 B W scales.
-            const V2C_LDS_BYTES: u32 = 33280;
+            // Two 16 KiB K128 slots (8 KiB W + 8 KiB X payload); scales bypass
+            // LDS. Must equal the kernel's LDS_BYTES: anything above 32 KiB
+            // drops gfx1100 from 2 to 1 CTA/WGP.
+            const V2C_LDS_BYTES: u32 = 32768;
             let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
             let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
             // Token tile on x, row tile on y.
