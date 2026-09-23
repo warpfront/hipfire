@@ -1,0 +1,155 @@
+=== mtp_only_demo ===
+target:     /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x
+mtp-head:   /home/kaden/.hipfire/models/qwen3.6-35b-a3b.moe-mtp-mq4-cvs16384.mtp
+prompt md5: 22bc348376d1289f80f71dd2b9cf62cc
+max=1024 ctx=4096 max_n=5 chatml=true trunk_spine=true
+GPU dev 0: gfx1151 (103.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1151
+gpu: gfx1151
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+    (Q8_0 raw, 540 MB)
+  loading output_norm...
+  loading output (separate lm_head, qt=3)...
+  loading layer 0/40 (LinearAttention + MoE)...
+  loading layer 1/40 (LinearAttention + MoE)...
+  loading layer 2/40 (LinearAttention + MoE)...
+  loading layer 3/40 (FullAttention + MoE)...
+  loading layer 4/40 (LinearAttention + MoE)...
+  loading layer 5/40 (LinearAttention + MoE)...
+  loading layer 6/40 (LinearAttention + MoE)...
+  loading layer 7/40 (FullAttention + MoE)...
+  loading layer 8/40 (LinearAttention + MoE)...
+  loading layer 9/40 (LinearAttention + MoE)...
+  loading layer 10/40 (LinearAttention + MoE)...
+  loading layer 11/40 (FullAttention + MoE)...
+  loading layer 12/40 (LinearAttention + MoE)...
+  loading layer 13/40 (LinearAttention + MoE)...
+  loading layer 14/40 (LinearAttention + MoE)...
+  loading layer 15/40 (FullAttention + MoE)...
+  loading layer 16/40 (LinearAttention + MoE)...
+  loading layer 17/40 (LinearAttention + MoE)...
+  loading layer 18/40 (LinearAttention + MoE)...
+  loading layer 19/40 (FullAttention + MoE)...
+  loading layer 20/40 (LinearAttention + MoE)...
+  loading layer 21/40 (LinearAttention + MoE)...
+  loading layer 22/40 (LinearAttention + MoE)...
+  loading layer 23/40 (FullAttention + MoE)...
+  loading layer 24/40 (LinearAttention + MoE)...
+  loading layer 25/40 (LinearAttention + MoE)...
+  loading layer 26/40 (LinearAttention + MoE)...
+  loading layer 27/40 (FullAttention + MoE)...
+  loading layer 28/40 (LinearAttention + MoE)...
+  loading layer 29/40 (LinearAttention + MoE)...
+  loading layer 30/40 (LinearAttention + MoE)...
+  loading layer 31/40 (FullAttention + MoE)...
+  loading layer 32/40 (LinearAttention + MoE)...
+  loading layer 33/40 (LinearAttention + MoE)...
+  loading layer 34/40 (LinearAttention + MoE)...
+  loading layer 35/40 (FullAttention + MoE)...
+  loading layer 36/40 (LinearAttention + MoE)...
+  loading layer 37/40 (LinearAttention + MoE)...
+  loading layer 38/40 (LinearAttention + MoE)...
+  loading layer 39/40 (FullAttention + MoE)...
+KV cache: q8 (10/40 layers carry KV, others placeholder)
+trunk loaded in 23.03s
+mtp head loaded in 0.59s (standalone .mtp) — n_embd=2048 vocab=248320 n_rot=64 rope_theta=10000000 compressed_lm_head_draft=true
+chatml wrap: prompt 60 tokens after wrap
+mtp-head kv-mode: Q8
+trunk-spine: ON (sidecar draft lm_head, cvs=16384, K=5)
+prefilling 60 tokens (batched trunk + MTP cache fill)...
+prefill: 0.13s (469.7 tok/s)
+prefill split: trunk=0.012s (4992.0 tok/s) mtp_prompt_fill=0.116s total=0.128s
+seed token (greedy after prefill): 248068 ('<think>')
+
+=== output ===
+<think>
+Here's a thinking process:
+
+1.  **Understand User Request:**
+   - **Topic:** Speculative decoding
+   - **Key Phenomenon:** Fast on short coding prompts, slower on long open-ended chat responses
+   - **Requirements:** 
+     - Concrete intuition
+     - Simple example
+     - Short list of practical debugging checks
+     - Conversational tone
+     - Avoid code unless necessary
+   - **Goal:** Explain why this performance difference happens
+
+2.  **Deconstruct Speculative Decoding:**
+   - What is it? A technique where a smaller "draft" model generates multiple tokens quickly, then a larger "target" model verifies them in parallel. If they match, all tokens are accepted. If not, the target model corrects and continues.
+   - Key metrics: Acceptance rate, draft speed, verification cost, token generation pattern.
+   - Why does it work well for coding? Coding is deterministic, structured, has high predictability, low branching factor, and often follows patterns/rules.
+   - Why does it struggle with long open-ended chat? Chat is creative, highly contextual, has high branching factor, low predictability, and requires deep reasoning/context tracking.
+
+3.  **Develop Concrete Intuition:**
+   - Think of speculative decoding like a student (draft model) writing a draft, and a professor (target model) checking it.
+   - For coding: The student knows the rules (syntax, logic, patterns). They can predict the next few lines accurately. The professor just signs off quickly.
+   - For chat: The student is guessing what the professor wants. The conversation is open-ended, nuanced, and context-heavy. The professor has to rewrite most of it. The student's guesses are often wrong, causing frequent rejections and sequential fallbacks.
+
+4.  **Create a Simple Example:**
+   - Coding prompt: "Write a Python function to reverse a string."
+     - Draft model predicts: `def reverse(s): return s[::-1]`
+     - High match rate → fast
+   - Chat prompt: "Tell me a story about a detective who finds a lost key in a rainy city."
+     - Draft model predicts: "The detective walked down the street. It was raining. He found a key under a bench."
+     - Target model rejects most because it wants more nuance, better pacing, specific tone, etc. → slow
+
+5.  **Identify Key Factors for Performance Difference:**
+   - **Predictability/Entropy:** Coding has low entropy; chat has high entropy.
+   - **Context Window/Depth:** Long chat requires tracking subtle context; draft models often lose track or oversimplify.
+   - **Branching Factor:** Coding has few valid continuations; chat has many plausible but different paths.
+   - **Verification Cost vs. Draft Speed:** If acceptance rate drops, verification overhead dominates.
+
+6.  **Develop Practical Debugging Checks:**
+   - Need a short list (4-5 items) that a practitioner can actually run/check.
+   - Examples:
+     1. Check acceptance rate per token/step
+     2. Monitor draft vs target token generation time
+     3. Analyze rejection patterns (where do they diverge?)
+     4. Test with controlled prompts (vary length, domain, creativity)
+     5. Check context window utilization / attention patterns
+
+7.  **Structure the Response:**
+   - Conversational opening
+   - Core intuition (analogy + explanation)
+   - Simple example (coding vs chat)
+   - Why the difference happens (key factors)
+   - Practical debugging checks (short list)
+   - Conversational closing
+   - Keep it tight, avoid code, maintain tone.
+
+8.  **Draft - Mental Refinement (Self-Correction/Verification):**
+   - *Tone:* Keep it friendly, like explaining to a colleague over coffee.
+   - *Intuition:* Use the "draft vs editor" or "student vs professor" analogy. Make it concrete.
+   - *Example:* Keep it short and clear. Show how acceptance rate differs.
+   - *Debugging checks:* Make them actionable. Not just "check acceptance rate" but "track acceptance rate per step and plot it against prompt length".
+   - *Avoid code:* I'll stick to conceptual descriptions. Maybe mention "acceptance rate" or "draft tokens" but no actual code.
+   - *Check accuracy:* Speculative decoding speed depends heavily on acceptance rate. High acceptance = speedup. Low acceptance = overhead from draft generation + verification. Coding = high acceptance. Chat = low acceptance, especially as context grows. Long open-ended chat also suffers from draft model's limited context/depth, causing more mismatches. All accurate.
+   - *Structure:* 
+     - Quick intro
+     - The intuition (predictability + context)
+     - Concrete
+=== end ===
+
+prompt_md5:           22bc348376d1289f80f71dd2b9cf62cc
+prompt_tokens:        60
+max_n:                5
+cycles:               436
+replay_skipped:       23 cycles (5.3%)
+committed_total:      1028
+committed_seed:       1
+committed_per_cycle_avg: 2.3555
+accepted_mtp_total:   591
+bonus_total:          436
+tau:                  2.3555
+prefill_secs:         0.128
+prefill_tok_s:        469.72
+trunk_prefill_secs:   0.012
+trunk_prefill_tok_s:  4992.00
+mtp_prompt_fill_secs: 0.116
+decode_secs:          18.450
+tok_s:                55.72
+eos_hit:              n
+preview_200:          "<think>\nHere's a thinking process:\n\n1.  **Understand User Request:**\n   - **Topic:** Speculative decoding\n   - **Key Phenomenon:** Fast on short coding prompts, slower on long open-ended chat response"

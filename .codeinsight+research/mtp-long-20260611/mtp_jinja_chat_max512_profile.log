@@ -1,0 +1,158 @@
+=== mtp_only_demo ===
+target:     /home/kaden/.hipfire/models/qwen3.6-35b-a3b.mq4-awq-mi300x
+mtp-head:   /home/kaden/.hipfire/models/qwen3.6-35b-a3b.moe-mtp-mq4-cvs16384.mtp
+prompt md5: 0a34fd692b84d40377580678baf9ae3a
+max=512 ctx=4096 max_n=5 chatml=true jinja_chat=true trunk_spine=true
+GPU dev 0: gfx1151 (103.1 GB VRAM, HIP 7.2)
+  pre-compiled kernels: .hipfire_kernels/gfx1151
+gpu: gfx1151
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+    (Q8_0 raw, 540 MB)
+  loading output_norm...
+  loading output (separate lm_head, qt=3)...
+  loading layer 0/40 (LinearAttention + MoE)...
+  loading layer 1/40 (LinearAttention + MoE)...
+  loading layer 2/40 (LinearAttention + MoE)...
+  loading layer 3/40 (FullAttention + MoE)...
+  loading layer 4/40 (LinearAttention + MoE)...
+  loading layer 5/40 (LinearAttention + MoE)...
+  loading layer 6/40 (LinearAttention + MoE)...
+  loading layer 7/40 (FullAttention + MoE)...
+  loading layer 8/40 (LinearAttention + MoE)...
+  loading layer 9/40 (LinearAttention + MoE)...
+  loading layer 10/40 (LinearAttention + MoE)...
+  loading layer 11/40 (FullAttention + MoE)...
+  loading layer 12/40 (LinearAttention + MoE)...
+  loading layer 13/40 (LinearAttention + MoE)...
+  loading layer 14/40 (LinearAttention + MoE)...
+  loading layer 15/40 (FullAttention + MoE)...
+  loading layer 16/40 (LinearAttention + MoE)...
+  loading layer 17/40 (LinearAttention + MoE)...
+  loading layer 18/40 (LinearAttention + MoE)...
+  loading layer 19/40 (FullAttention + MoE)...
+  loading layer 20/40 (LinearAttention + MoE)...
+  loading layer 21/40 (LinearAttention + MoE)...
+  loading layer 22/40 (LinearAttention + MoE)...
+  loading layer 23/40 (FullAttention + MoE)...
+  loading layer 24/40 (LinearAttention + MoE)...
+  loading layer 25/40 (LinearAttention + MoE)...
+  loading layer 26/40 (LinearAttention + MoE)...
+  loading layer 27/40 (FullAttention + MoE)...
+  loading layer 28/40 (LinearAttention + MoE)...
+  loading layer 29/40 (LinearAttention + MoE)...
+  loading layer 30/40 (LinearAttention + MoE)...
+  loading layer 31/40 (FullAttention + MoE)...
+  loading layer 32/40 (LinearAttention + MoE)...
+  loading layer 33/40 (LinearAttention + MoE)...
+  loading layer 34/40 (LinearAttention + MoE)...
+  loading layer 35/40 (FullAttention + MoE)...
+  loading layer 36/40 (LinearAttention + MoE)...
+  loading layer 37/40 (LinearAttention + MoE)...
+  loading layer 38/40 (LinearAttention + MoE)...
+  loading layer 39/40 (FullAttention + MoE)...
+KV cache: q8 (10/40 layers carry KV, others placeholder)
+trunk loaded in 23.07s
+mtp head loaded in 0.59s (standalone .mtp) — n_embd=2048 vocab=248320 n_rot=64 rope_theta=10000000 compressed_lm_head_draft=true
+jinja chat render: prompt 105 tokens after render (rendered_md5=5da7879c3ea6c091ebf3c94faf0aa2f4)
+prompt: 105 tokens (jinja chat)
+mtp-head kv-mode: Q8
+trunk-spine: ON (sidecar draft lm_head, cvs=16384, K=5)
+prefilling 105 tokens (batched trunk + MTP cache fill)...
+prefill: 0.17s (604.4 tok/s)
+prefill split: trunk=0.012s (8865.3 tok/s) mtp_prompt_fill=0.162s total=0.174s
+seed token (greedy after prefill): 8160 ('Here')
+
+=== PROFILE: 9768 kernel calls over 8 cycles, 429.7ms total kernel time ===
+  per-cycle kernel total: 53.71 ms
+  kernel                                              calls   total_ms    us/call       %         MB
+  gemm_hfq4g256_moe_grouped_wmma_k2                     384      87.24        227   20.3%     2892.1
+  gemm_hfq6g256_moe_grouped_wmma_gfx1151                256      68.16        266   15.9%     2028.7
+  gemm_q8_0_wmma                                        648      40.06         62    9.3%     4567.3
+  gemm_qkvza_q8_0_wmma                                  216      36.47        169    8.5%     5875.0
+  gemm_q8_0_residual_wmma                               288      21.37         74    5.0%     2609.4
+  gated_delta_net_q8_batch_seq                          450      19.17         43    4.5%      614.9
+  rmsnorm_batched                                       856      14.79         17    3.4%      119.6
+  gemv_hfq4g256                                         320      12.35         39    2.9%     1523.4
+  fused_silu_mul_mq_rotate_batched                      680      10.20         15    2.4%      144.2
+  gemm_gate_up_hfq4g256_wmma_ldscoop_nosync             288       9.41         33    2.2%      348.0
+  gemm_qkv_q8_0_wmma                                     72       9.37        130    2.2%     1461.6
+  conv1d_silu_split_f32_n                               450       7.59         17    1.8%      766.8
+  fused_qk_l2_norm_scale_f32_batched                    450       7.35         16    1.7%       63.9
+  moe_scatter_fused_k8                                  320       6.59         21    1.5%        1.2
+  repeat_interleave_qk_f32_batched                      450       6.52         14    1.5%       95.8
+  moe_topk_renorm_k8_batched                            320       6.35         20    1.5%        2.1
+  moe_gate_up_unscatter_k8                              320       5.47         17    1.3%     2014.2
+  moe_down_combine_grouped_k8                           320       5.39         17    1.3%       31.6
+  mq_rotate_x_batched                                   352       5.28         15    1.2%       42.1
+  mq_rotate_x                                           360       5.13         14    1.2%        7.9
+  gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched     192       4.79         25    1.1%      663.0
+  gated_norm_f32_batched                                240       3.86         16    0.9%       94.4
+  gemm_qkvza_hfq6g256_wmma                               24       3.77        157    0.9%      339.3
+  rmsnorm_f32                                           200       3.61         18    0.8%        4.9
+  fused_sigmoid_alpha_gate_f32_batched                  240       3.53         15    0.8%        0.7
+  gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched     128       3.26         25    0.8%      637.0
+  attention_q8_0_kv_batched                              80       2.44         30    0.6%       79.8
+  gemv_hfq4g256_moe_gate_up_k8_indexed                   40       2.36         59    0.5%      361.8
+  gemm_hfq6g256_residual_wmma_k2                         32       2.23         70    0.5%      148.1
+=== /PROFILE ===
+
+
+=== output ===
+Here's a thinking process:
+
+1.  **Understand User Requirements:**
+   - **Topic:** Deterministic bounded LRU cache in Rust
+   - **Constraints:** Safe Rust only, no external crates, O(1) get and put operations
+   - **Content Requirements:** Clear invariants, edge cases, compact but complete implementation
+   - **Section Labels:** Overview, Data layout, Invariants, Get path, Put path, Eviction path, Error cases, Tests, Full code, Complexity, Review checklist, Final notes
+   - **Tone/Style:** Detailed implementation note, substantive and concrete for each section
+
+2.  **Deconstruct the Problem:**
+   - **LRU Cache:** Least Recently Used cache with a fixed maximum capacity.
+   - **O(1) Operations:** Requires a hash map for O(1) lookups and a doubly-linked list for O(1) reordering/eviction.
+   - **Safe Rust Only:** No `unsafe`, no raw pointers. This means I need to implement the linked list using indices (like a free-list or arena-based approach) or use `std::collections::VecDeque`/`std::collections::HashMap` with careful management. Actually, a doubly-linked list in safe Rust without `unsafe` is tricky because you can't have self-referential structs or raw pointers. The standard approach is to use an arena (vector) of nodes and store indices instead of pointers. This is safe and O(1).
+   - **Deterministic:** The eviction order must be strictly predictable. No randomness, no non-deterministic ordering. The index-based linked list approach is deterministic.
+   - **Bounded:** Fixed capacity.
+   - **No external crates:** Only `std`.
+
+3.  **Design Decisions:**
+   - **Data Structure:** 
+     - `HashMap<K, NodeIndex>` for O(1) lookup
+     - `Vec<Node>` as an arena for the doubly-linked list
+     - `head` and `tail` indices (or `Option<usize>`) for the list ends
+     - `capacity: usize`
+   - **Node Structure:**
+     ```rust
+     struct Node {
+         key: K,
+         value: V,
+         prev: Option<usize>,
+         next: Option<usize>,
+     }
+     ```
+   - **Operations:**
+     - `get(key)`: Look up in map, if found, move node
+=== end ===
+
+prompt_md5:           0a34fd692b84d40377580678baf9ae3a
+rendered_prompt_md5:  5da7879c3ea6c091ebf3c94faf0aa2f4
+prompt_tokens:        105
+max_n:                5
+cycles:               196
+replay_skipped:       13 cycles (6.6%)
+committed_total:      515
+committed_seed:       1
+committed_per_cycle_avg: 2.6224
+accepted_mtp_total:   318
+bonus_total:          196
+tau:                  2.6224
+prefill_secs:         0.174
+prefill_tok_s:        604.39
+trunk_prefill_secs:   0.012
+trunk_prefill_tok_s:  8865.28
+mtp_prompt_fill_secs: 0.162
+decode_secs:          8.329
+tok_s:                61.83
+eos_hit:              n
+preview_200:          "Here's a thinking process:\n\n1.  **Understand User Requirements:**\n   - **Topic:** Deterministic bounded LRU cache in Rust\n   - **Constraints:** Safe Rust only, no external crates, O(1) get and put ope"
