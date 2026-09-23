@@ -594,6 +594,18 @@ impl<'a> JinjaChatFrame<'a> {
         // prompts could propagate to the model unnoticed (Codex review on
         // PR #175 flagged this; we apply it here in the same port).
         env.set_undefined_behavior(minijinja::UndefinedBehavior::Strict);
+        // Match HuggingFace's apply_chat_template Jinja environment, which is
+        // constructed with `trim_blocks=True, lstrip_blocks=True`. Without these,
+        // block tags (`{% … %}`) leak their surrounding source whitespace into
+        // the rendered output — off-distribution vs. what the model trained on.
+        // Worse, for templates with history-length-dependent control flow (e.g.
+        // MiniMax-M2's `last_user_index` scan, which emits a `\n        ` per
+        // user message), the leaked leading whitespace VARIES by turn, so turn
+        // N+1's render diverges from turn N's at token 1 and the LCP prompt
+        // cache collapses to lcp=1. Enabling both makes our render byte-track
+        // HF and keeps the structural prefix history-invariant.
+        env.set_trim_blocks(true);
+        env.set_lstrip_blocks(true);
         // Make Python-style str/list/dict methods (`.startswith`,
         // `.split`, `.rstrip`, `.lstrip`, `|items`, etc.) work on
         // ordinary Jinja values. Required by the Qwen3 family
