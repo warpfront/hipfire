@@ -44,11 +44,9 @@ fn main() {
         }
     }
 
-    let shapes: &[(usize, usize, &str)] = &[
-        (256, 7168, "comp_idx M=256 K=7168"),
-        (1024, 7168, "comp_main_r4 M=1024 K=7168"),
-    ];
-    let batches: &[usize] = &[16, 64, 128, 256, 512];
+    let shapes: &[(usize, usize, &str)] =
+        &[(19_968, 6_656, "Muse gate M=19968 K=6656")];
+    let batches: &[usize] = &[192];
 
     for &(m, k, label) in shapes {
         println!("\n=== {label} ===");
