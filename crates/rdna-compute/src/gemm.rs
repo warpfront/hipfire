@@ -19794,22 +19794,37 @@ impl Gpu {
             // guarded writeback). Block [256,1,1].
             let symfold = self.mq4v2_symmetric
                 && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0");
-            let kernel_name = match (symfold, add) {
-                (true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
-                (true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
-                (false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
-                (false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
+            // Banded CTA raster + wide epilogue (bit-identical outputs, see
+            // the kernel header); `HIPFIRE_G12_RASTER=0` restores the
+            // incumbent modules.
+            let g12r = hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0");
+            let kernel_name = match (g12r, symfold, add) {
+                (true, true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold_g12r",
+                (true, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold_g12r",
+                (true, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_g12r",
+                (true, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_g12r",
+                (false, true, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold",
+                (false, true, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold",
+                (false, false, true) => "gemm_mq4g256v2_residual_mmq_iu4_full_add",
+                (false, false, false) => "gemm_mq4g256v2_residual_mmq_iu4_full_set",
             };
-            let (module, source) = if symfold {
-                (
+            let (module, source) = match (g12r, symfold) {
+                (true, true) => (
+                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_G12R_SRC,
+                ),
+                (true, false) => (
+                    "gemm_mq4g256v2_residual_mmq_iu4_gfx12_g12r",
+                    kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_G12R_SRC,
+                ),
+                (false, true) => (
                     "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold",
                     kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC,
-                )
-            } else {
-                (
+                ),
+                (false, false) => (
                     "gemm_mq4g256v2_residual_mmq_iu4_gfx12",
                     kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SRC,
-                )
+                ),
             };
             self.ensure_kernel(module, source, kernel_name)?;
             let mut a_ptr = a_raw.buf.as_ptr();
@@ -31868,12 +31883,23 @@ impl Gpu {
         }
         self.bind_thread()?;
         let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
-        const KERNEL: &str = "gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold";
-        self.ensure_kernel(
-            "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold",
-            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC,
-            KERNEL,
-        )?;
+        // `HIPFIRE_G12_RASTER=0` keeps the incumbent module (two-group raster,
+        // b32 h stores); default is the banded-raster, wide-h-store build.
+        let g12r = hipfire_config::developer_var("HIPFIRE_G12_RASTER").as_deref() != Ok("0");
+        let (module, source, kernel) = if g12r {
+            (
+                "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold_g12r",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_G12R_SRC,
+                "gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold_g12r",
+            )
+        } else {
+            (
+                "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC,
+                "gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold",
+            )
+        };
+        self.ensure_kernel(module, source, kernel)?;
         let mut g_ptr = a_gate.buf.as_ptr();
         let mut u_ptr = a_up.buf.as_ptr();
         let mut xq_ptr = xq;
@@ -31891,10 +31917,10 @@ impl Gpu {
             &mut n_val as *mut _ as *mut c_void,
         ];
         let bytes = 2 * m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + n * m * 4;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel, bytes);
         // Virtual (gate/up interleaved) row tile on x, token tile on y, as the SET.
         let result = self.launch_maybe_blob(
-            KERNEL,
+            kernel,
             [(2 * m / 128) as u32, n.div_ceil(128) as u32, 1],
             [256, 1, 1],
             20480,

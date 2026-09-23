@@ -111,6 +111,26 @@
 //
 // Grid: [ceil(M/128), ceil(N/128)]. Block: [256,1,1]. LDS: 20480 bytes.
 //
+// IU4_G12_RASTER (the `_g12r` modules; `HIPFIRE_G12_RASTER=0` selects the
+// incumbent build) changes only CTA order and the full-tile store paths; the
+// K order, fold DAG and per-element SET/ADD/SILU arithmetic are untouched,
+// so its outputs are bit-identical:
+//   - Raster: the linear dispatch id walks bands of IU4_RASTER_BAND (8) row
+//     tiles (SILU: virtual gate+up tiles, replacing IU4_SILU_RGROUPS), rows
+//     fastest within a band, then tokens. The ~96 resident CTAs then share
+//     ~8 W row tiles and ~12 token tiles (about 7 MB, L2-sized) instead of
+//     streaming the whole weight matrix per token tile.
+//   - Wide SET/ADD epilogue: per 16-token block nb, all waves dump
+//     acc[nb][0..1] into one [32 tok][132] f32 LDS tile, then each wave
+//     writes whole 128-row token columns (512 contiguous B) with b128 stores:
+//     8 barriers instead of 16, 16 b128 instead of 64 b32 global stores
+//     (plus as many old-Y loads for ADD) per thread. SILU does the same with
+//     a [32 tok][68] tile of its 64 h rows (256 contiguous B per column).
+//     Needs full tiles (SILU: full token columns), M % 4 == 0 and a 16 B
+//     aligned Y; anything else takes the incumbent stores.
+//   Measured card-E standalone and in pp8192 rocprof: see
+//   scratch-g12raster2/REPORT.md.
+//
 // Sweep note: 64x256 / 256x64 aspects need a different wave map (wt_pair /
 // tok_half split) plus matching host grid/LDS; the fold/prefetch/store
 // mechanisms transfer unchanged. Host, oracle, and timing launchers hardcode
@@ -143,6 +163,10 @@
 #define IU4_WAVES 8
 #endif
 #define IU4_NTHREADS (IU4_WAVES * 32)
+// Row-tile band of the IU4_G12_RASTER CTA order.
+#ifndef IU4_RASTER_BAND
+#define IU4_RASTER_BAND 8
+#endif
 // Fragment-order slab: each 64-K slab (IU4_BK nibbles/row) holds 8 row/token
 // groups of 16 x 2 K32 steps = 16 fragments of 256 contiguous bytes
 // (32 lanes x 8 B, lane L at frag*256 + L*8). Same 4096 data bytes as the
@@ -326,6 +350,21 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     const int lane = tid & 31;
     int rs = blockIdx.x * IU4_BN;
     int bs = blockIdx.y * IU4_BM;
+#if defined(IU4_G12_RASTER)
+    // Banded raster (see header), SET/ADD and SILU alike: bijective for any
+    // grid, partial last band. SILU bands count virtual (gate+up) row tiles.
+    {
+        const int n_row_tiles = gridDim.x;
+        const int lin = blockIdx.y * n_row_tiles + blockIdx.x;
+        const int per_band = IU4_RASTER_BAND * gridDim.y;
+        const int band = lin / per_band;
+        const int in_band = lin - band * per_band;
+        const int band_row0 = band * IU4_RASTER_BAND;
+        const int band_rows = min(n_row_tiles - band_row0, IU4_RASTER_BAND);
+        rs = (band_row0 + in_band % band_rows) * IU4_BN;
+        bs = (in_band / band_rows) * IU4_BM;
+    }
+#else
     if constexpr (SILU) {
         // Raster: the fused grid streams both matrices, twice the weight
         // bytes of one SET. Visit IU4_SILU_RGROUPS contiguous row-tile groups
@@ -340,6 +379,7 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         rs = (grp * per + in % per) * IU4_BN;
         bs = (in / per) * IU4_BM;
     }
+#endif
 
     if (rs >= (SILU ? 2 * M : M) || bs >= N) return;
 
@@ -733,6 +773,42 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
         const auto h_rsrc = __builtin_amdgcn_make_buffer_rsrc(
             h_tile, 0, 0xffffffffu, 0x31004000u);
         const bool full_cols = bs + IU4_BM <= N;
+#if defined(IU4_G12_RASTER)
+        // Wide h epilogue: per nb, all waves dump their 16 h rows x 16 tokens
+        // into a [32 tok][68] f32 tile (8704 B), then 16 lanes per token
+        // column write its 64 h rows (256 contiguous B) as b128 stores.
+        // Same IU4_SILU_MUL values; only the store shape changes.
+        if (full_cols && (M & 3) == 0 && (reinterpret_cast<uintptr_t>(Y) & 15u) == 0) {
+            const unsigned dump_tok = (unsigned)(tok_half * 16 + m_lane);
+            const unsigned wide_h_off =
+                ((unsigned)(tid >> 4) * (unsigned)M + (unsigned)(tid & 15) * 4u) * sizeof(float);
+            #pragma unroll
+            for (int nb = 0; nb < 4; nb++) {
+                #pragma unroll
+                for (int c = 0; c < 2; c++) {
+                    float4 v4;
+                    v4.x = IU4_SILU_MUL(acc[nb][0][4 * c + 0], acc[nb][1][4 * c + 0]);
+                    v4.y = IU4_SILU_MUL(acc[nb][0][4 * c + 1], acc[nb][1][4 * c + 1]);
+                    v4.z = IU4_SILU_MUL(acc[nb][0][4 * c + 2], acc[nb][1][4 * c + 2]);
+                    v4.w = IU4_SILU_MUL(acc[nb][0][4 * c + 3], acc[nb][1][4 * c + 3]);
+                    *(float4*)(slots + dump_tok * 68u
+                        + (unsigned)(wt_pair * 16 + 8 * k_grp + 4 * c)) = v4;
+                }
+                __syncthreads();
+                #pragma unroll
+                for (int it = 0; it < 2; it++) {
+                    // Token column it*64 + nb*16 + (tid>>4), h rows (tid&15)*4..+3.
+                    const float4 v4 = *(const float4*)(slots
+                        + (unsigned)(it * 16 + (tid >> 4)) * 68u + (unsigned)(tid & 15) * 4u);
+                    const unsigned phase_off =
+                        (unsigned)(it * 64 + nb * 16) * (unsigned)M * sizeof(float);
+                    *(float4*)((char*)h_tile + wide_h_off + phase_off) = v4;
+                }
+                __syncthreads();
+            }
+            return;
+        }
+#endif
         #pragma unroll
         for (int nb = 0; nb < 4; nb++) {
             #pragma unroll
@@ -768,6 +844,56 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_iu4_gfx12_bod
     const auto y_tile_rsrc = __builtin_amdgcn_make_buffer_rsrc(
         y_tile, 0, 0xffffffffu, 0x31004000u);
     const bool full_tile = rs + IU4_BN <= M && bs + IU4_BM <= N;
+#if defined(IU4_G12_RASTER)
+    // Wide epilogue (see header). Tile [32 tok][132] f32 = 16896 B over the
+    // dead compute planes; the loop's final barrier already fenced them.
+    // Plain float4 accesses (no ext-vector bit casts: clang 23 lowers
+    // __builtin_bit_cast(T, v[i]) to element 0).
+    if (full_tile && (M & 3) == 0 && (reinterpret_cast<uintptr_t>(Y) & 15u) == 0) {
+        const unsigned wide_lane_off =
+            ((unsigned)wave * (unsigned)M + (unsigned)lane * 4u) * sizeof(float);
+        const unsigned dump_tok = (unsigned)(tok_half * 16 + m_lane);
+        #pragma unroll
+        for (int nb = 0; nb < 4; nb++) {
+            #pragma unroll
+            for (int rg = 0; rg < 2; rg++) {
+                #pragma unroll
+                for (int c = 0; c < 2; c++) {
+                    float4 v4;
+                    v4.x = acc[nb][rg][4 * c + 0];
+                    v4.y = acc[nb][rg][4 * c + 1];
+                    v4.z = acc[nb][rg][4 * c + 2];
+                    v4.w = acc[nb][rg][4 * c + 3];
+                    *(float4*)(slots + dump_tok * 132u
+                        + (unsigned)(wave_row0 + rg * 16 + 8 * k_grp + 4 * c)) = v4;
+                }
+            }
+            __syncthreads();
+            #pragma unroll
+            for (int it = 0; it < 4; it++) {
+                // Token column (it>>1)*64 + nb*16 + (it&1)*8 + wave, rows lane*4..+3.
+                const float4 v4 = *(const float4*)(slots + (unsigned)(it * 8 + wave) * 132u
+                    + (unsigned)lane * 4u);
+                const unsigned phase_off =
+                    (unsigned)((it >> 1) * 64 + nb * 16 + (it & 1) * 8) * (unsigned)M * sizeof(float);
+                float4* const yp = (float4*)((char*)y_tile + wide_lane_off + phase_off);
+                if constexpr (ADD) {
+                    const float4 old = *yp;
+                    float4 out;
+                    out.x = old.x + v4.x;
+                    out.y = old.y + v4.y;
+                    out.z = old.z + v4.z;
+                    out.w = old.w + v4.w;
+                    *yp = out;
+                } else {
+                    *yp = v4;
+                }
+            }
+            __syncthreads();
+        }
+        return;
+    }
+#endif
     if (full_tile) {
         #pragma unroll
         for (int rg = 0; rg < 2; rg++) {
