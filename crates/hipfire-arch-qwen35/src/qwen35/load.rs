@@ -2903,7 +2903,49 @@ fn load_layer_into(
     let moe = |bk: &mut HfqBackend, cfg: &Qwen35Config, li: usize| {
         load_moe_ffn(bk.hfq, bk.gpu, &format!("layers.{li}"), cfg, li as u16)
     };
-    crate::layer_driver::load_layer(&mut b, config, layer_idx, moe)
+    let mut layer = crate::layer_driver::load_layer(&mut b, config, layer_idx, moe)?;
+    if let LayerWeights::DeltaNet(dn) = &mut layer {
+        if let Err(e) = append_betaalpha_to_z(hfq, gpu, p, dn) {
+            layer.free_gpu(gpu);
+            return Err(e);
+        }
+    }
+    Ok(layer)
+}
+
+/// MQ4V2's 136-byte groups contain both half-group headers inline, and rows
+/// are consecutive groups. Appending complete rows therefore preserves every
+/// scale, zero and nibble verbatim; zero rows complete the SET's M128 tile
+/// (M256 on Halo). Keep the original beta/alpha owners for decode/fallback.
+fn append_betaalpha_to_z(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    prefix: &str,
+    dn: &mut DeltaNetLayerWeights,
+) -> HipResult<()> {
+    let (qkv, z, beta, alpha) = (&dn.wqkv, &mut dn.wz, &dn.w_beta, &dn.w_alpha);
+    if [qkv.gpu_dtype, z.gpu_dtype, beta.gpu_dtype, alpha.gpu_dtype]
+        != [DType::MQ4G256V2; 4]
+        || !gpu.mq4v2_fold_betaalpha_active(qkv.m, z.m, beta.m, alpha.m, qkv.k, 512)
+        || [z.k, beta.k, alpha.k] != [qkv.k; 3]
+    {
+        return Ok(());
+    }
+    let row_bytes = (z.k / 256) * rdna_compute::MQ4V2_GROUP_BYTES;
+    let mut rows = vec![0u8; gpu.mq4v2_fold_betaalpha_padded_m(z.m) * row_bytes];
+    for (stem, start, count) in [("z", 0, z.m), ("b", z.m, beta.m), ("a", z.m + beta.m, alpha.m)] {
+        let name = format!("{prefix}.linear_attn.in_proj_{stem}.weight");
+        let (info, data) = qwen35_tensor_data_cow(hfq, &name)
+            .ok_or_else(|| HipError::new(0, &format!("fold weight missing: {name}")))?;
+        if info.quant_type != MQ4V2_G256_QT || data.len() != count * row_bytes {
+            return Err(HipError::new(0, &format!("fold weight layout mismatch: {name}")));
+        }
+        rows[start * row_bytes..(start + count) * row_bytes].copy_from_slice(&data);
+    }
+    let packed = gpu.upload_raw(&rows, &[rows.len()])?;
+    let old = std::mem::replace(&mut z.buf, packed);
+    gpu.free_tensor(old)?;
+    Ok(())
 }
 
 #[derive(Clone, Copy)]
