@@ -1,0 +1,178 @@
+{
+  "b16": [
+    {
+      "decode": 243.64,
+      "prefill": 458.95,
+      "ttft": 115.33,
+      "tau": 13.1818,
+      "accept": 0.8788,
+      "cycles": 11.0,
+      "committed": 167.0,
+      "accepted": 145.0,
+      "emitted": 157.0,
+      "decode_secs": 0.6444,
+      "returncode": 0,
+      "stdout_md5": "065f34489cf05af516d58455bc288bc3"
+    },
+    {
+      "decode": 286.17,
+      "prefill": 465.92,
+      "ttft": 109.16,
+      "tau": 13.1818,
+      "accept": 0.8788,
+      "cycles": 11.0,
+      "committed": 167.0,
+      "accepted": 145.0,
+      "emitted": 157.0,
+      "decode_secs": 0.5486,
+      "returncode": 0,
+      "stdout_md5": "065f34489cf05af516d58455bc288bc3"
+    },
+    {
+      "decode": 286.0,
+      "prefill": 463.39,
+      "ttft": 109.79,
+      "tau": 13.1818,
+      "accept": 0.8788,
+      "cycles": 11.0,
+      "committed": 167.0,
+      "accepted": 145.0,
+      "emitted": 157.0,
+      "decode_secs": 0.549,
+      "returncode": 0,
+      "stdout_md5": "065f34489cf05af516d58455bc288bc3"
+    }
+  ],
+  "b24": [
+    {
+      "decode": 200.32,
+      "prefill": 465.7,
+      "ttft": 129.29,
+      "tau": 13.2727,
+      "accept": 0.5771,
+      "cycles": 11.0,
+      "committed": 168.0,
+      "accepted": 146.0,
+      "emitted": 158.0,
+      "decode_secs": 0.7887,
+      "returncode": 0,
+      "stdout_md5": "2a1e2c5c994982cbdffd23f572d82a32"
+    },
+    {
+      "decode": 200.22,
+      "prefill": 467.87,
+      "ttft": 130.06,
+      "tau": 13.2727,
+      "accept": 0.5771,
+      "cycles": 11.0,
+      "committed": 168.0,
+      "accepted": 146.0,
+      "emitted": 158.0,
+      "decode_secs": 0.7891,
+      "returncode": 0,
+      "stdout_md5": "2a1e2c5c994982cbdffd23f572d82a32"
+    },
+    {
+      "decode": 200.14,
+      "prefill": 467.16,
+      "ttft": 129.66,
+      "tau": 13.2727,
+      "accept": 0.5771,
+      "cycles": 11.0,
+      "committed": 168.0,
+      "accepted": 146.0,
+      "emitted": 158.0,
+      "decode_secs": 0.7895,
+      "returncode": 0,
+      "stdout_md5": "2a1e2c5c994982cbdffd23f572d82a32"
+    }
+  ],
+  "b32": [
+    {
+      "decode": 161.33,
+      "prefill": 467.48,
+      "ttft": 133.0,
+      "tau": 11.0,
+      "accept": 0.3548,
+      "cycles": 13.0,
+      "committed": 169.0,
+      "accepted": 143.0,
+      "emitted": 157.0,
+      "decode_secs": 0.9732,
+      "returncode": 0,
+      "stdout_md5": "065f34489cf05af516d58455bc288bc3"
+    },
+    {
+      "decode": 161.24,
+      "prefill": 466.13,
+      "ttft": 132.6,
+      "tau": 11.0,
+      "accept": 0.3548,
+      "cycles": 13.0,
+      "committed": 169.0,
+      "accepted": 143.0,
+      "emitted": 157.0,
+      "decode_secs": 0.9737,
+      "returncode": 0,
+      "stdout_md5": "065f34489cf05af516d58455bc288bc3"
+    },
+    {
+      "decode": 161.32,
+      "prefill": 466.87,
+      "ttft": 132.85,
+      "tau": 11.0,
+      "accept": 0.3548,
+      "cycles": 13.0,
+      "committed": 169.0,
+      "accepted": 143.0,
+      "emitted": 157.0,
+      "decode_secs": 0.9732,
+      "returncode": 0,
+      "stdout_md5": "065f34489cf05af516d58455bc288bc3"
+    }
+  ],
+  "adaptive": [
+    {
+      "decode": 285.56,
+      "prefill": 461.88,
+      "ttft": 110.22,
+      "tau": 13.1818,
+      "accept": 0.8788,
+      "cycles": 11.0,
+      "committed": 167.0,
+      "accepted": 145.0,
+      "emitted": 157.0,
+      "decode_secs": 0.5498,
+      "returncode": 0,
+      "stdout_md5": "065f34489cf05af516d58455bc288bc3"
+    },
+    {
+      "decode": 285.13,
+      "prefill": 461.69,
+      "ttft": 110.66,
+      "tau": 13.1818,
+      "accept": 0.8788,
+      "cycles": 11.0,
+      "committed": 167.0,
+      "accepted": 145.0,
+      "emitted": 157.0,
+      "decode_secs": 0.5506,
+      "returncode": 0,
+      "stdout_md5": "065f34489cf05af516d58455bc288bc3"
+    },
+    {
+      "decode": 285.35,
+      "prefill": 466.55,
+      "ttft": 109.75,
+      "tau": 13.1818,
+      "accept": 0.8788,
+      "cycles": 11.0,
+      "committed": 167.0,
+      "accepted": 145.0,
+      "emitted": 157.0,
+      "decode_secs": 0.5502,
+      "returncode": 0,
+      "stdout_md5": "065f34489cf05af516d58455bc288bc3"
+    }
+  ]
+}

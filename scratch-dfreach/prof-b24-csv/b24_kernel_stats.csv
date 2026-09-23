@@ -1,0 +1,2 @@
+"Name","Calls","TotalDurationNs","AverageNs","Percentage","MinNs","MaxNs","StdDev"
+"__amd_rocclr_copyBuffer",127,5520851,43471.267717,100.00,2360,795853,107938.097480
