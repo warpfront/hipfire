@@ -1,0 +1,21 @@
+{
+  "lane": 2,
+  "disposition": "Experiment complete; not promoted to production",
+  "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+  "model_sha256": "9f91556f7e0431a077d03756a7102d0154108757289e6e5fe9a2d204c0c9eeb7",
+  "production_base": "77cd6ce7d",
+  "scope": "JSON AfterOpen only; InArgs oracle fallback; DSML unchanged",
+  "parity_bits": 63773008,
+  "synthetic_parity_bits": 184,
+  "measurement": "Single-process CPU microbenchmark, eight repeats; allocation counting separate from wallclock. No end-to-end performance claim.",
+  "header_ms_oracle": 26.6121845,
+  "header_ms_trie": 0.0587915,
+  "trace_ms_per_mask_oracle": 34.62074396837349,
+  "trace_ms_per_mask_trie": 31.36750396987952,
+  "trace_distribution": {"AfterOpen": 11, "InArgs": 72},
+  "trie_build_ms_instrumented": 91.209936,
+  "reason_not_promoted": "Header-only improvement is real in this host experiment, but argument-body masking remains the dominant cost. Existing required-field history expiration rejects long valid tool arguments; preserve this finding rather than silently changing grammar semantics in an acceleration experiment. Production dependency/integration and end-to-end speedup remain unproven.",
+  "baseline_serving": "PASS: GPU3, Qwen3.8 MQ4XT, grammar explicitly enabled, AR, q8 contiguous, max_seq4096; finish_reason tool_calls, bash arguments {command: echo Hello}. This exercised unchanged production matcher, not the experimental adapter.",
+  "evidence": ["result.json", "../grammar-serving/response.json", "../grammar-serving/serve.log", "artifact://5858"],
+  "changes": "Standalone ignored research crate only; production manifests and code unchanged"
+}

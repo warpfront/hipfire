@@ -1,0 +1,138 @@
+{
+  "request": {
+    "url": "http://127.0.0.1:11520/v1/chat/completions",
+    "body": {
+      "messages": [
+        {
+          "role": "user",
+          "content": "Use the bash tool to run: echo Hello"
+        }
+      ],
+      "tools": [
+        {
+          "type": "function",
+          "function": {
+            "name": "bash",
+            "description": "Run a bash command",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "command": {
+                  "type": "string"
+                }
+              },
+              "required": [
+                "command"
+              ]
+            }
+          }
+        },
+        {
+          "type": "function",
+          "function": {
+            "name": "read",
+            "description": "Read a file from disk",
+            "parameters": {
+              "type": "object",
+              "properties": {
+                "path": {
+                  "type": "string"
+                },
+                "offset": {
+                  "type": "integer"
+                },
+                "limit": {
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "path"
+              ]
+            }
+          }
+        }
+      ],
+      "stream": false,
+      "max_tokens": 256,
+      "temperature": 0,
+      "enable_thinking": false,
+      "chat_template_kwargs": {
+        "enable_thinking": false
+      },
+      "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt"
+    }
+  },
+  "error": null,
+  "response": {
+    "id": "chatcmpl-436293-1",
+    "object": "chat.completion",
+    "created": 1788636455,
+    "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt",
+    "choices": [
+      {
+        "index": 0,
+        "message": {
+          "role": "assistant",
+          "content": null,
+          "tool_calls": [
+            {
+              "id": "call_0",
+              "type": "function",
+              "function": {
+                "name": "bash",
+                "arguments": "{\"command\":\"echo Hello\"}"
+              }
+            }
+          ]
+        },
+        "finish_reason": "tool_calls"
+      }
+    ],
+    "usage": {
+      "prompt_tokens": 349,
+      "completion_tokens": 22,
+      "total_tokens": 371,
+      "prompt_tokens_details": {
+        "cached_tokens": 0
+      }
+    },
+    "timings": {
+      "ttft_ms": 10243.1,
+      "prefill_ms": 10243.1,
+      "prefill_tok_s": 34.1,
+      "decode_tok_s": 4.0,
+      "latency_ms": null,
+      "tau": null,
+      "cycles": null,
+      "dflash": null,
+      "mtp": null,
+      "mtp_ngram": null,
+      "ngram_mod_windows": null,
+      "ngram_mod_drafts": null,
+      "ngram_mod_accepted": null,
+      "ngram_mod_accept_rate": null,
+      "mtp_windows": null,
+      "ar_windows": null,
+      "mtp_retired": null,
+      "mtp_window_timings": null
+    },
+    "hipfire": {
+      "tok_s": 1.4,
+      "prefill_tok_s": 34.1,
+      "decode_tok_s": 4.0,
+      "execution_mode": null,
+      "continuous_batch": null,
+      "reasoning": {
+        "contract": "qwen_jinja",
+        "mode": "disabled",
+        "effort": null,
+        "max_think_tokens": null,
+        "cap_source": "none"
+      },
+      "config_warnings": [
+        "max_think_tokens/budget dropped: thinking disabled"
+      ]
+    }
+  },
+  "http_status": 200
+}
