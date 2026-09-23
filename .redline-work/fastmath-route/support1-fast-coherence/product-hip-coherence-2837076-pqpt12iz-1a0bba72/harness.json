@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 768,
+"finish": "length",
+"think_words": 308,
+"ans_words": 163,
+"prefill_ms": 68.9,
+"prefill_tok_s": 319.2,
+"decode_tok_s": 97.1,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.423,
+"wall_s": 7.979,
+"attractor": false,
+"empty": false,
+"runaway": true,
+"ans_preview": "**Direct Answer:**  \nFlagstaff, Arizona\u2019s name originates from a physical **flagstaff** (a",
+"assistant_content": "**Direct Answer:**  \nFlagstaff, Arizona\u2019s name originates from a physical **flagstaff** (a tall pole used to fly flags for signaling/navigation) erected at the site in **January\u2013February 1857** by members of **Lieutenant Edward F. Beale\u2019s Pacific Railroad Expedition**. The campsite was originally known as \u201cPine Creek Camp\u201d during earlier mapping efforts, but when Beale\u2019s party reached the area in February 1857, they raised a flag on a freshly cut pine trunk and officially named it **\u201cFlagstaff\u201d** due to this prominent landmark.\n\n### Key Historical Details:\n- \ud83d\udccd **Location Context**: The site sits near present-day downtown Flagstaff, in a high-elevation pine forest (~7,000 ft).\n- \u2693 **Original Purpose**: The pole served as a visual marker for the expedition and later rail surveys, helping map potential transcontinental railroad routes through the region.\n- \ud83d\udd01 **Name Evolution**: Before \u201cFlagstaff,\u201d settlers referred to the camp as \u201cPine Creek Camp\u201d or informally as \u201cWagons Around the Corner.\u201d After the 1857 visit, \u201cFlagstaff\u201d stuck and was officially adopted when the town"
+}
+]

@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 768,
+"finish": "length",
+"think_words": 312,
+"ans_words": 168,
+"prefill_ms": 49.8,
+"prefill_tok_s": 441.6,
+"decode_tok_s": 208.6,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.234,
+"wall_s": 3.744,
+"attractor": false,
+"empty": false,
+"runaway": true,
+"ans_preview": "The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erect",
+"assistant_content": "The name **Flagstaff, Arizona**, originates from a physical flagpole (a \"flagstaff\") erected by members of the **U.S. Pacific Railroad Survey** in **1858**.\n\nHere are the key historical details behind the name:\n\n\ud83d\udd0d **Key Facts:**\n- In the fall of 1858, a team of topographic engineers led by **Lieut. Amiel Wentworth Whipple** was surveying potential routes for the transcontinental railroad.\n- While camped near the base of the San Francisco Peaks, they erected a tall wooden pole with an American flag at its summit to mark their location and serve as a visible landmark.\n- The expedition members began referring to the site as **\"Flagstaff Camp\"** or simply **\"Flagstaff.\"**\n- Initially, there were two nearby settlements\u2014the one on the high ground near the peak became known as \"New Flagstaff,\" while a lower-elevation settlement downwind was called \"Old Flagstaff.\" Over time, only \"Flagstaff\" remained.\n\n\ud83d\udcc5 **Official Recognition:**\n- The name gradually shifted from a military/exploration camp designation to a permanent civilian settlement.\n- The town was officially incorporated in **1886"
+}
+]

@@ -1,0 +1,72 @@
+{
+  "schema_version": 3,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1785197833,
+  "source": "/home/kaden/hipfire-rw-nofm/.hipfire_kernels/gfx1151/moe_router_softmax_topk_k8_wave64_exact.hip",
+  "output": "/home/kaden/hipfire-rw-nofm/.redline-work/fastmath-route/fast/moe_router_softmax_topk_k8_wave64_exact.hsaco",
+  "arch": "gfx1151",
+  "wavefront": "wave64",
+  "scheduler_profile": "default",
+  "hipcc": "/opt/rocm/core/bin/hipcc",
+  "hipcc_version": "HIP version: 7.14.60850-0000000\nAMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 46fcb339fb61119b337f973c7ca9e710a319fdd0+PATCHED:440716f8b87be9d8e20ed910e10e5b6d14d57cf6)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-7.14/lib/llvm/bin",
+  "command": [
+    "/opt/rocm/core/bin/hipcc",
+    "--genco",
+    "--offload-arch=gfx1151",
+    "-O3",
+    "-ffast-math",
+    "-fno-exceptions",
+    "-fno-rtti",
+    "-include",
+    "/home/kaden/hipfire-rw-nofm/crates/radiowave/include/radiowave/hip.h",
+    "-DRADIOWAVE_ACTIVE=1",
+    "-mwavefrontsize64",
+    "-o",
+    "/home/kaden/hipfire-rw-nofm/.redline-work/fastmath-route/fast/moe_router_softmax_topk_k8_wave64_exact.hsaco",
+    "/home/kaden/hipfire-rw-nofm/.hipfire_kernels/gfx1151/moe_router_softmax_topk_k8_wave64_exact.hip"
+  ],
+  "source_sha256": "466434205d9f04206c36399ba394b831e1d1a6c7b355138f60e0cdd4003119ce",
+  "support_header_sha256": "1b27c71a6def4cfe6dadd54da4d759ec8094e108e78fdc034e0cdc0804185a4d",
+  "output_sha256": "2d47812e9fcc4c0d596cd0acb6608c392b2f5e84fa20a964375fc5e484f8d5f5",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1151",
+    "identity": {
+      "architecture": "gfx1151",
+      "elf_machine_id": 74,
+      "isa": {
+        "major": 11,
+        "minor": 5,
+        "stepping": 1
+      }
+    },
+    "kernels": [
+      {
+        "name": "moe_router_softmax_topk_k8_wave64_exact",
+        "wavefront_size": 64,
+        "vgpr_count": 41,
+        "sgpr_count": 28,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "vmem_only",
+        "instructions": {
+          "static_instructions": 539,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 4,
+          "global_stores": 2,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 3,
+          "kernarg_scalar_loads": 3,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 0,
+          "wait_instructions": 137,
+          "delay_alu_instructions": 48,
+          "memory_clause_instructions": 2,
+          "max_consecutive_vmem_instructions": 2
+        }
+      }
+    ]
+  }
+}

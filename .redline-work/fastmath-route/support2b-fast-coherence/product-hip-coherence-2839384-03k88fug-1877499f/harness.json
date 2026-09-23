@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 700,
+"finish": "stop",
+"think_words": 324,
+"ans_words": 134,
+"prefill_ms": 67.6,
+"prefill_tok_s": 325.3,
+"decode_tok_s": 97.2,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.421,
+"wall_s": 7.27,
+"attractor": false,
+"empty": false,
+"runaway": false,
+"ans_preview": "The city of Flagstaff, Arizona, was named by members of the **Wheeler Expedition** (offici",
+"assistant_content": "The city of Flagstaff, Arizona, was named by members of the **Wheeler Expedition** (officially the U.S. Geographical Survey of the Forty-First Parallel) in 1875. During their mapping work, the team erected a tall wooden pole at the site flying a red and blue striped banner to serve as a navigational landmark and visual marker for high terrain. Because the pole carried flags, they dubbed the location **\"Flagstaff.\"**\n\nThe name was later formalized when Flagstaff's first post office opened there in 1876, and it has remained ever since. Interestingly, the location also proved ideal for astronomy due to its high elevation and clear night skies, eventually leading to the establishment of the nearby Lowell Observatory (1894) and later Kitt Peak National Observatory, but the original name stems simply from that early survey camp's flag-carrying staff."
+}
+]

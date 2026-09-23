@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 729,
+"finish": "stop",
+"think_words": 332,
+"ans_words": 154,
+"prefill_ms": 69.3,
+"prefill_tok_s": 317.3,
+"decode_tok_s": 108.1,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.398,
+"wall_s": 6.816,
+"attractor": false,
+"empty": false,
+"runaway": false,
+"ans_preview": "The origin of Flagstaff, Arizona\u2019s name traces back to an actual **flagstaff** (a tall pol",
+"assistant_content": "The origin of Flagstaff, Arizona\u2019s name traces back to an actual **flagstaff** (a tall pole or mast) erected in the mid-19th century. \n\nIn **May 1854**, during the federally funded **Pacific Railroad Survey** under Lieutenant Edward Fitzgerald Beale, surveyors and soldiers were camped near a natural spring in the region. To mark their location and signal their presence, they felled a large ponderosa pine tree, mounted it upright, and hoisted a U.S. flag on top. Because of this landmark, the campsite and surrounding area became known as **\u201cFlagstaff.\u201d** \n\nThe name was first used officially on maps and by travelers in the late 1850s, and it was retained when the city was formally founded and incorporated later that century. While Indigenous peoples (such as the Navajo) had long used the area, the English name \u201cFlagstaff\u201d comes directly from this act of planting a national flag on a pole for surveying and navigation purposes during westward expansion."
+}
+]

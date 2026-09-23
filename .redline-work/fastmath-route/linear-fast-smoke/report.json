@@ -1,0 +1,17 @@
+{
+  "coherence": {
+    "valid": false,
+    "error": "hip coherence smoke failed: finish must be 'stop', got 'length'; runaway generation (finish=length)\nmodels/qwen3.6-35b-a3b.mq4r\n  registry tag  : qwen3.6:35b-a3b\n  kv_mode       : q8   mtp_mode: off   mode: battery\n  seed          : 1   prompts_file: /home/kaden/hipfire-rw-nofm/.redline-work/fastmath-route/linear-fast-smoke/product-hip-coherence-2830431-rrozx1fq-93c58c77/prompts.json\n  thinking_budget: low -> 512 tok (CONCRETE cap)\n  max_tokens     : 768  (> think cap 512 \u2014 model can answer)\n  sampling (what IS set):\n      temperature       = 1.0      [registry(qwen3.6:35b-a3b)]\n      top_p             = 0.95     [registry(qwen3.6:35b-a3b)]\n      top_k             = 20       [registry(qwen3.6:35b-a3b)]\n      min_p             = 0.0      [registry(qwen3.6:35b-a3b)]\n      presence_penalty  = 1.5      [registry(qwen3.6:35b-a3b)]\n      repeat_penalty    = 1.0      [registry(qwen3.6:35b-a3b)]\n  sampling (NOT set, serve/daemon default applies): reasoning_effort\n=======================================================================================\n  [serve warm; MTP head loaded lines=0]\n### RUN qwen3.6-35b-a3b.mq4r|off|battery  kv=q8 sampling={'temperature': 1.0, 'top_p': 0.95, 'top_k': 20, 'min_p': 0.0, 'presence_penalty': 1.5, 'repeat_penalty': 1.0} seed=1 ###\n  [factual]t1  finish=length ctx=22     cached=0      gen=768  (think 337/ans 177w) prefill=69.9ms decode=97.9 tau=None !RUNAWAY | \"The origin of **Flagstaff, Arizona's** name dates back to the early days of the **Transcon\"\n[qwen3.6-35b-a3b.mq4r|off|battery DONE] turns=1 runaway=1 empty=0 attractor=0 avg_decode=97.9tok/s\n"
+  },
+  "tok_s": [
+    102.22455355255097,
+    102.22094994762527,
+    102.20633755101174,
+    102.19828698952004,
+    102.2182820623733,
+    102.20884607246052,
+    102.23132640814762,
+    102.25335510952738
+  ],
+  "median": 102.2196160049993
+}
