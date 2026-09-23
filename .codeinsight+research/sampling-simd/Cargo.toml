@@ -1,0 +1,11 @@
+[package]
+name = "sampling-simd"
+version = "0.1.0"
+edition = "2021"
+
+# Detached from the parent workspace: this is a standalone research
+# experiment, never a production dependency.
+[workspace]
+
+[dependencies]
+hipfire-runtime = { path = "../../crates/hipfire-runtime" }

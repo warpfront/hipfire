@@ -1,0 +1,44 @@
+{
+  "experiment": "sampling-simd-avx2-block-rejection",
+  "host": {"arch": "x86_64", "avx2_detected": true, "cpu_model": "AMD Ryzen Threadripper 9970X 32-Cores"},
+  "production_base": "77cd6ce7d",
+  "note": "inputs are synthetic logits sized to measured vocab 248144 and padded row 248320; sampler scans logits.len()",
+  "logit_sizes": [248144, 248320],
+  "paths_exercised": {"scalar": true, "avx2": true, "dispatch": true},
+  "parity": {"scan_cases": 16, "scan_mismatches": 0, "argmax_cases": 48, "argmax_mismatches": 0, "e2e_cases": 64, "e2e_mismatches": 0, "small_len_cases": 265, "small_len_mismatches": 0},
+  "reps": {"big_scan": 30, "big_argmax": 30, "small": 300},
+  "cases": [
+    {"name": "random_uniform@n248144", "scan_ns_per_call": {"scalar": 167189.167, "avx2": 19589.000, "dispatch": 19150.000}, "argmax_ns_per_call": {"scalar": 133474.800, "avx2": 14172.800, "dispatch": 14117.367, "production": 133322.567}},
+    {"name": "ascending@n248144", "scan_ns_per_call": {"scalar": 6633452.933, "avx2": 6784354.100, "dispatch": 6790274.400}, "argmax_ns_per_call": {"scalar": 132631.500, "avx2": 130085.333, "dispatch": 130046.633, "production": 129940.100}},
+    {"name": "descending@n248144", "scan_ns_per_call": {"scalar": 164504.800, "avx2": 14255.267, "dispatch": 14243.900}, "argmax_ns_per_call": {"scalar": 132901.600, "avx2": 13724.800, "dispatch": 20597.833, "production": 133425.733}},
+    {"name": "ties@n248144", "scan_ns_per_call": {"scalar": 164657.667, "avx2": 14349.400, "dispatch": 14293.667}, "argmax_ns_per_call": {"scalar": 134345.767, "avx2": 13818.600, "dispatch": 14323.367, "production": 134291.700}},
+    {"name": "tie_spikes@n248144", "scan_ns_per_call": {"scalar": 164549.500, "avx2": 14477.233, "dispatch": 14424.200}, "argmax_ns_per_call": {"scalar": 133289.500, "avx2": 13785.867, "dispatch": 13720.100, "production": 133510.200}},
+    {"name": "sparse_mask@n248144", "scan_ns_per_call": {"scalar": 110470.967, "avx2": 14326.667, "dispatch": 14381.100}, "argmax_ns_per_call": {"scalar": 133913.100, "avx2": 13785.200, "dispatch": 13723.767, "production": 133477.133}},
+    {"name": "nonfinite_mix@n248144", "scan_ns_per_call": {"scalar": 166342.933, "avx2": 18690.967, "dispatch": 18808.133}, "argmax_ns_per_call": {"scalar": 133930.500, "avx2": 13745.500, "dispatch": 13799.567, "production": 133396.000}},
+    {"name": "signed_zeros@n248144", "scan_ns_per_call": {"scalar": 168046.133, "avx2": 15468.767, "dispatch": 15370.967}, "argmax_ns_per_call": {"scalar": 133920.800, "avx2": 13719.133, "dispatch": 13707.100, "production": 134155.467}},
+    {"name": "random_uniform@n248320", "scan_ns_per_call": {"scalar": 166882.733, "avx2": 19435.100, "dispatch": 19349.300}, "argmax_ns_per_call": {"scalar": 133424.733, "avx2": 13917.733, "dispatch": 13857.667, "production": 133679.767}},
+    {"name": "ascending@n248320", "scan_ns_per_call": {"scalar": 6603703.533, "avx2": 6777767.133, "dispatch": 6788762.433}, "argmax_ns_per_call": {"scalar": 130885.900, "avx2": 131263.767, "dispatch": 131421.333, "production": 128792.067}},
+    {"name": "descending@n248320", "scan_ns_per_call": {"scalar": 164696.100, "avx2": 14315.367, "dispatch": 14304.667}, "argmax_ns_per_call": {"scalar": 132537.367, "avx2": 13602.267, "dispatch": 13701.400, "production": 133155.333}},
+    {"name": "ties@n248320", "scan_ns_per_call": {"scalar": 164388.967, "avx2": 14081.000, "dispatch": 14281.267}, "argmax_ns_per_call": {"scalar": 132968.367, "avx2": 13860.667, "dispatch": 13761.500, "production": 133138.300}},
+    {"name": "tie_spikes@n248320", "scan_ns_per_call": {"scalar": 164619.633, "avx2": 14276.967, "dispatch": 14484.267}, "argmax_ns_per_call": {"scalar": 132451.567, "avx2": 13679.733, "dispatch": 13744.467, "production": 133441.733}},
+    {"name": "sparse_mask@n248320", "scan_ns_per_call": {"scalar": 110529.067, "avx2": 14333.733, "dispatch": 14295.633}, "argmax_ns_per_call": {"scalar": 133361.267, "avx2": 13695.067, "dispatch": 13696.733, "production": 133588.633}},
+    {"name": "nonfinite_mix@n248320", "scan_ns_per_call": {"scalar": 166471.133, "avx2": 17945.533, "dispatch": 17871.033}, "argmax_ns_per_call": {"scalar": 133405.367, "avx2": 13854.967, "dispatch": 13795.533, "production": 133543.933}},
+    {"name": "signed_zeros@n248320", "scan_ns_per_call": {"scalar": 164661.033, "avx2": 14681.233, "dispatch": 14704.267}, "argmax_ns_per_call": {"scalar": 133859.400, "avx2": 13790.233, "dispatch": 13724.100, "production": 134059.667}}
+  ],
+  "small_sizes": {
+    "mean_ns_per_call_len0_65": {"scan_scalar": 619.150, "scan_avx2": 607.731, "scan_dispatch": 608.096, "argmax_scalar": 17.650, "argmax_avx2": 10.696, "argmax_dispatch": 10.801},
+    "probes": [
+      {"len": 0, "scan_ns_per_call": {"scalar": 3.840, "avx2": 10.747, "dispatch": 10.513}, "argmax_ns_per_call": {"scalar": 0.503, "avx2": 1.503, "dispatch": 1.533}},
+      {"len": 1, "scan_ns_per_call": {"scalar": 8.443, "avx2": 12.687, "dispatch": 12.320}, "argmax_ns_per_call": {"scalar": 0.970, "avx2": 1.703, "dispatch": 1.800}},
+      {"len": 7, "scan_ns_per_call": {"scalar": 87.967, "avx2": 92.373, "dispatch": 93.943}, "argmax_ns_per_call": {"scalar": 4.140, "avx2": 4.507, "dispatch": 4.740}},
+      {"len": 8, "scan_ns_per_call": {"scalar": 100.020, "avx2": 105.693, "dispatch": 107.293}, "argmax_ns_per_call": {"scalar": 4.840, "avx2": 4.773, "dispatch": 4.807}},
+      {"len": 9, "scan_ns_per_call": {"scalar": 113.740, "avx2": 117.310, "dispatch": 117.813}, "argmax_ns_per_call": {"scalar": 5.007, "avx2": 5.540, "dispatch": 5.473}},
+      {"len": 16, "scan_ns_per_call": {"scalar": 335.107, "avx2": 353.603, "dispatch": 352.167}, "argmax_ns_per_call": {"scalar": 8.880, "avx2": 9.113, "dispatch": 9.147}},
+      {"len": 20, "scan_ns_per_call": {"scalar": 523.427, "avx2": 386.887, "dispatch": 398.337}, "argmax_ns_per_call": {"scalar": 11.217, "avx2": 11.783, "dispatch": 12.320}},
+      {"len": 32, "scan_ns_per_call": {"scalar": 702.263, "avx2": 738.753, "dispatch": 725.333}, "argmax_ns_per_call": {"scalar": 17.327, "avx2": 9.950, "dispatch": 9.847}},
+      {"len": 64, "scan_ns_per_call": {"scalar": 1026.753, "avx2": 1051.860, "dispatch": 1048.423}, "argmax_ns_per_call": {"scalar": 34.483, "avx2": 15.690, "dispatch": 15.623}},
+      {"len": 65, "scan_ns_per_call": {"scalar": 1061.573, "avx2": 1054.797, "dispatch": 1055.867}, "argmax_ns_per_call": {"scalar": 35.120, "avx2": 16.457, "dispatch": 16.457}}
+    ]
+  },
+  "result": "pass"
+}
