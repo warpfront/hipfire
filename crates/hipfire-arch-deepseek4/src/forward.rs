@@ -314,6 +314,9 @@ pub(crate) fn gemv_auto(
         row_stride: 0,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     // DeepSeek prepares and reuses the FWHT input in architecture-owned
     // scratch. `run_auto` treats its input as plain and rotates every typed MQ
@@ -1096,10 +1099,12 @@ fn attention_input_e8_pack_b3(
 ///     applies tail RoPE with cfg.compress_rope_theta;
 ///     targets `state._indexer[l].indexer_*`
 ///
-pub(crate) fn compressor_cache_uses_vmm(gpu: &Gpu) -> bool {
-    // Keep this model-owned route chip-strict. gfx1100 and every other
-    // architecture retain the existing dense grow-and-copy fallback.
-    gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201()
+pub(crate) fn compressor_cache_uses_vmm(
+    gpu: &Gpu,
+    backend: hipfire_runtime::kv_backend::KvBackend,
+) -> bool {
+    backend == hipfire_runtime::kv_backend::KvBackend::Vmm
+        && (gpu.arch_caps.is_gfx1151() || gpu.arch_caps.is_gfx1201())
 }
 
 fn ensure_cache_tensor_rows(
@@ -1110,10 +1115,11 @@ fn ensure_cache_tensor_rows(
     row_elems: usize,
     dtype: DType,
     access_devices: &[i32],
+    backend: hipfire_runtime::kv_backend::KvBackend,
     label: &str,
 ) -> Result<bool, String> {
     let required_rows = required_rows.min(logical_rows).max(1);
-    let use_vmm = compressor_cache_uses_vmm(gpu);
+    let use_vmm = compressor_cache_uses_vmm(gpu, backend);
     let mut changed = false;
 
     if slot.is_none() {
@@ -1245,12 +1251,13 @@ fn cache_growth_bytes(
     row_elems: usize,
     dtype: DType,
     default_granularity: usize,
+    backend: hipfire_runtime::kv_backend::KvBackend,
     label: &str,
 ) -> Result<usize, String> {
     let row_bytes = row_elems
         .checked_mul(dtype.size())
         .ok_or_else(|| format!("{label}: row-byte overflow"))?;
-    if !compressor_cache_uses_vmm(gpu) {
+    if !compressor_cache_uses_vmm(gpu, backend) {
         return match slot {
             Some(tensor) if tensor.shape.first().copied().unwrap_or(0) >= required_rows => Ok(0),
             _ => required_rows
@@ -1292,7 +1299,7 @@ fn admit_compressor_growth(
     let prepared_target = state
         .compressor_capacity
         .prepared_target_for_tokens(required_tokens)?;
-    let default_granularity = if compressor_cache_uses_vmm(gpu) {
+    let default_granularity = if compressor_cache_uses_vmm(gpu, state.compressor_cache_backend) {
         gpu.vmm_recommended_granularity()
             .map_err(|e| format!("query {} VMM granularity: {e:?}", gpu.arch))?
     } else {
@@ -1322,6 +1329,7 @@ fn admit_compressor_growth(
                 cfg.head_dim,
                 state.compressor_cache_dtype,
                 default_granularity,
+                state.compressor_cache_backend,
                 &format!("main_kv_cache l{layer_idx}"),
             )?,
             "main_kv_cache",
@@ -1337,6 +1345,7 @@ fn admit_compressor_growth(
                     cfg.index_head_dim,
                     state.compressor_cache_dtype,
                     default_granularity,
+                    state.compressor_cache_backend,
                     &format!("indexer_kv_cache l{layer_idx}"),
                 )?,
                 "indexer_kv_cache",
@@ -1413,6 +1422,7 @@ pub fn ensure_compressor_capacity(
     let access_devices =
         &state.compressor_cache_access_devices[..state.compressor_cache_access_count];
     let placement = state.compressor_cache_placement;
+    let backend = state.compressor_cache_backend;
 
     for (layer_idx, layer) in state._indexer.iter_mut().enumerate() {
         let ratio = layer.compress_ratio as usize;
@@ -1431,6 +1441,7 @@ pub fn ensure_compressor_capacity(
             cfg.head_dim,
             state.compressor_cache_dtype,
             access_devices,
+            backend,
             &format!("main_kv_cache l{layer_idx}"),
         )?;
         if ratio == 4 {
@@ -1442,6 +1453,7 @@ pub fn ensure_compressor_capacity(
                 cfg.index_head_dim,
                 state.compressor_cache_dtype,
                 access_devices,
+                backend,
                 &format!("indexer_kv_cache l{layer_idx}"),
             )?;
             layout_grew |= ensure_indexer_scratch_rows(gpu, layer, active_rows, layer_idx)?;
@@ -1481,7 +1493,9 @@ pub fn ensure_request_capacity(
     Ok(scratch_grew || cache_grew)
 }
 
-pub(crate) fn refresh_compressor_cache_shard_tables(states: &mut [DeepseekV4State]) -> Result<(), String> {
+pub(crate) fn refresh_compressor_cache_shard_tables(
+    states: &mut [DeepseekV4State],
+) -> Result<(), String> {
     let world = states.len();
     if !matches!(world, 3 | 4) {
         return Err(format!(

@@ -1,0 +1,52 @@
+fwd device AMD Radeon AI PRO R9700 gfx1201
+fwd TIME N=8192 F1.A set+set+producer                13.5097 ms
+fwd TIME N=8192 F1.C silu-gemm+h-producer            14.6310 ms
+fwd TIME N=8192 F1.A gemm-pair only                  12.1923 ms
+fwd TIME N=8192 F1.C silu-gemm only                  13.4292 ms
+fwd TIME N=8192 F1.A producer only                    2.1312 ms
+fwd TIME N=8192 F1.C h-producer only                  1.1543 ms
+fwd TIME N=8192 ZBA.A Z+beta+alpha SETs               2.1965 ms
+fwd TIME N=8192 ZBA.C folded SET                      2.1921 ms
+fwd TIME N=8192 KEEP.A rms awq i4                     0.4877 ms
+fwd TIME N=8192 KEEP.C rms awq i4 keep-x              0.6243 ms
+fwd TIME N=8192 GRID.A gemv down+out grid M           0.0759 ms
+fwd TIME N=8192 GRID.C gemv down+out grid M/2         0.0752 ms
+rev device AMD Radeon AI PRO R9700 gfx1201
+rev TIME N=8192 F1.A set+set+producer                14.1438 ms
+rev TIME N=8192 F1.C silu-gemm+h-producer            14.5462 ms
+rev TIME N=8192 F1.A gemm-pair only                  12.3028 ms
+rev TIME N=8192 F1.C silu-gemm only                  12.5353 ms
+rev TIME N=8192 F1.A producer only                    2.1257 ms
+rev TIME N=8192 F1.C h-producer only                  1.1470 ms
+rev TIME N=8192 ZBA.A Z+beta+alpha SETs               2.1466 ms
+rev TIME N=8192 ZBA.C folded SET                      2.0335 ms
+rev TIME N=8192 KEEP.A rms awq i4                     0.4229 ms
+rev TIME N=8192 KEEP.C rms awq i4 keep-x              0.5660 ms
+rev TIME N=8192 GRID.A gemv down+out grid M           0.0713 ms
+rev TIME N=8192 GRID.C gemv down+out grid M/2         0.0709 ms
+rev device AMD Radeon AI PRO R9700 gfx1201
+rev TIME N=8192 F1.A set+set+producer                14.2164 ms
+rev TIME N=8192 F1.C silu-gemm+h-producer            14.5178 ms
+rev TIME N=8192 F1.A gemm-pair only                  12.3057 ms
+rev TIME N=8192 F1.C silu-gemm only                  12.5380 ms
+rev TIME N=8192 F1.A producer only                    2.1508 ms
+rev TIME N=8192 F1.C h-producer only                  1.1626 ms
+rev TIME N=8192 ZBA.A Z+beta+alpha SETs               2.1532 ms
+rev TIME N=8192 ZBA.C folded SET                      2.0195 ms
+rev TIME N=8192 KEEP.A rms awq i4                     0.4148 ms
+rev TIME N=8192 KEEP.C rms awq i4 keep-x              0.5615 ms
+rev TIME N=8192 GRID.A gemv down+out grid M           0.0734 ms
+rev TIME N=8192 GRID.C gemv down+out grid M/2         0.0720 ms
+fwd device AMD Radeon AI PRO R9700 gfx1201
+fwd TIME N=8192 F1.A set+set+producer                13.4979 ms
+fwd TIME N=8192 F1.C silu-gemm+h-producer            14.6533 ms
+fwd TIME N=8192 F1.A gemm-pair only                  12.2254 ms
+fwd TIME N=8192 F1.C silu-gemm only                  13.3907 ms
+fwd TIME N=8192 F1.A producer only                    2.1173 ms
+fwd TIME N=8192 F1.C h-producer only                  1.1481 ms
+fwd TIME N=8192 ZBA.A Z+beta+alpha SETs               2.2083 ms
+fwd TIME N=8192 ZBA.C folded SET                      2.1915 ms
+fwd TIME N=8192 KEEP.A rms awq i4                     0.4852 ms
+fwd TIME N=8192 KEEP.C rms awq i4 keep-x              0.6110 ms
+fwd TIME N=8192 GRID.A gemv down+out grid M           0.0748 ms
+fwd TIME N=8192 GRID.C gemv down+out grid M/2         0.0744 ms

@@ -13,7 +13,7 @@ use crate::tables::KernelRegistry;
 use crate::traits::KernelFamily;
 use crate::types::*;
 use hip_bridge::DeviceBuffer;
-use rdna_compute::{Gpu, GpuTensor};
+use rdna_compute::{DType, Gpu, GpuTensor};
 
 pub struct AttnParams<'a> {
     pub q: &'a GpuTensor,
@@ -62,6 +62,12 @@ pub struct AttnParams<'a> {
     /// rotation in the flash-reduce epilogue; all other callers leave this
     /// `None`.
     pub output_gate: Option<&'a GpuTensor>,
+    /// AWQ scale for the WO projection following this attention output. Some
+    /// with output_gate None is a dispatch error; (Some gate, Some scale)
+    /// routes to the AWQ producer fusion, (Some, None) to the existing
+    /// non-AWQ producer fusion, (None, None) to the normal reducer. All
+    /// non-Qwen constructors supply None.
+    pub output_awq_scale: Option<&'a GpuTensor>,
     pub output: &'a GpuTensor,
 }
 
@@ -156,6 +162,21 @@ impl AttentionFamily {
             is_tree: io.tree_bias.is_some(),
         };
         self.resolve(plan.write_key, ctx, Some(&shape))?; // arch-gate check
+        if io.q.dtype == DType::Raw
+            && !(plan.attend_key == KernelKey::AttnFp8E4m3KvBatchedMasked
+                && gpu.arch == "gfx1201"
+                && gpu.flags.attn_qresident
+                && gpu.flags.attn_qresident_v2
+                && io.n_heads == 24
+                && io.n_kv_heads == 4
+                && io.head_dim == 256
+                && (64..=32768).contains(&io.batch_size)
+                && (io.batch_size <= 512 || io.batch_size % 512 == 0)
+                && (64..=262_144).contains(&io.max_ctx_len)
+                && io.tree_bias.is_none())
+        {
+            return Err(DispatchError::Hip("Raw Q requires gfx1201 native-fp8 Q-resident v2 attention".into()));
+        }
         dispatch_kv_write(gpu, plan.write_key, plan, io).map_err(|error| {
             DispatchError::Hip(format!(
                 "KV write {:?} for {:?} at pos={} cap={}: {error}",
@@ -441,6 +462,26 @@ fn dispatch_kv_write(
                 ))
             }
         }
+        KernelKey::KvWriteFp8E4m3 => {
+            debug_assert_eq!(plan.batch_size, 1);
+            // Native fp8: two launches, K then V (same shape as the Q8
+            // non-pair branch). No pair kernel, no ring variant: fp8 has no
+            // sliding-window or fused-gate route.
+            hip!(gpu.kv_cache_write_fp8_e4m3(
+                io.k_cache,
+                io.k,
+                io.pos_buf,
+                io.n_kv_heads,
+                io.head_dim
+            ))?;
+            hip!(gpu.kv_cache_write_fp8_e4m3(
+                io.v_cache,
+                io.v,
+                io.pos_buf,
+                io.n_kv_heads,
+                io.head_dim,
+            ))
+        }
         KernelKey::KvWriteBf16 => {
             debug_assert_eq!(plan.batch_size, 1);
             // Two launches, K then V — same shape as the Q8 non-pair branch.
@@ -697,6 +738,28 @@ fn dispatch_kv_write(
                 io.batch_size,
             ))?;
             hip!(gpu.kv_cache_write_q8_0_batched(
+                io.v_cache,
+                io.v,
+                pos,
+                io.n_kv_heads,
+                io.head_dim,
+                io.batch_size,
+            ))
+        }
+        KernelKey::KvWriteFp8E4m3Batched => {
+            // No gfx1100 pair fold, no slot descriptors: fp8 is contiguous,
+            // single-GPU, noslots. The writer overwrites every code and scale
+            // of each requested physical row before the paired attend reads.
+            let pos = io.positions();
+            hip!(gpu.kv_cache_write_fp8_e4m3_batched(
+                io.k_cache,
+                io.k,
+                pos,
+                io.n_kv_heads,
+                io.head_dim,
+                io.batch_size,
+            ))?;
+            hip!(gpu.kv_cache_write_fp8_e4m3_batched(
                 io.v_cache,
                 io.v,
                 pos,
@@ -1045,8 +1108,24 @@ fn dispatch_attend(
                 debug_assert_eq!(plan.batch_size, 1);
                 let seq_len = io.pos + 1;
                 let fp = io.flash_partials.unwrap();
-                if let Some(gate) = io.output_gate {
-                    hip!(gpu.attention_flash_q8_0_gated_mq_rotate_gfx1100(
+                match (io.output_gate, io.output_awq_scale) {
+                    (Some(gate), Some(scale)) => hip!(gpu
+                        .attention_flash_q8_0_gated_mq_rotate_awq_gfx1100(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            gate,
+                            scale,
+                            io.pos_buf,
+                            seq_len,
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.physical_cap,
+                            fp,
+                        )),
+                    (Some(gate), None) => hip!(gpu.attention_flash_q8_0_gated_mq_rotate_gfx1100(
                         io.q,
                         io.k_cache,
                         io.v_cache,
@@ -1059,9 +1138,8 @@ fn dispatch_attend(
                         io.head_dim,
                         io.physical_cap,
                         fp,
-                    ))
-                } else {
-                    hip!(gpu.attention_flash_q8_0(
+                    )),
+                    (None, None) => hip!(gpu.attention_flash_q8_0(
                         io.q,
                         io.k_cache,
                         io.v_cache,
@@ -1073,7 +1151,12 @@ fn dispatch_attend(
                         io.head_dim,
                         io.physical_cap,
                         fp,
-                    ))
+                    )),
+                    (None, Some(_)) => {
+                        return Err(DispatchError::Hip(
+                            "output_awq_scale without output_gate".into(),
+                        ))
+                    }
                 }
             }
             KernelKey::AttnFlashQ8_0Windowed => {
@@ -1133,6 +1216,92 @@ fn dispatch_attend(
                     io.n_kv_heads,
                     io.head_dim,
                     io.physical_cap,
+                ))
+            }
+            KernelKey::AttnFp8E4m3Kv => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                hip!(gpu.attention_fp8_e4m3_kv(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.pos_buf,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+            }
+            KernelKey::AttnBf16Kv => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                // F's NEW native bf16 scalar kernel (HIPFIRE_KV_BF16=1), not
+                // a flash-tile lowering: same arg shape as attention_q8_0_kv.
+                hip!(gpu.attention_bf16_kv(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.pos_buf,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                ))
+            }
+            KernelKey::AttnFlashBf16 => {
+                debug_assert_eq!(plan.batch_size, 1);
+                let seq_len = io.pos + 1;
+                let fp = io.flash_partials.unwrap();
+                // Qwen dense has no sliding window: window=0 == plain causal
+                // through the existing maple tile launcher (whose ABI lacks
+                // q8's trailing effective_seq_len).
+                hip!(gpu.attention_flash_bf16_windowed(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.pos_buf,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                    fp,
+                    0,
+                ))
+            }
+            KernelKey::AttnFlashFp8E4m3 => {
+                debug_assert_eq!(plan.batch_size, 1);
+                // StageB S6: the fp8 tile writes the same [2+head_dim] f32
+                // partials as the q8 tile, so the shared q8 gated MQ-rotate
+                // reducer consumes them unmodified (format-neutral). Gate/AWQ
+                // route to the fused epilogue; scale-without-gate is a
+                // dispatch error, same as the q8 arm.
+                if io.output_gate.is_none() && io.output_awq_scale.is_some() {
+                    return Err(DispatchError::Hip(
+                        "output_awq_scale without output_gate".into(),
+                    ));
+                }
+                let seq_len = io.pos + 1;
+                let fp = io.flash_partials.unwrap();
+                hip!(gpu.attention_flash_fp8_e4m3_tile(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    io.pos_buf,
+                    seq_len,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                    fp,
+                    io.output_gate,
+                    io.output_awq_scale,
                 ))
             }
             KernelKey::AttnFlashAsym4 => {
@@ -1203,22 +1372,62 @@ fn dispatch_attend(
                         fp,
                     ));
                 }
-                hip!(gpu.attention_flash_asym3(
-                    io.q,
-                    io.k_cache,
-                    io.v_cache,
-                    io.output,
-                    io.pos_buf,
-                    ct,
-                    st,
-                    seq_len,
-                    io.n_heads,
-                    io.n_kv_heads,
-                    io.head_dim,
-                    io.physical_cap,
-                    fp,
-                    io.output_gate,
-                ))
+                match (io.output_gate, io.output_awq_scale) {
+                    (Some(gate), Some(scale)) => hip!(gpu.attention_flash_asym3_gated_mq_rotate_awq(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        ct,
+                        st,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                        gate,
+                        scale,
+                    )),
+                    (Some(gate), None) => hip!(gpu.attention_flash_asym3(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        ct,
+                        st,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                        Some(gate),
+                    )),
+                    (None, None) => hip!(gpu.attention_flash_asym3(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.pos_buf,
+                        ct,
+                        st,
+                        seq_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        fp,
+                        None,
+                    )),
+                    (None, Some(_)) => {
+                        return Err(DispatchError::Hip(
+                            "output_awq_scale without output_gate".into(),
+                        ))
+                    }
+                }
             }
             KernelKey::AttnFlashAsym3Fwht => {
                 debug_assert_eq!(plan.batch_size, 1);
@@ -1612,16 +1821,19 @@ fn dispatch_attend(
                 );
                 // gfx1201 FA2 prefill with fwht3 K (default on;
                 // `HIPFIRE_GFX12_FA2_PREFILL=0` opts out). K stays in the fwht3 layout
-                // (100 B/head); the kernel rotates this WG's Q rows in place
-                // and dequantizes fwht3 K into its K plane, V unchanged Q8.
-                // Same shape/eager predicates as the Q8 FA2 ingress, plus:
+                // (100 B/head); F4b: the launcher pre-converts Q into f16
+                // scratch (rotation fused, Q never mutated) and dequantizes
+                // fwht3 K into its K plane, V unchanged Q8 — replay-idempotent
+                // and capture-safe, so no recorder/capture gates (like the
+                // Q8 FA2 ingress). Same shape predicates as before, plus:
                 // no tree-verify (FA2 has no tree path) and V must be Q8_0
                 // (v_mode 8 — lloyd V lives in rotated space FA2 never
                 // inverts). Falls through to the incumbent below otherwise.
+                //
+                // No stage-b fwht3 twin exists (plan §14.3): fwht3-K always
+                // runs the f16 fwht3 body below, never an fp8 entry.
                 if gpu.flags.gfx12_fa2_prefill
                     && gpu.arch == "gfx1201"
-                    && !gpu.replay.is_recording()
-                    && !gpu.graphs.capture_mode
                     && io.n_heads == 24
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
@@ -1648,22 +1860,24 @@ fn dispatch_attend(
                     return Ok(());
                 }
                 // gfx11 FA2 prefill with fwht3 K (default on;
-                // `HIPFIRE_GFX11_FA2_PREFILL=0` opts out). Same contract and predicates
-                // as the gfx1201 arm above; arch-disjoint (gfx11 allowlist
-                // only) and an independent flag. Falls through to the
+                // `HIPFIRE_GFX11_FA2_PREFILL=0` opts out). F4b: the launcher
+                // pre-converts Q into f16 scratch (rotation fused, Q never
+                // mutated), so like the gfx1201 arm above this one is
+                // replay-idempotent and capture-safe — no recorder/capture
+                // gates. The fixed 16-row query tile zero-fills and guards its
+                // final partial tile. F2: exactly-1024 is admitted on exact
+                // gfx1151 only (shared predicate with the Q8 ingress); every
+                // other batch keeps the 64..=512 gate. Falls through to the
                 // incumbent below otherwise.
                 if gpu.flags.gfx11_fa2_prefill
                     && matches!(
                         gpu.arch.as_str(),
                         "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
                     )
-                    && !gpu.replay.is_recording()
-                    && !gpu.graphs.capture_mode
                     && io.n_heads == 24
                     && io.n_kv_heads == 4
                     && io.head_dim == 256
-                    && (64..=512).contains(&io.batch_size)
-                    && io.batch_size % 16 == 0
+                    && gpu.fa2_gfx11_batch_admitted(io.batch_size)
                     && (64..=32768).contains(&io.max_ctx_len)
                     && io.tree_bias.is_none()
                     && plan.v_mode_bits == 8
@@ -1877,6 +2091,54 @@ fn dispatch_attend(
                     ))? {
                         return Ok(());
                     }
+                }
+                // Wide Q8/Q8 FA2 is independent of the default flash envelope,
+                // but cannot override explicit flash-off, CK, scalar/batched,
+                // tree/window, or speculative verify. The lower ingress
+                // rechecks exact arch, shape and batch before direct launch.
+                if gpu.flags.gfx11_q8_fa2_wide
+                    && gpu.flags.gfx11_fa2_prefill
+                    && matches!(gpu.arch.as_str(), "gfx1100" | "gfx1151")
+                    && flash_optin
+                    && !gpu.flash_attn_ck_loaded()
+                    && !matches!(
+                        hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_KERNEL")
+                            .ok().as_deref(),
+                        Some("scalar") | Some("batched")
+                    )
+                    && ctx.workload == crate::context::DispatchWorkload::Standard
+                    && io.tree_bias.is_none()
+                    && plan.window <= 0
+                    && plan.v_mode_bits == 8
+                    && io.block_cols == 0
+                    && io.k_cache.buf.is_vmm_owner()
+                    && io.v_cache.buf.is_vmm_owner()
+                    && io.n_heads == 24
+                    && io.n_kv_heads == 4
+                    && io.head_dim == 256
+                    && (64..=8192).contains(&io.batch_size)
+                    && (io.batch_size <= 512 || io.batch_size % 512 == 0)
+                    && (64..=32768).contains(&io.max_ctx_len)
+                    && io.max_ctx_len
+                        .checked_mul(4 * (256 / 32) * 34)
+                        .is_some_and(|bytes| {
+                            io.k_cache.buf.size() >= bytes && io.v_cache.buf.size() >= bytes
+                        })
+                    && io.pos.checked_add(io.batch_size) == Some(io.max_ctx_len)
+                    && io.max_ctx_len <= io.physical_cap
+                {
+                    return hip!(gpu.attention_q8_0_flash_prefill_wmma(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ));
                 }
                 // Query-tiled flash prefill. Its LDS depends only on BR/BC and
                 // never on context, so it has no capacity ceiling and no
@@ -2092,6 +2354,190 @@ fn dispatch_attend(
                     plan.window,
                 ))
             }
+            KernelKey::AttnFp8E4m3KvBatchedMasked => {
+                // gfx1201 FA2 prefill on native fp8 KV, Q0 (slice-B; default
+                // on; `HIPFIRE_GFX12_FA2_PREFILL=0` opts out). F4b: the
+                // launcher pre-converts Q into f16 scratch (Q never mutated)
+                // and the fill decodes native E4M3 rows into its f16 planes,
+                // so like the q8/fwht3 FA2 ingresses this arm is
+                // replay-idempotent and capture-safe — no recorder/capture
+                // gates. Same shape predicates as those ingresses (exact
+                // gfx1201/H24/KV4/D256, 64..=512 rows, 64..=262144 ctx),
+                // plus no tree-verify (FA2 has no tree path). Falls through
+                // to the scalar/tile crossover below otherwise.
+                // Stage-b route N retains its separate Q pre-convert for the
+                // oracle-only fallback. The packet route instead converts Q
+                // in-kernel. Batches above 512 are equal-length 512-row runs:
+                // one 3-D launch uses z for the run while x restarts the exact
+                // former per-step ownership and causal-bound grouping.
+                // Context is bounded by the model's 262144 positions, not by
+                // the fixed per-run query tile; KV offsets use 64-bit arithmetic.
+                const FP8_FA2_MAX_CTX: usize = 262_144;
+                if gpu.flags.attn_qresident
+                    && gpu.arch == "gfx1201"
+                    && io.n_heads == 24
+                    && io.n_kv_heads == 4
+                    && io.head_dim == 256
+                    && (64..=32768).contains(&io.batch_size)
+                    && (io.batch_size <= 512 || io.batch_size % 512 == 0)
+                    && (64..=FP8_FA2_MAX_CTX).contains(&io.max_ctx_len)
+                    && io.tree_bias.is_none()
+                {
+                    if io.q.dtype == DType::Raw {
+                        hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201(
+                            io.q, io.k_cache, io.v_cache, io.output, io.positions(),
+                            io.n_heads, io.n_kv_heads, io.head_dim, io.max_ctx_len, io.batch_size,
+                        ))?;
+                        return Ok(());
+                    }
+                    // v2 is the bit-exact reschedule of the same body;
+                    // `kernel.attn_qresident_v2=false` restores v1.
+                    if gpu.flags.attn_qresident_v2 {
+                        hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ))?;
+                    } else {
+                        hip!(gpu.attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
+                            io.q,
+                            io.k_cache,
+                            io.v_cache,
+                            io.output,
+                            io.positions(),
+                            io.n_heads,
+                            io.n_kv_heads,
+                            io.head_dim,
+                            io.max_ctx_len,
+                            io.batch_size,
+                        ))?;
+                    }
+                    return Ok(());
+                }
+                if gpu.flags.gfx12_fa_packet
+                    && gpu.arch == "gfx1201"
+                    && io.n_heads == 24
+                    && io.n_kv_heads == 4
+                    && io.head_dim == 256
+                    && (64..=32768).contains(&io.batch_size)
+                    && (io.batch_size <= 512 || io.batch_size % 512 == 0)
+                    && (64..=FP8_FA2_MAX_CTX).contains(&io.max_ctx_len)
+                    && io.tree_bias.is_none()
+                {
+                    hip!(gpu.attention_fp8_e4m3_fa2_gqa_packet_gfx1201(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ))?;
+                    return Ok(());
+                }
+                if gpu.flags.gfx12_fa2_prefill
+                    && gpu.arch == "gfx1201"
+                    && io.n_heads == 24
+                    && io.n_kv_heads == 4
+                    && io.head_dim == 256
+                    && (64..=512).contains(&io.batch_size)
+                    && (64..=FP8_FA2_MAX_CTX).contains(&io.max_ctx_len)
+                    && io.tree_bias.is_none()
+                {
+                    hip!(gpu.attention_fp8_e4m3_fa2_gqa_fp8_gfx1201(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.max_ctx_len,
+                        io.batch_size,
+                    ))?;
+                    return Ok(());
+                }
+                // Scalar-batched at short ctx (same gfx12 4096 crossover as
+                // q8: LDS holds occupancy), flash-tile-batched above it.
+                // tree_bias passes through to whichever backend runs; noslots
+                // (null descriptors inside the launchers), like the writer.
+                let crossover: usize =
+                    if gpu.arch_caps.is_gfx1200() || gpu.arch_caps.is_gfx1201() {
+                        4096
+                    } else {
+                        8192
+                    };
+                if io.max_ctx_len <= crossover {
+                    let positions = io.positions.unwrap();
+                    hip!(gpu.attention_fp8_e4m3_kv_batched(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        positions,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        io.max_ctx_len,
+                        io.batch_size,
+                        io.tree_bias,
+                        io.block_start,
+                        io.block_cols,
+                    ))
+                } else {
+                    let fp = io.flash_partials.unwrap();
+                    hip!(gpu.attention_flash_fp8_e4m3_tile_batched(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.positions(),
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.head_dim,
+                        io.physical_cap,
+                        io.max_ctx_len,
+                        io.batch_size,
+                        fp,
+                        io.tree_bias,
+                        io.block_start,
+                        io.block_cols,
+                    ))
+                }
+            }
+            KernelKey::AttnBf16KvBatchedMasked => {
+                // Qwen dense has no sliding window: plain causal through F's
+                // new native bf16 batched kernel (no window arg on its ABI).
+                let positions = io.positions.unwrap();
+                hip!(gpu.attention_bf16_kv_batched(
+                    io.q,
+                    io.k_cache,
+                    io.v_cache,
+                    io.output,
+                    positions,
+                    io.n_heads,
+                    io.n_kv_heads,
+                    io.head_dim,
+                    io.physical_cap,
+                    io.max_ctx_len,
+                    io.batch_size,
+                    io.tree_bias,
+                    io.block_start,
+                    io.block_cols,
+                ))
+            }
 
             _ => Err(DispatchError::UnsupportedVariant {
                 family: "attention/attend",
@@ -2121,6 +2567,7 @@ pub(crate) const DISPATCHED_KV_WRITE_KEYS: &[KernelKey] = &[
     KernelKey::KvWriteF32,
     KernelKey::KvWriteQ8_0,
     KernelKey::KvWriteBf16,
+    KernelKey::KvWriteFp8E4m3,
     KernelKey::KvWriteAsym4,
     KernelKey::KvWriteAsym4Fwht,
     KernelKey::KvWriteAsym3,
@@ -2135,6 +2582,7 @@ pub(crate) const DISPATCHED_KV_WRITE_KEYS: &[KernelKey] = &[
     KernelKey::KvWriteAsym2Batched,
     KernelKey::KvWriteAsym2FwhtBatched,
     KernelKey::KvWriteQ8_0Batched,
+    KernelKey::KvWriteFp8E4m3Batched,
     KernelKey::KvWriteBf16Batched,
     // Llama legacy
     KernelKey::KvWriteHfq4,
@@ -2150,6 +2598,10 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     KernelKey::AttnFlashQ8_0,
     KernelKey::AttnFlashQ8_0Windowed,
     KernelKey::AttnFlashBf16Windowed,
+    KernelKey::AttnFp8E4m3Kv,
+    KernelKey::AttnBf16Kv,
+    KernelKey::AttnFlashBf16,
+    KernelKey::AttnFlashFp8E4m3,
     KernelKey::AttnQ8_0Kv,
     KernelKey::AttnFlashAsym4,
     KernelKey::AttnFlashAsym4Fwht,
@@ -2170,6 +2622,8 @@ pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
     KernelKey::AttnFlashAsym2FwhtBatched,
     KernelKey::AttnQ8_0KvBatchedMasked,
     KernelKey::AttnQ8_0KvBatchedMaskedWindowed,
+    KernelKey::AttnFp8E4m3KvBatchedMasked,
+    KernelKey::AttnBf16KvBatchedMasked,
     KernelKey::AttnBf16KvBatchedMaskedWindowed,
     // Llama legacy
     KernelKey::AttnHfq4Kv,
@@ -2267,6 +2721,18 @@ mod tests {
     fn dispatch_kv_write_has_arms_for_all_registered_keys() {
         let family = AttentionFamily::new();
         let ctx = DispatchCtx::for_test("gfx1100");
+        // Native fp8 keys are IsGfx1201-gated: they only resolve on gfx1201.
+        let ctx_fp8 = DispatchCtx::for_test("gfx1201");
+        let ctx_for = |key: KernelKey| {
+            if matches!(
+                key,
+                KernelKey::KvWriteFp8E4m3 | KernelKey::KvWriteFp8E4m3Batched
+            ) {
+                &ctx_fp8
+            } else {
+                &ctx
+            }
+        };
 
         let dispatched_set: std::collections::HashSet<KernelKey> =
             DISPATCHED_KV_WRITE_KEYS.iter().copied().collect();
@@ -2281,7 +2747,7 @@ mod tests {
                 is_tree: false,
             };
             assert!(
-                family.resolve(key, &ctx, Some(&shape)).is_ok(),
+                family.resolve(key, ctx_for(key), Some(&shape)).is_ok(),
                 "DISPATCHED_KV_WRITE_KEYS contains {:?} but it is NOT registered — stale entry",
                 key
             );
@@ -2299,7 +2765,7 @@ mod tests {
                 m: 0,
                 is_tree: false,
             };
-            if family.resolve(key, &ctx, Some(&shape)).is_ok() {
+            if family.resolve(key, ctx_for(key), Some(&shape)).is_ok() {
                 assert!(
                     dispatched_set.contains(&key),
                     "registered KV write key {:?} is not in DISPATCHED_KV_WRITE_KEYS — missing dispatch arm",
@@ -2318,6 +2784,8 @@ mod tests {
                 | KvWriteQ8_0
                 | KvWriteBf16
                 | KvWriteBf16Batched
+                | KvWriteFp8E4m3
+                | KvWriteFp8E4m3Batched
                 | KvWriteAsym4
                 | KvWriteAsym4Fwht
                 | KvWriteAsym3
@@ -2331,6 +2799,7 @@ mod tests {
                 | KvWriteAsym2Batched
                 | KvWriteAsym2FwhtBatched
                 | KvWriteQ8_0Batched
+                | KvWriteFp8E4m3Batched
                 | KvWriteHfq4
                 | KvWriteQ4
                 | KvWriteInt8c
@@ -2351,6 +2820,7 @@ mod tests {
                 | KvWriteAsym2FwhtBatched
                 | KvWriteQ8_0Batched
                 | KvWriteBf16Batched
+                | KvWriteFp8E4m3Batched
         )
     }
 
@@ -2368,6 +2838,20 @@ mod tests {
     fn dispatch_attend_has_arms_for_all_registered_keys() {
         let family = AttentionFamily::new();
         let ctx = DispatchCtx::for_test("gfx1100");
+        // Native fp8 attend keys are IsGfx1201-gated: they only resolve on gfx1201.
+        let ctx_fp8 = DispatchCtx::for_test("gfx1201");
+        let ctx_for = |key: KernelKey| {
+            if matches!(
+                key,
+                KernelKey::AttnFp8E4m3Kv
+                    | KernelKey::AttnFlashFp8E4m3
+                    | KernelKey::AttnFp8E4m3KvBatchedMasked
+            ) {
+                &ctx_fp8
+            } else {
+                &ctx
+            }
+        };
 
         let dispatched_set: std::collections::HashSet<KernelKey> =
             DISPATCHED_ATTEND_KEYS.iter().copied().collect();
@@ -2383,7 +2867,7 @@ mod tests {
                 is_tree: false,
             };
             assert!(
-                family.resolve(key, &ctx, Some(&shape)).is_ok(),
+                family.resolve(key, ctx_for(key), Some(&shape)).is_ok(),
                 "DISPATCHED_ATTEND_KEYS contains {:?} but it is NOT registered — stale entry",
                 key
             );
@@ -2404,7 +2888,7 @@ mod tests {
                 m: 0,
                 is_tree: false,
             };
-            if family.resolve(key, &ctx, Some(&shape)).is_ok() {
+            if family.resolve(key, ctx_for(key), Some(&shape)).is_ok() {
                 assert!(
                     dispatched_set.contains(&key),
                     "registered attend key {:?} is not in DISPATCHED_ATTEND_KEYS — missing dispatch arm",
@@ -2428,6 +2912,8 @@ mod tests {
                 | AttnQ8_0KvBatchedMasked
                 | AttnQ8_0KvBatchedMaskedWindowed
                 | AttnBf16KvBatchedMaskedWindowed
+                | AttnFp8E4m3KvBatchedMasked
+                | AttnBf16KvBatchedMasked
         )
     }
 

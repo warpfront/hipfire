@@ -418,6 +418,15 @@ impl Gpu {
         // Partials scratch: [N_BLOCKS*TOP_K] f32 vals then [N_BLOCKS*TOP_K] i32 idx.
         let n_cand = N_BLOCKS as usize * top_k;
         let val_bytes = n_cand * 4;
+        // Growth under a captured graph would free a pointer the graph embeds:
+        // invalidate first (no-op unless captured).
+        if crate::scratch::scratch_will_grow(
+            self.scratch.sample_partials_bytes,
+            self.scratch.sample_partials.is_some(),
+            val_bytes * 2,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         let mut logits_ptr = logits.buf.as_ptr();
         let mut repeat_ptr = repeat_buf.buf.as_ptr();
         let mut vs = vocab_size as i32;
@@ -602,6 +611,14 @@ impl Gpu {
 
         let n_cand = N_BLOCKS as usize * top_k_width;
         let val_bytes = n_cand * 4;
+        // Same pre-growth invalidation contract as above.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.sample_partials_bytes,
+            self.scratch.sample_partials.is_some(),
+            val_bytes * 2,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         let partial_base = self
             .scratch
             .ensure_sample_partials(&self.hip, val_bytes * 2)?;

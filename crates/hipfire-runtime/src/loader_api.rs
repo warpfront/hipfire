@@ -57,10 +57,20 @@ impl ModelSource {
     }
 }
 
+/// Qwen's load-time sequence decision: capacity is filled from actual free
+/// VRAM after weights upload and before its VMM cache is constructed.
+#[derive(Clone, Copy)]
+pub struct SequenceHint {
+    pub model_ctx: usize,
+    pub automatic: bool,
+    pub card_cap: usize,
+}
+
 /// Everything a carrier's `load` needs beyond the source itself.
 pub struct LoadCtx<'a> {
     pub path: &'a str,
     pub max_seq: usize,
+    pub sequence: Option<SequenceHint>,
     /// DeepSeek V4-only physical compute placement. The default is `Single`;
     /// other carriers must ignore it.
     pub deepseek4_compute_placement: hipfire_config::Deepseek4ComputePlacement,
@@ -76,6 +86,11 @@ pub struct LoadCtx<'a> {
     /// (or text-only when the trunk has no tower either).
     pub vision_path: Option<PathBuf>,
     pub kv_mode_override: Option<&'a str>,
+    /// Authored Qwen-only K and V overrides. None preserves the selected whole-cache mode.
+    pub kv_k_override: Option<&'a str>,
+    pub kv_v_override: Option<&'a str>,
+    /// Sampled once per load from HIPFIRE_QWEN_KV_DEFAULT_Q8; never per token.
+    pub qwen_default_q8: bool,
     // NOTE: head overlays (`--head`) deliberately have NO LoadCtx field. They
     // validate and attach in `admit_source` before teardown, so the admitted
     // source the carrier consumes is already effective — threading a second
@@ -98,6 +113,14 @@ pub struct LoadCtx<'a> {
     /// load time via `gemma4_eagle_spec_len` (1..=5, default 3). Meaningful
     /// only when `gemma4_drafter_path` is `Some`.
     pub gemma4_draft_len: usize,
+    /// Opt-in gfx1151 XDNA NPU spillover sidecar, verified at load time
+    /// (`XdnaSidecarDescriptor::load_verified`) and admitted only when the
+    /// `kernel.npu_spillover` process flag is on AND the host arch is exactly
+    /// `gfx1151` (see `admit_for_arch`). `None` = GPU-only; carriers must not
+    /// open `/dev/accel`, allocate NPU mirrors, or change numerics when this
+    /// is `None`. Populated by the loader from the daemon `xdna` load param;
+    /// projected CLI-side by `load_params` from the registry `xdna` slot.
+    pub xdna: Option<hipfire_registry::XdnaSidecarDescriptor>,
 }
 
 /// Per-load model-free n-gram speculator settings, resolved by the CLI through

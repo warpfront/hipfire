@@ -972,7 +972,8 @@ impl EvictionCtx {
         let tier = kv.k_tier();
         assert!(
             tier.is_compactable(),
-            "TriAttention eviction only supports Q8, asym2, asym3, asym4 KV modes for now (got {tier:?})"
+            "TriAttention eviction only supports Q8, asym2, asym3, asym4 KV modes for now \
+             (got {tier:?}); native fp8/bf16 KV is rejected before compaction, never re-encoded"
         );
         let k_bytes_per_pos = tier.k_bytes_per_pos(self.n_kv_heads, self.head_dim);
         let v_bytes_per_pos = match kv.v_mode {

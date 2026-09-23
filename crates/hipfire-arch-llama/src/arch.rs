@@ -496,6 +496,7 @@ impl Llama {
                     block_start: 0,
                     block_cols: 0,
                     output_gate: None,
+                    output_awq_scale: None,
                     output: &scratch.attn_out,
                 };
                 family

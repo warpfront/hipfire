@@ -52,6 +52,12 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
     const float* __restrict__ c_buf,
 #endif
     int M, int K
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    , const unsigned int LUT0, const unsigned int LUT1,
+    const unsigned int LUT2, const unsigned int LUT3,
+    const unsigned int LUT4, const unsigned int LUT5,
+    const unsigned int LUT6, const unsigned int LUT7
+#endif
 ) {
     const int row = blockIdx.x;
     if (row >= M) return;
@@ -69,6 +75,23 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
     const char* row_ptr = A + (long long)row * groups_per_row * 136;
     const unsigned int row_weight_offset =
         (unsigned int)((long long)row * groups_per_row * 136);
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    // Centered-codebook LUT: 16 f16 levels in 8 dwords (2 per dword, LE).
+    // Staged once to 32 B of LDS (lanes 0..7 write one dword each to disjoint
+    // slots, then barrier); per-nibble decode reads LUT_SMEM[q] via
+    // MQ4V2_LUT below. Uniform builds have no LDS, no barrier, no extra args.
+    __shared__ unsigned short LUT_SMEM[16];
+    {
+        unsigned int d;
+        if (tid == 0) d = LUT0; else if (tid == 1) d = LUT1;
+        else if (tid == 2) d = LUT2; else if (tid == 3) d = LUT3;
+        else if (tid == 4) d = LUT4; else if (tid == 5) d = LUT5;
+        else if (tid == 6) d = LUT6; else d = LUT7;
+        if (tid < 8) ((unsigned int*)LUT_SMEM)[tid] = d;
+    }
+    __syncthreads();
+#define MQ4V2_LUT(q) (__half2float(__ushort_as_half(LUT_SMEM[(q)])))
+#endif
     const int boff = tid * 4;
 #if HIPFIRE_GFX12_WEIGHT_BUFFER_LOADS
     const auto weight_rsrc = HIPFIRE_WEIGHT_RSRC(A);
@@ -89,6 +112,20 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
+#ifdef HIPFIRE_MQ4G256V2_LUT
+        // Lloyd decode: nibble q looks up the centered f16 codebook staged in
+        // LUT_SMEM (w = sc*C[q] + zp' with zp' pre-folded in the headers).
+        // Same 4-accumulator interleaving and FMA order as DOG above.
+        #define DOG_LUT(pk, sc, zp, b, a) \
+            (a) += (sc * MQ4V2_LUT((pk) & 0xFu)        + zp) * x[(b)]     \
+                 + (sc * MQ4V2_LUT(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+                 + (sc * MQ4V2_LUT(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+                 + (sc * MQ4V2_LUT(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+                 + (sc * MQ4V2_LUT(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+                 + (sc * MQ4V2_LUT(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+                 + (sc * MQ4V2_LUT(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+                 + (sc * MQ4V2_LUT(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+#endif
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const char* gp0 = row_ptr + g * 136;
@@ -135,10 +172,17 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
                  + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
                  + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
 
+#ifdef HIPFIRE_MQ4G256V2_LUT
+        DOG_LUT(pk0, sc0, zp0, base, acc0);
+        DOG_LUT(pk1, sc1, zp1, base + 256, acc1);
+        DOG_LUT(pk2, sc2, zp2, base + 512, acc2);
+        DOG_LUT(pk3, sc3, zp3, base + 768, acc3);
+#else
         DOG(pk0, sc0, zp0, base, acc0);
         DOG(pk1, sc1, zp1, base + 256, acc1);
         DOG(pk2, sc2, zp2, base + 512, acc2);
         DOG(pk3, sc3, zp3, base + 768, acc3);
+#endif
         #undef DOG
     }
 
@@ -146,6 +190,17 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
     // group must accumulate into its OWN accumulator (acc[g % 4]) to
     // preserve the 4-way interleaving that the combine step assumes.
     // See gemv_mq4g256v2.gfx1100.hip for the full bug writeup.
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    #define TAIL_DOG_LUT(pk, sc, zp, b, a) \
+        (a) += (sc * MQ4V2_LUT((pk) & 0xFu)        + zp) * x[(b)]     \
+             + (sc * MQ4V2_LUT(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+             + (sc * MQ4V2_LUT(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+             + (sc * MQ4V2_LUT(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+             + (sc * MQ4V2_LUT(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+             + (sc * MQ4V2_LUT(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+             + (sc * MQ4V2_LUT(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+             + (sc * MQ4V2_LUT(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+#endif
     #define TAIL_DOG(pk, sc, zp, b, a) \
         (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
              + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
@@ -167,7 +222,11 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
         float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
         unsigned int pk = LOAD_WEIGHT_PACKED(gp + 8 + boff, goff + 8u + boff);
         int base = g * 256 + tid * 8;
+#ifdef HIPFIRE_MQ4G256V2_LUT
+        TAIL_DOG_LUT(pk, sc, zp, base, acc0);
+#else
         TAIL_DOG(pk, sc, zp, base, acc0);
+#endif
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
@@ -180,7 +239,11 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
         float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
         unsigned int pk = LOAD_WEIGHT_PACKED(gp + 8 + boff, goff + 8u + boff);
         int base = g * 256 + tid * 8;
+#ifdef HIPFIRE_MQ4G256V2_LUT
+        TAIL_DOG_LUT(pk, sc, zp, base, acc1);
+#else
         TAIL_DOG(pk, sc, zp, base, acc1);
+#endif
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
@@ -193,7 +256,11 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
         float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
         unsigned int pk = LOAD_WEIGHT_PACKED(gp + 8 + boff, goff + 8u + boff);
         int base = g * 256 + tid * 8;
+#ifdef HIPFIRE_MQ4G256V2_LUT
+        TAIL_DOG_LUT(pk, sc, zp, base, acc2);
+#else
         TAIL_DOG(pk, sc, zp, base, acc2);
+#endif
     }
     #undef TAIL_DOG
     #undef LOAD_WEIGHT_PACKED

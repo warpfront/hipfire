@@ -48,11 +48,15 @@ fn main() {
     let mut ctx = LoadCtx {
         path: &model_path,
         max_seq: 2048,
+        sequence: None,
         deepseek4_compute_placement: Default::default(),
         deepseek4_experts_per_token: None,
         draft_path: None,
         kv_mode_override: None,
-        kv_backend: hipfire_runtime::kv_backend::KvBackend::Contiguous,
+        kv_k_override: None,
+        kv_v_override: None,
+        qwen_default_q8: true,
+        kv_backend: hipfire_runtime::kv_backend::KvBackend::Legacy,
         kv_adaptive_override: None,
         state_quant_override: None,
         cask: &cask,
@@ -62,6 +66,7 @@ fn main() {
         gemma4_drafter_path: None,
         gemma4_draft_len: 3,
         vision_path: None,
+        xdna: None,
     };
 
     let mut bundle = load_llama_bundle(src, &mut ctx).expect("load llama bundle");

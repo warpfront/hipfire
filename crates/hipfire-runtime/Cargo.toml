@@ -52,6 +52,7 @@ serve-fault-inject = []
 [dependencies]
 hip-bridge = { path = "../hip-bridge" }
 hipfire-config = { path = "../hipfire-config" }
+hipfire-registry = { path = "../hipfire-registry" }
 rdna-compute = { path = "../rdna-compute" }
 saddle-core = { path = "../saddle-core" }
 hipfire-dispatch = { path = "../hipfire-dispatch" }
@@ -142,6 +143,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"]
 name = "coherence_probe"
 required-features = []
 
+
 [[example]]
 name = "bench_qwen35_mq4"
 required-features = []
@@ -184,6 +186,16 @@ required-features = []
 [[example]]
 name = "c8_sampler_validate"
 required-features = []
+
+# Gate F1: FA2 N=1024 vs two N=512 bit-identity oracle (throwaway; repaired positions).
+[[example]]
+name = "tmp_fa2_n1024_oracle"
+required-features = ["lab"]
+
+# Gate F3.0: FA2 fill/exp/PV attribution twins (throwaway; H24/KV4/D256).
+[[example]]
+name = "tmp_fa2_attrib"
+required-features = ["lab"]
 
 [[example]]
 name = "calib_sweep"
@@ -448,6 +460,8 @@ required-features = ["lab"]
 name = "prefill_microbench"
 required-features = ["lab"]
 
+
+
 [[example]]
 name = "probe_wmma"
 required-features = ["lab"]
@@ -641,6 +655,10 @@ name = "verify_mq_kernel"
 required-features = ["lab"]
 
 [[example]]
+name = "tmp_halo_iu4_calibrate"
+required-features = []
+
+[[example]]
 name = "wmma_fa_spike"
 required-features = ["lab"]
 
@@ -651,3 +669,21 @@ required-features = ["deltanet"]
 [[example]]
 name = "h2d_mmap_bench"
 required-features = ["deltanet"]
+
+
+
+
+[[example]]
+name = "tmp_halo_iu4_oracle"
+required-features = ["lab"]
+
+
+
+[[example]]
+name = "tmp_iu4_gfx12_oracle"
+required-features = ["lab"]
+
+
+[[example]]
+name = "fp8stream_producer_oracle"
+required-features = ["lab"]

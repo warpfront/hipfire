@@ -1,0 +1,2 @@
+pid=1925612 ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 HOME=/home/kaden/hipfire-gemmv2/scratch-gemmv2integ/gfx1100/serve-home
+pid=1925633 ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 HOME=/home/kaden/hipfire-gemmv2/scratch-gemmv2integ/gfx1100/serve-home

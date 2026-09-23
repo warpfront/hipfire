@@ -638,6 +638,9 @@ fn load_weight_tensor_from_source(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -685,6 +688,9 @@ fn load_lm_head_from_source(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         };
         Ok((wt, true))
     } else {
@@ -2129,6 +2135,7 @@ impl DenseArch for Qwen2Dense<'_> {
             quant_int8: false,
             quant_hfq8: false,
             quant_bf16: false,
+            quant_fp8: false,
             f32_policy: F32AttnPolicy::Gqa {
                 n_heads: k.n_heads,
                 n_kv_heads: k.n_kv_heads,
@@ -2172,6 +2179,7 @@ impl DenseArch for Qwen2Dense<'_> {
             block_start: 0,
             block_cols: 0,
             output_gate: None,
+            output_awq_scale: None,
             output: &st.attn_out,
         };
         Ok(Some((plan, io)))

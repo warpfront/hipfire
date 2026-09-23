@@ -52,6 +52,8 @@ fn main() {
         prefill_chunk: 512,
         host_budget_bytes: 8 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-tool-reentry-swap"),
+        kv_mode: "q8".to_string(),
+        kv_backend: "legacy".to_string(),
     })
     .expect("engine");
 

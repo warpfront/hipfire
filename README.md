@@ -50,6 +50,9 @@ repair, registry draft sidecars, Ornith 1.5, sealed MoE execution
 contracts, gfx1201 long-context DFlash, tool turns on daemon slots, and
 first-release image generation (FLUX). See [CHANGELOG.md](CHANGELOG.md).
 
+The upcoming [v0.4.0 KV migration](CHANGELOG.md) is documented under Unreleased;
+v0.3.1 remains the latest tagged stable release.
+
 Curated weights are published through
 [huggingface.co/hipfire-models](https://huggingface.co/hipfire-models)
 and the per-model repositories recorded in the dynamic registry.

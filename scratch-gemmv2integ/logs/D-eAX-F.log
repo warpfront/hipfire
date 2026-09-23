@@ -1,0 +1,30 @@
+DEVICE arch=gfx1100 name=AMD Radeon RX 7900 XTX mps=48 ROCR=0 HIP=0 pid=1895028
+OBJECT X5_OBJECT=/home/kaden/hipfire-x5/scratch-x5/gfx1100-8192/home/.hipfire_kernels/gfx1100/gemm_mq4g256v2_residual_mmq_iu4_gfx11_x5_symfold.936038d287cc3b6f.hsaco
+OBJECT EXTRA_V2C_MS_OBJECT=/home/kaden/hipfire-prof040/scratch-gemmv2/bin/v2c-ms-gfx1100.hsaco
+OBJECT V2CP_OBJECT=/home/kaden/hipfire-gemmv2/scratch-gemmv2integ/bin/diag-eAX.hsaco
+RESOURCE arm=x5 add=0 vgpr=92 private=0 static_lds=0 dynamic_lds=30720 blocks_per_mp=2 waves_per_mp=32
+RESOURCE arm=x5 add=1 vgpr=92 private=0 static_lds=0 dynamic_lds=30720 blocks_per_mp=2 waves_per_mp=32
+RESOURCE arm=v2c_ms add=0 vgpr=177 private=0 static_lds=0 dynamic_lds=32768 blocks_per_mp=2 waves_per_mp=16
+RESOURCE arm=v2c_ms add=1 vgpr=177 private=0 static_lds=0 dynamic_lds=32768 blocks_per_mp=2 waves_per_mp=16
+RESOURCE arm=v2c_prod add=0 vgpr=170 private=0 static_lds=0 dynamic_lds=32768 blocks_per_mp=2 waves_per_mp=16
+RESOURCE arm=v2c_prod add=1 vgpr=170 private=0 static_lds=0 dynamic_lds=32768 blocks_per_mp=2 waves_per_mp=16
+RESULT arm=x5 shape=set_m17408 M=17408 K=5120 N=8192 add=0 ms=9.807599 tops=148.893615 pct_of_105.543=141.0739 min=9.791519 max=9.864960 begin=1790141963.460569 end=1790141963.533590 all=9.8005,9.7915,9.8124,9.8076,9.7921,9.8650,9.8140,
+RESULT arm=v2c_ms shape=set_m17408 M=17408 K=5120 N=8192 add=0 ms=8.082392 tops=180.675341 pct_of_105.543=171.1865 min=8.047153 max=8.202794 begin=1790141964.141422 end=1790141964.202411 all=8.0824,8.0765,8.2028,8.0472,8.0586,8.0988,8.0951,
+RESULT arm=v2c_prod shape=set_m17408 M=17408 K=5120 N=8192 add=0 ms=8.524995 tops=171.294987 pct_of_105.543=162.2988 min=8.436634 max=8.606595 begin=1790141964.804345 end=1790141964.868331 all=8.4366,8.5480,8.5250,8.4905,8.6066,8.4761,8.5436,
+REPACK shape=set_m17408 K=5120 N=8192 ms=0.028801 bytes_in=23592960 identical_to_cpu_pack=1
+RESULT arm=x5 shape=set_m10240 M=10240 K=5120 N=8192 add=0 ms=5.783784 tops=148.517557 pct_of_105.543=140.7176 min=5.741824 max=5.786023 begin=1790141965.750821 end=1790141965.793715 all=5.7860,5.7590,5.7838,5.7655,5.7418,5.7854,5.7841,
+RESULT arm=v2c_ms shape=set_m10240 M=10240 K=5120 N=8192 add=0 ms=4.787740 tops=179.415236 pct_of_105.543=169.9925 min=4.757819 max=4.806060 begin=1790141966.395625 end=1790141966.431597 all=4.7670,4.7924,4.7660,4.7578,4.8061,4.7877,4.7998,
+RESULT arm=v2c_prod shape=set_m10240 M=10240 K=5120 N=8192 add=0 ms=5.021580 tops=171.060388 pct_of_105.543=162.0765 min=4.986180 max=5.062261 begin=1790141967.032525 end=1790141967.070221 all=5.0216,4.9862,4.9996,5.0623,5.0618,5.0235,5.0034,
+REPACK shape=set_m10240 K=5120 N=8192 ms=0.029080 bytes_in=23592960 identical_to_cpu_pack=1
+RESULT arm=x5 shape=set_m6144 M=6144 K=5120 N=8192 add=0 ms=3.486695 tops=147.817939 pct_of_105.543=140.0547 min=3.465174 max=3.508854 begin=1790141967.862213 end=1790141967.888096 all=3.5089,3.4975,3.4924,3.4830,3.4833,3.4867,3.4652,
+RESULT arm=v2c_ms shape=set_m6144 M=6144 K=5120 N=8192 add=0 ms=2.882812 tops=178.782408 pct_of_105.543=169.3930 min=2.874772 max=2.899492 begin=1790141968.489469 end=1790141968.511152 all=2.8851,2.8793,2.8828,2.8763,2.8995,2.8901,2.8748,
+RESULT arm=v2c_prod shape=set_m6144 M=6144 K=5120 N=8192 add=0 ms=3.027413 tops=170.243074 pct_of_105.543=161.3021 min=2.990373 max=3.054652 begin=1790141969.112487 end=1790141969.135201 all=3.0547,3.0272,2.9904,3.0123,3.0454,3.0326,3.0274,
+REPACK shape=set_m6144 K=5120 N=8192 ms=0.029400 bytes_in=23592960 identical_to_cpu_pack=1
+RESULT arm=x5 shape=add_k17408 M=5120 K=17408 N=8192 add=1 ms=9.866402 tops=148.006226 pct_of_105.543=140.2331 min=9.831482 max=10.041723 begin=1790141969.993064 end=1790141970.065078 all=9.8571,9.9125,9.8644,9.8315,9.8664,9.8737,10.0417,
+RESULT arm=v2c_ms shape=add_k17408 M=5120 K=17408 N=8192 add=1 ms=8.217076 tops=177.713925 pct_of_105.543=168.3806 min=8.114235 max=8.272796 begin=1790141970.665392 end=1790141970.725535 all=8.1825,8.2171,8.2728,8.1336,8.1142,8.2566,8.2225,
+RESULT arm=v2c_prod shape=add_k17408 M=5120 K=17408 N=8192 add=1 ms=8.482917 tops=172.144666 pct_of_105.543=163.1038 min=8.404756 max=8.535397 begin=1790141971.330582 end=1790141971.392623 all=8.4048,8.4264,8.5077,8.4884,8.4829,8.4519,8.5354,
+REPACK shape=add_k17408 K=17408 N=8192 ms=0.214761 bytes_in=80216064 identical_to_cpu_pack=1
+RESULT arm=x5 shape=add_k6144 M=5120 K=6144 N=8192 add=1 ms=3.546335 tops=145.332034 pct_of_105.543=137.6994 min=3.529415 max=3.588976 begin=1790141972.187537 end=1790141972.215282 all=3.5657,3.5535,3.5463,3.5294,3.5890,3.5426,3.5311,
+RESULT arm=v2c_ms shape=add_k6144 M=5120 K=6144 N=8192 add=1 ms=3.157173 tops=163.246071 pct_of_105.543=154.6726 min=3.121734 max=3.196854 begin=1790141972.815360 end=1790141972.840381 all=3.1572,3.1382,3.1909,3.1969,3.1217,3.1351,3.1700,
+RESULT arm=v2c_prod shape=add_k6144 M=5120 K=6144 N=8192 add=1 ms=3.365934 tops=153.121271 pct_of_105.543=145.0795 min=3.331615 max=3.382615 begin=1790141973.442765 end=1790141973.469234 all=3.3659,3.3316,3.3453,3.3826,3.3733,3.3716,3.3637,
+REPACK shape=add_k6144 K=6144 N=8192 ms=0.033320 bytes_in=28311552 identical_to_cpu_pack=1

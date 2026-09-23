@@ -287,7 +287,7 @@ concluding anything.
 eval_hipfire --model qwen3.6-35b-a3b.mq2 --ref q36a3b-wt2-f32.kldref.bin \
              --scoring-mode prefill --kv-mode q8
 → slice-mean KLD = 0.238060   mean NLL = 1.827463   PPL = 6.2181
-  8160 tokens scored in 199.3s; HIPFIRE_LLOYD_GFX12=1 (auto-set on gfx12)
+  8160 tokens scored in 199.3s;  (auto-set on gfx12)
 ```
 
 **The "coherent but degraded" label is accurate. Phase 0 does not close the

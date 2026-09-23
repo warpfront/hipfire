@@ -1,0 +1,12 @@
+== off1
+{"label": "off1", "dispatches": 3633, "gpu_ms": 2040.318, "wall_ms": 2081.686394} prefill_tok_s 4041.6
+== on1
+{"label": "on1", "dispatches": 3633, "gpu_ms": 2039.998, "wall_ms": 2080.085189} prefill_tok_s 4042.9
+== on2
+{"label": "on2", "dispatches": 3633, "gpu_ms": 2045.254, "wall_ms": 2088.605586} prefill_tok_s 4028.9
+== off2
+{"label": "off2", "dispatches": 3633, "gpu_ms": 2050.57, "wall_ms": 2094.053108} prefill_tok_s 4019.1
+== base-c2
+{"label": "base-c2", "dispatches": 3633, "gpu_ms": 2112.851, "wall_ms": 2157.268756} prefill_tok_s 3899.3
+== base-rtn
+{"label": "base-rtn", "dispatches": 3633, "gpu_ms": 2048.54, "wall_ms": 2083.952937} prefill_tok_s 4020.5

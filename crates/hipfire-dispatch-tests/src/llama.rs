@@ -25,6 +25,7 @@ fn tier_inputs_base() -> hipfire_dispatch::families::kv_tier::KvTierInputs {
         quant_int8: false,
         quant_hfq8: false,
         quant_bf16: false,
+        quant_fp8: false,
         f32_policy: F32AttnPolicy::Simple,
         v_mode_bits: 8,
         pos: 0,

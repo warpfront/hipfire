@@ -1,0 +1,8 @@
+OFF ['off1', 'off2']: g12r symbols seen=[False]  ON ['on1', 'on2']: g12r symbols seen=[True]
+class                                                                   calls     off ms      on ms     delta  delta%
+iu4 gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold                      368   1089.963   1053.644   -36.320   -3.33
+other                                                                    3233    621.436    619.332    -2.104   -0.34
+iu4 gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold                      128    518.456    497.119   -21.337   -4.12
+IU4 GEMM total                                                                  1608.419   1550.762   -57.657   -3.58
+GPU total (per run: off [2222.818, 2236.896] on [2167.972, 2172.216])           2229.857   2170.094   -59.763   -2.68
+prefill tok/s off [3707.0, 3683.5] mean 3695.2  on [3801.5, 3793.5] mean 3797.5  +2.77%

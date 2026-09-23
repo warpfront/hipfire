@@ -1,0 +1,36 @@
+{
+  "fixture": {
+    "device": "GPU-e475645fe0200397",
+    "model": "/home/kaden/qcal/qat/v25/qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq",
+    "model_size": 14987185152,
+    "model_md5": "2cfe88923b3671ca16a8de6ec1122fde",
+    "cli_md5": "db8ddad2430a30814768db935e437f20",
+    "daemon_md5": "3881e0945acce62e57be43db6c820f11",
+    "token_stream": "8192 little-endian u32 tokens: 10 + (i % 1000), i=0..8191",
+    "token_stream_md5": "c596ea04a31b9977adeca9eda88f622c",
+    "kv_backend": "automatic",
+    "environment": {
+      "HOME": "/home/kaden/.hipfire-homes/g12gate-b",
+      "ROCR_VISIBLE_DEVICES": "GPU-e475645fe0200397",
+      "HIP_VISIBLE_DEVICES": "GPU-e475645fe0200397",
+      "HIPFIRE_KERNEL_CACHE": "/home/kaden/.hipfire-homes/g12gate-b/.hipfire_kernels",
+      "HIPFIRE_MODELS_DIR": "/home/kaden/.hipfire/models",
+      "HIPFIRE_GRAPH": "1",
+      "HIPFIRE_DAEMON_BIN": "/home/kaden/ClaudeCode/warpfront/wt-g12stack/target/release/daemon"
+    }
+  },
+  "pp8192_process_medians": [
+    3881.1,
+    3846.6,
+    3844.1
+  ],
+  "decode_process_medians": [
+    36.485623319147415,
+    36.451705465203176,
+    36.48920565115101
+  ],
+  "pp8192_min": 3844.1,
+  "pp8192_max": 3881.1,
+  "decode_reference": 36.5,
+  "decode_within_one_percent": true
+}

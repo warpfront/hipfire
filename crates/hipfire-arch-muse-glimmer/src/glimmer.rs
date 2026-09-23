@@ -1099,6 +1099,9 @@ fn load_wt(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         });
     }
     if info.quant_type == 16 {
@@ -1117,6 +1120,9 @@ fn load_wt(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             });
         }
         let f32_data: Vec<f32> = data
@@ -1134,6 +1140,9 @@ fn load_wt(
             row_stride: 0,
             paro: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         });
     }
     let dtype = match info.quant_type {
@@ -1153,6 +1162,9 @@ fn load_wt(
                 row_stride: 0,
                 paro: None,
                 awq_scale: None,
+                lloyd_lut_e4m3: None,
+                lloyd_lut_f16: None,
+                lloyd_lut_c16: None,
             });
         }
         3 => DType::Q8_0,
@@ -1184,6 +1196,9 @@ fn load_wt(
         row_stride: 0,
         paro: None,
         awq_scale,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -1782,7 +1797,7 @@ impl GlimmerState {
         cfg: &GlimmerConfig,
         max_seq: usize,
     ) -> Result<Self, String> {
-        // `HIPFIRE_GLIMMER_KV_VMM=0` falls back to the contiguous allocator.
+        // `HIPFIRE_GLIMMER_KV_VMM=0` falls back to the legacy allocator.
         // Default remains VMM so examples/tools keep working without a LoadCtx.
         let use_vmm = hipfire_config::developer_var("HIPFIRE_GLIMMER_KV_VMM")
             .map(|v| v != "0" && !v.is_empty())
@@ -1790,14 +1805,14 @@ impl GlimmerState {
         let backend = if use_vmm {
             KvBackend::Vmm
         } else {
-            KvBackend::Contiguous
+            KvBackend::Legacy
         };
         Self::new_with_max_seq_backend(gpu, cfg, max_seq, backend)
     }
 
     /// Allocate Glimmer state with an explicit KV storage backend.
     ///
-    /// Chooses VMM iff `backend == KvBackend::Vmm`; otherwise contiguous.
+    /// Chooses VMM iff `backend == KvBackend::Vmm`; otherwise legacy.
     /// Does not read or mutate process environment — loader callers pass
     /// `ctx.kv_backend` so registry defaults and explicit overrides are
     /// deterministic. Non-loader callers should keep using
@@ -1930,7 +1945,7 @@ impl GlimmerState {
         // Two Q8 KV caches: one slot per layer of the matching type.
         // Both have identical head_dim=128 geometry; split is logical.
         //
-        // VMM backend by default. The contiguous constructor allocates every
+        // VMM backend by default. The legacy constructor allocates every
         // slot of max_seq for all 52 layers up front, which is what caps
         // context on a 16 GB card: weights are 15.5 GB and KV is nearly the
         // whole remainder (52 x max_seq x 544 B = 3.71 GB at 131072, against

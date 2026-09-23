@@ -24,6 +24,8 @@ use hipfire_registry::{
 };
 use hipfire_runtime::prompt_frame::ToolCall;
 use saddle_core::caps::ReasoningContract;
+use saddle_core::kv::KvBackend;
+
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -380,13 +382,19 @@ struct RunArgs {
     #[arg(long)]
     /// One-shot KV format override for this model load.
     kv_mode: Option<String>,
+    #[arg(long = "kv-k")]
+    /// Qwen-only K-format override (e.g. `fwht3`, `legacy-asym3`, `q8`).
+    kv_k: Option<String>,
+    #[arg(long = "kv-v")]
+    /// Qwen-only V-format override (`q8`, `lloyd2`, `lloyd3`, `lloyd4`).
+    kv_v: Option<String>,
     #[arg(long)]
     /// Select a published lm_head variant (see the registry's `heads`), e.g.
     /// `--head q4k`. The overlay shadows the model's own head at load time;
     /// omitting this uses the head baked into the model file.
     head: Option<String>,
-    #[arg(long, value_parser = ["contiguous", "vmm"])]
-    /// One-shot KV storage backend override for this model load.
+    #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
+    /// One-shot KV storage backend override for this model load (`legacy` or `vmm`).
     kv_backend: Option<String>,
     /// Tensor/expert-parallel degree for this model load (same admission as `serve --tp` / `bench --tp`).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
@@ -499,6 +507,12 @@ pub(crate) struct BenchArgs {
     /// Run deterministic synthetic prefill/decode rows.
     #[arg(long)]
     matrix: bool,
+    /// Client-side time-to-first-token: per run, generate one token on the
+    /// standard prompt and time request-send to first streamed token.
+    /// Reports prompt_tokens / TTFT, the competitor-comparable prefill
+    /// number. Standard generate path only (not --matrix).
+    #[arg(long)]
+    ttft: bool,
     #[arg(
         long,
         value_delimiter = ',',
@@ -524,7 +538,14 @@ pub(crate) struct BenchArgs {
     warmups: usize,
     #[arg(long)]
     kv_mode: Option<String>,
-    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    #[arg(long = "kv-k")]
+    /// Qwen-only K-format override (e.g. `fwht3`, `legacy-asym3`, `q8`).
+    kv_k: Option<String>,
+    #[arg(long = "kv-v")]
+    /// Qwen-only V-format override (`q8`, `lloyd2`, `lloyd3`, `lloyd4`).
+    kv_v: Option<String>,
+    #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
+    /// KV storage backend override (`legacy` or `vmm`).
     kv_backend: Option<String>,
     #[arg(long)]
     redline: bool,
@@ -635,8 +656,14 @@ pub(crate) struct ServeArgs {
     /// KV cache mode for models loaded by this service.
     #[arg(long)]
     kv_mode: Option<String>,
-    /// KV storage backend for models loaded by this service.
-    #[arg(long, value_parser = ["contiguous", "vmm"])]
+    /// Qwen-only K-format override for models loaded by this service.
+    #[arg(long = "kv-k")]
+    kv_k: Option<String>,
+    /// Qwen-only V-format override for models loaded by this service.
+    #[arg(long = "kv-v")]
+    kv_v: Option<String>,
+    /// KV storage backend for models loaded by this service (`legacy` or `vmm`).
+    #[arg(long, value_parser = parse_kv_backend_arg, value_name = "legacy|vmm")]
     kv_backend: Option<String>,
     /// Vision-tower sidecar wired into every model load (`params["vision"]`);
     /// overrides the registry `vision` slot and `HIPFIRE_VISION_SIDECAR`;
@@ -1723,6 +1750,7 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         ("MTP", entry.mtp.as_ref()),
         ("DSpark", entry.dspark.as_ref()),
         ("DFlash", entry.dflash.as_ref()),
+        ("XDNA", entry.xdna.as_ref()),
         ("Vision", entry.vision.as_ref()),
         ("T5", entry.t5.as_ref()),
         ("CLIP", entry.clip.as_ref()),
@@ -1956,6 +1984,10 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
     // tier declares `qwen3.8-27b-vision.hfq`, so the keeper check is copied
     // from DFlash exactly.
     let mut kept_vision: Option<(String, String)> = None;
+    // An XDNA spillover archive under the same shared-keeper rule: archives
+    // bind their model hash, so sharing across entries is unlikely, but a
+    // shared file must survive exactly like a shared DFlash draft.
+    let mut kept_xdna: Option<(String, String)> = None;
     if let Some((tag, entry)) = resolved {
         targets.extend(
             [
@@ -2021,6 +2053,31 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
                 }
             }
         }
+        if let Some(sidecar) = entry.xdna.as_ref() {
+            let sidecar_path = paths.models.join(&sidecar.file);
+            if sidecar_path.is_file() {
+                // `models` is a BTreeMap, so keepers list in sorted tag order.
+                let keepers: Vec<&str> = registry
+                    .models
+                    .iter()
+                    .filter(|(other_tag, other)| {
+                        other_tag.as_str() != tag
+                            && other.file != entry.file
+                            && other
+                                .xdna
+                                .as_ref()
+                                .is_some_and(|other_sidecar| other_sidecar.file == sidecar.file)
+                            && paths.models.join(&other.file).is_file()
+                    })
+                    .map(|(other_tag, _)| other_tag.as_str())
+                    .collect();
+                if keepers.is_empty() {
+                    targets.insert(sidecar_path);
+                } else {
+                    kept_xdna = Some((sidecar.file.clone(), keepers.join(", ")));
+                }
+            }
+        }
         targets.extend(
             entry
                 .heads
@@ -2076,6 +2133,9 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
     }
     if let Some((file, keepers)) = kept_vision {
         eprintln!("keeping Vision sidecar {file}: still declared by {keepers}");
+    }
+    if let Some((file, keepers)) = kept_xdna {
+        eprintln!("keeping XDNA sidecar {file}: still declared by {keepers}");
     }
     Ok(())
 }
@@ -2199,6 +2259,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         args.model_draft.is_some(),
         args.head.as_deref(),
     )?;
+    apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
     let selector = args
         .speculation
         .clone()
@@ -2568,6 +2629,8 @@ pub(crate) fn run_should_force_local(args: &RunArgs) -> bool {
     process_truthy("HIPFIRE_LOCAL")
         || args.image.is_some()
         || args.kv_mode.is_some()
+        || args.kv_k.is_some()
+        || args.kv_v.is_some()
         || args.kv_backend.is_some()
         || args.tp.is_some_and(|tp| tp > 1)
         || args.head.is_some()
@@ -2690,6 +2753,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             detach: true,
             no_prewarm: true,
             kv_mode: None,
+            kv_k: None,
+            kv_v: None,
             kv_backend: None,
             vision: None,
             idle_timeout: None,
@@ -2997,6 +3062,87 @@ pub(crate) fn find_model_path(
     candidates.into_iter().next()
 }
 
+
+/// Clap value parser for `--kv-backend`: shared `KvBackend::from_str` so the old
+/// `contiguous` spelling returns the migration error naming `legacy`.
+fn parse_kv_backend_arg(raw: &str) -> std::result::Result<String, String> {
+    raw.parse::<KvBackend>()
+        .map(|backend| backend.as_str().to_owned())
+        .map_err(|err| err.to_string())
+}
+
+/// Layer an authored typed K/V axis from resolved config. Built-in empty defaults
+/// and registry pins are omitted; user/one-shot/env sources emit non-empty values.
+fn authored_kv_axis(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<Option<String>> {
+    let Some(item) = resolved.get(key) else {
+        return Ok(None);
+    };
+    match &item.source {
+        ConfigSource::GlobalUser { .. }
+        | ConfigSource::ModelUser { .. }
+        | ConfigSource::OneShot { .. }
+        | ConfigSource::LegacyEnv { .. } => {}
+        _ => return Ok(None),
+    }
+    match &item.value {
+        hipfire_config::ConfigValue::String(value) if !value.is_empty() => Ok(Some(value.clone())),
+        _ => Ok(None),
+    }
+}
+
+/// Apply CLI `--kv-k` / `--kv-v` onto load params (CLI wins over config axes).
+/// Empty strings are ignored. Validates through the typed schema when present.
+pub(crate) fn apply_kv_axis_overrides(
+    params: &mut serde_json::Value,
+    kv_k: Option<&str>,
+    kv_v: Option<&str>,
+) -> Result<()> {
+    if let Some(raw) = kv_k.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(schema) = field("memory.kv_k") {
+            schema
+                .parse_cli(raw)
+                .map_err(|err| anyhow!("--kv-k {raw}: {err}"))?;
+        }
+        params["kv_k"] = serde_json::json!(raw);
+    }
+    if let Some(raw) = kv_v.map(str::trim).filter(|value| !value.is_empty()) {
+        if let Some(schema) = field("memory.kv_v") {
+            schema
+                .parse_cli(raw)
+                .map_err(|err| anyhow!("--kv-v {raw}: {err}"))?;
+        }
+        params["kv_v"] = serde_json::json!(raw);
+    }
+    Ok(())
+}
+
+/// Copy effective KV mode and backend fields from the validated loaded ACK.
+fn with_loaded_kv_backend_fields(
+    mut report: serde_json::Value,
+    loaded: &serde_json::Value,
+) -> serde_json::Value {
+    let Some(object) = report.as_object_mut() else {
+        return report;
+    };
+    for key in [
+        "kv_backend",
+        "kv_backend_request",
+        "kv_backend_reason",
+        "kv_backend_legacy",
+        "kv_backend_warning",
+        "kv_mode",
+    ] {
+        object.insert(
+            key.to_owned(),
+            loaded.get(key).cloned().unwrap_or(serde_json::Value::Null),
+        );
+    }
+    report
+}
+
 pub(crate) fn load_params(
     resolved: &hipfire_config::ResolvedConfig,
     entry: Option<&ModelEntry>,
@@ -3009,8 +3155,9 @@ pub(crate) fn load_params(
     explicit_draft: bool,
     head_override: Option<&str>,
 ) -> Result<serde_json::Value> {
-    let configured_max_seq = config_u64(resolved, "memory.max_seq")?;
-    let max_seq = configured_max_seq.max(max_tokens.saturating_add(1024));
+    // max_seq is omitted for built-in/registry provenance so the daemon can
+    // derive min(model context, card capacity). Explicit user sources are
+    // forwarded unchanged (no max_tokens+1024 inflation).
     let configured_kv = config_string(resolved, "memory.kv_cache")?;
     let kv_mode = kv_override
         .map(str::to_owned)
@@ -3022,14 +3169,14 @@ pub(crate) fn load_params(
         .expect("schema field")
         .parse_cli(&kv_mode)?;
     let configured_backend = config_string(resolved, "memory.kv_backend")?;
-    let kv_backend = kv_backend_override
-        .map(str::to_owned)
+    let backend_raw = kv_backend_override
         .filter(|value| !value.is_empty())
-        .unwrap_or(configured_backend)
-        .to_ascii_lowercase();
-    if !matches!(kv_backend.as_str(), "contiguous" | "vmm") {
-        bail!("--kv-backend must be contiguous or vmm");
-    }
+        .unwrap_or(configured_backend.as_str());
+    let kv_backend = backend_raw
+        .parse::<KvBackend>()
+        .map_err(|err| anyhow!("{err}"))?
+        .as_str()
+        .to_owned();
     let mut cask_sidecar = config_string(resolved, "memory.cask.sidecar")?;
     if cask_sidecar.is_empty() && config_bool(resolved, "memory.cask.auto_attach")? {
         if let Some(sidecar) = entry.and_then(|entry| entry.triattn.as_ref()) {
@@ -3082,13 +3229,11 @@ pub(crate) fn load_params(
         }
     };
     let mut params = serde_json::json!({
-        "max_seq": max_seq,
         "deepseek4_compute_placement": config_string(
             resolved,
             "hardware.deepseek4_compute_placement",
         )?,
         "kv_mode": kv_mode,
-        "kv_backend": kv_backend,
         "kv_adaptive": config_string(resolved, "memory.kv_adaptive")?,
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
         "vision_mode": config_string(resolved, "vision.mode")?,
@@ -3122,6 +3267,43 @@ pub(crate) fn load_params(
         "speculation": config_string(resolved, "speculation.mode")?,
         "continuous_batch_size": config_u64(resolved, "serve.continuous_batch_size")?,
     });
+    let backend_source = &resolved
+        .get("memory.kv_backend")
+        .expect("schema field")
+        .source;
+    if kv_backend_override.is_some()
+        || matches!(
+            backend_source,
+            ConfigSource::GlobalUser { .. }
+                | ConfigSource::ModelUser { .. }
+                | ConfigSource::OneShot { .. }
+        )
+    {
+        params["kv_backend"] = serde_json::json!(kv_backend);
+    }
+    // Authored K/V axes only: CLI is applied by callers via apply_kv_axis_overrides
+    // after this returns so serve can share the same helper. Empty/BuiltIn/registry
+    // defaults are omitted from IPC.
+    if let Some(kv_k) = authored_kv_axis(resolved, "memory.kv_k")? {
+        params["kv_k"] = serde_json::json!(kv_k);
+    }
+    if let Some(kv_v) = authored_kv_axis(resolved, "memory.kv_v")? {
+        params["kv_v"] = serde_json::json!(kv_v);
+    }
+    let max_seq_source = &resolved
+        .get("memory.max_seq")
+        .expect("schema field")
+        .source;
+    if matches!(
+        max_seq_source,
+        ConfigSource::GlobalUser { .. }
+            | ConfigSource::ModelUser { .. }
+            | ConfigSource::OneShot { .. }
+            | ConfigSource::LegacyEnv { .. }
+    ) {
+        let max_seq = config_u64(resolved, "memory.max_seq")?;
+        params["max_seq"] = serde_json::json!(max_seq);
+    }
     if let Some(experts_per_token) =
         config_optional_u64(resolved, "model.deepseek4_experts_per_token")?
     {
@@ -3137,6 +3319,7 @@ pub(crate) fn load_params(
         resolve_dflash_sidecar(&mut params, entry, models_dir, model_path, tag)?;
     }
     resolve_vision_sidecar(&mut params, entry, models_dir, model_path, tag)?;
+    resolve_xdna_sidecar(&mut params, resolved, entry, models_dir, model_path, tag)?;
     Ok(params)
 }
 
@@ -3200,6 +3383,67 @@ fn resolve_dflash_sidecar(
         "[hipfire] DFlash draft {} not pulled; running AR — `hipfire pull {tag}`",
         sidecar.file
     );
+    Ok(())
+}
+
+/// Resolve a registry-declared XDNA spillover archive into `params["xdna"]`.
+///
+/// The `kernel.npu_spillover` process flag is the opt-in: when it is off this
+/// is a no-op and no `xdna` param is projected, so flag-off loads can never
+/// observe an NPU path. When it is on, the entry's `xdna` slot must name a
+/// pulled `.xdna.zip` whose manifest verifies (`load_verified` checks shape,
+/// exact `gfx1151`/`npu5` identity, and every payload hash); the verified
+/// archive path is projected as `params["xdna"]` for the daemon, which
+/// re-verifies at load and admits it into `LoadCtx.xdna` only on an exact
+/// `gfx1151` host (see `admit_for_arch`).
+///
+/// Fail-closed only where an explicit opt-in names an artifact: flag on plus
+/// a declared-but-missing or corrupt archive bails with a `hipfire pull`
+/// hint. Flag on with no entry (a bare path that merely shares a basename)
+/// or no `xdna` slot logs one line and stays GPU-only — erroring there would
+/// make a process-global opt-in unusable for models that simply have no NPU
+/// artifact. Lookup order (models dir, then beside the target) mirrors the
+/// DFlash draft resolution, including the symlinked-target rationale.
+fn resolve_xdna_sidecar(
+    params: &mut serde_json::Value,
+    resolved: &hipfire_config::ResolvedConfig,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    tag: Option<&str>,
+) -> Result<()> {
+    if !config_bool(resolved, "kernel.npu_spillover")? {
+        return Ok(());
+    }
+    let Some(sidecar) = entry.and_then(|entry| entry.xdna.as_ref()) else {
+        let what = tag
+            .map(str::to_owned)
+            .unwrap_or_else(|| model_path.display().to_string());
+        eprintln!(
+            "[hipfire] NPU spillover opted in but {what} declares no xdna sidecar; staying GPU-only",
+        );
+        return Ok(());
+    };
+    let beside_target = model_path.parent().unwrap_or_else(|| Path::new("."));
+    let candidate = [models_dir, beside_target]
+        .into_iter()
+        .map(|dir| dir.join(&sidecar.file))
+        .find(|candidate| candidate.is_file());
+    let Some(candidate) = candidate else {
+        bail!(
+            "NPU spillover opted in but {} is not pulled; run `hipfire pull {}` (or turn kernel.npu_spillover off)",
+            sidecar.file,
+            tag.unwrap_or("<model>"),
+        );
+    };
+    if let Err(error) = hipfire_registry::XdnaSidecarDescriptor::load_verified(&candidate) {
+        bail!(
+            "NPU spillover archive {} failed verification ({error:#}); re-pull with `hipfire pull {}`",
+            candidate.display(),
+            tag.unwrap_or("<model>"),
+        );
+    }
+    params["xdna"] = serde_json::json!(candidate.display().to_string());
     Ok(())
 }
 
@@ -4393,6 +4637,9 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp && (args.matrix || args.redline) {
         bail!("--exp cannot be combined with matrix or Redline options");
     }
+    if args.ttft && args.matrix {
+        bail!("--ttft cannot be combined with --matrix (it measures the standard generate path)");
+    }
     if args.exp && args.json {
         bail!("--json is not supported with --exp");
     }
@@ -4404,6 +4651,12 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         bail!("--reasoning-on is not supported with --exp (its token budget is fixed at 128)");
     }
     if let Some(spec) = args.concurrency.clone() {
+        if args.json {
+            bail!(
+                "--json is not supported with --concurrency; omit --json for the concurrency table, \
+                 or run without --concurrency for standard bench JSON (including kv_backend fields)"
+            );
+        }
         return bench_concurrency_command(paths, &args, &spec);
     }
     for (name, values) in [
@@ -4461,6 +4714,16 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     eprintln!("  prompt_chars: {prompt_chars}");
     if args.matrix || args.redline {
         bench_matrix(&mut engine, &args, &loaded, &post_diag)
+    } else if args.ttft {
+        bench_ttft(
+            &mut engine,
+            &args,
+            &prompt,
+            &prompt_md5,
+            prompt_chars,
+            &loaded,
+            &post_diag,
+        )
     } else {
         // The warmup exists to populate kernel caches and its output is
         // discarded, so it stays in answer mode even under --reasoning-on: a
@@ -4519,25 +4782,28 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         for warning in &warnings {
             eprintln!("  warning: {warning}");
         }
-        let report = serde_json::json!({
-            "protocol": "native-generate-v1",
-            "model": args.model,
-            "loaded": loaded,
-            "gpu": post_diag,
-            "vram_free_before_mb": pre_diag.get("vram_free_mb"),
-            "max_tokens": args.max_tokens,
-            "runs": args.runs,
-            "batch": 1,
-            "prompt_tokens": prompt_tokens,
-            "prompt_md5": prompt_md5,
-            "prompt_chars": prompt_chars,
-            "warnings": warnings,
-            "decode_tok_s": sample_stats(&decode),
-            "prefill_tok_s": sample_stats(&prefill),
-            "wall_tok_s": sample_stats(&wall),
-            "ttft_ms": sample_stats(&ttft),
-            "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
-        });
+        let report = with_loaded_kv_backend_fields(
+            serde_json::json!({
+                "protocol": "native-generate-v1",
+                "model": args.model,
+                "loaded": loaded,
+                "gpu": post_diag,
+                "vram_free_before_mb": pre_diag.get("vram_free_mb"),
+                "max_tokens": args.max_tokens,
+                "runs": args.runs,
+                "batch": 1,
+                "prompt_tokens": prompt_tokens,
+                "prompt_md5": prompt_md5,
+                "prompt_chars": prompt_chars,
+                "warnings": warnings,
+                "decode_tok_s": sample_stats(&decode),
+                "prefill_tok_s": sample_stats(&prefill),
+                "wall_tok_s": sample_stats(&wall),
+                "ttft_ms": sample_stats(&ttft),
+                "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
+            }),
+            &loaded,
+        );
         if args.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
         } else {
@@ -4807,6 +5073,7 @@ fn open_bench_engine(
         // No --head on this path yet; the model's own head is used.
         None,
     )?;
+    apply_kv_axis_overrides(&mut params, args.kv_k.as_deref(), args.kv_v.as_deref())?;
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
     }
@@ -4821,8 +5088,16 @@ fn open_bench_engine(
     )?;
     if args.matrix || args.redline {
         let requested = longest_prefill.max(longest_decode).saturating_add(32);
-        let configured = params["max_seq"].as_u64().unwrap_or(0);
-        params["max_seq"] = serde_json::json!(configured.max(requested));
+        // Automatic max_seq stays omitted so admission can derive the bound.
+        // An explicit user value is never silently inflated — refuse if too small.
+        if let Some(configured) = params.get("max_seq").and_then(|v| v.as_u64()) {
+            if configured < requested {
+                bail!(
+                    "memory.max_seq={configured} is below bench requirement {requested} \
+                     (longest prefill/decode + 32); raise max_seq or shrink the matrix"
+                );
+            }
+        }
     }
     if let Ok(n) = hipfire_config::developer_var("HIPFIRE_BENCH_CONTINUOUS_BATCH") {
         if let Ok(n) = n.parse::<u64>() {
@@ -4915,6 +5190,98 @@ fn bench_probe(
             other.unwrap_or("missing type")
         ),
     }
+}
+
+/// Client-side TTFT on the standard generate path: per run, generate a
+/// single token with thinking off and time wall clock from request send to
+/// the first streamed `token` event. `pp_tok_s = prompt_tokens / ttft_s` is
+/// the competitor-comparable prefill number (radiance reports
+/// prompt_tokens/TTFT p50 at an HTTP client). Warmups run the same shape
+/// and are discarded. `--reasoning-on` is intentionally ignored here: the
+/// metric is defined with thinking off.
+fn bench_ttft(
+    engine: &mut Engine,
+    args: &BenchArgs,
+    prompt: &str,
+    prompt_md5: &str,
+    prompt_chars: u64,
+    loaded: &serde_json::Value,
+    diag: &serde_json::Value,
+) -> Result<()> {
+    // The shared bench banner prints args.max_tokens; the ttft path always
+    // generates exactly one token with thinking off, so say so explicitly.
+    eprintln!("  ttft shape: max_tokens=1, thinking off");
+    for _ in 0..args.warmups {
+        let _ = bench_generate(engine, prompt, 1)?;
+    }
+    let mut ttft_ms_samples = Vec::new();
+    let mut prompt_tokens: Option<u64> = None;
+    for _ in 0..args.runs {
+        let start = Instant::now();
+        let mut first: Option<Duration> = None;
+        let request = bench_generate_request(prompt, 1);
+        let done = engine.generate(&request, |event| {
+            if first.is_none()
+                && event.get("type").and_then(serde_json::Value::as_str) == Some("token")
+            {
+                first = Some(start.elapsed());
+            }
+            Ok(())
+        })?;
+        let elapsed =
+            first.ok_or_else(|| anyhow!("no streamed token observed; cannot measure client-side TTFT"))?;
+        ttft_ms_samples.push(elapsed.as_secs_f64() * 1000.0);
+        if prompt_tokens.is_none() {
+            prompt_tokens = bench_prompt_tokens_from_done(&done);
+        }
+        eprint!(".");
+        std::io::stderr().flush()?;
+    }
+    eprintln!();
+    if let Some(tokens) = prompt_tokens {
+        eprintln!("  prompt_tokens: {tokens}");
+    }
+    let pp_samples: Vec<f64> = match prompt_tokens {
+        Some(tokens) if tokens > 0 => ttft_ms_samples
+            .iter()
+            .map(|ms| tokens as f64 / (ms / 1000.0))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let ttft_stats = sample_stats(&ttft_ms_samples);
+    let pp_stats = sample_stats(&pp_samples);
+    let report = with_loaded_kv_backend_fields(
+        serde_json::json!({
+            "protocol": "client-ttft-v1",
+            "model": args.model,
+            "loaded": loaded,
+            "gpu": diag,
+            "max_tokens": 1,
+            "runs": args.runs,
+            "warmups": args.warmups,
+            "batch": 1,
+            "prompt_tokens": prompt_tokens,
+            "prompt_md5": prompt_md5,
+            "prompt_chars": prompt_chars,
+            "ttft": {
+                "samples": ttft_ms_samples,
+                "median": ttft_stats.map(|stats| stats.median),
+                "stdev": ttft_stats.map(|stats| stats.stdev),
+                "prompt_tokens": prompt_tokens,
+                "prompt_md5": prompt_md5,
+            },
+            "pp_tok_s": pp_stats,
+            "pp_tok_s_samples": pp_samples,
+        }),
+        loaded,
+    );
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print_sample_row("ttft ms", ttft_stats);
+        print_sample_row("pp tok/s", pp_stats);
+    }
+    Ok(())
 }
 
 fn bench_matrix(
@@ -5018,18 +5385,21 @@ fn bench_matrix(
             sustained_rows.push(serde_json::json!({ "context": context, "tokens": tg, "stats": sample_stats(&samples), "samples": samples }));
         }
     }
-    let report = serde_json::json!({
-        "protocol": "synthetic-pp-tg-matrix-v1",
-        "model": args.model,
-        "loaded": loaded,
-        "gpu": diag,
-        "redline_pm4": args.redline,
-        "kv_mode": args.kv_mode,
-        "runs": args.runs,
-        "prefill": pp_rows,
-        "decode": decode_rows,
-        "sustained": sustained_rows,
-    });
+    let report = with_loaded_kv_backend_fields(
+        serde_json::json!({
+            "protocol": "synthetic-pp-tg-matrix-v1",
+            "model": args.model,
+            "loaded": loaded,
+            "gpu": diag,
+            "redline_pm4": args.redline,
+            "kv_mode": args.kv_mode,
+            "runs": args.runs,
+            "prefill": pp_rows,
+            "decode": decode_rows,
+            "sustained": sustained_rows,
+        }),
+        loaded,
+    );
     if args.json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     }
@@ -5089,6 +5459,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             json: false,
             exp: false,
             matrix: false,
+            ttft: false,
             pp: vec![128],
             ctx: vec![128],
             tg: 1,
@@ -5097,6 +5468,8 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             sustained_ctx: vec![128],
             warmups: 1,
             kv_mode: None,
+            kv_k: None,
+            kv_v: None,
             kv_backend: None,
             redline: false,
             speculation: None,
@@ -6764,6 +7137,9 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
         ValueRule::Enum(values) => {
             serde_json::json!({ "type": "string", "enum": values })
         }
+        ValueRule::KvBackend => {
+            serde_json::json!({ "type": "string", "enum": ["legacy", "vmm"] })
+        }
         ValueRule::AutoBool => serde_json::json!({
             "type": ["boolean", "string"],
             "enum": [true, false, "auto"],
@@ -6807,6 +7183,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::Host => "host",
         ValueRule::PathOrEmpty => "path-or-empty",
         ValueRule::Enum(_) => "enum",
+        ValueRule::KvBackend => "kv-backend",
         ValueRule::AutoBool => "auto-bool",
         ValueRule::NullableString => "string|null",
         ValueRule::NullableEnum(_) => "enum|null",
@@ -7142,7 +7519,9 @@ mod tests {
     }
 
     #[test]
-    pub(crate) fn load_params_defaults_to_schema_contiguous_backend() {
+    pub(crate) fn load_params_omits_automatic_kv_backend_for_path() {
+        // Absolute path with only schema/built-in backend/max_seq is automatic:
+        // omit both so admission can pick VMM and the daemon can derive max_seq.
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         let model_path = PathBuf::from("/tmp/test-model.mq4");
         let params = load_params(
@@ -7158,9 +7537,16 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(params["kv_backend"], "contiguous");
-        assert_eq!(params["max_seq"], 32768);
+        assert!(
+            params.get("kv_backend").is_none(),
+            "absolute path automatic backend must omit kv_backend"
+        );
+        assert!(
+            params.get("max_seq").is_none(),
+            "absolute path automatic max_seq must be omitted for runtime default"
+        );
     }
+
 
     #[test]
     pub(crate) fn resolved_for_model_applies_qwen_tag_policy_and_excludes_original_and_sidecars() {
@@ -7182,7 +7568,8 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
-        // Exact Qwen families get VMM + 262144 + 81920
+        // Exact Qwen families keep max_tokens only; registry no longer pins
+        // max_seq or kv_backend. load_params omits automatic max_seq/backend.
         for tag in [
             "qwen3.5:4b",
             "qwen3.6:35b-a3b",
@@ -7191,32 +7578,53 @@ mod tests {
         ] {
             let (_, entry) = registry.model(tag).unwrap();
             let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
-            assert_eq!(
-                config_string(&resolved, "memory.kv_backend").unwrap(),
-                "vmm",
-                "{tag}"
+            let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
+            assert!(
+                direct.get("memory.kv_backend").is_none(),
+                "{tag} registry layer must not write kv_backend"
+            );
+            assert!(
+                direct.get("memory.max_seq").is_none(),
+                "{tag} registry layer must not write max_seq"
             );
             assert_eq!(
                 config_u64(&resolved, "memory.max_seq").unwrap(),
-                262144,
-                "{tag}"
+                32768,
+                "{tag} resolved max_seq is schema built-in only"
             );
             assert_eq!(
                 config_u64(&resolved, "generation.max_tokens").unwrap(),
                 81920,
                 "{tag}"
             );
+            let model_path = PathBuf::from("/tmp/test-model.mq4");
+            let params = load_params(
+                &resolved,
+                Some(entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                Some("q8"),
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(
+                params.get("kv_backend").is_none(),
+                "{tag} load_params must omit automatic kv_backend"
+            );
+            assert!(
+                params.get("max_seq").is_none(),
+                "{tag} load_params must omit automatic max_seq"
+            );
         }
 
-        // Original qwen3:* stays contiguous (no automatic policy) — original Qwen3 uses default schema.
+        // Original qwen3:* has no tag policy — backend/max_seq stay automatic.
         let (_, entry) = registry.model("qwen3:8b").unwrap();
         let resolved =
             resolved_for_model(&paths, "qwen3:8b", Some("qwen3:8b"), Some(entry)).unwrap();
-        assert_eq!(
-            config_string(&resolved, "memory.kv_backend").unwrap(),
-            "contiguous",
-            "original qwen3 must keep the built-in contiguous backend"
-        );
         assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 32768);
         assert_eq!(
             config_u64(&resolved, "generation.max_tokens").unwrap(),
@@ -7227,6 +7635,28 @@ mod tests {
         assert!(direct.get("memory.kv_backend").is_none());
         assert!(direct.get("memory.max_seq").is_none());
         assert!(direct.get("generation.max_tokens").is_none());
+        let model_path = PathBuf::from("/tmp/test-model.mq4");
+        let params = load_params(
+            &resolved,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(
+            params.get("kv_backend").is_none(),
+            "original qwen3 automatic backend must omit kv_backend"
+        );
+        assert!(
+            params.get("max_seq").is_none(),
+            "original qwen3 automatic max_seq must be omitted"
+        );
 
         // Draft/dflash sidecars do not get the Qwen policy even though family matches.
         for tag in ["qwen3.5:9b-draft", "qwen3.6:27b-dflash"] {
@@ -7268,7 +7698,7 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
-        // Muse Glimmer quality and fast targets get VMM + native 131072, no invented max_tokens.
+        // Muse Glimmer tags no longer pin max_seq; backend remains automatic.
         for tag in ["muse-glimmer", "muse-glimmer:fast"] {
             let (_, entry) = registry.model(tag).unwrap();
             let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
@@ -7279,32 +7709,43 @@ mod tests {
             );
             assert_eq!(
                 config_u64(&resolved, "memory.max_seq").unwrap(),
-                131072,
-                "{tag}"
+                32768,
+                "{tag} resolved max_seq is schema built-in only"
             );
             let direct = hipfire_registry::config_layer_for_tag(tag, entry).unwrap();
-            assert_eq!(
-                direct.get("memory.kv_backend"),
-                Some(&hipfire_config::ConfigValue::String("vmm".into()))
-            );
-            assert_eq!(
-                direct.get("memory.max_seq"),
-                Some(&hipfire_config::ConfigValue::Integer(131072)),
-                "{tag} should get 131072"
+            assert!(direct.get("memory.kv_backend").is_none());
+            assert!(
+                direct.get("memory.max_seq").is_none(),
+                "{tag} registry must not write max_seq"
             );
             assert!(
                 direct.get("generation.max_tokens").is_none(),
                 "{tag} must not get max_tokens"
             );
+            let model_path = PathBuf::from("/tmp/test-model.mq4");
+            let params = load_params(
+                &resolved,
+                Some(entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(
+                params.get("max_seq").is_none(),
+                "{tag} load_params must omit automatic max_seq"
+            );
         }
-        // quality alias lands on trunk policy.
+        // quality alias lands on trunk (still no max_seq policy).
         let (resolved_tag, entry) = registry.model("muse-glimmer:quality").unwrap();
         assert_eq!(resolved_tag, "muse-glimmer");
         let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
-        assert_eq!(
-            direct.get("memory.max_seq"),
-            Some(&hipfire_config::ConfigValue::Integer(131072))
-        );
+        assert!(direct.get("memory.max_seq").is_none());
 
         // Muse Glimmer draft receives none.
         let (_, entry) = registry.model("muse-glimmer:draft").unwrap();
@@ -7319,12 +7760,9 @@ mod tests {
             Some(entry),
         )
         .unwrap();
-        assert!(
-            resolved.get("memory.kv_backend").is_none()
-                || config_string(&resolved, "memory.kv_backend").unwrap() != "vmm"
-        );
+        assert_eq!(config_string(&resolved, "memory.kv_backend").unwrap(), "vmm");
 
-        // DeepSeek official / MQ2Lloyd / preview targets get VMM + 1M + 384Ki.
+        // DeepSeek tags keep generation.max_tokens only; no max_seq/backend pin.
         for tag in [
             "deepseek-v4-flash",
             "deepseek-v4-flash:mq2lloyd",
@@ -7340,8 +7778,8 @@ mod tests {
             );
             assert_eq!(
                 config_u64(&resolved, "memory.max_seq").unwrap(),
-                1048576,
-                "{tag}"
+                32768,
+                "{tag} resolved max_seq is schema built-in only"
             );
             assert_eq!(
                 config_u64(&resolved, "generation.max_tokens").unwrap(),
@@ -7349,25 +7787,39 @@ mod tests {
                 "{tag}"
             );
             let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
-            assert_eq!(
-                direct.get("memory.kv_backend"),
-                Some(&hipfire_config::ConfigValue::String("vmm".into()))
-            );
-            assert_eq!(
-                direct.get("memory.max_seq"),
-                Some(&hipfire_config::ConfigValue::Integer(1048576))
+            assert!(direct.get("memory.kv_backend").is_none());
+            assert!(
+                direct.get("memory.max_seq").is_none(),
+                "{tag} registry must not write max_seq"
             );
             assert_eq!(
                 direct.get("generation.max_tokens"),
                 Some(&hipfire_config::ConfigValue::Integer(393216))
             );
+            let model_path = PathBuf::from("/tmp/test-model.mq4");
+            let params = load_params(
+                &resolved,
+                Some(entry),
+                &model_path.parent().unwrap(),
+                &model_path,
+                64,
+                None,
+                None,
+                None,
+                false,
+                None,
+            )
+            .unwrap();
+            assert!(
+                params.get("max_seq").is_none(),
+                "{tag} load_params must omit automatic max_seq"
+            );
         }
         for alias in ["deepseek4", "ds4", "deepseek4:preview"] {
             let (resolved_tag, entry) = registry.model(alias).unwrap();
             let direct = hipfire_registry::config_layer_for_tag(resolved_tag, entry).unwrap();
-            assert_eq!(
-                direct.get("memory.max_seq"),
-                Some(&hipfire_config::ConfigValue::Integer(1048576)),
+            assert!(
+                direct.get("memory.max_seq").is_none(),
                 "{alias}->{resolved_tag}"
             );
             assert_eq!(
@@ -7411,7 +7863,7 @@ mod tests {
             config_string(&resolved, "memory.kv_backend").unwrap(),
             "vmm"
         );
-        assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 262144);
+        assert_eq!(config_u64(&resolved, "memory.max_seq").unwrap(), 32768);
         assert_eq!(
             config_u64(&resolved, "generation.max_tokens").unwrap(),
             81920
@@ -7420,7 +7872,7 @@ mod tests {
         // Global user override wins over registry tag policy (registry below global).
         let mut user_layer = ConfigLayer::default();
         user_layer
-            .set_cli("memory.kv_backend", "contiguous")
+            .set_cli("memory.kv_backend", "legacy")
             .unwrap();
         user_layer.set_cli("memory.max_seq", "32768").unwrap();
         user_layer.set_cli("generation.max_tokens", "1024").unwrap();
@@ -7442,7 +7894,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             config_string(&overridden, "memory.kv_backend").unwrap(),
-            "contiguous"
+            "legacy"
         );
         assert_eq!(config_u64(&overridden, "memory.max_seq").unwrap(), 32768);
         assert_eq!(
@@ -7450,7 +7902,7 @@ mod tests {
             1024
         );
 
-        // Also verify load_params respects explicit kv_backend override over configured vmm.
+        // Explicit CLI flag is emitted (flag wins over automatic resolved backend).
         let model_path = PathBuf::from("/tmp/test-model.mq4");
         let params = load_params(
             &resolved,
@@ -7459,14 +7911,14 @@ mod tests {
             &model_path,
             64,
             Some("q8"),
-            Some("contiguous"),
+            Some("legacy"),
             None,
             false,
             None,
         )
         .unwrap();
-        assert_eq!(params["kv_backend"], "contiguous");
-        // Without explicit override, load_params uses the resolved vmm.
+        assert_eq!(params["kv_backend"], "legacy");
+        // Automatic registry/built-in: omit kv_backend and max_seq.
         let params2 = load_params(
             &resolved,
             Some(entry),
@@ -7480,8 +7932,91 @@ mod tests {
             None,
         )
         .unwrap();
-        assert_eq!(params2["kv_backend"], "vmm");
-        assert_eq!(params2["max_seq"], 262144);
+        assert!(
+            params2.get("kv_backend").is_none(),
+            "registry-tag automatic backend must omit kv_backend"
+        );
+        assert!(
+            params2.get("max_seq").is_none(),
+            "registry-tag automatic max_seq must be omitted"
+        );
+
+        // Global user config is an explicit choice and is emitted.
+        let params_global = load_params(
+            &overridden,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params_global["kv_backend"], "legacy");
+        assert_eq!(params_global["max_seq"], 32768);
+
+        // Precedence: flag > model config > global config.
+        let mut global_layer = ConfigLayer::default();
+        global_layer
+            .set_cli("memory.kv_backend", "legacy")
+            .unwrap();
+        let mut model_layer = ConfigLayer::default();
+        model_layer.set_cli("memory.kv_backend", "vmm").unwrap();
+        let model_over_global = hipfire_config::resolve(vec![
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::GlobalUser {
+                    path: std::path::PathBuf::from("/tmp/global.toml"),
+                },
+                layer: global_layer,
+            },
+            hipfire_config::NamedLayer {
+                source: hipfire_config::ConfigSource::ModelUser {
+                    model: tag.to_owned(),
+                    path: std::path::PathBuf::from("/tmp/model.toml"),
+                },
+                layer: model_layer,
+            },
+        ])
+        .unwrap();
+        assert_eq!(
+            config_string(&model_over_global, "memory.kv_backend").unwrap(),
+            "vmm",
+            "model user config must beat global user"
+        );
+        let params_model = load_params(
+            &model_over_global,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params_model["kv_backend"], "vmm");
+        let params_flag = load_params(
+            &model_over_global,
+            Some(entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            Some("legacy"),
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            params_flag["kv_backend"], "legacy",
+            "CLI flag must beat model user config"
+        );
 
         // Glimmer target likewise overridable (backend + max_seq).
         let raw2 = r#"{
@@ -7493,17 +8028,11 @@ mod tests {
         let registry2 = RegistryV1::parse(raw2, "test").unwrap();
         let (g_tag, g_entry) = registry2.model("muse-glimmer").unwrap();
         let g_layer = hipfire_registry::config_layer_for_tag(g_tag, g_entry).unwrap();
-        assert_eq!(
-            g_layer.get("memory.kv_backend"),
-            Some(&hipfire_config::ConfigValue::String("vmm".into()))
-        );
-        assert_eq!(
-            g_layer.get("memory.max_seq"),
-            Some(&hipfire_config::ConfigValue::Integer(131072))
-        );
+        assert!(g_layer.get("memory.kv_backend").is_none());
+        assert!(g_layer.get("memory.max_seq").is_none());
         assert!(g_layer.get("generation.max_tokens").is_none());
         let mut g_user = ConfigLayer::default();
-        g_user.set_cli("memory.kv_backend", "contiguous").unwrap();
+        g_user.set_cli("memory.kv_backend", "legacy").unwrap();
         g_user.set_cli("memory.max_seq", "8192").unwrap();
         let g_resolved = hipfire_config::resolve(vec![
             hipfire_config::NamedLayer {
@@ -7523,11 +8052,27 @@ mod tests {
         .unwrap();
         assert_eq!(
             config_string(&g_resolved, "memory.kv_backend").unwrap(),
-            "contiguous"
+            "legacy"
         );
         assert_eq!(config_u64(&g_resolved, "memory.max_seq").unwrap(), 8192);
+        let model_path_g = PathBuf::from("/tmp/test-model.mq4");
+        let g_params = load_params(
+            &g_resolved,
+            Some(g_entry),
+            &model_path_g.parent().unwrap(),
+            &model_path_g,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(g_params["kv_backend"], "legacy");
+        assert_eq!(g_params["max_seq"], 8192);
 
-        // DeepSeek target override wins over 1M/384Ki policy.
+        // DeepSeek target: generation policy remains; user max_seq still wins.
         let raw3 = r#"{
             "schema_version":1,
             "generated_at":"2026-09-01T00:00:00Z",
@@ -7541,7 +8086,7 @@ mod tests {
             config_string(&d_resolved, "memory.kv_backend").unwrap(),
             "vmm"
         );
-        assert_eq!(config_u64(&d_resolved, "memory.max_seq").unwrap(), 1048576);
+        assert_eq!(config_u64(&d_resolved, "memory.max_seq").unwrap(), 32768);
         assert_eq!(
             config_u64(&d_resolved, "generation.max_tokens").unwrap(),
             393216
@@ -7570,6 +8115,20 @@ mod tests {
             config_u64(&d_overridden, "generation.max_tokens").unwrap(),
             2048
         );
+        let d_params = load_params(
+            &d_overridden,
+            Some(d_entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            None,
+            None,
+            None,
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(d_params["max_seq"], 65536);
 
         fs::remove_dir_all(&paths.root).unwrap();
     }
@@ -7713,6 +8272,140 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+    fn xdna_sidecar_entry(xdna_file: &str) -> ModelEntry {
+        ModelEntry {
+            repo: "hipfire-models/qwen3.8-27b".into(),
+            file: "qwen3.8-27b.mq4".into(),
+            size_gb: 15.66,
+            min_vram_gb: 17.0,
+            desc: "test target".into(),
+            xdna: Some(hipfire_registry::Sidecar {
+                file: xdna_file.into(),
+                sha256: None,
+                size_bytes: None,
+            }),
+            ..Default::default()
+        }
+    }
+
+    fn resolved_with_npu_spillover(on: bool) -> hipfire_config::ResolvedConfig {
+        let mut explicit = ConfigLayer::default();
+        explicit
+            .set_cli("kernel.npu_spillover", if on { "true" } else { "false" })
+            .unwrap();
+        resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: format!("kernel.npu_spillover={on}"),
+            },
+            layer: explicit,
+        }])
+        .unwrap()
+    }
+
+    /// Minimal stored-ZIP writer for XDNA sidecar fixtures (local headers +
+    /// central directory + EOCD, method 0 throughout).
+    fn write_stored_zip(path: &Path, entries: &[(&str, &[u8])]) {
+        fn u16le(out: &mut Vec<u8>, value: u16) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        fn u32le(out: &mut Vec<u8>, value: u32) {
+            out.extend_from_slice(&value.to_le_bytes());
+        }
+        let mut bytes = Vec::new();
+        let mut central = Vec::new();
+        for (name, data) in entries {
+            let local_offset = bytes.len() as u32;
+            bytes.extend_from_slice(b"PK\x03\x04");
+            u16le(&mut bytes, 20);
+            u16le(&mut bytes, 0);
+            u16le(&mut bytes, 0);
+            u16le(&mut bytes, 0);
+            u16le(&mut bytes, 0);
+            u32le(&mut bytes, 0);
+            u32le(&mut bytes, data.len() as u32);
+            u32le(&mut bytes, data.len() as u32);
+            u16le(&mut bytes, name.len() as u16);
+            u16le(&mut bytes, 0);
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.extend_from_slice(data);
+            central.extend_from_slice(b"PK\x01\x02");
+            u16le(&mut central, 20);
+            u16le(&mut central, 20);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u32le(&mut central, 0);
+            u32le(&mut central, data.len() as u32);
+            u32le(&mut central, data.len() as u32);
+            u16le(&mut central, name.len() as u16);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u16le(&mut central, 0);
+            u32le(&mut central, 0);
+            u32le(&mut central, local_offset);
+            central.extend_from_slice(name.as_bytes());
+        }
+        let central_offset = bytes.len() as u32;
+        bytes.extend_from_slice(&central);
+        let central_size = central.len() as u32;
+        bytes.extend_from_slice(b"PK\x05\x06");
+        u16le(&mut bytes, 0);
+        u16le(&mut bytes, 0);
+        u16le(&mut bytes, entries.len() as u16);
+        u16le(&mut bytes, entries.len() as u16);
+        u32le(&mut bytes, central_size);
+        u32le(&mut bytes, central_offset);
+        u16le(&mut bytes, 0);
+        fs::write(path, &bytes).unwrap();
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        let digest = Sha256::digest(bytes);
+        digest.iter().fold(String::with_capacity(64), |mut out, byte| {
+            out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+            out.push(char::from_digit((byte & 0x0F) as u32, 16).unwrap());
+            out
+        })
+    }
+
+    /// A manifest-v1 `.xdna.zip` binding the given payloads, written to the
+    /// models dir. Returns the archive path.
+    fn write_xdna_fixture(models_dir: &Path, file: &str) -> PathBuf {
+        let pdi = b"fixture-pdi-bytes";
+        let insts = b"fixture-insts-bytes";
+        let manifest = serde_json::json!({
+            "version": 1,
+            "model_sha256": "c".repeat(64),
+            "quant": "mq4g256v2",
+            "arch": "gfx1151",
+            "npu": "npu5",
+            "toolchain": {"mlir_aie": "f50bef7", "peano": "22.0.0.2026090701"},
+            "profiles": [{
+                "tensor_role": "gate_up",
+                "M": 1024, "K": 5120, "N": 512, "row_count": 1024,
+                "tile_m": 128, "tile_k": 64, "tile_n": 64,
+                "cols": 8, "k_mt": 512,
+                "pdi": "profiles/gate_up/main.pdi",
+                "insts": "profiles/gate_up/insts.bin",
+                "arg_layout": [{"name": "a", "offset": 0, "size": 64}],
+                "sha256_pdi": sha256_hex(pdi),
+                "sha256_insts": sha256_hex(insts)
+            }]
+        })
+        .to_string();
+        let path = models_dir.join(file);
+        write_stored_zip(
+            &path,
+            &[
+                ("manifest.json", manifest.as_bytes()),
+                ("profiles/gate_up/main.pdi", pdi),
+                ("profiles/gate_up/insts.bin", insts),
+            ],
+        );
+        path
     }
 
     fn resolved_with_dflash_mode(
@@ -8013,6 +8706,115 @@ mod tests {
         )
         .unwrap();
         assert_eq!(params["vision"], vision_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+    #[test]
+    pub(crate) fn load_params_xdna_off_by_default_projects_nothing() {
+        // Default-off: even a declared AND pulled archive must not surface.
+        let paths = test_paths("xdna-sidecar-off-default");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        write_xdna_fixture(&paths.models, "qwen38-27b.xdna.zip");
+        let entry = xdna_sidecar_entry("qwen38-27b.xdna.zip");
+        let resolved = resolved_with_npu_spillover(false);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(params.get("xdna").is_none(), "flag-off must not project xdna");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_xdna_on_projects_verified_archive() {
+        // Flag on + pulled verified archive → params["xdna"] carries the path
+        // for the daemon (which re-verifies and arch-gates into LoadCtx.xdna).
+        let paths = test_paths("xdna-sidecar-on-present");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let xdna_path = write_xdna_fixture(&paths.models, "qwen38-27b.xdna.zip");
+        let entry = xdna_sidecar_entry("qwen38-27b.xdna.zip");
+        let resolved = resolved_with_npu_spillover(true);
+        let params = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(params["xdna"], xdna_path.display().to_string());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_xdna_on_fails_closed_when_sidecar_missing() {
+        // Flag on + declared but unpulled archive fails with a pull hint —
+        // an explicit opt-in must not silently run GPU-only.
+        let paths = test_paths("xdna-sidecar-on-missing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let entry = xdna_sidecar_entry("qwen38-27b.xdna.zip");
+        let resolved = resolved_with_npu_spillover(true);
+        let error = load_params(
+            &resolved,
+            Some(&entry),
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .expect_err("missing xdna archive must fail closed");
+        let message = format!("{error:#}");
+        assert!(message.contains("qwen38-27b.xdna.zip"), "{message}");
+        assert!(message.contains("hipfire pull qwen3.8:27b"), "{message}");
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    pub(crate) fn load_params_xdna_on_without_entry_stays_gpu_only() {
+        // Flag on with a bare (non-registry) artifact logs one line and stays
+        // GPU-only instead of failing every load for models with no artifact.
+        let paths = test_paths("xdna-sidecar-on-no-entry");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("qwen3.8-27b.mq4");
+        fs::write(&model_path, b"model").unwrap();
+        let resolved = resolved_with_npu_spillover(true);
+        let params = load_params(
+            &resolved,
+            None,
+            &model_path.parent().unwrap(),
+            &model_path,
+            64,
+            Some("q8"),
+            None,
+            Some("qwen3.8:27b"),
+            false,
+            None,
+        )
+        .unwrap();
+        assert!(params.get("xdna").is_none());
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -10109,6 +10911,8 @@ mod tests {
                     current_max_seq: 0,
                     cache_capable: false,
                     kv_override: None,
+                    kv_k_override: None,
+                    kv_v_override: None,
                     kv_backend_override: None,
                     vision_override: None,
                     tp: None,
@@ -10985,6 +11789,7 @@ mod tests {
             json: true,
             exp: false,
             matrix: false,
+            ttft: false,
             pp: vec![128],
             ctx: vec![128],
             tg: 128,
@@ -10993,6 +11798,8 @@ mod tests {
             sustained_ctx: vec![128],
             warmups: 1,
             kv_mode: None,
+            kv_k: None,
+            kv_v: None,
             kv_backend: None,
             redline: false,
             speculation: None,
@@ -11749,6 +12556,8 @@ mod tests {
             repeat_penalty: None,
             max_tokens: None,
             kv_mode: None,
+            kv_k: None,
+            kv_v: None,
             head: Some("q4k".into()),
             kv_backend: None,
             tp: None,
@@ -11815,7 +12624,7 @@ mod tests {
     }
 
     #[test]
-    fn load_params_preserves_auto_for_direct_path_and_registry() {
+    fn load_params_preserves_auto_for_direct_path_and_lowers_registry_bf16() {
         // Direct-path load: no registry entry, config is auto -> must stay auto.
         let defaults = resolve(Vec::<NamedLayer>::new()).unwrap();
         assert_eq!(config_string(&defaults, "memory.kv_cache").unwrap(), "auto");
@@ -11837,8 +12646,9 @@ mod tests {
             params["kv_mode"], "auto",
             "direct-path auto must survive to architecture"
         );
-        // Registry path with default_kv_mode=bf16 must also preserve auto when
-        // no explicit --kv-mode is given; architecture picks BF16.
+
+        // A non-q8 registry default is a model-specific opinion and must lower
+        // into the resolved config before load parameters are built.
         let raw = r#"{
             "schema_version":1,
             "generated_at":"2099-01-01T00:00:00Z",
@@ -11849,8 +12659,16 @@ mod tests {
         }"#;
         let registry = RegistryV1::parse(raw, "test").unwrap();
         let (_, entry) = registry.model("maple-preview").unwrap();
+        let resolved = resolve(vec![NamedLayer {
+            source: ConfigSource::RegistryModel {
+                tag: "maple-preview".into(),
+                revision: "test".into(),
+            },
+            layer: entry.config_layer().unwrap(),
+        }])
+        .unwrap();
         let params2 = load_params(
-            &defaults,
+            &resolved,
             Some(entry),
             &direct_path.parent().unwrap(),
             &direct_path,
@@ -11863,12 +12681,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            params2["kv_mode"], "auto",
-            "registry auto must survive even when entry has bf16 default"
+            params2["kv_mode"], "bf16",
+            "non-q8 registry default must resolve to BF16"
         );
-        // Explicit override still wins
+
+        // Explicit override still wins.
         let params3 = load_params(
-            &defaults,
+            &resolved,
             Some(entry),
             &direct_path.parent().unwrap(),
             &direct_path,

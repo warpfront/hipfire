@@ -291,6 +291,9 @@ fn main() {
                     row_stride: 0,
                     paro: None,
                     awq_scale: if awq { Some(d_awq) } else { None },
+                    lloyd_lut_e4m3: None,
+                    lloyd_lut_f16: None,
+                    lloyd_lut_c16: None,
                 };
                 // NOTE: anchor takes ownership of d_awq in the AWQ arm; the
                 // direct-producer oracle above already ran, so reuse the

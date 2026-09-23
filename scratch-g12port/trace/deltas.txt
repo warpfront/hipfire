@@ -1,0 +1,34 @@
+== base-A -> f1only-A
+symbol                                                                     base-A           f1only-A  delta ms
+gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold                        0/      0.000    64/    758.251  +758.251
+gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold                 368/   1097.742   240/    355.567  -742.175
+fused_silu_mul_mq_rotate_awq_i4_gfx12                             64/    135.670     0/      0.000  -135.670
+fused_silu_mul_mq_rotate_awq_i4_hin_gfx12                          0/      0.000    64/     73.041   +73.041
+fused_gate_up_mq4g256v2                                           64/     10.729    64/      9.998    -0.731
+attention_fp8_e4m3_fa2_gqa_qresident_gfx1201                      16/    166.835    16/    167.551    +0.716
+gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold                 128/    519.987   128/    520.613    +0.626
+fused_qkvza_mq4g256v2                                             48/      4.126    48/      3.616    -0.510
+__amd_rocclr_fillBufferUnAligned                                 192/      0.813   192/      1.315    +0.502
+TOTAL GPU                                                       3729/   2244.320  3665/   2197.081   -47.239
+server prefill ms 2228.4 -> 2183.6  tok/s 3676.1 -> 3751.6  wall 2285.0 -> 2233.6  text 'A' / 'A'
+== base-A -> foldonly-A
+symbol                                                                     base-A         foldonly-A  delta ms
+gemm_mq4g256v2_zba_set_mmq_iu4_symfold                             0/      0.000    48/    102.464  +102.464
+gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold                 368/   1097.742   224/    996.548  -101.194
+gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold                 128/    519.987   128/    524.400    +4.413
+attention_fp8_e4m3_fa2_gqa_qresident_gfx1201                      16/    166.835    16/    167.656    +0.821
+fused_gate_up_mq4g256v2                                           64/     10.729    64/     10.020    -0.709
+TOTAL GPU                                                       3729/   2244.320  3633/   2248.099    +3.779
+server prefill ms 2228.4 -> 2239.6  tok/s 3676.1 -> 3657.8  wall 2285.0 -> 2287.3  text 'A' / 'A'
+== base-A -> both-A
+symbol                                                                     base-A             both-A  delta ms
+gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold                 368/   1097.742    96/    247.346  -850.396
+gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold                        0/      0.000    64/    756.432  +756.432
+fused_silu_mul_mq_rotate_awq_i4_gfx12                             64/    135.670     0/      0.000  -135.670
+gemm_mq4g256v2_zba_set_mmq_iu4_symfold                             0/      0.000    48/    102.728  +102.728
+fused_silu_mul_mq_rotate_awq_i4_hin_gfx12                          0/      0.000    64/     72.910   +72.910
+gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold                 128/    519.987   128/    521.390    +1.403
+fused_gate_up_mq4g256v2                                           64/     10.729    64/     10.063    -0.666
+attention_fp8_e4m3_fa2_gqa_qresident_gfx1201                      16/    166.835    16/    167.354    +0.519
+TOTAL GPU                                                       3729/   2244.320  3569/   2190.069   -54.251
+server prefill ms 2228.4 -> 2176.6  tok/s 3676.1 -> 3763.7  wall 2285.0 -> 2225.2  text 'A' / 'A'

@@ -119,6 +119,9 @@ pub struct LoadedWeights<L> {
 pub trait WeightSource {
     type Layer;
     fn n_layers(&self) -> usize;
+    fn mq4v2_symmetric(&self) -> bool {
+        false
+    }
     /// Pre-load hook. HFQ drops the mmap when n==1; PaRo rejects n>1; llama no-op.
     fn prepare(&mut self, n_devices: usize) -> HipResult<()>;
     fn read_embed(&mut self, gpu: &mut Gpu) -> HipResult<(GpuTensor, EmbeddingFormat)>;
@@ -418,6 +421,10 @@ fn load_weights_inner<S: WeightSource>(
             0,
             "load_weights: at least one device is required",
         ));
+    }
+    let mq4v2_symmetric = source.mq4v2_symmetric();
+    for device in devices.iter_mut() {
+        device.mq4v2_symmetric = mq4v2_symmetric;
     }
     layout
         .validate(n_devices, source.n_layers())

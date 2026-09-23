@@ -57,6 +57,7 @@ fn dn_requant_per_token() -> bool {
         .unwrap_or(false)
 }
 
+
 /// Use the chunked (parallel) FP32 GDN kernel on the multi-token (n>1) linear
 /// arm instead of the sequential batch_seq. DEFAULT OFF. Correctness-first
 /// PoC: each chunk is a separate host-side launch (cross-chunk is serial).
@@ -342,12 +343,20 @@ impl Gpu {
 
     /// a += b (in-place element-wise add)
     pub fn add_inplace_f32(&mut self, a: &GpuTensor, b: &GpuTensor) -> HipResult<()> {
+        self.add_inplace_f32_raw(a.buf.as_ptr(), b.buf.as_ptr(), a.numel())
+    }
+
+    /// `a[0..n] += b[0..n]` over raw device pointers.
+    pub(crate) fn add_inplace_f32_raw(
+        &mut self,
+        a_ptr: *mut c_void,
+        b_ptr: *mut c_void,
+        n: usize,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("add_inplace", kernels::ADD_INPLACE_SRC, "add_inplace_f32")?;
 
-        let n = a.numel() as i32;
-        let a_ptr = a.buf.as_ptr();
-        let b_ptr = b.buf.as_ptr();
+        let n = n as i32;
         let n_val = n;
 
         let mut params: Vec<*mut c_void> = vec![
@@ -1289,15 +1298,19 @@ impl Gpu {
             &mut po as *mut _ as *mut c_void,
         ];
         let n_pairs = (n_rot / 2) as u32;
-        let block = 32u32.min(n_pairs);
-        let grid_x = (n_pairs + block - 1) / block;
+        let (grid_x, block, shared_bytes) = if legacy {
+            let block = 32u32.min(n_pairs);
+            ((n_pairs + block - 1) / block, block, 0)
+        } else {
+            (1, 256, 2 * n_pairs * std::mem::size_of::<f32>() as u32)
+        };
         let bytes = crate::profile::rope_bytes(n_heads_q, n_heads_k, head_dim) * batch_size;
         let timer = crate::profile::begin_timer(&self.hip, "rope", entry, bytes);
         let result = self.launch_maybe_blob(
             entry,
             [grid_x, batch_size as u32, 1],
             [block, 1, 1],
-            0,
+            shared_bytes,
             &mut params,
             || {
                 let mut b = hip_bridge::KernargBlob::new();
@@ -2133,6 +2146,85 @@ impl Gpu {
         result
     }
 
+    /// T-C Halo prefill fusion: batched deinterleave with the FullAttention Q
+    /// RMSNorm folded in. Bit-identical q_out/gate_out to the
+    /// `deinterleave_f32_batched` + in-place `rmsnorm_batched(q)` sequence;
+    /// the Q global-memory round trip is gone. Uses the same blockDim the
+    /// unfused `rmsnorm_batched` would pick (min(256, head_dim)) so the
+    /// reduction order matches exactly. `q_out` must not alias `interleaved`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn deinterleave_q_rmsnorm_f32_batched(
+        &mut self,
+        interleaved: &GpuTensor,
+        q_out: &GpuTensor,
+        gate_out: &GpuTensor,
+        q_norm: &GpuTensor,
+        n_heads: usize,
+        head_dim: usize,
+        n: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let block = 256u32.min(head_dim as u32);
+        if head_dim > 8 * block as usize {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "deinterleave+qnorm fusion requires head_dim<=2048",
+            ));
+        }
+        const KERNEL: &str = "deinterleave_q_rmsnorm_f32_batched";
+        self.ensure_kernel(
+            KERNEL,
+            kernels::DEINTERLEAVE_Q_RMSNORM_BATCHED_SRC,
+            KERNEL,
+        )?;
+        let mut inp = interleaved.buf.as_ptr();
+        let mut qp = q_out.buf.as_ptr();
+        let mut gp = gate_out.buf.as_ptr();
+        let mut wp = q_norm.buf.as_ptr();
+        let mut nh = n_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut nn = n as i32;
+        let mut ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut inp as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut gp as *mut _ as *mut c_void,
+            &mut wp as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut nn as *mut _ as *mut c_void,
+            &mut ep as *mut _ as *mut c_void,
+        ];
+        // Fused traffic: interleaved read + Q/gate writes + norm weight;
+        // the Q store+reload round trip is gone.
+        let bytes = n * n_heads * head_dim * 4 * 4 + head_dim * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "fused", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [n_heads as u32, n as u32, 1],
+            [block, 1, 1],
+            block * 4,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(inp);
+                b.push_ptr(qp);
+                b.push_ptr(gp);
+                b.push_ptr(wp);
+                b.push_i32(nh);
+                b.push_i32(hd);
+                b.push_i32(nn);
+                b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     #[cfg(feature = "deltanet")]
     pub fn sigmoid_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
@@ -2266,6 +2358,10 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        // `out` is a stable batched scratch rewritten every layer; drop any
+        // pointer-keyed F16/FP8 conversion cached from its previous contents
+        // (the Q8 residual WMMA consumer would otherwise reuse stale X).
+        self.invalidate_x_caches_for(out.buf.as_ptr());
         result
     }
 
@@ -2547,6 +2643,10 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+        // `out` is a stable batched scratch rewritten every layer; drop any
+        // pointer-keyed F16/FP8 conversion cached from its previous contents
+        // (the Q8 residual WMMA consumer would otherwise reuse stale X).
+        self.invalidate_x_caches_for(out.buf.as_ptr());
         result
     }
 
@@ -2990,20 +3090,18 @@ impl Gpu {
         self.bind_thread()?;
 
         let use_fast = !dn_requant_per_token();
-        let kernel_name = if use_fast {
-            "gated_delta_net_q8_fast"
+        let (kernel_name, kernel_src, kernel_fn) = if use_fast {
+            (
+                "gated_delta_net_q8_fast",
+                kernels::GATED_DELTA_NET_Q8_FAST_SRC,
+                "gated_delta_net_q8_fast",
+            )
         } else {
-            "gated_delta_net_q8"
-        };
-        let kernel_src = if use_fast {
-            kernels::GATED_DELTA_NET_Q8_FAST_SRC
-        } else {
-            kernels::GATED_DELTA_NET_Q8_SRC
-        };
-        let kernel_fn = if use_fast {
-            "gated_delta_net_q8_fast"
-        } else {
-            "gated_delta_net_q8"
+            (
+                "gated_delta_net_q8",
+                kernels::GATED_DELTA_NET_Q8_SRC,
+                "gated_delta_net_q8",
+            )
         };
         self.ensure_kernel(kernel_name, kernel_src, kernel_fn)?;
 
@@ -3054,7 +3152,7 @@ impl Gpu {
                 &mut efp as *mut _ as *mut c_void,
             ];
             self.launch_maybe_blob(
-                "gated_delta_net_q8_fast",
+                kernel_name,
                 [n_heads as u32, n_tiles, 1],
                 [32, 1, 1],
                 0,
@@ -3125,6 +3223,8 @@ impl Gpu {
         }
         result
     }
+
+
 
     /// One-token recurrent update for several independent sequence lanes.
     /// State tensors are lane-major; the kernel uses grid.z as the lane id.
@@ -4564,6 +4664,387 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result
+    }
+
+    /// gfx1201 batched prefill GDN preamble fusion (slice P): sigmoid(beta) +
+    /// alpha gate + conv1d + SiLU + split + Q/K norm + scale + interleave in
+    /// ONE launch (`gdn_pre_batched_gfx1201`). Byte-exact vs the 3-launch
+    /// sequence; the launcher gates every admission condition the kernel
+    /// header requires (exact gfx1201 is checked at the dispatch site).
+    /// `q_raw`/`k_raw` stores are kept (v1).
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_pre_batched_gfx1201(
+        &mut self,
+        beta: &GpuTensor,
+        alpha: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        qkv_in: &GpuTensor,
+        conv_w: &GpuTensor,
+        conv_state: &GpuTensor,
+        q_raw: &GpuTensor,
+        k_raw: &GpuTensor,
+        v_out: &GpuTensor,
+        q_dst: &GpuTensor,
+        k_dst: &GpuTensor,
+        n_v_heads: usize,
+        n_key_heads: usize,
+        ratio: usize,
+        k_dim: usize,
+        v_dim: usize,
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        const KERNEL: &str = "gdn_pre_batched_gfx1201";
+        const BLOCK: u32 = 256;
+        const R: usize = 32;
+        self.ensure_kernel(KERNEL, kernels::GDN_PRE_BATCHED_GFX1201_SRC, KERNEL)?;
+        let bp = beta.buf.as_ptr();
+        let ap = alpha.buf.as_ptr();
+        let dtp = dt_bias.buf.as_ptr();
+        let alp = a_log.buf.as_ptr();
+        let ip = qkv_in.buf.as_ptr();
+        let wp = conv_w.buf.as_ptr();
+        let sp = conv_state.buf.as_ptr();
+        let qrp = q_raw.buf.as_ptr();
+        let krp = k_raw.buf.as_ptr();
+        let vp = v_out.buf.as_ptr();
+        let qdp = q_dst.buf.as_ptr();
+        let kdp = k_dst.buf.as_ptr();
+        let nvh = n_v_heads as i32;
+        let nkh = n_key_heads as i32;
+        let ra = ratio as i32;
+        let kd = k_dim as i32;
+        let vd = v_dim as i32;
+        let qkv = (2 * k_dim + v_dim) as i32;
+        let nt = n_tokens as i32;
+        let qs = q_scale;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &bp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &dtp as *const _ as *mut c_void,
+            &alp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &qrp as *const _ as *mut c_void,
+            &krp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &qdp as *const _ as *mut c_void,
+            &kdp as *const _ as *mut c_void,
+            &nvh as *const _ as *mut c_void,
+            &nkh as *const _ as *mut c_void,
+            &ra as *const _ as *mut c_void,
+            &kd as *const _ as *mut c_void,
+            &vd as *const _ as *mut c_void,
+            &qkv as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        let n_groups = (n_tokens + R - 1) / R;
+        let qk_blocks = n_key_heads * n_groups;
+        let v_blocks = (v_dim + BLOCK as usize - 1) / BLOCK as usize;
+        let grid = (qk_blocks + v_blocks * n_groups + n_groups) as u32;
+        // Distinct DRAM: qkv read + raw write + normed q/k write +
+        // beta/alpha read+write (weights/ring negligible, L2-resident).
+        let n = n_tokens;
+        let bytes = n * (2 * k_dim + v_dim) * 4
+            + n * (2 * k_dim + v_dim) * 4
+            + 2 * n * n_v_heads * 128 * 4
+            + 4 * n * n_v_heads * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "deltanet", KERNEL, bytes);
+        let result = self.launch_maybe_blob(
+            KERNEL,
+            [grid, 1, 1],
+            [BLOCK, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(bp);
+                b.push_ptr(ap);
+                b.push_ptr(dtp);
+                b.push_ptr(alp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(qrp);
+                b.push_ptr(krp);
+                b.push_ptr(vp);
+                b.push_ptr(qdp);
+                b.push_ptr(kdp);
+                b.push_i32(nvh);
+                b.push_i32(nkh);
+                b.push_i32(ra);
+                b.push_i32(kd);
+                b.push_i32(vd);
+                b.push_i32(qkv);
+                b.push_i32(nt);
+                b.push_f32(qs);
+                b.push_f32(ep);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Row-major GDN preparation is exact on gfx11. Disable for A/B via
+    /// `HIPFIRE_GDN_PREP_GFX11=0`.
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_prep_gfx11(&self) -> bool {
+        matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+            && hipfire_config::developer_var("HIPFIRE_GDN_PREP_GFX11").as_deref() != Ok("0")
+    }
+
+    #[cfg(feature = "deltanet")]
+    fn gdn_chunk_kkt_gfx1100(&self) -> bool {
+        self.arch == "gfx1100"
+            && hipfire_config::developer_var("HIPFIRE_GDN_KKT_GFX1100").as_deref() != Ok("0")
+    }
+
+    /// Resolve the gfx1100/gfx1151/gfx1201 chunk scan modules before any
+    /// admitted route mutates its input scratch or persistent convolution state.
+    #[cfg(feature = "deltanet")]
+    pub fn gdn_chunk_prepare(&mut self) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.gdn_chunk_prep_gfx11() {
+            self.ensure_kernel(
+                "gdn_chunk_prep_gfx11",
+                kernels::GDN_CHUNK_PREP_GFX11_SRC,
+                "gdn_chunk_prep_gfx11",
+            )?;
+        } else {
+            self.ensure_kernel("gdn_chunk_prep", kernels::GDN_CHUNK_PREP_SRC, "gdn_chunk_prep")?;
+        }
+        if self.gdn_chunk_kkt_gfx1100() {
+            self.ensure_kernel(
+                "gdn_chunk_kkt_solve_gfx1100",
+                kernels::GDN_CHUNK_KKT_SOLVE_GFX1100_SRC,
+                "gdn_chunk_kkt_solve_gfx1100",
+            )?;
+        } else {
+            self.ensure_kernel(
+                "gdn_chunk_kkt_solve",
+                kernels::GDN_CHUNK_KKT_SOLVE_SRC,
+                "gdn_chunk_kkt_solve",
+            )?;
+        }
+        self.ensure_kernel("gdn_chunk_scan", kernels::GDN_CHUNK_SCAN_SRC, "gdn_chunk_scan")
+    }
+    /// GDN chunk scan preamble for gfx1100/gfx1151/gfx1201. The compact Q/K/V
+    /// buffers are BF16 byte views borrowed from the ordinary prefill scratch.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_prep(
+        &mut self,
+        input: &GpuTensor,
+        conv_weight: &GpuTensor,
+        conv_state: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        dt_bias: &GpuTensor,
+        a_log: &GpuTensor,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        n_tokens: usize,
+        q_scale: f32,
+        eps: f32,
+    ) -> HipResult<()> {
+        self.gdn_chunk_prepare()?;
+        let gfx11 = self.gdn_chunk_prep_gfx11();
+        let prep_module = if gfx11 {
+            "gdn_chunk_prep_gfx11"
+        } else {
+            "gdn_chunk_prep"
+        };
+        let chunks = ((n_tokens + 63) / 64) as u32;
+        let grid = if gfx11 { [10, chunks, 1] } else { [chunks, 10, 1] };
+
+        let xp = input.buf.as_ptr();
+        let wp = conv_weight.buf.as_ptr();
+        let sp = conv_state.buf.as_ptr();
+        let gp = g.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let dtp = dt_bias.buf.as_ptr();
+        let alp = a_log.buf.as_ptr();
+        let qp = q.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let nt = n_tokens as i32;
+        let qs = q_scale;
+        let ep = eps;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &dtp as *const _ as *mut c_void,
+            &alp as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+            &qs as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            prep_module,
+            grid,
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(wp);
+                b.push_ptr(sp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(dtp);
+                b.push_ptr(alp);
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_i32(nt);
+                b.push_f32(qs);
+                b.push_f32(ep);
+                b
+            },
+        )
+    }
+
+    /// GDN KKT solve and fused scan for one legacy segment.
+    /// All parent arrays remain unsliced; `row0` selects the segment and state
+    /// stays the single unsliced persistent owner.
+    #[cfg(feature = "deltanet")]
+    #[allow(clippy::too_many_arguments)]
+    pub fn gdn_chunk_scan_segment(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        a: &GpuTensor,
+        g: &GpuTensor,
+        beta: &GpuTensor,
+        state_q8: &GpuTensor,
+        state_scales: &GpuTensor,
+        ef_residual: &GpuTensor,
+        out: &GpuTensor,
+        row0: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let (kkt_module, kkt_source, kkt_symbol, kkt_rows, kkt_heads, kkt_block) =
+            if self.gdn_chunk_kkt_gfx1100() {
+                (
+                    "gdn_chunk_kkt_solve_gfx1100",
+                    kernels::GDN_CHUNK_KKT_SOLVE_GFX1100_SRC,
+                    "gdn_chunk_kkt_solve_gfx1100",
+                    64,
+                    48,
+                    128,
+                )
+            } else {
+                (
+                    "gdn_chunk_kkt_solve",
+                    kernels::GDN_CHUNK_KKT_SOLVE_SRC,
+                    "gdn_chunk_kkt_solve",
+                    64,
+                    16,
+                    128,
+                )
+            };
+        self.ensure_kernel(kkt_module, kkt_source, kkt_symbol)?;
+        self.ensure_kernel("gdn_chunk_scan", kernels::GDN_CHUNK_SCAN_SRC, "gdn_chunk_scan")?;
+
+        let kp = k.buf.as_ptr();
+        let gp = g.buf.as_ptr();
+        let bp = beta.buf.as_ptr();
+        let ap = a.buf.as_ptr();
+        let r0 = row0 as i32;
+        let nt = n_tokens as i32;
+        let mut kkt_params: Vec<*mut c_void> = vec![
+            &kp as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &r0 as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            kkt_symbol,
+            [((n_tokens + kkt_rows - 1) / kkt_rows) as u32, kkt_heads, 1],
+            [kkt_block, 1, 1],
+            0,
+            &mut kkt_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(kp);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(ap);
+                b.push_i32(r0);
+                b.push_i32(nt);
+                b
+            },
+        )?;
+
+        // Preserve the incumbent deterministic frame cadence even though the
+        // required EF path does not consume the stochastic seed.
+        let _frame = reserve_gdn_requant_frames(n_tokens as u32);
+        let qp = q.buf.as_ptr();
+        let vp = v.buf.as_ptr();
+        let sqp = state_q8.buf.as_ptr();
+        let scp = state_scales.buf.as_ptr();
+        let efp = ef_residual.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let mut scan_params: Vec<*mut c_void> = vec![
+            &qp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &vp as *const _ as *mut c_void,
+            &ap as *const _ as *mut c_void,
+            &gp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &sqp as *const _ as *mut c_void,
+            &scp as *const _ as *mut c_void,
+            &efp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &r0 as *const _ as *mut c_void,
+            &nt as *const _ as *mut c_void,
+        ];
+        self.launch_maybe_blob(
+            "gdn_chunk_scan",
+            [1, 48, 1],
+            [512, 1, 1],
+            0,
+            &mut scan_params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qp);
+                b.push_ptr(kp);
+                b.push_ptr(vp);
+                b.push_ptr(ap);
+                b.push_ptr(gp);
+                b.push_ptr(bp);
+                b.push_ptr(sqp);
+                b.push_ptr(scp);
+                b.push_ptr(efp);
+                b.push_ptr(op);
+                b.push_i32(r0);
+                b.push_i32(nt);
+                b
+            },
+        )
     }
 
     /// Independent-sequence decode variant of [`Self::conv1d_silu_split_f32_n`].

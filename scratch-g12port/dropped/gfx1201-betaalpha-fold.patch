@@ -1,0 +1,392 @@
+--- a/crates/rdna-compute/src/gemm.rs
++++ b/crates/rdna-compute/src/gemm.rs
+@@ -29564,7 +29564,9 @@
+     }
+ 
+     /// Exact symmetric MQ4V2 producer/consumer route. Only a complete IU4
+-    /// column tile may omit the otherwise necessary F32 rotated X.
++    /// column tile may omit the otherwise necessary F32 rotated X on gfx11;
++    /// exact gfx1201 needs its fused RMSNorm+IU4 producer (the only LA route
++    /// feeding the SET) and handles partial N tiles in-kernel.
+     pub fn mq4v2_fold_betaalpha_active(
+         &self,
+         qkv_m: usize,
+@@ -29574,10 +29576,18 @@
+         k: usize,
+         n: usize,
+     ) -> bool {
+-        matches!(self.arch.as_str(), "gfx1100" | "gfx1151")
+-            && self.iu4_producer_sidecar_active(n, k)
++        let route = match self.arch.as_str() {
++            "gfx1100" | "gfx1151" => {
++                self.iu4_producer_sidecar_active(n, k)
++                    && self.flags.gfx11_iu4_symfold
++                    && n >= 128
++                    && n % 128 == 0
++            }
++            "gfx1201" => self.iu4_producer_quant_fused_active(n, k),
++            _ => false,
++        };
++        route
+             && self.mq4v2_symmetric
+-            && self.flags.gfx11_iu4_symfold
+             && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+             && hipfire_config::developer_var("HIPFIRE_IU4_BAFOLD").as_deref() != Ok("0")
+             && qkv_m > 0
+@@ -29587,15 +29597,19 @@
+             && beta_m == 48
+             && alpha_m == 48
+             && k == 5120
+-            && n >= 128
+-            && n % 128 == 0
+     }
+     /// Z's expanded M must be a complete tile of whichever SET kernel the
+-    /// architecture selects (M128 for V2C/X5, M256 for Halo v2b).
++    /// architecture selects (M128 for V2C/X5 and gfx1201, M256 for Halo v2b).
+     pub fn mq4v2_fold_betaalpha_padded_m(&self, z_m: usize) -> usize {
+         let tile = if self.arch == "gfx1151" { 256 } else { 128 };
+         (z_m + 96).div_ceil(tile) * tile
+     }
++    /// Whether the fold's widened Z SET writes a [N][padded_m] buffer that
++    /// `split_mq4v2_z_betaalpha` scatters (gfx11), rather than scattering in
++    /// its own epilogue (exact gfx1201, no widened buffer).
++    pub fn mq4v2_fold_betaalpha_split(&self) -> bool {
++        self.arch != "gfx1201"
++    }
+ 
+ 
+     /// MQ4 v2 (qt 44) — gfx11 (RDNA3/3.5) qkvza WMMA.
+@@ -29835,7 +29849,10 @@
+ 
+     /// Append beta/alpha as ordinary Z weight rows. The SET selector is the
+     /// same one used for QKV and Z elsewhere (V2C, X5 or future Halo v2b);
+-    /// the only fold-specific GPU work is deinterleaving its output.
++    /// the only fold-specific GPU work is deinterleaving its output. Exact
++    /// gfx1201 instead runs the production gfx12 SET tile with a scattering
++    /// epilogue (`gemm_mq4g256v2_zba_set_mmq_iu4_symfold`): Z tiles store
++    /// `y_z`, the tail tile stores `y_beta`/`y_alpha`, and `y_z_fold` is unused.
+     #[allow(clippy::too_many_arguments)]
+     pub fn gemm_qkvza_mq4g256v2_wmma_iu4_fold_prepared(
+         &mut self,
+@@ -29856,11 +29873,17 @@
+         let folded_m = self.mq4v2_fold_betaalpha_padded_m(z_m);
+         if !self.mq4v2_fold_betaalpha_active(qkv_m, z_m, 48, 48, k, n)
+             || a_z_fold.byte_size() != folded_m * row_bytes
+-            || y_z_fold.byte_size() < n * folded_m * 4
++            || (self.mq4v2_fold_betaalpha_split() && y_z_fold.byte_size() < n * folded_m * 4)
+         {
+             return Err(hip_bridge::HipError::new(1, "invalid MQ4V2 Z beta/alpha fold layout"));
+         }
+         let xq = self.int4_mmq_prepared_ptr(prepared, k, n)?;
++        if !self.mq4v2_fold_betaalpha_split() {
++            self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, n)?;
++            return self.gemm_mq4g256v2_zba_set_iu4_gfx12(
++                a_z_fold, xq, y_z, y_beta, y_alpha, folded_m, z_m, 48, k, n,
++            );
++        }
+         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_qkv, xq, y_qkv, qkv_m, k, n)?;
+         self.gemm_mq4g256v2_mmq_set_prequant_iu4(
+             a_z_fold, xq, y_z_fold, folded_m, k, n,
+@@ -29909,6 +29932,86 @@
+         result
+     }
+ 
++    /// gfx1201 beta/alpha fold SET: `a_fold` = [Z | beta | alpha | zero pad]
++    /// rows (`folded_m` in all, `z_m % 128 == 0`, one tail tile). Same tile,
++    /// K order and fold DAG as `gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold`,
++    /// so every Z/beta/alpha element equals its separate-SET value.
++    #[allow(clippy::too_many_arguments)]
++    fn gemm_mq4g256v2_zba_set_iu4_gfx12(
++        &mut self,
++        a_fold: &GpuTensor,
++        xq: *mut c_void,
++        y_z: &GpuTensor,
++        y_beta: &GpuTensor,
++        y_alpha: &GpuTensor,
++        folded_m: usize,
++        z_m: usize,
++        ba_m: usize,
++        k: usize,
++        n: usize,
++    ) -> HipResult<()> {
++        if z_m % 128 != 0 || folded_m <= z_m || folded_m > z_m + 128 || folded_m < z_m + 2 * ba_m {
++            return Err(hip_bridge::HipError::new(1, "invalid gfx1201 Z beta/alpha fold tile"));
++        }
++        self.bind_thread()?;
++        const KERNEL: &str = "gemm_mq4g256v2_zba_set_mmq_iu4_symfold";
++        self.ensure_kernel(
++            "gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold",
++            kernels::GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SYMFOLD_SRC,
++            KERNEL,
++        )?;
++        let mut a_ptr = a_fold.buf.as_ptr();
++        let mut xq_ptr = xq;
++        let mut z_ptr = y_z.buf.as_ptr();
++        let mut b_ptr = y_beta.buf.as_ptr();
++        let mut al_ptr = y_alpha.buf.as_ptr();
++        let mut m_val = folded_m as i32;
++        let mut k_val = k as i32;
++        let mut n_val = n as i32;
++        let mut zm_val = z_m as i32;
++        let mut ba_val = ba_m as i32;
++        let mut params: [*mut c_void; 10] = [
++            &mut a_ptr as *mut _ as *mut c_void,
++            &mut xq_ptr as *mut _ as *mut c_void,
++            &mut z_ptr as *mut _ as *mut c_void,
++            &mut b_ptr as *mut _ as *mut c_void,
++            &mut al_ptr as *mut _ as *mut c_void,
++            &mut m_val as *mut _ as *mut c_void,
++            &mut k_val as *mut _ as *mut c_void,
++            &mut n_val as *mut _ as *mut c_void,
++            &mut zm_val as *mut _ as *mut c_void,
++            &mut ba_val as *mut _ as *mut c_void,
++        ];
++        let bytes = folded_m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES
++            + n * (z_m + 2 * ba_m) * 4;
++        let timer = crate::profile::begin_timer(&self.hip, "gemm", KERNEL, bytes);
++        let result = self.launch_maybe_blob(
++            KERNEL,
++            [folded_m.div_ceil(128) as u32, n.div_ceil(128) as u32, 1],
++            [256, 1, 1],
++            20480,
++            &mut params,
++            || {
++                let mut b = hip_bridge::KernargBlob::new();
++                b.push_ptr(a_ptr);
++                b.push_ptr(xq_ptr);
++                b.push_ptr(z_ptr);
++                b.push_ptr(b_ptr);
++                b.push_ptr(al_ptr);
++                b.push_i32(m_val);
++                b.push_i32(k_val);
++                b.push_i32(n_val);
++                b.push_i32(zm_val);
++                b.push_i32(ba_val);
++                b
++            },
++        );
++        if let Some(t) = timer {
++            t.finish(&self.hip);
++        }
++        result
++    }
++
+     /// MQ4V2 gfx1100 qkvza batch-tile (BT4 / BT12).
+     ///
+     /// Direct harness entry and production selector target: reuses one
+--- a/crates/hipfire-arch-qwen35/src/qwen35/batch.rs
++++ b/crates/hipfire-arch-qwen35/src/qwen35/batch.rs
+@@ -53,7 +53,8 @@
+     pub dn_qkv_batch: GpuTensor,      // [N × qkv_dim]
+     pub dn_z_batch: GpuTensor,        // [N × v_dim]
+     /// Z plus up to 256 appended beta/alpha/padding rows, used only by the
+-    /// symmetric IU4 fold; output is deinterleaved before GDN consumes it.
++    /// symmetric IU4 fold on gfx11; output is deinterleaved before GDN
++    /// consumes it. One element per row on gfx1201 (in-epilogue scatter).
+     pub dn_z_fold_batch: GpuTensor,
+     pub dn_alpha_batch: GpuTensor,    // [N × n_v_heads]
+     pub dn_beta_batch: GpuTensor,     // [N × n_v_heads]
+@@ -278,7 +279,9 @@
+         let i_x_norm_batch = alloc!(&[fallback_rows * dim], DType::F32);
+         let i_dn_qkv_batch = alloc!(&[max_batch * qkv_dim], DType::F32);
+         let i_dn_z_batch = alloc!(&[max_batch * v_dim], DType::F32);
+-        let i_dn_z_fold_batch = alloc!(&[max_batch * (v_dim + 256)], DType::F32);
++        // gfx1201's fold scatters in the SET epilogue and never reads it.
++        let z_fold_row = if gpu.mq4v2_fold_betaalpha_split() { v_dim + 256 } else { 1 };
++        let i_dn_z_fold_batch = alloc!(&[max_batch * z_fold_row], DType::F32);
+         let i_dn_alpha_batch = alloc!(&[max_batch * n_v_heads], DType::F32);
+         let i_dn_beta_batch = alloc!(&[max_batch * n_v_heads], DType::F32);
+         // dn_q_raw_batch doubles as the GDN chunk scan's A workspace, which is
+--- a/crates/rdna-compute/src/kernels.rs
++++ b/crates/rdna-compute/src/kernels.rs
+@@ -3737,8 +3737,10 @@
+ // k_grp=tid>>4 lane split, contiguous-row C — same conventions as the gfx12
+ // iu8 MMQ). Same 7-arg ABI and block_i4_128 activations as the gfx11 iu4
+ // kernel. Opt-in through HIPFIRE_IU4_PREFILL on gfx1201 (default off). Same
+-// module adds the F1-lite `gemm_mq4g256v2_gate_up_silu_mmq_iu4` entry (G, U,
+-// Xq, H, M, K, N: gate/up rows address-interleaved, stores h = silu(g)*u).
++// module adds the F1-lite `gemm_mq4g256v2_gate_up_silu_mmq_iu4` (G, U, Xq, H,
++// M, K, N: gate/up rows address-interleaved, stores h = silu(g)*u) and the
++// beta/alpha fold `gemm_mq4g256v2_zba_set_mmq_iu4` (A, Xq, Z, B, Al, M, K, N,
++// zm, ba_m: widened Z SET scattering its tail tile to beta/alpha) entries.
+ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_SRC: &str = concat!(
+     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip")
+@@ -3749,6 +3751,7 @@
+     "#define gemm_mq4g256v2_residual_mmq_iu4_full_add gemm_mq4g256v2_residual_mmq_iu4_full_add_symfold\n",
+     "#define gemm_mq4g256v2_residual_mmq_iu4_full_set gemm_mq4g256v2_residual_mmq_iu4_full_set_symfold\n",
+     "#define gemm_mq4g256v2_gate_up_silu_mmq_iu4 gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold\n",
++    "#define gemm_mq4g256v2_zba_set_mmq_iu4 gemm_mq4g256v2_zba_set_mmq_iu4_symfold\n",
+     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip")
+ );
+--- a/kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip
++++ b/kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx12.hip
+@@ -306,7 +306,12 @@
+ //     address interleave; weights untouched). Every g and u folds exactly as in
+ //     full_set, and Y = h [N][M] = IU4_SILU_MUL(g, u), spelled as SILU_MUL in
+ //     fused_silu_mul_mq_rotate_awq.hip so the h-producer reproduces it.
+-enum { IU4_EPI_SET = 0, IU4_EPI_ADD = 1, IU4_EPI_SILU = 2 };
++//   IU4_EPI_ZBA (DeltaNet beta/alpha fold): A = Z rows, then ba_m beta and
++//     ba_m alpha rows (load-time row concat, M rows in all). Tiles below zm
++//     store Y [N][zm]; the one tail tile scatters rows zm..zm+ba_m-1 to Yb and
++//     the next ba_m rows to Ya ([N][ba_m] each), dropping padding. Every
++//     element is the full_set value of its own row.
++enum { IU4_EPI_SET = 0, IU4_EPI_ADD = 1, IU4_EPI_SILU = 2, IU4_EPI_ZBA = 3 };
+ #define IU4_SILU_MUL(g, u) ((g) / (1.0f + expf(-(g))) * (u))
+ #ifndef IU4_SILU_RGROUPS
+ #define IU4_SILU_RGROUPS 2
+@@ -317,10 +322,13 @@
+     const char*           __restrict__ U,   // SILU: W_up, same layout as A
+     const block_i4_128*   __restrict__ Xq,  // [K/128 × N]
+     float*                __restrict__ Y,   // [N × M] column-major
+-    int M, int K, int N
++    float*                __restrict__ Yb,  // ZBA: beta [N × ba_m]
++    float*                __restrict__ Ya,  // ZBA: alpha [N × ba_m]
++    int M, int K, int N, int zm, int ba_m
+ ) {
+     constexpr bool ADD = EPI == IU4_EPI_ADD;
+     constexpr bool SILU = EPI == IU4_EPI_SILU;
++    constexpr bool ZBA = EPI == IU4_EPI_ZBA;
+     const int tid = threadIdx.x;
+     const int wave = tid >> 5;
+     const int lane = tid & 31;
+@@ -762,12 +770,48 @@
+         }
+         return;
+     }
++    if constexpr (ZBA) {
++        if (rs >= zm) {
++            // Tail tile: rows zm.. are beta then alpha (ba_m each), then pad.
++            #pragma unroll
++            for (int rg = 0; rg < 2; rg++) {
++                #pragma unroll
++                for (int nb = 0; nb < 4; nb++) {
++                    #pragma unroll
++                    for (int j = 0; j < 8; j++) {
++                        slots[(unsigned)(wave * 320 + (8 * k_grp + j) * 20 + m_lane)] = acc[nb][rg][j];
++                    }
++                    __syncthreads();
++                    #pragma unroll
++                    for (int k = 0; k < 8; k++) {
++                        const int p = k >> 1;
++                        const int h = k & 1;
++                        const int owner = (p << 1) | h;
++                        const float v = slots[(unsigned)(owner * 320 + store_i * 20 + store_x)];
++                        const int r = rs - zm + p * 32 + rg * 16 + store_i;
++                        const int col = bs + h * 64 + nb * 16 + store_x;
++                        if (col < N) {
++                            if (r < ba_m) {
++                                Yb[(long long)col * ba_m + r] = v;
++                            } else if (r < 2 * ba_m) {
++                                Ya[(long long)col * ba_m + (r - ba_m)] = v;
++                            }
++                        }
++                    }
++                    __syncthreads();
++                }
++            }
++            return;
++        }
++    }
++    // Output row stride: M, or Z's own zm for the folded Z tiles.
++    const int OM = ZBA ? zm : M;
+     const unsigned store_lane_off =
+-        ((unsigned)store_x * (unsigned)M + (unsigned)store_i) * sizeof(float);
+-    float* const y_tile = Y + (long long)bs * M + rs;
++        ((unsigned)store_x * (unsigned)OM + (unsigned)store_i) * sizeof(float);
++    float* const y_tile = Y + (long long)bs * OM + rs;
+     const auto y_tile_rsrc = __builtin_amdgcn_make_buffer_rsrc(
+         y_tile, 0, 0xffffffffu, 0x31004000u);
+-    const bool full_tile = rs + IU4_BN <= M && bs + IU4_BM <= N;
++    const bool full_tile = rs + IU4_BN <= OM && bs + IU4_BM <= N;
+     if (full_tile) {
+         #pragma unroll
+         for (int rg = 0; rg < 2; rg++) {
+@@ -785,7 +829,7 @@
+                     const int owner = (p << 1) | h;
+                     const float v = slots[(unsigned)(owner * 320 + store_i * 20 + store_x)];
+                     const unsigned phase_off =
+-                        ((unsigned)(h * 64 + nb * 16) * (unsigned)M
++                        ((unsigned)(h * 64 + nb * 16) * (unsigned)OM
+                             + (unsigned)(p * 32 + rg * 16)) * sizeof(float);
+                     if constexpr (ADD) {
+                         const unsigned old_bits = __builtin_amdgcn_raw_buffer_load_b32(
+@@ -823,8 +867,8 @@
+                     const float v = slots[(unsigned)(owner * 320 + store_i * 20 + store_x)];
+                     const int row = rs + row_rel;
+                     const int col = bs + col_rel;
+-                    if (row < M && col < N) {
+-                        float* yp = Y + (long long)col * M + row;
++                    if (row < OM && col < N) {
++                        float* yp = Y + (long long)col * OM + row;
+                         if constexpr (ADD) {
+                             *yp += v;
+                         } else {
+@@ -848,10 +892,10 @@
+ ) {
+     if (add) {
+         gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<IU4_EPI_ADD>(
+-            A, nullptr, Xq, Y, M, K, N);
++            A, nullptr, Xq, Y, nullptr, nullptr, M, K, N, M, 0);
+     } else {
+         gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<IU4_EPI_SET>(
+-            A, nullptr, Xq, Y, M, K, N);
++            A, nullptr, Xq, Y, nullptr, nullptr, M, K, N, M, 0);
+     }
+ }
+ 
+@@ -863,7 +907,7 @@
+     int M, int K, int N, int
+ ) {
+     gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<IU4_EPI_ADD>(
+-        A, nullptr, Xq, Y, M, K, N);
++        A, nullptr, Xq, Y, nullptr, nullptr, M, K, N, M, 0);
+ }
+ 
+ extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
+@@ -874,7 +918,7 @@
+     int M, int K, int N, int
+ ) {
+     gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<IU4_EPI_SET>(
+-        A, nullptr, Xq, Y, M, K, N);
++        A, nullptr, Xq, Y, nullptr, nullptr, M, K, N, M, 0);
+ }
+ 
+ // F1-lite gate/up SwiGLU: G/U = gate/up MQ4V2 rows (M each, M % 64 == 0),
+@@ -888,9 +932,24 @@
+     int M, int K, int N
+ ) {
+     gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<IU4_EPI_SILU>(
+-        G, U, Xq, H, M, K, N);
++        G, U, Xq, H, nullptr, nullptr, M, K, N, M, 0);
+ }
+ 
++// Beta/alpha fold SET: A = [Z | beta | alpha | zero pad] rows (M in all,
++// zm % 128 == 0, zm < M <= zm + 128, 2*ba_m <= M - zm). Z [N][zm], B/Al
++// [N][ba_m]. Grid [ceil(M/128), ceil(N/128)], block [256], LDS 20480.
++extern "C" __global__ __launch_bounds__(IU4_NTHREADS, 2)
++void gemm_mq4g256v2_zba_set_mmq_iu4(
++    const char*           __restrict__ A,
++    const block_i4_128*   __restrict__ Xq,
++    float*                __restrict__ Z,
++    float*                __restrict__ B,
++    float*                __restrict__ Al,
++    int M, int K, int N, int zm, int ba_m
++) {
++    gemm_mq4g256v2_residual_mmq_iu4_gfx12_body<IU4_EPI_ZBA>(
++        A, nullptr, Xq, Z, B, Al, M, K, N, zm, ba_m);
++}
+ #undef IU4_SILU_MUL
+ 
+ #else
+@@ -913,4 +972,8 @@
+     const char*, const char*, const void*, float*, int, int, int
+ ) {}
+ 
++extern "C" __global__ void gemm_mq4g256v2_zba_set_mmq_iu4(
++    const char*, const void*, float*, float*, float*, int, int, int, int, int
++) {}
++
+ #endif
+\ No newline at end of file

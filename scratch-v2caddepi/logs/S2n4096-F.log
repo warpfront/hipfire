@@ -1,0 +1,33 @@
+device gfx1100, 48 MPs
+time fwd add_k6144  add:base        1.641 ms
+time fwd add_k6144  set:base        1.565 ms
+time fwd add_k6144  add:l64d16      1.616 ms
+time fwd add_k6144  add:l64d8       1.613 ms
+time fwd add_k6144  add:l64d32      1.578 ms
+time fwd add_k6144  add:l128d16     1.650 ms
+time fwd add_k6144  add:l64d16p4    1.676 ms
+time fwd add_k6144  add:start       1.764 ms
+time fwd add_k6144  norm:base       0.491 ms
+time fwd add_k6144  seq:add+norm    2.207 ms
+summary fwd add_k6144 touch l64d16    1.616 vs 1.641 ms: -1.55%
+summary fwd add_k6144 touch l64d8     1.613 vs 1.641 ms: -1.70%
+summary fwd add_k6144 touch l64d32    1.578 vs 1.641 ms: -3.84%
+summary fwd add_k6144 touch l128d16   1.650 vs 1.641 ms: +0.53%
+summary fwd add_k6144 touch l64d16p4  1.676 vs 1.641 ms: +2.11%
+summary fwd add_k6144 touch start     1.764 vs 1.641 ms: +7.50%
+time fwd add_k17408 add:base        4.423 ms
+time fwd add_k17408 set:base        4.309 ms
+time fwd add_k17408 add:l64d16      4.343 ms
+time fwd add_k17408 add:l64d8       4.327 ms
+time fwd add_k17408 add:l64d32      4.330 ms
+time fwd add_k17408 add:l128d16     4.361 ms
+time fwd add_k17408 add:l64d16p4    4.418 ms
+time fwd add_k17408 add:start       4.420 ms
+time fwd add_k17408 norm:base       0.493 ms
+time fwd add_k17408 seq:add+norm    4.903 ms
+summary fwd add_k17408 touch l64d16    4.343 vs 4.423 ms: -1.81%
+summary fwd add_k17408 touch l64d8     4.327 vs 4.423 ms: -2.18%
+summary fwd add_k17408 touch l64d32    4.330 vs 4.423 ms: -2.12%
+summary fwd add_k17408 touch l128d16   4.361 vs 4.423 ms: -1.41%
+summary fwd add_k17408 touch l64d16p4  4.418 vs 4.423 ms: -0.12%
+summary fwd add_k17408 touch start     4.420 vs 4.423 ms: -0.08%

@@ -6,12 +6,15 @@
 
 #![allow(dead_code, unused_imports, unused_variables, non_snake_case, clippy::all)]
 
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, HashSet};
 use std::fs::File;
-use std::io::Write;
-use std::sync::OnceLock;
+use std::io::{BufReader, Read, Write};
+use std::ops::Range;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex, OnceLock};
+use memmap2::Mmap;
+use safetensors::{Dtype, SafeTensors};
 
 use clap::Parser;
 use hipfire_quantize::float16::{bf16_to_f32, f16_to_f32, f32_to_f16};
@@ -25,6 +28,524 @@ use crate::dequant::*;
 
 pub(crate) static IMATRIX: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
 pub(crate) static AWQ_ALPHA: OnceLock<f32> = OnceLock::new();
+pub(crate) static AWQ_A4_AWARE: OnceLock<bool> = OnceLock::new();
+pub(crate) const AWQ_A4_CANDIDATE_ALPHAS: [f32; 5] = [0.35, 0.45, 0.55, 0.65, 0.75];
+static AWQ_A4_ALPHA_BY_ACTIVATION: LazyLock<Mutex<HashMap<Vec<u32>, f32>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+pub(crate) const MQ4V2_FINAL_CODE_QTYPE: u8 = 44;
+
+/// Borrowed view of one merge-aware QAT export record.
+///
+/// The three tensor payloads use safetensors' little-endian representation.
+/// `d_z_f16` is flattened from `[M, K/256, 2, 2]` in row-major order, with
+/// the last axis ordered `(d, z)`.
+#[derive(Clone, Copy)]
+pub(crate) struct Mq4v2FinalCodeRecord<'a> {
+    pub(crate) name: &'a str,
+    pub(crate) m: usize,
+    pub(crate) k: usize,
+    pub(crate) qt: u8,
+    pub(crate) source_sha: &'a str,
+    pub(crate) s_f16: &'a [u8],
+    pub(crate) d_z_f16: &'a [u8],
+    pub(crate) codes_u8: &'a [u8],
+}
+
+pub(crate) struct MappedMq4v2FinalCodeRecord {
+    pub(crate) path: PathBuf,
+    name: String,
+    m: usize,
+    k: usize,
+    qt: u8,
+    source_sha: String,
+    s_range: Range<usize>,
+    d_z_range: Range<usize>,
+    codes_range: Range<usize>,
+    mmap: Mmap,
+}
+
+impl MappedMq4v2FinalCodeRecord {
+    pub(crate) fn as_record(&self) -> Mq4v2FinalCodeRecord<'_> {
+        Mq4v2FinalCodeRecord {
+            name: &self.name,
+            m: self.m,
+            k: self.k,
+            qt: self.qt,
+            source_sha: &self.source_sha,
+            s_f16: &self.mmap[self.s_range.clone()],
+            d_z_f16: &self.mmap[self.d_z_range.clone()],
+            codes_u8: &self.mmap[self.codes_range.clone()],
+        }
+    }
+}
+
+fn checked_record_sizes(m: usize, k: usize) -> Result<(usize, usize), String> {
+    if m == 0 || k == 0 {
+        return Err(format!("MQ4V2 final-code dimensions must be nonzero, got M={m}, K={k}"));
+    }
+    if k % 256 != 0 {
+        return Err(format!("MQ4V2 final-code K must be divisible by 256, got K={k}"));
+    }
+    let codes = m
+        .checked_mul(k)
+        .ok_or_else(|| format!("MQ4V2 final-code shape overflows: {m}x{k}"))?;
+    let grid_values = codes
+        .checked_div(256)
+        .and_then(|groups| groups.checked_mul(4))
+        .ok_or_else(|| format!("MQ4V2 final-code grid shape overflows: {m}x{k}"))?;
+    Ok((codes, grid_values))
+}
+
+fn f16_bits_at(bytes: &[u8], index: usize) -> u16 {
+    u16::from_le_bytes([bytes[index * 2], bytes[index * 2 + 1]])
+}
+
+/// Validate the frozen C3 record before any artifact byte is written.
+pub(crate) fn validate_mq4v2_final_code_record(
+    record: &Mq4v2FinalCodeRecord<'_>,
+    expected_source_sha: &str,
+) -> Result<(), String> {
+    if record.name.is_empty() {
+        return Err("MQ4V2 final-code record has an empty tensor name".to_string());
+    }
+    if record.qt != MQ4V2_FINAL_CODE_QTYPE {
+        return Err(format!(
+            "{}: final-code qt={} but MQ4V2 requires qt=44",
+            record.name, record.qt
+        ));
+    }
+    if record.source_sha.len() != 64
+        || !record
+            .source_sha
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!(
+            "{}: source_sha must be a lowercase 64-digit SHA-256",
+            record.name
+        ));
+    }
+    if record.source_sha != expected_source_sha {
+        return Err(format!(
+            "{}: source_sha {} does not match input artifact {}",
+            record.name, record.source_sha, expected_source_sha
+        ));
+    }
+
+    let (expected_codes, expected_grid_values) = checked_record_sizes(record.m, record.k)?;
+    if record.s_f16.len() != record.k * 2 {
+        return Err(format!(
+            "{}: S_f16 has {} bytes, expected {} for shape [{}]",
+            record.name,
+            record.s_f16.len(),
+            record.k * 2,
+            record.k
+        ));
+    }
+    if record.d_z_f16.len() != expected_grid_values * 2 {
+        return Err(format!(
+            "{}: d_z_f16 has {} bytes, expected {} for shape [{},{},2,2]",
+            record.name,
+            record.d_z_f16.len(),
+            expected_grid_values * 2,
+            record.m,
+            record.k / 256
+        ));
+    }
+    if record.codes_u8.len() != expected_codes {
+        return Err(format!(
+            "{}: codes_u8 has {} bytes, expected {} for shape [{},{}]",
+            record.name,
+            record.codes_u8.len(),
+            expected_codes,
+            record.m,
+            record.k
+        ));
+    }
+
+    for index in 0..record.k {
+        let value = f16_to_f32(f16_bits_at(record.s_f16, index));
+        if !value.is_finite() || value <= 0.0 {
+            return Err(format!(
+                "{}: S_f16[{index}] must be finite and positive, got {value}",
+                record.name
+            ));
+        }
+    }
+    for index in 0..expected_grid_values {
+        let value = f16_to_f32(f16_bits_at(record.d_z_f16, index));
+        if !value.is_finite() {
+            return Err(format!(
+                "{}: d_z_f16 flat index {index} is non-finite",
+                record.name
+            ));
+        }
+        if index % 2 == 0 && value < 0.0 {
+            return Err(format!(
+                "{}: d_z_f16 scale at flat index {index} is negative",
+                record.name
+            ));
+        }
+    }
+    if let Some((index, code)) = record
+        .codes_u8
+        .iter()
+        .enumerate()
+        .find(|(_, code)| **code > 15)
+    {
+        return Err(format!(
+            "{}: codes_u8[{index}]={code} exceeds the uint4 range",
+            record.name
+        ));
+    }
+
+    let groups = expected_codes / 256;
+    for group in 0..groups {
+        for half in 0..2 {
+            let scale_index = group * 4 + half * 2;
+            if f16_bits_at(record.d_z_f16, scale_index) == 0
+                && record.codes_u8[group * 256 + half * 128..group * 256 + (half + 1) * 128]
+                    .iter()
+                    .any(|&code| code != 0)
+            {
+                return Err(format!(
+                    "{}: group {group} half {half} has zero scale with nonzero codes",
+                    record.name
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn safetensor_range(
+    mmap: &Mmap,
+    tensor: &safetensors::tensor::TensorView<'_>,
+) -> Result<Range<usize>, String> {
+    let start = (tensor.data().as_ptr() as usize)
+        .checked_sub(mmap.as_ptr() as usize)
+        .ok_or_else(|| "safetensors payload is outside its mmap".to_string())?;
+    let end = start
+        .checked_add(tensor.data().len())
+        .ok_or_else(|| "safetensors payload range overflows".to_string())?;
+    Ok(start..end)
+}
+
+fn parse_record_metadata_usize(
+    metadata: &HashMap<String, String>,
+    key: &str,
+    path: &Path,
+) -> Result<usize, String> {
+    metadata
+        .get(key)
+        .ok_or_else(|| format!("{}: missing safetensors metadata `{key}`", path.display()))?
+        .parse::<usize>()
+        .map_err(|error| format!("{}: invalid metadata `{key}`: {error}", path.display()))
+}
+
+pub(crate) fn load_mq4v2_final_code_record(
+    path: &Path,
+    expected_source_sha: &str,
+) -> Result<MappedMq4v2FinalCodeRecord, String> {
+    let file = File::open(path)
+        .map_err(|error| format!("open final-code record {}: {error}", path.display()))?;
+    let mmap = unsafe { Mmap::map(&file) }
+        .map_err(|error| format!("mmap final-code record {}: {error}", path.display()))?;
+    let (_, header) = SafeTensors::read_metadata(&mmap)
+        .map_err(|error| format!("parse final-code record {}: {error}", path.display()))?;
+    let parsed = SafeTensors::deserialize(&mmap)
+        .map_err(|error| format!("parse final-code record {}: {error}", path.display()))?;
+    let names: HashSet<&str> = parsed.names().into_iter().collect();
+    let expected_names: HashSet<&str> = ["S_f16", "d_z_f16", "codes_u8"].into_iter().collect();
+    if names != expected_names {
+        let mut actual: Vec<&str> = names.into_iter().collect();
+        actual.sort_unstable();
+        return Err(format!(
+            "{}: record tensors must be exactly S_f16,d_z_f16,codes_u8; got {:?}",
+            path.display(),
+            actual
+        ));
+    }
+    let metadata = header
+        .metadata()
+        .as_ref()
+        .ok_or_else(|| format!("{}: final-code record has no metadata", path.display()))?;
+    let name = metadata
+        .get("name")
+        .cloned()
+        .ok_or_else(|| format!("{}: missing safetensors metadata `name`", path.display()))?;
+    let m = parse_record_metadata_usize(metadata, "M", path)?;
+    let k = parse_record_metadata_usize(metadata, "K", path)?;
+    let qt_usize = parse_record_metadata_usize(metadata, "qt", path)?;
+    let qt = u8::try_from(qt_usize)
+        .map_err(|_| format!("{}: metadata `qt` does not fit u8", path.display()))?;
+    let source_sha = metadata
+        .get("source_sha")
+        .cloned()
+        .ok_or_else(|| format!("{}: missing safetensors metadata `source_sha`", path.display()))?;
+
+    let s = parsed
+        .tensor("S_f16")
+        .map_err(|error| format!("{}: read S_f16: {error}", path.display()))?;
+    let d_z = parsed
+        .tensor("d_z_f16")
+        .map_err(|error| format!("{}: read d_z_f16: {error}", path.display()))?;
+    let codes = parsed
+        .tensor("codes_u8")
+        .map_err(|error| format!("{}: read codes_u8: {error}", path.display()))?;
+    if s.dtype() != Dtype::F16 || s.shape() != [k] {
+        return Err(format!(
+            "{}: S_f16 must have dtype F16 and shape [{k}], got {:?} {:?}",
+            path.display(),
+            s.dtype(),
+            s.shape()
+        ));
+    }
+    if d_z.dtype() != Dtype::F16 || d_z.shape() != [m, k / 256, 2, 2] {
+        return Err(format!(
+            "{}: d_z_f16 must have dtype F16 and shape [{m},{},2,2], got {:?} {:?}",
+            path.display(),
+            k / 256,
+            d_z.dtype(),
+            d_z.shape()
+        ));
+    }
+    if codes.dtype() != Dtype::U8 || codes.shape() != [m, k] {
+        return Err(format!(
+            "{}: codes_u8 must have dtype U8 and shape [{m},{k}], got {:?} {:?}",
+            path.display(),
+            codes.dtype(),
+            codes.shape()
+        ));
+    }
+    let s_range = safetensor_range(&mmap, &s)?;
+    let d_z_range = safetensor_range(&mmap, &d_z)?;
+    let codes_range = safetensor_range(&mmap, &codes)?;
+    drop(parsed);
+
+    let mapped = MappedMq4v2FinalCodeRecord {
+        path: path.to_path_buf(),
+        name,
+        m,
+        k,
+        qt,
+        source_sha,
+        s_range,
+        d_z_range,
+        codes_range,
+        mmap,
+    };
+    validate_mq4v2_final_code_record(&mapped.as_record(), expected_source_sha)?;
+    Ok(mapped)
+}
+
+pub(crate) fn load_mq4v2_final_code_records(
+    path: &Path,
+    expected_source_sha: &str,
+) -> Result<Vec<MappedMq4v2FinalCodeRecord>, String> {
+    let mut paths = if path.is_dir() {
+        std::fs::read_dir(path)
+            .map_err(|error| format!("read final-code directory {}: {error}", path.display()))?
+            .map(|entry| {
+                entry
+                    .map(|entry| entry.path())
+                    .map_err(|error| format!("read final-code directory entry: {error}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .filter(|entry| entry.extension().and_then(|ext| ext.to_str()) == Some("safetensors"))
+            .collect()
+    } else {
+        vec![path.to_path_buf()]
+    };
+    paths.sort();
+    if paths.is_empty() {
+        return Err(format!(
+            "{} contains no .safetensors final-code records",
+            path.display()
+        ));
+    }
+
+    let mut records = Vec::with_capacity(paths.len());
+    let mut names = HashSet::with_capacity(paths.len());
+    for record_path in paths {
+        let record = load_mq4v2_final_code_record(&record_path, expected_source_sha)?;
+        let name = record.as_record().name.to_string();
+        if !names.insert(name.clone()) {
+            return Err(format!("duplicate MQ4V2 final-code record for `{name}`"));
+        }
+        records.push(record);
+    }
+    Ok(records)
+}
+
+/// Shared runtime producer whose inverse-AWQ scale must be identical.
+pub(crate) fn mq4v2_shared_scale_group(name: &str) -> Option<String> {
+    const FULL_ATTN: [&str; 3] = ["q_proj.weight", "k_proj.weight", "v_proj.weight"];
+    for suffix in FULL_ATTN {
+        if let Some(prefix) = name.strip_suffix(suffix) {
+            return Some(format!("{prefix}qkv"));
+        }
+    }
+    for suffix in ["gate_proj.weight", "up_proj.weight"] {
+        if let Some(prefix) = name.strip_suffix(suffix) {
+            return Some(format!("{prefix}gate_up"));
+        }
+    }
+    for suffix in [
+        "in_proj_qkv.weight",
+        "in_proj_z.weight",
+        "in_proj_a.weight",
+        "in_proj_b.weight",
+    ] {
+        if let Some(prefix) = name.strip_suffix(suffix) {
+            return Some(format!("{prefix}in_proj_qkvzab"));
+        }
+    }
+    None
+}
+
+struct Sha256 {
+    state: [u32; 8],
+    block: [u8; 64],
+    block_len: usize,
+    byte_len: u64,
+}
+
+impl Sha256 {
+    fn new() -> Self {
+        Self {
+            state: [
+                0x6a09e667,
+                0xbb67ae85,
+                0x3c6ef372,
+                0xa54ff53a,
+                0x510e527f,
+                0x9b05688c,
+                0x1f83d9ab,
+                0x5be0cd19,
+            ],
+            block: [0; 64],
+            block_len: 0,
+            byte_len: 0,
+        }
+    }
+
+    fn compress(&mut self, block: &[u8; 64]) {
+        const K: [u32; 64] = [
+            0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1,
+            0x923f82a4, 0xab1c5ed5, 0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3,
+            0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174, 0xe49b69c1, 0xefbe4786,
+            0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+            0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147,
+            0x06ca6351, 0x14292967, 0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13,
+            0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85, 0xa2bfe8a1, 0xa81a664b,
+            0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+            0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a,
+            0x5b9cca4f, 0x682e6ff3, 0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208,
+            0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
+        ];
+        let mut words = [0u32; 64];
+        for (index, chunk) in block.chunks_exact(4).take(16).enumerate() {
+            words[index] = u32::from_be_bytes(chunk.try_into().unwrap());
+        }
+        for index in 16..64 {
+            let s0 = words[index - 15].rotate_right(7)
+                ^ words[index - 15].rotate_right(18)
+                ^ (words[index - 15] >> 3);
+            let s1 = words[index - 2].rotate_right(17)
+                ^ words[index - 2].rotate_right(19)
+                ^ (words[index - 2] >> 10);
+            words[index] = words[index - 16]
+                .wrapping_add(s0)
+                .wrapping_add(words[index - 7])
+                .wrapping_add(s1);
+        }
+        let [mut a, mut b, mut c, mut d, mut e, mut f, mut g, mut h] = self.state;
+        for index in 0..64 {
+            let sum1 = e.rotate_right(6) ^ e.rotate_right(11) ^ e.rotate_right(25);
+            let choose = (e & f) ^ ((!e) & g);
+            let temp1 = h
+                .wrapping_add(sum1)
+                .wrapping_add(choose)
+                .wrapping_add(K[index])
+                .wrapping_add(words[index]);
+            let sum0 = a.rotate_right(2) ^ a.rotate_right(13) ^ a.rotate_right(22);
+            let majority = (a & b) ^ (a & c) ^ (b & c);
+            let temp2 = sum0.wrapping_add(majority);
+            h = g;
+            g = f;
+            f = e;
+            e = d.wrapping_add(temp1);
+            d = c;
+            c = b;
+            b = a;
+            a = temp1.wrapping_add(temp2);
+        }
+        for (state, value) in self.state.iter_mut().zip([a, b, c, d, e, f, g, h]) {
+            *state = state.wrapping_add(value);
+        }
+    }
+
+    fn update(&mut self, mut bytes: &[u8]) {
+        self.byte_len = self.byte_len.wrapping_add(bytes.len() as u64);
+        while !bytes.is_empty() {
+            let take = (64 - self.block_len).min(bytes.len());
+            self.block[self.block_len..self.block_len + take].copy_from_slice(&bytes[..take]);
+            self.block_len += take;
+            bytes = &bytes[take..];
+            if self.block_len == 64 {
+                let block = self.block;
+                self.compress(&block);
+                self.block_len = 0;
+            }
+        }
+    }
+
+    fn finish(mut self) -> [u8; 32] {
+        let bit_len = self.byte_len.wrapping_mul(8);
+        self.block[self.block_len] = 0x80;
+        self.block_len += 1;
+        if self.block_len > 56 {
+            self.block[self.block_len..].fill(0);
+            let block = self.block;
+            self.compress(&block);
+            self.block = [0; 64];
+        } else {
+            self.block[self.block_len..56].fill(0);
+        }
+        self.block[56..].copy_from_slice(&bit_len.to_be_bytes());
+        let block = self.block;
+        self.compress(&block);
+        let mut digest = [0u8; 32];
+        for (chunk, word) in digest.chunks_exact_mut(4).zip(self.state) {
+            chunk.copy_from_slice(&word.to_be_bytes());
+        }
+        digest
+    }
+}
+
+pub(crate) fn sha256_file_hex(path: &Path) -> Result<String, String> {
+    let file = File::open(path).map_err(|error| format!("open {} for SHA-256: {error}", path.display()))?;
+    let mut reader = BufReader::with_capacity(4 * 1024 * 1024, file);
+    let mut buffer = vec![0u8; 4 * 1024 * 1024];
+    let mut hasher = Sha256::new();
+    loop {
+        let count = reader
+            .read(&mut buffer)
+            .map_err(|error| format!("read {} for SHA-256: {error}", path.display()))?;
+        if count == 0 {
+            break;
+        }
+        hasher.update(&buffer[..count]);
+    }
+    Ok(hasher
+        .finish()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
 
 
 pub(crate) fn resolve_model_path(input: &str) -> String {
@@ -521,6 +1042,339 @@ pub(crate) fn compute_awq_scales(in_sum2: &[f32], alpha: f32) -> Vec<f32> {
         .into_iter()
         .map(|l| ((l - mean_log).exp() as f32).clamp(AWQ_SCALE_MIN, AWQ_SCALE_MAX))
         .collect()
+}
+
+/// Host representation of the runtime's 72-byte `block_i4_128` activation block.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct BlockI4_128 {
+    pub(crate) d: f32,
+    pub(crate) s: i32,
+    pub(crate) qs: [u8; 64],
+}
+
+impl BlockI4_128 {
+    pub(crate) fn to_bytes(&self) -> [u8; 72] {
+        let mut bytes = [0u8; 72];
+        bytes[..4].copy_from_slice(&self.d.to_le_bytes());
+        bytes[4..8].copy_from_slice(&self.s.to_le_bytes());
+        bytes[8..].copy_from_slice(&self.qs);
+        bytes
+    }
+
+    fn dequantize(&self) -> [f32; 128] {
+        let mut values = [0.0f32; 128];
+        for (i, value) in values.iter_mut().enumerate() {
+            let nibble = if i & 1 == 0 {
+                self.qs[i / 2] & 0x0f
+            } else {
+                self.qs[i / 2] >> 4
+            };
+            let q = ((nibble as i8) << 4) >> 4;
+            *value = self.d * q as f32;
+        }
+        values
+    }
+}
+
+/// CPU twin of the gfx1201 producer specialization in
+/// `kernels/src/block_i4_128_quant.hip`.
+///
+/// Arithmetic order is intentional: four values are accumulated per simulated
+/// wave lane and then reduced with the same XOR 16,8,4,2,1 tree. The four scale
+/// candidates and their pre-rounded constants are the runtime contract.
+pub(crate) fn fake_quantize_block_i4_128(input: &[f32; 128]) -> BlockI4_128 {
+    let mut lane_amax = [0.0f32; 32];
+    for lane in 0..32 {
+        let base = lane * 4;
+        lane_amax[lane] = input[base]
+            .abs()
+            .max(input[base + 1].abs())
+            .max(input[base + 2].abs())
+            .max(input[base + 3].abs());
+    }
+    for offset in [16usize, 8, 4, 2, 1] {
+        let prior = lane_amax;
+        for lane in 0..32 {
+            lane_amax[lane] = lane_amax[lane].max(prior[lane ^ offset]);
+        }
+    }
+    let amax = lane_amax[0];
+
+    let mut best_d = 1.0f32;
+    if amax != 0.0 {
+        let candidate_base = (amax / 7.0f32) * 0.5f32;
+        let multipliers = [
+            1.0f32,
+            f32::from_bits(0x3fa4_9249),
+            f32::from_bits(0x3fdb_6db7),
+            2.0f32,
+        ];
+        let mut best_mse = 1.0e30f32;
+        for multiplier in multipliers {
+            let d = candidate_base * multiplier;
+            let mut lane_mse = [0.0f32; 32];
+            for lane in 0..32 {
+                let base = lane * 4;
+                let mut mse = 0.0f32;
+                for e in 0..4 {
+                    let q = (input[base + e] / d)
+                        .round_ties_even()
+                        .clamp(-8.0, 7.0);
+                    let err = (-q).mul_add(d, input[base + e]);
+                    mse = err.mul_add(err, mse);
+                }
+                lane_mse[lane] = mse;
+            }
+            for offset in [16usize, 8, 4, 2, 1] {
+                let prior = lane_mse;
+                for lane in 0..32 {
+                    lane_mse[lane] += prior[lane ^ offset];
+                }
+            }
+            if lane_mse[0] < best_mse {
+                best_mse = lane_mse[0];
+                best_d = d;
+            }
+        }
+    }
+
+    let mut q4 = [0i32; 128];
+    for i in 0..128 {
+        q4[i] = if amax == 0.0 {
+            0
+        } else {
+            (input[i] / best_d)
+                .round_ties_even()
+                .clamp(-8.0, 7.0) as i32
+        };
+    }
+    let s = q4.iter().sum();
+    let mut qs = [0u8; 64];
+    for i in 0..64 {
+        qs[i] = ((q4[2 * i] & 15) | ((q4[2 * i + 1] & 15) << 4)) as u8;
+    }
+    BlockI4_128 { d: best_d, s, qs }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct A4AwareAwqResult {
+    pub(crate) scales: Vec<f32>,
+    pub(crate) alpha: f32,
+    pub(crate) relative_output_mse: f64,
+}
+
+fn representative_activation(in_sum2: &[f32]) -> Vec<f32> {
+    let mut x: Vec<f32> = in_sum2
+        .iter()
+        .map(|&v| (v as f64).max(1e-12).min(1e30).sqrt() as f32)
+        .collect();
+    let rms = (x
+        .iter()
+        .map(|&v| (v as f64) * (v as f64))
+        .sum::<f64>()
+        / x.len() as f64)
+        .sqrt() as f32;
+    if rms.is_finite() && rms > 0.0 {
+        for value in &mut x {
+            *value /= rms;
+        }
+    }
+    x
+}
+
+fn fake_quantize_runtime_activation(
+    activation: &[f32],
+    scales: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<f32> {
+    use crate::quant_fwht::cpu_fwht_256;
+
+    debug_assert_eq!(activation.len(), scales.len());
+    debug_assert_eq!(activation.len() % 256, 0);
+    let mut output = vec![0.0f32; activation.len()];
+    for group_start in (0..activation.len()).step_by(256) {
+        let mut group = [0.0f32; 256];
+        for i in 0..256 {
+            group[i] = activation[group_start + i] / scales[group_start + i];
+        }
+        cpu_fwht_256(&mut group, signs1, signs2);
+        for half in 0..2 {
+            let mut input = [0.0f32; 128];
+            input.copy_from_slice(&group[half * 128..(half + 1) * 128]);
+            let dequantized = fake_quantize_block_i4_128(&input).dequantize();
+            output[group_start + half * 128..group_start + (half + 1) * 128]
+                .copy_from_slice(&dequantized);
+        }
+    }
+    output
+}
+
+fn fake_quantize_mq4v2_weight_group(group: &mut [f32; 256]) {
+    for half in 0..2 {
+        let values = &group[half * 128..(half + 1) * 128];
+        let lo = values.iter().copied().fold(f32::INFINITY, f32::min);
+        let hi = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+        let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
+        let scale_bits = if hi == lo { 0 } else { f32_to_f16(step_f32) };
+        let zero_bits = f32_to_f16(lo);
+        let scale = f16_to_f32(scale_bits);
+        let zero = f16_to_f32(zero_bits);
+        let degenerate = hi == lo || step_f32 == 0.0 || scale == 0.0;
+        for i in half * 128..(half + 1) * 128 {
+            group[i] = if degenerate {
+                zero
+            } else {
+                let q = ((group[i] - zero) * (1.0 / scale) + 0.5)
+                    .floor()
+                    .clamp(0.0, 15.0);
+                q.mul_add(scale, zero)
+            };
+        }
+    }
+}
+
+fn w4a4_relative_output_mse(
+    weights: &[f32],
+    m: usize,
+    k: usize,
+    activation: &[f32],
+    reference_outputs: &[f64],
+    sampled_rows: &[usize],
+    scales: &[f32],
+    signs1: &[f32],
+    signs2: &[f32],
+) -> f64 {
+    use crate::quant_fwht::cpu_fwht_256;
+
+    let quantized_activation =
+        fake_quantize_runtime_activation(activation, scales, signs1, signs2);
+    let mut error2 = 0.0f64;
+    let mut signal2 = 0.0f64;
+    for (sample, &row) in sampled_rows.iter().enumerate() {
+        let row_weights = &weights[row * k..(row + 1) * k];
+        let mut output = 0.0f64;
+        for group_start in (0..k).step_by(256) {
+            let mut group = [0.0f32; 256];
+            for i in 0..256 {
+                group[i] = row_weights[group_start + i] * scales[group_start + i];
+            }
+            cpu_fwht_256(&mut group, signs1, signs2);
+            fake_quantize_mq4v2_weight_group(&mut group);
+            for i in 0..256 {
+                output +=
+                    (group[i] as f64) * (quantized_activation[group_start + i] as f64);
+            }
+        }
+        let reference = reference_outputs[sample];
+        let error = output - reference;
+        error2 += error * error;
+        signal2 += reference * reference;
+    }
+    error2 / signal2.max(1e-30)
+}
+
+/// Search the fixed AWQ alpha grid against the actual MQ4V2 × runtime-A4
+/// output objective. The imatrix diagonal supplies a representative per-channel
+/// RMS activation; rows are sampled uniformly to keep the search bounded on
+/// vocab and wide projection matrices.
+pub(crate) fn compute_a4_aware_awq_scales(
+    in_sum2: &[f32],
+    weights: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> A4AwareAwqResult {
+    debug_assert_eq!(in_sum2.len(), k);
+    debug_assert_eq!(weights.len(), m * k);
+    debug_assert_eq!(k % 256, 0);
+
+    let activation = representative_activation(in_sum2);
+    let sample_count = m.min(128);
+    let sampled_rows: Vec<usize> = (0..sample_count)
+        .map(|sample| sample * m / sample_count)
+        .collect();
+    let reference_outputs: Vec<f64> = sampled_rows
+        .iter()
+        .map(|&row| {
+            weights[row * k..(row + 1) * k]
+                .iter()
+                .zip(&activation)
+                .map(|(&w, &x)| (w as f64) * (x as f64))
+                .sum()
+        })
+        .collect();
+
+    let mut best: Option<A4AwareAwqResult> = None;
+    for alpha in AWQ_A4_CANDIDATE_ALPHAS {
+        let scales = compute_awq_scales(in_sum2, alpha);
+        let relative_output_mse = w4a4_relative_output_mse(
+            weights,
+            m,
+            k,
+            &activation,
+            &reference_outputs,
+            &sampled_rows,
+            &scales,
+            signs1,
+            signs2,
+        );
+        if best
+            .as_ref()
+            .map_or(true, |current| relative_output_mse < current.relative_output_mse)
+        {
+            best = Some(A4AwareAwqResult {
+                scales,
+                alpha,
+                relative_output_mse,
+            });
+        }
+    }
+    best.expect("AWQ A4 alpha grid is non-empty")
+}
+
+pub(crate) fn compute_awq_scales_for_weight(
+    in_sum2: &[f32],
+    fallback_alpha: f32,
+    weights: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> A4AwareAwqResult {
+    if AWQ_A4_AWARE.get().copied().unwrap_or(false) {
+        // Fused qkvza/gate-up producers inverse-scale one activation for several
+        // weight matrices. Every matrix consuming the same calibration vector
+        // must therefore use the same alpha, or its folded W*s no longer
+        // cancels x/s at runtime. Tensor ordering puts the large fused anchor
+        // first; subsequent siblings reuse its winning alpha.
+        let activation_key: Vec<u32> = in_sum2.iter().map(|value| value.to_bits()).collect();
+        if let Some(alpha) = AWQ_A4_ALPHA_BY_ACTIVATION
+            .lock()
+            .expect("A4 AWQ alpha cache poisoned")
+            .get(&activation_key)
+            .copied()
+        {
+            return A4AwareAwqResult {
+                scales: compute_awq_scales(in_sum2, alpha),
+                alpha,
+                relative_output_mse: f64::NAN,
+            };
+        }
+        let selected = compute_a4_aware_awq_scales(in_sum2, weights, m, k, signs1, signs2);
+        AWQ_A4_ALPHA_BY_ACTIVATION
+            .lock()
+            .expect("A4 AWQ alpha cache poisoned")
+            .insert(activation_key, selected.alpha);
+        selected
+    } else {
+        A4AwareAwqResult {
+            scales: compute_awq_scales(in_sum2, fallback_alpha),
+            alpha: fallback_alpha,
+            relative_output_mse: f64::NAN,
+        }
+    }
 }
 
 /// Apply AWQ pre-scaling to a row-major [m, k] weight tensor in place:
@@ -1346,6 +2200,91 @@ mod gemma4_name_translation_tests {
         assert_eq!(
             gguf_to_safetensors_name("blk.2.layer_output_scale.weight", 13).unwrap(),
             "model.layers.2.layer_scalar"
+        );
+    }
+}
+
+#[cfg(test)]
+mod block_i4_128_tests {
+    use super::fake_quantize_block_i4_128;
+
+    /// Fixture dumped on gfx1201 by launching the shipping
+    /// `quantize_int4_mmq_ds128` kernel from `block_i4_128_quant.hip`.
+    #[test]
+    fn cpu_fake_quant_matches_dumped_gfx1201_block_bit_for_bit() {
+        let mut input = [0.0f32; 128];
+        let mut state = 0x1234_5678u32;
+        for value in &mut input {
+            state = state.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            let centered = ((state >> 8) & 0xffff) as i32 - 32_768;
+            *value = centered as f32 * (1.0f32 / 4096.0f32);
+        }
+        let expected = [
+            0xe5, 0x54, 0x7a, 0x3f, 0x05, 0x00, 0x00, 0x00, 0xbc, 0xe6, 0x36, 0x59, 0x5b,
+            0xd0, 0x8f, 0x68, 0x01, 0x3e, 0x48, 0x9d, 0x72, 0x1e, 0x70, 0xfc, 0xc5, 0x1c,
+            0xfa, 0x7b, 0x2f, 0x0a, 0xdc, 0x5a, 0x18, 0x1a, 0xb4, 0x7d, 0x15, 0xc2, 0xae,
+            0x60, 0x3f, 0x17, 0x22, 0x43, 0x4a, 0xe5, 0x25, 0x70, 0xa1, 0x06, 0x27, 0x91,
+            0xc8, 0x19, 0xd5, 0x2e, 0x5b, 0x6c, 0xb6, 0xbe, 0x1e, 0x45, 0x63, 0x25, 0x4c,
+            0xa6, 0x4a, 0x07, 0xec, 0xa7, 0xec, 0x62,
+        ];
+        assert_eq!(fake_quantize_block_i4_128(&input).to_bytes(), expected);
+    }
+}
+
+#[cfg(test)]
+mod mq4v2_final_code_record_tests {
+    use super::{
+        sha256_file_hex, validate_mq4v2_final_code_record, Mq4v2FinalCodeRecord,
+        MQ4V2_FINAL_CODE_QTYPE,
+    };
+    use hipfire_quantize::float16::f32_to_f16;
+    use std::io::Write;
+
+    fn f16_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|&value| f32_to_f16(value).to_le_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn final_code_record_validator_enforces_frozen_contract() {
+        let source_sha = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let s_f16 = f16_bytes(&vec![1.0; 256]);
+        let d_z_f16 = f16_bytes(&[0.25, -1.0, 0.5, -2.0]);
+        let codes_u8 = (0..256).map(|index| (index % 16) as u8).collect::<Vec<_>>();
+        let valid = Mq4v2FinalCodeRecord {
+            name: "model.layers.0.mlp.gate_proj.weight",
+            m: 1,
+            k: 256,
+            qt: MQ4V2_FINAL_CODE_QTYPE,
+            source_sha,
+            s_f16: &s_f16,
+            d_z_f16: &d_z_f16,
+            codes_u8: &codes_u8,
+        };
+        validate_mq4v2_final_code_record(&valid, source_sha).unwrap();
+
+        let mut bad_codes = codes_u8.clone();
+        bad_codes[37] = 16;
+        let bad_nibble = Mq4v2FinalCodeRecord {
+            codes_u8: &bad_codes,
+            ..valid
+        };
+        assert!(validate_mq4v2_final_code_record(&bad_nibble, source_sha)
+            .unwrap_err()
+            .contains("uint4 range"));
+
+        let wrong_source = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        assert!(validate_mq4v2_final_code_record(&valid, wrong_source)
+            .unwrap_err()
+            .contains("does not match input artifact"));
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"abc").unwrap();
+        assert_eq!(
+            sha256_file_hex(file.path()).unwrap(),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
 }

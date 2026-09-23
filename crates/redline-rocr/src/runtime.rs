@@ -579,6 +579,35 @@ impl GpuDevice {
         Ok(frequency)
     }
 
+    /// Number of compute units on this GPU agent
+    /// (`HSA_AMD_AGENT_INFO_COMPUTE_UNIT_COUNT`).
+    ///
+    /// Ported from upstream redline-rocr runtime.rs. Diagnostic use: CU
+    /// partition sizing for `create_with_cu_mask` flows.
+    pub fn compute_unit_count(&self) -> Result<u32, RuntimeError> {
+        let mut count = 0_u32;
+        query_agent(
+            &self.runtime.symbols,
+            self.gpu_agent(),
+            abi::AMD_AGENT_INFO_COMPUTE_UNIT_COUNT,
+            (&mut count as *mut u32).cast(),
+        )?;
+        Ok(count)
+    }
+
+    /// CUs fully enabled for cooperative dispatch
+    /// (`HSA_AMD_AGENT_INFO_COOPERATIVE_COMPUTE_UNIT_COUNT`).
+    pub fn cooperative_compute_unit_count(&self) -> Result<u32, RuntimeError> {
+        let mut count = 0_u32;
+        query_agent(
+            &self.runtime.symbols,
+            self.gpu_agent(),
+            abi::AMD_AGENT_INFO_COOPERATIVE_COMPUTE_UNIT_COUNT,
+            (&mut count as *mut u32).cast(),
+        )?;
+        Ok(count)
+    }
+
     fn gpu_agent(&self) -> abi::Agent {
         self.gpu.handle
     }
@@ -1072,6 +1101,15 @@ pub struct AqlQueue {
     raw: NonNull<abi::Queue>,
     fault: Option<Box<QueueFaultState>>,
     active: bool,
+    /// True when the last `hsa_amd_queue_cu_set_mask` returned
+    /// `HSA_STATUS_CU_MASK_REDUCED` (requested bits ANDed with process-wide
+    /// `HSA_CU_MASK`). False after a plain success or when no mask was set.
+    cu_mask_was_reduced: bool,
+    /// Effective CU affinity after the last successful set-mask, one bool per
+    /// device CU. Cached because ROCr 1.21 `AqlQueue::SetCUMasking` returns
+    /// from the KFD path without updating its internal `cu_mask_`, so
+    /// `hsa_amd_queue_cu_get_mask` keeps reporting the init-time all-CU mask.
+    effective_cu_mask: Option<Vec<bool>>,
 }
 
 impl fmt::Debug for AqlQueue {
@@ -1079,6 +1117,7 @@ impl fmt::Debug for AqlQueue {
         f.debug_struct("AqlQueue")
             .field("id", &self.id())
             .field("size", &self.size())
+            .field("cu_mask_was_reduced", &self.cu_mask_was_reduced)
             .finish()
     }
 }
@@ -1127,6 +1166,8 @@ impl AqlQueue {
             raw,
             fault: Some(fault),
             active: true,
+            cu_mask_was_reduced: false,
+            effective_cu_mask: None,
         };
         let descriptor = queue.descriptor();
         if descriptor.base_address.is_null()
@@ -1139,6 +1180,157 @@ impl AqlQueue {
             ));
         }
         Ok(queue)
+    }
+
+    /// Create a queue and apply a CU affinity mask before first use.
+    ///
+    /// Ported from upstream redline-rocr runtime.rs (`AqlQueue::create_with_cu_mask`).
+    /// `cu_mask[i] == true` enables compute unit `i`. The mask must not be
+    /// longer than `GpuDevice::compute_unit_count`; it is packed into the
+    /// `uint32_t` bit-vector expected by `hsa_amd_queue_cu_set_mask` (bit
+    /// count rounded up to a multiple of 32). An empty mask enables every CU
+    /// (`num_cu_mask_count == 0`).
+    ///
+    /// `HSA_STATUS_CU_MASK_REDUCED` handling matches upstream: ROCr combines
+    /// the requested mask with any process-wide `HSA_CU_MASK` via bitwise AND.
+    /// When that intersection drops requested CUs the queue is still kept and
+    /// `cu_mask_was_reduced` reports the reduction; only an effective mask
+    /// with no CUs enabled is an error (`CuMaskEmptyAfterReduce`).
+    ///
+    /// Diagnostic-only entry point: hipfire wires no default partition. The
+    /// disjoint-mask slowdown upstream measured (0.57x/0.43x) is why this
+    /// stays opt-in.
+    pub fn create_with_cu_mask(
+        device: &GpuDevice,
+        requested_size: u32,
+        cu_mask: &[bool],
+    ) -> Result<Self, RuntimeError> {
+        let cu_count = device.compute_unit_count()?;
+        if cu_mask.len() > cu_count as usize {
+            return Err(RuntimeError::CuMaskWiderThanDevice {
+                mask_bits: cu_mask.len(),
+                compute_unit_count: cu_count,
+            });
+        }
+        let mut queue = Self::create(device, requested_size)?;
+        queue.set_cu_mask(device, cu_mask)?;
+        Ok(queue)
+    }
+
+    /// Apply a per-CU bool affinity mask to this queue.
+    ///
+    /// See `create_with_cu_mask` for `HSA_STATUS_CU_MASK_REDUCED` semantics
+    /// (effective-mask read-back and empty-mask rejection).
+    fn set_cu_mask(&mut self, device: &GpuDevice, cu_mask: &[bool]) -> Result<(), RuntimeError> {
+        let cu_count = device.compute_unit_count()? as usize;
+        let (num_bits, words) = pack_cu_mask_words(cu_mask);
+        let cu_mask_ptr = if num_bits == 0 {
+            ptr::null()
+        } else {
+            words.as_ptr()
+        };
+        // SAFETY: the queue is live and owned; `cu_mask_ptr` is either null
+        // (enable-all) or points at `words`, which outlives the call.
+        let status = unsafe {
+            (self.runtime().symbols.queue_cu_set_mask)(self.raw.as_ptr(), num_bits, cu_mask_ptr)
+        };
+        self.apply_cu_mask_set_status(device, status, cu_mask, cu_count)
+    }
+
+    /// Interpret `hsa_amd_queue_cu_set_mask` status, including REDUCED read-back.
+    ///
+    /// On plain success the requested mask is the effective affinity (any
+    /// process-wide `HSA_CU_MASK` clip would have returned REDUCED). On REDUCED
+    /// the HSA get-mask is consulted; when ROCr returns the un-updated all-CU
+    /// init vector (the KFD early-return path upstream documented) the
+    /// requested bits are kept so callers never observe a silent full-device
+    /// mask after a successful partitioned set. When this runtime predates the
+    /// get-mask symbol the requested bits are likewise kept.
+    fn apply_cu_mask_set_status(
+        &mut self,
+        device: &GpuDevice,
+        status: abi::Status,
+        requested: &[bool],
+        cu_count: usize,
+    ) -> Result<(), RuntimeError> {
+        if status == abi::STATUS_SUCCESS {
+            self.cu_mask_was_reduced = false;
+            self.effective_cu_mask = Some(normalize_cu_mask(requested, cu_count));
+            return Ok(());
+        }
+        if status == STATUS_CU_MASK_REDUCED {
+            let requested_norm = normalize_cu_mask(requested, cu_count);
+            let from_hsa = self
+                .cu_mask_from_hsa(device)
+                .unwrap_or_else(|_| requested_norm.clone());
+            let effective =
+                if cu_mask_is_all_enabled(&from_hsa) && !cu_mask_is_all_enabled(&requested_norm) {
+                    requested_norm
+                } else {
+                    from_hsa
+                };
+            if effective.iter().all(|enabled| !*enabled) {
+                return Err(RuntimeError::CuMaskEmptyAfterReduce);
+            }
+            self.cu_mask_was_reduced = true;
+            self.effective_cu_mask = Some(effective);
+            return Ok(());
+        }
+        Err(RuntimeError::Hsa {
+            operation: "hsa_amd_queue_cu_set_mask",
+            status,
+            message: status_message(&self.runtime().symbols, status),
+        })
+    }
+
+    /// Whether the last CU mask application was reduced by process-wide
+    /// `HSA_CU_MASK` (`HSA_STATUS_CU_MASK_REDUCED`).
+    ///
+    /// When true, call `cu_mask` for the effective affinity; the
+    /// requested mask was not applied verbatim.
+    #[must_use]
+    pub fn cu_mask_was_reduced(&self) -> bool {
+        self.cu_mask_was_reduced
+    }
+
+    /// Read the queue's current CU affinity mask (one bool per compute unit).
+    ///
+    /// Prefers the post-set effective cache when present (see
+    /// `effective_cu_mask`). Otherwise queries `hsa_amd_queue_cu_get_mask`
+    /// when the loaded runtime exports it; on older runtimes without the
+    /// symbol a fresh queue reports the creation-state all-enabled mask.
+    pub fn cu_mask(&self, device: &GpuDevice) -> Result<Vec<bool>, RuntimeError> {
+        if let Some(mask) = self.effective_cu_mask.as_ref() {
+            let cu_count = device.compute_unit_count()? as usize;
+            return Ok(normalize_cu_mask(mask, cu_count));
+        }
+        self.cu_mask_from_hsa(device)
+    }
+
+    fn cu_mask_from_hsa(&self, device: &GpuDevice) -> Result<Vec<bool>, RuntimeError> {
+        let runtime = self.runtime.as_ref().ok_or(RuntimeError::InvalidRuntimeObject(
+            "queue runtime is not retained",
+        ))?;
+        if !Arc::ptr_eq(runtime, &device.runtime) {
+            return Err(RuntimeError::InvalidRuntimeObject(
+                "CU mask query device belongs to another HSA runtime",
+            ));
+        }
+        let cu_count = device.compute_unit_count()?;
+        let num_bits = cu_mask_bit_capacity(cu_count as usize);
+        if num_bits == 0 {
+            return Ok(Vec::new());
+        }
+        let word_count = (num_bits / 32) as usize;
+        let Some(get_mask) = runtime.symbols.queue_cu_get_mask else {
+            return Ok(vec![true; cu_count as usize]);
+        };
+        let mut words = vec![0_u32; word_count];
+        // SAFETY: the queue descriptor is owned and live; `words` is a valid
+        // output buffer sized to a non-zero multiple of 32 bits.
+        let status = unsafe { get_mask(self.raw.as_ptr(), num_bits, words.as_mut_ptr()) };
+        check_status(&runtime.symbols, "hsa_amd_queue_cu_get_mask", status)?;
+        Ok(unpack_cu_mask_words(&words, cu_count as usize))
     }
 
     pub fn id(&self) -> u64 {
@@ -1164,7 +1356,7 @@ impl AqlQueue {
         )
     }
 
-    fn set_cu_mask(&self, mask_bits: u32, mask: &[u32]) -> Result<(), RuntimeError> {
+    fn set_cu_mask_words(&self, mask_bits: u32, mask: &[u32]) -> Result<(), RuntimeError> {
         if mask_bits == 0 || !mask_bits.is_multiple_of(32) {
             return Err(RuntimeError::InvalidCuMask(
                 "mask bit count must be a non-zero multiple of 32",
@@ -1453,6 +1645,35 @@ impl QueueSet {
         })
     }
 
+    /// Create one queue per CU mask, applying each mask before first use.
+    ///
+    /// Ported from upstream redline-rocr runtime.rs (`QueueSet::create_with_cu_masks`).
+    /// Empty `cu_masks` is rejected (`ZeroQueues`). Each mask is forwarded to
+    /// `AqlQueue::create_with_cu_mask`; an empty per-lane mask enables every CU.
+    /// Diagnostic-only: hipfire wires no default partition.
+    pub fn create_with_cu_masks(
+        device: &GpuDevice,
+        queue_size: u32,
+        cu_masks: &[Vec<bool>],
+    ) -> Result<Self, RuntimeError> {
+        if cu_masks.is_empty() {
+            return Err(RuntimeError::ZeroQueues);
+        }
+        let mut queues = Vec::with_capacity(cu_masks.len());
+        for mask in cu_masks {
+            queues.push(AqlQueue::create_with_cu_mask(device, queue_size, mask)?);
+        }
+        let mut ids = queues.iter().map(AqlQueue::id).collect::<Vec<_>>();
+        ids.sort_unstable();
+        if ids.windows(2).any(|pair| pair[0] == pair[1]) {
+            return Err(RuntimeError::DuplicateQueueId);
+        }
+        Ok(Self {
+            prepared_doorbells: vec![None; queues.len()],
+            queues,
+        })
+    }
+
     /// Create one queue for each explicitly supplied GPU agent.
     ///
     /// This is the mixed-agent counterpart to [`Self::create`]. All devices
@@ -1502,13 +1723,31 @@ impl QueueSet {
 
     pub fn set_cu_mask(&self, mask_bits: u32, mask: &[u32]) -> Result<(), RuntimeError> {
         for queue in &self.queues {
-            queue.set_cu_mask(mask_bits, mask)?;
+            queue.set_cu_mask_words(mask_bits, mask)?;
         }
         Ok(())
     }
 
     pub fn size(&self, lane: usize) -> Option<u32> {
         self.queues.get(lane).map(AqlQueue::size)
+    }
+
+    /// Read lane `lane`'s effective CU affinity via `AqlQueue::cu_mask`.
+    ///
+    /// Returns `None` when `lane` is out of range.
+    pub fn cu_mask(
+        &self,
+        lane: usize,
+        device: &GpuDevice,
+    ) -> Option<Result<Vec<bool>, RuntimeError>> {
+        self.queues.get(lane).map(|queue| queue.cu_mask(device))
+    }
+
+    /// Whether lane `lane`'s last CU mask application was reduced by process-wide
+    /// `HSA_CU_MASK`. Returns `None` when `lane` is out of range.
+    #[must_use]
+    pub fn cu_mask_was_reduced(&self, lane: usize) -> Option<bool> {
+        self.queues.get(lane).map(AqlQueue::cu_mask_was_reduced)
     }
 
     /// Prepare every queue without ringing any queue. This avoids a CPU packet
@@ -2582,6 +2821,63 @@ fn read_elf_u64(bytes: &[u8], offset: usize) -> Option<u64> {
     ))
 }
 
+/// `HSA_STATUS_CU_MASK_REDUCED` — set-mask applied the request ANDed with
+/// process-wide `HSA_CU_MASK`; some requested CUs may be disabled. Handled by
+/// `AqlQueue::apply_cu_mask_set_status` (not treated as unconditional success).
+const STATUS_CU_MASK_REDUCED: abi::Status = 44;
+
+/// Bit capacity for HSA CU mask APIs: 0, or a positive multiple of 32.
+fn cu_mask_bit_capacity(bit_len: usize) -> u32 {
+    if bit_len == 0 {
+        0
+    } else {
+        (bit_len.div_ceil(32) * 32) as u32
+    }
+}
+
+/// Pack a per-CU bool mask into the `uint32_t` bit-vector HSA expects.
+///
+/// Returns `(num_cu_mask_count, words)` where `num_cu_mask_count` is the bit
+/// width (0 or a multiple of 32). Empty input means "enable all CUs".
+fn pack_cu_mask_words(cu_mask: &[bool]) -> (u32, Vec<u32>) {
+    let num_bits = cu_mask_bit_capacity(cu_mask.len());
+    if num_bits == 0 {
+        return (0, Vec::new());
+    }
+    let mut words = vec![0_u32; (num_bits / 32) as usize];
+    for (index, enabled) in cu_mask.iter().enumerate() {
+        if *enabled {
+            words[index / 32] |= 1_u32 << (index % 32);
+        }
+    }
+    (num_bits, words)
+}
+
+fn unpack_cu_mask_words(words: &[u32], bit_len: usize) -> Vec<bool> {
+    (0..bit_len)
+        .map(|index| {
+            let word = words.get(index / 32).copied().unwrap_or(0);
+            word & (1_u32 << (index % 32)) != 0
+        })
+        .collect()
+}
+
+/// Normalize a CU bool mask to exactly `cu_count` bits (pad false / truncate).
+fn normalize_cu_mask(cu_mask: &[bool], cu_count: usize) -> Vec<bool> {
+    let mut out = vec![false; cu_count];
+    let n = cu_mask.len().min(cu_count);
+    out[..n].copy_from_slice(&cu_mask[..n]);
+    // Empty request means "all CUs" per hsa_amd_queue_cu_set_mask.
+    if cu_mask.is_empty() {
+        out.fill(true);
+    }
+    out
+}
+
+fn cu_mask_is_all_enabled(mask: &[bool]) -> bool {
+    !mask.is_empty() && mask.iter().all(|&bit| bit)
+}
+
 fn check_status(
     symbols: &abi::Symbols,
     operation: &'static str,
@@ -2657,6 +2953,12 @@ pub enum RuntimeError {
     ZeroQueues,
     DuplicateQueueId,
     InvalidCuMask(&'static str),
+    CuMaskWiderThanDevice {
+        mask_bits: usize,
+        compute_unit_count: u32,
+    },
+    /// Effective CU mask after `HSA_STATUS_CU_MASK_REDUCED` enables no CUs.
+    CuMaskEmptyAfterReduce,
     ProfilingUnavailable(&'static str),
     InvalidRuntimeObject(&'static str),
     NoKernargPool,
@@ -2751,6 +3053,17 @@ impl fmt::Display for RuntimeError {
             Self::ZeroQueues => write!(f, "at least one HSA queue is required"),
             Self::DuplicateQueueId => write!(f, "ROCr returned duplicate IDs for distinct queues"),
             Self::InvalidCuMask(message) => write!(f, "invalid HSA CU mask: {message}"),
+            Self::CuMaskWiderThanDevice {
+                mask_bits,
+                compute_unit_count,
+            } => write!(
+                f,
+                "CU mask has {mask_bits} bits but device reports only {compute_unit_count} compute units"
+            ),
+            Self::CuMaskEmptyAfterReduce => write!(
+                f,
+                "CU mask was reduced by process-wide HSA_CU_MASK to an empty affinity (no compute units enabled)"
+            ),
             Self::ProfilingUnavailable(symbol) => {
                 write!(f, "ROCr profiling capability is unavailable: {symbol}")
             }
@@ -2808,6 +3121,68 @@ mod tests {
     use proptest::prelude::*;
 
     use super::*;
+
+    #[test]
+    fn pack_cu_mask_words_empty_means_all_cus() {
+        let (bits, words) = pack_cu_mask_words(&[]);
+        assert_eq!(bits, 0);
+        assert!(words.is_empty());
+    }
+
+    #[test]
+    fn pack_cu_mask_words_rounds_up_to_multiple_of_32() {
+        let mask = vec![true, false, true];
+        let (bits, words) = pack_cu_mask_words(&mask);
+        assert_eq!(bits, 32);
+        assert_eq!(words, vec![0b101]);
+        assert_eq!(unpack_cu_mask_words(&words, mask.len()), mask);
+    }
+
+    #[test]
+    fn pack_cu_mask_words_spans_multiple_words() {
+        let mut mask = vec![false; 40];
+        mask[0] = true;
+        mask[31] = true;
+        mask[32] = true;
+        mask[39] = true;
+        let (bits, words) = pack_cu_mask_words(&mask);
+        assert_eq!(bits, 64);
+        assert_eq!(words.len(), 2);
+        assert_eq!(words[0], 1 | (1 << 31));
+        assert_eq!(words[1], 1 | (1 << 7));
+        assert_eq!(unpack_cu_mask_words(&words, mask.len()), mask);
+    }
+
+    #[test]
+    fn normalize_cu_mask_pads_and_truncates_to_device_width() {
+        assert_eq!(normalize_cu_mask(&[true], 3), vec![true, false, false]);
+        assert_eq!(normalize_cu_mask(&[true, false, true, true], 2), vec![true, false]);
+        // Empty request means all CUs per hsa_amd_queue_cu_set_mask.
+        assert_eq!(normalize_cu_mask(&[], 2), vec![true, true]);
+    }
+
+    #[test]
+    fn cu_mask_wider_than_device_display_names_counts() {
+        let err = RuntimeError::CuMaskWiderThanDevice {
+            mask_bits: 128,
+            compute_unit_count: 64,
+        };
+        let text = err.to_string();
+        assert!(text.contains("128"), "{text}");
+        assert!(text.contains("64"), "{text}");
+    }
+
+    #[test]
+    fn cu_mask_empty_after_reduce_display_names_cause() {
+        let text = RuntimeError::CuMaskEmptyAfterReduce.to_string();
+        assert!(text.contains("HSA_CU_MASK"), "{text}");
+        assert!(text.contains("empty"), "{text}");
+    }
+
+    #[test]
+    fn status_cu_mask_reduced_is_hsa_value_44() {
+        assert_eq!(STATUS_CU_MASK_REDUCED, 44);
+    }
 
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(512))]

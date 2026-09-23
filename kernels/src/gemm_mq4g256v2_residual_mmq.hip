@@ -184,6 +184,33 @@ extern "C" __global__ void gemm_mq4g256v2_residual_mmq_full_set(
     int,
     int
 ) {}
+#ifdef HIPFIRE_MMQ_LUT
+// LUT-arg twin stubs (same file, distinct symbols). Real bodies are RDNA3-only.
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_lloyd(
+    const char*, const block_q8_1_mmq*, float*, int, int, int, int,
+    unsigned int, unsigned int, unsigned int, unsigned int
+) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_x128_lloyd(
+    const char*, const block_q8_1_mmq*, float*, int, int, int, int,
+    unsigned int, unsigned int, unsigned int, unsigned int
+) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_full_add_lloyd(
+    const char*, const block_q8_1_mmq*, float*, int, int, int, int,
+    unsigned int, unsigned int, unsigned int, unsigned int
+) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_full_set_lloyd(
+    const char*, const block_q8_1_mmq*, float*, int, int, int, int,
+    unsigned int, unsigned int, unsigned int, unsigned int
+) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_full_add_x128_lloyd(
+    const char*, const block_q8_1_mmq*, float*, int, int, int, int,
+    unsigned int, unsigned int, unsigned int, unsigned int
+) {}
+extern "C" __global__ void gemm_mq4g256v2_residual_mmq_full_set_x128_lloyd(
+    const char*, const block_q8_1_mmq*, float*, int, int, int, int,
+    unsigned int, unsigned int, unsigned int, unsigned int
+) {}
+#endif
 
 #else
 
@@ -295,6 +322,58 @@ static __device__ __forceinline__ void mma_i8(
 // quantize_q8_1_mmq_ds4 hoisted above the HIPFIRE_RDNA3 split (line ~38)
 // because the body is wave-portable. Phase 0 §3.5 verified.
 
+#ifdef HIPFIRE_MMQ_LUT
+// MQ4G256V2-Lloyd (qt=52) MMQ-LUT: 16-entry signed i8 codebook as 4 kernarg
+// dwords. Outcome A (signed weight operand): mma_i8 calls
+// __builtin_amdgcn_wmma_i32_16x16x16_iu8_w32(true, A, true, B, C, true) —
+// both A_sign and B_sign are true, so C16 codes in [-120,120] feed the A
+// (weight) operand directly. sc' = sc/16; zp' already folded in headers via
+// apply_lloyd_centering. i32 C_frag headroom: worst |C| = 128·240·127 =
+// 3,901,440 ≪ 2³¹ (X128 half; per-32 is 4× smaller). No overflow handling.
+//
+// Decode forms (HIPFIRE_MMQ_LUT_PAIRTAB, default ON):
+//   1 — 256-entry u16 LDS pair-table, one ds_read_u16 per packed nibble-byte
+//       (lo nibble → low byte, hi nibble → high byte). +512 B LDS.
+//   0 — v_perm spread4+lut8 chain (A/B baseline; more VALU, no extra LDS).
+#ifndef HIPFIRE_MMQ_LUT_PAIRTAB
+#define HIPFIRE_MMQ_LUT_PAIRTAB 1
+#endif
+#if HIPFIRE_MMQ_LUT_PAIRTAB
+// pair = code[lo] | (code[hi]<<8) for packed byte b = lo | (hi<<4).
+__device__ static inline unsigned short mq4_pair_from_c16(
+    unsigned b, unsigned C0, unsigned C1, unsigned C2, unsigned C3) {
+    const unsigned Cs[4] = {C0, C1, C2, C3};
+    const unsigned lo_q = b & 0xFu;
+    const unsigned hi_q = b >> 4;
+    const unsigned lo = (Cs[lo_q >> 2] >> ((lo_q & 3u) * 8u)) & 0xFFu;
+    const unsigned hi = (Cs[hi_q >> 2] >> ((hi_q & 3u) * 8u)) & 0xFFu;
+    return (unsigned short)(lo | (hi << 8));
+}
+__device__ static inline void mq4_build_pairtab(
+    unsigned short* __restrict__ tab,
+    unsigned C0, unsigned C1, unsigned C2, unsigned C3) {
+    const int nthreads = (int)(blockDim.x * blockDim.y * blockDim.z);
+    const int tid = (int)(threadIdx.z * (blockDim.x * blockDim.y)
+                        + threadIdx.y * blockDim.x + threadIdx.x);
+    for (int b = tid; b < 256; b += nthreads)
+        tab[b] = mq4_pair_from_c16((unsigned)b, C0, C1, C2, C3);
+}
+#else
+// v_perm form from gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:76-95.
+__device__ static inline unsigned int mq4_spread4(unsigned int x16) {
+    const unsigned int a = (x16 & 0x00FFu) | ((x16 & 0xFF00u) << 8);
+    return (a & 0x000F000Fu) | ((a & 0x00F000F0u) << 4);
+}
+__device__ static inline unsigned int mq4_lut8(unsigned int sel,
+    unsigned int C0, unsigned int C1, unsigned int C2, unsigned int C3) {
+    // v_perm_b32(hi, lo, s): result byte i = {lo,hi} byte s_i for s_i in 0..7.
+    const unsigned int lo = __builtin_amdgcn_perm(C1, C0, sel & 0x07070707u);
+    const unsigned int hi = __builtin_amdgcn_perm(C3, C2, sel & 0x07070707u);
+    const unsigned int m = ((sel >> 3) & 0x01010101u) * 0xFFu;
+    return (hi & m) | (lo & ~m);
+}
+#endif
+#endif
 template <bool FULL>
 static __device__ __forceinline__ void load_mq4v2_tile(
     const char* __restrict__ A,
@@ -303,6 +382,13 @@ static __device__ __forceinline__ void load_mq4v2_tile(
     int kb,
     int M,
     int groups_per_row
+#ifdef HIPFIRE_MMQ_LUT
+#if HIPFIRE_MMQ_LUT_PAIRTAB
+    , const unsigned short* __restrict__ pair_tab
+#else
+    , unsigned int C0, unsigned int C1, unsigned int C2, unsigned int C3
+#endif
+#endif
 ) {
     int* x_qs = tile_x;
     half2* x_dm = (half2*)(x_qs + 2 * MMQ_TILE_NE_K);
@@ -317,6 +403,25 @@ static __device__ __forceinline__ void load_mq4v2_tile(
         const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
         const unsigned int qs0 = *(const unsigned int*)(gp + 8 + txi * 4);
 
+#ifdef HIPFIRE_MMQ_LUT
+#if HIPFIRE_MMQ_LUT_PAIRTAB
+        // One ds_read_u16 per packed nibble-byte; 4×u16 → two i8x4 words.
+        const unsigned short p0 = pair_tab[qs0 & 0xFFu];
+        const unsigned short p1 = pair_tab[(qs0 >>  8) & 0xFFu];
+        const unsigned short p2 = pair_tab[(qs0 >> 16) & 0xFFu];
+        const unsigned short p3 = pair_tab[(qs0 >> 24) & 0xFFu];
+        x_qs[i * MMQ_TILE_X_K + 2 * txi + 0] =
+            (int)((unsigned)p0 | ((unsigned)p1 << 16));
+        x_qs[i * MMQ_TILE_X_K + 2 * txi + 1] =
+            (int)((unsigned)p2 | ((unsigned)p3 << 16));
+#else
+        // One v_perm byte lookup per 8 codes (spread4 + lut8 × 2).
+        x_qs[i * MMQ_TILE_X_K + 2 * txi + 0] =
+            (int)mq4_lut8(mq4_spread4(qs0 & 0xFFFFu), C0, C1, C2, C3);
+        x_qs[i * MMQ_TILE_X_K + 2 * txi + 1] =
+            (int)mq4_lut8(mq4_spread4(qs0 >> 16), C0, C1, C2, C3);
+#endif
+#else
         const unsigned int q0 = (qs0 >>  0) & 0xFu;
         const unsigned int q1 = (qs0 >>  4) & 0xFu;
         const unsigned int q2 = (qs0 >>  8) & 0xFu;
@@ -327,6 +432,7 @@ static __device__ __forceinline__ void load_mq4v2_tile(
         const unsigned int q7 = (qs0 >> 28) & 0xFu;
         x_qs[i * MMQ_TILE_X_K + 2 * txi + 0] = q0 | (q1 << 8) | (q2 << 16) | (q3 << 24);
         x_qs[i * MMQ_TILE_X_K + 2 * txi + 1] = q4 | (q5 << 8) | (q6 << 16) | (q7 << 24);
+#endif
     }
 
     // MQ4V2 dual-fp16 headers: ksc 0 owns K 0..127 (dm slots 0..3),
@@ -339,7 +445,13 @@ static __device__ __forceinline__ void load_mq4v2_tile(
             const char* gp = A + ((long long)row * groups_per_row + kb) * 136;
             const int ksc = threadIdx.x & 1;
             const unsigned int hs = *(const unsigned int*)(gp + 4 * ksc);
+#ifdef HIPFIRE_MMQ_LUT
+            // sc' = sc/16: codes are 16·(L−7.5); zp' already in headers.
+            // i32 headroom |C| ≤ 128·240·127 = 3,901,440 ≪ 2³¹ (see helpers).
+            const float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu))) * 0.0625f;
+#else
             const float sc = __half2float(__ushort_as_half((unsigned short)(hs & 0xFFFFu)));
+#endif
             const float zp = __half2float(__ushort_as_half((unsigned short)(hs >> 16)));
             const half2 dm = make_half2((_Float16)sc, (_Float16)zp);
             #pragma unroll
@@ -471,6 +583,9 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_base_body(
     int K,
     int N,
     int add
+#ifdef HIPFIRE_MMQ_LUT
+    , unsigned int C0, unsigned int C1, unsigned int C2, unsigned int C3
+#endif
 ) {
     const int row0 = blockIdx.x * MMQ_Y;
     const int col0 = blockIdx.y * MMQ_X;
@@ -482,11 +597,30 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_base_body(
     extern __shared__ int smem[];
     int* tile_y = smem;
     int* tile_x = tile_y + MMQ_X * MMQ_TILE_Y_K;
+#ifdef HIPFIRE_MMQ_LUT
+#if HIPFIRE_MMQ_LUT_PAIRTAB
+    // +512 B after tiles: 256×u16 pair table. Base tiles =
+    // (MMQ_X*MMQ_TILE_Y_K + MMQ_Y*MMQ_TILE_X_K)*4 = 57344 B; +512 = 57856 B.
+    // 2 blocks × 57856 = 115712 > 65536 → still 1 block/CU LDS-bound on gfx11
+    // (same as the uniform kernel). Occ is not worsened vs pre-pairtab twin.
+    unsigned short* pair_tab = (unsigned short*)(tile_x + MMQ_Y * MMQ_TILE_X_K);
+    mq4_build_pairtab(pair_tab, C0, C1, C2, C3);
+    __syncthreads();
+#endif
+#endif
 
     float sum[MMQ_X * MMQ_Y / (MMQ_NWARPS * WARP_SIZE)] = {0.0f};
 
     for (int kb = 0; kb < groups_per_row; ++kb) {
+#ifdef HIPFIRE_MMQ_LUT
+#if HIPFIRE_MMQ_LUT_PAIRTAB
+        load_mq4v2_tile<false>(A, tile_x, row0, kb, M, groups_per_row, pair_tab);
+#else
+        load_mq4v2_tile<false>(A, tile_x, row0, kb, M, groups_per_row, C0, C1, C2, C3);
+#endif
+#else
         load_mq4v2_tile<false>(A, tile_x, row0, kb, M, groups_per_row);
+#endif
 
         const int* by0 = (const int*)(Xq + (long long)(2 * kb) * N + col0);
         for (int l0 = 0; l0 < MMQ_X * MMQ_TILE_Y_K; l0 += MMQ_NWARPS * WARP_SIZE) {
@@ -540,6 +674,35 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_base_body(
     }
 }
 
+#ifdef HIPFIRE_MMQ_LUT
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_mq4g256v2_residual_mmq_lloyd(
+    const char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add,
+    unsigned int C0, unsigned int C1, unsigned int C2, unsigned int C3
+) {
+    gemm_mq4g256v2_residual_mmq_base_body<false>(A, Xq, Y, M, K, N, add, C0, C1, C2, C3);
+}
+
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_mq4g256v2_residual_mmq_x128_lloyd(
+    const char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int add,
+    unsigned int C0, unsigned int C1, unsigned int C2, unsigned int C3
+) {
+    gemm_mq4g256v2_residual_mmq_base_body<true>(A, Xq, Y, M, K, N, add, C0, C1, C2, C3);
+}
+#else
 extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
 void gemm_mq4g256v2_residual_mmq(
     const char* __restrict__ A,
@@ -565,6 +728,7 @@ void gemm_mq4g256v2_residual_mmq_x128(
 ) {
     gemm_mq4g256v2_residual_mmq_base_body<true>(A, Xq, Y, M, K, N, add);
 }
+#endif
 
 template <bool ADD, bool X128>
 static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_full_body(
@@ -574,6 +738,9 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_full_body(
     int M,
     int K,
     int N
+#ifdef HIPFIRE_MMQ_LUT
+    , unsigned int C0, unsigned int C1, unsigned int C2, unsigned int C3
+#endif
 ) {
     const int row0 = blockIdx.x * MMQ_Y;
     const int col0 = blockIdx.y * MMQ_X;
@@ -584,11 +751,26 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_full_body(
     extern __shared__ int smem[];
     int* tile_y = smem;
     int* tile_x = tile_y + MMQ_X * MMQ_TILE_Y_K;
+#ifdef HIPFIRE_MMQ_LUT
+#if HIPFIRE_MMQ_LUT_PAIRTAB
+    unsigned short* pair_tab = (unsigned short*)(tile_x + MMQ_Y * MMQ_TILE_X_K);
+    mq4_build_pairtab(pair_tab, C0, C1, C2, C3);
+    __syncthreads();
+#endif
+#endif
 
     float sum[MMQ_X * MMQ_Y / (MMQ_NWARPS * WARP_SIZE)] = {0.0f};
 
     for (int kb = 0; kb < groups_per_row; ++kb) {
+#ifdef HIPFIRE_MMQ_LUT
+#if HIPFIRE_MMQ_LUT_PAIRTAB
+        load_mq4v2_tile<true>(A, tile_x, row0, kb, M, groups_per_row, pair_tab);
+#else
+        load_mq4v2_tile<true>(A, tile_x, row0, kb, M, groups_per_row, C0, C1, C2, C3);
+#endif
+#else
         load_mq4v2_tile<true>(A, tile_x, row0, kb, M, groups_per_row);
+#endif
 
         const int* by0 = (const int*)(Xq + (long long)(2 * kb) * N + col0);
         for (int l0 = 0; l0 < MMQ_X * MMQ_TILE_Y_K; l0 += MMQ_NWARPS * WARP_SIZE) {
@@ -638,6 +820,63 @@ static __device__ __forceinline__ void gemm_mq4g256v2_residual_mmq_full_body(
     }
 }
 
+#ifdef HIPFIRE_MMQ_LUT
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_mq4g256v2_residual_mmq_full_add_lloyd(
+    const char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int,
+    unsigned int C0, unsigned int C1, unsigned int C2, unsigned int C3
+) {
+    gemm_mq4g256v2_residual_mmq_full_body<true, false>(A, Xq, Y, M, K, N, C0, C1, C2, C3);
+}
+
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_mq4g256v2_residual_mmq_full_set_lloyd(
+    const char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int,
+    unsigned int C0, unsigned int C1, unsigned int C2, unsigned int C3
+) {
+    gemm_mq4g256v2_residual_mmq_full_body<false, false>(A, Xq, Y, M, K, N, C0, C1, C2, C3);
+}
+
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_mq4g256v2_residual_mmq_full_add_x128_lloyd(
+    const char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int,
+    unsigned int C0, unsigned int C1, unsigned int C2, unsigned int C3
+) {
+    gemm_mq4g256v2_residual_mmq_full_body<true, true>(A, Xq, Y, M, K, N, C0, C1, C2, C3);
+}
+
+extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
+void gemm_mq4g256v2_residual_mmq_full_set_x128_lloyd(
+    const char* __restrict__ A,
+    const block_q8_1_mmq* __restrict__ Xq,
+    float* __restrict__ Y,
+    int M,
+    int K,
+    int N,
+    int,
+    unsigned int C0, unsigned int C1, unsigned int C2, unsigned int C3
+) {
+    gemm_mq4g256v2_residual_mmq_full_body<false, true>(A, Xq, Y, M, K, N, C0, C1, C2, C3);
+}
+#else
 extern "C" __global__ __launch_bounds__(MMQ_NWARPS * WARP_SIZE, 2)
 void gemm_mq4g256v2_residual_mmq_full_add(
     const char* __restrict__ A,
@@ -689,5 +928,6 @@ void gemm_mq4g256v2_residual_mmq_full_set_x128(
 ) {
     gemm_mq4g256v2_residual_mmq_full_body<false, true>(A, Xq, Y, M, K, N);
 }
+#endif
 
 #endif

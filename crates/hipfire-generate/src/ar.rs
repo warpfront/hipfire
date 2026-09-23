@@ -2554,7 +2554,20 @@ pub fn generate(
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
     // Borrow `tokenizer` per-use (never held across whole-`m` calls): the
     // context-full reset below reborrows `m` through the canonical reset.
-    let prompt_est = m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20;
+    // Skip the full BPE encode when the prompt provably fits: every token
+    // covers >= 1 byte, so byte length over-approximates the token count
+    // and a byte-fit implies a token-fit. Near-boundary requests still
+    // measure exactly, so reset decisions are unchanged.
+    let prompt_est = if m.eviction.is_none()
+        && m.seq_pos.saturating_add(prompt.len())
+            .saturating_add(20)
+            .saturating_add(max_tokens)
+            > m.max_seq
+    {
+        m.tokenizer.as_ref().unwrap().encode(prompt).len() + 20
+    } else {
+        0
+    };
     if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
         .ok()
         .as_deref()
@@ -3794,15 +3807,26 @@ pub fn generate(
             }
         } else {
             // Manually chunk the no-eviction prefill so the abort check fires
-            // between batches. Outer chunks must agree with internal chunk /
-            // PBS capacity via `prefill_max_batch` (gfx1201 defaults 384;
-            // gfx11/CDNA stay 256; HIPFIRE_PREFILL_MAX_BATCH>=2 overrides).
+            // between batches. Outer chunks follow the admitted ordinary
+            // ceiling (the same decision the forward below enforces) with the
+            // serve tail rule (1025→1024+1); the inner forward re-admits per
+            // chunk, so a smaller memory admission only narrows chunks, never
+            // breaks them. At the 512 ceiling this is `min(remaining, 512),
+            // identical to the legacy split.
             // Adaptive-KV keeps the hard `PREFILL_MAX_BATCH` (256) cap so the
             // controller's margin and maybe_downshift boundaries stay exact.
             let chunk_max = if m.kv_adaptive.is_some() {
                 qwen35::PREFILL_MAX_BATCH
             } else {
-                qwen35::prefill_max_batch(gpu)
+                match qwen35::ordinary_prefill_chunk_limit(gpu, weights, config, dn, kv, None) {
+                    Ok(limit) => limit,
+                    Err(e) => {
+                        eprintln!(
+                            "ar prefill: chunk-limit query failed ({e}); keeping legacy ceiling"
+                        );
+                        qwen35::prefill_max_batch(gpu)
+                    }
+                }
             };
             let mut start = 0usize;
             while start < new_tokens.len() {
@@ -3810,7 +3834,10 @@ pub fn generate(
                     prefill_aborted = true;
                     break;
                 }
-                let end = (start + chunk_max).min(new_tokens.len());
+                let remaining = new_tokens.len() - start;
+                let outer = qwen35::prefill::ordinary_serve_prefill_chunk_len(remaining, chunk_max)
+                    .unwrap_or(remaining.min(chunk_max).max(1));
+                let end = (start + outer).min(new_tokens.len());
                 let chunk = &new_tokens[start..end];
                 if let Err(e) = qwen35::forward_prefill_batch(
                     gpu, weights, config, chunk, m.seq_pos, kv, dn, scratch, None, None, None, None,

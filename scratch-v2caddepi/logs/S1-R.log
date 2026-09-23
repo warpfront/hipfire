@@ -1,0 +1,53 @@
+device gfx1100, 48 MPs
+time rev add_k6144  seq:set+fold    4.120 ms
+time rev add_k6144  seq:add+norm    4.409 ms
+time rev add_k6144  norm:fold       1.084 ms
+time rev add_k6144  norm:base       0.951 ms
+time rev add_k6144  add:start       3.234 ms
+time rev add_k6144  add:l64d16p4    3.228 ms
+time rev add_k6144  add:l128d8      3.210 ms
+time rev add_k6144  add:l128d16     3.177 ms
+time rev add_k6144  add:l64d32      3.166 ms
+time rev add_k6144  add:l64d4       3.449 ms
+time rev add_k6144  add:l64d8       3.173 ms
+time rev add_k6144  add:l64d16      3.132 ms
+time rev add_k6144  add:base        3.489 ms
+time rev add_k6144  set:base        3.078 ms
+time rev add_k6144  add:base        3.497 ms
+summary rev add_k6144 touch base      3.497 vs 3.497 ms: +0.00%
+summary rev add_k6144 touch l64d16    3.132 vs 3.497 ms: -10.44%
+summary rev add_k6144 touch l64d8     3.173 vs 3.497 ms: -9.27%
+summary rev add_k6144 touch l64d4     3.449 vs 3.497 ms: -1.38%
+summary rev add_k6144 touch l64d32    3.166 vs 3.497 ms: -9.49%
+summary rev add_k6144 touch l128d16   3.177 vs 3.497 ms: -9.17%
+summary rev add_k6144 touch l128d8    3.210 vs 3.497 ms: -8.23%
+summary rev add_k6144 touch l64d16p4  3.228 vs 3.497 ms: -7.70%
+summary rev add_k6144 touch start     3.234 vs 3.497 ms: -7.52%
+summary rev add_k6144 seq add+norm 4.409  seq set+fold 4.120  (-6.55%)
+summary rev add_k6144 add+norm 4.448  set+foldnorm 4.161  fold saves 0.287 ms (6.45%)
+time rev add_k17408 seq:set+fold    9.632 ms
+time rev add_k17408 seq:add+norm    9.647 ms
+time rev add_k17408 norm:fold       1.082 ms
+time rev add_k17408 norm:base       0.947 ms
+time rev add_k17408 add:start       8.735 ms
+time rev add_k17408 add:l64d16p4    8.727 ms
+time rev add_k17408 add:l128d8      8.679 ms
+time rev add_k17408 add:l128d16     8.656 ms
+time rev add_k17408 add:l64d32      8.659 ms
+time rev add_k17408 add:l64d4       8.871 ms
+time rev add_k17408 add:l64d8       8.635 ms
+time rev add_k17408 add:l64d16      8.636 ms
+time rev add_k17408 add:base        8.730 ms
+time rev add_k17408 set:base        8.561 ms
+time rev add_k17408 add:base        8.677 ms
+summary rev add_k17408 touch base      8.677 vs 8.677 ms: +0.00%
+summary rev add_k17408 touch l64d16    8.636 vs 8.677 ms: -0.47%
+summary rev add_k17408 touch l64d8     8.635 vs 8.677 ms: -0.48%
+summary rev add_k17408 touch l64d4     8.871 vs 8.677 ms: +2.23%
+summary rev add_k17408 touch l64d32    8.659 vs 8.677 ms: -0.21%
+summary rev add_k17408 touch l128d16   8.656 vs 8.677 ms: -0.24%
+summary rev add_k17408 touch l128d8    8.679 vs 8.677 ms: +0.02%
+summary rev add_k17408 touch l64d16p4  8.727 vs 8.677 ms: +0.57%
+summary rev add_k17408 touch start     8.735 vs 8.677 ms: +0.67%
+summary rev add_k17408 seq add+norm 9.647  seq set+fold 9.632  (-0.16%)
+summary rev add_k17408 add+norm 9.624  set+foldnorm 9.643  fold saves -0.019 ms (-0.20%)

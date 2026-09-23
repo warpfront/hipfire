@@ -1,0 +1,22 @@
+device gfx1100, 48 MPs
+oracle add_k6144  ADD base     outputs 41943040 differing 0
+oracle add_k6144  ADD l64d16   outputs 41943040 differing 0
+oracle add_k6144  ADD l64d8    outputs 41943040 differing 0
+oracle add_k6144  ADD l64d4    outputs 41943040 differing 0
+oracle add_k6144  ADD l64d32   outputs 41943040 differing 0
+oracle add_k6144  ADD l128d16  outputs 41943040 differing 0
+oracle add_k6144  ADD l128d8   outputs 41943040 differing 0
+oracle add_k6144  ADD l64d16p4 outputs 41943040 differing 0
+oracle add_k6144  ADD start    outputs 41943040 differing 0
+oracle add_k6144  FOLD residual outputs 41943040 differing 0; block_i4_128 bytes 23592960 differing 0
+oracle add_k17408 ADD base     outputs 41943040 differing 0
+oracle add_k17408 ADD l64d16   outputs 41943040 differing 0
+oracle add_k17408 ADD l64d8    outputs 41943040 differing 0
+oracle add_k17408 ADD l64d4    outputs 41943040 differing 0
+oracle add_k17408 ADD l64d32   outputs 41943040 differing 0
+oracle add_k17408 ADD l128d16  outputs 41943040 differing 0
+oracle add_k17408 ADD l128d8   outputs 41943040 differing 0
+oracle add_k17408 ADD l64d16p4 outputs 41943040 differing 0
+oracle add_k17408 ADD start    outputs 41943040 differing 0
+oracle add_k17408 FOLD residual outputs 41943040 differing 0; block_i4_128 bytes 23592960 differing 0
+oracle total compared 886046720 differing 0 -> PASS

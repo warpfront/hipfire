@@ -96,7 +96,8 @@ fn main() {
                 let v = argv[i + 1].clone();
                 if !matches!(
                     v.as_str(),
-                    "q8" | "asym2"
+                    "q8" | "fp8" | "bf16"
+                        | "asym2"
                         | "asym3"
                         | "asym4"
                         | "fwht2"
@@ -105,7 +106,7 @@ fn main() {
                         | "f32"
                         | "f16"
                 ) {
-                    eprintln!("--kv-mode must be one of: q8 asym2 asym3 asym4 fwht2 fwht3 fwht4 f32 f16 (got {v})");
+                    eprintln!("--kv-mode must be one of: q8 fp8 bf16 asym2 asym3 asym4 fwht2 fwht3 fwht4 f32 f16 (got {v})");
                     std::process::exit(1);
                 }
                 kv_mode = v;
@@ -201,14 +202,6 @@ fn main() {
         gpu.arch,
         args.model.display()
     );
-    // gfx12 Lloyd kernels are gated by HIPFIRE_LLOYD_GFX12 (see PR #195).
-    // Set if running on gfx12; harmless on other arches.
-    if gpu.arch.starts_with("gfx12") {
-        unsafe {
-            std::env::set_var("HIPFIRE_LLOYD_GFX12", "1");
-        }
-        eprintln!("eval_hipfire: arch is gfx12; set HIPFIRE_LLOYD_GFX12=1");
-    }
 
     // -------- arch detection (mirrors calib_sweep.rs:654-658) --------
     // HFQ header is authoritative for file models; for safetensors dirs we
@@ -447,6 +440,93 @@ fn main() {
                 kv_max,
             )
             .unwrap(),
+            "fp8" => {
+                // Stage-b Q0: native fp8 KV (E4M3FN + f16 scale per
+                // token/head, 1032 B rows at Hkv4/D256). Admission is exact
+                // and fails before allocation: gfx1201 only, dense Qwen
+                // H24/Hkv4/D256, neutral V (`--kv-v q8` spelling identifies
+                // fp8/fp8); never falls through to a q8 reader.
+                if args.kv_v != "q8" {
+                    eprintln!(
+                        "eval_hipfire: --kv-mode fp8 requires --kv-v q8 (neutral V spelling); got --kv-v {}",
+                        args.kv_v
+                    );
+                    std::process::exit(1);
+                }
+                if config.num_experts != 0 {
+                    eprintln!(
+                        "eval_hipfire: --kv-mode fp8 admitted only for dense Qwen (num_experts={})",
+                        config.num_experts
+                    );
+                    std::process::exit(1);
+                }
+                if config.n_heads != 24 || config.n_kv_heads != 4 || config.head_dim != 256 {
+                    eprintln!(
+                        "eval_hipfire: --kv-mode fp8 admitted only for H24/Hkv4/D256 (got H{}/Hkv{}/D{})",
+                        config.n_heads, config.n_kv_heads, config.head_dim
+                    );
+                    std::process::exit(1);
+                }
+                if gpu.arch != "gfx1201" {
+                    eprintln!(
+                        "eval_hipfire: --kv-mode fp8 admitted only on gfx1201 (got {})",
+                        gpu.arch
+                    );
+                    std::process::exit(1);
+                }
+                eprintln!("eval_hipfire: fp8/fp8 native KV (E4M3FN + f16/token/head)");
+                KvCache::new_gpu_fp8_filtered(
+                    &mut gpu,
+                    &is_kv_layer,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    kv_max,
+                )
+                .unwrap()
+            },
+            "bf16" => {
+                // Quality control: unscaled bf16 K/V (stride D*2 per head,
+                // no scales). Same exact admission as fp8 (gfx1201, dense
+                // Qwen H24/Hkv4/D256, neutral V); never falls through to a
+                // q8 reader. Expected to read ≈ the f32 reference.
+                if args.kv_v != "q8" {
+                    eprintln!(
+                        "eval_hipfire: --kv-mode bf16 requires --kv-v q8 (neutral V spelling); got --kv-v {}",
+                        args.kv_v
+                    );
+                    std::process::exit(1);
+                }
+                if config.num_experts != 0 {
+                    eprintln!(
+                        "eval_hipfire: --kv-mode bf16 admitted only for dense Qwen (num_experts={})",
+                        config.num_experts
+                    );
+                    std::process::exit(1);
+                }
+                if config.n_heads != 24 || config.n_kv_heads != 4 || config.head_dim != 256 {
+                    eprintln!(
+                        "eval_hipfire: --kv-mode bf16 admitted only for H24/Hkv4/D256 (got H{}/Hkv{}/D{})",
+                        config.n_heads, config.n_kv_heads, config.head_dim
+                    );
+                    std::process::exit(1);
+                }
+                if gpu.arch != "gfx1201" {
+                    eprintln!(
+                        "eval_hipfire: --kv-mode bf16 admitted only on gfx1201 (got {})",
+                        gpu.arch
+                    );
+                    std::process::exit(1);
+                }
+                eprintln!("eval_hipfire: bf16/bf16 unscaled KV (quality control)");
+                KvCache::new_gpu_bf16_filtered(
+                    &mut gpu,
+                    &is_kv_layer,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    kv_max,
+                )
+                .unwrap()
+            },
             "asym4" => KvCache::new_gpu_asym4(
                 &mut gpu,
                 config.n_layers,

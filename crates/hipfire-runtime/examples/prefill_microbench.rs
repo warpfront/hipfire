@@ -140,11 +140,6 @@ fn main() {
         gpu.arch,
         args.model.display()
     );
-    if gpu.arch.starts_with("gfx12") {
-        unsafe {
-            std::env::set_var("HIPFIRE_LLOYD_GFX12", "1");
-        }
-    }
     let weights = {
         let mut src = qwen35::HfqSource::new(&mut hfq, &config);
         let layout = qwen35::Layout::single(config.n_layers);

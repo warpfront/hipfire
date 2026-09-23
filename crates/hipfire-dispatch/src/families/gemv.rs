@@ -40,6 +40,13 @@ pub struct WeightRef<'a> {
     pub row_stride: usize,
     pub rotation: Option<GivensRef<'a>>,
     pub awq_scale: Option<&'a GpuTensor>,
+    /// MQ4G256V2-Lloyd (qt=52) centered codebook LUTs, copied from
+    /// `WeightTensor` by `dispatch_ref`. `Some` iff the tensor was correctly
+    /// loaded; LUT-kernel arms fail closed on `None`. `lloyd_lut_c16` is the
+    /// MMQ byte-code table (GEMV decode does not consume it).
+    pub lloyd_lut_e4m3: Option<[u32; 4]>,
+    pub lloyd_lut_f16: Option<[u32; 8]>,
+    pub lloyd_lut_c16: Option<[u32; 4]>,
 }
 
 // ── Dispatch parameters ────────────────────────────────
@@ -494,7 +501,21 @@ fn launch(gpu: &mut Gpu, key: KernelKey, p: &GemvParams) -> Result<(), DispatchE
         K::GemvQ8HFQ => hip!(gpu.gemv_q8hfq(w.buf, x, y, m, k, w.row_stride)),
         // prerotated
         K::GemvMq4G256Prerotated => hip!(gpu.gemv_mq4g256_prerotated(w.buf, x, y, m, k)),
-        K::GemvMq4G256V2Prerotated => hip!(gpu.gemv_mq4g256v2(w.buf, x, y, m, k)),
+        K::GemvMq4G256V2Prerotated => {
+            // qt=52 shares the qt=44 dispatch key: branch on the WEIGHT dtype,
+            // never the key. LUT None fails closed (a Lloyd tensor without its
+            // codebook must error, never decode on the uniform grid).
+            if w.dtype == DType::MQ4G256V2Lloyd {
+                let lut = w.lloyd_lut_f16.ok_or_else(|| {
+                    DispatchError::Hip(
+                        "gemv family (prerotated): MQ4G256V2Lloyd weight reached the LUT kernel with lloyd_lut_f16=None — re-quantize with a build that emits lloyd_levels (F32[16]); refusing uniform decode".into(),
+                    )
+                })?;
+                hip!(gpu.gemv_mq4g256v2_lloyd(w.buf, x, y, m, k, lut))
+            } else {
+                hip!(gpu.gemv_mq4g256v2(w.buf, x, y, m, k))
+            }
+        }
         K::GemvMq5G256V2Prerotated => hip!(gpu.gemv_mq5g256v2(w.buf, x, y, m, k)),
         K::GemvMq6G256V2Prerotated => hip!(gpu.gemv_mq6g256v2(w.buf, x, y, m, k)),
         K::GemvMq3G256V2Prerotated => hip!(gpu.gemv_mq3g256v2(w.buf, x, y, m, k)),
@@ -547,6 +568,15 @@ fn dispatch_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), DispatchE
         // (same contract as Prerotated) — dispatch through HFQ residual kernel.
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x, y, m, k)),
         MQ4G256V2 => hip!(gpu.gemv_hfq4g256_residual_mq4v2(w.buf, x, y, m, k)),
+        // qt=52 residual LUT twin. LUT None fails closed (never uniform).
+        MQ4G256V2Lloyd => {
+            let lut = w.lloyd_lut_f16.ok_or_else(|| {
+                DispatchError::Hip(
+                    "gemv family (residual): MQ4G256V2Lloyd weight reached the LUT kernel with lloyd_lut_f16=None — re-quantize with a build that emits lloyd_levels (F32[16]); refusing uniform decode".into(),
+                )
+            })?;
+            hip!(gpu.gemv_hfq4g256_residual_mq4v2_lloyd(w.buf, x, y, m, k, lut))
+        }
         MQ5G256V2 => hip!(gpu.gemv_mq5g256v2_residual(w.buf, x, y, m, k)),
         MQ6G256V2 => hip!(gpu.gemv_mq6g256v2_residual(w.buf, x, y, m, k)),
         MQ3G256V2 => hip!(gpu.gemv_mq3g256v2_residual(w.buf, x, y, m, k)),
@@ -590,6 +620,16 @@ fn dispatch_swiglu_residual(gpu: &mut Gpu, params: &GemvParams) -> Result<(), Di
         HFQ6G256 => hip!(gpu.gemv_hfq6g256_residual(w.buf, x_in, residual, m, k)),
         MQ4G256 => hip!(gpu.gemv_hfq4g256_residual(w.buf, x_in, residual, m, k)),
         MQ4G256V2 => hip!(gpu.gemv_hfq4g256_residual_mq4v2(w.buf, x_in, residual, m, k)),
+        // qt=52: same contract as the V2 arm above (x_in already holds the
+        // rotated silu*up), through the LUT residual twin. LUT None fails closed.
+        MQ4G256V2Lloyd => {
+            let lut = w.lloyd_lut_f16.ok_or_else(|| {
+                DispatchError::Hip(
+                    "gemv family (swiglu_residual): MQ4G256V2Lloyd weight reached the LUT kernel with lloyd_lut_f16=None".into(),
+                )
+            })?;
+            hip!(gpu.gemv_hfq4g256_residual_mq4v2_lloyd(w.buf, x_in, residual, m, k, lut))
+        }
         MQ5G256V2 => hip!(gpu.gemv_mq5g256v2_residual(w.buf, x_in, residual, m, k)),
         MQ6G256V2 => hip!(gpu.gemv_mq6g256v2_residual(w.buf, x_in, residual, m, k)),
         MQ3G256V2 => hip!(gpu.gemv_mq3g256v2_residual(w.buf, x_in, residual, m, k)),

@@ -1,0 +1,5 @@
+warmup: untimed fresh-process GPU/JIT/DPM warmup
+process-1: pp8192 samples=[3666.5, 3726.3, 3725.4] median=3725.40, decode=36.44 tok/s
+process-2: pp8192 samples=[3717.6, 3719.5, 3087.4] median=3717.60, decode=36.48 tok/s
+process-3: pp8192 samples=[3722.5, 3724.0, 3724.2] median=3724.00, decode=36.50 tok/s
+PASS: actual fp8 backend and baseline guard

@@ -86,8 +86,39 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
 #endif
     int qkv_m, int z_m, int beta_m, int alpha_m,
     int K
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    // Lloyd (qt=52): four per-tensor centered f16 codebooks (qkv, z, beta,
+    // alpha), 8 dwords each, in row-source order. All 32 dwords are staged
+    // to LDS once per block; each wave indexes its source's 16 levels.
+    , const unsigned int L0, const unsigned int L1, const unsigned int L2, const unsigned int L3,
+    const unsigned int L4, const unsigned int L5, const unsigned int L6, const unsigned int L7,
+    const unsigned int L8, const unsigned int L9, const unsigned int L10, const unsigned int L11,
+    const unsigned int L12, const unsigned int L13, const unsigned int L14, const unsigned int L15,
+    const unsigned int L16, const unsigned int L17, const unsigned int L18, const unsigned int L19,
+    const unsigned int L20, const unsigned int L21, const unsigned int L22, const unsigned int L23,
+    const unsigned int L24, const unsigned int L25, const unsigned int L26, const unsigned int L27,
+    const unsigned int L28, const unsigned int L29, const unsigned int L30, const unsigned int L31
+#endif
 ) {
     const int block_tid = threadIdx.x;
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    __shared__ unsigned short LUT_SMEM[64];
+    if (block_tid < 32) {
+        unsigned int d;
+        switch (block_tid) {
+            case 0: d = L0; break;   case 1: d = L1; break;   case 2: d = L2; break;   case 3: d = L3; break;
+            case 4: d = L4; break;   case 5: d = L5; break;   case 6: d = L6; break;   case 7: d = L7; break;
+            case 8: d = L8; break;   case 9: d = L9; break;   case 10: d = L10; break; case 11: d = L11; break;
+            case 12: d = L12; break; case 13: d = L13; break; case 14: d = L14; break; case 15: d = L15; break;
+            case 16: d = L16; break; case 17: d = L17; break; case 18: d = L18; break; case 19: d = L19; break;
+            case 20: d = L20; break; case 21: d = L21; break; case 22: d = L22; break; case 23: d = L23; break;
+            case 24: d = L24; break; case 25: d = L25; break; case 26: d = L26; break; case 27: d = L27; break;
+            case 28: d = L28; break; case 29: d = L29; break; case 30: d = L30; break; default: d = L31; break;
+        }
+        ((unsigned int*)LUT_SMEM)[block_tid] = d;
+    }
+    __syncthreads();
+#endif
 #if defined(HIPFIRE_RDNA3_QKVZA_LDSX8)
     // Eight row waves reuse one K=2048 activation staged as
     // [group][element-in-lane][lane]. The transposition makes every LDS
@@ -121,15 +152,22 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
     const char* A;
     float* y;
     int row;
+    int lut_base = 0;
     if (gid < qkv_m) {
         A = A_qkv;   y = y_qkv;   row = gid;
     } else if (gid < qkv_m + z_m) {
-        A = A_z;     y = y_z;     row = gid - qkv_m;
+        A = A_z;     y = y_z;     row = gid - qkv_m;                    lut_base = 16;
     } else if (gid < qkv_m + z_m + beta_m) {
-        A = A_beta;  y = y_beta;  row = gid - (qkv_m + z_m);
+        A = A_beta;  y = y_beta;  row = gid - (qkv_m + z_m);           lut_base = 32;
     } else {
-        A = A_alpha; y = y_alpha; row = gid - (qkv_m + z_m + beta_m);
+        A = A_alpha; y = y_alpha; row = gid - (qkv_m + z_m + beta_m);  lut_base = 48;
     }
+#ifdef HIPFIRE_MQ4G256V2_LUT
+    #define MQ4V2_DEQ(q) (__half2float(__ushort_as_half(LUT_SMEM[lut_base + (q)])))
+#else
+    (void)lut_base;
+    #define MQ4V2_DEQ(q) ((float)(q))
+#endif
 
 #if defined(HIPFIRE_RDNA3_QKVZA_K2048)
     // Qwen3.5/3.6 A3B decode always reaches this path with K=2048. Exposing
@@ -194,14 +232,14 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         // latency.  Accumulator ownership and the final reduction are
         // unchanged, so this is bit-exact with the base four-chain kernel.
         #define DOG_PAIR(pk, sc, zp, b, a) \
-            (a) += (sc * (float)((pk) & 0xFu)         + zp) * x[(b)] \
-                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
-                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
-                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
-                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
-                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
-                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
-                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+            (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)         + zp) * x[(b)] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
         {
 #if defined(HIPFIRE_GFX1151_QKVZA_HYBRID_BUFFER)
             const unsigned int hA_sc0 = *(const unsigned int*)gp0;
@@ -325,14 +363,14 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         // retain the original scalar path byte-for-byte.
 #if defined(HIPFIRE_RDNA3_QKVZA_LDSX8)
         #define DOG_LDS(pk, sc, zp, group, a) \
-            (a) += (sc * (float)((pk) & 0xFu)         + zp) * x_lds[(group) * 256 + 0 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x_lds[(group) * 256 + 1 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x_lds[(group) * 256 + 2 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x_lds[(group) * 256 + 3 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x_lds[(group) * 256 + 4 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x_lds[(group) * 256 + 5 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x_lds[(group) * 256 + 6 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x_lds[(group) * 256 + 7 * 32 + tid]
+            (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)         + zp) * x_lds[(group) * 256 + 0 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 4) & 0xFu)  + zp) * x_lds[(group) * 256 + 1 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 8) & 0xFu)  + zp) * x_lds[(group) * 256 + 2 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * x_lds[(group) * 256 + 3 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * x_lds[(group) * 256 + 4 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * x_lds[(group) * 256 + 5 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * x_lds[(group) * 256 + 6 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * x_lds[(group) * 256 + 7 * 32 + tid]
         DOG_LDS(pk0, sc0, zp0, g + 0, acc0);
         DOG_LDS(pk1, sc1, zp1, g + 1, acc1);
         DOG_LDS(pk2, sc2, zp2, g + 2, acc2);
@@ -380,14 +418,14 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         const float4 xv3b = *reinterpret_cast<const float4*>(x + base + 772);
 #endif
         #define DOG_V(pk, sc, zp, a, x0, x1, x2, x3, x4, x5, x6, x7) \
-            (a) += (sc * (float)((pk) & 0xFu)        + zp) * (x0) \
-                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
-                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * (x2) \
-                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * (x3) \
-                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * (x4) \
-                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * (x5) \
-                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * (x6) \
-                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * (x7)
+            (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)        + zp) * (x0) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 4) & 0xFu)  + zp) * (x1) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 8) & 0xFu)  + zp) * (x2) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * (x3) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * (x4) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * (x5) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * (x6) \
+                 + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * (x7)
         DOG_V(pk0, sc0, zp0, acc0, xv0a.x,xv0a.y,xv0a.z,xv0a.w,xv0b.x,xv0b.y,xv0b.z,xv0b.w);
         DOG_V(pk1, sc1, zp1, acc1, xv1a.x,xv1a.y,xv1a.z,xv1a.w,xv1b.x,xv1b.y,xv1b.z,xv1b.w);
         DOG_V(pk2, sc2, zp2, acc2, xv2a.x,xv2a.y,xv2a.z,xv2a.w,xv2b.x,xv2b.y,xv2b.z,xv2b.w);
@@ -396,14 +434,14 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
 #else
         // ORIGINAL scalar path — verbatim, so gfx11/gfx10 compile byte-identically.
         #define DOG(pk, sc, zp, b, a) \
-            (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
-                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
-                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
-                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
-                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
-                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
-                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
-                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+            (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)        + zp) * x[(b)]     \
+                 + (sc * MQ4V2_DEQ(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
         DOG(pk0, sc0, zp0, base,       acc0);
         DOG(pk1, sc1, zp1, base + 256, acc1);
         DOG(pk2, sc2, zp2, base + 512, acc2);
@@ -415,14 +453,14 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
 
     // Tail handling: preserve acc[gi] interleaving. See 5302926 bug report.
     #define TAIL_DOG(pk, sc, zp, b, a) \
-        (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
-             + (sc * (float)(((pk) >>  4) & 0xFu) + zp) * x[(b) + 1] \
-             + (sc * (float)(((pk) >>  8) & 0xFu) + zp) * x[(b) + 2] \
-             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
-             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
-             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
-             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
-             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+        (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)        + zp) * x[(b)]     \
+             + (sc * MQ4V2_DEQ(((pk) >>  4) & 0xFu) + zp) * x[(b) + 1] \
+             + (sc * MQ4V2_DEQ(((pk) >>  8) & 0xFu) + zp) * x[(b) + 2] \
+             + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+             + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+             + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+             + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+             + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
 
     if (tail >= 1) {
         const int g = quads << 2;
@@ -436,14 +474,14 @@ extern "C" __global__ void HIPFIRE_QKVZA_KERNEL_NAME(
         int base = g * 256 + tid * 8;
 #if defined(HIPFIRE_RDNA3_QKVZA_LDSX8)
         #define TAIL_DOG_LDS(pk, sc, zp, group, a) \
-            (a) += (sc * (float)((pk) & 0xFu)         + zp) * x_lds[(group) * 256 + 0 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x_lds[(group) * 256 + 1 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x_lds[(group) * 256 + 2 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x_lds[(group) * 256 + 3 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x_lds[(group) * 256 + 4 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x_lds[(group) * 256 + 5 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x_lds[(group) * 256 + 6 * 32 + tid] \
-                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x_lds[(group) * 256 + 7 * 32 + tid]
+            (a) += (sc * MQ4V2_DEQ((pk) & 0xFu)         + zp) * x_lds[(group) * 256 + 0 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 4) & 0xFu)  + zp) * x_lds[(group) * 256 + 1 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 8) & 0xFu)  + zp) * x_lds[(group) * 256 + 2 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 12) & 0xFu) + zp) * x_lds[(group) * 256 + 3 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 16) & 0xFu) + zp) * x_lds[(group) * 256 + 4 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 20) & 0xFu) + zp) * x_lds[(group) * 256 + 5 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 24) & 0xFu) + zp) * x_lds[(group) * 256 + 6 * 32 + tid] \
+                 + (sc * MQ4V2_DEQ(((pk) >> 28) & 0xFu) + zp) * x_lds[(group) * 256 + 7 * 32 + tid]
         TAIL_DOG_LDS(pk, sc, zp, g, acc0);
 #else
         TAIL_DOG(pk, sc, zp, base, acc0);

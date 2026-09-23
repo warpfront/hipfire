@@ -1,0 +1,60 @@
+device AMD Radeon AI PRO R9700 gfx1201
+F1 prod-shape M=17408 K=5120 N=1024 dscale=1
+  |g|>88 count 0
+  block_i4_128 (no x_rot)                      n=10027008 differing=0
+  block_i4_128 (x_rot emitted)                 n=10027008 differing=0
+  x_rot f32 (A producer vs h-producer)         n=17825792 differing=0
+F1 wide-range M=1024 K=1024 N=512 dscale=40
+  |g|>88 count 0
+  block_i4_128 (no x_rot)                      n=294912 differing=0
+  block_i4_128 (x_rot emitted)                 n=294912 differing=0
+  x_rot f32 (A producer vs h-producer)         n=524288 differing=0
+F1 silu-specials M=1024 K=1024 N=512 dscale=20000
+  |g|>88 count 516555
+  block_i4_128 (no x_rot)                      n=294912 differing=0
+  block_i4_128 (x_rot emitted)                 n=294912 differing=0
+  x_rot f32 (A producer vs h-producer)         n=524288 differing=0
+F1 partial-N M=512 K=512 N=1000 dscale=1
+  |g|>88 count 0
+  block_i4_128 (no x_rot)                      n=288000 differing=0
+  block_i4_128 (x_rot emitted)                 n=288000 differing=0
+  x_rot f32 (A producer vs h-producer)         n=512000 differing=0
+F1 odd-tiles-N64 M=768 K=768 N=64 dscale=8000
+  |g|>88 count 47062
+  block_i4_128 (no x_rot)                      n=27648 differing=0
+  block_i4_128 (x_rot emitted)                 n=27648 differing=0
+  x_rot f32 (A producer vs h-producer)         n=49152 differing=0
+ZBA prod-shape zm=6144 ba=48 Mfold=6272 K=5120 N=1024
+  Z                                            n=6291456 differing=0
+  beta                                         n=49152 differing=0
+  alpha                                        n=49152 differing=0
+  SET new module vs base module                n=6291456 differing=0
+ZBA partial-N zm=6144 ba=48 Mfold=6272 K=5120 N=1000
+  Z                                            n=6144000 differing=0
+  beta                                         n=48000 differing=0
+  alpha                                        n=48000 differing=0
+  SET new module vs base module                n=6144000 differing=0
+ZBA small zm=256 ba=48 Mfold=384 K=512 N=64
+  Z                                            n=16384 differing=0
+  beta                                         n=3072 differing=0
+  alpha                                        n=3072 differing=0
+  SET new module vs base module                n=16384 differing=0
+KEEP prod-K K=5120 N=1024
+  block_i4_128 (no x_rot)                      n=2949120 differing=0
+  block_i4_128 (x_rot emitted)                 n=2949120 differing=0
+  x_rot f32                                    n=5242880 differing=0
+KEEP odd-N K=5120 N=77
+  block_i4_128 (no x_rot)                      n=221760 differing=0
+  block_i4_128 (x_rot emitted)                 n=221760 differing=0
+  x_rot f32                                    n=394240 differing=0
+KEEP small-K K=1024 N=256
+  block_i4_128 (no x_rot)                      n=147456 differing=0
+  block_i4_128 (x_rot emitted)                 n=147456 differing=0
+  x_rot f32                                    n=262144 differing=0
+GRID down M=5120 K=17408
+  y (residual +=)                              n=5120 differing=0
+GRID out M=5120 K=6144
+  y (residual +=)                              n=5120 differing=0
+GRID odd-M M=2049 K=512
+  y (residual +=)                              n=2049 differing=0
+ORACLE_PASS

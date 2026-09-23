@@ -1,0 +1,34 @@
+## new vs flag reference, seed 1, 5000 random amax + specials, +-64-ulp walks
+edge blocks 9212; blocks 269654 (adversarial 214410), waves 134827, ref d==1 blocks 76524, untouched 0
+differing bytes 0 in 0 blocks
+QC2_PASS
+## new vs flag reference, seed 2, 5000 random amax + specials, +-64-ulp walks
+edge blocks 9218; blocks 269654 (adversarial 214410), waves 134827, ref d==1 blocks 74460, untouched 0
+differing bytes 0 in 0 blocks
+QC2_PASS
+## new vs flag reference, seed 3, 5000 random amax + specials, +-64-ulp walks
+edge blocks 9244; blocks 269682 (adversarial 214410), waves 134841, ref d==1 blocks 75747, untouched 0
+differing bytes 0 in 0 blocks
+QC2_PASS
+## new vs flag reference, seed 4, 3000 amax, +-200-ulp walks
+edge blocks 5564; blocks 449036 (adversarial 397440), waves 224518, ref d==1 blocks 127507, untouched 0
+differing bytes 0 in 0 blocks
+QC2_PASS
+## edge-only (all values 1.02..4 x 2^-18 outside the window), new vs reference
+edge blocks 36308; blocks 36316 (adversarial 120630), waves 18158, ref d==1 blocks 11582, untouched 0
+differing bytes 0 in 0 blocks
+QC2_PASS
+## coverage: fast path forced (redo disabled) on edge-only data — must pass
+edge blocks 36308; blocks 36316 (adversarial 120630), waves 18158, ref d==1 blocks 11582, untouched 0
+differing bytes 0 in 0 blocks
+QC2_PASS
+## coverage: fast path forced on the full mix — must FAIL (redo path is exercised)
+edge blocks 5614; blocks 151004 (adversarial 99360), waves 75502, ref d==1 blocks 41954, untouched 0
+differing bytes 16217 in 3259 blocks
+first block 4: ref d 0x1.3f2154p-109 s -1014 | new d 0x1.3f2154p-109 s -1015
+QC2_FAIL
+## sanity: RTN build vs c2 reference — must FAIL
+edge blocks 560; blocks 48412 (adversarial 1830), waves 24206, ref d==1 blocks 12722, untouched 0
+differing bytes 1436527 in 35226 blocks
+first block 0: ref d 0x1p+0 s -78 | new d 0x1.f45ad2p+68 s 9
+QC2_FAIL

@@ -3615,6 +3615,9 @@ mod tests {
                         row_stride: expert.gate_up.row_stride,
                         rotation: None,
                         awq_scale: None,
+                        lloyd_lut_e4m3: None,
+                        lloyd_lut_f16: None,
+                        lloyd_lut_c16: None,
                     },
                     crate::families::gemv::WeightRef {
                         buf: &expert.down.buf,
@@ -3624,6 +3627,9 @@ mod tests {
                         row_stride: expert.down.row_stride,
                         rotation: None,
                         awq_scale: None,
+                        lloyd_lut_e4m3: None,
+                        lloyd_lut_f16: None,
+                        lloyd_lut_c16: None,
                     },
                 )
             })
@@ -4072,6 +4078,9 @@ mod tests {
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         }
     }
 
@@ -4634,6 +4643,9 @@ mod tests {
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: None,
+            lloyd_lut_f16: None,
+            lloyd_lut_c16: None,
         }
     }
 

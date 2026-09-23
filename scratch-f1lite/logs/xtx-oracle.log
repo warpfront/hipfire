@@ -1,0 +1,52 @@
+DEVICE arch=gfx1100 name=AMD Radeon RX 7900 XTX mps=48 ROCR=0 HIP=0 pid=2029491
+OBJECT GEMM_BASE_OBJECT=bin/base_v2c-gfx1100.hsaco
+OBJECT GEMM_F1_OBJECT=bin/v2c-gfx1100.hsaco
+OBJECT PROD_SILU_OBJECT=bin/base_silu_i4-gfx1100.hsaco
+OBJECT PROD_HIN_OBJECT=bin/silu_hin-gfx1100.hsaco
+OBJECT PROD_SILU_JIT_OBJECT=/home/kaden/hipfire-prof040/scratch-fusion/bin/jit/silu_prod_jit-gfx1100.hsaco
+RESOURCE gemm_set_base vgpr=179 private=0 dynamic_lds=32768 blocks_per_mp=2
+RESOURCE gemm_set_new vgpr=179 private=0 dynamic_lds=32768 blocks_per_mp=2
+RESOURCE gemm_gate_up_silu vgpr=180 private=0 dynamic_lds=32768 blocks_per_mp=2
+RESOURCE silu_producer vgpr=55 private=0 dynamic_lds=0 blocks_per_mp=64
+RESOURCE hin_producer vgpr=76 private=0 dynamic_lds=0 blocks_per_mp=64
+CASE full_hashed Me=17408 K=5120 N=4096
+ORACLE cpu_spot_vs_base_gemm compared=4096 differing=0
+ORACLE new_set_vs_base_set_up compared=71303168 differing=0
+ORACLE A_noxrot_vs_A_xi4 compared=40108032 differing=0
+ORACLE jit_producer_xrot_vs_local compared=71303168 differing=0
+ORACLE jit_producer_xi4_vs_local compared=40108032 differing=0
+ORACLE C_xrot_vs_A compared=71303168 differing=0
+ORACLE C_xi4_vs_A compared=40108032 differing=0
+COVERAGE full_hashed |g|>88=0 g==0=0 g<0=17583409 h_nonfinite=0 of 71303168
+ORACLE C_noxrot_xi4_vs_A compared=40108032 differing=0
+CASE silu_specials Me=1024 K=1024 N=512
+ORACLE cpu_spot_vs_base_gemm compared=4096 differing=0
+ORACLE new_set_vs_base_set_up compared=524288 differing=0
+ORACLE A_noxrot_vs_A_xi4 compared=294912 differing=0
+ORACLE jit_producer_xrot_vs_local compared=524288 differing=0
+ORACLE jit_producer_xi4_vs_local compared=294912 differing=0
+ORACLE C_xrot_vs_A compared=524288 differing=0
+ORACLE C_xi4_vs_A compared=294912 differing=0
+COVERAGE silu_specials |g|>88=170343 g==0=0 g<0=245991 h_nonfinite=0 of 524288
+ORACLE C_noxrot_xi4_vs_A compared=294912 differing=0
+CASE small_multitile Me=512 K=512 N=768
+ORACLE cpu_spot_vs_base_gemm compared=4096 differing=0
+ORACLE new_set_vs_base_set_up compared=393216 differing=0
+ORACLE A_noxrot_vs_A_xi4 compared=221184 differing=0
+ORACLE jit_producer_xrot_vs_local compared=393216 differing=0
+ORACLE jit_producer_xi4_vs_local compared=221184 differing=0
+ORACLE C_xrot_vs_A compared=393216 differing=0
+ORACLE C_xi4_vs_A compared=221184 differing=0
+COVERAGE small_multitile |g|>88=0 g==0=0 g<0=158972 h_nonfinite=0 of 393216
+ORACLE C_noxrot_xi4_vs_A compared=221184 differing=0
+CASE odd_tiles Me=768 K=768 N=1280
+ORACLE cpu_spot_vs_base_gemm compared=4096 differing=0
+ORACLE new_set_vs_base_set_up compared=983040 differing=0
+ORACLE A_noxrot_vs_A_xi4 compared=552960 differing=0
+ORACLE jit_producer_xrot_vs_local compared=983040 differing=0
+ORACLE jit_producer_xi4_vs_local compared=552960 differing=0
+ORACLE C_xrot_vs_A compared=983040 differing=0
+ORACLE C_xi4_vs_A compared=552960 differing=0
+COVERAGE odd_tiles |g|>88=241173 g==0=0 g<0=458769 h_nonfinite=0 of 983040
+ORACLE C_noxrot_xi4_vs_A compared=552960 differing=0
+ORACLE_PASS

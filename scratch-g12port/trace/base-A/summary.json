@@ -1,0 +1,31 @@
+{
+  "label": "base-A",
+  "card": "A",
+  "bindir": "/home/kaden/ClaudeCode/warpfront/wt-g12port/scratch-g12port/bin-base",
+  "extra_env": {},
+  "daemon_sha256": "4dada9b26e1d7c6e3ead88fc2c78587f40ea9012ebebece68acb8e5e37eb0c87",
+  "dispatches": 3729,
+  "gpu_ms": 2244.32,
+  "wall_ms": 2284.958357,
+  "timings": {
+    "ttft_ms": 2228.4,
+    "prefill_ms": 2228.4,
+    "prefill_tok_s": 3676.1,
+    "decode_tok_s": 22.3,
+    "latency_ms": null,
+    "tau": null,
+    "cycles": null,
+    "dflash": null,
+    "mtp": null,
+    "mtp_ngram": null,
+    "ngram_mod_windows": null,
+    "ngram_mod_drafts": null,
+    "ngram_mod_accepted": null,
+    "ngram_mod_accept_rate": null,
+    "mtp_windows": null,
+    "ar_windows": null,
+    "mtp_retired": null,
+    "mtp_window_timings": null
+  },
+  "text": "A"
+}

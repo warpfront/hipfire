@@ -64,6 +64,15 @@ pub struct EngineConfig {
     pub prefill_chunk: usize,
     pub host_budget_bytes: u64,
     pub swap_dir: PathBuf,
+    /// Effective `--kv-mode` for this load (`q8` default). Slot arenas are
+    /// fixed Q8; anything else (fp8/bf16/…) is rejected in `Rig::build`.
+    /// Carried explicitly so a bypass of the daemon capability gate still
+    /// fails closed inside the engine thread.
+    pub kv_mode: String,
+    /// Effective `--kv-backend` for this load (`legacy` default). Slot
+    /// arenas are fixed contiguous `SlotPool` allocations; `vmm` is rejected
+    /// in `Rig::build` alongside non-q8 modes.
+    pub kv_backend: String,
 }
 
 pub struct SlotEngine {
@@ -248,6 +257,24 @@ impl Rig {
             .iter()
             .filter(|t| **t == LayerType::FullAttention)
             .count();
+        // Slot arenas below are fixed Q8 contiguous `SlotPool` allocations
+        // (tag1/Q8 stride). Native fp8/bf16 KV and VMM have no slot readers;
+        // reject before any GPU allocation rather than storing foreign bytes
+        // under the Q8 layout. The daemon capability gate normally refuses
+        // these first; this is the fail-closed inner check.
+        if cfg.kv_mode != "q8" {
+            return Err(format!(
+                "experimental multi-slot requires kv_mode=q8 (got {:?}); \
+                 fp8/bf16 KV is not admitted on slot arenas",
+                cfg.kv_mode
+            ));
+        }
+        if cfg.kv_backend != "legacy" {
+            return Err(format!(
+                "experimental multi-slot requires kv_backend=legacy (got {:?})",
+                cfg.kv_backend
+            ));
+        }
         let per_pos_bytes = config.n_kv_heads * (config.head_dim / 32) * 34;
         let prefill_chunk = cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1));
         let max_batch = (prefill_chunk * cfg.n_slots).max(cfg.n_slots);

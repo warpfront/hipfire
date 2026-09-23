@@ -146,6 +146,18 @@ for arch in "${ARCHS[@]}"; do
         out="$out_dir/${name}.hsaco"
         printf '%s|%s|%s|%s\n' "$arch" "$name" "$src" "$out" >> "$JOB_FILE"
     done
+
+    # These portable chunk scan sources use a gfx1201-tagged origin filename
+    # and explicit runtime module names on every WMMA-capable target.
+    for spec in \
+        "gdn_chunk_prep:gdn_chunk_scan_prep.gfx1201.hip" \
+        "gdn_chunk_kkt_solve:gdn_chunk_scan_kkt_solve.gfx1201.hip" \
+        "gdn_chunk_scan:gdn_chunk_scan.gfx1201.hip"; do
+        name="${spec%%:*}"
+        src="$SRC_DIR/${spec#*:}"
+        out="$out_dir/${name}.hsaco"
+        printf '%s|%s|%s|%s\n' "$arch" "$name" "$src" "$out" >> "$JOB_FILE"
+    done
 done
 
 TOTAL=$(wc -l < "$JOB_FILE")
@@ -160,10 +172,20 @@ echo "=== Compiling $TOTAL jobs across $JOBS workers... ==="
 worker() {
     local job="$1"
     local arch name src out
+    local -a module_flags=()
     IFS='|' read -r arch name src out <<< "$job"
+    case "$name" in
+        gdn_chunk_prep|gdn_chunk_kkt_solve)
+            module_flags+=("-ffp-contract=off")
+            ;;
+        gdn_chunk_scan)
+            module_flags+=("-ffp-contract=off")
+            [ "$arch" = "gfx1201" ] && module_flags+=("-mcumode")
+            ;;
+    esac
 
     if ROCM_PATH="$SELECTED_ROCM_ROOT" "$HIPCC_BIN" \
-        --genco --offload-arch="$arch" -O3 \
+        --genco --offload-arch="$arch" -O3 "${module_flags[@]}" \
         --rocm-path="$SELECTED_ROCM_ROOT" --hip-path="$SELECTED_ROCM_ROOT" \
         -I "$SELECTED_ROCM_ROOT/include" -I "$SCRIPT_DIR/kernels/src" \
         -o "$out" "$src" 2>/dev/null; then

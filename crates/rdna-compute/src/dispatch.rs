@@ -308,6 +308,15 @@ pub enum DType {
     /// Little-endian, low 16 scale / high 16 zero per dword, half-wave uniform,
     /// lane-invariant scalar loads. `K % 256 == 0`, 4.25 bpw.
     MQ4G256V2,
+    /// MQ4-G256 v2 Lloyd (qt=52): FWHT-rotated, 136 B/group, wire layout
+    /// BYTE-IDENTICAL to MQ4G256V2 (dual fp16 half-grids + 128 B nibbles).
+    /// Nibble q decodes through a PER-TENSOR 16-level centered codebook
+    /// `w = sc·(C[q]) + zp'` with `C[q] = L[q]−7.5` (sidecar `lloyd_levels`,
+    /// f32[16] in [0,15] units, E4M3-snapped) and rewritten headers
+    /// `zp' = fp16(zp+7.5·sc)` per half (loader-applied; the file keeps the
+    /// uncentered zp). `K % 256 == 0`, 4.25 bpw. NEVER decoded by a uniform
+    /// kernel: every dispatch arm must check the LUT variant / fail closed.
+    MQ4G256V2Lloyd,
     /// MQ4-G256-C (qt=45): FWHT-rotated, 136 B/group, 4.25 bpw, pad layout:
     /// per group 136 B: `[0..4)` fp16 header (low scale, high zero), `[4..8)` zero padding,
     /// `[8..136)` 128 B nibbles at same offset as v1 (MQ4G256). ONE affine grid per 256
@@ -419,6 +428,7 @@ impl DType {
             | DType::HFQ6G256
             | DType::MQ4G256
             | DType::MQ4G256V2
+            | DType::MQ4G256V2Lloyd
             | DType::MQ4CG256
             | DType::MQ6G256V2
             | DType::MQ5G256V2
@@ -517,6 +527,10 @@ impl DType {
                 // That is the May 2026 regression this predicate was centralised to
                 // prevent; qt=44's artifact carries 496 sidecars.
                 | DType::MQ4G256V2
+                // qt=52 shares qt=44's AWQ contract exactly (same pipeline,
+                // same rotate-step x/s division). Omitting it silently drops
+                // the sidecar → (W·s)·x scale error on every projection.
+                | DType::MQ4G256V2Lloyd
                 // qt=45 shares qt=13/qt=44's AWQ contract exactly — same failure mode
                 // if omitted: silent sidecar drop → (W·s)·x. Include it.
                 | DType::MQ4CG256
@@ -557,6 +571,7 @@ impl DType {
                 | DType::MQ2G256GL
                 | DType::MQ3G256GL
                 | DType::MQ4G256V2
+                | DType::MQ4G256V2Lloyd
                 | DType::MQ4CG256
                 | DType::MQ6G256V2
                 | DType::MQ5G256V2
@@ -618,6 +633,24 @@ pub struct MmqScreenState {
     pub threshold: f32,
 }
 
+/// Delta buffer offered to the next residual GEMM by [`Gpu::arm_residual_fold`].
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResidualFoldArm {
+    pub delta: *mut c_void,
+    /// Capacity of `delta` in f32 elements.
+    pub len: usize,
+}
+
+/// A residual add deferred by the gfx1151 V2B GEMM: `y[n][m] += delta[n][m]`
+/// is owed, and the next IU4 RMSNorm over `y` performs it.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct ResidualFold {
+    pub y: *mut c_void,
+    pub delta: *mut c_void,
+    pub m: usize,
+    pub n: usize,
+}
+
 /// High-level GPU context. Owns the HIP runtime, compiler, and loaded kernels.
 ///
 /// Tape completeness invariant: for any body executed via `Gpu`,
@@ -658,6 +691,15 @@ pub struct Gpu {
     pub scratch: crate::scratch::ScratchState,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
+    /// Artifact-level MQ4V2 grid contract. Set by the model loader from HFQ
+    /// metadata; false for legacy/asymmetric artifacts.
+    pub mq4v2_symmetric: bool,
+    /// ADD-epilogue fold (gfx1151 V2B, `HIPFIRE_V2B_ADDEPI`): delta buffer
+    /// armed by the caller for the next residual GEMM, and the deferred add
+    /// that GEMM left for the following IU4 RMSNorm. See
+    /// [`Gpu::arm_residual_fold`].
+    pub(crate) residual_fold_arm: Option<ResidualFoldArm>,
+    pub(crate) residual_fold_pending: Option<ResidualFold>,
 
     /// Process-pinned optional CK runtime. Loading is explicit and fail-closed;
     /// individual attention families still decide whether a capability cell is
@@ -1352,6 +1394,7 @@ impl Gpu {
                 q8_1_mmq_x_scratch_bytes: 0,
                 int4_mmq_x_scratch: None,
                 int4_mmq_x_scratch_bytes: 0,
+                int4_mmq_generation: 0,
                 mq4v2_fp8_x_scratch: None,
                 mq4v2_fp8_x_scratch_bytes: 0,
                 mq4v2_fp8_half_sums_scratch: None,
@@ -1362,8 +1405,15 @@ impl Gpu {
                 ksplit_det_partials_bytes: 0,
                 sample_partials: None,
                 sample_partials_bytes: 0,
+                fa2_q16_scratch: None,
+                fa2_q16_scratch_bytes: 0,
+                fa2_fp8_q_scratch: None,
+                fa2_fp8_q_scratch_bytes: 0,
             },
             replay: crate::replay::ReplayController::from_config(),
+            mq4v2_symmetric: false,
+            residual_fold_arm: None,
+            residual_fold_pending: None,
             #[cfg(feature = "flash-attn-ck")]
             flash_attn_ck,
             #[cfg(feature = "flash-attn-ck")]
@@ -2358,6 +2408,18 @@ impl Gpu {
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         let record = self.replay.is_recording();
+        // Slice 1: drain a post-scratch-growth binding refresh before the
+        // first launch that follows the growth. Growth always completes
+        // before this point (callers invalidate, then grow, then launch), so
+        // the probe sees post-growth addresses. One branch when idle; the
+        // refresh itself runs at most once per growth event. Failure drops
+        // the retained route (historic path) and the HIP launch below runs.
+        if self.replay.binding_refresh_pending() {
+            if let Err(reason) = self.replay.refresh_bindings_after_growth(&self.hip) {
+                eprintln!("[redline] PM4 binding refresh failed ({reason}); route re-armed");
+                self.replay.rearm_after_layout_growth();
+            }
+        }
         let result: HipResult<()> = if record
             || self.graphs.capture_mode
             || self.flags.force_blob_path
@@ -2619,6 +2681,24 @@ impl Gpu {
         }
         .map_err(|e| e.with_kernel(func_name))
     }
+    /// Occupancy probe for a pre-loaded kernel by name (oracle metadata gate).
+    pub fn occupancy_max_active_blocks(
+        &self,
+        func_name: &str,
+        block: [u32; 3],
+        shared_mem: u32,
+    ) -> HipResult<i32> {
+        self.bind_thread()?;
+        let func = self.functions.get(func_name).ok_or_else(|| {
+            hip_bridge::HipError::new(
+                0,
+                &format!("occupancy_max_active_blocks: function '{func_name}' not loaded"),
+            )
+        })?;
+        let block_size = block[0] * block[1] * block[2];
+        self.hip
+            .occupancy_max_active_blocks(func, block_size, shared_mem as usize)
+    }
 
     /// Compile and load a kernel, caching the result.
     pub(crate) fn ensure_kernel(
@@ -2646,6 +2726,16 @@ impl Gpu {
         x: &GpuTensor,
         n_elems: usize,
     ) -> HipResult<*mut c_void> {
+        // Scratch growth under a captured graph would free a pointer the graph
+        // embeds: invalidate first (no-op unless captured). See
+        // `invalidate_for_scratch_growth`.
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fp16_x_scratch_bytes,
+            self.scratch.fp16_x_scratch.is_some(),
+            n_elems * 2,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         // Split borrows so `self.replay` and `self.graphs`/`self.scratch` can be
         // borrowed simultaneously. The scratch helper will record into replay
         // when `is_recording()` and push to capture_blobs when `capture_mode`,
@@ -2669,6 +2759,13 @@ impl Gpu {
 
     /// Ensure the deterministic-ksplit partials scratch is at least `n_bytes`.
     pub(crate) fn ensure_ksplit_det_partials(&mut self, n_bytes: usize) -> HipResult<*mut c_void> {
+        if crate::scratch::scratch_will_grow(
+            self.scratch.ksplit_det_partials_bytes,
+            self.scratch.ksplit_det_partials.is_some(),
+            n_bytes,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         self.scratch.ensure_ksplit_det_partials(&self.hip, n_bytes)
     }
 
@@ -2682,6 +2779,13 @@ impl Gpu {
     ) -> HipResult<*mut c_void> {
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fp16_x_scratch_bytes,
+            self.scratch.fp16_x_scratch.is_some(),
+            n_elems * 2,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         self.scratch.convert_fp16_x_uncached(
             &self.hip,
             &mut self.compiler,
@@ -2704,6 +2808,13 @@ impl Gpu {
     pub(crate) fn ensure_fp8_x(&mut self, x: &GpuTensor, n_elems: usize) -> HipResult<*mut c_void> {
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
+        if crate::scratch::scratch_will_grow(
+            self.scratch.fp8_x_scratch_bytes,
+            self.scratch.fp8_x_scratch.is_some(),
+            n_elems,
+        ) {
+            self.invalidate_for_scratch_growth();
+        }
         self.scratch.ensure_fp8_x(
             &self.hip,
             &mut self.compiler,
@@ -2742,6 +2853,27 @@ impl Gpu {
                 0,
                 "prepare_mq4v2_fp8_x: eager-only (capture/replay rejected)",
             ));
+        }
+        // All three MQ4v2 FP8 buffers grow below (both sub-paths); invalidate
+        // first if any of them will. Eager-only is already enforced above.
+        {
+            let (x8, half_sums, row_scales) = crate::scratch::mq4v2_fp8_needed(n, k);
+            let s = &self.scratch;
+            if crate::scratch::scratch_will_grow(
+                s.mq4v2_fp8_x_scratch_bytes,
+                s.mq4v2_fp8_x_scratch.is_some(),
+                x8,
+            ) || crate::scratch::scratch_will_grow(
+                s.mq4v2_fp8_half_sums_scratch_bytes,
+                s.mq4v2_fp8_half_sums_scratch.is_some(),
+                half_sums,
+            ) || crate::scratch::scratch_will_grow(
+                s.mq4v2_fp8_row_scales_scratch_bytes,
+                s.mq4v2_fp8_row_scales_scratch.is_some(),
+                row_scales,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
         }
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
@@ -2795,6 +2927,16 @@ impl Gpu {
         // bind_thread: skip — delegated to scratch.rs
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
+        {
+            let needed = crate::scratch::q8_1_mmq_x_needed(k, batch_size);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.q8_1_mmq_x_scratch_bytes,
+                self.scratch.q8_1_mmq_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
         self.scratch.ensure_q8_1_mmq_x(
             &self.hip,
             &mut self.compiler,
@@ -2823,6 +2965,16 @@ impl Gpu {
         // bind_thread: skip — delegated to scratch.rs
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
+        {
+            let needed = crate::scratch::q8_1_mmq_x_needed(k, batch_size);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.q8_1_mmq_x_scratch_bytes,
+                self.scratch.q8_1_mmq_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
         self.scratch.ensure_q8_1_mmq_x128(
             &self.hip,
             &mut self.compiler,
@@ -2839,9 +2991,8 @@ impl Gpu {
             k,
         )
     }
-
     /// Ensure prefill activations are quantized to int4 (`block_i4_128`) for
-    /// the iu4-direct MMQ consumer (`HIPFIRE_GFX11_MQ4V2_IU4` path).
+    /// the iu4-direct MMQ consumer (`HIPFIRE_IU4_PREFILL` path).
     /// See `scratch.rs::ensure_int4_mmq_x`.
     pub fn ensure_int4_mmq_x(
         &mut self,
@@ -2852,6 +3003,16 @@ impl Gpu {
         // bind_thread: skip — delegated to scratch.rs
         let capture_mode = self.graphs.capture_mode;
         let force_blob = self.flags.force_blob_path;
+        {
+            let needed = crate::scratch::int4_mmq_x_needed(k, batch_size);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.int4_mmq_x_scratch_bytes,
+                self.scratch.int4_mmq_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
         self.scratch.ensure_int4_mmq_x(
             &self.hip,
             &mut self.compiler,
@@ -2867,6 +3028,114 @@ impl Gpu {
             batch_size,
             k,
         )
+    }
+
+    /// Reserve `int4_mmq_x_scratch` for a producer-emitted IU4 sidecar (C2).
+    /// Does not launch the standalone quantizer.
+    pub fn reserve_int4_mmq(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int4MmqReservation> {
+        // Mirror `reserve_int4_mmq`'s validity gate: no growth on the error path.
+        if k != 0 && n != 0 && k % 256 == 0 {
+            let needed = crate::scratch::int4_mmq_reserve_needed(k, n);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.int4_mmq_x_scratch_bytes,
+                self.scratch.int4_mmq_x_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
+        self.scratch.reserve_int4_mmq(&self.hip, k, n)
+    }
+
+    /// True when the portable producer-sidecar route is live for this call:
+    /// IU4 + gfx1100/gfx1151 + eager (no replay/capture) + the K constraint
+    /// of the IU4 MMQ consumer. Every producer grid is row-parallel, and the
+    /// gfx11 IU4 MMQ base entry handles partial 128-row tiles.
+    pub fn iu4_producer_sidecar_active(&self, batch: usize, k: usize) -> bool {
+        self.flags.iu4_producer_sidecar_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && batch >= 64
+            && k > 0
+            && k % 256 == 0
+    }
+    /// True when the gfx1201 slice-1 silu+quant fusion is live for this call:
+    /// IU4 + exact gfx1201 + eager (no replay/capture) + K constraint of the
+    /// iu4 MMQ consumer. Any batch >= 64: every producer grid is row-parallel
+    /// in batch (one row per workgroup), and the gfx1201 iu4 MMQ consumer
+    /// handles partial 128-row tiles natively (zero-filled slab / guarded
+    /// writeback), so the old %128 multiple was grid convenience only.
+    /// Default on for the IU4 route (`HIPFIRE_GFX12_SILU_QUANT_FUSED=0` opts out).
+    pub fn iu4_silu_quant_fused_active(&self, batch: usize, k: usize) -> bool {
+        self.flags.gfx12_silu_quant_fused_enabled()
+            && self.flags.iu4_prefill_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && batch >= 64
+            && k > 0
+            && k % 256 == 0
+    }
+    /// True when a gfx1201 slices-2-4 producer+quant fusion is live for this
+    /// call: IU4 + `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED` on exact gfx1201 +
+    /// eager (no replay/capture) + K constraint of the iu4 MMQ consumer. Any
+    /// batch >= 64, same row-parallel justification as
+    /// `iu4_silu_quant_fused_active`; the GDN fused producer additionally
+    /// requires head_dim == 128 at its callsite helper.
+    pub fn iu4_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
+        self.flags.gfx12_producer_quant_fused_enabled()
+            && self.flags.iu4_prefill_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && batch >= 64
+            && k > 0
+            && k % 256 == 0
+    }
+    /// True when a gfx11 sigmoid/gated-norm producer+quant fusion is live
+    /// for this call: IU4 + `HIPFIRE_GFX11_PRODUCER_QUANT_FUSED` on
+    /// gfx1100/gfx1151 + eager (no replay/capture) + K constraint of the
+    /// iu4 MMQ consumer. Any batch >= 64, same row-parallel justification
+    /// as `iu4_producer_quant_fused_active`; the GDN fused producer
+    /// additionally requires head_dim == 128 at its callsite helper.
+    pub fn iu4_gfx11_producer_quant_fused_active(&self, batch: usize, k: usize) -> bool {
+        self.flags.gfx11_producer_quant_fused_enabled()
+            && self.flags.iu4_prefill_enabled()
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && batch >= 64
+            && k > 0
+            && k % 256 == 0
+    }
+    /// True when the gfx1201 FP8-stream producer fusion is live for this
+    /// call: `HIPFIRE_GFX12_FP8_STREAM=1` on exact gfx1201 + eager (no
+    /// replay/capture) + K constraint of the MQ4v2 FP8 consumer (`k % 256
+    /// == 0`). Any batch >= 64: the producer grid is row-parallel in batch
+    /// (one workgroup per row), and the fp8 kernels mask partial N tiles
+    /// in-kernel (clamped loads, `oc < N` guarded stores), so the old %64
+    /// multiple was grid convenience only. The callsite additionally
+    /// requires Lloyd weights and scale_mode == 1. Default OFF.
+    pub fn fp8_stream_active(&self, batch: usize, k: usize) -> bool {
+        self.flags.gfx12_fp8_stream_enabled()
+            && self.arch == "gfx1201"
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode
+            && batch >= 64
+            && k > 0
+            && k % 256 == 0
+    }
+
+    /// Validate a prepared IU4 handle against the live scratch generation.
+    pub fn int4_mmq_prepared_ptr(
+        &self,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        k: usize,
+        n: usize,
+    ) -> HipResult<*mut c_void> {
+        let (gen, ptr) = self.scratch.int4_mmq_live();
+        prepared.checked_ptr(gen, ptr, k, n)
     }
 
     /// Returns the number of launches recorded by the `ReplayController`.
@@ -3153,6 +3422,17 @@ impl Gpu {
 
     pub fn ensure_gemv_residual_tmp(&mut self, min_elems: usize) -> HipResult<&GpuTensor> {
         // bind_thread: skip — delegated to scratch.rs (takes device_id explicitly).
+        {
+            let needed_bytes = min_elems * 4;
+            let will_grow = self
+                .scratch
+                .gemv_residual_tmp
+                .as_ref()
+                .map_or(true, |tmp| tmp.buf.size() < needed_bytes);
+            if will_grow {
+                self.invalidate_for_scratch_growth();
+            }
+        }
         self.scratch
             .ensure_gemv_residual_tmp(&self.hip, self.device_id, min_elems)
     }
@@ -4265,6 +4545,42 @@ impl Gpu {
         // bind_thread: skip — invalidate_graph_state binds; rearm is CPU.
         self.invalidate_graph_state();
         self.replay.rearm_after_layout_growth();
+    }
+
+    /// Drop captured execution state before a scratch slot grows. A captured
+    /// hipGraph embeds the pointers live at capture time; freeing a replaced
+    /// buffer under it replays freed memory (`HipError(700)`), so hipGraphs
+    /// still drop wholesale here. The retained PM4 route is different: its
+    /// kernarg segments re-encode from `ReplayBindings`, so the route is kept
+    /// and only armed for a post-growth re-resolve (revision bump +
+    /// re-encode, no re-lowering). The next launch drains the refresh; a
+    /// resource that actually moved fails closed back to the historic drop
+    /// path (`rearm_after_layout_growth`) and HIP runs.
+    ///
+    /// Called by every `Gpu` scratch wrapper that can grow, gated on
+    /// [`crate::scratch::scratch_will_grow`]. Cheap no-op unless a graph has
+    /// been captured in this process (see
+    /// [`crate::graph::any_graph_captured`]); growth is monotonic and bounded
+    /// by the largest shape ever seen, so the invalidation is rare.
+    ///
+    /// Never invalidates mid-capture/record: destroying graph state then
+    /// would clear the `capture_blobs` the in-flight capture is filling.
+    /// Growth inside a capture keeps the historical behaviour (warmup-first
+    /// flows size scratch before capturing, so this is not expected).
+    pub fn invalidate_for_scratch_growth(&mut self) {
+        if !crate::scratch::scratch_growth_invalidates(
+            crate::graph::any_graph_captured(),
+            self.graphs.capture_mode,
+            self.replay.is_recording(),
+        ) {
+            return;
+        }
+        self.invalidate_graph_state();
+        if self.replay.prepared_pm4_route_active() {
+            self.replay.arm_binding_refresh_for_scratch_growth();
+        } else {
+            self.replay.rearm_after_layout_growth();
+        }
     }
 
     // ── Kernel operations ───────────────────────────────────────

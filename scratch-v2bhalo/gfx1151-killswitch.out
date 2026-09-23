@@ -1,0 +1,4 @@
+gemm_mq4g256v2_residual_mmq_iu4_gfx11_x5_symfold.c4e902d85a7eb0e1.hsaco
+  pp512: 944.10 tok/s median
+  pp8192: 838.00 tok/s median
+killswitch PASS: X5 only, no V2B object

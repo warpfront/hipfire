@@ -1,0 +1,2 @@
+parent pid=2043616 ROCR_VISIBLE_DEVICES=1 HIP_VISIBLE_DEVICES=0 HOME=/home/kaden/hipfire-f1lite/scratch-f1lite/trace/gfx1151-8192/home
+daemon pid=2043618 ROCR_VISIBLE_DEVICES=1 HIP_VISIBLE_DEVICES=0

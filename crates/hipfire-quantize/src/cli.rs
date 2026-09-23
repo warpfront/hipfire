@@ -205,6 +205,28 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, value_name = "ALPHA")]
     pub awq_alpha: Option<f32>,
 
+    /// Select AWQ alpha per shared activation group using the runtime-exact
+    /// MQ4V2 × A4 block-output error over the fixed alpha grid.
+    #[arg(long, conflicts_with = "awq_alpha")]
+    pub awq_a4_aware: bool,
+
+    /// Encode MQ4V2 with a per-128 symmetric grid while retaining the existing
+    /// affine header layout. The stored zero is `-8*d`, so code 8 maps to zero.
+    #[arg(long)]
+    pub mq4v2_symmetric: bool,
+
+    /// Replace selected MQ4V2-XT tensors in an existing HFQ with trained final
+    /// codes. PATH is one frozen-record `.safetensors` file or a directory of
+    /// them; each record carries metadata `name,M,K,qt,source_sha` and tensors
+    /// `S_f16`, `d_z_f16`, `codes_u8`. `--input` must be the source HFQ named
+    /// by `source_sha`; unselected tensor/index/metadata bytes are copied intact.
+    #[arg(
+        long,
+        value_name = "PATH",
+        conflicts_with_all = ["flux_pipe", "reap_overlay", "reap_bake"]
+    )]
+    pub mq4v2_final_codes: Option<PathBuf>,
+
     /// Enable K-map promotion for dense models.
     #[arg(long)]
     pub kmap_dense: bool,

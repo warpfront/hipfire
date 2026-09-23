@@ -341,3 +341,182 @@ __global__ void attention_flash_q8_0_tile_batched(
     for (int i = 0; i < dpt; i++)
         p[2 + d0 + i] = out_vec[i];
 }
+
+#ifdef HIPFIRE_KV_FP8_E4M3
+// Batched native-fp8 flash tile. Same grid, tree-bias, slot-descriptor
+// plumbing and partials contract as attention_flash_q8_0_tile_batched
+// (partials `[sub_batch × n_heads × max_tiles × (2+head_dim)]` feed the
+// shared reduce), with fp8 row addressing and f32 decode. The single
+// per-head f16 scale is loaded once per token and reused across the
+// lane's dims. Handles tree verify and the >32K fallback path.
+//
+// Grid: [n_heads, max_tiles, sub_batch_size]. Block: [32, 1, 1].
+#if defined(__HIP_DEVICE_COMPILE__) && !defined(__gfx1201__)
+#error "attention_flash_fp8_e4m3_tile_batched requires --offload-arch=gfx1201"
+#endif
+static __device__ __forceinline__ float hipfire_fp8_e4m3_to_f32_tile_b(unsigned char b) {
+    const unsigned int u = b;
+    const unsigned int s = (u & 0x80u) << 24;
+    const unsigned int e = (u >> 3) & 0x0fu;
+    const unsigned int m = u & 0x07u;
+    if (e == 0u) {
+        const float f = (float)m * 1.953125e-3f;  // m * 2^-9, exact
+        return s ? -f : f;
+    }
+    if (e == 15u) {
+        const float f = (m == 7u) ? __builtin_bit_cast(float, 0x7fc00000u)
+                                  : 256.0f * (1.0f + (float)m * 0.125f);
+        return s ? -f : f;
+    }
+    return __builtin_bit_cast(float, s | ((e - 7u + 127u) << 23) | (m << 20));
+}
+
+extern "C" __launch_bounds__(32, 16)
+__global__ void attention_flash_fp8_e4m3_tile_batched(
+    const float* __restrict__ q,               // [sub_batch × n_heads × head_dim]
+    const unsigned char* __restrict__ k_cache, // token-local fp8 rows
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ partials,
+    const int* __restrict__ positions,         // [total_batch]
+    const float* __restrict__ /*cos_theta*/,   // unused (fp8 K unrotated)
+    const float* __restrict__ /*sin_theta*/,   // unused
+    const float* __restrict__ tree_bias,       // optional [total_batch × block_cols]
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn,
+    int tile_size,
+    int max_tiles,
+    int batch_offset,
+    int block_start,                           // ignored when tree_bias == nullptr
+    int block_cols,                            // ignored when tree_bias == nullptr
+    int /*v_mode_bits*/,                       // consumed-but-unused, ABI parity
+    int window,                                // sliding-window span; <= 0 = full causal
+    const KvSlotDesc* __restrict__ slot_descs, // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot           // [total_batch] or nullptr = legacy
+) {
+    const int h = blockIdx.x;
+    const int tile_id = blockIdx.y;
+    const int local_bid = blockIdx.z;
+    if (h >= n_heads) return;
+    const int tid = threadIdx.x;
+
+    const int global_bid = batch_offset + local_bid;
+    const bool tree_mode = (tree_bias != nullptr);
+    const int eff_block_start = tree_mode ? positions[0] : block_start;
+    const int seq_len = tree_mode ? (eff_block_start + block_cols) : (positions[global_bid] + 1);
+
+    const int slot = (row_slot != nullptr) ? row_slot[global_bid] : 0;
+    const int per_pos_bytes = n_kv_heads * (head_dim + 2);
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(seq_len, max_seq);
+    const int eff_seq_len = seq_len;
+
+    // Sliding-window lower bound (window <= 0 = full causal).
+    const int win_lo = (window > 0) ? (eff_seq_len - window) : 0;
+    const int tile_start = tile_id * tile_size;
+    if (tile_start >= eff_seq_len) return;
+    const int tile_end = min(tile_start + tile_size, eff_seq_len);
+    const int tile_len = tile_end - tile_start;
+
+    // Sliding-window fast path: a tile entirely below win_lo contributes
+    // nothing; write an empty partial and return before Phase A-D.
+    if (window > 0 && tile_end <= win_lo) {
+        if (tid == 0) {
+            float* pe = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
+                                 + tile_id * (2 + head_dim);
+            pe[0] = -1e30f;
+            pe[1] = 0.0f;
+        }
+        return;
+    }
+
+    const int kv_group = n_heads / n_kv_heads;
+    const int kv_h = h / kv_group;
+    const int q_dim = n_heads * head_dim;
+
+    const size_t codes_len = (size_t)n_kv_heads * head_dim;
+    const size_t k_head_off = (size_t)kv_h * head_dim;
+    const size_t scale_off = codes_len + (size_t)kv_h * 2;
+
+    extern __shared__ float sdata[];
+    float* scores = sdata;
+
+    // Load Q for this batch position: 8 consecutive dims per thread at
+    // D256 (matches the q8 tile's dim-indexed partials/reduce layout).
+    const float* q_head = q + local_bid * q_dim + h * head_dim;
+    const int dpt = head_dim / 32;
+    const int d0 = tid * dpt;
+    float mq[16];
+    for (int i = 0; i < dpt; i++) mq[i] = q_head[d0 + i];
+
+    // Phase A: Q·K with fp8 decode.
+    for (int t_local = 0; t_local < tile_len; t_local++) {
+        int t = tile_start + t_local;
+        if (t < win_lo) {                  // outside sliding window → mask, skip dot
+            if (tid == 0) scores[t_local] = -INFINITY;
+            continue;                      // t is wave-uniform, so all lanes skip together
+        }
+        const unsigned char* krow = k_cache + kv_offset_for_k(desc, t, per_pos_bytes);
+        const float ks = (float)*((const _Float16*)(krow + scale_off));
+        const unsigned char* kc = krow + k_head_off + d0;
+        float partial = 0.0f;
+        #pragma unroll
+        for (int i = 0; i < dpt; i++)
+            partial += mq[i] * (ks * hipfire_fp8_e4m3_to_f32_tile_b(kc[i]));
+        for (int off = 16; off > 0; off >>= 1)
+            partial += __shfl_xor(partial, off);
+        if (tid == 0) {
+            float s = partial * scale_attn;
+            if (tree_mode && t >= eff_block_start)
+                s += tree_bias[global_bid * block_cols + (t - eff_block_start)];
+            scores[t_local] = s;
+        }
+    }
+    __syncthreads();
+
+    // Phase B: tile max
+    float local_max = -1e30f;
+    for (int i = tid; i < tile_len; i += 32)
+        local_max = fmaxf(local_max, scores[i]);
+    for (int off = 16; off > 0; off >>= 1)
+        local_max = fmaxf(local_max, __shfl_xor(local_max, off));
+    float tile_max = local_max;
+
+    // Phase C: exp + sum
+    float local_sum = 0.0f;
+    for (int i = tid; i < tile_len; i += 32) {
+        float e = expf(scores[i] - tile_max);
+        scores[i] = e;
+        local_sum += e;
+    }
+    for (int off = 16; off > 0; off >>= 1)
+        local_sum += __shfl_xor(local_sum, off);
+    float tile_sum = local_sum;
+    __syncthreads();
+
+    // Phase D: V-weighted accumulation with fp8 decode.
+    float out_vec[16] = { 0.0f };
+    for (int t_local = 0; t_local < tile_len; t_local++) {
+        const float w = scores[t_local];
+        const int t = tile_start + t_local;
+        const unsigned char* vrow = v_cache + kv_offset_for_v(desc, t, per_pos_bytes);
+        const float vs = (float)*((const _Float16*)(vrow + scale_off));
+        const unsigned char* vc = vrow + k_head_off + d0;
+        #pragma unroll
+        for (int i = 0; i < dpt; i++)
+            out_vec[i] += w * (vs * hipfire_fp8_e4m3_to_f32_tile_b(vc[i]));
+    }
+
+    float* p = partials + ((long long)local_bid * n_heads + h) * max_tiles * (2 + head_dim)
+                        + tile_id * (2 + head_dim);
+    if (tid == 0) {
+        p[0] = tile_max;
+        p[1] = tile_sum;
+    }
+    for (int i = 0; i < dpt; i++)
+        p[2 + d0 + i] = out_vec[i];
+}
+#endif

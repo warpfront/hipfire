@@ -1,0 +1,1 @@
+["/home/kaden/hipfire-gemmv2/scratch-gemmv2integ/baseline-land042/target/release/hipfire", "bench", "/home/kaden/.hipfire/models/qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq", "--matrix", "--pp", "512,8192", "--ctx", "128", "--tg", "128", "--spec", "off", "--runs", "3", "--warmups", "1", "--kv-mode", "q8", "--kv-backend", "vmm", "--json"]

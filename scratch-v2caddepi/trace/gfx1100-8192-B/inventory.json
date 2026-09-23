@@ -1,0 +1,256 @@
+{
+  "arch": "gfx1100",
+  "length": "8192-B",
+  "kernel_count": 3980,
+  "warm_count": 2996,
+  "total_trace_count": 7440,
+  "gpu_ms": 3091.424827,
+  "wall_ms": 3152.866454,
+  "warm_ms": 43488.853563,
+  "first_after_start_ms": 12.401258,
+  "last_before_end_ms": 1.294823,
+  "sum_by_symbol": [
+    {
+      "name": "gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11",
+      "calls": 128,
+      "ms": 1088.461652,
+      "pct": 35.209060964172686
+    },
+    {
+      "name": "gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11",
+      "calls": 256,
+      "ms": 744.088012,
+      "pct": 24.069419560238266
+    },
+    {
+      "name": "gemm_mq4g256v2_residual_iu4_v2c_set_gfx11",
+      "calls": 288,
+      "ms": 508.359575,
+      "pct": 16.4441836191542
+    },
+    {
+      "name": "attention_q8_0_fa2_gqa_gfx11",
+      "calls": 32,
+      "ms": 347.293551,
+      "pct": 11.234093352902997
+    },
+    {
+      "name": "gdn_chunk_scan",
+      "calls": 768,
+      "ms": 79.75701,
+      "pct": 2.5799433744406555
+    },
+    {
+      "name": "fused_silu_mul_mq_rotate_awq_i4_hin",
+      "calls": 128,
+      "ms": 66.677511,
+      "pct": 2.156853707638287
+    },
+    {
+      "name": "fused_rmsnorm_mq_rotate_awq_i4",
+      "calls": 256,
+      "ms": 56.074714,
+      "pct": 1.8138792672638389
+    },
+    {
+      "name": "gated_norm_mq_rotate_awq_i4_gfx11",
+      "calls": 96,
+      "ms": 44.656529,
+      "pct": 1.444529027844286
+    },
+    {
+      "name": "gdn_chunk_prep",
+      "calls": 96,
+      "ms": 41.910244,
+      "pct": 1.355693453515763
+    },
+    {
+      "name": "gdn_chunk_kkt_solve",
+      "calls": 768,
+      "ms": 23.986783,
+      "pct": 0.7759135137462619
+    },
+    {
+      "name": "split_mq4v2_z_betaalpha",
+      "calls": 96,
+      "ms": 22.581781,
+      "pct": 0.7304651500102609
+    },
+    {
+      "name": "deinterleave_q_rmsnorm_f32_batched",
+      "calls": 32,
+      "ms": 16.171426,
+      "pct": 0.523105910865482
+    },
+    {
+      "name": "sigmoid_mul_rotate_x_mq_awq_i4_gfx11",
+      "calls": 32,
+      "ms": 9.349674,
+      "pct": 0.30243898924345414
+    },
+    {
+      "name": "attention_fa2_q_preconvert_gfx11",
+      "calls": 32,
+      "ms": 7.559915,
+      "pct": 0.24454468159707252
+    },
+    {
+      "name": "fused_gate_up_mq4g256v2",
+      "calls": 64,
+      "ms": 7.186116,
+      "pct": 0.23245320207166725
+    },
+    {
+      "name": "rope_partial_halfsplit_batched_f32",
+      "calls": 32,
+      "ms": 7.138152,
+      "pct": 0.23090168448077875
+    },
+    {
+      "name": "gemv_mq4g256v2_residual",
+      "calls": 128,
+      "ms": 5.218195,
+      "pct": 0.16879579132654743
+    },
+    {
+      "name": "fused_qkvza_mq4g256v2",
+      "calls": 48,
+      "ms": 2.652796,
+      "pct": 0.08581143480607753
+    },
+    {
+      "name": "kv_cache_write_q8_0_pair_batched_gfx1100",
+      "calls": 32,
+      "ms": 2.509077,
+      "pct": 0.0811624781584896
+    },
+    {
+      "name": "gemv_mq4g256v2",
+      "calls": 3,
+      "ms": 2.281399,
+      "pct": 0.07379765408088314
+    },
+    {
+      "name": "rmsnorm_f32",
+      "calls": 35,
+      "ms": 2.200359,
+      "pct": 0.07117620913122077
+    },
+    {
+      "name": "attention_flash_q8_0_tile",
+      "calls": 16,
+      "ms": 1.108119,
+      "pct": 0.0358449278896213
+    },
+    {
+      "name": "fused_rmsnorm_mq_rotate_awq",
+      "calls": 128,
+      "ms": 0.859679,
+      "pct": 0.02780850410761096
+    },
+    {
+      "name": "fused_qkv_mq4g256v2",
+      "calls": 16,
+      "ms": 0.75652,
+      "pct": 0.024471563836606272
+    },
+    {
+      "name": "__amd_rocclr_fillBufferUnAligned",
+      "calls": 192,
+      "ms": 0.555919,
+      "pct": 0.01798261420250928
+    },
+    {
+      "name": "dflash_state_bulk_copy_gfx1100",
+      "calls": 2,
+      "ms": 0.50504,
+      "pct": 0.01633680352143979
+    },
+    {
+      "name": "attention_flash_q8_0_reduce_gated_mq_rotate_awq_gfx1100",
+      "calls": 16,
+      "ms": 0.36388,
+      "pct": 0.011770624238439553
+    },
+    {
+      "name": "gated_delta_net_q8_compact3_b2",
+      "calls": 48,
+      "ms": 0.36096,
+      "pct": 0.011676169410539576
+    },
+    {
+      "name": "gated_norm_mq_rotate_awq_k6144_gfx1100",
+      "calls": 48,
+      "ms": 0.19028,
+      "pct": 0.006155090634523134
+    },
+    {
+      "name": "embedding_q8_batched",
+      "calls": 2,
+      "ms": 0.12764,
+      "pct": 0.004128840490805827
+    },
+    {
+      "name": "fused_silu_mul_mq_rotate_awq",
+      "calls": 64,
+      "ms": 0.121,
+      "pct": 0.003914052799964785
+    },
+    {
+      "name": "conv1d_silu_split_qknorm_b256_scalar_prep",
+      "calls": 48,
+      "ms": 0.10388,
+      "pct": 0.0033602628500854696
+    },
+    {
+      "name": "sample_topk_partial_fast21",
+      "calls": 2,
+      "ms": 0.055599,
+      "pct": 0.0017984910878119178
+    },
+    {
+      "name": "__amd_rocclr_copyBuffer",
+      "calls": 10,
+      "ms": 0.0554,
+      "pct": 0.001792053926595447
+    },
+    {
+      "name": "qwen36_27b_fa_prep_gfx1100",
+      "calls": 16,
+      "ms": 0.05512,
+      "pct": 0.0017829966143310656
+    },
+    {
+      "name": "sample_topk_finalize_fast21",
+      "calls": 2,
+      "ms": 0.05252,
+      "pct": 0.0016988930004475248
+    },
+    {
+      "name": "kv_cache_write_q8_0_pair",
+      "calls": 16,
+      "ms": 0.02304,
+      "pct": 0.0007452874091833771
+    },
+    {
+      "name": "mq_rotate_x",
+      "calls": 3,
+      "ms": 0.0086,
+      "pct": 0.00027818887669171197
+    },
+    {
+      "name": "embedding_q8",
+      "calls": 1,
+      "ms": 0.00716,
+      "pct": 0.0002316084136177509
+    }
+  ],
+  "usage": {
+    "prompt_tokens": 8192,
+    "completion_tokens": 1,
+    "total_tokens": 8193,
+    "prompt_tokens_details": {
+      "cached_tokens": 0
+    }
+  }
+}

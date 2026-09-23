@@ -1,0 +1,33 @@
+{
+  "label": "865off1",
+  "card": "E",
+  "bindir": "/home/kaden/ClaudeCode/warpfront/wt-g12raster2/scratch-g12raster2/bin865",
+  "extra_env": {
+    "HIPFIRE_G12_RASTER": "0"
+  },
+  "daemon_sha256": "f81ccacbe66048ff45d09ef447609556b5a0be1a0094b3eaa416005438380bc4",
+  "dispatches": 3633,
+  "gpu_ms": 2108.419,
+  "wall_ms": 2144.953101,
+  "timings": {
+    "ttft_ms": 2097.5,
+    "prefill_ms": 2097.5,
+    "prefill_tok_s": 3905.6,
+    "decode_tok_s": 27.7,
+    "latency_ms": null,
+    "tau": null,
+    "cycles": null,
+    "dflash": null,
+    "mtp": null,
+    "mtp_ngram": null,
+    "ngram_mod_windows": null,
+    "ngram_mod_drafts": null,
+    "ngram_mod_accepted": null,
+    "ngram_mod_accept_rate": null,
+    "mtp_windows": null,
+    "ar_windows": null,
+    "mtp_retired": null,
+    "mtp_window_timings": null
+  },
+  "text": "A"
+}

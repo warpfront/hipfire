@@ -1657,6 +1657,8 @@ pub struct DeepseekV4State {
     /// Rank-local physical ownership for the long-lived main/indexer
     /// compressor caches. Small recurrent rings remain replicated.
     pub compressor_cache_placement: CompressorCachePlacement,
+    /// Admitted storage backend for the model-owned long-lived compressor cache.
+    pub compressor_cache_backend: hipfire_runtime::kv_backend::KvBackend,
 
     /// Storage dtype for the two long-lived compressor caches only. All
     /// compressor arithmetic, score reductions, recurrent rings, and scratch
@@ -2045,6 +2047,7 @@ impl DeepseekV4State {
         Ok(DeepseekV4State {
             compressor_capacity: CompressorCapacityPlan::new(cfg.max_position_embeddings)?,
             compressor_cache_placement: CompressorCachePlacement::Replicated,
+            compressor_cache_backend: hipfire_runtime::kv_backend::KvBackend::Vmm,
             compressor_cache_dtype: rdna_compute::DType::F32,
             compressor_cache_access_devices: [0; 4],
             compressor_cache_access_count: 0,

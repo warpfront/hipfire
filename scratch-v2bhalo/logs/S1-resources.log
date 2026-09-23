@@ -1,0 +1,10 @@
+DEVICE arch=gfx1151 name=AMD Radeon 8060S Graphics mps=20 ROCR=1 HIP=0 pid=1954853
+OBJECT X5_OBJECT=/home/kaden/hipfire-land042/scratch-land042/gfx1151/abba/06-B-home/.hipfire_kernels/gfx1151/gemm_mq4g256v2_residual_mmq_iu4_gfx11_x5_symfold.c4e902d85a7eb0e1.hsaco
+OBJECT V2B_MS_OBJECT=/home/kaden/hipfire-prof040/scratch-gemmv2/bin/v2b-ms-gfx1151.hsaco
+OBJECT V2BP_OBJECT=/home/kaden/hipfire-v2bhalo/scratch-v2bhalo/bin/v2bp-gfx1151.hsaco
+RESOURCE arm=x5 add=0 vgpr=92 private=0 static_lds=0 dynamic_lds=30720 blocks_per_mp=2 waves_per_mp=32
+RESOURCE arm=x5 add=1 vgpr=92 private=0 static_lds=0 dynamic_lds=30720 blocks_per_mp=2 waves_per_mp=32
+RESOURCE arm=v2b_ms add=0 vgpr=250 private=0 static_lds=0 dynamic_lds=65536 blocks_per_mp=1 waves_per_mp=16
+RESOURCE arm=v2b_ms add=1 vgpr=250 private=0 static_lds=0 dynamic_lds=65536 blocks_per_mp=1 waves_per_mp=16
+RESOURCE arm=v2b_prod add=0 vgpr=254 private=0 static_lds=0 dynamic_lds=65536 blocks_per_mp=1 waves_per_mp=16
+RESOURCE arm=v2b_prod add=1 vgpr=254 private=0 static_lds=0 dynamic_lds=65536 blocks_per_mp=1 waves_per_mp=16

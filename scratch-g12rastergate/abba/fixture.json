@@ -1,0 +1,17 @@
+{
+  "order": "ABBAABBA",
+  "device": "GPU-05f92432f2312a0e",
+  "model": "/home/kaden/qcal/qat/v25/qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq",
+  "model_size": 14987185152,
+  "binaries_md5": {
+    "A": {
+      "hipfire": "969086c437ff0d52a8f9114754f9ef90",
+      "daemon": "cbd27dfa49c960d0dee1c32b41e6c0bb"
+    },
+    "B": {
+      "hipfire": "714a2d8451d132fa20f96f4a86a38c87",
+      "daemon": "a2e12566e6bf0dcfc807b96cf88d3ccc"
+    }
+  },
+  "matrix": "--pp 512,8192 --ctx 128 --tg 128 --spec off --runs 3 --warmups 1 --kv-mode fp8 --json"
+}

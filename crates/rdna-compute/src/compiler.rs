@@ -543,6 +543,21 @@ impl KernelCompiler {
         // Radiowave-selected spill-free RM2/BV6 schedule.
         if arch == "gfx1100" && name == "gemm_hfq4g256_residual_wmma_gfx1100_muse_rm_bt" {
             vec!["-mllvm".to_owned(), "-misched=gcn-iterative-ilp".to_owned()]
+        } else if matches!(arch, "gfx1100" | "gfx1151" | "gfx1201")
+            && matches!(
+                name,
+                "gdn_chunk_prep"
+                    | "gdn_chunk_kkt_solve"
+                    | "gdn_chunk_scan"
+                    | "gdn_chunk_prep_gfx11"
+                    | "gdn_chunk_kkt_solve_gfx1100"
+            )
+        {
+            let mut flags = vec!["-ffp-contract=off".to_owned()];
+            if arch == "gfx1201" && name == "gdn_chunk_scan" {
+                flags.push("-mcumode".to_owned());
+            }
+            flags
         } else if arch == "gfx1151" && gfx1151_cumode_modules.contains(name) {
             vec!["-mcumode".to_owned()]
         } else {
@@ -755,6 +770,7 @@ impl KernelCompiler {
         // matching hash certifies it. Hashless/mismatched nonempty blobs may be
         // used only when hipcc is unavailable (packaged install), with warning.
         // See: https://github.com/warpfront/hipfire/issues/2
+        let mut stale_precompiled = false;
         if let Some(dir) = &self.precompiled_dir {
             let precompiled = dir.join(format!("{name}.hsaco"));
             let hash_file = dir.join(format!("{name}.hash"));
@@ -779,7 +795,9 @@ impl KernelCompiler {
                     self.compiled.insert(name.to_string(), precompiled);
                     return Ok(&self.compiled[name]);
                 }
-                eprintln!("  {name}: pre-compiled blob has no hash file, recompiling");
+                // Stale legacy pair; a content-keyed hot entry may still hit
+                // below, so report the recompile only once that is ruled out.
+                stale_precompiled = true;
             }
         }
 
@@ -839,6 +857,9 @@ impl KernelCompiler {
             );
         }
 
+        if stale_precompiled {
+            eprintln!("  {name}: pre-compiled blob hash is stale and no cached build matches; recompiling");
+        }
         Self::hipcc_compile_publish(
             &self.hipcc_bin,
             self.rocm_env_root.as_deref(),

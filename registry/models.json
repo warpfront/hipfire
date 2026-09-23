@@ -832,10 +832,48 @@
     "qwen3.8:27b-mq4-xt": {
       "repo": "hipfire-models/qwen3.8-27b",
       "file": "qwen3.8-27b.mq4-xt",
-      "size_gb": 14.98,
+      "size_gb": 14.99,
       "min_vram_gb": 16,
       "default_kv_mode": "q8",
-      "desc": "Qwen3.8 27B MQ4V2 XT tier (speed). Teacher KLD WT2 0.057 / v6sel 0.771. Supersedes legacy .mq4r / qwen3.8:27b-fast; native 262K context, xhigh thinking.",
+      "desc": "Qwen3.8 27B MQ4V2 XT tier (speed). Teacher KLD WT2 0.048 / v6sel 0.771. Supersedes legacy .mq4r / qwen3.8:27b-fast; native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      }
+    },
+    "qwen3.8:27b-mq4-xts": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq4-xts",
+      "size_gb": 14.99,
+      "size_bytes": 14987185152,
+      "sha256": "de8ee8256033c3690b0f1a2aff14e77cc88fff490e118648b04a833a3f2969b5",
+      "min_vram_gb": 16,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ4V2 XT, symmetric, QAT r7s200. Test SKU for the mq4-lloyd gfx11 prefill work (X5 staging, V2C on gfx1100, V2B on gfx1151). WT2 c24 q8/q8: 0.076879 gfx1100, 0.076901 gfx1151. qwen3.8:27b-mq4-xt is unchanged.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -908,6 +946,114 @@
       "min_vram_gb": 18,
       "default_kv_mode": "q8",
       "desc": "Qwen3.8 27B MQ4V2 Pro tier. Teacher KLD WT2 0.032 / v6sel 0.484. Role-lifted MQ4V2; native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      }
+    },
+    "qwen3.8:27b-mq4l-xt": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq4l-xt",
+      "size_gb": 14.99,
+      "min_vram_gb": 16,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ4L XT tier (MQ4V2-Lloyd, qt=52). Same MQ4V2 wire + per-tensor 16-level Lloyd codebook sidecars; ~15% lower teacher KLD than the uniform MQ4V2 tier (WT2 0.041). gfx12 (RDNA4) prefill+decode; gfx11 decode only. Native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      }
+    },
+    "qwen3.8:27b-mq4l": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq4l",
+      "size_gb": 15.66,
+      "min_vram_gb": 17,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ4L base tier (MQ4V2-Lloyd, qt=52). Same MQ4V2 wire + per-tensor 16-level Lloyd codebook sidecars; ~15% lower teacher KLD than the uniform MQ4V2 tier (WT2 0.035). gfx12 (RDNA4) prefill+decode; gfx11 decode only. Native 262K context, xhigh thinking.",
+      "recommended_settings": {
+        "temperature": 1.0,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 1.0,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        }
+      },
+      "dflash": {
+        "file": "qwen38-27b-dflash-mq4.hfq"
+      },
+      "vision": {
+        "file": "qwen3.8-27b-vision.hfq",
+        "sha256": "269457cb42adc9d2fd20b33d2911e1b3015a30ef2033927f500c7fbe508753c9",
+        "size_bytes": 927611840
+      }
+    },
+    "qwen3.8:27b-mq4l-pro": {
+      "repo": "hipfire-models/qwen3.8-27b",
+      "file": "qwen3.8-27b.mq4l-pro",
+      "size_gb": 16.46,
+      "min_vram_gb": 18,
+      "default_kv_mode": "q8",
+      "desc": "Qwen3.8 27B MQ4L Pro tier (MQ4V2-Lloyd, qt=52). Same MQ4V2 wire + per-tensor 16-level Lloyd codebook sidecars; ~15% lower teacher KLD than the uniform MQ4V2 tier (WT2 0.028). gfx12 (RDNA4) prefill+decode; gfx11 decode only. Native 262K context, xhigh thinking.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,

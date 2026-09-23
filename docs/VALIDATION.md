@@ -143,6 +143,40 @@ through [`docs/methodology/perf-benchmarking.md`](methodology/perf-benchmarking.
 The same harnesses are the manual evidence path when automation is not used:
 run them locally, attach the artifacts, and let the maintainer review.
 
+### KV backend / K–V axis changes (load + serve)
+
+When a change touches KV backend selection, Qwen K/V axes, or the Qwen
+implicit default, authors filing PRs use the disclosure checkbox in the
+PR template — do **not** copy that checklist here:
+
+- [`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md)
+  test-plan item: *I inspected loaded/bench/harness KV backend fields
+  (`kv_backend`, `kv_backend_legacy`, `kv_backend_reason`); if any run
+  used legacy, I disclose the `HIPFIRE_KV_BACKEND=legacy` token…*
+
+Manual load/serve evidence for those changes (in addition to the
+`battery` / `chain` fixtures above):
+
+1. **Qwen path and tag.** Load the same Qwen artifact once by filesystem
+   path and once by registry tag. Confirm both routes report the same
+   effective backend and the same effective K/V axes (loaded ACK /
+   harness `--out` / bench `--json` fields and stderr markers agree).
+2. **Default axes.** On exact **gfx1201**, unpinned eligible Qwen must
+   keep native **fp8/fp8** (`KV cache: Fp8 vmm (` or equivalent admission
+   marker). On a **non-gfx1201** arch, unpinned Qwen HFQ/PaRo must
+   default **q8/q8** (not the former FWHT3/Q8).
+3. **Card-B baseline guard.** Run
+   [`scripts/guard_gfx1201_baseline.py`](../scripts/guard_gfx1201_baseline.py)
+   on the pinned card-B fixture. The guard sets `HIPFIRE_GRAPH=1`; treat
+   a green run as graph-capture **and** replay coverage for that
+   baseline, not a portable perf claim. Attach its `fixture.json` /
+   `summary.json` when the change can affect gfx1201 FP8 VMM selection
+   or allocation.
+
+Numerical/state parity for KV still needs a path-specific oracle (claim
+map row below); this procedure only covers user-facing load/serve
+semantics and the disclosure path for agents filing PRs.
+
 ### Seat 2 — Fable (when automation runs)
 
 Fable (`anthropic/claude-fable-5-1`, thinking `xhigh`) reads the diff, the
@@ -259,6 +293,7 @@ Use only when the claim class below names them. They are not universal.
 | Dispatch `bind_thread` / public `dispatch.rs` bind surface | `.githooks/pre-commit` → `scripts/verify-bind-thread.sh` (or run that script manually) | Automatic hook or manual bind check — **not** `test_kernels` |
 | Forward / fusion / KV **numerical or state parity** | Path-specific parity/state oracle for that arch/surface; **blocked** if no oracle exists | Manual oracle — **not** `serve_harness.py` |
 | Forward / fusion / sampling / KV **user-facing serve semantics** | `scripts/serve_harness.py` with the exact model (after parity route if the change can break numbers/state); add `scripts/gates.sh` when the Redline+serve+optional perf wrapper is desired | Manual serve (semantics only) |
+| KV backend rename / Qwen K–V axes / Qwen implicit default (load+serve semantics) | Load/serve harness route above **plus** [KV backend / K–V axis changes](#kv-backend--kv-axis-changes-load--serve): Qwen path **and** tag with matching backend + K/V axes; exact gfx1201 native fp8 and non-gfx1201 q8 defaults; card-B [`scripts/guard_gfx1201_baseline.py`](../scripts/guard_gfx1201_baseline.py) including graph replay (`HIPFIRE_GRAPH=1`). PR authors check the legacy-disclosure item in [`.github/PULL_REQUEST_TEMPLATE.md`](../.github/PULL_REQUEST_TEMPLATE.md) — do not duplicate that checklist here. | Manual load/serve + guard; disclosure via PR template |
 | LFM2.5 chat framing / thinking output | `scripts/serve_harness.py` with an `lfm2.5:*` registry tag | Manual LFM |
 | VL vision-tower forward numerical parity (arch-5 / arch-11 carriers) | Dump-and-diff vs an HF `transformers` reference for the exact checkpoint, pixel inputs pinned by hash (`benchmarks/vision/dump_hf_reference.py` precedent; family route: [`qwen35-vl-mq4v2-spec.md`](qwen35-vl-mq4v2-spec.md) §5, [`specs/2026-08-27-qwen35-vl-vision-serve.md`](specs/2026-08-27-qwen35-vl-vision-serve.md)); **blocked** for a checkpoint with no reference dump. Expected floor on 4:2:0 JPEG inputs: `patches` rel-L1 ≈ 5e-3 (zune-jpeg IDCT/chroma vs PIL's libjpeg-turbo; `jpeg-decoder` only narrows it to ≈ 3.5e-3; since d147fccb3 hipfire decodes JPEG with `libjpeg-turbo-rs`, byte-identical to PIL/libjpeg-turbo on all five committed fixtures, and the `patches` floor is the CatmullRom-vs-PIL-bicubic kernel alone: ≈ 2.6e-3 on doge, max one u8 step; 2026-09-07); 4:4:4 inputs reach ≈ 1e-4. Judge tower parity on the shape of the per-block curve and the serve battery, not on beating that floor | Manual oracle — not `serve_harness.py`; a green VL serve battery is *not* parity evidence |
 | VL image-bearing serve semantics (`generate_vl` over `/v1/chat/completions`) | Manual OpenAI-compatible battery through `hipfire serve` with the exact VL artifact: committed fixtures under [`../benchmarks/vision/images/`](../benchmarks/vision/images/) + the fixed desc/ocr prompts of `comparison-2026-05-23.md`, greedy temp 0; stream **and** non-stream typed-emission check (reasoning vs `content` deltas; no literal `<think>`/`<|im_end|>` chunks in content); client-disconnect probe mid-stream followed by an immediate follow-up turn (no slot wedge); eyeball every decoded output; record artifact sha256, fixture hashes, binary md5s. No scripted harness exists (**blocked** until one lands); `scripts/serve_harness.py` is text-only today and does not exercise this surface | Manual serve (semantics only) |

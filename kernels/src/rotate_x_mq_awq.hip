@@ -7,7 +7,7 @@
 // which Stage A's AWQ whitelist excluded because no AWQ-aware rotate existed
 // for that path. This kernel completes the AWQ math `(W·s) · (x/s) = W·x`
 // by dividing each input element by `awq_scale[i]` BEFORE the FWHT — exact
-// mirror of `fused_rmsnorm_mq_rotate_awq.hip` Phase 1c.
+// mirror of `fused_rmsnorm_mq_rotate_awq` (derived from fused_rmsnorm_mq_rotate.hip via -DHIPFIRE_RMSNORM_AWQ) Phase 1c.
 //
 // Backward compatibility: this kernel is dispatched ONLY when the upcoming
 // linear carries an `awq_scale` GpuTensor. Otherwise the standard

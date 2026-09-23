@@ -42,6 +42,7 @@ use hipfire_generate::ar::{
     GenerationRouteScope,
 };
 use hipfire_runtime::hfq::HfqFile;
+use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::prompt_frame::{
     continuation_suffix_tool_results, qwen35_grammar_on, AssistantPrefix, ChatFrame,
     JinjaChatFrame, Message, Role, ThinkMode, ToolCall,
@@ -208,11 +209,16 @@ impl PendingToolBroker {
 
 impl SlotBackend {
     /// CPU preflight then GPU load. Called only when experimental_multi_slot load is requested.
+    /// `kv_mode`/`kv_backend` are the effective per-load values (already gated by
+    /// `validate_load_caps` to q8/legacy); they ride into `EngineConfig`
+    /// so `Rig::build` fails closed if a non-q8/non-legacy value arrives.
     pub fn load(
         model_path: &str,
         n_slots: usize,
         cap_tokens: usize,
         prefill_chunk: usize,
+        kv_mode: &str,
+        kv_backend: &str,
     ) -> Result<Self, String> {
         // CPU preflight: open HFQ, arch, VL, config, tokenizer.
         let preflight = cpu_preflight(model_path)?;
@@ -241,6 +247,8 @@ impl SlotBackend {
                 prefill_chunk,
                 host_budget_bytes: 16 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
+                kv_mode: kv_mode.to_string(),
+                kv_backend: kv_backend.to_string(),
             },
         )
         .map_err(|e| format!("SlotEngine spawn: {e}"))?;
@@ -1274,15 +1282,21 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("experimental multi-slot currently requires kv_mode=q8".to_string());
     }
-    if params
+    if let Some(v) = params
         .and_then(|p| p.get("kv_backend"))
         .and_then(|v| v.as_str())
-        .is_some_and(|v| !v.is_empty() && v != "contiguous")
+        .filter(|v| !v.is_empty())
     {
-        return Some(
-            "experimental multi-slot uses fixed slot arenas and requires kv_backend=contiguous"
-                .to_string(),
-        );
+        match v.parse::<KvBackend>() {
+            Ok(KvBackend::Legacy) => {}
+            Ok(_) => {
+                return Some(
+                    "experimental multi-slot uses fixed slot arenas and requires kv_backend=legacy"
+                        .to_string(),
+                );
+            }
+            Err(e) => return Some(e.to_string()),
+        }
     }
     None
 }
@@ -1911,7 +1925,7 @@ mod tests {
             "tp": 1,
             "pp": 1,
             "kv_mode": "q8",
-            "kv_backend": "contiguous",
+            "kv_backend": "legacy",
             "kv_adaptive": "off",
             "dflash_mode": "off",
             "mtp_mode": "off",

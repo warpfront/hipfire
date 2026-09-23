@@ -1,0 +1,2 @@
+parent pid=1964611 ROCR_VISIBLE_DEVICES=1 HIP_VISIBLE_DEVICES=0 HOME=/home/kaden/hipfire-v2bhalo/scratch-v2bhalo/trace/gfx1151-8192/home
+daemon pid=1964613 ROCR_VISIBLE_DEVICES=1 HIP_VISIBLE_DEVICES=0

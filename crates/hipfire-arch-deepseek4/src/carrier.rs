@@ -134,6 +134,7 @@ pub fn load_bundle(
         ));
     }
     let mut state = DeepseekV4State::new(&config)?;
+    state.compressor_cache_backend = ctx.kv_backend;
     state.compressor_cache_dtype = if compressor_cache == hipfire_config::Deepseek4CompressorCache::F16
     {
         rdna_compute::DType::F16

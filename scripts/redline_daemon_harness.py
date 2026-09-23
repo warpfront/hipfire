@@ -579,11 +579,18 @@ def main():
                     and bool(shadow["blob_bit_exact"])
                     and frame_exact
                 )
+                backend = "pm4_ib" if args.pm4 else "aql_packets"
+                replay_us = report["aql_shadow"]["aql_host_us"]
+                hip_us = report["aql_shadow"]["hip_host_us"]
+                # The daemon field is named `aql_host_us` for both transports;
+                # label it by the backend that actually ran so a PM4 run never
+                # reads as an AQL number.
                 print(
-                    f"shadow: backend={'pm4_ib' if args.pm4 else 'aql_packets'} "
+                    f"shadow: backend={backend} "
                     f"exact={shadow_pass} gdn_frame_exact={frame_exact} "
-                    f"aql={report['aql_shadow']['aql_host_us']:.1f}us "
-                    f"hip={report['aql_shadow']['hip_host_us']:.1f}us",
+                    f"{backend}={replay_us:.1f}us "
+                    f"hip={hip_us:.1f}us "
+                    f"delta={(replay_us / hip_us - 1.0) * 100.0:+.2f}%",
                     flush=True,
                 )
         else:

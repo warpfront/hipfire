@@ -48,7 +48,7 @@
 #define HIPFIRE_GDN_KERNEL gated_delta_net_q8_fast
 #endif
 
-#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
 // Preserve the shipping shfl_down reduction order while replacing its LDS
 // bpermutes with gfx11 VALU cross-lane operations. Only lane 0 is consumed.
 // row_shl:N gives lane i the value from lane i+N; after each addition the next
@@ -142,6 +142,173 @@ __global__ void HIPFIRE_GDN_KERNEL(
             scale * (float)src[tid + 96]);
     }
 
+
+#if defined(HIPFIRE_GDN_PREFETCH) && (HIPFIRE_GDN_WAVES_PER_BLOCK == 1)
+    // One-token-ahead register prefetch (G1b). Prologue loads token0; each
+    // iteration issues next-token q/k/v/gate/beta into a distinct pending
+    // bundle before the unchanged recurrence, then promotes. No OOB final load.
+    float k0 = 0.0f, k1 = 0.0f, k2 = 0.0f, k3 = 0.0f;
+    float q0 = 0.0f, q1 = 0.0f, q2 = 0.0f, q3 = 0.0f;
+    float gate_raw = 0.0f, beta_v = 0.0f;
+#if TILE_ROWS == 4
+    float4 v_rows = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#elif TILE_ROWS == 8
+    float v_row0 = 0.0f, v_row1 = 0.0f, v_row2 = 0.0f, v_row3 = 0.0f;
+    float v_row4 = 0.0f, v_row5 = 0.0f, v_row6 = 0.0f, v_row7 = 0.0f;
+#endif
+    if (n_tokens > 0) {
+        const int bt0 = lane * n_tokens;
+        const float* q_t = q + bt0 * qk_stride + qk_head * HD;
+        const float* k_t = k + bt0 * qk_stride + qk_head * HD;
+        const float* v_t = v + bt0 * stride + h * HD;
+        k0 = k_t[tid]; k1 = k_t[tid + 32]; k2 = k_t[tid + 64]; k3 = k_t[tid + 96];
+        q0 = q_t[tid]; q1 = q_t[tid + 32]; q2 = q_t[tid + 64]; q3 = q_t[tid + 96];
+        gate_raw = gate[bt0 * n_heads + h];
+        beta_v = beta[bt0 * n_heads + h];
+#if TILE_ROWS == 4
+        v_rows = *reinterpret_cast<const float4*>(v_t + row_start);
+#elif TILE_ROWS == 8
+        v_row0 = v_t[row_start + 0]; v_row1 = v_t[row_start + 1];
+        v_row2 = v_t[row_start + 2]; v_row3 = v_t[row_start + 3];
+        v_row4 = v_t[row_start + 4]; v_row5 = v_t[row_start + 5];
+        v_row6 = v_t[row_start + 6]; v_row7 = v_t[row_start + 7];
+#endif
+    }
+    for (int t = 0; t < n_tokens; t++) {
+        const int bt = lane * n_tokens + t;
+        const bool has_next = (t + 1 < n_tokens);
+        float pk0 = 0.0f, pk1 = 0.0f, pk2 = 0.0f, pk3 = 0.0f;
+        float pq0 = 0.0f, pq1 = 0.0f, pq2 = 0.0f, pq3 = 0.0f;
+        float pgate = 0.0f, pbeta = 0.0f;
+#if TILE_ROWS == 4
+        float4 pv_rows = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+#elif TILE_ROWS == 8
+        float pv0 = 0.0f, pv1 = 0.0f, pv2 = 0.0f, pv3 = 0.0f;
+        float pv4 = 0.0f, pv5 = 0.0f, pv6 = 0.0f, pv7 = 0.0f;
+#endif
+        if (has_next) {
+            const int btn = bt + 1;
+            const float* q_n = q + btn * qk_stride + qk_head * HD;
+            const float* k_n = k + btn * qk_stride + qk_head * HD;
+            const float* v_n = v + btn * stride + h * HD;
+            pk0 = k_n[tid]; pk1 = k_n[tid + 32]; pk2 = k_n[tid + 64]; pk3 = k_n[tid + 96];
+            pq0 = q_n[tid]; pq1 = q_n[tid + 32]; pq2 = q_n[tid + 64]; pq3 = q_n[tid + 96];
+            pgate = gate[btn * n_heads + h];
+            pbeta = beta[btn * n_heads + h];
+#if TILE_ROWS == 4
+            pv_rows = *reinterpret_cast<const float4*>(v_n + row_start);
+#elif TILE_ROWS == 8
+            pv0 = v_n[row_start + 0]; pv1 = v_n[row_start + 1];
+            pv2 = v_n[row_start + 2]; pv3 = v_n[row_start + 3];
+            pv4 = v_n[row_start + 4]; pv5 = v_n[row_start + 5];
+            pv6 = v_n[row_start + 6]; pv7 = v_n[row_start + 7];
+#endif
+        }
+
+        float alpha = expf(gate_raw);
+#if TILE_ROWS == 4
+        float out0 = 0.0f, out1 = 0.0f, out2 = 0.0f, out3 = 0.0f;
+        for (int r = 0; r < TILE_ROWS; r++) {
+            float4 s = S_f4[HIPFIRE_GDN_S_INDEX(r, tid)];
+            float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
+
+            float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
+            kv = hipfire_gdn_read_lane0(hipfire_gdn_reduce_sum_lane0_dpp(kv));
+#else
+            for (int o = 16; o > 0; o >>= 1)
+                kv += __shfl_down(kv, o);
+            kv = __shfl(kv, 0);
+#endif
+
+            const float v_row =
+                (r == 0) ? v_rows.x :
+                (r == 1) ? v_rows.y :
+                (r == 2) ? v_rows.z : v_rows.w;
+            float delta = (v_row - alpha * kv) * beta_v;
+
+            s0 = alpha * s0 + k0 * delta;
+            s1 = alpha * s1 + k1 * delta;
+            s2 = alpha * s2 + k2 * delta;
+            s3 = alpha * s3 + k3 * delta;
+            S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = make_float4(s0, s1, s2, s3);
+
+            float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
+            out_v = hipfire_gdn_reduce_sum_lane0_dpp(out_v);
+#else
+            for (int o = 16; o > 0; o >>= 1)
+                out_v += __shfl_down(out_v, o);
+#endif
+            if (tid == 0) {
+                if (r == 0) out0 = out_v;
+                else if (r == 1) out1 = out_v;
+                else if (r == 2) out2 = out_v;
+                else out3 = out_v;
+            }
+        }
+        if (tid == 0) {
+            *reinterpret_cast<float4*>(output + bt * stride + h * HD + row_start) =
+                make_float4(out0, out1, out2, out3);
+        }
+#elif TILE_ROWS == 8
+#pragma clang loop unroll(disable)
+        for (int r = 0; r < TILE_ROWS; r++) {
+            float4 s = S_f4[r * 32 + tid];
+            float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
+
+            float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
+            kv = hipfire_gdn_read_lane0(hipfire_gdn_reduce_sum_lane0_dpp(kv));
+#else
+            for (int o = 16; o > 0; o >>= 1)
+                kv += __shfl_down(kv, o);
+            kv = __shfl(kv, 0);
+#endif
+
+            const float v_row =
+                (r == 0) ? v_row0 :
+                (r == 1) ? v_row1 :
+                (r == 2) ? v_row2 :
+                (r == 3) ? v_row3 :
+                (r == 4) ? v_row4 :
+                (r == 5) ? v_row5 :
+                (r == 6) ? v_row6 : v_row7;
+            float delta = (v_row - alpha * kv) * beta_v;
+
+            s0 = alpha * s0 + k0 * delta;
+            s1 = alpha * s1 + k1 * delta;
+            s2 = alpha * s2 + k2 * delta;
+            s3 = alpha * s3 + k3 * delta;
+            S_f4[r * 32 + tid] = make_float4(s0, s1, s2, s3);
+
+            float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
+            out_v = hipfire_gdn_reduce_sum_lane0_dpp(out_v);
+#else
+            for (int o = 16; o > 0; o >>= 1)
+                out_v += __shfl_down(out_v, o);
+#endif
+            if (tid == 0)
+                output[bt * stride + h * HD + row_start + r] = out_v;
+        }
+#else
+#error "unsupported HIPFIRE_GDN_TILE_ROWS"
+#endif
+        if (has_next) {
+            k0 = pk0; k1 = pk1; k2 = pk2; k3 = pk3;
+            q0 = pq0; q1 = pq1; q2 = pq2; q3 = pq3;
+            gate_raw = pgate;
+            beta_v = pbeta;
+#if TILE_ROWS == 4
+            v_rows = pv_rows;
+#elif TILE_ROWS == 8
+            v_row0 = pv0; v_row1 = pv1; v_row2 = pv2; v_row3 = pv3;
+            v_row4 = pv4; v_row5 = pv5; v_row6 = pv6; v_row7 = pv7;
+#endif
+        }
+    }
+#else
     for (int t = 0; t < n_tokens; t++) {
         const int bt = lane * n_tokens + t;
         const float* q_t = q + bt * qk_stride + qk_head * HD;
@@ -174,7 +341,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
             float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
             float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
-#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
             kv = hipfire_gdn_read_lane0(hipfire_gdn_reduce_sum_lane0_dpp(kv));
 #else
             for (int o = 16; o > 0; o >>= 1)
@@ -195,7 +362,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
             S_f4[HIPFIRE_GDN_S_INDEX(r, tid)] = make_float4(s0, s1, s2, s3);
 
             float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
-#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
             out_v = hipfire_gdn_reduce_sum_lane0_dpp(out_v);
 #else
             for (int o = 16; o > 0; o >>= 1)
@@ -219,7 +386,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
             float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
             float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
-#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
             kv = hipfire_gdn_read_lane0(hipfire_gdn_reduce_sum_lane0_dpp(kv));
 #else
             for (int o = 16; o > 0; o >>= 1)
@@ -237,7 +404,7 @@ __global__ void HIPFIRE_GDN_KERNEL(
             S_f4[r * 32 + tid] = make_float4(s0, s1, s2, s3);
 
             float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
-#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
             out_v = hipfire_gdn_reduce_sum_lane0_dpp(out_v);
 #else
             for (int o = 16; o > 0; o >>= 1)
@@ -254,6 +421,8 @@ __global__ void HIPFIRE_GDN_KERNEL(
             __syncthreads();
 #endif
     }
+
+#endif
 
     // Requant FP32 → Q8 — OUTSIDE the token loop.
     // Only the final state is quantized (intermediate tokens stay FP32 in LDS).
@@ -413,7 +582,7 @@ __global__ void gated_delta_net_q8_fast_independent_masked(
             float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
             float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
-#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
             kv = hipfire_gdn_read_lane0(hipfire_gdn_reduce_sum_lane0_dpp(kv));
 #else
             for (int o = 16; o > 0; o >>= 1)
@@ -434,7 +603,7 @@ __global__ void gated_delta_net_q8_fast_independent_masked(
             S_f4[HIPFIRE_GDN_S_INDEX_M(r, tid)] = make_float4(s0, s1, s2, s3);
 
             float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
-#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
             out_v = hipfire_gdn_reduce_sum_lane0_dpp(out_v);
 #else
             for (int o = 16; o > 0; o >>= 1)
@@ -458,7 +627,7 @@ __global__ void gated_delta_net_q8_fast_independent_masked(
             float s0 = s.x, s1 = s.y, s2 = s.z, s3 = s.w;
 
             float kv = s0*k0 + s1*k1 + s2*k2 + s3*k3;
-#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
             kv = hipfire_gdn_read_lane0(hipfire_gdn_reduce_sum_lane0_dpp(kv));
 #else
             for (int o = 16; o > 0; o >>= 1)
@@ -476,7 +645,7 @@ __global__ void gated_delta_net_q8_fast_independent_masked(
             S_f4[r * 32 + tid] = make_float4(s0, s1, s2, s3);
 
             float out_v = s0*q0 + s1*q1 + s2*q2 + s3*q3;
-#if defined(HIPFIRE_GFX1151_GDN_DPP_REDUCE)
+#if defined(HIPFIRE_GDN_DPP_REDUCE)
             out_v = hipfire_gdn_reduce_sum_lane0_dpp(out_v);
 #else
             for (int o = 16; o > 0; o >>= 1)

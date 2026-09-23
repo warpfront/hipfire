@@ -334,6 +334,9 @@ pub enum ValueRule {
         max: f64,
     },
     KvAdaptive,
+    /// `legacy` | `vmm`. Rejects the pre-rename `contiguous` spelling with a
+    /// migration message rather than a generic enum failure.
+    KvBackend,
     Deepseek4Placement,
 }
 
@@ -405,12 +408,22 @@ impl ConfigField {
                 matches!(v.as_str(), "off" | "conservative" | "balanced" | "aggressive")
                     || valid_advanced_kv(v)
             }),
+            ValueRule::KvBackend => {
+                matches!(value, ConfigValue::String(v) if matches!(v.as_str(), "legacy" | "vmm"))
+            }
             ValueRule::Deepseek4Placement => matches!(value, ConfigValue::String(v)
                 if v.parse::<Deepseek4ComputePlacement>().is_ok()),
         };
 
         if valid {
             Ok(())
+        } else if matches!(self.rule, ValueRule::KvBackend)
+            && matches!(value, ConfigValue::String(v) if v == "contiguous")
+        {
+            Err(ConfigError::InvalidValue {
+                key: self.key.to_owned(),
+                message: "KV backend 'contiguous' was renamed to 'legacy'; use --kv-backend legacy or memory.kv_backend = \"legacy\"".into(),
+            })
         } else {
             Err(ConfigError::InvalidValue {
                 key: self.key.to_owned(),
@@ -478,14 +491,36 @@ fn expand_tilde(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
+// Qwen-only K/V axis overrides. Empty is the unset default (not an authored
+// format); consumers omit BuiltIn empty values from IPC.
+const KV_K_NAMES: &[&str] = &[
+    "",
+    "q8",
+    "fwht2",
+    "fwht3",
+    "fwht4",
+    "asym2",
+    "asym3",
+    "asym4",
+    "turbo",
+    "turbo2",
+    "turbo3",
+    "turbo4",
+    "legacy-asym2",
+    "legacy-asym3",
+    "legacy-asym4",
+];
+const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
+
 // The union of every KV-mode name any SITE accepts. This is the config
 // schema's allow-list only — it is NOT a promise that a given model supports a
 // mode. Per-site acceptance lives in `hipfire_runtime::kv_mode`'s policies,
 // which warn and fall back for anything they cannot allocate. `bf16` is
-// currently maple-only (arch 15).
+// maple's default plus the Qwen quality-control arm; `fp8` is admitted at
+// the single-GPU Qwen sites under the carrier's exact gfx1201/geometry guards.
 const KV_MODES: &[&str] = &[
     "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
-    "turbo", "turbo4", "turbo3", "turbo2",
+    "turbo", "turbo4", "turbo3", "turbo2", "fp8",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
@@ -627,7 +662,7 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         false,
         Some("HIPFIRE_KV_MODE"),
-        "KV cache format; auto inherits the registry recommendation, then q8. DeepSeek V4 currently supports f32 and f16."
+        "KV cache format; auto inherits the registry recommendation, then q8 — except single-GPU Qwen on exact gfx1201, where auto means native fp8 (stage-b FA2 arithmetic). DeepSeek V4 currently supports f32 and f16."
     ),
     field!(
         "memory.kv_adaptive",
@@ -890,12 +925,36 @@ pub static FIELDS: &[ConfigField] = &[
         "kv_backend",
         Memory,
         ModelLoad,
-        DefaultValue::String("contiguous"),
-        ValueRule::Enum(&["contiguous", "vmm"]),
+        DefaultValue::String("vmm"),
+        ValueRule::KvBackend,
         true,
         false,
         None,
-        "KV storage backend. VMM reserves the logical context window and commits physical pages on demand."
+        "KV storage backend: legacy (physically contiguous) or vmm (reserves the logical context window and commits physical pages on demand)."
+    ),
+    field!(
+        "memory.kv_k",
+        "kv_k",
+        Memory,
+        ModelLoad,
+        DefaultValue::String(""),
+        ValueRule::Enum(KV_K_NAMES),
+        true,
+        false,
+        None,
+        "Qwen-only K-axis override; empty leaves the mode-preset K unchanged."
+    ),
+    field!(
+        "memory.kv_v",
+        "kv_v",
+        Memory,
+        ModelLoad,
+        DefaultValue::String(""),
+        ValueRule::Enum(KV_V_NAMES),
+        true,
+        false,
+        None,
+        "Qwen-only V-axis override; empty leaves the mode-preset V unchanged."
     ),
     field!(
         "reasoning.mode",
@@ -1910,6 +1969,16 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_PREFILL_BATCHED",
         "Use batched prefill kernels when eligible."
     ),
+    process_field!(
+        "prefill.chunk_rows",
+        "prefill_chunk_rows",
+        Kernel,
+        DefaultValue::Integer(512),
+        ValueRule::Integer { min: 2, max: 1048576 },
+        false,
+        "HIPFIRE_PREFILL_CHUNK_ROWS",
+        "Widened ordinary-prefill chunk ceiling in rows (arch default 8192 on exact gfx1100/gfx1151/gfx1201, 512 elsewhere; HIPFIRE_PREFILL_MAX_BATCH overrides; per-device VRAM admission may select a smaller rung)."
+    ),
     process_bool_field!(
         "speculation.draft_f16",
         "draft_f16",
@@ -2121,6 +2190,106 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx1201 MQ4v2 FP8 WMMA 3-way QKV prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_QKV=0 to opt out)."
     ),
     process_bool_field!(
+        "kernel.gfx12_mq4v2_fp8_v2",
+        "gfx12_mq4v2_fp8_v2",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_MQ4V2_FP8_V2",
+        "Enable the gfx1201 MQ4v2 FP8 WMMA staged-tile v2 prefill route (default on exact gfx1201; set to false or HIPFIRE_GFX12_MQ4V2_FP8_V2=0 to opt out; selects the _v2_gfx1201 symbols at N>=256 with 128x128 geometry and 2 slabs unless HIPFIRE_GFX12_MQ4V2_FP8_V2_GEOM/_SLABS override, the four family flags remain prerequisites)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_gdn_pre_fused",
+        "gfx12_gdn_pre_fused",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_GDN_PRE_FUSED",
+        "Enable the gfx1201 batched prefill GDN preamble fusion (default on exact gfx1201; set to false or HIPFIRE_GFX12_GDN_PRE_FUSED=0 to opt out; fuses sigmoid+conv+qknorm into gdn_pre_batched_gfx1201, byte-exact)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_gdn_chunk_scan",
+        "gfx12_gdn_chunk_scan",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_GDN_CHUNK_SCAN",
+        "Enable the fused chunked gated-delta-net prefill scan on gfx1100/gfx1151/gfx1201 (default on; set to false or HIPFIRE_GFX12_GDN_CHUNK_SCAN=0 to opt out; exact-shape ordinary prefill only)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_silu_quant_fused",
+        "gfx12_silu_quant_fused",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_SILU_QUANT_FUSED",
+        "Fuse the int4 activation quantiser into fused_silu_mul_mq_rotate_awq on gfx1201 (default on exact gfx1201; set to false or HIPFIRE_GFX12_SILU_QUANT_FUSED=0 to opt out; emits block_i4_128 from the down-proj SwiGLU/FWHT producer so the standalone quantize_int4_mmq_ds128 launch disappears, bit-identical)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_producer_quant_fused",
+        "gfx12_producer_quant_fused",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_PRODUCER_QUANT_FUSED",
+        "Fuse the int4 activation quantiser into the gfx1201 RMSNorm/rotate/gated-norm producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx12 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
+    ),
+    process_bool_field!(
+        "kernel.g12_norm",
+        "g12_norm",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_G12_NORM",
+        "Launch the gfx1201 _v2 RMSNorm and gated-norm int4 producers (default on exact gfx1201; set to false or HIPFIRE_G12_NORM=0 to restore the incumbent _gfx12 symbols; batched sum-of-squares loads, one-reciprocal RTN codes and one wave per gated-norm group, bit-identical)."
+    ),
+    process_bool_field!(
+        "kernel.g12_a4c2",
+        "g12_a4c2",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_G12_A4C2",
+        "Search two activation-quantization scales ({5,7}, as on gfx11) inside the gfx1201 int4 producers (default on exact gfx1201; set to false or HIPFIRE_G12_A4C2=0 to restore round-to-nearest d = amax/7; compiles the gfx1201 JIT with -DIU4_A4_CANDIDATES=2, whose one-pass producer-layout search is bit-identical to the generic candidate loop)."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_producer_quant_fused",
+        "gfx11_producer_quant_fused",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX11_PRODUCER_QUANT_FUSED",
+        "Fuse the int4 activation quantiser into the gfx11 sigmoid/gated-norm producers (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_PRODUCER_QUANT_FUSED=0 to opt out; emits block_i4_128 from the _gfx11 producer twins so the standalone quantize_int4_mmq_ds128 launch disappears at each admitted site, bit-identical)."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_lean_pbs",
+        "gfx11_lean_pbs",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_GFX11_LEAN_PBS",
+        "Size fallback-only ordinary gfx11 MQ4V2 prefill scratch for at most 64 rows (default on for the admitted fused gfx1100/gfx1151 route); verify, non-fused, and other architectures retain full scratch. Set false or HIPFIRE_GFX11_LEAN_PBS=0 to opt out."
+    ),
+    process_field!(
+        "kernel.gfx11_a4_candidates",
+        "gfx11_a4_candidates",
+        Kernel,
+        DefaultValue::String("2"),
+        ValueRule::Enum(&["1", "2", "4", "8"]),
+        true,
+        "HIPFIRE_GFX11_A4_CANDIDATES",
+        "Number of activation-quantization candidates searched inside fused gfx1100/gfx1151 IU4 producers (default 2, selecting {5,7}); 8 restores the full-grid search. Other architectures and the standalone quantizer are unchanged."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_fp8_stream",
+        "gfx12_fp8_stream",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_FP8_STREAM",
+        "Fuse the MQ4v2 FP8 activation pre-pass into the gfx1201 RMSNorm/rotate producers (default on exact gfx1201; set to false or HIPFIRE_GFX12_FP8_STREAM=0 to opt out; emits byte-identical prepare_mq4v2_fp8_x_f32 outputs for the qkvza/gate_up/qkv inputs so the standalone pack_f32_to_fp8_mq4v2_gfx12 launch disappears at each admitted site)."
+    ),
+    process_bool_field!(
         "kernel.gfx12_fa2_prefill",
         "gfx12_fa2_prefill",
         Kernel,
@@ -2128,6 +2297,59 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_GFX12_FA2_PREFILL",
         "Enable the gfx1201 GQA-fused FA2 prefill attention route (default on exact gfx1201; set to false or HIPFIRE_GFX12_FA2_PREFILL=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_fa_packet",
+        "gfx12_fa_packet",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_FA_PACKET",
+        "Enable the gfx1201 packet-minimal Q128 FA2 attention body (default on exact gfx1201; set to false or HIPFIRE_GFX12_FA_PACKET=0 to opt out to route-N; exact stage-b arithmetic)."
+    ),
+    process_bool_field!(
+        "kernel.attn_qresident",
+        "attn_qresident",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_ATTN_QRESIDENT",
+        "Enable the gfx1201 register-resident-Q wide-workgroup FA2 prefill route (default on exact gfx1201; set to false or HIPFIRE_ATTN_QRESIDENT=0 to opt out; exact H24/KV4/D256 native-fp8-KV shapes only)."
+    ),
+    process_bool_field!(
+        "kernel.attn_qresident_v2",
+        "attn_qresident_v2",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_ATTN_QRESIDENT_V2",
+        "Use the bit-exact v2 schedule of the gfx1201 Q-resident FA2 prefill kernel (default on exact gfx1201; set to false or HIPFIRE_ATTN_QRESIDENT_V2=0 to restore the v1 Q-resident kernel; only applies where kernel.attn_qresident selects the Q-resident route)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_fa_prep_fused",
+        "gfx12_fa_prep_fused",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_FA_PREP_FUSED",
+        "Fuse gfx1201 prefill Q/K norm and RoPE (default on exact gfx1201; false restores the separate launches)."
+    ),
+    process_bool_field!(
+        "kernel.gfx12_fa_prep_fp8q",
+        "gfx12_fa_prep_fp8q",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX12_FA_PREP_FP8Q",
+        "Emit preconverted fp8 Q for gfx1201 Q-resident v2 attention (default on exact gfx1201; false retains F32 Q)."
+    ),
+    process_auto_bool_field!(
+        "kernel.gfx11_q8_fa2_wide",
+        "gfx11_q8_fa2_wide",
+        Kernel,
+        true,
+        "HIPFIRE_GFX11_Q8_FA2_WIDE",
+        "Whole-chunk Q8/Q8 FA2 prefill: auto enables on exact gfx1100 only; gfx1151 and other arches default off. Explicit false opts out; explicit true can opt gfx1151 in. Requires kernel.gfx11_fa2_prefill, H24/KV4/D256, 64..8192 rows (above 512 aligned to 512), context 64..32768; explicit flash-off, CK and alternate variants retain precedence."
     ),
     process_bool_field!(
         "kernel.gfx11_fa2_prefill",
@@ -2139,13 +2361,49 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the gfx11 GQA-fused FA2 prefill attention route (default on gfx1100/gfx1151; set to false or HIPFIRE_GFX11_FA2_PREFILL=0 to opt out)."
     ),
     process_bool_field!(
-        "kernel.gfx11_mq4v2_iu4",
-        "gfx11_mq4v2_iu4",
+        "kernel.iu4_prefill",
+        "iu4_prefill",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_IU4_PREFILL",
+        "Enable the W4A4 iu4-direct MMQ prefill route (default on exact gfx1100/gfx1151/gfx1201, other arches keep their incumbent route; set to false or HIPFIRE_IU4_PREFILL=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_iu4_gridspec",
+        "gfx11_iu4_gridspec",
+        Kernel,
+        true,
+        false,
+        "HIPFIRE_GFX11_IU4_GRIDSPEC",
+        "Split partial-N gfx11 IU4 GEMMs so full interior tiles use the unchecked specialization and only the final tile uses guarded loads/stores (default on; set to false or HIPFIRE_GFX11_IU4_GRIDSPEC=0 to opt out)."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_iu4_shape",
+        "gfx11_iu4_shape",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_GFX11_IU4_SHAPE",
+        "Use the 16-wave low-footprint IU4 full-tile entry on gfx1100 (default on); ignored on other architectures. Set false or HIPFIRE_GFX11_IU4_SHAPE=0 to restore the prior gfx1100 shape."
+    ),
+    process_bool_field!(
+        "kernel.gfx11_iu4_symfold",
+        "gfx11_iu4_symfold",
+        Kernel,
+        true,
+        true,
+        "HIPFIRE_IU4_SYMFOLD",
+        "Exploit symmetric MQ4V2 weights on exact gfx1100/gfx1151 by rebiasing q to q-8 and using signed-weight IU4 WMMA (default on for symmetric artifacts only); set false or HIPFIRE_IU4_SYMFOLD=0 to opt out. Asymmetric artifacts and other architectures are unchanged."
+    ),
+    process_bool_field!(
+        "kernel.npu_spillover",
+        "npu_spillover",
         Kernel,
         false,
         true,
-        "HIPFIRE_GFX11_MQ4V2_IU4",
-        "Enable the gfx11 iu4-direct MMQ prefill route (opt-in on gfx1100/gfx1151; set to true or HIPFIRE_GFX11_MQ4V2_IU4=1 to opt in)."
+        "HIPFIRE_NPU_SPILLOVER",
+        "Enable the opt-in gfx1151-only XDNA NPU spillover sidecar (requires a verified .xdna.zip registry sidecar; default off, never active on other architectures)."
     ),
     process_bool_field!(
         "kernel.dot2_gemv",
@@ -4676,10 +4934,6 @@ fn config_profile_bundle(name: &str) -> Option<Vec<(&'static str, ConfigValue)>>
             ("reasoning.max_total_tokens", ConfigValue::Integer(0)),
             ("memory.kv_cache", ConfigValue::String("q8".to_owned())),
             ("memory.max_seq", ConfigValue::Integer(32768)),
-            (
-                "memory.kv_backend",
-                ConfigValue::String("contiguous".to_owned()),
-            ),
             ("memory.prompt_cache_capacity", ConfigValue::Integer(32)),
             ("memory.prompt_cache_unbounded", ConfigValue::Bool(false)),
             ("attention.flash", ConfigValue::String("auto".to_owned())),
@@ -4997,6 +5251,40 @@ mod tests {
             );
         }
         assert!(field.parse_cli("sometimes").is_err());
+    }
+    #[test]
+    fn npu_spillover_defaults_off_with_env_parse() {
+        let field = field("kernel.npu_spillover").expect("npu_spillover schema field");
+        assert_eq!(field.legacy_key, "npu_spillover");
+        assert_eq!(field.env_compat, Some("HIPFIRE_NPU_SPILLOVER"));
+        assert_eq!(field.default.to_value(), ConfigValue::Bool(false));
+        assert_eq!(field.parse_cli("1").unwrap(), ConfigValue::Bool(true));
+        assert_eq!(field.parse_cli("0").unwrap(), ConfigValue::Bool(false));
+        // Default-off snapshot: an empty resolve leaves the bridge default
+        // absent (same as other default-false kernel flags), which the
+        // runtime parses as off.
+        let process =
+            ProcessConfig::from_resolved(&resolve([]).expect("empty resolve")).expect("process");
+        assert_eq!(process.legacy_value("HIPFIRE_NPU_SPILLOVER"), None);
+        // Env spelling flows through the env layer into the same snapshot.
+        // HIPFIRE_NPU_SPILLOVER is unique to this test; no other test reads it.
+        std::env::set_var("HIPFIRE_NPU_SPILLOVER", "1");
+        let env_layer = load_env_layer().expect("env layer");
+        std::env::remove_var("HIPFIRE_NPU_SPILLOVER");
+        let process = ProcessConfig::from_resolved(
+            &resolve([NamedLayer {
+                source: ConfigSource::LegacyEnv {
+                    name: "HIPFIRE_NPU_SPILLOVER".into(),
+                },
+                layer: env_layer,
+            }])
+            .expect("env resolve"),
+        )
+        .expect("process");
+        assert_eq!(
+            process.legacy_value("HIPFIRE_NPU_SPILLOVER").as_deref(),
+            Some("1")
+        );
     }
     #[test]
     fn image_decode_defaults_cpu_with_cpu_vcn_auto_values() {
@@ -5425,6 +5713,131 @@ mod tests {
         assert!(layer.set_cli("dflash_ngram_block", "auto").is_ok());
         assert!(layer.set_cli("dflash_ngram_block", "false").is_ok());
     }
+
+    #[test]
+    fn kv_backend_accepts_legacy_and_vmm_rejects_contiguous_with_migration() {
+        let field = field("memory.kv_backend").expect("memory.kv_backend schema field");
+        assert_eq!(field.legacy_key, "kv_backend");
+        assert_eq!(field.default.to_value(), ConfigValue::String("vmm".into()));
+        assert!(matches!(field.rule, ValueRule::KvBackend));
+        assert_eq!(
+            field.parse_cli("legacy").unwrap(),
+            ConfigValue::String("legacy".into())
+        );
+        assert_eq!(
+            field.parse_cli("vmm").unwrap(),
+            ConfigValue::String("vmm".into())
+        );
+
+        let message = field.parse_cli("contiguous").unwrap_err().to_string();
+        assert!(
+            message.contains("contiguous") && message.contains("legacy"),
+            "contiguous rejection must name the legacy rename: {message}"
+        );
+        assert!(
+            message.contains("memory.kv_backend") || message.contains("--kv-backend"),
+            "contiguous rejection must be actionable: {message}"
+        );
+
+        // Both TOML-layer set and config-set CLI paths share field.validate.
+        let mut layer = ConfigLayer::default();
+        layer
+            .set(
+                "memory.kv_backend",
+                ConfigValue::String("legacy".into()),
+            )
+            .expect("legacy must validate on TOML load path");
+        assert!(layer
+            .set(
+                "memory.kv_backend",
+                ConfigValue::String("contiguous".into()),
+            )
+            .is_err());
+        let set_cli_err = layer.set_cli("memory.kv_backend", "contiguous").unwrap_err();
+        let set_cli_msg = set_cli_err.to_string();
+        assert!(
+            set_cli_msg.contains("legacy"),
+            "config set contiguous must name legacy: {set_cli_msg}"
+        );
+    }
+
+    #[test]
+    fn kv_k_and_kv_v_default_empty_and_accept_named_overrides() {
+        let k = field("memory.kv_k").expect("memory.kv_k schema field");
+        let v = field("memory.kv_v").expect("memory.kv_v schema field");
+        assert_eq!(k.legacy_key, "kv_k");
+        assert_eq!(v.legacy_key, "kv_v");
+        assert_eq!(k.default.to_value(), ConfigValue::String(String::new()));
+        assert_eq!(v.default.to_value(), ConfigValue::String(String::new()));
+
+        let resolved = resolve([]).expect("empty resolve");
+        let k_resolved = resolved.get("memory.kv_k").expect("built-in kv_k");
+        let v_resolved = resolved.get("memory.kv_v").expect("built-in kv_v");
+        assert_eq!(k_resolved.value, ConfigValue::String(String::new()));
+        assert_eq!(v_resolved.value, ConfigValue::String(String::new()));
+        assert_eq!(k_resolved.source, ConfigSource::BuiltIn);
+        assert_eq!(v_resolved.source, ConfigSource::BuiltIn);
+
+        for name in [
+            "",
+            "q8",
+            "fwht2",
+            "fwht3",
+            "fwht4",
+            "asym2",
+            "asym3",
+            "asym4",
+            "turbo",
+            "turbo2",
+            "turbo3",
+            "turbo4",
+            "legacy-asym2",
+            "legacy-asym3",
+            "legacy-asym4",
+        ] {
+            assert_eq!(
+                k.parse_cli(name).unwrap(),
+                ConfigValue::String(name.into()),
+                "kv_k must accept {name:?}"
+            );
+        }
+        for name in ["", "q8", "lloyd2", "lloyd3", "lloyd4"] {
+            assert_eq!(
+                v.parse_cli(name).unwrap(),
+                ConfigValue::String(name.into()),
+                "kv_v must accept {name:?}"
+            );
+        }
+        assert!(k.parse_cli("lloyd3").is_err());
+        assert!(v.parse_cli("fwht3").is_err());
+        assert!(k.parse_cli("auto").is_err());
+
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("memory.kv_k", "legacy-asym3").unwrap();
+        layer.set_cli("memory.kv_v", "lloyd3").unwrap();
+        assert_eq!(
+            layer.get("memory.kv_k"),
+            Some(&ConfigValue::String("legacy-asym3".into()))
+        );
+        assert_eq!(
+            layer.get("memory.kv_v"),
+            Some(&ConfigValue::String("lloyd3".into()))
+        );
+
+        // Default profile still authors only memory.kv_cache = q8, not K/V axes.
+        let default = load_config_profile(
+            &ConfigPaths::under(temp_root("profile-kv-axes")),
+            "default",
+        )
+        .unwrap();
+        assert_eq!(
+            default.get("memory.kv_cache"),
+            Some(&ConfigValue::String("q8".into()))
+        );
+        assert!(default.get("memory.kv_k").is_none());
+        assert!(default.get("memory.kv_v").is_none());
+    }
+
 
     #[test]
     fn documented_config_profiles_match_the_schema() {

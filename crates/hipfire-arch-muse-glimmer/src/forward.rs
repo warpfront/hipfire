@@ -69,6 +69,9 @@ fn run_prefill_plain_gemm_key(
         row_stride: k,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let params = GemmParams {
         w: &w,
@@ -105,6 +108,9 @@ fn run_prefill_residual_gemm_key(
         row_stride: k,
         rotation: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     };
     let params = GemmParams {
         w: &w,
@@ -2167,7 +2173,10 @@ fn verify_block_capture_impl(
     let restore_pos = position as usize;
     let device = matches!(&capture, CaptureBackend::Device);
     let t_verify_start = std::time::Instant::now();
-    let do_timing = hipfire_config::developer_var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
+    let do_timing = hipfire_config::developer_var("HIPFIRE_GLIMMER_TIMING")
+        .ok()
+        .as_deref()
+        == Some("1");
 
     // Host: sorted capture index + position-major buf. Device: validate cursor
     // and clone layer_to_slot; begin_verify runs after scratch alloc succeeds.
@@ -3353,7 +3362,8 @@ fn prefill_chunk_batched(
             let flash_full = hipfire_config::developer_var("HIPFIRE_GLIMMER_FLASH_FULL")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(true);
-            let use_flash = hipfire_config::developer_var("HIPFIRE_GLIMMER_NO_FLASH").as_deref() != Ok("1")
+            let use_flash = hipfire_config::developer_var("HIPFIRE_GLIMMER_NO_FLASH").as_deref()
+                != Ok("1")
                 && ((window != 0 && seq_len > window)
                     || (window == 0 && flash_full && seq_len > 2048));
             if use_flash {

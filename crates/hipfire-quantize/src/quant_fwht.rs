@@ -197,6 +197,124 @@ pub(crate) fn quantize_mq4cg256(
 ///   for i in half: q[i]=clamp(rint((w[i]-z)/st),0,15)
 /// Degenerate half (hi==lo): scale=0, zero=f16(lo), all q=0.
 /// Header: [0..2) fp16 scale h0, [2..4) fp16 zero h0, [4..6) fp16 scale h1, [6..8) fp16 zero h1, [8..136) nibbles.
+fn write_mq4g256v2_group(
+    output: &mut [u8],
+    scales: [u16; 2],
+    zeros: [u16; 2],
+    codes: &[u8],
+) {
+    debug_assert_eq!(output.len(), MQ4V2_GROUP_BYTES);
+    debug_assert_eq!(codes.len(), 256);
+    output[..2].copy_from_slice(&scales[0].to_le_bytes());
+    output[2..4].copy_from_slice(&zeros[0].to_le_bytes());
+    output[4..6].copy_from_slice(&scales[1].to_le_bytes());
+    output[6..8].copy_from_slice(&zeros[1].to_le_bytes());
+    for i in 0..128 {
+        output[8 + i] = codes[2 * i] | (codes[2 * i + 1] << 4);
+    }
+}
+
+/// Pack already-selected MQ4V2 codes without applying FWHT or rounding again.
+///
+/// `headers` is one `[scale0, zero0, scale1, zero1]` F16-bit tuple per
+/// 256-weight group. `codes` is row-major and contains one unpacked uint4 code
+/// per weight. This is the export boundary used by learned-rounding tools.
+pub(crate) fn pack_mq4g256v2_from_codes(
+    m: usize,
+    k: usize,
+    headers: &[[u16; 4]],
+    codes: &[u8],
+) -> Result<Vec<u8>, String> {
+    if k % 256 != 0 {
+        return Err(format!("MQ4V2 learned codes require K % 256 == 0, got K={k}"));
+    }
+    let expected_codes = m
+        .checked_mul(k)
+        .ok_or_else(|| format!("MQ4V2 shape overflows: {m}x{k}"))?;
+    if codes.len() != expected_codes {
+        return Err(format!(
+            "MQ4V2 learned code count {} != M*K {}",
+            codes.len(),
+            expected_codes
+        ));
+    }
+    let group_count = expected_codes / 256;
+    if headers.len() != group_count {
+        return Err(format!(
+            "MQ4V2 learned header count {} != M*K/256 {}",
+            headers.len(),
+            group_count
+        ));
+    }
+    if let Some((index, code)) = codes.iter().enumerate().find(|(_, code)| **code > 15) {
+        return Err(format!("MQ4V2 code {code} at index {index} exceeds uint4"));
+    }
+
+    let mut output = vec![0u8; group_count * MQ4V2_GROUP_BYTES];
+    for group in 0..group_count {
+        let header = headers[group];
+        let group_codes = &codes[group * 256..(group + 1) * 256];
+        for half in 0..2 {
+            if header[half * 2] == 0
+                && group_codes[half * 128..(half + 1) * 128]
+                    .iter()
+                    .any(|&code| code != 0)
+            {
+                return Err(format!(
+                    "MQ4V2 group {group} half {half} has zero scale with nonzero codes"
+                ));
+            }
+        }
+        write_mq4g256v2_group(
+            &mut output[group * MQ4V2_GROUP_BYTES..(group + 1) * MQ4V2_GROUP_BYTES],
+            [header[0], header[2]],
+            [header[1], header[3]],
+            group_codes,
+        );
+    }
+    Ok(output)
+}
+
+/// Pack the frozen C3 `[M,K/256,2,2]` F16 `(d,z)` grid and unpacked U8
+/// codes directly. This function only serializes: it never applies FWHT or
+/// selects a grid/code, so trained codes cross the export boundary exactly once.
+pub(crate) fn pack_mq4g256v2_from_f16_grid(
+    m: usize,
+    k: usize,
+    d_z_f16: &[u8],
+    codes: &[u8],
+) -> Result<Vec<u8>, String> {
+    if k % 256 != 0 {
+        return Err(format!("MQ4V2 final codes require K % 256 == 0, got K={k}"));
+    }
+    let group_count = m
+        .checked_mul(k)
+        .ok_or_else(|| format!("MQ4V2 shape overflows: {m}x{k}"))?
+        / 256;
+    let expected_grid_bytes = group_count
+        .checked_mul(8)
+        .ok_or_else(|| format!("MQ4V2 grid byte count overflows: {m}x{k}"))?;
+    if d_z_f16.len() != expected_grid_bytes {
+        return Err(format!(
+            "MQ4V2 d_z_f16 byte count {} != M*K/256*2*2*2 {}",
+            d_z_f16.len(),
+            expected_grid_bytes
+        ));
+    }
+    let headers: Vec<[u16; 4]> = d_z_f16
+        .chunks_exact(8)
+        .map(|bytes| {
+            [
+                u16::from_le_bytes([bytes[0], bytes[1]]),
+                u16::from_le_bytes([bytes[2], bytes[3]]),
+                u16::from_le_bytes([bytes[4], bytes[5]]),
+                u16::from_le_bytes([bytes[6], bytes[7]]),
+            ]
+        })
+        .collect();
+    pack_mq4g256v2_from_codes(m, k, &headers, codes)
+}
+
 pub(crate) fn quantize_mq4g256v2(
     w: &[f32],
     m: usize,
@@ -204,69 +322,119 @@ pub(crate) fn quantize_mq4g256v2(
     signs1: &[f32],
     signs2: &[f32],
 ) -> Vec<u8> {
-    let _ = (m, k);
-    let group_size = 256;
-    let block_bytes = MQ4V2_GROUP_BYTES;
-    let n = w.len();
-    let n_blocks = (n + group_size - 1) / group_size;
-    let mut output = vec![0u8; n_blocks * block_bytes];
-    for b in 0..n_blocks {
-        let start = b * group_size;
-        let end = (start + group_size).min(n);
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, false)
+}
+
+/// MQ4V2 with a symmetric per-128 grid in the existing affine wire format.
+///
+/// The stored zero point is exactly `-8*d`, so code 8 reconstructs zero and
+/// shipped decoders remain byte-format compatible. The four scale candidates
+/// mirror the runtime A4 producer ladder, shifted to the 15-interval midpoint
+/// grid; selection includes fp16 round-trip error.
+pub(crate) fn quantize_mq4g256v2_symmetric(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+) -> Vec<u8> {
+    quantize_mq4g256v2_impl(w, m, k, signs1, signs2, true)
+}
+
+fn quantize_mq4g256v2_impl(
+    w: &[f32],
+    m: usize,
+    k: usize,
+    signs1: &[f32],
+    signs2: &[f32],
+    symmetric: bool,
+) -> Vec<u8> {
+    assert!(k % 256 == 0, "MQ4V2 requires K % 256 == 0, got K={k}");
+    assert_eq!(w.len(), m * k, "w.len() {} != m*k {}*{}={}", w.len(), m, k, m * k);
+    let group_count = w.len() / 256;
+    let mut output = vec![0u8; group_count * MQ4V2_GROUP_BYTES];
+    for group_index in 0..group_count {
         let mut group = [0.0f32; 256];
-        let actual_len = end - start;
-        group[..actual_len].copy_from_slice(&w[start..end]);
+        group.copy_from_slice(&w[group_index * 256..(group_index + 1) * 256]);
         cpu_fwht_256(&mut group, signs1, signs2);
+
         let mut scales = [0u16; 2];
         let mut zeros = [0u16; 2];
-        let mut sts = [0.0f32; 2];
-        let mut zs = [0.0f32; 2];
-        let mut degenerate = [false; 2];
-        for h in 0..2 {
-            let off = h * 128;
-            let slice = &group[off..off + 128];
-            let lo = slice.iter().cloned().fold(f32::INFINITY, f32::min);
-            let hi = slice.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-            let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
-            let sc_bits = f32_to_f16(step_f32);
-            let z_bits = f32_to_f16(lo);
-            let sc_bits = if hi == lo { 0u16 } else { sc_bits };
-            scales[h] = sc_bits;
-            zeros[h] = z_bits;
-            let st = f16_to_f32(sc_bits);
-            let z = f16_to_f32(z_bits);
-            sts[h] = st;
-            zs[h] = z;
-            degenerate[h] = hi == lo || step_f32 == 0.0 || st == 0.0;
-        }
-        let out_off = b * block_bytes;
-        output[out_off..out_off + 2].copy_from_slice(&scales[0].to_le_bytes());
-        output[out_off + 2..out_off + 4].copy_from_slice(&zeros[0].to_le_bytes());
-        output[out_off + 4..out_off + 6].copy_from_slice(&scales[1].to_le_bytes());
-        output[out_off + 6..out_off + 8].copy_from_slice(&zeros[1].to_le_bytes());
-        let mut q = [0u8; 256];
-        for h in 0..2 {
-            let off = h * 128;
-            if degenerate[h] {
+        let mut codes = [0u8; 256];
+        for half in 0..2 {
+            let offset = half * 128;
+            let values = &group[offset..offset + 128];
+            if symmetric {
+                let amax = values.iter().fold(0.0f32, |acc, &value| acc.max(value.abs()));
+                if amax == 0.0 {
+                    scales[half] = 0;
+                    zeros[half] = f32_to_f16(-0.0);
+                    codes[offset..offset + 128].fill(8);
+                    continue;
+                }
+
+                let candidate_base = (amax / 7.5) * 0.5;
+                let multipliers = [
+                    1.0f32,
+                    f32::from_bits(0x3fa4_9249),
+                    f32::from_bits(0x3fdb_6db7),
+                    2.0f32,
+                ];
+                let mut best_mse = f64::INFINITY;
+                for multiplier in multipliers {
+                    let scale_bits = f32_to_f16(candidate_base * multiplier);
+                    let scale = f16_to_f32(scale_bits);
+                    if scale == 0.0 {
+                        continue;
+                    }
+                    let zero_bits = f32_to_f16(-8.0 * scale);
+                    let zero = f16_to_f32(zero_bits);
+                    let inverse = 1.0 / scale;
+                    let mut mse = 0.0f64;
+                    for &value in values {
+                        let code = ((value - zero) * inverse + 0.5).floor().clamp(0.0, 15.0);
+                        let error = value - code.mul_add(scale, zero);
+                        mse += (error as f64) * (error as f64);
+                    }
+                    if mse < best_mse {
+                        best_mse = mse;
+                        scales[half] = scale_bits;
+                        zeros[half] = zero_bits;
+                    }
+                }
+                let scale = f16_to_f32(scales[half]);
+                let zero = f16_to_f32(zeros[half]);
+                let inverse = 1.0 / scale;
                 for i in 0..128 {
-                    q[off + i] = 0;
+                    codes[offset + i] =
+                        ((group[offset + i] - zero) * inverse + 0.5).floor().clamp(0.0, 15.0)
+                            as u8;
                 }
             } else {
-                let st = sts[h];
-                let z = zs[h];
-                let inv = 1.0 / st;
-                for i in 0..128 {
-                    let v = group[off + i];
-                    let qq = ((v - z) * inv + 0.5).floor().clamp(0.0, 15.0) as u8;
-                    q[off + i] = qq;
+                let lo = values.iter().copied().fold(f32::INFINITY, f32::min);
+                let hi = values.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let step_f32 = if hi > lo { (hi - lo) / 15.0 } else { 0.0 };
+                scales[half] = if hi == lo { 0 } else { f32_to_f16(step_f32) };
+                zeros[half] = f32_to_f16(lo);
+                let scale = f16_to_f32(scales[half]);
+                let zero = f16_to_f32(zeros[half]);
+                if hi != lo && step_f32 != 0.0 && scale != 0.0 {
+                    let inverse = 1.0 / scale;
+                    for i in 0..128 {
+                        codes[offset + i] =
+                            ((group[offset + i] - zero) * inverse + 0.5).floor().clamp(0.0, 15.0)
+                                as u8;
+                    }
                 }
             }
         }
-        for i in 0..128 {
-            let lo_q = q[2 * i];
-            let hi_q = q[2 * i + 1];
-            output[out_off + 8 + i] = (lo_q & 0xF) | ((hi_q & 0xF) << 4);
-        }
+        write_mq4g256v2_group(
+            &mut output[group_index * MQ4V2_GROUP_BYTES
+                ..(group_index + 1) * MQ4V2_GROUP_BYTES],
+            scales,
+            zeros,
+            &codes,
+        );
     }
     output
 }
@@ -681,6 +849,41 @@ mod tests {
     }
 
     #[test]
+    fn mq4g256v2_learned_code_export_is_byte_exact() {
+        let m = 2usize;
+        let k = 512usize;
+        let w: Vec<f32> = (0..m * k)
+            .map(|i| ((i as f32 * 0.03125).sin() * 3.0) + (i % 11) as f32)
+            .collect();
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let encoded = quantize_mq4g256v2(&w, m, k, &s1, &s2);
+        let mut headers = Vec::new();
+        let mut codes = Vec::new();
+        for block in encoded.chunks_exact(MQ4V2_GROUP_BYTES) {
+            headers.push([
+                u16::from_le_bytes([block[0], block[1]]),
+                u16::from_le_bytes([block[2], block[3]]),
+                u16::from_le_bytes([block[4], block[5]]),
+                u16::from_le_bytes([block[6], block[7]]),
+            ]);
+            for &packed in &block[8..] {
+                codes.push(packed & 0x0f);
+                codes.push(packed >> 4);
+            }
+        }
+        let repacked = pack_mq4g256v2_from_codes(m, k, &headers, &codes).unwrap();
+        assert_eq!(repacked, encoded);
+        let d_z_f16: Vec<u8> = headers
+            .iter()
+            .flat_map(|header| header.iter().flat_map(|bits| bits.to_le_bytes()))
+            .collect();
+        let repacked_from_grid =
+            pack_mq4g256v2_from_f16_grid(m, k, &d_z_f16, &codes).unwrap();
+        assert_eq!(repacked_from_grid, encoded);
+    }
+
+    #[test]
     fn mq4cg256_pad_layout_136() {
         let m = 2usize;
         let k = 512usize;
@@ -711,6 +914,11 @@ mod tests {
         use crate::pipeline_gguf::GgufFormat;
         assert_eq!(GgufFormat::from_flag("mq4"), Some(GgufFormat::Mq4V2));
         assert_eq!(GgufFormat::from_flag("mq4v2"), Some(GgufFormat::Mq4V2));
+        assert_eq!(
+            GgufFormat::from_flag("mq4v2-lloyd"),
+            Some(GgufFormat::Mq4V2Lloyd)
+        );
+        assert_eq!(GgufFormat::from_flag("mq4l"), Some(GgufFormat::Mq4V2Lloyd));
         assert_eq!(GgufFormat::from_flag("mq4c"), Some(GgufFormat::Mq4C));
         assert_eq!(GgufFormat::from_flag("mq4v1"), Some(GgufFormat::Mq4));
         assert_eq!(GgufFormat::from_flag("mq4g256v2"), Some(GgufFormat::Mq4V2));
@@ -738,9 +946,11 @@ mod tests {
         // ternary), claimed 2026-08-22. This line previously pinned 51 as free.
         assert_eq!(QuantType::from_u8(51), Some(QuantType::MQ2G256LloydU));
         assert_eq!(QuantType::MQ2G256LloydU as u8, 51);
-        // unknown remains rejected — 46 and 52 are the next genuinely free ids
+        // 52 = MQ4G256V2L (MQ4v2 + per-tensor Lloyd codebook). Claimed with this PR.
+        assert_eq!(QuantType::from_u8(52), Some(QuantType::MQ4G256V2L));
+        assert_eq!(QuantType::MQ4G256V2L as u8, 52);
+        // unknown remains rejected — 46 is the next genuinely free id
         assert_eq!(QuantType::from_u8(46), None);
-        assert_eq!(QuantType::from_u8(52), None);
         assert_eq!(QuantType::from_u8(255), None);
     }
 

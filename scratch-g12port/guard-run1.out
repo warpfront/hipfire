@@ -1,0 +1,5 @@
+warmup: untimed fresh-process GPU/JIT/DPM warmup
+process-1: pp8192 samples=[3733.6, 3728.7, 3721.0] median=3728.70, decode=36.44 tok/s
+process-2: pp8192 samples=[3718.3, 3717.5, 3714.6] median=3717.50, decode=36.48 tok/s
+process-3: pp8192 samples=[3711.7, 3714.5, 3718.8] median=3714.50, decode=28.74 tok/s
+FAIL: decode outside 1% of 36.5 tok/s reference

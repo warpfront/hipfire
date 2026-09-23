@@ -1104,6 +1104,14 @@ pub struct Qwen35Scratch {
     // Optional long-prefill scratch. Default is None to preserve VRAM
     // footprint; set HIPFIRE_PREFILL_REUSE_PBS=1 to allocate and reuse it.
     pub prefill_batch: Option<PrefillBatchScratch>,
+    // Retained widened-prefill PBS: the fully-admitted large owned scratch
+    // (up to the 8192-row ceiling) is reused across requests when it fits
+    // instead of alloc/free per request (~25 ms on 6k-token prefills).
+    // Bit-identical: every PBS tensor is overwritten before it is read,
+    // the same reuse contract the legacy `prefill_batch` cache above relies
+    // on. RefCell because the prefill entries take `&Qwen35Scratch`; all
+    // mutation happens on the single owning daemon thread.
+    pub widened_prefill_batch: std::cell::RefCell<Option<PrefillBatchScratch>>,
 }
 
 fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
@@ -1321,6 +1329,7 @@ impl Qwen35Scratch {
             moe_topk_weights: None,
             moe_down_expanded: None,
             prefill_batch: None,
+            widened_prefill_batch: std::cell::RefCell::new(None),
         })
         .and_then(|mut s| {
             // Allocate MoE scratch only for MoE configs. Done after the
@@ -1376,12 +1385,24 @@ impl Qwen35Scratch {
                 .as_deref()
                 == Some("1")
             {
-                let max_batch = if gpu.arch == "gfx1151" {
-                    super::prefill::prefill_max_batch(gpu).max(512)
+                // Ordinary reuse cache: tape-free and capped at legacy ≤512
+                // even under a larger requested ceiling — only a fully
+                // admitted request allocates the larger owned PBS, after
+                // Q8+EF/KV/free-VRAM checks in the inner entry. Tree/tape
+                // wrappers use separate owned tape-enabled scratch, never
+                // this cache. Other arches keep their existing sizing and
+                // tape behavior.
+                let (max_batch, cap_tape) = if gpu.arch == "gfx1201" {
+                    (super::prefill::prefill_max_batch(gpu).min(512), false)
+                } else if gpu.arch == "gfx1151" {
+                    (
+                        super::prefill::prefill_max_batch(gpu).max(512),
+                        true,
+                    )
                 } else {
-                    super::prefill::prefill_max_batch(gpu)
+                    (super::prefill::prefill_max_batch(gpu), true)
                 };
-                s.prefill_batch = match PrefillBatchScratch::new(gpu, config, max_batch) {
+                s.prefill_batch = match PrefillBatchScratch::new_opt(gpu, config, max_batch, cap_tape) {
                     Ok(prefill) => Some(prefill),
                     Err(error) => {
                         cleanup_allocations!();
@@ -1462,6 +1483,9 @@ impl Qwen35Scratch {
             }
         }
         if let Some(pbs) = self.prefill_batch {
+            note(pbs.free_gpu(gpu));
+        }
+        if let Some(pbs) = self.widened_prefill_batch.into_inner() {
             note(pbs.free_gpu(gpu));
         }
         match first_err {
@@ -2819,6 +2843,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: wqkv.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wqkv.lloyd_lut_e4m3,
+            lloyd_lut_f16: wqkv.lloyd_lut_f16,
+            lloyd_lut_c16: wqkv.lloyd_lut_c16,
         };
         let wr_z = WeightRef {
             buf: &wz.buf,
@@ -2828,6 +2855,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: wz.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wz.lloyd_lut_e4m3,
+            lloyd_lut_f16: wz.lloyd_lut_f16,
+            lloyd_lut_c16: wz.lloyd_lut_c16,
         };
         let wr_beta = WeightRef {
             buf: &w_beta.buf,
@@ -2837,6 +2867,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: w_beta.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: w_beta.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_beta.lloyd_lut_f16,
+            lloyd_lut_c16: w_beta.lloyd_lut_c16,
         };
         let wr_alpha = WeightRef {
             buf: &w_alpha.buf,
@@ -2846,6 +2879,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: w_alpha.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: w_alpha.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_alpha.lloyd_lut_f16,
+            lloyd_lut_c16: w_alpha.lloyd_lut_c16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -2892,6 +2928,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wqkv.lloyd_lut_e4m3,
+            lloyd_lut_f16: wqkv.lloyd_lut_f16,
+            lloyd_lut_c16: wqkv.lloyd_lut_c16,
         };
         let wr_z = WeightRef {
             buf: &wz.buf,
@@ -2901,6 +2940,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wz.lloyd_lut_e4m3,
+            lloyd_lut_f16: wz.lloyd_lut_f16,
+            lloyd_lut_c16: wz.lloyd_lut_c16,
         };
         let wr_beta = WeightRef {
             buf: &w_beta.buf,
@@ -2910,6 +2952,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w_beta.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_beta.lloyd_lut_f16,
+            lloyd_lut_c16: w_beta.lloyd_lut_c16,
         };
         let wr_alpha = WeightRef {
             buf: &w_alpha.buf,
@@ -2919,6 +2964,9 @@ fn qkvza_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w_alpha.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_alpha.lloyd_lut_f16,
+            lloyd_lut_c16: w_alpha.lloyd_lut_c16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -2986,6 +3034,9 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wq.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wq.lloyd_lut_e4m3,
+            lloyd_lut_f16: wq.lloyd_lut_f16,
+            lloyd_lut_c16: wq.lloyd_lut_c16,
         };
         let wrk = WeightRef {
             buf: &wk.buf,
@@ -2995,6 +3046,9 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wk.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wk.lloyd_lut_e4m3,
+            lloyd_lut_f16: wk.lloyd_lut_f16,
+            lloyd_lut_c16: wk.lloyd_lut_c16,
         };
         let wrv = WeightRef {
             buf: &wv.buf,
@@ -3004,6 +3058,9 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: wv.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: wv.lloyd_lut_e4m3,
+            lloyd_lut_f16: wv.lloyd_lut_f16,
+            lloyd_lut_c16: wv.lloyd_lut_c16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3042,6 +3099,9 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wq.lloyd_lut_e4m3,
+            lloyd_lut_f16: wq.lloyd_lut_f16,
+            lloyd_lut_c16: wq.lloyd_lut_c16,
         };
         let wrk = WeightRef {
             buf: &wk.buf,
@@ -3051,6 +3111,9 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wk.lloyd_lut_e4m3,
+            lloyd_lut_f16: wk.lloyd_lut_f16,
+            lloyd_lut_c16: wk.lloyd_lut_c16,
         };
         let wrv = WeightRef {
             buf: &wv.buf,
@@ -3060,6 +3123,9 @@ fn qkv_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: wv.lloyd_lut_e4m3,
+            lloyd_lut_f16: wv.lloyd_lut_f16,
+            lloyd_lut_c16: wv.lloyd_lut_c16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3118,6 +3184,9 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: w_gate.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: w_gate.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_gate.lloyd_lut_f16,
+            lloyd_lut_c16: w_gate.lloyd_lut_c16,
         };
         let wru = WeightRef {
             buf: &w_up.buf,
@@ -3127,6 +3196,9 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: w_up.paro.as_ref().map(paro_to_givens),
             awq_scale: None,
+            lloyd_lut_e4m3: w_up.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_up.lloyd_lut_f16,
+            lloyd_lut_c16: w_up.lloyd_lut_c16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -3160,6 +3232,9 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w_gate.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_gate.lloyd_lut_f16,
+            lloyd_lut_c16: w_gate.lloyd_lut_c16,
         };
         let wru = WeightRef {
             buf: &w_up.buf,
@@ -3169,6 +3244,9 @@ fn gate_up_via_execute_steps(
             row_stride: 0,
             rotation: None,
             awq_scale: None,
+            lloyd_lut_e4m3: w_up.lloyd_lut_e4m3,
+            lloyd_lut_f16: w_up.lloyd_lut_f16,
+            lloyd_lut_c16: w_up.lloyd_lut_c16,
         };
         let steps = [
             Step::RmsnormAutomatic {
@@ -4198,8 +4276,17 @@ fn triattn_tap(
     Ok(())
 }
 
-fn qwen35_fa_epilogue_route_supported(is_gfx1201: bool, q8_route: bool, asym3_route: bool) -> bool {
-    q8_route || (!is_gfx1201 && asym3_route)
+fn qwen35_fa_epilogue_route_supported(
+    is_gfx1201: bool,
+    q8_route: bool,
+    asym3_route: bool,
+    fp8_route: bool,
+) -> bool {
+    // fp8: admitted only for the flash-tile attend key whose [2+head_dim] f32
+    // partials the shared q8 gated reducer consumes unmodified (StageB S6).
+    // The scalar fp8 reader writes final output directly and has no fused
+    // path, so it must never set output_gate.
+    q8_route || fp8_route || (!is_gfx1201 && asym3_route)
 }
 
 /// KV cache write + attention dispatch. Inline from original.
@@ -4224,8 +4311,14 @@ pub(crate) fn kv_cache_attention_dispatch(
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashQ8_0;
     let asym3_route = plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteAsym3
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashAsym3;
-    let fused_epilogue_route =
-        qwen35_fa_epilogue_route_supported(gpu.arch_caps.is_gfx1201(), q8_route, asym3_route);
+    let fp8_route = plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteFp8E4m3
+        && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashFp8E4m3;
+    let fused_epilogue_route = qwen35_fa_epilogue_route_supported(
+        gpu.arch_caps.is_gfx1201(),
+        q8_route,
+        asym3_route,
+        fp8_route,
+    );
     let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo) && fused_epilogue_route;
     let io = AttnParams {
         q: &s.fa_q,
@@ -4251,6 +4344,11 @@ pub(crate) fn kv_cache_attention_dispatch(
         block_start: 0,
         block_cols: 0,
         output_gate: fused_epilogue.then_some(&s.fa_gate),
+        output_awq_scale: if fused_epilogue {
+            wo.awq_scale.as_ref()
+        } else {
+            None
+        },
         output: &s.fa_attn_out,
     };
     execute_steps(gpu, ctx, &[Step::Attend { plan, io }])
@@ -5242,8 +5340,18 @@ pub(crate) fn forward_prefill_dense_tp_with_pbs_capture(
         ));
     }
     let last_n = forward_prefill_dense_tp_batched(
-        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, pbs,
-        partials, Some(captures),
+        gpus,
+        shard,
+        weights,
+        configs,
+        tokens,
+        start_pos,
+        kv_caches,
+        dn_states,
+        scratches,
+        pbs,
+        partials,
+        Some(captures),
     )?;
     debug_assert_eq!(last_n, n);
     gpus.devices[0].bind_thread()?;
@@ -5435,6 +5543,8 @@ fn forward_prefill_dense_tp_batched(
                                 q8_flags[rank],
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
+                                None, // commit_stride: TP ranks keep legacy cadence
+                                false, // Chunk scan is single-GPU ordinary prefill only
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -5443,8 +5553,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5456,9 +5565,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5503,8 +5610,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5516,9 +5622,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5573,6 +5677,7 @@ fn forward_prefill_dense_tp_batched(
                                 layer_idx,
                                 BatchEpilogue::Partial(partials[rank]),
                                 DflashFusionCtx::Off,
+                                None, // commit_stride: TP ranks keep legacy cadence
                             ) {
                                 process_res = Err(e);
                                 break;
@@ -5581,8 +5686,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5594,9 +5698,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5641,8 +5743,7 @@ fn forward_prefill_dense_tp_batched(
                         if process_res.is_err() {
                             break;
                         }
-                        if let Err(e) =
-                            dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
+                        if let Err(e) = dense_tp_allreduce_batched(gpus, pbs_vec, partials, n, dim)
                         {
                             process_res = Err(e);
                             break;
@@ -5654,9 +5755,7 @@ fn forward_prefill_dense_tp_batched(
                                     let caps = captures.as_ref().ok_or_else(|| {
                                         HipError::new(0, "dense TP capture missing")
                                     })?;
-                                    if let Some(slot) =
-                                        caps[rank].hidden.extract_slot(layer_idx)
-                                    {
+                                    if let Some(slot) = caps[rank].hidden.extract_slot(layer_idx) {
                                         gpus.devices[rank].bind_thread()?;
                                         caps[rank].hidden.write_rows_to_staging(
                                             &mut gpus.devices[rank],
@@ -5701,8 +5800,8 @@ fn forward_prefill_dense_tp_batched(
             }
             offset += n;
         }
-    Ok(last_chunk_n)
-}
+        Ok(last_chunk_n)
+    }
 }
 
 /// Layer-granular batched dense-TP prefill. Chunks with the existing
@@ -5783,8 +5882,18 @@ pub fn forward_prefill_dense_tp(
     let pbs_refs: Vec<&PrefillBatchScratch> = pbs_vec.iter().collect();
     let partial_refs: Vec<&GpuTensor> = partials.iter().collect();
     let last_chunk_n = match forward_prefill_dense_tp_batched(
-        gpus, shard, weights, configs, tokens, start_pos, kv_caches, dn_states, scratches, &pbs_refs,
-        &partial_refs, None,
+        gpus,
+        shard,
+        weights,
+        configs,
+        tokens,
+        start_pos,
+        kv_caches,
+        dn_states,
+        scratches,
+        &pbs_refs,
+        &partial_refs,
+        None,
     ) {
         Ok(n) => n,
         Err(e) => {
@@ -6340,6 +6449,7 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                 &s.dn_attn_out,
                 &s.dn_z,
                 norm_weight,
+                wo.awq_scale.as_ref(),
                 &s.x_rot,
                 self.n_v_heads,
                 config.linear_value_head_dim,
@@ -7018,7 +7128,6 @@ fn gated_norm_mq_rotate_enabled(
             wo.gpu_dtype,
             DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
         )
-        && wo.awq_scale.is_none()
 }
 
 /// Collapse full-attention Q/gate deinterleave, Q/K RMS normalization, and
@@ -7082,7 +7191,6 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
             wo.gpu_dtype,
             DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256
         )
-        && wo.awq_scale.is_none()
 }
 
 /// Exact dense Qwen3.6-27B shape shared by its gfx1100 decode selectors.
@@ -7394,12 +7502,13 @@ mod tests {
         assert_eq!(qwen35_x_rot_len(2048, 0, 4096), 4096);
         assert_eq!(qwen35_x_rot_len(2048, 8192, 4096), 8192);
     }
-
     #[test]
-    fn gfx1201_fa_epilogue_is_q8_only() {
-        assert!(qwen35_fa_epilogue_route_supported(true, true, false));
-        assert!(!qwen35_fa_epilogue_route_supported(true, false, true));
-        assert!(qwen35_fa_epilogue_route_supported(false, false, true));
+    fn gfx1201_fa_epilogue_admits_q8_and_fp8_tile() {
+        assert!(qwen35_fa_epilogue_route_supported(true, true, false, false));
+        assert!(qwen35_fa_epilogue_route_supported(true, false, false, true));
+        assert!(!qwen35_fa_epilogue_route_supported(true, false, true, false));
+        assert!(qwen35_fa_epilogue_route_supported(false, false, true, false));
+        assert!(!qwen35_fa_epilogue_route_supported(true, false, false, false));
     }
 
     // ── #397 Ship 6 — lowered decode super-op program shapes ──────────────

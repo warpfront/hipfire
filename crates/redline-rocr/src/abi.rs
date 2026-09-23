@@ -34,6 +34,8 @@ pub const AGENT_INFO_QUEUE_TYPE: u32 = 15;
 pub const AGENT_INFO_DEVICE: u32 = 17;
 pub const AMD_AGENT_INFO_BDFID: u32 = 0xA006;
 pub const AMD_AGENT_INFO_DOMAIN: u32 = 0xA00F;
+pub const AMD_AGENT_INFO_COMPUTE_UNIT_COUNT: u32 = 0xA002;
+pub const AMD_AGENT_INFO_COOPERATIVE_COMPUTE_UNIT_COUNT: u32 = 0xA014;
 pub const AMD_AGENT_INFO_TIMESTAMP_FREQUENCY: u32 = 0xA016;
 
 pub const PROFILE_BASE: u32 = 0;
@@ -175,8 +177,9 @@ pub type QueueInactivateFn = unsafe extern "C" fn(*mut Queue) -> Status;
 pub type QueueLoadReadIndexRelaxedFn = unsafe extern "C" fn(*const Queue) -> u64;
 pub type QueueLoadReadIndexScAcquireFn = unsafe extern "C" fn(*const Queue) -> u64;
 pub type QueueLoadWriteIndexRelaxedFn = unsafe extern "C" fn(*const Queue) -> u64;
-pub type QueueAddWriteIndexRelaxedFn = unsafe extern "C" fn(*const Queue, u64) -> u64;
 pub type QueueCuSetMaskFn = unsafe extern "C" fn(*const Queue, u32, *const u32) -> Status;
+pub type QueueCuGetMaskFn = unsafe extern "C" fn(*const Queue, u32, *mut u32) -> Status;
+pub type QueueAddWriteIndexRelaxedFn = unsafe extern "C" fn(*const Queue, u64) -> u64;
 pub type ProfilingSetProfilerEnabledFn = unsafe extern "C" fn(*mut Queue, i32) -> Status;
 pub type ProfilingGetDispatchTimeFn =
     unsafe extern "C" fn(Agent, Signal, *mut ProfilingDispatchTime) -> Status;
@@ -262,6 +265,11 @@ pub struct Symbols {
     pub queue_load_write_index_relaxed: QueueLoadWriteIndexRelaxedFn,
     pub queue_add_write_index_relaxed: QueueAddWriteIndexRelaxedFn,
     pub queue_cu_set_mask: QueueCuSetMaskFn,
+    /// `hsa_amd_queue_cu_get_mask`, present on ROCm back to 7.14-era
+    /// runtimes. Optional so CU-affinity read-back degrades to the
+    /// post-set effective cache instead of breaking symbol loading on
+    /// older libraries; creation-time masking itself stays required.
+    pub queue_cu_get_mask: Option<QueueCuGetMaskFn>,
     pub profiling_set_profiler_enabled: ProfilingSetProfilerEnabledFn,
     pub profiling_get_dispatch_time: ProfilingGetDispatchTimeFn,
     pub profiling_async_copy_enable: Option<ProfilingAsyncCopyEnableFn>,
@@ -367,6 +375,10 @@ impl Symbols {
                 QueueAddWriteIndexRelaxedFn
             ),
             queue_cu_set_mask: symbol!("hsa_amd_queue_cu_set_mask", QueueCuSetMaskFn),
+            queue_cu_get_mask: optional_symbol!(
+                "hsa_amd_queue_cu_get_mask",
+                QueueCuGetMaskFn
+            ),
             profiling_set_profiler_enabled: symbol!(
                 "hsa_amd_profiling_set_profiler_enabled",
                 ProfilingSetProfilerEnabledFn
