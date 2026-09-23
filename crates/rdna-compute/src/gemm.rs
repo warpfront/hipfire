@@ -29829,7 +29829,7 @@ impl Gpu {
         let mut zm = z_m as i32;
         let mut fm = folded_m as i32;
         let mut nv = n as i32;
-        let mut params: Vec<*mut c_void> = vec![
+        let mut params: [*mut c_void; 7] = [
             &mut src as *mut _ as *mut c_void,
             &mut z as *mut _ as *mut c_void,
             &mut beta as *mut _ as *mut c_void,
