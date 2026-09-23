@@ -7,6 +7,9 @@
 //! 3. Hole mask 0b101: no durable inactive-lane write (lane-1 isolated decode parity)
 //! 4. Reset/reuse a longer lane with a shorter prompt; 8 tokens match short isolated ref
 //! 5. free_gpu on every batch and sequential state on success paths
+//! 6. DP3 simultaneous-lane greedy vs isolated B=1 refs
+//! 7. DP4 simultaneous-lane greedy vs isolated B=1 refs
+//! 8. Cancel mid-prefill → reset_lane → reuse parity (sibling lane untouched)
 //!
 //! Usage: batch_decode_parity <model.mq4|model.hfq>
 
@@ -162,6 +165,16 @@ fn main() {
         v.extend((0..10).map(|i| ((200 + i * 11) % 202_040) as u32));
         v
     };
+    let prompt_c: Vec<u32> = {
+        let mut v = vec![cfg.bos_token];
+        v.extend((0..10).map(|i| ((300 + i * 13) % 202_040) as u32));
+        v
+    };
+    let prompt_d: Vec<u32> = {
+        let mut v = vec![cfg.bos_token];
+        v.extend((0..10).map(|i| ((400 + i * 17) % 202_040) as u32));
+        v
+    };
     let short_prompt: Vec<u32> = vec![cfg.bos_token, 111, 222, 333];
     let long_prompt: Vec<u32> = (0..64).map(|i| ((500 + i * 3) % 202_040) as u32).collect();
 
@@ -184,6 +197,24 @@ fn main() {
         out
     };
     eprintln!("batch_b1_b = {batch_b1_b:?}");
+    let batch_b1_c = {
+        let mut bs =
+            GlimmerDecodeBatchState::new(&mut gpu, &cfg, 1, LANE_CAPACITY).expect("batch b1 c");
+        let out = batch_lane_greedy(&mut gpu, &cfg, &weights, &mut bs, 0, &prompt_c, STEPS, 1)
+            .expect("batch b1 c");
+        bs.free_gpu(&mut gpu);
+        out
+    };
+    eprintln!("batch_b1_c = {batch_b1_c:?}");
+    let batch_b1_d = {
+        let mut bs =
+            GlimmerDecodeBatchState::new(&mut gpu, &cfg, 1, LANE_CAPACITY).expect("batch b1 d");
+        let out = batch_lane_greedy(&mut gpu, &cfg, &weights, &mut bs, 0, &prompt_d, STEPS, 1)
+            .expect("batch b1 d");
+        bs.free_gpu(&mut gpu);
+        out
+    };
+    eprintln!("batch_b1_d = {batch_b1_d:?}");
     let batch_b1_short = {
         let mut bs =
             GlimmerDecodeBatchState::new(&mut gpu, &cfg, 1, LANE_CAPACITY).expect("batch b1 short");
@@ -390,6 +421,255 @@ fn main() {
             .expect("lifecycle alloc2");
         bs2.free_gpu(&mut gpu);
         eprintln!("PASS gate5 free_gpu lifecycle");
+    }
+
+    // --- Gate 6: DP3 simultaneous lanes vs isolated B=1 refs ---
+    {
+        let mut bs = GlimmerDecodeBatchState::new(&mut gpu, &cfg, 3, LANE_CAPACITY)
+            .expect("batch state B=3");
+        let ok0 = bs
+            .prefill_lane_cancellable(&mut gpu, &weights, &cfg, 0, &prompt_a, &mut || false)
+            .expect("dp3 prefill lane0");
+        let ok1 = bs
+            .prefill_lane_cancellable(&mut gpu, &weights, &cfg, 1, &prompt_b, &mut || false)
+            .expect("dp3 prefill lane1");
+        let ok2 = bs
+            .prefill_lane_cancellable(&mut gpu, &weights, &cfg, 2, &prompt_c, &mut || false)
+            .expect("dp3 prefill lane2");
+        assert!(ok0 && ok1 && ok2, "dp3 prefill cancelled");
+
+        let (mut t0, _) = bs
+            .sample_lane_product(&mut gpu, &cfg, 0, 0.0, 1.0, None, 1)
+            .expect("dp3 pending lane0");
+        let (mut t1, _) = bs
+            .sample_lane_product(&mut gpu, &cfg, 1, 0.0, 1.0, None, 1)
+            .expect("dp3 pending lane1");
+        let (mut t2, _) = bs
+            .sample_lane_product(&mut gpu, &cfg, 2, 0.0, 1.0, None, 1)
+            .expect("dp3 pending lane2");
+        let mut p0 = prompt_a.len();
+        let mut p1 = prompt_b.len();
+        let mut p2 = prompt_c.len();
+        let mut out0 = Vec::with_capacity(STEPS);
+        let mut out1 = Vec::with_capacity(STEPS);
+        let mut out2 = Vec::with_capacity(STEPS);
+        let mask = 0b111u64;
+
+        for step in 0..STEPS {
+            out0.push(t0);
+            out1.push(t1);
+            out2.push(t2);
+            let tokens = vec![t0, t1, t2];
+            let positions = vec![p0, p1, p2];
+            forward_decode_batch_glimmer(
+                &mut gpu, &weights, &cfg, &tokens, &positions, mask, &mut bs,
+            )
+            .unwrap_or_else(|e| panic!("B=3 forward step {step}: {e}"));
+            let (n0, _) = bs
+                .sample_lane_product(&mut gpu, &cfg, 0, 0.0, 1.0, None, 1)
+                .expect("dp3 sample lane0");
+            let (n1, _) = bs
+                .sample_lane_product(&mut gpu, &cfg, 1, 0.0, 1.0, None, 1)
+                .expect("dp3 sample lane1");
+            let (n2, _) = bs
+                .sample_lane_product(&mut gpu, &cfg, 2, 0.0, 1.0, None, 1)
+                .expect("dp3 sample lane2");
+            t0 = n0;
+            t1 = n1;
+            t2 = n2;
+            p0 += 1;
+            p1 += 1;
+            p2 += 1;
+        }
+        assert_tokens_eq("gate6 DP3 lane0 vs sequential A", &seq_a, &out0);
+        assert_tokens_eq("gate6 DP3 lane1 vs batch B=1 B", &batch_b1_b, &out1);
+        assert_tokens_eq("gate6 DP3 lane2 vs batch B=1 C", &batch_b1_c, &out2);
+        bs.free_gpu(&mut gpu);
+    }
+
+    // --- Gate 7: DP4 simultaneous lanes vs isolated B=1 refs ---
+    {
+        let mut bs = GlimmerDecodeBatchState::new(&mut gpu, &cfg, 4, LANE_CAPACITY)
+            .expect("batch state B=4");
+        let ok0 = bs
+            .prefill_lane_cancellable(&mut gpu, &weights, &cfg, 0, &prompt_a, &mut || false)
+            .expect("dp4 prefill lane0");
+        let ok1 = bs
+            .prefill_lane_cancellable(&mut gpu, &weights, &cfg, 1, &prompt_b, &mut || false)
+            .expect("dp4 prefill lane1");
+        let ok2 = bs
+            .prefill_lane_cancellable(&mut gpu, &weights, &cfg, 2, &prompt_c, &mut || false)
+            .expect("dp4 prefill lane2");
+        let ok3 = bs
+            .prefill_lane_cancellable(&mut gpu, &weights, &cfg, 3, &prompt_d, &mut || false)
+            .expect("dp4 prefill lane3");
+        assert!(ok0 && ok1 && ok2 && ok3, "dp4 prefill cancelled");
+
+        let (mut t0, _) = bs
+            .sample_lane_product(&mut gpu, &cfg, 0, 0.0, 1.0, None, 1)
+            .expect("dp4 pending lane0");
+        let (mut t1, _) = bs
+            .sample_lane_product(&mut gpu, &cfg, 1, 0.0, 1.0, None, 1)
+            .expect("dp4 pending lane1");
+        let (mut t2, _) = bs
+            .sample_lane_product(&mut gpu, &cfg, 2, 0.0, 1.0, None, 1)
+            .expect("dp4 pending lane2");
+        let (mut t3, _) = bs
+            .sample_lane_product(&mut gpu, &cfg, 3, 0.0, 1.0, None, 1)
+            .expect("dp4 pending lane3");
+        let mut p0 = prompt_a.len();
+        let mut p1 = prompt_b.len();
+        let mut p2 = prompt_c.len();
+        let mut p3 = prompt_d.len();
+        let mut out0 = Vec::with_capacity(STEPS);
+        let mut out1 = Vec::with_capacity(STEPS);
+        let mut out2 = Vec::with_capacity(STEPS);
+        let mut out3 = Vec::with_capacity(STEPS);
+        let mask = 0b1111u64;
+
+        for step in 0..STEPS {
+            out0.push(t0);
+            out1.push(t1);
+            out2.push(t2);
+            out3.push(t3);
+            let tokens = vec![t0, t1, t2, t3];
+            let positions = vec![p0, p1, p2, p3];
+            forward_decode_batch_glimmer(
+                &mut gpu, &weights, &cfg, &tokens, &positions, mask, &mut bs,
+            )
+            .unwrap_or_else(|e| panic!("B=4 forward step {step}: {e}"));
+            let (n0, _) = bs
+                .sample_lane_product(&mut gpu, &cfg, 0, 0.0, 1.0, None, 1)
+                .expect("dp4 sample lane0");
+            let (n1, _) = bs
+                .sample_lane_product(&mut gpu, &cfg, 1, 0.0, 1.0, None, 1)
+                .expect("dp4 sample lane1");
+            let (n2, _) = bs
+                .sample_lane_product(&mut gpu, &cfg, 2, 0.0, 1.0, None, 1)
+                .expect("dp4 sample lane2");
+            let (n3, _) = bs
+                .sample_lane_product(&mut gpu, &cfg, 3, 0.0, 1.0, None, 1)
+                .expect("dp4 sample lane3");
+            t0 = n0;
+            t1 = n1;
+            t2 = n2;
+            t3 = n3;
+            p0 += 1;
+            p1 += 1;
+            p2 += 1;
+            p3 += 1;
+        }
+        assert_tokens_eq("gate7 DP4 lane0 vs sequential A", &seq_a, &out0);
+        assert_tokens_eq("gate7 DP4 lane1 vs batch B=1 B", &batch_b1_b, &out1);
+        assert_tokens_eq("gate7 DP4 lane2 vs batch B=1 C", &batch_b1_c, &out2);
+        assert_tokens_eq("gate7 DP4 lane3 vs batch B=1 D", &batch_b1_d, &out3);
+        bs.free_gpu(&mut gpu);
+    }
+
+    // --- Gate 8: cancel mid-prefill → reset_lane → reuse; sibling lane untouched ---
+    {
+        let mut bs = GlimmerDecodeBatchState::new(&mut gpu, &cfg, 2, LANE_CAPACITY)
+            .expect("batch state cancel");
+
+        // Sibling lane fully prefills and stays live across the cancelled lane's cleanup.
+        let ok_sib = bs
+            .prefill_lane_cancellable(&mut gpu, &weights, &cfg, 1, &prompt_b, &mut || false)
+            .expect("cancel-gate sibling prefill");
+        assert!(ok_sib, "sibling prefill must complete");
+        let (mut t_sib, _) = bs
+            .sample_lane_product(&mut gpu, &cfg, 1, 0.0, 1.0, None, 1)
+            .expect("cancel-gate sibling pending");
+        let mut p_sib = prompt_b.len();
+
+        let mut seen = 0usize;
+        let cancel_after = long_prompt.len() / 2;
+        assert!(cancel_after > 0 && cancel_after < long_prompt.len());
+        let ok_cancel = bs
+            .prefill_lane_cancellable(
+                &mut gpu,
+                &weights,
+                &cfg,
+                0,
+                &long_prompt,
+                &mut || {
+                    // Checked before each token and once after the last.
+                    // Trip after `cancel_after` successful token admissions.
+                    if seen >= cancel_after {
+                        true
+                    } else {
+                        seen += 1;
+                        false
+                    }
+                },
+            )
+            .expect("cancel mid-prefill call");
+        assert!(!ok_cancel, "mid-prefill must return Ok(false)");
+        assert!(
+            seen >= cancel_after,
+            "cancel callback must have tripped (seen={seen}, after={cancel_after})"
+        );
+
+        // Sibling must still decode from its pre-cancel prefill without contamination.
+        let mut out_sib = Vec::with_capacity(STEPS);
+        for step in 0..STEPS {
+            out_sib.push(t_sib);
+            let tokens = vec![0u32, t_sib];
+            let positions = vec![0usize, p_sib];
+            forward_decode_batch_glimmer(
+                &mut gpu, &weights, &cfg, &tokens, &positions, 0b10, &mut bs,
+            )
+            .unwrap_or_else(|e| panic!("gate8 sibling forward step {step}: {e}"));
+            let (n, _) = bs
+                .sample_lane_product(&mut gpu, &cfg, 1, 0.0, 1.0, None, 1)
+                .expect("gate8 sibling sample");
+            t_sib = n;
+            p_sib += 1;
+        }
+        assert_tokens_eq(
+            "gate8 sibling post-cancel vs batch B=1 B",
+            &batch_b1_b,
+            &out_sib,
+        );
+
+        // Contract: cancelled lane is left dirty for daemon reset; reuse without reset is
+        // undefined. reset_lane must restore clean admission for a shorter prompt.
+        bs.reset_lane(&mut gpu, 0).expect("reset_lane after cancel");
+        let short_bat = batch_lane_greedy(
+            &mut gpu,
+            &cfg,
+            &weights,
+            &mut bs,
+            0,
+            &short_prompt,
+            STEPS,
+            2,
+        )
+        .expect("short after cancel+reset");
+        assert_tokens_eq(
+            "gate8 cancel/reset/reuse short vs batch B=1 short",
+            &batch_b1_short,
+            &short_bat,
+        );
+
+        // Sibling physical slot must also admit clean reset/reuse after foreign-lane cancel.
+        bs.reset_lane(&mut gpu, 1).expect("reset sibling after foreign cancel");
+        let sib_reuse = batch_lane_greedy(
+            &mut gpu,
+            &cfg,
+            &weights,
+            &mut bs,
+            1,
+            &prompt_b,
+            STEPS,
+            2,
+        )
+        .expect("sibling reset/reuse after cancel");
+        assert_tokens_eq(
+            "gate8 sibling reset/reuse vs batch B=1 B",
+            &batch_b1_b,
+            &sib_reuse,
+        );
+        bs.free_gpu(&mut gpu);
     }
 
     eprintln!("All batch parity/lifecycle checks passed.");

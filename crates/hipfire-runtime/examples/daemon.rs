@@ -1170,7 +1170,7 @@ fn batch_rng_for_key(key: &AttemptKey) -> u64 {
 }
 
 /// Eligibility for continuous batching. Conservative: only single-GPU
-/// exact HIP Qwen 5/6 and dense LFM 11 stateless text without excluded features.
+/// exact HIP Qwen 5/6, dense LFM 11, and Muse Glimmer 14 stateless text without excluded features.
 fn is_batch_eligible(
     arch_id: usize,
     pp: usize,
@@ -1192,7 +1192,7 @@ fn is_batch_eligible(
     if continuous_batch_size <= 1 {
         return false;
     }
-    if arch_id != 5 && arch_id != 6 && arch_id != 11 {
+    if arch_id != 5 && arch_id != 6 && arch_id != 11 && arch_id != 14 {
         return false;
     }
     if pp != 1 || ep_is_some {
@@ -1207,7 +1207,7 @@ fn is_batch_eligible(
     if has_messages_history {
         return false;
     }
-    if !think_mode_is_nonthink {
+    if arch_id != 14 && !think_mode_is_nonthink {
         return false;
     }
     true
@@ -1234,6 +1234,10 @@ fn qwen_batch_weight_formats_supported(weights: &qwen35::Qwen35Weights) -> bool 
             | DType::MQ3G256
     );
     embd_ok && lm_ok
+}
+
+fn glimmer_batch_weight_formats_supported(weights: &glimmer::glimmer::GlimmerWeights) -> bool {
+    glimmer::batch::batch_weight_formats_supported(weights).is_ok()
 }
 
 /// Return the sole user message's text when the request has an eligible
@@ -1542,6 +1546,32 @@ fn is_batch_request_eligible(
                 return false;
             }
         }
+        14 => {
+            if route != GenerationRoute::GlimmerAr {
+                return false;
+            }
+            if m.glimmer_decode_batch.is_none() {
+                return false;
+            }
+            if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_ref() {
+                if !glimmer_batch_weight_formats_supported(&bundle.weights) {
+                    return false;
+                }
+            } else {
+                return false;
+            }
+            // Sampler admissibility: Glimmer batch supports only temp/top_p/top_k
+            // with neutral repeat/presence/frequency/min_p.
+            if sampling.min_p.is_some() {
+                return false;
+            }
+            if sampling.repeat_penalty != 1.0 {
+                return false;
+            }
+            if sampling.presence_penalty != 0.0 || sampling.frequency_penalty != 0.0 {
+                return false;
+            }
+        }
         _ => return false,
     }
     // No multi-turn/history/tools/images/custom stops etc.
@@ -1554,7 +1584,7 @@ fn is_batch_request_eligible(
     if m.pp != 1 || m.ep.is_some() {
         return false;
     }
-    if !(m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 11) {
+    if !(m.arch_id == 5 || m.arch_id == 6 || m.arch_id == 11 || m.arch_id == 14) {
         return false;
     }
     if !serve_continuous_batch || continuous_batch_size <= 1 {
@@ -3711,6 +3741,1214 @@ fn drive_lfm_continuous_batch(
             if let BatchLane::Running(lane) = &mut sched.lanes[*lane_idx] {
                 lane.next_token = Some(tok);
                 lane.rng_state = rng as u64;
+            }
+        }
+    }
+    Ok(())
+}
+fn drive_glimmer_continuous_batch(
+    sched: &mut ContinuousBatchScheduler,
+    gpu: &mut rdna_compute::Gpu,
+    model: &mut LoadedModel,
+    stdout: &mut std::io::Stdout,
+    inbox: &mut DaemonInbox,
+) -> Result<(), BatchDriveError> {
+    let batch_size = sched.max_batch;
+    if batch_size == 0 {
+        return Ok(());
+    }
+    let batch_state_ptr = match model.glimmer_decode_batch.as_mut() {
+        Some(s) => s as *mut glimmer::batch::GlimmerDecodeBatchState,
+        None => {
+            return Err(BatchDriveError::Gpu(
+                "batch state not allocated".to_string(),
+            ))
+        }
+    };
+    let batch_state = unsafe { &mut *batch_state_ptr };
+    let (config_ptr, weights_ptr, tokenizer_ptr, chat_template_clone) =
+        match model.state.as_ref() {
+            Some(ModelState::MuseGlimmer(b)) => (
+                &b.config as *const glimmer::config::GlimmerConfig,
+                &b.weights as *const glimmer::glimmer::GlimmerWeights,
+                match model.tokenizer.as_ref() {
+                    Some(t) => t as *const _,
+                    None => return Err(BatchDriveError::Gpu("tokenizer missing".to_string())),
+                },
+                model.chat_template.clone(),
+            ),
+            _ => return Err(BatchDriveError::Gpu("batch model not MuseGlimmer".to_string())),
+        };
+    let config = unsafe { &*config_ptr };
+    let weights = unsafe { &*weights_ptr };
+    let tokenizer: &hipfire_runtime::tokenizer::Tokenizer = unsafe { &*tokenizer_ptr };
+    let chat_template = chat_template_clone;
+    let cfg_eos = config.eos_token;
+    // Build stop set mirroring generate_muse_glimmer (scalar eos plus tokenizer-resolved eot etc).
+    let mut stop_set: Vec<u32> = vec![cfg_eos];
+    // bundle eos_tok is config.eos_token for Glimmer (same), but include for parity.
+    if let Some(ModelState::MuseGlimmer(bundle)) = model.state.as_ref() {
+        if !stop_set.contains(&bundle.eos_tok) {
+            stop_set.push(bundle.eos_tok);
+        }
+    }
+    for candidate in [
+        "<|eot|>",
+        "<|end_of_text|>",
+        "<end_of_turn>",
+        "<|end_of_turn|>",
+        "<|im_end|>",
+        "<|endoftext|>",
+        "</s>",
+        "<eos>",
+    ] {
+        if let Some(tid) = tokenizer.special_token_id(candidate) {
+            if !stop_set.contains(&tid) {
+                stop_set.push(tid);
+            }
+        } else {
+            let ids = tokenizer.encode(candidate);
+            if ids.len() == 1 && !stop_set.contains(&ids[0]) {
+                stop_set.push(ids[0]);
+            }
+        }
+    }
+    stop_set.sort_unstable();
+    stop_set.dedup();
+    let mut loop_guards: Vec<hipfire_runtime::loop_guard::LoopGuard> = (0..batch_size)
+        .map(|_| hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get()))
+        .collect();
+    let mut routers: Vec<Option<GlimmerHarmonyRouter>> = (0..batch_size).map(|_| None).collect();
+    let mut recorders: Vec<Option<GlimmerChannelRecorder>> = (0..batch_size).map(|_| None).collect();
+    let mut visible_acc: Vec<String> = vec![String::new(); batch_size];
+    let mut tool_acc: Vec<String> = vec![String::new(); batch_size];
+    let mut emitted_ids: Vec<Vec<u32>> = vec![Vec::new(); batch_size];
+    let mut tokens = vec![0u32; batch_size];
+    let mut positions = vec![0usize; batch_size];
+    let fail_all = |sched: &mut ContinuousBatchScheduler,
+                    gpu: &mut rdna_compute::Gpu,
+                    batch_state: &mut glimmer::batch::GlimmerDecodeBatchState,
+                    stdout: &mut std::io::Stdout,
+                    reason: String|
+     -> Result<(), BatchDriveError> {
+        let mut uniq_set = std::collections::HashSet::new();
+        let mut uniq: Vec<AttemptKey> = Vec::new();
+        for l in sched.lanes.iter() {
+            if let Some(k) = l.key() {
+                if uniq_set.insert(k.clone()) {
+                    uniq.push(k.clone());
+                }
+            }
+        }
+        for k in sched.inbox.iter().cloned() {
+            if uniq_set.insert(k.clone()) {
+                uniq.push(k);
+            }
+        }
+        for k in sched.pending.keys().cloned() {
+            if uniq_set.insert(k.clone()) {
+                uniq.push(k);
+            }
+        }
+        let mut first_err: Option<String> = None;
+        if let Err(e) = batch_state.reset(gpu) {
+            first_err = Some(format!("batch reset: {e}"));
+        }
+        fail_closed_invalidate_graphs_and_replay(gpu);
+        let sync = fail_closed_device_sync(gpu);
+        let prior = match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        };
+        let ep = fail_closed_epilogue_after_sync(prior, sync);
+        for key in &uniq {
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            emit_fail_closed_error(
+                stdout,
+                Some(&key.id),
+                &format!("batch GPU error: {reason}"),
+                "gpu",
+                ep.rolled_back,
+                &ep,
+            );
+        }
+        let _ = sched.fail_all_active();
+        for k in &uniq {
+            batch_clear_terminal(&k.id, k.attempt_id);
+        }
+        if !ep.rolled_back {
+            return Err(BatchDriveError::Poisoned(format!(
+                "{reason}; {}",
+                ep.context.unwrap_or_default()
+            )));
+        }
+        Err(BatchDriveError::Gpu(reason))
+    };
+    loop {
+        let mut to_commit: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
+        let mut to_abort: Vec<(usize, AttemptKey)> = Vec::new();
+        for idx in 0..batch_size {
+            if let BatchLane::AwaitingClient(term) = &sched.lanes[idx] {
+                let key = term.key.clone();
+                let expired = Instant::now() >= term.deadline;
+                if batch_check_abort(&key.id, key.attempt_id) || expired {
+                    to_abort.push((idx, key));
+                } else if let Some(ClientTerminalDecision::Commit) =
+                    batch_poll_decision(&key.id, key.attempt_id)
+                {
+                    to_commit.push((idx, key.clone(), term.pending_done.clone()));
+                }
+            }
+        }
+        for (idx, key) in to_abort {
+            if let Err(e) = batch_state.reset_lane(gpu, idx) {
+                return fail_all(
+                    sched,
+                    gpu,
+                    batch_state,
+                    stdout,
+                    format!("reset lane {idx} on abort: {e}"),
+                );
+            }
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _ = sched.abort_lane(idx, &key);
+            routers[idx] = None;
+            recorders[idx] = None;
+            visible_acc[idx].clear();
+            tool_acc[idx].clear();
+            emitted_ids[idx].clear();
+        }
+        for (idx, key, pending_done) in to_commit {
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            let reset_ok = match batch_state.reset_lane(gpu, idx) {
+                Ok(()) => true,
+                Err(e) => {
+                    return fail_all(
+                        sched,
+                        gpu,
+                        batch_state,
+                        stdout,
+                        format!("reset lane {idx} on commit: {e}"),
+                    );
+                }
+            };
+            let commit_ok = sched.commit_lane(idx, &key);
+            match batch_commit_teardown_class(reset_ok, commit_ok) {
+                BatchCommitTeardownClass::ResetFailed => unreachable!("reset_ok handled above"),
+                BatchCommitTeardownClass::CommitFailed => {
+                    let ep = RollbackEpilogue {
+                        rolled_back: true,
+                        context: None,
+                    };
+                    emit_fail_closed_error(
+                        stdout,
+                        Some(&key.id),
+                        "batch commit_lane failed after reset",
+                        "internal",
+                        false,
+                        &ep,
+                    );
+                    let _ = sched.abort_lane(idx, &key);
+                    routers[idx] = None;
+                    recorders[idx] = None;
+                    visible_acc[idx].clear();
+                    tool_acc[idx].clear();
+                    emitted_ids[idx].clear();
+                }
+                BatchCommitTeardownClass::EmitDone => {
+                    emit_staged_terminal_done(stdout, &pending_done);
+                    routers[idx] = None;
+                    recorders[idx] = None;
+                    visible_acc[idx].clear();
+                    tool_acc[idx].clear();
+                    emitted_ids[idx].clear();
+                }
+            }
+        }
+        let mut queued_abort: Vec<AttemptKey> = Vec::new();
+        for k in sched.inbox.iter().cloned().collect::<Vec<_>>() {
+            if batch_check_abort(&k.id, k.attempt_id) {
+                queued_abort.push(k);
+            }
+        }
+        for k in queued_abort {
+            let _scope = BatchAttemptScope::enter(k.attempt_id);
+            emit_qwen_ar_cancelled(stdout, &k.id, 0);
+            let _ = sched.abort_queued(&k);
+        }
+        let mut running_abort: Vec<(usize, AttemptKey)> = Vec::new();
+        for idx in 0..batch_size {
+            if let Some(k) = sched.lanes[idx].key().cloned() {
+                if matches!(
+                    sched.lanes[idx],
+                    BatchLane::Running(_) | BatchLane::Seeding(_)
+                ) && batch_check_abort(&k.id, k.attempt_id)
+                {
+                    running_abort.push((idx, k));
+                }
+            }
+        }
+        for (idx, key) in running_abort {
+            if let Err(e) = batch_state.reset_lane(gpu, idx) {
+                return fail_all(
+                    sched,
+                    gpu,
+                    batch_state,
+                    stdout,
+                    format!("reset lane {idx} on running abort: {e}"),
+                );
+            }
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _ = sched.abort_lane(idx, &key);
+            routers[idx] = None;
+            recorders[idx] = None;
+            visible_acc[idx].clear();
+            tool_acc[idx].clear();
+            emitted_ids[idx].clear();
+        }
+        let mut barrier: Option<DaemonMsg> = None;
+        let admission_deadline = (sched.active_count() == 0 && sched.awaiting_count() == 0)
+            .then(|| Instant::now() + Duration::from_millis(20));
+        loop {
+            let dm = match inbox.try_recv() {
+                Ok(m) => m,
+                Err(mpsc::TryRecvError::Empty) => {
+                    let Some(deadline) = admission_deadline else {
+                        break;
+                    };
+                    if sched.active_count() != 0
+                        || sched.awaiting_count() != 0
+                        || sched.inbox.len() >= batch_size
+                    {
+                        break;
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    match inbox.recv_timeout(remaining) {
+                        Ok(m) => m,
+                        Err(
+                            mpsc::RecvTimeoutError::Timeout | mpsc::RecvTimeoutError::Disconnected,
+                        ) => {
+                            break;
+                        }
+                    }
+                }
+                Err(mpsc::TryRecvError::Disconnected) => break,
+            };
+            match dm {
+                DaemonMsg::ParseError(e) => {
+                    emit_uncorrelated_error(
+                        stdout,
+                        None,
+                        &format!("invalid JSON: {e}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                }
+                DaemonMsg::Regular(json) => {
+                    let t = json.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if t == "generate" {
+                        let attempt_id = match json.get("attempt_id").and_then(|v| v.as_u64()) {
+                            Some(v) => v,
+                            None => {
+                                emit_uncorrelated_error(
+                                    stdout,
+                                    json.get("id").and_then(|v| v.as_str()),
+                                    "generate missing attempt_id",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                continue;
+                            }
+                        };
+                        let id = json
+                            .get("id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("0")
+                            .to_string();
+                        batch_announce_terminal(&id, attempt_id);
+                        if batch_check_abort(&id, attempt_id) {
+                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            emit_gen_start(
+                                stdout,
+                                &id,
+                                false,
+                                Some(GLIMMER_SEMANTIC_CONTRACT_VERSION),
+                            );
+                            emit_qwen_ar_cancelled(stdout, &id, 0);
+                            batch_clear_terminal(&id, attempt_id);
+                            continue;
+                        }
+                        if !is_batch_request_eligible(
+                            &json,
+                            model,
+                            batch_size,
+                            parse_serve_continuous_batch(&json),
+                            false,
+                        ) {
+                            barrier = Some(DaemonMsg::Regular(json));
+                            break;
+                        }
+                        let prompt_str = batch_single_user_content(&json).unwrap_or_else(|| {
+                            json.get("prompt")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("Hello")
+                                .to_string()
+                        });
+                        let system_str = json
+                            .get("system")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                        let assistant_prefix = match json
+                            .get("assistant_prefix")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("plain")
+                        {
+                            "open_think" => {
+                                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                            }
+                            "closed_think" => {
+                                hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink
+                            }
+                            _ => hipfire_runtime::prompt_frame::AssistantPrefix::Plain,
+                        };
+                        let max_think = json
+                            .get("max_think_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as usize;
+                        let max_tokens_req = json
+                            .get("max_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(4096) as usize;
+                        // For Glimmer we render via Jinja with reasoning_strength; reuse generic helper
+                        // but inject reasoning_strength when template is present.
+                        let batch_messages = match json.get("messages") {
+                            Some(v) => match serde_json::from_value::<
+                                Vec<hipfire_runtime::prompt_frame::Message>,
+                            >(v.clone())
+                            {
+                                Ok(v) => Some(v),
+                                Err(e) => {
+                                    let _scope = BatchAttemptScope::enter(attempt_id);
+                                    emit_uncorrelated_error(
+                                        stdout,
+                                        Some(&id),
+                                        &format!("invalid messages field: {e}"),
+                                        "validation",
+                                        false,
+                                        false,
+                                    );
+                                    batch_clear_terminal(&id, attempt_id);
+                                    continue;
+                                }
+                            },
+                            None => None,
+                        };
+                        // Use Glimmer-aware rendering when arch 14, otherwise generic.
+                        let (prompt_tokens, started_in_think) = if model.arch_id == 14 {
+                            // Replicate generate_muse_glimmer's Jinja path with reasoning_strength.
+                            let think_mode = json
+                                .get("reasoning_effort")
+                                .or_else(|| json.get("thinking_mode"))
+                                .and_then(|v| v.as_str())
+                                .map(hipfire_runtime::prompt_frame::ThinkMode::from_str)
+                                .unwrap_or(hipfire_runtime::prompt_frame::ThinkMode::NonThink);
+                            let rs = glimmer_reasoning_strength(think_mode, max_think);
+                            let tok = model.tokenizer.as_ref().unwrap();
+                            let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+                            let try_jinja = jinja_enabled && chat_template.is_some();
+                            let mut started = matches!(
+                                assistant_prefix,
+                                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                            );
+                            let ids = if try_jinja {
+                                let template = chat_template.as_ref().unwrap();
+                                let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                                    tokenizer: tok,
+                                    template,
+                                    system: system_str.as_deref(),
+                                    user: &prompt_str,
+                                    enable_thinking: max_think != 1,
+                                    bos_token: Some("<bos>"),
+                                    reasoning_strength: Some(rs),
+                                };
+                                let render_res = if let Some(msgs) = batch_messages.as_deref() {
+                                    frame.render_messages(msgs, None, None)
+                                } else {
+                                    frame.render()
+                                };
+                                match render_res {
+                                    Ok(rendered) => {
+                                        started = render_tail_opens_think(&rendered);
+                                        tok.encode(&rendered)
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
+                                        hipfire_runtime::prompt_frame::ChatFrame {
+                                            tokenizer: tok,
+                                            system: system_str.as_deref(),
+                                            user: "",
+                                            assistant_prefix,
+                                            raw: false,
+                                        }
+                                        .build_with_user_tokens(&tok.encode(&prompt_str))
+                                    }
+                                }
+                            } else {
+                                let tok = model.tokenizer.as_ref().unwrap();
+                                let q = tok.encode(&prompt_str);
+                                hipfire_runtime::prompt_frame::ChatFrame {
+                                    tokenizer: tok,
+                                    system: system_str.as_deref(),
+                                    user: "",
+                                    assistant_prefix,
+                                    raw: false,
+                                }
+                                .build_with_user_tokens(&q)
+                            };
+                            let mut ids_mut = ids;
+                            if ids_mut.first() != Some(&config.bos_token) {
+                                ids_mut.insert(0, config.bos_token);
+                            }
+                            (ids_mut, started)
+                        } else {
+                            match batch_render_prompt_tokens(
+                                &prompt_str,
+                                system_str.as_deref(),
+                                assistant_prefix,
+                                tokenizer,
+                                chat_template.as_ref(),
+                                max_think,
+                                batch_messages.as_deref(),
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _scope = BatchAttemptScope::enter(attempt_id);
+                                    emit_uncorrelated_error(
+                                        stdout,
+                                        Some(&id),
+                                        &format!("render failed: {e}"),
+                                        "validation",
+                                        false,
+                                        false,
+                                    );
+                                    batch_clear_terminal(&id, attempt_id);
+                                    continue;
+                                }
+                            }
+                        };
+                        // Glimmer allows reasoning, so started_in_think is NOT a barrier; only Qwen/LFM treat it as such.
+                        if prompt_tokens.is_empty() || prompt_tokens.len() >= sched.lane_capacity {
+                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            emit_uncorrelated_error(
+                                stdout,
+                                Some(&id),
+                                "prompt exceeds lane capacity or empty",
+                                "validation",
+                                false,
+                                false,
+                            );
+                            batch_clear_terminal(&id, attempt_id);
+                            continue;
+                        }
+                        batch_transition_to_queued(&id, attempt_id);
+                        let sampling = resolve_batch_sampling(&json, model);
+                        let req = BatchPendingRequest {
+                            key: AttemptKey::new(&id, attempt_id),
+                            prompt: prompt_str.clone(),
+                            prompt_tokens: prompt_tokens.clone(),
+                            started_in_think,
+                            system: system_str.clone(),
+                            assistant_prefix,
+                            max_think_tokens: max_think,
+                            max_tokens: max_tokens_req,
+                            sampling,
+                        };
+                        if !sched.enqueue(req) {
+                            eprintln!(
+                                "[batch] duplicate enqueue rejected id={} attempt_id={}; preserving live registry",
+                                id, attempt_id
+                            );
+                            continue;
+                        }
+                        {
+                            let _scope = BatchAttemptScope::enter(attempt_id);
+                            emit_gen_start(
+                                stdout,
+                                &id,
+                                started_in_think,
+                                Some(GLIMMER_SEMANTIC_CONTRACT_VERSION),
+                            );
+                        }
+                    } else if t == "abort" || t == "commit" {
+                        if let (Some(id), Some(aid), Some(kind)) = (
+                            json.get("id").and_then(|v| v.as_str()),
+                            json.get("attempt_id").and_then(|v| v.as_u64()),
+                            json.get("type").and_then(|v| v.as_str()),
+                        ) {
+                            batch_apply_terminal_control(kind, id, aid);
+                        }
+                    } else {
+                        barrier = Some(DaemonMsg::Regular(json));
+                        break;
+                    }
+                }
+            }
+        }
+        if let Some(msg) = barrier {
+            inbox.push_front(msg);
+            if sched.active_count() == 0 && sched.inbox.is_empty() {
+                return Ok(());
+            }
+        }
+        while let Some((key, ticket)) = sched.try_assign_one() {
+            let lane_idx = ticket.lane;
+            let pending_req = match sched.pending.get(&key).cloned() {
+                Some(r) => r,
+                None => continue,
+            };
+            let prompt_tokens = pending_req.prompt_tokens.clone();
+            let max_tokens_req = pending_req.max_tokens;
+            if let Err(e) = batch_state.reset_lane(gpu, lane_idx) {
+                return fail_all(
+                    sched,
+                    gpu,
+                    batch_state,
+                    stdout,
+                    format!("reset lane {lane_idx}: {e}"),
+                );
+            }
+            if max_tokens_req == 0 {
+                if let BatchLane::Running(lane) = &mut sched.lanes[lane_idx] {
+                    lane.prompt_len = prompt_tokens.len();
+                    lane.seq_pos = prompt_tokens.len();
+                    lane.next_token = None;
+                    lane.streamed_tokens = Vec::new();
+                    lane.bytes_fed_to_filter = 0;
+                    lane.prefill_done_at = Some(Instant::now());
+                }
+                routers[lane_idx] = Some(GlimmerHarmonyRouter::new(pending_req.max_think_tokens));
+                recorders[lane_idx] = Some(GlimmerChannelRecorder::new());
+                let lane_ref = match &sched.lanes[lane_idx] {
+                    BatchLane::Running(l) => l,
+                    _ => continue,
+                };
+                let metrics = batch_lane_done_metrics(
+                    lane_ref.created_at,
+                    lane_ref.prefill_done_at,
+                    lane_ref.first_token_at,
+                    Instant::now(),
+                    lane_ref.prompt_len,
+                    0,
+                );
+                let mut pending_done = serde_json::json!({
+                    "type": "done",
+                    "id": key.id,
+                    "tokens": 0,
+                    "tok_s": (metrics.tok_s * 10.0).round() / 10.0,
+                    "prefill_tokens": lane_ref.prompt_len,
+                    "prefill_ms": (metrics.prefill_ms * 10.0).round() / 10.0,
+                    "prefill_tok_s": (metrics.prefill_tok_s * 10.0).round() / 10.0,
+                    "decode_tok_s": (metrics.decode_tok_s * 10.0).round() / 10.0,
+                    "ttft_ms": (metrics.ttft_ms * 10.0).round() / 10.0,
+                    "cached_tokens": 0,
+                    "finish_reason": "length",
+                    "attempt_id": key.attempt_id,
+                });
+                pending_done["latency_ms"] = serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
+                attach_continuous_batch_route_evidence(
+                    &mut pending_done,
+                    batch_size,
+                    lane_idx,
+                    sched.lane_capacity,
+                    lane_ref.max_active_lanes.max(1),
+                );
+                let mut envelope = pending_done.clone();
+                envelope["type"] = serde_json::json!("commit_ready");
+                let marked = sched.mark_awaiting_commit(lane_idx, pending_done.clone());
+                if !marked {
+                    let _ = batch_state.reset_lane(gpu, lane_idx);
+                    let _ = sched.abort_lane(lane_idx, &key);
+                    routers[lane_idx] = None;
+                    recorders[lane_idx] = None;
+                    continue;
+                }
+                let write_ok = {
+                    let _scope = BatchAttemptScope::enter(key.attempt_id);
+                    writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
+                };
+                if !write_ok {
+                    let _ = batch_state.reset_lane(gpu, lane_idx);
+                    let _ = sched.abort_lane(lane_idx, &key);
+                    routers[lane_idx] = None;
+                    recorders[lane_idx] = None;
+                }
+                continue;
+            }
+            if batch_check_abort(&key.id, key.attempt_id) {
+                if let Err(e) = batch_state.reset_lane(gpu, lane_idx) {
+                    return fail_all(
+                        sched,
+                        gpu,
+                        batch_state,
+                        stdout,
+                        format!("reset lane {lane_idx} on pre-prefill abort: {e}"),
+                    );
+                }
+                let _scope = BatchAttemptScope::enter(key.attempt_id);
+                emit_qwen_ar_cancelled(stdout, &key.id, 0);
+                let _ = sched.abort_lane(lane_idx, &key);
+                routers[lane_idx] = None;
+                recorders[lane_idx] = None;
+                continue;
+            }
+            // Initialise per-lane Harmony state before prefill so first token routing has correct cap.
+            routers[lane_idx] = Some(GlimmerHarmonyRouter::new(pending_req.max_think_tokens));
+            recorders[lane_idx] = Some(GlimmerChannelRecorder::new());
+            visible_acc[lane_idx].clear();
+            tool_acc[lane_idx].clear();
+            emitted_ids[lane_idx].clear();
+            let should_cancel = || batch_check_abort(&key.id, key.attempt_id);
+            let mut should_cancel_mut = should_cancel;
+            let prefill_ok = match batch_state.prefill_lane_cancellable(
+                gpu,
+                weights,
+                config,
+                lane_idx,
+                &prompt_tokens,
+                &mut should_cancel_mut,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    routers[lane_idx] = None;
+                    recorders[lane_idx] = None;
+                    return fail_all(
+                        sched,
+                        gpu,
+                        batch_state,
+                        stdout,
+                        format!("prefill lane {lane_idx}: {e}"),
+                    );
+                }
+            };
+            if !prefill_ok || batch_check_abort(&key.id, key.attempt_id) {
+                if let Err(e) = batch_state.reset_lane(gpu, lane_idx) {
+                    return fail_all(
+                        sched,
+                        gpu,
+                        batch_state,
+                        stdout,
+                        format!("reset lane {lane_idx} on prefill abort: {e}"),
+                    );
+                }
+                let _scope = BatchAttemptScope::enter(key.attempt_id);
+                emit_qwen_ar_cancelled(stdout, &key.id, 0);
+                let _ = sched.abort_lane(lane_idx, &key);
+                routers[lane_idx] = None;
+                recorders[lane_idx] = None;
+                continue;
+            }
+            let sampling = pending_req.sampling.clone();
+            let lane_rng = match &sched.lanes[lane_idx] {
+                BatchLane::Running(l) => l.rng_state as u32,
+                _ => continue,
+            };
+            let (next_token, next_rng) = match batch_state.sample_lane_product(
+                gpu,
+                config,
+                lane_idx,
+                sampling.temp,
+                sampling.top_p,
+                sampling.top_k,
+                lane_rng,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    routers[lane_idx] = None;
+                    recorders[lane_idx] = None;
+                    return fail_all(
+                        sched,
+                        gpu,
+                        batch_state,
+                        stdout,
+                        format!("sample lane {lane_idx}: {e}"),
+                    );
+                }
+            };
+            if let BatchLane::Running(lane) = &mut sched.lanes[lane_idx] {
+                lane.prompt_len = prompt_tokens.len();
+                lane.seq_pos = prompt_tokens.len();
+                lane.next_token = Some(next_token);
+                lane.rng_state = next_rng as u64;
+                lane.conversation_tokens = Vec::new();
+                lane.streamed_tokens = Vec::new();
+                lane.bytes_fed_to_filter = 0;
+                lane.prefill_done_at = Some(Instant::now());
+            }
+            // Keep router/recorder alive for the decode ticks.
+        }
+        let running: Vec<usize> = sched
+            .lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| if matches!(l, BatchLane::Running(_)) { Some(i) } else { None })
+            .collect();
+        let awaiting: Vec<usize> = sched
+            .lanes
+            .iter()
+            .enumerate()
+            .filter_map(|(i, l)| if matches!(l, BatchLane::AwaitingClient(_)) { Some(i) } else { None })
+            .collect();
+        if running.is_empty() && awaiting.is_empty() && sched.inbox.is_empty() && inbox.backlog.is_empty() {
+            break;
+        }
+        if running.is_empty() {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+            continue;
+        }
+        let active_now = running.len();
+        for &idx in &running {
+            if let BatchLane::Running(lane) = &mut sched.lanes[idx] {
+                if active_now > lane.max_active_lanes {
+                    lane.max_active_lanes = active_now;
+                }
+            }
+        }
+        for i in 0..batch_size {
+            match &sched.lanes[i] {
+                BatchLane::Running(lane) => {
+                    tokens[i] = lane.next_token.unwrap_or(cfg_eos);
+                    positions[i] = lane.seq_pos;
+                }
+                _ => {
+                    tokens[i] = cfg_eos;
+                    positions[i] = 0;
+                }
+            }
+        }
+        let mut active_mask: u64 = 0;
+        for &idx in &running {
+            active_mask |= 1u64 << idx;
+        }
+        if let Err(e) = glimmer::forward_batch::forward_decode_batch_glimmer(
+            gpu,
+            weights,
+            config,
+            &tokens,
+            &positions,
+            active_mask,
+            batch_state,
+        ) {
+            return fail_all(
+                sched,
+                gpu,
+                batch_state,
+                stdout,
+                format!("forward_decode_batch_glimmer: {e}"),
+            );
+        }
+        // Sample all active lanes (shared cohort guarantees same temp/top_p/top_k per wave)
+        let cohort_sampling = if let Some(idx) = running.first() {
+            match &sched.lanes[*idx] {
+                BatchLane::Running(l) => l.sampling.clone(),
+                _ => continue,
+            }
+        } else {
+            continue;
+        };
+        // Collect current RNG states for sampling.
+        let mut rng_states: Vec<u32> = vec![0; batch_size];
+        for &idx in &running {
+            if let BatchLane::Running(lane) = &sched.lanes[idx] {
+                rng_states[idx] = lane.rng_state as u32;
+            }
+        }
+        // We need to handle per-lane decode+router BEFORE sampling next.
+        // Instead sample first to get next tokens, then handle routing of current token.
+        // But forward just produced logits for current tokens; sampling uses those logits.
+        // So we must first classify current token via router, then sample next.
+        let mut survivors: Vec<usize> = Vec::new();
+        let mut to_await: Vec<(usize, AttemptKey, serde_json::Value)> = Vec::new();
+        let mut to_abort_running: Vec<(usize, AttemptKey)> = Vec::new();
+        // Temporary store of next samples for survivors.
+        let mut next_samples: std::collections::HashMap<usize, (u32, u32)> = std::collections::HashMap::new();
+        // Pre-sample all lanes (batched) before per-lane classification so we have logits for next.
+        // However we need to interleave: classify current token, decide finish, otherwise sample next.
+        // For Glimmer we can sample per-lane after classification; batched sample is not needed for classification.
+        // So classify first, then sample survivors via sample_product.
+        let mut need_sample: Vec<usize> = Vec::new();
+        for idx in running.clone() {
+            let key = match sched.lanes[idx].key().cloned() {
+                Some(k) => k,
+                None => continue,
+            };
+            if batch_check_abort(&key.id, key.attempt_id) {
+                to_abort_running.push((idx, key));
+                continue;
+            }
+            let cur_token = match &sched.lanes[idx] {
+                BatchLane::Running(l) => l.next_token.unwrap_or(cfg_eos),
+                _ => continue,
+            };
+            // Fast stop via token id
+            let is_stop_id = stop_set.contains(&cur_token);
+            let frag = tokenizer.decode(&[cur_token]);
+            let router = routers[idx].as_mut().unwrap();
+            let recorder = recorders[idx].as_mut().unwrap();
+            // Handle stop id: route through harmony but do not count as generated token
+            if is_stop_id {
+                let (events, _) = router.push(&frag);
+                for ev in events {
+                    match ev {
+                        GlimmerEmit::Reasoning(text) => {
+                            let _scope = BatchAttemptScope::enter(key.attempt_id);
+                            emit_reasoning_token(stdout, &key.id, &text);
+                        }
+                        GlimmerEmit::Token(text) => {
+                            visible_acc[idx].push_str(&text);
+                            let _scope = BatchAttemptScope::enter(key.attempt_id);
+                            emit_visible_token(stdout, &key.id, &text);
+                        }
+                        GlimmerEmit::Tool(text) => {
+                            tool_acc[idx].push_str(&text);
+                        }
+                    }
+                }
+                if router.just_forced() {
+                    recorder.mark_forced_reasoning_close();
+                }
+                recorder.push(cur_token, &frag);
+                // Flush any pending incomplete marker text
+                for ev in router.flush() {
+                    match ev {
+                        GlimmerEmit::Reasoning(text) => {
+                            let _scope = BatchAttemptScope::enter(key.attempt_id);
+                            emit_reasoning_token(stdout, &key.id, &text);
+                        }
+                        GlimmerEmit::Token(text) => {
+                            visible_acc[idx].push_str(&text);
+                            let _scope = BatchAttemptScope::enter(key.attempt_id);
+                            emit_visible_token(stdout, &key.id, &text);
+                        }
+                        GlimmerEmit::Tool(text) => {
+                            tool_acc[idx].push_str(&text);
+                        }
+                    }
+                }
+                let lane = match &sched.lanes[idx] {
+                    BatchLane::Running(l) => l,
+                    _ => continue,
+                };
+                let generated = lane.streamed_tokens.len();
+                let parsed_tool_calls = parse_glimmer_atem(&tool_acc[idx]).unwrap_or_default();
+                let finish_reason = if !parsed_tool_calls.is_empty() {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
+                let metrics = batch_lane_done_metrics(
+                    lane.created_at,
+                    lane.prefill_done_at,
+                    lane.first_token_at,
+                    Instant::now(),
+                    lane.prompt_len,
+                    generated,
+                );
+                let mut pending_done = serde_json::json!({
+                    "type": "done",
+                    "id": key.id,
+                    "tokens": generated,
+                    "tok_s": (metrics.tok_s * 10.0).round() / 10.0,
+                    "prefill_tokens": lane.prompt_len,
+                    "prefill_ms": (metrics.prefill_ms * 10.0).round() / 10.0,
+                    "prefill_tok_s": (metrics.prefill_tok_s * 10.0).round() / 10.0,
+                    "decode_tok_s": (metrics.decode_tok_s * 10.0).round() / 10.0,
+                    "ttft_ms": (metrics.ttft_ms * 10.0).round() / 10.0,
+                    "cached_tokens": 0,
+                    "finish_reason": finish_reason,
+                    "attempt_id": key.attempt_id,
+                });
+                pending_done["latency_ms"] = serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
+                stage_terminal_tool_calls(&mut pending_done, finish_reason, &parsed_tool_calls);
+                attach_continuous_batch_route_evidence(
+                    &mut pending_done,
+                    batch_size,
+                    idx,
+                    sched.lane_capacity,
+                    lane.max_active_lanes.max(1),
+                );
+                to_await.push((idx, key.clone(), pending_done));
+                continue;
+            }
+            // Normal token: route via harmony
+            let (events, should_stop) = router.push(&frag);
+            for ev in events {
+                match ev {
+                    GlimmerEmit::Reasoning(text) => {
+                        let _scope = BatchAttemptScope::enter(key.attempt_id);
+                        emit_reasoning_token(stdout, &key.id, &text);
+                    }
+                    GlimmerEmit::Token(text) => {
+                        visible_acc[idx].push_str(&text);
+                        let _scope = BatchAttemptScope::enter(key.attempt_id);
+                        emit_visible_token(stdout, &key.id, &text);
+                    }
+                    GlimmerEmit::Tool(text) => {
+                        tool_acc[idx].push_str(&text);
+                    }
+                }
+            }
+            if router.just_forced() {
+                recorder.mark_forced_reasoning_close();
+            }
+            recorder.push(cur_token, &frag);
+            if should_stop {
+                // Harmony signaled end of final channel (eom in answer etc)
+                for ev in router.flush() {
+                    match ev {
+                        GlimmerEmit::Reasoning(text) => {
+                            let _scope = BatchAttemptScope::enter(key.attempt_id);
+                            emit_reasoning_token(stdout, &key.id, &text);
+                        }
+                        GlimmerEmit::Token(text) => {
+                            visible_acc[idx].push_str(&text);
+                            let _scope = BatchAttemptScope::enter(key.attempt_id);
+                            emit_visible_token(stdout, &key.id, &text);
+                        }
+                        GlimmerEmit::Tool(text) => {
+                            tool_acc[idx].push_str(&text);
+                        }
+                    }
+                }
+                let lane = match &sched.lanes[idx] {
+                    BatchLane::Running(l) => l,
+                    _ => continue,
+                };
+                // Include this token as generated
+                let mut generated_ids = emitted_ids[idx].clone();
+                generated_ids.push(cur_token);
+                let generated = lane.streamed_tokens.len() + 1;
+                // Update lane's emitted tracking before metrics
+                emitted_ids[idx].push(cur_token);
+                // Need to push to lane's streamed_tokens for metrics consistency
+                // but we will handle after.
+                let parsed_tool_calls = parse_glimmer_atem(&tool_acc[idx]).unwrap_or_default();
+                let finish_reason = if !parsed_tool_calls.is_empty() {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
+                let metrics = batch_lane_done_metrics(
+                    lane.created_at,
+                    lane.prefill_done_at,
+                    lane.first_token_at,
+                    Instant::now(),
+                    lane.prompt_len,
+                    generated,
+                );
+                let mut pending_done = serde_json::json!({
+                    "type": "done",
+                    "id": key.id,
+                    "tokens": generated,
+                    "tok_s": (metrics.tok_s * 10.0).round() / 10.0,
+                    "prefill_tokens": lane.prompt_len,
+                    "prefill_ms": (metrics.prefill_ms * 10.0).round() / 10.0,
+                    "prefill_tok_s": (metrics.prefill_tok_s * 10.0).round() / 10.0,
+                    "decode_tok_s": (metrics.decode_tok_s * 10.0).round() / 10.0,
+                    "ttft_ms": (metrics.ttft_ms * 10.0).round() / 10.0,
+                    "cached_tokens": 0,
+                    "finish_reason": finish_reason,
+                    "attempt_id": key.attempt_id,
+                });
+                pending_done["latency_ms"] = serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
+                stage_terminal_tool_calls(&mut pending_done, finish_reason, &parsed_tool_calls);
+                attach_continuous_batch_route_evidence(
+                    &mut pending_done,
+                    batch_size,
+                    idx,
+                    sched.lane_capacity,
+                    lane.max_active_lanes.max(1),
+                );
+                to_await.push((idx, key.clone(), pending_done));
+                continue;
+            }
+            // Not finished yet: commit token to lane state and prepare to sample next.
+            // Update first_token_at if first visible.
+            if let BatchLane::Running(lane) = &mut sched.lanes[idx] {
+                if lane.first_token_at.is_none() && !visible_acc[idx].is_empty() {
+                    lane.first_token_at = Some(Instant::now());
+                }
+                lane.streamed_tokens.push(cur_token);
+                emitted_ids[idx].push(cur_token);
+                lane.seq_pos += 1;
+            }
+            let lane = match &sched.lanes[idx] {
+                BatchLane::Running(l) => l,
+                _ => continue,
+            };
+            let hit_max = lane.streamed_tokens.len() >= lane_max_tokens(&key, sched);
+            let hit_lane_cap = batch_lane_at_capacity(lane.seq_pos, sched.lane_capacity);
+            let loop_hit = loop_guards[idx].check(&lane.streamed_tokens).is_some();
+            let should_finish = batch_should_finish_decode(false, hit_max, hit_lane_cap, false, loop_hit);
+            if should_finish {
+                for ev in router.flush() {
+                    match ev {
+                        GlimmerEmit::Reasoning(text) => {
+                            let _scope = BatchAttemptScope::enter(key.attempt_id);
+                            emit_reasoning_token(stdout, &key.id, &text);
+                        }
+                        GlimmerEmit::Token(text) => {
+                            visible_acc[idx].push_str(&text);
+                            let _scope = BatchAttemptScope::enter(key.attempt_id);
+                            emit_visible_token(stdout, &key.id, &text);
+                        }
+                        GlimmerEmit::Tool(text) => {
+                            tool_acc[idx].push_str(&text);
+                        }
+                    }
+                }
+                let hit_length_cap = batch_hit_length_cap(hit_max, hit_lane_cap, false, false, loop_hit);
+                let parsed_tool_calls = parse_glimmer_atem(&tool_acc[idx]).unwrap_or_default();
+                let finish_reason = if hit_length_cap {
+                    "length"
+                } else if !parsed_tool_calls.is_empty() {
+                    "tool_calls"
+                } else {
+                    "stop"
+                };
+                let generated = lane.streamed_tokens.len();
+                let metrics = batch_lane_done_metrics(
+                    lane.created_at,
+                    lane.prefill_done_at,
+                    lane.first_token_at,
+                    Instant::now(),
+                    lane.prompt_len,
+                    generated,
+                );
+                let mut pending_done = serde_json::json!({
+                    "type": "done",
+                    "id": key.id,
+                    "tokens": generated,
+                    "tok_s": (metrics.tok_s * 10.0).round() / 10.0,
+                    "prefill_tokens": lane.prompt_len,
+                    "prefill_ms": (metrics.prefill_ms * 10.0).round() / 10.0,
+                    "prefill_tok_s": (metrics.prefill_tok_s * 10.0).round() / 10.0,
+                    "decode_tok_s": (metrics.decode_tok_s * 10.0).round() / 10.0,
+                    "ttft_ms": (metrics.ttft_ms * 10.0).round() / 10.0,
+                    "cached_tokens": 0,
+                    "finish_reason": finish_reason,
+                    "attempt_id": key.attempt_id,
+                });
+                pending_done["latency_ms"] = serde_json::json!((metrics.latency_ms * 10.0).round() / 10.0);
+                stage_terminal_tool_calls(&mut pending_done, finish_reason, &parsed_tool_calls);
+                attach_continuous_batch_route_evidence(
+                    &mut pending_done,
+                    batch_size,
+                    idx,
+                    sched.lane_capacity,
+                    lane.max_active_lanes.max(1),
+                );
+                to_await.push((idx, key.clone(), pending_done));
+            } else {
+                need_sample.push(idx);
+                survivors.push(idx);
+                rng_states[idx] = match &sched.lanes[idx] {
+                    BatchLane::Running(l) => l.rng_state as u32,
+                    _ => 0,
+                };
+            }
+        }
+        for (idx, key) in to_abort_running {
+            if let Err(e) = batch_state.reset_lane(gpu, idx) {
+                return fail_all(
+                    sched,
+                    gpu,
+                    batch_state,
+                    stdout,
+                    format!("reset lane {idx} on abort post-forward: {e}"),
+                );
+            }
+            let _scope = BatchAttemptScope::enter(key.attempt_id);
+            emit_qwen_ar_cancelled(stdout, &key.id, 0);
+            let _ = sched.abort_lane(idx, &key);
+            routers[idx] = None;
+            recorders[idx] = None;
+            visible_acc[idx].clear();
+            tool_acc[idx].clear();
+            emitted_ids[idx].clear();
+        }
+        for (idx, key, pending_done) in to_await {
+            let mut envelope = pending_done.clone();
+            envelope["type"] = serde_json::json!("commit_ready");
+            let marked = sched.mark_awaiting_commit(idx, pending_done.clone());
+            if !marked {
+                eprintln!(
+                    "[batch] glimmer mark_awaiting_commit failed lane {idx} id={} — aborting lane",
+                    key.id
+                );
+                let _ = batch_state.reset_lane(gpu, idx);
+                let _ = sched.abort_lane(idx, &key);
+                routers[idx] = None;
+                recorders[idx] = None;
+                visible_acc[idx].clear();
+                tool_acc[idx].clear();
+                emitted_ids[idx].clear();
+                continue;
+            }
+            let write_ok = {
+                let _scope = BatchAttemptScope::enter(key.attempt_id);
+                writeln!(stdout, "{}", envelope).is_ok() && stdout.flush().is_ok()
+            };
+            if !write_ok {
+                let _ = batch_state.reset_lane(gpu, idx);
+                let _ = sched.abort_lane(idx, &key);
+                routers[idx] = None;
+                recorders[idx] = None;
+                visible_acc[idx].clear();
+                tool_acc[idx].clear();
+                emitted_ids[idx].clear();
+            }
+        }
+        if survivors.is_empty() {
+            continue;
+        }
+        // Sample next tokens for survivors using Glimmer's simpler sampler.
+        // Survivors share cohort key (same temp/top_p/top_k) so we can use sample_product.
+        // But we fallback to per-lane if needed.
+        let sampled = match batch_state.sample_product(
+            gpu,
+            config,
+            cohort_sampling.temp,
+            cohort_sampling.top_p,
+            cohort_sampling.top_k,
+            &mut rng_states,
+            active_mask,
+        ) {
+            Ok(v) => v,
+            Err(e) => {
+                return fail_all(
+                    sched,
+                    gpu,
+                    batch_state,
+                    stdout,
+                    format!("glimmer sample_product: {e}"),
+                )
+            }
+        };
+        for &lane_idx in &survivors {
+            if let Some((tok, new_rng)) = sampled[lane_idx] {
+                if let BatchLane::Running(lane) = &mut sched.lanes[lane_idx] {
+                    lane.next_token = Some(tok);
+                    lane.rng_state = new_rng as u64;
+                }
+                rng_states[lane_idx] = new_rng;
             }
         }
     }
@@ -6680,9 +7918,160 @@ mod continuous_batch_tests {
         let n = super::lfm_fast_path_candidate_len(&sched);
         assert_eq!(n, 2);
     }
+
+    #[test]
+    fn glimmer_batch_eligible_allows_reasoning_and_requires_single_gpu() {
+        let _l = begin();
+        // Glimmer (14) is batch-eligible even when thinking is enabled (unlike Qwen).
+        assert!(is_batch_eligible(
+            14, 1, false, false, false, false, false, false, false, false, false, true, 4
+        ));
+        assert!(is_batch_eligible(
+            14, 1, false, false, false, false, false, false, false, false, true, true, 2
+        ));
+        // Still requires single-GPU, no EP, no tools etc.
+        assert!(!is_batch_eligible(
+            14, 2, false, false, false, false, false, false, false, false, false, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            14, 1, true, false, false, false, false, false, false, false, false, true, 4
+        ));
+        // Image/tools/stop are barriers.
+        assert!(!is_batch_eligible(
+            14, 1, false, true, false, false, false, false, false, false, false, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            14, 1, false, false, true, false, false, false, false, false, false, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            14, 1, false, false, false, false, false, true, false, false, false, true, 4
+        ));
+        // History (messages) is barrier.
+        assert!(!is_batch_eligible(
+            14, 1, false, false, false, false, false, false, true, false, false, true, 4
+        ));
+        // Spec/adaptive/pflash remain barriers.
+        assert!(!is_batch_eligible(
+            14, 1, false, false, false, true, false, false, false, false, false, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            14, 1, false, false, false, false, true, false, false, false, false, true, 4
+        ));
+        assert!(!is_batch_eligible(
+            14, 1, false, false, false, false, false, true, false, false, false, true, 4
+        ));
+        // serve_continuous_batch false or B=1 still ineligible.
+        assert!(!is_batch_eligible(
+            14, 1, false, false, false, false, false, false, false, false, false, false, 4
+        ));
+        assert!(!is_batch_eligible(
+            14, 1, false, false, false, false, false, false, false, false, false, true, 1
+        ));
+        // Unknown arch beside 5/6/11/14 stays ineligible.
+        assert!(!is_batch_eligible(
+            12, 1, false, false, false, false, false, false, false, false, false, true, 4
+        ));
+    }
+
+    #[test]
+    fn glimmer_route_evidence_uses_independent_mode() {
+        let _l = begin();
+        let mut env = serde_json::json!({"type":"done","id":"r1","tokens":3});
+        super::attach_continuous_batch_route_evidence(&mut env, 4, 2, 4096, 3);
+        assert_eq!(env["execution_mode"], "continuous_batch_independent");
+        let cb = &env["continuous_batch"];
+        assert_eq!(cb["executed"], true);
+        assert_eq!(cb["slots"], 4);
+        assert_eq!(cb["lane"], 2);
+        assert_eq!(cb["lane_capacity"], 4096);
+        assert_eq!(cb["max_active_lanes"], 3);
+    }
+
+    #[test]
+    fn glimmer_sampler_neutrality_is_batch_barrier() {
+        let _l = begin();
+        // Glimmer batch supports only temp/top_p/top_k with neutral repeat/presence/frequency/min_p.
+        let neutral = BatchSampling {
+            temp: 0.7,
+            top_p: 0.9,
+            top_k: Some(50),
+            min_p: None,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            repeat_window: 128,
+        };
+        let with_repeat = BatchSampling {
+            repeat_penalty: 1.05,
+            ..neutral.clone()
+        };
+        let with_presence = BatchSampling {
+            presence_penalty: 0.1,
+            ..neutral.clone()
+        };
+        let with_frequency = BatchSampling {
+            frequency_penalty: 0.1,
+            ..neutral.clone()
+        };
+        let with_min_p = BatchSampling {
+            min_p: Some(0.05),
+            ..neutral.clone()
+        };
+        // Neutral is the only batch-admissible shape for Glimmer.
+        assert!(neutral.min_p.is_none());
+        assert_eq!(neutral.repeat_penalty, 1.0);
+        assert_eq!(neutral.presence_penalty, 0.0);
+        assert_eq!(neutral.frequency_penalty, 0.0);
+        // Non-neutral samplers must be considered distinct barriers (per-request eligibility rejects them).
+        assert!(with_repeat.repeat_penalty != 1.0);
+        assert!(with_presence.presence_penalty != 0.0);
+        assert!(with_frequency.frequency_penalty != 0.0);
+        assert!(with_min_p.min_p.is_some());
+        // Cohort keys for neutral vs non-neutral must differ so scheduler cannot coalesce them.
+        assert_ne!(neutral.key(), with_repeat.key());
+        assert_ne!(neutral.key(), with_presence.key());
+        assert_ne!(neutral.key(), with_min_p.key());
+    }
+    #[test]
+    fn glimmer_harmony_routers_are_per_lane_isolated() {
+        let _l = begin();
+        // Two lanes with same model output fragments but different max_think caps must not leak.
+        let mut r0 = super::GlimmerHarmonyRouter::new(1); // low cap forces early close
+        let mut r1 = super::GlimmerHarmonyRouter::new(0); // uncapped
+        let header_self = "<|start|>assistant to=self<|message|>";
+        let body = "reason";
+        let eom = "<|eom|>";
+        // Split header across UTF-8 boundary: include multibyte char before split marker.
+        let frag_with_multibyte = format!("a×{}", &header_self[0..6]); // contains multibyte ×
+        // Feed same fragments to both routers; they should handle char-boundary suffix correctly.
+        let _ = r0.push(&frag_with_multibyte);
+        let _ = r1.push(&frag_with_multibyte);
+        let (ev0, _) = r0.push(&format!("{}{}{} hello ", &header_self[6..], body, eom));
+        let (ev1, _) = r1.push(&format!("{}{}{} hello ", &header_self[6..], body, eom));
+        // Both should emit reasoning, but r0's low cap may force answer; verify no header leaks.
+        for ev in ev0.iter().chain(ev1.iter()) {
+            match ev {
+                super::GlimmerEmit::Token(t) | super::GlimmerEmit::Reasoning(t) | super::GlimmerEmit::Tool(t) => {
+                    assert!(!t.contains("<|start|>"), "header leaked into visible/reasoning: {t:?}");
+                    assert!(!t.contains("<|message|>"), "header leaked: {t:?}");
+                }
+            }
+        }
+        // Reasoning should have been emitted as Reasoning, not Token, for the self channel.
+        assert!(ev0.iter().any(|e| matches!(e, super::GlimmerEmit::Reasoning(_))));
+        assert!(ev1.iter().any(|e| matches!(e, super::GlimmerEmit::Reasoning(_))));
+        // A subsequent answer channel must be isolated per lane.
+        let header_user = "<|start|>assistant to=user<|message|>";
+        let (ev0a, _) = r0.push(&format!("{}answer text<|eot|>", header_user));
+        let (ev1a, _) = r1.push(&format!("{}answer text<|eot|>", header_user));
+        assert!(ev0a.iter().any(|e| matches!(e, super::GlimmerEmit::Token(_))));
+        assert!(ev1a.iter().any(|e| matches!(e, super::GlimmerEmit::Token(_))));
+        // Ensure pending suffix does not split multibyte.
+        let s = "abc×<|eo";
+        let hold = super::glimmer_longest_marker_suffix(s);
+        assert!(s.is_char_boundary(s.len() - hold));
+    }
 }
-/// Message types pushed from the stdin-reader thread to the main
-/// processing loop. Abort/commit control messages are NOT forwarded —
 /// they're handled inline in the reader thread via
 /// [`apply_terminal_control`]. This is what lets the abort signal
 /// interrupt a mid-flight prefill; the main loop is blocked on prefill
@@ -10053,6 +11442,11 @@ fn fail_closed_reset_target_and_spec(
         if let Some(bs) = m.lfm2_decode_batch.as_mut() {
             if let Err(e) = bs.reset(gpu) {
                 push_reset_err(&mut first_err, "lfm2_decode_batch.reset", e);
+            }
+        }
+        if let Some(bs) = m.glimmer_decode_batch.as_mut() {
+            if let Err(e) = bs.reset(gpu) {
+                push_reset_err(&mut first_err, "glimmer_decode_batch.reset", e);
             }
         }
     }
@@ -13899,21 +15293,15 @@ fn main() {
                                 } else {
                                     eprintln!("[daemon] continuous batch requested but model state not Qwen35 — fallback to sequential");
                                 }
-                            } else if m.arch_id == 11 {
-                                if let Some(ModelState::Lfm2Moe(bundle)) = m.state.as_ref() {
-                                    if !bundle.config.is_dense() {
+                            } else if m.arch_id == 14 {
+                                if let Some(ModelState::MuseGlimmer(bundle)) = m.state.as_ref() {
+                                    if !glimmer_batch_weight_formats_supported(&bundle.weights) {
                                         eprintln!(
-                                            "[daemon] continuous batch requested but LFM MoE not supported (dense only) — fallback to sequential"
-                                        );
-                                    } else if let Err(reason) =
-                                        lfm2moe::batch_weight_formats_supported(&bundle.weights)
-                                    {
-                                        eprintln!(
-                                            "[daemon] continuous batch requested but weight formats unsupported: {} — fallback to sequential",
-                                            reason
+                                            "[daemon] continuous batch requested but weight formats unsupported (glimmer embd={:?} lm_head={:?}) — fallback to sequential",
+                                            bundle.weights.embd_format,
+                                            bundle.weights.lm_head.gpu_dtype
                                         );
                                     } else {
-                                        let repeat_cap = 2048usize.max(1);
                                         let max_attention_lane = gpu
                                             .attention_q8_0_kv_independent_max_lane_capacity(
                                                 bundle.config.head_dim,
@@ -13931,15 +15319,14 @@ fn main() {
                                                     batch_lane_capacity
                                                 );
                                             }
-                                            match Lfm2DecodeBatchState::new(
+                                            match glimmer::batch::GlimmerDecodeBatchState::new(
                                                 &mut gpu,
                                                 &bundle.config,
                                                 parsed_continuous_batch_size,
                                                 batch_lane_capacity,
-                                                repeat_cap,
                                             ) {
                                                 Ok(batch_state) => {
-                                                    m.lfm2_decode_batch = Some(batch_state);
+                                                    m.glimmer_decode_batch = Some(batch_state);
                                                     staged_batch_scheduler =
                                                         Some(ContinuousBatchScheduler::new(
                                                             parsed_continuous_batch_size,
@@ -13947,10 +15334,9 @@ fn main() {
                                                         ));
                                                     staged_batch_capable = true;
                                                     eprintln!(
-                                                        "[daemon] continuous batch staged: slots={} lane_cap={} repeat_cap={}",
+                                                        "[daemon] continuous batch staged: slots={} lane_cap={}",
                                                         parsed_continuous_batch_size,
-                                                        batch_lane_capacity,
-                                                        repeat_cap
+                                                        batch_lane_capacity
                                                     );
                                                 }
                                                 Err(e) => {
@@ -13962,7 +15348,7 @@ fn main() {
                                         }
                                     }
                                 } else {
-                                    eprintln!("[daemon] continuous batch requested but model state not Lfm2Moe — fallback to sequential");
+                                    eprintln!("[daemon] continuous batch requested but model state not MuseGlimmer — fallback to sequential");
                                 }
                             } else {
                                 eprintln!("[daemon] continuous batch requested but not capable (arch_id={} pp={} ep={:?}) — fallback to sequential", m.arch_id, m.pp, m.ep.is_some());
@@ -15056,31 +16442,108 @@ fn main() {
                         // Render prompt once at admission and store tokens/started flag; do not render twice at lane assignment.
                         let prompt_owned =
                             batch_single_user_content(&msg).unwrap_or_else(|| prompt.to_string());
-                        let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
-                            &prompt_owned,
-                            system,
-                            assistant_prefix,
-                            m.tokenizer.as_ref().unwrap(),
-                            m.chat_template.as_ref(),
-                            max_think_tokens,
-                            messages_history.as_deref(),
-                        ) {
-                            Ok(v) => v,
-                            Err(e) => {
-                                let _scope = BatchAttemptScope::enter(gen_attempt_id);
-                                emit_uncorrelated_error(
-                                    &mut stdout,
-                                    Some(id),
-                                    &format!("render failed: {e}"),
-                                    "validation",
-                                    false,
-                                    false,
-                                );
-                                batch_clear_terminal(id, gen_attempt_id);
-                                continue;
+                        let (prompt_tokens, started_in_think) = if m.arch_id == 14 {
+                            let think_mode = msg
+                                .get("reasoning_effort")
+                                .or_else(|| msg.get("thinking_mode"))
+                                .and_then(|v| v.as_str())
+                                .map(hipfire_runtime::prompt_frame::ThinkMode::from_str)
+                                .unwrap_or(hipfire_runtime::prompt_frame::ThinkMode::NonThink);
+                            let rs = glimmer_reasoning_strength(think_mode, max_think_tokens);
+                            let tok = m.tokenizer.as_ref().unwrap();
+                            let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+                            let try_jinja = jinja_enabled && m.chat_template.is_some();
+                            let mut started = matches!(
+                                assistant_prefix,
+                                hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+                            );
+                            let ids = if try_jinja {
+                                let template = m.chat_template.as_ref().unwrap();
+                                let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                                    tokenizer: tok,
+                                    template,
+                                    system,
+                                    user: &prompt_owned,
+                                    enable_thinking: max_think_tokens != 1,
+                                    bos_token: Some("<bos>"),
+                                    reasoning_strength: Some(rs),
+                                };
+                                let batch_msgs = match msg.get("messages") {
+                                    Some(v) => serde_json::from_value::<Vec<hipfire_runtime::prompt_frame::Message>>(v.clone()).ok(),
+                                    None => None,
+                                };
+                                let render_res = if let Some(msgs) = batch_msgs.as_deref() {
+                                    frame.render_messages(msgs, None, None)
+                                } else {
+                                    frame.render()
+                                };
+                                match render_res {
+                                    Ok(rendered) => {
+                                        started = render_tail_opens_think(&rendered);
+                                        tok.encode(&rendered)
+                                    }
+                                    Err(e) => {
+                                        eprintln!("[daemon] jinja render failed ({e}) — falling back to Plain");
+                                        hipfire_runtime::prompt_frame::ChatFrame {
+                                            tokenizer: tok,
+                                            system,
+                                            user: "",
+                                            assistant_prefix,
+                                            raw: false,
+                                        }
+                                        .build_with_user_tokens(&tok.encode(&prompt_owned))
+                                    }
+                                }
+                            } else {
+                                let tok = m.tokenizer.as_ref().unwrap();
+                                let q = tok.encode(&prompt_owned);
+                                hipfire_runtime::prompt_frame::ChatFrame {
+                                    tokenizer: tok,
+                                    system,
+                                    user: "",
+                                    assistant_prefix,
+                                    raw: false,
+                                }
+                                .build_with_user_tokens(&q)
+                            };
+                            let mut ids_mut = ids;
+                            let bos = m.state.as_ref().and_then(|s| match s {
+                                ModelState::MuseGlimmer(b) => Some(b.config.bos_token),
+                                _ => None,
+                            }).unwrap_or(1);
+                            if ids_mut.first() != Some(&bos) {
+                                ids_mut.insert(0, bos);
+                            }
+                            (ids_mut, started)
+                        } else {
+                            match batch_render_prompt_tokens(
+                                &prompt_owned,
+                                system,
+                                assistant_prefix,
+                                m.tokenizer.as_ref().unwrap(),
+                                m.chat_template.as_ref(),
+                                max_think_tokens,
+                                messages_history.as_deref(),
+                            ) {
+                                Ok(v) => v,
+                                Err(e) => {
+                                    let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                    emit_uncorrelated_error(
+                                        &mut stdout,
+                                        Some(id),
+                                        &format!("render failed: {e}"),
+                                        "validation",
+                                        false,
+                                        false,
+                                    );
+                                    batch_clear_terminal(id, gen_attempt_id);
+                                    continue;
+                                }
                             }
                         };
-                        if started_in_think {
+                        // For Glimmer, reasoning is per-lane Harmony-routed, not a barrier; Qwen/LFM keep the barrier.
+                        let is_glimmer = m.arch_id == 14;
+                        if started_in_think && !is_glimmer {
                             // Rendered prompts that open a think span are sequential
                             // barriers. Transfer any pre-latched abort exactly once
                             // (transfer itself clears the keyed entry).
@@ -15170,6 +16633,44 @@ fn main() {
                                         );
                                     }
                                     let drive_res = drive_qwen_continuous_batch(
+                                        sched,
+                                        &mut gpu,
+                                        m,
+                                        &mut stdout,
+                                        &mut inbox,
+                                    );
+                                    match drive_res {
+                                        Ok(()) => {}
+                                        Err(BatchDriveError::Gpu(e)) => {
+                                            eprintln!("[batch] drive failed (attested): {e}");
+                                        }
+                                        Err(BatchDriveError::Poisoned(e)) => {
+                                            eprintln!("[batch] drive poisoned (unattested): {e} — generation poisoned until unload/reload");
+                                            batch_scheduler = None;
+                                            continuous_batch_size = 1;
+                                            batch_poisoned = Some(e);
+                                            batch_clear_all_terminals();
+                                        }
+                                    }
+                                } else if arch == 14 {
+                                    let enq_ok = sched.enqueue(pending);
+                                    if !enq_ok {
+                                        eprintln!(
+                                            "[batch] duplicate enqueue rejected id={} attempt_id={}; preserving live registry",
+                                            id, gen_attempt_id
+                                        );
+                                        continue;
+                                    }
+                                    {
+                                        let _scope = BatchAttemptScope::enter(gen_attempt_id);
+                                        emit_gen_start(
+                                            &mut stdout,
+                                            id,
+                                            started_in_think,
+                                            Some(GLIMMER_SEMANTIC_CONTRACT_VERSION),
+                                        );
+                                    }
+                                    let drive_res = drive_glimmer_continuous_batch(
                                         sched,
                                         &mut gpu,
                                         m,
