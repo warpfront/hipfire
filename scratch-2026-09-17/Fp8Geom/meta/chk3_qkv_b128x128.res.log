@@ -1,0 +1,11 @@
+/home/kaden/ClaudeCode/warpfront/wt-fp8geom/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:387:1: remark: Function Name: chk3_qkv_b128x128 [-Rpass-analysis=kernel-resource-usage]
+  387 | ) {
+      | ^
+/home/kaden/ClaudeCode/warpfront/wt-fp8geom/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:387:1: remark:     TotalSGPRs: 42 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8geom/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:387:1: remark:     VGPRs: 211 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8geom/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:387:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8geom/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:387:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8geom/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:387:1: remark:     Occupancy [waves/SIMD]: 7 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8geom/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:387:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8geom/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:387:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+/home/kaden/ClaudeCode/warpfront/wt-fp8geom/kernels/src/gemm_gate_up_mq4g256v2_wmma_fp8.gfx12.hip:387:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]

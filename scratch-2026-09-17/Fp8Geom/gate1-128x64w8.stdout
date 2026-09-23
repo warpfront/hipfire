@@ -1,0 +1,45 @@
+CPU suite: 9/9 pass
+  [ok] codec/exact-grid-roundtrip — 0 mismatches (tie_fails=0)
+  [ok] prelude/dyadic224-rule — zero/224/clamp/pow2 boundaries exact
+  [ok] weights/all-nibble-roundtrip — codes_seen=16/16 worst_dequant_err=0e0
+  [ok] address/one-hot-diagonal — worst_onehot_err=0e0
+  [ok] determinism/cpu-repeat-identical — hash=2bc16d3dcd1c6f9b
+  [ok] bounds/f64-audit-within-model — worst_gap_over_bound=0.000
+  [ok] bounds/rne-eps-model — worst_excess_over_half_ulp=0e0
+  [ok] weights/zero-scale-half — s0=0 z0=3 s1=4.234375 z1=64
+  [ok] address/qkvza-48row-boundary — tm=192 row144->(split3,pr0)
+v2 route ACTIVE (BM128xBN64xBK64/8w):
+  compiled: gemm_gate_up_mq4g256v2_wmma_fp8_v2_gfx1201
+  compiled: gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201
+  compiled: gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201
+  compiled: gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201
+GPU: arch=gfx1201 ordinal=0
+GPU cases: 28/28 pass
+  [pass] gate_up  N=64    K=512    M=128     max_abs=6.250e-2 tail_mse=2.776e-4 bound_ratio=0.017 viol=0 x8mm=0 
+  [pass] gate_up  N=128   K=512    M=128     max_abs=6.250e-2 tail_mse=3.316e-4 bound_ratio=0.017 viol=0 x8mm=0 
+  [pass] gate_up  N=192   K=512    M=128     max_abs=6.641e-2 tail_mse=3.160e-4 bound_ratio=0.017 viol=0 x8mm=0 
+  [pass] gate_up  N=256   K=512    M=128     max_abs=6.250e-2 tail_mse=2.863e-4 bound_ratio=0.016 viol=0 x8mm=0 
+  [pass] gate_up  N=320   K=512    M=128     max_abs=6.250e-2 tail_mse=3.710e-4 bound_ratio=0.016 viol=0 x8mm=0 
+  [pass] gate_up  N=512   K=512    M=128     max_abs=7.031e-2 tail_mse=3.818e-4 bound_ratio=0.016 viol=0 x8mm=0 
+  [pass] gate_up  N=512   K=5120   M=34816   max_abs=2.469e0 tail_mse=1.950e-1 bound_ratio=0.008 viol=0 x8mm=0 
+  [pass] qkv      N=64    K=512    M=192     max_abs=6.250e-2 tail_mse=2.996e-4 bound_ratio=0.017 viol=0 x8mm=0 
+  [pass] qkv      N=128   K=512    M=192     max_abs=6.250e-2 tail_mse=2.703e-4 bound_ratio=0.017 viol=0 x8mm=0 
+  [pass] qkv      N=192   K=512    M=192     max_abs=6.250e-2 tail_mse=2.703e-4 bound_ratio=0.017 viol=0 x8mm=0 
+  [pass] qkv      N=256   K=512    M=192     max_abs=5.859e-2 tail_mse=2.875e-4 bound_ratio=0.016 viol=0 x8mm=0 
+  [pass] qkv      N=320   K=512    M=192     max_abs=5.859e-2 tail_mse=3.715e-4 bound_ratio=0.016 viol=0 x8mm=0 
+  [pass] qkv      N=512   K=512    M=192     max_abs=7.031e-2 tail_mse=3.270e-4 bound_ratio=0.016 viol=0 x8mm=0 
+  [pass] qkv      N=512   K=5120   M=14336   max_abs=2.031e0 tail_mse=1.948e-1 bound_ratio=0.007 viol=0 x8mm=0 
+  [pass] qkvza    N=64    K=512    M=192     max_abs=6.250e-2 tail_mse=3.738e-4 bound_ratio=0.017 viol=0 x8mm=0 
+  [pass] qkvza    N=128   K=512    M=192     max_abs=6.250e-2 tail_mse=3.362e-4 bound_ratio=0.017 viol=0 x8mm=0 
+  [pass] qkvza    N=192   K=512    M=192     max_abs=6.250e-2 tail_mse=4.097e-4 bound_ratio=0.017 viol=0 x8mm=0 
+  [pass] qkvza    N=256   K=512    M=192     max_abs=6.250e-2 tail_mse=3.751e-4 bound_ratio=0.016 viol=0 x8mm=0 
+  [pass] qkvza    N=320   K=512    M=192     max_abs=6.250e-2 tail_mse=3.847e-4 bound_ratio=0.016 viol=0 x8mm=0 
+  [pass] qkvza    N=512   K=512    M=192     max_abs=7.031e-2 tail_mse=4.255e-4 bound_ratio=0.016 viol=0 x8mm=0 
+  [pass] qkvza    N=512   K=5120   M=16480   max_abs=2.031e0 tail_mse=2.102e-1 bound_ratio=0.007 viol=0 x8mm=0 
+  [pass] residual N=64    K=512    M=128     max_abs=6.676e-6 tail_mse=7.407e-12 bound_ratio=0.002 viol=0 x8mm=0 
+  [pass] residual N=128   K=512    M=128     max_abs=7.629e-6 tail_mse=6.179e-12 bound_ratio=0.002 viol=0 x8mm=0 
+  [pass] residual N=192   K=512    M=128     max_abs=7.629e-6 tail_mse=5.733e-12 bound_ratio=0.002 viol=0 x8mm=0 
+  [pass] residual N=256   K=512    M=128     max_abs=8.583e-6 tail_mse=5.927e-12 bound_ratio=0.002 viol=0 x8mm=0 
+  [pass] residual N=320   K=512    M=128     max_abs=8.583e-6 tail_mse=5.948e-12 bound_ratio=0.002 viol=0 x8mm=0 
+  [pass] residual N=512   K=512    M=128     max_abs=1.049e-5 tail_mse=6.102e-12 bound_ratio=0.002 viol=0 x8mm=0 
+  [pass] residual N=512   K=17408  M=5120    max_abs=6.561e-4 tail_mse=1.575e-8 bound_ratio=0.000 viol=0 x8mm=0 

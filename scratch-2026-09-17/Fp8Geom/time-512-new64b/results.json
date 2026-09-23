@@ -1,0 +1,318 @@
+{
+  "status": "ok",
+  "elapsed_s": 46.926424955,
+  "v2_symbols": [
+    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_gfx1201",
+    "gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201",
+    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201",
+    "gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201"
+  ],
+  "v2_geometry": {
+    "BM": 128,
+    "BN": 64,
+    "BK": 64,
+    "waves": 8,
+    "route": "v2"
+  },
+  "s2bt8_hist_us_N512": {
+    "gate_up": 1804.7,
+    "qkv": 770.1,
+    "qkvza": 825.7,
+    "residual": 676.8
+  },
+  "cpu_tests": [
+    {
+      "name": "codec/exact-grid-roundtrip",
+      "pass": true,
+      "detail": "0 mismatches (tie_fails=0)"
+    },
+    {
+      "name": "prelude/dyadic224-rule",
+      "pass": true,
+      "detail": "zero/224/clamp/pow2 boundaries exact"
+    },
+    {
+      "name": "weights/all-nibble-roundtrip",
+      "pass": true,
+      "detail": "codes_seen=16/16 worst_dequant_err=0e0"
+    },
+    {
+      "name": "address/one-hot-diagonal",
+      "pass": true,
+      "detail": "worst_onehot_err=0e0"
+    },
+    {
+      "name": "determinism/cpu-repeat-identical",
+      "pass": true,
+      "detail": "hash=2bc16d3dcd1c6f9b"
+    },
+    {
+      "name": "bounds/f64-audit-within-model",
+      "pass": true,
+      "detail": "worst_gap_over_bound=0.000"
+    },
+    {
+      "name": "bounds/rne-eps-model",
+      "pass": true,
+      "detail": "worst_excess_over_half_ulp=0e0"
+    },
+    {
+      "name": "weights/zero-scale-half",
+      "pass": true,
+      "detail": "s0=0 z0=3 s1=4.234375 z1=64"
+    },
+    {
+      "name": "address/qkvza-48row-boundary",
+      "pass": true,
+      "detail": "tm=192 row144->(split3,pr0)"
+    }
+  ],
+  "gpu_cases": [
+    {
+      "family": "gate_up",
+      "n": 512,
+      "k": 512,
+      "m_total": 128,
+      "kernel": "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201",
+      "kernels_seen": [
+        "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201",
+        "pack_f32_to_fp8_mq4v2_gfx12"
+      ],
+      "max_abs": 0.0703125,
+      "tail_mse": 0.00038179438164893617,
+      "tail_thr": 68734.9296875,
+      "tail_worst": 0.0625,
+      "maxrel_peak": 1.0661163800359473e-7,
+      "bound_ratio": 0.016328463380915162,
+      "bound_viol": 0,
+      "max_abs_orig": 20456.59375,
+      "bound_orig_ratio": 0.7579855044681557,
+      "bound_orig_viol": 0,
+      "x8_mismatch": 0,
+      "max_s_err_ratio": 0.0,
+      "hash": "f688c138b60198b8",
+      "hash_repeat": "f688c138b60198b8",
+      "deterministic": true,
+      "time_us": 11.640000157058239,
+      "verdict": "pass"
+    },
+    {
+      "family": "gate_up",
+      "n": 512,
+      "k": 5120,
+      "m_total": 34816,
+      "kernel": "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201",
+      "kernels_seen": [
+        "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201",
+        "pack_f32_to_fp8_mq4v2_gfx12"
+      ],
+      "max_abs": 2.46875,
+      "tail_mse": 0.19497399558580164,
+      "tail_thr": 436269.03125,
+      "tail_worst": 1.90625,
+      "maxrel_peak": 6.705796411167492e-7,
+      "bound_ratio": 0.008460042395952945,
+      "bound_viol": 0,
+      "max_abs_orig": 8483.625,
+      "bound_orig_ratio": 0.4210351213497359,
+      "bound_orig_viol": 0,
+      "x8_mismatch": 0,
+      "max_s_err_ratio": 0.0,
+      "hash": "2adf7620c1d722e1",
+      "hash_repeat": "2adf7620c1d722e1",
+      "deterministic": true,
+      "time_us": 55.88100105524063,
+      "verdict": "pass"
+    },
+    {
+      "family": "qkv",
+      "n": 512,
+      "k": 512,
+      "m_total": 192,
+      "kernel": "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201",
+      "kernels_seen": [
+        "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201",
+        "pack_f32_to_fp8_mq4v2_gfx12"
+      ],
+      "max_abs": 0.0703125,
+      "tail_mse": 0.0003270004734848485,
+      "tail_thr": 68817.6015625,
+      "tail_worst": 0.0546875,
+      "maxrel_peak": 1.1967914022505663e-7,
+      "bound_ratio": 0.016328463380915162,
+      "bound_viol": 0,
+      "max_abs_orig": 20456.59375,
+      "bound_orig_ratio": 0.7700421024630971,
+      "bound_orig_viol": 0,
+      "x8_mismatch": 0,
+      "max_s_err_ratio": 0.0,
+      "hash": "c31888173eaf8bf9",
+      "hash_repeat": "c31888173eaf8bf9",
+      "deterministic": true,
+      "time_us": 12.679999694228172,
+      "verdict": "pass"
+    },
+    {
+      "family": "qkv",
+      "n": 512,
+      "k": 5120,
+      "m_total": 14336,
+      "kernel": "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201",
+      "kernels_seen": [
+        "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201",
+        "pack_f32_to_fp8_mq4v2_gfx12"
+      ],
+      "max_abs": 2.03125,
+      "tail_mse": 0.1948055962766972,
+      "tail_thr": 436291.84375,
+      "tail_worst": 1.65625,
+      "maxrel_peak": 1.5946821031894255e-6,
+      "bound_ratio": 0.007295685705069685,
+      "bound_viol": 0,
+      "max_abs_orig": 8432.0625,
+      "bound_orig_ratio": 0.3997166886316582,
+      "bound_orig_viol": 0,
+      "x8_mismatch": 0,
+      "max_s_err_ratio": 0.0,
+      "hash": "09726b10ba1eb1b2",
+      "hash_repeat": "09726b10ba1eb1b2",
+      "deterministic": true,
+      "time_us": 30.559999868273735,
+      "verdict": "pass"
+    },
+    {
+      "family": "qkvza",
+      "n": 512,
+      "k": 512,
+      "m_total": 192,
+      "kernel": "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201",
+      "kernels_seen": [
+        "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201",
+        "pack_f32_to_fp8_mq4v2_gfx12"
+      ],
+      "max_abs": 0.0703125,
+      "tail_mse": 0.0004255163524797571,
+      "tail_thr": 68817.6015625,
+      "tail_worst": 0.0546875,
+      "maxrel_peak": 1.6496109268908108e-7,
+      "bound_ratio": 0.016328463380915162,
+      "bound_viol": 0,
+      "max_abs_orig": 20456.59375,
+      "bound_orig_ratio": 0.7579855044681557,
+      "bound_orig_viol": 0,
+      "x8_mismatch": 0,
+      "max_s_err_ratio": 0.0,
+      "hash": "08e6db9ee7c39f46",
+      "hash_repeat": "08e6db9ee7c39f46",
+      "deterministic": true,
+      "time_us": 16.279999166727066,
+      "verdict": "pass"
+    },
+    {
+      "family": "qkvza",
+      "n": 512,
+      "k": 5120,
+      "m_total": 16480,
+      "kernel": "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201",
+      "kernels_seen": [
+        "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201",
+        "pack_f32_to_fp8_mq4v2_gfx12"
+      ],
+      "max_abs": 2.03125,
+      "tail_mse": 0.21021397393724697,
+      "tail_thr": 436325.46875,
+      "tail_worst": 1.90625,
+      "maxrel_peak": 9.530703096487313e-7,
+      "bound_ratio": 0.007295685705069685,
+      "bound_viol": 0,
+      "max_abs_orig": 8442.96875,
+      "bound_orig_ratio": 0.3997166886316582,
+      "bound_orig_viol": 0,
+      "x8_mismatch": 0,
+      "max_s_err_ratio": 0.0,
+      "hash": "082a7b24def26f75",
+      "hash_repeat": "082a7b24def26f75",
+      "deterministic": true,
+      "time_us": 29.920000582933426,
+      "verdict": "pass"
+    },
+    {
+      "family": "residual",
+      "n": 512,
+      "k": 512,
+      "m_total": 128,
+      "kernel": "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x64w8_gfx1201",
+      "kernels_seen": [
+        "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x64w8_gfx1201",
+        "pack_f32_to_fp8_mq4v2_gfx12"
+      ],
+      "max_abs": 0.00001049041748046875,
+      "tail_mse": 6.1020588210275e-12,
+      "tail_thr": 10.741787910461426,
+      "tail_worst": 0.00001049041748046875,
+      "maxrel_peak": 9.71316348312877e-8,
+      "bound_ratio": 0.0022399311124153875,
+      "bound_viol": 0,
+      "max_abs_orig": 4.534143924713135,
+      "bound_orig_ratio": 0.7700419722211723,
+      "bound_orig_viol": 0,
+      "x8_mismatch": 0,
+      "max_s_err_ratio": 0.0,
+      "hash": "cca47513e02283dc",
+      "hash_repeat": "cca47513e02283dc",
+      "deterministic": true,
+      "time_us": 12.199999764561653,
+      "verdict": "pass"
+    },
+    {
+      "family": "residual",
+      "n": 512,
+      "k": 17408,
+      "m_total": 5120,
+      "kernel": "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x64w8_gfx1201",
+      "kernels_seen": [
+        "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x64w8_gfx1201",
+        "pack_f32_to_fp8_mq4v2_gfx12"
+      ],
+      "max_abs": 0.0006561279296875,
+      "tail_mse": 1.574764736825876e-8,
+      "tail_thr": 60.62922286987305,
+      "tail_worst": 0.0006561279296875,
+      "maxrel_peak": 2.910907122678791e-6,
+      "bound_ratio": 0.00019587243919474726,
+      "bound_viol": 0,
+      "max_abs_orig": 3.6100603342056274,
+      "bound_orig_ratio": 0.2243110492913142,
+      "bound_orig_viol": 0,
+      "x8_mismatch": 0,
+      "max_s_err_ratio": 0.0,
+      "hash": "373cb087fb519b9e",
+      "hash_repeat": "373cb087fb519b9e",
+      "deterministic": true,
+      "time_us": 77.96099781990051,
+      "verdict": "pass"
+    }
+  ],
+  "time_medians_us": {
+    "gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201": {
+      "median_us": 720.009982585907,
+      "n": 6
+    },
+    "gemm_mq4g256v2_residual_wmma_fp8_v2_b128x64w8_gfx1201": {
+      "median_us": 815.9310221672058,
+      "n": 6
+    },
+    "pack_f32_to_fp8_mq4v2_gfx12": {
+      "median_us": 28.560999780893326,
+      "n": 48
+    },
+    "gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201": {
+      "median_us": 648.5679745674133,
+      "n": 6
+    },
+    "gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x64w8_gfx1201": {
+      "median_us": 1586.6199731826782,
+      "n": 6
+    }
+  }
+}

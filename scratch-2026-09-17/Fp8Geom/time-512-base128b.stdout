@@ -1,0 +1,31 @@
+CPU suite: 9/9 pass
+  [ok] codec/exact-grid-roundtrip — 0 mismatches (tie_fails=0)
+  [ok] prelude/dyadic224-rule — zero/224/clamp/pow2 boundaries exact
+  [ok] weights/all-nibble-roundtrip — codes_seen=16/16 worst_dequant_err=0e0
+  [ok] address/one-hot-diagonal — worst_onehot_err=0e0
+  [ok] determinism/cpu-repeat-identical — hash=2bc16d3dcd1c6f9b
+  [ok] bounds/f64-audit-within-model — worst_gap_over_bound=0.000
+  [ok] bounds/rne-eps-model — worst_excess_over_half_ulp=0e0
+  [ok] weights/zero-scale-half — s0=0 z0=3 s1=4.234375 z1=64
+  [ok] address/qkvza-48row-boundary — tm=192 row144->(split3,pr0)
+v2 route ACTIVE (BM128xBN128xBK64/8w):
+  compiled: gemm_gate_up_mq4g256v2_wmma_fp8_v2_gfx1201
+  compiled: gemm_qkv_mq4g256v2_wmma_fp8_v2_gfx1201
+  compiled: gemm_qkvza_mq4g256v2_wmma_fp8_v2_gfx1201
+  compiled: gemm_mq4g256v2_residual_wmma_fp8_v2_gfx1201
+GPU: arch=gfx1201 ordinal=0
+TIME medians (us, same-session):
+  gemm_gate_up_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201          median     1446.3 n=6
+  gemm_mq4g256v2_residual_wmma_fp8_v2_b128x128_gfx1201         median      796.2 n=6
+  gemm_qkv_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201              median      604.7 n=6
+  gemm_qkvza_mq4g256v2_wmma_fp8_v2_b128x128_gfx1201            median      695.9 n=6
+  pack_f32_to_fp8_mq4v2_gfx12                                  median       28.2 n=48
+GPU cases: 8/8 pass
+  [pass] gate_up  N=512   K=512    M=128     max_abs=7.031e-2 tail_mse=3.818e-4 bound_ratio=0.016 viol=0 x8mm=0 11.3us
+  [pass] gate_up  N=512   K=5120   M=34816   max_abs=2.469e0 tail_mse=1.950e-1 bound_ratio=0.008 viol=0 x8mm=0 59.6us
+  [pass] qkv      N=512   K=512    M=192     max_abs=7.031e-2 tail_mse=3.270e-4 bound_ratio=0.016 viol=0 x8mm=0 15.5us
+  [pass] qkv      N=512   K=5120   M=14336   max_abs=2.031e0 tail_mse=1.948e-1 bound_ratio=0.007 viol=0 x8mm=0 31.4us
+  [pass] qkvza    N=512   K=512    M=192     max_abs=7.031e-2 tail_mse=4.255e-4 bound_ratio=0.016 viol=0 x8mm=0 12.2us
+  [pass] qkvza    N=512   K=5120   M=16480   max_abs=2.031e0 tail_mse=2.102e-1 bound_ratio=0.007 viol=0 x8mm=0 30.4us
+  [pass] residual N=512   K=512    M=128     max_abs=1.049e-5 tail_mse=6.102e-12 bound_ratio=0.002 viol=0 x8mm=0 14.7us
+  [pass] residual N=512   K=17408  M=5120    max_abs=6.561e-4 tail_mse=1.575e-8 bound_ratio=0.000 viol=0 x8mm=0 78.0us
