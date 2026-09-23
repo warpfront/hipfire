@@ -100,7 +100,6 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         (ua) += usc * udot + uzp * xs; \
     } while (0)
 
-    #pragma clang loop unroll(disable)
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
         const int base0 = g * 256 + tid * 8;
@@ -147,16 +146,10 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
 
     float gacc = (gacc0 + gacc1) + (gacc2 + gacc3);
     float uacc = (uacc0 + uacc1) + (uacc2 + uacc3);
-    gacc += __shfl_down(gacc, 16);
-    uacc += __shfl_down(uacc, 16);
-    gacc += __shfl_down(gacc, 8);
-    uacc += __shfl_down(uacc, 8);
-    gacc += __shfl_down(gacc, 4);
-    uacc += __shfl_down(uacc, 4);
-    gacc += __shfl_down(gacc, 2);
-    uacc += __shfl_down(uacc, 2);
-    gacc += __shfl_down(gacc, 1);
-    uacc += __shfl_down(uacc, 1);
+    for (int offset = 16; offset > 0; offset >>= 1) {
+        gacc += __shfl_down(gacc, offset);
+        uacc += __shfl_down(uacc, offset);
+    }
 
     if (tid == 0) {
         y_gate[krank * mi + row] = gacc;
