@@ -1,0 +1,24 @@
+{
+  "kld": 0.083278,
+  "md5": "9d0e860f41db992820ebdc9483c0a041",
+  "expected_md5": "9d0e860f41db992820ebdc9483c0a041",
+  "evaluator_md5": "5306b8037edf7ec7a8a2b5cfe6e7505d",
+  "device": "GPU-6109a4cb5f833235",
+  "command": [
+    "/home/kaden/ClaudeCode/warpfront/wt-g12rastergate/target/release/examples/eval_hipfire",
+    "--model",
+    "/home/kaden/qcal/qat/v25/qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq",
+    "--ref",
+    "/home/kaden/kldrefs/qwen3.8-27b.ref_wt2.bin",
+    "--kv-mode",
+    "fp8",
+    "--kv-v",
+    "q8",
+    "--scoring-mode",
+    "prefill",
+    "--max-chunks",
+    "24",
+    "--output",
+    "/home/kaden/ClaudeCode/warpfront/wt-g12rastergate/scratch-g12rastergate/wt2/candidate.kldseq"
+  ]
+}
