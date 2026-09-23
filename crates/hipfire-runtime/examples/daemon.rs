@@ -465,6 +465,10 @@ enum SpecPath {
     PpMtp,
     /// pp=1, DFlash spec-decode (greedy-only). generate_dflash today.
     Dflash,
+    /// pp>1, DFlash spec-decode (greedy-only, experimental). Banded target +
+    /// co-located drafter on output_device. generate_pp_dflash;
+    /// HIPFIRE_PP_DFLASH=1 + a draft attached via load_model_pp_with_dflash.
+    PpDflash,
 }
 
 /// Decide which path a request would take given the loaded model
@@ -482,20 +486,32 @@ fn pick_path(m: &LoadedModel, ctx: &GenerateCtx<'_>) -> SpecPath {
     if m.arch_id == 7 {
         return SpecPath::Qwen2;
     }
+    let budgeted_thinking_needs_ar = ctx.max_think_tokens > 0
+        && !matches!(ctx.assistant_prefix,
+                     hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink);
     if m.pp > 1 {
-        // PP+MTP routes to Mtp ONLY when step 5d's SpecPath::PpMtp arm
-        // exists. Today (pre-step-5d) the dispatcher falls through to
-        // generate_multi for the PP+MTP case — record that as PpAr so
-        // the assertion matches today's behavior. Step 5d flips this
-        // to PpMtp.
+        // PP + DFlash (experimental): a draft attached via
+        // load_model_pp_with_dflash (HIPFIRE_PP_DFLASH=1) leaves
+        // m.dflash.pp_extras = Some. Greedy requests route to the cross-card
+        // DFlash stepper. Checked before MTP so a model carrying both prefers
+        // DFlash on greedy (matches single-GPU ordering).
+        let pp_dflash_ready = m
+            .dflash
+            .as_ref()
+            .map_or(false, |d| d.pp_extras.is_some());
+        // PpDflash handles both greedy (temp==0) and rejection sampling
+        // (temp>0), so route both — unlike single-GPU Dflash which is gated
+        // greedy because generate_dflash hardcodes temp=0.
+        if pp_dflash_ready && (m.arch_id == 5 || m.arch_id == 6)
+            && !budgeted_thinking_needs_ar {
+            return SpecPath::PpDflash;
+        }
+        // PP+MTP routes to PpMtp when an MTP head is loaded; else PpAr.
         if m.mtp.is_some() {
             return SpecPath::PpMtp;
         }
         return SpecPath::PpAr;
     }
-    let budgeted_thinking_needs_ar = ctx.max_think_tokens > 0
-        && !matches!(ctx.assistant_prefix,
-                     hipfire_runtime::prompt_frame::AssistantPrefix::ClosedThink);
     if m.dflash.is_some() && ctx.temp <= 1e-6 && (m.arch_id == 5 || m.arch_id == 6)
         && !budgeted_thinking_needs_ar {
         return SpecPath::Dflash;
@@ -710,6 +726,24 @@ struct DflashState {
     /// the decode loop falls through to `spec_step_dflash` (chain mode).
     /// See `spec_step_ddtree_batched` for the tree-verify path.
     ddtree: Option<DdtreeState>,
+    /// Pipeline-parallel (pp>1) extras. `None` for the single-GPU DFlash
+    /// path. `Some` when the draft is attached to a banded target via
+    /// `load_model_pp_with_dflash` (HIPFIRE_PP_DFLASH=1). When `Some`, the
+    /// reusable fields above (draft_weights/scratch/hidden_rb/verify_scratch/
+    /// target_snap/target_hidden_host) live on `output_device`, and the
+    /// dispatcher routes to `spec_step_dflash_pp` via `generate_pp_dflash`.
+    pp_extras: Option<DflashPpExtras>,
+}
+
+/// PP-only (pp>1) extension of [`DflashState`]. The cross-card pieces DFlash
+/// needs on top of the single-GPU state: the per-band extract-layer capture
+/// rings (gathered into `DflashState::hidden_rb`), the per-band GDN tape
+/// shards for the rollback replay, and the output_device-mirrored token
+/// embedding for the noise lookup.
+struct DflashPpExtras {
+    hidden_rb_shards: speculative::HiddenRbShards,
+    gdn_tape_shards: speculative::GdnTapeShards,
+    mirrored_token_embd: rdna_compute::GpuTensor,
 }
 
 /// Side state for DDTree-mode speculative decoding. Allocated alongside
@@ -2106,15 +2140,23 @@ fn warn_tiny_model_state(hfq: &HfqFile, q: hipfire_arch_qwen35::qwen35::StateQua
 
 fn load_model(path: &str, max_seq: usize, draft_path: Option<&str>, kv_mode_override: Option<&str>, state_quant_override: Option<&str>, cask: &CaskConfig, pp: usize, mtp_head_path: Option<&str>, mtp_k: usize, mtp_p_min: f32, mtp_kv_mode_str: &str, gpu: &mut rdna_compute::Gpu) -> Result<LoadedModel, String> {
     if pp > 1 {
-        // Refusal contracts (DFlash, CASK sidecar) are enforced upstream in
-        // the "load" event handler so the operator gets a structured error
-        // before any HFQ open / weight allocation. By the time we get here
-        // with pp>1, draft_path is None and cask.sidecar is None.
-        let _ = (draft_path, cask);
-        return load_model_pp(
+        // Refusal contracts (CASK sidecar) are enforced upstream in the
+        // "load" event handler. DFlash on a PP target is gated behind
+        // HIPFIRE_PP_DFLASH=1 (the handler lifts its refusal when set); when
+        // opted in, attach the draft + cross-card capture structures after
+        // the base banded model is up. cask.sidecar is None on this path.
+        let _ = cask;
+        let mut loaded = load_model_pp(
             path, max_seq, kv_mode_override, state_quant_override, pp,
             mtp_head_path, mtp_k, mtp_p_min, mtp_kv_mode_str, gpu,
-        );
+        )?;
+        if let Some(dp) = draft_path {
+            if std::env::var("HIPFIRE_PP_DFLASH").ok().as_deref() == Some("1") {
+                let ctx_capacity = loaded.physical_cap;
+                load_model_pp_with_dflash(&mut loaded, dp, ctx_capacity)?;
+            }
+        }
+        return Ok(loaded);
     }
     // Per-load kv_mode (sent in load message params) overrides the env var.
     // Lets the CLI set size-aware defaults — e.g. Qwen3.5-27B prefers asym4
@@ -3743,7 +3785,152 @@ fn load_dflash_state(
         ctx_capacity,
         block_size,
         ddtree,
+        pp_extras: None,
     })
+}
+
+/// Attach a DFlash draft to an already-loaded pipeline-parallel (pp>1) target.
+/// Mirrors [`load_dflash_state`] but the target is banded across `gpus`: the
+/// draft + its scratch + the unified hidden ring + verify scratch + DN
+/// snapshot live on `output_device`, and two cross-card structures are added —
+/// per-band extract-layer capture rings ([`HiddenRbShards`]) and per-band GDN
+/// tape shards ([`GdnTapeShards`]) — plus the output_device-mirrored token
+/// embedding. The result is stored in `loaded.dflash` with `pp_extras = Some`.
+/// Greedy-only (no DDTree, no temp>0) in v1.
+fn load_model_pp_with_dflash(
+    loaded: &mut LoadedModel,
+    draft_path: &str,
+    ctx_capacity: usize,
+) -> Result<(), String> {
+    let target_config = loaded
+        .q35_config
+        .as_ref()
+        .ok_or("pp-dflash: q35_config missing")?
+        .clone();
+    let output_device = loaded
+        .pp_gpus
+        .as_ref()
+        .ok_or("pp-dflash: pp_gpus missing")?
+        .output_device;
+
+    // ── 1. Mirror trunk.token_embd (dev 0 under Variant-2 PP) → output_device,
+    //       so the draft's noise-embedding lookup runs locally on the drafter.
+    let mirrored_token_embd = {
+        let token_embd_src = &loaded
+            .q35_weights
+            .as_ref()
+            .ok_or("pp-dflash: q35_weights missing")?
+            .token_embd;
+        let gpus = loaded.pp_gpus.as_mut().unwrap();
+        if output_device == 0 {
+            let g = gpus.single_mut(0);
+            hipfire_runtime::mtp_mirror::clone_tensor_same(g, token_embd_src)
+                .map_err(|e| format!("pp-dflash mirror token_embd: {e}"))?
+        } else {
+            let (src_gpu, dst_gpu) = gpus.split_pair_mut(0, output_device);
+            hipfire_runtime::mtp_mirror::clone_tensor_peer(src_gpu, dst_gpu, token_embd_src)
+                .map_err(|e| format!("pp-dflash mirror token_embd: {e}"))?
+        }
+    };
+
+    // ── 2. Draft config + cross-card capture shards + output_device-local state.
+    let hfq = HfqFile::open(Path::new(draft_path))
+        .map_err(|e| format!("pp-dflash open draft: {e}"))?;
+    let draft_config = DflashConfig::from_hfq(&hfq).ok_or("pp-dflash parse DflashConfig")?;
+    let block_size = draft_config.block_size;
+    let num_extract = draft_config.num_extract();
+    let max_batch = hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(block_size);
+
+    let gpus = loaded.pp_gpus.as_mut().unwrap();
+
+    // Per-band extract-layer capture rings (touch every device).
+    let hidden_rb_shards = speculative::HiddenRbShards::new(
+        gpus,
+        target_config.n_layers,
+        num_extract,
+        draft_config.hidden,
+        max_batch,
+    )
+    .map_err(|e| format!("pp-dflash hidden_rb_shards: {e}"))?;
+
+    // Per-band GDN innovation tape shards (sized for one verify block).
+    let gdn_tape_shards = speculative::GdnTapeShards::new(gpus, &target_config, block_size)
+        .map_err(|e| format!("pp-dflash gdn_tape_shards: {e}"))?;
+
+    // DeltaNet snapshot on output_device (cross-device save/restore at runtime).
+    let target_snap = {
+        let target_dn = loaded.dn_state.as_ref().ok_or("pp-dflash: dn_state missing")?;
+        let dev = &mut gpus.devices[output_device];
+        dev.bind_thread().map_err(|e| format!("pp-dflash bind: {e}"))?;
+        DeltaNetSnapshot::new_for(dev, target_dn)
+            .map_err(|e| format!("pp-dflash target_snap: {e}"))?
+    };
+
+    // Output-device-local draft state (identical sizing to single-card).
+    let dev = &mut gpus.devices[output_device];
+    let draft_weights = DflashWeights::load(dev, &hfq, &draft_config)
+        .map_err(|e| format!("pp-dflash load draft weights: {e}"))?;
+    let draft_scratch = DflashScratch::new_with_mq(
+        dev,
+        &draft_config,
+        block_size,
+        ctx_capacity,
+        draft_weights.has_mq,
+    )
+    .map_err(|e| format!("pp-dflash draft scratch: {e}"))?;
+    let hidden_rb = HiddenStateRingBuffer::new(
+        dev,
+        target_config.n_layers,
+        num_extract,
+        draft_config.hidden,
+        ctx_capacity + block_size,
+        max_batch,
+    )
+    .map_err(|e| format!("pp-dflash hidden_rb: {e}"))?;
+    let verify_scratch = VerifyScratch::with_prefill(
+        dev,
+        block_size,
+        target_config.dim,
+        target_config.vocab_size,
+        target_config.dim,
+        &target_config,
+    )
+    .map_err(|e| format!("pp-dflash verify_scratch: {e}"))?;
+    // Unused single-card GdnTape — the struct requires it; the PP path replays
+    // from `gdn_tape_shards` instead. Sized minimally (one verify block).
+    let gdn_tape = GdnTape::new_for_config(dev, &target_config, block_size)
+        .map_err(|e| format!("pp-dflash gdn_tape: {e}"))?;
+    let target_hidden_host: Vec<f32> =
+        Vec::with_capacity(ctx_capacity * num_extract * draft_config.hidden);
+
+    loaded.dflash = Some(DflashState {
+        draft_config,
+        draft_weights,
+        draft_scratch,
+        hidden_rb,
+        verify_scratch,
+        target_snap,
+        gdn_tape,
+        target_hidden_host,
+        ctx_capacity,
+        block_size,
+        ddtree: None,
+        pp_extras: Some(DflashPpExtras {
+            hidden_rb_shards,
+            gdn_tape_shards,
+            mirrored_token_embd,
+        }),
+    });
+    let df = loaded.dflash.as_ref().unwrap();
+    eprintln!(
+        "  DFlash-PP draft attached on output_device={} (layers={}, hidden={}, block={}, extract={})",
+        output_device,
+        df.draft_config.n_layers,
+        df.draft_config.hidden,
+        block_size,
+        num_extract,
+    );
+    Ok(())
 }
 
 /// DFlash-powered greedy decode. Mirrors `generate`'s ChatML shape and
@@ -4819,6 +5006,8 @@ fn generate_pp_mtp(m: &mut LoadedModel, ctx: &mut GenerateCtx<'_>) {
             &mut kv_cache, &mut dn_state, &pp_scratch_set,
             Some(&per_tok_hidden_out),
             None, // gdn_tape_shards — prefill doesn't need tape capture
+            None, // hidden_rb_shards — DFlash-PP only
+            None, // hidden_rb_unified — DFlash-PP only
             None, // tree_verify — MTP verify is linear
             false, // needs_last_token_logits: MTP verify uses per_token_hidden_out
         ) {
@@ -5042,6 +5231,354 @@ fn generate_pp_mtp(m: &mut LoadedModel, ctx: &mut GenerateCtx<'_>) {
         tokens: generated,
         tok_s,
         prefill_tokens: new_tokens.len(),
+        prefill_ms: prefill_s * 1000.0,
+        prefill_tok_s,
+        decode_tok_s,
+        ttft_ms: prefill_s * 1000.0,
+    }, &path_extras);
+}
+
+/// pp>1 DFlash greedy decode (experimental). The target is banded across
+/// `m.pp_gpus`; the DFlash drafter + its scratch live on `output_device`
+/// (attached by `load_model_pp_with_dflash`). Single-turn per request: resets
+/// DN, re-prefills the whole prompt capturing the extract-layer hiddens
+/// across bands (gathered into the unified ring), seeds the drafter's context,
+/// then runs `spec_step_dflash_pp` cycles. Mirrors `generate_dflash`'s
+/// streaming + stats and `generate_pp_mtp`'s PP plumbing.
+fn generate_pp_dflash(m: &mut LoadedModel, ctx: &mut GenerateCtx<'_>) {
+    debug_assert_eq!(pick_path(m, ctx), SpecPath::PpDflash,
+        "generate_pp_dflash called with path={:?}", pick_path(m, ctx));
+
+    let stdout: &mut std::io::Stdout = &mut *ctx.stdout;
+    let id: &str = ctx.id;
+    let prompt: &str = ctx.prompt;
+    let system_prompt: Option<&str> = ctx.system_prompt;
+    let max_tokens: usize = ctx.max_tokens;
+    let max_think_tokens: usize = ctx.max_think_tokens;
+    let assistant_prefix = ctx.assistant_prefix;
+    let tools: Option<&[serde_json::Value]> = ctx.tools;
+    let messages_history: Option<&[hipfire_runtime::prompt_frame::Message]> = ctx.messages_history;
+    // temp==0 → greedy; temp>0 → rejection sampling (spec_step_dflash_pp).
+    // top_p / repeat-penalty / pflash / budget are not wired on this path.
+    let temp: f32 = ctx.temp;
+    let _ = (ctx.top_p, ctx.repeat_penalty, ctx.repeat_window,
+             ctx.budget_alert_at_tok, ctx.budget_alert_text,
+             &mut ctx.drafter_gpu, &mut ctx.pflash_state, ctx.pflash_cfg,
+             ctx.pflash_bypass_reason, ctx.pflash_alpha);
+
+    let output_device = m.pp_gpus.as_ref().expect("pp_gpus populated").output_device;
+    let target_config = m.q35_config.as_ref().unwrap().clone();
+    let dim = target_config.dim;
+
+    // Build the prompt frame (full prompt — DFlash is single-turn).
+    let new_tokens: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let raw_q_tokens = tokenizer.encode(prompt);
+        build_prompt_frame(&FrameInputs {
+            tokenizer,
+            chat_template: m.chat_template.as_deref(),
+            system_prompt,
+            prompt_text: prompt,
+            user_tokens: &raw_q_tokens,
+            assistant_prefix,
+            max_think_tokens,
+            tools,
+            messages_history,
+            seq_pos: 0,
+            err_path_label: "pp-dflash",
+        })
+    };
+    let im_end_token = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let im_end = tokenizer.encode("<|im_end|>");
+        if im_end.len() == 1 { Some(im_end[0]) } else { None }
+    };
+
+    // Single-turn reset: zero recurrent state on each LA layer's OWNING band
+    // (route via pp_dn_la_to_device — same as the daemon's "reset" handler).
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+    if let (Some(dn), Some(gpus), Some(la)) = (
+        m.dn_state.as_ref(), m.pp_gpus.as_mut(), m.pp_dn_la_to_device.as_ref(),
+    ) {
+        for (i, s) in dn.s_matrices.iter().enumerate() {
+            let g = &mut gpus.devices[la[i] as usize];
+            let _ = g.bind_thread(); let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+        }
+        for (i, s) in dn.s_scales.iter().enumerate() {
+            let g = &mut gpus.devices[la[i] as usize];
+            let _ = g.bind_thread(); let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+        }
+        for (i, s) in dn.conv_states.iter().enumerate() {
+            let g = &mut gpus.devices[la[i] as usize];
+            let _ = g.bind_thread(); let _ = g.hip.memset(&s.buf, 0, s.buf.size());
+        }
+    }
+
+    let t0 = Instant::now();
+
+    // Take bookkeeping fields out so we can pass &mut refs alongside
+    // &mut m.pp_gpus. Restore unconditionally before return.
+    let weights = m.q35_weights.take().expect("q35 weights");
+    let mut kv_cache = m.kv_cache.take().expect("kv cache");
+    let mut dn_state = m.dn_state.take().expect("dn state");
+    let pp_scratch_set = m.pp_scratch_set.take().expect("pp_scratch_set populated for PP path");
+    let mut df = m.dflash.take().expect("dflash populated on PpDflash path");
+    let mut ppx = df.pp_extras.take().expect("pp_extras populated on PpDflash path");
+
+    macro_rules! ppdf_bail {
+        ($msg:expr) => {{
+            let _ = writeln!(stdout, r#"{{"type":"error","id":"{}","message":{}}}"#,
+                id, serde_json::to_string(&$msg).unwrap_or_default());
+            let _ = stdout.flush();
+            m.q35_weights = Some(weights);
+            m.kv_cache = Some(kv_cache);
+            m.dn_state = Some(dn_state);
+            m.pp_scratch_set = Some(pp_scratch_set);
+            df.pp_extras = Some(ppx);
+            m.dflash = Some(df);
+            return;
+        }};
+    }
+
+    // Reset the draft context trackers (single-turn).
+    df.hidden_rb.reset();
+    df.target_hidden_host.clear();
+    df.draft_scratch.reset_upload_tracking();
+
+    let prompt_len = new_tokens.len();
+    // Capacity: prompt + decode block must fit the ring.
+    if prompt_len + df.block_size > df.ctx_capacity {
+        ppdf_bail!(format!(
+            "pp-dflash: prompt+block_size ({}+{}) exceeds ctx_capacity {}",
+            prompt_len, df.block_size, df.ctx_capacity));
+    }
+
+    // Per-token post-output-norm hidden capture for the prompt prefill
+    // (drives the first-token GEMV). Sized for the whole prompt.
+    let per_tok_hidden_out = {
+        let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+        let _ = g.bind_thread();
+        match g.alloc_tensor(&[prompt_len * dim], rdna_compute::DType::F32) {
+            Ok(t) => t,
+            Err(e) => ppdf_bail!(format!("pp-dflash alloc per_tok_hidden_out: {e}")),
+        }
+    };
+
+    // ── Prompt prefill: advances KV+DN, captures extract hiddens across bands
+    //    (gathered per-chunk into df.hidden_rb), and per-token hiddens for the
+    //    first-token GEMV. No GDN tape capture (one-time prefill). ──
+    {
+        let gpus = m.pp_gpus.as_mut().unwrap();
+        if let Err(e) = qwen35::forward_prefill_batch_multi_with_caps(
+            gpus, &weights, &target_config, &new_tokens, 0,
+            &mut kv_cache, &mut dn_state, &pp_scratch_set,
+            Some(&per_tok_hidden_out),
+            None,                          // gdn_tape_shards — not needed for prefill
+            Some(&ppx.hidden_rb_shards),   // capture extract layers per band
+            Some(&mut df.hidden_rb),       // gather into the unified ring
+            None,                          // tree_verify
+            false,                         // needs_last_token_logits: we GEMV below
+        ) {
+            let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+            let _ = g.free_tensor(per_tok_hidden_out);
+            ppdf_bail!(format!("pp-dflash prefill: {e}"));
+        }
+    }
+    m.conversation_tokens.extend_from_slice(&new_tokens);
+
+    // First token: GEMV the last per-token hidden through trunk.output (on
+    // output_device) → argmax. (The multi prefill doesn't materialize a
+    // single-device logits buffer; mirror generate_pp_mtp.)
+    let first_token: u32 = {
+        let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+        let _ = g.bind_thread();
+        let logits = match g.alloc_tensor(&[target_config.vocab_size], rdna_compute::DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = g.free_tensor(per_tok_hidden_out);
+                ppdf_bail!(format!("pp-dflash alloc first-token logits: {e}"));
+            }
+        };
+        let last_row_view = per_tok_hidden_out.sub_offset((prompt_len - 1) * dim, dim);
+        if let Err(e) = hipfire_runtime::llama::weight_gemv(g, &weights.output, &last_row_view, &logits) {
+            let _ = g.free_tensor(logits);
+            let _ = g.free_tensor(per_tok_hidden_out);
+            ppdf_bail!(format!("pp-dflash first-token GEMV: {e}"));
+        }
+        let logits_host = match g.download_f32(&logits) {
+            Ok(v) => v,
+            Err(e) => {
+                let _ = g.free_tensor(logits);
+                let _ = g.free_tensor(per_tok_hidden_out);
+                ppdf_bail!(format!("pp-dflash first-token download: {e}"));
+            }
+        };
+        let _ = g.free_tensor(logits);
+        logits_host.iter().enumerate()
+            .fold((0u32, f32::NEG_INFINITY), |(best, bv), (i, &v)| {
+                if v > bv { (i as u32, v) } else { (best, bv) }
+            }).0
+    };
+    {
+        let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+        let _ = g.free_tensor(per_tok_hidden_out);
+    }
+
+    // Seed the drafter's GPU target_hidden from the prompt's gathered extract
+    // hiddens (skip the per-cycle H2D of the whole context).
+    {
+        let g = &mut m.pp_gpus.as_mut().unwrap().devices[output_device];
+        let _ = g.bind_thread();
+        if let Err(e) = speculative::scatter_hidden_block_to_interleaved(
+            g, &df.hidden_rb, &df.draft_scratch.target_hidden, 0, prompt_len, prompt_len,
+        ) {
+            ppdf_bail!(format!("pp-dflash seed scatter: {e}"));
+        }
+    }
+    df.draft_scratch.uploaded_target_hidden_rows = prompt_len;
+    df.draft_scratch.target_hidden_abs_positions = (0..prompt_len as i32).collect();
+
+    let t_prefill = Instant::now();
+
+    // ── Decode loop ──
+    let mut emitted: Vec<u32> = vec![first_token];
+    let mut streamed_tokens: Vec<u32> = Vec::new();
+    let mut bytes_fed_to_filter = 0usize;
+    let mut filter = hipfire_runtime::eos_filter::EosFilter::new(
+        hipfire_runtime::eos_filter::EosFilterConfig::default());
+    let mut position = prompt_len;
+    let mut seed_token = first_token;
+    let mut generated = 0usize;
+    let mut total_cycles = 0usize;
+    let mut total_accepted = 0usize;
+    let mut committed_from_cycles = 0usize;
+    let eos_token = target_config.eos_token;
+
+    // Stream the first token immediately (TTFT = prefill).
+    {
+        streamed_tokens.push(first_token);
+        emit_committed_event(stdout, id, first_token, streamed_tokens.len() - 1,
+                             t0.elapsed().as_millis() as u64);
+        let all_bytes = m.tokenizer.as_ref().unwrap().decode_bytes(&streamed_tokens);
+        let new_bytes = &all_bytes[bytes_fed_to_filter..];
+        bytes_fed_to_filter = all_bytes.len();
+        if let hipfire_runtime::eos_filter::FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+            if let Ok(text) = std::str::from_utf8(&text_bytes) {
+                let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#,
+                    id, serde_json::to_string(text).unwrap_or_default());
+                let _ = stdout.flush();
+            }
+        }
+        generated = 1;
+    }
+    let first_token_terminal = first_token == eos_token
+        || im_end_token == Some(first_token)
+        || m.tokenizer.as_ref().unwrap().is_terminator(first_token);
+
+    // Deterministic RNG seed (matches single-card generate_dflash) so temp>0
+    // runs are reproducible for A/B comparison.
+    let mut rng_state: u64 = 0x13579BDFu64;
+
+    while generated < max_tokens && !first_token_terminal {
+        if position + df.block_size >= m.physical_cap { break; }
+
+        let step_result = {
+            let gpus = m.pp_gpus.as_mut().unwrap();
+            speculative::spec_step_dflash_pp(
+                gpus,
+                output_device,
+                &weights,
+                &target_config,
+                &ppx.mirrored_token_embd,
+                &mut kv_cache,
+                &mut dn_state,
+                &pp_scratch_set,
+                &df.draft_weights,
+                &df.draft_config,
+                &mut df.draft_scratch,
+                &mut df.hidden_rb,
+                &ppx.hidden_rb_shards,
+                &df.verify_scratch,
+                &mut df.target_snap,
+                &mut ppx.gdn_tape_shards,
+                position,
+                seed_token,
+                None,
+                temp,
+                &mut rng_state,
+            )
+        };
+        let step = match step_result {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = writeln!(stdout,
+                    r#"{{"type":"error","id":"{}","message":"pp-dflash spec_step: {}"}}"#, id, e);
+                let _ = stdout.flush();
+                break;
+            }
+        };
+
+        total_cycles += 1;
+        total_accepted += step.accepted;
+
+        // committed[0] is the seed (already emitted); stream committed[1..].
+        let mut hit_eos = false;
+        for &tok in step.committed.iter().skip(1) {
+            if generated >= max_tokens { break; }
+            emitted.push(tok);
+            streamed_tokens.push(tok);
+            emit_committed_event(stdout, id, tok, streamed_tokens.len() - 1,
+                                 t0.elapsed().as_millis() as u64);
+            let all_bytes = m.tokenizer.as_ref().unwrap().decode_bytes(&streamed_tokens);
+            let new_bytes = &all_bytes[bytes_fed_to_filter..];
+            bytes_fed_to_filter = all_bytes.len();
+            if let hipfire_runtime::eos_filter::FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
+                if let Ok(text) = std::str::from_utf8(&text_bytes) {
+                    let _ = writeln!(stdout, r#"{{"type":"token","id":"{}","text":{}}}"#,
+                        id, serde_json::to_string(text).unwrap_or_default());
+                    let _ = stdout.flush();
+                }
+            }
+            generated += 1;
+            committed_from_cycles += 1;
+            if tok == eos_token || im_end_token == Some(tok)
+                || m.tokenizer.as_ref().unwrap().is_terminator(tok) {
+                hit_eos = true; break;
+            }
+        }
+        position += step.accepted + 1;
+        seed_token = step.bonus_token;
+        if hit_eos { break; }
+    }
+
+    // Restore state.
+    df.pp_extras = Some(ppx);
+    m.q35_weights = Some(weights);
+    m.kv_cache = Some(kv_cache);
+    m.dn_state = Some(dn_state);
+    m.pp_scratch_set = Some(pp_scratch_set);
+    m.dflash = Some(df);
+    m.conversation_tokens.extend_from_slice(&emitted);
+    m.seq_pos = position;
+
+    let t_end = Instant::now();
+    let total_s = t_end.duration_since(t0).as_secs_f64();
+    let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
+    let decode_s = t_end.duration_since(t_prefill).as_secs_f64();
+    let tok_s = if total_s > 0.0 { generated as f64 / total_s } else { 0.0 };
+    let decode_tok_s = if decode_s > 0.0 { generated as f64 / decode_s } else { 0.0 };
+    let prefill_tok_s = if prefill_s > 0.0 { prompt_len as f64 / prefill_s } else { 0.0 };
+    let tau = if total_cycles > 0 { committed_from_cycles as f64 / total_cycles as f64 } else { 0.0 };
+    let accept_rate = if total_cycles > 0 { total_accepted as f64 / total_cycles as f64 } else { 0.0 };
+    let path_extras = format!(
+        r#","spec_path":"pp-dflash","dflash":true,"tau":{:.2},"accept_rate":{:.2},"cycles":{},"pp":{}"#,
+        tau, accept_rate, total_cycles, m.pp,
+    );
+    emit_done_event(stdout, id, &DoneStats {
+        tokens: generated,
+        tok_s,
+        prefill_tokens: prompt_len,
         prefill_ms: prefill_s * 1000.0,
         prefill_tok_s,
         decode_tok_s,
@@ -5624,6 +6161,31 @@ fn generate_qwen35(
                 think_mode,
             };
             generate_pp_mtp(m, &mut pp_mtp_ctx);
+            return;
+        }
+        SpecPath::PpDflash => {
+            // pp>1 DFlash spec-decode (experimental, greedy-only). Banded
+            // target + co-located drafter on output_device. Like PpMtp, the
+            // caller's gpu arg is ignored — generate_pp_dflash pulls
+            // m.pp_gpus directly. PFlash compression is not wired on this
+            // path (greedy DFlash decode); pass None.
+            let _ = gpu;
+            let mut pp_dflash_ctx = GenerateCtx {
+                stdout, id, prompt, system_prompt, tools, messages_history,
+                assistant_prefix,
+                temp, top_p, repeat_penalty, repeat_window,
+                max_tokens, max_think_tokens,
+                budget_alert_at_tok: 0,
+                budget_alert_text: "",
+                drafter_gpu: None,
+                pflash_state: None,
+                pflash_cfg: None,
+                pflash_bypass_reason: None,
+                pflash_alpha: None,
+                think_mode,
+            };
+            generate_pp_dflash(m, &mut pp_dflash_ctx);
+            let _ = (budget_alert_at_tok, budget_alert_text, pflash_state, pflash_cfg);
             return;
         }
         SpecPath::Dflash => {

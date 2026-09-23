@@ -3468,6 +3468,8 @@ pub fn spec_step_mtp_compressed_serial_multi(
         target_kv, target_dn, pp_scratch_set,
         Some(&state.verify_hidden),
         state.trunk_gdn_tape_shards.as_mut(), // capture into persistent shards (None = no capture)
+        None, // hidden_rb_shards — MTP needs only the final hidden, not extract layers
+        None, // hidden_rb_unified — DFlash-PP only
         None, // tree_verify — MTP verify is linear
         false, // needs_last_token_logits: MTP verify uses per_token_hidden_out,
                // not the last-token logits; skipping saves one rmsnorm + GEMV.

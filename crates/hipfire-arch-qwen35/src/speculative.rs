@@ -2019,6 +2019,126 @@ impl HiddenStateRingBuffer {
     }
 }
 
+/// Per-band shards of the DFlash extract-layer hidden capture, for the
+/// pipeline-parallel (pp>1) DFlash verify path. Mirrors [`GdnTapeShards`]
+/// but captures the `HiddenStateRingBuffer` extract-layer staging instead of
+/// the GDN innovation tape.
+///
+/// In single-GPU DFlash the verify forward writes every extract layer's
+/// hidden into one `HiddenStateRingBuffer` on the same device. Under PP the
+/// extract layers (`dflash_extract_layer_ids`) are spread across bands, so
+/// each band captures only the extract layers in its own layer range into a
+/// per-band ring's `staging_bufs`, and [`HiddenRbShards::assemble_into`]
+/// peer-copies each owned layer's staging rows onto the unified ring on
+/// `output_device` (where the drafter reads them).
+///
+/// Each shard carries the FULL `extract_layers` list so the band's
+/// `forward_prefill_chunk` (which sees global layer indices) matches via
+/// `extract_slot(global_layer_idx)` — only the layers physically in that
+/// band's range are ever written. `layer_bufs` on the shards are unused
+/// (allocated at `max_positions = 1`); only `staging_bufs` carry data.
+pub struct HiddenRbShards {
+    /// One ring per band, on that band's device. Only `staging_bufs` matter.
+    pub shards: Vec<HiddenStateRingBuffer>,
+    /// `extract_owner[ei]` = band index that owns `extract_layers[ei]`.
+    pub extract_owner: Vec<usize>,
+}
+
+impl HiddenRbShards {
+    /// Allocate one per-band capture ring. `max_batch` sizes the staging
+    /// (= the largest chunk the verify/prefill forward writes at once;
+    /// `PREFILL_MAX_BATCH` for prompt prefill, ≥ block_size for decode).
+    pub fn new(
+        gpus: &mut Gpus,
+        num_target_layers: usize,
+        num_extract: usize,
+        hidden_dim: usize,
+        max_batch: usize,
+    ) -> HipResult<Self> {
+        let n_bands = gpus.devices.len();
+        let extract_layers = dflash_extract_layer_ids(num_target_layers, num_extract);
+        let extract_owner: Vec<usize> = extract_layers
+            .iter()
+            .map(|&li| gpus.device_for_layer(li))
+            .collect();
+        let mut shards = Vec::with_capacity(n_bands);
+        for b in 0..n_bands {
+            let g = &mut gpus.devices[b];
+            g.bind_thread()?;
+            // max_positions=1: per-band layer_bufs are unused (only staging
+            // is read by assemble_into). num_extract staging buffers are
+            // allocated on every band; only the owned slots are written by
+            // that band's forward_prefill_chunk.
+            shards.push(HiddenStateRingBuffer::new(
+                g, num_target_layers, num_extract, hidden_dim, 1, max_batch,
+            )?);
+        }
+        Ok(Self { shards, extract_owner })
+    }
+
+    /// Per-band immutable ring for the chunk loop's `hidden_rb` arg.
+    #[inline]
+    pub fn shard(&self, band: usize) -> &HiddenStateRingBuffer {
+        &self.shards[band]
+    }
+
+    /// Gather one chunk of `n_rows` extract-layer hiddens from each owning
+    /// band's staging into the unified ring on `output_device`, then commit
+    /// (scatter staging→layer_bufs at head, advance head by n_rows).
+    ///
+    /// Must be called once per forward chunk, AFTER that chunk's band loop
+    /// has written staging. Bytes/cycle at decode:
+    /// `num_extract × B × hidden × 4` ≈ 5 × 16 × 5120 × 4 ≈ 1.6 MB —
+    /// sub-millisecond at PCIe DMA.
+    pub fn assemble_into(
+        &self,
+        gpus: &mut Gpus,
+        unified: &mut HiddenStateRingBuffer,
+        n_rows: usize,
+    ) -> HipResult<()> {
+        let tdev = gpus.output_device;
+        let row_bytes = unified.hidden_dim * 4;
+        let bytes = n_rows * row_bytes;
+        // Ensure each band's staging writes (issued on band streams during
+        // the forward) are visible before we read them cross-device. The PP
+        // forward is fully serialized, so there is no overlap to lose here.
+        for b in 0..gpus.devices.len() {
+            gpus.devices[b].bind_thread()?;
+            gpus.devices[b].hip.device_synchronize()?;
+        }
+        for ei in 0..self.extract_owner.len() {
+            let ob = self.extract_owner[ei];
+            if ob == tdev {
+                let g = &mut gpus.devices[tdev];
+                g.bind_thread()?;
+                g.hip.memcpy_dtod_at(
+                    &unified.staging_bufs[ei].buf,
+                    0,
+                    &self.shards[ob].staging_bufs[ei].buf,
+                    0,
+                    bytes,
+                )?;
+            } else {
+                let (src_g, dst_g) = gpus.split_pair_mut(ob, tdev);
+                let src_id = src_g.device_id;
+                let dst_id = dst_g.device_id;
+                dst_g.hip.memcpy_peer(
+                    &unified.staging_bufs[ei].buf,
+                    dst_id,
+                    &self.shards[ob].staging_bufs[ei].buf,
+                    src_id,
+                    bytes,
+                )?;
+            }
+        }
+        // Commit unified staging → ring at head, advance head by n_rows.
+        let g = &mut gpus.devices[tdev];
+        g.bind_thread()?;
+        unified.commit_staging_to_ring(g, n_rows)?;
+        Ok(())
+    }
+}
+
 /// Single-pass argmax for token sampling. Not SIMD-optimized — the logit
 /// vector is downloaded once per verify step so the CPU scan cost is
 /// negligible relative to GEMV work.
@@ -3102,6 +3222,339 @@ pub fn download_hidden_block(
 /// Use this for accept-rate bisect experiments — if training-time context
 /// was shorter than inference-time, truncation may help. `None` uses the
 /// full cumulative context (the default, distribution-preserving path).
+/// Pipeline-parallel (pp>1) sibling of [`spec_step_dflash`]. The TARGET is
+/// banded across `gpus` (too big for one card); the DFlash drafter is
+/// co-located on `output_device` (where `trunk.output` + `output_norm` live,
+/// per Variant-2 PP layout). Greedy-only (temp=0) for v1 — the daemon DFlash
+/// path runs greedy.
+///
+/// Per cycle:
+///   1. Draft on `output_device`: embed the [seed, mask×(B-1)] block via the
+///      mirrored `token_embd`, run `draft_forward_opts` against the cumulative
+///      `draft_scratch.target_hidden` context, apply `trunk.output` over the
+///      B-1 draft rows → argmax → drafted tokens. (Identical to single-card.)
+///   2. Verify across all bands via `forward_prefill_batch_multi_with_caps`:
+///      fills `verify_scratch.final_hidden` (post-output-norm, B rows) on
+///      `output_device`, captures the extract-layer hiddens per-band and
+///      gathers them into the unified `hidden_rb` (`hidden_rb_shards`), and
+///      captures the GDN innovation tape into `gdn_tape_shards`.
+///   3. lm_head over `final_hidden` on `output_device` → per-position argmax;
+///      greedy accept = longest prefix where `argmax[i] == block[i+1]`.
+///   4. Scatter the accepted extract hiddens into `draft_scratch.target_hidden`
+///      (same as single-card), then roll DeltaNet back to pre-verify and
+///      replay `accept+1` steps via `replay_gdn_multi` (the cheap GDN-only
+///      advance — KV auto-overwrites next cycle).
+///
+/// `mirrored_token_embd` must be `trunk.token_embd` mirrored onto
+/// `output_device` (the embedding lives on dev 0 under Variant-2 PP).
+#[allow(clippy::too_many_arguments)]
+pub fn spec_step_dflash_pp(
+    gpus: &mut Gpus,
+    output_device: usize,
+    trunk_weights: &qwen35::Qwen35Weights,
+    trunk_config: &qwen35::Qwen35Config,
+    mirrored_token_embd: &GpuTensor,
+    target_kv: &mut llama::KvCache,
+    target_dn: &mut qwen35::DeltaNetState,
+    pp_scratch_set: &qwen35::Qwen35ScratchSet,
+    draft_weights: &DflashWeights,
+    draft_cfg: &DflashConfig,
+    draft_scratch: &mut DflashScratch,
+    hidden_rb: &mut HiddenStateRingBuffer,
+    hidden_rb_shards: &HiddenRbShards,
+    verify_scratch: &VerifyScratch,
+    target_snap: &mut DeltaNetSnapshot,
+    gdn_tape_shards: &mut GdnTapeShards,
+    position: usize,
+    seed_token: u32,
+    block_size_override: Option<usize>,
+    temp: f32,
+    rng_state: &mut u64,
+) -> HipResult<SpecStepResult> {
+    let b = block_size_override.unwrap_or(draft_cfg.block_size);
+    assert!(b >= 2, "dflash block size must be ≥ 2");
+    let h = draft_cfg.hidden;
+    let ne = draft_cfg.num_extract();
+    let vocab = trunk_config.vocab_size;
+    let dim = trunk_config.dim;
+    let mask_token = draft_cfg.mask_token_id;
+    // temp>0 → rejection sampling (distribution-preserving); temp==0 → greedy.
+    let use_temp = temp > 0.0;
+
+    // ── 1. block: [seed, mask, mask, ...] (B slots) ─────────────────────
+    let mut block: Vec<u32> = vec![mask_token; b];
+    block[0] = seed_token;
+    let mut drafted: Vec<u32> = vec![seed_token];
+    // Sampling bookkeeping (temp>0 only): per-draft-position p_draft[token] and
+    // the full draft softmax row, for the rejection-acceptance residual.
+    let mut draft_probs_at_drafted: Vec<f32> = Vec::new();
+    let mut draft_softmaxes: Vec<Vec<f32>> = Vec::new();
+
+    // ── Draft phase (output_device) ─────────────────────────────────────
+    {
+        let gpu = &mut gpus.devices[output_device];
+        gpu.bind_thread()?;
+        if gpu.active_stream.is_none() {
+            gpu.active_stream = Some(gpu.hip.stream_create()?);
+        }
+
+        // Noise embeddings written directly into draft_scratch.x via the
+        // output_device-mirrored token_embd (no host round-trip).
+        for (i, &tok) in block.iter().enumerate() {
+            let dst = draft_scratch.x.sub_offset(i * h, h);
+            match trunk_weights.embd_format {
+                hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 => {
+                    gpu.embedding_lookup_hfq4g256(mirrored_token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::HFQ4G128 => {
+                    gpu.embedding_lookup_hfq4g128(mirrored_token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::Q8_0 => {
+                    gpu.embedding_lookup_q8(mirrored_token_embd, &dst, tok, h)?
+                }
+                hipfire_runtime::llama::EmbeddingFormat::F32 => {
+                    gpu.embedding_lookup(mirrored_token_embd, &dst, tok, h)?
+                }
+                _ => {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "dflash-pp: unsupported target embedding format for noise lookup",
+                    ))
+                }
+            }
+        }
+
+        // Positions. Full cumulative context (no ctx_slice in v1). K
+        // positions are the abs positions of all populated target_hidden
+        // rows, then the B block slots.
+        let effective_ctx_len = draft_scratch
+            .target_hidden_abs_positions
+            .len()
+            .min(position);
+        let co = target_kv.compact_offset as i32;
+        let positions_q: Vec<i32> =
+            ((position as i32 + co)..(position as i32 + b as i32 + co)).collect();
+        let positions_k: Vec<i32> = {
+            let mut v = Vec::with_capacity(effective_ctx_len + b);
+            let th_abs = &draft_scratch.target_hidden_abs_positions;
+            let start_idx = th_abs.len().saturating_sub(effective_ctx_len);
+            v.extend_from_slice(&th_abs[start_idx..]);
+            for p in 0..b {
+                v.push(position as i32 + p as i32 + co);
+            }
+            v
+        };
+
+        // Draft forward. target_hidden already on GPU (seeded from prompt /
+        // scattered from prev cycle) → pass None to skip H2D.
+        dflash::draft_forward_opts(
+            gpu,
+            draft_weights,
+            draft_cfg,
+            None,
+            None,
+            &positions_q,
+            &positions_k,
+            b,
+            effective_ctx_len,
+            draft_scratch,
+            false, // draft_ffn_graph: dense target (num_experts=0); keep simple in v1
+        )?;
+
+        // Draft lm_head over the B-1 draft hidden rows (rows 1..B of
+        // draft_scratch.x). Reuses the verify lm_head GEMM (handles the dtype
+        // dispatch incl. the gfx12 WMMA path). Runs BEFORE verify, so reusing
+        // verify_scratch.logits/.rot is safe. Greedy → GPU argmax + tiny D2H;
+        // temp>0 → full (B-1)×vocab D2H, CPU softmax+sample, record p_draft.
+        let batch = b - 1;
+        let hidden_rows = draft_scratch.x.sub_offset(h, batch * h);
+        if use_temp {
+            dflash_enqueue_verify_lm_head(
+                gpu, &trunk_weights.output, &hidden_rows, verify_scratch, batch, vocab,
+            )?;
+            let logits_batch = verify_scratch.logits.sub_offset(0, batch * vocab);
+            let host_logits = gpu.download_f32(&logits_batch)?;
+            draft_softmaxes.reserve(batch);
+            draft_probs_at_drafted.reserve(batch);
+            for i in 0..batch {
+                let row = &host_logits[i * vocab..(i + 1) * vocab];
+                let mut probs = Vec::with_capacity(vocab);
+                softmax_temp_into(row, temp, &mut probs);
+                let u = xorshift_next_unit(rng_state);
+                let t = sample_categorical(&probs, u);
+                draft_probs_at_drafted.push(probs[t as usize]);
+                drafted.push(t);
+                draft_softmaxes.push(probs);
+            }
+        } else {
+            dflash_enqueue_verify_lm_head_argmax(
+                gpu, &trunk_weights.output, &hidden_rows, verify_scratch, batch, vocab,
+            )?;
+            let tail = dflash_download_verify_argmax(gpu, verify_scratch, batch)?;
+            drafted.extend_from_slice(&tail);
+        }
+    }
+    for i in 1..b {
+        block[i] = drafted[i];
+    }
+
+    // ── 2. Snapshot DeltaNet, run multi-GPU verify ──────────────────────
+    // The previous cycle's `replay_gdn_multi` advanced dn_state on each
+    // band's own stream (async). The snapshot below reads dn_state
+    // cross-device from output_device's context, so every band's recurrent
+    // writes MUST be drained first — otherwise save_from captures a stale /
+    // partially-written baseline and the rollback restores garbage,
+    // manifesting as run-to-run non-determinism + slow token drift.
+    for b in 0..gpus.devices.len() {
+        gpus.devices[b].bind_thread()?;
+        gpus.devices[b].hip.device_synchronize()?;
+    }
+    {
+        let gpu = &mut gpus.devices[output_device];
+        gpu.bind_thread()?;
+        target_snap.save_from(target_dn, gpu)?;
+    }
+    qwen35::forward_prefill_batch_multi_with_caps(
+        gpus,
+        trunk_weights,
+        trunk_config,
+        &block,
+        position,
+        target_kv,
+        target_dn,
+        pp_scratch_set,
+        Some(&verify_scratch.final_hidden), // per_token_hidden_out: post-output-norm [B × dim]
+        Some(&mut *gdn_tape_shards),        // reborrow: capture GDN tape (used again at replay)
+        Some(hidden_rb_shards),             // per-band extract capture (&, Copy)
+        Some(&mut *hidden_rb),              // reborrow: gather dst (read again at scatter)
+        None,                               // tree_verify: linear chain
+        false,                              // needs_last_token_logits: we lm_head per-position below
+    )?;
+
+    // ── 3. lm_head over final_hidden + accept (output_device) ───────────
+    //   greedy : GPU argmax per position; accept longest prefix that matches.
+    //   temp>0 : full B×vocab logits → Leviathan rejection sampling, residual
+    //            bonus. Distribution-preserving (matches AR sampling at temp).
+    let mut accept_len = 0usize;
+    let bonus_token: u32;
+    if use_temp {
+        let tgt_logits: Vec<f32> = {
+            let gpu = &mut gpus.devices[output_device];
+            gpu.bind_thread()?;
+            let final_hidden = verify_scratch.final_hidden.sub_offset(0, b * dim);
+            dflash_enqueue_verify_lm_head(
+                gpu, &trunk_weights.output, &final_hidden, verify_scratch, b, vocab,
+            )?;
+            let logits_batch = verify_scratch.logits.sub_offset(0, b * vocab);
+            gpu.download_f32(&logits_batch)?
+        };
+        debug_assert_eq!(draft_softmaxes.len(), b - 1);
+        let mut target_probs = Vec::with_capacity(vocab);
+        let mut rejected_bonus: Option<u32> = None;
+        for i in 0..b - 1 {
+            softmax_temp_into(&tgt_logits[i * vocab..(i + 1) * vocab], temp, &mut target_probs);
+            let t = block[i + 1] as usize;
+            let p_d = draft_probs_at_drafted[i].max(f32::MIN_POSITIVE);
+            let p_t = target_probs[t];
+            let u = xorshift_next_unit(rng_state);
+            if u * p_d <= p_t {
+                accept_len += 1;
+            } else {
+                let u2 = xorshift_next_unit(rng_state);
+                rejected_bonus = Some(sample_residual(&target_probs, &draft_softmaxes[i], u2));
+                break;
+            }
+        }
+        bonus_token = if let Some(bt) = rejected_bonus {
+            bt
+        } else {
+            let i = b - 1;
+            softmax_temp_into(&tgt_logits[i * vocab..(i + 1) * vocab], temp, &mut target_probs);
+            let u = xorshift_next_unit(rng_state);
+            sample_categorical(&target_probs, u)
+        };
+    } else {
+        let argmax_per_pos: Vec<u32> = {
+            let gpu = &mut gpus.devices[output_device];
+            gpu.bind_thread()?;
+            let final_hidden = verify_scratch.final_hidden.sub_offset(0, b * dim);
+            dflash_enqueue_verify_lm_head_argmax(
+                gpu, &trunk_weights.output, &final_hidden, verify_scratch, b, vocab,
+            )?;
+            dflash_download_verify_argmax(gpu, verify_scratch, b)?
+        };
+        for i in 0..b - 1 {
+            if argmax_per_pos[i] == block[i + 1] {
+                accept_len += 1;
+            } else {
+                break;
+            }
+        }
+        bonus_token = argmax_per_pos[accept_len];
+    }
+
+    // ── 4. Committed sequence ───────────────────────────────────────────
+    let mut committed: Vec<u32> = Vec::with_capacity(accept_len + 2);
+    committed.push(seed_token);
+    for i in 0..accept_len {
+        committed.push(drafted[i + 1]);
+    }
+    committed.push(bonus_token);
+
+    // ── 5. Scatter accepted extract hiddens → draft_scratch.target_hidden ─
+    // Verify gathered B rows into the unified ring; keep the first
+    // accept_len+1 (the bonus's hidden materializes next cycle as block[0]).
+    let rows_to_keep = accept_len + 1;
+    {
+        let gpu = &mut gpus.devices[output_device];
+        gpu.bind_thread()?;
+        scatter_hidden_block_to_interleaved(
+            gpu,
+            hidden_rb,
+            &draft_scratch.target_hidden,
+            position,
+            b,
+            rows_to_keep,
+        )?;
+    }
+    draft_scratch.uploaded_target_hidden_rows = position + rows_to_keep;
+    let co = target_kv.compact_offset as i32;
+    for p in 0..rows_to_keep {
+        draft_scratch
+            .target_hidden_abs_positions
+            .push(position as i32 + p as i32 + co);
+    }
+    let _ = ne; // ne documented in scatter stride; not needed explicitly here
+
+    // ── 6. Rewind DeltaNet + replay accept+1 via the captured GDN tape ──
+    {
+        let gpu = &mut gpus.devices[output_device];
+        gpu.bind_thread()?;
+        target_snap.restore_to(target_dn, gpu)?;
+    }
+    // The restore wrote dn_state cross-device from output_device's context;
+    // drain every band so the per-band GDN replay below reads the restored
+    // (not stale) recurrent state.
+    for b in 0..gpus.devices.len() {
+        gpus.devices[b].bind_thread()?;
+        gpus.devices[b].hip.device_synchronize()?;
+    }
+    gdn_tape_shards.replay_gdn_multi(
+        gpus,
+        trunk_weights,
+        trunk_config,
+        target_dn,
+        accept_len + 1,
+    )?;
+
+    Ok(SpecStepResult {
+        accepted: accept_len,
+        bonus_token,
+        drafted,
+        committed,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn spec_step_dflash(
     gpu: &mut Gpu,

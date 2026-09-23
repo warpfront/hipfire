@@ -10962,7 +10962,7 @@ pub fn forward_prefill_batch_multi(
 ) -> HipResult<()> {
     forward_prefill_batch_multi_with_caps(
         gpus, weights, config, tokens, start_pos, kv_cache, dn_state, scratch_set,
-        None, None, None,
+        None, None, None, None, None,
         true, // needs_last_token_logits: preserve multi-GPU post-condition for non-MTP callers
     )
 }
@@ -11004,6 +11004,14 @@ pub fn forward_prefill_batch_multi_with_caps(
     scratch_set: &Qwen35ScratchSet,
     per_token_hidden_out: Option<&GpuTensor>,
     gdn_tape_shards: Option<&mut crate::speculative::GdnTapeShards>,
+    // DFlash-PP extract-layer hidden capture. `hidden_rb_shards` is threaded
+    // per-band into each forward_prefill_chunk's `hidden_rb` slot (each band
+    // captures the extract layers in its own range into staging); after every
+    // chunk's band loop, `assemble_into` gathers those staged rows onto the
+    // unified ring on output_device (`hidden_rb_unified`). Both None for the
+    // AR / MTP paths (unchanged behavior). See `HiddenRbShards`.
+    hidden_rb_shards: Option<&crate::speculative::HiddenRbShards>,
+    hidden_rb_unified: Option<&mut crate::speculative::HiddenStateRingBuffer>,
     tree_verify: Option<TreeVerifyCtx<'_>>,
     needs_last_token_logits: bool,
 ) -> HipResult<()> {
@@ -11133,6 +11141,9 @@ pub fn forward_prefill_batch_multi_with_caps(
     //
     // Shadow the parameter to avoid borrow conflicts with the closure below.
     let mut gdn_tape_shards = gdn_tape_shards;
+    // Same for the DFlash-PP unified hidden ring (mutated by the per-chunk
+    // gather inside the closure).
+    let mut hidden_rb_unified = hidden_rb_unified;
 
     let last_band = n_bands - 1;
 
@@ -11179,7 +11190,7 @@ pub fn forward_prefill_batch_multi_with_caps(
                     forward_prefill_chunk(
                         g_b, weights, config, chunk, start_pos + chunk_start,
                         kv_cache, dn_state, s_b, pbs_b,
-                        None, // hidden_rb: pp=1 only
+                        hidden_rb_shards.map(|sh| sh.shard(b)), // per-band extract capture (DFlash-PP); None for AR/MTP
                         pth_for_band,
                         tape_for_band,
                         0,
@@ -11204,6 +11215,16 @@ pub fn forward_prefill_batch_multi_with_caps(
                     let pbs_dst = &right[0];
                     let evt = gpus.boundary_copy(b, b + 1, &pbs_src.x_batch.buf, &pbs_dst.x_batch.buf, copy_bytes)?;
                     gpus.wait_boundary(evt)?;
+                }
+            }
+
+            // DFlash-PP: gather this chunk's per-band extract-layer staging
+            // into the unified ring on output_device, then commit (advances
+            // the unified head by chunk_n). One device-sync + peer-gather per
+            // chunk. No-op when the DFlash-PP capture args are None (AR/MTP).
+            if let Some(unified) = hidden_rb_unified.as_deref_mut() {
+                if let Some(shards) = hidden_rb_shards {
+                    shards.assemble_into(gpus, unified, chunk_n)?;
                 }
             }
 
