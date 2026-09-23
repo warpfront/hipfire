@@ -1,0 +1,26 @@
+{
+  "slice": "candidate-header-constant-schedule",
+  "device": "gfx1201 physical ordinal 3 via ROCR_VISIBLE_DEVICES=3",
+  "inputs": "real layer-0 producer inputs from qwen3.8-27b-mq4-xt, N=128",
+  "silu": {
+    "K": 17408,
+    "compared_block_bytes": 1253376,
+    "result": "PASS"
+  },
+  "rmsnorm": {
+    "K": 5120,
+    "compared_f32_elements": 655360,
+    "compared_block_bytes": 368640,
+    "result": "PASS"
+  },
+  "gated_norm": {
+    "K": 6144,
+    "compared_f32_elements": 786432,
+    "compared_block_bytes": 442368,
+    "result": "PASS"
+  },
+  "raw_outputs": [
+    "artifact://21411",
+    "artifact://21403"
+  ]
+}

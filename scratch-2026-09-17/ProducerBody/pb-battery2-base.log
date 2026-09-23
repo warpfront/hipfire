@@ -1,0 +1,41 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+  registry tag  : qwen3.8:27b-mq4-xt
+  kv_mode       : fp8 [explicit(--kv)]   kv_backend: vmm [tag-policy(qwen3.8:27b-mq4-xt)]   mtp_mode: off   mode: battery
+  max_seq       : 262144 [tag-policy(qwen3.8:27b-mq4-xt)]
+  dflash        : off   draft: (none / filename auto-match)
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : off   <-- OVERRIDES dflash/mtp
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : (runtime default)
+  expert parallel: tp=1
+  seed          : None   prompt_source: (built-in battery)
+  thinking_cap  : 512 tok (CONCRETE cap) [named-budget(low)]
+  reasoning_effort: xhigh  (parent prompt semantics; independent of cap)
+  max_tokens     : 1024 [explicit(--max-tokens)]  (> think cap 512 — model can answer)
+  sampling (what IS set):
+      temperature       = 1.0      [registry(qwen3.8:27b-mq4-xt)]
+      top_p             = 0.95     [registry(qwen3.8:27b-mq4-xt)]
+      top_k             = 20       [registry(qwen3.8:27b-mq4-xt)]
+      min_p             = 0.0      [registry(qwen3.8:27b-mq4-xt)]
+      presence_penalty  = 0.0      [registry(qwen3.8:27b-mq4-xt)]
+      repeat_penalty    = 1.0      [registry(qwen3.8:27b-mq4-xt)]
+      reasoning_effort  = xhigh    [registry(qwen3.8:27b-mq4-xt)]
+  sampling (NOT set, serve/daemon default applies): (none)
+=======================================================================================
+  [serve warm; MTP head loaded lines=0]
+### RUN qwen3.8-27b.mq4-xt|off|battery  kv=fp8 sampling={'temperature': 1.0, 'top_p': 0.95, 'top_k': 20, 'min_p': 0.0, 'presence_penalty': 0.0, 'repeat_penalty': 1.0, 'reasoning_effort': 'xhigh'} seed=None ###
+  [code]t1  finish=None   ctx=0      cached=0      gen=0    (think 0/ans 0w) prefill=Nonems/n/atok/s decode=Nonetok/s tau=None !EMPTY | '<<no visible content>>'
+  [reason]t2  finish=stop   ctx=95     cached=0      gen=125  (think 26/ans 36w) prefill=71.6ms/1325.9tok/s decode=36.3tok/s tau=None | 'Distance = speed × time.\n\n- First part: 60 mph × 2.5 hours = 150 miles  \n- Second part: 40'
+  [factual]t3  finish=stop   ctx=65     cached=0      gen=223  (think 117/ans 52w) prefill=64.1ms/1014.8tok/s decode=36.4tok/s tau=None | "The seasons on Earth are caused by the tilt of Earth's axis relative to its orbital plane."
+  [prose]t4  finish=stop   ctx=73     cached=0      gen=193  (think 89/ans 49w) prefill=64.7ms/1129.1tok/s decode=36.4tok/s tau=None | "The keeper found a glass bottle, its label worn blank by salt. Inside, a child's drawing s"
+  [instruct]t5  finish=stop   ctx=71     cached=0      gen=206  (think 96/ans 53w) prefill=64.5ms/1100.3tok/s decode=36.4tok/s tau=None | '1. Use clear, descriptive names for variables, functions, and modules.\n2. Keep functions s'
+[qwen3.8-27b.mq4-xt|off|battery DONE] turns=5 runaway=0 empty=1 attractor=0 retrieval_miss=0 avg_prefill=1142.5tok/s avg_decode=36.4tok/s
+  prompt_md5=43ca0d15712d3dfb777b51ae76d8fd5f request_md5=6813b8945cd5697f09373707fe1f788c step=
+  prompt_md5=640e0fd4f55996cb175a422f0a12cef5 request_md5=1d3a7cdbc8fec7caa166065225730da4 step=
+  prompt_md5=8f66b4c97988825bd8e7840aaf44357e request_md5=b31f675756286dae9991ec1acc2015a6 step=
+  prompt_md5=8fe0ad36f61bcf4992cc9df81cdf3817 request_md5=832c3b0d9bd18ebf40873207e8279c4a step=
+  prompt_md5=8bed8e2d056dc1d47dccae9d32dbecf4 request_md5=53bf9f60bb15adb4bd30b44a26039ece step=
+  daemon_binary_md5=758a9aa701066c668e2a3f1961df9518 path=/home/kaden/ClaudeCode/warpfront/wt-prodbody/scratch-2026-09-17/ProducerBody/bin/daemon-pb-base

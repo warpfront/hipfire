@@ -1,0 +1,13 @@
+
+hipfire: failed to initialize GPU runtime.
+  HIP error: hipInit: no ROCm-capable device is detected (code 100)
+
+  Most common Linux causes:
+    1. amdgpu kernel module not loaded (check `lsmod | grep amdgpu`).
+    2. /dev/kfd missing or not readable by the current user
+       (add to the `render` group; reboot).
+    3. ROCm not installed or libamdhip64.so missing
+       (check `ldconfig -p | grep amdhip64`).
+
+  Run `hipfire diag` for a full environment report.
+hipfire: daemon closed its output (status exit status: 1)

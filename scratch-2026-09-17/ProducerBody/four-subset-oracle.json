@@ -1,0 +1,18 @@
+{
+  "oracle_policy": "standalone quantizer temporarily selected the same frozen subset; shipping source restored standalone original-eight specialization after proof",
+  "silu": {
+    "artifact": "artifact://21676",
+    "identity": "1253376 block bytes",
+    "shape": "K=17408 N=128 awq=true"
+  },
+  "rmsnorm": {
+    "artifact": "artifact://21686",
+    "identity": "655360 f32 + 368640 block bytes",
+    "shape": "K=5120 N=128 awq=true"
+  },
+  "gated_norm": {
+    "artifact": "artifact://21697",
+    "identity": "786432 f32 + 442368 block bytes",
+    "shape": "K=6144 N=128 heads=48 awq=true"
+  }
+}

@@ -1,0 +1,8 @@
+{
+  "device_uuid": "GPU-6109a4cb5f833235",
+  "base": "bc1a55de9",
+  "policy": "producer and standalone both frozen four-candidate subset",
+  "silu": "PASS",
+  "rmsnorm": "PASS",
+  "gated_norm": "PASS"
+}

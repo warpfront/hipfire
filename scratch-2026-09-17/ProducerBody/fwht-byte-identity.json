@@ -1,0 +1,20 @@
+{
+  "silu": {
+    "artifact": "artifact://21543",
+    "result": "PASS",
+    "identity": "1253376 block bytes",
+    "shape": "K=17408 N=128 awq=true"
+  },
+  "rmsnorm": {
+    "artifact": "artifact://21554",
+    "result": "PASS",
+    "identity": "655360 f32 + 368640 block bytes",
+    "shape": "K=5120 N=128 awq=true"
+  },
+  "gated_norm": {
+    "artifact": "artifact://21565",
+    "result": "PASS",
+    "identity": "786432 f32 + 442368 block bytes",
+    "shape": "K=6144 N=128 heads=48 awq=true"
+  }
+}

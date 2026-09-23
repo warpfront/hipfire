@@ -1,0 +1,50 @@
+{
+  "base-silu": {
+    "static_vector_plus_ds": 883,
+    "v_rcp_f32": 0,
+    "v_div_fixup_f32": 36,
+    "v_cndmask_b32": 0,
+    "v_cmp_eq_u32": 0,
+    "lines": 1623
+  },
+  "base-rmsnorm": {
+    "static_vector_plus_ds": 805,
+    "v_rcp_f32": 0,
+    "v_div_fixup_f32": 29,
+    "v_cndmask_b32": 0,
+    "v_cmp_eq_u32": 0,
+    "lines": 1666
+  },
+  "base-gated_norm": {
+    "static_vector_plus_ds": 690,
+    "v_rcp_f32": 0,
+    "v_div_fixup_f32": 22,
+    "v_cndmask_b32": 0,
+    "v_cmp_eq_u32": 0,
+    "lines": 1390
+  },
+  "header-silu": {
+    "static_vector_plus_ds": 858,
+    "v_rcp_f32": 0,
+    "v_div_fixup_f32": 34,
+    "v_cndmask_b32": 0,
+    "v_cmp_eq_u32": 0,
+    "lines": 1784
+  },
+  "header-rmsnorm": {
+    "static_vector_plus_ds": 782,
+    "v_rcp_f32": 0,
+    "v_div_fixup_f32": 27,
+    "v_cndmask_b32": 0,
+    "v_cmp_eq_u32": 0,
+    "lines": 1828
+  },
+  "header-gated_norm": {
+    "static_vector_plus_ds": 665,
+    "v_rcp_f32": 0,
+    "v_div_fixup_f32": 20,
+    "v_cndmask_b32": 0,
+    "v_cmp_eq_u32": 0,
+    "lines": 1551
+  }
+}

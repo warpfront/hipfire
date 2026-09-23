@@ -1,0 +1,35 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : /home/kaden/.hipfire/models/qwen3.8-27b.mq4-xt
+  registry tag  : qwen3.8:27b-mq4-xt
+  kv_mode       : fp8 [explicit(--kv)]   kv_backend: vmm [tag-policy(qwen3.8:27b-mq4-xt)]   mtp_mode: off   mode: battery
+  max_seq       : 262144 [tag-policy(qwen3.8:27b-mq4-xt)]
+  dflash        : off   draft: (none / filename auto-match)
+  ngram         : off   ngram_k: (loader default 12)
+  mtp_ngram     : off   (off / default gate 24/48/64 when enabled)
+  speculation   : off   <-- OVERRIDES dflash/mtp
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : (runtime default)
+  expert parallel: tp=1
+  seed          : None   prompt_source: (built-in battery)
+  thinking_cap  : thinking DISABLED (sentinel cap 1) [named-budget(off)]
+  reasoning_effort: auto  (parent prompt semantics; independent of cap)
+  max_tokens     : 128 [explicit(--max-tokens)]  (no think block emitted)
+  sampling (what IS set):
+      temperature       = 0.0      [explicit(greedy)]
+  sampling (NOT set, serve/daemon default applies): top_p, top_k, min_p, presence_penalty, repeat_penalty, reasoning_effort
+=======================================================================================
+  [serve warm; MTP head loaded lines=0]
+### RUN qwen3.8-27b.mq4-xt|off|battery  kv=fp8 sampling={'temperature': 0.0} seed=None ###
+  [code]t1  finish=None   ctx=0      cached=0      gen=0    (think 0/ans 0w) prefill=Nonems/n/atok/s decode=Nonetok/s tau=None !EMPTY | '<<no visible content>>'
+  [reason]t2  finish=length ctx=95     cached=0      gen=128  (think 22/ans 28w) prefill=73.2ms/1297.9tok/s decode=36.3tok/s tau=None !RUNAWAY | '1. First part:  \n   \\(60 \\text{ mph} \\times 2.5 \\text{ hours} = 150 \\text{ miles}\\)\n\n2. Se'
+  [factual]t3  finish=length ctx=65     cached=0      gen=128  (think 82/ans 12w) prefill=63.4ms/1025.6tok/s decode=36.4tok/s tau=None !RUNAWAY | "Earth's seasons are caused by the tilt of its rotational axis relative"
+  [prose]t4  finish=None   ctx=0      cached=0      gen=0    (think 96/ans 0w) prefill=Nonems/n/atok/s decode=Nonetok/s tau=None !EMPTY | '<<no visible content>>'
+  [instruct]t5  finish=None   ctx=0      cached=0      gen=0    (think 95/ans 0w) prefill=Nonems/n/atok/s decode=Nonetok/s tau=None !EMPTY | '<<no visible content>>'
+[qwen3.8-27b.mq4-xt|off|battery DONE] turns=5 runaway=2 empty=3 attractor=0 retrieval_miss=0 avg_prefill=1161.8tok/s avg_decode=36.3tok/s
+  prompt_md5=43ca0d15712d3dfb777b51ae76d8fd5f request_md5=1dae5f2a040ade27006734f8d37024e0 step=
+  prompt_md5=640e0fd4f55996cb175a422f0a12cef5 request_md5=7a0845a85e7e3bc6456bf38e3052ae8d step=
+  prompt_md5=8f66b4c97988825bd8e7840aaf44357e request_md5=5bfb63928b57ce00c47dbe0caff37750 step=
+  prompt_md5=8fe0ad36f61bcf4992cc9df81cdf3817 request_md5=3a943a12f7a127157f3fb2d85fe141be step=
+  prompt_md5=8bed8e2d056dc1d47dccae9d32dbecf4 request_md5=23a2dbd4fe592b8bbcd3f4d0ff5e27e2 step=
+  daemon_binary_md5=758a9aa701066c668e2a3f1961df9518 path=/home/kaden/ClaudeCode/warpfront/wt-prodbody/scratch-2026-09-17/ProducerBody/bin/daemon-pb-base

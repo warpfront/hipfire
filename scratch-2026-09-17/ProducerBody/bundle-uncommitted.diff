@@ -1,0 +1,107 @@
+diff --git a/kernels/src/block_i4_128_quant.hip b/kernels/src/block_i4_128_quant.hip
+index 6646cbcbe..e26c87c79 100644
+--- a/kernels/src/block_i4_128_quant.hip
++++ b/kernels/src/block_i4_128_quant.hip
+@@ -31,8 +31,10 @@ static_assert(sizeof(block_i4_128) == 72, "bad block size");
+ // Wave32-synchronous quant of one 128-element group.
+ // Lane l owns elements 4l..4l+3 in xv[4]. Reductions use offsets 16..1
+ // (wave64-safe width-32 shuffles). Writes qs for every lane; lane 0 of the
+-// group publishes d and s. Arithmetic matches the original standalone body
+-// (amax → 8 MSE candidates with strict-`<` → rintf/clamp → exact int sum).
++// group publishes d and s. The default specialization matches the original
++// 8-candidate body. The explicit gfx1201 producer specialization uses the
++// frozen candidate subset {0,2,5,7} with pre-rounded exact header constants.
++template <bool ProducerFourCandidates>
+ __device__ __forceinline__ void quantize_block_i4_128_wave(
+     const float xv[4],
+     block_i4_128* __restrict__ out,
+@@ -46,22 +48,52 @@ __device__ __forceinline__ void quantize_block_i4_128_wave(
+     float best_d = 1.0f;
+     if (amax != 0.0f) {
+         float best_mse = 1.0e30f;
+-        for (int j = 0; j < 8; ++j) {
+-            const float dj = (amax / 7.0f) * 0.5f * (1.0f + (float)j / 7.0f);
+-            float mse = 0.0f;
+-            #pragma unroll
+-            for (int e = 0; e < 4; ++e) {
+-                float q = rintf(xv[e] / dj);
+-                q = fminf(fmaxf(q, -8.0f), 7.0f);
+-                const float err = __fmaf_rn(-q, dj, xv[e]);
+-                mse = __fmaf_rn(err, err, mse);
++        if constexpr (ProducerFourCandidates) {
++            const float candidate_base = (amax / 7.0f) * 0.5f;
++            #pragma unroll 1
++            for (int ci = 0; ci < 4; ++ci) {
++                float multiplier;
++                switch (ci) {
++                    case 0: multiplier = 1.0f; break;
++                    case 1: multiplier = 0x1.492492p+0f; break;
++                    case 2: multiplier = 0x1.b6db6ep+0f; break;
++                    default: multiplier = 2.0f; break;
++                }
++                const float dj = candidate_base * multiplier;
++                float mse = 0.0f;
++                #pragma unroll
++                for (int e = 0; e < 4; ++e) {
++                    float q = rintf(xv[e] / dj);
++                    q = fminf(fmaxf(q, -8.0f), 7.0f);
++                    const float err = __fmaf_rn(-q, dj, xv[e]);
++                    mse = __fmaf_rn(err, err, mse);
++                }
++                for (int offset = 16; offset > 0; offset >>= 1) {
++                    mse += __shfl_xor(mse, offset, 32);
++                }
++                if (mse < best_mse) {
++                    best_mse = mse;
++                    best_d = dj;
++                }
+             }
+-            for (int offset = 16; offset > 0; offset >>= 1) {
+-                mse += __shfl_xor(mse, offset, 32);
+-            }
+-            if (mse < best_mse) {
+-                best_mse = mse;
+-                best_d = dj;
++        } else {
++            for (int j = 0; j < 8; ++j) {
++                const float dj = (amax / 7.0f) * 0.5f * (1.0f + (float)j / 7.0f);
++                float mse = 0.0f;
++                #pragma unroll
++                for (int e = 0; e < 4; ++e) {
++                    float q = rintf(xv[e] / dj);
++                    q = fminf(fmaxf(q, -8.0f), 7.0f);
++                    const float err = __fmaf_rn(-q, dj, xv[e]);
++                    mse = __fmaf_rn(err, err, mse);
++                }
++                for (int offset = 16; offset > 0; offset >>= 1) {
++                    mse += __shfl_xor(mse, offset, 32);
++                }
++                if (mse < best_mse) {
++                    best_mse = mse;
++                    best_d = dj;
++                }
+             }
+         }
+     }
+@@ -119,7 +151,11 @@ __device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
+             xv[0] = s4; xv[1] = s5; xv[2] = s6; xv[3] = s7;
+         }
+         block_i4_128* out = Y + (long long)(2 * group + h) * N + token;
+-        quantize_block_i4_128_wave(xv, out, lane);
++#if defined(__gfx1201__)
++        quantize_block_i4_128_wave<true>(xv, out, lane);
++#else
++        quantize_block_i4_128_wave<false>(xv, out, lane);
++#endif
+     }
+ }
+ 
+@@ -146,7 +182,7 @@ extern "C" __global__ void quantize_int4_mmq_ds128(
+ 
+     const int kblock = i0 / 128;
+     block_i4_128* out = Y + (long long)kblock * N + token;
+-    quantize_block_i4_128_wave(xv, out, lane);
++    quantize_block_i4_128_wave<false>(xv, out, lane);
+ }
+ #endif // HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE
+ 

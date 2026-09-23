@@ -1,0 +1,78 @@
+{
+  "normalization": "prefill dispatches selected by 8192-token grid shape; device sum / 8192 tokens",
+  "base": {
+    "fused_silu_mul_mq_rotate_awq_i4_gfx12": {
+      "dispatches": 128,
+      "sum_ms": 537.990173,
+      "us_per_token": 65.67262854003906,
+      "vgpr": [
+        56
+      ],
+      "sgpr": [
+        128
+      ]
+    },
+    "fused_rmsnorm_mq_rotate_awq_i4_gfx12": {
+      "dispatches": 256,
+      "sum_ms": 346.952483,
+      "us_per_token": 42.35259802246094,
+      "vgpr": [
+        96
+      ],
+      "sgpr": [
+        128
+      ]
+    },
+    "gated_norm_mq_rotate_awq_i4_gfx12": {
+      "dispatches": 96,
+      "sum_ms": 254.47956,
+      "us_per_token": 31.0643994140625,
+      "vgpr": [
+        48
+      ],
+      "sgpr": [
+        128
+      ]
+    }
+  },
+  "candidate": {
+    "fused_silu_mul_mq_rotate_awq_i4_gfx12": {
+      "dispatches": 128,
+      "sum_ms": 479.186477,
+      "us_per_token": 58.494442993164064,
+      "vgpr": [
+        56
+      ],
+      "sgpr": [
+        128
+      ]
+    },
+    "fused_rmsnorm_mq_rotate_awq_i4_gfx12": {
+      "dispatches": 256,
+      "sum_ms": 324.455765,
+      "us_per_token": 39.606416625976564,
+      "vgpr": [
+        96
+      ],
+      "sgpr": [
+        128
+      ]
+    },
+    "gated_norm_mq_rotate_awq_i4_gfx12": {
+      "dispatches": 96,
+      "sum_ms": 226.557119,
+      "us_per_token": 27.65589831542969,
+      "vgpr": [
+        48
+      ],
+      "sgpr": [
+        128
+      ]
+    }
+  },
+  "candidate_delta_pct": {
+    "fused_silu_mul_mq_rotate_awq_i4_gfx12": -10.930254668424954,
+    "fused_rmsnorm_mq_rotate_awq_i4_gfx12": -6.484091944083303,
+    "gated_norm_mq_rotate_awq_i4_gfx12": -10.97237082616772
+  }
+}

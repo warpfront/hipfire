@@ -1,0 +1,63 @@
+{
+  "scope": "nonzero-amax shared quant path per lane per 256-feature producer group; VOPD counts as two logical vector operations",
+  "base_vector_ops": 1557,
+  "header_vector_ops": 1349,
+  "delta": -208,
+  "silu_total_base": 1998,
+  "silu_total_header": 1790,
+  "dynamic_ds_base": 156,
+  "dynamic_ds_header": 156,
+  "resources": {
+    "silu": {
+      "base": {
+        "sgpr": 18,
+        "vgpr": 55,
+        "occupancy": 16
+      },
+      "header": {
+        "sgpr": 18,
+        "vgpr": 55,
+        "occupancy": 16
+      }
+    },
+    "rmsnorm": {
+      "base": {
+        "sgpr": 34,
+        "vgpr": 91,
+        "occupancy": 16
+      },
+      "header": {
+        "sgpr": 33,
+        "vgpr": 91,
+        "occupancy": 16
+      }
+    },
+    "gated_norm": {
+      "base": {
+        "sgpr": 28,
+        "vgpr": 45,
+        "occupancy": 16
+      },
+      "header": {
+        "sgpr": 28,
+        "vgpr": 45,
+        "occupancy": 16
+      }
+    }
+  },
+  "static_emitted_vector_plus_ds": {
+    "silu": [
+      883,
+      858
+    ],
+    "rmsnorm": [
+      805,
+      782
+    ],
+    "gated_norm": [
+      690,
+      665
+    ]
+  },
+  "notes": "Header j/7 true-division lowering and add disappear; final candidate-base multiply remains. Switch selection is scalar. No spills or occupancy-class changes."
+}

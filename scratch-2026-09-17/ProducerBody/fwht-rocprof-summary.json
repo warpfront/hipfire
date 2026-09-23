@@ -1,0 +1,80 @@
+{
+  "normalization": "prefill dispatches selected by 8192-token grid shape; device sum / 8192 tokens",
+  "baseline_trace": "rocprof-base/trace-base_kernel_trace.csv",
+  "candidate_trace": "rocprof-fwht/trace-fwht_kernel_trace.csv",
+  "base": {
+    "fused_silu_mul_mq_rotate_awq_i4_gfx12": {
+      "dispatches": 128,
+      "sum_ms": 537.990173,
+      "us_per_token": 65.67262854003906,
+      "vgpr": [
+        56
+      ],
+      "sgpr": [
+        128
+      ]
+    },
+    "fused_rmsnorm_mq_rotate_awq_i4_gfx12": {
+      "dispatches": 256,
+      "sum_ms": 346.952483,
+      "us_per_token": 42.35259802246094,
+      "vgpr": [
+        96
+      ],
+      "sgpr": [
+        128
+      ]
+    },
+    "gated_norm_mq_rotate_awq_i4_gfx12": {
+      "dispatches": 96,
+      "sum_ms": 254.47956,
+      "us_per_token": 31.0643994140625,
+      "vgpr": [
+        48
+      ],
+      "sgpr": [
+        128
+      ]
+    }
+  },
+  "candidate": {
+    "fused_silu_mul_mq_rotate_awq_i4_gfx12": {
+      "dispatches": 128,
+      "sum_ms": 548.290831,
+      "us_per_token": 66.93003308105469,
+      "vgpr": [
+        56
+      ],
+      "sgpr": [
+        128
+      ]
+    },
+    "fused_rmsnorm_mq_rotate_awq_i4_gfx12": {
+      "dispatches": 256,
+      "sum_ms": 351.959389,
+      "us_per_token": 42.963792602539066,
+      "vgpr": [
+        96
+      ],
+      "sgpr": [
+        128
+      ]
+    },
+    "gated_norm_mq_rotate_awq_i4_gfx12": {
+      "dispatches": 96,
+      "sum_ms": 258.901557,
+      "us_per_token": 31.604193969726563,
+      "vgpr": [
+        48
+      ],
+      "sgpr": [
+        128
+      ]
+    }
+  },
+  "candidate_delta_pct": {
+    "fused_silu_mul_mq_rotate_awq_i4_gfx12": 1.9146554188081755,
+    "fused_rmsnorm_mq_rotate_awq_i4_gfx12": 1.4431100065077196,
+    "gated_norm_mq_rotate_awq_i4_gfx12": 1.7376629384301179
+  }
+}
