@@ -1,0 +1,1 @@
+{"name":"packed","daemon":"/home/kaden/redline-results/qwen35-packed-experts-target/release/examples/daemon","daemon_sha256":"ef7aaaae82ea92498f1e98853d23dc043ab8247130aa497451158591982fe7cb","before":28753920,"loaded":19406700544,"after_unload":282771456,"load_seconds":29}

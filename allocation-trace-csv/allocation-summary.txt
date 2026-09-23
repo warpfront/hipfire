@@ -1,0 +1,13 @@
+gpu_alloc_count=1023 requested_bytes=18896841988
+size=2048 count=85
+size=142606336 count=40
+size=1088 count=40
+size=16384 count=42
+size=285212672 count=40
+size=256 count=129
+size=8192 count=91
+size=34816 count=60
+size=278528 count=40
+size=557056 count=140
+size=4456448 count=90
+size=8912896 count=40
