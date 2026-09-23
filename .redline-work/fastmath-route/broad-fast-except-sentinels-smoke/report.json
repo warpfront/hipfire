@@ -1,0 +1,17 @@
+{
+  "coherence": {
+    "valid": false,
+    "error": "hip coherence smoke failed: finish must be 'stop', got 'length'; answer missing real flag object (standalone flag / flagpole / flag pole / flag-staff / flagstaff with pole or mast); answer missing naming/history cue (named/name/origin/1876/centennial/boston party/fourth of july/4th of july); runaway generation (finish=length)\n-35b-a3b.mq4r\n  registry tag  : qwen3.6:35b-a3b\n  kv_mode       : q8   mtp_mode: off   mode: battery\n  seed          : 1   prompts_file: /home/kaden/hipfire-rw-nofm/.redline-work/fastmath-route/broad-fast-except-sentinels-smoke/product-hip-coherence-2834750-6ybc2bnb-b517ec5e/prompts.json\n  thinking_budget: low -> 512 tok (CONCRETE cap)\n  max_tokens     : 768  (> think cap 512 \u2014 model can answer)\n  sampling (what IS set):\n      temperature       = 1.0      [registry(qwen3.6:35b-a3b)]\n      top_p             = 0.95     [registry(qwen3.6:35b-a3b)]\n      top_k             = 20       [registry(qwen3.6:35b-a3b)]\n      min_p             = 0.0      [registry(qwen3.6:35b-a3b)]\n      presence_penalty  = 1.5      [registry(qwen3.6:35b-a3b)]\n      repeat_penalty    = 1.0      [registry(qwen3.6:35b-a3b)]\n  sampling (NOT set, serve/daemon default applies): reasoning_effort\n=======================================================================================\n  [serve warm; MTP head loaded lines=0]\n### RUN qwen3.6-35b-a3b.mq4r|off|battery  kv=q8 sampling={'temperature': 1.0, 'top_p': 0.95, 'top_k': 20, 'min_p': 0.0, 'presence_penalty': 1.5, 'repeat_penalty': 1.0} seed=1 ###\n  [factual]t1  finish=length ctx=22     cached=0      gen=768  (think 1/ans 1w) prefill=68.9ms decode=112.3 tau=None !RUNAWAY | '!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!'\n[qwen3.6-35b-a3b.mq4r|off|battery DONE] turns=1 runaway=1 empty=0 attractor=0 avg_decode=112.3tok/s\n"
+  },
+  "tok_s": [
+    118.74929358666078,
+    118.42574959791752,
+    118.74843704327658,
+    118.3368014028532,
+    118.5660067292304,
+    118.44495192019588,
+    118.4138907457179,
+    118.52786937968033
+  ],
+  "median": 118.48641064993811
+}

@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 712,
+"finish": "stop",
+"think_words": 345,
+"ans_words": 146,
+"prefill_ms": 69.3,
+"prefill_tok_s": 317.3,
+"decode_tok_s": 105.5,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.405,
+"wall_s": 6.822,
+"attractor": false,
+"empty": false,
+"runaway": false,
+"ans_preview": "The name **Flagstaff** originates from an event in **August 1876**, during an expedition o",
+"assistant_content": "The name **Flagstaff** originates from an event in **August 1876**, during an expedition organized by the U.S. Army Signal Corps to survey a telegraph line route. \n\nIn late summer that year, the party was exploring the high desert plateau east of the San Francisco Peaks in northern Arizona. On **August 20, 1876**, the team erected a tall pine pole topped with a flag on a prominent hill near natural freshwater springs (now the site of downtown Flagstaff). They officially named the location **\u201cFlagstaff\u201d** to mark the spot for future travelers and military/telegraph operations.\n\nOver the following decades, the site grew into a stagecoach stop and then a railroad hub after the arrival of the transcontinental railway in 1882, eventually becoming the incorporated city we know today. \n\nLet me know if you'd like details on how it evolved into a major cultural/scientific hub or its Indigenous origins!"
+}
+]

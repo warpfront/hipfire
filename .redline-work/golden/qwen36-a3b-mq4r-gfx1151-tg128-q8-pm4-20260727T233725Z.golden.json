@@ -1,0 +1,90 @@
+{
+  "schema": "hipfire.redline.golden-reproduction.v1",
+  "created_at_utc": "2026-07-27T23:41:22.591221+00:00",
+  "fixture_registry": "/home/kaden/hipfire-rw-nofm/registry/redline-golden-v1.json",
+  "fixture_registry_sha256": "ca5963ac3663bd3fa0ab3907c0e06bb390ef7cf19c5110f3263146f8c335f01d",
+  "fixture": {
+    "id": "qwen36-a3b-mq4r-gfx1151-tg128-q8-pm4",
+    "architecture": "gfx1151",
+    "reference": {
+      "created_at_utc": "2026-07-22",
+      "source_commit": "76f2a5748959a75c3a9cb484564fe467b6d184d8",
+      "daemon_sha256": "ff93c14e0b7bc2aad8f7bffd6d6c4144d07d1ea8bff69ce92b98a613205bcb27",
+      "report_sha256": "2cc50777843f3919535540449d119b1b97263ea923c91ff257753d8bbd088dfd",
+      "hip_median_tok_s": 102.34810044125717,
+      "pm4_min_tok_s": 115.21925370186791,
+      "pm4_median_tok_s": 115.28981279309554,
+      "pm4_max_tok_s": 115.41962647862607,
+      "speedup": 1.1264479975304111,
+      "historical_headline": {
+        "route_proof_status": "sealed certification bundle",
+        "min_tok_s": 115.021,
+        "median_tok_s": 115.104,
+        "max_tok_s": 115.185
+      }
+    },
+    "acceptance": {
+      "minimum_pm4_tok_s": 115.021,
+      "minimum_speedup": 1.1
+    },
+    "benchmark": {
+      "context": 128,
+      "iterations": 128,
+      "warmups": 10,
+      "warmup_iterations": 32,
+      "runs": 8,
+      "transport": "pm4",
+      "kv_mode": "q8",
+      "max_seq": 2048,
+      "settle_window": 8,
+      "settle_min_runs": 8,
+      "settle_confirmation_runs": 8,
+      "settle_max_runs": 120,
+      "settle_max_slope_pct": 0.05,
+      "settle_max_spread_pct": 1.0,
+      "settle_max_median_drift_pct": 0.5
+    },
+    "route": {
+      "dispatches": 604,
+      "packets": 1,
+      "phases": 2,
+      "command_dwords": 16708,
+      "unique_kernels": 23,
+      "sequence_hash": "42f566b752920679",
+      "observed_positions": [
+        128,
+        255
+      ]
+    },
+    "sealed_bundle": {
+      "source_commit": "661cb5d63a08ac4fde6dc9e2cebc45c5db347317",
+      "daemon_sha256": "43b4bcaba90db63c14bcde107c32da77361fd79ef2c4ddbc762ce641dfb4279c",
+      "certification_payload_sha256": "61d80dab7c5f0c266191d46bc926e0c3de8b76ce5bf442f478fd6e17e461c59e",
+      "hip_source_aggregate_sha256": "eeaca7ae5296f922c4ec4e847570a3f244161cf2a13f57b9e8cffc5e4d2d83ea",
+      "dispatch_source_aggregate_sha256": "342286e2306ab0310c927887a92c8463a070b9b96940f27f1f070362341777e0",
+      "hsaco_manifest_sha256": "a26cef6c353ae02c5dfb17fe8d1dfb38be42e158254478365e28e398f799053b",
+      "launches": 604,
+      "unique_kernels": 23,
+      "sequence_hash": "53414b0dc0f988ac"
+    }
+  },
+  "product_report": "/home/kaden/hipfire-rw-nofm/.redline-work/golden/qwen36-a3b-mq4r-gfx1151-tg128-q8-pm4-20260727T233725Z.json",
+  "product_report_sha256": "c728740e9f0446124d75ea850cb363c79cf0dfa4c37d52b1386d7fcc8902f681",
+  "validation": {
+    "valid": false,
+    "classification": "failed",
+    "fixture_id": "qwen36-a3b-mq4r-gfx1151-tg128-q8-pm4",
+    "architecture": "gfx1151",
+    "hip_median_tok_s": 101.50382195750399,
+    "pm4_median_tok_s": 113.65174802335181,
+    "speedup": 1.119679494146868,
+    "errors": [
+      "prepared identity [[604, 1, 2, 16831]] does not contain [604, 1, 2, 16708]",
+      "PM4 median 113.652 < 115.021 tok/s"
+    ],
+    "warnings": [
+      "source commit d67a98b6957e4652c9648badf454069f4273bb44 differs from reference 76f2a5748959a75c3a9cb484564fe467b6d184d8",
+      "daemon sha256 73a89a1ea57f8938ea02e264ebdd55b8d0b11f950a95f08def4553f580dc795f differs from reference ff93c14e0b7bc2aad8f7bffd6d6c4144d07d1ea8bff69ce92b98a613205bcb27"
+    ]
+  }
+}

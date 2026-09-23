@@ -1,0 +1,70 @@
+{
+  "schema_version": 3,
+  "compiler": "radiowave",
+  "generated_unix_seconds": 1785186750,
+  "source": "/home/kaden/hipfire-rw-nofm/.hipfire_kernels/gfx1151/moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151.hip",
+  "output": "/home/kaden/hipfire-rw-nofm/.hipfire_kernels/gfx1151/moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151.hsaco",
+  "arch": "gfx1151",
+  "wavefront": "wave32",
+  "scheduler_profile": "default",
+  "hipcc": "hipcc",
+  "hipcc_version": "HIP version: 7.14.60850-0000000\nAMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 46fcb339fb61119b337f973c7ca9e710a319fdd0+PATCHED:440716f8b87be9d8e20ed910e10e5b6d14d57cf6)\nTarget: x86_64-unknown-linux-gnu\nThread model: posix\nInstalledDir: /opt/rocm/core-7.14/lib/llvm/bin",
+  "command": [
+    "hipcc",
+    "--genco",
+    "--offload-arch=gfx1151",
+    "-O3",
+    "-fno-exceptions",
+    "-fno-rtti",
+    "-include",
+    "/home/kaden/hipfire-rw-nofm/crates/radiowave/include/radiowave/hip.h",
+    "-DRADIOWAVE_ACTIVE=1",
+    "-o",
+    "/home/kaden/hipfire-rw-nofm/.hipfire_kernels/gfx1151/moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151.hsaco",
+    "/home/kaden/hipfire-rw-nofm/.hipfire_kernels/gfx1151/moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151.hip"
+  ],
+  "source_sha256": "bd105e949ef1bb535f172a1e3927deccc1c34a6de1bbea79bb90599c972e0455",
+  "support_header_sha256": "1b27c71a6def4cfe6dadd54da4d759ec8094e108e78fdc034e0cdc0804185a4d",
+  "output_sha256": "a26f7cbf22a933ced5a9e1a097fd78d2e8a6eb55401b21c31e8ceb34a3bd2579",
+  "inspection": {
+    "bundle_target": "hipv4-amdgcn-amd-amdhsa--gfx1151",
+    "identity": {
+      "architecture": "gfx1151",
+      "elf_machine_id": 74,
+      "isa": {
+        "major": 11,
+        "minor": 5,
+        "stepping": 1
+      }
+    },
+    "kernels": [
+      {
+        "name": "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151",
+        "wavefront_size": 32,
+        "vgpr_count": 93,
+        "sgpr_count": 26,
+        "vgpr_spill_count": 0,
+        "sgpr_spill_count": 0,
+        "private_segment_fixed_size": 0,
+        "mutable_read_cache": "scalar_or_unknown",
+        "instructions": {
+          "static_instructions": 449,
+          "buffer_loads": 0,
+          "buffer_stores": 0,
+          "global_loads": 24,
+          "global_stores": 4,
+          "flat_loads": 0,
+          "flat_stores": 0,
+          "scalar_loads": 4,
+          "kernarg_scalar_loads": 3,
+          "scalar_buffer_loads": 0,
+          "unknown_scalar_loads": 1,
+          "wait_instructions": 94,
+          "delay_alu_instructions": 33,
+          "memory_clause_instructions": 11,
+          "max_consecutive_vmem_instructions": 7
+        }
+      }
+    ]
+  }
+}

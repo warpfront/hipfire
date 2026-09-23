@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 768,
+"finish": "length",
+"think_words": 333,
+"ans_words": 178,
+"prefill_ms": 60.9,
+"prefill_tok_s": 361.0,
+"decode_tok_s": 97.0,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.415,
+"wall_s": 7.979,
+"attractor": false,
+"empty": false,
+"runaway": true,
+"ans_preview": "The original name of Flagstaff, Arizona is Low's Camp, after Joseph Low, an early settler ",
+"assistant_content": "   The original name of Flagstaff, Arizona is Low's Camp, after Joseph Low, an early settler and guide. The area was later renamed Flagstaff after a large wooden mast (about 20 feet tall) that was planted there and flown with a flag in 1863 (or around that time) to serve as a landmark for emigrants and railroads. Actually, I recall it was specifically used as a navigation aid on the Santa Fe Trail. Wait, I should verify. Let's think carefully.\n\n   According to historical records from the National Park Service and local histories: The site was first known as \"Low's Camp\". In 1858, a group of travelers led by Joseph Low established a camp there. Later, in 1863, a flagpole was erected there by emigrants on the Overland Trail. The name \"Flagstaff\" stuck because of this mast. It was officially incorporated as Flagstaff in 1876.\n\n   But I need to be precise. Let me recall exact details: The mast was actually about 20-30 feet tall, made from a ponderosa pine trunk, planted vertically, and flew flags. It became a well-known landmark."
+}
+]

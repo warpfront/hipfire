@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 768,
+"finish": "length",
+"think_words": 310,
+"ans_words": 174,
+"prefill_ms": 69.3,
+"prefill_tok_s": 317.3,
+"decode_tok_s": 98.2,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.418,
+"wall_s": 7.892,
+"attractor": false,
+"empty": false,
+"runaway": true,
+"ans_preview": "The name **Flagstaff** originates from a literal **flagstaff**\u2014a tall pole topped with a f",
+"assistant_content": "The name **Flagstaff** originates from a literal **flagstaff**\u2014a tall pole topped with a flag\u2014that early explorers erected in the area to mark their location and signal passing travelers. Here's the key historical context:\n\n- \ud83d\udcc5 **October 1853**: During the **Pacific Railroad Survey** (a U.S. Army expedition commissioned by Congress to locate a transcontinental railroad route), members of the party camping near a prominent volcanic rock outcrop drove a flagpole into the ground as a landmark.\n- \ud83c\udfd4\ufe0f The group camped at what is now downtown Flagstaff, using the flagstaff to visually identify their encampment and communicate with other survey teams moving along the same corridor.\n- \ud83d\udcdc In **1858**, a U.S. Mail stagecoach route was established through the region, and a supply depot/trading post known as **Camp Flagstaff** was set up near the original site. Over time, \u201cCamp Flagstaff\u201d shortened to just \u201cFlagstaff.\u201d\n- \ud83c\udf06 By **1876**, when the town was officially incorporated, it had already been widely known by that name for nearly two decades.\n\nThe choice of a simple, descriptive name reflects "
+}
+]

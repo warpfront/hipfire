@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 768,
+"finish": "length",
+"think_words": 322,
+"ans_words": 172,
+"prefill_ms": 73.2,
+"prefill_tok_s": 300.5,
+"decode_tok_s": 96.9,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.429,
+"wall_s": 8.002,
+"attractor": false,
+"empty": false,
+"runaway": true,
+"ans_preview": "Flagstaff\u2019s name originates from an actual **flagpole** used to mark a campsite during the",
+"assistant_content": "Flagstaff\u2019s name originates from an actual **flagpole** used to mark a campsite during the **1852\u20131853 Pacific Railroad Survey** led by Lieutenant Edward Fitzgerald Beale of the U.S. Army. \n\nHere are the key details:\n- **Purpose & Origin**: In late December 1852, Beale\u2019s expedition built a winter camp on Walnut Creek (in what is now northern Arizona). To mark their location and display national pride, they erected a **90-foot wooden pole** and flew the American flag from it\u2014a structure known as a \u201cflagstaff.\u201d\n- **Naming Timeline**: The term \u201cFlag Staff\u201d (or \u201cFlagstaff\u201d) was used by the expedition members in journals and reports throughout that winter. By the mid-1850s, the name appeared on early surveys and maps, gradually replacing earlier informal or descriptive local names.\n- **Official Recognition**: As railroads and settlers moved into the region, the nearby post office and settlement adopted the name. Flagstaff officially became a city in 1886, but the name had been in use for over two decades.\n\nThe name is purely geographical/functional\u2014**not named after a person**, but after"
+}
+]

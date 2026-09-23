@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 768,
+"finish": "length",
+"think_words": 337,
+"ans_words": 177,
+"prefill_ms": 69.9,
+"prefill_tok_s": 314.5,
+"decode_tok_s": 97.9,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.42,
+"wall_s": 7.916,
+"attractor": false,
+"empty": false,
+"runaway": true,
+"ans_preview": "The origin of **Flagstaff, Arizona's** name dates back to the early days of the **Transcon",
+"assistant_content": "The origin of **Flagstaff, Arizona's** name dates back to the early days of the **Transcontinental Railroad** construction in **1870**.\n\nHere\u2019s how it happened:\n- In April 1870, **William J. Jackson**, a Union Pacific Railroad surveyor, erected a wooden pole topped with a red-and-white striped flag at his camp along the Little Colorado River. This flagpole was used to mark the route for incoming train workers and travelers, effectively serving as a navigation aid in the vast, featureless desert landscape.\n- Initially, the settlement was known by other names during its brief history as a railroad stop (including \u201cCamp Green\u201d and \u201cTown of Buttes\u201d), but after Jackson\u2019s flagpole became a recognizable landmark, locals began referring to the site as **\u201cFlagstaff.\u201d**\n- In **1876**, the town officially adopted the name **Flagstaff**, and it was incorporated as a city in **1886**.\n\nInterestingly, Flagstaff is also famously located at the base of the **San Francisco Peaks**, which rise dramatically nearby and have influenced the area\u2019s ecology, climate, and cultural history\u2014but the *city\u2019s name itself* comes directly from that original railroad surveyor"
+}
+]

@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 736,
+"finish": "stop",
+"think_words": 333,
+"ans_words": 159,
+"prefill_ms": 69.9,
+"prefill_tok_s": 315.0,
+"decode_tok_s": 97.0,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.424,
+"wall_s": 7.662,
+"attractor": false,
+"empty": false,
+"runaway": false,
+"ans_preview": "The name **Flagstaff, Arizona** originates from a physical landmark known as a **flagstaff",
+"assistant_content": "The name **Flagstaff, Arizona** originates from a physical landmark known as a **flagstaff** (a tall pole used to fly flags as visual signals). \n\nHere's how it developed:\n- The early settlement was initially called **\"Pine Creek\"** when established by Mormon pioneers in the mid-1860s.\n- As the area became a stopover for stagecoaches and wagons traveling along the overland route between Prescott and San Francisco (the Old Overland Mail Route), settlers erected a tall wooden pole near the pass to fly flags that helped guide travelers and signal conditions ahead.\n- Because of this prominent landmark, the area gradually became known as **\"Flagstaff Point.\"**\n- When the **Atlantic and Pacific Railroad** extended into northern Arizona in 1876, the town was officially renamed **Flagstaff**, and the name stuck.\n\nThe original flagstaff itself was eventually replaced by modern steel poles, but the historic landmark remains a recognizable part of the city's heritage, with several commemorative flagpoles along Route 66 and downtown."
+}
+]

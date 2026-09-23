@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 768,
+"finish": "length",
+"think_words": 321,
+"ans_words": 171,
+"prefill_ms": 69.1,
+"prefill_tok_s": 318.6,
+"decode_tok_s": 97.1,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.423,
+"wall_s": 7.984,
+"attractor": false,
+"empty": false,
+"runaway": true,
+"ans_preview": "The city of Flagstaff, Arizona, gets its name from a physical **flagpole** (originally spe",
+"assistant_content": "The city of Flagstaff, Arizona, gets its name from a physical **flagpole** (originally spelled as two words: \"Flag Staff\") that served as a landmark for early explorers and surveys. Here's the precise origin:\n\n\ud83d\udccd **Key Details:**\n- In **February 1853**, members of the U.S. Pacific Railroad Survey, led by Lieutenant Ammon B. Beers under Lt. Edward Fitzgerald Beale, established a winter camp in the area.\n- To signal their location to other survey teams traveling up and down what is now the Mogollon Rim and nearby routes, they felled a tall pine tree near a spring (now known as Historic Downtown Flagstaff) and erected it vertically as a makeshift flagpole, topping it with a large canvas or fabric \"flag.\"\n- This improvised **flag staff** became a well-known reference point on maps and journals, eventually being called the \"Flag Staff\" post.\n\n\ud83c\udfd9\ufe0f **From Landmark to City:**\n- The name stuck through official land patents and mail routes in the 1860s\u20131870s.\n- When the first post office was established in 1875, it was"
+}
+]

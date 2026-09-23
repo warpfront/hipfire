@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 712,
+"finish": "stop",
+"think_words": 367,
+"ans_words": 143,
+"prefill_ms": 69.5,
+"prefill_tok_s": 316.6,
+"decode_tok_s": 107.2,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.403,
+"wall_s": 6.719,
+"attractor": false,
+"empty": false,
+"runaway": false,
+"ans_preview": "The name **Flagstaff** originates from the late-19th-century **transcontinental telegraph ",
+"assistant_content": "The name **Flagstaff** originates from the late-19th-century **transcontinental telegraph system**. \n\nIn 1876, U.S. government surveyors and telegraph crews established observation and relay stations along the new telegraph route in what is now northern Arizona. At their vantage point near the summit of **San Francisco Mountain**, workers used large, high-visibility flags hoisted on tall poles to send visual signals between stations, confirming message transmissions and synchronizing timing across long distances. Early observers reported seeing these markers from afar, referring to the location as **\"flag staff\"** (a pole or structure bearing flags). Over time, the phrase was contracted into the single word **Flagstaff**, and the settlement that grew around the telegraph site officially adopted it as its name when it was established in 1876. The area later became a major stop for the Atlantic & Pacific Railroad and eventually incorporated as a city in 1881."
+}
+]

@@ -354,6 +354,19 @@ def validate_route_proof(
     }
 
 
+def require_retained_pm4(row):
+    proof = validate_route_proof([row], "auto", "pm4")
+    if proof["valid"]:
+        return
+    route = row.get("redline_route") or {}
+    fallback = route.get("fallback_reason")
+    detail = f": {fallback}" if fallback else ""
+    raise RuntimeError(
+        "Redline PM4 did not engage on the first automatic decode row"
+        f"{detail}; route proof: {'; '.join(proof['errors'])}"
+    )
+
+
 class Daemon:
     def __init__(
         self,
@@ -459,8 +472,18 @@ def run_arm(args, backend):
             "iterations": args.iterations,
             "redline_product_route": True,
         }
+        pm4_checked = False
+
+        def request_decode(payload):
+            nonlocal pm4_checked
+            row = daemon.request(payload)
+            if backend == "auto" and args.transport == "pm4" and not pm4_checked:
+                require_retained_pm4(row)
+                pm4_checked = True
+            return row
+
         warmup_started = time.monotonic()
-        warmups = [daemon.request(warmup_request) for _ in range(args.warmups)]
+        warmups = [request_decode(warmup_request) for _ in range(args.warmups)]
         warmup_seconds = time.monotonic() - warmup_started
         if warmups:
             print(
@@ -472,7 +495,7 @@ def run_arm(args, backend):
         settling_rows = []
         settlement = None
         for _ in range(args.settle_max_runs):
-            settling_rows.append(daemon.request(request))
+            settling_rows.append(request_decode(request))
             settlement = analyze_stationarity(
                 [row["tok_s"] for row in settling_rows],
                 **stationarity_kwargs(args),
@@ -495,7 +518,7 @@ def run_arm(args, backend):
             flush=True,
         )
 
-        rows = [daemon.request(request) for _ in range(args.runs)]
+        rows = [request_decode(request) for _ in range(args.runs)]
         values = [row["tok_s"] for row in rows]
         measurement_validation = validate_measurement(values, settlement, args)
         print(
