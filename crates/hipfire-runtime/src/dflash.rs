@@ -209,6 +209,20 @@ fn hfq_weight(hfq: &HfqFile, gpu: &mut Gpu, name: &str, m: usize, k: usize) -> H
             //
             // HIPFIRE_DRAFT_F16=0 falls back to the legacy F16→F32 lift for
             // A/B comparison.
+            //
+            // gfx1151 τ-parity finding (Track C, 2026-06-02): the F16-WMMA vs
+            // F32-lift draft path is NUMERICALLY IRRELEVANT to acceptance.
+            // On gfx1151 (Strix Halo, RDNA3.5) the 27B-3.5 LRU DFlash bench
+            // measured τ=8.786 under BOTH HIPFIRE_DRAFT_F16=1 (F16 WMMA) and
+            // HIPFIRE_DRAFT_F16=0 (F32 lift) — byte-identical. The mw16 WMMA
+            // kernel accumulates in FP32 (gemm_mw16_residual_wmma.hip), and
+            // the FP16 rounding of draft activations does not move the greedy
+            // argmax that drives acceptance. The exp-#10 "τ=2.72 silicon
+            // alignment gap" was NOT a draft-GEMM precision problem — it was a
+            // ChatML-on-code-prompt config artifact (ChatML wrapping collapses
+            // τ on code prompts; --no-chatml restores τ=8.79 on gfx1151, at
+            // parity with gfx1100 τ=8.92). Keep F16 default for the 3-5× draft
+            // speedup; it costs zero τ.
             let use_f16 = crate::config::get().draft_f16;
             if use_f16 {
                 assert_eq!(data.len(), m * k * 2, "dflash {name} F16 byte-size mismatch");

@@ -820,6 +820,16 @@ fn main() {
             chat.extend_from_slice(&nl);
             prompt_tokens = chat;
             eprintln!("chatml wrapping enabled: prompt is {} tokens after wrap", prompt_tokens.len());
+            // Track-C gfx1151 finding (2026-06-02): ChatML wrapping COLLAPSES
+            // DFlash τ on code prompts. 27B-3.5 LRU on gfx1151 measured τ=3.36
+            // / 34.7 tok/s WITH ChatML vs τ=8.79 / 74.4 tok/s WITHOUT (--no-chatml,
+            // the CLAUDE.md canonical code-DFlash config). The instruction
+            // template steers the target into thinking/markdown scaffolding the
+            // draft predicts poorly, halving acceptance. This artifact is what
+            // exp #10 mis-read as a gfx1151 "silicon alignment gap" (the real
+            // gfx1100 canonical also uses --no-chatml). For code / completion
+            // benches, run with --no-chatml.
+            eprintln!("[track-c advisory] ChatML is ON: on code/completion prompts                 this roughly HALVES DFlash τ vs --no-chatml (gfx1151 27B-3.5 LRU:                 τ 3.36→8.79, 34.7→74.4 tok/s). Use --no-chatml for code-DFlash benches.");
         }
         if prompt_normalized.len() < 2000 {
             eprintln!("prompt: {:?}", prompt_normalized);
