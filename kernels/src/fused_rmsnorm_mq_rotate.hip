@@ -1,62 +1,11 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 Kaden Schutt
-// hipfire — see LICENSE and NOTICE in the project root.
+// hipfire - see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
 
-// Fused RMSNorm + FWHT rotation for MagnumQuant inputs.
-// Replaces the rmsnorm_f32 + mq_rotate_x kernel pair with a single launch.
-//
-// Layout:
-// - 1 workgroup of 256 threads = 8 waves of 32 threads *per batch element*.
-// - Grid.x is the batch dimension — grid=[1,1,1] for decode, grid=[N,1,1]
-//   for batched prefill. Each block picks row blockIdx.x out of the [N × K]
-//   x and x_rot tensors. LDS is per-block, so batches don't interfere.
-// - The whole K-length input vector is processed within that workgroup.
-// - LDS holds `x_shared[K] + reduce[256]` (K<=12288 fits in 64 KB).
-//
-// Phase 1 — RMSNorm pre-pass:
-//   Each thread strides through x, caching values into x_shared[] and
-//   accumulating local sum-of-squares. A block reduction in `reduce[]` gives
-//   the global sum; rsqrt gives rms. Each thread then multiplies its cached
-//   values by weight[i] * rms in place inside x_shared[].
-//
-// Phase 2 — FWHT rotation per 256-element group:
-//   Each of the 8 waves handles `groups_per_warp` groups serially. Within a
-//   wave, lane_id selects 8 elements per group, multiplied by signs1, then
-//   the local 3-stage butterfly (strides 1/2/4) plus the wave-level
-//   ds_swizzle butterfly (strides 1-16). Result scaled by 1/16 and signs2,
-//   then written to x_rot[].
-//
-// Correctness vs the split version:
-//   Byte-exact for normalization + rotation modulo float reordering (the
-//   reduction order for sum-of-squares is identical to rmsnorm_f32, and the
-//   butterfly order matches mq_rotate_x exactly).
-//
-// R2c2: direct-normalize into the FWHT registers. The baseline caches raw x
-// in LDS, writes normalized x back to the same LDS slab, then reads it again
-// for rotation. For decode this kernel is latency/working-set dominated, so
-// this variant keeps only the reduction buffer in LDS and reloads x+weight
-// directly when each FWHT group is formed. That removes the normalized-x LDS
-// write pass, the Phase 1c barrier, and the Phase 2 LDS reads while preserving
-// the exact multiplication order: ((x * weight) * rms) * sign.
-//
-// R3c2_rms_warptail: keep the R2c2 dataflow, then replace only the final
-// intra-warp half of the reduction tree with shuffles. The s=128,64,32
-// shared-memory reductions and their barriers are preserved; lane 0 then
-// performs the same s=16,8,4,2,1 add tree via __shfl_down and publishes
-// reduce[0]. This cuts four block-wide barriers without changing the lane-0
-// reduction order that determines rms.
-//
-// R12c1_rms_s2early_vstore: keep the R9 signs2-early load placement, then
-// write the eight contiguous rotated outputs as two float4 stores. Arithmetic
-// order is unchanged; only the final store access pattern changes.
-//
-// R17c2_rms_one_rsqrt: reduce[0] is uniform, so only lane 0 computes the
-// rsqrt and publishes the rms scalar. All lanes then consume the identical
-// value from LDS instead of issuing the same special-function op 256 times.
-//
-// R5c3_rms_s2f4: extend that vectorization to the final signs2 stream.
+// gfx1151 experiment: combine the no-xshared rotation path with a warp-first
+// sum-of-squares reduction to reduce block-wide barrier count.
 
 __launch_bounds__(256, 1)
 extern "C" __global__ void fused_rmsnorm_mq_rotate(
@@ -69,52 +18,44 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
     float eps
 ) {
     extern __shared__ float smem[];
-    float* reduce = smem;              // [256]
+    float* reduce = smem;              // [8] warp sums are enough here.
 
     const int tid = threadIdx.x;
-    const int block_size = blockDim.x; // 256
+    const int block_size = blockDim.x;
     const int lane_id = tid & 31;
-    const int warp_id = tid >> 5;      // 0..7
+    const int warp_id = tid >> 5;
     const int num_warps = block_size >> 5;
 
-    // Batch row: this block processes x[blockIdx.x * K .. (blockIdx.x+1) * K].
-    // For decode (grid.x == 1), offset is 0 and the behaviour is identical
-    // to the pre-batching version. weight/signs1/signs2 are shared across
-    // the batch (same per-feature scalars for every token).
     const long long batch_off = (long long)blockIdx.x * K;
-    const float* x_b     = x     + batch_off;
-          float* x_rot_b = x_rot + batch_off;
+    const float* x_b = x + batch_off;
+    float* x_rot_b = x_rot + batch_off;
 
-    // Phase 1a: gather → cache to LDS and accumulate sum-of-squares.
     float local_sum = 0.0f;
-    for (int i = tid; i < K; i += block_size) {
+    int i = tid;
+    for (; i + block_size < K; i += block_size * 2) {
+        float v0 = x_b[i];
+        float v1 = x_b[i + block_size];
+        local_sum += v0 * v0;
+        local_sum += v1 * v1;
+    }
+    if (i < K) {
         float v = x_b[i];
         local_sum += v * v;
     }
-    reduce[tid] = local_sum;
+    for (int off = 16; off > 0; off >>= 1)
+        local_sum += __shfl_down(local_sum, off);
+    if (lane_id == 0) reduce[warp_id] = local_sum;
     __syncthreads();
 
-    // Phase 1b: block reduction -> RMS. Keep the cross-warp tree in LDS,
-    // then finish the warp-local tail with shuffles in the same add order.
-    for (int s = block_size >> 1; s >= 32; s >>= 1) {
-        if (tid < s) reduce[tid] += reduce[tid + s];
-        __syncthreads();
-    }
-    if (tid < 32) {
-        float warp_sum = reduce[tid];
-        warp_sum += __shfl_down(warp_sum, 16);
-        warp_sum += __shfl_down(warp_sum, 8);
-        warp_sum += __shfl_down(warp_sum, 4);
-        warp_sum += __shfl_down(warp_sum, 2);
-        warp_sum += __shfl_down(warp_sum, 1);
-        if (tid == 0) reduce[0] = rsqrtf(warp_sum / (float)K + eps);
+    float block_sum = (tid < num_warps) ? reduce[tid] : 0.0f;
+    if (warp_id == 0) {
+        for (int off = 16; off > 0; off >>= 1)
+            block_sum += __shfl_down(block_sum, off);
+        if (tid == 0) reduce[0] = block_sum;
     }
     __syncthreads();
-    const float rms = reduce[0];
+    const float rms = rsqrtf(reduce[0] / (float)K + eps);
 
-    // Phase 2: FWHT per group, 256 elements at a time. Each wave owns
-    // `groups_per_warp` groups and processes them serially. Register usage per
-    // thread: 8 floats for v0..v7 + a handful of scalars, well under budget.
     const int groups_total = K / 256;
     const int groups_per_warp = (groups_total + num_warps - 1) / num_warps;
     const int warp_group_start = warp_id * groups_per_warp;
@@ -126,25 +67,15 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
         const int d0 = lane_id * 8;
         const int base = group * 256 + d0;
 
-        const float4 x0 = *reinterpret_cast<const float4*>(x_b + base);
-        const float4 x1 = *reinterpret_cast<const float4*>(x_b + base + 4);
-        const float4 w0 = *reinterpret_cast<const float4*>(weight + base);
-        const float4 w1 = *reinterpret_cast<const float4*>(weight + base + 4);
-        const float4 s10 = *reinterpret_cast<const float4*>(signs1 + d0);
-        const float4 s11 = *reinterpret_cast<const float4*>(signs1 + d0 + 4);
-        const float4 s20 = *reinterpret_cast<const float4*>(signs2 + d0);
-        const float4 s21 = *reinterpret_cast<const float4*>(signs2 + d0 + 4);
+        float v0 = (x_b[base]     * weight[base]     * rms) * signs1[d0];
+        float v1 = (x_b[base + 1] * weight[base + 1] * rms) * signs1[d0 + 1];
+        float v2 = (x_b[base + 2] * weight[base + 2] * rms) * signs1[d0 + 2];
+        float v3 = (x_b[base + 3] * weight[base + 3] * rms) * signs1[d0 + 3];
+        float v4 = (x_b[base + 4] * weight[base + 4] * rms) * signs1[d0 + 4];
+        float v5 = (x_b[base + 5] * weight[base + 5] * rms) * signs1[d0 + 5];
+        float v6 = (x_b[base + 6] * weight[base + 6] * rms) * signs1[d0 + 6];
+        float v7 = (x_b[base + 7] * weight[base + 7] * rms) * signs1[d0 + 7];
 
-        float v0 = x0.x * w0.x * rms * s10.x;
-        float v1 = x0.y * w0.y * rms * s10.y;
-        float v2 = x0.z * w0.z * rms * s10.z;
-        float v3 = x0.w * w0.w * rms * s10.w;
-        float v4 = x1.x * w1.x * rms * s11.x;
-        float v5 = x1.y * w1.y * rms * s11.y;
-        float v6 = x1.z * w1.z * rms * s11.z;
-        float v7 = x1.w * w1.w * rms * s11.w;
-
-        // Local butterfly: strides 1, 2, 4 (within each thread's 8 registers).
         float t;
         t = v0; v0 = v0 + v1; v1 = t - v1;
         t = v2; v2 = v2 + v3; v3 = t - v3;
@@ -161,10 +92,6 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
         t = v2; v2 = v2 + v6; v6 = t - v6;
         t = v3; v3 = v3 + v7; v7 = t - v7;
 
-        // Wave butterfly via ds_swizzle. ds_swizzle is wave-local, so each of
-        // the 8 warps applies its own butterfly independently within its 32
-        // lanes. `lane_id & (str)` selects which side of the butterfly each
-        // thread writes.
         #define HBFLY(v, pat, str) do { \
             float _p = __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), (pat))); \
             if (lane_id & (str)) { (v) = _p - (v); } else { (v) = (v) + _p; } \
@@ -182,17 +109,13 @@ extern "C" __global__ void fused_rmsnorm_mq_rotate(
         #undef HBFLY
 
         const float s = 0.0625f;
-        float4 out0;
-        float4 out1;
-        out0.x = v0 * s * s20.x;
-        out0.y = v1 * s * s20.y;
-        out0.z = v2 * s * s20.z;
-        out0.w = v3 * s * s20.w;
-        out1.x = v4 * s * s21.x;
-        out1.y = v5 * s * s21.y;
-        out1.z = v6 * s * s21.z;
-        out1.w = v7 * s * s21.w;
-        *reinterpret_cast<float4*>(x_rot_b + base) = out0;
-        *reinterpret_cast<float4*>(x_rot_b + base + 4) = out1;
+        x_rot_b[base]     = v0 * s * signs2[d0];
+        x_rot_b[base + 1] = v1 * s * signs2[d0 + 1];
+        x_rot_b[base + 2] = v2 * s * signs2[d0 + 2];
+        x_rot_b[base + 3] = v3 * s * signs2[d0 + 3];
+        x_rot_b[base + 4] = v4 * s * signs2[d0 + 4];
+        x_rot_b[base + 5] = v5 * s * signs2[d0 + 5];
+        x_rot_b[base + 6] = v6 * s * signs2[d0 + 6];
+        x_rot_b[base + 7] = v7 * s * signs2[d0 + 7];
     }
 }

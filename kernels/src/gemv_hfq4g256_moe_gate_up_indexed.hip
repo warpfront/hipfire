@@ -26,9 +26,8 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
     float* __restrict__ y_up,                            // [K_TOP × MI]
     int M, int K
 ) {
-    const int mi = M >> 1;
     const int row = blockIdx.x;
-    if (row >= mi) return;
+    if (row >= M) return;
     const int krank = blockIdx.y;
     const int tid = threadIdx.x;
 
@@ -38,128 +37,102 @@ extern "C" __global__ void gemv_hfq4g256_moe_gate_up_k8_indexed(
         reinterpret_cast<const char*>(expert_ptrs[expert_id]);
 
     const int groups_per_row = K / 256;
-    const char* gate_ptr = A + (long long)row * groups_per_row * 136;
-    const char* up_ptr = A + (long long)(row + mi) * groups_per_row * 136;
+    const char* row_ptr = A + (long long)row * groups_per_row * 136;
     const int boff = tid * 4;
 
-    float gacc0 = 0.0f, gacc1 = 0.0f, gacc2 = 0.0f, gacc3 = 0.0f;
-    float uacc0 = 0.0f, uacc1 = 0.0f, uacc2 = 0.0f, uacc3 = 0.0f;
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
     const int quads = groups_per_row >> 2;
     const int tail = groups_per_row & 3;
 
-    #define LOAD_X8(b) \
-        const float x0 = x[(b) + 0]; \
-        const float x1 = x[(b) + 1]; \
-        const float x2 = x[(b) + 2]; \
-        const float x3 = x[(b) + 3]; \
-        const float x4 = x[(b) + 4]; \
-        const float x5 = x[(b) + 5]; \
-        const float x6 = x[(b) + 6]; \
-        const float x7 = x[(b) + 7]; \
-        const float xs = ((x0 + x1) + (x2 + x3)) + ((x4 + x5) + (x6 + x7))
-
-    #define DOG_X8(gp, a) do { \
-        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp)); \
-        float zp = __builtin_bit_cast(float, *(const unsigned int*)((gp) + 4)); \
-        unsigned int pk = *(const unsigned int*)((gp) + 8 + boff); \
-        const float dot = (float)((pk) & 0xFu) * x0 \
-             + (float)(((pk) >> 4) & 0xFu) * x1 \
-             + (float)(((pk) >> 8) & 0xFu) * x2 \
-             + (float)(((pk) >> 12) & 0xFu) * x3 \
-             + (float)(((pk) >> 16) & 0xFu) * x4 \
-             + (float)(((pk) >> 20) & 0xFu) * x5 \
-             + (float)(((pk) >> 24) & 0xFu) * x6 \
-             + (float)(((pk) >> 28) & 0xFu) * x7; \
-        (a) += sc * dot + zp * xs; \
-    } while (0)
-
-    #define DOG_PAIR_X8(gp_g, gp_u, ga, ua) do { \
-        const float gsc = __builtin_bit_cast(float, *(const unsigned int*)(gp_g)); \
-        const float gzp = __builtin_bit_cast(float, *(const unsigned int*)((gp_g) + 4)); \
-        const unsigned int gpk = *(const unsigned int*)((gp_g) + 8 + boff); \
-        const float usc = __builtin_bit_cast(float, *(const unsigned int*)(gp_u)); \
-        const float uzp = __builtin_bit_cast(float, *(const unsigned int*)((gp_u) + 4)); \
-        const unsigned int upk = *(const unsigned int*)((gp_u) + 8 + boff); \
-        float gdot = (float)(gpk & 0xFu) * x0; \
-        float udot = (float)(upk & 0xFu) * x0; \
-        gdot += (float)((gpk >> 4) & 0xFu) * x1; \
-        udot += (float)((upk >> 4) & 0xFu) * x1; \
-        gdot += (float)((gpk >> 8) & 0xFu) * x2; \
-        udot += (float)((upk >> 8) & 0xFu) * x2; \
-        gdot += (float)((gpk >> 12) & 0xFu) * x3; \
-        udot += (float)((upk >> 12) & 0xFu) * x3; \
-        gdot += (float)((gpk >> 16) & 0xFu) * x4; \
-        udot += (float)((upk >> 16) & 0xFu) * x4; \
-        gdot += (float)((gpk >> 20) & 0xFu) * x5; \
-        udot += (float)((upk >> 20) & 0xFu) * x5; \
-        gdot += (float)((gpk >> 24) & 0xFu) * x6; \
-        udot += (float)((upk >> 24) & 0xFu) * x6; \
-        gdot += (float)((gpk >> 28) & 0xFu) * x7; \
-        udot += (float)((upk >> 28) & 0xFu) * x7; \
-        (ga) += gsc * gdot + gzp * xs; \
-        (ua) += usc * udot + uzp * xs; \
-    } while (0)
-
-    #pragma clang loop unroll(disable)
     for (int q = 0; q < quads; q++) {
         const int g = q << 2;
-        const int base0 = g * 256 + tid * 8;
+        const char* gp0 = row_ptr + g * 136;
+        const char* gp1 = gp0 + 136;
+        const char* gp2 = gp1 + 136;
+        const char* gp3 = gp2 + 136;
 
-        {
-            LOAD_X8(base0);
-            DOG_PAIR_X8(gate_ptr + g * 136, up_ptr + g * 136, gacc0, uacc0);
-        }
-        {
-            LOAD_X8(base0 + 256);
-            DOG_PAIR_X8(gate_ptr + (g + 1) * 136, up_ptr + (g + 1) * 136, gacc1, uacc1);
-        }
-        {
-            LOAD_X8(base0 + 512);
-            DOG_PAIR_X8(gate_ptr + (g + 2) * 136, up_ptr + (g + 2) * 136, gacc2, uacc2);
-        }
-        {
-            LOAD_X8(base0 + 768);
-            DOG_PAIR_X8(gate_ptr + (g + 3) * 136, up_ptr + (g + 3) * 136, gacc3, uacc3);
-        }
+        float sc0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0));
+        float zp0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0 + 4));
+        float sc1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1));
+        float zp1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1 + 4));
+        float sc2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2));
+        float zp2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2 + 4));
+        float sc3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3));
+        float zp3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3 + 4));
+
+        unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
+        unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
+        unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
+        unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
+
+        int base = g * 256 + tid * 8;
+
+        #define DOG(pk, sc, zp, b, a) \
+            (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
+                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+
+        DOG(pk0, sc0, zp0, base, acc0);
+        DOG(pk1, sc1, zp1, base + 256, acc1);
+        DOG(pk2, sc2, zp2, base + 512, acc2);
+        DOG(pk3, sc3, zp3, base + 768, acc3);
+        #undef DOG
     }
+
+    #define TAIL_DOG(pk, sc, zp, b, a) \
+        (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
 
     if (tail >= 1) {
         const int g = quads << 2;
+        const char* gp = row_ptr + g * 136;
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
         int base = g * 256 + tid * 8;
-        LOAD_X8(base);
-        DOG_PAIR_X8(gate_ptr + g * 136, up_ptr + g * 136, gacc0, uacc0);
+        TAIL_DOG(pk, sc, zp, base, acc0);
     }
     if (tail >= 2) {
         const int g = (quads << 2) + 1;
+        const char* gp = row_ptr + g * 136;
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
         int base = g * 256 + tid * 8;
-        LOAD_X8(base);
-        DOG_PAIR_X8(gate_ptr + g * 136, up_ptr + g * 136, gacc1, uacc1);
+        TAIL_DOG(pk, sc, zp, base, acc1);
     }
     if (tail >= 3) {
         const int g = (quads << 2) + 2;
+        const char* gp = row_ptr + g * 136;
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
         int base = g * 256 + tid * 8;
-        LOAD_X8(base);
-        DOG_PAIR_X8(gate_ptr + g * 136, up_ptr + g * 136, gacc2, uacc2);
+        TAIL_DOG(pk, sc, zp, base, acc2);
     }
-    #undef DOG_PAIR_X8
-    #undef DOG_X8
-    #undef LOAD_X8
+    #undef TAIL_DOG
 
-    float gacc = (gacc0 + gacc1) + (gacc2 + gacc3);
-    float uacc = (uacc0 + uacc1) + (uacc2 + uacc3);
-    gacc += __shfl_down(gacc, 16);
-    uacc += __shfl_down(uacc, 16);
-    gacc += __shfl_down(gacc, 8);
-    uacc += __shfl_down(uacc, 8);
-    gacc += __shfl_down(gacc, 4);
-    uacc += __shfl_down(uacc, 4);
-    gacc += __shfl_down(gacc, 2);
-    uacc += __shfl_down(uacc, 2);
-    gacc += __shfl_down(gacc, 1);
-    uacc += __shfl_down(uacc, 1);
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
 
     if (tid == 0) {
-        y_gate[krank * mi + row] = gacc;
-        y_up[krank * mi + row] = uacc;
+        const int mi = M >> 1;
+        if (row < mi) {
+            y_gate[krank * mi + row] = acc;
+        } else {
+            y_up[krank * mi + (row - mi)] = acc;
+        }
     }
 }

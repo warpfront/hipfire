@@ -81,7 +81,6 @@ __global__ void attention_flash_q8_0_tile(
         q_lds[d_base + 2] = q_head[d_base + 2];
         q_lds[d_base + 3] = q_head[d_base + 3];
     }
-    __syncthreads();
 
     // ═══ Phase A: compute tile_len dot products (wave-cooperative) ═══
     // Each thread handles 4 of 128 elements per half, accumulates across
@@ -90,100 +89,37 @@ __global__ void attention_flash_q8_0_tile(
     // half*4 + bi_k.
     const int k_off = (tid % 8) * 4;
 
-    int valid_start = win_lo - tile_start;
-    if (valid_start < 0) valid_start = 0;
-    if (valid_start > tile_len) valid_start = tile_len;
-    for (int t_local = 0; t_local < valid_start; t_local++) {
-        if (tid == 0) scores[t_local] = -INFINITY;
+    #define SCORE_ONE(tl) do { \
+        int t = tile_start + (tl); \
+        if (t < win_lo) { \
+            if (tid == 0) scores[(tl)] = -INFINITY; \
+        } else { \
+            float partial = 0.0f; \
+            for (int half = 0; half < n_halves; half++) { \
+                const int k_bi = half * 4 + tid / 8; \
+                const int k_blk_off = (kv_head_block_start + k_bi) * 34; \
+                const unsigned char* kb = k_cache + (size_t)t * row_stride + k_blk_off; \
+                float ks = (float)*((const _Float16*)kb); \
+                const float* qb_thread = q_lds + k_bi * 32 + k_off; \
+                partial += qb_thread[0] * (ks * (float)((signed char)kb[2 + k_off + 0])) \
+                         + qb_thread[1] * (ks * (float)((signed char)kb[2 + k_off + 1])) \
+                         + qb_thread[2] * (ks * (float)((signed char)kb[2 + k_off + 2])) \
+                         + qb_thread[3] * (ks * (float)((signed char)kb[2 + k_off + 3])); \
+            } \
+            for (int off = 16; off > 0; off >>= 1) \
+                partial += __shfl_xor(partial, off); \
+            if (tid == 0) \
+                scores[(tl)] = partial * scale_attn; \
+        } \
+    } while (0)
+    int score_i = 0;
+    for (; score_i + 1 < tile_len; score_i += 2) {
+        SCORE_ONE(score_i + 0);
+        SCORE_ONE(score_i + 1);
     }
-
-    int t_local = valid_start;
-    for (; t_local + 3 < tile_len; t_local += 4) {
-        const int t0 = tile_start + t_local + 0;
-        const int t1 = tile_start + t_local + 1;
-        const int t2 = tile_start + t_local + 2;
-        const int t3 = tile_start + t_local + 3;
-        float partial0 = 0.0f;
-        float partial1 = 0.0f;
-        float partial2 = 0.0f;
-        float partial3 = 0.0f;
-        for (int half = 0; half < n_halves; half++) {
-            const int k_bi = half * 4 + tid / 8;
-            const int k_blk_off = (kv_head_block_start + k_bi) * 34;
-            const unsigned char* kb0 = k_cache + (size_t)t0 * row_stride + k_blk_off;
-            const unsigned char* kb1 = k_cache + (size_t)t1 * row_stride + k_blk_off;
-            const unsigned char* kb2 = k_cache + (size_t)t2 * row_stride + k_blk_off;
-            const unsigned char* kb3 = k_cache + (size_t)t3 * row_stride + k_blk_off;
-            float ks0 = (float)*((const _Float16*)kb0);
-            float ks1 = (float)*((const _Float16*)kb1);
-            float ks2 = (float)*((const _Float16*)kb2);
-            float ks3 = (float)*((const _Float16*)kb3);
-            const signed char k00 = (signed char)kb0[2 + k_off + 0];
-            const signed char k01 = (signed char)kb0[2 + k_off + 1];
-            const signed char k02 = (signed char)kb0[2 + k_off + 2];
-            const signed char k03 = (signed char)kb0[2 + k_off + 3];
-            const signed char k10 = (signed char)kb1[2 + k_off + 0];
-            const signed char k11 = (signed char)kb1[2 + k_off + 1];
-            const signed char k12 = (signed char)kb1[2 + k_off + 2];
-            const signed char k13 = (signed char)kb1[2 + k_off + 3];
-            const signed char k20 = (signed char)kb2[2 + k_off + 0];
-            const signed char k21 = (signed char)kb2[2 + k_off + 1];
-            const signed char k22 = (signed char)kb2[2 + k_off + 2];
-            const signed char k23 = (signed char)kb2[2 + k_off + 3];
-            const signed char k30 = (signed char)kb3[2 + k_off + 0];
-            const signed char k31 = (signed char)kb3[2 + k_off + 1];
-            const signed char k32 = (signed char)kb3[2 + k_off + 2];
-            const signed char k33 = (signed char)kb3[2 + k_off + 3];
-            const float* qb_thread = q_lds + k_bi * 32 + k_off;
-            partial0 += qb_thread[0] * (ks0 * (float)k00)
-                      + qb_thread[1] * (ks0 * (float)k01)
-                      + qb_thread[2] * (ks0 * (float)k02)
-                      + qb_thread[3] * (ks0 * (float)k03);
-            partial1 += qb_thread[0] * (ks1 * (float)k10)
-                      + qb_thread[1] * (ks1 * (float)k11)
-                      + qb_thread[2] * (ks1 * (float)k12)
-                      + qb_thread[3] * (ks1 * (float)k13);
-            partial2 += qb_thread[0] * (ks2 * (float)k20)
-                      + qb_thread[1] * (ks2 * (float)k21)
-                      + qb_thread[2] * (ks2 * (float)k22)
-                      + qb_thread[3] * (ks2 * (float)k23);
-            partial3 += qb_thread[0] * (ks3 * (float)k30)
-                      + qb_thread[1] * (ks3 * (float)k31)
-                      + qb_thread[2] * (ks3 * (float)k32)
-                      + qb_thread[3] * (ks3 * (float)k33);
-        }
-        for (int off = 16; off > 0; off >>= 1) {
-            partial0 += __shfl_xor(partial0, off);
-            partial1 += __shfl_xor(partial1, off);
-            partial2 += __shfl_xor(partial2, off);
-            partial3 += __shfl_xor(partial3, off);
-        }
-        if (tid == 0) {
-            scores[t_local + 0] = partial0 * scale_attn;
-            scores[t_local + 1] = partial1 * scale_attn;
-            scores[t_local + 2] = partial2 * scale_attn;
-            scores[t_local + 3] = partial3 * scale_attn;
-        }
-    }
-    for (; t_local < tile_len; t_local++) {
-        int t = tile_start + t_local;
-        float partial = 0.0f;
-        for (int half = 0; half < n_halves; half++) {
-            const int k_bi = half * 4 + tid / 8;
-            const int k_blk_off = (kv_head_block_start + k_bi) * 34;
-            const unsigned char* kb = k_cache + (size_t)t * row_stride + k_blk_off;
-            float ks = (float)*((const _Float16*)kb);
-            const float* qb_thread = q_lds + k_bi * 32 + k_off;
-            partial += qb_thread[0] * (ks * (float)((signed char)kb[2 + k_off + 0]))
-                     + qb_thread[1] * (ks * (float)((signed char)kb[2 + k_off + 1]))
-                     + qb_thread[2] * (ks * (float)((signed char)kb[2 + k_off + 2]))
-                     + qb_thread[3] * (ks * (float)((signed char)kb[2 + k_off + 3]));
-        }
-        for (int off = 16; off > 0; off >>= 1)
-            partial += __shfl_xor(partial, off);
-        if (tid == 0)
-            scores[t_local] = partial * scale_attn;
-    }
+    for (; score_i < tile_len; score_i++)
+        SCORE_ONE(score_i);
+    #undef SCORE_ONE
     __syncthreads();
 
     // ═══ Phase B: find tile max ═══
@@ -255,9 +191,8 @@ __global__ void attention_flash_q8_0_tile(
             ACCUM_V(t_local + 6);
             ACCUM_V(t_local + 7);
         }
-        for (; t_local < tile_len; t_local++) {
+        for (; t_local < tile_len; t_local++)
             ACCUM_V(t_local);
-        }
         #undef ACCUM_V
         p[2 + d_base + 0] = out0;
         p[2 + d_base + 1] = out1;
