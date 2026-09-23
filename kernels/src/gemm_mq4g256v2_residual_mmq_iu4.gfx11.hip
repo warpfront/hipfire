@@ -1092,6 +1092,51 @@ static __device__ __forceinline__ void gemm_iu4_body_lf16_symfold(
     int* tile_y = smem;
     int* tile_x = tile_y + IU4_MMQ_X * IU4_TILE_Y_K;
     float sum[IU4_LF16_SUMS] = {0.0f};
+#if defined(IU4_STAGE_X5)
+    // Only full N128 tiles take this route. The 72-byte block stride then
+    // makes every packet base 16-byte aligned.
+    int4 pending_packet;
+    int pending_extra = 0;
+    if (groups_per_row > 0) {
+        const int p_tid = threadIdx.y * 32 + threadIdx.x;
+        const int* p_x = (const int*)(Xq + col0);
+        pending_packet = *reinterpret_cast<const int4*>(p_x + 4 * p_tid);
+        if (p_tid < 256) pending_extra = p_x[2048 + p_tid];
+    }
+    for (int kb = 0; kb < groups_per_row; ++kb) {
+        load_iu4_tile_lf16_symfold(
+            A, tile_x, row0, kb, groups_per_row);
+        const int* by0 =
+            (const int*)(Xq + (long long)(2 * kb) * N + col0);
+        const int p_tid0 = threadIdx.y * 32 + threadIdx.x;
+        *reinterpret_cast<int4*>(tile_y + 4 * p_tid0) = pending_packet;
+        if (p_tid0 < 256) tile_y[2048 + p_tid0] = pending_extra;
+        __syncthreads();
+        const int p_tid1 = threadIdx.y * 32 + threadIdx.x;
+        const int* p_x1 = (const int*)(Xq + (long long)(2 * kb + 1) * N + col0);
+        pending_packet = *reinterpret_cast<const int4*>(p_x1 + 4 * p_tid1);
+        if (p_tid1 < 256) pending_extra = p_x1[2048 + p_tid1];
+        __builtin_amdgcn_sched_barrier(0);
+        vec_dot_i4_x128_lf16_symfold(tile_x, tile_y, sum, 0);
+        __syncthreads();
+        if (2 * kb + 1 < 2 * groups_per_row) {
+            const int* by1 =
+                (const int*)(Xq + (long long)(2 * kb + 1) * N + col0);
+            *reinterpret_cast<int4*>(tile_y + 4 * p_tid1) = pending_packet;
+            if (p_tid1 < 256) tile_y[2048 + p_tid1] = pending_extra;
+            __syncthreads();
+            if (kb + 1 < groups_per_row) {
+                const int p_tid2 = threadIdx.y * 32 + threadIdx.x;
+                const int* p_x2 = (const int*)(Xq + (long long)(2 * kb + 2) * N + col0);
+                pending_packet = *reinterpret_cast<const int4*>(p_x2 + 4 * p_tid2);
+                if (p_tid2 < 256) pending_extra = p_x2[2048 + p_tid2];
+                __builtin_amdgcn_sched_barrier(0);
+            }
+            vec_dot_i4_x128_lf16_symfold(tile_x, tile_y, sum, 1);
+            __syncthreads();
+        }
+    }
+#else
     for (int kb = 0; kb < groups_per_row; ++kb) {
         load_iu4_tile_lf16_symfold(
             A, tile_x, row0, kb, groups_per_row);
@@ -1116,6 +1161,7 @@ static __device__ __forceinline__ void gemm_iu4_body_lf16_symfold(
             __syncthreads();
         }
     }
+#endif
     {
         const int tid_y = (int)__builtin_amdgcn_workitem_id_y();
         int row_part, col_part, tmp;
@@ -1147,6 +1193,25 @@ static __device__ __forceinline__ void gemm_iu4_body_lf16_symfold(
     }
 }
 
+#if defined(IU4_STAGE_X5)
+#define IU4_SYMFOLD_LF16_ENTRY(name, is_add, row_index, col_index) \
+extern "C" __global__ __launch_bounds__(512, 2) \
+__attribute__((amdgpu_num_vgpr(96))) void name( \
+    const char* __restrict__ A, \
+    const block_i4_128* __restrict__ Xq, \
+    float* __restrict__ Y, \
+    int M, int K, int N, int add \
+) { \
+    gemm_iu4_body_lf16_symfold<is_add>( \
+        A, Xq, Y, M, K, N, add, row_index, col_index); \
+}
+IU4_SYMFOLD_LF16_ENTRY(
+    gemm_mq4g256v2_residual_mmq_iu4_full_set_x5_col_gfx1151_symfold,
+    false, blockIdx.y, blockIdx.x)
+IU4_SYMFOLD_LF16_ENTRY(
+    gemm_mq4g256v2_residual_mmq_iu4_full_add_x5_col_gfx1151_symfold,
+    true, blockIdx.y, blockIdx.x)
+#else
 #define IU4_SYMFOLD_LF16_ENTRY(name, is_add, row_index, col_index) \
 extern "C" __global__ __launch_bounds__(512, 2) \
 __attribute__((amdgpu_num_vgpr(96))) void name( \
@@ -1172,6 +1237,7 @@ IU4_SYMFOLD_LF16_ENTRY(
 IU4_SYMFOLD_LF16_ENTRY(
     gemm_mq4g256v2_residual_mmq_iu4_full_add_lf16_gfx1100_symfold,
     true, blockIdx.x, blockIdx.y)
+#endif
 #endif
 
 #undef IU4_SYMFOLD_LF16_ENTRY

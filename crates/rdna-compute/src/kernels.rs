@@ -3683,6 +3683,13 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_SYMFOLD_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
 );
+/// Isolated gfx11 X5 packet/prefetch module. Keep the incumbent symfold
+/// translation unit unchanged so its VGPR allocation and fallback are stable.
+pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX11_X5_SYMFOLD_SRC: &str = concat!(
+    "#define IU4_SYMMETRIC_FOLD 1\n#define IU4_STAGE_X5 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_residual_mmq_iu4.gfx11.hip")
+);
 // gfx12 (RDNA4) iu4-direct MMQ sister: weight nibbles feed
 // wmma_i32_16x16x32_iu4_w32_gfx12 directly (K=32/call, int32x2/lane,
 // k_grp=tid>>4 lane split, contiguous-row C — same conventions as the gfx12
