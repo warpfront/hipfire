@@ -1,0 +1,449 @@
+GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.15)
+  pre-compiled kernels: /home/kaden/.hipfire-homes/warmup/partial_kernel_cache/gfx1201
+[hipfire] native serve listening on http://127.0.0.1:19237
+[hipfire-daemon] vision_mode=off — skipping tower sidecar load (/home/kaden/.hipfire/models/qwen3.8-27b-vision.hfq)
+  KV cache: requested mode=auto, effective KV=fp8
+  DeltaNet state: Q8
+  loading token_embd...
+  qwen3.5-vl text wrapper: mrope_interleaved=true mrope_section=[11, 11, 10]
+  loading output_norm...
+  loading output (separate lm_head)...
+  lm_head AWQ sidecar: absent (no-op)
+  loading layer 0/64 (LinearAttention)...
+  loading layer 1/64 (LinearAttention)...
+  loading layer 2/64 (LinearAttention)...
+  loading layer 3/64 (FullAttention)...
+  loading layer 4/64 (LinearAttention)...
+  loading layer 5/64 (LinearAttention)...
+  loading layer 6/64 (LinearAttention)...
+  loading layer 7/64 (FullAttention)...
+  loading layer 8/64 (LinearAttention)...
+  loading layer 9/64 (LinearAttention)...
+  loading layer 10/64 (LinearAttention)...
+  loading layer 11/64 (FullAttention)...
+  loading layer 12/64 (LinearAttention)...
+  loading layer 13/64 (LinearAttention)...
+  loading layer 14/64 (LinearAttention)...
+  loading layer 15/64 (FullAttention)...
+  loading layer 16/64 (LinearAttention)...
+  loading layer 17/64 (LinearAttention)...
+  loading layer 18/64 (LinearAttention)...
+  loading layer 19/64 (FullAttention)...
+  loading layer 20/64 (LinearAttention)...
+  loading layer 21/64 (LinearAttention)...
+  loading layer 22/64 (LinearAttention)...
+  loading layer 23/64 (FullAttention)...
+  loading layer 24/64 (LinearAttention)...
+  loading layer 25/64 (LinearAttention)...
+  loading layer 26/64 (LinearAttention)...
+  loading layer 27/64 (FullAttention)...
+  loading layer 28/64 (LinearAttention)...
+  loading layer 29/64 (LinearAttention)...
+  loading layer 30/64 (LinearAttention)...
+  loading layer 31/64 (FullAttention)...
+  loading layer 32/64 (LinearAttention)...
+  loading layer 33/64 (LinearAttention)...
+  loading layer 34/64 (LinearAttention)...
+  loading layer 35/64 (FullAttention)...
+  loading layer 36/64 (LinearAttention)...
+  loading layer 37/64 (LinearAttention)...
+  loading layer 38/64 (LinearAttention)...
+  loading layer 39/64 (FullAttention)...
+  loading layer 40/64 (LinearAttention)...
+  loading layer 41/64 (LinearAttention)...
+  loading layer 42/64 (LinearAttention)...
+  loading layer 43/64 (FullAttention)...
+  loading layer 44/64 (LinearAttention)...
+  loading layer 45/64 (LinearAttention)...
+  loading layer 46/64 (LinearAttention)...
+  loading layer 47/64 (FullAttention)...
+  loading layer 48/64 (LinearAttention)...
+  loading layer 49/64 (LinearAttention)...
+  loading layer 50/64 (LinearAttention)...
+  loading layer 51/64 (FullAttention)...
+  loading layer 52/64 (LinearAttention)...
+  loading layer 53/64 (LinearAttention)...
+  loading layer 54/64 (LinearAttention)...
+  loading layer 55/64 (FullAttention)...
+  loading layer 56/64 (LinearAttention)...
+  loading layer 57/64 (LinearAttention)...
+  loading layer 58/64 (LinearAttention)...
+  loading layer 59/64 (FullAttention)...
+  loading layer 60/64 (LinearAttention)...
+  loading layer 61/64 (LinearAttention)...
+  loading layer 62/64 (LinearAttention)...
+  loading layer 63/64 (FullAttention)...
+  weight sweep: 796 ms (packed-expert host-read 0 ms, H2D 0 ms)
+max_seq budget: free_after_weights=18687721472 min_prefill=1460625664 page_rounding=134217728 kv_bytes_per_token=33024
+  KV cache: requested mode=auto, effective KV=fp8
+WARMUP vmm_map bytes=2097152 us=138
+WARMUP vmm_map bytes=2097152 us=74
+WARMUP vmm_map bytes=2097152 us=75
+WARMUP vmm_map bytes=2097152 us=70
+WARMUP vmm_map bytes=2097152 us=74
+WARMUP vmm_map bytes=2097152 us=69
+WARMUP vmm_map bytes=2097152 us=75
+WARMUP vmm_map bytes=2097152 us=71
+WARMUP vmm_map bytes=2097152 us=73
+WARMUP vmm_map bytes=2097152 us=69
+WARMUP vmm_map bytes=2097152 us=78
+WARMUP vmm_map bytes=2097152 us=69
+WARMUP vmm_map bytes=2097152 us=100
+WARMUP vmm_map bytes=2097152 us=69
+WARMUP vmm_map bytes=2097152 us=69
+WARMUP vmm_map bytes=2097152 us=71
+WARMUP vmm_map bytes=2097152 us=73
+WARMUP vmm_map bytes=2097152 us=68
+WARMUP vmm_map bytes=2097152 us=71
+WARMUP vmm_map bytes=2097152 us=69
+WARMUP vmm_map bytes=2097152 us=68
+WARMUP vmm_map bytes=2097152 us=68
+WARMUP vmm_map bytes=2097152 us=70
+WARMUP vmm_map bytes=2097152 us=69
+WARMUP vmm_map bytes=2097152 us=69
+WARMUP vmm_map bytes=2097152 us=70
+WARMUP vmm_map bytes=2097152 us=69
+WARMUP vmm_map bytes=2097152 us=73
+WARMUP vmm_map bytes=2097152 us=69
+WARMUP vmm_map bytes=2097152 us=83
+WARMUP vmm_map bytes=2097152 us=69
+WARMUP vmm_map bytes=2097152 us=74
+KV cache: mapped_prefix=0->2032 / physical_cap=262144 / max_seq=262144
+KV cache: Fp8 vmm (16/64 layers carry KV; K/V 1032B/row; mapped_prefix=2032 / physical_cap=262144 / max_seq=262144)
+max_seq: 262144 (bound=model; model_ctx=262144, card_cap=517589, kv=fp8)
+[hipfire] pre-warmed /home/kaden/qcal/qat/v25/qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq
+[WARN: INVALID CONFIG] reasoning_effort 'low' dropped: thinking disabled
+[WARN: INVALID CONFIG] reasoning.effort 'xhigh' dropped: thinking disabled
+WARMUP vmm_map bytes=8388608 us=515
+WARMUP vmm_map bytes=8388608 us=209
+WARMUP vmm_map bytes=8388608 us=224
+WARMUP vmm_map bytes=8388608 us=196
+WARMUP vmm_map bytes=8388608 us=203
+WARMUP vmm_map bytes=8388608 us=195
+WARMUP vmm_map bytes=8388608 us=497
+WARMUP vmm_map bytes=8388608 us=143
+WARMUP vmm_map bytes=8388608 us=144
+WARMUP vmm_map bytes=8388608 us=147
+WARMUP vmm_map bytes=8388608 us=146
+WARMUP vmm_map bytes=8388608 us=147
+WARMUP vmm_map bytes=8388608 us=147
+WARMUP vmm_map bytes=8388608 us=146
+WARMUP vmm_map bytes=8388608 us=385
+WARMUP vmm_map bytes=8388608 us=145
+WARMUP vmm_map bytes=8388608 us=152
+WARMUP vmm_map bytes=8388608 us=143
+WARMUP vmm_map bytes=8388608 us=143
+WARMUP vmm_map bytes=8388608 us=144
+WARMUP vmm_map bytes=8388608 us=150
+WARMUP vmm_map bytes=8388608 us=144
+WARMUP vmm_map bytes=8388608 us=148
+WARMUP vmm_map bytes=8388608 us=355
+WARMUP vmm_map bytes=8388608 us=142
+WARMUP vmm_map bytes=8388608 us=140
+WARMUP vmm_map bytes=8388608 us=151
+WARMUP vmm_map bytes=8388608 us=142
+WARMUP vmm_map bytes=8388608 us=141
+WARMUP vmm_map bytes=8388608 us=321
+WARMUP vmm_map bytes=8388608 us=139
+WARMUP vmm_map bytes=8388608 us=139
+KV cache: mapped_prefix=2032->10160 / physical_cap=262144 / max_seq=262144
+WARMUP kv_ensure tokens=8192 us=6411
+prefill_chunk: requested=8192 admitted=8192 commit_stride=512
+WARMUP pbs rows=8192 us=70144
+WARMUP kernel embedding_q8_batched compile_us=84 load_us=420
+WARMUP kernel gdn_chunk_prep compile_us=46 load_us=214
+WARMUP kernel gdn_chunk_kkt_solve compile_us=50 load_us=228
+WARMUP kernel gdn_chunk_scan compile_us=40 load_us=185
+WARMUP kernel fused_rmsnorm_mq_rotate_awq_i4_gfx12 compile_us=43 load_us=223
+WARMUP kernel gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold compile_us=80 load_us=363
+WARMUP kernel gated_norm_mq_rotate_awq_i4_gfx12 compile_us=49 load_us=216
+WARMUP kernel gemm_mq4g256v2_residual_mmq_iu4_gfx12_symfold compile_us=0 load_us=0
+WARMUP kernel fused_silu_mul_mq_rotate_awq_i4_gfx12 compile_us=101 load_us=384
+WARMUP kernel deinterleave_q_rmsnorm_f32_batched compile_us=35 load_us=181
+WARMUP kernel rmsnorm compile_us=41 load_us=232
+WARMUP kernel rope_partial_halfsplit_batched compile_us=30 load_us=154
+WARMUP kernel kv_cache_write_fp8_e4m3_batched compile_us=41 load_us=259
+WARMUP kernel attention_fp8_e4m3_fa2_gqa_qresident_gfx1201 compile_us=78 load_us=355
+WARMUP kernel sigmoid_mul_rotate_x_mq_awq_i4_gfx12 compile_us=35 load_us=145
+WARMUP kernel mq_rotate_x compile_us=37 load_us=194
+  gemv_mq4g256v2_mq4v2: pre-compiled blob hash is stale and no cached build matches; recompiling
+WARMUP kernel gemv_mq4g256v2_mq4v2 compile_us=401273 load_us=541
+WARMUP kernel gemv_hfq4g256_multirow_default_mq4v2 compile_us=120 load_us=317
+WARMUP chunk start=0 rows=8192 us=433946
+WARMUP vmm_map bytes=8388608 us=227
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=168
+WARMUP vmm_map bytes=8388608 us=168
+WARMUP vmm_map bytes=8388608 us=170
+WARMUP vmm_map bytes=8388608 us=169
+WARMUP vmm_map bytes=8388608 us=169
+WARMUP vmm_map bytes=8388608 us=168
+WARMUP vmm_map bytes=8388608 us=168
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=168
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=170
+WARMUP vmm_map bytes=8388608 us=168
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=214
+WARMUP vmm_map bytes=8388608 us=235
+WARMUP vmm_map bytes=8388608 us=232
+WARMUP vmm_map bytes=8388608 us=231
+WARMUP vmm_map bytes=8388608 us=185
+WARMUP vmm_map bytes=8388608 us=168
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=172
+WARMUP vmm_map bytes=8388608 us=165
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=169
+WARMUP vmm_map bytes=8388608 us=170
+WARMUP vmm_map bytes=8388608 us=166
+KV cache: mapped_prefix=10160->18289 / physical_cap=262144 / max_seq=262144
+WARMUP kv_ensure tokens=16384 us=5809
+WARMUP pbs rows=8192 us=0
+WARMUP chunk start=8192 rows=8192 us=1757899
+WARMUP vmm_map bytes=8388608 us=227
+WARMUP vmm_map bytes=8388608 us=180
+WARMUP vmm_map bytes=8388608 us=183
+WARMUP vmm_map bytes=8388608 us=168
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=183
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=177
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=165
+WARMUP vmm_map bytes=8388608 us=193
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=165
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=174
+WARMUP vmm_map bytes=8388608 us=168
+WARMUP vmm_map bytes=8388608 us=165
+WARMUP vmm_map bytes=8388608 us=164
+WARMUP vmm_map bytes=8388608 us=164
+WARMUP vmm_map bytes=8388608 us=164
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=165
+WARMUP vmm_map bytes=8388608 us=165
+WARMUP vmm_map bytes=8388608 us=163
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=164
+WARMUP vmm_map bytes=8388608 us=165
+WARMUP vmm_map bytes=8388608 us=176
+KV cache: mapped_prefix=18289->26417 / physical_cap=262144 / max_seq=262144
+WARMUP kv_ensure tokens=24576 us=5609
+WARMUP pbs rows=8192 us=1
+WARMUP chunk start=16384 rows=8192 us=2471494
+WARMUP vmm_map bytes=8388608 us=251
+WARMUP vmm_map bytes=8388608 us=178
+WARMUP vmm_map bytes=8388608 us=184
+WARMUP vmm_map bytes=8388608 us=181
+WARMUP vmm_map bytes=8388608 us=177
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=177
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=177
+WARMUP vmm_map bytes=8388608 us=177
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=182
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=175
+WARMUP vmm_map bytes=8388608 us=175
+WARMUP vmm_map bytes=8388608 us=183
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=175
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=169
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=165
+WARMUP vmm_map bytes=8388608 us=184
+WARMUP vmm_map bytes=8388608 us=208
+WARMUP vmm_map bytes=8388608 us=177
+WARMUP vmm_map bytes=8388608 us=180
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=166
+KV cache: mapped_prefix=26417->34546 / physical_cap=262144 / max_seq=262144
+WARMUP kv_ensure tokens=32768 us=5817
+WARMUP pbs rows=8192 us=1
+WARMUP chunk start=24576 rows=8192 us=2769385
+WARMUP vmm_map bytes=8388608 us=231
+WARMUP vmm_map bytes=8388608 us=178
+WARMUP vmm_map bytes=8388608 us=184
+WARMUP vmm_map bytes=8388608 us=182
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=177
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=181
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=178
+WARMUP vmm_map bytes=8388608 us=177
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=187
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=177
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=178
+WARMUP vmm_map bytes=8388608 us=180
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=178
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=168
+WARMUP vmm_map bytes=8388608 us=177
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=176
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=167
+WARMUP vmm_map bytes=8388608 us=175
+WARMUP vmm_map bytes=8388608 us=166
+WARMUP vmm_map bytes=8388608 us=184
+KV cache: mapped_prefix=34546->42674 / physical_cap=262144 / max_seq=262144
+WARMUP kv_ensure tokens=40960 us=5803
+WARMUP pbs rows=8192 us=0
+WARMUP chunk start=32768 rows=8192 us=3110214
+WARMUP vmm_map bytes=8388608 us=239
+WARMUP vmm_map bytes=8388608 us=185
+WARMUP vmm_map bytes=8388608 us=182
+WARMUP vmm_map bytes=8388608 us=180
+WARMUP vmm_map bytes=8388608 us=181
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=182
+WARMUP vmm_map bytes=8388608 us=206
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=190
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=190
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=178
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=181
+WARMUP vmm_map bytes=8388608 us=182
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=182
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=171
+WARMUP vmm_map bytes=8388608 us=180
+WARMUP vmm_map bytes=8388608 us=182
+WARMUP vmm_map bytes=8388608 us=179
+WARMUP vmm_map bytes=8388608 us=170
+KV cache: mapped_prefix=42674->50803 / physical_cap=262144 / max_seq=262144
+WARMUP kv_ensure tokens=49152 us=5957
+WARMUP pbs rows=8192 us=0
+WARMUP chunk start=40960 rows=8192 us=3419459
+WARMUP vmm_map bytes=8388608 us=236
+WARMUP vmm_map bytes=8388608 us=188
+WARMUP vmm_map bytes=8388608 us=192
+WARMUP vmm_map bytes=8388608 us=182
+WARMUP vmm_map bytes=8388608 us=185
+WARMUP vmm_map bytes=8388608 us=181
+WARMUP vmm_map bytes=8388608 us=181
+WARMUP vmm_map bytes=8388608 us=181
+WARMUP vmm_map bytes=8388608 us=184
+WARMUP vmm_map bytes=8388608 us=185
+WARMUP vmm_map bytes=8388608 us=182
+WARMUP vmm_map bytes=8388608 us=189
+WARMUP vmm_map bytes=8388608 us=191
+WARMUP vmm_map bytes=8388608 us=188
+WARMUP vmm_map bytes=8388608 us=181
+WARMUP vmm_map bytes=8388608 us=180
+WARMUP vmm_map bytes=8388608 us=187
+WARMUP vmm_map bytes=8388608 us=183
+WARMUP vmm_map bytes=8388608 us=184
+WARMUP vmm_map bytes=8388608 us=180
+WARMUP vmm_map bytes=8388608 us=180
+WARMUP vmm_map bytes=8388608 us=181
+WARMUP vmm_map bytes=8388608 us=185
+WARMUP vmm_map bytes=8388608 us=182
+WARMUP vmm_map bytes=8388608 us=181
+WARMUP vmm_map bytes=8388608 us=185
+WARMUP vmm_map bytes=8388608 us=181
+WARMUP vmm_map bytes=8388608 us=185
+WARMUP vmm_map bytes=8388608 us=181
+WARMUP vmm_map bytes=8388608 us=182
+WARMUP vmm_map bytes=8388608 us=188
+WARMUP vmm_map bytes=8388608 us=184
+KV cache: mapped_prefix=50803->58931 / physical_cap=262144 / max_seq=262144
+WARMUP kv_ensure tokens=57030 us=6051
+WARMUP pbs rows=7878 us=1
+WARMUP chunk start=49152 rows=7878 us=3735500
+WARMUP kernel sample_top_p_parallel compile_us=112 load_us=466
+WARMUP kernel sample_top_p_parallel compile_us=0 load_us=0
+WARMUP kernel sample_top_p_parallel compile_us=0 load_us=0
+WARMUP kernel sample_top_p_parallel_fast21 compile_us=58 load_us=254
+WARMUP kernel sample_top_p_parallel_fast21 compile_us=0 load_us=0
+WARMUP kernel embedding_q8 compile_us=90 load_us=488
+  fused_rmsnorm_mq_rotate_awq: pre-compiled blob hash is stale and no cached build matches; recompiling
+WARMUP kernel fused_rmsnorm_mq_rotate_awq compile_us=413755 load_us=654
+  fused_qkvza_hfq4g256_mq4v2: pre-compiled blob hash is stale and no cached build matches; recompiling
+WARMUP kernel fused_qkvza_hfq4g256_mq4v2 compile_us=489398 load_us=853
+WARMUP kernel fused_sigmoid_alpha_gate compile_us=69 load_us=411
+WARMUP kernel conv1d_silu_split_qknorm_b256 compile_us=53 load_us=343
+WARMUP kernel repeat_interleave_qk compile_us=51 load_us=348
+  gated_delta_net_q8_fast: pre-compiled blob hash is stale and no cached build matches; recompiling
+WARMUP kernel gated_delta_net_q8_fast compile_us=520025 load_us=707
+WARMUP kernel gated_norm compile_us=48 load_us=158
+WARMUP kernel rotate_x_mq_awq compile_us=32 load_us=145
+  gemv_hfq4g256_residual_mq4v2: pre-compiled blob hash is stale and no cached build matches; recompiling
+WARMUP kernel gemv_hfq4g256_residual_mq4v2 compile_us=443116 load_us=818
+  fused_gate_up_hfq4g256_mq4v2: pre-compiled blob hash is stale and no cached build matches; recompiling
+WARMUP kernel fused_gate_up_hfq4g256_mq4v2 compile_us=425061 load_us=803
+  fused_silu_mul_mq_rotate_awq: pre-compiled blob hash is stale and no cached build matches; recompiling
+WARMUP kernel fused_silu_mul_mq_rotate_awq compile_us=404896 load_us=767
+  fused_qkv_hfq4g256_mq4v2: pre-compiled blob hash is stale and no cached build matches; recompiling
+WARMUP kernel fused_qkv_hfq4g256_mq4v2 compile_us=396940 load_us=597
+WARMUP kernel deinterleave compile_us=51 load_us=235
+WARMUP kernel rope_partial_halfsplit compile_us=32 load_us=212
+WARMUP kernel kv_cache_write_fp8_e4m3 compile_us=42 load_us=201
+WARMUP kernel attention_flash_fp8_e4m3_tile compile_us=44 load_us=178
+WARMUP kernel attention_flash_q8_0_reduce compile_us=35 load_us=151
+WARMUP kernel sigmoid_mul compile_us=25 load_us=158
+[daemon-control] received commit for id=chatcmpl-1939816-1 attempt_id=1
+[WARN: INVALID CONFIG] reasoning_effort 'low' dropped: thinking disabled
+[WARN: INVALID CONFIG] reasoning.effort 'xhigh' dropped: thinking disabled
+[qwen-cache miss] lcp=3 prior_len=57031 rendered_len=57034
+  common@0..3="<|im_start|>user\n"
+  prior_past@3..15="gentle distant the synchrony painting everything the alive w" rendered_past@3..15="Different opening:\ngentle distant the synchrony painting eve"
+  prior_tail="\n\n</think>\n\nThe" rendered_tail="<think>\n\n</think>\n\n"
+WARMUP kv_ensure tokens=8192 us=3
+WARMUP pbs rows=8192 us=1
+WARMUP chunk start=0 rows=8192 us=2773
+WARMUP kv_ensure tokens=16384 us=0
+WARMUP pbs rows=8192 us=0
+WARMUP chunk start=8192 rows=8192 us=2224809
+WARMUP kv_ensure tokens=24576 us=1
+WARMUP pbs rows=8192 us=0
+WARMUP chunk start=16384 rows=8192 us=2515215
+WARMUP kv_ensure tokens=32768 us=1
+WARMUP pbs rows=8192 us=0
+WARMUP chunk start=24576 rows=8192 us=2817945
+WARMUP kv_ensure tokens=40960 us=1
+WARMUP pbs rows=8192 us=0
+WARMUP chunk start=32768 rows=8192 us=3160470
+WARMUP kv_ensure tokens=49152 us=1
+WARMUP pbs rows=8192 us=0
+WARMUP chunk start=40960 rows=8192 us=3470690
+WARMUP kv_ensure tokens=57034 us=1
+WARMUP pbs rows=7882 us=0
+WARMUP chunk start=49152 rows=7882 us=3785082
+[daemon-control] received commit for id=chatcmpl-1939816-3 attempt_id=2
+[warmup-cardc-profile-cold: ready; cursor=19551]
