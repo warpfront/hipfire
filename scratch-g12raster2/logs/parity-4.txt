@@ -1,0 +1,144 @@
+DEVICE AMD Radeon AI PRO R9700 arch=gfx1201 mps=32 pci=0000:c3:00.0
+RESOURCE arm=epi2 entry=set vgpr=184 private=0 occ_blocks_per_mp=3
+RESOURCE arm=epi2 entry=add vgpr=184 private=0 occ_blocks_per_mp=3
+RESOURCE arm=r1g8e2 entry=set vgpr=184 private=0 occ_blocks_per_mp=3
+RESOURCE arm=r1g8e2 entry=add vgpr=184 private=0 occ_blocks_per_mp=3
+RESOURCE arm=r1g4e2 entry=set vgpr=184 private=0 occ_blocks_per_mp=3
+RESOURCE arm=r1g4e2 entry=add vgpr=184 private=0 occ_blocks_per_mp=3
+RESOURCE arm=r1g2e1 entry=set vgpr=185 private=0 occ_blocks_per_mp=3
+RESOURCE arm=r1g2e1 entry=add vgpr=185 private=0 occ_blocks_per_mp=3
+RESOURCE arm=r1g6e1 entry=set vgpr=185 private=0 occ_blocks_per_mp=3
+RESOURCE arm=r1g6e1 entry=add vgpr=185 private=0 occ_blocks_per_mp=3
+RESOURCE arm=control entry=set vgpr=182 private=0 occ_blocks_per_mp=3
+RESOURCE arm=control entry=add vgpr=182 private=0 occ_blocks_per_mp=3
+PARITY arm=epi2 SET M=48 K=5120 N=8192 edges=1 outputs=393216 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=48 K=5120 N=8192 edges=1 outputs=393216 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=48 K=5120 N=8192 edges=1 outputs=393216 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=48 K=5120 N=8192 edges=1 outputs=393216 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=48 K=5120 N=8192 edges=1 outputs=393216 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=48 K=5120 N=8192 edges=1 outputs=393216 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=48 K=5120 N=8192 edges=1 outputs=393216 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=48 K=5120 N=8192 edges=1 outputs=393216 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=48 K=5120 N=8192 edges=1 outputs=393216 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=48 K=5120 N=8192 edges=1 outputs=393216 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 SET M=1024 K=5120 N=4173 edges=1 outputs=4273152 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=1024 K=5120 N=4173 edges=1 outputs=4273152 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=1024 K=5120 N=4173 edges=1 outputs=4273152 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=1024 K=5120 N=4173 edges=1 outputs=4273152 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=1024 K=5120 N=4173 edges=1 outputs=4273152 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=1024 K=5120 N=4173 edges=1 outputs=4273152 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=1024 K=5120 N=4173 edges=1 outputs=4273152 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=1024 K=5120 N=4173 edges=1 outputs=4273152 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=1024 K=5120 N=4173 edges=1 outputs=4273152 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=1024 K=5120 N=4173 edges=1 outputs=4273152 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 SET M=1000 K=5120 N=8155 edges=1 outputs=8155000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=1000 K=5120 N=8155 edges=1 outputs=8155000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=1000 K=5120 N=8155 edges=1 outputs=8155000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=1000 K=5120 N=8155 edges=1 outputs=8155000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=1000 K=5120 N=8155 edges=1 outputs=8155000 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=1000 K=5120 N=8155 edges=1 outputs=8155000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=1000 K=5120 N=8155 edges=1 outputs=8155000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=1000 K=5120 N=8155 edges=1 outputs=8155000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=1000 K=5120 N=8155 edges=1 outputs=8155000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=1000 K=5120 N=8155 edges=1 outputs=8155000 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 SET M=1002 K=256 N=1000 edges=1 outputs=1002000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=1002 K=256 N=1000 edges=1 outputs=1002000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=1002 K=256 N=1000 edges=1 outputs=1002000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=1002 K=256 N=1000 edges=1 outputs=1002000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=1002 K=256 N=1000 edges=1 outputs=1002000 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=1002 K=256 N=1000 edges=1 outputs=1002000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=1002 K=256 N=1000 edges=1 outputs=1002000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=1002 K=256 N=1000 edges=1 outputs=1002000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=1002 K=256 N=1000 edges=1 outputs=1002000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=1002 K=256 N=1000 edges=1 outputs=1002000 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 SET M=2944 K=6144 N=777 edges=1 outputs=2287488 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=2944 K=6144 N=777 edges=1 outputs=2287488 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=2944 K=6144 N=777 edges=1 outputs=2287488 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=2944 K=6144 N=777 edges=1 outputs=2287488 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=2944 K=6144 N=777 edges=1 outputs=2287488 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=2944 K=6144 N=777 edges=1 outputs=2287488 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=2944 K=6144 N=777 edges=1 outputs=2287488 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=2944 K=6144 N=777 edges=1 outputs=2287488 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=2944 K=6144 N=777 edges=1 outputs=2287488 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=2944 K=6144 N=777 edges=1 outputs=2287488 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 SET M=5120 K=17408 N=300 edges=1 outputs=1536000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=5120 K=17408 N=300 edges=1 outputs=1536000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=5120 K=17408 N=300 edges=1 outputs=1536000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=5120 K=17408 N=300 edges=1 outputs=1536000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=5120 K=17408 N=300 edges=1 outputs=1536000 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=5120 K=17408 N=300 edges=1 outputs=1536000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=5120 K=17408 N=300 edges=1 outputs=1536000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=5120 K=17408 N=300 edges=1 outputs=1536000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=5120 K=17408 N=300 edges=1 outputs=1536000 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=5120 K=17408 N=300 edges=1 outputs=1536000 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 SET M=1920 K=5120 N=4096 edges=1 outputs=7864320 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=1920 K=5120 N=4096 edges=1 outputs=7864320 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=1920 K=5120 N=4096 edges=1 outputs=7864320 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=1920 K=5120 N=4096 edges=1 outputs=7864320 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=1920 K=5120 N=4096 edges=1 outputs=7864320 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=1920 K=5120 N=4096 edges=1 outputs=7864320 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=1920 K=5120 N=4096 edges=1 outputs=7864320 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=1920 K=5120 N=4096 edges=1 outputs=7864320 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=1920 K=5120 N=4096 edges=1 outputs=7864320 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=1920 K=5120 N=4096 edges=1 outputs=7864320 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 SET M=256 K=512 N=1 edges=1 outputs=256 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=256 K=512 N=1 edges=1 outputs=256 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=256 K=512 N=1 edges=1 outputs=256 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=256 K=512 N=1 edges=1 outputs=256 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=256 K=512 N=1 edges=1 outputs=256 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=256 K=512 N=1 edges=1 outputs=256 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=256 K=512 N=1 edges=1 outputs=256 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=256 K=512 N=1 edges=1 outputs=256 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=256 K=512 N=1 edges=1 outputs=256 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=256 K=512 N=1 edges=1 outputs=256 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 SET M=17024 K=512 N=2112 edges=1 outputs=35954688 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=17024 K=512 N=2112 edges=1 outputs=35954688 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=17024 K=512 N=2112 edges=1 outputs=35954688 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=17024 K=512 N=2112 edges=1 outputs=35954688 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=17024 K=512 N=2112 edges=1 outputs=35954688 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=17024 K=512 N=2112 edges=1 outputs=35954688 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=17024 K=512 N=2112 edges=1 outputs=35954688 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=17024 K=512 N=2112 edges=1 outputs=35954688 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=17024 K=512 N=2112 edges=1 outputs=35954688 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=17024 K=512 N=2112 edges=1 outputs=35954688 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 SET M=640 K=256 N=4739 edges=1 outputs=3032960 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=640 K=256 N=4739 edges=1 outputs=3032960 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=640 K=256 N=4739 edges=1 outputs=3032960 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=640 K=256 N=4739 edges=1 outputs=3032960 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=640 K=256 N=4739 edges=1 outputs=3032960 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=640 K=256 N=4739 edges=1 outputs=3032960 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=640 K=256 N=4739 edges=1 outputs=3032960 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=640 K=256 N=4739 edges=1 outputs=3032960 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=640 K=256 N=4739 edges=1 outputs=3032960 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=640 K=256 N=4739 edges=1 outputs=3032960 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 SET M=384 K=768 N=4736 edges=0 outputs=1818624 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=384 K=768 N=4736 edges=0 outputs=1818624 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=384 K=768 N=4736 edges=0 outputs=1818624 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=384 K=768 N=4736 edges=0 outputs=1818624 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=384 K=768 N=4736 edges=0 outputs=1818624 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=384 K=768 N=4736 edges=0 outputs=1818624 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=384 K=768 N=4736 edges=0 outputs=1818624 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=384 K=768 N=4736 edges=0 outputs=1818624 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=384 K=768 N=4736 edges=0 outputs=1818624 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=384 K=768 N=4736 edges=0 outputs=1818624 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 SET M=17408 K=256 N=8192 edges=0 outputs=142606336 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=17408 K=256 N=8192 edges=0 outputs=142606336 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=17408 K=256 N=8192 edges=0 outputs=142606336 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=17408 K=256 N=8192 edges=0 outputs=142606336 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=17408 K=256 N=8192 edges=0 outputs=142606336 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=17408 K=256 N=8192 edges=0 outputs=142606336 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=17408 K=256 N=8192 edges=0 outputs=142606336 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=17408 K=256 N=8192 edges=0 outputs=142606336 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=17408 K=256 N=8192 edges=0 outputs=142606336 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=17408 K=256 N=8192 edges=0 outputs=142606336 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 SET M=5120 K=256 N=4113 edges=0 outputs=21058560 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 SET M=5120 K=256 N=4113 edges=0 outputs=21058560 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 SET M=5120 K=256 N=4113 edges=0 outputs=21058560 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 SET M=5120 K=256 N=4113 edges=0 outputs=21058560 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 SET M=5120 K=256 N=4113 edges=0 outputs=21058560 mismatches=0 control_stale_nan=0
+PARITY arm=epi2 ADD M=5120 K=256 N=4113 edges=0 outputs=21058560 mismatches=0 control_stale_nan=0
+PARITY arm=r1g8e2 ADD M=5120 K=256 N=4113 edges=0 outputs=21058560 mismatches=0 control_stale_nan=0
+PARITY arm=r1g4e2 ADD M=5120 K=256 N=4113 edges=0 outputs=21058560 mismatches=0 control_stale_nan=0
+PARITY arm=r1g2e1 ADD M=5120 K=256 N=4113 edges=0 outputs=21058560 mismatches=0 control_stale_nan=0
+PARITY arm=r1g6e1 ADD M=5120 K=256 N=4113 edges=0 outputs=21058560 mismatches=0 control_stale_nan=0
+PARITY_SUMMARY cases=13 arms=5 fails=0

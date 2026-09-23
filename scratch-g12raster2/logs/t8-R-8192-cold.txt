@@ -1,0 +1,47 @@
+DEVICE AMD Radeon AI PRO R9700 arch=gfx1201 mps=32 pci=0000:c3:00.0
+RESOURCE arm=control865 entry=set vgpr=182 private=0 occ_blocks_per_mp=3
+RESOURCE arm=control865 entry=add vgpr=182 private=0 occ_blocks_per_mp=3
+RESOURCE arm=p865_g12r2 entry=set vgpr=185 private=0 occ_blocks_per_mp=3
+RESOURCE arm=p865_g12r2 entry=add vgpr=185 private=0 occ_blocks_per_mp=3
+RESOURCE arm=p865_g12r entry=set vgpr=185 private=0 occ_blocks_per_mp=3
+RESOURCE arm=p865_g12r entry=add vgpr=185 private=0 occ_blocks_per_mp=3
+FULLPARITY N=8192 shape=gate_up_SILU_M17408_K5120 arm=p865_g12r2 outputs=142606336 mismatches=0
+FULLPARITY N=8192 shape=gate_up_SILU_M17408_K5120 arm=p865_g12r outputs=142606336 mismatches=0
+TIME order=R N=8192 mode=cold shape=gate_up_SILU_M17408_K5120 calls=64 arm=control865 median_ms=12.2925 min_ms=12.1741 max_ms=12.3860 TOPS=118.79 speedup_vs_control_med=1.0000 sclk_med_mhz=2238 power_w=300 junction_c=87
+TIME order=R N=8192 mode=cold shape=gate_up_SILU_M17408_K5120 calls=64 arm=p865_g12r2 median_ms=11.8706 min_ms=11.7216 max_ms=12.1201 TOPS=123.02 speedup_vs_control_med=1.0374 sclk_med_mhz=2238 power_w=300 junction_c=87
+TIME order=R N=8192 mode=cold shape=gate_up_SILU_M17408_K5120 calls=64 arm=p865_g12r median_ms=11.8712 min_ms=11.7635 max_ms=12.0091 TOPS=123.01 speedup_vs_control_med=1.0359 sclk_med_mhz=2238 power_w=300 junction_c=87
+FULLPARITY N=8192 shape=res_ADD_M5120_K17408 arm=p865_g12r2 outputs=41943040 mismatches=0
+FULLPARITY N=8192 shape=res_ADD_M5120_K17408 arm=p865_g12r outputs=41943040 mismatches=0
+TIME order=R N=8192 mode=cold shape=res_ADD_M5120_K17408 calls=64 arm=control865 median_ms=5.8468 min_ms=5.8090 max_ms=5.9262 TOPS=249.76 speedup_vs_control_med=1.0000 sclk_med_mhz=2363 power_w=298 junction_c=85
+TIME order=R N=8192 mode=cold shape=res_ADD_M5120_K17408 calls=64 arm=p865_g12r2 median_ms=5.7072 min_ms=5.6730 max_ms=5.7786 TOPS=255.87 speedup_vs_control_med=1.0246 sclk_med_mhz=2363 power_w=298 junction_c=85
+TIME order=R N=8192 mode=cold shape=res_ADD_M5120_K17408 calls=64 arm=p865_g12r median_ms=5.7062 min_ms=5.6398 max_ms=5.7749 TOPS=255.91 speedup_vs_control_med=1.0275 sclk_med_mhz=2363 power_w=298 junction_c=85
+FULLPARITY N=8192 shape=res_ADD_M5120_K6144 arm=p865_g12r2 outputs=41943040 mismatches=0
+FULLPARITY N=8192 shape=res_ADD_M5120_K6144 arm=p865_g12r outputs=41943040 mismatches=0
+TIME order=R N=8192 mode=cold shape=res_ADD_M5120_K6144 calls=64 arm=control865 median_ms=2.0503 min_ms=2.0258 max_ms=2.0678 TOPS=251.37 speedup_vs_control_med=1.0000 sclk_med_mhz=2612 power_w=298 junction_c=84
+TIME order=R N=8192 mode=cold shape=res_ADD_M5120_K6144 calls=64 arm=p865_g12r2 median_ms=1.9585 min_ms=1.9287 max_ms=1.9801 TOPS=263.15 speedup_vs_control_med=1.0520 sclk_med_mhz=2612 power_w=298 junction_c=84
+TIME order=R N=8192 mode=cold shape=res_ADD_M5120_K6144 calls=64 arm=p865_g12r median_ms=1.9557 min_ms=1.9249 max_ms=1.9787 TOPS=263.53 speedup_vs_control_med=1.0477 sclk_med_mhz=2612 power_w=298 junction_c=84
+FULLPARITY N=8192 shape=qkv_KV_SET_M1024_K5120 arm=p865_g12r2 outputs=8388608 mismatches=0
+FULLPARITY N=8192 shape=qkv_KV_SET_M1024_K5120 arm=p865_g12r outputs=8388608 mismatches=0
+TIME order=R N=8192 mode=cold shape=qkv_KV_SET_M1024_K5120 calls=32 arm=control865 median_ms=0.3524 min_ms=0.3351 max_ms=0.3551 TOPS=243.78 speedup_vs_control_med=1.0000 sclk_med_mhz=3032 power_w=298 junction_c=83
+TIME order=R N=8192 mode=cold shape=qkv_KV_SET_M1024_K5120 calls=32 arm=p865_g12r2 median_ms=0.3502 min_ms=0.3260 max_ms=0.3534 TOPS=245.31 speedup_vs_control_med=1.0079 sclk_med_mhz=3032 power_w=298 junction_c=83
+TIME order=R N=8192 mode=cold shape=qkv_KV_SET_M1024_K5120 calls=32 arm=p865_g12r median_ms=0.3509 min_ms=0.3277 max_ms=0.3557 TOPS=244.78 speedup_vs_control_med=0.9983 sclk_med_mhz=3032 power_w=298 junction_c=83
+FULLPARITY N=8192 shape=qkv_Q_SET_M12288_K5120 arm=p865_g12r2 outputs=100663296 mismatches=0
+FULLPARITY N=8192 shape=qkv_Q_SET_M12288_K5120 arm=p865_g12r outputs=100663296 mismatches=0
+TIME order=R N=8192 mode=cold shape=qkv_Q_SET_M12288_K5120 calls=16 arm=control865 median_ms=4.2455 min_ms=4.1824 max_ms=4.3069 TOPS=242.79 speedup_vs_control_med=1.0000 sclk_med_mhz=2275 power_w=300 junction_c=86
+TIME order=R N=8192 mode=cold shape=qkv_Q_SET_M12288_K5120 calls=16 arm=p865_g12r2 median_ms=4.0964 min_ms=4.0426 max_ms=4.1470 TOPS=251.63 speedup_vs_control_med=1.0410 sclk_med_mhz=2275 power_w=300 junction_c=86
+TIME order=R N=8192 mode=cold shape=qkv_Q_SET_M12288_K5120 calls=16 arm=p865_g12r median_ms=4.0862 min_ms=4.0375 max_ms=4.1541 TOPS=252.26 speedup_vs_control_med=1.0388 sclk_med_mhz=2275 power_w=300 junction_c=86
+FULLPARITY N=8192 shape=qkvza_BA_SET_M48_K5120 arm=p865_g12r2 outputs=393216 mismatches=0
+FULLPARITY N=8192 shape=qkvza_BA_SET_M48_K5120 arm=p865_g12r outputs=393216 mismatches=0
+TIME order=R N=8192 mode=cold shape=qkvza_BA_SET_M48_K5120 calls=96 arm=control865 median_ms=0.0586 min_ms=0.0581 max_ms=0.0593 TOPS=68.66 speedup_vs_control_med=1.0000 sclk_med_mhz=3246 power_w=232 junction_c=75
+TIME order=R N=8192 mode=cold shape=qkvza_BA_SET_M48_K5120 calls=96 arm=p865_g12r2 median_ms=0.0593 min_ms=0.0590 max_ms=0.0596 TOPS=67.88 speedup_vs_control_med=0.9899 sclk_med_mhz=3246 power_w=232 junction_c=75
+TIME order=R N=8192 mode=cold shape=qkvza_BA_SET_M48_K5120 calls=96 arm=p865_g12r median_ms=0.0591 min_ms=0.0589 max_ms=0.0594 TOPS=68.15 speedup_vs_control_med=0.9932 sclk_med_mhz=3246 power_w=232 junction_c=75
+FULLPARITY N=8192 shape=qkvza_Z_SET_M6144_K5120 arm=p865_g12r2 outputs=50331648 mismatches=0
+FULLPARITY N=8192 shape=qkvza_Z_SET_M6144_K5120 arm=p865_g12r outputs=50331648 mismatches=0
+TIME order=R N=8192 mode=cold shape=qkvza_Z_SET_M6144_K5120 calls=48 arm=control865 median_ms=2.0613 min_ms=2.0184 max_ms=2.1006 TOPS=250.03 speedup_vs_control_med=1.0000 sclk_med_mhz=2373 power_w=299 junction_c=86
+TIME order=R N=8192 mode=cold shape=qkvza_Z_SET_M6144_K5120 calls=48 arm=p865_g12r2 median_ms=2.0294 min_ms=1.9611 max_ms=2.0443 TOPS=253.97 speedup_vs_control_med=1.0214 sclk_med_mhz=2373 power_w=299 junction_c=86
+TIME order=R N=8192 mode=cold shape=qkvza_Z_SET_M6144_K5120 calls=48 arm=p865_g12r median_ms=2.0117 min_ms=1.9642 max_ms=2.0419 TOPS=256.20 speedup_vs_control_med=1.0270 sclk_med_mhz=2373 power_w=299 junction_c=86
+FULLPARITY N=8192 shape=qkvza_QKV_SET_M10240_K5120 arm=p865_g12r2 outputs=83886080 mismatches=0
+FULLPARITY N=8192 shape=qkvza_QKV_SET_M10240_K5120 arm=p865_g12r outputs=83886080 mismatches=0
+TIME order=R N=8192 mode=cold shape=qkvza_QKV_SET_M10240_K5120 calls=48 arm=control865 median_ms=3.5178 min_ms=3.4823 max_ms=3.5783 TOPS=244.19 speedup_vs_control_med=1.0000 sclk_med_mhz=2288 power_w=299 junction_c=87
+TIME order=R N=8192 mode=cold shape=qkvza_QKV_SET_M10240_K5120 calls=48 arm=p865_g12r2 median_ms=3.3951 min_ms=3.3591 max_ms=3.4323 TOPS=253.01 speedup_vs_control_med=1.0371 sclk_med_mhz=2288 power_w=299 junction_c=87
+TIME order=R N=8192 mode=cold shape=qkvza_QKV_SET_M10240_K5120 calls=48 arm=p865_g12r median_ms=3.3811 min_ms=3.3522 max_ms=3.4046 TOPS=254.06 speedup_vs_control_med=1.0416 sclk_med_mhz=2288 power_w=299 junction_c=87
