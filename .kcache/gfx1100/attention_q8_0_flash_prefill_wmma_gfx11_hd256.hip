@@ -1,0 +1,412 @@
+#define SPLIT_Q 0
+#define FIXED_HEAD_DIM 256
+#define PREFETCH_V 1
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Nick Woolmer
+// hipfire — see LICENSE and NOTICE in the project root.
+//
+// Multi-slot KV descriptor — the single point of KV address translation for
+// every batched attention kernel.
+//
+// A "slot" is one independent sequence in a batch. Today each slot owns a
+// contiguous slab of `cap` tokens inside a per-layer arena, so translation is
+// base + pos*stride. When this moves to paged block tables, ONLY
+// kv_offset_for() changes — no kernel is touched. That is the entire reason
+// this indirection exists; do not inline it away.
+//
+// Layout must stay byte-identical to the Rust mirror in
+// crates/rdna-compute/src/kv_slots.rs. 24 bytes, 8-byte aligned.
+
+#pragma once
+
+#include <hip/hip_runtime.h>
+
+struct KvSlotDesc {
+    unsigned long long k_base;  // byte offset of this slot's K slab in the arena
+    unsigned long long v_base;  // byte offset of this slot's V slab in the arena
+    int seq_len;                // logical KV length; kernel reads [0, seq_len)
+    int cap;                    // physical slab capacity in tokens; seq_len <= cap
+};
+
+// Byte offset of position `pos` within slot `s`'s K slab.
+// `per_pos_bytes` is the per-position stride in bytes, uniform across slots
+// (n_kv_heads * (head_dim/32) * 34 for Q8_0).
+__device__ __forceinline__ unsigned long long kv_offset_for_k(
+    const KvSlotDesc& s, int pos, int per_pos_bytes)
+{
+    return s.k_base + (unsigned long long)pos * (unsigned long long)per_pos_bytes;
+}
+
+__device__ __forceinline__ unsigned long long kv_offset_for_v(
+    const KvSlotDesc& s, int pos, int per_pos_bytes)
+{
+    return s.v_base + (unsigned long long)pos * (unsigned long long)per_pos_bytes;
+}
+
+// Single-slot fallback used when the descriptor pointer is null. Keeps the
+// ported kernels on ONE code path: callers build this on the stack from the
+// legacy scalar args, so there is no `if (descs) ... else ...` around every
+// KV read. Behaviour is then bitwise identical to the pre-SP1 kernel.
+__device__ __forceinline__ KvSlotDesc kv_slot_legacy(int seq_len, int max_seq)
+{
+    KvSlotDesc s;
+    s.k_base = 0ULL;
+    s.v_base = 0ULL;
+    s.seq_len = seq_len;
+    s.cap = max_seq;
+    return s;
+}
+
+// Legacy fallback for kernels that also honour the pre-descriptor
+// independent-sequence contract: a NEGATIVE `max_seq` whose magnitude is one
+// lane's token capacity, with batch row `row` reading only its own
+// `[row * cap, (row + 1) * cap)` slice of a lane-major arena. Folding that
+// base into the synthesised descriptor keeps those kernels on the single
+// kv_offset_for_*() address path instead of branching at every KV read.
+// A positive `max_seq` reproduces `kv_slot_legacy` exactly (base 0, shared
+// cache), so sequential prefill stays byte-for-byte unchanged.
+__device__ __forceinline__ KvSlotDesc kv_slot_legacy_lane(
+    int seq_len, int max_seq, int row, int per_pos_bytes)
+{
+    const bool independent = max_seq < 0;
+    const int lane_capacity = independent ? -max_seq : max_seq;
+    const unsigned long long lane_bytes =
+        (unsigned long long)lane_capacity * (unsigned long long)per_pos_bytes;
+    const unsigned long long base =
+        independent ? (unsigned long long)row * lane_bytes : 0ULL;
+
+    KvSlotDesc s;
+    s.k_base = base;
+    s.v_base = base;
+    s.seq_len = seq_len;
+    s.cap = lane_capacity;
+    return s;
+}
+
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Nick Woolmer
+// hipfire — see LICENSE and NOTICE in the project root.
+//
+// Query-tiled Q8_0 flash prefill attention on RDNA3 WMMA (wave32).
+//
+// Stage C of the flash-prefill work. Same algorithm as
+// attention_q8_0_flash_prefill (query tiling + online softmax, LDS
+// independent of context) but the QK^T and P·V inner products run on the
+// matrix cores instead of scalar VALU FMAs.
+//
+// Why this is not a port of the attention_dflash_wmma_* family: every one of
+// those kernels hard-guards head_dim == 128, and the single head_dim-generic
+// variant (attention_dflash_wmma_m32) stages Q/V/O in LDS sized by head_dim,
+// which needs ~84 KB at head_dim=256 — over the 64 KB limit. This kernel fits
+// by (a) storing everything in LDS as f16 rather than f32, and (b) never
+// staging K in LDS at all: each B fragment is dequantised straight out of the
+// Q8_0 cache in global memory, exactly as the v6 f16kv exemplar reads its f16
+// K rows.
+//
+// The Q8 dequant cost is amortised by the matrix layout itself: one WMMA B
+// fragment (16 keys × 16 dims) is reused across all 16 query rows of the A
+// fragment, so each cache byte is converted once per 16 queries instead of
+// once per query as in the scalar kernel.
+//
+// Grid:  [ceil(batch_size / M_TILE), n_heads] in legacy (single-slot) mode, or
+//        [n_tiles, n_heads] in multi-slot mode, where n_tiles = tile_slot.len()
+//        from crates/rdna-compute/src/kv_slots.rs::build_tiles(_, M_TILE).
+// Block: 32 threads (one wave32).
+//
+// LDS (head_dim=256): Q 16×256 f16 = 8192 | V^T 256×18 f16 = 9216
+//                     | S 16×18 f16 = 576 | m,l,alpha 16×3 f32 = 192
+//                     ≈ 18.0 KB → 3 workgroups/CU.
+//
+// Multi-slot descriptor plumbing mirrors attention_q8_0_flash_prefill.hip
+// exactly (same ABI, same "positions[] is authoritative, never desc.seq_len"
+// rule, same single-shared-slab-offset constraint: this kernel is Q8_0-only,
+// so K and V share a stride and a slot occupies the same offset in both
+// arenas — only kv_offset_for_k (i.e. desc.k_base) is ever read here,
+// deliberately, to avoid keeping a second runtime-unknown 64-bit base live
+// across the K/V loop (see that file's Task 6 commit for the 23-VGPR/25%-
+// occupancy cost this was found to have).
+
+#include <hip/hip_runtime.h>
+
+
+typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
+typedef float __attribute__((ext_vector_type(8))) float8_t;
+
+#define M_TILE 16   // query rows per workgroup (one WMMA A fragment)
+#define N_TILE 16   // keys per K/V tile (one WMMA B fragment)
+#define S_STRIDE 18 // N_TILE + 2 padding, breaks LDS bank conflicts
+#define V_STRIDE 18 // N_TILE + 2 padding
+#define MAX_D_CHUNKS 16 // head_dim / 16, bounded so O_frags is a fixed array
+#ifndef FIXED_HEAD_DIM
+#define FIXED_HEAD_DIM 0
+#endif
+#ifndef SPLIT_Q
+// 1 = carry Q as a double-single (hi+lo) pair through two WMMA passes.
+// Rounding Q to f16 for the A fragment was MEASURED to be the dominant error
+// term: f16 Q alone through an otherwise-f32 kernel gives rel_l2 5.36e-4 of a
+// 5.48e-4 total at CTX=12288 (82-98% across shapes). Everything else -- K, V,
+// P, the accumulator -- contributes ~1.1e-4 combined.
+#define SPLIT_Q 0
+#endif
+
+extern "C" __global__ __launch_bounds__(32) void attention_q8_0_flash_prefill_wmma(
+    const float* __restrict__ q,               // [batch_size × n_heads × head_dim]
+    const unsigned char* __restrict__ k_cache, // [pos][n_kv_heads × bph][34]
+    const unsigned char* __restrict__ v_cache,
+    float* __restrict__ out,                   // [batch_size × n_heads × head_dim]
+    const int* __restrict__ positions,         // [batch_size]
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int batch_size,
+    float scale_attn,
+    const KvSlotDesc* __restrict__ slot_descs, // [n_slots] or nullptr = legacy
+    const int* __restrict__ tile_slot,         // [n_tiles] or nullptr = legacy
+    const int* __restrict__ tile_row0,         // [n_tiles] or nullptr = legacy
+    const int* __restrict__ tile_qbase         // [n_tiles] or nullptr = legacy
+) {
+#if FIXED_HEAD_DIM
+    if (head_dim != FIXED_HEAD_DIM) return;
+#endif
+    const int q_tile = blockIdx.x;
+    const int h      = blockIdx.y;
+    if (h >= n_heads) return;
+
+    const int slot = (tile_slot != nullptr) ? tile_slot[q_tile] : 0;
+    // Slot-relative row: ABI-reserved, unread here — positions[] already
+    // carries each row's own absolute causal position, indexed by qbase
+    // like q/out (see kv_slot_desc.h and the scalar kernel's identical
+    // comment).
+    const int row0 = (tile_row0 != nullptr) ? tile_row0[q_tile] : (q_tile * M_TILE);
+    (void)row0;
+    // Global flat row, for indexing q/out/positions. Conflating this with
+    // row0 leaves slot 0 correct and every later slot reading the wrong
+    // query.
+    const int q_base = (tile_qbase != nullptr) ? tile_qbase[q_tile] : (q_tile * M_TILE);
+    if (q_base >= batch_size) return;
+
+    // `desc` supplies only the K/V slab BASE ADDRESS — positions[] stays
+    // authoritative for the causal bound below. In legacy mode k_base ==
+    // v_base == 0, so kv_offset_for_k degenerates to the original
+    // `pos * row_stride` addressing and output is bitwise identical.
+    const KvSlotDesc desc = (slot_descs != nullptr) ? slot_descs[slot] : kv_slot_legacy(0, 0);
+
+    const int lane    = threadIdx.x & 31;
+    const int half    = lane & 15;   // 0..15 — row within A / col within C
+    const int half_id = lane >> 4;   // 0..1  — C fragment row parity
+
+    const int bph          = head_dim / 32;      // Q8_0 blocks per head
+    const int total_blocks = n_kv_heads * bph;
+    const int row_stride   = total_blocks * 34;  // bytes per cache position
+    const int kv_group     = n_heads / n_kv_heads;
+    const int kv_h         = h / kv_group;
+    const int kv_blk       = kv_h * bph;
+    const int q_stride     = n_heads * head_dim;
+#if FIXED_HEAD_DIM
+    const int d_chunks = FIXED_HEAD_DIM / 16;
+#else
+    const int d_chunks = head_dim / 16;
+#endif
+
+    extern __shared__ char smem_raw[];
+    _Float16* Q_lds   = (_Float16*)smem_raw;                        // [M_TILE][head_dim]
+#if SPLIT_Q
+    _Float16* Q_lo_lds = Q_lds + M_TILE * head_dim;                 // [M_TILE][head_dim]
+    _Float16* V_lds_T = Q_lo_lds + M_TILE * head_dim;               // [head_dim][V_STRIDE]
+#else
+    _Float16* V_lds_T = Q_lds + M_TILE * head_dim;                  // [head_dim][V_STRIDE]
+#endif
+    _Float16* S_lds   = V_lds_T + head_dim * V_STRIDE;              // [M_TILE][S_STRIDE]
+    float*    m_lds   = (float*)(S_lds + M_TILE * S_STRIDE);        // [M_TILE]
+    float*    l_lds   = m_lds + M_TILE;                             // [M_TILE]
+    float*    a_lds   = l_lds + M_TILE;                             // [M_TILE]
+
+    // Rows present in this tile. In legacy (single-slot) mode a tile can only
+    // be ragged if it is the batch's last tile, so `batch_size - q_base`
+    // bounds it correctly. In multi-slot mode a tile can ALSO be ragged
+    // because its OWNING SLOT ends before a full M_TILE rows — build_tiles
+    // never lets a tile span a slot boundary, and slots lay out contiguously
+    // in the flat row space q/out use, so the boundary where this tile's
+    // valid rows end is exactly the NEXT tile's q_base (or batch_size, for
+    // the last tile in the whole launch). See
+    // attention_q8_0_flash_prefill.hip's identical comment.
+    int rows_end = batch_size;
+    if (tile_qbase != nullptr && (q_tile + 1) < (int)gridDim.x) {
+        rows_end = tile_qbase[q_tile + 1];
+    }
+    const int rows = min(M_TILE, rows_end - q_base);
+
+    // ── Stage Q tile (f16) ──────────────────────────────────────────────
+    for (int i = lane; i < M_TILE * head_dim; i += 32) {
+        const int r = i / head_dim;
+        const int d = i % head_dim;
+        const float qv = (r < rows)
+            ? q[(long long)(q_base + r) * q_stride + h * head_dim + d]
+            : 0.0f;
+        const _Float16 qhi = (_Float16)qv;
+        Q_lds[i] = qhi;
+#if SPLIT_Q
+        Q_lo_lds[i] = (_Float16)(qv - (float)qhi);
+#endif
+    }
+    if (lane < M_TILE) {
+        m_lds[lane] = -INFINITY;
+        l_lds[lane] = 0.0f;
+        a_lds[lane] = 1.0f;
+    }
+    __syncthreads();
+
+    // Output accumulator: C fragment j → row (2*j + half_id), col `half` = dim.
+    float8_t O_frags[MAX_D_CHUNKS];
+#pragma unroll
+    for (int dc = 0; dc < d_chunks; ++dc)
+        O_frags[dc] = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+
+    // Longest causal window in this tile bounds the key sweep.
+    int seq_len = 0;
+    for (int r = 0; r < rows; ++r)
+        seq_len = max(seq_len, positions[q_base + r] + 1);
+
+    for (int kt = 0; kt < seq_len; kt += N_TILE) {
+        const int t_len = min(N_TILE, seq_len - kt);
+
+        // ── Phase A: S = Q · K^T on the matrix cores ────────────────────
+        // This lane owns key (kt + half); it walks head_dim in 16-dim chunks.
+        // K is read straight from global, NOT staged in LDS. Staging it the
+        // same coalesced way V is staged was measured and REJECTED: it costs
+        // 8 KB, dropping occupancy 3 -> 2 WG/CU, and made the kernel 2.26x
+        // slower at CTX=8192 (9.45 -> 21.38 ms). Occupancy dominates the
+        // coalescing gain here, matching the Stage A tile-size finding.
+        float8_t s_acc = (float8_t){0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
+        {
+            const int my_k = kt + half;
+            const bool k_ok = (half < t_len);
+            // ONE shared slab offset (kv_offset_for_k, i.e. desc.k_base) for
+            // both K and V, deliberately — see the file header comment and
+            // attention_q8_0_flash_prefill.hip's identical note. v_base MUST
+            // equal k_base for this kernel's descriptors.
+            const unsigned char* kb =
+                k_ok ? (k_cache + kv_offset_for_k(desc, my_k, row_stride) + kv_blk * 34) : nullptr;
+
+            for (int dc = 0; dc < d_chunks; ++dc) {
+                const int d0 = dc * 16;
+                half16_t a_reg;
+                for (int j = 0; j < 16; ++j) a_reg[j] = Q_lds[half * head_dim + d0 + j];
+#if SPLIT_Q
+                half16_t a_lo;
+                for (int j = 0; j < 16; ++j) a_lo[j] = Q_lo_lds[half * head_dim + d0 + j];
+#endif
+                half16_t b_reg;
+                if (k_ok) {
+                    // 16 consecutive dims sit inside one 32-dim Q8_0 block.
+                    const unsigned char* blk = kb + (d0 >> 5) * 34;
+                    const float ks = (float)*((const _Float16*)blk);
+                    const int off = 2 + (d0 & 31);
+                    for (int j = 0; j < 16; ++j)
+                        b_reg[j] = (_Float16)(ks * (float)((signed char)blk[off + j]));
+                } else {
+                    for (int j = 0; j < 16; ++j) b_reg[j] = (_Float16)0.0f;
+                }
+                s_acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_reg, b_reg, s_acc);
+#if SPLIT_Q
+                s_acc = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(a_lo, b_reg, s_acc);
+#endif
+            }
+        }
+
+        // Publish S with the causal mask applied per (row, key).
+        for (int j = 0; j < 8; ++j) {
+            const int r  = 2 * j + half_id;   // query row within tile
+            const int c  = half;              // key within tile
+            float sv = s_acc[j] * scale_attn;
+            const bool valid =
+                (r < rows) && (c < t_len) && ((kt + c) <= positions[q_base + r]);
+            // -INF (not f16 min) so a fully-masked row-tile yields m_new = -INF,
+            // which the softmax guard turns into zero weight rather than exp(0)=1.
+            S_lds[r * S_STRIDE + c] = valid ? (_Float16)sv : (_Float16)(-INFINITY);
+        }
+        __syncthreads();
+
+        // ── Phase B: online softmax over this tile, one row per lane ────
+        if (lane < rows) {
+            _Float16* srow = S_lds + lane * S_STRIDE;
+            float tm = -INFINITY;
+            for (int c = 0; c < N_TILE; ++c) tm = fmaxf(tm, (float)srow[c]);
+            const float m_old = m_lds[lane];
+            const float m_new = fmaxf(m_old, tm);
+            const float alpha = (m_old == -INFINITY) ? 0.0f : __expf(m_old - m_new);
+            float sum = 0.0f;
+            for (int c = 0; c < N_TILE; ++c) {
+                const float e = (m_new == -INFINITY) ? 0.0f : __expf((float)srow[c] - m_new);
+                srow[c] = (_Float16)e;
+                sum += e;
+            }
+            m_lds[lane] = m_new;
+            l_lds[lane] = l_lds[lane] * alpha + sum;
+            a_lds[lane] = alpha;
+        } else if (lane < M_TILE) {
+            for (int c = 0; c < N_TILE; ++c) S_lds[lane * S_STRIDE + c] = (_Float16)0.0f;
+            a_lds[lane] = 1.0f;
+        }
+        __syncthreads();
+
+        // ── Phase C: stage V^T (dequantised) then O += P · V ────────────
+        // Lane L owns the contiguous dim run [L*DPL, (L+1)*DPL). Two things
+        // fall out: the 32 lanes together read one key's 272 contiguous cache
+        // bytes (coalesced) instead of each lane touching a different cache
+        // position row_stride apart, and a lane's whole run lives inside ONE
+        // 32-dim Q8_0 block, so the fp16 scale is loaded once per key rather
+        // than once per element.
+        const int dpl = head_dim / 32;              // dims per lane
+        const int d_lo = lane * dpl;
+        const int v_blk = d_lo >> 5;                // block index (run-uniform)
+        const int v_off = 2 + (d_lo & 31);          // byte offset within block
+        for (int kr = 0; kr < N_TILE; ++kr) {
+            if (kr < t_len) {
+                const unsigned char* vb = v_cache + kv_offset_for_k(desc, kt + kr, row_stride)
+                                        + kv_blk * 34 + v_blk * 34;
+                const float vs = (float)*((const _Float16*)vb);
+                for (int e = 0; e < dpl; ++e)
+                    V_lds_T[(d_lo + e) * V_STRIDE + kr] =
+                        (_Float16)(vs * (float)((signed char)vb[v_off + e]));
+            } else {
+                for (int e = 0; e < dpl; ++e)
+                    V_lds_T[(d_lo + e) * V_STRIDE + kr] = (_Float16)0.0f;
+            }
+        }
+        __syncthreads();
+
+        // Rescale the running accumulator before adding this tile.
+        #pragma unroll
+        for (int dc = 0; dc < d_chunks; ++dc)
+            for (int j = 0; j < 8; ++j)
+                O_frags[dc][j] *= a_lds[2 * j + half_id];
+
+        // A = P (row `half`, 16 keys); B = V^T (dim, 16 keys).
+        half16_t p_reg;
+        for (int j = 0; j < 16; ++j) p_reg[j] = S_lds[half * S_STRIDE + j];
+#pragma unroll
+        for (int dc = 0; dc < d_chunks; ++dc) {
+            const int d = dc * 16 + half;
+            half16_t v_reg;
+            for (int j = 0; j < 16; ++j)
+                v_reg[j] = V_lds_T[d * V_STRIDE + j];
+            O_frags[dc] = __builtin_amdgcn_wmma_f32_16x16x16_f16_w32(p_reg, v_reg, O_frags[dc]);
+        }
+        __syncthreads();
+    }
+
+    // ── Write O = acc / l ───────────────────────────────────────────────
+#pragma unroll
+    for (int dc = 0; dc < d_chunks; ++dc) {
+        const int d = dc * 16 + half;
+        for (int j = 0; j < 8; ++j) {
+            const int r = 2 * j + half_id;
+            if (r >= rows) continue;
+            const float denom = l_lds[r];
+            const float inv = (denom > 0.0f) ? (1.0f / denom) : 0.0f;
+            out[(long long)(q_base + r) * q_stride + h * head_dim + d] =
+                O_frags[dc][j] * inv;
+        }
+    }
+}
