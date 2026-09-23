@@ -2675,7 +2675,13 @@ void attention_fp8_e4m3_fa2_gqa_qresident_gfx1201(
 //  * Workgroups run heaviest-first (grid x/z reversed).
 // Grid [ceil(min(batch,512)/64), 4, ceil(batch/512)], block 768,
 // 33536 B dynamic LDS: K8 16 KiB, V8 16 KiB, SK/SV f32 256 B each, bounds.
-#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8) && defined(HIPFIRE_FA2_QRESIDENT_V2)
+// HIPFIRE_FA2_QRESIDENT_V2_Q8 builds the Q8-input twin
+// attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201: identical body, but the
+// prologue loads the E4M3 Q codes and row scales emitted by
+// qwen35_fa_prep_fp8q_batched_gfx1201 (same values the F32 prologue derives;
+// per (row, head) 256 code bytes with dim 16f+8kg+j at byte kg*128+f*8+j).
+#if HIPFIRE_FA2_KMODE == 8 && defined(HIPFIRE_FA2_FP8) \
+    && (defined(HIPFIRE_FA2_QRESIDENT_V2) || defined(HIPFIRE_FA2_QRESIDENT_V2_Q8))
 static __device__ __forceinline__ float fa2_qr2_xor16(float v)
 {
     int bits = __builtin_bit_cast(int, v);
@@ -2699,8 +2705,14 @@ static __device__ __forceinline__ float fa2_qr2_div448(float x)
 
 extern "C" __global__ __launch_bounds__(768, 1)
 __attribute__((amdgpu_waves_per_eu(6), amdgpu_num_vgpr(240)))
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8)
+void attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201(
+    const unsigned char* __restrict__ q_codes,
+    const float* __restrict__ q_scales,
+#else
 void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     const float* __restrict__ q,
+#endif
     const unsigned char* __restrict__ k_cache,
     const unsigned char* __restrict__ v_cache,
     float* __restrict__ out,
@@ -2764,9 +2776,23 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
     }
     const int pos = qok ? positions[query] : 0;
 
-    // Resident Q fragments: the v1 codes, computed with the bracket check.
+    // Resident Q fragments: the v1 codes, computed with the bracket check
+    // (or loaded as produced upstream by the Q8-input twin).
     v2i_t Qfr[16];
     float q_row_scale = 1.0f;
+#if defined(HIPFIRE_FA2_QRESIDENT_V2_Q8)
+    if (qok) {
+        const uint4* qp8 = (const uint4*)(q_codes
+            + (unsigned long long)qrow * 256ULL + (unsigned)kg * 128u);
+#pragma unroll
+        for (int m = 0; m < 8; ++m) {
+            const uint4 w = qp8[m];
+            Qfr[2 * m] = (v2i_t){(int)w.x, (int)w.y};
+            Qfr[2 * m + 1] = (v2i_t){(int)w.z, (int)w.w};
+        }
+        q_row_scale = q_scales[qrow];
+    } else
+#else
     if (qok) {
         const float* qp = q + (unsigned long long)qrow * 256ULL;
         float a = 0.0f;
@@ -2817,7 +2843,9 @@ void attention_fp8_e4m3_fa2_gqa_qresident_v2_gfx1201(
             }
             Qfr[frag] = (v2i_t){(int)w0, (int)w1};
         }
-    } else {
+    } else
+#endif
+    {
 #pragma unroll
         for (int frag = 0; frag < 16; ++frag)
             Qfr[frag] = (v2i_t){0, 0};
