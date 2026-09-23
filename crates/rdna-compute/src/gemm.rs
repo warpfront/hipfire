@@ -17341,22 +17341,12 @@ impl Gpu {
             ("gemm_q8_0_wmma", kernels::GEMM_Q8_0_WMMA_SRC)
         };
         self.ensure_kernel(kname, ksrc, kname)?;
-        // Use unconditional F32→F16 conversion (no pointer-keyed cache).
-        //
-        // STALE-CACHE BUG (2026-06-16): the former `ensure_fp16_x` is
-        // pointer-keyed — it skips reconversion when the source ptr matches
-        // the last call's ptr. In the MTP decode path the `tmp_batched`
-        // scratch tensor is a FIXED allocation (same device address) that
-        // gets NEW content from `rmsnorm_batched` each step. After step 0
-        // warms the cache, every subsequent step read stale FP16 from step 0,
-        // producing wrong logits and collapsing τ from ~1.85 to ~1.01.
-        // Using `convert_fp16_x_uncached` (always re-converts) is always
-        // correct; the perf cost is one extra F32→F16 kernel per lm_head
-        // call, negligible vs the GEMM itself.
+        // Honor a pre-converted F16 activation (forward.rs pre-converts into
+        // scratch); avoid the double-convert that masked the gfx1151 path.
         let x_f16_ptr = if matches!(x.dtype, DType::F16) {
             x.buf.as_ptr()
         } else {
-            self.convert_fp16_x_uncached(x, batch_size * k)?
+            self.ensure_fp16_x(x, batch_size * k)?
         };
 
         let mut a_p = a.buf.as_ptr();
