@@ -1,0 +1,3 @@
+5c49765c97632d8fdfdee16a7115da53  scratch-2026-09-17/ExactBundle/c1.bin
+3a3b524171a970226e32f966f6c6001b  scratch-2026-09-17/ExactBundle/c2.bin
+f9b2021b984ff24bdbe6f40332f8cca1  scratch-2026-09-17/ExactBundle/c24.bin
