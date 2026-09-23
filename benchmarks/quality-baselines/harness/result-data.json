@@ -1,0 +1,62 @@
+[
+  {
+    "variant": "barto-a55-mq4head",
+    "arch": "gfx1201",
+    "scoring_mode": "prefill",
+    "n_chunks": 24,
+    "mean_kld": 0.052139826056518984,
+    "mean_kld_ci_lo": 0.044527435437848505,
+    "mean_kld_ci_hi": 0.061788712872636084,
+    "p99_kld": 0.9831346094972647,
+    "ppl": 6.466536785679549,
+    "notes": ""
+  },
+  {
+    "variant": "barto-a55-q8head-ssmout",
+    "arch": "gfx1201",
+    "scoring_mode": "prefill",
+    "n_chunks": 24,
+    "mean_kld": 0.03674556581733799,
+    "mean_kld_ci_lo": 0.03014579224537452,
+    "mean_kld_ci_hi": 0.04510664926650641,
+    "p99_kld": 0.8089291527272744,
+    "ppl": 6.377326274797406,
+    "notes": ""
+  },
+  {
+    "variant": "barto-a55-q8head",
+    "arch": "gfx1201",
+    "scoring_mode": "prefill",
+    "n_chunks": 24,
+    "mean_kld": 0.04377631101544771,
+    "mean_kld_ci_lo": 0.03600817889631198,
+    "mean_kld_ci_hi": 0.053485706616341146,
+    "p99_kld": 1.006431590042104,
+    "ppl": 6.408761864165947,
+    "notes": ""
+  },
+  {
+    "variant": "barto-a55-ssmout",
+    "arch": "gfx1201",
+    "scoring_mode": "prefill",
+    "n_chunks": 24,
+    "mean_kld": 0.045248850365903294,
+    "mean_kld_ci_lo": 0.03876467936474606,
+    "mean_kld_ci_hi": 0.05353590557039437,
+    "p99_kld": 0.8008178967988235,
+    "ppl": 6.436834194876806,
+    "notes": ""
+  },
+  {
+    "variant": "uncalibrated",
+    "arch": "gfx1201",
+    "scoring_mode": "prefill",
+    "n_chunks": 24,
+    "mean_kld": 0.06666823024924202,
+    "mean_kld_ci_lo": 0.057519749725240404,
+    "mean_kld_ci_hi": 0.07859211146238611,
+    "p99_kld": 1.1497489628148077,
+    "ppl": 6.569035581598152,
+    "notes": ""
+  }
+]

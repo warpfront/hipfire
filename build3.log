@@ -1,0 +1,674 @@
+ Downloading crates ...
+  Downloaded crossbeam-queue v0.3.13
+  Downloaded pulp-wasm-simd-flag v0.1.1
+  Downloaded bytemuck_derive v1.12.0
+  Downloaded crossbeam-channel v0.5.16
+  Downloaded pulp v0.22.3
+  Downloaded faer v0.24.4
+   Compiling bytemuck v1.25.1
+   Compiling nano-gemm-codegen v0.2.1
+   Compiling paste v1.0.15
+   Compiling libm v0.2.16
+   Compiling pulp v0.22.3
+   Compiling pulp-wasm-simd-flag v0.1.1
+   Compiling reborrow v0.5.5
+   Compiling dyn-stack-macros v0.1.3
+   Compiling syn v1.0.109
+   Compiling seq-macro v0.3.6
+   Compiling nano-gemm-core v0.2.1
+   Compiling utf8parse v0.2.2
+   Compiling defer v0.2.1
+   Compiling is_terminal_polyfill v1.70.2
+   Compiling anstyle-query v1.1.5
+   Compiling colorchoice v1.0.5
+   Compiling anstyle v1.0.14
+   Compiling heck v0.5.0
+   Compiling generativity v1.2.1
+   Compiling strsim v0.11.1
+   Compiling clap_lex v1.1.0
+   Compiling equator-macro v0.6.0
+   Compiling num-traits v0.2.19
+   Compiling raw-cpuid v11.6.0
+   Compiling tracing-core v0.1.36
+   Compiling crossbeam-queue v0.3.13
+   Compiling crossbeam-channel v0.5.16
+   Compiling regex-automata v0.4.16
+   Compiling equator-macro v0.4.2
+   Compiling equator-macro v0.2.1
+   Compiling atomic-wait v1.1.0
+   Compiling num_cpus v1.17.0
+warning: field `cpu` is never read
+    --> crates/redline-rocr/src/runtime.rs:1645:5
+     |
+1641 | struct KernargPoolInner {
+     |        ---------------- field in this struct
+...
+1645 |     cpu: Option<abi::Agent>,
+     |     ^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `device_local` is never read
+    --> crates/redline-rocr/src/runtime.rs:2056:5
+     |
+2054 | pub struct KernargBuffer {
+     |            ------------- field in this struct
+2055 |     pool: Arc<KernargPoolInner>,
+2056 |     device_local: bool,
+     |     ^^^^^^^^^^^^
+
+warning: `redline-rocr` (lib) generated 2 warnings
+   Compiling anstyle-parse v1.0.0
+warning: unused import: `HipError`
+  --> crates/rdna-compute/src/gemm.rs:11:32
+   |
+11 | use hip_bridge::{DeviceBuffer, HipError, HipResult};
+   |                                ^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `func`
+    --> crates/rdna-compute/src/attention.rs:7871:13
+     |
+7871 |         let func = &self.functions["kv_cache_write"];
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `head_dim`
+    --> crates/rdna-compute/src/dispatch.rs:3467:9
+     |
+3467 |         head_dim: usize,
+     |         ^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_head_dim`
+
+warning: unused variable: `func`
+     --> crates/rdna-compute/src/gemm.rs:25108:13
+      |
+25108 |         let func = &self.functions["gemv_q8_0_moe_gate_up_k8_indexed"];
+      |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:372:5
+    |
+372 |     force_baseline: bool,
+    |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `force_baseline`
+   --> crates/rdna-compute/src/kernels.rs:389:5
+    |
+389 |     force_baseline: bool,
+    |     ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_force_baseline`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:454:9
+    |
+454 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:479:9
+    |
+479 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:504:9
+    |
+504 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:523:9
+    |
+523 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:828:9
+    |
+828 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:855:9
+    |
+855 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:882:9
+    |
+882 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `arch`
+   --> crates/rdna-compute/src/kernels.rs:902:9
+    |
+902 |     let arch = caps.arch();
+    |         ^^^^ help: if this is intentional, prefix it with an underscore: `_arch`
+
+warning: unused variable: `func`
+   --> crates/rdna-compute/src/norm.rs:777:13
+    |
+777 |         let func = &self.functions["rope_f32"];
+    |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: unused variable: `func`
+    --> crates/rdna-compute/src/norm.rs:4787:13
+     |
+4787 |         let func = &self.functions["bias_add_f32"];
+     |             ^^^^ help: if this is intentional, prefix it with an underscore: `_func`
+
+warning: constant `N_TILE` is never used
+    --> crates/rdna-compute/src/attention.rs:2894:15
+     |
+2894 |         const N_TILE: usize = 16;
+     |               ^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `GEMV_MQ5G256_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:1061:11
+     |
+1061 | pub const GEMV_MQ5G256_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256.hip");
+     |           ^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5405:11
+     |
+5405 | pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5407:11
+     |
+5407 | pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_F16_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5409:11
+     |
+5409 | pub const GEMV_MQ2G256_LLOYD_MOE_GATE_UP_INDEXED_MFMA_F16_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5414:11
+     |
+5414 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5416:11
+     |
+5416 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_F16_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5418:11
+     |
+5418 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_MFMA_F16_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_ALLRANKS_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5420:11
+     |
+5420 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_ALLRANKS_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_GFX942_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5422:11
+     |
+5422 | pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_EXPANDED_K4_GFX942_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `V4F_TOPK_KV_GATHER_TILED_GFX1151_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:5787:11
+     |
+5787 | pub const V4F_TOPK_KV_GATHER_TILED_GFX1151_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `GEMM_HFQ4G256_WMMA_GFX12_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6009:11
+     |
+6009 | pub const GEMM_HFQ4G256_WMMA_GFX12_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ATTENTION_FLASH_ASYM3_TILE_HD512_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6025:11
+     |
+6025 | pub const ATTENTION_FLASH_ASYM3_TILE_HD512_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ATTENTION_FLASH_ASYM3_TILE_HD512_BATCHED_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6027:11
+     |
+6027 | pub const ATTENTION_FLASH_ASYM3_TILE_HD512_BATCHED_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6029:11
+     |
+6029 | pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6031:11
+     |
+6031 | pub const KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KV_CACHE_WRITE_FWHT3_HD512_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6033:11
+     |
+6033 | pub const KV_CACHE_WRITE_FWHT3_HD512_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `KV_CACHE_WRITE_FWHT3_HD512_BATCHED_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6035:11
+     |
+6035 | pub const KV_CACHE_WRITE_FWHT3_HD512_BATCHED_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ATTENTION_FLASH_FWHT3_TILE_HD512_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6037:11
+     |
+6037 | pub const ATTENTION_FLASH_FWHT3_TILE_HD512_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ATTENTION_FLASH_FWHT3_TILE_HD512_BATCHED_SRC` is never used
+    --> crates/rdna-compute/src/kernels.rs:6039:11
+     |
+6039 | pub const ATTENTION_FLASH_FWHT3_TILE_HD512_BATCHED_SRC: &str =
+     |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: field `pgm_rsrc2` is never read
+   --> crates/rdna-compute/src/profiler.rs:360:5
+    |
+358 | struct RawKernelMeta {
+    |        ------------- field in this struct
+359 |     pgm_rsrc1: u32,
+360 |     pgm_rsrc2: u32,
+    |     ^^^^^^^^^
+
+warning: unused `Result` that must be used
+    --> crates/rdna-compute/src/gemv.rs:9721:9
+     |
+9721 |         crate::profile::end_timer(&self.hip, timer);
+     |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: this `Result` may be an `Err` variant, which should be handled
+     = note: `#[warn(unused_must_use)]` (part of `#[warn(unused)]`) on by default
+help: use `let _ = ...` to ignore the resulting value
+     |
+9721 |         let _ = crate::profile::end_timer(&self.hip, timer);
+     |         +++++++
+
+warning: `rdna-compute` (lib) generated 38 warnings (run `cargo fix --lib -p rdna-compute` to apply 16 suggestions)
+   Compiling hipfire-dispatch v0.3.0 (/home/kaden/hipfire-quantcal/crates/hipfire-dispatch)
+   Compiling clap_derive v4.6.1
+   Compiling dyn-stack v0.13.2
+   Compiling anstream v1.0.0
+   Compiling equator v0.6.0
+   Compiling clap_builder v4.6.0
+   Compiling tracing v0.1.44
+   Compiling equator v0.2.2
+   Compiling crossbeam v0.8.4
+   Compiling nano-gemm-f64 v0.2.1
+   Compiling nano-gemm-c64 v0.2.1
+   Compiling nano-gemm-c32 v0.2.1
+   Compiling nano-gemm-f32 v0.2.1
+   Compiling equator v0.4.2
+warning: unused variable: `mu`
+   --> crates/hipfire-dispatch/src/families/fused_qkv.rs:721:22
+    |
+721 |             let [mg, mu] =
+    |                      ^^ help: if this is intentional, prefix it with an underscore: `_mu`
+    |
+    = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling spindle v0.2.6
+   Compiling num-complex v0.4.6
+warning: constant `DISPATCHED_KV_WRITE_KEYS` is never used
+    --> crates/hipfire-dispatch/src/families/attention.rs:1520:18
+     |
+1520 | pub(crate) const DISPATCHED_KV_WRITE_KEYS: &[KernelKey] = &[
+     |                  ^^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `DISPATCHED_ATTEND_KEYS` is never used
+    --> crates/hipfire-dispatch/src/families/attention.rs:1546:18
+     |
+1546 | pub(crate) const DISPATCHED_ATTEND_KEYS: &[KernelKey] = &[
+     |                  ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `DISPATCHED_FULL_ATTENTION_KEYS` is never used
+    --> crates/hipfire-dispatch/src/families/attention.rs:1579:7
+     |
+1579 | const DISPATCHED_FULL_ATTENTION_KEYS: &[KernelKey] = &[
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `build_contiguous_permutation` is never used
+    --> crates/hipfire-dispatch/src/pipeline/mod.rs:1086:4
+     |
+1086 | fn build_contiguous_permutation(
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `dtype_name` is never used
+    --> crates/hipfire-dispatch/src/pipeline/mod.rs:1105:4
+     |
+1105 | fn dtype_name(d: DType) -> &'static str {
+     |    ^^^^^^^^^^
+
+warning: `hipfire-dispatch` (lib) generated 6 warnings (run `cargo fix --lib -p hipfire-dispatch` to apply 1 suggestion)
+   Compiling interpol v0.2.1
+   Compiling regex v1.13.1
+   Compiling clap v4.6.1
+   Compiling private-gemm-x86 v0.1.20
+   Compiling hipfire-runtime v0.3.0 (/home/kaden/hipfire-quantcal/crates/hipfire-runtime)
+   Compiling gemm-common v0.19.0
+   Compiling qd v0.8.0
+   Compiling faer-traits v0.24.0
+warning: unused variable: `qd`
+    --> crates/hipfire-runtime/src/dflash.rs:1590:9
+     |
+1590 |     let qd = cfg.q_dim();
+     |         ^^ help: if this is intentional, prefix it with an underscore: `_qd`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `row0`
+    --> crates/hipfire-runtime/src/dflash.rs:1759:14
+     |
+1759 |         for (row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
+     |              ^^^^ help: if this is intentional, prefix it with an underscore: `_row0`
+
+warning: variable does not need to be mutable
+    --> crates/hipfire-runtime/src/dspark_core.rs:1312:14
+     |
+1312 |         let (mut drafts, draft_confidence): (Vec<u32>, Vec<f32>) = if block == 0 {
+     |              ----^^^^^^
+     |              |
+     |              help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `index_start`
+   --> crates/hipfire-runtime/src/hfq.rs:297:13
+    |
+297 |         let index_start = metadata_offset;
+    |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_index_start`
+
+   Compiling gemm-c32 v0.19.0
+   Compiling gemm-c64 v0.19.0
+   Compiling gemm-f32 v0.19.0
+   Compiling gemm-f64 v0.19.0
+warning: unused variable: `name`
+   --> crates/hipfire-runtime/src/hfq.rs:946:27
+    |
+946 |     fn tensor_data(&self, name: &str) -> Option<(&crate::model_source::TensorInfo, &[u8])> {
+    |                           ^^^^ help: if this is intentional, prefix it with an underscore: `_name`
+
+warning: unused variable: `name`
+   --> crates/hipfire-runtime/src/hfq.rs:955:27
+    |
+955 |     fn tensor_info(&self, name: &str) -> Option<&crate::model_source::TensorInfo> {
+    |                           ^^^^ help: if this is intentional, prefix it with an underscore: `_name`
+
+warning: unused variable: `i`
+    --> crates/hipfire-runtime/src/llama.rs:1570:13
+     |
+1570 |         for i in 0..batch {
+     |             ^ help: if this is intentional, prefix it with an underscore: `_i`
+
+warning: variable does not need to be mutable
+    --> crates/hipfire-runtime/src/llama.rs:5113:9
+     |
+5113 |     let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
+     |         ----^
+     |         |
+     |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+    --> crates/hipfire-runtime/src/llama.rs:5316:9
+     |
+5316 |     let mut x = gpu.alloc_tensor(&[dim], DType::F32)?;
+     |         ----^
+     |         |
+     |         help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/hipfire-runtime/src/swap/snapshot.rs:132:13
+    |
+132 |         let mut u64_at = |o: &mut usize| {
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: variable does not need to be mutable
+   --> crates/hipfire-runtime/src/swap/snapshot.rs:140:13
+    |
+140 |         let mut u32_at = |o: &mut usize| {
+    |             ----^^^^^^
+    |             |
+    |             help: remove this `mut`
+
+   Compiling gemm v0.19.0
+warning: variable does not need to be mutable
+   --> crates/hipfire-runtime/src/eos_filter.rs:366:13
+    |
+366 |         let mut end = utf8_safe_end(slice) + lo;
+    |             ----^^^
+    |             |
+    |             help: remove this `mut`
+
+warning: methods `prefix_k_bytes` and `prefix_v_bytes` are never used
+    --> crates/hipfire-runtime/src/llama.rs:5613:8
+     |
+5609 | impl VmmKvLayout {
+     | ---------------- methods in this implementation
+...
+5613 |     fn prefix_k_bytes(self, n_positions: usize) -> HipResult<usize> {
+     |        ^^^^^^^^^^^^^^
+...
+5619 |     fn prefix_v_bytes(self, n_positions: usize) -> HipResult<usize> {
+     |        ^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: associated functions `q8_vmm_layout`, `asym3_vmm_layout`, and `fwht3_vmm_layout` are never used
+    --> crates/hipfire-runtime/src/llama.rs:5931:8
+     |
+5624 | impl KvCache {
+     | ------------ associated functions in this implementation
+...
+5931 |     fn q8_vmm_layout(
+     |        ^^^^^^^^^^^^^
+...
+5945 |     fn asym3_vmm_layout(
+     |        ^^^^^^^^^^^^^^^^
+...
+5963 |     fn fwht3_vmm_layout(
+     |        ^^^^^^^^^^^^^^^^
+
+warning: field `bytes` is never read
+  --> crates/hipfire-runtime/src/swap/store.rs:23:27
+   |
+23 |     Disk { path: PathBuf, bytes: u64 },
+   |     ----                  ^^^^^
+   |     |
+   |     field in this variant
+
+warning: method `append_assistant_turn_tokens` is never used
+   --> crates/hipfire-runtime/src/prompt_frame.rs:383:8
+    |
+327 | impl<'a> ChatScaffold<'a> {
+    | ------------------------- method in this implementation
+...
+383 |     fn append_assistant_turn_tokens(&self, out: &mut Vec<u32>, body: &[u32]) {
+    |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `bf16_bits_to_f32` is never used
+  --> crates/hipfire-runtime/src/calibration.rs:24:4
+   |
+24 | fn bf16_bits_to_f32(bits: u16) -> f32 {
+   |    ^^^^^^^^^^^^^^^^
+
+   Compiling nano-gemm v0.2.2
+   Compiling faer v0.24.4
+   Compiling hipfire-reap v0.3.0 (/home/kaden/hipfire-quantcal/crates/hipfire-reap)
+warning: `hipfire-runtime` (lib) generated 17 warnings (run `cargo fix --lib -p hipfire-runtime` to apply 12 suggestions)
+   Compiling hipfire-quantize v0.3.0 (/home/kaden/hipfire-quantcal/crates/hipfire-quantize)
+warning: unreachable pattern
+    --> crates/hipfire-quantize/src/main.rs:7001:17
+     |
+6934 | /                 GgufFormat::Mq4
+6935 | |                 | GgufFormat::Mq3
+6936 | |                 | GgufFormat::Mq2
+6937 | |                 | GgufFormat::Mq2Lloyd
+6938 | |                 | GgufFormat::Mq3Lloyd
+6939 | |                 | GgufFormat::Mq6 => {
+     | |_________________________________- matches all the relevant values
+...
+7001 |                   GgufFormat::Mq4 => {
+     |                   ^^^^^^^^^^^^^^^ no value can reach this
+     |
+     = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+    --> crates/hipfire-quantize/src/main.rs:7009:17
+     |
+6934 | /                 GgufFormat::Mq4
+6935 | |                 | GgufFormat::Mq3
+6936 | |                 | GgufFormat::Mq2
+6937 | |                 | GgufFormat::Mq2Lloyd
+6938 | |                 | GgufFormat::Mq3Lloyd
+6939 | |                 | GgufFormat::Mq6 => {
+     | |_________________________________- matches all the relevant values
+...
+7009 |                   GgufFormat::Mq3 => {
+     |                   ^^^^^^^^^^^^^^^ no value can reach this
+
+warning: unreachable pattern
+    --> crates/hipfire-quantize/src/main.rs:7013:17
+     |
+6934 | /                 GgufFormat::Mq4
+6935 | |                 | GgufFormat::Mq3
+6936 | |                 | GgufFormat::Mq2
+6937 | |                 | GgufFormat::Mq2Lloyd
+6938 | |                 | GgufFormat::Mq3Lloyd
+6939 | |                 | GgufFormat::Mq6 => {
+     | |_________________________________- matches all the relevant values
+...
+7013 |                   GgufFormat::Mq2 => {
+     |                   ^^^^^^^^^^^^^^^ no value can reach this
+
+warning: unreachable pattern
+    --> crates/hipfire-quantize/src/main.rs:7017:17
+     |
+6934 | /                 GgufFormat::Mq4
+6935 | |                 | GgufFormat::Mq3
+6936 | |                 | GgufFormat::Mq2
+6937 | |                 | GgufFormat::Mq2Lloyd
+6938 | |                 | GgufFormat::Mq3Lloyd
+6939 | |                 | GgufFormat::Mq6 => {
+     | |_________________________________- matches all the relevant values
+...
+7017 |                   GgufFormat::Mq2Lloyd => {
+     |                   ^^^^^^^^^^^^^^^^^^^^ no value can reach this
+
+warning: unreachable pattern
+    --> crates/hipfire-quantize/src/main.rs:7021:17
+     |
+6934 | /                 GgufFormat::Mq4
+6935 | |                 | GgufFormat::Mq3
+6936 | |                 | GgufFormat::Mq2
+6937 | |                 | GgufFormat::Mq2Lloyd
+6938 | |                 | GgufFormat::Mq3Lloyd
+6939 | |                 | GgufFormat::Mq6 => {
+     | |_________________________________- matches all the relevant values
+...
+7021 |                   GgufFormat::Mq3Lloyd => {
+     |                   ^^^^^^^^^^^^^^^^^^^^ no value can reach this
+
+warning: unreachable pattern
+    --> crates/hipfire-quantize/src/main.rs:7033:17
+     |
+6943 |                 GgufFormat::Hfq4 | GgufFormat::Hfq6 => {
+     |                 ----------------------------------- matches all the relevant values
+...
+7033 |                 GgufFormat::Hfq4 => {
+     |                 ^^^^^^^^^^^^^^^^ no value can reach this
+
+warning: variable does not need to be mutable
+    --> crates/hipfire-quantize/src/main.rs:7431:9
+     |
+7431 |     let mut hfq = hipfire_runtime::hfq::HfqFile::open(input)
+     |         ----^^^
+     |         |
+     |         help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `quantize_mfp3g32_e8_row` is never used
+    --> crates/hipfire-quantize/src/main.rs:1950:4
+     |
+1950 | fn quantize_mfp3g32_e8_row(row: &[f32]) -> Vec<u8> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+     |
+     = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `quantize_mfp2g32_e8_row` is never used
+    --> crates/hipfire-quantize/src/main.rs:1954:4
+     |
+1954 | fn quantize_mfp2g32_e8_row(row: &[f32]) -> Vec<u8> {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `default_promote_target` is never used
+    --> crates/hipfire-quantize/src/main.rs:5087:4
+     |
+5087 | fn default_promote_target(base: GgufFormat) -> GgufFormat {
+     |    ^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `is_promote_pair_supported` is never used
+    --> crates/hipfire-quantize/src/main.rs:5113:4
+     |
+5113 | fn is_promote_pair_supported(base: GgufFormat, promote: GgufFormat) -> bool {
+     |    ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: function `kmap_resolve` is never used
+    --> crates/hipfire-quantize/src/main.rs:5209:4
+     |
+5209 | fn kmap_resolve(name: &str, n_layers: usize, is_moe: bool) -> QuantLevel {
+     |    ^^^^^^^^^^^^
+
+warning: constant `E8_SIGMA` is never used
+  --> crates/hipfire-quantize/src/e8.rs:17:11
+   |
+17 | pub const E8_SIGMA: f32 = 1.7;
+   |           ^^^^^^^^
+
+warning: method `as_f32` is never used
+   --> crates/hipfire-quantize/src/gguf_input.rs:121:12
+    |
+112 | impl MetaValue {
+    | -------------- method in this implementation
+...
+121 |     pub fn as_f32(&self) -> Option<f32> {
+    |            ^^^^^^
+
+warning: methods `meta_u32` and `meta_f32` are never used
+   --> crates/hipfire-quantize/src/gguf_input.rs:242:12
+    |
+160 | impl GgufFile {
+    | ------------- methods in this implementation
+...
+242 |     pub fn meta_u32(&self, key: &str) -> Option<u32> {
+    |            ^^^^^^^^
+...
+245 |     pub fn meta_f32(&self, key: &str) -> Option<f32> {
+    |            ^^^^^^^^
+
+warning: `hipfire-quantize` (bin "hipfire-quantize") generated 15 warnings (run `cargo fix --bin "hipfire-quantize" -p hipfire-quantize` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 25.44s
+EXIT=0
