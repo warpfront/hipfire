@@ -1,0 +1,5599 @@
+{
+  "model": "/home/kaden/qcal/q38.mq4v2.mq4",
+  "model_bytes": 15662615552,
+  "draft": "/home/kaden/.hipfire/models/qwen38-27b-dflash2-mq4v2.hfq",
+  "draft_bytes": 1209603072,
+  "daemon": "/home/kaden/hipfire-pm4-verify/target/release/daemon",
+  "kv_mode": "q8",
+  "automatic_clocks_required": true,
+  "prefill": {},
+  "decode": {},
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "dflash_verify_shadow": {
+    "type": "redline_dflash_shadow_result",
+    "backend": "pm4_ib",
+    "execution_mode": "dflash_verify",
+    "verify_batch": 16,
+    "iterations": 12,
+    "positions": [
+      112,
+      128,
+      144,
+      160,
+      176,
+      192,
+      208,
+      224,
+      240,
+      256,
+      272,
+      288
+    ],
+    "extract_layers": [
+      5,
+      19,
+      33,
+      47,
+      61
+    ],
+    "arch": "gfx1201",
+    "arch_id": 5,
+    "physical_cap": 4096,
+    "model": {
+      "path": "/home/kaden/qcal/q38.mq4v2.mq4",
+      "bytes": 15662615552,
+      "header_hash": "cb8b2a8284f61a40"
+    },
+    "oracle": "unconditional Q8 recurrent-state byte parity is not a correctness oracle (stochastic GDN rounding); arms share a GDN frame checkpoint and compare tokens/argmax/indices bit-exact plus claim-scoped max-abs/rel on dequantized regions",
+    "arms": {
+      "hip_auto": {
+        "name": "hip_auto",
+        "host_us": 2565412.223,
+        "guard_unchanged": true,
+        "guard_before_hash": "27bb0bfe48e079c5",
+        "guard_after_hash": "27bb0bfe48e079c5",
+        "windows": [
+          {
+            "position": 112,
+            "tokens": [
+              149,
+              150,
+              151,
+              152,
+              153,
+              154,
+              155,
+              156,
+              157,
+              158,
+              159,
+              160,
+              161,
+              162,
+              163,
+              164
+            ],
+            "argmax": [
+              94,
+              94,
+              123,
+              252,
+              106,
+              115,
+              123,
+              61084,
+              95,
+              254,
+              226,
+              226,
+              67917,
+              38513,
+              38513,
+              38513
+            ],
+            "ring_head": 64,
+            "ring_written": 64,
+            "gdn_frame": 6144,
+            "kv_active_hash": "809132e3f5e6144c",
+            "logits_hash": "4991e9200df66dd4",
+            "final_hidden_hash": "24c1f0de9a0d617a"
+          },
+          {
+            "position": 128,
+            "tokens": [
+              165,
+              166,
+              167,
+              168,
+              169,
+              170,
+              171,
+              172,
+              173,
+              174,
+              175,
+              176,
+              177,
+              178,
+              179,
+              180
+            ],
+            "argmax": [
+              123,
+              107,
+              123,
+              115,
+              253,
+              222,
+              115,
+              238,
+              107,
+              254,
+              123,
+              123,
+              123,
+              166,
+              198,
+              126
+            ],
+            "ring_head": 80,
+            "ring_written": 80,
+            "gdn_frame": 6528,
+            "kv_active_hash": "b1a391968d01154b",
+            "logits_hash": "b2523b6f5bc2a39d",
+            "final_hidden_hash": "17f74bc8cff967e6"
+          },
+          {
+            "position": 144,
+            "tokens": [
+              181,
+              182,
+              183,
+              184,
+              185,
+              186,
+              187,
+              188,
+              189,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196
+            ],
+            "argmax": [
+              198,
+              166,
+              126,
+              166,
+              254,
+              157,
+              248046,
+              188,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196,
+              197
+            ],
+            "ring_head": 96,
+            "ring_written": 96,
+            "gdn_frame": 6912,
+            "kv_active_hash": "536941770d316732",
+            "logits_hash": "d4085ec5bdc6cb81",
+            "final_hidden_hash": "31cd51fd102af25d"
+          },
+          {
+            "position": 160,
+            "tokens": [
+              197,
+              198,
+              199,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212
+            ],
+            "argmax": [
+              199,
+              10,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212,
+              213
+            ],
+            "ring_head": 112,
+            "ring_written": 112,
+            "gdn_frame": 7296,
+            "kv_active_hash": "68787167b7130169",
+            "logits_hash": "47bf2275caa78a3a",
+            "final_hidden_hash": "ccce35bdd2c4c499"
+          },
+          {
+            "position": 176,
+            "tokens": [
+              213,
+              214,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              221,
+              222,
+              223,
+              224,
+              225,
+              226,
+              227,
+              228
+            ],
+            "argmax": [
+              214,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              92762,
+              198,
+              188,
+              190,
+              3100,
+              2230,
+              193,
+              194,
+              195
+            ],
+            "ring_head": 128,
+            "ring_written": 128,
+            "gdn_frame": 7680,
+            "kv_active_hash": "329e3dc55c5b8bf4",
+            "logits_hash": "9f02a8052c81e159",
+            "final_hidden_hash": "04f3dee19a9c257b"
+          },
+          {
+            "position": 192,
+            "tokens": [
+              229,
+              230,
+              231,
+              232,
+              233,
+              234,
+              235,
+              236,
+              237,
+              238,
+              239,
+              240,
+              241,
+              242,
+              243,
+              244
+            ],
+            "argmax": [
+              198,
+              197,
+              198,
+              198,
+              200,
+              198,
+              198,
+              78,
+              198,
+              205,
+              81,
+              207,
+              83,
+              198,
+              85,
+              86
+            ],
+            "ring_head": 144,
+            "ring_written": 144,
+            "gdn_frame": 8064,
+            "kv_active_hash": "a6a770945ff73f2d",
+            "logits_hash": "efc25bbfb709d933",
+            "final_hidden_hash": "e19b86e371825bc2"
+          },
+          {
+            "position": 208,
+            "tokens": [
+              245,
+              246,
+              247,
+              248,
+              249,
+              250,
+              251,
+              252,
+              253,
+              254,
+              255,
+              256,
+              257,
+              258,
+              259,
+              260
+            ],
+            "argmax": [
+              87,
+              88,
+              89,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              32,
+              45,
+              220,
+              220,
+              279,
+              198,
+              220
+            ],
+            "ring_head": 160,
+            "ring_written": 160,
+            "gdn_frame": 8448,
+            "kv_active_hash": "20594ba9e18b8505",
+            "logits_hash": "58cfb4ed417f8734",
+            "final_hidden_hash": "52fc25cf610e107b"
+          },
+          {
+            "position": 224,
+            "tokens": [
+              261,
+              262,
+              263,
+              264,
+              265,
+              266,
+              267,
+              268,
+              269,
+              270,
+              271,
+              272,
+              273,
+              274,
+              275,
+              276
+            ],
+            "argmax": [
+              188,
+              220,
+              220,
+              220,
+              220,
+              220,
+              377,
+              220,
+              220,
+              220,
+              10,
+              220,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 176,
+            "ring_written": 176,
+            "gdn_frame": 8832,
+            "kv_active_hash": "f17d497e46a9d40b",
+            "logits_hash": "092e08375c4b42f8",
+            "final_hidden_hash": "c89c1714c137f135"
+          },
+          {
+            "position": 240,
+            "tokens": [
+              277,
+              278,
+              279,
+              280,
+              281,
+              282,
+              283,
+              284,
+              285,
+              286,
+              287,
+              288,
+              289,
+              290,
+              291,
+              292
+            ],
+            "argmax": [
+              282,
+              220,
+              220,
+              220,
+              220,
+              71,
+              220,
+              220,
+              304,
+              220,
+              220,
+              220,
+              220,
+              304,
+              76,
+              304
+            ],
+            "ring_head": 192,
+            "ring_written": 192,
+            "gdn_frame": 9216,
+            "kv_active_hash": "37ff69dbbec671ae",
+            "logits_hash": "0b5010bf369db2e5",
+            "final_hidden_hash": "3ad71184efb731f2"
+          },
+          {
+            "position": 256,
+            "tokens": [
+              293,
+              294,
+              295,
+              296,
+              297,
+              298,
+              299,
+              300,
+              301,
+              302,
+              303,
+              304,
+              305,
+              306,
+              307,
+              308
+            ],
+            "argmax": [
+              220,
+              220,
+              220,
+              220,
+              197,
+              220,
+              220,
+              197,
+              72,
+              72,
+              220,
+              220,
+              220,
+              70,
+              220,
+              360
+            ],
+            "ring_head": 208,
+            "ring_written": 208,
+            "gdn_frame": 9600,
+            "kv_active_hash": "fca40ed305663ac2",
+            "logits_hash": "70d67c6cb25de903",
+            "final_hidden_hash": "c6cd61186bbd74af"
+          },
+          {
+            "position": 272,
+            "tokens": [
+              309,
+              310,
+              311,
+              312,
+              313,
+              314,
+              315,
+              316,
+              317,
+              318,
+              319,
+              320,
+              321,
+              322,
+              323,
+              324
+            ],
+            "argmax": [
+              304,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              197,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 224,
+            "ring_written": 224,
+            "gdn_frame": 9984,
+            "kv_active_hash": "ee173f7af44544bf",
+            "logits_hash": "99ddecb9345c101e",
+            "final_hidden_hash": "401f7e2536ce31c7"
+          },
+          {
+            "position": 288,
+            "tokens": [
+              325,
+              326,
+              327,
+              328,
+              329,
+              330,
+              331,
+              332,
+              333,
+              334,
+              335,
+              336,
+              337,
+              338,
+              339,
+              340
+            ],
+            "argmax": [
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              269,
+              198,
+              198,
+              220,
+              220,
+              304,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 240,
+            "ring_written": 240,
+            "gdn_frame": 10368,
+            "kv_active_hash": "c82fe097d46302d4",
+            "logits_hash": "cd78a5c7a2a381dc",
+            "final_hidden_hash": "4bceaa1b002ad71b"
+          }
+        ]
+      },
+      "direct_capture_safe": {
+        "name": "direct_capture_safe",
+        "host_us": 2553755.752,
+        "guard_unchanged": true,
+        "guard_before_hash": "27bb0bfe48e079c5",
+        "guard_after_hash": "27bb0bfe48e079c5",
+        "windows": [
+          {
+            "position": 112,
+            "tokens": [
+              149,
+              150,
+              151,
+              152,
+              153,
+              154,
+              155,
+              156,
+              157,
+              158,
+              159,
+              160,
+              161,
+              162,
+              163,
+              164
+            ],
+            "argmax": [
+              94,
+              94,
+              123,
+              252,
+              106,
+              115,
+              123,
+              61084,
+              95,
+              254,
+              226,
+              226,
+              67917,
+              38513,
+              38513,
+              38513
+            ],
+            "ring_head": 64,
+            "ring_written": 64,
+            "gdn_frame": 7680,
+            "kv_active_hash": "809132e3f5e6144c",
+            "logits_hash": "4991e9200df66dd4",
+            "final_hidden_hash": "24c1f0de9a0d617a"
+          },
+          {
+            "position": 128,
+            "tokens": [
+              165,
+              166,
+              167,
+              168,
+              169,
+              170,
+              171,
+              172,
+              173,
+              174,
+              175,
+              176,
+              177,
+              178,
+              179,
+              180
+            ],
+            "argmax": [
+              123,
+              107,
+              123,
+              115,
+              253,
+              222,
+              115,
+              238,
+              107,
+              254,
+              123,
+              123,
+              123,
+              166,
+              198,
+              126
+            ],
+            "ring_head": 80,
+            "ring_written": 80,
+            "gdn_frame": 8832,
+            "kv_active_hash": "b1a391968d01154b",
+            "logits_hash": "b2523b6f5bc2a39d",
+            "final_hidden_hash": "17f74bc8cff967e6"
+          },
+          {
+            "position": 144,
+            "tokens": [
+              181,
+              182,
+              183,
+              184,
+              185,
+              186,
+              187,
+              188,
+              189,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196
+            ],
+            "argmax": [
+              198,
+              166,
+              126,
+              166,
+              254,
+              157,
+              248046,
+              188,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196,
+              197
+            ],
+            "ring_head": 96,
+            "ring_written": 96,
+            "gdn_frame": 9984,
+            "kv_active_hash": "536941770d316732",
+            "logits_hash": "d4085ec5bdc6cb81",
+            "final_hidden_hash": "31cd51fd102af25d"
+          },
+          {
+            "position": 160,
+            "tokens": [
+              197,
+              198,
+              199,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212
+            ],
+            "argmax": [
+              199,
+              10,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212,
+              213
+            ],
+            "ring_head": 112,
+            "ring_written": 112,
+            "gdn_frame": 11136,
+            "kv_active_hash": "68787167b7130169",
+            "logits_hash": "47bf2275caa78a3a",
+            "final_hidden_hash": "ccce35bdd2c4c499"
+          },
+          {
+            "position": 176,
+            "tokens": [
+              213,
+              214,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              221,
+              222,
+              223,
+              224,
+              225,
+              226,
+              227,
+              228
+            ],
+            "argmax": [
+              214,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              92762,
+              198,
+              188,
+              190,
+              3100,
+              2230,
+              193,
+              194,
+              195
+            ],
+            "ring_head": 128,
+            "ring_written": 128,
+            "gdn_frame": 12288,
+            "kv_active_hash": "329e3dc55c5b8bf4",
+            "logits_hash": "9f02a8052c81e159",
+            "final_hidden_hash": "04f3dee19a9c257b"
+          },
+          {
+            "position": 192,
+            "tokens": [
+              229,
+              230,
+              231,
+              232,
+              233,
+              234,
+              235,
+              236,
+              237,
+              238,
+              239,
+              240,
+              241,
+              242,
+              243,
+              244
+            ],
+            "argmax": [
+              198,
+              197,
+              198,
+              198,
+              200,
+              198,
+              198,
+              78,
+              198,
+              205,
+              81,
+              207,
+              83,
+              198,
+              85,
+              86
+            ],
+            "ring_head": 144,
+            "ring_written": 144,
+            "gdn_frame": 13440,
+            "kv_active_hash": "a6a770945ff73f2d",
+            "logits_hash": "efc25bbfb709d933",
+            "final_hidden_hash": "e19b86e371825bc2"
+          },
+          {
+            "position": 208,
+            "tokens": [
+              245,
+              246,
+              247,
+              248,
+              249,
+              250,
+              251,
+              252,
+              253,
+              254,
+              255,
+              256,
+              257,
+              258,
+              259,
+              260
+            ],
+            "argmax": [
+              87,
+              88,
+              89,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              32,
+              45,
+              220,
+              220,
+              279,
+              198,
+              220
+            ],
+            "ring_head": 160,
+            "ring_written": 160,
+            "gdn_frame": 14592,
+            "kv_active_hash": "20594ba9e18b8505",
+            "logits_hash": "58cfb4ed417f8734",
+            "final_hidden_hash": "52fc25cf610e107b"
+          },
+          {
+            "position": 224,
+            "tokens": [
+              261,
+              262,
+              263,
+              264,
+              265,
+              266,
+              267,
+              268,
+              269,
+              270,
+              271,
+              272,
+              273,
+              274,
+              275,
+              276
+            ],
+            "argmax": [
+              188,
+              220,
+              220,
+              220,
+              220,
+              220,
+              377,
+              220,
+              220,
+              220,
+              10,
+              220,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 176,
+            "ring_written": 176,
+            "gdn_frame": 15744,
+            "kv_active_hash": "f17d497e46a9d40b",
+            "logits_hash": "092e08375c4b42f8",
+            "final_hidden_hash": "c89c1714c137f135"
+          },
+          {
+            "position": 240,
+            "tokens": [
+              277,
+              278,
+              279,
+              280,
+              281,
+              282,
+              283,
+              284,
+              285,
+              286,
+              287,
+              288,
+              289,
+              290,
+              291,
+              292
+            ],
+            "argmax": [
+              282,
+              220,
+              220,
+              220,
+              220,
+              71,
+              220,
+              220,
+              304,
+              220,
+              220,
+              220,
+              220,
+              304,
+              76,
+              304
+            ],
+            "ring_head": 192,
+            "ring_written": 192,
+            "gdn_frame": 16896,
+            "kv_active_hash": "37ff69dbbec671ae",
+            "logits_hash": "0b5010bf369db2e5",
+            "final_hidden_hash": "3ad71184efb731f2"
+          },
+          {
+            "position": 256,
+            "tokens": [
+              293,
+              294,
+              295,
+              296,
+              297,
+              298,
+              299,
+              300,
+              301,
+              302,
+              303,
+              304,
+              305,
+              306,
+              307,
+              308
+            ],
+            "argmax": [
+              220,
+              220,
+              220,
+              220,
+              197,
+              220,
+              220,
+              197,
+              72,
+              72,
+              220,
+              220,
+              220,
+              70,
+              220,
+              360
+            ],
+            "ring_head": 208,
+            "ring_written": 208,
+            "gdn_frame": 18048,
+            "kv_active_hash": "fca40ed305663ac2",
+            "logits_hash": "70d67c6cb25de903",
+            "final_hidden_hash": "c6cd61186bbd74af"
+          },
+          {
+            "position": 272,
+            "tokens": [
+              309,
+              310,
+              311,
+              312,
+              313,
+              314,
+              315,
+              316,
+              317,
+              318,
+              319,
+              320,
+              321,
+              322,
+              323,
+              324
+            ],
+            "argmax": [
+              304,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              197,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 224,
+            "ring_written": 224,
+            "gdn_frame": 19200,
+            "kv_active_hash": "ee173f7af44544bf",
+            "logits_hash": "99ddecb9345c101e",
+            "final_hidden_hash": "401f7e2536ce31c7"
+          },
+          {
+            "position": 288,
+            "tokens": [
+              325,
+              326,
+              327,
+              328,
+              329,
+              330,
+              331,
+              332,
+              333,
+              334,
+              335,
+              336,
+              337,
+              338,
+              339,
+              340
+            ],
+            "argmax": [
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              269,
+              198,
+              198,
+              220,
+              220,
+              304,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 240,
+            "ring_written": 240,
+            "gdn_frame": 20352,
+            "kv_active_hash": "c82fe097d46302d4",
+            "logits_hash": "cd78a5c7a2a381dc",
+            "final_hidden_hash": "4bceaa1b002ad71b"
+          }
+        ]
+      },
+      "recorded_hip": {
+        "name": "recorded_hip",
+        "host_us": 2956993.1130000004,
+        "guard_unchanged": true,
+        "guard_before_hash": "27bb0bfe48e079c5",
+        "guard_after_hash": "27bb0bfe48e079c5",
+        "windows": [
+          {
+            "position": 112,
+            "tokens": [
+              149,
+              150,
+              151,
+              152,
+              153,
+              154,
+              155,
+              156,
+              157,
+              158,
+              159,
+              160,
+              161,
+              162,
+              163,
+              164
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 64,
+            "ring_written": 64,
+            "gdn_frame": 7680,
+            "kv_active_hash": "6c89bf97a473c2dd",
+            "logits_hash": "c451b543c2f3b47a",
+            "final_hidden_hash": "c62a0890bc1a4fa4"
+          },
+          {
+            "position": 128,
+            "tokens": [
+              165,
+              166,
+              167,
+              168,
+              169,
+              170,
+              171,
+              172,
+              173,
+              174,
+              175,
+              176,
+              177,
+              178,
+              179,
+              180
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 80,
+            "ring_written": 80,
+            "gdn_frame": 8832,
+            "kv_active_hash": "4fda017ad0181b77",
+            "logits_hash": "826b013984a3d510",
+            "final_hidden_hash": "700dc8db4bd8bb7e"
+          },
+          {
+            "position": 144,
+            "tokens": [
+              181,
+              182,
+              183,
+              184,
+              185,
+              186,
+              187,
+              188,
+              189,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 96,
+            "ring_written": 96,
+            "gdn_frame": 9984,
+            "kv_active_hash": "4c96914e5231ed63",
+            "logits_hash": "c39c7c93b7d91ae7",
+            "final_hidden_hash": "c7be1223d7174bbc"
+          },
+          {
+            "position": 160,
+            "tokens": [
+              197,
+              198,
+              199,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 112,
+            "ring_written": 112,
+            "gdn_frame": 11136,
+            "kv_active_hash": "5f642ea8ba458eab",
+            "logits_hash": "ee4d1bc2a155c5b5",
+            "final_hidden_hash": "1b7b0eb8dd64801f"
+          },
+          {
+            "position": 176,
+            "tokens": [
+              213,
+              214,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              221,
+              222,
+              223,
+              224,
+              225,
+              226,
+              227,
+              228
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 128,
+            "ring_written": 128,
+            "gdn_frame": 12288,
+            "kv_active_hash": "b622b8950141c043",
+            "logits_hash": "cd1a059a8f380228",
+            "final_hidden_hash": "dc65cf40d70d581a"
+          },
+          {
+            "position": 192,
+            "tokens": [
+              229,
+              230,
+              231,
+              232,
+              233,
+              234,
+              235,
+              236,
+              237,
+              238,
+              239,
+              240,
+              241,
+              242,
+              243,
+              244
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 144,
+            "ring_written": 144,
+            "gdn_frame": 13440,
+            "kv_active_hash": "ff1781cb3053f564",
+            "logits_hash": "8734e6c019f9931a",
+            "final_hidden_hash": "0519688318e63274"
+          },
+          {
+            "position": 208,
+            "tokens": [
+              245,
+              246,
+              247,
+              248,
+              249,
+              250,
+              251,
+              252,
+              253,
+              254,
+              255,
+              256,
+              257,
+              258,
+              259,
+              260
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 160,
+            "ring_written": 160,
+            "gdn_frame": 14592,
+            "kv_active_hash": "8bb32f2e0f1cadb8",
+            "logits_hash": "51e2e6b0ff2f276f",
+            "final_hidden_hash": "19fcb495f29178a7"
+          },
+          {
+            "position": 224,
+            "tokens": [
+              261,
+              262,
+              263,
+              264,
+              265,
+              266,
+              267,
+              268,
+              269,
+              270,
+              271,
+              272,
+              273,
+              274,
+              275,
+              276
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 176,
+            "ring_written": 176,
+            "gdn_frame": 15744,
+            "kv_active_hash": "fbeb8b9e2a61ee7c",
+            "logits_hash": "cf69cc43b32e7478",
+            "final_hidden_hash": "9fa9e4c92bba9a2a"
+          },
+          {
+            "position": 240,
+            "tokens": [
+              277,
+              278,
+              279,
+              280,
+              281,
+              282,
+              283,
+              284,
+              285,
+              286,
+              287,
+              288,
+              289,
+              290,
+              291,
+              292
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 192,
+            "ring_written": 192,
+            "gdn_frame": 16896,
+            "kv_active_hash": "87da347d4da6b472",
+            "logits_hash": "fca6107c9792fc9f",
+            "final_hidden_hash": "dc68f8a152976744"
+          },
+          {
+            "position": 256,
+            "tokens": [
+              293,
+              294,
+              295,
+              296,
+              297,
+              298,
+              299,
+              300,
+              301,
+              302,
+              303,
+              304,
+              305,
+              306,
+              307,
+              308
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 208,
+            "ring_written": 208,
+            "gdn_frame": 18048,
+            "kv_active_hash": "cf970f2a7069d409",
+            "logits_hash": "5a10066241a515ec",
+            "final_hidden_hash": "dfdce8c368f6ef8b"
+          },
+          {
+            "position": 272,
+            "tokens": [
+              309,
+              310,
+              311,
+              312,
+              313,
+              314,
+              315,
+              316,
+              317,
+              318,
+              319,
+              320,
+              321,
+              322,
+              323,
+              324
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 224,
+            "ring_written": 224,
+            "gdn_frame": 19200,
+            "kv_active_hash": "0396ca741b5f0318",
+            "logits_hash": "fd4043ee81e1e7ae",
+            "final_hidden_hash": "d59728c0e5d9e0ad"
+          },
+          {
+            "position": 288,
+            "tokens": [
+              325,
+              326,
+              327,
+              328,
+              329,
+              330,
+              331,
+              332,
+              333,
+              334,
+              335,
+              336,
+              337,
+              338,
+              339,
+              340
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 240,
+            "ring_written": 240,
+            "gdn_frame": 20352,
+            "kv_active_hash": "55f076fd3dc89762",
+            "logits_hash": "85ac989062a2373a",
+            "final_hidden_hash": "c9eed0195e767ada"
+          }
+        ]
+      },
+      "pm4": {
+        "name": "pm4",
+        "host_us": 2373525.19,
+        "guard_unchanged": true,
+        "guard_before_hash": "27bb0bfe48e079c5",
+        "guard_after_hash": "27bb0bfe48e079c5",
+        "windows": [
+          {
+            "position": 112,
+            "tokens": [
+              149,
+              150,
+              151,
+              152,
+              153,
+              154,
+              155,
+              156,
+              157,
+              158,
+              159,
+              160,
+              161,
+              162,
+              163,
+              164
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 64,
+            "ring_written": 64,
+            "gdn_frame": 7680,
+            "kv_active_hash": "eca0d4c68ab4a36f",
+            "logits_hash": "570efa0199679769",
+            "final_hidden_hash": "c62a0890bc1a4fa4"
+          },
+          {
+            "position": 128,
+            "tokens": [
+              165,
+              166,
+              167,
+              168,
+              169,
+              170,
+              171,
+              172,
+              173,
+              174,
+              175,
+              176,
+              177,
+              178,
+              179,
+              180
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 80,
+            "ring_written": 80,
+            "gdn_frame": 8832,
+            "kv_active_hash": "dc3b55f7c7ed729e",
+            "logits_hash": "d970595211d8df2c",
+            "final_hidden_hash": "700dc8db4bd8bb7e"
+          },
+          {
+            "position": 144,
+            "tokens": [
+              181,
+              182,
+              183,
+              184,
+              185,
+              186,
+              187,
+              188,
+              189,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 96,
+            "ring_written": 96,
+            "gdn_frame": 9984,
+            "kv_active_hash": "6eb7902727289c7f",
+            "logits_hash": "e807a81c55fad86a",
+            "final_hidden_hash": "c7be1223d7174bbc"
+          },
+          {
+            "position": 160,
+            "tokens": [
+              197,
+              198,
+              199,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 112,
+            "ring_written": 112,
+            "gdn_frame": 11136,
+            "kv_active_hash": "1b8417b58caf46c5",
+            "logits_hash": "7da7528b1977bcc6",
+            "final_hidden_hash": "1b7b0eb8dd64801f"
+          },
+          {
+            "position": 176,
+            "tokens": [
+              213,
+              214,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              221,
+              222,
+              223,
+              224,
+              225,
+              226,
+              227,
+              228
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 128,
+            "ring_written": 128,
+            "gdn_frame": 12288,
+            "kv_active_hash": "32c5dfb58da73144",
+            "logits_hash": "d7d211226f70d26d",
+            "final_hidden_hash": "dc65cf40d70d581a"
+          },
+          {
+            "position": 192,
+            "tokens": [
+              229,
+              230,
+              231,
+              232,
+              233,
+              234,
+              235,
+              236,
+              237,
+              238,
+              239,
+              240,
+              241,
+              242,
+              243,
+              244
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 144,
+            "ring_written": 144,
+            "gdn_frame": 13440,
+            "kv_active_hash": "f1ab03184d58cf87",
+            "logits_hash": "130355157475b92e",
+            "final_hidden_hash": "0519688318e63274"
+          },
+          {
+            "position": 208,
+            "tokens": [
+              245,
+              246,
+              247,
+              248,
+              249,
+              250,
+              251,
+              252,
+              253,
+              254,
+              255,
+              256,
+              257,
+              258,
+              259,
+              260
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 160,
+            "ring_written": 160,
+            "gdn_frame": 14592,
+            "kv_active_hash": "4d5284abbf3873a3",
+            "logits_hash": "a177510fc60a4d99",
+            "final_hidden_hash": "19fcb495f29178a7"
+          },
+          {
+            "position": 224,
+            "tokens": [
+              261,
+              262,
+              263,
+              264,
+              265,
+              266,
+              267,
+              268,
+              269,
+              270,
+              271,
+              272,
+              273,
+              274,
+              275,
+              276
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 176,
+            "ring_written": 176,
+            "gdn_frame": 15744,
+            "kv_active_hash": "9972b30f16b693f0",
+            "logits_hash": "9fce084fa43f45ac",
+            "final_hidden_hash": "9fa9e4c92bba9a2a"
+          },
+          {
+            "position": 240,
+            "tokens": [
+              277,
+              278,
+              279,
+              280,
+              281,
+              282,
+              283,
+              284,
+              285,
+              286,
+              287,
+              288,
+              289,
+              290,
+              291,
+              292
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 192,
+            "ring_written": 192,
+            "gdn_frame": 16896,
+            "kv_active_hash": "b79e7d8cbf6a1432",
+            "logits_hash": "4463bf11a95185d6",
+            "final_hidden_hash": "dc68f8a152976744"
+          },
+          {
+            "position": 256,
+            "tokens": [
+              293,
+              294,
+              295,
+              296,
+              297,
+              298,
+              299,
+              300,
+              301,
+              302,
+              303,
+              304,
+              305,
+              306,
+              307,
+              308
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 208,
+            "ring_written": 208,
+            "gdn_frame": 18048,
+            "kv_active_hash": "e40161837620ae70",
+            "logits_hash": "c636fbf42ecf0453",
+            "final_hidden_hash": "dfdce8c368f6ef8b"
+          },
+          {
+            "position": 272,
+            "tokens": [
+              309,
+              310,
+              311,
+              312,
+              313,
+              314,
+              315,
+              316,
+              317,
+              318,
+              319,
+              320,
+              321,
+              322,
+              323,
+              324
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 224,
+            "ring_written": 224,
+            "gdn_frame": 19200,
+            "kv_active_hash": "16b24ea3c8dccfd0",
+            "logits_hash": "2baf7a2e1bd303c5",
+            "final_hidden_hash": "d59728c0e5d9e0ad"
+          },
+          {
+            "position": 288,
+            "tokens": [
+              325,
+              326,
+              327,
+              328,
+              329,
+              330,
+              331,
+              332,
+              333,
+              334,
+              335,
+              336,
+              337,
+              338,
+              339,
+              340
+            ],
+            "argmax": [
+              186543,
+              95958,
+              71713,
+              93532,
+              108811,
+              92634,
+              17584,
+              218401,
+              132002,
+              171730,
+              43206,
+              4398,
+              96475,
+              71851,
+              49440,
+              143096
+            ],
+            "ring_head": 240,
+            "ring_written": 240,
+            "gdn_frame": 20352,
+            "kv_active_hash": "1081b66598ffeae1",
+            "logits_hash": "8d577fdb285fb747",
+            "final_hidden_hash": "c9eed0195e767ada"
+          }
+        ]
+      }
+    },
+    "parity": {
+      "q8_byte_parity_invalid": true,
+      "windows": [
+        {
+          "position": 112,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 112,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 112,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 76.81204223632812,
+              "max_rel": 1.9999958276748657,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 76.81204223632812,
+              "max_rel": 1.9999958276748657,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 43.49970245361328,
+              "max_rel": 1.9999806880950928,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 26.007034301757812,
+              "max_rel": 1.999997615814209,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 26.32888412475586,
+              "max_rel": 1.9999980926513672,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 51.582191467285156,
+              "max_rel": 0.9990252256393433,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.7235705852508545,
+              "max_rel": 0.9861609935760498,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.010512243025004864,
+              "max_rel": 0.9999468922615051,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 33.35629653930664,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.04098467901349068,
+              "max_rel": 0.999502420425415,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 25.406715393066406,
+              "max_rel": 1.9999895095825195,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 112,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 76.81204223632812,
+              "max_rel": 1.9999958276748657,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 76.81204223632812,
+              "max_rel": 1.9999958276748657,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 43.49970245361328,
+              "max_rel": 1.9999806880950928,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 26.007976531982422,
+              "max_rel": 1.999999761581421,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 26.32888412475586,
+              "max_rel": 1.9999980926513672,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 51.582191467285156,
+              "max_rel": 0.9990252256393433,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.7235705852508545,
+              "max_rel": 0.9861609935760498,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.010512243025004864,
+              "max_rel": 0.9999468922615051,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 33.35629653930664,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.04098467901349068,
+              "max_rel": 0.999502420425415,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 25.406715393066406,
+              "max_rel": 1.9999895095825195,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 128,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 128,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 128,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 140.42405700683594,
+              "max_rel": 1.9999969005584717,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 140.42405700683594,
+              "max_rel": 1.9999969005584717,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 50.806087493896484,
+              "max_rel": 1.999990701675415,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 26.41629409790039,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 34.66913604736328,
+              "max_rel": 1.9999988079071045,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 44.8823127746582,
+              "max_rel": 0.9995680451393127,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9217771291732788,
+              "max_rel": 0.9991738200187683,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.026165321469306946,
+              "max_rel": 0.9999204277992249,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 25.953393936157227,
+              "max_rel": 1.9999977350234985,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0457962304353714,
+              "max_rel": 0.9995091557502747,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 34.66913604736328,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 128,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 140.42405700683594,
+              "max_rel": 1.9999969005584717,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 140.42405700683594,
+              "max_rel": 1.9999969005584717,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 50.806087493896484,
+              "max_rel": 1.999990701675415,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 26.41657257080078,
+              "max_rel": 1.9999992847442627,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 34.66913604736328,
+              "max_rel": 1.9999988079071045,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 44.8823127746582,
+              "max_rel": 0.9995680451393127,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9217771291732788,
+              "max_rel": 0.9991738200187683,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.026165321469306946,
+              "max_rel": 0.9999204277992249,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 25.953393936157227,
+              "max_rel": 1.9999977350234985,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0457962304353714,
+              "max_rel": 0.9995091557502747,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 34.66913604736328,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 144,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 144,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 144,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 40.739837646484375,
+              "max_rel": 1.9999693632125854,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 21.476594924926758,
+              "max_rel": 1.999998688697815,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 34.611053466796875,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 68.63284301757812,
+              "max_rel": 1.0,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9016824960708618,
+              "max_rel": 0.9999958872795105,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.02914239466190338,
+              "max_rel": 0.9992666840553284,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 26.443281173706055,
+              "max_rel": 2.0,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.08975479006767273,
+              "max_rel": 0.9993099570274353,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 28.060941696166992,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 144,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 40.739837646484375,
+              "max_rel": 1.9999693632125854,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 21.476560592651367,
+              "max_rel": 1.9999974966049194,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 34.611053466796875,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 68.63284301757812,
+              "max_rel": 1.0,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9016824960708618,
+              "max_rel": 0.9999958872795105,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.02914239466190338,
+              "max_rel": 0.9992666840553284,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 26.443281173706055,
+              "max_rel": 2.0,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.08975479006767273,
+              "max_rel": 0.9993099570274353,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 28.060941696166992,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 160,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 160,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 160,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 87.74510192871094,
+              "max_rel": 1.999988079071045,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 40.92329025268555,
+              "max_rel": 1.999994158744812,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 21.187641143798828,
+              "max_rel": 1.9999985694885254,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 58.659080505371094,
+              "max_rel": 1.9999979734420776,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 48.770469665527344,
+              "max_rel": 0.9997442960739136,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9326801300048828,
+              "max_rel": 0.9875422120094299,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.06183768808841705,
+              "max_rel": 0.9990462064743042,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 37.3336296081543,
+              "max_rel": 1.9999998807907104,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1344747692346573,
+              "max_rel": 0.9995601773262024,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 26.110816955566406,
+              "max_rel": 1.9999972581863403,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 160,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 87.74510192871094,
+              "max_rel": 1.999988079071045,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 40.92329025268555,
+              "max_rel": 1.999994158744812,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 21.187923431396484,
+              "max_rel": 1.9999990463256836,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 58.659080505371094,
+              "max_rel": 1.9999979734420776,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 48.770469665527344,
+              "max_rel": 0.9997442960739136,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9326801300048828,
+              "max_rel": 0.9875422120094299,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.06183768808841705,
+              "max_rel": 0.9990462064743042,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 37.3336296081543,
+              "max_rel": 1.9999998807907104,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1344747692346573,
+              "max_rel": 0.9995601773262024,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 26.110816955566406,
+              "max_rel": 1.9999972581863403,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 176,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 176,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 176,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 51.30961990356445,
+              "max_rel": 1.9999960660934448,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 39.39712142944336,
+              "max_rel": 1.9999659061431885,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 19.50357437133789,
+              "max_rel": 1.9999992847442627,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 58.0686149597168,
+              "max_rel": 1.9999990463256836,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 62.10323715209961,
+              "max_rel": 0.9998096227645874,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.8666903376579285,
+              "max_rel": 0.985049843788147,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.1247062087059021,
+              "max_rel": 0.9999234080314636,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 27.684141159057617,
+              "max_rel": 1.999996304512024,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.11653760820627213,
+              "max_rel": 0.9995539784431458,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 58.0686149597168,
+              "max_rel": 1.9999933242797852,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 176,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 51.30961990356445,
+              "max_rel": 1.9999960660934448,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 39.39712142944336,
+              "max_rel": 1.9999659061431885,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 19.504106521606445,
+              "max_rel": 2.0,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 58.0686149597168,
+              "max_rel": 1.9999990463256836,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 62.10323715209961,
+              "max_rel": 0.9998096227645874,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.8666903376579285,
+              "max_rel": 0.985049843788147,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.1247062087059021,
+              "max_rel": 0.9999234080314636,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 27.684141159057617,
+              "max_rel": 1.999996304512024,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.11653760820627213,
+              "max_rel": 0.9995539784431458,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 58.0686149597168,
+              "max_rel": 1.9999933242797852,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 192,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 192,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 192,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 112.67243957519531,
+              "max_rel": 1.9999827146530151,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 39.76466369628906,
+              "max_rel": 1.9999252557754517,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 19.342790603637695,
+              "max_rel": 1.9999988079071045,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 25.151395797729492,
+              "max_rel": 1.9999996423721313,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 39.219810485839844,
+              "max_rel": 0.9998469352722168,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.8729709386825562,
+              "max_rel": 0.9856752753257751,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.12212264537811279,
+              "max_rel": 0.9993405938148499,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 30.65105628967285,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.11048920452594757,
+              "max_rel": 0.9994993805885315,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 23.06903839111328,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 192,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 112.67243957519531,
+              "max_rel": 1.9999827146530151,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 39.76466369628906,
+              "max_rel": 1.9999252557754517,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 19.34355926513672,
+              "max_rel": 1.9999985694885254,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 25.151395797729492,
+              "max_rel": 1.9999996423721313,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 39.219810485839844,
+              "max_rel": 0.9998469352722168,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.8729709386825562,
+              "max_rel": 0.9856752753257751,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.12212264537811279,
+              "max_rel": 0.9993405938148499,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 30.65105628967285,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.11048920452594757,
+              "max_rel": 0.9994993805885315,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 23.06903839111328,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 208,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 208,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 208,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 147.65077209472656,
+              "max_rel": 1.9999850988388062,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 35.35622024536133,
+              "max_rel": 1.999991536140442,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 18.436803817749023,
+              "max_rel": 1.999997854232788,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 56.578887939453125,
+              "max_rel": 1.9999992847442627,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 49.47410583496094,
+              "max_rel": 0.9999293684959412,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9195281267166138,
+              "max_rel": 0.9881675243377686,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.09557086229324341,
+              "max_rel": 0.9993709921836853,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 28.875385284423828,
+              "max_rel": 1.9999988079071045,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1074368879199028,
+              "max_rel": 0.9994661211967468,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 25.402660369873047,
+              "max_rel": 1.9999895095825195,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 208,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 147.65077209472656,
+              "max_rel": 1.9999850988388062,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 35.35622024536133,
+              "max_rel": 1.999991536140442,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 18.43631935119629,
+              "max_rel": 1.999999761581421,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 56.578887939453125,
+              "max_rel": 1.9999992847442627,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 49.47410583496094,
+              "max_rel": 0.9999293684959412,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9195281267166138,
+              "max_rel": 0.9881675243377686,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.09557086229324341,
+              "max_rel": 0.9993709921836853,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 28.875385284423828,
+              "max_rel": 1.9999988079071045,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1074368879199028,
+              "max_rel": 0.9994661211967468,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 25.402660369873047,
+              "max_rel": 1.9999895095825195,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 224,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 224,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 224,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 164.39219665527344,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 42.59742736816406,
+              "max_rel": 1.9999873638153076,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 18.460769653320312,
+              "max_rel": 1.9999992847442627,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 51.97041320800781,
+              "max_rel": 2.0,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 56.826629638671875,
+              "max_rel": 0.9997206926345825,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9044880270957947,
+              "max_rel": 0.9904515743255615,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.07586446404457092,
+              "max_rel": 0.9997666478157043,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 31.695892333984375,
+              "max_rel": 1.999993085861206,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.14131173491477966,
+              "max_rel": 0.9993067383766174,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 39.403076171875,
+              "max_rel": 1.9999946355819702,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 224,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 164.39219665527344,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 42.59742736816406,
+              "max_rel": 1.9999873638153076,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 18.460573196411133,
+              "max_rel": 1.999998927116394,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 51.97041320800781,
+              "max_rel": 2.0,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 56.826629638671875,
+              "max_rel": 0.9997206926345825,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9044880270957947,
+              "max_rel": 0.9904515743255615,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.07586446404457092,
+              "max_rel": 0.9997666478157043,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 31.695892333984375,
+              "max_rel": 1.999993085861206,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.14131173491477966,
+              "max_rel": 0.9993067383766174,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 39.403076171875,
+              "max_rel": 1.9999946355819702,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 240,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 240,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 240,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 92.1151123046875,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 32.71327209472656,
+              "max_rel": 1.9999693632125854,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 19.03993797302246,
+              "max_rel": 2.0,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 50.8743782043457,
+              "max_rel": 1.9999998807907104,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 64.72818756103516,
+              "max_rel": 0.9996359944343567,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9416813850402832,
+              "max_rel": 0.9877459406852722,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.07635097205638885,
+              "max_rel": 0.9998421669006348,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 28.515188217163086,
+              "max_rel": 1.999997615814209,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1789197027683258,
+              "max_rel": 0.9992305040359497,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 49.67209243774414,
+              "max_rel": 1.9999929666519165,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 240,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 92.1151123046875,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 32.71327209472656,
+              "max_rel": 1.9999693632125854,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 19.039400100708008,
+              "max_rel": 1.9999979734420776,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 50.8743782043457,
+              "max_rel": 1.9999998807907104,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 64.72818756103516,
+              "max_rel": 0.9996359944343567,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9416813850402832,
+              "max_rel": 0.9877459406852722,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.07635097205638885,
+              "max_rel": 0.9998421669006348,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 28.515188217163086,
+              "max_rel": 1.999997615814209,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1789197027683258,
+              "max_rel": 0.9992305040359497,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 49.67209243774414,
+              "max_rel": 1.9999929666519165,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 256,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 256,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 256,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 103.28341674804688,
+              "max_rel": 1.9999958276748657,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 31.41852569580078,
+              "max_rel": 1.9999209642410278,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 17.34709358215332,
+              "max_rel": 1.9999995231628418,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 48.353729248046875,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 62.322853088378906,
+              "max_rel": 0.9997362494468689,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9454854726791382,
+              "max_rel": 0.9870714545249939,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.09349077939987183,
+              "max_rel": 0.9999672770500183,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 23.861957550048828,
+              "max_rel": 1.9999983310699463,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1735168993473053,
+              "max_rel": 0.999235212802887,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 38.36432647705078,
+              "max_rel": 1.999998927116394,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 256,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 103.28341674804688,
+              "max_rel": 1.9999958276748657,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 31.41852569580078,
+              "max_rel": 1.9999209642410278,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 17.347436904907227,
+              "max_rel": 1.999993085861206,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 48.353729248046875,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 62.322853088378906,
+              "max_rel": 0.9997362494468689,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9454854726791382,
+              "max_rel": 0.9870714545249939,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.09349077939987183,
+              "max_rel": 0.9999672770500183,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 23.861957550048828,
+              "max_rel": 1.9999983310699463,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1735168993473053,
+              "max_rel": 0.999235212802887,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 38.36432647705078,
+              "max_rel": 1.999998927116394,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 272,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 272,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 272,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 117.69761657714844,
+              "max_rel": 1.9999942779541016,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 36.26631164550781,
+              "max_rel": 1.999953031539917,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 18.143850326538086,
+              "max_rel": 1.999997615814209,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 53.38997268676758,
+              "max_rel": 1.9999998807907104,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 55.551082611083984,
+              "max_rel": 0.9998709559440613,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9574099183082581,
+              "max_rel": 0.9851934909820557,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.09258627891540527,
+              "max_rel": 0.999945878982544,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 23.030689239501953,
+              "max_rel": 1.9999942779541016,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.16781871020793915,
+              "max_rel": 0.9994379878044128,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 44.693748474121094,
+              "max_rel": 1.9999920129776,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 272,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 117.69761657714844,
+              "max_rel": 1.9999942779541016,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 36.26631164550781,
+              "max_rel": 1.999953031539917,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 18.14377784729004,
+              "max_rel": 1.9999995231628418,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 53.38997268676758,
+              "max_rel": 1.9999998807907104,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 55.551082611083984,
+              "max_rel": 0.9998709559440613,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9574099183082581,
+              "max_rel": 0.9851934909820557,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.09258627891540527,
+              "max_rel": 0.999945878982544,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 23.030689239501953,
+              "max_rel": 1.9999942779541016,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.16781871020793915,
+              "max_rel": 0.9994379878044128,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 44.693748474121094,
+              "max_rel": 1.9999920129776,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 288,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 288,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 288,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 111.2018814086914,
+              "max_rel": 1.999990463256836,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 33.996219635009766,
+              "max_rel": 1.9999579191207886,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 19.669565200805664,
+              "max_rel": 1.999998688697815,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 64.46219635009766,
+              "max_rel": 2.0,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 62.8898811340332,
+              "max_rel": 0.9999446868896484,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9595466256141663,
+              "max_rel": 0.9851878881454468,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.08339458703994751,
+              "max_rel": 0.9999515414237976,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 24.494709014892578,
+              "max_rel": 1.9999979734420776,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.13472265005111694,
+              "max_rel": 0.999434232711792,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 47.704376220703125,
+              "max_rel": 1.9999945163726807,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 288,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 111.2018814086914,
+              "max_rel": 1.999990463256836,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 33.996219635009766,
+              "max_rel": 1.9999579191207886,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 19.67050552368164,
+              "max_rel": 1.999998927116394,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 64.46219635009766,
+              "max_rel": 2.0,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 62.8898811340332,
+              "max_rel": 0.9999446868896484,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9595466256141663,
+              "max_rel": 0.9851878881454468,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.08339458703994751,
+              "max_rel": 0.9999515414237976,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 24.494709014892578,
+              "max_rel": 1.9999979734420776,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.13472265005111694,
+              "max_rel": 0.999434232711792,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 47.704376220703125,
+              "max_rel": 1.9999945163726807,
+              "bytes_equal": false
+            }
+          }
+        }
+      ]
+    },
+    "capture": {
+      "launches": 1074,
+      "aql_contracts": 19,
+      "aql_equals_unique_kernels": true
+    },
+    "prepared_identity": {
+      "dispatch_count": 1074,
+      "packet_count": 1,
+      "queue_id": 4,
+      "command_dwords": 28721,
+      "queue_count": 1,
+      "phase_count": 1,
+      "dispatch_equals_launches": true
+    },
+    "route": {
+      "phase": "ready",
+      "reason": null,
+      "binding": {
+        "batch": 16,
+        "arch": "gfx1201",
+        "model_fingerprint": 2743607360290628609,
+        "layout_generation": 3357239843120326450,
+        "max_position": 4096,
+        "kv_mode": "q8",
+        "dn_state_quant": "q8"
+      },
+      "kv_mode": "q8",
+      "dn_state_quant": "q8",
+      "prepared_dispatch_count": 1074,
+      "prepared_packet_count": 1,
+      "prepared_queue_id": 4,
+      "prepared_queue_count": 1,
+      "prepared_phase_count": 1,
+      "counters": {
+        "full_hip": 0,
+        "partial_hip": 0,
+        "prime_windows": 1,
+        "capture_attempts": 2,
+        "captures": 2,
+        "calibration_captures": 1,
+        "contract_failures": 0,
+        "prepare_failures": 0,
+        "replays": 212,
+        "replay_failures": 0,
+        "safe_hip_retries": 0,
+        "poison_count": 0,
+        "rearms": 0,
+        "position_bindings": 0,
+        "first_replay_position": 112,
+        "last_replay_position": 2512
+      }
+    },
+    "production_route": {
+      "phase": "armed",
+      "reason": null,
+      "binding": null,
+      "kv_mode": "q8",
+      "dn_state_quant": "q8",
+      "prepared_dispatch_count": null,
+      "prepared_packet_count": null,
+      "prepared_queue_id": null,
+      "prepared_queue_count": null,
+      "prepared_phase_count": null,
+      "counters": {
+        "full_hip": 0,
+        "partial_hip": 0,
+        "prime_windows": 0,
+        "capture_attempts": 0,
+        "captures": 0,
+        "calibration_captures": 0,
+        "contract_failures": 0,
+        "prepare_failures": 0,
+        "replays": 0,
+        "replay_failures": 0,
+        "safe_hip_retries": 0,
+        "poison_count": 0,
+        "rearms": 0,
+        "position_bindings": 0,
+        "first_replay_position": null,
+        "last_replay_position": null
+      }
+    },
+    "protocol": {
+      "prepare_reject": {
+        "hip_completed": true,
+        "route": {
+          "phase": "poisoned",
+          "reason": "shadow inject: preparation rejected after successful recorded HIP body",
+          "binding": {
+            "batch": 16,
+            "arch": "gfx1201",
+            "model_fingerprint": 2743607360290628609,
+            "layout_generation": 3357239843120326450,
+            "max_position": 4096,
+            "kv_mode": "q8",
+            "dn_state_quant": "q8"
+          },
+          "kv_mode": "q8",
+          "dn_state_quant": "q8",
+          "prepared_dispatch_count": null,
+          "prepared_packet_count": null,
+          "prepared_queue_id": null,
+          "prepared_queue_count": null,
+          "prepared_phase_count": null,
+          "counters": {
+            "full_hip": 0,
+            "partial_hip": 0,
+            "prime_windows": 1,
+            "capture_attempts": 0,
+            "captures": 0,
+            "calibration_captures": 0,
+            "contract_failures": 0,
+            "prepare_failures": 1,
+            "replays": 0,
+            "replay_failures": 0,
+            "safe_hip_retries": 0,
+            "poison_count": 1,
+            "rearms": 0,
+            "position_bindings": 0,
+            "first_replay_position": null,
+            "last_replay_position": null
+          }
+        }
+      },
+      "replay_proven": {
+        "safe_hip_retry": true,
+        "double_ring_commit": false,
+        "ring_written_before": 16,
+        "ring_written_after": 16,
+        "route": {
+          "phase": "poisoned",
+          "reason": "shadow inject: replay failure with Proven quiescence",
+          "binding": null,
+          "kv_mode": "q8",
+          "dn_state_quant": "q8",
+          "prepared_dispatch_count": null,
+          "prepared_packet_count": null,
+          "prepared_queue_id": null,
+          "prepared_queue_count": null,
+          "prepared_phase_count": null,
+          "counters": {
+            "full_hip": 0,
+            "partial_hip": 0,
+            "prime_windows": 0,
+            "capture_attempts": 0,
+            "captures": 0,
+            "calibration_captures": 0,
+            "contract_failures": 0,
+            "prepare_failures": 0,
+            "replays": 0,
+            "replay_failures": 1,
+            "safe_hip_retries": 1,
+            "poison_count": 1,
+            "rearms": 0,
+            "position_bindings": 0,
+            "first_replay_position": null,
+            "last_replay_position": 112
+          }
+        }
+      },
+      "replay_unknown": {
+        "lm_head": false,
+        "accept": false,
+        "emission": false,
+        "shutdown": null,
+        "route": {
+          "phase": "quarantined",
+          "reason": "shadow inject: replay failure with Unknown quiescence",
+          "binding": null,
+          "kv_mode": "q8",
+          "dn_state_quant": "q8",
+          "prepared_dispatch_count": null,
+          "prepared_packet_count": null,
+          "prepared_queue_id": null,
+          "prepared_queue_count": null,
+          "prepared_phase_count": null,
+          "counters": {
+            "full_hip": 0,
+            "partial_hip": 0,
+            "prime_windows": 0,
+            "capture_attempts": 0,
+            "captures": 0,
+            "calibration_captures": 0,
+            "contract_failures": 0,
+            "prepare_failures": 0,
+            "replays": 0,
+            "replay_failures": 1,
+            "safe_hip_retries": 0,
+            "poison_count": 1,
+            "rearms": 0,
+            "position_bindings": 0,
+            "first_replay_position": null,
+            "last_replay_position": 112
+          }
+        }
+      }
+    },
+    "timing": {
+      "windows_per_arm": 200,
+      "interleaved": true,
+      "capture_prepare_us": 662180.596,
+      "hipgraph_verify_body_ms": {
+        "median": 43.115451,
+        "p95": 49.815391
+      },
+      "pm4_verify_body_ms": {
+        "median": 40.680537,
+        "p95": 47.149977
+      },
+      "median_delta_ms": -2.434913999999999,
+      "percent_delta": -5.647427879160998,
+      "p95_delta_ms": -2.6654139999999984,
+      "kill_if_under_1ms_and_2pct_or_p95_regresses": false
+    }
+  },
+  "pass": false,
+  "dflash_verify_failures": [
+    "position 112: recorded_hip.argmax_equal is false",
+    "position 112: recorded_hip.kv_active_hash_equal is false",
+    "position 112: recorded_hip.hidden_staging diverged max_abs=76.81204223632812 max_rel=1.9999958276748657",
+    "position 112: recorded_hip.hidden_ring diverged max_abs=76.81204223632812 max_rel=1.9999958276748657",
+    "position 112: recorded_hip.final_hidden diverged max_abs=43.49970245361328 max_rel=1.9999806880950928",
+    "position 112: recorded_hip.logits diverged max_abs=26.007034301757812 max_rel=1.999997615814209",
+    "position 112: recorded_hip.gdn_qkv diverged max_abs=26.32888412475586 max_rel=1.9999980926513672",
+    "position 112: recorded_hip.gdn_alpha diverged max_abs=51.582191467285156 max_rel=0.9990252256393433",
+    "position 112: recorded_hip.gdn_beta diverged max_abs=0.7235705852508545 max_rel=0.9861609935760498",
+    "position 112: recorded_hip.dn_scales_after_forward diverged max_abs=0.010512243025004864 max_rel=0.9999468922615051",
+    "position 112: recorded_hip.dn_conv_after_forward diverged max_abs=33.35629653930664 max_rel=1.9999984502792358",
+    "position 112: recorded_hip.dn_scales_after_rollback diverged max_abs=0.04098467901349068 max_rel=0.999502420425415",
+    "position 112: recorded_hip.dn_conv_after_rollback diverged max_abs=25.406715393066406 max_rel=1.9999895095825195",
+    "position 112: pm4.argmax_equal is false",
+    "position 112: pm4.kv_active_hash_equal is false",
+    "position 112: pm4.hidden_staging diverged max_abs=76.81204223632812 max_rel=1.9999958276748657",
+    "position 112: pm4.hidden_ring diverged max_abs=76.81204223632812 max_rel=1.9999958276748657",
+    "position 112: pm4.final_hidden diverged max_abs=43.49970245361328 max_rel=1.9999806880950928",
+    "position 112: pm4.logits diverged max_abs=26.007976531982422 max_rel=1.999999761581421",
+    "position 112: pm4.gdn_qkv diverged max_abs=26.32888412475586 max_rel=1.9999980926513672",
+    "position 112: pm4.gdn_alpha diverged max_abs=51.582191467285156 max_rel=0.9990252256393433",
+    "position 112: pm4.gdn_beta diverged max_abs=0.7235705852508545 max_rel=0.9861609935760498",
+    "position 112: pm4.dn_scales_after_forward diverged max_abs=0.010512243025004864 max_rel=0.9999468922615051",
+    "position 112: pm4.dn_conv_after_forward diverged max_abs=33.35629653930664 max_rel=1.9999984502792358",
+    "position 112: pm4.dn_scales_after_rollback diverged max_abs=0.04098467901349068 max_rel=0.999502420425415",
+    "position 112: pm4.dn_conv_after_rollback diverged max_abs=25.406715393066406 max_rel=1.9999895095825195",
+    "position 128: recorded_hip.argmax_equal is false",
+    "position 128: recorded_hip.kv_active_hash_equal is false",
+    "position 128: recorded_hip.hidden_staging diverged max_abs=140.42405700683594 max_rel=1.9999969005584717",
+    "position 128: recorded_hip.hidden_ring diverged max_abs=140.42405700683594 max_rel=1.9999969005584717",
+    "position 128: recorded_hip.final_hidden diverged max_abs=50.806087493896484 max_rel=1.999990701675415",
+    "position 128: recorded_hip.logits diverged max_abs=26.41629409790039 max_rel=1.9999991655349731",
+    "position 128: recorded_hip.gdn_qkv diverged max_abs=34.66913604736328 max_rel=1.9999988079071045",
+    "position 128: recorded_hip.gdn_alpha diverged max_abs=44.8823127746582 max_rel=0.9995680451393127",
+    "position 128: recorded_hip.gdn_beta diverged max_abs=0.9217771291732788 max_rel=0.9991738200187683",
+    "position 128: recorded_hip.dn_scales_after_forward diverged max_abs=0.026165321469306946 max_rel=0.9999204277992249",
+    "position 128: recorded_hip.dn_conv_after_forward diverged max_abs=25.953393936157227 max_rel=1.9999977350234985",
+    "position 128: recorded_hip.dn_scales_after_rollback diverged max_abs=0.0457962304353714 max_rel=0.9995091557502747",
+    "position 128: recorded_hip.dn_conv_after_rollback diverged max_abs=34.66913604736328 max_rel=1.9999982118606567",
+    "position 128: pm4.argmax_equal is false",
+    "position 128: pm4.kv_active_hash_equal is false",
+    "position 128: pm4.hidden_staging diverged max_abs=140.42405700683594 max_rel=1.9999969005584717",
+    "position 128: pm4.hidden_ring diverged max_abs=140.42405700683594 max_rel=1.9999969005584717",
+    "position 128: pm4.final_hidden diverged max_abs=50.806087493896484 max_rel=1.999990701675415",
+    "position 128: pm4.logits diverged max_abs=26.41657257080078 max_rel=1.9999992847442627",
+    "position 128: pm4.gdn_qkv diverged max_abs=34.66913604736328 max_rel=1.9999988079071045",
+    "position 128: pm4.gdn_alpha diverged max_abs=44.8823127746582 max_rel=0.9995680451393127",
+    "position 128: pm4.gdn_beta diverged max_abs=0.9217771291732788 max_rel=0.9991738200187683",
+    "position 128: pm4.dn_scales_after_forward diverged max_abs=0.026165321469306946 max_rel=0.9999204277992249",
+    "position 128: pm4.dn_conv_after_forward diverged max_abs=25.953393936157227 max_rel=1.9999977350234985",
+    "position 128: pm4.dn_scales_after_rollback diverged max_abs=0.0457962304353714 max_rel=0.9995091557502747",
+    "position 128: pm4.dn_conv_after_rollback diverged max_abs=34.66913604736328 max_rel=1.9999982118606567",
+    "position 144: recorded_hip.argmax_equal is false",
+    "position 144: recorded_hip.kv_active_hash_equal is false",
+    "position 144: recorded_hip.hidden_staging diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 144: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 144: recorded_hip.final_hidden diverged max_abs=40.739837646484375 max_rel=1.9999693632125854",
+    "position 144: recorded_hip.logits diverged max_abs=21.476594924926758 max_rel=1.999998688697815",
+    "position 144: recorded_hip.gdn_qkv diverged max_abs=34.611053466796875 max_rel=1.9999991655349731",
+    "position 144: recorded_hip.gdn_alpha diverged max_abs=68.63284301757812 max_rel=1.0",
+    "position 144: recorded_hip.gdn_beta diverged max_abs=0.9016824960708618 max_rel=0.9999958872795105",
+    "position 144: recorded_hip.dn_scales_after_forward diverged max_abs=0.02914239466190338 max_rel=0.9992666840553284",
+    "position 144: recorded_hip.dn_conv_after_forward diverged max_abs=26.443281173706055 max_rel=2.0",
+    "position 144: recorded_hip.dn_scales_after_rollback diverged max_abs=0.08975479006767273 max_rel=0.9993099570274353",
+    "position 144: recorded_hip.dn_conv_after_rollback diverged max_abs=28.060941696166992 max_rel=1.9999991655349731",
+    "position 144: pm4.argmax_equal is false",
+    "position 144: pm4.kv_active_hash_equal is false",
+    "position 144: pm4.hidden_staging diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 144: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 144: pm4.final_hidden diverged max_abs=40.739837646484375 max_rel=1.9999693632125854",
+    "position 144: pm4.logits diverged max_abs=21.476560592651367 max_rel=1.9999974966049194",
+    "position 144: pm4.gdn_qkv diverged max_abs=34.611053466796875 max_rel=1.9999991655349731",
+    "position 144: pm4.gdn_alpha diverged max_abs=68.63284301757812 max_rel=1.0",
+    "position 144: pm4.gdn_beta diverged max_abs=0.9016824960708618 max_rel=0.9999958872795105",
+    "position 144: pm4.dn_scales_after_forward diverged max_abs=0.02914239466190338 max_rel=0.9992666840553284",
+    "position 144: pm4.dn_conv_after_forward diverged max_abs=26.443281173706055 max_rel=2.0",
+    "position 144: pm4.dn_scales_after_rollback diverged max_abs=0.08975479006767273 max_rel=0.9993099570274353",
+    "position 144: pm4.dn_conv_after_rollback diverged max_abs=28.060941696166992 max_rel=1.9999991655349731",
+    "position 160: recorded_hip.argmax_equal is false",
+    "position 160: recorded_hip.kv_active_hash_equal is false",
+    "position 160: recorded_hip.hidden_staging diverged max_abs=87.74510192871094 max_rel=1.999988079071045",
+    "position 160: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 160: recorded_hip.final_hidden diverged max_abs=40.92329025268555 max_rel=1.999994158744812",
+    "position 160: recorded_hip.logits diverged max_abs=21.187641143798828 max_rel=1.9999985694885254",
+    "position 160: recorded_hip.gdn_qkv diverged max_abs=58.659080505371094 max_rel=1.9999979734420776",
+    "position 160: recorded_hip.gdn_alpha diverged max_abs=48.770469665527344 max_rel=0.9997442960739136",
+    "position 160: recorded_hip.gdn_beta diverged max_abs=0.9326801300048828 max_rel=0.9875422120094299",
+    "position 160: recorded_hip.dn_scales_after_forward diverged max_abs=0.06183768808841705 max_rel=0.9990462064743042",
+    "position 160: recorded_hip.dn_conv_after_forward diverged max_abs=37.3336296081543 max_rel=1.9999998807907104",
+    "position 160: recorded_hip.dn_scales_after_rollback diverged max_abs=0.1344747692346573 max_rel=0.9995601773262024",
+    "position 160: recorded_hip.dn_conv_after_rollback diverged max_abs=26.110816955566406 max_rel=1.9999972581863403",
+    "position 160: pm4.argmax_equal is false",
+    "position 160: pm4.kv_active_hash_equal is false",
+    "position 160: pm4.hidden_staging diverged max_abs=87.74510192871094 max_rel=1.999988079071045",
+    "position 160: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 160: pm4.final_hidden diverged max_abs=40.92329025268555 max_rel=1.999994158744812",
+    "position 160: pm4.logits diverged max_abs=21.187923431396484 max_rel=1.9999990463256836",
+    "position 160: pm4.gdn_qkv diverged max_abs=58.659080505371094 max_rel=1.9999979734420776",
+    "position 160: pm4.gdn_alpha diverged max_abs=48.770469665527344 max_rel=0.9997442960739136",
+    "position 160: pm4.gdn_beta diverged max_abs=0.9326801300048828 max_rel=0.9875422120094299",
+    "position 160: pm4.dn_scales_after_forward diverged max_abs=0.06183768808841705 max_rel=0.9990462064743042",
+    "position 160: pm4.dn_conv_after_forward diverged max_abs=37.3336296081543 max_rel=1.9999998807907104",
+    "position 160: pm4.dn_scales_after_rollback diverged max_abs=0.1344747692346573 max_rel=0.9995601773262024",
+    "position 160: pm4.dn_conv_after_rollback diverged max_abs=26.110816955566406 max_rel=1.9999972581863403",
+    "position 176: recorded_hip.argmax_equal is false",
+    "position 176: recorded_hip.kv_active_hash_equal is false",
+    "position 176: recorded_hip.hidden_staging diverged max_abs=51.30961990356445 max_rel=1.9999960660934448",
+    "position 176: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 176: recorded_hip.final_hidden diverged max_abs=39.39712142944336 max_rel=1.9999659061431885",
+    "position 176: recorded_hip.logits diverged max_abs=19.50357437133789 max_rel=1.9999992847442627",
+    "position 176: recorded_hip.gdn_qkv diverged max_abs=58.0686149597168 max_rel=1.9999990463256836",
+    "position 176: recorded_hip.gdn_alpha diverged max_abs=62.10323715209961 max_rel=0.9998096227645874",
+    "position 176: recorded_hip.gdn_beta diverged max_abs=0.8666903376579285 max_rel=0.985049843788147",
+    "position 176: recorded_hip.dn_scales_after_forward diverged max_abs=0.1247062087059021 max_rel=0.9999234080314636",
+    "position 176: recorded_hip.dn_conv_after_forward diverged max_abs=27.684141159057617 max_rel=1.999996304512024",
+    "position 176: recorded_hip.dn_scales_after_rollback diverged max_abs=0.11653760820627213 max_rel=0.9995539784431458",
+    "position 176: recorded_hip.dn_conv_after_rollback diverged max_abs=58.0686149597168 max_rel=1.9999933242797852",
+    "position 176: pm4.argmax_equal is false",
+    "position 176: pm4.kv_active_hash_equal is false",
+    "position 176: pm4.hidden_staging diverged max_abs=51.30961990356445 max_rel=1.9999960660934448",
+    "position 176: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 176: pm4.final_hidden diverged max_abs=39.39712142944336 max_rel=1.9999659061431885",
+    "position 176: pm4.logits diverged max_abs=19.504106521606445 max_rel=2.0",
+    "position 176: pm4.gdn_qkv diverged max_abs=58.0686149597168 max_rel=1.9999990463256836",
+    "position 176: pm4.gdn_alpha diverged max_abs=62.10323715209961 max_rel=0.9998096227645874",
+    "position 176: pm4.gdn_beta diverged max_abs=0.8666903376579285 max_rel=0.985049843788147",
+    "position 176: pm4.dn_scales_after_forward diverged max_abs=0.1247062087059021 max_rel=0.9999234080314636",
+    "position 176: pm4.dn_conv_after_forward diverged max_abs=27.684141159057617 max_rel=1.999996304512024",
+    "position 176: pm4.dn_scales_after_rollback diverged max_abs=0.11653760820627213 max_rel=0.9995539784431458",
+    "position 176: pm4.dn_conv_after_rollback diverged max_abs=58.0686149597168 max_rel=1.9999933242797852",
+    "position 192: recorded_hip.argmax_equal is false",
+    "position 192: recorded_hip.kv_active_hash_equal is false",
+    "position 192: recorded_hip.hidden_staging diverged max_abs=112.67243957519531 max_rel=1.9999827146530151",
+    "position 192: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 192: recorded_hip.final_hidden diverged max_abs=39.76466369628906 max_rel=1.9999252557754517",
+    "position 192: recorded_hip.logits diverged max_abs=19.342790603637695 max_rel=1.9999988079071045",
+    "position 192: recorded_hip.gdn_qkv diverged max_abs=25.151395797729492 max_rel=1.9999996423721313",
+    "position 192: recorded_hip.gdn_alpha diverged max_abs=39.219810485839844 max_rel=0.9998469352722168",
+    "position 192: recorded_hip.gdn_beta diverged max_abs=0.8729709386825562 max_rel=0.9856752753257751",
+    "position 192: recorded_hip.dn_scales_after_forward diverged max_abs=0.12212264537811279 max_rel=0.9993405938148499",
+    "position 192: recorded_hip.dn_conv_after_forward diverged max_abs=30.65105628967285 max_rel=1.9999984502792358",
+    "position 192: recorded_hip.dn_scales_after_rollback diverged max_abs=0.11048920452594757 max_rel=0.9994993805885315",
+    "position 192: recorded_hip.dn_conv_after_rollback diverged max_abs=23.06903839111328 max_rel=1.9999991655349731",
+    "position 192: pm4.argmax_equal is false",
+    "position 192: pm4.kv_active_hash_equal is false",
+    "position 192: pm4.hidden_staging diverged max_abs=112.67243957519531 max_rel=1.9999827146530151",
+    "position 192: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 192: pm4.final_hidden diverged max_abs=39.76466369628906 max_rel=1.9999252557754517",
+    "position 192: pm4.logits diverged max_abs=19.34355926513672 max_rel=1.9999985694885254",
+    "position 192: pm4.gdn_qkv diverged max_abs=25.151395797729492 max_rel=1.9999996423721313",
+    "position 192: pm4.gdn_alpha diverged max_abs=39.219810485839844 max_rel=0.9998469352722168",
+    "position 192: pm4.gdn_beta diverged max_abs=0.8729709386825562 max_rel=0.9856752753257751",
+    "position 192: pm4.dn_scales_after_forward diverged max_abs=0.12212264537811279 max_rel=0.9993405938148499",
+    "position 192: pm4.dn_conv_after_forward diverged max_abs=30.65105628967285 max_rel=1.9999984502792358",
+    "position 192: pm4.dn_scales_after_rollback diverged max_abs=0.11048920452594757 max_rel=0.9994993805885315",
+    "position 192: pm4.dn_conv_after_rollback diverged max_abs=23.06903839111328 max_rel=1.9999991655349731",
+    "position 208: recorded_hip.argmax_equal is false",
+    "position 208: recorded_hip.kv_active_hash_equal is false",
+    "position 208: recorded_hip.hidden_staging diverged max_abs=147.65077209472656 max_rel=1.9999850988388062",
+    "position 208: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 208: recorded_hip.final_hidden diverged max_abs=35.35622024536133 max_rel=1.999991536140442",
+    "position 208: recorded_hip.logits diverged max_abs=18.436803817749023 max_rel=1.999997854232788",
+    "position 208: recorded_hip.gdn_qkv diverged max_abs=56.578887939453125 max_rel=1.9999992847442627",
+    "position 208: recorded_hip.gdn_alpha diverged max_abs=49.47410583496094 max_rel=0.9999293684959412",
+    "position 208: recorded_hip.gdn_beta diverged max_abs=0.9195281267166138 max_rel=0.9881675243377686",
+    "position 208: recorded_hip.dn_scales_after_forward diverged max_abs=0.09557086229324341 max_rel=0.9993709921836853",
+    "position 208: recorded_hip.dn_conv_after_forward diverged max_abs=28.875385284423828 max_rel=1.9999988079071045",
+    "position 208: recorded_hip.dn_scales_after_rollback diverged max_abs=0.1074368879199028 max_rel=0.9994661211967468",
+    "position 208: recorded_hip.dn_conv_after_rollback diverged max_abs=25.402660369873047 max_rel=1.9999895095825195",
+    "position 208: pm4.argmax_equal is false",
+    "position 208: pm4.kv_active_hash_equal is false",
+    "position 208: pm4.hidden_staging diverged max_abs=147.65077209472656 max_rel=1.9999850988388062",
+    "position 208: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 208: pm4.final_hidden diverged max_abs=35.35622024536133 max_rel=1.999991536140442",
+    "position 208: pm4.logits diverged max_abs=18.43631935119629 max_rel=1.999999761581421",
+    "position 208: pm4.gdn_qkv diverged max_abs=56.578887939453125 max_rel=1.9999992847442627",
+    "position 208: pm4.gdn_alpha diverged max_abs=49.47410583496094 max_rel=0.9999293684959412",
+    "position 208: pm4.gdn_beta diverged max_abs=0.9195281267166138 max_rel=0.9881675243377686",
+    "position 208: pm4.dn_scales_after_forward diverged max_abs=0.09557086229324341 max_rel=0.9993709921836853",
+    "position 208: pm4.dn_conv_after_forward diverged max_abs=28.875385284423828 max_rel=1.9999988079071045",
+    "position 208: pm4.dn_scales_after_rollback diverged max_abs=0.1074368879199028 max_rel=0.9994661211967468",
+    "position 208: pm4.dn_conv_after_rollback diverged max_abs=25.402660369873047 max_rel=1.9999895095825195",
+    "position 224: recorded_hip.argmax_equal is false",
+    "position 224: recorded_hip.kv_active_hash_equal is false",
+    "position 224: recorded_hip.hidden_staging diverged max_abs=164.39219665527344 max_rel=1.9999984502792358",
+    "position 224: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999984502792358",
+    "position 224: recorded_hip.final_hidden diverged max_abs=42.59742736816406 max_rel=1.9999873638153076",
+    "position 224: recorded_hip.logits diverged max_abs=18.460769653320312 max_rel=1.9999992847442627",
+    "position 224: recorded_hip.gdn_qkv diverged max_abs=51.97041320800781 max_rel=2.0",
+    "position 224: recorded_hip.gdn_alpha diverged max_abs=56.826629638671875 max_rel=0.9997206926345825",
+    "position 224: recorded_hip.gdn_beta diverged max_abs=0.9044880270957947 max_rel=0.9904515743255615",
+    "position 224: recorded_hip.dn_scales_after_forward diverged max_abs=0.07586446404457092 max_rel=0.9997666478157043",
+    "position 224: recorded_hip.dn_conv_after_forward diverged max_abs=31.695892333984375 max_rel=1.999993085861206",
+    "position 224: recorded_hip.dn_scales_after_rollback diverged max_abs=0.14131173491477966 max_rel=0.9993067383766174",
+    "position 224: recorded_hip.dn_conv_after_rollback diverged max_abs=39.403076171875 max_rel=1.9999946355819702",
+    "position 224: pm4.argmax_equal is false",
+    "position 224: pm4.kv_active_hash_equal is false",
+    "position 224: pm4.hidden_staging diverged max_abs=164.39219665527344 max_rel=1.9999984502792358",
+    "position 224: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999984502792358",
+    "position 224: pm4.final_hidden diverged max_abs=42.59742736816406 max_rel=1.9999873638153076",
+    "position 224: pm4.logits diverged max_abs=18.460573196411133 max_rel=1.999998927116394",
+    "position 224: pm4.gdn_qkv diverged max_abs=51.97041320800781 max_rel=2.0",
+    "position 224: pm4.gdn_alpha diverged max_abs=56.826629638671875 max_rel=0.9997206926345825",
+    "position 224: pm4.gdn_beta diverged max_abs=0.9044880270957947 max_rel=0.9904515743255615",
+    "position 224: pm4.dn_scales_after_forward diverged max_abs=0.07586446404457092 max_rel=0.9997666478157043",
+    "position 224: pm4.dn_conv_after_forward diverged max_abs=31.695892333984375 max_rel=1.999993085861206",
+    "position 224: pm4.dn_scales_after_rollback diverged max_abs=0.14131173491477966 max_rel=0.9993067383766174",
+    "position 224: pm4.dn_conv_after_rollback diverged max_abs=39.403076171875 max_rel=1.9999946355819702",
+    "position 240: recorded_hip.argmax_equal is false",
+    "position 240: recorded_hip.kv_active_hash_equal is false",
+    "position 240: recorded_hip.hidden_staging diverged max_abs=92.1151123046875 max_rel=1.9999994039535522",
+    "position 240: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 240: recorded_hip.final_hidden diverged max_abs=32.71327209472656 max_rel=1.9999693632125854",
+    "position 240: recorded_hip.logits diverged max_abs=19.03993797302246 max_rel=2.0",
+    "position 240: recorded_hip.gdn_qkv diverged max_abs=50.8743782043457 max_rel=1.9999998807907104",
+    "position 240: recorded_hip.gdn_alpha diverged max_abs=64.72818756103516 max_rel=0.9996359944343567",
+    "position 240: recorded_hip.gdn_beta diverged max_abs=0.9416813850402832 max_rel=0.9877459406852722",
+    "position 240: recorded_hip.dn_scales_after_forward diverged max_abs=0.07635097205638885 max_rel=0.9998421669006348",
+    "position 240: recorded_hip.dn_conv_after_forward diverged max_abs=28.515188217163086 max_rel=1.999997615814209",
+    "position 240: recorded_hip.dn_scales_after_rollback diverged max_abs=0.1789197027683258 max_rel=0.9992305040359497",
+    "position 240: recorded_hip.dn_conv_after_rollback diverged max_abs=49.67209243774414 max_rel=1.9999929666519165",
+    "position 240: pm4.argmax_equal is false",
+    "position 240: pm4.kv_active_hash_equal is false",
+    "position 240: pm4.hidden_staging diverged max_abs=92.1151123046875 max_rel=1.9999994039535522",
+    "position 240: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 240: pm4.final_hidden diverged max_abs=32.71327209472656 max_rel=1.9999693632125854",
+    "position 240: pm4.logits diverged max_abs=19.039400100708008 max_rel=1.9999979734420776",
+    "position 240: pm4.gdn_qkv diverged max_abs=50.8743782043457 max_rel=1.9999998807907104",
+    "position 240: pm4.gdn_alpha diverged max_abs=64.72818756103516 max_rel=0.9996359944343567",
+    "position 240: pm4.gdn_beta diverged max_abs=0.9416813850402832 max_rel=0.9877459406852722",
+    "position 240: pm4.dn_scales_after_forward diverged max_abs=0.07635097205638885 max_rel=0.9998421669006348",
+    "position 240: pm4.dn_conv_after_forward diverged max_abs=28.515188217163086 max_rel=1.999997615814209",
+    "position 240: pm4.dn_scales_after_rollback diverged max_abs=0.1789197027683258 max_rel=0.9992305040359497",
+    "position 240: pm4.dn_conv_after_rollback diverged max_abs=49.67209243774414 max_rel=1.9999929666519165",
+    "position 256: recorded_hip.argmax_equal is false",
+    "position 256: recorded_hip.kv_active_hash_equal is false",
+    "position 256: recorded_hip.hidden_staging diverged max_abs=103.28341674804688 max_rel=1.9999958276748657",
+    "position 256: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 256: recorded_hip.final_hidden diverged max_abs=31.41852569580078 max_rel=1.9999209642410278",
+    "position 256: recorded_hip.logits diverged max_abs=17.34709358215332 max_rel=1.9999995231628418",
+    "position 256: recorded_hip.gdn_qkv diverged max_abs=48.353729248046875 max_rel=1.9999991655349731",
+    "position 256: recorded_hip.gdn_alpha diverged max_abs=62.322853088378906 max_rel=0.9997362494468689",
+    "position 256: recorded_hip.gdn_beta diverged max_abs=0.9454854726791382 max_rel=0.9870714545249939",
+    "position 256: recorded_hip.dn_scales_after_forward diverged max_abs=0.09349077939987183 max_rel=0.9999672770500183",
+    "position 256: recorded_hip.dn_conv_after_forward diverged max_abs=23.861957550048828 max_rel=1.9999983310699463",
+    "position 256: recorded_hip.dn_scales_after_rollback diverged max_abs=0.1735168993473053 max_rel=0.999235212802887",
+    "position 256: recorded_hip.dn_conv_after_rollback diverged max_abs=38.36432647705078 max_rel=1.999998927116394",
+    "position 256: pm4.argmax_equal is false",
+    "position 256: pm4.kv_active_hash_equal is false",
+    "position 256: pm4.hidden_staging diverged max_abs=103.28341674804688 max_rel=1.9999958276748657",
+    "position 256: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 256: pm4.final_hidden diverged max_abs=31.41852569580078 max_rel=1.9999209642410278",
+    "position 256: pm4.logits diverged max_abs=17.347436904907227 max_rel=1.999993085861206",
+    "position 256: pm4.gdn_qkv diverged max_abs=48.353729248046875 max_rel=1.9999991655349731",
+    "position 256: pm4.gdn_alpha diverged max_abs=62.322853088378906 max_rel=0.9997362494468689",
+    "position 256: pm4.gdn_beta diverged max_abs=0.9454854726791382 max_rel=0.9870714545249939",
+    "position 256: pm4.dn_scales_after_forward diverged max_abs=0.09349077939987183 max_rel=0.9999672770500183",
+    "position 256: pm4.dn_conv_after_forward diverged max_abs=23.861957550048828 max_rel=1.9999983310699463",
+    "position 256: pm4.dn_scales_after_rollback diverged max_abs=0.1735168993473053 max_rel=0.999235212802887",
+    "position 256: pm4.dn_conv_after_rollback diverged max_abs=38.36432647705078 max_rel=1.999998927116394",
+    "position 272: recorded_hip.argmax_equal is false",
+    "position 272: recorded_hip.kv_active_hash_equal is false",
+    "position 272: recorded_hip.hidden_staging diverged max_abs=117.69761657714844 max_rel=1.9999942779541016",
+    "position 272: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 272: recorded_hip.final_hidden diverged max_abs=36.26631164550781 max_rel=1.999953031539917",
+    "position 272: recorded_hip.logits diverged max_abs=18.143850326538086 max_rel=1.999997615814209",
+    "position 272: recorded_hip.gdn_qkv diverged max_abs=53.38997268676758 max_rel=1.9999998807907104",
+    "position 272: recorded_hip.gdn_alpha diverged max_abs=55.551082611083984 max_rel=0.9998709559440613",
+    "position 272: recorded_hip.gdn_beta diverged max_abs=0.9574099183082581 max_rel=0.9851934909820557",
+    "position 272: recorded_hip.dn_scales_after_forward diverged max_abs=0.09258627891540527 max_rel=0.999945878982544",
+    "position 272: recorded_hip.dn_conv_after_forward diverged max_abs=23.030689239501953 max_rel=1.9999942779541016",
+    "position 272: recorded_hip.dn_scales_after_rollback diverged max_abs=0.16781871020793915 max_rel=0.9994379878044128",
+    "position 272: recorded_hip.dn_conv_after_rollback diverged max_abs=44.693748474121094 max_rel=1.9999920129776",
+    "position 272: pm4.argmax_equal is false",
+    "position 272: pm4.kv_active_hash_equal is false",
+    "position 272: pm4.hidden_staging diverged max_abs=117.69761657714844 max_rel=1.9999942779541016",
+    "position 272: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 272: pm4.final_hidden diverged max_abs=36.26631164550781 max_rel=1.999953031539917",
+    "position 272: pm4.logits diverged max_abs=18.14377784729004 max_rel=1.9999995231628418",
+    "position 272: pm4.gdn_qkv diverged max_abs=53.38997268676758 max_rel=1.9999998807907104",
+    "position 272: pm4.gdn_alpha diverged max_abs=55.551082611083984 max_rel=0.9998709559440613",
+    "position 272: pm4.gdn_beta diverged max_abs=0.9574099183082581 max_rel=0.9851934909820557",
+    "position 272: pm4.dn_scales_after_forward diverged max_abs=0.09258627891540527 max_rel=0.999945878982544",
+    "position 272: pm4.dn_conv_after_forward diverged max_abs=23.030689239501953 max_rel=1.9999942779541016",
+    "position 272: pm4.dn_scales_after_rollback diverged max_abs=0.16781871020793915 max_rel=0.9994379878044128",
+    "position 272: pm4.dn_conv_after_rollback diverged max_abs=44.693748474121094 max_rel=1.9999920129776",
+    "position 288: recorded_hip.argmax_equal is false",
+    "position 288: recorded_hip.kv_active_hash_equal is false",
+    "position 288: recorded_hip.hidden_staging diverged max_abs=111.2018814086914 max_rel=1.999990463256836",
+    "position 288: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 288: recorded_hip.final_hidden diverged max_abs=33.996219635009766 max_rel=1.9999579191207886",
+    "position 288: recorded_hip.logits diverged max_abs=19.669565200805664 max_rel=1.999998688697815",
+    "position 288: recorded_hip.gdn_qkv diverged max_abs=64.46219635009766 max_rel=2.0",
+    "position 288: recorded_hip.gdn_alpha diverged max_abs=62.8898811340332 max_rel=0.9999446868896484",
+    "position 288: recorded_hip.gdn_beta diverged max_abs=0.9595466256141663 max_rel=0.9851878881454468",
+    "position 288: recorded_hip.dn_scales_after_forward diverged max_abs=0.08339458703994751 max_rel=0.9999515414237976",
+    "position 288: recorded_hip.dn_conv_after_forward diverged max_abs=24.494709014892578 max_rel=1.9999979734420776",
+    "position 288: recorded_hip.dn_scales_after_rollback diverged max_abs=0.13472265005111694 max_rel=0.999434232711792",
+    "position 288: recorded_hip.dn_conv_after_rollback diverged max_abs=47.704376220703125 max_rel=1.9999945163726807",
+    "position 288: pm4.argmax_equal is false",
+    "position 288: pm4.kv_active_hash_equal is false",
+    "position 288: pm4.hidden_staging diverged max_abs=111.2018814086914 max_rel=1.999990463256836",
+    "position 288: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 288: pm4.final_hidden diverged max_abs=33.996219635009766 max_rel=1.9999579191207886",
+    "position 288: pm4.logits diverged max_abs=19.67050552368164 max_rel=1.999998927116394",
+    "position 288: pm4.gdn_qkv diverged max_abs=64.46219635009766 max_rel=2.0",
+    "position 288: pm4.gdn_alpha diverged max_abs=62.8898811340332 max_rel=0.9999446868896484",
+    "position 288: pm4.gdn_beta diverged max_abs=0.9595466256141663 max_rel=0.9851878881454468",
+    "position 288: pm4.dn_scales_after_forward diverged max_abs=0.08339458703994751 max_rel=0.9999515414237976",
+    "position 288: pm4.dn_conv_after_forward diverged max_abs=24.494709014892578 max_rel=1.9999979734420776",
+    "position 288: pm4.dn_scales_after_rollback diverged max_abs=0.13472265005111694 max_rel=0.999434232711792",
+    "position 288: pm4.dn_conv_after_rollback diverged max_abs=47.704376220703125 max_rel=1.9999945163726807"
+  ]
+}

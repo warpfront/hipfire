@@ -1,0 +1,5594 @@
+{
+  "model": "/home/kaden/qcal/q38.mq4v2.mq4",
+  "model_bytes": 15662615552,
+  "draft": "/home/kaden/.hipfire/models/qwen38-27b-dflash2-mq4v2.hfq",
+  "draft_bytes": 1209603072,
+  "daemon": "/home/kaden/hipfire-pm4-verify/target/release/daemon",
+  "kv_mode": "q8",
+  "automatic_clocks_required": true,
+  "prefill": {},
+  "decode": {},
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "dflash_verify_shadow": {
+    "type": "redline_dflash_shadow_result",
+    "backend": "pm4_ib",
+    "execution_mode": "dflash_verify",
+    "verify_batch": 16,
+    "iterations": 12,
+    "positions": [
+      112,
+      128,
+      144,
+      160,
+      176,
+      192,
+      208,
+      224,
+      240,
+      256,
+      272,
+      288
+    ],
+    "extract_layers": [
+      5,
+      19,
+      33,
+      47,
+      61
+    ],
+    "arch": "gfx1201",
+    "arch_id": 5,
+    "physical_cap": 4096,
+    "model": {
+      "path": "/home/kaden/qcal/q38.mq4v2.mq4",
+      "bytes": 15662615552,
+      "header_hash": "cb8b2a8284f61a40"
+    },
+    "oracle": "unconditional Q8 recurrent-state byte parity is not a correctness oracle (stochastic GDN rounding); arms share a GDN frame checkpoint and compare tokens/argmax/indices bit-exact plus claim-scoped max-abs/rel on dequantized regions",
+    "arms": {
+      "hip_auto": {
+        "name": "hip_auto",
+        "host_us": 2561084.515,
+        "guard_unchanged": true,
+        "guard_before_hash": "27bb0bfe48e079c5",
+        "guard_after_hash": "27bb0bfe48e079c5",
+        "windows": [
+          {
+            "position": 112,
+            "tokens": [
+              149,
+              150,
+              151,
+              152,
+              153,
+              154,
+              155,
+              156,
+              157,
+              158,
+              159,
+              160,
+              161,
+              162,
+              163,
+              164
+            ],
+            "argmax": [
+              94,
+              94,
+              123,
+              252,
+              106,
+              115,
+              123,
+              61084,
+              95,
+              254,
+              226,
+              226,
+              67917,
+              38513,
+              38513,
+              38513
+            ],
+            "ring_head": 64,
+            "ring_written": 64,
+            "gdn_frame": 6144,
+            "kv_active_hash": "809132e3f5e6144c",
+            "logits_hash": "4991e9200df66dd4",
+            "final_hidden_hash": "24c1f0de9a0d617a"
+          },
+          {
+            "position": 128,
+            "tokens": [
+              165,
+              166,
+              167,
+              168,
+              169,
+              170,
+              171,
+              172,
+              173,
+              174,
+              175,
+              176,
+              177,
+              178,
+              179,
+              180
+            ],
+            "argmax": [
+              123,
+              107,
+              123,
+              115,
+              253,
+              222,
+              115,
+              238,
+              107,
+              254,
+              123,
+              123,
+              123,
+              166,
+              198,
+              126
+            ],
+            "ring_head": 80,
+            "ring_written": 80,
+            "gdn_frame": 6528,
+            "kv_active_hash": "b1a391968d01154b",
+            "logits_hash": "b2523b6f5bc2a39d",
+            "final_hidden_hash": "17f74bc8cff967e6"
+          },
+          {
+            "position": 144,
+            "tokens": [
+              181,
+              182,
+              183,
+              184,
+              185,
+              186,
+              187,
+              188,
+              189,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196
+            ],
+            "argmax": [
+              198,
+              166,
+              126,
+              166,
+              254,
+              157,
+              248046,
+              188,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196,
+              197
+            ],
+            "ring_head": 96,
+            "ring_written": 96,
+            "gdn_frame": 6912,
+            "kv_active_hash": "536941770d316732",
+            "logits_hash": "d4085ec5bdc6cb81",
+            "final_hidden_hash": "31cd51fd102af25d"
+          },
+          {
+            "position": 160,
+            "tokens": [
+              197,
+              198,
+              199,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212
+            ],
+            "argmax": [
+              199,
+              10,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212,
+              213
+            ],
+            "ring_head": 112,
+            "ring_written": 112,
+            "gdn_frame": 7296,
+            "kv_active_hash": "68787167b7130169",
+            "logits_hash": "47bf2275caa78a3a",
+            "final_hidden_hash": "ccce35bdd2c4c499"
+          },
+          {
+            "position": 176,
+            "tokens": [
+              213,
+              214,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              221,
+              222,
+              223,
+              224,
+              225,
+              226,
+              227,
+              228
+            ],
+            "argmax": [
+              214,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              92762,
+              198,
+              188,
+              190,
+              3100,
+              2230,
+              193,
+              194,
+              195
+            ],
+            "ring_head": 128,
+            "ring_written": 128,
+            "gdn_frame": 7680,
+            "kv_active_hash": "329e3dc55c5b8bf4",
+            "logits_hash": "9f02a8052c81e159",
+            "final_hidden_hash": "04f3dee19a9c257b"
+          },
+          {
+            "position": 192,
+            "tokens": [
+              229,
+              230,
+              231,
+              232,
+              233,
+              234,
+              235,
+              236,
+              237,
+              238,
+              239,
+              240,
+              241,
+              242,
+              243,
+              244
+            ],
+            "argmax": [
+              198,
+              197,
+              198,
+              198,
+              200,
+              198,
+              198,
+              78,
+              198,
+              205,
+              81,
+              207,
+              83,
+              198,
+              85,
+              86
+            ],
+            "ring_head": 144,
+            "ring_written": 144,
+            "gdn_frame": 8064,
+            "kv_active_hash": "a6a770945ff73f2d",
+            "logits_hash": "efc25bbfb709d933",
+            "final_hidden_hash": "e19b86e371825bc2"
+          },
+          {
+            "position": 208,
+            "tokens": [
+              245,
+              246,
+              247,
+              248,
+              249,
+              250,
+              251,
+              252,
+              253,
+              254,
+              255,
+              256,
+              257,
+              258,
+              259,
+              260
+            ],
+            "argmax": [
+              87,
+              88,
+              89,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              32,
+              45,
+              220,
+              220,
+              279,
+              198,
+              220
+            ],
+            "ring_head": 160,
+            "ring_written": 160,
+            "gdn_frame": 8448,
+            "kv_active_hash": "20594ba9e18b8505",
+            "logits_hash": "58cfb4ed417f8734",
+            "final_hidden_hash": "52fc25cf610e107b"
+          },
+          {
+            "position": 224,
+            "tokens": [
+              261,
+              262,
+              263,
+              264,
+              265,
+              266,
+              267,
+              268,
+              269,
+              270,
+              271,
+              272,
+              273,
+              274,
+              275,
+              276
+            ],
+            "argmax": [
+              188,
+              220,
+              220,
+              220,
+              220,
+              220,
+              377,
+              220,
+              220,
+              220,
+              10,
+              220,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 176,
+            "ring_written": 176,
+            "gdn_frame": 8832,
+            "kv_active_hash": "f17d497e46a9d40b",
+            "logits_hash": "092e08375c4b42f8",
+            "final_hidden_hash": "c89c1714c137f135"
+          },
+          {
+            "position": 240,
+            "tokens": [
+              277,
+              278,
+              279,
+              280,
+              281,
+              282,
+              283,
+              284,
+              285,
+              286,
+              287,
+              288,
+              289,
+              290,
+              291,
+              292
+            ],
+            "argmax": [
+              282,
+              220,
+              220,
+              220,
+              220,
+              71,
+              220,
+              220,
+              304,
+              220,
+              220,
+              220,
+              220,
+              304,
+              76,
+              304
+            ],
+            "ring_head": 192,
+            "ring_written": 192,
+            "gdn_frame": 9216,
+            "kv_active_hash": "37ff69dbbec671ae",
+            "logits_hash": "0b5010bf369db2e5",
+            "final_hidden_hash": "3ad71184efb731f2"
+          },
+          {
+            "position": 256,
+            "tokens": [
+              293,
+              294,
+              295,
+              296,
+              297,
+              298,
+              299,
+              300,
+              301,
+              302,
+              303,
+              304,
+              305,
+              306,
+              307,
+              308
+            ],
+            "argmax": [
+              220,
+              220,
+              220,
+              220,
+              197,
+              220,
+              220,
+              197,
+              72,
+              72,
+              220,
+              220,
+              220,
+              70,
+              220,
+              360
+            ],
+            "ring_head": 208,
+            "ring_written": 208,
+            "gdn_frame": 9600,
+            "kv_active_hash": "fca40ed305663ac2",
+            "logits_hash": "70d67c6cb25de903",
+            "final_hidden_hash": "c6cd61186bbd74af"
+          },
+          {
+            "position": 272,
+            "tokens": [
+              309,
+              310,
+              311,
+              312,
+              313,
+              314,
+              315,
+              316,
+              317,
+              318,
+              319,
+              320,
+              321,
+              322,
+              323,
+              324
+            ],
+            "argmax": [
+              304,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              197,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 224,
+            "ring_written": 224,
+            "gdn_frame": 9984,
+            "kv_active_hash": "ee173f7af44544bf",
+            "logits_hash": "99ddecb9345c101e",
+            "final_hidden_hash": "401f7e2536ce31c7"
+          },
+          {
+            "position": 288,
+            "tokens": [
+              325,
+              326,
+              327,
+              328,
+              329,
+              330,
+              331,
+              332,
+              333,
+              334,
+              335,
+              336,
+              337,
+              338,
+              339,
+              340
+            ],
+            "argmax": [
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              269,
+              198,
+              198,
+              220,
+              220,
+              304,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 240,
+            "ring_written": 240,
+            "gdn_frame": 10368,
+            "kv_active_hash": "c82fe097d46302d4",
+            "logits_hash": "cd78a5c7a2a381dc",
+            "final_hidden_hash": "4bceaa1b002ad71b"
+          }
+        ]
+      },
+      "direct_capture_safe": {
+        "name": "direct_capture_safe",
+        "host_us": 2551081.436,
+        "guard_unchanged": true,
+        "guard_before_hash": "27bb0bfe48e079c5",
+        "guard_after_hash": "27bb0bfe48e079c5",
+        "windows": [
+          {
+            "position": 112,
+            "tokens": [
+              149,
+              150,
+              151,
+              152,
+              153,
+              154,
+              155,
+              156,
+              157,
+              158,
+              159,
+              160,
+              161,
+              162,
+              163,
+              164
+            ],
+            "argmax": [
+              94,
+              94,
+              123,
+              252,
+              106,
+              115,
+              123,
+              61084,
+              95,
+              254,
+              226,
+              226,
+              67917,
+              38513,
+              38513,
+              38513
+            ],
+            "ring_head": 64,
+            "ring_written": 64,
+            "gdn_frame": 7680,
+            "kv_active_hash": "809132e3f5e6144c",
+            "logits_hash": "4991e9200df66dd4",
+            "final_hidden_hash": "24c1f0de9a0d617a"
+          },
+          {
+            "position": 128,
+            "tokens": [
+              165,
+              166,
+              167,
+              168,
+              169,
+              170,
+              171,
+              172,
+              173,
+              174,
+              175,
+              176,
+              177,
+              178,
+              179,
+              180
+            ],
+            "argmax": [
+              123,
+              107,
+              123,
+              115,
+              253,
+              222,
+              115,
+              238,
+              107,
+              254,
+              123,
+              123,
+              123,
+              166,
+              198,
+              126
+            ],
+            "ring_head": 80,
+            "ring_written": 80,
+            "gdn_frame": 8832,
+            "kv_active_hash": "b1a391968d01154b",
+            "logits_hash": "b2523b6f5bc2a39d",
+            "final_hidden_hash": "17f74bc8cff967e6"
+          },
+          {
+            "position": 144,
+            "tokens": [
+              181,
+              182,
+              183,
+              184,
+              185,
+              186,
+              187,
+              188,
+              189,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196
+            ],
+            "argmax": [
+              198,
+              166,
+              126,
+              166,
+              254,
+              157,
+              248046,
+              188,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196,
+              197
+            ],
+            "ring_head": 96,
+            "ring_written": 96,
+            "gdn_frame": 9984,
+            "kv_active_hash": "536941770d316732",
+            "logits_hash": "d4085ec5bdc6cb81",
+            "final_hidden_hash": "31cd51fd102af25d"
+          },
+          {
+            "position": 160,
+            "tokens": [
+              197,
+              198,
+              199,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212
+            ],
+            "argmax": [
+              199,
+              10,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212,
+              213
+            ],
+            "ring_head": 112,
+            "ring_written": 112,
+            "gdn_frame": 11136,
+            "kv_active_hash": "68787167b7130169",
+            "logits_hash": "47bf2275caa78a3a",
+            "final_hidden_hash": "ccce35bdd2c4c499"
+          },
+          {
+            "position": 176,
+            "tokens": [
+              213,
+              214,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              221,
+              222,
+              223,
+              224,
+              225,
+              226,
+              227,
+              228
+            ],
+            "argmax": [
+              214,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              92762,
+              198,
+              188,
+              190,
+              3100,
+              2230,
+              193,
+              194,
+              195
+            ],
+            "ring_head": 128,
+            "ring_written": 128,
+            "gdn_frame": 12288,
+            "kv_active_hash": "329e3dc55c5b8bf4",
+            "logits_hash": "9f02a8052c81e159",
+            "final_hidden_hash": "04f3dee19a9c257b"
+          },
+          {
+            "position": 192,
+            "tokens": [
+              229,
+              230,
+              231,
+              232,
+              233,
+              234,
+              235,
+              236,
+              237,
+              238,
+              239,
+              240,
+              241,
+              242,
+              243,
+              244
+            ],
+            "argmax": [
+              198,
+              197,
+              198,
+              198,
+              200,
+              198,
+              198,
+              78,
+              198,
+              205,
+              81,
+              207,
+              83,
+              198,
+              85,
+              86
+            ],
+            "ring_head": 144,
+            "ring_written": 144,
+            "gdn_frame": 13440,
+            "kv_active_hash": "a6a770945ff73f2d",
+            "logits_hash": "efc25bbfb709d933",
+            "final_hidden_hash": "e19b86e371825bc2"
+          },
+          {
+            "position": 208,
+            "tokens": [
+              245,
+              246,
+              247,
+              248,
+              249,
+              250,
+              251,
+              252,
+              253,
+              254,
+              255,
+              256,
+              257,
+              258,
+              259,
+              260
+            ],
+            "argmax": [
+              87,
+              88,
+              89,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              32,
+              45,
+              220,
+              220,
+              279,
+              198,
+              220
+            ],
+            "ring_head": 160,
+            "ring_written": 160,
+            "gdn_frame": 14592,
+            "kv_active_hash": "20594ba9e18b8505",
+            "logits_hash": "58cfb4ed417f8734",
+            "final_hidden_hash": "52fc25cf610e107b"
+          },
+          {
+            "position": 224,
+            "tokens": [
+              261,
+              262,
+              263,
+              264,
+              265,
+              266,
+              267,
+              268,
+              269,
+              270,
+              271,
+              272,
+              273,
+              274,
+              275,
+              276
+            ],
+            "argmax": [
+              188,
+              220,
+              220,
+              220,
+              220,
+              220,
+              377,
+              220,
+              220,
+              220,
+              10,
+              220,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 176,
+            "ring_written": 176,
+            "gdn_frame": 15744,
+            "kv_active_hash": "f17d497e46a9d40b",
+            "logits_hash": "092e08375c4b42f8",
+            "final_hidden_hash": "c89c1714c137f135"
+          },
+          {
+            "position": 240,
+            "tokens": [
+              277,
+              278,
+              279,
+              280,
+              281,
+              282,
+              283,
+              284,
+              285,
+              286,
+              287,
+              288,
+              289,
+              290,
+              291,
+              292
+            ],
+            "argmax": [
+              282,
+              220,
+              220,
+              220,
+              220,
+              71,
+              220,
+              220,
+              304,
+              220,
+              220,
+              220,
+              220,
+              304,
+              76,
+              304
+            ],
+            "ring_head": 192,
+            "ring_written": 192,
+            "gdn_frame": 16896,
+            "kv_active_hash": "37ff69dbbec671ae",
+            "logits_hash": "0b5010bf369db2e5",
+            "final_hidden_hash": "3ad71184efb731f2"
+          },
+          {
+            "position": 256,
+            "tokens": [
+              293,
+              294,
+              295,
+              296,
+              297,
+              298,
+              299,
+              300,
+              301,
+              302,
+              303,
+              304,
+              305,
+              306,
+              307,
+              308
+            ],
+            "argmax": [
+              220,
+              220,
+              220,
+              220,
+              197,
+              220,
+              220,
+              197,
+              72,
+              72,
+              220,
+              220,
+              220,
+              70,
+              220,
+              360
+            ],
+            "ring_head": 208,
+            "ring_written": 208,
+            "gdn_frame": 18048,
+            "kv_active_hash": "fca40ed305663ac2",
+            "logits_hash": "70d67c6cb25de903",
+            "final_hidden_hash": "c6cd61186bbd74af"
+          },
+          {
+            "position": 272,
+            "tokens": [
+              309,
+              310,
+              311,
+              312,
+              313,
+              314,
+              315,
+              316,
+              317,
+              318,
+              319,
+              320,
+              321,
+              322,
+              323,
+              324
+            ],
+            "argmax": [
+              304,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              197,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 224,
+            "ring_written": 224,
+            "gdn_frame": 19200,
+            "kv_active_hash": "ee173f7af44544bf",
+            "logits_hash": "99ddecb9345c101e",
+            "final_hidden_hash": "401f7e2536ce31c7"
+          },
+          {
+            "position": 288,
+            "tokens": [
+              325,
+              326,
+              327,
+              328,
+              329,
+              330,
+              331,
+              332,
+              333,
+              334,
+              335,
+              336,
+              337,
+              338,
+              339,
+              340
+            ],
+            "argmax": [
+              220,
+              220,
+              220,
+              220,
+              220,
+              220,
+              269,
+              198,
+              198,
+              220,
+              220,
+              304,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 240,
+            "ring_written": 240,
+            "gdn_frame": 20352,
+            "kv_active_hash": "c82fe097d46302d4",
+            "logits_hash": "cd78a5c7a2a381dc",
+            "final_hidden_hash": "4bceaa1b002ad71b"
+          }
+        ]
+      },
+      "recorded_hip": {
+        "name": "recorded_hip",
+        "host_us": 2968831.1010000003,
+        "guard_unchanged": true,
+        "guard_before_hash": "27bb0bfe48e079c5",
+        "guard_after_hash": "27bb0bfe48e079c5",
+        "windows": [
+          {
+            "position": 112,
+            "tokens": [
+              149,
+              150,
+              151,
+              152,
+              153,
+              154,
+              155,
+              156,
+              157,
+              158,
+              159,
+              160,
+              161,
+              162,
+              163,
+              164
+            ],
+            "argmax": [
+              94,
+              94,
+              123,
+              252,
+              106,
+              115,
+              123,
+              61084,
+              95,
+              254,
+              226,
+              226,
+              67917,
+              38513,
+              38513,
+              38513
+            ],
+            "ring_head": 64,
+            "ring_written": 64,
+            "gdn_frame": 7680,
+            "kv_active_hash": "809132e3f5e6144c",
+            "logits_hash": "110f2814c68fb17c",
+            "final_hidden_hash": "24c1f0de9a0d617a"
+          },
+          {
+            "position": 128,
+            "tokens": [
+              165,
+              166,
+              167,
+              168,
+              169,
+              170,
+              171,
+              172,
+              173,
+              174,
+              175,
+              176,
+              177,
+              178,
+              179,
+              180
+            ],
+            "argmax": [
+              123,
+              222,
+              123,
+              115,
+              253,
+              222,
+              115,
+              238,
+              107,
+              254,
+              123,
+              237,
+              123,
+              188,
+              198,
+              188
+            ],
+            "ring_head": 80,
+            "ring_written": 80,
+            "gdn_frame": 8832,
+            "kv_active_hash": "4124538a4acd1349",
+            "logits_hash": "2daf75889db5e9de",
+            "final_hidden_hash": "1747885aa7e1cb75"
+          },
+          {
+            "position": 144,
+            "tokens": [
+              181,
+              182,
+              183,
+              184,
+              185,
+              186,
+              187,
+              188,
+              189,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196
+            ],
+            "argmax": [
+              137,
+              139,
+              133,
+              128,
+              101,
+              134,
+              198,
+              188,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196,
+              197
+            ],
+            "ring_head": 96,
+            "ring_written": 96,
+            "gdn_frame": 9984,
+            "kv_active_hash": "41add947cdbb47b1",
+            "logits_hash": "f7e2439bd91d888b",
+            "final_hidden_hash": "c8ac7cdaafae8857"
+          },
+          {
+            "position": 160,
+            "tokens": [
+              197,
+              198,
+              199,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212
+            ],
+            "argmax": [
+              137,
+              197,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212,
+              213
+            ],
+            "ring_head": 112,
+            "ring_written": 112,
+            "gdn_frame": 11136,
+            "kv_active_hash": "0c61a1ddfa84de9c",
+            "logits_hash": "c21c9fa57d7db761",
+            "final_hidden_hash": "12e2758f92c1e9aa"
+          },
+          {
+            "position": 176,
+            "tokens": [
+              213,
+              214,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              221,
+              222,
+              223,
+              224,
+              225,
+              226,
+              227,
+              228
+            ],
+            "argmax": [
+              198,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              92762,
+              221,
+              188,
+              190,
+              3100,
+              192,
+              193,
+              194,
+              195
+            ],
+            "ring_head": 128,
+            "ring_written": 128,
+            "gdn_frame": 12288,
+            "kv_active_hash": "30c4846097f92d86",
+            "logits_hash": "c72cb4d938ab15ec",
+            "final_hidden_hash": "b449beccead1972c"
+          },
+          {
+            "position": 192,
+            "tokens": [
+              229,
+              230,
+              231,
+              232,
+              233,
+              234,
+              235,
+              236,
+              237,
+              238,
+              239,
+              240,
+              241,
+              242,
+              243,
+              244
+            ],
+            "argmax": [
+              137,
+              157,
+              198,
+              144,
+              198,
+              198,
+              198,
+              78,
+              198,
+              149362,
+              198,
+              82,
+              198,
+              198,
+              244,
+              86
+            ],
+            "ring_head": 144,
+            "ring_written": 144,
+            "gdn_frame": 13440,
+            "kv_active_hash": "e901e0e771e69020",
+            "logits_hash": "4be63aa2e723b69c",
+            "final_hidden_hash": "09a6fbbb0a10e22b"
+          },
+          {
+            "position": 208,
+            "tokens": [
+              245,
+              246,
+              247,
+              248,
+              249,
+              250,
+              251,
+              252,
+              253,
+              254,
+              255,
+              256,
+              257,
+              258,
+              259,
+              260
+            ],
+            "argmax": [
+              137,
+              132,
+              89,
+              198,
+              91,
+              198,
+              198,
+              129,
+              220,
+              142,
+              141,
+              220,
+              220,
+              279,
+              198,
+              220
+            ],
+            "ring_head": 160,
+            "ring_written": 160,
+            "gdn_frame": 14592,
+            "kv_active_hash": "07fc3ac1bfe4cb68",
+            "logits_hash": "f8ecd52107579cb6",
+            "final_hidden_hash": "2389afc205588870"
+          },
+          {
+            "position": 224,
+            "tokens": [
+              261,
+              262,
+              263,
+              264,
+              265,
+              266,
+              267,
+              268,
+              269,
+              270,
+              271,
+              272,
+              273,
+              274,
+              275,
+              276
+            ],
+            "argmax": [
+              69,
+              220,
+              198,
+              220,
+              220,
+              220,
+              220,
+              220,
+              198,
+              220,
+              248068,
+              198,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 176,
+            "ring_written": 176,
+            "gdn_frame": 15744,
+            "kv_active_hash": "ee1c2e477728252a",
+            "logits_hash": "ce24332a04a1624c",
+            "final_hidden_hash": "412dc97fdc5cc6ec"
+          },
+          {
+            "position": 240,
+            "tokens": [
+              277,
+              278,
+              279,
+              280,
+              281,
+              282,
+              283,
+              284,
+              285,
+              286,
+              287,
+              288,
+              289,
+              290,
+              291,
+              292
+            ],
+            "argmax": [
+              131,
+              198,
+              82,
+              314,
+              259,
+              427,
+              220,
+              264,
+              220,
+              220,
+              220,
+              220,
+              220,
+              303,
+              220,
+              220
+            ],
+            "ring_head": 192,
+            "ring_written": 192,
+            "gdn_frame": 16896,
+            "kv_active_hash": "8f409a4bbdef946d",
+            "logits_hash": "8ec6a8325e023b0b",
+            "final_hidden_hash": "22c8d70444d03467"
+          },
+          {
+            "position": 256,
+            "tokens": [
+              293,
+              294,
+              295,
+              296,
+              297,
+              298,
+              299,
+              300,
+              301,
+              302,
+              303,
+              304,
+              305,
+              306,
+              307,
+              308
+            ],
+            "argmax": [
+              378,
+              1514,
+              220,
+              307,
+              197,
+              220,
+              197,
+              197,
+              72,
+              72,
+              78,
+              647,
+              70,
+              77,
+              2491,
+              378
+            ],
+            "ring_head": 208,
+            "ring_written": 208,
+            "gdn_frame": 18048,
+            "kv_active_hash": "0b2e433cacf62bc5",
+            "logits_hash": "d420836344a08ee4",
+            "final_hidden_hash": "517fb4f051648002"
+          },
+          {
+            "position": 272,
+            "tokens": [
+              309,
+              310,
+              311,
+              312,
+              313,
+              314,
+              315,
+              316,
+              317,
+              318,
+              319,
+              320,
+              321,
+              322,
+              323,
+              324
+            ],
+            "argmax": [
+              220,
+              220,
+              2171,
+              198,
+              198,
+              220,
+              220,
+              220,
+              220,
+              64,
+              8,
+              8,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 224,
+            "ring_written": 224,
+            "gdn_frame": 19200,
+            "kv_active_hash": "d9329587e3fb8585",
+            "logits_hash": "87872dbf919f2a5d",
+            "final_hidden_hash": "a7edefbcf0f51f59"
+          },
+          {
+            "position": 288,
+            "tokens": [
+              325,
+              326,
+              327,
+              328,
+              329,
+              330,
+              331,
+              332,
+              333,
+              334,
+              335,
+              336,
+              337,
+              338,
+              339,
+              340
+            ],
+            "argmax": [
+              2613,
+              82,
+              79,
+              198,
+              1,
+              1,
+              1,
+              1,
+              198,
+              1,
+              198,
+              220,
+              220,
+              418,
+              3298,
+              220
+            ],
+            "ring_head": 240,
+            "ring_written": 240,
+            "gdn_frame": 20352,
+            "kv_active_hash": "f0a58a9ce5f0c7a2",
+            "logits_hash": "cb7834b30fe4e2d0",
+            "final_hidden_hash": "19aa89bc33594871"
+          }
+        ]
+      },
+      "pm4": {
+        "name": "pm4",
+        "host_us": 2378726.4220000003,
+        "guard_unchanged": true,
+        "guard_before_hash": "27bb0bfe48e079c5",
+        "guard_after_hash": "27bb0bfe48e079c5",
+        "windows": [
+          {
+            "position": 112,
+            "tokens": [
+              149,
+              150,
+              151,
+              152,
+              153,
+              154,
+              155,
+              156,
+              157,
+              158,
+              159,
+              160,
+              161,
+              162,
+              163,
+              164
+            ],
+            "argmax": [
+              94,
+              94,
+              123,
+              252,
+              106,
+              115,
+              123,
+              61084,
+              254,
+              254,
+              226,
+              226,
+              222,
+              38513,
+              38513,
+              38513
+            ],
+            "ring_head": 64,
+            "ring_written": 64,
+            "gdn_frame": 7680,
+            "kv_active_hash": "0c79f1f583cab452",
+            "logits_hash": "2b89b67aa9687f9a",
+            "final_hidden_hash": "bb5a88dc738bb77d"
+          },
+          {
+            "position": 128,
+            "tokens": [
+              165,
+              166,
+              167,
+              168,
+              169,
+              170,
+              171,
+              172,
+              173,
+              174,
+              175,
+              176,
+              177,
+              178,
+              179,
+              180
+            ],
+            "argmax": [
+              123,
+              222,
+              123,
+              115,
+              253,
+              222,
+              115,
+              238,
+              123,
+              254,
+              123,
+              123,
+              123,
+              188,
+              28,
+              188
+            ],
+            "ring_head": 80,
+            "ring_written": 80,
+            "gdn_frame": 8832,
+            "kv_active_hash": "c6f863d0d914e759",
+            "logits_hash": "fc148736018588e9",
+            "final_hidden_hash": "6ddd99a85ee83aa1"
+          },
+          {
+            "position": 144,
+            "tokens": [
+              181,
+              182,
+              183,
+              184,
+              185,
+              186,
+              187,
+              188,
+              189,
+              190,
+              191,
+              192,
+              193,
+              194,
+              195,
+              196
+            ],
+            "argmax": [
+              137,
+              139,
+              133,
+              128,
+              103,
+              134,
+              198,
+              188,
+              190,
+              191,
+              192,
+              193,
+              193,
+              195,
+              196,
+              1517
+            ],
+            "ring_head": 96,
+            "ring_written": 96,
+            "gdn_frame": 9984,
+            "kv_active_hash": "06f6272e111bebd6",
+            "logits_hash": "776e9d458946b483",
+            "final_hidden_hash": "842cbe2f09dae458"
+          },
+          {
+            "position": 160,
+            "tokens": [
+              197,
+              198,
+              199,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212
+            ],
+            "argmax": [
+              137,
+              197,
+              200,
+              201,
+              202,
+              203,
+              204,
+              205,
+              206,
+              207,
+              208,
+              209,
+              210,
+              211,
+              212,
+              213
+            ],
+            "ring_head": 112,
+            "ring_written": 112,
+            "gdn_frame": 11136,
+            "kv_active_hash": "ffa31d57116c23d2",
+            "logits_hash": "4d8a190129c146d1",
+            "final_hidden_hash": "84edd51b9fc45d0e"
+          },
+          {
+            "position": 176,
+            "tokens": [
+              213,
+              214,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              221,
+              222,
+              223,
+              224,
+              225,
+              226,
+              227,
+              228
+            ],
+            "argmax": [
+              198,
+              215,
+              216,
+              217,
+              218,
+              219,
+              220,
+              92762,
+              221,
+              221,
+              190,
+              3100,
+              192,
+              193,
+              194,
+              195
+            ],
+            "ring_head": 128,
+            "ring_written": 128,
+            "gdn_frame": 12288,
+            "kv_active_hash": "330407f8152dd9c1",
+            "logits_hash": "e632937c13085e3e",
+            "final_hidden_hash": "ef951b689e82ece8"
+          },
+          {
+            "position": 192,
+            "tokens": [
+              229,
+              230,
+              231,
+              232,
+              233,
+              234,
+              235,
+              236,
+              237,
+              238,
+              239,
+              240,
+              241,
+              242,
+              243,
+              244
+            ],
+            "argmax": [
+              137,
+              157,
+              198,
+              144,
+              198,
+              198,
+              198,
+              78,
+              198,
+              149362,
+              198,
+              82,
+              198,
+              198,
+              244,
+              86
+            ],
+            "ring_head": 144,
+            "ring_written": 144,
+            "gdn_frame": 13440,
+            "kv_active_hash": "7093cf7f555f68df",
+            "logits_hash": "b3e698e65fb3e379",
+            "final_hidden_hash": "503983bd383824af"
+          },
+          {
+            "position": 208,
+            "tokens": [
+              245,
+              246,
+              247,
+              248,
+              249,
+              250,
+              251,
+              252,
+              253,
+              254,
+              255,
+              256,
+              257,
+              258,
+              259,
+              260
+            ],
+            "argmax": [
+              137,
+              132,
+              89,
+              198,
+              91,
+              198,
+              198,
+              129,
+              220,
+              142,
+              142,
+              220,
+              220,
+              279,
+              198,
+              220
+            ],
+            "ring_head": 160,
+            "ring_written": 160,
+            "gdn_frame": 14592,
+            "kv_active_hash": "5832c4589361595b",
+            "logits_hash": "e740962054c27b07",
+            "final_hidden_hash": "60f9d739bfbc2008"
+          },
+          {
+            "position": 224,
+            "tokens": [
+              261,
+              262,
+              263,
+              264,
+              265,
+              266,
+              267,
+              268,
+              269,
+              270,
+              271,
+              272,
+              273,
+              274,
+              275,
+              276
+            ],
+            "argmax": [
+              69,
+              220,
+              198,
+              220,
+              220,
+              220,
+              220,
+              220,
+              198,
+              82,
+              2,
+              198,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 176,
+            "ring_written": 176,
+            "gdn_frame": 15744,
+            "kv_active_hash": "d393143cc2554964",
+            "logits_hash": "4392b459ab064751",
+            "final_hidden_hash": "af70f179c6a01ca0"
+          },
+          {
+            "position": 240,
+            "tokens": [
+              277,
+              278,
+              279,
+              280,
+              281,
+              282,
+              283,
+              284,
+              285,
+              286,
+              287,
+              288,
+              289,
+              290,
+              291,
+              292
+            ],
+            "argmax": [
+              131,
+              198,
+              82,
+              314,
+              259,
+              427,
+              220,
+              264,
+              220,
+              220,
+              220,
+              220,
+              83,
+              303,
+              220,
+              220
+            ],
+            "ring_head": 192,
+            "ring_written": 192,
+            "gdn_frame": 16896,
+            "kv_active_hash": "9434841a0c83b0e5",
+            "logits_hash": "62465f2605edc504",
+            "final_hidden_hash": "9b8f7602ed8e4db3"
+          },
+          {
+            "position": 256,
+            "tokens": [
+              293,
+              294,
+              295,
+              296,
+              297,
+              298,
+              299,
+              300,
+              301,
+              302,
+              303,
+              304,
+              305,
+              306,
+              307,
+              308
+            ],
+            "argmax": [
+              378,
+              1514,
+              220,
+              307,
+              197,
+              220,
+              197,
+              197,
+              72,
+              72,
+              78,
+              647,
+              70,
+              77,
+              2491,
+              378
+            ],
+            "ring_head": 208,
+            "ring_written": 208,
+            "gdn_frame": 18048,
+            "kv_active_hash": "60caba08d44e21e7",
+            "logits_hash": "ee26461338222e75",
+            "final_hidden_hash": "d6a91cb38b7ec59c"
+          },
+          {
+            "position": 272,
+            "tokens": [
+              309,
+              310,
+              311,
+              312,
+              313,
+              314,
+              315,
+              316,
+              317,
+              318,
+              319,
+              320,
+              321,
+              322,
+              323,
+              324
+            ],
+            "argmax": [
+              220,
+              220,
+              2171,
+              198,
+              198,
+              220,
+              220,
+              220,
+              220,
+              64,
+              8,
+              8,
+              220,
+              220,
+              220,
+              220
+            ],
+            "ring_head": 224,
+            "ring_written": 224,
+            "gdn_frame": 19200,
+            "kv_active_hash": "a5dae9f5111d8faf",
+            "logits_hash": "52d53fbb39e3c987",
+            "final_hidden_hash": "b19948a1e90b9157"
+          },
+          {
+            "position": 288,
+            "tokens": [
+              325,
+              326,
+              327,
+              328,
+              329,
+              330,
+              331,
+              332,
+              333,
+              334,
+              335,
+              336,
+              337,
+              338,
+              339,
+              340
+            ],
+            "argmax": [
+              2613,
+              82,
+              79,
+              198,
+              1,
+              1,
+              1,
+              1,
+              198,
+              1,
+              198,
+              220,
+              220,
+              418,
+              3298,
+              220
+            ],
+            "ring_head": 240,
+            "ring_written": 240,
+            "gdn_frame": 20352,
+            "kv_active_hash": "cf7f07b70477305f",
+            "logits_hash": "75551b12ac3a94ac",
+            "final_hidden_hash": "c356305ac8e7f875"
+          }
+        ]
+      }
+    },
+    "parity": {
+      "q8_byte_parity_invalid": true,
+      "windows": [
+        {
+          "position": 112,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 112,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 112,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 76.81204223632812,
+              "max_rel": 1.9999958276748657,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 76.81204223632812,
+              "max_rel": 1.9999958276748657,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.009493827819824219,
+              "max_rel": 1.9986964464187622,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 26.32888412475586,
+              "max_rel": 1.9999980926513672,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 51.582191467285156,
+              "max_rel": 0.9990252256393433,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.7235705852508545,
+              "max_rel": 0.9861609935760498,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.04098467901349068,
+              "max_rel": 0.999502420425415,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 25.406715393066406,
+              "max_rel": 1.9999895095825195,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 112,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 76.81204223632812,
+              "max_rel": 1.9999958276748657,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 76.81204223632812,
+              "max_rel": 1.9999958276748657,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 8.932687759399414,
+              "max_rel": 1.9998903274536133,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 5.908941745758057,
+              "max_rel": 1.9999812841415405,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 26.32888412475586,
+              "max_rel": 1.9999980926513672,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 51.582191467285156,
+              "max_rel": 0.9990252256393433,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.7235705852508545,
+              "max_rel": 0.9861609935760498,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.00305048911832273,
+              "max_rel": 0.9971555471420288,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 6.027111053466797,
+              "max_rel": 1.999977946281433,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.04098467901349068,
+              "max_rel": 0.999502420425415,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 25.406715393066406,
+              "max_rel": 1.9999895095825195,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 128,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 128,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 128,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 140.42405700683594,
+              "max_rel": 1.9999969005584717,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 140.42405700683594,
+              "max_rel": 1.9999969005584717,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 7.139289855957031,
+              "max_rel": 1.9998266696929932,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 3.4210963249206543,
+              "max_rel": 1.999989628791809,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 34.66913604736328,
+              "max_rel": 1.9999988079071045,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 44.8823127746582,
+              "max_rel": 0.9995680451393127,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9217771291732788,
+              "max_rel": 0.9991738200187683,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.026165321469306946,
+              "max_rel": 0.992499053478241,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 4.454716682434082,
+              "max_rel": 1.9999891519546509,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0457962304353714,
+              "max_rel": 0.9995091557502747,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 34.66913604736328,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 128,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 140.42405700683594,
+              "max_rel": 1.9999969005584717,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 140.42405700683594,
+              "max_rel": 1.9999969005584717,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 8.288103103637695,
+              "max_rel": 1.9999257326126099,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 4.020841598510742,
+              "max_rel": 1.9999967813491821,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 34.66913604736328,
+              "max_rel": 1.9999988079071045,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 44.8823127746582,
+              "max_rel": 0.9995680451393127,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9217771291732788,
+              "max_rel": 0.9991738200187683,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.026165321469306946,
+              "max_rel": 0.9971144199371338,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 7.063453674316406,
+              "max_rel": 1.9999924898147583,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0457962304353714,
+              "max_rel": 0.9995091557502747,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 34.66913604736328,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 144,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 144,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 144,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 19.085479736328125,
+              "max_rel": 1.9996460676193237,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 7.3878679275512695,
+              "max_rel": 1.9999967813491821,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 34.611053466796875,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 68.63284301757812,
+              "max_rel": 1.0,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9016824960708618,
+              "max_rel": 0.9999958872795105,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.02914239466190338,
+              "max_rel": 0.9985893964767456,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 2.454681873321533,
+              "max_rel": 1.9999843835830688,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.08975479006767273,
+              "max_rel": 0.9993099570274353,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 28.060941696166992,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 144,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 19.196216583251953,
+              "max_rel": 1.999896764755249,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 7.498174667358398,
+              "max_rel": 1.9999929666519165,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 34.611053466796875,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 68.63284301757812,
+              "max_rel": 1.0,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9016824960708618,
+              "max_rel": 0.9999958872795105,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.02914239466190338,
+              "max_rel": 0.9973641633987427,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 7.267241954803467,
+              "max_rel": 1.9999868869781494,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.08975479006767273,
+              "max_rel": 0.9993099570274353,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 28.060941696166992,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 160,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 160,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 160,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 87.74510192871094,
+              "max_rel": 1.999988079071045,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 9.765424728393555,
+              "max_rel": 1.999738097190857,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 7.585926055908203,
+              "max_rel": 1.9999947547912598,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 58.659080505371094,
+              "max_rel": 1.9999979734420776,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 48.770469665527344,
+              "max_rel": 0.9997442960739136,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9326801300048828,
+              "max_rel": 0.9875422120094299,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.06183768808841705,
+              "max_rel": 0.9971035122871399,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 4.1349639892578125,
+              "max_rel": 1.9999654293060303,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1344747692346573,
+              "max_rel": 0.9995601773262024,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 26.110816955566406,
+              "max_rel": 1.9999972581863403,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 160,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 87.74510192871094,
+              "max_rel": 1.999988079071045,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 9.709197998046875,
+              "max_rel": 1.9999607801437378,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 7.681037425994873,
+              "max_rel": 1.9999914169311523,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 58.659080505371094,
+              "max_rel": 1.9999979734420776,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 48.770469665527344,
+              "max_rel": 0.9997442960739136,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9326801300048828,
+              "max_rel": 0.9875422120094299,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.06183768808841705,
+              "max_rel": 0.996335506439209,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 3.8907546997070312,
+              "max_rel": 1.9999923706054688,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1344747692346573,
+              "max_rel": 0.9995601773262024,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 26.110816955566406,
+              "max_rel": 1.9999972581863403,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 176,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 176,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 176,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 51.30961990356445,
+              "max_rel": 1.9999960660934448,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 12.433450698852539,
+              "max_rel": 1.9998782873153687,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 6.734248161315918,
+              "max_rel": 1.999995470046997,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 58.0686149597168,
+              "max_rel": 1.9999990463256836,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 62.10323715209961,
+              "max_rel": 0.9998096227645874,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.8666903376579285,
+              "max_rel": 0.985049843788147,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.1247062087059021,
+              "max_rel": 0.996371328830719,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 6.8033447265625,
+              "max_rel": 1.9999831914901733,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.11653760820627213,
+              "max_rel": 0.9995539784431458,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 58.0686149597168,
+              "max_rel": 1.9999933242797852,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 176,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 51.30961990356445,
+              "max_rel": 1.9999960660934448,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 12.653900146484375,
+              "max_rel": 1.9998552799224854,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 6.644880771636963,
+              "max_rel": 1.9999985694885254,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 58.0686149597168,
+              "max_rel": 1.9999990463256836,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 62.10323715209961,
+              "max_rel": 0.9998096227645874,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.8666903376579285,
+              "max_rel": 0.985049843788147,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.1247062087059021,
+              "max_rel": 0.9995660781860352,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 8.752164840698242,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.11653760820627213,
+              "max_rel": 0.9995539784431458,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 58.0686149597168,
+              "max_rel": 1.9999933242797852,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 192,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 192,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 192,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 112.67243957519531,
+              "max_rel": 1.9999827146530151,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 15.983227729797363,
+              "max_rel": 1.9997506141662598,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 8.748433113098145,
+              "max_rel": 1.999985933303833,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 25.151395797729492,
+              "max_rel": 1.9999996423721313,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 39.219810485839844,
+              "max_rel": 0.9998469352722168,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.8729709386825562,
+              "max_rel": 0.9856752753257751,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.12212264537811279,
+              "max_rel": 0.9980630874633789,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 5.8693952560424805,
+              "max_rel": 1.9999924898147583,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.11048920452594757,
+              "max_rel": 0.9994993805885315,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 23.06903839111328,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 192,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 112.67243957519531,
+              "max_rel": 1.9999827146530151,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 15.99530029296875,
+              "max_rel": 1.9999985694885254,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 8.682038307189941,
+              "max_rel": 1.999997854232788,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 25.151395797729492,
+              "max_rel": 1.9999996423721313,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 39.219810485839844,
+              "max_rel": 0.9998469352722168,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.8729709386825562,
+              "max_rel": 0.9856752753257751,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.12212264537811279,
+              "max_rel": 0.9979857802391052,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 5.57551383972168,
+              "max_rel": 1.9999960660934448,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.11048920452594757,
+              "max_rel": 0.9994993805885315,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 23.06903839111328,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 208,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 208,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 208,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 147.65077209472656,
+              "max_rel": 1.9999850988388062,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 14.618937492370605,
+              "max_rel": 1.9999254941940308,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 8.526779174804688,
+              "max_rel": 1.9999794960021973,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 56.578887939453125,
+              "max_rel": 1.9999992847442627,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 49.47410583496094,
+              "max_rel": 0.9999293684959412,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9195281267166138,
+              "max_rel": 0.9881675243377686,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.09557086229324341,
+              "max_rel": 0.9947844743728638,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 8.098184585571289,
+              "max_rel": 1.999969482421875,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1074368879199028,
+              "max_rel": 0.9994661211967468,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 25.402660369873047,
+              "max_rel": 1.9999895095825195,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 208,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 147.65077209472656,
+              "max_rel": 1.9999850988388062,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999982118606567,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 13.586862564086914,
+              "max_rel": 1.9999065399169922,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 8.632862091064453,
+              "max_rel": 1.999990701675415,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 56.578887939453125,
+              "max_rel": 1.9999992847442627,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 49.47410583496094,
+              "max_rel": 0.9999293684959412,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9195281267166138,
+              "max_rel": 0.9881675243377686,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.09557086229324341,
+              "max_rel": 0.9982513785362244,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 8.496589660644531,
+              "max_rel": 1.9999979734420776,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1074368879199028,
+              "max_rel": 0.9994661211967468,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 25.402660369873047,
+              "max_rel": 1.9999895095825195,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 224,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 224,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 224,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 164.39219665527344,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 12.318947792053223,
+              "max_rel": 1.9999350309371948,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 7.578372478485107,
+              "max_rel": 1.9999797344207764,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 51.97041320800781,
+              "max_rel": 2.0,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 56.826629638671875,
+              "max_rel": 0.9997206926345825,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9044880270957947,
+              "max_rel": 0.9904515743255615,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.07586446404457092,
+              "max_rel": 0.9971944689750671,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 9.15639877319336,
+              "max_rel": 1.9999969005584717,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.14131173491477966,
+              "max_rel": 0.9993067383766174,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 39.403076171875,
+              "max_rel": 1.9999946355819702,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 224,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 164.39219665527344,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999984502792358,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 12.249592781066895,
+              "max_rel": 1.9994655847549438,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 7.564402103424072,
+              "max_rel": 1.9999843835830688,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 51.97041320800781,
+              "max_rel": 2.0,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 56.826629638671875,
+              "max_rel": 0.9997206926345825,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9044880270957947,
+              "max_rel": 0.9904515743255615,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.07586446404457092,
+              "max_rel": 0.9976734519004822,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 18.4300594329834,
+              "max_rel": 1.9999964237213135,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.14131173491477966,
+              "max_rel": 0.9993067383766174,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 39.403076171875,
+              "max_rel": 1.9999946355819702,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 240,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 240,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 240,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 92.1151123046875,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 17.336383819580078,
+              "max_rel": 1.999756097793579,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 11.565732955932617,
+              "max_rel": 1.999977946281433,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 50.8743782043457,
+              "max_rel": 1.9999998807907104,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 64.72818756103516,
+              "max_rel": 0.9996359944343567,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9416813850402832,
+              "max_rel": 0.9877459406852722,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.07635097205638885,
+              "max_rel": 0.9992915391921997,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 11.538161277770996,
+              "max_rel": 1.999993920326233,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1789197027683258,
+              "max_rel": 0.9992305040359497,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 49.67209243774414,
+              "max_rel": 1.9999929666519165,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 240,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 92.1151123046875,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 17.494857788085938,
+              "max_rel": 1.9998570680618286,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 11.574834823608398,
+              "max_rel": 1.9999867677688599,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 50.8743782043457,
+              "max_rel": 1.9999998807907104,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 64.72818756103516,
+              "max_rel": 0.9996359944343567,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9416813850402832,
+              "max_rel": 0.9877459406852722,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.07635097205638885,
+              "max_rel": 0.9993415474891663,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 17.41927146911621,
+              "max_rel": 1.999995470046997,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1789197027683258,
+              "max_rel": 0.9992305040359497,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 49.67209243774414,
+              "max_rel": 1.9999929666519165,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 256,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 256,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 256,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 103.28341674804688,
+              "max_rel": 1.9999958276748657,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 13.596183776855469,
+              "max_rel": 1.9998911619186401,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 10.20979118347168,
+              "max_rel": 1.9999535083770752,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 48.353729248046875,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 62.322853088378906,
+              "max_rel": 0.9997362494468689,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9454854726791382,
+              "max_rel": 0.9870714545249939,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.09349077939987183,
+              "max_rel": 0.9970235824584961,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 11.694113731384277,
+              "max_rel": 1.9999799728393555,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1735168993473053,
+              "max_rel": 0.999235212802887,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 38.36432647705078,
+              "max_rel": 1.999998927116394,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 256,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 103.28341674804688,
+              "max_rel": 1.9999958276748657,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 13.611674308776855,
+              "max_rel": 1.999973177909851,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 10.201705932617188,
+              "max_rel": 1.9999979734420776,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 48.353729248046875,
+              "max_rel": 1.9999991655349731,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 62.322853088378906,
+              "max_rel": 0.9997362494468689,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9454854726791382,
+              "max_rel": 0.9870714545249939,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.09349077939987183,
+              "max_rel": 0.9961375594139099,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 14.899852752685547,
+              "max_rel": 1.9999916553497314,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.1735168993473053,
+              "max_rel": 0.999235212802887,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 38.36432647705078,
+              "max_rel": 1.999998927116394,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 272,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 272,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 272,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 117.69761657714844,
+              "max_rel": 1.9999942779541016,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 20.262907028198242,
+              "max_rel": 1.9998823404312134,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 12.784638404846191,
+              "max_rel": 1.999975323677063,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 53.38997268676758,
+              "max_rel": 1.9999998807907104,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 55.551082611083984,
+              "max_rel": 0.9998709559440613,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9574099183082581,
+              "max_rel": 0.9851934909820557,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.09258627891540527,
+              "max_rel": 0.9974859356880188,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 10.083040237426758,
+              "max_rel": 1.9999873638153076,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.16781871020793915,
+              "max_rel": 0.9994379878044128,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 44.693748474121094,
+              "max_rel": 1.9999920129776,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 272,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 117.69761657714844,
+              "max_rel": 1.9999942779541016,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 20.409025192260742,
+              "max_rel": 1.9999667406082153,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 12.7540922164917,
+              "max_rel": 1.9999951124191284,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 53.38997268676758,
+              "max_rel": 1.9999998807907104,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 55.551082611083984,
+              "max_rel": 0.9998709559440613,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9574099183082581,
+              "max_rel": 0.9851934909820557,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.09258627891540527,
+              "max_rel": 0.9971114993095398,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 9.665204048156738,
+              "max_rel": 1.9999964237213135,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.16781871020793915,
+              "max_rel": 0.9994379878044128,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 44.693748474121094,
+              "max_rel": 1.9999920129776,
+              "bytes_equal": false
+            }
+          }
+        },
+        {
+          "position": 288,
+          "direct_capture_safe_vs_hip_auto": {
+            "arm": "direct_capture_safe",
+            "position": 288,
+            "tokens_equal": true,
+            "argmax_equal": true,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": false,
+            "kv_active_hash_equal": true,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "hidden_ring": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "final_hidden": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "logits": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_qkv": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_alpha": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "gdn_beta": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": true
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 0.0,
+              "max_rel": 0.0,
+              "bytes_equal": true
+            }
+          },
+          "recorded_hip": {
+            "arm": "recorded_hip",
+            "position": 288,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 111.2018814086914,
+              "max_rel": 1.999990463256836,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 18.398460388183594,
+              "max_rel": 1.9999879598617554,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 13.065900802612305,
+              "max_rel": 1.999998688697815,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 64.46219635009766,
+              "max_rel": 2.0,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 62.8898811340332,
+              "max_rel": 0.9999446868896484,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9595466256141663,
+              "max_rel": 0.9851878881454468,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.08339458703994751,
+              "max_rel": 0.9980759620666504,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 15.348854064941406,
+              "max_rel": 1.9999974966049194,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.13472265005111694,
+              "max_rel": 0.999434232711792,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 47.704376220703125,
+              "max_rel": 1.9999945163726807,
+              "bytes_equal": false
+            }
+          },
+          "pm4": {
+            "arm": "pm4",
+            "position": 288,
+            "tokens_equal": true,
+            "argmax_equal": false,
+            "ring_head_equal": true,
+            "ring_written_equal": true,
+            "gdn_frame_equal": true,
+            "kv_active_hash_equal": false,
+            "kv_guard_equal": true,
+            "pbs_guard_equal": true,
+            "hidden_staging": {
+              "max_abs": 111.2018814086914,
+              "max_rel": 1.999990463256836,
+              "bytes_equal": false
+            },
+            "hidden_ring": {
+              "max_abs": 165.7646484375,
+              "max_rel": 1.9999994039535522,
+              "bytes_equal": false
+            },
+            "final_hidden": {
+              "max_abs": 18.440858840942383,
+              "max_rel": 1.9998598098754883,
+              "bytes_equal": false
+            },
+            "logits": {
+              "max_abs": 12.923598289489746,
+              "max_rel": 1.999985694885254,
+              "bytes_equal": false
+            },
+            "gdn_qkv": {
+              "max_abs": 64.46219635009766,
+              "max_rel": 2.0,
+              "bytes_equal": false
+            },
+            "gdn_alpha": {
+              "max_abs": 62.8898811340332,
+              "max_rel": 0.9999446868896484,
+              "bytes_equal": false
+            },
+            "gdn_beta": {
+              "max_abs": 0.9595466256141663,
+              "max_rel": 0.9851878881454468,
+              "bytes_equal": false
+            },
+            "dn_s_after_forward": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_forward": {
+              "max_abs": 0.08339458703994751,
+              "max_rel": 0.9962545037269592,
+              "bytes_equal": false
+            },
+            "dn_conv_after_forward": {
+              "max_abs": 16.242218017578125,
+              "max_rel": 1.999997615814209,
+              "bytes_equal": false
+            },
+            "dn_s_after_rollback": {
+              "max_abs": null,
+              "max_rel": null,
+              "bytes_equal": false
+            },
+            "dn_scales_after_rollback": {
+              "max_abs": 0.13472265005111694,
+              "max_rel": 0.999434232711792,
+              "bytes_equal": false
+            },
+            "dn_conv_after_rollback": {
+              "max_abs": 47.704376220703125,
+              "max_rel": 1.9999945163726807,
+              "bytes_equal": false
+            }
+          }
+        }
+      ]
+    },
+    "capture": {
+      "launches": 1138,
+      "aql_contracts": 20,
+      "aql_equals_unique_kernels": true
+    },
+    "prepared_identity": {
+      "dispatch_count": 1138,
+      "packet_count": 1,
+      "queue_id": 4,
+      "command_dwords": 30577,
+      "queue_count": 1,
+      "phase_count": 1,
+      "dispatch_equals_launches": true
+    },
+    "route": {
+      "phase": "ready",
+      "reason": null,
+      "binding": {
+        "batch": 16,
+        "arch": "gfx1201",
+        "model_fingerprint": 7862753805394101581,
+        "layout_generation": 15891613444157407652,
+        "max_position": 4096,
+        "kv_mode": "q8",
+        "dn_state_quant": "q8"
+      },
+      "kv_mode": "q8",
+      "dn_state_quant": "q8",
+      "prepared_dispatch_count": 1138,
+      "prepared_packet_count": 1,
+      "prepared_queue_id": 4,
+      "prepared_queue_count": 1,
+      "prepared_phase_count": 1,
+      "counters": {
+        "full_hip": 0,
+        "partial_hip": 0,
+        "prime_windows": 1,
+        "capture_attempts": 2,
+        "captures": 2,
+        "calibration_captures": 1,
+        "contract_failures": 0,
+        "prepare_failures": 0,
+        "replays": 212,
+        "replay_failures": 0,
+        "safe_hip_retries": 0,
+        "poison_count": 0,
+        "rearms": 0,
+        "position_bindings": 0,
+        "first_replay_position": 112,
+        "last_replay_position": 2512
+      }
+    },
+    "production_route": {
+      "phase": "armed",
+      "reason": null,
+      "binding": null,
+      "kv_mode": "q8",
+      "dn_state_quant": "q8",
+      "prepared_dispatch_count": null,
+      "prepared_packet_count": null,
+      "prepared_queue_id": null,
+      "prepared_queue_count": null,
+      "prepared_phase_count": null,
+      "counters": {
+        "full_hip": 0,
+        "partial_hip": 0,
+        "prime_windows": 0,
+        "capture_attempts": 0,
+        "captures": 0,
+        "calibration_captures": 0,
+        "contract_failures": 0,
+        "prepare_failures": 0,
+        "replays": 0,
+        "replay_failures": 0,
+        "safe_hip_retries": 0,
+        "poison_count": 0,
+        "rearms": 0,
+        "position_bindings": 0,
+        "first_replay_position": null,
+        "last_replay_position": null
+      }
+    },
+    "protocol": {
+      "prepare_reject": {
+        "hip_completed": true,
+        "route": {
+          "phase": "poisoned",
+          "reason": "shadow inject: preparation rejected after successful recorded HIP body",
+          "binding": {
+            "batch": 16,
+            "arch": "gfx1201",
+            "model_fingerprint": 7862753805394101581,
+            "layout_generation": 15891613444157407652,
+            "max_position": 4096,
+            "kv_mode": "q8",
+            "dn_state_quant": "q8"
+          },
+          "kv_mode": "q8",
+          "dn_state_quant": "q8",
+          "prepared_dispatch_count": null,
+          "prepared_packet_count": null,
+          "prepared_queue_id": null,
+          "prepared_queue_count": null,
+          "prepared_phase_count": null,
+          "counters": {
+            "full_hip": 0,
+            "partial_hip": 0,
+            "prime_windows": 1,
+            "capture_attempts": 0,
+            "captures": 0,
+            "calibration_captures": 0,
+            "contract_failures": 0,
+            "prepare_failures": 1,
+            "replays": 0,
+            "replay_failures": 0,
+            "safe_hip_retries": 0,
+            "poison_count": 1,
+            "rearms": 0,
+            "position_bindings": 0,
+            "first_replay_position": null,
+            "last_replay_position": null
+          }
+        }
+      },
+      "replay_proven": {
+        "safe_hip_retry": true,
+        "double_ring_commit": false,
+        "ring_written_before": 16,
+        "ring_written_after": 16,
+        "route": {
+          "phase": "poisoned",
+          "reason": "shadow inject: replay failure with Proven quiescence",
+          "binding": null,
+          "kv_mode": "q8",
+          "dn_state_quant": "q8",
+          "prepared_dispatch_count": null,
+          "prepared_packet_count": null,
+          "prepared_queue_id": null,
+          "prepared_queue_count": null,
+          "prepared_phase_count": null,
+          "counters": {
+            "full_hip": 0,
+            "partial_hip": 0,
+            "prime_windows": 0,
+            "capture_attempts": 0,
+            "captures": 0,
+            "calibration_captures": 0,
+            "contract_failures": 0,
+            "prepare_failures": 0,
+            "replays": 0,
+            "replay_failures": 1,
+            "safe_hip_retries": 1,
+            "poison_count": 1,
+            "rearms": 0,
+            "position_bindings": 0,
+            "first_replay_position": null,
+            "last_replay_position": 112
+          }
+        }
+      },
+      "replay_unknown": {
+        "lm_head": false,
+        "accept": false,
+        "emission": false,
+        "shutdown": null,
+        "route": {
+          "phase": "quarantined",
+          "reason": "shadow inject: replay failure with Unknown quiescence",
+          "binding": null,
+          "kv_mode": "q8",
+          "dn_state_quant": "q8",
+          "prepared_dispatch_count": null,
+          "prepared_packet_count": null,
+          "prepared_queue_id": null,
+          "prepared_queue_count": null,
+          "prepared_phase_count": null,
+          "counters": {
+            "full_hip": 0,
+            "partial_hip": 0,
+            "prime_windows": 0,
+            "capture_attempts": 0,
+            "captures": 0,
+            "calibration_captures": 0,
+            "contract_failures": 0,
+            "prepare_failures": 0,
+            "replays": 0,
+            "replay_failures": 1,
+            "safe_hip_retries": 0,
+            "poison_count": 1,
+            "rearms": 0,
+            "position_bindings": 0,
+            "first_replay_position": null,
+            "last_replay_position": 112
+          }
+        }
+      }
+    },
+    "timing": {
+      "windows_per_arm": 200,
+      "interleaved": true,
+      "capture_prepare_us": 662829.04,
+      "hipgraph_verify_body_ms": {
+        "median": 42.641254,
+        "p95": 49.10754
+      },
+      "pm4_verify_body_ms": {
+        "median": 40.659966,
+        "p95": 46.914521
+      },
+      "median_delta_ms": -1.9812880000000064,
+      "percent_delta": -4.646411196068498,
+      "p95_delta_ms": -2.1930189999999996,
+      "kill_if_under_1ms_and_2pct_or_p95_regresses": false
+    }
+  },
+  "pass": false,
+  "dflash_verify_failures": [
+    "position 112: recorded_hip.hidden_staging diverged max_abs=76.81204223632812 max_rel=1.9999958276748657",
+    "position 112: recorded_hip.hidden_ring diverged max_abs=76.81204223632812 max_rel=1.9999958276748657",
+    "position 112: recorded_hip.logits diverged max_abs=0.009493827819824219 max_rel=1.9986964464187622",
+    "position 112: recorded_hip.gdn_qkv diverged max_abs=26.32888412475586 max_rel=1.9999980926513672",
+    "position 112: recorded_hip.gdn_alpha diverged max_abs=51.582191467285156 max_rel=0.9990252256393433",
+    "position 112: recorded_hip.gdn_beta diverged max_abs=0.7235705852508545 max_rel=0.9861609935760498",
+    "position 112: recorded_hip.dn_scales_after_rollback diverged max_abs=0.04098467901349068 max_rel=0.999502420425415",
+    "position 112: recorded_hip.dn_conv_after_rollback diverged max_abs=25.406715393066406 max_rel=1.9999895095825195",
+    "position 112: pm4.argmax_equal is false",
+    "position 112: pm4.kv_active_hash_equal is false",
+    "position 112: pm4.hidden_staging diverged max_abs=76.81204223632812 max_rel=1.9999958276748657",
+    "position 112: pm4.hidden_ring diverged max_abs=76.81204223632812 max_rel=1.9999958276748657",
+    "position 112: pm4.final_hidden diverged max_abs=8.932687759399414 max_rel=1.9998903274536133",
+    "position 112: pm4.logits diverged max_abs=5.908941745758057 max_rel=1.9999812841415405",
+    "position 112: pm4.gdn_qkv diverged max_abs=26.32888412475586 max_rel=1.9999980926513672",
+    "position 112: pm4.gdn_alpha diverged max_abs=51.582191467285156 max_rel=0.9990252256393433",
+    "position 112: pm4.gdn_beta diverged max_abs=0.7235705852508545 max_rel=0.9861609935760498",
+    "position 112: pm4.dn_scales_after_forward diverged max_abs=0.00305048911832273 max_rel=0.9971555471420288",
+    "position 112: pm4.dn_conv_after_forward diverged max_abs=6.027111053466797 max_rel=1.999977946281433",
+    "position 112: pm4.dn_scales_after_rollback diverged max_abs=0.04098467901349068 max_rel=0.999502420425415",
+    "position 112: pm4.dn_conv_after_rollback diverged max_abs=25.406715393066406 max_rel=1.9999895095825195",
+    "position 128: recorded_hip.argmax_equal is false",
+    "position 128: recorded_hip.kv_active_hash_equal is false",
+    "position 128: recorded_hip.hidden_staging diverged max_abs=140.42405700683594 max_rel=1.9999969005584717",
+    "position 128: recorded_hip.hidden_ring diverged max_abs=140.42405700683594 max_rel=1.9999969005584717",
+    "position 128: recorded_hip.final_hidden diverged max_abs=7.139289855957031 max_rel=1.9998266696929932",
+    "position 128: recorded_hip.logits diverged max_abs=3.4210963249206543 max_rel=1.999989628791809",
+    "position 128: recorded_hip.gdn_qkv diverged max_abs=34.66913604736328 max_rel=1.9999988079071045",
+    "position 128: recorded_hip.gdn_alpha diverged max_abs=44.8823127746582 max_rel=0.9995680451393127",
+    "position 128: recorded_hip.gdn_beta diverged max_abs=0.9217771291732788 max_rel=0.9991738200187683",
+    "position 128: recorded_hip.dn_scales_after_forward diverged max_abs=0.026165321469306946 max_rel=0.992499053478241",
+    "position 128: recorded_hip.dn_conv_after_forward diverged max_abs=4.454716682434082 max_rel=1.9999891519546509",
+    "position 128: recorded_hip.dn_scales_after_rollback diverged max_abs=0.0457962304353714 max_rel=0.9995091557502747",
+    "position 128: recorded_hip.dn_conv_after_rollback diverged max_abs=34.66913604736328 max_rel=1.9999982118606567",
+    "position 128: pm4.argmax_equal is false",
+    "position 128: pm4.kv_active_hash_equal is false",
+    "position 128: pm4.hidden_staging diverged max_abs=140.42405700683594 max_rel=1.9999969005584717",
+    "position 128: pm4.hidden_ring diverged max_abs=140.42405700683594 max_rel=1.9999969005584717",
+    "position 128: pm4.final_hidden diverged max_abs=8.288103103637695 max_rel=1.9999257326126099",
+    "position 128: pm4.logits diverged max_abs=4.020841598510742 max_rel=1.9999967813491821",
+    "position 128: pm4.gdn_qkv diverged max_abs=34.66913604736328 max_rel=1.9999988079071045",
+    "position 128: pm4.gdn_alpha diverged max_abs=44.8823127746582 max_rel=0.9995680451393127",
+    "position 128: pm4.gdn_beta diverged max_abs=0.9217771291732788 max_rel=0.9991738200187683",
+    "position 128: pm4.dn_scales_after_forward diverged max_abs=0.026165321469306946 max_rel=0.9971144199371338",
+    "position 128: pm4.dn_conv_after_forward diverged max_abs=7.063453674316406 max_rel=1.9999924898147583",
+    "position 128: pm4.dn_scales_after_rollback diverged max_abs=0.0457962304353714 max_rel=0.9995091557502747",
+    "position 128: pm4.dn_conv_after_rollback diverged max_abs=34.66913604736328 max_rel=1.9999982118606567",
+    "position 144: recorded_hip.argmax_equal is false",
+    "position 144: recorded_hip.kv_active_hash_equal is false",
+    "position 144: recorded_hip.hidden_staging diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 144: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 144: recorded_hip.final_hidden diverged max_abs=19.085479736328125 max_rel=1.9996460676193237",
+    "position 144: recorded_hip.logits diverged max_abs=7.3878679275512695 max_rel=1.9999967813491821",
+    "position 144: recorded_hip.gdn_qkv diverged max_abs=34.611053466796875 max_rel=1.9999991655349731",
+    "position 144: recorded_hip.gdn_alpha diverged max_abs=68.63284301757812 max_rel=1.0",
+    "position 144: recorded_hip.gdn_beta diverged max_abs=0.9016824960708618 max_rel=0.9999958872795105",
+    "position 144: recorded_hip.dn_scales_after_forward diverged max_abs=0.02914239466190338 max_rel=0.9985893964767456",
+    "position 144: recorded_hip.dn_conv_after_forward diverged max_abs=2.454681873321533 max_rel=1.9999843835830688",
+    "position 144: recorded_hip.dn_scales_after_rollback diverged max_abs=0.08975479006767273 max_rel=0.9993099570274353",
+    "position 144: recorded_hip.dn_conv_after_rollback diverged max_abs=28.060941696166992 max_rel=1.9999991655349731",
+    "position 144: pm4.argmax_equal is false",
+    "position 144: pm4.kv_active_hash_equal is false",
+    "position 144: pm4.hidden_staging diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 144: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 144: pm4.final_hidden diverged max_abs=19.196216583251953 max_rel=1.999896764755249",
+    "position 144: pm4.logits diverged max_abs=7.498174667358398 max_rel=1.9999929666519165",
+    "position 144: pm4.gdn_qkv diverged max_abs=34.611053466796875 max_rel=1.9999991655349731",
+    "position 144: pm4.gdn_alpha diverged max_abs=68.63284301757812 max_rel=1.0",
+    "position 144: pm4.gdn_beta diverged max_abs=0.9016824960708618 max_rel=0.9999958872795105",
+    "position 144: pm4.dn_scales_after_forward diverged max_abs=0.02914239466190338 max_rel=0.9973641633987427",
+    "position 144: pm4.dn_conv_after_forward diverged max_abs=7.267241954803467 max_rel=1.9999868869781494",
+    "position 144: pm4.dn_scales_after_rollback diverged max_abs=0.08975479006767273 max_rel=0.9993099570274353",
+    "position 144: pm4.dn_conv_after_rollback diverged max_abs=28.060941696166992 max_rel=1.9999991655349731",
+    "position 160: recorded_hip.argmax_equal is false",
+    "position 160: recorded_hip.kv_active_hash_equal is false",
+    "position 160: recorded_hip.hidden_staging diverged max_abs=87.74510192871094 max_rel=1.999988079071045",
+    "position 160: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 160: recorded_hip.final_hidden diverged max_abs=9.765424728393555 max_rel=1.999738097190857",
+    "position 160: recorded_hip.logits diverged max_abs=7.585926055908203 max_rel=1.9999947547912598",
+    "position 160: recorded_hip.gdn_qkv diverged max_abs=58.659080505371094 max_rel=1.9999979734420776",
+    "position 160: recorded_hip.gdn_alpha diverged max_abs=48.770469665527344 max_rel=0.9997442960739136",
+    "position 160: recorded_hip.gdn_beta diverged max_abs=0.9326801300048828 max_rel=0.9875422120094299",
+    "position 160: recorded_hip.dn_scales_after_forward diverged max_abs=0.06183768808841705 max_rel=0.9971035122871399",
+    "position 160: recorded_hip.dn_conv_after_forward diverged max_abs=4.1349639892578125 max_rel=1.9999654293060303",
+    "position 160: recorded_hip.dn_scales_after_rollback diverged max_abs=0.1344747692346573 max_rel=0.9995601773262024",
+    "position 160: recorded_hip.dn_conv_after_rollback diverged max_abs=26.110816955566406 max_rel=1.9999972581863403",
+    "position 160: pm4.argmax_equal is false",
+    "position 160: pm4.kv_active_hash_equal is false",
+    "position 160: pm4.hidden_staging diverged max_abs=87.74510192871094 max_rel=1.999988079071045",
+    "position 160: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 160: pm4.final_hidden diverged max_abs=9.709197998046875 max_rel=1.9999607801437378",
+    "position 160: pm4.logits diverged max_abs=7.681037425994873 max_rel=1.9999914169311523",
+    "position 160: pm4.gdn_qkv diverged max_abs=58.659080505371094 max_rel=1.9999979734420776",
+    "position 160: pm4.gdn_alpha diverged max_abs=48.770469665527344 max_rel=0.9997442960739136",
+    "position 160: pm4.gdn_beta diverged max_abs=0.9326801300048828 max_rel=0.9875422120094299",
+    "position 160: pm4.dn_scales_after_forward diverged max_abs=0.06183768808841705 max_rel=0.996335506439209",
+    "position 160: pm4.dn_conv_after_forward diverged max_abs=3.8907546997070312 max_rel=1.9999923706054688",
+    "position 160: pm4.dn_scales_after_rollback diverged max_abs=0.1344747692346573 max_rel=0.9995601773262024",
+    "position 160: pm4.dn_conv_after_rollback diverged max_abs=26.110816955566406 max_rel=1.9999972581863403",
+    "position 176: recorded_hip.argmax_equal is false",
+    "position 176: recorded_hip.kv_active_hash_equal is false",
+    "position 176: recorded_hip.hidden_staging diverged max_abs=51.30961990356445 max_rel=1.9999960660934448",
+    "position 176: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 176: recorded_hip.final_hidden diverged max_abs=12.433450698852539 max_rel=1.9998782873153687",
+    "position 176: recorded_hip.logits diverged max_abs=6.734248161315918 max_rel=1.999995470046997",
+    "position 176: recorded_hip.gdn_qkv diverged max_abs=58.0686149597168 max_rel=1.9999990463256836",
+    "position 176: recorded_hip.gdn_alpha diverged max_abs=62.10323715209961 max_rel=0.9998096227645874",
+    "position 176: recorded_hip.gdn_beta diverged max_abs=0.8666903376579285 max_rel=0.985049843788147",
+    "position 176: recorded_hip.dn_scales_after_forward diverged max_abs=0.1247062087059021 max_rel=0.996371328830719",
+    "position 176: recorded_hip.dn_conv_after_forward diverged max_abs=6.8033447265625 max_rel=1.9999831914901733",
+    "position 176: recorded_hip.dn_scales_after_rollback diverged max_abs=0.11653760820627213 max_rel=0.9995539784431458",
+    "position 176: recorded_hip.dn_conv_after_rollback diverged max_abs=58.0686149597168 max_rel=1.9999933242797852",
+    "position 176: pm4.argmax_equal is false",
+    "position 176: pm4.kv_active_hash_equal is false",
+    "position 176: pm4.hidden_staging diverged max_abs=51.30961990356445 max_rel=1.9999960660934448",
+    "position 176: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 176: pm4.final_hidden diverged max_abs=12.653900146484375 max_rel=1.9998552799224854",
+    "position 176: pm4.logits diverged max_abs=6.644880771636963 max_rel=1.9999985694885254",
+    "position 176: pm4.gdn_qkv diverged max_abs=58.0686149597168 max_rel=1.9999990463256836",
+    "position 176: pm4.gdn_alpha diverged max_abs=62.10323715209961 max_rel=0.9998096227645874",
+    "position 176: pm4.gdn_beta diverged max_abs=0.8666903376579285 max_rel=0.985049843788147",
+    "position 176: pm4.dn_scales_after_forward diverged max_abs=0.1247062087059021 max_rel=0.9995660781860352",
+    "position 176: pm4.dn_conv_after_forward diverged max_abs=8.752164840698242 max_rel=1.9999984502792358",
+    "position 176: pm4.dn_scales_after_rollback diverged max_abs=0.11653760820627213 max_rel=0.9995539784431458",
+    "position 176: pm4.dn_conv_after_rollback diverged max_abs=58.0686149597168 max_rel=1.9999933242797852",
+    "position 192: recorded_hip.argmax_equal is false",
+    "position 192: recorded_hip.kv_active_hash_equal is false",
+    "position 192: recorded_hip.hidden_staging diverged max_abs=112.67243957519531 max_rel=1.9999827146530151",
+    "position 192: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 192: recorded_hip.final_hidden diverged max_abs=15.983227729797363 max_rel=1.9997506141662598",
+    "position 192: recorded_hip.logits diverged max_abs=8.748433113098145 max_rel=1.999985933303833",
+    "position 192: recorded_hip.gdn_qkv diverged max_abs=25.151395797729492 max_rel=1.9999996423721313",
+    "position 192: recorded_hip.gdn_alpha diverged max_abs=39.219810485839844 max_rel=0.9998469352722168",
+    "position 192: recorded_hip.gdn_beta diverged max_abs=0.8729709386825562 max_rel=0.9856752753257751",
+    "position 192: recorded_hip.dn_scales_after_forward diverged max_abs=0.12212264537811279 max_rel=0.9980630874633789",
+    "position 192: recorded_hip.dn_conv_after_forward diverged max_abs=5.8693952560424805 max_rel=1.9999924898147583",
+    "position 192: recorded_hip.dn_scales_after_rollback diverged max_abs=0.11048920452594757 max_rel=0.9994993805885315",
+    "position 192: recorded_hip.dn_conv_after_rollback diverged max_abs=23.06903839111328 max_rel=1.9999991655349731",
+    "position 192: pm4.argmax_equal is false",
+    "position 192: pm4.kv_active_hash_equal is false",
+    "position 192: pm4.hidden_staging diverged max_abs=112.67243957519531 max_rel=1.9999827146530151",
+    "position 192: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 192: pm4.final_hidden diverged max_abs=15.99530029296875 max_rel=1.9999985694885254",
+    "position 192: pm4.logits diverged max_abs=8.682038307189941 max_rel=1.999997854232788",
+    "position 192: pm4.gdn_qkv diverged max_abs=25.151395797729492 max_rel=1.9999996423721313",
+    "position 192: pm4.gdn_alpha diverged max_abs=39.219810485839844 max_rel=0.9998469352722168",
+    "position 192: pm4.gdn_beta diverged max_abs=0.8729709386825562 max_rel=0.9856752753257751",
+    "position 192: pm4.dn_scales_after_forward diverged max_abs=0.12212264537811279 max_rel=0.9979857802391052",
+    "position 192: pm4.dn_conv_after_forward diverged max_abs=5.57551383972168 max_rel=1.9999960660934448",
+    "position 192: pm4.dn_scales_after_rollback diverged max_abs=0.11048920452594757 max_rel=0.9994993805885315",
+    "position 192: pm4.dn_conv_after_rollback diverged max_abs=23.06903839111328 max_rel=1.9999991655349731",
+    "position 208: recorded_hip.argmax_equal is false",
+    "position 208: recorded_hip.kv_active_hash_equal is false",
+    "position 208: recorded_hip.hidden_staging diverged max_abs=147.65077209472656 max_rel=1.9999850988388062",
+    "position 208: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 208: recorded_hip.final_hidden diverged max_abs=14.618937492370605 max_rel=1.9999254941940308",
+    "position 208: recorded_hip.logits diverged max_abs=8.526779174804688 max_rel=1.9999794960021973",
+    "position 208: recorded_hip.gdn_qkv diverged max_abs=56.578887939453125 max_rel=1.9999992847442627",
+    "position 208: recorded_hip.gdn_alpha diverged max_abs=49.47410583496094 max_rel=0.9999293684959412",
+    "position 208: recorded_hip.gdn_beta diverged max_abs=0.9195281267166138 max_rel=0.9881675243377686",
+    "position 208: recorded_hip.dn_scales_after_forward diverged max_abs=0.09557086229324341 max_rel=0.9947844743728638",
+    "position 208: recorded_hip.dn_conv_after_forward diverged max_abs=8.098184585571289 max_rel=1.999969482421875",
+    "position 208: recorded_hip.dn_scales_after_rollback diverged max_abs=0.1074368879199028 max_rel=0.9994661211967468",
+    "position 208: recorded_hip.dn_conv_after_rollback diverged max_abs=25.402660369873047 max_rel=1.9999895095825195",
+    "position 208: pm4.argmax_equal is false",
+    "position 208: pm4.kv_active_hash_equal is false",
+    "position 208: pm4.hidden_staging diverged max_abs=147.65077209472656 max_rel=1.9999850988388062",
+    "position 208: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999982118606567",
+    "position 208: pm4.final_hidden diverged max_abs=13.586862564086914 max_rel=1.9999065399169922",
+    "position 208: pm4.logits diverged max_abs=8.632862091064453 max_rel=1.999990701675415",
+    "position 208: pm4.gdn_qkv diverged max_abs=56.578887939453125 max_rel=1.9999992847442627",
+    "position 208: pm4.gdn_alpha diverged max_abs=49.47410583496094 max_rel=0.9999293684959412",
+    "position 208: pm4.gdn_beta diverged max_abs=0.9195281267166138 max_rel=0.9881675243377686",
+    "position 208: pm4.dn_scales_after_forward diverged max_abs=0.09557086229324341 max_rel=0.9982513785362244",
+    "position 208: pm4.dn_conv_after_forward diverged max_abs=8.496589660644531 max_rel=1.9999979734420776",
+    "position 208: pm4.dn_scales_after_rollback diverged max_abs=0.1074368879199028 max_rel=0.9994661211967468",
+    "position 208: pm4.dn_conv_after_rollback diverged max_abs=25.402660369873047 max_rel=1.9999895095825195",
+    "position 224: recorded_hip.argmax_equal is false",
+    "position 224: recorded_hip.kv_active_hash_equal is false",
+    "position 224: recorded_hip.hidden_staging diverged max_abs=164.39219665527344 max_rel=1.9999984502792358",
+    "position 224: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999984502792358",
+    "position 224: recorded_hip.final_hidden diverged max_abs=12.318947792053223 max_rel=1.9999350309371948",
+    "position 224: recorded_hip.logits diverged max_abs=7.578372478485107 max_rel=1.9999797344207764",
+    "position 224: recorded_hip.gdn_qkv diverged max_abs=51.97041320800781 max_rel=2.0",
+    "position 224: recorded_hip.gdn_alpha diverged max_abs=56.826629638671875 max_rel=0.9997206926345825",
+    "position 224: recorded_hip.gdn_beta diverged max_abs=0.9044880270957947 max_rel=0.9904515743255615",
+    "position 224: recorded_hip.dn_scales_after_forward diverged max_abs=0.07586446404457092 max_rel=0.9971944689750671",
+    "position 224: recorded_hip.dn_conv_after_forward diverged max_abs=9.15639877319336 max_rel=1.9999969005584717",
+    "position 224: recorded_hip.dn_scales_after_rollback diverged max_abs=0.14131173491477966 max_rel=0.9993067383766174",
+    "position 224: recorded_hip.dn_conv_after_rollback diverged max_abs=39.403076171875 max_rel=1.9999946355819702",
+    "position 224: pm4.argmax_equal is false",
+    "position 224: pm4.kv_active_hash_equal is false",
+    "position 224: pm4.hidden_staging diverged max_abs=164.39219665527344 max_rel=1.9999984502792358",
+    "position 224: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999984502792358",
+    "position 224: pm4.final_hidden diverged max_abs=12.249592781066895 max_rel=1.9994655847549438",
+    "position 224: pm4.logits diverged max_abs=7.564402103424072 max_rel=1.9999843835830688",
+    "position 224: pm4.gdn_qkv diverged max_abs=51.97041320800781 max_rel=2.0",
+    "position 224: pm4.gdn_alpha diverged max_abs=56.826629638671875 max_rel=0.9997206926345825",
+    "position 224: pm4.gdn_beta diverged max_abs=0.9044880270957947 max_rel=0.9904515743255615",
+    "position 224: pm4.dn_scales_after_forward diverged max_abs=0.07586446404457092 max_rel=0.9976734519004822",
+    "position 224: pm4.dn_conv_after_forward diverged max_abs=18.4300594329834 max_rel=1.9999964237213135",
+    "position 224: pm4.dn_scales_after_rollback diverged max_abs=0.14131173491477966 max_rel=0.9993067383766174",
+    "position 224: pm4.dn_conv_after_rollback diverged max_abs=39.403076171875 max_rel=1.9999946355819702",
+    "position 240: recorded_hip.argmax_equal is false",
+    "position 240: recorded_hip.kv_active_hash_equal is false",
+    "position 240: recorded_hip.hidden_staging diverged max_abs=92.1151123046875 max_rel=1.9999994039535522",
+    "position 240: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 240: recorded_hip.final_hidden diverged max_abs=17.336383819580078 max_rel=1.999756097793579",
+    "position 240: recorded_hip.logits diverged max_abs=11.565732955932617 max_rel=1.999977946281433",
+    "position 240: recorded_hip.gdn_qkv diverged max_abs=50.8743782043457 max_rel=1.9999998807907104",
+    "position 240: recorded_hip.gdn_alpha diverged max_abs=64.72818756103516 max_rel=0.9996359944343567",
+    "position 240: recorded_hip.gdn_beta diverged max_abs=0.9416813850402832 max_rel=0.9877459406852722",
+    "position 240: recorded_hip.dn_scales_after_forward diverged max_abs=0.07635097205638885 max_rel=0.9992915391921997",
+    "position 240: recorded_hip.dn_conv_after_forward diverged max_abs=11.538161277770996 max_rel=1.999993920326233",
+    "position 240: recorded_hip.dn_scales_after_rollback diverged max_abs=0.1789197027683258 max_rel=0.9992305040359497",
+    "position 240: recorded_hip.dn_conv_after_rollback diverged max_abs=49.67209243774414 max_rel=1.9999929666519165",
+    "position 240: pm4.argmax_equal is false",
+    "position 240: pm4.kv_active_hash_equal is false",
+    "position 240: pm4.hidden_staging diverged max_abs=92.1151123046875 max_rel=1.9999994039535522",
+    "position 240: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 240: pm4.final_hidden diverged max_abs=17.494857788085938 max_rel=1.9998570680618286",
+    "position 240: pm4.logits diverged max_abs=11.574834823608398 max_rel=1.9999867677688599",
+    "position 240: pm4.gdn_qkv diverged max_abs=50.8743782043457 max_rel=1.9999998807907104",
+    "position 240: pm4.gdn_alpha diverged max_abs=64.72818756103516 max_rel=0.9996359944343567",
+    "position 240: pm4.gdn_beta diverged max_abs=0.9416813850402832 max_rel=0.9877459406852722",
+    "position 240: pm4.dn_scales_after_forward diverged max_abs=0.07635097205638885 max_rel=0.9993415474891663",
+    "position 240: pm4.dn_conv_after_forward diverged max_abs=17.41927146911621 max_rel=1.999995470046997",
+    "position 240: pm4.dn_scales_after_rollback diverged max_abs=0.1789197027683258 max_rel=0.9992305040359497",
+    "position 240: pm4.dn_conv_after_rollback diverged max_abs=49.67209243774414 max_rel=1.9999929666519165",
+    "position 256: recorded_hip.argmax_equal is false",
+    "position 256: recorded_hip.kv_active_hash_equal is false",
+    "position 256: recorded_hip.hidden_staging diverged max_abs=103.28341674804688 max_rel=1.9999958276748657",
+    "position 256: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 256: recorded_hip.final_hidden diverged max_abs=13.596183776855469 max_rel=1.9998911619186401",
+    "position 256: recorded_hip.logits diverged max_abs=10.20979118347168 max_rel=1.9999535083770752",
+    "position 256: recorded_hip.gdn_qkv diverged max_abs=48.353729248046875 max_rel=1.9999991655349731",
+    "position 256: recorded_hip.gdn_alpha diverged max_abs=62.322853088378906 max_rel=0.9997362494468689",
+    "position 256: recorded_hip.gdn_beta diverged max_abs=0.9454854726791382 max_rel=0.9870714545249939",
+    "position 256: recorded_hip.dn_scales_after_forward diverged max_abs=0.09349077939987183 max_rel=0.9970235824584961",
+    "position 256: recorded_hip.dn_conv_after_forward diverged max_abs=11.694113731384277 max_rel=1.9999799728393555",
+    "position 256: recorded_hip.dn_scales_after_rollback diverged max_abs=0.1735168993473053 max_rel=0.999235212802887",
+    "position 256: recorded_hip.dn_conv_after_rollback diverged max_abs=38.36432647705078 max_rel=1.999998927116394",
+    "position 256: pm4.argmax_equal is false",
+    "position 256: pm4.kv_active_hash_equal is false",
+    "position 256: pm4.hidden_staging diverged max_abs=103.28341674804688 max_rel=1.9999958276748657",
+    "position 256: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 256: pm4.final_hidden diverged max_abs=13.611674308776855 max_rel=1.999973177909851",
+    "position 256: pm4.logits diverged max_abs=10.201705932617188 max_rel=1.9999979734420776",
+    "position 256: pm4.gdn_qkv diverged max_abs=48.353729248046875 max_rel=1.9999991655349731",
+    "position 256: pm4.gdn_alpha diverged max_abs=62.322853088378906 max_rel=0.9997362494468689",
+    "position 256: pm4.gdn_beta diverged max_abs=0.9454854726791382 max_rel=0.9870714545249939",
+    "position 256: pm4.dn_scales_after_forward diverged max_abs=0.09349077939987183 max_rel=0.9961375594139099",
+    "position 256: pm4.dn_conv_after_forward diverged max_abs=14.899852752685547 max_rel=1.9999916553497314",
+    "position 256: pm4.dn_scales_after_rollback diverged max_abs=0.1735168993473053 max_rel=0.999235212802887",
+    "position 256: pm4.dn_conv_after_rollback diverged max_abs=38.36432647705078 max_rel=1.999998927116394",
+    "position 272: recorded_hip.argmax_equal is false",
+    "position 272: recorded_hip.kv_active_hash_equal is false",
+    "position 272: recorded_hip.hidden_staging diverged max_abs=117.69761657714844 max_rel=1.9999942779541016",
+    "position 272: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 272: recorded_hip.final_hidden diverged max_abs=20.262907028198242 max_rel=1.9998823404312134",
+    "position 272: recorded_hip.logits diverged max_abs=12.784638404846191 max_rel=1.999975323677063",
+    "position 272: recorded_hip.gdn_qkv diverged max_abs=53.38997268676758 max_rel=1.9999998807907104",
+    "position 272: recorded_hip.gdn_alpha diverged max_abs=55.551082611083984 max_rel=0.9998709559440613",
+    "position 272: recorded_hip.gdn_beta diverged max_abs=0.9574099183082581 max_rel=0.9851934909820557",
+    "position 272: recorded_hip.dn_scales_after_forward diverged max_abs=0.09258627891540527 max_rel=0.9974859356880188",
+    "position 272: recorded_hip.dn_conv_after_forward diverged max_abs=10.083040237426758 max_rel=1.9999873638153076",
+    "position 272: recorded_hip.dn_scales_after_rollback diverged max_abs=0.16781871020793915 max_rel=0.9994379878044128",
+    "position 272: recorded_hip.dn_conv_after_rollback diverged max_abs=44.693748474121094 max_rel=1.9999920129776",
+    "position 272: pm4.argmax_equal is false",
+    "position 272: pm4.kv_active_hash_equal is false",
+    "position 272: pm4.hidden_staging diverged max_abs=117.69761657714844 max_rel=1.9999942779541016",
+    "position 272: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 272: pm4.final_hidden diverged max_abs=20.409025192260742 max_rel=1.9999667406082153",
+    "position 272: pm4.logits diverged max_abs=12.7540922164917 max_rel=1.9999951124191284",
+    "position 272: pm4.gdn_qkv diverged max_abs=53.38997268676758 max_rel=1.9999998807907104",
+    "position 272: pm4.gdn_alpha diverged max_abs=55.551082611083984 max_rel=0.9998709559440613",
+    "position 272: pm4.gdn_beta diverged max_abs=0.9574099183082581 max_rel=0.9851934909820557",
+    "position 272: pm4.dn_scales_after_forward diverged max_abs=0.09258627891540527 max_rel=0.9971114993095398",
+    "position 272: pm4.dn_conv_after_forward diverged max_abs=9.665204048156738 max_rel=1.9999964237213135",
+    "position 272: pm4.dn_scales_after_rollback diverged max_abs=0.16781871020793915 max_rel=0.9994379878044128",
+    "position 272: pm4.dn_conv_after_rollback diverged max_abs=44.693748474121094 max_rel=1.9999920129776",
+    "position 288: recorded_hip.argmax_equal is false",
+    "position 288: recorded_hip.kv_active_hash_equal is false",
+    "position 288: recorded_hip.hidden_staging diverged max_abs=111.2018814086914 max_rel=1.999990463256836",
+    "position 288: recorded_hip.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 288: recorded_hip.final_hidden diverged max_abs=18.398460388183594 max_rel=1.9999879598617554",
+    "position 288: recorded_hip.logits diverged max_abs=13.065900802612305 max_rel=1.999998688697815",
+    "position 288: recorded_hip.gdn_qkv diverged max_abs=64.46219635009766 max_rel=2.0",
+    "position 288: recorded_hip.gdn_alpha diverged max_abs=62.8898811340332 max_rel=0.9999446868896484",
+    "position 288: recorded_hip.gdn_beta diverged max_abs=0.9595466256141663 max_rel=0.9851878881454468",
+    "position 288: recorded_hip.dn_scales_after_forward diverged max_abs=0.08339458703994751 max_rel=0.9980759620666504",
+    "position 288: recorded_hip.dn_conv_after_forward diverged max_abs=15.348854064941406 max_rel=1.9999974966049194",
+    "position 288: recorded_hip.dn_scales_after_rollback diverged max_abs=0.13472265005111694 max_rel=0.999434232711792",
+    "position 288: recorded_hip.dn_conv_after_rollback diverged max_abs=47.704376220703125 max_rel=1.9999945163726807",
+    "position 288: pm4.argmax_equal is false",
+    "position 288: pm4.kv_active_hash_equal is false",
+    "position 288: pm4.hidden_staging diverged max_abs=111.2018814086914 max_rel=1.999990463256836",
+    "position 288: pm4.hidden_ring diverged max_abs=165.7646484375 max_rel=1.9999994039535522",
+    "position 288: pm4.final_hidden diverged max_abs=18.440858840942383 max_rel=1.9998598098754883",
+    "position 288: pm4.logits diverged max_abs=12.923598289489746 max_rel=1.999985694885254",
+    "position 288: pm4.gdn_qkv diverged max_abs=64.46219635009766 max_rel=2.0",
+    "position 288: pm4.gdn_alpha diverged max_abs=62.8898811340332 max_rel=0.9999446868896484",
+    "position 288: pm4.gdn_beta diverged max_abs=0.9595466256141663 max_rel=0.9851878881454468",
+    "position 288: pm4.dn_scales_after_forward diverged max_abs=0.08339458703994751 max_rel=0.9962545037269592",
+    "position 288: pm4.dn_conv_after_forward diverged max_abs=16.242218017578125 max_rel=1.999997615814209",
+    "position 288: pm4.dn_scales_after_rollback diverged max_abs=0.13472265005111694 max_rel=0.999434232711792",
+    "position 288: pm4.dn_conv_after_rollback diverged max_abs=47.704376220703125 max_rel=1.9999945163726807"
+  ]
+}
