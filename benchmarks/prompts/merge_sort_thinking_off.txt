@@ -1,0 +1,7 @@
+<|im_start|>user
+Write a Python merge_sort function. Only show the code, no explanation.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+

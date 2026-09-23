@@ -1,0 +1,428 @@
+[package]
+name = "hipfire-runtime"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Inference orchestrator for RDNA GPUs"
+
+[features]
+# Cargo features for selective architecture inclusion (Phase 2 PR 12).
+#
+# Default keeps today's full-featured behavior: `cargo build --release`
+# produces the same daemon + example surface as before this PR.
+# Downstream library consumers may opt out of any subset of arches, e.g.
+#
+#   [dependencies]
+#   hipfire-runtime = { version = "...", default-features = false,
+#                       features = ["deltanet", "arch-qwen35"] }
+#
+# This trims the resolved dep graph to just the qwen35 arch crate plus
+# the deltanet runtime feature, with all other arch crates absent.
+#
+# Internal example builds:
+# Each arch crate already lists `hipfire-runtime` in its
+# `[dependencies]`; promoting these to `[dependencies]` here would form
+# a package-level cycle, which cargo rejects. To keep the cycle
+# avoidance, the arch crates are listed as plain (non-optional)
+# `[dev-dependencies]` of this crate. cargo's resolver excludes the
+# dev-dep edge from the cycle check.
+#
+# Side-effect: when a workspace example is built (via
+# `cargo build --example daemon` etc.), cargo's resolver follows the
+# dev-dep edge in both directions, which activates the `default`
+# feature on `hipfire-runtime` from the dev-dep activation path. That
+# in turn re-activates all `arch-*` features, undoing any
+# `--no-default-features` the user passed for an example build. This
+# is a workspace-internal limitation only; it does NOT affect
+# downstream library consumers, who never enter the dev-dep cycle.
+#
+# Example-target gating uses `required-features` (per `[[example]]`
+# block below) which serves both as documentation of which features
+# each example needs and as the gate for downstream library consumers
+# who attempt to build examples through their own build script.
+default = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr", "deltanet"]
+deltanet = ["rdna-compute/deltanet", "hipfire-dispatch/deltanet"]
+arch-qwen35 = []
+arch-qwen35-vl = []
+arch-llama = []
+arch-qwen2 = []
+arch-deepseek4 = []
+arch-cohere2moe = []
+arch-dots-ocr = []
+# ep-fault-inject: enables the EP partial-load fault-injection knob
+# (HIPFIRE_EP_FAIL_RANK) in the daemon example, which makes a chosen EP rank
+# return a synthetic Err after uploading its weights so the staging-guard VRAM
+# cleanup can be exercised on real GPUs without forcing an OOM. NOT in the
+# default set: a production build (`--features deltanet`) compiles the env read
+# and the synthetic-error branches OUT, so HIPFIRE_EP_FAIL_RANK has no effect.
+# Build the GPU cleanup test with `--features deltanet,ep-fault-inject`.
+ep-fault-inject = []
+[dependencies]
+hip-bridge = { path = "../hip-bridge" }
+hipfire-config = { path = "../hipfire-config" }
+rdna-compute = { path = "../rdna-compute" }
+hipfire-dispatch = { path = "../hipfire-dispatch" }
+memmap2 = "0.9"
+safetensors.workspace = true
+half.workspace = true
+byteorder = "1"
+serde = { version = "1", features = ["derive"] }
+# preserve_order: keep JSON object key insertion-order (IndexMap) instead of the
+# default BTreeMap alphabetic sort. Required so request tool-definition key order
+# survives parse → render → `| tojson`, byte-matching the model's trained
+# chat_template (HF apply_chat_template preserves insertion order). Feature-
+# unifies across the workspace build.
+serde_json = { version = "1", features = ["preserve_order"] }
+base64 = "0.22"
+libc = "0.2"
+rayon = "1"
+# Inline-small token buffer for `spec::SpecStep::emit` — keeps the
+# autoregressive one-token-per-step path heap-alloc-free; only large
+# speculative windows spill to the heap.
+smallvec = "1"
+# GPT-2 / cl100k pre-tokenization for encode_gpt2_bpe. Reference encoders
+# (HF tokenizers, tiktoken) chunk input via regex into ≤10-byte words/runs,
+# then BPE each chunk independently; without that step the merge PQ runs
+# on the whole prompt as one problem and goes O(N log N) with a huge
+# constant from cross-word merges + stale-entry churn. PR #230 fixed
+# per-iteration costs but not the algorithmic shape — this regex restores
+# the canonical chunking.
+regex = "1"
+# Renders the upstream HF chat_template (Jinja) when present in
+# .hfq metadata, so prompt framing matches what the model was
+# trained on. Falls back to the hand-rolled `prompt_frame::ChatFrame`
+# scaffolding when the template is absent or fails to render.
+# `json` enables the `tojson` filter — Qwen3.5/3.6 + Gemma 4 tool-rendering
+# branches use `{{ tool | tojson }}` to emit OpenAI-shape function specs
+# inside the system block; without it, tool-using turns die at render time
+# (caught by jinja_smoke scenario C, 2026-05-09).
+minijinja = { version = "2", features = ["loop_controls", "json", "preserve_order"] }
+# `pycompat` ships an unknown-method callback that makes Python
+# str/list/dict methods (e.g. `.startswith`, `.split`, `.rstrip`)
+# work on plain Jinja values — required by the Qwen3 family
+# template which uses these throughout.
+minijinja-contrib = { version = "2", features = ["pycompat"] }
+tracing = "0.1"
+
+# Examples in this crate (daemon, infer_qwen35, infer_qwen3, infer_vl, etc.)
+# consume the arch crates. These are dev-dependencies — cargo refuses
+# optional dev-dependencies AND its cycle checker excludes the dev-dep
+# edge, which is what allows hipfire-runtime to list arch crates here
+# despite each arch crate already depending on hipfire-runtime.
+# Per-arch granularity for downstream consumers comes from the cargo
+# features above and `required-features` on each `[[example]]` block
+# below.
+[dev-dependencies]
+hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hipfire-arch-llama = { path = "../hipfire-arch-llama" }
+hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
+hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
+hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
+hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
+hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
+hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
+hipfire-loader = { path = "../hipfire-loader" }
+hipfire-detect = { path = "../hipfire-detect" }
+hipfire-atlas = { path = "../hipfire-atlas" }
+# In-test minimal HFQ writer (overlay resolution tests in src/hfq.rs).
+tempfile = "3"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
+
+# Each example below carries `required-features` listing the cargo
+# features its `use hipfire_arch_*` imports depend on. This documents
+# the per-example arch dependency and gates the example for downstream
+# library consumers (who do not enter the dev-dep cycle and so respect
+# the `--no-default-features` flag faithfully).
+#
+# Examples NOT listed here (bench_q8, probe_wmma, dump_meta, …) do not
+# touch arch crates and build under any feature combination.
+
+[[example]]
+name = "daemon"
+required-features = ["arch-qwen35", "arch-qwen35-vl", "arch-llama", "arch-qwen2", "arch-deepseek4", "arch-cohere2moe", "arch-dots-ocr"]
+
+[[example]]
+name = "hfq_split"
+required-features = []
+
+[[example]]
+name = "coherence_probe"
+required-features = []
+
+[[example]]
+name = "gpus_smoke"
+required-features = []
+
+[[example]]
+name = "infer_qwen35"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "infer_qwen3"
+required-features = ["arch-llama"]
+
+[[example]]
+name = "infer_vl"
+required-features = ["arch-qwen35-vl", "arch-qwen35"]
+
+[[example]]
+name = "infer"
+required-features = ["arch-qwen35", "arch-qwen35-vl"]
+
+[[example]]
+name = "infer_hfq"
+required-features = ["arch-llama"]
+
+[[example]]
+name = "run"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "a3b_load_check"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "a3b_multiturn_oneshot"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "a3b_smoke_forward"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "bench_qwen35_forward"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "bench_qwen35_mq4"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "channel_test_mmq"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "dflash_spec_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "mtp_probe_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "mtp_only_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "dump_logits_qwen35"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "dump_qwen35_hidden_states"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "greedy_dump"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "greedy_dump_top5"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "logit_dump"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "pflash_compress_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "pflash_load_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "perplexity"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pflash_niah_bench"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "probe_argmax_agreement"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_attention_phases"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_bandwidth_fwd"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_deltanet"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_host_vs_gpu"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_qwen35_mq4"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "profile_prefill_qwen35"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "test_inference"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_inferenceQA"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_long_ctx"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_qwen35_load"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "test_qwen35_loadQA"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_accuracy_sweep"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_decode_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_infer"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_longctx_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_periodic_demo"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "triattn_validate"
+required-features = ["arch-qwen35"]
+
+[[example]]
+name = "pp_parity"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pp_parity_chatml"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "pp2_vram_probe"
+required-features = ["arch-qwen35", "deltanet"]
+
+# build_kld_ref needs no GPU / arch features — it just orchestrates
+# llama-perplexity and reduces uint16 logits to top-K. Stdlib-only.
+[[example]]
+name = "build_kld_ref"
+required-features = []
+
+# build_kld_ref_native (F2) — llama-FREE KLD ref producer; runs the hipfire
+# F32 oracle forward and writes the SAME HFKLDR format eval_hipfire consumes.
+[[example]]
+name = "build_kld_ref_native"
+required-features = ["arch-qwen35", "deltanet"]
+
+# eval_hipfire_fullvocab (F3) — FULL-VOCAB KLD of a hipfire quant vs the hipfire
+# F32 oracle (dual forward, no ref top-K approx) for parity with
+# llama-perplexity --kl-divergence full-vocab KLD.
+[[example]]
+name = "eval_hipfire_fullvocab"
+required-features = ["arch-qwen35", "deltanet"]
+
+# oracle_xcheck (F1) — dumps per-token F32-oracle logits over real tokens (true
+# fp32 KV) for cross-checking the native bf16/F32 forward against a reference.
+[[example]]
+name = "oracle_xcheck"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "eval_hipfire"
+required-features = ["arch-qwen35", "deltanet"]
+
+[[example]]
+name = "collect_e8_hessian_native"
+required-features = ["arch-qwen35", "deltanet"]
+
+# eval_hipfire_llama — KLD eval for llama-arch hipfire models (Qwen3 /
+# Qwen2 / Llama / Mistral / TinyLlama). Same HFKSEQ output as
+# eval_hipfire, but the forward path goes through
+# `<Llama as Architecture>` + `hipfire_runtime::llama::*` instead of
+# the qwen35 arch. Per-token scoring only — llama-arch
+# `forward_prefill_batch` doesn't expose the hidden-state capture hook
+# that eval_hipfire's prefill mode relies on.
+[[example]]
+name = "eval_hipfire_llama"
+required-features = ["arch-llama"]
+
+# Tokenizer-parity helper: reads a .hfq's tokenizer + tokenizes a text slice.
+# No GPU / arch features needed (tokenizer is pure CPU).
+[[example]]
+name = "tokenize_slice"
+required-features = []
+
+# eval_gguf — KLD eval for GGUF candidates (FIFO + llama-perplexity).
+# Stdlib only; no GPU / arch features.
+[[example]]
+name = "eval_gguf"
+required-features = []
+
+# imatrix_collect — Phase A Step 4 (Tier 2): subprocess wrapper around
+# llama-imatrix for the activation-weighted-LS calibration pipeline.
+# Stdlib only; no GPU / arch features.
+[[example]]
+name = "imatrix_collect"
+required-features = []
+
+# C8 GPU sampler kernel validation — distribution-parity gate for
+# batched_categorical_sample_f32 and chain_accept_spec_f32.
+# No model load; uses synthetic logits on GPU.  Requires a live GPU.
+[[example]]
+name = "c8_sampler_validate"
+required-features = []
+
+# ─── Tier 1 calibration binaries (foundation scaffolds, 2026-05-19) ────
+#
+# `collect_imatrix` and `collect_hessian` are the hipfire-native
+# replacements for the Tier 2 wrappers above. Both currently ship as
+# `unimplemented!()` scaffolds — argument parsing + module docs only —
+# so that the workspace compiles cleanly while follow-on subagent
+# tasks build the forward pass, on-GPU activation/Hessian reductions,
+# and the GGUF/HFHS-v1 writers on top.
+#
+# Stdlib only at this stage; no GPU / arch features required for the
+# scaffold itself. When the forward pass lands these bins will pick up
+# `required-features = ["arch-qwen35", "arch-llama"]` (or whichever
+# arches the Tier 1 path supports).
+[[bin]]
+name = "collect_imatrix"
+path = "src/bin/collect_imatrix.rs"
+required-features = []
+
+[[bin]]
+name = "collect_hessian"
+path = "src/bin/collect_hessian.rs"
+required-features = []

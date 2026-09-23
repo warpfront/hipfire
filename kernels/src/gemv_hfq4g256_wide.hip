@@ -1,0 +1,133 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+#include <hip/hip_runtime.h>
+
+// HFQ4-G256 GEMV, wide variant: 2 rows per block (one per warp), 64 threads.
+// Used on non-RDNA2 non-RDNA3 archs (gfx1010, gfx1013 / BC-250, etc.) for
+// large M as a throughput optimization over the narrow base kernel.
+//
+// Math is identical to gemv_hfq4g256.hip (default base kernel): 4-accumulator
+// group-interleaved summation with pairwise combine. That pattern is REQUIRED
+// for byte-exactness against the MQ4 quality-gate baselines, which are
+// captured on gfx1100 using the 4-accumulator variant. See
+// gemv_hfq4g256.hip and gemv_hfq4g256.gfx1100.hip for the full writeup on
+// the FP-associativity drift that motivates this structure.
+//
+// Before the port, this kernel used:
+//     acc = (((0 + g0) + g1) + g2) + ...   // single-accumulator sequential
+// which is the same drift the 5302926 gfx1100 fix squashed. Because
+// gemv_hfq4g256_wide is the HOT path on gfx1010 / gfx1013 for any M >= 64
+// (i.e. all Qwen3.5 projection and FFN matrices), this was the actual
+// cause of the MQ4 quality-gate failure on BC-250 — not the narrow base
+// kernel that gets hit only at small M. Patching only the narrow kernel
+// moved the divergence point but did not fix the gate.
+
+extern "C" __global__ void gemv_hfq4g256_wide(
+    const char* __restrict__ A,
+    const float* __restrict__ x,
+    float* __restrict__ y,
+    int M, int K
+) {
+    const int tid = threadIdx.x;
+    const int warp_id = tid / 32;
+    const int lane = tid & 31;
+    const int row = blockIdx.x * 2 + warp_id;
+    if (row >= M) return;
+
+    const int groups_per_row = K / 256;
+    const char* row_ptr = A + (long long)row * groups_per_row * 136;
+    const int boff = lane * 4;
+
+    float acc0 = 0.0f, acc1 = 0.0f, acc2 = 0.0f, acc3 = 0.0f;
+    const int quads = groups_per_row >> 2;
+    const int tail = groups_per_row & 3;
+
+    for (int q = 0; q < quads; q++) {
+        const int g = q << 2;
+        const char* gp0 = row_ptr + g * 136;
+        const char* gp1 = gp0 + 136;
+        const char* gp2 = gp1 + 136;
+        const char* gp3 = gp2 + 136;
+
+        float sc0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0));
+        float zp0 = __builtin_bit_cast(float, *(const unsigned int*)(gp0 + 4));
+        float sc1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1));
+        float zp1 = __builtin_bit_cast(float, *(const unsigned int*)(gp1 + 4));
+        float sc2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2));
+        float zp2 = __builtin_bit_cast(float, *(const unsigned int*)(gp2 + 4));
+        float sc3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3));
+        float zp3 = __builtin_bit_cast(float, *(const unsigned int*)(gp3 + 4));
+
+        unsigned int pk0 = *(const unsigned int*)(gp0 + 8 + boff);
+        unsigned int pk1 = *(const unsigned int*)(gp1 + 8 + boff);
+        unsigned int pk2 = *(const unsigned int*)(gp2 + 8 + boff);
+        unsigned int pk3 = *(const unsigned int*)(gp3 + 8 + boff);
+
+        int base = g * 256 + lane * 8;
+
+        #define DOG(pk, sc, zp, b, a) \
+            (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
+                 + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+                 + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+                 + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+                 + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+                 + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+                 + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+                 + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+
+        DOG(pk0, sc0, zp0, base, acc0);
+        DOG(pk1, sc1, zp1, base + 256, acc1);
+        DOG(pk2, sc2, zp2, base + 512, acc2);
+        DOG(pk3, sc3, zp3, base + 768, acc3);
+        #undef DOG
+    }
+
+    // Tail groups accumulate into acc[g % 4] — see gemv_hfq4g256.gfx1100.hip
+    // for the full bug explanation.
+    #define TAIL_DOG(pk, sc, zp, b, a) \
+        (a) += (sc * (float)((pk) & 0xFu)        + zp) * x[(b)]     \
+             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * x[(b) + 1] \
+             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * x[(b) + 2] \
+             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * x[(b) + 3] \
+             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * x[(b) + 4] \
+             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * x[(b) + 5] \
+             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * x[(b) + 6] \
+             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * x[(b) + 7]
+
+    if (tail >= 1) {
+        const int g = quads << 2;
+        const char* gp = row_ptr + g * 136;
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        int base = g * 256 + lane * 8;
+        TAIL_DOG(pk, sc, zp, base, acc0);
+    }
+    if (tail >= 2) {
+        const int g = (quads << 2) + 1;
+        const char* gp = row_ptr + g * 136;
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        int base = g * 256 + lane * 8;
+        TAIL_DOG(pk, sc, zp, base, acc1);
+    }
+    if (tail >= 3) {
+        const int g = (quads << 2) + 2;
+        const char* gp = row_ptr + g * 136;
+        float sc = __builtin_bit_cast(float, *(const unsigned int*)(gp));
+        float zp = __builtin_bit_cast(float, *(const unsigned int*)(gp + 4));
+        unsigned int pk = *(const unsigned int*)(gp + 8 + boff);
+        int base = g * 256 + lane * 8;
+        TAIL_DOG(pk, sc, zp, base, acc2);
+    }
+    #undef TAIL_DOG
+
+    float acc = (acc0 + acc1) + (acc2 + acc3);
+    for (int offset = 16; offset > 0; offset >>= 1)
+        acc += __shfl_down(acc, offset);
+
+    if (lane == 0) y[row] = acc;
+}

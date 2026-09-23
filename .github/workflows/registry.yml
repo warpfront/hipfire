@@ -1,0 +1,48 @@
+name: registry
+
+# Dynamic model registry refresh (task #47).
+#
+# Probes the HF Hub API (hipfire-models + schuttdev namespaces and every repo
+# referenced by registry/models.json) and regenerates registry/v1.json with live
+# LFS sha256 / size_bytes. The generator is fail-closed: any missing file,
+# missing sha256, or curated-vs-HF size drift aborts without writing, so a
+# broken probe can never replace a good committed registry.
+#
+# Commits only when the file actually changed (generated_at is held stable on
+# no-op runs, so a quiet day produces no commit).
+
+on:
+  schedule:
+    - cron: "23 6 * * *" # daily, off the top-of-hour rush
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: registry-refresh
+  cancel-in-progress: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Regenerate registry/v1.json
+        env:
+          # Optional: raises HF API rate limits; public repos work without it.
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: python3 scripts/registry_gen.py
+
+      - name: Commit on diff
+        run: |
+          if git diff --quiet -- registry/v1.json; then
+            echo "registry/v1.json unchanged — nothing to commit"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add registry/v1.json
+          git commit -m "chore(registry): refresh v1.json from HF probe"
+          git push

@@ -1,0 +1,83 @@
+{
+  "session": "2026-04-25 perf regression recovery",
+  "branch": "dflash",
+  "hardware": {
+    "gpu": "RX 7900 XTX (gfx1100)",
+    "cpu": "AMD Ryzen 9 3900X 12-core",
+    "ram_gb": 64,
+    "os": "Ubuntu 24.04 LTS"
+  },
+  "model": {
+    "target": "qwen3.5-27b.mq4 (FWHT-rotated 4-bit)",
+    "draft": "qwen35-27b-dflash.mq4 (8-layer DFlash)",
+    "kv_cache": "asym3"
+  },
+  "prompt": {
+    "name": "LRU cache PEP-8 strict",
+    "shape": "PEP-8 strict (\\n\\n\\n between top-level defs)",
+    "max_tokens": 120,
+    "flags": "--no-chatml --kv-mode asym3"
+  },
+  "timeline": [
+    {
+      "stage": "regression discovered",
+      "commit": "133f9b3 (post-merge HEAD)",
+      "tok_s_median": 95,
+      "tau": 8.5,
+      "ms_per_cycle": 100,
+      "note": "27% drop from canonical 161 baseline. Initial 'WTF' moment."
+    },
+    {
+      "stage": "ollama killed + cache nuked + DPM warmup",
+      "commit": "133f9b3 (same HEAD)",
+      "tok_s_median": 95,
+      "note": "Eliminated environmental confounds. Regression remained — confirmed code-side."
+    },
+    {
+      "stage": "checkout pre-merge engine (49ac688)",
+      "commit": "49ac688 (dflash before merge from master)",
+      "tok_s_median": 159,
+      "tau": 8.07,
+      "ms_per_cycle": 57,
+      "note": "Baseline restored. Regression isolated to merge content."
+    },
+    {
+      "stage": "revert merge (357e314)",
+      "commit": "357e314 (revert of e3a3da2)",
+      "tok_s_median": 159,
+      "tau": 8.07,
+      "note": "Confirmed via narrow revert. Cleanup-dead-wmma-kernels PR removed load-bearing kernels."
+    },
+    {
+      "stage": "cherry-pick 8 master commits onto dflash",
+      "commit": "0b39d75 (post-cherry-pick HEAD)",
+      "tok_s_median": 159,
+      "tau": 8.07,
+      "note": "Restored other valuable master fixes (graph_launch, dispatch.rs, version bump). Perf still at canonical baseline."
+    },
+    {
+      "stage": "flip prompt_normalize default ON",
+      "commit": "TBD (this commit)",
+      "tok_s_median_new_default": 199,
+      "tok_s_median_opt_out": 161,
+      "tau_new_default": 10.36,
+      "tau_opt_out": 8.07,
+      "note": "+24% tok/s by collapsing \\n{3,} to \\n\\n at engine entry. The 200+ tok/s number user remembered came from this lever, which had been opt-in until now."
+    }
+  ],
+  "env_var_sweep": {
+    "description": "Post-cherry-pick, max=120, all 3-run medians",
+    "rows": [
+      {"config": "no env (BEFORE flip)", "tok_s_med": 159, "tau": 8.07},
+      {"config": "HIPFIRE_NORMALIZE_PROMPT=1", "tok_s_med": 180, "tau_range": "8.5-10.4", "tok_s_peak": 196},
+      {"config": "HIPFIRE_GRAPH=1 only", "tok_s_med": 159, "tau": 8.07, "note": "no effect on dflash_spec_demo"},
+      {"config": "NORMALIZE + GRAPH", "tok_s_med": 197, "tau": 10.36, "tok_s_peak": 197.43},
+      {"config": "default-ON (post-flip)", "tok_s_med": 199, "tau": 10.36, "tok_s_peak": 199.53}
+    ]
+  },
+  "root_cause": {
+    "primary": "PR #32 cleanup/dead-wmma-kernels removed load-bearing kernels (gemm_hfq4g256_residual_wmma{,2,_k4}.hip) thinking dead. Dispatch table fell back to slower variants for some shapes, doubling per-cycle cost on 27B verify forward.",
+    "secondary": "HIPFIRE_NORMALIZE_PROMPT defaulted OFF until 2026-04-26 — undisclosed major perf lever. User's prior 200+ tok/s benches had it ON; recent benches without it appeared regressed even when not.",
+    "smoking_gun_path_in_session": "earlier in this session I deleted K4 references from dispatch.rs because the kernel file was missing — that file was missing because of PR #32. Should have flagged as a regression source then."
+  }
+}

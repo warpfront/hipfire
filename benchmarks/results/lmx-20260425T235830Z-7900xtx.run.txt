@@ -1,0 +1,69 @@
+[16:21:16] === LocalMaxxing bench orchestrator @ engine 6d451e4 ===
+[16:21:16] 5 models × 2 modes = 10 benches; submitting with 310s spacing
+[16:21:16] backed up per_model_config to /tmp/per_model_config.bak.json
+[16:21:16] 
+=== [1/10] qwen3.5:9b dflash=off ===
+[16:21:16]   $ hipfire bench qwen3.5:9b --runs 3 Explain the theory of general relativity in simple terms.
+[16:21:48]   rc=0 dt=32.2s
+[16:21:48]   decode=122.3 ttft=71.5ms wall=114.6
+[16:21:48] 
+=== [2/10] qwen3.5:9b dflash=on ===
+[16:21:48]   $ hipfire bench qwen3.5:9b --runs 3 Explain the theory of general relativity in simple terms.
+[16:22:23]   rc=0 dt=34.6s
+[16:22:23]   decode=66.8 ttft=47.9ms wall=65.2
+[16:22:23] 
+=== [3/10] qwen3.5:27b dflash=off ===
+[16:22:23]   $ hipfire bench qwen3.5:27b --runs 3 Explain the theory of general relativity in simple terms.
+[16:23:46]   rc=0 dt=83.8s
+[16:23:46]   decode=43.5 ttft=117.8ms wall=41.8
+[16:23:46] 
+=== [4/10] qwen3.5:27b dflash=on ===
+[16:23:46]   $ hipfire bench qwen3.5:27b --runs 3 Explain the theory of general relativity in simple terms.
+[16:25:13]   rc=0 dt=86.4s
+[16:25:13]   decode=34.2 ttft=118.5ms wall=33.1
+[16:25:13] 
+=== [5/10] qwen3.5:35b-a3b dflash=off ===
+[16:25:13]   $ hipfire bench qwen3.5:35b-a3b --runs 3 Explain the theory of general relativity in simple terms.
+[16:26:29]   rc=0 dt=76.3s
+[16:26:29]   decode=135.8 ttft=75.7ms wall=125.7
+[16:26:29] 
+=== [6/10] qwen3.5:35b-a3b dflash=on ===
+[16:26:29]   $ hipfire bench qwen3.5:35b-a3b --runs 3 Explain the theory of general relativity in simple terms.
+[16:27:37]   rc=0 dt=68.0s
+[16:27:37]   decode=34.8 ttft=75.4ms wall=34.1
+[16:27:37] 
+=== [7/10] qwen3.6:27b dflash=off ===
+[16:27:37]   $ hipfire bench qwen3.6:27b --runs 3 Explain the theory of general relativity in simple terms.
+[16:29:03]   rc=0 dt=86.2s
+[16:29:03]   decode=43.5 ttft=118.3ms wall=41.8
+[16:29:03] 
+=== [8/10] qwen3.6:27b dflash=on ===
+[16:29:03]   $ hipfire bench qwen3.6:27b --runs 3 Explain the theory of general relativity in simple terms.
+[16:30:27]   rc=0 dt=83.9s
+[16:30:27]   decode=47.2 ttft=119.3ms wall=45.2
+[16:30:27] 
+=== [9/10] qwen3.6:35b-a3b dflash=off ===
+[16:30:27]   $ hipfire bench qwen3.6:35b-a3b --runs 3 Explain the theory of general relativity in simple terms.
+[16:31:44]   rc=0 dt=76.4s
+[16:31:44]   decode=133.9 ttft=75.8ms wall=124.1
+[16:31:44] 
+=== [10/10] qwen3.6:35b-a3b dflash=on ===
+[16:31:44]   $ hipfire bench qwen3.6:35b-a3b --runs 3 Explain the theory of general relativity in simple terms.
+[16:32:52]   rc=0 dt=68.6s
+[16:32:52]   decode=29.0 ttft=76.1ms wall=None
+[16:32:52] 
+=== Phase 1 complete: bench results written to /tmp/lmx_bench_results.json ===
+[16:32:52] 
+=== submit [1/10] qwen3.5:9b dflash=off ===
+[16:32:52]   hfId=Qwen/Qwen3.5-9B tokSOut=122.3 ttft=71.5ms
+[16:32:53]   HTTP 307
+[16:32:53]   body: Redirecting...
+
+[16:32:53]   ...sleeping 310s for rate limit before next submission
+[16:38:03] 
+=== submit [2/10] qwen3.5:9b dflash=on ===
+[16:38:03]   hfId=Qwen/Qwen3.5-9B tokSOut=66.8 ttft=47.9ms
+[16:38:03]   HTTP 307
+[16:38:03]   body: Redirecting...
+
+[16:38:03]   ...sleeping 310s for rate limit before next submission

@@ -1,0 +1,12 @@
+[package]
+name = "hipfire-arch-llama"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "LLaMA / Mistral / plain-Qwen3 architecture for hipfire"
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }

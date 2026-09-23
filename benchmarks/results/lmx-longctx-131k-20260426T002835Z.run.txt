@@ -1,0 +1,36 @@
+[17:28:35] === max_seq=131072 (Qwen3 native) AR bench sweep ===
+[17:28:35] budget=2048 beta=128 runs=3 prompt="Explain the theory of general relativity in simple terms."
+[17:28:35] backed up per_model_config to /tmp/per_model_config.before_131k.bak.json
+[17:28:35] 
+=== [1/5] qwen3.5:9b sidecar=on max_seq=131072 ===
+[17:28:35]   $ hipfire bench qwen3.5:9b --runs 3 Explain the theory of general relativity in simple terms.
+[17:29:08]   rc=0 dt=33.2s
+[17:29:08]   decode=122.3 ttft=47.9ms wall=117.0
+[17:29:08]   max_seq=131072 physical_cap=2432 vram_loaded=5658MB
+[17:29:08] 
+=== [2/5] qwen3.5:27b sidecar=on max_seq=131072 ===
+[17:29:08]   $ hipfire bench qwen3.5:27b --runs 3 Explain the theory of general relativity in simple terms.
+[17:30:37]   rc=0 dt=88.3s
+[17:30:37]   decode=43.5 ttft=117.6ms wall=41.8
+[17:30:37]   max_seq=131072 physical_cap=2432 vram_loaded=15208MB
+[17:30:37] 
+=== [3/5] qwen3.5:35b-a3b sidecar=on max_seq=131072 ===
+[17:30:37]   $ hipfire bench qwen3.5:35b-a3b --runs 3 Explain the theory of general relativity in simple terms.
+[17:31:52]   rc=0 dt=74.8s
+[17:31:52]   decode=133.9 ttft=75.5ms wall=124.1
+[17:31:52]   max_seq=131072 physical_cap=2432 vram_loaded=22492MB
+[17:31:52] 
+=== [4/5] qwen3.6:27b sidecar=off max_seq=32768 ===
+[17:31:52]   $ hipfire bench qwen3.6:27b --runs 3 Explain the theory of general relativity in simple terms.
+[17:33:20]   rc=0 dt=88.4s
+[17:33:20]   decode=43.6 ttft=117.4ms wall=41.9
+[17:33:20]   max_seq=32768 physical_cap=32768 vram_loaded=19382MB
+[17:33:20] 
+=== [5/5] qwen3.6:35b-a3b sidecar=on max_seq=131072 ===
+[17:33:20]   $ hipfire bench qwen3.6:35b-a3b --runs 3 Explain the theory of general relativity in simple terms.
+[17:34:35]   rc=0 dt=75.4s
+[17:34:35]   decode=133.7 ttft=75.3ms wall=124.0
+[17:34:35]   max_seq=131072 physical_cap=2432 vram_loaded=22492MB
+[17:34:35] 
+Wrote results → /home/kaden/ClaudeCode/autorocm/hipfire/.worktrees/dflash/benchmarks/results/lmx-longctx-131k-20260426T002835Z.json
+[17:34:35] per_model_config restored

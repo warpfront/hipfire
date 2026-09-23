@@ -1,0 +1,36 @@
+[17:04:01] === LongCtx + Sidecar AR Bench Sweep ===
+[17:04:01] max_seq=32768 budget=2048 beta=128 runs=3
+[17:04:01] backed up per_model_config to /tmp/per_model_config.before_longctx.bak.json
+[17:04:01] 
+=== [1/5] qwen3.5:9b sidecar=on ===
+[17:04:01]   $ hipfire bench qwen3.5:9b --runs 3 Explain the theory of general relativity in simple terms.
+[17:04:35]   rc=0 dt=34.0s
+[17:04:35]   decode=122.3 ttft=48.2ms wall=116.9
+[17:04:35]   max_seq=32768 physical_cap=2432 vram_loaded=5658MB
+[17:04:35] 
+=== [2/5] qwen3.5:27b sidecar=on ===
+[17:04:35]   $ hipfire bench qwen3.5:27b --runs 3 Explain the theory of general relativity in simple terms.
+[17:06:05]   rc=0 dt=89.6s
+[17:06:05]   decode=43.5 ttft=117.8ms wall=41.9
+[17:06:05]   max_seq=32768 physical_cap=2432 vram_loaded=15208MB
+[17:06:05] 
+=== [3/5] qwen3.5:35b-a3b sidecar=on ===
+[17:06:05]   $ hipfire bench qwen3.5:35b-a3b --runs 3 Explain the theory of general relativity in simple terms.
+[17:07:18]   rc=0 dt=72.6s
+[17:07:18]   decode=133.3 ttft=75.3ms wall=123.6
+[17:07:18]   max_seq=32768 physical_cap=2432 vram_loaded=22492MB
+[17:07:18] 
+=== [4/5] qwen3.6:27b sidecar=off (none avail) ===
+[17:07:18]   $ hipfire bench qwen3.6:27b --runs 3 Explain the theory of general relativity in simple terms.
+[17:08:46]   rc=0 dt=88.4s
+[17:08:46]   decode=43.6 ttft=118.3ms wall=41.9
+[17:08:46]   max_seq=32768 physical_cap=32768 vram_loaded=19382MB
+[17:08:46] 
+=== [5/5] qwen3.6:35b-a3b sidecar=on ===
+[17:08:46]   $ hipfire bench qwen3.6:35b-a3b --runs 3 Explain the theory of general relativity in simple terms.
+[17:10:01]   rc=0 dt=75.4s
+[17:10:01]   decode=135.4 ttft=75.4ms wall=125.4
+[17:10:01]   max_seq=32768 physical_cap=2432 vram_loaded=22492MB
+[17:10:01] 
+Wrote results → /home/kaden/ClaudeCode/autorocm/hipfire/.worktrees/dflash/benchmarks/results/lmx-longctx-20260426T000401Z.json
+[17:10:01] per_model_config restored

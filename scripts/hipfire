@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# Repository/developer shim for the native Rust control plane.
+set -e
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+for candidate in "$ROOT/target/release/hipfire" "$ROOT/target/debug/hipfire" "$HOME/.hipfire/bin/hipfire"; do
+    if [ -x "$candidate" ]; then
+        exec "$candidate" "$@"
+    fi
+done
+
+if command -v cargo >/dev/null 2>&1; then
+    exec cargo run --quiet --manifest-path "$ROOT/Cargo.toml" -p hipfire-cli -- "$@"
+fi
+
+echo "hipfire: native CLI not built; run 'cargo build --release -p hipfire-cli'" >&2
+exit 127

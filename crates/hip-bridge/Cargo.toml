@@ -1,0 +1,11 @@
+[package]
+name = "hip-bridge"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Safe Rust FFI to AMD HIP/HSA runtime via dlopen"
+
+[dependencies]
+hipfire-config = { path = "../hipfire-config" }
+libloading.workspace = true
+thiserror = "2"

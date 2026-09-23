@@ -1,0 +1,125 @@
+name: CI
+
+# GPU-free continuous integration.
+#
+# hipfire loads the HIP/ROCm runtime via dlopen at *runtime* (see
+# crates/hip-bridge — libloading, no build.rs, no link-time -lamdhip64),
+# so the entire workspace compiles and unit-tests on a stock runner with
+# no GPU and no ROCm installed. The GPU-bound gates need real RDNA
+# hardware and are run MANUALLY from a checkout — see docs/VALIDATION.md
+# and scripts/gates.sh. The agentic CI gate workflows (claude-review.yml,
+# gpu-gates.yml, gate-merge.yml, gate-sweep.yml) were removed; they were
+# never reached on the release line and are being replaced by a
+# cheaper, provider-agnostic reviewer. Do not reintroduce a self-hosted
+# GPU gate workflow without a matching validation-policy update.
+#
+# Required vs advisory: `build` and `test` are the load-bearing
+# "is it broken" gates and are intended to be required status checks on
+# master. `fmt` and `clippy` start advisory (not required) because this
+# repo predates CI and carries lint/format debt. rustfmt is enforced on
+# changed Rust files only until the historical workspace-wide churn is paid
+# down; promote the full gate after that cleanup pass.
+
+on:
+  pull_request:
+  push:
+    # master = release line; integration/** = team staging branches for the
+    # dispatch-unification effort (#393/#397), pushed to directly by the team.
+    # Gating direct pushes catches the dead-gate / missing-arm / broken-test
+    # class (e.g. the 3 stale prerotated tests, gfx12 dead-gate) at push time
+    # via the GPU-free `cargo test --lib --workspace` dispatch coverage gate,
+    # not just on PRs.
+    branches: [master, 'integration/**']
+
+# Supersede in-flight runs when a PR gets new pushes.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # NOTE: deliberately NOT setting `RUSTFLAGS: -D warnings` yet. This repo
+  # predates CI and may carry rustc-warning debt; denying warnings now would
+  # red the build on legacy code. Add it after a warning-cleanup pass.
+
+jobs:
+  build:
+    name: build (workspace, no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build workspace (lib + bins + examples + tests)
+        run: cargo build --release --workspace --all-targets --locked
+      - name: Build daemon example (real shipped binary, arch features on)
+        run: >
+          cargo build --release --locked
+          -p hipfire-runtime --example daemon
+          --features arch-qwen35,arch-qwen35-vl,arch-llama,arch-qwen2,arch-deepseek4,arch-dots-ocr
+
+  test:
+    name: unit tests (lib, no GPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Run workspace lib unit tests
+        # --lib only: unit tests inside library targets are GPU-free
+        # (detector logic, sampler, framing, quant math). Integration
+        # tests / examples that dispatch kernels need the self-hosted
+        # GPU runner and are intentionally excluded here.
+        run: cargo test --lib --workspace --locked
+
+  supply-chain:
+    name: cargo-deny (${{ matrix.checks }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        checks:
+          - advisories
+          - bans licenses sources
+    # A newly published advisory should be visible immediately without making
+    # an unrelated PR unmergeable. License, source, and ban policy is blocking.
+    continue-on-error: ${{ matrix.checks == 'advisories' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check ${{ matrix.checks }}
+
+  fmt:
+    name: rustfmt (advisory)
+    runs-on: ubuntu-latest
+    # Truly advisory: on pushes, ci-rustfmt-changed diffs vs master and surfaces
+    # the whole dispatch-effort format backlog (Kevin's in-flight files included),
+    # so keep the step visible without making the job's status check red.
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: bash scripts/ci-rustfmt-changed.sh
+        continue-on-error: true
+
+  clippy:
+    name: clippy (advisory)
+    runs-on: ubuntu-latest
+    # Advisory (no -D warnings yet) — annotate lint debt without failing the run.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      # No -D warnings yet: surface lint debt without blocking. Promote to
+      # `-- -D warnings` (and add to required checks) after a cleanup pass.
+      - run: cargo clippy --workspace --all-targets --locked
