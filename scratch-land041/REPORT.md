@@ -31,4 +31,4 @@
 
 ## Finish
 
-- All gates above passed with zero failures; no scope was reduced. `mq4-lloyd` fast-forwarded to this commit on hipx and locally, and pushed to GitHub `Kaden-Schutt/hipfire` `mq4-lloyd`. No formatters or workspace suites were run; only the scoped `q8_flash` CPU tests.
+- All gates above passed with zero failures; no scope was reduced. `mq4-lloyd` fast-forwarded to this commit on hipx and GitHub `Kaden-Schutt/hipfire` `mq4-lloyd`. The local `mq4-lloyd` checkout (`wt-lloyd`) stays at `34ccae74b`: it holds uncommitted user edits (`hipfire-arch-qwen35/src/speculative.rs`, `hipfire-runtime/examples/dflash_spec_demo.rs`) from outside this session, so no stash/commit/ref move was made there. No formatters or workspace suites were run; only the scoped `q8_flash` CPU tests.
