@@ -1,0 +1,72 @@
+{
+  "protocol": "synthetic-pp-tg-matrix-v1",
+  "model": "qwen3.6-35b-a3b.mq4p",
+  "arch": "qwen3_5_moe",
+  "gpu": "gfx1201",
+  "hip_version": "7.2",
+  "kv_mode": "q8",
+  "max_seq": 24576,
+  "automatic_clocks": true,
+  "replay": {
+    "backend": "auto",
+    "transport": "pm4"
+  },
+  "warmups": 10,
+  "runs": 5,
+  "prefill_tok_s": 1865.2,
+  "gen_tok_s": 128.28,
+  "prefill": [
+    {
+      "pp": 128,
+      "tok_s": {
+        "median": 1865.2,
+        "mean": 1865.04,
+        "min": 1857.2,
+        "max": 1873.3,
+        "stdev": 5.346
+      },
+      "ms": {
+        "median": 68.63,
+        "mean": 68.634,
+        "min": 68.33,
+        "max": 68.92,
+        "stdev": 0.196
+      },
+      "samples": [
+        1873.3,
+        1857.2,
+        1862.2,
+        1865.2,
+        1867.3
+      ]
+    }
+  ],
+  "decode": [
+    {
+      "tg": 128,
+      "context": 128,
+      "tok_s": {
+        "median": 128.275,
+        "mean": 128.275,
+        "min": 128.156,
+        "max": 128.382,
+        "stdev": 0.084
+      },
+      "us_per_token": {
+        "median": 7795.75,
+        "mean": 7795.729,
+        "min": 7789.271,
+        "max": 7802.972,
+        "stdev": 5.125
+      },
+      "samples": [
+        128.21141472515671,
+        128.15629352038795,
+        128.38172482857283,
+        128.35265495205556,
+        128.27501560453038
+      ]
+    }
+  ],
+  "sustained_decode": []
+}
