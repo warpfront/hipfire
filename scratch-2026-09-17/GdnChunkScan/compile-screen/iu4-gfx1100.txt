@@ -1,0 +1,88 @@
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:135:1: remark: Function Name: quantize_int4_mmq_ds128 [-Rpass-analysis=kernel-resource-usage]
+  135 | ) {
+      | ^
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:135:1: remark:     TotalSGPRs: 18 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:135:1: remark:     VGPRs: 36 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:135:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:135:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:135:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:135:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:135:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:135:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:479:1: remark: Function Name: gemm_mq4g256v2_residual_mmq_iu4 [-Rpass-analysis=kernel-resource-usage]
+  479 | IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4, false, 2)
+      | ^
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:479:1: remark:     TotalSGPRs: 33 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:479:1: remark:     VGPRs: 195 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:479:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:479:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:479:1: remark:     Occupancy [waves/SIMD]: 7 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:479:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:479:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:479:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:480:1: remark: Function Name: gemm_mq4g256v2_residual_mmq_iu4_full_add [-Rpass-analysis=kernel-resource-usage]
+  480 | IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add, true, 2)
+      | ^
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:480:1: remark:     TotalSGPRs: 21 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:480:1: remark:     VGPRs: 190 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:480:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:480:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:480:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:480:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:480:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:480:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:481:1: remark: Function Name: gemm_mq4g256v2_residual_mmq_iu4_full_set [-Rpass-analysis=kernel-resource-usage]
+  481 | IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set, true, 2)
+      | ^
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:481:1: remark:     TotalSGPRs: 21 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:481:1: remark:     VGPRs: 190 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:481:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:481:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:481:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:481:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:481:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:481:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:482:1: remark: Function Name: gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3 [-Rpass-analysis=kernel-resource-usage]
+  482 | IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3, true, 3)
+      | ^
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:482:1: remark:     TotalSGPRs: 21 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:482:1: remark:     VGPRs: 190 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:482:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:482:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:482:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:482:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:482:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:482:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:483:1: remark: Function Name: gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3 [-Rpass-analysis=kernel-resource-usage]
+  483 | IU4_ENTRY(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3, true, 3)
+      | ^
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:483:1: remark:     TotalSGPRs: 21 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:483:1: remark:     VGPRs: 190 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:483:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:483:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:483:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:483:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:483:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:483:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:763:1: remark: Function Name: gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151 [-Rpass-analysis=kernel-resource-usage]
+  763 | IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_add_occ3_col_gfx1151, true, 3)
+      | ^
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:763:1: remark:     TotalSGPRs: 21 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:763:1: remark:     VGPRs: 190 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:763:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:763:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:763:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:763:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:763:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:763:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:764:1: remark: Function Name: gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151 [-Rpass-analysis=kernel-resource-usage]
+  764 | IU4_ENTRY_COL(gemm_mq4g256v2_residual_mmq_iu4_full_set_occ3_col_gfx1151, true, 3)
+      | ^
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:764:1: remark:     TotalSGPRs: 21 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:764:1: remark:     VGPRs: 190 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:764:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:764:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:764:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:764:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:764:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+scratch-2026-09-17/GdnChunkScan/compile-screen/iu4-combined.hip:764:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
