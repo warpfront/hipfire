@@ -47,6 +47,60 @@ pub const GEMV_MQ3G256_LLOYD_GFX1100_SRC: &str = include_str!("../../../kernels/
 /// add_inplace_f32 launch on the residual path (~4.4% of decode time).
 pub const GEMV_MQ3G256_LLOYD_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd_residual.hip");
 pub const GEMV_MQ3G256_LLOYD_RESIDUAL_GFX1100_SRC: &str = include_str!("../../../kernels/src/gemv_mq3g256_lloyd_residual.gfx1100.hip");
+/// MQ3G256Lloyd WMMA residual GEMM (Phase 5 / issue #116 — batched-prefill kernel).
+/// gfx1100+ wave32 WMMA. 16-row × 16-batch tile, per-row LDS-staged fp16 codebook
+/// (256 B/workgroup, no cvt at decode — fp16 won the Phase A bench by 7.15%).
+pub const GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_mq3g256_lloyd_residual_wmma.hip");
+/// gfx12 (RDNA4) sibling — code-complete but runtime-unvalidated locally per Phase B1 plan.
+pub const GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_mq3g256_lloyd_residual_wmma.gfx12.hip");
+/// MQ3G256Lloyd WMMA fused QKVZA (LA preamble: qkv + z + beta + alpha, 4-way).
+pub const GEMM_QKVZA_MQ3G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq3g256_lloyd_wmma.hip");
+pub const GEMM_QKVZA_MQ3G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_mq3g256_lloyd_wmma.gfx12.hip");
+/// MQ3G256Lloyd WMMA fused QKV (FA preamble: q + k + v, 3-way).
+pub const GEMM_QKV_MQ3G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq3g256_lloyd_wmma.hip");
+pub const GEMM_QKV_MQ3G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_mq3g256_lloyd_wmma.gfx12.hip");
+/// MQ3G256Lloyd WMMA fused gate+up (FFN, 2-way).
+pub const GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq3g256_lloyd_wmma.hip");
+pub const GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_GFX12_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_mq3g256_lloyd_wmma.gfx12.hip");
+
+/// Returns the MQ3G256Lloyd WMMA residual GEMM kernel source AND module name for
+/// the given arch. Mirrors `gemm_hfq3g256_residual_wmma_for_arch`'s arch matrix.
+pub fn gemm_mq3g256_lloyd_residual_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1200" | "gfx1201" =>
+            (GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_GFX12_SRC, "gemm_mq3g256_lloyd_residual_wmma_rdna4"),
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_SRC, "gemm_mq3g256_lloyd_residual_wmma_rdna3"),
+        _ => (GEMM_MQ3G256_LLOYD_RESIDUAL_WMMA_SRC, "gemm_mq3g256_lloyd_residual_wmma"),
+    }
+}
+pub fn gemm_qkvza_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1200" | "gfx1201" =>
+            (GEMM_QKVZA_MQ3G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkvza_mq3g256_lloyd_wmma_rdna4"),
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_QKVZA_MQ3G256_LLOYD_WMMA_SRC, "gemm_qkvza_mq3g256_lloyd_wmma_rdna3"),
+        _ => (GEMM_QKVZA_MQ3G256_LLOYD_WMMA_SRC, "gemm_qkvza_mq3g256_lloyd_wmma"),
+    }
+}
+pub fn gemm_qkv_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1200" | "gfx1201" =>
+            (GEMM_QKV_MQ3G256_LLOYD_WMMA_GFX12_SRC, "gemm_qkv_mq3g256_lloyd_wmma_rdna4"),
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_QKV_MQ3G256_LLOYD_WMMA_SRC, "gemm_qkv_mq3g256_lloyd_wmma_rdna3"),
+        _ => (GEMM_QKV_MQ3G256_LLOYD_WMMA_SRC, "gemm_qkv_mq3g256_lloyd_wmma"),
+    }
+}
+pub fn gemm_gate_up_mq3g256_lloyd_wmma_for_arch(arch: &str) -> (&'static str, &'static str) {
+    match arch {
+        "gfx1200" | "gfx1201" =>
+            (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_GFX12_SRC, "gemm_gate_up_mq3g256_lloyd_wmma_rdna4"),
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" =>
+            (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq3g256_lloyd_wmma_rdna3"),
+        _ => (GEMM_GATE_UP_MQ3G256_LLOYD_WMMA_SRC, "gemm_gate_up_mq3g256_lloyd_wmma"),
+    }
+}
 /// MQ3G256Lloyd fused gate+up GEMV: two GEMVs in one launch (saves 1 launch
 /// per FFN). Mirrors fused_gate_up_hfq4g256.{,gfx1100.}hip.
 pub const FUSED_GATE_UP_MQ3G256_LLOYD_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_mq3g256_lloyd.hip");
@@ -162,6 +216,42 @@ pub const GEMV_HFQ8G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq8
 /// Packing: 4 weights per 3 bytes (24 bits = 4×6 bits).
 pub const GEMV_HFQ6G256_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256.hip");
 pub const GEMV_HFQ6G256_RESIDUAL_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256_residual.hip");
+
+/// Wave64-native HFQ6-G256 residual GEMV. Mirror of the HFQ4 sibling
+/// (`gemv_hfq4g256_residual_wave64.hip`) with 6-bit unpack from
+/// `gemv_hfq6g256_residual.hip`. Used for HFQ6/MQ6 `wo` and `w_down`
+/// projections on wave64-native arches (gfx906/908/94x). Plan §3.1.1
+/// item 2 (gfx906-mq6-mq8-port.md v3.2.1).
+pub const GEMV_HFQ6G256_RESIDUAL_WAVE64_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256_residual_wave64.hip");
+
+/// Wave64-native HFQ6-G256 residual GEMV with software-pipelined
+/// across-quad weight prefetch. Mirror of `gemv_hfq4g256_residual_wave64_prefetch.hip`.
+/// Plan §3.1.1 item 2 / v3.2.2 §5.1 item 1b (the ILP-prefetch lever).
+/// Default-on for gfx906 via `gemv_prefetch_enabled(arch)`.
+pub const GEMV_HFQ6G256_RESIDUAL_WAVE64_PREFETCH_SRC: &str = include_str!("../../../kernels/src/gemv_hfq6g256_residual_wave64_prefetch.hip");
+
+/// gfx906 wave64+dp4a fused single-token GEMVs for HFQ6/MQ6 — the
+/// Phase A.1c headline lever. Mirror of HFQ4 fused-dp4a family; uses
+/// sdot4 with HFQ6's 6-bit unsigned weights (no zp shift correction).
+/// Plan §3.1.1 item 3 / v3.2.2 §5.1 item 1c.
+pub const FUSED_GATE_UP_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_gate_up_hfq6g256_wave64_dp4a.hip");
+pub const FUSED_QKV_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_qkv_hfq6g256_wave64_dp4a.hip");
+pub const FUSED_QKVZA_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/fused_qkvza_hfq6g256_wave64_dp4a.hip");
+
+/// Phase A.2 (plan v3.2.3 §5.1 item 2): wave64+dp4a batched residual
+/// GEMM for HFQ6/MQ6 prefill. Mirror of `gemm_hfq4g256_wave64_dp4a.hip`
+/// with HFQ6 6-bit unpack and `+=` residual write semantic. Used for
+/// per-layer wo + w_down at B>1.
+pub const GEMM_HFQ6G256_RESIDUAL_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_hfq6g256_residual_wave64_dp4a.hip");
+
+/// Phase A.3 (plan v3.2.3 §5.1 item 3): wave64+dp4a batched fused
+/// GEMMs for HFQ6/MQ6 prefill. Sibling of A.2 with multi-output row
+/// routing (qkvza 4-way, qkv 3-way, gate_up 2-way). Overwrite output
+/// semantics — caller fuses residual at the wo + w_down sites via
+/// gemm_hfq6g256_residual_wave64_dp4a (Phase A.2).
+pub const GEMM_QKVZA_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkvza_hfq6g256_wave64_dp4a.hip");
+pub const GEMM_QKV_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_qkv_hfq6g256_wave64_dp4a.hip");
+pub const GEMM_GATE_UP_HFQ6G256_WAVE64_DP4A_SRC: &str = include_str!("../../../kernels/src/gemm_gate_up_hfq6g256_wave64_dp4a.hip");
 
 
 /// HFQ3-G256: flat 3-bit with 256-weight groups.

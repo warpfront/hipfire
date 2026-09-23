@@ -8,5 +8,5 @@ pub mod profile;
 pub mod profiler;
 
 pub use compiler::KernelCompiler;
-pub use dispatch::{DType, Gpu, GpuTensor, PredraftedBlock};
+pub use dispatch::{gemv_dp4a_enabled, DType, Gpu, GpuTensor};
 pub use kernels::GEMV_SRC;
