@@ -1,0 +1,14 @@
+pair=1 arm=serial med=702.222 min=650.119 max=759.162 us
+pair=1 arm=cand med=893.281 min=856.422 max=919.667 us
+pair=2 arm=serial med=498.750 min=479.834 max=507.538 us
+pair=2 arm=cand med=894.367 min=858.119 max=928.083 us
+pair=3 arm=serial med=497.718 min=479.852 max=507.664 us
+pair=3 arm=cand med=897.177 min=864.281 max=927.848 us
+pair=4 arm=serial med=502.172 min=482.080 max=506.932 us
+pair=4 arm=cand med=896.614 min=869.698 max=924.706 us
+pair=5 arm=serial med=502.285 min=479.184 max=511.879 us
+pair=5 arm=cand med=895.311 min=870.973 max=925.747 us
+serial_median_of_process_medians=502.172 us
+candidate_median_of_process_medians=895.311 us
+ratio=1.782877
+admission_limit_0.8x=401.738 us

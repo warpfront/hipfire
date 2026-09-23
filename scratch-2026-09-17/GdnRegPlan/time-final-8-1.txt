@@ -1,0 +1,12 @@
+device=AMD Radeon AI PRO R9700 arch=gfx1201 CUs=32 clock_kHz=2350000 shared/CU=65536 warp=32 chunks=8
+f32-full blocks=48 chunks=8 lds=0 regs=118 local=0 static_shared=0 activeWG/CU=5 min_us=91.473 median_us=92.591 max_us=92.653 norm_us/head/chunk=0.241121
+f16-full blocks=48 chunks=8 lds=0 regs=114 local=0 static_shared=0 activeWG/CU=5 min_us=68.034 median_us=69.364 max_us=70.346 norm_us/head/chunk=0.180637
+f32-split2 blocks=96 chunks=8 lds=0 regs=74 local=0 static_shared=0 activeWG/CU=8 min_us=92.861 median_us=94.093 max_us=96.605 norm_us/head/chunk=0.122517
+f16-split2 blocks=96 chunks=8 lds=0 regs=70 local=0 static_shared=0 activeWG/CU=8 min_us=36.312 median_us=37.232 max_us=37.592 norm_us/head/chunk=0.048479
+f32-full blocks=48 chunks=8 lds=28672 regs=118 local=0 static_shared=0 activeWG/CU=2 min_us=32.832 median_us=33.072 max_us=34.094 norm_us/head/chunk=0.086126
+f16-full blocks=48 chunks=8 lds=28672 regs=114 local=0 static_shared=0 activeWG/CU=2 min_us=32.786 median_us=33.550 max_us=34.212 norm_us/head/chunk=0.087370
+f32-split2 blocks=96 chunks=8 lds=28672 regs=74 local=0 static_shared=0 activeWG/CU=2 min_us=34.542 median_us=34.750 max_us=35.288 norm_us/head/chunk=0.045248
+f16-split2 blocks=96 chunks=8 lds=28672 regs=70 local=0 static_shared=0 activeWG/CU=2 min_us=34.700 median_us=35.038 max_us=35.172 norm_us/head/chunk=0.045623
+f32-full-solve blocks=48 chunks=8 lds=28672 regs=217 local=0 static_shared=0 activeWG/CU=2 min_us=276.510 median_us=283.464 max_us=292.940 norm_us/head/chunk=0.738187
+f16-full-solve blocks=48 chunks=8 lds=28672 regs=142 local=0 static_shared=0 activeWG/CU=2 min_us=271.224 median_us=279.544 max_us=284.638 norm_us/head/chunk=0.727979
+f32-split2-solve blocks=96 chunks=8 lds=28672 regs=169 local=0 static_shared=0 activeWG/CU=2 min_us=326.114 median_us=333.592 max_us=346.180 norm_us/head/chunk=0.434365

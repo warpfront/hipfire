@@ -1,0 +1,68 @@
+{
+  "reg_probe.hip": {
+    "bytes": 5531,
+    "sha256": "8d3e0f3bbbf2b8d63e78d8a7a32e60390168df9fd3fb27658a74b0b1fbeba960"
+  },
+  "reg_probe-unrolled": {
+    "bytes": 235688,
+    "sha256": "7e4b8f8f75d6288d492625106c8baecf6ebd0d156c7aacbd937100ca75a0f3ec"
+  },
+  "reg_probe-unrolled.s": {
+    "bytes": 923355,
+    "sha256": "c0165917b4960868878876bf41f1bb2aa6602471d6d2fe1e4ea3e1c40b2fd87c"
+  },
+  "reg_probe-bounded.hip": {
+    "bytes": 5551,
+    "sha256": "7de0ab986ac35c00a05a09662876852662908e20dfc7d62ffd5012383b1be59e"
+  },
+  "reg_probe-bounded.s": {
+    "bytes": 403333,
+    "sha256": "9950bb17f62f8287fc9613cbbf5133f706f3400fcad7b985f676b2e3a93fd040"
+  },
+  "compile-unrolled.log": {
+    "bytes": 15180,
+    "sha256": "0e32abff3d76c48b9388dc3082fb4b4b2a48a960c1abd27d59e92d884e156bab"
+  },
+  "time-unrolled-128-0.txt": {
+    "bytes": 2438,
+    "sha256": "a09f166dd127cddafd319b6b92a50107b1a4fc6ee0af77d12ffee6654203bb29"
+  },
+  "time-unrolled-8-1.txt": {
+    "bytes": 2366,
+    "sha256": "a45c593570eab0fbbcd246c58aff46890850dd1d24526fa718e89016ed1487d1"
+  },
+  "time-unrolled-8-2.txt": {
+    "bytes": 2366,
+    "sha256": "d1ae45ca80840164aba95b31c63119e4f0a3bed7e2960842def658b311d19488"
+  },
+  "serial-shipped.o": {
+    "bytes": 15104,
+    "sha256": "67d93eec252c2ad12d86e9a1796d03af56ab469d762feb9053efe39b614e3782"
+  },
+  "serial-shipped.isa": {
+    "bytes": 147121,
+    "sha256": "326d0f4d5dd77e0c37ba3f52992161220706b0a80f93d0aa70af2b37dffd2149"
+  },
+  "serial-steady-loop.isa": {
+    "bytes": 24093,
+    "sha256": "58015f25498b3f5b29040e365b7cfda8b63754fdfdc493d0c185aefc00c05602"
+  },
+  "isa-census.json": {
+    "bytes": 18280,
+    "sha256": "47824cf020adfd11585e76180f452d849d0cbd0038b316f7bf5f044f732e075f"
+  },
+  "algebra.json": {
+    "bytes": 222,
+    "sha256": "9c8ecf80faf0afd6c944d21f5e3bac6dad701bcda8556ab58a45f2dde6787720"
+  },
+  "budgets.json": {
+    "bytes": 468,
+    "sha256": "77249fc51df1e1e9be8043e10ed01ae62ecdecf1345b9555ab28dd8f4f17a81a"
+  },
+  "verification": {
+    "source_census": "96WMMA/wave/chunk in split2; solve unroll32\u00d72; 7044dynamic packets",
+    "shape_probe": "124VGPR,0scratch,2activeWG/reportedMP at28672B LDS",
+    "production_kernel": "not implemented;30720B arena and128VGPR gate unpassed",
+    "project_validation": "not run"
+  }
+}

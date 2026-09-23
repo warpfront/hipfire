@@ -1,0 +1,16 @@
+gfx1201 register-scan occupancy derivation (2026-09-19)
+
+Compiler -Rpass-analysis=kernel-resource-usage:
+  serial fast: 60 VGPR, 55 SGPR, 0 scratch/spill, 2,048 B LDS/block, 16 waves/SIMD
+  register scan: 192 VGPR, 42 SGPR, 0 scratch/spill, 29,824 B LDS/block, 8 waves/SIMD
+
+Runtime hipOccupancyMaxActiveBlocksPerMultiprocessor:
+  serial 32-thread block: 32 blocks/reported MP
+  register scan 256-thread block: 2 blocks/reported MP
+
+The reported MP has 65,536 B LDS. Therefore:
+  serial: floor(65,536 / 2,048) = 32 blocks
+  register scan: floor(65,536 / 29,824) = 2 blocks
+  2 * 29,824 = 59,648 B; 3 * 29,824 = 89,472 B > 65,536 B.
+
+A register-scan workgroup has eight wave32 waves. The compiler permits eight resident waves per SIMD at 192 VGPR. On gfx1201's four SIMD32 per reported WGP/MP, one workgroup contributes two waves/SIMD and two workgroups contribute four waves/SIMD, below the eight-wave register limit. Even under a conservative two-SIMD accounting, two workgroups consume eight waves/SIMD, exactly the compiler limit. Thus VGPR allocation does not reduce the two-WG residency already imposed by LDS. Runtime occupancy confirms the LDS bound. The plan's standalone <=128 VGPR gate is void; the meaningful gates are 0 spill/scratch, 29,824 B LDS, and >=2 active 256-thread blocks, all met.

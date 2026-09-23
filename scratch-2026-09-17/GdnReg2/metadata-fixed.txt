@@ -1,0 +1,2 @@
+serial: vgpr=60 sgpr=0 lds=2048 const=18446744073709551615 local=0 occ=32
+cand:   vgpr=192 sgpr=0 lds=29824 const=18446744073709551615 local=0 occ=2

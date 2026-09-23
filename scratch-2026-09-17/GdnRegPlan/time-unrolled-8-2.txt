@@ -1,0 +1,15 @@
+device=AMD Radeon AI PRO R9700 arch=gfx1201 CUs=32 clock_kHz=2350000 shared/CU=65536 warp=32 chunks=8
+f32-full blocks=48 chunks=8 lds=0 regs=170 local=0 static_shared=0 activeWG/CU=4 min_us=35.508 median_us=35.914 max_us=36.032 norm_us/head/chunk=0.093527
+f16-full blocks=48 chunks=8 lds=0 regs=98 local=0 static_shared=0 activeWG/CU=7 min_us=35.066 median_us=35.664 max_us=35.948 norm_us/head/chunk=0.092875
+f32-split2 blocks=96 chunks=8 lds=0 regs=110 local=0 static_shared=0 activeWG/CU=6 min_us=32.472 median_us=33.414 max_us=35.122 norm_us/head/chunk=0.043508
+f16-split2 blocks=96 chunks=8 lds=0 regs=98 local=0 static_shared=0 activeWG/CU=7 min_us=33.334 median_us=34.594 max_us=36.098 norm_us/head/chunk=0.045044
+f32-full blocks=48 chunks=8 lds=28672 regs=170 local=0 static_shared=0 activeWG/CU=2 min_us=34.178 median_us=34.248 max_us=34.380 norm_us/head/chunk=0.089188
+f16-full blocks=48 chunks=8 lds=28672 regs=98 local=0 static_shared=0 activeWG/CU=2 min_us=34.004 median_us=34.104 max_us=34.666 norm_us/head/chunk=0.088813
+f32-split2 blocks=96 chunks=8 lds=28672 regs=110 local=0 static_shared=0 activeWG/CU=2 min_us=35.100 median_us=35.604 max_us=35.648 norm_us/head/chunk=0.046360
+f16-split2 blocks=96 chunks=8 lds=28672 regs=98 local=0 static_shared=0 activeWG/CU=2 min_us=35.724 median_us=35.888 max_us=36.058 norm_us/head/chunk=0.046729
+f32-full-solve blocks=48 chunks=8 lds=28672 regs=189 local=0 static_shared=0 activeWG/CU=2 min_us=299.504 median_us=301.286 max_us=336.466 norm_us/head/chunk=0.784598
+f16-full-solve blocks=48 chunks=8 lds=28672 regs=144 local=0 static_shared=0 activeWG/CU=2 min_us=300.602 median_us=300.740 max_us=301.742 norm_us/head/chunk=0.783178
+f32-split2-solve blocks=96 chunks=8 lds=28672 regs=141 local=0 static_shared=0 activeWG/CU=2 min_us=307.318 median_us=309.059 max_us=311.222 norm_us/head/chunk=0.402420
+f16-split2-solve blocks=96 chunks=8 lds=28672 regs=124 local=0 static_shared=0 activeWG/CU=2 min_us=221.160 median_us=222.204 max_us=223.534 norm_us/head/chunk=0.289328
+f32-split4-solve blocks=192 chunks=8 lds=28672 regs=117 local=0 static_shared=0 activeWG/CU=2 min_us=607.243 median_us=607.387 max_us=608.163 norm_us/head/chunk=0.395434
+f16-split4-solve blocks=192 chunks=8 lds=28672 regs=114 local=0 static_shared=0 activeWG/CU=2 min_us=611.985 median_us=612.063 max_us=613.079 norm_us/head/chunk=0.398479

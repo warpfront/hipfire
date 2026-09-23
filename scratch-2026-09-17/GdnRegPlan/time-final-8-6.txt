@@ -1,0 +1,13 @@
+device=AMD Radeon AI PRO R9700 arch=gfx1201 CUs=32 clock_kHz=2350000 shared/CU=65536 warp=32 chunks=8
+f32-full blocks=48 chunks=8 lds=0 regs=118 local=0 static_shared=0 activeWG/CU=5 min_us=22.740 median_us=23.088 max_us=23.146 norm_us/head/chunk=0.060126
+f16-full blocks=48 chunks=8 lds=0 regs=114 local=0 static_shared=0 activeWG/CU=5 min_us=22.414 median_us=22.474 max_us=22.678 norm_us/head/chunk=0.058527
+f32-split2 blocks=96 chunks=8 lds=0 regs=74 local=0 static_shared=0 activeWG/CU=8 min_us=23.360 median_us=23.866 max_us=24.118 norm_us/head/chunk=0.031076
+f16-split2 blocks=96 chunks=8 lds=0 regs=70 local=0 static_shared=0 activeWG/CU=8 min_us=21.966 median_us=22.916 max_us=23.416 norm_us/head/chunk=0.029839
+f32-full blocks=48 chunks=8 lds=28672 regs=118 local=0 static_shared=0 activeWG/CU=2 min_us=20.132 median_us=20.408 max_us=20.720 norm_us/head/chunk=0.053146
+f16-full blocks=48 chunks=8 lds=28672 regs=114 local=0 static_shared=0 activeWG/CU=2 min_us=20.914 median_us=21.208 max_us=21.504 norm_us/head/chunk=0.055230
+f32-split2 blocks=96 chunks=8 lds=28672 regs=74 local=0 static_shared=0 activeWG/CU=2 min_us=23.130 median_us=23.174 max_us=23.310 norm_us/head/chunk=0.030175
+f16-split2 blocks=96 chunks=8 lds=28672 regs=70 local=0 static_shared=0 activeWG/CU=2 min_us=23.182 median_us=23.270 max_us=23.516 norm_us/head/chunk=0.030300
+f32-full-solve blocks=48 chunks=8 lds=28672 regs=217 local=0 static_shared=0 activeWG/CU=2 min_us=190.751 median_us=194.661 max_us=202.083 norm_us/head/chunk=0.506931
+f16-full-solve blocks=48 chunks=8 lds=28672 regs=142 local=0 static_shared=0 activeWG/CU=2 min_us=192.080 median_us=195.008 max_us=196.104 norm_us/head/chunk=0.507832
+f32-split2-solve blocks=96 chunks=8 lds=28672 regs=169 local=0 static_shared=0 activeWG/CU=2 min_us=256.734 median_us=258.306 max_us=262.882 norm_us/head/chunk=0.336336
+f16-split2-solve blocks=96 chunks=8 lds=28672 regs=119 local=0 static_shared=0 activeWG/CU=2 min_us=256.254 median_us=257.660 max_us=262.134 norm_us/head/chunk=0.335495

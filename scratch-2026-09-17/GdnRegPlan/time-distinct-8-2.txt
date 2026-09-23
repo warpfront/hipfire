@@ -1,0 +1,13 @@
+device=AMD Radeon AI PRO R9700 arch=gfx1201 CUs=32 clock_kHz=2350000 shared/CU=65536 warp=32 chunks=8
+f32-full blocks=48 chunks=8 lds=0 regs=170 local=0 static_shared=0 activeWG/CU=4 min_us=35.071 median_us=35.505 max_us=35.927 norm_us/head/chunk=0.092460
+f16-full blocks=48 chunks=8 lds=0 regs=98 local=0 static_shared=0 activeWG/CU=7 min_us=34.612 median_us=35.370 max_us=35.521 norm_us/head/chunk=0.092111
+f32-split2 blocks=96 chunks=8 lds=0 regs=110 local=0 static_shared=0 activeWG/CU=6 min_us=32.312 median_us=33.002 max_us=34.606 norm_us/head/chunk=0.042972
+f16-split2 blocks=96 chunks=8 lds=0 regs=98 local=0 static_shared=0 activeWG/CU=7 min_us=33.410 median_us=35.158 max_us=36.460 norm_us/head/chunk=0.045779
+f32-full blocks=48 chunks=8 lds=28672 regs=170 local=0 static_shared=0 activeWG/CU=2 min_us=33.728 median_us=34.278 max_us=34.886 norm_us/head/chunk=0.089267
+f16-full blocks=48 chunks=8 lds=28672 regs=98 local=0 static_shared=0 activeWG/CU=2 min_us=34.136 median_us=34.310 max_us=34.398 norm_us/head/chunk=0.089350
+f32-split2 blocks=96 chunks=8 lds=28672 regs=110 local=0 static_shared=0 activeWG/CU=2 min_us=34.602 median_us=34.838 max_us=35.960 norm_us/head/chunk=0.045362
+f16-split2 blocks=96 chunks=8 lds=28672 regs=98 local=0 static_shared=0 activeWG/CU=2 min_us=35.842 median_us=35.992 max_us=36.678 norm_us/head/chunk=0.046865
+f32-full-solve blocks=48 chunks=8 lds=28672 regs=216 local=0 static_shared=0 activeWG/CU=2 min_us=199.450 median_us=206.618 max_us=216.778 norm_us/head/chunk=0.538067
+f16-full-solve blocks=48 chunks=8 lds=28672 regs=151 local=0 static_shared=0 activeWG/CU=2 min_us=196.142 median_us=200.020 max_us=202.182 norm_us/head/chunk=0.520884
+f32-split2-solve blocks=96 chunks=8 lds=28672 regs=168 local=0 static_shared=0 activeWG/CU=2 min_us=265.620 median_us=268.292 max_us=269.986 norm_us/head/chunk=0.349339
+f16-split2-solve blocks=96 chunks=8 lds=28672 regs=141 local=0 static_shared=0 activeWG/CU=2 min_us=257.784 median_us=259.676 max_us=265.060 norm_us/head/chunk=0.338120

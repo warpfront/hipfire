@@ -1,0 +1,19 @@
+{
+  "serial_packets_per_head_chunk64": 524288,
+  "wmma_full_per_head_chunk64": 1152,
+  "wmma_split2_per_head_chunk64": 1536,
+  "wmma_split4_per_head_chunk64": 2304,
+  "distinct_bytes_per_launch": 55296000,
+  "gdn_us_per_token_at_launch_us": {
+    "219.412": 20.569875,
+    "300": 28.125,
+    "320": 30.0,
+    "350": 32.8125,
+    "410": 38.4375,
+    "427.5": 40.078125,
+    "570": 53.4375
+  },
+  "lds_phase_gram": 25600,
+  "lds_phase_sk": 29696,
+  "lds_target": 30720
+}

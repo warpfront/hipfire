@@ -1,0 +1,13 @@
+device=AMD Radeon AI PRO R9700 arch=gfx1201 CUs=32 clock_kHz=2350000 shared/CU=65536 warp=32 chunks=8
+f32-full blocks=48 chunks=8 lds=0 regs=118 local=0 static_shared=0 activeWG/CU=5 min_us=23.156 median_us=23.268 max_us=23.298 norm_us/head/chunk=0.060594
+f16-full blocks=48 chunks=8 lds=0 regs=114 local=0 static_shared=0 activeWG/CU=5 min_us=22.764 median_us=22.942 max_us=22.998 norm_us/head/chunk=0.059745
+f32-split2 blocks=96 chunks=8 lds=0 regs=74 local=0 static_shared=0 activeWG/CU=8 min_us=23.852 median_us=24.368 max_us=24.654 norm_us/head/chunk=0.031729
+f16-split2 blocks=96 chunks=8 lds=0 regs=70 local=0 static_shared=0 activeWG/CU=8 min_us=22.252 median_us=23.018 max_us=23.836 norm_us/head/chunk=0.029971
+f32-full blocks=48 chunks=8 lds=28672 regs=118 local=0 static_shared=0 activeWG/CU=2 min_us=20.142 median_us=20.340 max_us=20.450 norm_us/head/chunk=0.052969
+f16-full blocks=48 chunks=8 lds=28672 regs=114 local=0 static_shared=0 activeWG/CU=2 min_us=20.604 median_us=21.172 max_us=21.232 norm_us/head/chunk=0.055136
+f32-split2 blocks=96 chunks=8 lds=28672 regs=74 local=0 static_shared=0 activeWG/CU=2 min_us=22.752 median_us=22.806 max_us=22.946 norm_us/head/chunk=0.029695
+f16-split2 blocks=96 chunks=8 lds=28672 regs=70 local=0 static_shared=0 activeWG/CU=2 min_us=22.954 median_us=23.282 max_us=23.362 norm_us/head/chunk=0.030315
+f32-full-solve blocks=48 chunks=8 lds=28672 regs=217 local=0 static_shared=0 activeWG/CU=2 min_us=187.947 median_us=193.045 max_us=198.347 norm_us/head/chunk=0.502721
+f16-full-solve blocks=48 chunks=8 lds=28672 regs=142 local=0 static_shared=0 activeWG/CU=2 min_us=190.659 median_us=192.847 max_us=197.805 norm_us/head/chunk=0.502206
+f32-split2-solve blocks=96 chunks=8 lds=28672 regs=169 local=0 static_shared=0 activeWG/CU=2 min_us=255.314 median_us=256.087 max_us=257.889 norm_us/head/chunk=0.333447
+f16-split2-solve blocks=96 chunks=8 lds=28672 regs=119 local=0 static_shared=0 activeWG/CU=2 min_us=254.568 median_us=256.082 max_us=258.042 norm_us/head/chunk=0.333440

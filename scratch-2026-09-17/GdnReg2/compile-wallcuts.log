@@ -1,0 +1,35 @@
+In file included from gdn_scan_check.hip:6:
+../../kernels/src/gated_delta_net_q8_fast.hip:101:1: remark: Function Name: gated_delta_net_q8_fast [-Rpass-analysis=kernel-resource-usage]
+  101 | ) {
+      | ^
+../../kernels/src/gated_delta_net_q8_fast.hip:101:1: remark:     TotalSGPRs: 55 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:101:1: remark:     VGPRs: 60 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:101:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:101:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:101:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:101:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:101:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:101:1: remark:     LDS Size [bytes/block]: 2048 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:510:1: remark: Function Name: gated_delta_net_q8_fast_independent_masked [-Rpass-analysis=kernel-resource-usage]
+  510 | ) {
+      | ^
+../../kernels/src/gated_delta_net_q8_fast.hip:510:1: remark:     TotalSGPRs: 46 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:510:1: remark:     VGPRs: 55 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:510:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:510:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:510:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:510:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:510:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gated_delta_net_q8_fast.hip:510:1: remark:     LDS Size [bytes/block]: 2048 [-Rpass-analysis=kernel-resource-usage]
+In file included from gdn_scan_check.hip:7:
+../../kernels/src/gdn_register_scan_q8.gfx1201.hip:90:1: remark: Function Name: gated_delta_net_q8_register_scan_gfx1201 [-Rpass-analysis=kernel-resource-usage]
+   90 |     __half* __restrict__ s_ef_residual) {
+      | ^
+../../kernels/src/gdn_register_scan_q8.gfx1201.hip:90:1: remark:     TotalSGPRs: 45 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gdn_register_scan_q8.gfx1201.hip:90:1: remark:     VGPRs: 192 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gdn_register_scan_q8.gfx1201.hip:90:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gdn_register_scan_q8.gfx1201.hip:90:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gdn_register_scan_q8.gfx1201.hip:90:1: remark:     Occupancy [waves/SIMD]: 8 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gdn_register_scan_q8.gfx1201.hip:90:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gdn_register_scan_q8.gfx1201.hip:90:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+../../kernels/src/gdn_register_scan_q8.gfx1201.hip:90:1: remark:     LDS Size [bytes/block]: 29824 [-Rpass-analysis=kernel-resource-usage]

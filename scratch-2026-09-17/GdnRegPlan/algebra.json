@@ -1,0 +1,9 @@
+{
+  "f64_output_max_abs": 4.996003610813204e-16,
+  "f64_state_max_abs": 3.3306690738754696e-16,
+  "tokens": 129,
+  "key_dim": 128,
+  "value_rows": 64,
+  "chunk": 64,
+  "claim": "Algebra only, not f16/KLD GPU correctness"
+}

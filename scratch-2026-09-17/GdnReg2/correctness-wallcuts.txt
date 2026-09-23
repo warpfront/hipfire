@@ -1,0 +1,10 @@
+deqhalves: 0 0
+chunkmax: 0 0
+N=128 H=2 mode=2: maxabs=0 nrmse=0 omax=2 codes_mm=0/32768 sc_rel=0 det=1 finite=1 deq=0 deqref=2 state_exact=1
+onehot_output_and_S_out_bitexact=1
+deqhalves: 0.000661 0.0006608
+chunkmax: 0.000682 0.000146 0.000194 0.000126 0.000237 0.000167 0.000158 0.000191
+N=512 H=1 mode=0: maxabs=0.0006823 nrmse=0.0003982 omax=1.89 codes_mm=245/16384 sc_rel=0.00056 det=1 finite=1 deq=0.000661 deqref=0.08403 state_exact=0
+deqhalves: 0.001628 0.001564
+chunkmax: 0.000407 0.000171 0.000166 0.000168 0.000136 0.000159 0.00012 0.000201
+N=511 H=1 mode=0: maxabs=0.0004067 nrmse=0.0004014 omax=1.71 codes_mm=258/16384 sc_rel=0.000703 det=1 finite=1 deq=0.001628 deqref=0.2065 state_exact=0

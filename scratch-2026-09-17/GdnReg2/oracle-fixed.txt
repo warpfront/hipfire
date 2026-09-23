@@ -1,0 +1,29 @@
+PASS alg N=1 gauss/mid/mid s0=1  out=1.11e-15 state=0.00e+00 resid=1.11e-15
+PASS alg N=63 gauss/mid/mid s0=1  out=1.33e-15 state=1.55e-15 resid=1.33e-15
+PASS alg N=64 gauss/mid/mid s0=1  out=1.67e-15 state=1.55e-15 resid=1.67e-15
+PASS alg N=65 gauss/mid/mid s0=1  out=1.55e-15 state=2.22e-16 resid=1.55e-15
+PASS alg N=129 gauss/mid/mid s0=1  out=4.44e-15 state=2.22e-16 resid=4.44e-15
+PASS alg N=511 gauss/mid/mid s0=1  out=7.99e-15 state=8.27e-16 resid=7.99e-15
+PASS alg N=512 gauss/mid/mid s0=1  out=9.77e-15 state=1.94e-16 resid=9.77e-15
+PASS alg N=129 ortho/mid/mid s0=1  out=5.55e-16 state=2.22e-16 resid=5.55e-16
+PASS alg N=129 collinear/mid/mid s0=1  out=9.44e-16 state=5.55e-17 resid=9.44e-16
+PASS alg N=129 repeated/mid/mid s0=1  out=3.11e-15 state=2.50e-16 resid=3.11e-15
+PASS alg N=129 gauss/zero/mid s0=1  out=1.03e-15 state=6.57e-47 resid=1.03e-15
+PASS alg N=129 gauss/one/mid s0=1  out=4.00e-15 state=1.11e-16 resid=4.00e-15
+PASS alg N=129 gauss/mid/zero s0=1  out=9.95e-14 state=4.66e-14 resid=9.95e-14
+PASS alg N=129 gauss/mid/neg s0=1  out=8.88e-16 state=5.55e-17 resid=8.88e-16
+PASS alg N=65 gauss/mid/mid s0=0  out=2.00e-15 state=1.67e-16 resid=2.00e-15
+worst: out=9.95e-14 state=4.66e-14 resid=9.95e-14
+PASS seam out
+PASS seam state bytes
+PASS seam codes
+PASS seam scales
+PASS seam EF bytes
+PASS commit zero-row
+PASS commit saturate
+PASS commit finite
+PASS commit scalar row7  code=-52 expect=-52
+PASS commit no-mutate
+PASS onehot exact  maxdiff=0.0
+PASS onehot values  out must equal v (delta=v, S_out*k-free)
+ORACLE PASS

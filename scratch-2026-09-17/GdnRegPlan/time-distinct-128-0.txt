@@ -1,0 +1,13 @@
+device=AMD Radeon AI PRO R9700 arch=gfx1201 CUs=32 clock_kHz=2350000 shared/CU=65536 warp=32 chunks=128
+f32-full blocks=48 chunks=128 lds=0 regs=170 local=0 static_shared=0 activeWG/CU=4 min_us=926.703 median_us=1826.805 max_us=2227.263 norm_us/head/chunk=0.297331
+f16-full blocks=48 chunks=128 lds=0 regs=98 local=0 static_shared=0 activeWG/CU=7 min_us=463.493 median_us=475.456 max_us=480.902 norm_us/head/chunk=0.077385
+f32-split2 blocks=96 chunks=128 lds=0 regs=110 local=0 static_shared=0 activeWG/CU=6 min_us=485.520 median_us=489.358 max_us=495.994 norm_us/head/chunk=0.039824
+f16-split2 blocks=96 chunks=128 lds=0 regs=98 local=0 static_shared=0 activeWG/CU=7 min_us=473.024 median_us=479.272 max_us=484.752 norm_us/head/chunk=0.039003
+f32-full blocks=48 chunks=128 lds=28672 regs=170 local=0 static_shared=0 activeWG/CU=2 min_us=434.513 median_us=434.717 max_us=442.151 norm_us/head/chunk=0.070755
+f16-full blocks=48 chunks=128 lds=28672 regs=98 local=0 static_shared=0 activeWG/CU=2 min_us=442.191 median_us=442.805 max_us=442.979 norm_us/head/chunk=0.072071
+f32-split2 blocks=96 chunks=128 lds=28672 regs=110 local=0 static_shared=0 activeWG/CU=2 min_us=454.723 median_us=481.806 max_us=484.512 norm_us/head/chunk=0.039209
+f16-split2 blocks=96 chunks=128 lds=28672 regs=98 local=0 static_shared=0 activeWG/CU=2 min_us=482.478 median_us=484.022 max_us=485.076 norm_us/head/chunk=0.039390
+f32-full-solve blocks=48 chunks=128 lds=28672 regs=216 local=0 static_shared=0 activeWG/CU=2 min_us=2881.490 median_us=2882.875 max_us=2888.556 norm_us/head/chunk=0.469218
+f16-full-solve blocks=48 chunks=128 lds=28672 regs=151 local=0 static_shared=0 activeWG/CU=2 min_us=2886.786 median_us=2890.289 max_us=2897.999 norm_us/head/chunk=0.470425
+f32-split2-solve blocks=96 chunks=128 lds=28672 regs=168 local=0 static_shared=0 activeWG/CU=2 min_us=3830.082 median_us=3896.480 max_us=3900.802 norm_us/head/chunk=0.317096
+f16-split2-solve blocks=96 chunks=128 lds=28672 regs=141 local=0 static_shared=0 activeWG/CU=2 min_us=3861.292 median_us=3864.118 max_us=3868.292 norm_us/head/chunk=0.314463

@@ -1,0 +1,17 @@
+chunk=0 phase=0 S_max_halves=0,0 mismatches=0
+chunk=0 phase=1 S_max_halves=0,0 mismatches=0
+chunk=0 phase=2 S_max_halves=0,0 mismatches=0
+chunk=0 phase=3 S_max_halves=0,0 mismatches=0
+chunk=0 phase=4 S_max_halves=0,0 mismatches=0
+chunk=0 phase=5 S_max_halves=0,0 mismatches=0
+chunk=0 phase=6 S_max_halves=0,0 mismatches=0
+chunk=0 phase=7 S_max_halves=0,0 mismatches=0
+chunk=1 phase=0 S_max_halves=0,0 mismatches=0
+chunk=1 phase=1 S_max_halves=0,0 mismatches=0
+chunk=1 phase=2 S_max_halves=0,0 mismatches=0
+chunk=1 phase=3 S_max_halves=0,0 mismatches=0
+chunk=1 phase=4 S_max_halves=0,0 mismatches=0
+chunk=1 phase=5 S_max_halves=0,0 mismatches=0
+chunk=1 phase=6 S_max_halves=0,0 mismatches=0
+chunk=1 phase=7 S_max_halves=0,0 mismatches=0
+phase_dump_mode2_exact=1
