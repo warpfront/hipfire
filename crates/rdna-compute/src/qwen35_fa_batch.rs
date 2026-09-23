@@ -25,6 +25,19 @@ const FA_PREP_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1100.hip");
 const KV_PAIR_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_q8_0_pair_batched.gfx1100.hip");
+const FA_PREP_BATCHED_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/qwen35_fa_prep_batched.gfx1201.hip");
+
+/// Output of the gfx1201 fused FA prep for the Q rows.
+pub enum FaPrepQOut<'a> {
+    /// Row-major `[batch × n_q × 256]` F32 Q (post norm + RoPE).
+    F32(&'a GpuTensor),
+    /// `DType::Raw` view: `[batch × n_q × 256]` permuted E4M3 codes followed
+    /// by `[batch × n_q]` f32 row scales at byte offset `batch × n_q × 256`
+    /// (the layout `attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201`
+    /// reads).
+    Fp8Codes(&'a GpuTensor),
+}
 /// Admitted prep geometries (Q heads, K heads): 16/2 and 24/4, head_dim 256,
 /// n_rot 64. The kernel takes the Q-head split as a grid-uniform arg, so one
 /// symbol serves both; the launcher validates the pair.
@@ -225,6 +238,135 @@ impl Gpu {
                 b.push_ptr(p);
                 b.push_i32(nkv);
                 b.push_i32(hd);
+                b.push_i32(bs);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// gfx1201 full-attention prep: deinterleave + Q/K rmsnorm + partial
+    /// half-split RoPE in one wave-per-row launch, bit-exact to the
+    /// three-launch sequence (see the `.hip` header). With
+    /// [`FaPrepQOut::Fp8Codes`] the Q rows are emitted as the exact E4M3
+    /// codes and row scales the Q-resident attention prologue derives.
+    /// `k` is read pre-norm and written post-norm+rope in place.
+    #[allow(clippy::too_many_arguments)]
+    pub fn qwen35_fa_prep_batched_gfx1201(
+        &mut self,
+        q_interleaved: &GpuTensor,
+        q_out: FaPrepQOut<'_>,
+        gate: &GpuTensor,
+        k: &GpuTensor,
+        q_weight: &GpuTensor,
+        k_weight: &GpuTensor,
+        positions: &GpuTensor,
+        eps: f32,
+        freq_base: f32,
+        pos_offset: i32,
+        n_q_heads: usize,
+        n_kv_heads: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if self.arch != "gfx1201" {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "qwen35_fa_prep_batched_gfx1201 requires gfx1201",
+            ));
+        }
+        if !FA_PREP_BATCHED_GEOMETRIES.contains(&(n_q_heads, n_kv_heads)) || batch_size == 0 {
+            return Err(hip_bridge::HipError::new(
+                1,
+                "qwen35_fa_prep_batched_gfx1201 requires 16Q/2K or 24Q/4K heads and batch >= 1",
+            ));
+        }
+        let q_elems = batch_size * n_q_heads * 256;
+        let (symbol, qp, sp) = match q_out {
+            FaPrepQOut::F32(q) => {
+                if q.numel() < q_elems {
+                    return Err(hip_bridge::HipError::new(1, "fa prep: Q output too small"));
+                }
+                ("qwen35_fa_prep_batched_gfx1201", q.buf.as_ptr(), None)
+            }
+            FaPrepQOut::Fp8Codes(codes) => {
+                let need = q_elems + batch_size * n_q_heads * 4;
+                if codes.dtype != crate::DType::Raw || codes.buf.size() < need {
+                    return Err(hip_bridge::HipError::new(
+                        1,
+                        "fa prep: fp8 Q output must be a Raw view of >= codes + scales bytes",
+                    ));
+                }
+                let base = codes.buf.as_ptr();
+                let scales = unsafe { (base as *mut u8).add(q_elems) as *mut c_void };
+                ("qwen35_fa_prep_fp8q_batched_gfx1201", base, Some(scales))
+            }
+        };
+        self.ensure_kernel(symbol, FA_PREP_BATCHED_GFX1201_SRC, symbol)?;
+
+        let qip = q_interleaved.buf.as_ptr();
+        let gp = gate.buf.as_ptr();
+        let kp = k.buf.as_ptr();
+        let qwp = q_weight.buf.as_ptr();
+        let kwp = k_weight.buf.as_ptr();
+        let pp = positions.buf.as_ptr();
+        let ep = eps;
+        let fb = freq_base;
+        let po = pos_offset;
+        let nq = n_q_heads as i32;
+        let nkv = n_kv_heads as i32;
+        let bs = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &qip as *const _ as *mut c_void,
+            &qp as *const _ as *mut c_void,
+        ];
+        if let Some(sp) = sp.as_ref() {
+            params.push(sp as *const _ as *mut c_void);
+        }
+        params.extend_from_slice(&[
+            &gp as *const _ as *mut c_void,
+            &kp as *const _ as *mut c_void,
+            &qwp as *const _ as *mut c_void,
+            &kwp as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &ep as *const _ as *mut c_void,
+            &fb as *const _ as *mut c_void,
+            &po as *const _ as *mut c_void,
+            &nq as *const _ as *mut c_void,
+            &nkv as *const _ as *mut c_void,
+            &bs as *const _ as *mut c_void,
+        ]);
+        let rows = (n_q_heads + n_kv_heads) * batch_size;
+        let q_bytes = if sp.is_some() { 256 + 4 } else { 256 * 4 };
+        let bytes = batch_size
+            * (n_q_heads * (256 * 4 * 2 + 256 * 4 + q_bytes) + n_kv_heads * 256 * 4 * 2);
+        let timer = crate::profile::begin_timer(&self.hip, "fused", symbol, bytes);
+        let result = self.launch_maybe_blob(
+            symbol,
+            [rows.div_ceil(8) as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(qip);
+                b.push_ptr(qp);
+                if let Some(sp) = sp {
+                    b.push_ptr(sp);
+                }
+                b.push_ptr(gp);
+                b.push_ptr(kp);
+                b.push_ptr(qwp);
+                b.push_ptr(kwp);
+                b.push_ptr(pp);
+                b.push_f32(ep);
+                b.push_f32(fb);
+                b.push_i32(po);
+                b.push_i32(nq);
+                b.push_i32(nkv);
                 b.push_i32(bs);
                 b
             },

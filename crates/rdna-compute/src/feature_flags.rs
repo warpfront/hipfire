@@ -292,6 +292,17 @@ pub struct FeatureFlags {
     /// (`HIPFIRE_ATTN_QRESIDENT`, `kernel.attn_qresident`). Default ON on
     /// exact gfx1201; `=0` opts out. Exact H24/KV4/D256 native-fp8-KV shapes only.
     pub attn_qresident: bool,
+    /// Bit-exact reschedule of the Q-resident body
+    /// (`HIPFIRE_ATTN_QRESIDENT_V2`, `kernel.attn_qresident_v2`). Default ON
+    /// on exact gfx1201; `=0` restores the v1 Q-resident kernel. Only
+    /// consulted where `attn_qresident` selects the Q-resident route.
+    pub attn_qresident_v2: bool,
+    /// Exact gfx1201 FA deinterleave, Q/K norm and RoPE fusion.
+    /// `HIPFIRE_GFX12_FA_PREP_FUSED=0` restores the original chain.
+    pub gfx12_fa_prep_fused: bool,
+    /// Emit preconverted fp8 Q for the v2 Q-resident attention twin.
+    /// `HIPFIRE_GFX12_FA_PREP_FP8Q=0` retains F32 Q.
+    pub gfx12_fa_prep_fp8q: bool,
     /// Experimental whole-chunk Q8/Q8 FA2 on exact gfx1100/gfx1151
     /// (`HIPFIRE_GFX11_Q8_FA2_WIDE`, `kernel.gfx11_q8_fa2_wide`).
     /// Default ON only on exact gfx1100; gfx1151 defaults OFF but an
@@ -700,6 +711,12 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             attn_qresident: parse_bool("HIPFIRE_ATTN_QRESIDENT")
                 .unwrap_or(arch == "gfx1201"),
+            attn_qresident_v2: parse_bool("HIPFIRE_ATTN_QRESIDENT_V2")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_fa_prep_fused: parse_bool("HIPFIRE_GFX12_FA_PREP_FUSED")
+                .unwrap_or(arch == "gfx1201"),
+            gfx12_fa_prep_fp8q: parse_bool("HIPFIRE_GFX12_FA_PREP_FP8Q")
+                .unwrap_or(arch == "gfx1201"),
             gfx11_q8_fa2_wide: parse_bool("HIPFIRE_GFX11_Q8_FA2_WIDE")
                 .unwrap_or(arch == "gfx1100"),
             gfx11_fa2_prefill: parse_bool("HIPFIRE_GFX11_FA2_PREFILL")
@@ -1037,6 +1054,9 @@ impl FeatureFlags {
             gfx12_fa2_prefill: false,
             gfx12_fa_packet: false,
             attn_qresident: false,
+            attn_qresident_v2: false,
+            gfx12_fa_prep_fused: false,
+            gfx12_fa_prep_fp8q: false,
             gfx11_q8_fa2_wide: false,
             gfx11_fa2_prefill: false,
             gemm_dump: false,
