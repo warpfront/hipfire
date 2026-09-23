@@ -673,6 +673,12 @@ pub struct Gpu {
     pub scratch: crate::scratch::ScratchState,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
+    /// Secondary Redline recorder for the widened-prefill graph route
+    /// (`HIPFIRE_GFX12_PREFILL_GRAPH`). None until first flag use; separate
+    /// from the AR `replay` controller so decode capture/replay never
+    /// observes prefill bodies. Swapped into the funnel slot for one chunk
+    /// at a time (mem::swap around the chunk body), then swapped back.
+    pub prefill_tape: Option<crate::replay::PrefillGraphSlot>,
 
     /// Process-pinned optional CK runtime. Loading is explicit and fail-closed;
     /// individual attention families still decide whether a capability cell is
@@ -1384,6 +1390,7 @@ impl Gpu {
                 fa2_fp8_q_scratch_bytes: 0,
             },
             replay: crate::replay::ReplayController::from_config(),
+            prefill_tape: None,
             #[cfg(feature = "flash-attn-ck")]
             flash_attn_ck,
             #[cfg(feature = "flash-attn-ck")]

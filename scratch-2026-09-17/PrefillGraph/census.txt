@@ -1,0 +1,46 @@
+arch=gfx1201 replay_backend_state_init
+model: dim=5120 hidden=17408 layers=64 heads=24/4/256 kv_heads=4 head_dim=256 vocab=248320 experts=0
+L0 dtypes=[MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2]
+L1 dtypes=[MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2]
+flags: fp8_gateup=true fp8_resid=true fp8_qkvza=true fp8_qkv=true fp8_v2=true gdn_pre_fused=true silu_quant_fused=true producer_quant_fused=true fp8_stream=true fa2_prefill=true
+layers: LA=48 FA=16
+dn: quant=Q8 s=48 sc=48 ef=48 conv=48
+ordinary_prefill_chunk_limit admitted=4096
+replay controller: manual_pm4 cap=16384
+warmup: forward_prefill_batch 8192 (JIT)
+chunk0 post: state=RecordingWarmup fallback=None recorded=3656
+chunk0: tape=3656 total=3656 rawinv=0 htod=4 dtod=2 dtoh=0 memset=0 ssync=0 esync=0 dsync=3 enslookup=0 unique=21 seq_hash=b9439c489e09da65
+single: split M=1828 (shared PBS, continued frames)
+typed(binding_layout)=1828 untyped=0 grid_bound=0
+per-kernel histogram (all launches):
+    128  attention_fp8_e4m3_fa2_gqa_gfx1201
+    128  attention_fp8_e4m3_fa2_q_preconvert_fp8_gfx1201
+    256  convert_f32_to_f16
+     16  deinterleave_q_rmsnorm_f32_batched
+      1  embedding_q8_batched
+    128  fused_rmsnorm_mq_rotate_awq
+     64  fused_silu_mul_mq_rotate_awq
+    384  gated_delta_net_q8_fast
+     48  gated_norm_f32
+     48  gdn_pre_batched_gfx1201
+     64  gemm_gate_up_mq4g256v2_wmma_gfx12_bt8
+    128  gemm_mq4g256v2_residual_wmma_gfx12_bt8
+     16  gemm_qkv_mq4g256v2_wmma_gfx12
+     48  gemm_qkvza_mq4g256v2_wmma_gfx12_bt8
+      1  gemv_mq4g256v2_multirow_r2
+    256  kv_cache_write_fp8_e4m3_batched
+      1  mq_rotate_x
+     17  rmsnorm_f32
+     16  rope_partial_halfsplit_batched_f32
+     64  rotate_x_mq_awq
+     16  sigmoid_mul_f32
+untyped kernels: NONE
+grid/block/lds mismatches=0 kernarg-len mismatches=0
+scalar (non-pointer) variant slots, grouped by (kernel, off, len):
+  n=   2  convert_f32_to_f16                                               off= 10 len= 2 A=0xbaa0 B=0xb520 d=-1408 idx0=15 
+  n=   1  convert_f32_to_f16                                               off= 10 len= 3 A=0x800660 B=0x7fb520 d=-20800 idx0=2 
+  n= 384  gated_delta_net_q8_fast                                          off= 78 len= 1 A=0x6 B=0x9 d=+3 idx0=5 
+  n=   1  gemm_gate_up_mq4g256v2_wmma_gfx12_bt8                            off= 18 len= 2 A=0xbaa0 B=0xb520 d=-1408 idx0=19 
+  n=   1  gemm_mq4g256v2_residual_wmma_gfx12_bt8                           off= 10 len= 2 A=0xbaa0 B=0xb520 d=-1408 idx0=16 
+  n=   1  gemm_qkvza_mq4g256v2_wmma_gfx12_bt8                              off= 34 len= 3 A=0x800660 B=0x7fb520 d=-20800 idx0=3 
+pointer-like variant slots: 0 in 0 distinct deltas

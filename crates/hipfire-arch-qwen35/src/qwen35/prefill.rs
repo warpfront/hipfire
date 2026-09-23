@@ -4856,6 +4856,378 @@ fn prefill_dispatch_workload(
     }
 }
 
+// ── Prefill-graph retained replay (HIPFIRE_GFX12_PREFILL_GRAPH) ─────────────
+//
+// Captures the widened 4096-row chunk body (layers only; lm-head tail runs
+// eager per replay) as a Redline tape on the first admitted full chunk and
+// replays it for later full chunks. Key: rung 4096 + widened-route admission
+// (recomputed per call: dtypes, shapes, flags, EF) + anchor addresses
+// (KV k_gpu[0], DN s_matrices[0]; pool reuse makes these stable across
+// same-geometry requests, anything else fails open to eager).
+//
+// Exactness argument (see scratch-2026-09-17/PrefillGraph/INVENTORY.md):
+// launch sequence, grids and every non-frame kernarg byte are identical
+// across full chunks (census: 1828 launches, 0 raw, 0 untyped); positions
+// flow via device buffers; GDN stochastic frames are re-reserved fresh at
+// every replay, landing on exactly the frames eager would have used by
+// reservation-order lockstep (384 commits x 512 frames/chunk).
+
+/// Full-chunk rung captured by the prefill-graph route.
+const PREFILL_GRAPH_RUNG: usize = 4096;
+/// Trailing lm-head launches excluded from the retained body (D2D + norm +
+/// rotate + gemv); they run eager after every replay.
+const PREFILL_GRAPH_LM_TAIL: usize = 3;
+
+/// Drop-guard restoring the primary AR replay controller into the dispatch
+/// funnel. The capture arm swaps the prefill secondary in for the chunk body;
+/// every `?` early-return inside the body must still restore the primary, or
+/// decode would record into (or replay from) the wrong controller. Raw
+/// pointer: the forward is single-threaded per model; the guard only swaps
+/// when `active` was set after a successful swap-in.
+struct PrefillTapeGuard {
+    gpu: *mut Gpu,
+    active: bool,
+}
+impl Drop for PrefillTapeGuard {
+    fn drop(&mut self) {
+        if self.active {
+            unsafe {
+                let gpu = &mut *self.gpu;
+                if let Some(slot) = gpu.prefill_tape.as_mut() {
+                    std::mem::swap(&mut gpu.replay, &mut slot.controller);
+                }
+            }
+        }
+    }
+}
+
+/// Capture-time anchor addresses (base, numel) for KV + DN state layer 0.
+/// Replay requires an exact match: same-geometry requests reuse pool
+/// addresses (census-verified); anything else runs eager.
+fn prefill_graph_anchors(
+    kv_cache: &llama::KvCache,
+    dn_state: &DeltaNetState,
+) -> Option<[(u64, u64); 2]> {
+    let k = kv_cache.k_gpu.first()?;
+    let s = dn_state.s_matrices.first()?;
+    Some([
+        (k.buf.as_ptr() as u64, k.numel() as u64),
+        (s.buf.as_ptr() as u64, s.numel() as u64),
+    ])
+}
+
+/// The retained body must end with the lm-head triple; anything else means
+/// the route changed under us and truncating would drop layer work.
+fn prefill_graph_tail_ok(rec: &[rdna_compute::replay::RecordedHipLaunch]) -> bool {
+    if rec.len() <= PREFILL_GRAPH_LM_TAIL {
+        return false;
+    }
+    let tail = &rec[rec.len() - PREFILL_GRAPH_LM_TAIL..];
+    tail[0].kernel == "rmsnorm_f32"
+        && tail[0].grid == [1, 1, 1]
+        && tail[1].kernel == "mq_rotate_x"
+        && tail[2].kernel == "gemv_mq4g256v2_multirow_r2"
+}
+
+
+/// Decide the prefill-graph mode for this chunk. Returns the retained PBS to
+/// use (pinned address across requests) plus the mode. Eager unless: flag
+/// on, exact gfx1201, full 4096 widened chunk, whole-stack sequential
+/// ordinary route, widened admission still holds, retained PBS allocated.
+#[allow(clippy::too_many_arguments)]
+fn prefill_graph_enter<'a>(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &DeltaNetState,
+    kv_cache: &llama::KvCache,
+    scratch: &'a Qwen35Scratch,
+    n: usize,
+    commit_stride: Option<usize>,
+    pre_uploaded: bool,
+    has_band: bool,
+    has_max_layer: bool,
+    has_routed: bool,
+    has_hidden_rb: bool,
+    has_gdn_tape: bool,
+    has_tree: bool,
+    has_mask_override: bool,
+    fusion_off: bool,
+    is_sequential: bool,
+) -> (Option<&'a PrefillBatchScratch>, PrefillGraphMode, PrefillTapeGuard) {
+    // Raw device pointer up front: the guard constructors below must not hold
+    // the `&mut Gpu` borrow while the body below reuses `gpu`.
+    let gpu_ptr = gpu as *mut Gpu;
+    let fresh_guard = move || PrefillTapeGuard {
+        gpu: gpu_ptr,
+        active: false,
+    };
+    let eager = move || (None, PrefillGraphMode::Eager, fresh_guard());
+    if !gfx12_prefill_graph_enabled() || gpu.arch.as_str() != "gfx1201" {
+        return eager();
+    }
+    if n != PREFILL_GRAPH_RUNG || commit_stride != Some(WIDENED_COMMIT_ROWS) {
+        return eager();
+    }
+    if pre_uploaded
+        || has_band
+        || has_max_layer
+        || has_routed
+        || has_hidden_rb
+        || has_gdn_tape
+        || has_tree
+        || has_mask_override
+        || !fusion_off
+        || !is_sequential
+    {
+        return eager();
+    }
+    // Route admission must still hold (dtypes, shapes, flags, EF): the loop
+    // admitted the ceiling, but weights/config could have changed under a
+    // reused scratch (model swap) since the tape was prepared.
+    let admitted = ordinary_prefill_static_ceiling(gpu, weights, config, dn_state)
+        .is_some_and(|c| c > WIDENED_COMMIT_ROWS);
+    if !admitted {
+        return eager();
+    }
+    // Retained PBS: allocate once (pinned address forever), fail open on OOM.
+    // `set` (not get_or_try_init: stable) + `get`; single-threaded forward
+    // makes the check-then-set sound here.
+    if scratch.prefill_graph_pbs.get().is_none() {
+        match PrefillBatchScratch::new_opt(gpu, config, PREFILL_GRAPH_RUNG, false) {
+            Ok(pbs) => {
+                let _ = scratch.prefill_graph_pbs.set(pbs);
+            }
+            Err(_) => return eager(),
+        }
+    }
+    let retained = match scratch.prefill_graph_pbs.get() {
+        Some(pbs) => pbs,
+        None => return eager(),
+    };
+    if retained.max_batch < PREFILL_GRAPH_RUNG {
+        return eager();
+    }
+    // Slot state decides capture vs replay; never touch the primary AR
+    // controller except through the guarded swap below.
+    let prepared = gpu
+        .prefill_tape
+        .as_ref()
+        .is_some_and(|slot| !slot.poisoned && slot.controller.prepared_route_identity().is_some());
+    if prepared {
+        // Anchor check now (cheap exact match); submit-time staleness checks
+        // backstop. Mismatch (different request geometry) runs eager and
+        // keeps the prepared slot for a later address-matching request.
+        let live = prefill_graph_anchors(kv_cache, dn_state);
+        let stored = gpu.prefill_tape.as_ref().map(|slot| slot.anchors.as_slice());
+        let anchors_ok = match (live, stored) {
+            (Some(live), Some(stored)) => stored.len() == live.len() && stored == live,
+            _ => false,
+        };
+        if !anchors_ok {
+            return (None, PrefillGraphMode::Eager, fresh_guard());
+        }
+        return (Some(retained), PrefillGraphMode::Replay, fresh_guard());
+    }
+    (Some(retained), PrefillGraphMode::Capture, fresh_guard())
+}
+
+/// Capture/replay mode for one widened chunk.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PrefillGraphMode {
+    Eager,
+    Capture,
+    Replay,
+}
+/// Begin a capture: ensure the secondary slot, swap it into the funnel,
+/// arm recording. Returns false (eager fallback on the retained PBS) when
+/// the controller cannot record; the guard stays inactive so no swap-back
+/// is owed. Poisoned slots never re-record.
+fn prefill_graph_begin_capture(gpu: &mut Gpu, guard: &mut PrefillTapeGuard) -> bool {
+    if gpu.prefill_tape.is_none() {
+        let (controller, native_aql) = prefill_graph_secondary();
+        let mut slot = rdna_compute::replay::PrefillGraphSlot::new(controller);
+        slot.use_aql = native_aql;
+        gpu.prefill_tape = Some(slot);
+    }
+    if gpu
+        .prefill_tape
+        .as_ref()
+        .is_some_and(|slot| slot.poisoned)
+    {
+        return false;
+    }
+    {
+        let slot = gpu.prefill_tape.as_mut().unwrap();
+        std::mem::swap(&mut gpu.replay, &mut slot.controller);
+    }
+    guard.active = true;
+    gpu.replay.set_forward_eligible(true);
+    if gpu.replay.begin_capture().is_err() {
+        let slot = gpu.prefill_tape.as_mut().unwrap();
+        std::mem::swap(&mut gpu.replay, &mut slot.controller);
+        guard.active = false;
+        return false;
+    }
+    true
+}
+/// Secondary-controller transport. PM4 is the prefill default (explicit
+/// `HIPFIRE_REPLAY_TRANSPORT=aql*` opts into AQL): the PM4 submit path
+/// re-reserves the exact per-dispatch GDN frame runs
+/// (`GdnFrameU32{frames:512}`) while the AQL path reserves a single frame
+/// per dispatch, and the first AQL prefill replay hung on the HSA doorbell
+/// in testing. Returns the controller plus whether AQL is native (tried
+/// first at prepare).
+fn prefill_graph_secondary() -> (rdna_compute::replay::ReplayController, bool) {
+    let aql = hipfire_config::developer_var("HIPFIRE_REPLAY_TRANSPORT")
+        .map(|v| v.trim().to_ascii_lowercase().starts_with("aql"))
+        .unwrap_or(false);
+    let controller = if aql {
+        rdna_compute::replay::ReplayController::new_manual_aql()
+    } else {
+        rdna_compute::replay::ReplayController::new_manual_pm4()
+    };
+    (
+        controller.with_max_recorded_launches(8192),
+        aql,
+    )
+}
+
+/// Finalize a capture after the body ran eager (results already valid):
+/// finish, truncate the lm-head tail, prepare (native transport first),
+/// store anchors. Never fails the request: on any error the slot is
+/// poisoned and the already-computed eager results stand. Runs while the
+/// secondary is still swapped in; the guard swaps back at scope exit.
+fn prefill_graph_finalize(
+    gpu: &mut Gpu,
+    kv_cache: &llama::KvCache,
+    dn_state: &DeltaNetState,
+) {
+    static LOGGED: std::sync::Once = std::sync::Once::new();
+    let outcome = (|| -> Result<(bool, usize), String> {
+        let summary = gpu.replay.finish_capture().map_err(|e| e.to_string())?;
+        if !prefill_graph_tail_ok(gpu.replay.recorded_launches()) {
+            return Err("lm-tail shape mismatch (route changed?)".to_owned());
+        }
+        let body_len = gpu.replay.recorded_launches().len() - PREFILL_GRAPH_LM_TAIL;
+        gpu.replay.truncate_recorded(body_len);
+        // Prepare the secondary's native transport first, fall back to the
+        // other; record the winner for replay.
+        let native_aql = gpu
+            .prefill_tape
+            .as_ref()
+            .map(|slot| slot.use_aql)
+            .unwrap_or(false);
+        let dev = gpu.device_id as usize;
+        let use_aql = if native_aql {
+            match gpu.replay.prepare_linear_aql(dev) {
+                Ok(_) => true,
+                Err(aql_err) => match gpu.replay.prepare_pm4_prefix(dev, body_len) {
+                    Ok(_) => false,
+                    Err(pm4_err) => {
+                        return Err(format!("prepare failed: aql: {aql_err}; pm4: {pm4_err}"));
+                    }
+                },
+            }
+        } else {
+            match gpu.replay.prepare_pm4_prefix(dev, body_len) {
+                Ok(_) => false,
+                Err(pm4_err) => match gpu.replay.prepare_linear_aql(dev) {
+                    Ok(_) => true,
+                    Err(aql_err) => {
+                        return Err(format!("prepare failed: pm4: {pm4_err}; aql: {aql_err}"));
+                    }
+                },
+            }
+        };
+        let anchors = prefill_graph_anchors(kv_cache, dn_state).ok_or("anchor read failed")?;
+        let slot = gpu.prefill_tape.as_mut().ok_or("slot vanished")?;
+        slot.use_aql = use_aql;
+        slot.anchors = anchors.to_vec();
+        Ok((use_aql, summary.launch_count))
+    })();
+    match outcome {
+        Ok((use_aql, launches)) => {
+            eprintln!(
+                "[prefill-graph] captured 4096 body: {launches} launches, transport={}",
+                if use_aql { "aql" } else { "pm4" }
+            );
+        }
+        Err(reason) => {
+            if let Some(slot) = gpu.prefill_tape.as_mut() {
+                slot.poisoned = true;
+            }
+            LOGGED.call_once(|| {
+                eprintln!("[prefill-graph] capture abandoned (eager continues): {reason}");
+            });
+        }
+    }
+}
+
+/// Replay a prepared body (layers only), then the eager lm-head tail.
+/// Submit failure poisons the slot and fails LOUD (decode pattern): the
+/// layers were skipped, so this chunk has no eager fallback.
+#[allow(clippy::too_many_arguments)]
+fn prefill_graph_replay(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+    pbs: &PrefillBatchScratch,
+    n: usize,
+    dim: usize,
+    dim_row_bytes: usize,
+    per_token_hidden_out: Option<(&GpuTensor, usize)>,
+    needs_last_token_logits: bool,
+    dispatch_workload: DispatchWorkload,
+) -> HipResult<()> {
+    let use_aql = gpu
+        .prefill_tape
+        .as_ref()
+        .map(|slot| slot.use_aql)
+        .unwrap_or(true);
+    let submit = if use_aql {
+        let slot = gpu
+            .prefill_tape
+            .as_mut()
+            .ok_or_else(|| HipError::new(0, "prefill-graph: slot vanished"))?;
+        unsafe { slot.controller.replay_linear_aql(0) }
+            .map(|_| ())
+            .map_err(|e| e)
+    } else {
+        let slot = gpu
+            .prefill_tape
+            .as_mut()
+            .ok_or_else(|| HipError::new(0, "prefill-graph: slot vanished"))?;
+        unsafe { slot.controller.replay_pm4(0) }
+            .map(|_| ())
+            .map_err(|e| e)
+    };
+    if let Err(reason) = submit {
+        if let Some(slot) = gpu.prefill_tape.as_mut() {
+            slot.poisoned = true;
+            slot
+                .controller
+                .poison(format!("prefill-graph replay failed: {reason}"));
+        }
+        return Err(HipError::new(0, &format!("prefill-graph replay failed: {reason}")));
+    }
+    let ctx = DispatchCtx::new(gpu).with_workload(dispatch_workload);
+    batch_chunk_final_logits(
+        gpu,
+        weights,
+        config,
+        s,
+        pbs,
+        n,
+        dim,
+        dim_row_bytes,
+        per_token_hidden_out,
+        needs_last_token_logits,
+        true,
+        &ctx,
+    )
+}
 pub(crate) fn forward_prefill_chunk(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -11181,6 +11553,35 @@ pub(crate) fn forward_batch_chunk_impl(
                 .unwrap_or(false),
         "forward_prefill_chunk: routed_out requires a single-layer band (EP driver invariant)",
     );
+    // Prefill-graph route (HIPFIRE_GFX12_PREFILL_GRAPH): full widened chunks
+    // may capture or replay through the retained PBS. Eager mode leaves
+    // everything below untouched.
+    let (graph_pbs, graph_mode, mut graph_guard) = prefill_graph_enter(
+        gpu,
+        weights,
+        config,
+        dn_state,
+        kv_cache,
+        s,
+        n,
+        commit_stride,
+        pre_uploaded,
+        band.is_some(),
+        max_layer.is_some(),
+        routed_out.is_some(),
+        hidden_rb.is_some(),
+        gdn_tape.is_some(),
+        tree_verify.is_some(),
+        mask_override.is_some(),
+        matches!(fusion, DflashFusionCtx::Off),
+        matches!(batch_semantics, BatchSemantics::Sequential),
+    );
+    let pbs: &PrefillBatchScratch = graph_pbs.unwrap_or(pbs);
+    let graph_recording = if graph_mode == PrefillGraphMode::Capture {
+        prefill_graph_begin_capture(gpu, &mut graph_guard)
+    } else {
+        false
+    };
 
     let dim = config.dim;
     let hidden_dim = config.hidden_dim;
@@ -11240,6 +11641,24 @@ pub(crate) fn forward_batch_chunk_impl(
         tree_verify,
         pre_uploaded,
     )?;
+    // Prefill-graph replay: inputs are staged above; the retained body runs
+    // the layers, then the eager lm-head tail. Capture mode continues into
+    // the layer loop below (recording through the swapped-in secondary).
+    if graph_mode == PrefillGraphMode::Replay {
+        return prefill_graph_replay(
+            gpu,
+            weights,
+            config,
+            s,
+            pbs,
+            n,
+            dim,
+            dim_row_bytes,
+            per_token_hidden_out,
+            needs_last_token_logits,
+            dispatch_workload,
+        );
+    }
 
     let fa_arch = gpu.arch.as_str();
     let q8_wmma_arch = q8_prefill_wmma_enabled(gpu);
@@ -11492,6 +11911,13 @@ pub(crate) fn forward_batch_chunk_impl(
         do_lm_head,
         &ctx,
     )?;
+    // Prefill-graph capture finalize: the body above ran eager (results
+    // valid); finish the recording, truncate the lm tail, prepare the
+    // retained body. Never fails the request. The guard below swaps the
+    // primary controller back at scope exit on every path.
+    if graph_mode == PrefillGraphMode::Capture && graph_recording {
+        prefill_graph_finalize(gpu, kv_cache, dn_state);
+    }
 
     Ok(())
 }

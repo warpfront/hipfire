@@ -1104,6 +1104,12 @@ pub struct Qwen35Scratch {
     // Optional long-prefill scratch. Default is None to preserve VRAM
     // footprint; set HIPFIRE_PREFILL_REUSE_PBS=1 to allocate and reuse it.
     pub prefill_batch: Option<PrefillBatchScratch>,
+    // Retained 4096-row PBS for the prefill-graph replay route
+    // (`HIPFIRE_GFX12_PREFILL_GRAPH`). Allocated once on first flag use;
+    // `OnceCell` pins the address forever, so prepared-tape pointer
+    // bindings stay valid across requests. The per-call owned PBS keeps
+    // serving every other path.
+    pub prefill_graph_pbs: std::cell::OnceCell<PrefillBatchScratch>,
 }
 
 fn qwen35_x_rot_len(dim: usize, hidden_dim: usize, v_dim: usize) -> usize {
@@ -1321,6 +1327,7 @@ impl Qwen35Scratch {
             moe_topk_weights: None,
             moe_down_expanded: None,
             prefill_batch: None,
+            prefill_graph_pbs: std::cell::OnceCell::new(),
         })
         .and_then(|mut s| {
             // Allocate MoE scratch only for MoE configs. Done after the

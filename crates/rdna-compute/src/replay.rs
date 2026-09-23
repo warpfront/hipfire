@@ -4182,6 +4182,31 @@ impl ShadowValidation {
 
 /// Process-local replay adoption state. HIP remains the route until an adapter
 /// both supplies two certified observations and installs a concrete prepared
+/// Retained widened-prefill tape slot (one (rung, route, layer-set) body).
+/// Owned by `Gpu::prefill_tape`; driven by the qwen35 prefill-graph route.
+/// `anchors` are capture-time (allocation_base, bytes) pairs for the
+/// buffers the body touches (PBS, KV, DN state); replay verifies them
+/// before submitting so a reallocated buffer fails open to eager instead
+/// of replaying stale pointers. `use_aql` selects the prepared transport.
+/// `poisoned` latches permanent abandonment (prepare failed, tail mismatch).
+pub struct PrefillGraphSlot {
+    pub controller: ReplayController,
+    pub use_aql: bool,
+    pub anchors: Vec<(u64, u64)>,
+    pub poisoned: bool,
+}
+
+impl PrefillGraphSlot {
+    pub fn new(controller: ReplayController) -> Self {
+        Self {
+            controller,
+            use_aql: true,
+            anchors: Vec::new(),
+            poisoned: false,
+        }
+    }
+}
+
 pub struct ReplayController {
     request: ReplayBackendRequest,
     transport: ReplayTransport,
@@ -5852,7 +5877,15 @@ impl ReplayController {
         };
         Ok(summary)
     }
-
+    /// Truncate the recorded launch sequence to `len` entries, dropping a
+    /// trailing region before prepare. The prefill-graph route drops the
+    /// lm-head tail (D2D + norm + rotate + gemv) so the retained body is
+    /// layers-only and the tail runs eager per replay. Callers must
+    /// re-validate the tail shape before truncating; silently truncating a
+    /// mismatched sequence would drop layer work.
+    pub fn truncate_recorded(&mut self, len: usize) {
+        self.recorded.truncate(len);
+    }
     pub fn capture_summary(&self) -> ReplayCaptureSummary {
         let unique_kernel_count = self
             .recorded

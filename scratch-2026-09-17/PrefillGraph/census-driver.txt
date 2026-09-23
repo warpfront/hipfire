@@ -1,0 +1,22 @@
+arch=gfx1201 replay_backend_state_init
+model: dim=5120 hidden=17408 layers=64 heads=24/4/256 kv_heads=4 head_dim=256 vocab=248320 experts=0
+L0 dtypes=[MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2]
+L1 dtypes=[MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2, MQ4G256V2]
+flags: fp8_gateup=true fp8_resid=true fp8_qkvza=true fp8_qkv=true fp8_v2=true gdn_pre_fused=true silu_quant_fused=true producer_quant_fused=true fp8_stream=true fa2_prefill=true
+layers: LA=48 FA=16
+dn: quant=Q8 s=48 sc=48 ef=48 conv=48
+ordinary_prefill_chunk_limit admitted=4096
+replay controller: manual_pm4 cap=16384
+warmup: forward_prefill_batch 8192 (JIT)
+runA(flagON): frame_checkpoint=393216 flag_on=true
+runB(flagOFF): frame_checkpoint=393216 flag_on=false
+runC(flagON-reuse): frame_checkpoint=393216 flag_on=true
+  ok   logits A==B (248320 f32)
+  ok   hidden A==B (41943040 f32)
+  ok   scales A==B (6144 f32)
+  ok   conv A==B (30720 f32)
+  ok   logits A==C (248320 f32)
+  ok   hidden A==C (41943040 f32)
+  ok   scales A==C (6144 f32)
+  ok   conv A==C (30720 f32)
+driver-test: PASS

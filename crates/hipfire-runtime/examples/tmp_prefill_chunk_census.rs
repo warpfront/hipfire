@@ -85,6 +85,9 @@ mod ora {
                     single = true;
                     i += 1;
                 }
+                "--driver-test" => {
+                    i += 2;
+                }
                 h => {
                     eprintln!("unknown flag {h}; want --model --out-dir [--single]");
                     std::process::exit(2);
@@ -203,6 +206,100 @@ mod ora {
         )
         .unwrap_or_else(|e| panic!("warmup: {e:?}"));
         gpu.hip.device_synchronize().expect("sync");
+        // Driver exactness protocol (two processes; the flag is a
+        // process-start snapshot, invisible to mid-process set_var):
+        //   pass 1: outer HIPFIRE_GFX12_PREFILL_GRAPH=1 --driver-test snap.bin
+        //           (no file yet -> run + write snap with frame checkpoint)
+        //   pass 2: outer flag unset          --driver-test snap.bin
+        //           (file exists -> restore checkpoint, run, compare exact)
+        // Eager-vs-eager (both flag unset) must also PASS (harness check).
+        if let Some(pos) = a.iter().position(|x| x == "--driver-test") {
+            let snap_path = PathBuf::from(&a[pos + 1]);
+            let mut kv = KvCache::new_gpu_fp8_filtered(
+                &mut gpu, &is_kv_layer, config.n_kv_heads, config.head_dim, kv_max,
+            )
+            .expect("kv fresh");
+            let mut dn = DeltaNetState::new(&mut gpu, &config).expect("dn fresh");
+            let hbuf = gpu
+                .alloc_tensor(&[l, config.dim], DType::F32)
+                .expect("hbuf");
+            // (live-env read mirrors the process-start snapshot taken from the same env)
+            let flag_on = std::env::var("HIPFIRE_GFX12_PREFILL_GRAPH")
+                .map(|v| {
+                    let v = v.trim().to_owned();
+                    !v.is_empty() && v != "0"
+                })
+                .unwrap_or(false);
+            if !std::path::Path::new(&snap_path).exists() {
+                let ck = rdna_compute::norm::gdn_requant_frame_checkpoint();
+                qwen35::forward_prefill_batch(
+                    &mut gpu, &weights, &config, &toks, 0, &mut kv, &mut dn, &scratch,
+                    None, Some(&hbuf), None, None,
+                )
+                .expect("snap forward");
+                gpu.hip.device_synchronize().expect("sync");
+                let mut bytes = Vec::new();
+                bytes.extend_from_slice(&ck.to_le_bytes());
+                for t in [
+                    gpu.download_f32(&scratch.logits).expect("logits"),
+                    gpu.download_f32(&hbuf).expect("hidden"),
+                    gpu.download_f32(&dn.s_scales[0]).expect("sc0"),
+                    gpu.download_f32(&dn.conv_states[0]).expect("cv0"),
+                ] {
+                    bytes.extend_from_slice(&(t.len() as u64).to_le_bytes());
+                    for v in &t {
+                        bytes.extend_from_slice(&v.to_le_bytes());
+                    }
+                }
+                std::fs::write(&snap_path, &bytes).expect("write snap");
+                log(&format!("snap written: {} B ck={ck}", bytes.len()));
+                std::process::exit(0);
+            }
+            let raw = std::fs::read(&snap_path).expect("read snap");
+            let ck = u32::from_le_bytes(raw[0..4].try_into().unwrap());
+            let mut off = 4usize;
+            let mut expect = Vec::new();
+            while off < raw.len() {
+                let n = u64::from_le_bytes(raw[off..off + 8].try_into().unwrap()) as usize;
+                off += 8;
+                let mut v = Vec::with_capacity(n);
+                for _ in 0..n {
+                    v.push(f32::from_le_bytes(raw[off..off + 4].try_into().unwrap()));
+                    off += 4;
+                }
+                expect.push(v);
+            }
+            rdna_compute::norm::restore_gdn_requant_frame_checkpoint(ck);
+            log(&format!("restored checkpoint ck={ck}, running"));
+            qwen35::forward_prefill_batch(
+                &mut gpu, &weights, &config, &toks, 0, &mut kv, &mut dn, &scratch, None,
+                Some(&hbuf), None, None,
+            )
+            .expect("cmp forward");
+            gpu.hip.device_synchronize().expect("sync");
+            let got = [
+                gpu.download_f32(&scratch.logits).expect("logits"),
+                gpu.download_f32(&hbuf).expect("hidden"),
+                gpu.download_f32(&dn.s_scales[0]).expect("sc0"),
+                gpu.download_f32(&dn.conv_states[0]).expect("cv0"),
+            ];
+            let mut fails = 0;
+            for (name, (x, y)) in ["logits", "hidden", "scales", "conv"]
+                .iter()
+                .zip(expect.iter().zip(got.iter()))
+            {
+                if x == y {
+                    log(&format!("  ok   {name} ({} f32)", x.len()));
+                } else {
+                    let nd = x.iter().zip(y.iter()).filter(|(p, q)| p != q).count();
+                    fails += 1;
+                    log(&format!("  DIFF {name}: {nd}/{} f32 differ", x.len()));
+                }
+            }
+            log(&format!("driver-test: {}", if fails == 0 { "PASS" } else { "FAIL" }));
+            std::fs::write(out_dir.join("census-driver.txt"), &out).ok();
+            std::process::exit(if fails == 0 { 0 } else { 1 });
+        }
 
         // Fresh state, same sizes (steady-state census, no growth inside).
         let mut kv =
