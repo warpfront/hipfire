@@ -1,0 +1,6 @@
+kernel.iu4_prefill
+  model:       qwen3.8:27b-mq4-xt
+  value:       true
+  source:      built-in
+  scope:       Process
+  about:       Enable W4A4 iu4-direct MMQ prefill (default on; exact gfx1100/gfx1151/gfx1201 admit the route and other architectures fall through unchanged). Set kernel.iu4_prefill=false globally or per model to opt out; HIPFIRE_IU4_PREFILL is a developer override.

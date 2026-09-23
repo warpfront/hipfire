@@ -1,0 +1,9 @@
+kernel.iu4_prefill
+  value:       true
+  source:      built-in
+  default:     true
+  category:    Kernel
+  scope:       Process
+  registry:    false
+  legacy env:  HIPFIRE_IU4_PREFILL
+  about:       Enable W4A4 iu4-direct MMQ prefill (default on; exact gfx1100/gfx1151/gfx1201 admit the route and other architectures fall through unchanged). Set kernel.iu4_prefill=false globally or per model to opt out; HIPFIRE_IU4_PREFILL is a developer override.
