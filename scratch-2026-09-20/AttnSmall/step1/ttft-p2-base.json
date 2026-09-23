@@ -1,0 +1,73 @@
+{
+  "protocol": "client-ttft-v1",
+  "model": "qwen3.8:27b-mq4-xt",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1201",
+    "hip_version": "7.15",
+    "vram_free_mb": 16840,
+    "vram_total_mb": 32624,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "max_tokens": 1,
+  "runs": 8,
+  "warmups": 2,
+  "batch": 1,
+  "prompt_tokens": 5909,
+  "prompt_md5": "ed720348b81a19fab64d4783c75c1ae3",
+  "prompt_chars": 24535,
+  "ttft": {
+    "samples": [
+      2059.250474,
+      2061.721908,
+      2062.869727,
+      2071.8147679999997,
+      2073.116827,
+      2071.320176,
+      2067.401831,
+      2066.811207
+    ],
+    "median": 2067.106519,
+    "stdev": 4.7967807260373485,
+    "prompt_tokens": 5909,
+    "prompt_md5": "ed720348b81a19fab64d4783c75c1ae3"
+  },
+  "pp_tok_s": {
+    "median": 2858.5852089806503,
+    "mean": 2859.0405975158073,
+    "min": 2850.297640268973,
+    "max": 2869.4906591532977,
+    "stdev": 6.638065152058573
+  },
+  "pp_tok_s_samples": [
+    2869.4906591532977,
+    2866.0509339652417,
+    2864.4562100357975,
+    2852.088946978681,
+    2850.297640268973,
+    2852.769971763168,
+    2858.176824358244,
+    2858.993593603056
+  ]
+}
