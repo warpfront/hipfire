@@ -1,0 +1,22 @@
+[
+{
+"ctx": 22,
+"cached": 0,
+"gen": 721,
+"finish": "stop",
+"think_words": 336,
+"ans_words": 162,
+"prefill_ms": 31.8,
+"prefill_tok_s": 691.1,
+"decode_tok_s": 195.6,
+"decode_estimated": false,
+"tau": null,
+"ttft_s": 0.224,
+"wall_s": 3.721,
+"attractor": false,
+"empty": false,
+"runaway": false,
+"ans_preview": "Flagstaff, Arizona's name originates from a physical **flagstaff** erected in **1875** by ",
+"assistant_content": "Flagstaff, Arizona's name originates from a physical **flagstaff** erected in **1875** by telegraph workers and pioneers establishing a camp near the San Francisco Peaks. \n\nWhen a group led by John Farabee was extending the transcontinental telegraph line to the Southwest, they chose a high hill (now known as Fort Hill) overlooking the valley to set up their camp. To mark the location for travelers and create a visible landmark, they cut down a tall pine tree, stripped its branches, raised it vertically, and flew a flag from its top. This conspicuous wooden pole quickly became known locally as \"the Flagstaff,\" and by 1876 the settlement officially adopted the name.\n\nThe original staff was later replaced with a more permanent iron one, but the geographical nickname stuck. The town was formally incorporated under that name, turning a simple trail marker into the city's identity. Today, a replica of the original flagstaff stands in downtown Flagstaff near where the landmark once marked the horizon."
+}
+]
