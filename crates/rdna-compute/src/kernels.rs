@@ -1152,6 +1152,30 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+/// gfx1201 `_v2` twins of the slices-2 RMSNorm IU4 producers
+/// (`HIPFIRE_G12_NORM`, default on): the sum-of-squares pass keeps up to 20
+/// row loads in flight per wave instead of one, and the RTN codes use one
+/// reciprocal per lane with an exact near-tie divide fallback. Same launch
+/// geometry and arguments; bit-identical `block_i4_128` and `x_rot`.
+pub const FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_RTN_RCP 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_i4_gfx12_v2\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    "#define HIPFIRE_IU4_RTN_RCP 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_RMSNORM_P1A_BATCHED 1\n",
+    "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2\n",
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
+);
 /// gfx1201 FP8-stream producer: RMSNorm/FWHT + in-register whole-row scale +
 /// E4M3 pack under distinct entry symbols so HSACO caches and profiler rows
 /// cannot alias any other fusion. Emits byte-identical
@@ -1373,6 +1397,25 @@ pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
     "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+/// gfx1201 `_v2` twins of the slices-4 gated-norm IU4 producers
+/// (`HIPFIRE_G12_NORM`, default on): one wave per 256-group with every
+/// element load issued up front. Grid [ceil((K/256)/2), N], block 64, 2 KiB
+/// LDS; bit-identical `block_i4_128` and `x_rot`.
+pub const GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_gfx12_v2\n",
+    include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
+);
+pub const GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ 1\n",
+    "#define HIPFIRE_GATED_NORM_WAVE_GROUP 1\n",
+    "#define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_awq_i4_gfx12_v2\n",
     include_str!("../../../kernels/src/gated_norm_mq_rotate_quant.gfx12.hip")
 );
 /// gfx1201 FP8-stream gated-norm producer for the LA output projection.

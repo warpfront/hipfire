@@ -3392,7 +3392,9 @@ impl Gpu {
     /// sidecar under the `_gfx12` entry symbols. `x_rot = None` skips the f32
     /// store (emit_f32=false). `awq = Some` selects the AWQ twin symbol.
     /// Seals `reservation` into a prepared handle — never calls
-    /// `ensure_int4_mmq_x`. Gated by `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`.
+    /// `ensure_int4_mmq_x`. Gated by `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`;
+    /// `HIPFIRE_G12_NORM` (default on) selects the bit-identical `_v2` twins
+    /// (same geometry and arguments).
     pub fn fused_rmsnorm_rotate_mq_i4_gfx12_batched(
         &mut self,
         x: &GpuTensor,
@@ -3412,16 +3414,27 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let v2 = self.flags.g12_norm_enabled();
+        let (module, source, kernel) = match (awq.is_some(), v2) {
+            (true, false) => (
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_awq_i4_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "fused_rmsnorm_mq_rotate_i4_gfx12",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_SRC,
                 "fused_rmsnorm_mq_rotate_i4_gfx12",
+            ),
+            (true, true) => (
+                "fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i4_gfx12_v2",
+            ),
+            (false, true) => (
+                "fused_rmsnorm_mq_rotate_i4_gfx12_v2",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC,
+                "fused_rmsnorm_mq_rotate_i4_gfx12_v2",
             ),
         };
         self.ensure_kernel(module, source, kernel)?;
@@ -4454,7 +4467,9 @@ impl Gpu {
     /// downstream reader). Requires `head_dim == 128`, `K % 256 == 0`, exact
     /// gfx1201. `awq = Some` selects the AWQ twin. Seals `reservation` into
     /// a prepared handle — never calls `ensure_int4_mmq_x`. Gated by
-    /// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`.
+    /// `HIPFIRE_GFX12_PRODUCER_QUANT_FUSED`; `HIPFIRE_G12_NORM` (default on)
+    /// selects the bit-identical `_v2` twins (one wave per 256-group, two
+    /// groups per 64-thread workgroup).
     #[allow(clippy::too_many_arguments)]
     pub fn gated_norm_rotate_mq_i4_gfx12_batched(
         &mut self,
@@ -4498,18 +4513,31 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match awq {
-            Some(_) => (
+        let v2 = self.flags.g12_norm_enabled();
+        let (module, source, kernel) = match (awq.is_some(), v2) {
+            (true, false) => (
                 "gated_norm_mq_rotate_awq_i4_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_SRC,
                 "gated_norm_mq_rotate_awq_i4_gfx12",
             ),
-            None => (
+            (false, false) => (
                 "gated_norm_mq_rotate_i4_gfx12",
                 kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_SRC,
                 "gated_norm_mq_rotate_i4_gfx12",
             ),
+            (true, true) => (
+                "gated_norm_mq_rotate_awq_i4_gfx12_v2",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC,
+                "gated_norm_mq_rotate_awq_i4_gfx12_v2",
+            ),
+            (false, true) => (
+                "gated_norm_mq_rotate_i4_gfx12_v2",
+                kernels::GATED_NORM_MQ_ROTATE_I4_GFX12_V2_SRC,
+                "gated_norm_mq_rotate_i4_gfx12_v2",
+            ),
         };
+        // v2: two 256-groups (one per wave) per 64-thread workgroup.
+        let grid_x = if v2 { (k / 256).div_ceil(2) } else { k / 256 };
         self.ensure_kernel(module, source, kernel)?;
         let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
         let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
@@ -4564,7 +4592,7 @@ impl Gpu {
         );
         let result = self.launch_maybe_blob(
             kernel,
-            [(k / 256) as u32, batch_size as u32, 1],
+            [grid_x as u32, batch_size as u32, 1],
             [64, 1, 1],
             0,
             &mut params,

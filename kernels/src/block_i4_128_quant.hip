@@ -51,6 +51,21 @@ static_assert(sizeof(block_i4_128) == 72, "bad block size");
 // 8-candidate body. IU4_A4_CANDIDATES selects the fused producer search: 8 is
 // the full grid, 4 keeps {0,2,5,7}, 2 keeps the measured-most-selected {5,7},
 // and 1 is plain RTN with d=max(abs(x))/7.
+//
+// -DHIPFIRE_IU4_RTN_RCP=1 (gfx1201 `_v2` RMSNorm producers, RTN only) forms
+// the producer codes with one IEEE reciprocal per lane instead of four
+// divides; the codes are bit-identical. With r = RN(1/d) and y = RN(x*r),
+// |y - x/d| <= |x/d| * (2^-24 + 2^-24 + 2^-48) < 2^-20.2 because
+// |x/d| <= 7(1 + 2^-24). If the computed distance from y to the nearest
+// half-integer exceeds 2^-19 (the subtraction may be contracted with the
+// product: error <= 2^-22 + 2^-25), x/d is more than
+// 2^-19 - 2^-22 - 2^-25 - 2^-20.2 > 2^-21 from every half-integer, so
+// RN(x/d) (within half an ulp, <= 2^-22 below 8) is not a tie and lies in
+// y's rounding cell:
+// rint(y) == rint(RN(x/d)). Any lane with a value inside that window
+// recomputes its four codes with the divide. amax outside [2^-100, FLT_MAX]
+// (zero, tiny, Inf, NaN) keeps the divide; NaN elements clamp to -8 either
+// way (fmaxf(NaN, -8) = -8).
 template <bool ProducerCandidateSet>
 __device__ __forceinline__ void quantize_block_i4_128_wave(
     const float xv[4],
@@ -133,12 +148,42 @@ __device__ __forceinline__ void quantize_block_i4_128_wave(
     }
 
     int q4[4];
+#if defined(HIPFIRE_IU4_RTN_RCP) && IU4_A4_CANDIDATES == 1
+    if (ProducerCandidateSet && amax >= 0x1p-100f && amax <= 0x1.fffffep+127f) {
+        const float r = 1.0f / best_d;
+        float qf[4];
+        bool near_half = false;
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float y = xv[e] * r;
+            qf[e] = rintf(y);
+            near_half |= (0.5f - fabsf(y - qf[e])) <= 0x1p-19f;
+        }
+        if (near_half) {
+            #pragma unroll
+            for (int e = 0; e < 4; ++e) qf[e] = rintf(xv[e] / best_d);
+        }
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float q = fminf(fmaxf(qf[e], -8.0f), 7.0f);
+            q4[e] = (int)q;
+        }
+    } else {
+        #pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            float q = (amax == 0.0f) ? 0.0f : rintf(xv[e] / best_d);
+            q = fminf(fmaxf(q, -8.0f), 7.0f);
+            q4[e] = (int)q;
+        }
+    }
+#else
     #pragma unroll
     for (int e = 0; e < 4; ++e) {
         float q = (amax == 0.0f) ? 0.0f : rintf(xv[e] / best_d);
         q = fminf(fmaxf(q, -8.0f), 7.0f);
         q4[e] = (int)q;
     }
+#endif
     int s = q4[0] + q4[1] + q4[2] + q4[3];
     for (int offset = 16; offset > 0; offset >>= 1) {
         s += __shfl_xor(s, offset, 32);

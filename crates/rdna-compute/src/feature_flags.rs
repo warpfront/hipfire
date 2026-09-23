@@ -263,6 +263,13 @@ pub struct FeatureFlags {
     /// Bit-identical vs the producer+quantizer chain; any byte difference
     /// kills it.
     pub gfx12_producer_quant_fused: bool,
+    /// gfx1201 `_v2` RMSNorm and gated-norm IU4 producers (`HIPFIRE_G12_NORM`,
+    /// `kernel.g12_norm`). Default ON on exact gfx1201; `=0` restores the
+    /// incumbent `_gfx12` symbols. The RMSNorm twin batches its
+    /// sum-of-squares loads and forms RTN codes with one reciprocal per lane;
+    /// the gated-norm twin runs one wave per 256-group. Bit-identical outputs;
+    /// any byte difference kills it.
+    pub g12_norm: bool,
     /// gfx11 sigmoid/gated-norm + int4 quant fusions
     /// (`HIPFIRE_GFX11_PRODUCER_QUANT_FUSED`,
     /// `kernel.gfx11_producer_quant_fused`). Default ON on gfx1100/gfx1151;
@@ -701,6 +708,7 @@ impl FeatureFlags {
                 .unwrap_or(arch == "gfx1201"),
             gfx12_producer_quant_fused: parse_bool("HIPFIRE_GFX12_PRODUCER_QUANT_FUSED")
                 .unwrap_or(arch == "gfx1201"),
+            g12_norm: parse_bool("HIPFIRE_G12_NORM").unwrap_or(arch == "gfx1201"),
             gfx11_producer_quant_fused: parse_bool("HIPFIRE_GFX11_PRODUCER_QUANT_FUSED")
                 .unwrap_or(matches!(arch, "gfx1100" | "gfx1151")),
             gfx12_fp8_stream: parse_bool("HIPFIRE_GFX12_FP8_STREAM")
@@ -884,6 +892,11 @@ impl FeatureFlags {
     pub fn gfx12_producer_quant_fused_enabled(&self) -> bool {
         self.gfx12_producer_quant_fused && self.arch == "gfx1201"
     }
+    /// True only on exact gfx1201 with `HIPFIRE_G12_NORM` on: the
+    /// slices-2/4 producers launch their bit-identical `_v2` twins.
+    pub fn g12_norm_enabled(&self) -> bool {
+        self.g12_norm && self.arch == "gfx1201"
+    }
     /// True only on gfx1100/gfx1151 with the opt-in set. The `_gfx11`
     /// sigmoid/gated-norm producers emit the shared `block_i4_128` recipe,
     /// so output is bit-identical to the standalone
@@ -1042,6 +1055,7 @@ impl FeatureFlags {
             gfx12_gdn_chunk_scan: false,
             gfx12_silu_quant_fused: false,
             gfx12_producer_quant_fused: false,
+            g12_norm: false,
             gfx11_producer_quant_fused: false,
             gfx12_fp8_stream: false,
             residual_ldsstage: false,

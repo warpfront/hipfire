@@ -37,11 +37,110 @@
 //
 // Grid: [groups_per_row, N, 1] (groups_per_row = K/256 = n_heads/2).
 // Block: [64, 1, 1]. LDS: 256 floats (one group, incumbent handoff).
+//
+// -DHIPFIRE_GATED_NORM_WAVE_GROUP=1 (gfx1201 `_v2` symbols): one wave owns a
+// whole 256-group, both heads. It issues all 28 of the group's element loads
+// (x, z, awq per head; weight) before any arithmetic, where the incumbent's
+// two runtime lane loops waited on every load (8 serialized DRAM round trips
+// per wave) and left the second wave idle through Phase B. Per head, the
+// same per-lane fma chain from +0 (explicit, so the backend cannot pair the
+// unrolled products differently), XOR tree, rsqrt and per-element
+// expressions; the transpose stays in LDS, private to the wave. Waves never
+// share LDS, so the handoff needs no workgroup barrier.
+// Grid: [ceil(groups_per_row / HIPFIRE_GATED_NORM_WAVES), N, 1].
+// Block: [32 * HIPFIRE_GATED_NORM_WAVES, 1, 1] (default 2 waves).
 
 #ifndef HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL
 #define HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL gated_norm_mq_rotate_i4_gfx12
 #endif
 
+#ifdef HIPFIRE_GATED_NORM_WAVE_GROUP
+#ifndef HIPFIRE_GATED_NORM_WAVES
+#define HIPFIRE_GATED_NORM_WAVES 2
+#endif
+extern "C" __launch_bounds__(32 * HIPFIRE_GATED_NORM_WAVES)
+__global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
+    const float* __restrict__ x,
+    const float* __restrict__ z,
+    const float* __restrict__ weight,
+#ifdef HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ
+    const float* __restrict__ awq_scale,   // [K], FP32, unrotated basis
+#endif
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    float* __restrict__ x_rot,             // nullable when emit_f32=false
+    block_i4_128* __restrict__ x_i4,       // [K/128, N] block_i4_128
+    int n_heads,
+    int head_dim,
+    float eps,
+    int K,
+    int N)
+{
+    if (head_dim != 128) return;
+
+    const int tid = threadIdx.x;
+    const int wave = tid >> 5;
+    const int lane = tid & 31;
+    const int group = blockIdx.x * HIPFIRE_GATED_NORM_WAVES + wave;
+    const int batch = blockIdx.y;
+    const int groups_per_row = K / 256;
+    if (group >= groups_per_row) return;
+    if (group * 2 + 1 >= n_heads) return;
+
+    const long long batch_off = (long long)batch * K;
+    const float* xg = x + batch_off + (long long)group * 256;
+    const float* zg = z + batch_off + (long long)group * 256;
+
+    __shared__ float normalized_waves[HIPFIRE_GATED_NORM_WAVES * 256];
+    float* normalized = normalized_waves + wave * 256;
+
+    // Every element head h, lane, k = 0..3 touches: i = lane + 32*k, the
+    // incumbent lane loops' ownership.
+    float xv[2][4], zv[2][4], wv[4];
+#ifdef HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ
+    float av[2][4];
+#endif
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            xv[h][k] = xg[h * 128 + lane + 32 * k];
+            zv[h][k] = zg[h * 128 + lane + 32 * k];
+#ifdef HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ
+            av[h][k] = awq_scale[(long long)group * 256 + h * 128 + lane + 32 * k];
+#endif
+        }
+    }
+    #pragma unroll
+    for (int k = 0; k < 4; ++k) wv[k] = weight[lane + 32 * k];
+
+    // Phase A per head: gated_norm_f32's accumulation and XOR reduction.
+    #pragma unroll
+    for (int h = 0; h < 2; ++h) {
+        float sq_sum = 0.0f;
+        #pragma unroll
+        for (int k = 0; k < 4; ++k)
+            sq_sum = __fmaf_rn(xv[h][k], xv[h][k], sq_sum);
+        for (int o = 16; o > 0; o >>= 1)
+            sq_sum += __shfl_xor(sq_sum, o);
+        const float inv_rms = rsqrtf(sq_sum / (float)head_dim + eps);
+        #pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            const float normed = xv[h][k] * inv_rms * wv[k];
+            const float z_val = zv[h][k];
+            const float silu_z = z_val / (1.0f + expf(-z_val));
+#ifdef HIPFIRE_GATED_NORM_MQ_ROTATE_AWQ
+            normalized[h * 128 + lane + 32 * k] = normed * silu_z / av[h][k];
+#else
+            normalized[h * 128 + lane + 32 * k] = normed * silu_z;
+#endif
+        }
+    }
+    // Wave-private LDS handoff: order this wave's stores before its loads.
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+#else
 extern "C" __launch_bounds__(64, 8)
 __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     const float* __restrict__ x,
@@ -110,6 +209,7 @@ __global__ void HIPFIRE_GATED_NORM_MQ_ROTATE_KERNEL(
     // Phase B: mq_rotate_x's original lane ownership and butterfly.
     // Each 256-value MQ group spans exactly two normalized heads.
     if (wave != 0) return;
+#endif
     const int d0 = lane * 8;
     const float4 x0 = *reinterpret_cast<const float4*>(normalized + d0);
     const float4 x1 = *reinterpret_cast<const float4*>(normalized + d0 + 4);
