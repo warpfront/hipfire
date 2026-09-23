@@ -1,0 +1,119 @@
+DEVICE arch=gfx1100 name=AMD Radeon RX 7900 XTX mps=48 ROCR=0 HIP=0 pid=1890774
+OBJECT X5_OBJECT=/home/kaden/hipfire-x5/scratch-x5/gfx1100-8192/home/.hipfire_kernels/gfx1100/gemm_mq4g256v2_residual_mmq_iu4_gfx11_x5_symfold.936038d287cc3b6f.hsaco
+OBJECT EXTRA_V2C_MS_OBJECT=/home/kaden/hipfire-prof040/scratch-gemmv2/bin/v2c-ms-gfx1100.hsaco
+OBJECT V2CP_OBJECT=/home/kaden/hipfire-gemmv2/scratch-gemmv2integ/bin/v2cp3-gfx1100.hsaco
+RESOURCE arm=x5 add=0 vgpr=92 private=0 static_lds=0 dynamic_lds=30720 blocks_per_mp=2 waves_per_mp=32
+RESOURCE arm=x5 add=1 vgpr=92 private=0 static_lds=0 dynamic_lds=30720 blocks_per_mp=2 waves_per_mp=32
+RESOURCE arm=v2c_ms add=0 vgpr=177 private=0 static_lds=0 dynamic_lds=32768 blocks_per_mp=2 waves_per_mp=16
+RESOURCE arm=v2c_ms add=1 vgpr=177 private=0 static_lds=0 dynamic_lds=32768 blocks_per_mp=2 waves_per_mp=16
+RESOURCE arm=v2c_prod add=0 vgpr=179 private=0 static_lds=0 dynamic_lds=32768 blocks_per_mp=2 waves_per_mp=16
+RESOURCE arm=v2c_prod add=1 vgpr=179 private=0 static_lds=0 dynamic_lds=32768 blocks_per_mp=2 waves_per_mp=16
+ORACLE arm=x5 corpus=hashed M=256 K=256 N=256 add=0 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=256 K=256 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=256 K=256 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=hashed M=256 K=256 N=256 add=1 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=256 K=256 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=256 K=256 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=hashed M=256 K=512 N=256 add=0 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=256 K=512 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=256 K=512 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=hashed M=256 K=512 N=256 add=1 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=256 K=512 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=256 K=512 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=hashed M=256 K=5120 N=256 add=0 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=256 K=5120 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=256 K=5120 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=hashed M=256 K=5120 N=256 add=1 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=256 K=5120 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=256 K=5120 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=hashed M=256 K=6144 N=256 add=0 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=256 K=6144 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=256 K=6144 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=hashed M=256 K=6144 N=256 add=1 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=256 K=6144 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=256 K=6144 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=hashed M=256 K=17408 N=256 add=0 onehot_k=-1 compared=65536 cpu_checked=0 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=256 K=17408 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=256 K=17408 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=hashed M=256 K=17408 N=256 add=1 onehot_k=-1 compared=65536 cpu_checked=0 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=256 K=17408 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=256 K=17408 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=witness M=256 K=256 N=256 add=0 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=witness M=256 K=256 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=witness M=256 K=256 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=witness M=256 K=256 N=256 add=1 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=witness M=256 K=256 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=witness M=256 K=256 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=witness M=256 K=512 N=256 add=0 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=witness M=256 K=512 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=witness M=256 K=512 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=witness M=256 K=512 N=256 add=1 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=witness M=256 K=512 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=witness M=256 K=512 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=extrema M=256 K=512 N=256 add=0 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=extrema M=256 K=512 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=extrema M=256 K=512 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=extrema M=256 K=512 N=256 add=1 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=extrema M=256 K=512 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=extrema M=256 K=512 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=scales M=256 K=1024 N=256 add=0 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=scales M=256 K=1024 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=scales M=256 K=1024 N=256 add=0 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=scales M=256 K=1024 N=256 add=1 onehot_k=-1 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=scales M=256 K=1024 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=scales M=256 K=1024 N=256 add=1 onehot_k=-1 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=512 N=256 add=0 onehot_k=0 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=512 N=256 add=0 onehot_k=0 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=512 N=256 add=0 onehot_k=0 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=512 N=256 add=1 onehot_k=0 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=512 N=256 add=1 onehot_k=0 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=512 N=256 add=1 onehot_k=0 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=512 N=256 add=0 onehot_k=127 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=512 N=256 add=0 onehot_k=127 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=512 N=256 add=0 onehot_k=127 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=512 N=256 add=1 onehot_k=127 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=512 N=256 add=1 onehot_k=127 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=512 N=256 add=1 onehot_k=127 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=512 N=256 add=0 onehot_k=128 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=512 N=256 add=0 onehot_k=128 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=512 N=256 add=0 onehot_k=128 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=512 N=256 add=1 onehot_k=128 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=512 N=256 add=1 onehot_k=128 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=512 N=256 add=1 onehot_k=128 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=512 N=256 add=0 onehot_k=255 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=512 N=256 add=0 onehot_k=255 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=512 N=256 add=0 onehot_k=255 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=512 N=256 add=1 onehot_k=255 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=512 N=256 add=1 onehot_k=255 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=512 N=256 add=1 onehot_k=255 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=512 N=256 add=0 onehot_k=256 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=512 N=256 add=0 onehot_k=256 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=512 N=256 add=0 onehot_k=256 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=512 N=256 add=1 onehot_k=256 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=512 N=256 add=1 onehot_k=256 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=512 N=256 add=1 onehot_k=256 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=512 N=256 add=0 onehot_k=511 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=512 N=256 add=0 onehot_k=511 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=512 N=256 add=0 onehot_k=511 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=512 N=256 add=1 onehot_k=511 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=512 N=256 add=1 onehot_k=511 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=512 N=256 add=1 onehot_k=511 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=5120 N=256 add=0 onehot_k=5119 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=5120 N=256 add=0 onehot_k=5119 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=5120 N=256 add=0 onehot_k=5119 compared=65536 differing=0
+ORACLE arm=x5 corpus=onehot M=256 K=5120 N=256 add=1 onehot_k=5119 compared=65536 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=onehot M=256 K=5120 N=256 add=1 onehot_k=5119 compared=65536 differing=0
+ORACLE arm=v2c_prod corpus=onehot M=256 K=5120 N=256 add=1 onehot_k=5119 compared=65536 differing=0
+ORACLE arm=x5 corpus=hashed M=512 K=1024 N=768 add=0 onehot_k=-1 compared=393216 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=512 K=1024 N=768 add=0 onehot_k=-1 compared=393216 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=512 K=1024 N=768 add=0 onehot_k=-1 compared=393216 differing=0
+ORACLE arm=x5 corpus=hashed M=512 K=1024 N=768 add=1 onehot_k=-1 compared=393216 cpu_checked=1 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=512 K=1024 N=768 add=1 onehot_k=-1 compared=393216 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=512 K=1024 N=768 add=1 onehot_k=-1 compared=393216 differing=0
+ORACLE arm=x5 corpus=hashed M=768 K=1536 N=512 add=0 onehot_k=-1 compared=393216 cpu_checked=0 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=768 K=1536 N=512 add=0 onehot_k=-1 compared=393216 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=768 K=1536 N=512 add=0 onehot_k=-1 compared=393216 differing=0
+ORACLE arm=x5 corpus=hashed M=768 K=1536 N=512 add=1 onehot_k=-1 compared=393216 cpu_checked=0 cpu_differing=0
+ORACLE arm=v2c_ms corpus=hashed M=768 K=1536 N=512 add=1 onehot_k=-1 compared=393216 differing=0
+ORACLE arm=v2c_prod corpus=hashed M=768 K=1536 N=512 add=1 onehot_k=-1 compared=393216 differing=0
+ORACLE_PASS total_v2_outputs_compared=7340032

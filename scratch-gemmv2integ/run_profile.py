@@ -33,7 +33,7 @@ def run(arch, length):
         if name.startswith('HIPFIRE_') and name not in (
             'HIPFIRE_DAEMON_BIN', 'HIPFIRE_ROCPROF_DAEMON_TARGET', 'HIPFIRE_ROCPROF_OUTPUT_DIR'):
             del env[name]
-    prompt_path = Path('/home/kaden/hipfire-gemmv2/benchmarks/prompts') / f'pp{length}.txt'
+    prompt_path = Path('/home/kaden/hipfire-prof040/benchmarks/prompts') / f'pp{length}.txt'
     prompt = prompt_path.read_text()
     (dest / 'prompt.md5').write_text(f'{hashlib.md5(prompt_path.read_bytes()).hexdigest()}  {prompt_path}\n')
     def capture(cmd, name):
@@ -102,7 +102,12 @@ def run(arch, length):
                 for row in (dest / 'pids-ready.txt').read_text().splitlines():
                     fields = row.split()
                     if len(fields) > 1 and fields[0].isdigit() and fields[1] != 'gpusentry':
-                        pids.append(int(fields[0]))
+                        # Other agents' daemons on the other card are not ours.
+                        try:
+                            if process_env(int(fields[0])).get('HOME') == str(home):
+                                pids.append(int(fields[0]))
+                        except (FileNotFoundError, PermissionError):
+                            pass
                 for pid in pids:
                     child = process_env(pid)
                     assertion.write(f'daemon pid={pid} ROCR_VISIBLE_DEVICES={child.get("ROCR_VISIBLE_DEVICES")} HIP_VISIBLE_DEVICES={child.get("HIP_VISIBLE_DEVICES")}\n')

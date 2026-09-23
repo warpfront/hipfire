@@ -1,0 +1,2 @@
+parent pid=1905211 ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 HOME=/home/kaden/hipfire-gemmv2/scratch-gemmv2integ/trace/gfx1100-8192/home
+daemon pid=1905213 ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0

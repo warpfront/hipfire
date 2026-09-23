@@ -1,0 +1,109 @@
+{
+  "protocol": "synthetic-pp-tg-matrix-v1",
+  "model": "/home/kaden/.hipfire/models/qwen3.8-27b.mq4v2.xt.sym-a035.qat-r7s200.hfq",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3_5",
+    "dim": 5120,
+    "layers": 64,
+    "vocab": 248320,
+    "vl": false,
+    "reasoning_contract": "qwen_jinja",
+    "reasoning_effort_native": true,
+    "reasoning_efforts": [
+      "low",
+      "medium",
+      "xhigh"
+    ],
+    "cache_capable": true,
+    "retry_reset_eligible": true,
+    "continuous_batch_capable": false,
+    "kv_backend_request": "explicit",
+    "kv_backend": "vmm",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "max_seq": 249344,
+    "max_seq_bound": "card",
+    "max_seq_reason": null,
+    "model_ctx": 262144,
+    "card_cap": 249344,
+    "kv_mode": "q8"
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "vram_free_mb": 8848,
+    "vram_total_mb": 24560,
+    "model_loaded": true,
+    "model_arch": "qwen3_5",
+    "kernels": 0,
+    "kernel_hashes": 0,
+    "kv_backend": "vmm",
+    "kv_backend_request": "explicit",
+    "kv_backend_reason": null,
+    "kv_backend_legacy": false,
+    "kv_backend_warning": null,
+    "kv_mode": "q8"
+  },
+  "redline_pm4": false,
+  "kv_mode": "q8",
+  "runs": 3,
+  "prefill": [
+    {
+      "tokens": 512,
+      "stats": {
+        "median": 2556.7,
+        "mean": 2553.133333333333,
+        "min": 2545.6,
+        "max": 2557.1,
+        "stdev": 5.329373529995999
+      },
+      "samples": [
+        2545.6,
+        2556.7,
+        2557.1
+      ]
+    },
+    {
+      "tokens": 8192,
+      "stats": {
+        "median": 2562.5,
+        "mean": 2562.5333333333333,
+        "min": 2562.0,
+        "max": 2563.1,
+        "stdev": 0.4496912521076965
+      },
+      "samples": [
+        2563.1,
+        2562.5,
+        2562.0
+      ]
+    }
+  ],
+  "decode": [
+    {
+      "context": 128,
+      "tokens": 128,
+      "stats": {
+        "median": 49.05318556771431,
+        "mean": 49.049184476901054,
+        "min": 49.04115573290223,
+        "max": 49.053212130086614,
+        "stdev": 0.0056771896826294825
+      },
+      "samples": [
+        49.04115573290223,
+        49.05318556771431,
+        49.053212130086614
+      ]
+    }
+  ],
+  "sustained": [],
+  "kv_backend": "vmm",
+  "kv_backend_request": "explicit",
+  "kv_backend_reason": null,
+  "kv_backend_legacy": false,
+  "kv_backend_warning": null
+}

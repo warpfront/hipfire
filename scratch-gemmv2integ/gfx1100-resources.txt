@@ -1,0 +1,3 @@
+GPU dev 0: gfx1100
+gemm_mq4g256v2_residual_iu4_v2c_set_gfx11: 179 VGPR, 0 private bytes, 0 static LDS, dynamic LDS 32768, 2 blocks/MP (16 waves)
+gemm_mq4g256v2_residual_iu4_v2c_add_gfx11: 179 VGPR, 0 private bytes, 0 static LDS, dynamic LDS 32768, 2 blocks/MP (16 waves)
