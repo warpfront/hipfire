@@ -29531,7 +29531,7 @@ impl Gpu {
             && self.mq4v2_symmetric
             && self.flags.gfx11_iu4_symfold
             && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
-            && hipfire_config::developer_var("HIPFIRE_IU4_BAFOLD").as_deref() == Ok("1")
+            && hipfire_config::developer_var("HIPFIRE_IU4_BAFOLD").as_deref() != Ok("0")
             && qkv_m > 0
             && qkv_m % 128 == 0
             && z_m > 0
