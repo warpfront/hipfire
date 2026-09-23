@@ -1,0 +1,26 @@
+Command before moving killed sources to scratch:
+hipcc -O3 --offload-arch=gfx1201 --cuda-device-only -S kernels/src/gdn_wy_carry_output_q8.gfx1201.hip -o /tmp/gdn_resident.s
+
+ISA footer / AMDGPU metadata:
+codeLenInByte = 33016
+TotalNumSgprs: 77
+NumVgprs: 170
+ScratchSize: 0
+LDSByteSize: 21504 bytes/workgroup
+Occupancy: 8
+COMPUTE_PGM_RSRC2:SCRATCH_EN: 0
+.group_segment_fixed_size: 21504
+.private_segment_fixed_size: 0
+.sgpr_count: 77
+.sgpr_spill_count: 0
+.vgpr_count: 170
+.vgpr_spill_count: 0
+.wavefront_size: 32
+.workgroup_processor_mode: 1
+target: amdgcn-amd-amdhsa--gfx1201
+
+SHA256 (content hashes; killed sources subsequently moved under this evidence directory):
+63db8b95593dbe2de9e43c3af111710c7c186756eb9dde53d121a14ef56e5b1d  gdn_wy_carry_output_q8.gfx1201.hip
+935e6218b8d5442ebc050c3f626073db8ac7703f995eb9b1e80a3e4b7c0770e0  gdn_resident_probe.hip
+ac7fc6741a219b86710a9b7c074b8a928ae8a64e71000eb53eedc5011e6bf8c4  /tmp/gdn_resident.s
+a02c7f0ce04313a48db4e6ab7c9f500aa9c6b12e4052e9da9b9a0610706a8008  /tmp/gdn_resident_probe

@@ -1,0 +1,21 @@
+Command environment:
+HOME=/home/kaden/.hipfire-homes/ab0
+ROCR_VISIBLE_DEVICES=0
+HIPFIRE_MODELS_DIR=/home/kaden/.hipfire/models
+HIPFIRE_KERNEL_CACHE=/home/kaden/.hipfire-homes/ab0/.hipfire_kernels
+HIPFIRE_GRAPH=1
+HIPFIRE_LLOYD_GFX12=1
+
+Command:
+/tmp/gdn_k3_probe
+
+device=AMD Radeon AI PRO R9700
+geometry=N512 H48 D128 C64 grid=(8,48,1) block=(256,1,1) rows=512
+runtime_active_blocks_per_mp=4
+warmups=5 samples=20
+raw_event_us=350.482,139.560,145.280,143.641,143.041,147.161,145.881,141.041,138.241,144.041,145.561,138.361,141.001,138.521,146.681,146.041,138.920,143.920,148.360,140.600
+median_event_us=143.780
+cpu_f64_first_c64_w_max_abs_delta=3.04273138e-05
+cpu_f64_first_c64_u_max_abs_delta=0.000121279733
+tail_N493_invalid_row_max_abs=0
+gate=ALIVE

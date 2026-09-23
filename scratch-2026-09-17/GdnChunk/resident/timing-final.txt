@@ -1,0 +1,33 @@
+Command environment:
+HOME=/home/kaden/.hipfire-homes/ab0
+ROCR_VISIBLE_DEVICES=0
+HIPFIRE_MODELS_DIR=/home/kaden/.hipfire/models
+HIPFIRE_KERNEL_CACHE=/home/kaden/.hipfire-homes/ab0/.hipfire_kernels
+HIPFIRE_GRAPH=1
+HIPFIRE_LLOYD_GFX12=1
+
+Command:
+/tmp/gdn_resident_probe
+
+Input provenance:
+Actual gdn_pre_batched_gfx1201 output, N512/H48, 656 K1 workgroups; identical prepared q/k/v/gate/beta consumed by candidate and serial. Persistent Q8/sc/EF restored D2D before each timed launch.
+
+device=AMD Radeon AI PRO R9700
+geometry=N512 H48 resident_grid=(48,4,1) block=(256,1,1)
+runtime_active_blocks_per_mp=3
+k1_blocks=656 warmups=3 samples=20
+candidate_k2_plus_resident_raw_us=1796.294,1747.334,1665.694,1598.812,1517.412,1553.333,1572.932,1565.492,1580.293,1602.047,1579.768,1602.648,1596.008,1586.127,1599.368,1617.528,1605.968,1588.127,1572.488,1595.328
+serial_raw_us=503.884,482.884,458.723,430.523,430.483,442.483,443.644,442.363,451.364,453.322,448.042,454.682,448.483,449.362,455.402,453.482,450.643,444.242,445.362,451.762
+candidate_median_us=1595.668
+serial_median_us=450.003
+saving_us=-1145.666
+required_saving_us=68.257
+cpu_f64_output_nrmse=NaN
+cpu_f64_output_max_abs_delta=0.0253348631
+cpu_f64_output_ref_max_abs=0.0348872123
+cpu_f64_final_state_nrmse=NaN
+cpu_f64_final_state_max_abs_delta=415.924874
+cpu_f64_final_state_ref_max_abs=0.0930247734
+numeric_gate=KILL (nonfinite plus error screens)
+performance_gate=KILL
+gate=KILL

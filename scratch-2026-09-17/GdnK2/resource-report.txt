@@ -1,0 +1,20 @@
+Compiler:
+HIP version: 7.15.26333-0000000
+AMD clang 23.0.0git, llvm-project 8f497e0992fb7513f7f78a6f6b6f1056c375e961
+
+Command:
+hipcc -O3 --offload-arch=gfx1201 -Rpass-analysis=kernel-resource-usage crates/saddle-lab/examples/gdn_k2_probe.hip -o /tmp/gdn_k2_probe
+
+-Rpass-analysis=kernel-resource-usage:
+Function Name: gdn_kkt_bc16_solve_gfx1201
+TotalSGPRs: 26
+VGPRs: 62
+ScratchSize [bytes/lane]: 0
+Dynamic Stack: False
+Occupancy [waves/SIMD]: 16
+SGPRs Spill: 0
+VGPRs Spill: 0
+LDS Size [bytes/block]: 16384
+
+Runtime occupancy query at block=256, dynamic_smem=0:
+active_blocks_per_mp=4

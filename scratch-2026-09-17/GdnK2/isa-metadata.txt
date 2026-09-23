@@ -1,0 +1,25 @@
+Command:
+hipcc -O3 --offload-arch=gfx1201 --cuda-device-only -S kernels/src/gdn_kkt_bc16_solve.gfx1201.hip -o /tmp/gdn_k2.s
+
+ISA footer / AMDGPU metadata:
+codeLenInByte = 14604
+TotalNumSgprs: 26
+NumVgprs: 62
+ScratchSize: 0
+LDSByteSize: 16384 bytes/workgroup
+Occupancy: 16
+COMPUTE_PGM_RSRC2:SCRATCH_EN: 0
+.group_segment_fixed_size: 16384
+.private_segment_fixed_size: 0
+.sgpr_count: 26
+.sgpr_spill_count: 0
+.vgpr_count: 62
+.vgpr_spill_count: 0
+.wavefront_size: 32
+.workgroup_processor_mode: 1
+target: amdgcn-amd-amdhsa--gfx1201
+
+SHA256:
+401af90c200c8b8a73e5a89baa650f575d0579ccc5fb3520ccd312117dc44415  kernels/src/gdn_kkt_bc16_solve.gfx1201.hip
+dd24eedc9573d75c92662043290fe2fee96ce5cc565769a83d7556c65278d24e  crates/saddle-lab/examples/gdn_k2_probe.hip
+e0f64fc5f5f4a54676326aaa113534ab73ccff47e49d67e588a60364ad5f776d  /tmp/gdn_k2.s
