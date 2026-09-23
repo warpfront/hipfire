@@ -6,22 +6,12 @@ max_tokens = 128
 prompt_md5 = "d97ec9d3f761ec68093631be27d32441"
 cand_wall = 3.0
 k_exhaust = 10
-agent_harness = "codex"
+agent_harness = "grok"
 [[workers]]
-card = 1
-dev = 1
-model = "gpt-5.6-luna"
-effort = "max"
-[[workers]]
-card = 2
-dev = 2
-model = "gpt-5.6-terra"
-effort = "xhigh"
-[[workers]]
-card = 3
-dev = 3
-model = "gpt-5.6-sol"
-effort = "medium"
+card = 0
+dev = 0
+model = "grok-4.5"
+effort = "high"
 [bounds]
 call_budget = 400
 wall_ttl_s = 43200
