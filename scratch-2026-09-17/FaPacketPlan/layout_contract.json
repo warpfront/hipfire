@@ -1,0 +1,36 @@
+{
+  "PASS": true,
+  "regions": {
+    "K": [
+      0,
+      16384
+    ],
+    "V": [
+      16384,
+      32768
+    ],
+    "scratch": [
+      32768,
+      49152
+    ],
+    "sk": [
+      49152,
+      49280
+    ],
+    "sv": [
+      49280,
+      49408
+    ]
+  },
+  "KT64_dynamic_LDS": 49408,
+  "KT128_payload_only": 65536,
+  "KT128_with_same_scratch_and_scales": 82432,
+  "paired_fragment_bytes": 16,
+  "byte_bijections": 16384,
+  "scratch_words_per_wave": 512,
+  "claim": "host label/address algebra only; no device bank/race/tail correctness or performance claim",
+  "dense_row_ownership_batches_checked": [
+    1,
+    512
+  ]
+}

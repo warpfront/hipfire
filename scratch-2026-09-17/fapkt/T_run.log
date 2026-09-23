@@ -1,0 +1,7 @@
+compare: 72 cases, 0 diffs (K=0 V=0 S=0 R=0)
+round 0: old=7.424/7.207 new=5.343/5.273 us/fill
+round 1: old=7.063/6.738 new=4.994/4.898 us/fill
+round 2: old=6.732/6.782 new=4.899/4.903 us/fill
+round 3: old=6.773/6.778 new=4.885/4.906 us/fill
+round 4: old=6.757/6.791 new=4.883/4.886 us/fill
+fill best: old=6.732 new=4.883 us/fill (27.5% reduction)

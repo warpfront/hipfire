@@ -1,0 +1,61 @@
+{
+  "base": "2c093bd4a4e4e994b832e35a29d7f53b027f4803",
+  "branch": "gfx1201-fapkt-plan",
+  "worktree": "/home/kaden/ClaudeCode/warpfront/wt-fapkt",
+  "ordinal": 0,
+  "compiler": {
+    "hip": "7.15.26333",
+    "clang": "23.0.0git",
+    "llvm_revision": "8f497e0992fb7513f7f78a6f6b6f1056c375e961"
+  },
+  "environment": {
+    "HOME": "/home/kaden/.hipfire-homes/ab0",
+    "ROCR_VISIBLE_DEVICES": "0",
+    "HIPFIRE_MODELS_DIR": "/home/kaden/.hipfire/models",
+    "HIPFIRE_KERNEL_CACHE": "/home/kaden/.hipfire-homes/ab0/.hipfire_kernels",
+    "TMPDIR": "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan"
+  },
+  "sha256": {
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/baseline.s": "da1d7e450931ab120099e0a3ced2ae0b8073e558134999f177a6d63a52426d84",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/baseline_build.log": "cb1a85745bf181b1111875532a4c01c2af1603e93980b0d787b118e370de36a1",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/baseline_flat.txt": "e2fd79caf4c8f113ee501ff201b851b3507825aea00ae01843ba1f42510edce3",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/census.py": "4263be7b0f0509f39380c9cdd0e20a0ccd2645df8e0946c7c856265792eaf43b",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/census.json": "184c4e8940b186cf36ffc643f43fa2630b399efb6b0d20d91d3c14dfb59af5e5",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/census_verified.json": "f91b6ec6adee0a5d0edf06c1bf39345213ef12b0dde1fbd204aa8c3945759f49",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/floor.hip": "9c71f41d08a1a1fdf8dd289c3f76431c202ebe9bf3de7e3a35a982124edc3fd3",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/floor": "52404dc0b1c5fb606b462264a5784eaeb8686f8f14937aae340cdaf02bc2af7f",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/floor_build.log": "9df1ec5680579a8e5aa635d822171fdab5159394578ad40390140c65c8ecb36f",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/floor-hip-amdgcn-amd-amdhsa-gfx1201.s": "a96e7096115aa801d1f5251283fd612f47ba1659b1f80555dc3485a8bf556b98",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/floor_census.json": "5ff03c4860390506fbf06441562ac1db7e566faae87e7d37eb6ec51bb469be01",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/layout_contract.py": "a533676b237261c189c5acc1fa70435a66036622998214d34defd2767a2a0929",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/layout_contract.json": "e888dae1156fe99b98b57f67fa3c7cc60f401ec93266ae4fe87113a2d785823c",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/floor_64_128_128_32768.log": "5c0ba42084afeb4ba502d7632cfc25ccf83ab33f4a58d6f09aee20156e888a06",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/floor_256_128_128_32768.log": "f0e658bc2f43af94ce2f78185c797fd62394a4745cb78279fd736079cb5793ce",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/floor_64_256_128_32768.log": "21bd9b42ea3de43dd63284c893e0644cb26f2d26c0798224a7f5a9b8e8435b39",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/floor_256_256_128_32768.log": "222e52f0543c8761b12eb02c5b072ef796f8ff58d04b1f1fd1340af37673b2d7",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/floor_64_256_128_40960.log": "28f9bc565a70cadcaacc603bd66259e8651bac846a50e944bc127f6ae5583c9e",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/floor_256_256_128_40960.log": "d50ea40388df17d658ac23bda090e53fc5364e34624fb714db1eecaf152927ea",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/final_64_128_512_32768.log": "652a1d01fe75d055d37c48937bbd3f3df21745b6331e024142c04bfc0ebf5b94",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/final_64_256_512_49408.log": "2be64e730286e425ed44f26bd63c1c1c4512e1ea166380e3f4e2862ee8e6a66b",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/final_256_256_512_49408.log": "d22e0531f358b4191ee1e79e35066af10a218a3ba9b4c39f698f857a5bef0a6f",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/scratch-2026-09-17/FaPacketPlan/final_64_512_512_49408.log": "fe1f6fab2c6af1eec248a5fc7a73449b171e8de60cda66039260b358e3904778",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/kernels/src/attention_q8_0_fa2_gqa.gfx1201.hip": "71705f87cbf0b18d71b6d0aba7db34bef7b818d9d4486ce6c47c990aa60140fd",
+    "/home/kaden/ClaudeCode/warpfront/wt-fapkt/docs/plans/2026-09-19-gfx1201-fa-packet.md": "d444a6708da547719397788f7624c69d2895a0c7fe848cba50b47ec4cea4316d"
+  },
+  "claims": {
+    "retained_current_direct_instructions_identical": true,
+    "baseline_compute_packets_KT64": 4138,
+    "baseline_helper_packets_KT64": 1215,
+    "baseline_fair_packets_per_compute": 4543,
+    "floor_packets_KT16": [
+      399,
+      396,
+      255
+    ],
+    "candidate_dense_query_head_rows": 128,
+    "candidate_threads": 256,
+    "candidate_dynamic_LDS": 49408,
+    "candidate_performance_measured": false,
+    "production_source_modified": false
+  }
+}

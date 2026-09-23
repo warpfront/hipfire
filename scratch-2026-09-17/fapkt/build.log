@@ -1,0 +1,2 @@
+clang++: warning: argument unused during compilation: '-Llib' [-Wunused-command-line-argument]
+clang++: warning: argument unused during compilation: '--hip-link' [-Wunused-command-line-argument]

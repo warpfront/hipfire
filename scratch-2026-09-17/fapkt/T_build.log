@@ -1,0 +1,46 @@
+clang++: warning: argument unused during compilation: '-Llib' [-Wunused-command-line-argument]
+clang++: warning: argument unused during compilation: '--hip-link' [-Wunused-command-line-argument]
+transpose.hip:41:1: remark: Function Name: t_old_fill_dump [-Rpass-analysis=kernel-resource-usage]
+   41 | {
+      | ^
+transpose.hip:41:1: remark:     TotalSGPRs: 16 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:41:1: remark:     VGPRs: 66 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:41:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:41:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:41:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:41:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:41:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:41:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:126:1: remark: Function Name: t_old_fill [-Rpass-analysis=kernel-resource-usage]
+  126 | {
+      | ^
+transpose.hip:126:1: remark:     TotalSGPRs: 10 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:126:1: remark:     VGPRs: 25 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:126:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:126:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:126:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:126:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:126:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:126:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:320:1: remark: Function Name: t_new_fill_dump [-Rpass-analysis=kernel-resource-usage]
+  320 | {
+      | ^
+transpose.hip:320:1: remark:     TotalSGPRs: 16 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:320:1: remark:     VGPRs: 34 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:320:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:320:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:320:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:320:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:320:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:320:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:368:1: remark: Function Name: t_new_fill [-Rpass-analysis=kernel-resource-usage]
+  368 | {
+      | ^
+transpose.hip:368:1: remark:     TotalSGPRs: 10 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:368:1: remark:     VGPRs: 24 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:368:1: remark:     ScratchSize [bytes/lane]: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:368:1: remark:     Dynamic Stack: False [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:368:1: remark:     Occupancy [waves/SIMD]: 16 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:368:1: remark:     SGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:368:1: remark:     VGPRs Spill: 0 [-Rpass-analysis=kernel-resource-usage]
+transpose.hip:368:1: remark:     LDS Size [bytes/block]: 0 [-Rpass-analysis=kernel-resource-usage]
