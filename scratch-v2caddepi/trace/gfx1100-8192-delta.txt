@@ -1,0 +1,13 @@
+gpu_ms A 3100.274 B 3091.425 delta -8.850 (-0.29%)
+wall_ms A 3162.935 B 3152.866 delta -10.069 (-0.32%)
+pp8192 t/s (wall) A 2590.0 B 2598.3
+per-symbol (B - A), |delta| >= 0.5 ms:
+   -755.892 gemm_mq4g256v2_residual_iu4_v2c_add_gfx11            A  256   755.892  B    0     0.000
+   +744.088 gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11      A    0     0.000  B  256   744.088
+     +1.743 gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11            A  128  1086.719  B  128  1088.462
+     +0.800 gemm_mq4g256v2_residual_iu4_v2c_set_gfx11            A  288   507.560  B  288   508.360
+V2C ADD populations (K17408 > 3 ms = big, K6144 = small):
+  A gemm_mq4g256v2_residual_iu4_v2c_add_gfx11 big              n=128 sum=  553.082 mean=  4.321
+  A gemm_mq4g256v2_residual_iu4_v2c_add_gfx11 small            n=128 sum=  202.810 mean=  1.584
+  B gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11 big        n=128 sum=  548.833 mean=  4.288
+  B gemm_mq4g256v2_residual_iu4_v2c_add_touch_gfx11 small      n=128 sum=  195.255 mean=  1.525

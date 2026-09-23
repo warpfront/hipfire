@@ -1,0 +1,2 @@
+parent pid=2187627 ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0 HOME=/home/kaden/hipfire-v2caddepi/scratch-v2caddepi/trace/gfx1100-8192-B/home
+daemon pid=2187629 ROCR_VISIBLE_DEVICES=0 HIP_VISIBLE_DEVICES=0

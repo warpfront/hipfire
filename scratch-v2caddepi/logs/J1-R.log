@@ -1,0 +1,25 @@
+device gfx1100, 48 MPs
+time rev add_k6144  seq:set+fold    4.125 ms
+time rev add_k6144  seq:add+norm    4.429 ms
+time rev add_k6144  norm:fold       1.079 ms
+time rev add_k6144  norm:base       0.951 ms
+time rev add_k6144  add:l64d16      3.151 ms
+time rev add_k6144  add:touchjit    3.147 ms
+time rev add_k6144  set:base        3.081 ms
+time rev add_k6144  add:base        3.514 ms
+summary rev add_k6144 touch touchjit  3.147 vs 3.514 ms: -10.43%
+summary rev add_k6144 touch l64d16    3.151 vs 3.514 ms: -10.34%
+summary rev add_k6144 seq add+norm 4.429  seq set+fold 4.125  (-6.87%)
+summary rev add_k6144 add+norm 4.465  set+foldnorm 4.160  fold saves 0.305 ms (6.84%)
+time rev add_k17408 seq:set+fold    9.598 ms
+time rev add_k17408 seq:add+norm    9.621 ms
+time rev add_k17408 norm:fold       1.077 ms
+time rev add_k17408 norm:base       0.950 ms
+time rev add_k17408 add:l64d16      8.628 ms
+time rev add_k17408 add:touchjit    8.654 ms
+time rev add_k17408 set:base        8.565 ms
+time rev add_k17408 add:base        8.683 ms
+summary rev add_k17408 touch touchjit  8.654 vs 8.683 ms: -0.33%
+summary rev add_k17408 touch l64d16    8.628 vs 8.683 ms: -0.64%
+summary rev add_k17408 seq add+norm 9.621  seq set+fold 9.598  (-0.24%)
+summary rev add_k17408 add+norm 9.634  set+foldnorm 9.642  fold saves -0.009 ms (-0.09%)
