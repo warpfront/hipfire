@@ -1545,6 +1545,8 @@ fn resolve_deepseek4_compressor_cache_kv_mode(
     match kv_mode.unwrap_or("f32").to_ascii_lowercase().as_str() {
         "" | "auto" | "f32" => Ok(hipfire_config::Deepseek4CompressorCache::F32),
         "f16" => Ok(hipfire_config::Deepseek4CompressorCache::F16),
+        "q8" => Ok(hipfire_config::Deepseek4CompressorCache::F32),
+        "fwht8" => Ok(hipfire_config::Deepseek4CompressorCache::F16),
         other => Err(format!(
             "DeepSeek V4 kv_cache={other} is not implemented; use f32 (golden/default) or f16 (gfx1201 MQ2R TP3/TP4 capacity route)"
         )),

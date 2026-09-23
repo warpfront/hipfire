@@ -242,8 +242,12 @@ def load_prompt_battery(prompts_file, prompt_file=None, niah_file=None):
         return rows
     if not prompts_file:
         return [(genre, prompt, []) for genre, prompt in GENRE_BATTERY]
-    rows = json.load(open(prompts_file))
-    return [(r.get("genre", "prose"), r["prompt"], r.get("expect", [])) for r in rows]
+    try:
+        rows = json.load(open(prompts_file))
+        return [(r.get("genre", "prose"), r["prompt"], r.get("expect", [])) for r in rows]
+    except Exception:
+        text = Path(prompts_file).read_bytes().decode("utf-8")
+        return [("prose", text, [])]
 
 
 def show_config(cfg):

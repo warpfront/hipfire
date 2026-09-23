@@ -1,0 +1,22 @@
+==================== serve_harness pre-flight (CONFIRM before run) ====================
+  model         : /home/kaden/models/deepseek-v4-flash-0731.mq2r
+  registry tag  : deepseek-v4-flash:mq2r
+  kv_mode       : q8 [explicit(--kv)]   kv_backend: contiguous   mtp_mode: off   mode: battery
+  dflash        : off   draft: (none / filename auto-match)
+  speculation   : off   <-- OVERRIDES dflash/mtp
+  ds4 experts/tok: (checkpoint default)
+  ds4 placement : single
+  devices       : 0,1,2
+  expert parallel: tp=3
+  seed          : None   prompt_source: /home/kaden/hipfire-ds4-gfx1201-opt/benchmarks/prompts/ds4-gfx942-ar-2048.txt
+  thinking_budget: off -> thinking DISABLED (sentinel cap 1)
+  reasoning_effort: auto  (parent prompt semantics; independent of cap)
+  max_tokens     : 512  (no think block emitted)
+  sampling (what IS set):
+      temperature       = 0.0      [explicit(greedy)]
+  sampling (NOT set, serve/daemon default applies): top_p, top_k, min_p, presence_penalty, repeat_penalty, reasoning_effort
+=======================================================================================
+  [serve warm; MTP head loaded lines=1]
+### RUN deepseek-v4-flash-0731.mq2r|off|battery  kv=q8 sampling={'temperature': 0.0} seed=None ###
+  [prose]t1  finish=length ctx=2052   cached=0      gen=512  (think 0/ans 395w) prefill=4268.558986ms/480.724292842184tok/s decode=53.16277596723412tok/s tau=None !RUNAWAY | 'Understood. This response is framed as a technical briefing for operators and implementers'
+[deepseek-v4-flash-0731.mq2r|off|battery DONE] turns=1 runaway=1 empty=0 attractor=0 retrieval_miss=0 avg_prefill=480.7tok/s avg_decode=53.2tok/s

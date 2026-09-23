@@ -1,0 +1,29 @@
+[
+{
+"request_id": "chatcmpl-742423-1",
+"ctx": 2052,
+"cached": 0,
+"gen": 512,
+"finish": "length",
+"think_words": 0,
+"ans_words": 392,
+"prefill_ms": 5131.556095,
+"prefill_tok_s": 399.8787038495777,
+"decode_tok_s": 53.17146389995562,
+"decode_estimated": false,
+"tau": null,
+"cycles": null,
+"dflash": null,
+"mtp": null,
+"ttft_s": 5.998,
+"wall_s": 14.788,
+"attractor": false,
+"empty": false,
+"runaway": true,
+"ans_preview": "Understood. This is a technical briefing for operators and implementers who must keep the ",
+"assistant_content": "Understood. This is a technical briefing for operators and implementers who must keep the product path honest. The measurement fixture is ordinary batch-1 AR, temperature 0, Q8 KV, a 2048-token prompt, 510 generated tokens, and no speculation of any kind. Nothing below invents alternate routes, draft models, tree verification, or retained PM4 shortcuts as substitutes for the ordinary HIP path.\n\n---\n\n### 1. Why Prompt Bytes Matter More Than Prompt \"Text\" in This Setting\n\nBenchmarks collapse when two runs believe they share a prompt but do not share bytes. Command substitution that strips a trailing newline, an editor that rewrites line endings, a chat template applied in one arm and omitted in the other, or a Python tokenizer substituted for the embedded HFQ tokenizer will each change token identities even when the glyphs look identical to a human. The contract therefore freezes three artifacts:\n\n- A deterministic source corpus (revisioned prose or chat, not random word salad, not a hostname, not a timestamp, not a single paragraph repeated until the byte budget is met).\n- A derived exact-N token prefix written with no final LF.\n- A little-endian u32 token dump produced by the same runtime tokenizer that the daemon will use at load time.\n\nMD5 and SHA-256 of the prompt bytes are ledger fields, not optional commentary.\n\nThe source corpus must be realistic technical prose that exercises a broader mixture of short function words, domain nouns, punctuation, and paragraph structure. Degenerate repetition distiates attention patterns and decode timing. The derived fixture is a strict prefix of that corpus at a verified token boundary. If decode-then-re-encode does not reproduce the same ID sequence and the same count, the fixture generator must refuse to write. Fail closed beats a convenient wrong file.\n\n---\n\n### 2. Product Path for a Single Generate Request Under `HIPFIRE_SPECULATION=off` and `--kv-mode q8`\n\nLoad resolves the model artifact and its embedded metadata. The metadata carries tokenizer configuration, special tokens, and the chat template digest when present. For a raw prompt fixture measurement, the operator passes the exact fixture bytes as one argument so the client does not rejoin words or append a newline.\n\nThe daemon builds a generate request with:\n- Temperature fixed at zero for the bench path.\n- Top-p left at a non-sampling setting consistent with greedy selection.\n- Speculation selectors projected to off for dflash, mtp,",
+"prompt_md5": "25e22faef15a20ae53501f1956e62b79",
+"expected_substrings": [],
+"retrieval_missing": []
+}
+]
