@@ -359,7 +359,8 @@ static void oracle() {
     oracle_case(17408, 5120, N, XMode::Hashed, "full_hashed");
     oracle_case(1024, 1024, 512, XMode::SiluSpecials, "silu_specials");
     oracle_case(512, 512, 768, XMode::Hashed, "small_multitile");
-    oracle_case(384, 768, 1280, XMode::SiluSpecials, "odd_tiles");
+    // Producer K (= Me) must be a multiple of 256; 2Me/TM = 12 (V2C) / 6 (V2B).
+    oracle_case(768, 768, 1280, XMode::SiluSpecials, "odd_tiles");
     printf(g_fail ? "ORACLE_FAIL\n" : "ORACLE_PASS\n");
     if (g_fail) exit(5);
 }
