@@ -2,6 +2,7 @@
 //! chain, qwen3 dense transformer) is the only arch-specific seam — see
 //! [`DsparkBody`]. Everything else (main_proj ingest, markov head, confidence
 //! head, window orchestration) lives here.
+use crate::ngram_mod::{NgramModConfig, NgramModPool};
 use crate::spec::{
     accept_greedy_prefix, MtpDrafter, MtpSpeculator, MtpWindow, SpecGrammar, SpecScratch,
     SpecTarget, Speculator,
@@ -1132,6 +1133,18 @@ pub struct DsparkDrafter {
     /// Adaptive block-size controller. `None` when `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`
     /// (opt-out; fixed block == pre-change behaviour).
     block_controller: Option<crate::dspark_block_controller::BlockController>,
+    /// Optional exact-match CPU ngram route. A hit bypasses the DSpark body and
+    /// heads, but still uses the target's normal verify/capture/commit path.
+    ngram_mod: Option<NgramModPool>,
+    /// Request-local prompt + actually committed continuation used for lookup.
+    ngram_context: Vec<u32>,
+    /// First not-yet-indexed next-token position in `ngram_context`.
+    ngram_indexed_until: usize,
+    /// The prefill seed is returned separately and must be appended exactly once.
+    ngram_seed_pending: bool,
+    ngram_windows: u64,
+    ngram_drafts: u64,
+    ngram_accepted: u64,
 }
 
 impl MtpDrafter for DsparkDrafter {
@@ -1173,6 +1186,14 @@ impl MtpDrafter for DsparkDrafter {
             return Err("DsparkDrafter::mtp_prefill: fill_tokens is empty".into());
         }
 
+        if let Some(pool) = self.ngram_mod.as_mut() {
+            self.ngram_context.clear();
+            self.ngram_context.extend_from_slice(fill_tokens);
+            pool.insert_range(&self.ngram_context, 0);
+            self.ngram_indexed_until = self.ngram_context.len();
+            self.ngram_seed_pending = true;
+        }
+
         // Run the full prefill through spec_advance (reset=false; recurrent was
         // already reset above on cache_miss). Returns argmax at the last position,
         // which is the seed for the first decode window.
@@ -1199,6 +1220,10 @@ impl MtpDrafter for DsparkDrafter {
         // wired for the generic drafter (no arch-specific grammar type to
         // downcast to) — ignore silently; post-hoc emission-layer grammar applies.
 
+        if self.ngram_seed_pending {
+            self.ngram_context.push(seed);
+            self.ngram_seed_pending = false;
+        }
         let layers = self.weights.cfg.target_layer_ids.clone();
         let n_targets = layers.len();
         // Adaptive path may shrink below the caller's k, but MUST NOT exceed it:
@@ -1309,57 +1334,65 @@ impl MtpDrafter for DsparkDrafter {
         // ── 2–3. Draft the block (skipped on k==0 one-token path) ──────────
         // k==0: verify [seed] only and emit the single bonus — no draft_block /
         // run_heads, and no conf-threshold that would force keep≥1.
-        let (mut drafts, draft_confidence): (Vec<u32>, Vec<f32>) = if block == 0 {
-            (Vec::new(), Vec::new())
-        } else {
-            let x_head_out = gpu
-                .alloc_tensor(&[block, hidden], DType::F32)
-                .map_err(|e| format!("DsparkDrafter: alloc x_head: {e:?}"))?;
-            let t_draft = self.profiler.sync_start(gpu);
-            self.body.draft_block(
-                gpu,
-                &self.weights,
-                main_hidden,
-                &ctx_positions,
-                seed,
-                position,
-                block,
-                &x_head_out,
-            )?;
-            self.profiler.sync_end(gpu, t_draft, 1);
+        let ngram_drafts = self
+            .ngram_mod
+            .as_ref()
+            .and_then(|pool| pool.draft(&self.ngram_context, k));
+        let used_ngram = ngram_drafts.is_some();
+        let (mut drafts, draft_confidence): (Vec<u32>, Vec<f32>) =
+            if let Some(drafts) = ngram_drafts {
+                (drafts, Vec::new())
+            } else if block == 0 {
+                (Vec::new(), Vec::new())
+            } else {
+                let x_head_out = gpu
+                    .alloc_tensor(&[block, hidden], DType::F32)
+                    .map_err(|e| format!("DsparkDrafter: alloc x_head: {e:?}"))?;
+                let t_draft = self.profiler.sync_start(gpu);
+                self.body.draft_block(
+                    gpu,
+                    &self.weights,
+                    main_hidden,
+                    &ctx_positions,
+                    seed,
+                    position,
+                    block,
+                    &x_head_out,
+                )?;
+                self.profiler.sync_end(gpu, t_draft, 1);
 
-            let t_heads = self.profiler.sync_start(gpu);
-            let draft = run_heads(
-                gpu,
-                &self.weights,
-                &self.stage_norm,
-                &self.lm_head,
-                &x_head_out,
-                seed,
-                block,
-                vocab,
-            )?;
-            self.profiler.sync_end(gpu, t_heads, 2);
-            let _ = gpu.free_tensor(x_head_out);
+                let t_heads = self.profiler.sync_start(gpu);
+                let draft = run_heads(
+                    gpu,
+                    &self.weights,
+                    &self.stage_norm,
+                    &self.lm_head,
+                    &x_head_out,
+                    seed,
+                    block,
+                    vocab,
+                )?;
+                self.profiler.sync_end(gpu, t_heads, 2);
+                let _ = gpu.free_tensor(x_head_out);
 
-            let mut drafts: Vec<u32> = draft.tokens.into_iter().take(block).collect();
-            // Confidence-threshold truncation: walk slots, truncate at first
-            // slot whose sigmoid(confidence) < conf_threshold; always keep ≥1.
-            let conf_threshold = self.conf_threshold;
-            let confident_len = {
-                let mut l = drafts.len();
-                for (i, &c) in draft.confidence.iter().enumerate().take(drafts.len()) {
-                    let survival = 1.0f32 / (1.0 + (-c).exp());
-                    if survival < conf_threshold {
-                        l = i;
-                        break;
+                let mut drafts: Vec<u32> = draft.tokens.into_iter().take(block).collect();
+                // Confidence-threshold truncation: walk slots, truncate at first
+                // slot whose sigmoid(confidence) < conf_threshold; always keep ≥1.
+                let conf_threshold = self.conf_threshold;
+                let confident_len = {
+                    let mut l = drafts.len();
+                    for (i, &c) in draft.confidence.iter().enumerate().take(drafts.len()) {
+                        let survival = 1.0f32 / (1.0 + (-c).exp());
+                        if survival < conf_threshold {
+                            l = i;
+                            break;
+                        }
                     }
-                }
-                l.max(1)
+                    l.max(1)
+                };
+                drafts.truncate(confident_len);
+                (drafts, draft.confidence)
             };
-            drafts.truncate(confident_len);
-            (drafts, draft.confidence)
-        };
         let n_proposed = drafts.len();
 
         // ── 4. Verify: target forward over [seed, draft0..draft_{n-1}] ───────
@@ -1374,10 +1407,14 @@ impl MtpDrafter for DsparkDrafter {
         let n_verify = verify_tokens.len(); // seed + n_proposed drafts
 
         let mut scratch = if self.persistent_verify_context_scratch {
-            self.verify_scratch
-                .take()
-                .map(Ok)
-                .unwrap_or_else(|| target.new_spec_scratch(gpu, self.block + 1))?
+            self.verify_scratch.take().map(Ok).unwrap_or_else(|| {
+                let scratch_capacity = self
+                    .ngram_mod
+                    .as_ref()
+                    .map_or(self.block + 1, |pool| pool.config().n_max + 1)
+                    .max(n_verify);
+                target.new_spec_scratch(gpu, scratch_capacity)
+            })?
         } else {
             target.new_spec_scratch(gpu, n_verify)?
         };
@@ -1392,7 +1429,7 @@ impl MtpDrafter for DsparkDrafter {
         let expected_hidden_per_pos = n_targets * hidden;
         let mut transient_capture = None;
         if self.persistent_verify_context_scratch {
-            let max_capture_floats = (self.block + 1) * expected_hidden_per_pos;
+            let max_capture_floats = n_verify.max(self.block + 1) * expected_hidden_per_pos;
             let needs_alloc = self
                 .verify_capture_dev
                 .as_ref()
@@ -1610,11 +1647,27 @@ impl MtpDrafter for DsparkDrafter {
             let _ = gpu.free_tensor(capture_buf);
         }
         self.profiler.sync_end(gpu, t_rest, 4);
-        if let Some(c) = self.block_controller.as_mut() {
-            if let Some(tw) = t_window_ms {
-                c.observe_timing(tw, n_verify);
+        if !used_ngram {
+            if let Some(c) = self.block_controller.as_mut() {
+                if let Some(tw) = t_window_ms {
+                    c.observe_timing(tw, n_verify);
+                }
+                c.observe(accept_len, n_proposed);
             }
-            c.observe(accept_len, n_proposed);
+        }
+        if let Some(pool) = self.ngram_mod.as_mut() {
+            if used_ngram {
+                self.ngram_windows += 1;
+                self.ngram_drafts += n_proposed as u64;
+                self.ngram_accepted += n_accepted as u64;
+                let _ = pool.record_draft_result(n_proposed as u32, n_accepted as u32);
+                eprintln!(
+                    "[dspark-ngram] pos={position} drafted={n_proposed} accepted={n_accepted}"
+                );
+            }
+            self.ngram_context.extend_from_slice(&committed);
+            pool.insert_range(&self.ngram_context, self.ngram_indexed_until);
+            self.ngram_indexed_until = self.ngram_context.len();
         }
         self.profiler.end_window();
 
@@ -1645,6 +1698,11 @@ impl MtpDrafter for DsparkDrafter {
             }
         }
         self.ctx_positions.clear();
+        if self.ngram_mod.is_some() {
+            self.ngram_context.clear();
+            self.ngram_indexed_until = 0;
+            self.ngram_seed_pending = true;
+        }
         match target.spec_advance(gpu, tokens, start_pos, false, abort, None)? {
             crate::spec::SpecAdvance::Ready { .. } => Ok(true),
             crate::spec::SpecAdvance::Aborted => Ok(true),
@@ -1659,6 +1717,9 @@ impl MtpDrafter for DsparkDrafter {
             }
         }
         self.ctx_positions.clear();
+        self.ngram_context.clear();
+        self.ngram_indexed_until = 0;
+        self.ngram_seed_pending = false;
         // Body-owned draft rings / scratch (e.g. DeepSeek dspark_swa_k) must
         // not survive cold reset — otherwise retry sees prior-window KV.
         self.body.reset_for_retry(gpu);
@@ -1666,6 +1727,17 @@ impl MtpDrafter for DsparkDrafter {
     }
 
     fn mtp_free(self: Box<Self>, gpu: &mut Gpu) {
+        if self.ngram_mod.is_some() {
+            let rate = if self.ngram_drafts == 0 {
+                0.0
+            } else {
+                self.ngram_accepted as f64 / self.ngram_drafts as f64
+            };
+            eprintln!(
+                "[dspark-ngram] windows={} drafts={} accepted={} accept_rate={rate:.4}",
+                self.ngram_windows, self.ngram_drafts, self.ngram_accepted
+            );
+        }
         if let Some(dev) = self.main_hidden_dev {
             let _ = gpu.free_tensor(dev);
         }
@@ -1679,7 +1751,9 @@ impl MtpDrafter for DsparkDrafter {
     }
 
     fn k(&self) -> usize {
-        self.block
+        self.ngram_mod
+            .as_ref()
+            .map_or(self.block, |pool| self.block.max(pool.config().n_max))
     }
 
     fn ctx_capacity(&self) -> usize {
@@ -1745,6 +1819,48 @@ pub fn build_dspark_speculator(
             max_cost_ratio,
         )
     });
+    let ngram_requested =
+        hipfire_config::developer_var("HIPFIRE_DSPARK_NGRAM_MOD").as_deref() == Ok("1");
+    let ngram_mod = ngram_requested
+        .then(|| {
+            let n_match = std::env::var("HIPFIRE_DSPARK_NGRAM_MATCH")
+                .or_else(|_| std::env::var("HIPFIRE_NGRAM_MOD_N_MATCH"))
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(16);
+            let n_min = std::env::var("HIPFIRE_DSPARK_NGRAM_MIN")
+                .or_else(|_| std::env::var("HIPFIRE_NGRAM_MOD_N_MIN"))
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(32);
+            let n_max = std::env::var("HIPFIRE_DSPARK_NGRAM_MAX")
+                .or_else(|_| std::env::var("HIPFIRE_NGRAM_MOD_N_MAX"))
+                .ok()
+                .and_then(|value| value.parse().ok())
+                .unwrap_or(48);
+            if n_max > 64 {
+                return None;
+            }
+            NgramModPool::new(NgramModConfig {
+                capacity: 1 << 22,
+                n_match,
+                n_min,
+                n_max,
+            })
+            .ok()
+        })
+        .flatten();
+    if ngram_requested {
+        if let Some(pool) = ngram_mod.as_ref() {
+            let cfg = pool.config();
+            eprintln!(
+                "[dspark-ngram] armed n_match={} n_min={} n_max={}",
+                cfg.n_match, cfg.n_min, cfg.n_max
+            );
+        } else {
+            eprintln!("[dspark-ngram] disabled: invalid ngram configuration");
+        }
+    }
     Box::new(MtpSpeculator::new(DsparkDrafter {
         body,
         weights,
@@ -1766,5 +1882,12 @@ pub fn build_dspark_speculator(
         ctx_positions: Vec::new(),
         profiler: DsparkProfiler::new(),
         block_controller,
+        ngram_mod,
+        ngram_context: Vec::new(),
+        ngram_indexed_until: 0,
+        ngram_seed_pending: false,
+        ngram_windows: 0,
+        ngram_drafts: 0,
+        ngram_accepted: 0,
     }))
 }
