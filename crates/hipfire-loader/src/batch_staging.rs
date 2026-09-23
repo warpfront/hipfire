@@ -44,7 +44,8 @@ pub struct BatchStaging {
 
 /// True when embedding and lm_head formats admit the batched decode kernels.
 pub fn qwen_batch_weight_formats_supported(
-weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights) -> bool {
+    weights: &hipfire_arch_qwen35::qwen35::Qwen35Weights,
+) -> bool {
     use hipfire_runtime::llama::EmbeddingFormat;
     use rdna_compute::DType;
     let embd_ok = matches!(
@@ -77,209 +78,211 @@ pub fn stage_continuous_batch(
     requested: usize,
 ) -> BatchStaging {
     let mut out = BatchStaging::default();
-                        // ── Continuous batch staging (must be before `loaded` ack) ──
-                        // Stage Qwen35DecodeBatchState / hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState (single-GPU) or
-                        // Qwen35DecodeBatchEpState (EP TP=4 pure gfx1201) + host scheduler.
-                        // `continuous_batch_capable` reflects the newly staged state, not the previous.
-                        // EP is batch-only: TP must be 4 and exactly 4×gfx1201, else fail closed.
-                        // Allocation failure advertises false and preserves sequential/poison handling.
-                        if requested > 1 && m.pp == 1 && m.ep.is_none() {
-                            match crate::continuous_batch_route(m.arch_id) {
-                                Some(crate::ContinuousBatchRoute::Qwen35) => {
-                                // Immutable borrow of `m` ends after this extraction; mutable borrow for batch field later is disjoint.
-                                let qwen_info = m.qwen35().map(|b| {
-                                    (
-                                        qwen_batch_weight_formats_supported(&b.weights),
-                                        b.scratch.repeat_buf.buf.size(),
-                                        b.config.head_dim,
-                                        b.config.clone(),
-                                        b.weights.embd_format,
-                                        b.weights.output.gpu_dtype,
-                                    )
-                                });
-                                if let Some((weight_ok, scratch_size, head_dim, config_clone, embd_fmt, out_dtype)) = qwen_info {
-                                    if !weight_ok {
-                                        eprintln!(
+    // ── Continuous batch staging (must be before `loaded` ack) ──
+    // Stage Qwen35DecodeBatchState / hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState (single-GPU) or
+    // Qwen35DecodeBatchEpState (EP TP=4 pure gfx1201) + host scheduler.
+    // `continuous_batch_capable` reflects the newly staged state, not the previous.
+    // EP is batch-only: TP must be 4 and exactly 4×gfx1201, else fail closed.
+    // Allocation failure advertises false and preserves sequential/poison handling.
+    if requested > 1 && m.pp == 1 && m.ep.is_none() {
+        match crate::continuous_batch_route(m.arch_id) {
+            Some(crate::ContinuousBatchRoute::Qwen35) => {
+                // Immutable borrow of `m` ends after this extraction; mutable borrow for batch field later is disjoint.
+                let qwen_info = m.qwen35().map(|b| {
+                    (
+                        qwen_batch_weight_formats_supported(&b.weights),
+                        b.scratch.repeat_buf.buf.size(),
+                        b.config.head_dim,
+                        b.config.clone(),
+                        b.weights.embd_format,
+                        b.weights.output.gpu_dtype,
+                    )
+                });
+                if let Some((
+                    weight_ok,
+                    scratch_size,
+                    head_dim,
+                    config_clone,
+                    embd_fmt,
+                    out_dtype,
+                )) = qwen_info
+                {
+                    if !weight_ok {
+                        eprintln!(
                                             "[daemon] continuous batch requested but weight formats unsupported (embd={:?} lm_head={:?}) — fallback to sequential",
                                             embd_fmt, out_dtype
                                         );
-                                    } else {
-                                        let repeat_cap = (scratch_size / 4).max(1);
-                                        let max_attention_lane = gpu
-                                            .attention_q8_0_kv_independent_max_lane_capacity(
-                                                head_dim,
-                                            );
-                                        let batch_lane_capacity = m.max_seq.min(max_attention_lane);
-                                        if batch_lane_capacity == 0 {
-                                            eprintln!(
+                    } else {
+                        let repeat_cap = (scratch_size / 4).max(1);
+                        let max_attention_lane =
+                            gpu.attention_q8_0_kv_independent_max_lane_capacity(head_dim);
+                        let batch_lane_capacity = m.max_seq.min(max_attention_lane);
+                        if batch_lane_capacity == 0 {
+                            eprintln!(
                                                 "[daemon] continuous batch unavailable: independent attention admits no lanes — fallback to sequential"
                                             );
-                                        } else {
-                                            if batch_lane_capacity < m.max_seq {
-                                                eprintln!(
+                        } else {
+                            if batch_lane_capacity < m.max_seq {
+                                eprintln!(
                                                     "[daemon] continuous batch lane capacity clamped: requested={} supported={}",
                                                     m.max_seq,
                                                     batch_lane_capacity
                                                 );
-                                            }
-                                            match hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState::new(
-                                                gpu,
-                                                &config_clone,
-                                                requested,
-                                                batch_lane_capacity,
-                                                repeat_cap,
-                                            ) {
-                                                Ok(batch_state) => {
-                                                    m.qwen35_mut().unwrap().qwen35_decode_batch = Some(batch_state);
-                                                    out.slots = requested;
- out.lane_capacity = batch_lane_capacity;
-                                                    out.capable = true;
-                                                    eprintln!(
+                            }
+                            match hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchState::new(
+                                gpu,
+                                &config_clone,
+                                requested,
+                                batch_lane_capacity,
+                                repeat_cap,
+                            ) {
+                                Ok(batch_state) => {
+                                    m.qwen35_mut().unwrap().qwen35_decode_batch = Some(batch_state);
+                                    out.slots = requested;
+                                    out.lane_capacity = batch_lane_capacity;
+                                    out.capable = true;
+                                    eprintln!(
                                                         "[daemon] continuous batch staged: slots={} lane_cap={} repeat_cap={}",
                                                         requested,
                                                         batch_lane_capacity,
                                                         repeat_cap
                                                     );
-                                                }
-                                                Err(e) => {
-                                                    eprintln!(
+                                }
+                                Err(e) => {
+                                    eprintln!(
                                                         "[daemon] continuous batch allocation failed: {e} — fallback to sequential"
                                                     );
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    eprintln!("[daemon] continuous batch requested but model state not Qwen35 — fallback to sequential");
                                 }
-                                }
-                                Some(crate::ContinuousBatchRoute::Lfm2Moe) => {
-                                if m.lfm2moe().is_none() {
-                                    eprintln!("[daemon] continuous batch requested but model state not Lfm2Moe — fallback to sequential");
-                                } else if !m.lfm2moe().unwrap().config.is_dense() {
-                                    eprintln!(
+                            }
+                        }
+                    }
+                } else {
+                    eprintln!("[daemon] continuous batch requested but model state not Qwen35 — fallback to sequential");
+                }
+            }
+            Some(crate::ContinuousBatchRoute::Lfm2Moe) => {
+                if m.lfm2moe().is_none() {
+                    eprintln!("[daemon] continuous batch requested but model state not Lfm2Moe — fallback to sequential");
+                } else if !m.lfm2moe().unwrap().config.is_dense() {
+                    eprintln!(
                                         "[daemon] continuous batch requested but LFM MoE not supported (dense only) — fallback to sequential"
                                     );
-                                } else if let Err(reason) =
-                                    hipfire_arch_lfm2moe::batch_weight_formats_supported(&m.lfm2moe().unwrap().weights)
-                                {
-                                    eprintln!(
+                } else if let Err(reason) = hipfire_arch_lfm2moe::batch_weight_formats_supported(
+                    &m.lfm2moe().unwrap().weights,
+                ) {
+                    eprintln!(
                                         "[daemon] continuous batch requested but weight formats unsupported: {} — fallback to sequential",
                                         reason
                                     );
-                                } else {
-                                    let repeat_cap = 2048usize.max(1);
-                                    let max_attention_lane = {
-                                        let b = m.lfm2moe().unwrap();
-                                        gpu.attention_q8_0_kv_independent_max_lane_capacity(
-                                            b.config.head_dim,
-                                        )
-                                    };
-                                    let batch_lane_capacity = m.max_seq.min(max_attention_lane);
-                                    if batch_lane_capacity == 0 {
-                                        eprintln!(
+                } else {
+                    let repeat_cap = 2048usize.max(1);
+                    let max_attention_lane = {
+                        let b = m.lfm2moe().unwrap();
+                        gpu.attention_q8_0_kv_independent_max_lane_capacity(b.config.head_dim)
+                    };
+                    let batch_lane_capacity = m.max_seq.min(max_attention_lane);
+                    if batch_lane_capacity == 0 {
+                        eprintln!(
                                             "[daemon] continuous batch unavailable: independent attention admits no lanes — fallback to sequential"
                                         );
-                                    } else {
-                                        if batch_lane_capacity < m.max_seq {
-                                            eprintln!(
+                    } else {
+                        if batch_lane_capacity < m.max_seq {
+                            eprintln!(
                                                 "[daemon] continuous batch lane capacity clamped: requested={} supported={}",
                                                 m.max_seq,
                                                 batch_lane_capacity
                                             );
-                                        }
-                                        // Clone config for the call so the immutable borrow ends before the mutable one.
-                                        let cfg = m.lfm2moe().unwrap().config.clone();
-                                        match hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState::new(
-                                            gpu,
-                                            &cfg,
-                                            requested,
-                                            batch_lane_capacity,
-                                            repeat_cap,
-                                        ) {
-                                            Ok(batch_state) => {
-                                                if let Some(b) = m.lfm2moe_mut() {
-                                                    b.lfm2_decode_batch = Some(batch_state);
-                                                    out.slots = requested;
- out.lane_capacity = batch_lane_capacity;
-                                                    out.capable = true;
-                                                    eprintln!(
+                        }
+                        // Clone config for the call so the immutable borrow ends before the mutable one.
+                        let cfg = m.lfm2moe().unwrap().config.clone();
+                        match hipfire_arch_lfm2moe::batch::Lfm2DecodeBatchState::new(
+                            gpu,
+                            &cfg,
+                            requested,
+                            batch_lane_capacity,
+                            repeat_cap,
+                        ) {
+                            Ok(batch_state) => {
+                                if let Some(b) = m.lfm2moe_mut() {
+                                    b.lfm2_decode_batch = Some(batch_state);
+                                    out.slots = requested;
+                                    out.lane_capacity = batch_lane_capacity;
+                                    out.capable = true;
+                                    eprintln!(
                                                         "[daemon] continuous batch staged: slots={} lane_cap={} repeat_cap={}",
                                                         requested,
                                                         batch_lane_capacity,
                                                         repeat_cap
                                                     );
-                                                } else {
-                                                    // Should be unreachable (we checked is_some above), but free to avoid leak.
-                                                    batch_state.free_gpu(gpu);
-                                                    eprintln!("[daemon] continuous batch requested but model state not Lfm2Moe — fallback to sequential");
-                                                }
-                                            }
-                                            Err(e) => {
-                                                eprintln!(
-                                                    "[daemon] continuous batch allocation failed: {e} — fallback to sequential"
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                }
-                                None => {
-                                eprintln!("[daemon] continuous batch requested but not capable (arch_id={} pp={} ep={:?}) — fallback to sequential", m.arch_id, m.pp, m.ep.is_some());
+                                } else {
+                                    // Should be unreachable (we checked is_some above), but free to avoid leak.
+                                    batch_state.free_gpu(gpu);
+                                    eprintln!("[daemon] continuous batch requested but model state not Lfm2Moe — fallback to sequential");
                                 }
                             }
-                        } else if requested > 1 && m.pp == 1 && m.ep.is_some() {
-                            // EP Qwen35 pure expert-parallel batch route: TP=4, 4×gfx1201, batch-only.
-                            let tp_ok =
-                                m.ep.as_ref()
-                                    .map(|ep| ep.gpus.devices.len() == 4)
-                                    .unwrap_or(false);
-                            let gfx_ok = m
-                                .ep
-                                .as_ref()
-                                .map(|ep| ep.gpus.devices.iter().all(|d| d.arch_caps.is_gfx1201()))
-                                .unwrap_or(false);
-                            let arch_ok = matches!(m.arch_id, 5 | 6);
-                            if !arch_ok || !tp_ok || !gfx_ok {
-                                eprintln!("[daemon][EP] continuous batch requires arch 5/6, TP=4, 4×gfx1201 (arch_ok={arch_ok} tp_ok={tp_ok} gfx_ok={gfx_ok}) — fail closed");
-                                out.capable = false;
-                            } else if let Some(ep) = m.ep.as_mut() {
-                                if let crate::EpArch::Qwen35 {
-                                    config,
-                                    weights,
-                                    batch,
-                                } = &mut ep.inner
-                                {
-                                    if !qwen_ep_batch_weight_formats_supported(&weights[0]) {
-                                        eprintln!("[daemon][EP] continuous batch weight formats unsupported — fail closed");
-                                    } else {
-                                        // Derive capacities similar to single-GPU but via EP Gpus handle when possible.
-                                        let max_attention_lane = ep.gpus.devices[0]
-                                            .attention_q8_0_kv_independent_max_lane_capacity(
-                                                config.head_dim,
-                                            );
-                                        let batch_lane_capacity =
-                                            m.max_seq.min(max_attention_lane).max(1);
-                                        let repeat_cap = 128usize.max(1);
-                                        let prefill_chunk = 512usize;
-                                        if batch_lane_capacity == 0
-                                            || batch_lane_capacity >= m.max_seq + 1
-                                        {
-                                            eprintln!("[daemon][EP] continuous batch lane capacity invalid — fail closed");
-                                        } else {
-                                            let load_cfg = hipfire_arch_qwen35::qwen35::Qwen35BatchLoadConfig::new(
-                                                requested,
-                                                batch_lane_capacity,
-                                                repeat_cap,
-                                                prefill_chunk,
-                                            );
-                                            // Fail-closed validation before allocation.
-                                            match hipfire_arch_qwen35::qwen35::validate_ep_batch_compatibility(
-                                                &ep.gpus, weights, config, &load_cfg,
-                                            ) {
-                                                Ok(compat) => {
-                                                    // Enforce frozen invariants.
-                                                    if compat.rank_count() != 4 || compat.rank_mask() != 0x0f || compat.reduce() != hipfire_arch_qwen35::qwen35::Qwen35EpReduce::PeerRootedF32 || compat.topology() != hipfire_arch_qwen35::qwen35::Qwen35EpTopology::ExpertParallel {
+                            Err(e) => {
+                                eprintln!(
+                                                    "[daemon] continuous batch allocation failed: {e} — fallback to sequential"
+                                                );
+                            }
+                        }
+                    }
+                }
+            }
+            None => {
+                eprintln!("[daemon] continuous batch requested but not capable (arch_id={} pp={} ep={:?}) — fallback to sequential", m.arch_id, m.pp, m.ep.is_some());
+            }
+        }
+    } else if requested > 1 && m.pp == 1 && m.ep.is_some() {
+        // EP Qwen35 pure expert-parallel batch route: TP=4, 4×gfx1201, batch-only.
+        let tp_ok =
+            m.ep.as_ref()
+                .map(|ep| ep.gpus.devices.len() == 4)
+                .unwrap_or(false);
+        let gfx_ok =
+            m.ep.as_ref()
+                .map(|ep| ep.gpus.devices.iter().all(|d| d.arch_caps.is_gfx1201()))
+                .unwrap_or(false);
+        let arch_ok = matches!(m.arch_id, 5 | 6);
+        if !arch_ok || !tp_ok || !gfx_ok {
+            eprintln!("[daemon][EP] continuous batch requires arch 5/6, TP=4, 4×gfx1201 (arch_ok={arch_ok} tp_ok={tp_ok} gfx_ok={gfx_ok}) — fail closed");
+            out.capable = false;
+        } else if let Some(ep) = m.ep.as_mut() {
+            if let crate::EpArch::Qwen35 {
+                config,
+                weights,
+                batch,
+            } = &mut ep.inner
+            {
+                if !qwen_ep_batch_weight_formats_supported(&weights[0]) {
+                    eprintln!(
+                        "[daemon][EP] continuous batch weight formats unsupported — fail closed"
+                    );
+                } else {
+                    // Derive capacities similar to single-GPU but via EP Gpus handle when possible.
+                    let max_attention_lane = ep.gpus.devices[0]
+                        .attention_q8_0_kv_independent_max_lane_capacity(config.head_dim);
+                    let batch_lane_capacity = m.max_seq.min(max_attention_lane).max(1);
+                    let repeat_cap = 128usize.max(1);
+                    let prefill_chunk = 512usize;
+                    if batch_lane_capacity == 0 || batch_lane_capacity >= m.max_seq + 1 {
+                        eprintln!(
+                            "[daemon][EP] continuous batch lane capacity invalid — fail closed"
+                        );
+                    } else {
+                        let load_cfg = hipfire_arch_qwen35::qwen35::Qwen35BatchLoadConfig::new(
+                            requested,
+                            batch_lane_capacity,
+                            repeat_cap,
+                            prefill_chunk,
+                        );
+                        // Fail-closed validation before allocation.
+                        match hipfire_arch_qwen35::qwen35::validate_ep_batch_compatibility(
+                            &ep.gpus, weights, config, &load_cfg,
+                        ) {
+                            Ok(compat) => {
+                                // Enforce frozen invariants.
+                                if compat.rank_count() != 4 || compat.rank_mask() != 0x0f || compat.reduce() != hipfire_arch_qwen35::qwen35::Qwen35EpReduce::PeerRootedF32 || compat.topology() != hipfire_arch_qwen35::qwen35::Qwen35EpTopology::ExpertParallel {
                                                         eprintln!("[daemon][EP] compat invariants violated — fail closed: rank_count={} mask={:#x} reduce={:?} topo={:?}", compat.rank_count(), compat.rank_mask(), compat.reduce(), compat.topology());
                                                     } else {
                                                         match hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchEpState::new(&mut ep.gpus, weights, config, &load_cfg) {
@@ -318,19 +321,21 @@ pub fn stage_continuous_batch(
                                                             }
                                                         }
                                                     }
-                                                }
-                                                Err(e) => {
-                                                    eprintln!("[daemon][EP] expert-parallel batch compatibility failed: {e} — fail closed");
-                                                }
-                                            }
-                                        }
-                                    }
-                                } else {
-                                    eprintln!("[daemon][EP] continuous batch requested but EP arch not Qwen35 — fail closed");
-                                }
                             }
-                        } else if requested > 1 {
-                            eprintln!("[daemon] continuous batch requested but not capable (arch_id={} pp={} ep={:?}) — fallback to sequential", m.arch_id, m.pp, m.ep.is_some());
+                            Err(e) => {
+                                eprintln!("[daemon][EP] expert-parallel batch compatibility failed: {e} — fail closed");
+                            }
                         }
+                    }
+                }
+            } else {
+                eprintln!(
+                    "[daemon][EP] continuous batch requested but EP arch not Qwen35 — fail closed"
+                );
+            }
+        }
+    } else if requested > 1 {
+        eprintln!("[daemon] continuous batch requested but not capable (arch_id={} pp={} ep={:?}) — fallback to sequential", m.arch_id, m.pp, m.ep.is_some());
+    }
     out
 }
