@@ -56,6 +56,49 @@ fn main() {
 }
 
 #[cfg(feature = "deltanet")]
+fn accumulate_fc_sumsq(sumsq: &mut [f64], rows: &[f32], row_stride: usize) -> usize {
+    assert_eq!(
+        sumsq.len(),
+        row_stride,
+        "fc sumsq accumulator must match row stride"
+    );
+    assert_eq!(
+        rows.len() % row_stride,
+        0,
+        "target_hidden_host row data must be row-aligned"
+    );
+    for row in rows.chunks_exact(row_stride) {
+        for (acc, &value) in sumsq.iter_mut().zip(row.iter()) {
+            let x = value as f64;
+            *acc += x * x;
+        }
+    }
+    rows.len() / row_stride
+}
+
+#[cfg(feature = "deltanet")]
+fn write_fc_sumsq_json(path: &str, row_stride: usize, rows: usize, sumsq: &[f64]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let file = std::fs::File::create(path)?;
+    let mut out = std::io::BufWriter::new(file);
+    writeln!(out, "{{")?;
+    writeln!(out, r#"  "schema": "hipfire.dflash_fc_sumsq.v0","#)?;
+    writeln!(out, r#"  "tensor": "fc.weight","#)?;
+    writeln!(out, r#"  "stat": "target_hidden_input_sumsq","#)?;
+    writeln!(out, r#"  "row_stride": {row_stride},"#)?;
+    writeln!(out, r#"  "rows": {rows},"#)?;
+    writeln!(out, r#"  "sumsq": ["#)?;
+    for (i, value) in sumsq.iter().enumerate() {
+        let suffix = if i + 1 == sumsq.len() { "" } else { "," };
+        writeln!(out, "    {:.9e}{suffix}", value)?;
+    }
+    writeln!(out, "  ]")?;
+    writeln!(out, "}}")?;
+    out.flush()
+}
+
+#[cfg(feature = "deltanet")]
 fn main() {
     use hipfire_runtime::cask::CaskCtx;
     use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
@@ -197,6 +240,7 @@ fn main() {
     // forward_prefill_batch on committed tokens (byte-exact vs AR when
     // combined with HIPFIRE_PREFILL_BATCHED=0).
     let mut no_tape: bool = false;
+    let mut dump_fc_sumsq: Option<String> = None;
 
     // FlashCASK: TriAttention scoring + CASK core-aware m-folding merge
     // applied to target.kv_cache between spec_step cycles. Passes the
@@ -398,6 +442,10 @@ fn main() {
             "--no-tape" => {
                 no_tape = true;
                 i += 1;
+            }
+            "--dump-fc-sumsq" => {
+                dump_fc_sumsq = Some(args[i + 1].clone());
+                i += 2;
             }
             "--cask-sidecar" => {
                 cask_sidecar = Some(args[i + 1].clone());
@@ -632,6 +680,10 @@ fn main() {
     let tokenizer: Tokenizer = target.load_tokenizer().expect("target tokenizer");
     // Per-row tokenize, ChatML wrap, and optional PFlash compression are
     // done inside the loop below.
+    let fc_sumsq_row_stride = draft_cfg.num_extract() * draft_cfg.hidden;
+    let mut fc_sumsq: Option<Vec<f64>> =
+        dump_fc_sumsq.as_ref().map(|_| vec![0.0; fc_sumsq_row_stride]);
+    let mut fc_sumsq_rows: usize = 0;
 
     // ── Hidden ring buffer + snapshot + target_hidden_host ────────────
     // Size for the max block we may use this session so adaptive-B-up
@@ -1240,6 +1292,11 @@ fn main() {
         // the resident bench proceed to the next row.
         if multi_row {
             eprintln!("@@@ ROW {row_idx} END @@@");
+        }
+        if let Some(acc) = fc_sumsq.as_mut() {
+            let rows = accumulate_fc_sumsq(acc, &target_hidden_host, fc_sumsq_row_stride);
+            fc_sumsq_rows += rows;
+            eprintln!("fc_sumsq: accumulated {rows} rows from AR row {row_idx}");
         }
         continue;
     }
@@ -1968,8 +2025,23 @@ fn main() {
         );
     }
         // ── End of per-row loop body ──────────────────────────────
+        if let Some(acc) = fc_sumsq.as_mut() {
+            let rows = accumulate_fc_sumsq(acc, &target_hidden_host, fc_sumsq_row_stride);
+            fc_sumsq_rows += rows;
+            eprintln!("fc_sumsq: accumulated {rows} rows from DFlash row {row_idx}");
+        }
         if multi_row {
             eprintln!("@@@ ROW {row_idx} END @@@");
         }
+    }
+    if let (Some(path), Some(acc)) = (dump_fc_sumsq.as_ref(), fc_sumsq.as_ref()) {
+        write_fc_sumsq_json(path, fc_sumsq_row_stride, fc_sumsq_rows, acc)
+            .unwrap_or_else(|e| panic!("write --dump-fc-sumsq {path}: {e}"));
+        eprintln!(
+            "fc_sumsq: wrote {} rows x {} channels to {}",
+            fc_sumsq_rows,
+            fc_sumsq_row_stride,
+            path,
+        );
     }
 }

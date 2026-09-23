@@ -454,14 +454,15 @@ pub fn spec_step_dflash_mtp(
     // Snapshot trunk DN state for rollback.
     target_snap.save_from(&target.dn_state, gpu)?;
 
-    // MoE-aware: tape capture is lossy on MoE per the spec_step_dflash
-    // comment block. Preserve the same gate.
     let mut gdn_tape_opt = gdn_tape;
-    let target_has_moe = target.weights.layers.iter().any(|lw| matches!(
-        lw,
-        qwen35::LayerWeights::DeltaNetMoe(_) | qwen35::LayerWeights::FullAttnMoe(_),
-    ));
-    if target_has_moe {
+    let tape_captured = gdn_tape_opt.is_some()
+        && speculative::dflash_verify_pbs_eligible(
+            target,
+            verify_scratch,
+            n_verify,
+            gpu.arch.as_str(),
+        );
+    if !tape_captured {
         gdn_tape_opt = None;
     }
 
@@ -544,7 +545,10 @@ pub fn spec_step_dflash_mtp(
 
     // ── 8. Rollback trunk DN state + replay accepted committed tokens ────
     target_snap.restore_to(&mut target.dn_state, gpu)?;
-    if let Some(tape) = gdn_tape_opt.as_deref() {
+    if tape_captured {
+        let tape = gdn_tape_opt
+            .as_deref()
+            .expect("tape_captured requires a live GdnTape");
         tape.replay_gdn(
             gpu,
             &target.weights,
@@ -1027,13 +1031,15 @@ pub fn spec_step_dflash_mtp_tree(
     // ── 5. Tree verify ────────────────────────────────────────────────────
     target_snap.save_from(&target.dn_state, gpu)?;
 
-    // MoE-aware tape gate (mirrors spec_step_dflash).
     let mut gdn_tape_opt = gdn_tape;
-    let target_has_moe = target.weights.layers.iter().any(|lw| matches!(
-        lw,
-        qwen35::LayerWeights::DeltaNetMoe(_) | qwen35::LayerWeights::FullAttnMoe(_),
-    ));
-    if target_has_moe {
+    let tape_captured = gdn_tape_opt.is_some()
+        && speculative::dflash_verify_pbs_eligible(
+            target,
+            verify_scratch,
+            n_total,
+            gpu.arch.as_str(),
+        );
+    if !tape_captured {
         gdn_tape_opt = None;
     }
 
@@ -1151,7 +1157,10 @@ pub fn spec_step_dflash_mtp_tree(
     // beyond seed. The replay tokens mirror this: just `committed[..accept_dflash + accept_mtp + 1]`.
     target_snap.restore_to(&mut target.dn_state, gpu)?;
     let n_replay = accept_dflash + accept_mtp + 1; // committed up to (but not including) bonus
-    if let Some(tape) = gdn_tape_opt.as_deref() {
+    if tape_captured {
+        let tape = gdn_tape_opt
+            .as_deref()
+            .expect("tape_captured requires a live GdnTape");
         // Tape was captured in linearization order; replay only works for
         // contiguous dflash prefix (slots 0..=accept_dflash). MTP accepted
         // slots aren't on the dflash linear chain so we re-prefill if any

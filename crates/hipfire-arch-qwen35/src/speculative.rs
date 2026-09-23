@@ -1427,6 +1427,32 @@ impl VerifyScratch {
     }
 }
 
+/// Whether DFlash verify will run through Qwen35's batched PBS path for `n`
+/// tokens. This is also the condition for a supplied [`GdnTape`] to be
+/// populated during verify. MoE targets are eligible when their current
+/// quantization and scratch layout are supported by the batched MoE branches;
+/// unsupported dense/MoE variants must fall back to full replay.
+pub fn dflash_verify_pbs_eligible(
+    target: &ModelSlot,
+    verify_scratch: &VerifyScratch,
+    n: usize,
+    arch: &str,
+) -> bool {
+    let moe_router_logits_present = verify_scratch
+        .prefill_batch
+        .as_ref()
+        .map(|p| p.moe_router_logits_batch.is_some())
+        .unwrap_or(true);
+    qwen35::prefill_batch_pbs_eligible(
+        &target.weights,
+        &target.config,
+        &target.dn_state,
+        n,
+        arch,
+        moe_router_logits_present,
+    )
+}
+
 pub struct HiddenStateRingBuffer {
     pub layer_bufs: Vec<GpuTensor>,
     pub extract_layers: Vec<usize>,
@@ -2284,9 +2310,18 @@ fn verify_dflash_block_inner(
             );
         }
     }
+<<<<<<< Updated upstream
     let tree_ok_for_graph = !tree_verify_present || tree_graph_enabled;
+||||||| Stash base
+    let tree_ok_for_graph = tree_verify.is_none() || tree_graph_enabled;
+=======
+    let tree_ok_for_graph = tree_verify.is_none() || tree_graph_enabled;
+    let pbs_eligible =
+        dflash_verify_pbs_eligible(target, verify_scratch, b, gpu.arch.as_str());
+>>>>>>> Stashed changes
     let verify_graph_ok = std::env::var("HIPFIRE_VERIFY_GRAPH").ok().as_deref() != Some("0")
         && tree_ok_for_graph
+        && pbs_eligible
         && matches!(
             target.weights.embd_format,
             hipfire_runtime::llama::EmbeddingFormat::HFQ4G256
@@ -3254,11 +3289,15 @@ pub fn spec_step_dflash(
 
     // ── 6. Snapshot DeltaNet pre-verify, run verify (advances state by B) ─
     //
-    // If a GdnTape is supplied, the verify forward also records the
-    // per-LA-layer (q, k, v, α, β) innovation tape so the rollback can
-    // replay just the GDN recurrence for `accept+1` steps without
-    // re-running the target.
+    // If a GdnTape is supplied and the target will take the batched PBS
+    // prefill path, the verify forward records per-LA-layer (q, k, v, α,
+    // β) innovations so rollback can replay just the GDN recurrence for
+    // `accept+1` steps without re-running the target. Gate on the same
+    // predicate as the forward path: MoE targets are tape-capable when
+    // their current quant/scratch configuration is PBS-eligible, and
+    // non-MoE targets can still fall back when dtype/env constraints fail.
     target_snap.save_from(&target.dn_state, gpu)?;
+<<<<<<< Updated upstream
     // Mutable variable to allow both verify capture + rollback replay usage.
     let moe_router_logits_present = verify_scratch
         .prefill_batch
@@ -3275,6 +3314,32 @@ pub fn spec_step_dflash(
     );
     let use_tape_replay = dflash_use_gdn_tape_replay(gdn_tape.is_some(), verify_populates_tape);
     let mut gdn_tape_opt = if use_tape_replay { gdn_tape } else { None };
+||||||| Stash base
+    // Mutable variable to allow both verify capture + rollback replay usage.
+    let mut gdn_tape_opt = gdn_tape;
+    // MoE targets can't populate the tape: forward_prefill_batch_with_pbs's
+    // eligibility check rejects MoE (qwen35.rs `DeltaNetMoe|FullAttnMoe => false`),
+    // so verify falls through to the per-token loop which doesn't write the
+    // tape. With Some(tape) downstream `replay_gdn` then runs on zero-init
+    // buffers, corrupting `dn_state.conv_states` and hanging the next cycle.
+    // Force None so the fallback replay path (batched forward on committed
+    // tokens) runs instead — correct at ~3-5 ms/cycle extra vs proper tape
+    // replay. Remove once batched MoE prefill + tape recording lands.
+    let target_has_moe = target.weights.layers.iter().any(|lw| matches!(
+        lw,
+        qwen35::LayerWeights::DeltaNetMoe(_) | qwen35::LayerWeights::FullAttnMoe(_),
+    ));
+    if target_has_moe {
+        gdn_tape_opt = None;
+    }
+=======
+    let mut gdn_tape_opt = gdn_tape;
+    let tape_captured = gdn_tape_opt.is_some()
+        && dflash_verify_pbs_eligible(target, verify_scratch, b, gpu.arch.as_str());
+    if !tape_captured {
+        gdn_tape_opt = None;
+    }
+>>>>>>> Stashed changes
 
     if phase_on {
         gpu.hip.device_synchronize()?;
@@ -3586,7 +3651,10 @@ pub fn spec_step_dflash(
     // Fallback (no tape): batched forward_prefill_batch over (accept+1)
     // tokens, same as the prior version — re-runs the full target but one
     // batched call instead of (accept+1) sequential decodes.
-    if let Some(tape) = gdn_tape_opt.as_deref() {
+    if tape_captured {
+        let tape = gdn_tape_opt
+            .as_deref()
+            .expect("tape_captured requires a live GdnTape");
         tape.replay_gdn(
             gpu,
             &target.weights,

@@ -7760,8 +7760,8 @@ fn trace_finite_if_enabled(gpu: &Gpu, label: &str, tensor: &GpuTensor) -> HipRes
 /// A3B model fall back to per-token prefill because router is universally
 /// Q8_0. Widening to accept Q8 router + Q8 shared_expert_gate unlocks
 /// uniform-MQ4 A3B variants (Qwen3.5-A3B, qwen3.6-35b-a3b-uniform.mq4).
-/// Mixed-precision Qwen3.6-A3B (MQ6 in 16/40 layers) still falls back —
-/// needs an MQ6 sibling for `_k8_indexed_batched`, follow-up work.
+/// The production AWQ A3B checkpoints also use MQ6 in the MoE experts and
+/// shared expert, so the batched path admits MQ6 by default as well.
 /// MoE FFN admit predicate for the batched prefill body
 /// `prefill_moe_ffn_body_batched`. Per-projection MQ4 OR MQ6 admit:
 ///
@@ -7904,6 +7904,22 @@ fn moe_ffn_batched_admissible(ffn: &MoeFfnWeights, admit_mq6: bool) -> bool {
         }
     }
 
+<<<<<<< Updated upstream
+||||||| Stash base
+    // MQ6 admit env gate (default off — see comment above)
+    static MQ6_ADMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let admit_mq6 = *MQ6_ADMIT.get_or_init(|| {
+        std::env::var("HIPFIRE_MOE_MQ6_ADMIT").as_deref() == Ok("1")
+    });
+
+=======
+    // MQ6 admit env gate (default on; explicit 0 restores strict MQ4).
+    static MQ6_ADMIT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let admit_mq6 = *MQ6_ADMIT.get_or_init(|| {
+        std::env::var("HIPFIRE_MOE_MQ6_ADMIT").as_deref() != Ok("0")
+    });
+
+>>>>>>> Stashed changes
     if admit_mq6 {
         // Per-projection MQ4 OR MQ6 admit.
         let shared_gu_dt = ffn.shared_expert.gate.gpu_dtype;
@@ -8317,15 +8333,52 @@ fn prefill_moe_ffn_body_batched(
         }
     });
     let arch_supported = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
-    let path2_eligible = use_path2 && arch_supported;
+    // Grouped-WMMA wins decisively for large prefill, and is also the
+    // correctness-preserving route for current AWQ A3B small batches. An
+    // indexed small-batch experiment can be enabled by setting
+    // HIPFIRE_MOE_GROUPED_MIN_N above the verify batch size, but the default
+    // keeps every eligible batch on grouped-WMMA until that path is channel
+    // tested against the AWQ MoE models.
+    static GROUPED_MIN_N: OnceLock<usize> = OnceLock::new();
+    let grouped_min_n = *GROUPED_MIN_N.get_or_init(|| {
+        std::env::var("HIPFIRE_MOE_GROUPED_MIN_N")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(0)
+    });
+    let routed_dtype = ffn.experts[0].gate_up.gpu_dtype;
+    let force_mq6_indexed = std::env::var("HIPFIRE_MOE_MQ6_INDEXED")
+        .ok()
+        .as_deref()
+        == Some("1");
+    let keep_grouped_for_dtype = matches!(routed_dtype, DType::MQ6G256) && !force_mq6_indexed;
+    let path2_eligible =
+        use_path2 && arch_supported && (keep_grouped_for_dtype || n >= grouped_min_n);
     // m_total — computed during gate_up scatter, reused for down. Avoids
     // a second dtoh sync per MoE layer.
     let mut path2_m_total: usize = 0;
     if path2_eligible {
+<<<<<<< Updated upstream
         // Stage 1 scatter pipeline. The scratch buffers are sized for
         // worst-case max_batch. Runtime launch bounds use the tighter live
         // slot upper bound below. Block size 16 (the WMMA tile row count).
         const BLOCK_M: usize = MOE_GROUPED_BLOCK_M;
+||||||| Stash base
+        // Stage 1 scatter pipeline. The scratch buffers are sized for
+        // m_total_max = max_batch * k_top + n_exp * 15; here m_total ≤
+        // n * k_top + n_exp * 15. Block size 16 (the WMMA tile row count).
+        const BLOCK_M: usize = 16;
+=======
+        // Stage 1 scatter pipeline. The scratch buffers are sized for the
+        // large-prefill worst case:
+        //   max_batch * k_top + n_exp * 15
+        // At runtime, only `total_slots = n * k_top` experts can be active,
+        // so the tighter no-sync upper bound is:
+        //   total_slots + min(total_slots, n_exp) * 15
+        // This matters for DFlash MoE verify, where B is small and the old
+        // bound launched thousands of sentinel tiles for inactive experts.
+        const BLOCK_M: usize = 16;
+>>>>>>> Stashed changes
         let counts = pbs.moe_expert_token_counts.as_ref().expect("path2 scratch");
         let offsets = pbs.moe_expert_offsets.as_ref().expect("path2 scratch");
         let sorted = pbs.moe_sorted_slot_index.as_ref().expect("path2 scratch");
@@ -8333,6 +8386,7 @@ fn prefill_moe_ffn_body_batched(
         let tile_ids = pbs.moe_expert_tile_ids.as_ref().expect("path2 scratch");
         let y_gu_grouped = pbs.moe_y_gate_up_grouped.as_ref().expect("path2 scratch");
         let total_slots = n * k_top;
+<<<<<<< Updated upstream
         // m_total upper bound — scratch is sized in PrefillBatchScratch::new
         // with the all-experts worst case, while this launch only needs slots
         // plus padding for experts that can be non-empty at this N.
@@ -8340,6 +8394,21 @@ fn prefill_moe_ffn_body_batched(
         // bound with -1; grouped GEMM early-returns on sentinel tiles, so we
         // can skip the m_total dtoh sync entirely. Saves ~50µs/layer.
         let m_total_max = moe_grouped_m_total_bound(total_slots, n_exp);
+||||||| Stash base
+        // m_total upper bound — sized in PrefillBatchScratch::new with
+        // max_batch * k_top + n_exp * (BLOCK_M - 1). The scatter fused
+        // kernel pre-fills expert_tile_ids[0..m_total_max/16] with -1;
+        // the grouped GEMM and unscatter early-return on those tiles, so
+        // we can skip the m_total dtoh sync entirely. Saves ~50µs/layer.
+        let m_total_max = n * k_top + n_exp * (BLOCK_M - 1);
+=======
+        // m_total upper bound. `active_expert_ub` avoids padding all 256
+        // experts when a small verify batch can only route to N*K_TOP of
+        // them. The scatter fused kernel pre-fills the upper-bound range
+        // with -1; grouped GEMM and unscatter early-return on those tiles.
+        let active_expert_ub = total_slots.min(n_exp);
+        let m_total_max = total_slots + active_expert_ub * (BLOCK_M - 1);
+>>>>>>> Stashed changes
 
         // Fused scatter pipeline: one launch replaces histogram + offsets
         // + permute. Saves 2 launches × ~75µs × MoE layers.
@@ -8501,6 +8570,27 @@ fn prefill_moe_ffn_body_batched(
                 k_top,
                 n,
             )?,
+            DType::MQ6G256 => {
+                if std::env::var("HIPFIRE_MOE_MQ6_INDEXED_LOOP").ok().as_deref() == Some("1") {
+                    for bid in 0..n {
+                        let topk_row = topk_indices.sub_offset(bid * k_top, k_top);
+                        let x_row = pbs.x_rot_batch.sub_offset(bid * gate_up_k, gate_up_k);
+                        let gate_row = gate_batch.sub_offset(bid * k_top * mi, k_top * mi);
+                        let up_row = up_batch.sub_offset(bid * k_top * mi, k_top * mi);
+                        gpu.gemv_hfq6g256_moe_gate_up_k8_indexed(
+                            &ffn.expert_gate_up_ptrs, &topk_row,
+                            &x_row, &gate_row, &up_row,
+                            2 * mi, gate_up_k,
+                        )?;
+                    }
+                } else {
+                    gpu.gemv_hfq6g256_moe_gate_up_k8_indexed_batched(
+                        &ffn.expert_gate_up_ptrs, topk_indices,
+                        &pbs.x_rot_batch, gate_batch, up_batch,
+                        2 * mi, gate_up_k, k_top, n,
+                    )?;
+                }
+            },
             // Phase 3 PARO routed-expert: apply the layer's shared gate_up
             // Givens rotation to x_norm_batch into x_rot_batch ONCE, then
             // dispatch the HFQ4G128 indexed batched kernel. All 256 experts
@@ -8715,6 +8805,11 @@ fn prefill_moe_ffn_body_batched(
                     down_k,
                     k_top,
                     n,
+                )?,
+                DType::MQ6G256 => gpu.gemv_hfq6g256_moe_down_k8_indexed_batched_expanded(
+                    &ffn.expert_down_ptrs, topk_indices,
+                    rot_batch, down_expanded,
+                    down_m, down_k, k_top, n,
                 )?,
                 // Phase 3 PARO down: the layer-shared `down` Givens rotation
                 // has already been applied to rot_batch by the

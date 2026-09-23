@@ -1258,6 +1258,12 @@ pub const GIVENS_ROTATE_TO_SRC: &str = include_str!("../../../kernels/src/givens
 pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_SRC: &str =
     include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_indexed.hip");
 
+/// HFQ6G256 counterpart to the N-batched indexed MoE gate_up kernel.
+/// Used by small-batch speculative MoE verify where grouped-WMMA padding
+/// every expert to a 16-row tile overwhelms the useful work.
+pub const GEMV_HFQ6G256_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_hfq6g256_moe_gate_up_indexed_batched.hip");
+
 /// HFQ6G256 counterpart to the atomic-free expanded batched MoE down kernel.
 /// Same expand-then-combine pattern; pairs with `MOE_DOWN_COMBINE_K8_BATCHED_SRC`
 /// (combine is dtype-independent — operates on the f32 expanded buffer).
