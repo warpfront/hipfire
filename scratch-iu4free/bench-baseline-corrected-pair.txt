@@ -1,0 +1,1 @@
+RESULT,baseline,gate_up,B=8192,M=34816,K=5120,median_us=12910.419,mean_us=12901.944,tops=226.219,occ=3,lds=20480

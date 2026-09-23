@@ -1,0 +1,1 @@
+RESULT,shiftfold,gate_up,B=8192,M=34816,K=5120,median_us=11788.271,mean_us=12720.028,tops=247.753,occ=2,lds=30720
