@@ -1412,6 +1412,18 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_SRC: &str = concat!(
     "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
 );
+/// F1-lite h-producer: the C2 AWQ SwiGLU/FWHT IU4 producer with phase 1
+/// reading h = silu(gate)*up (formed by `gemm_mq4g256v2_gate_up_silu_iu4_*`)
+/// from one FP32 stream. Same source and quant recipe as
+/// [`FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_SRC`] from the AWQ divide on.
+pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_I4_HIN_SRC: &str = concat!(
+    "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
+    "#define HIPFIRE_IU4_SIDECAR 1\n",
+    "#define HIPFIRE_SILU_HIN 1\n",
+    "#define HIPFIRE_SILU_MQ_ROTATE_KERNEL fused_silu_mul_mq_rotate_awq_i4_hin\n",
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_awq.hip")
+);
 /// gfx1201 slice-1 IU4 producer: SwiGLU/FWHT + in-register `block_i4_128` emit.
 /// Same shared quant recipe as the C2 sidecars, but distinct entry symbols so
 /// gfx1151 HSACO caches and profiler rows cannot alias the gfx1201 fusion.
@@ -3696,13 +3708,17 @@ pub const SPLIT_MQ4V2_Z_BETAALPHA_SRC: &str =
 /// gfx11 GEMM v2 "V2C" symmetric IU4 prefill tile (M128xN128, 8 waves, two
 /// K128 LDS slots, 2 CTAs/WGP). Reads the production MQ4V2 weights and
 /// `block_i4_128` activations and permutes them at the LDS store; SET/ADD are
-/// separate entries with a 6-argument ABI (no `add` flag).
+/// separate entries with a 6-argument ABI (no `add` flag). The F1-lite entry
+/// `gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11` (7 arguments: gate, up, Xq, h,
+/// M, K, N) folds gate and up rows address-interleaved in one launch and stores
+/// h = silu(gate)*up.
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_iu4_v2c.gfx11.hip");
 /// gfx11 GEMM v2 "V2B" symmetric IU4 prefill tile (M256xN256, 16 waves, two
 /// 32 KiB K128 LDS slots, 1 CTA/WGP), dispatched on gfx1151. Same production
 /// operand layouts, staging permutation, fold numerics and 6-argument
-/// SET/ADD ABI as V2C.
+/// SET/ADD ABI as V2C, plus the F1-lite entry
+/// `gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11` with V2C's 7-argument ABI.
 pub const GEMM_MQ4G256V2_RESIDUAL_IU4_V2B_GFX11_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_iu4_v2b.gfx11.hip");
 // gfx12 (RDNA4) iu4-direct MMQ sister: weight nibbles feed

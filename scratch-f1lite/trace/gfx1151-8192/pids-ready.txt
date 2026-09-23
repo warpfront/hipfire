@@ -1,0 +1,10 @@
+
+
+============================ ROCm System Management Interface ============================
+===================================== KFD Processes ======================================
+KFD process information:
+PID    	PROCESS NAME	GPU(s)	VRAM USED  	SDMA USED	CU OCCUPANCY	
+2043618	daemon      	1     	16438243328	0        	UNKNOWN     	
+2970   	gpusentry   	0     	0          	0        	UNKNOWN     	
+==========================================================================================
+================================== End of ROCm SMI Log ===================================

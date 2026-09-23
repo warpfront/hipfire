@@ -311,6 +311,43 @@ enum Mq4v2QkvVariant {
     K2048XBufferGfx1100,
 }
 
+/// GEMM v2 tile of an exact-gfx11 symmetric IU4 full-tile prefill GEMM
+/// (`Gpu::iu4_v2_tile`). Both read the unchanged MQ4V2 / `block_i4_128`
+/// layouts and are bit-identical to X5.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Iu4V2Tile {
+    /// gfx1100 M128xN128, 8 waves (block 32x8), 2 CTAs/WGP.
+    V2c,
+    /// gfx1151 M256xN256, 16 waves (block 32x16), 1 CTA/WGP.
+    V2b,
+}
+
+impl Iu4V2Tile {
+    /// Rows and tokens per CTA.
+    const fn tile(self) -> usize {
+        match self {
+            Self::V2c => 128,
+            Self::V2b => 256,
+        }
+    }
+    /// Waves per CTA (block `[32, waves, 1]`).
+    const fn waves(self) -> u32 {
+        match self {
+            Self::V2c => 8,
+            Self::V2b => 16,
+        }
+    }
+    /// Dynamic LDS; must equal the kernel's `LDS_BYTES`. V2C: two 16 KiB K128
+    /// slots (8 KiB W + 8 KiB X payload; scales bypass LDS) — anything above
+    /// 32 KiB drops gfx1100 from 2 to 1 CTA/WGP. V2B: two 32 KiB slots.
+    const fn lds_bytes(self) -> u32 {
+        match self {
+            Self::V2c => 32768,
+            Self::V2b => 65536,
+        }
+    }
+}
+
 /// Exact-gfx1100 MQ4V2 residual verify-tier pick (N<=16 DFlash tier).
 ///
 /// Shared by the F32 entry below and the F16 entry in
@@ -19666,6 +19703,49 @@ impl Gpu {
     }
 
 
+    /// GEMM v2 tile of a symmetric MQ4V2 IU4 SET/ADD of shape (m, k, n), or
+    /// `None` for X5 and its fallbacks. Both tiles take the X5 eligibility
+    /// rule: symmetric fold, full M128/N128 tiles, eager column route (no
+    /// replay/graph capture), positive dims.
+    /// - V2C: exact gfx1100. `HIPFIRE_IU4_V2C=0` falls back to X5.
+    /// - V2B: exact gfx1151, M%256 == N%256 == 0 and at least two dispatch
+    ///   rounds of the 1-CTA/WGP grid ((M/256)*(N/256) >= CU count = 2x WGPs).
+    ///   On Halo every measured grid of >= 40 CTAs beat X5 (1.08-1.45x); grids
+    ///   of 4-12 and 24 CTAs (e.g. M1024 at N512) lost and keep X5.
+    ///   `HIPFIRE_IU4_V2B=0` falls back to X5.
+    fn iu4_v2_tile(&self, m: usize, k: usize, n: usize) -> Option<Iu4V2Tile> {
+        let eligible = m > 0
+            && k > 0
+            && n > 0
+            && k % 256 == 0
+            && m % 128 == 0
+            && n % 128 == 0
+            && self.mq4v2_symmetric
+            && self.flags.gfx11_iu4_symfold
+            && hipfire_config::developer_var("HIPFIRE_IU4_SYMFOLD").as_deref() != Ok("0")
+            && !self.replay.is_recording()
+            && !self.graphs.capture_mode;
+        if !eligible {
+            return None;
+        }
+        match self.arch.as_str() {
+            "gfx1100"
+                if hipfire_config::developer_var("HIPFIRE_IU4_V2C").as_deref() != Ok("0") =>
+            {
+                Some(Iu4V2Tile::V2c)
+            }
+            "gfx1151"
+                if m % 256 == 0
+                    && n % 256 == 0
+                    && (m / 256) * (n / 256) >= self.cu_count_or_default()
+                    && hipfire_config::developer_var("HIPFIRE_IU4_V2B").as_deref() != Ok("0") =>
+            {
+                Some(Iu4V2Tile::V2b)
+            }
+            _ => None,
+        }
+    }
+
 
     /// iu4-direct MMQ consumer for the MQ4V2 family (W4A4 prefill): reads the
     /// int4 `block_i4_128` prelude from `ensure_int4_mmq_x`, feeds weight
@@ -19817,19 +19897,10 @@ impl Gpu {
             && batch_size > 0
             && (self.arch.as_str() == "gfx1151" || shape_lf16)
             && hipfire_config::developer_var("HIPFIRE_IU4_X5").as_deref() != Ok("0");
-        // GEMM v2 V2C: exact gfx1100 only, on the X5 eligibility rule (full
-        // M128/N128 tiles, symfold, eager column route, positive dims). Same
-        // numerics as X5 bit-for-bit; reads the unchanged MQ4V2/block_i4_128
-        // layouts. `HIPFIRE_IU4_V2C=0` falls back to X5 (or its fallbacks).
-        if symfold
-            && full
-            && use_col
-            && m > 0
-            && k > 0
-            && batch_size > 0
-            && self.arch.as_str() == "gfx1100"
-            && hipfire_config::developer_var("HIPFIRE_IU4_V2C").as_deref() != Ok("0")
-        {
+        // GEMM v2 V2C (gfx1100) / V2B (gfx1151): see `iu4_v2_tile` for the
+        // eligibility rule and kill switches.
+        let v2_tile = self.iu4_v2_tile(m, k, batch_size);
+        if v2_tile == Some(Iu4V2Tile::V2c) {
             let kernel_name = if add {
                 "gemm_mq4g256v2_residual_iu4_v2c_add_gfx11"
             } else {
@@ -19854,10 +19925,7 @@ impl Gpu {
                 &mut k_val as *mut _ as *mut c_void,
                 &mut n_val as *mut _ as *mut c_void,
             ];
-            // Two 16 KiB K128 slots (8 KiB W + 8 KiB X payload); scales bypass
-            // LDS. Must equal the kernel's LDS_BYTES: anything above 32 KiB
-            // drops gfx1100 from 2 to 1 CTA/WGP.
-            const V2C_LDS_BYTES: u32 = 32768;
+            const V2C_LDS_BYTES: u32 = Iu4V2Tile::V2c.lds_bytes();
             let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
             let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
             // Token tile on x, row tile on y.
@@ -19883,25 +19951,7 @@ impl Gpu {
             }
             return result;
         }
-        // GEMM v2 V2B: exact gfx1151 only, on the X5 eligibility rule narrowed
-        // to M256/N256 tiles, and only when the 1-CTA/WGP grid fills at least
-        // two dispatch rounds ((M/256)*(N/256) >= CU count = 2x WGPs). On
-        // Halo every measured grid of >= 40 CTAs beat X5 (1.08-1.45x); grids
-        // of 4-12 and 24 CTAs (e.g. M1024 at N512) lost and keep X5.
-        // Same numerics as X5 bit-for-bit; reads the unchanged MQ4V2 /
-        // block_i4_128 layouts. `HIPFIRE_IU4_V2B=0` falls back to X5.
-        if symfold
-            && full
-            && use_col
-            && m > 0
-            && k > 0
-            && batch_size > 0
-            && m % 256 == 0
-            && batch_size % 256 == 0
-            && self.arch.as_str() == "gfx1151"
-            && (m / 256) * (batch_size / 256) >= self.cu_count_or_default()
-            && hipfire_config::developer_var("HIPFIRE_IU4_V2B").as_deref() != Ok("0")
-        {
+        if v2_tile == Some(Iu4V2Tile::V2b) {
             let kernel_name = if add {
                 "gemm_mq4g256v2_residual_iu4_v2b_add_gfx11"
             } else {
@@ -19926,9 +19976,7 @@ impl Gpu {
                 &mut k_val as *mut _ as *mut c_void,
                 &mut n_val as *mut _ as *mut c_void,
             ];
-            // Two 32 KiB K128 slots (16 KiB W + 16 KiB X payload); scales
-            // bypass LDS. Must equal the kernel's LDS_BYTES.
-            const V2B_LDS_BYTES: u32 = 65536;
+            const V2B_LDS_BYTES: u32 = Iu4V2Tile::V2b.lds_bytes();
             let bytes = m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * m * 4;
             let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
             // Token tile on x, row tile on y.
@@ -31620,6 +31668,95 @@ impl Gpu {
         )?;
         self.gemm_mq4g256v2_mmq_set_prequant_iu4(a_up, xq, y_up, up_m, k, batch_size)?;
         Ok(())
+    }
+
+    /// F1-lite prepared IU4 gate/up + SwiGLU (`HIPFIRE_F1LITE=0` opts out):
+    /// one GEMM v2 launch folds the gate and up rows (address-interleaved at
+    /// 16-row granularity, weights untouched) and its epilogue stores
+    /// h = silu(gate)*up to `h` (FP32 [N][M]) instead of the two streams.
+    /// Fires only where both projections would run that GEMM v2 tile on their
+    /// own ([`Self::iu4_v2_tile`]); returns `Ok(false)` without launching
+    /// otherwise. Each g and u is folded exactly as by the SET entry, and
+    /// [`Self::fused_silu_hin_rotate_mq_i4_batched`] then reproduces
+    /// `fused_silu_mul_mq_rotate_awq_i4` bit-for-bit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_silu_mq4g256v2_iu4_prepared(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        h: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<bool> {
+        if gate_m != up_m
+            || hipfire_config::developer_var("HIPFIRE_F1LITE").as_deref() == Ok("0")
+        {
+            return Ok(false);
+        }
+        let Some(tile) = self.iu4_v2_tile(gate_m, k, batch_size) else {
+            return Ok(false);
+        };
+        self.bind_thread()?;
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        let (module, source, kernel_name) = match tile {
+            Iu4V2Tile::V2c => (
+                "gemm_mq4g256v2_residual_iu4_v2c_gfx11",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2C_GFX11_SRC,
+                "gemm_mq4g256v2_gate_up_silu_iu4_v2c_gfx11",
+            ),
+            Iu4V2Tile::V2b => (
+                "gemm_mq4g256v2_residual_iu4_v2b_gfx11",
+                kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_V2B_GFX11_SRC,
+                "gemm_mq4g256v2_gate_up_silu_iu4_v2b_gfx11",
+            ),
+        };
+        self.ensure_kernel(module, source, kernel_name)?;
+        let mut g_ptr = a_gate.buf.as_ptr();
+        let mut u_ptr = a_up.buf.as_ptr();
+        let mut xq_ptr = xq;
+        let mut h_ptr = h.buf.as_ptr();
+        let mut m_val = gate_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut g_ptr as *mut _ as *mut c_void,
+            &mut u_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut h_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let t = tile.tile();
+        let bytes =
+            2 * gate_m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES + batch_size * gate_m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", kernel_name, bytes);
+        // Token tile on x, virtual (gate/up interleaved) row tile on y.
+        let result = self.launch_maybe_blob(
+            kernel_name,
+            [(batch_size / t) as u32, (2 * gate_m / t) as u32, 1],
+            [32, tile.waves(), 1],
+            tile.lds_bytes(),
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(g_ptr);
+                b.push_ptr(u_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(h_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result.map(|()| true)
     }
 
     /// MQ4V2 gfx1100 gate_up batch-tile (BT6 / BT12).

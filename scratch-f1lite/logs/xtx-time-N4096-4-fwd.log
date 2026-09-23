@@ -1,0 +1,13 @@
+DEVICE arch=gfx1100 name=AMD Radeon RX 7900 XTX mps=48 ROCR=0 HIP=0 pid=2028835
+OBJECT GEMM_BASE_OBJECT=bin/base_v2c-gfx1100.hsaco
+OBJECT GEMM_F1_OBJECT=bin/v2c-gfx1100.hsaco
+OBJECT PROD_SILU_OBJECT=bin/base_silu_i4-gfx1100.hsaco
+OBJECT PROD_HIN_OBJECT=bin/silu_hin-gfx1100.hsaco
+OBJECT PROD_SILU_JIT_OBJECT=/home/kaden/hipfire-prof040/scratch-fusion/bin/jit/silu_prod_jit-gfx1100.hsaco
+RESOURCE gemm_set_base vgpr=179 private=0 dynamic_lds=32768 blocks_per_mp=2
+RESOURCE gemm_set_new vgpr=179 private=0 dynamic_lds=32768 blocks_per_mp=2
+RESOURCE gemm_gate_up_silu vgpr=180 private=0 dynamic_lds=32768 blocks_per_mp=2
+RESOURCE silu_producer vgpr=55 private=0 dynamic_lds=0 blocks_per_mp=64
+RESOURCE hin_producer vgpr=76 private=0 dynamic_lds=0 blocks_per_mp=64
+RESULT arm=A_pair stem=v2c N=4096 total_ms=9.5795 gemm_ms=8.6255 producer_ms=0.9584 begin=1790151855.698 end=1790151855.765 all=9.5827,9.5708,9.5925,9.6554,9.5795,9.5768,9.5596,
+RESULT arm=C_f1lite stem=v2c N=4096 total_ms=9.2413 gemm_ms=8.7087 producer_ms=0.5324 begin=1790151856.367 end=1790151856.432 all=9.2501,9.2413,9.2450,9.2411,9.2413,9.2234,9.3099,

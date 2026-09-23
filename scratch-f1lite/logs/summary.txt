@@ -1,0 +1,14 @@
+## xtx (8 processes)
+N=4096
+  A_pair     total   9.5637 [9.5331,9.5795] gemm   8.6260 producer  0.9419
+  C_f1lite   total   9.2440 [9.2366,9.2590] gemm   8.7141 producer  0.5320
+  A/C 1.0346 [1.0321,1.0366]  saved/call 0.3198 ms
+N=8192
+  A_pair     total  19.0462 [19.0208,19.0610] gemm  17.2852 producer  1.7588
+  C_f1lite   total  18.4965 [18.4673,18.5182] gemm  17.4435 producer  1.0527
+  A/C 1.0297 [1.0284,1.0317]  saved/call 0.5497 ms
+## halo (4 processes)
+N=8192
+  A_pair     total  44.1067 [43.8207,44.3835] gemm  38.3383 producer  5.7675
+  C_f1lite   total  41.3812 [41.1230,41.7668] gemm  38.4136 producer  2.9670
+  A/C 1.0659 [1.0587,1.0715]  saved/call 2.7255 ms
